@@ -308,7 +308,7 @@ builtin_table! {
     ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; stdin nil|string|bytes|buffer|{file}|{null:true}; stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
     ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
     ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
-    ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool}))}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Every stage carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error and broken_pipe (killed by SIGPIPE: its reader closed); the result carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error, failed_stage (the RIGHTMOST non-ok stage, pipefail's rule; nil when none) and a one-line human summary — gates branch on status, never on text. Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool, status: string, broken_pipe: bool})), status: string, failed_stage: any, summary: string}); effects[must_use, blocking]; failure[returns_result])),
     ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
     ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal AND double-forks it so it is reparented to init (the caller never holds a zombie — v0.92.0), so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision (a NON-detached child is still the caller's to reap) — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
     ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result])),
@@ -6675,10 +6675,23 @@ fn pipeline_error_map(code: &str, message: &str, stages: Option<Value>) -> Value
     map.insert("utf8_lossy".to_string(), Value::Bool(false));
     map.insert("error_code".to_string(), Value::String(code.to_string()));
     map.insert("error".to_string(), Value::String(message.to_string()));
+    // PIPELINE_SPAWN is the one setup failure tied to a stage: every stage
+    // before it started, so the failing one is the next index. The other
+    // setup codes fail before any stage runs and name no stage.
+    let failed_stage = match (&stages, code) {
+        (Some(Value::List(started)), "PIPELINE_SPAWN") => Value::Number(started.len() as f64),
+        _ => Value::Nil,
+    };
     map.insert(
         "stages".to_string(),
         stages.unwrap_or_else(|| Value::list(Vec::new())),
     );
+    map.insert(
+        "status".to_string(),
+        Value::String("setup_error".to_string()),
+    );
+    map.insert("failed_stage".to_string(), failed_stage);
+    map.insert("summary".to_string(), Value::String(message.to_string()));
     Value::map(map)
 }
 
@@ -6695,7 +6708,7 @@ fn builtin_run_pipeline_impl(caller: &str, args: &[Value]) -> MixResult<Value> {
     let stages = parse_run_pipeline_stages(caller, &args[0])?;
     let opts = parse_run_pipeline_opts(caller, args.get(1))?;
     match run_pipeline_processes(caller, &stages, &opts) {
-        Ok(outcome) => Ok(pipeline_result_map(&stages, outcome, opts.allow_signal)),
+        Ok(outcome) => Ok(pipeline_result_map(&stages, outcome, &opts)),
         Err(MixError::Structured(info))
             if matches!(
                 info.code.as_str(),
@@ -8435,6 +8448,10 @@ struct PipelineChildRuntime {
     started: std::time::Instant,
     status: Option<std::process::ExitStatus>,
     duration_ms: u128,
+    /// The runtime signalled this stage's group (deadline or interrupt)
+    /// while the stage was still unreaped, so a signal death is OURS, not
+    /// the stage's own. A stage that had already exited is never marked.
+    runtime_signalled: bool,
 }
 
 struct PipelineRawStageOutcome {
@@ -8443,6 +8460,20 @@ struct PipelineRawStageOutcome {
     duration_ms: u128,
     stderr: Vec<u8>,
     stderr_truncated: bool,
+    runtime_signalled: bool,
+}
+
+/// Signal every stage group on behalf of the runtime (deadline/interrupt),
+/// first recording which stages were still running: those are the stages
+/// whose outcome the result attributes to the timeout or interrupt.
+#[cfg(unix)]
+fn signal_pipeline_groups_for_runtime(children: &mut [PipelineChildRuntime], signal: i32) {
+    for child in children.iter_mut() {
+        if child.status.is_none() {
+            child.runtime_signalled = true;
+        }
+    }
+    signal_pipeline_groups(children, signal);
 }
 
 struct PipelineProcessOutcome {
@@ -8548,6 +8579,13 @@ fn pipeline_started_stage_values(
             );
             map.insert("utf8_lossy".to_string(), Value::Bool(false));
             map.insert("accepted_signal".to_string(), Value::Bool(false));
+            // These stages started, then a LATER stage failed setup and the
+            // runtime killed them: their outcome is the setup failure's.
+            map.insert(
+                "status".to_string(),
+                Value::String("setup_error".to_string()),
+            );
+            map.insert("broken_pipe".to_string(), Value::Bool(false));
             Value::map(map)
         })
         .collect();
@@ -8876,6 +8914,7 @@ fn run_pipeline_processes(
                     started: Instant::now(),
                     status: None,
                     duration_ms: 0,
+                    runtime_signalled: false,
                 });
             }
             Err(error) => {
@@ -8976,7 +9015,7 @@ fn run_pipeline_processes(
 
     if interrupted {
         #[cfg(unix)]
-        signal_pipeline_groups(&children, libc::SIGTERM);
+        signal_pipeline_groups_for_runtime(&mut children, libc::SIGTERM);
         #[cfg(not(unix))]
         for runtime in &mut children {
             let _ = runtime.child.kill();
@@ -9001,8 +9040,15 @@ fn run_pipeline_processes(
             std::thread::sleep(poll_interval);
         }
         #[cfg(unix)]
-        signal_pipeline_groups(&children, libc::SIGKILL);
-    } else if timed_out || lifecycle_error.is_some() {
+        signal_pipeline_groups_for_runtime(&mut children, libc::SIGKILL);
+    } else if timed_out {
+        #[cfg(unix)]
+        signal_pipeline_groups_for_runtime(&mut children, libc::SIGKILL);
+        #[cfg(not(unix))]
+        for runtime in &mut children {
+            let _ = runtime.child.kill();
+        }
+    } else if lifecycle_error.is_some() {
         #[cfg(unix)]
         signal_pipeline_groups(&children, libc::SIGKILL);
         #[cfg(not(unix))]
@@ -9049,7 +9095,7 @@ fn run_pipeline_processes(
         {
             if start.elapsed() >= timeout {
                 #[cfg(unix)]
-                signal_pipeline_groups(&children, libc::SIGKILL);
+                signal_pipeline_groups_for_runtime(&mut children, libc::SIGKILL);
                 timed_out = true;
                 break;
             }
@@ -9147,6 +9193,7 @@ fn run_pipeline_processes(
             duration_ms: runtime.duration_ms,
             stderr,
             stderr_truncated,
+            runtime_signalled: runtime.runtime_signalled,
         });
     }
 
@@ -9160,11 +9207,126 @@ fn run_pipeline_processes(
     })
 }
 
+/// `SIGPIPE` on unix; a value no real signal number takes elsewhere, so the
+/// broken-pipe classification is simply never reached off unix.
+#[cfg(unix)]
+const PIPELINE_SIGPIPE: i32 = libc::SIGPIPE;
+#[cfg(not(unix))]
+const PIPELINE_SIGPIPE: i32 = -1;
+
+/// Why one stage ended — the machine-readable half of the TODO-mix P1
+/// contract. Precedence, first match wins:
+///
+/// 1. exit 0                                  → `ok`
+/// 2. the runtime signalled it while running  → `timeout` / `interrupted`
+///    (the death is the deadline's or the interrupt's, not the stage's)
+/// 3. killed by SIGPIPE                       → `broken_pipe` (its reader
+///    closed; reported even when `allow_signal` accepted it — `ok` carries
+///    the acceptance, `status` the fact)
+/// 4. killed by any other signal              → `signal`
+/// 5. non-zero exit                           → `exit_nonzero`
+///
+/// A stage that IGNORES SIGPIPE and exits non-zero on EPIPE is reported as
+/// `exit_nonzero`: the kernel's signal is the only evidence of a closed
+/// reader that cannot be forged by the stage's own exit code.
+fn pipeline_stage_status(raw: &PipelineRawStageOutcome, interrupted: bool) -> &'static str {
+    if raw.natural_code == Some(0) {
+        "ok"
+    } else if raw.runtime_signalled {
+        if interrupted { "interrupted" } else { "timeout" }
+    } else if raw.signal == Some(PIPELINE_SIGPIPE) {
+        "broken_pipe"
+    } else if raw.signal.is_some() {
+        "signal"
+    } else {
+        "exit_nonzero"
+    }
+}
+
+/// The concise human rendering of a pipeline outcome (`summary`). Gates read
+/// `status` / `failed_stage` / the stage maps; this line is for people and
+/// logs, and deliberately carries no duration so it is stable across runs.
+#[allow(clippy::too_many_arguments)]
+fn pipeline_summary(
+    status: &str,
+    failed_stage: Option<usize>,
+    stage_statuses: &[&str],
+    accepted: &[bool],
+    stages: &[PipelineStage],
+    raws: &[PipelineRawStageOutcome],
+    timeout_ms: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> String {
+    let name = |index: usize| {
+        let argv0 = stages[index].argv[0].as_str();
+        let base = argv0.rsplit('/').next().unwrap_or(argv0);
+        format!("stage[{index}] {}", sanitize_for_diag(base))
+    };
+    let mut line = match status {
+        "ok" => {
+            let accepted: Vec<String> = accepted
+                .iter()
+                .enumerate()
+                .filter(|(_, accepted)| **accepted)
+                .map(|(index, _)| format!("{} broken pipe accepted", name(index)))
+                .collect();
+            if accepted.is_empty() {
+                format!("ok ({} stage{})", stages.len(), if stages.len() == 1 { "" } else { "s" })
+            } else {
+                format!("ok ({} stages; {})", stages.len(), accepted.join(", "))
+            }
+        }
+        "timeout" | "interrupted" => {
+            let what = if status == "timeout" {
+                format!("timed out (deadline {timeout_ms} ms)")
+            } else {
+                "interrupted".to_string()
+            };
+            let killed: Vec<String> = stage_statuses
+                .iter()
+                .enumerate()
+                .filter(|(_, stage_status)| **stage_status == status)
+                .map(|(index, _)| name(index))
+                .collect();
+            if killed.is_empty() {
+                format!("{what}; every stage had exited, output was still open")
+            } else {
+                format!("{what}; killed {}", killed.join(", "))
+            }
+        }
+        _ => match failed_stage {
+            Some(index) => {
+                let raw = &raws[index];
+                match stage_statuses[index] {
+                    "broken_pipe" => format!("{}: broken pipe (its reader closed)", name(index)),
+                    "signal" => format!(
+                        "{} killed by signal {}",
+                        name(index),
+                        raw.signal.unwrap_or_default()
+                    ),
+                    _ => format!(
+                        "{} exited {}",
+                        name(index),
+                        raw.natural_code.unwrap_or_default()
+                    ),
+                }
+            }
+            None => "failed".to_string(),
+        },
+    };
+    if stdout_truncated || stderr_truncated {
+        line.push_str(" [output truncated]");
+    }
+    line
+}
+
 fn pipeline_result_map(
     stages: &[PipelineStage],
     outcome: PipelineProcessOutcome,
-    allow_signal: bool,
+    opts: &PipelineOpts,
 ) -> Value {
+    let allow_signal = opts.allow_signal;
     let stage_count = outcome.stages.len();
     let mut stage_ok = vec![false; stage_count];
     let mut accepted_signal = vec![false; stage_count];
@@ -9182,6 +9344,12 @@ fn pipeline_result_map(
         stage_ok[index] = raw.natural_code == Some(0) || accept;
         downstream_ok = stage_ok[index] && downstream_ok;
     }
+
+    let stage_statuses: Vec<&'static str> = outcome
+        .stages
+        .iter()
+        .map(|raw| pipeline_stage_status(raw, outcome.interrupted))
+        .collect();
 
     let mut aggregate_stderr = Vec::new();
     let mut stderr_truncated = false;
@@ -9227,12 +9395,45 @@ fn pipeline_result_map(
             "accepted_signal".to_string(),
             Value::Bool(accepted_signal[index]),
         );
+        map.insert(
+            "status".to_string(),
+            Value::String(stage_statuses[index].to_string()),
+        );
+        map.insert(
+            "broken_pipe".to_string(),
+            Value::Bool(raw.signal == Some(PIPELINE_SIGPIPE)),
+        );
         stage_values.push(Value::map(map));
     }
 
     let final_stage = outcome.stages.last().expect("pipeline is non-empty");
     let ok =
         !outcome.timed_out && !outcome.interrupted && stage_ok.iter().all(|stage_ok| *stage_ok);
+    // pipefail: the RIGHTMOST failing stage names the failure. Downstream
+    // closure makes upstream stages fail as a consequence (`cat big | grep
+    // --bad-flag` leaves cat with a broken pipe), so the rightmost failure is
+    // the cause and the ones to its left are the symptoms.
+    let failed_stage = (0..stage_count).rev().find(|index| !stage_ok[*index]);
+    let status: &str = if outcome.interrupted {
+        "interrupted"
+    } else if outcome.timed_out {
+        "timeout"
+    } else if ok {
+        "ok"
+    } else {
+        failed_stage.map_or("exit_nonzero", |index| stage_statuses[index])
+    };
+    let summary = pipeline_summary(
+        status,
+        failed_stage,
+        &stage_statuses,
+        &accepted_signal,
+        stages,
+        &outcome.stages,
+        opts.timeout_ms,
+        outcome.stdout_truncated,
+        stderr_truncated,
+    );
     let mut map = indexmap::IndexMap::new();
     map.insert("ok".to_string(), Value::Bool(ok));
     map.insert(
@@ -9273,6 +9474,12 @@ fn pipeline_result_map(
     map.insert("error_code".to_string(), Value::Nil);
     map.insert("error".to_string(), Value::Nil);
     map.insert("stages".to_string(), Value::list(stage_values));
+    map.insert("status".to_string(), Value::String(status.to_string()));
+    map.insert(
+        "failed_stage".to_string(),
+        failed_stage.map_or(Value::Nil, |index| Value::Number(index as f64)),
+    );
+    map.insert("summary".to_string(), Value::String(summary));
     Value::map(map)
 }
 

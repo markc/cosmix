@@ -199,7 +199,7 @@ execution and familiar result fields as `run_argv`, plus its one-element
 The distinct `pipeline_result` map always contains, in order:
 `ok`, `exit_code`, `stdout`, `stderr`, `timed_out`, `interrupted`, `signal`,
 `duration_ms`, `stdout_truncated`, `stderr_truncated`, `utf8_lossy`,
-`error_code`, `error`, `stages`.
+`error_code`, `error`, `stages`, `status`, `failed_stage`, `summary`.
 
 - `exit_code` and `signal` describe the **last** stage. They do not alone decide
   overall success: a middle-stage failure makes `.ok` false even when the last
@@ -220,8 +220,60 @@ The distinct `pipeline_result` map always contains, in order:
 
 Each `.stages[i]` map contains, in order: `index`, `argv`, `ok`, `exit_code`,
 `signal`, `duration_ms`, `stderr`, `stderr_truncated`, `utf8_lossy`,
-`accepted_signal`. Stage stderr is untrimmed. `accepted_signal` records the
-SIGPIPE policy below; it is false for ordinary exits and rejected signals.
+`accepted_signal`, `status`, `broken_pipe`. Stage stderr is untrimmed.
+`accepted_signal` records the SIGPIPE policy below; it is false for ordinary
+exits and rejected signals.
+
+#### Why each stage ended — `status`, `failed_stage`, `summary`
+
+Gates branch on these fields, never on stderr or `summary` text. A stage's
+`status` is the first of these that applies:
+
+| stage `status` | meaning |
+|---|---|
+| `ok` | exited 0 |
+| `timeout` / `interrupted` | still running when the deadline / Ctrl-C made Mix signal its group — the death is Mix's, not the stage's |
+| `broken_pipe` | killed by SIGPIPE: its reader closed (also set when `allow_signal` accepted it — `.ok` carries the acceptance, `status` the fact) |
+| `signal` | killed by any other signal (`.signal` names it) |
+| `exit_nonzero` | exited with a non-zero code (`.exit_code`) |
+| `setup_error` | started, then killed because a later stage could not be set up |
+
+`broken_pipe` (bool) is true whenever SIGPIPE killed the stage. SIGPIPE is the
+only evidence of a closed reader that a stage cannot forge: a program that
+ignores SIGPIPE and exits non-zero on `EPIPE` reports `exit_nonzero`.
+
+The pipeline's `status` is `setup_error` (with `error_code`), else
+`interrupted`, else `timeout`, else `ok` when `.ok` is true, else the status of
+`failed_stage`. `failed_stage` is the **rightmost** stage whose `ok` is false —
+`set -o pipefail`'s rule — or `nil`. Rightmost because a downstream stage that
+exits early leaves its writer with a broken pipe: in `yes | sh -c 'exit 3'` the
+cause is stage 1 (`exit_nonzero`) and stage 0's `broken_pipe` is the symptom.
+For `PIPELINE_SPAWN` it is the stage that could not start; other setup errors
+name no stage.
+
+`summary` is a one-line human rendering with no durations, so it is stable
+across runs:
+
+```
+ok (2 stages)
+ok (2 stages; stage[0] yes broken pipe accepted)
+stage[1] sh exited 3
+stage[0] sh killed by signal 15
+stage[0] yes: broken pipe (its reader closed)
+timed out (deadline 300 ms); killed stage[1] sleep
+```
+
+A captured stream that truncated appends ` [output truncated]`.
+
+```mix
+$r = run_pipeline([["producer"], ["filter"], ["consumer"]], {timeout: 60})
+if $r.status == "timeout" then
+  eprint("slow: " .. $r.summary)
+elif $r.status != "ok" then
+  $s = $r.stages[$r.failed_stage]
+  eprint("stage " .. $s.index .. " " .. $s.status .. ": " .. $s.stderr)
+end
+```
 
 Pipeline options (unknown keys raise `OPTION_INVALID`):
 
