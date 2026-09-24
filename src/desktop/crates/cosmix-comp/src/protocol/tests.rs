@@ -28816,6 +28816,75 @@ fn a_rejected_dmabuf_fails_that_import_only() {
     }
 }
 
+/// The protocol thread's own recording sites reach the import ledger too
+/// (review MINOR-4): an import accepted by metadata validation alone (the
+/// harness has no probe) counts as accepted, and a buffer comp's metadata
+/// check refuses -- a stride smaller than a packed row, through the fallible
+/// `create` so the client survives -- is recorded as `invalid_metadata` with
+/// its format and the check's own message.
+#[test]
+fn protocol_thread_dmabuf_outcomes_reach_the_import_ledger() {
+    let mut harness = KeybindingHarness::new(false);
+    assert!(
+        harness.server.state.dmabuf_validation.is_none(),
+        "the harness runs without a probe, so metadata validation is the whole check"
+    );
+    let before = harness.server.state.dmabuf_ledger.snapshot();
+
+    harness.create_dmabuf_buffer_sized(64, 32);
+    let accepted = harness.server.state.dmabuf_ledger.snapshot();
+    assert_eq!(accepted.accepted, before.accepted + 1);
+    assert_eq!(accepted.failed, before.failed);
+
+    let params = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_LINUX_DMABUF_ID,
+        1,
+        &words(&[params]),
+    ); // zwp_linux_dmabuf_v1.create_params
+    let plane = anonymous_plane("cosmix-dmabuf-ledger-metadata", 4 * 32);
+    let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
+    send_request_with_fd(
+        &mut harness.client,
+        params,
+        1,
+        &words(&[0, 0, 4, (modifier >> 32) as u32, modifier as u32]),
+        plane.as_fd(),
+    ); // add: stride 4 for a 64-pixel row
+    send_request(
+        &mut harness.client,
+        params,
+        2,
+        &words(&[
+            64,
+            32,
+            smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            0,
+        ]),
+    ); // create (fallible)
+    let events = harness.sync();
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == params && *opcode == 1),
+        "comp answers `failed` for the bad stride: {events:?}"
+    );
+
+    let refused = harness.server.state.dmabuf_ledger.snapshot();
+    assert_eq!(refused.accepted, accepted.accepted);
+    assert_eq!(refused.failed, accepted.failed + 1);
+    let record = refused.failures.last().expect("the refusal is recorded");
+    assert_eq!(record.reason, "invalid_metadata");
+    assert_eq!(record.format, "AR24");
+    assert_eq!(record.modifier, "0x0000000000000000");
+    assert!(
+        record.detail.contains("stride 4 is smaller than packed row 256"),
+        "{}",
+        record.detail
+    );
+}
+
 /// Every probe outcome lands in the import ledger that `dmabuf.*` props
 /// serve (TODO-comp C4): an accept counts, a driver rejection keeps its
 /// format, modifier and the probe's own message, and a panic retires the
