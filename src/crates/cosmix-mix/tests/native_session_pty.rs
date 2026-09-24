@@ -389,7 +389,9 @@ impl Child {
                 other => panic!("PTY ended: {other:?}; {output}"),
             }
             assert!(Instant::now() < deadline, "waiting for {marker}: {output}");
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         output
     }
@@ -404,8 +406,11 @@ impl Child {
         serde_json::from_str(&output[start..end]).unwrap()
     }
     fn exit(&mut self) {
+        self.exit_with_limit(Duration::from_secs(5));
+    }
+    fn exit_with_limit(&mut self, limit: Duration) {
         self.send("exit\n");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + limit;
         loop {
             let mut status = 0;
             let result = unsafe { libc::waitpid(self.pid(), &mut status, libc::WNOHANG) };
@@ -416,7 +421,9 @@ impl Child {
                 return;
             }
             assert!(result >= 0 && Instant::now() < deadline, "Mix did not exit");
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 }
@@ -786,17 +793,32 @@ async fn status_with_limit(
     record: &SessionRecord,
     limit: Duration,
 ) -> serde_json::Value {
-    parent.renew().await;
-    let start = Instant::now();
-    let value = tokio::time::timeout(
+    status_with_limit_message(
+        parent,
+        record,
         limit,
+        "status blocked behind shell activity",
+    )
+    .await
+}
+
+async fn status_with_limit_message(
+    parent: &mut Parent,
+    record: &SessionRecord,
+    limit: Duration,
+    timeout_message: &str,
+) -> serde_json::Value {
+    let start = Instant::now();
+    let value = tokio::time::timeout(limit, async {
+        parent.renew().await;
         parent
             .connection
             .client()
-            .call(&record.name, "shell.status", status_request(record)),
-    )
+            .call(&record.name, "shell.status", status_request(record))
+            .await
+    })
     .await
-    .expect("status blocked behind shell activity")
+    .expect(timeout_message)
     .unwrap();
     eprintln!(
         "status response {:?}, phase={}",
@@ -832,12 +854,25 @@ async fn phase_with_limit(
 ) -> serde_json::Value {
     let deadline = Instant::now() + limit;
     loop {
-        let value = status_with_limit(parent, record, read_limit).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "expected {expected}: phase deadline expired"
+        );
+        let value = tokio::time::timeout(
+            remaining,
+            status_with_limit(parent, record, read_limit.min(remaining)),
+        )
+        .await
+        .expect("phase deadline expired");
         if value["status"]["snapshot"]["phase"] == expected {
             return value;
         }
         assert!(Instant::now() < deadline, "expected {expected}: {value}");
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(
+            Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
     }
 }
 
@@ -1284,11 +1319,14 @@ async fn execute_call_with_limit(
     body: serde_json::Value,
     limit: Duration,
 ) -> Result<serde_json::Value, String> {
-    parent.renew().await;
-    tokio::time::timeout(
-        limit,
-        parent.connection.client().call(&record.name, verb, body),
-    )
+    tokio::time::timeout(limit, async {
+        parent.renew().await;
+        parent
+            .connection
+            .client()
+            .call(&record.name, verb, body)
+            .await
+    })
     .await
     .expect("an execute-family request must always answer")
     .map_err(|error| error.to_string())
@@ -1320,12 +1358,17 @@ async fn result_of_with_limit(
 ) -> serde_json::Value {
     let deadline = Instant::now() + limit;
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "result never finished: deadline expired"
+        );
         let value = execute_call_with_limit(
             parent,
             record,
             "shell.execute.result",
             operation_request(record, operation),
-            read_limit,
+            read_limit.min(remaining),
         )
         .await
         .expect("a known operation always has a state");
@@ -1334,7 +1377,10 @@ async fn result_of_with_limit(
         }
         assert_eq!(value["state"], "running", "{value}");
         assert!(Instant::now() < deadline, "result never finished: {value}");
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(
+            Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
     }
 }
 
@@ -1391,14 +1437,9 @@ fn stage_d_admits_at_an_idle_prompt_echoes_and_reports_a_structured_result() {
         let mut f = stage_d_fixture("owned").await;
         let before = prompt_generation(&mut f.parent, &f.bound).await;
         let submission = execute_request(&f.bound, 1, before, "print(\"ADMITTED_OK\")");
-        let accepted = execute_call(
-            &mut f.parent,
-            &f.bound,
-            "shell.execute",
-            submission.clone(),
-        )
-        .await
-        .expect("an idle primary prompt admits");
+        let accepted = execute_call(&mut f.parent, &f.bound, "shell.execute", submission.clone())
+            .await
+            .expect("an idle primary prompt admits");
         assert_eq!(accepted["status"], "accepted");
         assert_eq!(accepted["state"], "running");
         let operation = counter(&accepted["operation_id"]);
@@ -1853,7 +1894,13 @@ fn stage_d_reports_its_own_capability_and_refuses_unauthorised_callers() {
 }
 
 async fn stage_d_fixture_with(editor: &str, extra: &[(String, String)]) -> Fixture {
-    stage_d_fixture_with_limit(editor, extra, Duration::from_secs(5), Duration::from_secs(3)).await
+    stage_d_fixture_with_limit(
+        editor,
+        extra,
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+    )
+    .await
 }
 
 async fn stage_d_fixture_with_limit(
@@ -1862,6 +1909,7 @@ async fn stage_d_fixture_with_limit(
     limit: Duration,
     read_limit: Duration,
 ) -> Fixture {
+    let deadline = Instant::now() + limit;
     let broker = Broker::start();
     let mut parent = Parent::new(&broker).await;
     let key = fresh_key().unwrap();
@@ -1872,11 +1920,21 @@ async fn stage_d_fixture_with_limit(
     let mut child = Child::spawn_with(&broker, &launch, editor, extra);
     drop(launch);
     drop(key);
-    child.until_with_limit("RC_MARKER=[]\r\n", limit);
+    child.until_with_limit(
+        "RC_MARKER=[]\r\n",
+        deadline.saturating_duration_since(Instant::now()),
+    );
     let bound = parent
         .wait(grant.record.record_id, BindingState::Attached, 1)
         .await;
-    phase_with_limit(&mut parent, &bound, "prompt-ready", limit, read_limit).await;
+    phase_with_limit(
+        &mut parent,
+        &bound,
+        "prompt-ready",
+        deadline.saturating_duration_since(Instant::now()),
+        read_limit,
+    )
+    .await;
     Fixture {
         broker,
         parent,
@@ -1896,22 +1954,13 @@ fn stage_d_an_abandoned_admission_never_executes_and_its_retry_does_not_re_run()
         // Stall the editor past the admit budget, so the owner gives up while
         // the envelope is still queued — the one interleaving timing alone
         // cannot produce.
-        let mut f = stage_d_fixture_with(
-            "owned",
-            &[("MIX_ADMIT_DELAY_MS".into(), "2500".into())],
-        )
-        .await;
+        let mut f =
+            stage_d_fixture_with("owned", &[("MIX_ADMIT_DELAY_MS".into(), "2500".into())]).await;
         let generation = prompt_generation(&mut f.parent, &f.bound).await;
-        let submission =
-            execute_request(&f.bound, 1, generation, "print(\"MUST_NOT_RUN\")");
-        let error = execute_call(
-            &mut f.parent,
-            &f.bound,
-            "shell.execute",
-            submission.clone(),
-        )
-        .await
-        .unwrap_err();
+        let submission = execute_request(&f.bound, 1, generation, "print(\"MUST_NOT_RUN\")");
+        let error = execute_call(&mut f.parent, &f.bound, "shell.execute", submission.clone())
+            .await
+            .unwrap_err();
         // Never BUSY: a caller told BUSY retries, and a retry of something that
         // might have executed is how the line runs twice.
         assert!(error.contains("UNKNOWN_OUTCOME"), "{error}");
@@ -1956,11 +2005,8 @@ fn stage_d_a_keystroke_during_the_reservation_refuses_the_admission_intact() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
         // Long enough that the human types while the reservation stands.
-        let mut f = stage_d_fixture_with(
-            "owned",
-            &[("MIX_RESERVE_HOLD_MS".into(), "1200".into())],
-        )
-        .await;
+        let mut f =
+            stage_d_fixture_with("owned", &[("MIX_RESERVE_HOLD_MS".into(), "1200".into())]).await;
         let generation = prompt_generation(&mut f.parent, &f.bound).await;
         let submitting = tokio::spawn({
             let name = f.bound.name.clone();
@@ -2048,12 +2094,7 @@ fn stage_d_cancelling_a_managed_foreground_job_signals_its_process_group() {
             &mut f.parent,
             &f.bound,
             "shell.execute",
-            execute_request(
-                &f.bound,
-                1,
-                generation,
-                "sleep 30",
-            ),
+            execute_request(&f.bound, 1, generation, "sleep 30"),
         )
         .await
         .expect("admitted");
@@ -2098,7 +2139,10 @@ fn stage_d_a_cancelled_captured_runner_reports_cancelled_not_completed() {
     runtime().block_on(async {
         let mut f = stage_d_fixture("owned").await;
         for (id, source) in [
-            (1u64, "$r = run_argv([\"sleep\", \"20\"])\nprint(\"RAN_THROUGH\")"),
+            (
+                1u64,
+                "$r = run_argv([\"sleep\", \"20\"])\nprint(\"RAN_THROUGH\")",
+            ),
             (2, "$r = run(\"sleep 20\")\nprint(\"RAN_THROUGH\")"),
         ] {
             let generation = prompt_generation(&mut f.parent, &f.bound).await;
@@ -2207,11 +2251,8 @@ fn stage_d_paste_and_search_drafts_are_preserved_with_exact_refusals() {
 fn stage_d_an_abandoned_reservation_returns_the_prompt_to_the_human() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
-        let mut f = stage_d_fixture_with(
-            "owned",
-            &[("MIX_ADMIT_DELAY_MS".into(), "2500".into())],
-        )
-        .await;
+        let mut f =
+            stage_d_fixture_with("owned", &[("MIX_ADMIT_DELAY_MS".into(), "2500".into())]).await;
         let generation = prompt_generation(&mut f.parent, &f.bound).await;
         let _ = execute_call(
             &mut f.parent,
@@ -2239,71 +2280,103 @@ fn stage_d_an_abandoned_reservation_returns_the_prompt_to_the_human() {
 #[test]
 fn stage_d_a_refused_submission_may_be_retried_under_the_same_id() {
     let _fixture = fixture_guard();
+    let deadline = Instant::now() + Duration::from_secs(30);
     runtime().block_on(async {
-        let limit = Duration::from_secs(30);
-        let mut f = stage_d_fixture_with_limit(
-            "owned",
-            &[("MIX_RESERVE_HOLD_MS".into(), "1200".into())],
-            limit,
-            limit,
-        )
-        .await;
-        let generation = prompt_generation(&mut f.parent, &f.bound).await;
-        let body = execute_request(&f.bound, 1, generation, "print(\"RETRY_RAN\")");
-        let submitting = tokio::spawn({
-            let name = f.bound.name.clone();
-            let client = f.parent.connection.clone();
-            let body = body.clone();
-            async move {
-                client
-                    .client()
-                    .call(&name, "shell.execute", body)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        f.child.send("x");
-        let error = tokio::time::timeout(limit, submitting)
-            .await
-            .expect("the submission must answer")
-            .unwrap()
-            .expect_err("a keystroke must refuse the admission");
-        assert_eq!(error, r#"{"error_code":"BUSY"}"#, "{error}");
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
+            let remaining = || deadline.saturating_duration_since(Instant::now());
+            let mut f = stage_d_fixture_with_limit(
+                "owned",
+                &[("MIX_RESERVE_HOLD_MS".into(), "1200".into())],
+                remaining(),
+                remaining(),
+            )
+            .await;
+            let generation = prompt_generation(&mut f.parent, &f.bound).await;
+            let body = execute_request(&f.bound, 1, generation, "print(\"RETRY_RAN\")");
+            let submitting = tokio::spawn({
+                let name = f.bound.name.clone();
+                let client = f.parent.connection.clone();
+                let body = body.clone();
+                async move {
+                    client
+                        .client()
+                        .call(&name, "shell.execute", body)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            f.child.send("x");
+            let error = tokio::time::timeout(remaining(), submitting)
+                .await
+                .expect("the submission must answer")
+                .unwrap()
+                .expect_err("a keystroke must refuse the admission");
+            assert_eq!(error, r#"{"error_code":"BUSY"}"#, "{error}");
 
-        // Clear the stray byte, then retry THE SAME request id. The contract
-        // that refusal states is that this is a real submission, not a replay.
-        f.child.send("\x08\n");
-        // Wait for the editor to consume the clearing input. A status reply
-        // can still describe the old prompt while the PTY input is queued.
-        let deadline = Instant::now() + limit;
-        let generation = loop {
-            let value = status_with_limit(
+            // Clear the stray byte, then retry THE SAME request id. The contract
+            // that refusal states is that this is a real submission, not a replay.
+            f.child.send("\x08\n");
+            // Correctness: wait for the editor to consume the clearing input,
+            // rather than racing a status reply describing the old prompt. This
+            // assumes the refused submission itself does not bump prompt_generation.
+            let mut last_status = serde_json::Value::Null;
+            let generation = loop {
+                assert!(
+                    remaining() > Duration::from_millis(25),
+                    "cleared prompt not ready: {last_status}"
+                );
+                let value = status_with_limit_message(
+                    &mut f.parent,
+                    &f.bound,
+                    remaining(),
+                    &format!("cleared prompt not ready: {last_status}"),
+                )
+                .await;
+                let snapshot = &value["status"]["snapshot"];
+                let current = counter(&snapshot["prompt_generation"]);
+                if snapshot["phase"] == "prompt-ready" && current > generation {
+                    break current;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cleared prompt not ready: {value}"
+                );
+                last_status = value;
+                tokio::time::sleep(Duration::from_millis(25).min(remaining())).await;
+            };
+            let retry = execute_request(&f.bound, 1, generation, "print(\"RETRY_RAN\")");
+            let accepted = execute_call_with_limit(
                 &mut f.parent,
                 &f.bound,
-                deadline.saturating_duration_since(Instant::now()),
-            ).await;
-            let snapshot = &value["status"]["snapshot"];
-            let current = counter(&snapshot["prompt_generation"]);
-            if snapshot["phase"] == "prompt-ready" && current > generation {
-                break current;
-            }
-            assert!(Instant::now() < deadline, "cleared prompt not ready: {value}");
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        };
-        let retry = execute_request(&f.bound, 1, generation, "print(\"RETRY_RAN\")");
-        let accepted = execute_call_with_limit(&mut f.parent, &f.bound, "shell.execute", retry, limit)
+                "shell.execute",
+                retry,
+                remaining(),
+            )
             .await
-            .unwrap_or_else(|e| {
-                panic!("the refused id was burned; retry answered {e}")
-            });
-        assert_eq!(accepted["status"], "accepted", "{accepted}");
-        let operation = counter(&accepted["operation_id"]);
-        let result = result_of_with_limit(&mut f.parent, &f.bound, operation, limit, limit).await;
-        assert_eq!(result["result"]["outcome"], "completed", "{result}");
-        f.child.until_with_limit("RETRY_RAN\r\n", limit);
-        teardown(f).await;
+            .unwrap_or_else(|e| panic!("the refused id was burned; retry answered {e}"));
+            assert_eq!(accepted["status"], "accepted", "{accepted}");
+            let operation = counter(&accepted["operation_id"]);
+            let result =
+                result_of_with_limit(&mut f.parent, &f.bound, operation, remaining(), remaining())
+                    .await;
+            assert_eq!(result["result"]["outcome"], "completed", "{result}");
+            f.child.until_with_limit("RETRY_RAN\r\n", remaining());
+            f.child.exit_with_limit(remaining());
+            f.parent
+                .connection
+                .session_revoke(f.bound.reference())
+                .await
+                .unwrap();
+            f.parent.revoke_and_verify(&f.broker).await;
+        })
+        .await
+        .expect("refused-submission test exceeded 30-second deadline");
     });
+    assert!(
+        Instant::now() < deadline,
+        "refused-submission test exceeded 30-second deadline"
+    );
 }
 
 /// The `Unknown` branch: the owner's abandon LOSES, so the editor is already
@@ -2315,11 +2388,8 @@ fn stage_d_an_undetermined_admission_still_resolves_to_its_real_outcome() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
         // Stall AFTER the claim, past budget + grace, so abandon loses.
-        let mut f = stage_d_fixture_with(
-            "owned",
-            &[("MIX_CLAIM_DELAY_MS".into(), "2200".into())],
-        )
-        .await;
+        let mut f =
+            stage_d_fixture_with("owned", &[("MIX_CLAIM_DELAY_MS".into(), "2200".into())]).await;
         let generation = prompt_generation(&mut f.parent, &f.bound).await;
         let error = execute_call(
             &mut f.parent,
@@ -3172,9 +3242,7 @@ fn p4_a_survivor_cannot_wedge_the_supervisor() {
         let _ = operation;
         tokio::time::sleep(Duration::from_millis(600)).await;
         let shell = f.child.pid();
-        let group_alive = |pid: i32| {
-            std::path::Path::new(&format!("/proc/{pid}")).exists()
-        };
+        let group_alive = |pid: i32| std::path::Path::new(&format!("/proc/{pid}")).exists();
         assert!(group_alive(shell), "the shell should still be up");
         f.child.exit();
         let gone = Instant::now() + Duration::from_secs(15);

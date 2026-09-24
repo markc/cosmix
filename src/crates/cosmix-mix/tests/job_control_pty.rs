@@ -33,7 +33,9 @@ fn wait_for_with_limit(mut f: impl FnMut() -> bool, limit: Duration) {
     let end = Instant::now() + limit;
     while !f() {
         assert!(Instant::now() < end, "fixture deadline");
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(
+            Duration::from_millis(2).min(end.saturating_duration_since(Instant::now())),
+        );
     }
 }
 fn alive(pid: i32) -> bool {
@@ -203,6 +205,7 @@ fn fixture_process() {
 
 struct Pty {
     wait_limit: Duration,
+    deadline: Option<Instant>,
     master: File,
     slave: File,
     initial_modes: libc::termios,
@@ -331,6 +334,7 @@ impl Pty {
         let shell = cmd.spawn().unwrap();
         Self {
             wait_limit: LIMIT,
+            deadline: None,
             master,
             slave,
             initial_modes,
@@ -349,19 +353,23 @@ impl Pty {
         self.master.write_all(text.as_bytes()).unwrap();
     }
     fn until(&mut self, marker: &str) -> String {
+        let end = self.wait_deadline();
         if marker == PROMPT {
             // Ordinary repaints do not re-enable bracketed paste. Suspend /
             // resume does, even within the same readline: those tests must
             // observe command output before waiting for the following prompt.
             // Never inject typeahead into a job.
-            let mut out = self.read_until("\x1b[?2004h");
-            out.push_str(&self.read_until(PROMPT));
+            let mut out = self.read_until_deadline("\x1b[?2004h", end);
+            out.push_str(&self.read_until_deadline(PROMPT, end));
             return out;
         }
-        self.read_until(marker)
+        self.read_until_deadline(marker, end)
     }
-    fn read_until(&mut self, marker: &str) -> String {
+    fn wait_deadline(&self) -> Instant {
         let end = Instant::now() + self.wait_limit;
+        self.deadline.map_or(end, |deadline| deadline.min(end))
+    }
+    fn read_until_deadline(&mut self, marker: &str, end: Instant) -> String {
         loop {
             if let Some(i) = self.pending.find(marker) {
                 return self.pending.drain(..i + marker.len()).collect();
@@ -376,7 +384,11 @@ impl Pty {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            if unsafe { libc::poll(&mut fd, 1, 100) } <= 0 {
+            let remaining_ms = end
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(100) as i32;
+            if unsafe { libc::poll(&mut fd, 1, remaining_ms) } <= 0 {
                 continue;
             }
             let mut b = [0; 4096];
@@ -407,7 +419,8 @@ impl Pty {
         let path = self.home.path().join(name);
         wait_for_with_limit(
             || fs::read_to_string(&path).is_ok_and(|v| v.split_whitespace().count() == 4),
-            self.wait_limit,
+            self.wait_deadline()
+                .saturating_duration_since(Instant::now()),
         );
         let fields = fs::read_to_string(path)
             .unwrap()
@@ -824,20 +837,27 @@ fn source_shares_background_controller_and_hup_reaps_owned_jobs() {
 #[test]
 fn hup_restores_retained_slave_after_foreground_raw_leak() {
     let _fixture = fixture_guard();
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut p = Pty::new(&[], false, true);
-    let limit = Duration::from_secs(30);
-    p.wait_limit = limit;
+    p.wait_limit = Duration::from_secs(30);
+    p.deadline = Some(deadline);
     let original = p.initial_modes;
     p.until(PROMPT);
     p.send(&format!("{}\n", p.fixture("raw-hold", "raw-hup")));
     let child = p.report("raw-hup");
-    wait_for_with_limit(|| p.home.path().join("raw-hup.raw").exists(), limit);
+    wait_for_with_limit(
+        || p.home.path().join("raw-hup.raw").exists(),
+        deadline.saturating_duration_since(Instant::now()),
+    );
     assert_eq!(tty_modes(p.slave.as_raw_fd()).c_lflag & libc::ICANON, 0);
     assert_eq!(tty_modes(p.slave.as_raw_fd()).c_oflag & libc::OPOST, 0);
     unsafe {
         libc::kill(p.shell.id() as i32, libc::SIGHUP);
     }
-    wait_for_with_limit(|| p.shell.try_wait().unwrap().is_some(), limit);
+    wait_for_with_limit(
+        || p.shell.try_wait().unwrap().is_some(),
+        deadline.saturating_duration_since(Instant::now()),
+    );
     assert_eq!(p.shell.wait().unwrap().code(), Some(129));
     let restored = tty_modes(p.slave.as_raw_fd());
     assert_eq!(restored.c_iflag, original.c_iflag);
@@ -846,6 +866,10 @@ fn hup_restores_retained_slave_after_foreground_raw_leak() {
     assert_eq!(restored.c_lflag, original.c_lflag);
     assert_eq!(restored.c_cc, original.c_cc);
     assert!(!alive(child[0]));
+    assert!(
+        Instant::now() < deadline,
+        "raw HUP test exceeded 30-second deadline"
+    );
 }
 
 #[test]
