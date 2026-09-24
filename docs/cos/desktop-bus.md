@@ -240,20 +240,28 @@ still range-checks `set`, so an `N` above the live workspace count is comp's
 Every failure has an rc of 10 or more, so the `$rc >= 10` test reads it as a
 failure:
 
-| rc | Meaning | Body |
-|---|---|---|
-| 10 | Malformed request, refused locally and never sent to comp | `{ok:false,error}` |
-| 11 | comp unreachable: no reply, including the 3-second timeout | `{ok:false,error}` |
-| 12 | comp replied outside its contract | `{ok:false,error:"malformed comp reply",comp}` |
-| comp's rc | comp refused, for example `locked` under a session lock | `{ok:false,error,comp}` |
+| rc | Meaning | Body | What to do |
+|---|---|---|---|
+| 10 | Malformed request, refused locally and never sent to comp | `{ok:false,error}` | Fix the request body |
+| 11 | comp unreachable: no reply, a broker refusal such as an unregistered service, or the 3-second timeout | `{ok:false,error}` | Check that comp is registered and running |
+| 12 | comp replied outside its contract | `{ok:false,error:"malformed comp reply",comp}` | Likely a comp version mismatch, so file it |
+| comp's rc | comp refused, for example `locked` under a session lock | `{ok:false,error,comp}` | Read `comp.error_code` |
 
 A malformed request is a body that is not a JSON object, any field on `next`,
 `prev` or `current`, or a `set` without exactly an integer `n` in range. On a
-comp refusal, `error` is comp's `error` and `comp` is comp's whole reply,
-`error_code` and range fields included. A broker refusal, such as an unknown
-service, has no `comp` field. There is no retry and no second backend. Mesh
-callers reach every verb with no authorization gate, and only well-formedness
-is checked.
+comp refusal, `comp` is comp's whole reply. comp stamps `error_code` beside
+`error` on every refusal and adds detail fields where it has them. A `set`
+above the live count, for example, is rc 10 with this `comp` field:
+
+```json
+{"error":"invalid_value","path":"index","expected":"unsigned integer","range":"1..=4","error_code":"invalid_value"}
+```
+
+`error` in the reply is comp's `error`, or its `error_code` when `error` is
+absent. On a comp whose `workspaces` subtree has no `count`, which is true of
+releases before workspace counts, `current` answers rc 12 with the subtree
+under `comp`. There is no retry and no second backend. Mesh callers reach every
+verb with no authorization gate, and only well-formedness is checked.
 
 `next` is a Mix keyword, so quote the verb in a Mix `send` until the parser
 fix lands:
@@ -274,8 +282,9 @@ install -D -m 0644 src/desktop/scripts/lib/workspace.mix /opt/cosmix/share/deskt
 ```
 
 `src/desktop/scripts/cosmix-desktop-workspace.service` is an example system
-unit with a `User=` placeholder. Its comment describes the user-unit form for
-hosts that run a user session manager. Validation and reply shaping live in
+unit. Its one placeholder is `User=CHANGE-ME`: set it to the desktop user
+before `systemctl enable`. systemd derives `HOME` from it. The unit's comment
+describes the user-unit form for hosts that run a user session manager. Validation and reply shaping live in
 `src/desktop/scripts/lib/workspace.mix`.
 
 Earlier deployments ran a private copy of this citizen with a KWin fallback

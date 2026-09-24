@@ -47,21 +47,30 @@ try
   end
 
   -- ── comp refusals: rc kept, message from comp, whole map under `comp` ──
+  -- Fixtures are comp's wire shapes: the builder's `error` (+ detail,
+  -- cosmix-comp protocol/window_control.rs:441-443 for an index refusal)
+  -- with `error_code` stamped on every reply by PendingReply::new ->
+  -- with_error_code (cosmix-comp port.rs:1270, 460-474). Both are rc 10.
   $locked = {error: "locked", error_code: "locked"}
   $r = $w.finish($next, 10, $locked, $locked)
   check($r.rc == 10 and same(sorted_keys($r.body), ["comp", "error", "ok"]), "refusal keys wrong: " .. json_encode($r))
   check($r.body.ok == false and $r.body.error == "locked" and $r.body.comp.error_code == "locked", "comp refusal not relayed structurally: " .. json_encode($r))
-  $range = {error: "invalid_value", error_code: "invalid_value", path: "index", expected: "1..=4"}
+  $range = {error: "invalid_value", path: "index", expected: "unsigned integer", range: "1..=4", error_code: "invalid_value"}
   $set9 = $w.prepare("desktop.workspace.set", "{\"n\":9}")
-  $r = $w.finish($set9, 14, $range, $range)
-  check($r.rc == 14 and $r.body.error == "invalid_value" and $r.body.comp.path == "index" and $r.body.comp.expected == "1..=4", "invalid_value lost its fields: " .. json_encode($r))
-  -- A refusal map without an `error` string falls back to $result's text.
+  $r = $w.finish($set9, 10, $range, $range)
+  check($r.rc == 10 and $r.body.error == "invalid_value" and $r.body.comp.path == "index" and $r.body.comp.range == "1..=4" and $r.body.comp.expected == "unsigned integer" and $r.body.comp.error_code == "invalid_value", "invalid_value lost its fields: " .. json_encode($r))
+  -- A refusal map with only `error_code` names that code as the error.
   $odd = {error_code: "busy"}
-  $r = $w.finish($next, 11, $odd, $odd)
-  check($r.rc == 11 and type($r.body.error) == "string" and $r.body.comp.error_code == "busy", "error-less refusal mishandled: " .. json_encode($r))
-  -- A plain-text refusal (the broker's unknown service): no `comp` map.
+  $r = $w.finish($next, 10, $odd, $odd)
+  check($r.rc == 10 and $r.body.error == "busy" and $r.body.comp.error_code == "busy", "error_code-only refusal mishandled: " .. json_encode($r))
+  -- A refusal map with neither falls back to $result's text.
+  $bare = {reason: "x"}
+  $r = $w.finish($next, 10, "refused", $bare)
+  check($r.rc == 10 and $r.body.error == "refused" and $r.body.comp.reason == "x", "code-less refusal mishandled: " .. json_encode($r))
+  -- The broker's plain-text refusal (comp not registered) carries no comp
+  -- reply: it is comp unreachable, rc 11, never rc 10 "malformed request".
   $r = $w.finish($next, 10, "Service 'comp' not found", nil)
-  check($r.rc == 10 and same($r.body, {ok: false, error: "Service 'comp' not found"}), "plain refusal wrong: " .. json_encode($r))
+  check($r.rc == 11 and same($r.body, {ok: false, error: "comp unreachable: Service 'comp' not found"}), "broker refusal wrong: " .. json_encode($r))
   -- An rc above 255 is clamped into the reply range.
   $r = $w.finish($next, 300, $locked, $locked)
   check($r.rc == 255, "rc not clamped: " .. json_encode($r))
@@ -99,6 +108,10 @@ try
     $r = $w.finish($cur, 0, $bad, $bad)
     check($r.rc == 12 and $r.body.ok == false, "off-contract current accepted: " .. json_encode($bad))
   end
+  -- A pre-count comp: rc 12 with the subtree it did send under `comp`.
+  $old = {current: 2, list: []}
+  $r = $w.finish($cur, 0, $old, $old)
+  check($r.rc == 12 and $r.body.error == "malformed comp reply" and $r.body.comp.current == 2, "pre-count subtree not relayed: " .. json_encode($r))
 
   -- ── malformed requests: rc 10, exact refusal shape, never reach comp ──
   $bad_cases = [

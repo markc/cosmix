@@ -14,7 +14,8 @@
 -- Reply rc bands (Bus contract: 1..9 is delivered-with-warning SUCCESS, so
 -- every failure here is >= 10):
 --   10   the request is malformed (checked locally, never reaches comp)
---   11   comp unreachable: the send never got a reply (negative send rc)
+--   11   comp unreachable: no comp reply (negative send rc, or the broker's
+--        plain-text refusal such as an unregistered service)
 --   12   comp answered, but not in the shape its contract promises
 --   >=10 comp's own refusal, rc kept, its whole reply map under `comp`
 
@@ -123,17 +124,23 @@ fn finish($plan, $rc, $result, $reply)
   -- The reply for comp's answer to the plan's send: $rc and $result as send
   -- set them, $reply the parsed reply body (nil when there was none).
   -- Success: switch -> {ok, from, to}; current -> {ok, desktop, count}.
-  if $rc < 0 then
+  -- No comp reply at all: the send failed (negative rc), or the broker
+  -- refused it in plain text (rc >= 10 with no parsed body, e.g. "Service
+  -- 'comp' not found"). Both mean comp is unreachable.
+  if $rc < 0 or ($rc >= 10 and type($reply) != "map") then
     return {rc: 11, body: {ok: false, error: "comp unreachable: " .. to_string($result)}}
   end
   if $rc >= 10 then
+    -- comp's own refusal: every comp reply carries `error` and the stamped
+    -- `error_code` alias, plus detail fields such as path/expected/range.
     $code = $rc > 255 ? 255 : $rc
-    if type($reply) == "map" then
-      $msg = type($reply.error) == "string" ? $reply.error : to_string($result)
-      return {rc: $code, body: {ok: false, error: $msg, comp: $reply}}
+    $msg = to_string($result)
+    if type($reply.error) == "string" then
+      $msg = $reply.error
+    elif type($reply.error_code) == "string" then
+      $msg = $reply.error_code
     end
-    -- A plain-text refusal (e.g. the broker's "Service ... not found").
-    return {rc: $code, body: {ok: false, error: to_string($result)}}
+    return {rc: $code, body: {ok: false, error: $msg, comp: $reply}}
   end
   if type($reply) != "map" then
     return malformed($reply)
