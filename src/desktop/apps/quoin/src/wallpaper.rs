@@ -37,13 +37,56 @@ enum RequestKind {
     Set,
 }
 
+/// First retry delay after a failed read; doubles per failure up to
+/// [`RETRY_CAP`] and resets on the next authoritative reply.
+pub(crate) const RETRY_INITIAL: Duration = Duration::from_secs(2);
+pub(crate) const RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// Backstop re-read while — and only while — the page is visible. noded fans
+/// notifications out with a non-blocking send, and a full subscriber queue
+/// drops a `props.changed` silently (no gap reaches this client; the bridge's
+/// `DroppedMessages` covers only Quoin's own inbound queue). The LAST notice
+/// of a burst has no successor to reveal the loss, so without this the page
+/// would stay stale until the next change or a reopen. Remove it once noded
+/// signals subscriber-side gaps (TODO-cos § session plumbing).
+const VISIBLE_RECONCILE: Duration = Duration::from_secs(30);
+
+pub(crate) fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(RETRY_CAP)
+}
+
+/// Merge a wake time into the shared host deadline. Several projections
+/// share one resource, so none may overwrite or clear another's wake.
+pub(crate) fn arm(deadline: &mut LayerHostDeadline, at: Duration) {
+    deadline.0 = Some(deadline.0.map_or(at, |existing| existing.min(at)));
+}
+
 #[derive(Resource)]
 pub(crate) struct WallpaperState {
     generation: Option<u64>,
     next_id: u64,
     pending: Option<(u64, RequestKind, Duration)>,
     queued: Option<(&'static str, Value)>,
-    refresh: Duration,
+    /// When the next read is due. After an authoritative read it is set to
+    /// now + `VISIBLE_RECONCILE` (the visible-only backstop for a
+    /// broker-side dropped notice); a `props.changed` notification, a
+    /// dropped-message gap or a reconnect pulls it forward to "now". A
+    /// hidden page never sends on it.
+    refresh: Option<Duration>,
+    /// Delay applied after the next failed read.
+    backoff: Duration,
+    /// A read owed regardless of page visibility: the connection's
+    /// bootstrap and the readback after a write. Every other read (retries,
+    /// invalidations) waits until the page is visible. Cleared on send, so a
+    /// bootstrap that fails while hidden is not retried hidden: opening the
+    /// page reads anyway, and nothing on screen shows the stale value.
+    owed: bool,
+    /// Last page visibility seen by `present` (post-model, same update).
+    visible: bool,
+    /// An invalidation arrived while a read was in flight. Notices and
+    /// replies travel different noded paths with no mutual ordering, so that
+    /// read's reply may predate the change and must not clear it.
+    stale_since_send: bool,
     settings: Option<Value>,
     feedback: String,
 }
@@ -55,7 +98,11 @@ impl Default for WallpaperState {
             next_id: 0x57_0000_0000,
             pending: None,
             queued: None,
-            refresh: Duration::ZERO,
+            refresh: Some(Duration::ZERO),
+            backoff: RETRY_INITIAL,
+            owed: true,
+            visible: false,
+            stale_since_send: false,
             settings: None,
             feedback: String::new(),
         }
@@ -100,7 +147,24 @@ impl WallpaperState {
         self.settings = None;
         self.pending = None;
         self.queued = None;
-        self.refresh = Duration::ZERO;
+        self.refresh = Some(Duration::ZERO);
+        self.backoff = RETRY_INITIAL;
+        self.owed = true;
+        self.stale_since_send = false;
+    }
+
+    /// Mark the snapshot stale: re-read when allowed, and remember the
+    /// change if a read is already in flight.
+    fn invalidate(&mut self, now: Duration) {
+        self.refresh = Some(now);
+        if matches!(self.pending, Some((_, RequestKind::Get, _))) {
+            self.stale_since_send = true;
+        }
+    }
+
+    fn failed(&mut self, now: Duration) {
+        self.refresh = Some(now + self.backoff);
+        self.backoff = next_backoff(self.backoff);
     }
 
     pub(crate) fn event(&mut self, event: &BusBridgeEvent, now: Duration) {
@@ -118,8 +182,9 @@ impl WallpaperState {
                 self.generation = None;
             }
             BusBridgeEvent::DroppedMessages(_) => {
+                // A gap may have swallowed a change notification.
                 self.settings = None;
-                self.refresh = now;
+                self.invalidate(now);
             }
             BusBridgeEvent::Reply { request_id, result } => {
                 let Some((id, kind, _)) = self.pending else {
@@ -129,7 +194,6 @@ impl WallpaperState {
                     return;
                 }
                 self.pending = None;
-                self.refresh = now;
                 match result {
                     Ok(reply) if reply.rc == 0 => {
                         let value = serde_json::from_str::<Value>(&reply.body).ok();
@@ -138,10 +202,22 @@ impl WallpaperState {
                                 self.settings = value.filter(valid_settings);
                                 if self.settings.is_none() {
                                     self.feedback = "Background unavailable".into();
-                                } else if self.feedback == "Background unavailable" {
-                                    self.feedback.clear();
+                                    self.failed(now);
+                                } else {
+                                    if self.feedback == "Background unavailable" {
+                                        self.feedback.clear();
+                                    }
+                                    // Authoritative: re-read on invalidation, or
+                                    // the visible-only backstop — unless a
+                                    // change landed while this read was in
+                                    // flight, which the reply may predate.
+                                    self.refresh = Some(if self.stale_since_send {
+                                        now
+                                    } else {
+                                        now + VISIBLE_RECONCILE
+                                    });
+                                    self.backoff = RETRY_INITIAL;
                                 }
-                                self.refresh = now + Duration::from_secs(1);
                             }
                             RequestKind::Set => {
                                 self.feedback =
@@ -151,6 +227,8 @@ impl WallpaperState {
                                         "Save unconfirmed; checking settings".into()
                                     };
                                 self.settings = None;
+                                self.refresh = Some(now);
+                                self.owed = true;
                             }
                         }
                     }
@@ -160,7 +238,9 @@ impl WallpaperState {
                             RequestKind::Get => "Background unavailable".into(),
                             RequestKind::Set => "Could not confirm save; checking settings".into(),
                         };
-                        self.refresh = now + Duration::from_secs(1);
+                        // An unconfirmed write still owes the user a readback.
+                        self.owed |= matches!(kind, RequestKind::Set);
+                        self.failed(now);
                     }
                 }
             }
@@ -177,8 +257,34 @@ impl WallpaperState {
                 Some("wallpaper.props.changed" | "bg-showcase.props.changed")
             )
         {
-            self.refresh = now;
+            self.invalidate(now);
         }
+    }
+
+    /// Record the page's visibility from `present` (after the model update,
+    /// so a page opened this update is seen now). Opening the page re-reads
+    /// once — notifications are best-effort hints and nothing reconciled
+    /// while it was hidden. Returns true when that read is now due; the
+    /// caller requests a redraw so the next update sends it. (A zero
+    /// deadline would do the same but the runner reports a deadline still
+    /// due after an update as `quoin_wake_deadline_unconsumed`.)
+    ///
+    /// Hiding does not disarm a deadline already merged into the shared
+    /// host deadline (a backoff or the reconcile backstop): it fires once as
+    /// a no-op wake, then nothing is armed while hidden.
+    fn set_visible(&mut self, visible: bool) -> bool {
+        let open = visible && !self.visible && self.generation.is_some() && self.pending.is_none();
+        if open {
+            self.refresh = Some(Duration::ZERO);
+        }
+        self.visible = visible;
+        open
+    }
+
+    /// Whether a due read may be sent now: only while the page is visible,
+    /// or when the read is owed regardless (bootstrap, write readback).
+    fn may_read(&self) -> bool {
+        self.visible || self.owed
     }
 
     pub(crate) fn tick(
@@ -192,16 +298,26 @@ impl WallpaperState {
             self.generation = None;
         }
         if self.generation.is_none() {
-            deadline.0 = None;
             return;
         }
-        if self.pending.is_some_and(|(_, _, at)| at <= now) {
+        if let Some((_, kind, at)) = self.pending
+            && at <= now
+        {
             self.pending = None;
             self.settings = None;
             self.feedback = "Request timed out; checking settings".into();
-            self.refresh = now;
+            match kind {
+                // An unconfirmed write owes its readback at once.
+                RequestKind::Set => {
+                    self.refresh = Some(now);
+                    self.owed = true;
+                }
+                // A hung producer is a failed read: back off, visible-only.
+                RequestKind::Get => self.failed(now),
+            }
         }
-        if self.pending.is_none() && self.refresh <= now {
+        let due = self.refresh.is_some_and(|at| at <= now) && self.may_read();
+        if self.pending.is_none() && (self.queued.is_some() || due) {
             self.next_id = self
                 .next_id
                 .checked_add(1)
@@ -225,13 +341,25 @@ impl WallpaperState {
                 )
                 .is_ok()
             {
+                if matches!(kind, RequestKind::Get) {
+                    self.refresh = None;
+                    self.owed = false;
+                    self.stale_since_send = false;
+                }
                 self.queued = None;
                 self.pending = Some((self.next_id, kind, now + Duration::from_secs(3)));
             } else {
-                self.refresh = now + Duration::from_millis(100);
+                // Bridge queue full: a local condition, retried shortly.
+                self.refresh = Some(now + Duration::from_millis(100));
             }
         }
-        deadline.0 = Some(self.pending.map_or(self.refresh, |(_, _, at)| at));
+        if let Some((_, _, at)) = self.pending {
+            arm(deadline, at);
+        } else if let Some(at) = self.refresh
+            && (self.may_read() || self.queued.is_some())
+        {
+            arm(deadline, at);
+        }
     }
 
     fn available(&self) -> bool {
@@ -372,7 +500,7 @@ fn activate(
     let path = FIELDS[button.0].0;
     let value = leaf(state.settings.as_ref().unwrap(), path).unwrap();
     state.queued = Some((path, next_value(button.0, value)));
-    state.refresh = Duration::ZERO;
+    state.refresh = Some(Duration::ZERO);
     state.feedback = "Saving…".into();
     redraw.write(bevy::window::RequestRedraw);
 }
@@ -380,12 +508,19 @@ fn activate(
 fn present(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
-    state: Res<WallpaperState>,
+    (mut state, mut redraw): (
+        ResMut<WallpaperState>,
+        MessageWriter<bevy::window::RequestRedraw>,
+    ),
     mut focus: ResMut<InputFocus>,
     mut buttons: Query<(Entity, &mut TabIndex, Has<InteractionDisabled>), With<SettingButton>>,
     mut labels: Query<(&SettingLabel, &mut Text), Without<Feedback>>,
     mut feedback: Query<&mut Text, (With<Feedback>, Without<SettingLabel>)>,
 ) {
+    if state.visible != visible(&frame) && state.set_visible(visible(&frame)) {
+        // Captured in `Last` this update: an immediate re-update sends it.
+        redraw.write(bevy::window::RequestRedraw);
+    }
     let enabled = visible(&frame) && state.available();
     let keep_focus = visible(&frame)
         && state.generation.is_some()
@@ -474,7 +609,7 @@ mod tests {
         state.event(&reply(get.request_id, settings()), Duration::ZERO);
         assert!(state.available());
         state.queued = Some(("paused", json!(true)));
-        state.refresh = Duration::ZERO;
+        state.refresh = Some(Duration::ZERO);
         state.tick(&bridge, Duration::ZERO, &mut deadline);
         let set = peer.drain_calls().remove(0);
         assert_eq!(set.command, "wallpaper.props.set");
@@ -498,12 +633,240 @@ mod tests {
         changed["paused"] = json!(true);
         state.event(&reply(get.request_id, changed), Duration::ZERO);
         assert!(state.available());
-        state.tick(&bridge, Duration::from_secs(1), &mut deadline);
+        // The write's readback was owed although the page is hidden; after
+        // it a hidden page sends nothing, even past the visible-only
+        // reconcile backstop (a notice noded drops is recovered on reopen).
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
+        assert!(peer.drain_calls().is_empty());
+    }
+
+    fn changed_notice(generation: u64) -> BusMessage {
+        BusMessage {
+            connection_generation: generation,
+            from: "wallpaper".into(),
+            command: "props.changed".into(),
+            body: json!({"path":"paused","new":true}).to_string(),
+            headers: BTreeMap::from([("topic".into(), "wallpaper.props.changed".into())]),
+        }
+    }
+
+    #[test]
+    fn authoritative_read_reconciles_only_while_visible_and_invalidation_waits_for_the_page() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.event(&reply(get.request_id, settings()), Duration::ZERO);
         assert_eq!(
-            peer.drain_calls().len(),
-            1,
-            "lost notifications reconcile on a host deadline"
+            state.refresh,
+            Some(VISIBLE_RECONCILE),
+            "a good reply arms only the visible-only backstop"
         );
+        for secs in [1, 30, 60] {
+            let mut deadline = LayerHostDeadline::default();
+            state.tick(&bridge, Duration::from_secs(secs), &mut deadline);
+            assert!(peer.drain_calls().is_empty(), "hidden poll at {secs}s");
+            assert_eq!(deadline.0, None, "hidden wake armed at {secs}s");
+        }
+        // A change notice while the page is hidden marks the snapshot stale
+        // but neither sends nor wakes the host.
+        state.visible = false;
+        state.message(&changed_notice(1), Duration::from_secs(61));
+        let mut deadline = LayerHostDeadline::default();
+        state.tick(&bridge, Duration::from_secs(62), &mut deadline);
+        assert!(peer.drain_calls().is_empty());
+        assert_eq!(deadline.0, None);
+        // Opening the page makes a read due now (the caller requests a
+        // redraw); the next tick reads once.
+        assert!(state.set_visible(true));
+        assert_eq!(state.refresh, Some(Duration::ZERO));
+        state.tick(&bridge, Duration::from_secs(63), &mut deadline);
+        let get = peer.drain_calls().remove(0);
+        assert_eq!(get.command, "wallpaper.props.get");
+        let read_at = Duration::from_secs(63);
+        state.event(&reply(get.request_id, settings()), read_at);
+        // Visible and current: nothing before the backstop, which is armed.
+        let mut deadline = LayerHostDeadline::default();
+        state.tick(&bridge, read_at + VISIBLE_RECONCILE - Duration::from_millis(1), &mut deadline);
+        assert!(peer.drain_calls().is_empty(), "visible, current: no poll");
+        assert_eq!(deadline.0, Some(read_at + VISIBLE_RECONCILE));
+        // The backstop recovers a notice noded dropped with no successor.
+        let backstop = read_at + VISIBLE_RECONCILE;
+        state.tick(&bridge, backstop, &mut deadline);
+        let get = peer.drain_calls().remove(0);
+        state.event(&reply(get.request_id, settings()), backstop);
+        // A notice while visible re-reads on the next update.
+        let later = backstop + Duration::from_secs(1);
+        state.message(&changed_notice(1), later);
+        state.tick(&bridge, later, &mut deadline);
+        assert_eq!(peer.drain_calls().len(), 1);
+    }
+
+    #[test]
+    fn arm_keeps_the_earliest_of_the_shared_deadline() {
+        let mut deadline = LayerHostDeadline(Some(Duration::from_secs(1)));
+        arm(&mut deadline, Duration::from_secs(5));
+        assert_eq!(deadline.0, Some(Duration::from_secs(1)), "later loses");
+        arm(&mut deadline, Duration::from_millis(500));
+        assert_eq!(deadline.0, Some(Duration::from_millis(500)), "earlier wins");
+    }
+
+    #[test]
+    fn another_projections_deadline_survives_hidden_and_disconnected_ticks() {
+        let holders = Some(Duration::from_secs(7));
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.event(&reply(get.request_id, settings()), Duration::ZERO);
+        // Hidden, reconcile past due: arms nothing, clears nothing.
+        let mut deadline = LayerHostDeadline(holders);
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
+        assert_eq!(deadline.0, holders);
+        // Disconnected (the old code set the shared deadline to None).
+        state.event(
+            &BusBridgeEvent::Connection {
+                state: BusConnectionState::Disconnected,
+                generation: 1,
+            },
+            Duration::ZERO,
+        );
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
+        assert_eq!(deadline.0, holders);
+        drop(peer);
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
+        assert_eq!(deadline.0, holders, "a gone worker clears nothing either");
+    }
+
+    #[test]
+    fn the_real_present_wiring_opens_the_page_and_reads_once() {
+        use bevy::ecs::message::Messages;
+        use cosmix_shell::{
+            core::{LogicalSize, OutputKey, ShellModel},
+            runtime::ShellFrame,
+        };
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1536.0, 864.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.event(&reply(get.request_id, settings()), Duration::ZERO);
+        let mut app = App::new();
+        app.insert_resource(state)
+            .insert_resource(ShellFrameState(ShellFrame::from_model(&model)))
+            .init_resource::<InputFocus>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .add_plugins(WallpaperPlugin);
+        let redraws = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<Messages<bevy::window::RequestRedraw>>()
+                .drain()
+                .count()
+        };
+        app.update();
+        assert_eq!(redraws(&mut app), 0, "hidden: no redraw");
+        {
+            let mut frame = app.world_mut().resource_mut::<ShellFrameState>();
+            let panel = &mut frame.0.panels[Edge::Right.index()];
+            panel.mapped = true;
+            panel.active_page_id = Some("monitor".into());
+        }
+        app.update();
+        assert_eq!(redraws(&mut app), 1, "opening the page requests an update");
+        let now = Duration::from_secs(1);
+        let mut deadline = LayerHostDeadline::default();
+        {
+            let mut state = app.world_mut().resource_mut::<WallpaperState>();
+            state.tick(&bridge, now, &mut deadline);
+            assert_eq!(peer.drain_calls().len(), 1, "the open reads once");
+            state.tick(&bridge, now, &mut deadline);
+            assert!(peer.drain_calls().is_empty());
+        }
+        app.update();
+        assert_eq!(redraws(&mut app), 0, "staying open requests nothing more");
+    }
+
+    #[test]
+    fn a_change_during_an_in_flight_read_survives_its_reply() {
+        let (bridge, peer) = test_bridge("shell");
+        // Visible: the notice lands while the read is pending; the reply
+        // may predate it, so the next tick reads again.
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.visible = true;
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.message(&changed_notice(1), Duration::from_millis(5));
+        state.event(&reply(get.request_id, settings()), Duration::from_millis(10));
+        assert_eq!(state.refresh, Some(Duration::from_millis(10)));
+        state.tick(&bridge, Duration::from_millis(10), &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        // That read carries no stale mark: its reply arms only the backstop.
+        state.event(&reply(get.request_id, settings()), Duration::from_millis(20));
+        assert_eq!(
+            state.refresh,
+            Some(Duration::from_millis(20) + VISIBLE_RECONCILE)
+        );
+
+        // Hidden variant: the owed bootstrap is pending, a change lands, the
+        // page opens (no open-read: one is in flight), then the reply.
+        let mut state = WallpaperState::default();
+        connected(&mut state, 2);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.message(&changed_notice(2), Duration::from_millis(5));
+        state.visible = true;
+        state.event(&reply(get.request_id, settings()), Duration::from_millis(10));
+        state.tick(&bridge, Duration::from_millis(10), &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls().len(), 1, "the change is read, not lost");
+    }
+
+    #[test]
+    fn failed_reads_back_off_to_a_cap_and_only_retry_while_visible() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.visible = true;
+        let mut now = Duration::ZERO;
+        let mut gaps = Vec::new();
+        for _ in 0..7 {
+            state.tick(&bridge, now, &mut LayerHostDeadline::default());
+            let call = peer.drain_calls().remove(0);
+            state.event(
+                &BusBridgeEvent::Reply {
+                    request_id: call.request_id,
+                    result: Err("wallpaper is down".into()),
+                },
+                now,
+            );
+            let at = state.refresh.expect("a failure schedules a retry");
+            // Nothing is sent before the retry is due.
+            state.tick(&bridge, at - Duration::from_millis(1), &mut LayerHostDeadline::default());
+            assert!(peer.drain_calls().is_empty());
+            gaps.push((at - now).as_secs());
+            now = at;
+        }
+        assert_eq!(gaps, [2, 4, 8, 16, 30, 30, 30]);
+        state.visible = false;
+        let mut deadline = LayerHostDeadline::default();
+        state.tick(&bridge, now, &mut deadline);
+        assert!(peer.drain_calls().is_empty(), "hidden page: no retry");
+        assert_eq!(deadline.0, None, "hidden page: no retry wake");
+        state.visible = true;
+        state.tick(&bridge, now, &mut deadline);
+        let call = peer.drain_calls().remove(0);
+        state.event(&reply(call.request_id, settings()), now);
+        assert_eq!(state.backoff, RETRY_INITIAL, "success resets the backoff");
     }
 
     #[test]
@@ -512,6 +875,8 @@ mod tests {
         let mut state = WallpaperState::default();
         let mut deadline = LayerHostDeadline::default();
         connected(&mut state, 1);
+        // Timeout retries are visible-only; this test is about correlation.
+        state.visible = true;
         state.tick(&bridge, Duration::ZERO, &mut deadline);
         let old = peer.drain_calls().remove(0);
         for _ in 0..10 {
@@ -519,24 +884,52 @@ mod tests {
         }
         assert!(peer.drain_calls().is_empty());
         assert_eq!(deadline.0, Some(Duration::from_secs(3)));
+        // A timed-out read is a failed read: it backs off before retrying.
         state.tick(&bridge, Duration::from_secs(3), &mut deadline);
+        assert!(peer.drain_calls().is_empty(), "no flat 3 s retry");
+        assert_eq!(state.refresh, Some(Duration::from_secs(3) + RETRY_INITIAL));
+        let at = Duration::from_secs(3) + RETRY_INITIAL;
+        state.tick(&bridge, at, &mut deadline);
         let retry = peer.drain_calls().remove(0);
-        state.event(&reply(old.request_id, settings()), Duration::from_secs(3));
+        state.event(&reply(old.request_id, settings()), at);
         assert!(state.settings.is_none());
         connected(&mut state, 2);
-        state.tick(&bridge, Duration::from_secs(3), &mut deadline);
+        state.tick(&bridge, at, &mut deadline);
         let current = peer.drain_calls().remove(0);
-        state.event(&reply(retry.request_id, settings()), Duration::from_secs(3));
+        state.event(&reply(retry.request_id, settings()), at);
         assert!(state.settings.is_none());
-        state.event(
-            &reply(current.request_id, settings()),
-            Duration::from_secs(3),
-        );
+        state.event(&reply(current.request_id, settings()), at);
         assert!(state.available());
         drop(peer);
-        state.tick(&bridge, Duration::from_secs(4), &mut deadline);
+        // A gone worker arms nothing; the shared deadline belongs to other
+        // projections too, so it is never cleared here.
+        let mut fresh = LayerHostDeadline::default();
+        state.tick(&bridge, at + Duration::from_secs(1), &mut fresh);
         assert!(!state.available());
-        assert_eq!(deadline.0, None);
+        assert_eq!(fresh.0, None);
+    }
+
+    #[test]
+    fn a_hidden_timed_out_read_is_not_retried_and_a_set_readback_is() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        peer.drain_calls();
+        let late = Duration::from_secs(3);
+        let mut deadline = LayerHostDeadline::default();
+        state.tick(&bridge, late, &mut deadline);
+        state.tick(&bridge, late + RETRY_CAP, &mut deadline);
+        assert!(peer.drain_calls().is_empty(), "hidden: no retry");
+        assert_eq!(deadline.0, None, "hidden: no retry wake");
+        // A timed-out write is read back at once, even hidden.
+        state.queued = Some(("paused", json!(true)));
+        let now = late + RETRY_CAP;
+        state.tick(&bridge, now, &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls()[0].command, "wallpaper.props.set");
+        let timeout = now + Duration::from_secs(3);
+        state.tick(&bridge, timeout, &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls()[0].command, "wallpaper.props.get");
     }
 
     #[test]
@@ -576,6 +969,7 @@ mod tests {
         app.insert_resource(state)
             .insert_resource(ShellFrameState(ShellFrame::from_model(&model)))
             .init_resource::<InputFocus>()
+            .init_resource::<LayerHostDeadline>()
             .add_message::<bevy::window::RequestRedraw>()
             .add_observer(activate);
         let mut queue = bevy::ecs::world::CommandQueue::default();

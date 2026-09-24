@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use bevy::prelude::*;
 use cosmix_config::{CosmixDir, Value, cosmix_path, parse_mix_data};
 use cosmix_shell::core::Edge;
-use cosmix_shell::runtime::{ShellRuntimeSet, redeclare_shell_pages};
+use cosmix_shell::runtime::{CLOCK_PAGE_ID, ShellRuntimeSet, redeclare_shell_pages};
 use cosmix_shell_host::file_watch::{LayerHostFileWatch, LayerHostFileWatches};
 
 pub const SETTINGS_APPEARANCE: &str = "settings.appearance";
@@ -79,7 +79,7 @@ impl Default for ShellConfig {
         Self {
             panels: [
                 vec!["nav".into(), "places".into(), "info".into()],
-                vec!["launcher".into(), "power".into(), "tasks".into()],
+                vec![CLOCK_PAGE_ID.into(), "power".into(), "tasks".into()],
                 vec![
                     SETTINGS_APPEARANCE.into(),
                     "monitor".into(),

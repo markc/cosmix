@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::ui::{InteractionDisabled, px};
 use bevy::ui_widgets::{Activate, Button as WidgetButton};
 use cosmix_shell::core::Edge;
-use cosmix_shell::runtime::{ShellFrameState, ShellRuntimeSet};
+use cosmix_shell::runtime::{CLOCK_PAGE_ID, ShellFrameState, ShellRuntimeSet};
 use cosmix_shell_host::LayerHostWake;
 use ctk::theme::tokens;
 
@@ -124,7 +124,7 @@ fn run_launcher(app: LauncherApp, argv: &[OsString], started: impl FnOnce()) -> 
 
 fn visible(frame: &ShellFrameState) -> bool {
     let panel = frame.0.panel(Edge::Bottom);
-    panel.mapped && panel.active_page_id.as_deref() == Some("launcher")
+    panel.mapped && panel.active_page_id.as_deref() == Some(CLOCK_PAGE_ID)
 }
 
 fn activate(
