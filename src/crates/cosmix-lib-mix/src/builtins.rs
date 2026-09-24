@@ -4271,6 +4271,33 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::Number(child.id() as f64)))
 }
 
+/// A `fork` inside a forked child: the second fork must not be `libc::fork`,
+/// which runs every registered `pthread_atfork` handler. The intermediate is
+/// single-threaded, so a prepare handler that waits on another thread (an
+/// embedder's, or any linked crate's) deadlocks it — and POSIX.1-2024 no
+/// longer lists `fork` as async-signal-safe for exactly that reason. The raw
+/// `clone(SIGCHLD)` syscall is fork without the handlers. (glibc's `_Fork`
+/// is the same thing but the libc crate does not bind it.) The intermediate
+/// then only calls `write` and `_exit`, and the grandchild only `setsid`
+/// before std's exec, so the stale thread-id glibc keeps in their TLS is
+/// never consulted.
+///
+/// # Safety
+/// Call only in a post-fork child (the pre_exec window).
+#[cfg(target_os = "linux")]
+unsafe fn raw_fork() -> libc::pid_t {
+    // Every argument after the flags is 0: no new stack (copy-on-write, as
+    // fork), no tid pointers, no TLS — so the per-arch argument order of
+    // clone(2) does not matter.
+    unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0) as libc::pid_t }
+}
+
+/// Non-Linux unix: no raw clone; fall back to fork (atfork caveat applies).
+#[cfg(not(target_os = "linux"))]
+unsafe fn raw_fork() -> libc::pid_t {
+    unsafe { libc::fork() }
+}
+
 /// `detach: true`: double-fork, so the caller owns nothing after it returns.
 ///
 /// A plain `setsid` child stays the caller's child: when it exits it is a
@@ -4301,14 +4328,27 @@ fn spawn_detached(mut command: std::process::Command) -> MixResult<Option<Value>
     }
     // SAFETY: both fds were just created and are owned only here.
     let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    let wfd = fds[1];
+    // Move the write end to fd >= 3. A caller that closed its stdio gets the
+    // pipe on 0/1/2, and std's child-side dup2 of the stdio routes would then
+    // overwrite it before our pre_exec runs: the grandchild would start and
+    // spawn would raise "pid was not reported".
+    // SAFETY: fcntl returns a fresh owned fd or -1; fds[1] is ours to close.
+    let wfd = unsafe { libc::fcntl(fds[1], libc::F_DUPFD_CLOEXEC, 3) };
+    unsafe { libc::close(fds[1]) };
+    if wfd < 0 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("spawn: pid pipe: {}", std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: wfd was just created by fcntl and is owned only here.
+    let write_end = unsafe { OwnedFd::from_raw_fd(wfd) };
 
-    // SAFETY: only async-signal-safe calls (fork, write, _exit, setsid) run
-    // in the post-fork pre-exec window — no allocation, no locks.
+    // SAFETY: only raw syscalls (clone/fork, write, _exit, setsid) run in the
+    // post-fork pre-exec window — no allocation, no locks, no atfork handlers.
     unsafe {
         command.pre_exec(move || {
-            match libc::fork() {
+            match raw_fork() {
                 -1 => Err(std::io::Error::last_os_error()),
                 0 => {
                     // Grandchild: new session, then on to exec.
