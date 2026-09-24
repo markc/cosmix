@@ -61,7 +61,7 @@ use anyhow::Result;
 use cosmix_maild_bayesian::{
     DefaultClassifier,
     classifier::Classifier,
-    types::{Label, RetrainRequest},
+    types::{Label, RetrainOutcome, RetrainRequest},
 };
 use cosmix_maild_rules::AccountId;
 use cosmix_mds::{ItemId, Mds, SetId, SqliteCasMds};
@@ -84,6 +84,109 @@ pub const MAX_ATTEMPTS: i64 = 5;
 /// Rows claimed per set per tick. Bounds the per-tick work and the
 /// claim transaction's hold time.
 pub const BATCH: i64 = 64;
+
+/// Which surface asked for a training event. Logged on every train line
+/// so an operator can tell a user's IMAP drag from a JMAP move or an
+/// explicit `maild.bayesian.train`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainVia {
+    Imap,
+    Jmap,
+    Bus,
+}
+
+impl TrainVia {
+    fn as_str(self) -> &'static str {
+        match self {
+            TrainVia::Imap => "imap",
+            TrainVia::Jmap => "jmap",
+            TrainVia::Bus => "bus",
+        }
+    }
+}
+
+/// The structured record of one training attempt — what
+/// [`retrain_logged`] writes to the log under target
+/// `maild::bayesian::train`. Split out so the fields are testable.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TrainEvent {
+    pub account: String,
+    /// `spam` or `ham`.
+    pub direction: &'static str,
+    /// Classifier stamp (the MDS item id).
+    pub stamp: String,
+    /// RFC 5322 `Message-ID` of the trained message, when it has one.
+    pub message_id: Option<String>,
+    /// `applied`, `already_labeled`, `no_stamp`, or `error`.
+    pub result: &'static str,
+    pub via: TrainVia,
+}
+
+impl TrainEvent {
+    pub fn new(
+        req: &RetrainRequest<'_>,
+        result: &cosmix_maild_bayesian::Result<RetrainOutcome>,
+        via: TrainVia,
+    ) -> Self {
+        Self {
+            account: req.account.as_str().to_string(),
+            direction: match req.label {
+                Label::Spam => "spam",
+                Label::Ham => "ham",
+            },
+            stamp: req.stamp_id.to_string(),
+            message_id: mail_parser::MessageParser::default()
+                .parse_headers(req.message)
+                .and_then(|m| m.message_id().map(str::to_string)),
+            result: match result {
+                Ok(RetrainOutcome::Applied) => "applied",
+                Ok(RetrainOutcome::AlreadyLabeled) => "already_labeled",
+                Ok(RetrainOutcome::NoStamp) => "no_stamp",
+                Err(_) => "error",
+            },
+            via,
+        }
+    }
+}
+
+/// Apply one retrain through the classifier and log it. Every training
+/// surface (the IMAP outbox drain, JMAP moves, `maild.bayesian.train`)
+/// goes through here, so the log is a complete record of what was learned.
+pub async fn retrain_logged(
+    classifier: &DefaultClassifier,
+    req: &RetrainRequest<'_>,
+    via: TrainVia,
+) -> cosmix_maild_bayesian::Result<RetrainOutcome> {
+    let result = classifier.retrain(req).await;
+    let ev = TrainEvent::new(req, &result, via);
+    let message_id = ev.message_id.as_deref().unwrap_or("-");
+    match &result {
+        Ok(_) => info!(
+            target: "maild::bayesian::train",
+            account = %ev.account,
+            direction = ev.direction,
+            stamp = %ev.stamp,
+            message_id = %message_id,
+            result = ev.result,
+            via = ev.via.as_str(),
+            "trained {} as {}: {} (account {}, via {})",
+            message_id, ev.direction, ev.result, ev.account, ev.via.as_str(),
+        ),
+        Err(e) => warn!(
+            target: "maild::bayesian::train",
+            account = %ev.account,
+            direction = ev.direction,
+            stamp = %ev.stamp,
+            message_id = %message_id,
+            result = ev.result,
+            via = ev.via.as_str(),
+            error = %e,
+            "training {} as {} failed (account {}, via {}): {e}",
+            message_id, ev.direction, ev.account, ev.via.as_str(),
+        ),
+    }
+    result
+}
 
 /// One row claimed from `mail_retrain_outbox`, carrying the exact
 /// `rowid` so finalise can target it precisely (the re-drag guard).
@@ -301,7 +404,7 @@ impl RetrainOutboxWorker {
         // The exact call JMAP's `retrain_for_move` makes: shared
         // tokenize + `max_tokens_per_message` cap + `record_label`
         // reversal. This is the parity guarantee.
-        match self.classifier.retrain(&req).await {
+        match retrain_logged(&self.classifier, &req, TrainVia::Imap).await {
             Ok(_) => Finalise::Done,
             Err(e) => Finalise::Retry(format!("classifier.retrain: {e}")),
         }
@@ -378,4 +481,49 @@ pub(crate) fn finalise(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn train_event_carries_account_direction_message_id_and_result() {
+        let account = AccountId::new("13");
+        let message = b"Message-ID: <scam-1@example.invalid>\r\nSubject: x\r\n\r\nbody\r\n";
+        let req = RetrainRequest {
+            stamp_id: "0b7c0000-0000-4000-8000-000000000001",
+            account: &account,
+            message,
+            label: Label::Spam,
+        };
+        let ev = TrainEvent::new(&req, &Ok(RetrainOutcome::Applied), TrainVia::Bus);
+        assert_eq!(
+            ev,
+            TrainEvent {
+                account: "13".into(),
+                direction: "spam",
+                stamp: "0b7c0000-0000-4000-8000-000000000001".into(),
+                message_id: Some("scam-1@example.invalid".into()),
+                result: "applied",
+                via: TrainVia::Bus,
+            }
+        );
+
+        let req = RetrainRequest {
+            label: Label::Ham,
+            message: b"Subject: no id\r\n\r\nbody\r\n",
+            ..req
+        };
+        let err: cosmix_maild_bayesian::Result<RetrainOutcome> =
+            Err(cosmix_maild_bayesian::Error::Storage("disk full".into()));
+        let ev = TrainEvent::new(&req, &err, TrainVia::Imap);
+        assert_eq!(ev.direction, "ham");
+        assert_eq!(ev.message_id, None);
+        assert_eq!(ev.result, "error");
+        assert_eq!(
+            TrainEvent::new(&req, &Ok(RetrainOutcome::AlreadyLabeled), TrainVia::Jmap).result,
+            "already_labeled"
+        );
+    }
 }

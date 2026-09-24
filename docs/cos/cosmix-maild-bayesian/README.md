@@ -127,7 +127,9 @@ The SQLite schema contains `tokens`, `meta`, and `labels` tables. It preserves t
 
 `InMemoryBackend` and `InMemoryConnection` represent an always-empty corpus. They are suitable for tests and downstream stubs; they do not retain training.
 
-`AccountStats` reports message totals, approximate token totals, cold-start state, seed label, and model version. The SQLite implementation reports the same unique-token count in both token-total fields and currently returns no seed label.
+`AccountStats` reports message totals, approximate token totals, cold-start state, seed label, and model version. It also reports training counters: `labelled_spam` and `labelled_ham` count the messages that carry a training label, and `last_trained_at` is the Unix time of the latest label write (`None` if the account has never trained). The message totals include seeded and imported mail. The label counters do not, so they change only when training happens. The SQLite implementation reports the same unique-token count in both token-total fields.
+
+`StorageBackend::peek_stats` (exposed as `DefaultClassifier::peek_stats`) is the read-only form for inspection. It creates nothing and does not seed or promote a database. `SqliteBackend` answers from a cached live connection when one is open. Otherwise it opens the first file that `open_account` would start from, read-only: `bayes.db`, then a legacy `db.sqlite`, then the seed. When the answer comes from the seed, `seeded_from` names it. An account with none of these files reads as an empty cold-start corpus. The trait's default implementation calls `open_account`.
 
 ## Cargo features
 

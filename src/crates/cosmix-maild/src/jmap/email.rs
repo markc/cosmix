@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use cosmix_maild_bayesian::{
     DefaultClassifier,
-    classifier::Classifier,
     types::{Label, RetrainRequest},
 };
 use cosmix_maild_rules::AccountId;
@@ -2187,7 +2186,12 @@ async fn retrain_for_move(
         message: &blob_data,
         label,
     };
-    classifier.retrain(&req).await?;
+    crate::mailstore::retrain::retrain_logged(
+        classifier,
+        &req,
+        crate::mailstore::retrain::TrainVia::Jmap,
+    )
+    .await?;
     Ok(())
 }
 

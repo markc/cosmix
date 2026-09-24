@@ -88,4 +88,12 @@ pub struct AccountStats {
     /// trained past the seeded baseline.
     pub seeded_from: Option<String>,
     pub model_version: u32,
+    /// Messages currently carrying a Spam / Ham training label — user
+    /// corrections, operator `train`, and rebuilds. Unlike
+    /// `spam_messages`/`ham_messages` these exclude seeded and imported
+    /// corpus totals, so they move exactly when training happens.
+    pub labelled_spam: u64,
+    pub labelled_ham: u64,
+    /// Unix seconds of the most recent label write, `None` if never trained.
+    pub last_trained_at: Option<i64>,
 }

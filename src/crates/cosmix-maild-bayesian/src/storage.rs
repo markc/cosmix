@@ -287,10 +287,41 @@ impl StorageBackend for SqliteBackend {
 /// Corpus statistics from an open spamlite database.
 fn stats_from(c: &Connection, cold_floor: u32) -> Result<AccountStats> {
     let counts = spamlite::storage::ops::counts(c)?;
-    let version: String = c.query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
-        row.get(0)
-    })?;
+    let version: String =
+        c.query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
+            row.get(0)
+        })?;
+    // Training labels, as opposed to corpus totals (which also count seeded
+    // and imported messages). A pre-labels legacy database has no table.
+    let has_labels: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'labels')",
+        [],
+        |row| row.get(0),
+    )?;
+    let (mut labelled_spam, mut labelled_ham, mut last_trained_at) = (0u64, 0u64, None);
+    if has_labels {
+        let mut stmt = c.prepare("SELECT label, COUNT(*), MAX(ts) FROM labels GROUP BY label")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (label, n, ts) = row?;
+            if label == label_int(Label::Spam) {
+                labelled_spam = n as u64;
+            } else {
+                labelled_ham = n as u64;
+            }
+            last_trained_at = last_trained_at.max(ts);
+        }
+    }
     Ok(AccountStats {
+        labelled_spam,
+        labelled_ham,
+        last_trained_at,
         spam_messages: counts.total_spam as u32,
         ham_messages: counts.total_good as u32,
         spam_tokens: counts.unique_tokens,
@@ -914,6 +945,32 @@ mod tests {
         assert_eq!(stats.seeded_from, None);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn stats_report_label_counters_and_last_trained_at() {
+        let conn = SqliteAccountConnection::open_path(Path::new(":memory:"), 0).unwrap();
+        let before = conn.stats().await.unwrap();
+        assert_eq!((before.labelled_spam, before.labelled_ham), (0, 0));
+        assert_eq!(before.last_trained_at, None);
+
+        conn.record_label("s-1", &toks(&["alpha"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        conn.record_label("s-2", &toks(&["beta"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        conn.record_label("h-1", &toks(&["gamma"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        // A correction moves the counters with it.
+        conn.record_label("s-2", &toks(&["beta"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        let after = conn.stats().await.unwrap();
+        assert_eq!((after.labelled_spam, after.labelled_ham), (1, 2));
+        let ts = after.last_trained_at.expect("trained");
+        assert!(ts >= unix_secs() - 60, "last_trained_at {ts} is not recent");
     }
 
     #[tokio::test]
