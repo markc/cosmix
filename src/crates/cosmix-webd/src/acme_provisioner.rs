@@ -581,6 +581,16 @@ pub struct AcmeProvisioner {
     chain_validator: ChainValidatorFn,
 }
 
+/// Outcome of [`AcmeProvisioner::adopt_namespace_rows_at_startup`].
+#[derive(Debug, Default)]
+pub struct StartupAdoption {
+    /// Runtime rows whose on-disk cert was loaded into the resolvers.
+    pub adopted: usize,
+    /// Enabled runtime ACME rows with no servable cert on disk. They
+    /// need issuance, which cannot run before `:80` is bound.
+    pub pending: Vec<String>,
+}
+
 /// Signature of the carrying-chain check `classify_live` applies:
 /// `(chain_pem, fqdn, now, environment) -> servable?`.
 type ChainValidatorFn = fn(&[u8], &str, UnixTime, ChainEnvironment) -> bool;
@@ -1497,9 +1507,23 @@ impl AcmeProvisioner {
             ns_events_attached = ns_events.is_some(),
             "ACME provisioner renewal loop started"
         );
+        // The interval fires immediately on entry, before `main` has
+        // bound the listeners, so the first tick must not reconcile: a
+        // fresh HTTP-01 order then would fail and only arm a cooldown.
+        // `main` notifies once the listeners are up instead.
+        let mut first_tick = true;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Every later tick also reconciles the namespace, so a
+                    // row with no cert (a runtime add whose issuance
+                    // failed, or pending since boot) is retried on the
+                    // timer once its cooldown passes — `tick_once` alone
+                    // only renews certs that already have live meta.
+                    if !first_tick {
+                        self.snapshot_reconcile_additive().await;
+                    }
+                    first_tick = false;
                     self.tick_once().await;
                 }
                 _ = notify.notified() => {
@@ -1885,18 +1909,21 @@ impl AcmeProvisioner {
     /// runtime-added vhost already gets its own certificate. Never
     /// issues: HTTP-01 needs the `:80` listener that is not bound yet,
     /// and a failed order here would only arm a cooldown. Rows with
-    /// nothing servable on disk wait for the next reconcile (any
-    /// notify, e.g. `webd.acme.renew`).
+    /// nothing servable on disk come back in
+    /// [`StartupAdoption::pending`]; `main` wakes the provisioner once
+    /// the listeners are bound, and the 6 h timer's reconcile retries
+    /// them after that (cooldown-gated).
     ///
-    /// Returns the number of identities adopted. Errors are logged per
-    /// row; one broken row never blocks the others or the boot.
+    /// Errors are logged per row; one broken row never blocks the
+    /// others or the boot.
     pub async fn adopt_namespace_rows_at_startup(
         &mut self,
         now: OffsetDateTime,
         staging_orphan_ttl: Duration,
-    ) -> usize {
+    ) -> StartupAdoption {
+        let mut out = StartupAdoption::default();
         let Some(runtime) = self.vhosts_runtime.clone() else {
-            return 0;
+            return out;
         };
         let rows = match crate::vhosts_namespace::snapshot_rows(&runtime).await {
             Ok(rows) => rows,
@@ -1904,12 +1931,11 @@ impl AcmeProvisioner {
                 warn!(
                     error = %e,
                     "ACME startup adopt: namespace list failed — runtime-added \
-                     vhosts keep no cert until the next reconcile"
+                     vhosts get their certs from the post-bind reconcile"
                 );
-                return 0;
+                return out;
             }
         };
-        let mut adopted = 0;
         for row in rows {
             let fqdn = row.fqdn.clone();
             if self.acme_identities.contains_key(&fqdn) {
@@ -1937,10 +1963,13 @@ impl AcmeProvisioner {
                 continue;
             }
             if self.acme_identities.contains_key(&fqdn) {
-                adopted += 1;
+                out.adopted += 1;
+            } else if self.plans.iter().any(|p| p.fqdn == fqdn) {
+                // Registered ACME row with nothing servable on disk.
+                out.pending.push(fqdn);
             }
         }
-        adopted
+        out
     }
 
     async fn apply_vhost_row_inner(
@@ -2575,8 +2604,9 @@ impl AcmeProvisioner {
                     warn!(
                         fqdn = %plan.fqdn,
                         error = %e,
-                        "ACME renewal tick: live meta unreadable — skipping \
-                         (restart to recover via startup_pass)"
+                        "ACME renewal tick: live meta unreadable — skipping renewal \
+                         (a missing cert is re-issued by the timer's reconcile pass; \
+                         corrupt state needs the operator)"
                     );
                     // Record the meta-read failure in `last_error`
                     // so `webd.tls.status` surfaces stale-state
@@ -5601,10 +5631,15 @@ mod tests {
         _write_row(&runtime, &_acme_prod_row("nocert.example")).await;
         _stage_fake_live(tmp.path(), "ondisk.example");
 
-        let adopted = p
+        let adoption = p
             .adopt_namespace_rows_at_startup(OffsetDateTime::now_utc(), Duration::from_secs(3600))
             .await;
-        assert_eq!(adopted, 1);
+        assert_eq!(adoption.adopted, 1);
+        assert_eq!(
+            adoption.pending,
+            vec!["nocert.example".to_string()],
+            "the cert-less row is reported so main can wake issuance after bind"
+        );
         assert!(p.acme_identities.contains_key("ondisk.example"));
         assert!(!p.acme_identities.contains_key("nocert.example"));
         assert!(
@@ -5618,6 +5653,26 @@ mod tests {
                 "startup adopt must never attempt issuance ({fqdn})"
             );
         }
+
+        // Review MAJOR-5: the reconcile that the post-bind notify and
+        // every later timer tick run DOES attempt issuance for it —
+        // tick_once alone would skip it forever (no live meta).
+        p.tick_once().await;
+        assert_eq!(
+            p.vhost_state
+                .get("nocert.example")
+                .map(|s| s.last_error_count),
+            Some(0),
+            "tick_once alone never issues a cert-less plan (the old gap)"
+        );
+        p.snapshot_reconcile_additive().await;
+        assert_eq!(
+            p.vhost_state
+                .get("nocert.example")
+                .map(|s| s.last_error_count),
+            Some(1),
+            "the reconcile attempts issuance (fails hermetically: no ToS)"
+        );
     }
 
     fn _install_crypto_provider() {
@@ -5690,7 +5745,7 @@ mod tests {
         let adopted = p
             .adopt_namespace_rows_at_startup(OffsetDateTime::now_utc(), Duration::from_secs(3600))
             .await;
-        assert_eq!(adopted, 1);
+        assert_eq!(adopted.adopted, 1);
 
         let (bind_tls, mode) = crate::listener_bind_tls(Some(&handle));
         assert!(matches!(mode, TlsMode::Terminate), "binds TLS after adoption");

@@ -7990,6 +7990,9 @@ async fn main() -> Result<()> {
             // NodeState) so the C5 ergonomic verbs can share the same
             // lock map. The match arm here just clones it into the
             // provisioner via `attach_key_locks`.
+            // Set when the startup adoption left runtime rows needing
+            // issuance; the provisioner is woken once the listeners bind.
+            let mut acme_pending_after_bind = false;
             let acme_renewal_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
                 match acme_provisioner_opt {
                     // An ACME plan always issues at least one cert at
@@ -8021,19 +8024,27 @@ async fn main() -> Result<()> {
                         // `node.conf.mix` plans, so without this a
                         // restarted node served another vhost's cert for
                         // every runtime-added vhost.
-                        let adopted = provisioner
+                        let adoption = provisioner
                             .adopt_namespace_rows_at_startup(
                                 time::OffsetDateTime::now_utc(),
                                 std::time::Duration::from_secs(6 * 60 * 60),
                             )
                             .await;
-                        if adopted > 0 {
+                        if adoption.adopted > 0 {
                             provisioner.publish_tls_status();
                             tracing::info!(
-                                adopted,
+                                adopted = adoption.adopted,
                                 "ACME: adopted on-disk certs for runtime-added vhosts"
                             );
                         }
+                        if !adoption.pending.is_empty() {
+                            tracing::warn!(
+                                hosts = ?adoption.pending,
+                                "ACME: runtime-added vhosts have no cert on disk — issuing \
+                                 once the listeners are bound"
+                            );
+                        }
+                        acme_pending_after_bind = !adoption.pending.is_empty();
                         Some(tokio::spawn(async move { provisioner.run_forever().await }))
                     }
                     _ => None,
@@ -8137,6 +8148,14 @@ async fn main() -> Result<()> {
                 .start_all()
                 .await
                 .context("starting webd listener set")?;
+            // Listeners (incl. the :80 HTTP-01 path) are up: wake the ACME
+            // provisioner once so runtime rows the startup adoption left
+            // without a cert are issued now rather than at the first 6 h
+            // tick. The Notify stores the permit if the loop is not yet
+            // waiting.
+            if acme_pending_after_bind && let Some(n) = node.acme_notify.as_ref() {
+                n.notify_one();
+            }
 
             // `start_all` is best-effort (it only errors when *every*
             // enabled listener fails to bind), so a partial bind — e.g.
