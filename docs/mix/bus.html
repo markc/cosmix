@@ -589,8 +589,10 @@ after the <code>send</code>, or capture the reply with the expression form —
 <code>$r = send svc cmd</code> — and copy <code>$rc</code> into a local before the next await.</p>
 <p><strong>A wrong verb name answers at once.</strong> A <code>mix --serve</code> citizen (or any script
 with <code>on</code> handlers) that receives a request for a command it has no handler
-for refuses it immediately with <code>rc 10</code>: <code>$result</code> is the message ("unknown
-command 'x' (this citizen handles: …)"), and the structure is in <code>$reply</code> —
+for refuses it immediately with <code>rc 10</code>. On an ordinary send <code>$result</code> is the
+message ("unknown command 'x' (this citizen handles: …)"); on the header
+route (a <code>body=</code> send) the <code>error_code</code> rule above makes <code>$result</code> the whole
+object instead. Either way the structure is in <code>$reply</code> —
 <code>$reply.error_code == "UNKNOWN_COMMAND"</code>, <code>$reply.command</code> the verb you sent,
 <code>$reply.available</code> the citizen's declared handlers. (Before 0.92.0 the request
 was dropped: the caller waited out its full timeout and got <code>-2</code>, which read as

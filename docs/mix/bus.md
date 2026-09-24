@@ -188,8 +188,10 @@ after the `send`, or capture the reply with the expression form —
 
 **A wrong verb name answers at once.** A `mix --serve` citizen (or any script
 with `on` handlers) that receives a request for a command it has no handler
-for refuses it immediately with `rc 10`: `$result` is the message ("unknown
-command 'x' (this citizen handles: …)"), and the structure is in `$reply` —
+for refuses it immediately with `rc 10`. On an ordinary send `$result` is the
+message ("unknown command 'x' (this citizen handles: …)"); on the header
+route (a `body=` send) the `error_code` rule above makes `$result` the whole
+object instead. Either way the structure is in `$reply` —
 `$reply.error_code == "UNKNOWN_COMMAND"`, `$reply.command` the verb you sent,
 `$reply.available` the citizen's declared handlers. (Before 0.92.0 the request
 was dropped: the caller waited out its full timeout and got `-2`, which read as
