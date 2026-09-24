@@ -507,6 +507,29 @@ pub struct RunConfig {
 }
 
 pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()> {
+    serve(config, None, ready_tx).await
+}
+
+/// [`run`] on a listener the caller already bound; `config.listen` must name
+/// its address. Test brokers use this to own an ephemeral port from the start
+/// — binding `:0`, dropping it and handing noded the number lets another
+/// socket take the port in between.
+// The noded binary never calls it; term-core's test broker compiles this
+// file by path and does.
+#[allow(dead_code)]
+pub async fn run_on(
+    config: RunConfig,
+    listener: tokio::net::TcpListener,
+    ready_tx: oneshot::Sender<()>,
+) -> Result<()> {
+    serve(config, Some(listener), ready_tx).await
+}
+
+async fn serve(
+    config: RunConfig,
+    bound: Option<tokio::net::TcpListener>,
+    ready_tx: oneshot::Sender<()>,
+) -> Result<()> {
     let RunConfig {
         #[cfg(test)]
         session_probe,
@@ -562,7 +585,11 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         crate::authority::Posture::Verified(a) => (true, a.epoch),
         crate::authority::Posture::Unverified { .. } => (false, 0),
     };
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    // Same point in start-up either way: validation above runs first.
+    let listener = match bound {
+        Some(listener) => listener,
+        None => tokio::net::TcpListener::bind(&listen).await?,
+    };
     let mut unix_listener = match unix_socket.as_deref() {
         Some(path) => match crate::native_ingress::bind(path).await {
             Ok(listener) => Some(listener),
