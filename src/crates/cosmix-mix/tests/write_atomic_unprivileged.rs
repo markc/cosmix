@@ -134,3 +134,21 @@ fn a_write_search_only_directory_works_and_full_durability_says_it_cannot() {
         "the full-durability write replaced the file before the dir fsync failed"
     );
 }
+
+/// Review R5: the final mode is applied AFTER the write, so an unprivileged
+/// writer's requested setuid bit survives the kernel's write-clears-setuid
+/// rule — on the first write and on a later replace. (Mode applied before
+/// the write, the old order, fails this: the bit is gone after the write.)
+#[test]
+fn an_unprivileged_writer_keeps_a_requested_setuid_bit() {
+    let sb = Sandbox::new("suid");
+    let (ok, out, err) = sb.run(
+        "print(uid() != 0)\n\
+         write_atomic(\"tool\", \"#!/bin/sh\\n\", {mode: 0o4755})\n\
+         print(stat(\"tool\")[\"perm\"])\n\
+         write_atomic(\"tool\", \"#!/bin/sh\\n# v2\\n\")\n\
+         print(stat(\"tool\")[\"perm\"])\n",
+    );
+    assert!(ok, "script failed: {err}");
+    assert_eq!(out, "true\n2541\n2541\n", "stderr: {err}");
+}

@@ -24665,8 +24665,10 @@ mod write_atomic_tests {
 
     /// The final mode is applied after the write, so a requested setuid bit
     /// is not cleared by the kernel's write-clears-setuid rule for writers
-    /// without CAP_FSETID. (As root the kernel keeps the bit either way; the
-    /// test still pins the result.)
+    /// without CAP_FSETID. As root the kernel keeps the bit either way, so
+    /// this only pins the result; the test that bites is
+    /// cosmix-mix/tests/write_atomic_unprivileged.rs, which writes as uid
+    /// 65534 (review R5).
     #[test]
     fn a_requested_setuid_bit_survives_the_write() {
         let d = tmpdir("suid");
