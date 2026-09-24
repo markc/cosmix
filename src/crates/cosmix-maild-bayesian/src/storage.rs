@@ -978,6 +978,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Review MINOR-8: the legacy `db.sqlite` branch is read in place (not
+    /// promoted), and a database with no `labels` table reports zero label
+    /// counters instead of failing.
+    #[tokio::test]
+    async fn peek_stats_reads_legacy_db_and_tolerates_a_missing_labels_table() {
+        let base = std::env::temp_dir().join(format!(
+            "bayes-peek-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let legacy_path = base.join("5").join("db.sqlite");
+        let legacy = SqliteAccountConnection::open_path(&legacy_path, 0).unwrap();
+        legacy
+            .record_label("l-1", &toks(&["alpha"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        drop(legacy);
+        let backend = SqliteBackend::new(&base, None, 100);
+        let stats = backend.peek_stats(&AccountId::new("5")).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.labelled_spam), (1, 1));
+        assert!(
+            !base.join("5").join("bayes.db").exists(),
+            "peek_stats promoted the legacy database"
+        );
+
+        let bare_path = base.join("6").join("bayes.db");
+        let bare = SqliteAccountConnection::open_path(&bare_path, 0).unwrap();
+        bare.record_label("b-1", &toks(&["beta"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        drop(bare);
+        let raw = Connection::open(&bare_path).unwrap();
+        raw.execute_batch("DROP TABLE labels;").unwrap();
+        drop(raw);
+        let stats = backend.peek_stats(&AccountId::new("6")).await.unwrap();
+        assert_eq!(stats.ham_messages, 1);
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 0));
+        assert_eq!(stats.last_trained_at, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn stats_report_label_counters_and_last_trained_at() {
         let conn = SqliteAccountConnection::open_path(Path::new(":memory:"), 0).unwrap();

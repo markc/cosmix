@@ -2723,6 +2723,56 @@ mod tests {
 
     use crate::mailstore::{EmailEnvelope, EmailRecord};
 
+    /// Review MINOR-8: a JMAP move across Junk must train through the
+    /// logged, superseding inline path — not call the classifier directly.
+    #[tokio::test]
+    async fn retrain_for_move_trains_through_the_logged_inline_path() {
+        use crate::mailstore::retrain::{TrainVia, take_trained_via};
+        use cosmix_maild_bayesian::{ClassifierConfig, storage::SqliteBackend};
+        use cosmix_mds::{ContainerAttrs, Membership, SqliteCasMds};
+
+        let mds_dir = tempfile::tempdir().unwrap();
+        let mds = Arc::new(SqliteCasMds::open(mds_dir.path()).unwrap());
+        let mailstore = Arc::new(SqliteMailStore::new(Arc::clone(&mds)));
+        let set = mailstore.ensure_account_set(7).unwrap();
+        let inbox = mds
+            .create_container(
+                &set,
+                None,
+                "Inbox",
+                ContainerAttrs {
+                    special_use: Some("\\Inbox".into()),
+                    subscribed: false,
+                    extra: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        let hash = mds.put_blob(b"Subject: move me\r\n\r\nbody\r\n").unwrap();
+        let item = mds
+            .add_item(
+                &set,
+                &hash,
+                &[Membership {
+                    container: inbox,
+                    flags: Flags(0),
+                    added_at: 0,
+                }],
+            )
+            .unwrap()
+            .item_id;
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(SqliteBackend::new(corpus_dir.path(), None, 0));
+        let classifier = Arc::new(DefaultClassifier::new(ClassifierConfig::default(), backend));
+
+        take_trained_via();
+        retrain_for_move(&mailstore, &classifier, 7, item, hash, Label::Spam)
+            .await
+            .unwrap();
+        assert_eq!(take_trained_via(), vec![TrainVia::Jmap]);
+        let stats = classifier.peek_stats(&AccountId::new("7")).await.unwrap();
+        assert_eq!(stats.labelled_spam, 1);
+    }
+
     fn sample_record() -> EmailRecord {
         EmailRecord {
             id: ItemId(Uuid::nil()),

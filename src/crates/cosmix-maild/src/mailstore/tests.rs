@@ -8776,8 +8776,14 @@ mod retrain_drain {
 
         let cls = mk_classifier();
         let worker = RetrainOutboxWorker::new(Arc::clone(&mds), Arc::clone(&cls));
+        retrain::take_trained_via();
         let applied = worker.drain_once().await.unwrap();
         assert_eq!(applied, 2);
+        // Both rows went through the logged training path.
+        assert_eq!(
+            retrain::take_trained_via(),
+            vec![retrain::TrainVia::Imap, retrain::TrainVia::Imap]
+        );
 
         let (spam, ham) = corpus_counts(&cls).await;
         assert_eq!(

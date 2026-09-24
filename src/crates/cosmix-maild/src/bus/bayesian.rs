@@ -1898,8 +1898,13 @@ mod tests {
             "message_id": "<scam-1@example.com>",
             "class": "spam",
         });
+        crate::mailstore::retrain::take_trained_via();
         let (rc, body) = handle_train(&cls, &database, &store, &args).await;
         assert_eq!(rc, 0, "body was: {body}");
+        assert_eq!(
+            crate::mailstore::retrain::take_trained_via(),
+            vec![TrainVia::Bus]
+        );
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["account_id"], 3);
         assert_eq!(v["email_id"], item.0.to_string());
@@ -1920,6 +1925,12 @@ mod tests {
         assert_eq!(v["removed"], "spam");
         let stats = cls.peek_stats(&AccountId::new("3")).await.unwrap();
         assert_eq!((stats.spam_messages, stats.labelled_spam), (0, 0));
+
+        // Untraining a message that carries no label reports removed: null.
+        let (rc, body) = handle_untrain(&cls, &database, &store, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["removed"].is_null(), "{body}");
     }
 
     fn enqueue_outbox_row(

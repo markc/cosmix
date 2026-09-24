@@ -149,6 +149,21 @@ impl TrainEvent {
     }
 }
 
+// Test-only record of which surfaces reached `retrain_logged` on this
+// thread, so a test can prove a path trains THROUGH it and not around it.
+// `#[tokio::test]` runs on a current-thread runtime, so the thread is the test.
+#[cfg(test)]
+thread_local! {
+    static TRAINED_VIA: std::cell::RefCell<Vec<TrainVia>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain this thread's record of `retrain_logged` calls (test only).
+#[cfg(test)]
+pub(crate) fn take_trained_via() -> Vec<TrainVia> {
+    TRAINED_VIA.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
 /// Apply one retrain through the classifier and log it. Every
 /// single-message training surface (the IMAP outbox drain, JMAP moves,
 /// `maild.bayesian.train`) goes through here. `maild.bayesian.rebuild` does
@@ -159,6 +174,8 @@ pub async fn retrain_logged(
     via: TrainVia,
 ) -> cosmix_maild_bayesian::Result<RetrainOutcome> {
     let result = classifier.retrain(req).await;
+    #[cfg(test)]
+    TRAINED_VIA.with(|v| v.borrow_mut().push(via));
     let ev = TrainEvent::new(req, &result, via);
     let message_id = ev.message_id.as_deref().unwrap_or("-");
     match &result {
