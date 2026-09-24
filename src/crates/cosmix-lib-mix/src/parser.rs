@@ -1622,12 +1622,25 @@ impl Parser {
     /// invocations across `send.await`). `async` is parsed as a contextual
     /// identifier — it is NOT a global reserved word, so existing
     /// scripts/vars named `async` keep working everywhere else.
-    /// After a dot, keywords are names just as they are in field access.
+    /// After a dot, keywords are literal wire-name segments. Unlike field
+    /// access, preserve their source spelling (in particular `fn`).
     fn parse_dotted_command_name(&mut self) -> MixResult<String> {
         let mut command = self.expect_identifier()?;
         while self.peek() == &Token::Dot {
             self.advance();
-            let part = self.expect_field_name()?;
+            let part = if keyword_lexeme(self.peek()).is_some()
+                || matches!(self.peek(), Token::Function)
+            {
+                let start = self.tokens[self.pos].offset;
+                let literal = self.source[start..]
+                    .iter()
+                    .take_while(|c| c.is_alphanumeric() || **c == '_')
+                    .collect::<String>();
+                self.advance();
+                literal
+            } else {
+                self.expect_identifier()?
+            };
             command.push('.');
             command.push_str(&part);
         }

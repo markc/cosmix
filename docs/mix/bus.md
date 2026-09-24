@@ -504,9 +504,10 @@ Legacy `done` still closes `on` (with a deprecation warning); prefer `end`.
 
 Dotted verbs accept keyword segments after a dot: `on a.next`, `on a.end.b`,
 `send svc a.if` and `send svc a.for.b` need no quotes. This also applies to
-`emit` and implicit sends in `address` blocks. As in field access, `fn` and
-`function` after a dot both name `function`; quote the whole verb to preserve
-a literal `fn` segment. Bare keywords retain their statement meaning.
+`emit`, alias names and implicit sends in `address` blocks. Every segment keeps
+its literal spelling: `on a.fn` handles `a.fn`, and `send svc lib.fn` sends
+`lib.fn`, without expanding `fn` to `function`. Bare keywords retain their
+statement meaning and cannot start an unquoted verb.
 
 ### The `$event` map
 
