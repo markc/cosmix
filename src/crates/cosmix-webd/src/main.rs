@@ -8140,7 +8140,7 @@ async fn main() -> Result<()> {
                     let hosts: Vec<&String> = l
                         .hosts
                         .iter()
-                        .filter(|h| vhost_directory_handle.load().by_host.contains_key(*h))
+                        .filter(|h| all_hosts.contains(*h))
                         .collect();
                     tracing::warn!(
                         listener = %l.id,
