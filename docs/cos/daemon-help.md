@@ -31,8 +31,9 @@ Every `inputd` verb is reachable by mesh callers. This includes the keymap
 mutations `input.bind`, `input.unbind`, `input.mode` and `input.reload`.
 noded stamps each command's `broker_origin` from its source socket and strips
 any value the client sent. A caller stamped `local` or `mesh` is admitted, and
-being on the mesh is the whole authorization. A command carrying neither stamp
-did not come through the broker and is refused with rc 10.
+being on the mesh is the whole authorization. A keymap mutation carrying
+neither stamp did not come through the broker and is refused with rc 10.
+Queries and key and pointer injection do not check the stamp.
 
 Opening the gate does not relax admission. A mesh rebind is validated exactly
 like a local one: action grammar, `service` shape, `args` shape and size, and
@@ -45,6 +46,8 @@ Local callers are unaffected. Queries and key and pointer injection stay open
 either way. This is the same switch, with the same rule, as the clipboard
 citizen: any value other than exactly `0` means open. inputd reads it once at
 startup and logs the posture, so a running unit must be restarted to flip it.
+This switch is independent of noded's own mesh posture, which comes from the
+node config's `noded.mesh_open`. Locking one does not lock the other.
 
 | Verb | Body | Effect |
 |---|---|---|
@@ -162,10 +165,11 @@ The default keymap only seeds a missing keymap file, or one whose whole
 document is unusable. A document is unusable when its bytes are not UTF-8, are
 not JSON, are not a JSON object, lack a `physical` list, or lack an unsigned
 32-bit `version`. A `version` other than the one this inputd writes, currently
-`1`, is also unusable. A newer file is never loaded as the current version,
-because the next rebind would write it back as the older one; the reason
-reads `keymap version 2 is newer than this inputd's 1`. No older version
-exists yet. Since inputd 0.4.2, startup first renames such a file to
+`1`, is also unusable, with the reason `keymap version 2 is newer than this
+inputd's 1`. A newer file is never loaded as the current version, and it is
+never written over. At startup it is moved aside as below. If it appears
+while inputd runs, `input.reload` refuses it and also turns keymap writing
+off, as described further down. No older version exists yet. Since inputd 0.4.2, startup first renames such a file to
 `keymap.json.bad-YYYYmmdd-HHMMSS` in the same directory, then seeds the
 defaults. The rename never replaces an existing name. If the name is taken,
 even by a file created a moment earlier, inputd tries `-1`, `-2` and so on.
@@ -209,9 +213,11 @@ but their reply adds `"persisted":false` and the same `persist_disabled`
 reason. A save that fails while writing is enabled adds `"persisted":false`
 and `persist_error` instead. A successful save leaves the reply unchanged.
 
-`input.reload` never moves or rewrites the file. On a file that is still
-unusable it returns rc 10 with the reason, plus `persist_disabled` when
-writing is off, and the live keymap is unchanged. Once the file is fixed,
+`input.reload` never moves or rewrites the file. On an unusable file, such as
+bad JSON or a newer version, it returns rc 10 with the reason, and the live
+keymap is unchanged. It also turns writing off if it was on, so the next
+`input.bind` or `input.unbind` cannot replace that file. The reply then
+carries `persist_disabled`. Once the file is fixed,
 `input.reload` loads it and turns writing back on. Its reply then carries
 `persist_reenabled` with the reason that no longer applies.
 

@@ -52,7 +52,10 @@ struct RawKeymap {
 /// The document-level reason a keymap of `found` version is unusable to this
 /// binary, or `None` when it is the version this inputd writes. A newer file
 /// must not load as ours: the next bind would persist it back as
-/// [`KEYMAP_SCHEMA_VERSION`], a silent downgrade. An older version is the hook
+/// [`KEYMAP_SCHEMA_VERSION`], a silent downgrade. Being `Invalid` is only half
+/// of that guarantee — the file must also never be written over: startup
+/// moves it aside before seeding, and a failed `input.reload` turns
+/// persistence off until a good reload (service.rs). An older version is the hook
 /// for a future migration; none exists yet (version 1 is the first), so it
 /// takes the same unusable-document path.
 fn version_mismatch(found: u32) -> Option<String> {
@@ -482,11 +485,20 @@ fn parse(text: &str, path: &Path) -> Result<Loaded, String> {
     if !value.is_object() {
         return Err("not a JSON object".to_string());
     }
-    let parsed: RawKeymap =
-        serde_json::from_value(value).map_err(|error| format!("bad document: {error}"))?;
-    if let Some(reason) = version_mismatch(parsed.version) {
+    // Version first: a future document may reshape the rest (drop or rename
+    // `physical`), and its version is the reason that matters. A missing or
+    // non-u32 version falls through and is reported by the deserialize below.
+    if let Some(found) = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        && let Some(reason) = version_mismatch(found)
+    {
         return Err(reason);
     }
+    let parsed: RawKeymap =
+        serde_json::from_value(value).map_err(|error| format!("bad document: {error}"))?;
+    debug_assert_eq!(parsed.version, KEYMAP_SCHEMA_VERSION);
     let mut dropped = Vec::new();
     let mut drop_row = |raw: &serde_json::Value, reason: String| {
         let record = dropped_record(raw, &reason);
@@ -825,6 +837,26 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(seeded["version"], KEYMAP_SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reshaped_newer_document_reports_its_version_not_its_shape() {
+        let newer = KEYMAP_SCHEMA_VERSION + 1;
+        let expected = format!(
+            "keymap version {newer} is newer than this inputd's {KEYMAP_SCHEMA_VERSION}"
+        );
+        for text in [
+            format!(r#"{{"version":{newer}}}"#),
+            format!(r#"{{"version":{newer},"bindings":{{}}}}"#),
+            format!(r#"{{"version":{newer},"physical":{{}}}}"#),
+        ] {
+            assert_eq!(parse(&text, Path::new("t")).err().as_deref(), Some(expected.as_str()), "{text}");
+        }
+        // A version that is not a u32 still reports as a bad document.
+        for text in [r#"{"version":"2","physical":[]}"#, r#"{"version":4294967296,"physical":[]}"#] {
+            let reason = parse(text, Path::new("t")).err().expect("refused");
+            assert!(reason.starts_with("bad document"), "{text}: {reason}");
+        }
     }
 
     #[test]

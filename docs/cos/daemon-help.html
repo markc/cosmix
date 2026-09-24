@@ -467,8 +467,9 @@ node-local gate, whatever the mesh posture below.</p>
 mutations <code>input.bind</code>, <code>input.unbind</code>, <code>input.mode</code> and <code>input.reload</code>.
 noded stamps each command's <code>broker_origin</code> from its source socket and strips
 any value the client sent. A caller stamped <code>local</code> or <code>mesh</code> is admitted, and
-being on the mesh is the whole authorization. A command carrying neither stamp
-did not come through the broker and is refused with rc 10.</p>
+being on the mesh is the whole authorization. A keymap mutation carrying
+neither stamp did not come through the broker and is refused with rc 10.
+Queries and key and pointer injection do not check the stamp.</p>
 <p>Opening the gate does not relax admission. A mesh rebind is validated exactly
 like a local one: action grammar, <code>service</code> shape, <code>args</code> shape and size, and
 the row cap. A refused rebind changes nothing and leaves the generation as it
@@ -478,7 +479,9 @@ keymap mutations refuse mesh callers with rc 10 and an error naming the lock.
 Local callers are unaffected. Queries and key and pointer injection stay open
 either way. This is the same switch, with the same rule, as the clipboard
 citizen: any value other than exactly <code>0</code> means open. inputd reads it once at
-startup and logs the posture, so a running unit must be restarted to flip it.</p>
+startup and logs the posture, so a running unit must be restarted to flip it.
+This switch is independent of noded's own mesh posture, which comes from the
+node config's <code>noded.mesh_open</code>. Locking one does not lock the other.</p>
 <table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
 <tr><td><code>input.key</code></td><td><code>{"key":"F9","action":"tap"}</code></td><td>Key press (value 1), release (value 0), or tap (press then release); SYN_REPORT after each state change</td></tr>
 <tr><td><code>input.pointer.move</code></td><td><code>{"dx":12,"dy":-4}</code></td><td>Relative X/Y motion, then SYN_REPORT</td></tr>
@@ -576,10 +579,10 @@ After rolling forward again, those rows must be rebound with <code>service</code
 document is unusable. A document is unusable when its bytes are not UTF-8, are
 not JSON, are not a JSON object, lack a <code>physical</code> list, or lack an unsigned
 32-bit <code>version</code>. A <code>version</code> other than the one this inputd writes, currently
-<code>1</code>, is also unusable. A newer file is never loaded as the current version,
-because the next rebind would write it back as the older one; the reason
-reads <code>keymap version 2 is newer than this inputd's 1</code>. No older version
-exists yet. Since inputd 0.4.2, startup first renames such a file to
+<code>1</code>, is also unusable, with the reason <code>keymap version 2 is newer than this inputd's 1</code>. A newer file is never loaded as the current version, and it is
+never written over. At startup it is moved aside as below. If it appears
+while inputd runs, <code>input.reload</code> refuses it and also turns keymap writing
+off, as described further down. No older version exists yet. Since inputd 0.4.2, startup first renames such a file to
 <code>keymap.json.bad-YYYYmmdd-HHMMSS</code> in the same directory, then seeds the
 defaults. The rename never replaces an existing name. If the name is taken,
 even by a file created a moment earlier, inputd tries <code>-1</code>, <code>-2</code> and so on.
@@ -614,9 +617,11 @@ keymap file:</p>
 but their reply adds <code>"persisted":false</code> and the same <code>persist_disabled</code>
 reason. A save that fails while writing is enabled adds <code>"persisted":false</code>
 and <code>persist_error</code> instead. A successful save leaves the reply unchanged.</p>
-<p><code>input.reload</code> never moves or rewrites the file. On a file that is still
-unusable it returns rc 10 with the reason, plus <code>persist_disabled</code> when
-writing is off, and the live keymap is unchanged. Once the file is fixed,
+<p><code>input.reload</code> never moves or rewrites the file. On an unusable file, such as
+bad JSON or a newer version, it returns rc 10 with the reason, and the live
+keymap is unchanged. It also turns writing off if it was on, so the next
+<code>input.bind</code> or <code>input.unbind</code> cannot replace that file. The reply then
+carries <code>persist_disabled</code>. Once the file is fixed,
 <code>input.reload</code> loads it and turns writing back on. Its reply then carries
 <code>persist_reenabled</code> with the reason that no longer applies.</p>
 <p>A host with a usable file keeps its rows, apart from the legacy clipboard

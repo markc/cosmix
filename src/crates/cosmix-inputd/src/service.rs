@@ -374,6 +374,24 @@ fn reload(resolver: &Shared, store: &Store) -> (u8, String) {
         // in place and the live keymap is unchanged. The reply names the real
         // state: configured but unusable, plus why writing is off if it is.
         Err(load_error) => {
+            // An unusable document (bad JSON, a newer version, ...) now sits at
+            // the path. The next bind/unbind would rename our document over it
+            // with no backup, so writing goes off until a good reload — the
+            // startup rule, applied at runtime. An existing reason is kept.
+            if let keymap_file::LoadError::Invalid(reason, _) = &load_error {
+                store
+                    .persist_disabled
+                    .lock()
+                    .expect("store poisoned")
+                    .get_or_insert_with(|| {
+                        let why = format!(
+                            "{}: unusable ({reason}); left in place by input.reload",
+                            path.display()
+                        );
+                        eprintln!("cosmix-inputd: keymap persistence disabled: {why}");
+                        why
+                    });
+            }
             let mut reply = json!({
                 "error": format!(
                     "keymap file {} could not be read: {}",
@@ -617,6 +635,30 @@ mod tests {
         let (rc, reply) = dispatch(&resolver(), &locked, &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("node-local caller"));
+    }
+
+    #[test]
+    fn the_lock_never_gates_injection() {
+        // The lock covers the four keymap mutations only: a mesh key and
+        // pointer injection still reach the device under it.
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut injector = PointerInjector::with_test_file(File::from(OwnedFd::from(writer)));
+        let locked = Store::default().with_mesh_open(false);
+        for (verb, body, frames) in [
+            (verbs::KEY, json!({"key": "F9", "action": "press"}), 2),
+            (verbs::POINTER_MOVE, json!({"dx": 1, "dy": 2}), 3),
+        ] {
+            let cmd = command(verb, body, Some("mesh"));
+            let (rc, reply) = dispatch(&resolver(), &locked, &mut injector, &cmd);
+            assert_eq!(rc, 0, "{verb}: {reply}");
+            let mut event = [0; 24];
+            for _ in 0..frames {
+                reader.read_exact(&mut event).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -945,6 +987,48 @@ mod tests {
         assert!(reply.get("persisted").is_none(), "{reply}");
         let written = keymap_file::load(&path).unwrap();
         assert_eq!(written.rows.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_version_placed_at_runtime_is_never_overwritten() {
+        // Persistence was ON (startup was clean). A newer-version document
+        // then lands at the path; before the fix, reload refused it but the
+        // next bind renamed a version-1 document over it with no backup.
+        let current = r#"{"version":1,"physical":[]}"#;
+        let (dir, path) = keymap_dir("runtime-newer", current);
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let newer = format!(
+            r#"{{"version":{},"physical":[]}}"#,
+            cosmix_input_schema::KEYMAP_SCHEMA_VERSION + 1
+        );
+        std::fs::write(&path, &newer).unwrap();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 10, "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("is newer than"), "{reply}");
+        let disabled = reply["persist_disabled"].as_str().expect("writing turned off");
+        assert!(disabled.contains(&path.display().to_string()), "{disabled}");
+        assert!(disabled.contains("is newer than"), "{disabled}");
+        // bind/unbind still change the live table but never touch the file.
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(reply["persist_disabled"], disabled);
+        let (rc, reply) = run(&resolver, &store, verbs::UNBIND, json!({"code":63}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "file bytes unchanged");
+        // The operator restores a current-version file: reload re-enables.
+        std::fs::write(&path, current).unwrap();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persist_reenabled"], disabled);
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        let written = keymap_file::load(&path).expect("bind persisted a loadable file");
+        assert!(written.rows.iter().any(|r| r.action.as_str() == "user.f05"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
