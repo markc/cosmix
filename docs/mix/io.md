@@ -117,9 +117,10 @@ data without running it.
 ## Writing files
 
 ```
-write_file(path, content)        overwrite (or create); follows symlinks
-append_file(path, content)       create-if-missing, then append
-write_new(path, content, mode)   atomically create; FAILS if path exists
+write_file(path, content)            overwrite (or create); follows symlinks
+append_file(path, content)           create-if-missing, then append
+write_new(path, content, mode)       atomically create; FAILS if path exists
+write_atomic(path, data[, opts])     replace all-or-nothing: old OR new, never partial
 ```
 
 ```mix
@@ -161,6 +162,77 @@ second write_new: refused (exists)
 > `0o600` prints as `384` because Mix numbers are decimal f64 — `0o600` is just a
 > source spelling of the value 384. `stat`'s `perm` field is that same number;
 > feed it straight back into `chmod`.
+
+### `write_atomic` — replace a file all-or-nothing
+
+`write_file` truncates first and then writes. A crash, a kill, a full disk or a
+permission failure part-way leaves the target cut short, and a concurrent
+reader can see a half-written file at any time. `write_atomic` is the one call
+for "replace this file safely". Every reader and every crash sees either the
+**old complete file** or the **new complete file**:
+
+```mix
+write_atomic("/etc/myapp/config.json", json_encode($cfg, true))
+write_atomic("/srv/state.db", $bytes, {durability: "full"})
+write_atomic("/home/u/.ssh/authorized_keys", $keys, {mode: 0o600})
+```
+
+1. It claims a hidden temp name beside the target, `.NAME.mixtmp-…`, with
+   `O_EXCL`, so it never follows a planted symlink. Being in the same
+   directory keeps the final rename on one filesystem.
+2. It writes all the bytes to the temp and, if asked, `fsync`s it.
+3. It `rename`s the temp over the target. That is the atomic step.
+
+**Any failure before the rename removes the temp and leaves the target exactly
+as it was.** That covers a short write, `ENOSPC`, a failed sync and a failed
+rename. If the process is *killed* mid-write, nothing can run to clean up. The
+target is still intact, but a stale `.NAME.mixtmp-*` file may be left beside
+it, and it is safe to delete.
+
+Durability is explicit, and the default claims none it did not request:
+
+| `durability` | what is done | after a power loss or kernel crash |
+|---|---|---|
+| `"none"` (default) | temp, write, rename | no promise: the data may still be in the page cache |
+| `"file"` | `fsync` the temp before the rename | old complete file or new complete file |
+| `"full"` | `"file"`, then `fsync` the directory after the rename | the new file, once the call has returned |
+
+`"none"` is still fully atomic against readers and against the *process*
+dying. Only the machine dying can lose the new content. With `"full"`, a
+failed directory sync raises even though the new file is already in place.
+The message says so, because at that point its durability is unconfirmed.
+
+Other rules:
+
+- **data** must be a string, bytes or a buffer. Nothing else is coerced. A
+  wrong value written atomically is still a wrong value.
+- **Mode.** An existing target keeps its permission bits, including
+  setuid/setgid. A new file gets `write_file`'s `0o666 & ~umask`. `mode:`
+  (octal number or string, as for `chmod`) sets it exactly, not masked by the
+  umask.
+- **Owner.** An existing target keeps its owner and group. The new file is a
+  new inode, so root rewriting a user's file would otherwise hand it to root.
+  If the owner cannot be kept, typically because you are not root, the call
+  raises and leaves the target untouched. It never silently changes who owns
+  a file.
+- **Symlinks.** A symlink path replaces the file the link names and keeps the
+  link. That is `write_file`'s behaviour, and it avoids turning the link into
+  a regular file. A dangling link raises.
+- **max_bytes** bounds the write. If the data is larger, the call raises
+  `WRITE_TOO_LARGE` before anything touches the disk.
+- **Refusals.** A target that exists but is not a regular file, such as a
+  directory, raises. Bad options raise `OPTION_INVALID`. A wrong argument type
+  raises `TYPE_MISMATCH`.
+
+```mix
+write_atomic("/tmp/io/state", "v1\n")
+write_atomic("/tmp/io/state", "v2\n", {durability: "file"})
+print(read_file("/tmp/io/state"))
+```
+
+```text
+v2
+```
 
 ## Existence & type tests
 
@@ -574,6 +646,11 @@ copied + cleaned
 ```
 rename(src, dst)        rename(2) — moves src onto dst within one filesystem
 ```
+
+For an ordinary safe file replacement, use
+[`write_atomic`](#write_atomic--replace-a-file-all-or-nothing). It is the
+sequence below packaged with temp claiming, cleanup and durability levels.
+`rename` remains the primitive when you need the steps yourself.
 
 `rename` exists for the one guarantee `copy` cannot give: replacing an existing
 `dst` is **atomic**. A concurrent reader — or a `git` about to `exec` a hook, or a

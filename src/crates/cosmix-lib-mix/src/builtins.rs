@@ -245,6 +245,7 @@ builtin_table! {
     ("load_data", CapabilityClass::FsRead,       "io",      "Read + parse a strict-data .mix file (bare-key `k: v`, the zones.mix/conf.mix form) into a Value — the non-executing twin of source/include, for substrate-internal data that must NOT run as code (v0.9.0)", contract!((path: string) -> any; failure[raises])),
     ("write_file", CapabilityClass::FsWrite,      "io",      "Write string or bytes to file (creates/overwrites). Bytes are written verbatim (v0.3.1).", contract!((path: string, data: any) -> nil; failure[raises])),
     ("write_new", CapabilityClass::FsWrite,       "io",      "Atomically create a new file with mode. write_new(path, content, 0o600) — mode as a value (octal literal) or octal string \"0600\"; fails if path exists; mode applied at creation (no umask race)", contract!((path: string, content: any, mode: any_of(number, string)) -> nil; failure[raises])),
+    ("write_atomic", CapabilityClass::FsWrite,    "io",      "Replace or create a file so every reader and every crash sees the old complete file or the new complete file, never a partial one: write_atomic(path, data[, {durability, mode, max_bytes}]). data is a string, bytes or buffer (nothing else is coerced). A temp is claimed O_EXCL beside the target (same filesystem), written, optionally synced, and renamed over the target; any failure before the rename removes the temp and leaves the target untouched. durability \"none\" (default: atomic, NOT durable across power loss) | \"file\" (fsync the file before the rename) | \"full\" (also fsync the directory after it). An existing target keeps its mode and owner (raises rather than silently change the owner); a new file gets 0o666 & ~umask; mode sets it exactly. A symlink path replaces the file it names and keeps the link. max_bytes raises WRITE_TOO_LARGE before touching disk. A killed process can leave a hidden .NAME.mixtmp-* temp beside the target, never a partial target", contract!((path: string, data: any_of(string, bytes, buffer), opts?: map("write_atomic_options", {durability: string, mode: any_of(number, string), max_bytes: number})) -> nil; failure[raises])),
     ("append_file", CapabilityClass::FsWrite,     "io",      "Append string to file", contract!((path: string, s: any) -> nil; failure[raises])),
     ("exists", CapabilityClass::FsRead,          "io",      "Test if path exists. FOLLOWS symlinks by default, so a dangling link reads as absent — that is the right answer for \"can I open something here\" and the wrong one for \"is this name taken\". exists(path, {follow_symlinks: false}) is the lstat form and sees the link itself (v0.39.0).", contract!((path: string, opts?: map) -> bool)),
     ("access", CapabilityClass::FsRead,          "io",      "Ask the kernel whether this process can access path using its effective uid/gid: mode is a non-empty, duplicate-free string of r/w/x/f letters (f = existence and is redundant when combined). Follows symlinks. Unlike inspecting stat().perm, this honours POSIX ACLs. Ordinary absence/denial returns false; malformed input or an unexpected syscall failure raises (v0.45.0).", contract!((path: string, mode: string) -> bool; failure[raises])),
@@ -578,6 +579,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "load_data" => builtin_load_data(args),
         "write_file" => builtin_write_file(args),
         "write_new" => builtin_write_new(args),
+        "write_atomic" => builtin_write_atomic(args),
         "append_file" => builtin_append_file(args),
         "exists" => builtin_exists(args),
         "access" => builtin_access(args),
@@ -12924,6 +12926,354 @@ fn builtin_write_new(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::Nil))
 }
 
+/// How far `write_atomic` pushes the new content toward stable storage before
+/// it returns. Each level is exactly what it says and no more — the default
+/// claims no durability it did not ask the kernel for (TODO-mix P3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteDurability {
+    /// temp + write + rename. Atomic for every reader and against this
+    /// process dying at any point; NOT durable across a power loss or kernel
+    /// crash (the page cache may not have reached the disk).
+    None,
+    /// `fsync` the temp file before the rename: once the new name is visible,
+    /// its bytes are on disk. After a power loss the path holds the old
+    /// complete file or the new complete file.
+    File,
+    /// `File`, plus `fsync` of the parent directory after the rename: when
+    /// the call returns, the new content under the path survives a power loss.
+    Full,
+}
+
+struct WriteAtomicOpts {
+    durability: WriteDurability,
+    mode: Option<u32>,
+    max_bytes: Option<usize>,
+}
+
+/// Test-only fault injection for the crash-consistency tests: fail at a
+/// named point so the cleanup path runs exactly as it would on a real
+/// short write or a failed rename. Production passes `None`; the fault
+/// variants are constructed only by the unit tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum AtomicFault {
+    None,
+    /// Write half the bytes to the temp file, then fail (a short write / ENOSPC).
+    AfterPartialWrite,
+    /// Write and sync everything, then fail just before the rename.
+    BeforeRename,
+}
+
+const WRITE_ATOMIC_OPT_KEYS: &[&str] = &["durability", "mode", "max_bytes"];
+
+fn parse_write_atomic_opts(path: &str, v: Option<&Value>) -> MixResult<WriteAtomicOpts> {
+    let caller = "write_atomic";
+    let mut opts = WriteAtomicOpts {
+        durability: WriteDurability::None,
+        mode: None,
+        max_bytes: None,
+    };
+    let map = match v {
+        None | Some(Value::Nil) => return Ok(opts),
+        Some(Value::Map(m)) => m,
+        Some(other) => {
+            return Err(opt_invalid(
+                caller,
+                format!("options must be a map, got {}", other.type_name()),
+            ));
+        }
+    };
+    for (key, val) in map.iter() {
+        match key.as_str() {
+            "durability" => {
+                opts.durability = match val {
+                    Value::String(s) if s == "none" => WriteDurability::None,
+                    Value::String(s) if s == "file" => WriteDurability::File,
+                    Value::String(s) if s == "full" => WriteDurability::Full,
+                    other => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!(
+                                "durability must be \"none\", \"file\" or \"full\", got {}",
+                                match other {
+                                    Value::String(s) => format!("\"{}\"", sanitize_for_diag(s)),
+                                    other => other.type_name().to_string(),
+                                }
+                            ),
+                        ));
+                    }
+                };
+            }
+            "mode" => {
+                opts.mode = match val {
+                    Value::Nil => None,
+                    Value::Number(_) | Value::String(_) => Some(
+                        parse_octal_mode("write_atomic", path, val)
+                            .map_err(|e| opt_invalid(caller, format!("{e}")))?,
+                    ),
+                    other => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!(
+                                "mode must be an octal number or string, got {}",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+            }
+            "max_bytes" => {
+                let n = match extract_number(val, InputPolicy::NumberOnly) {
+                    Some(n) => n,
+                    None => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!("max_bytes must be a number, got {}", val.type_name()),
+                        ));
+                    }
+                };
+                opts.max_bytes = Some(as_count("write_atomic: max_bytes", n, usize::MAX).map_err(
+                    |_| {
+                        opt_invalid(
+                            caller,
+                            format!("max_bytes must be a non-negative whole number, got {n}"),
+                        )
+                    },
+                )?);
+            }
+            other => {
+                return Err(opt_invalid(
+                    caller,
+                    format!(
+                        "unknown option '{}' (supported: {})",
+                        sanitize_for_diag(other),
+                        WRITE_ATOMIC_OPT_KEYS.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+/// `write_atomic(path, data[, {durability, mode, max_bytes}])` — replace (or
+/// create) a file so that every reader, and every crash, sees either the old
+/// complete file or the new complete file, never a partial one.
+///
+/// The standard primitive for the write-temp-beside-then-rename sequence
+/// io.md used to spell out by hand: the temp name is claimed `O_EXCL` in the
+/// target's own directory (so the rename is same-filesystem), the existing
+/// target's mode and owner carry over to the new inode, and ANY failure
+/// before the rename removes the temp and leaves the target untouched.
+fn builtin_write_atomic(args: Vec<Value>) -> MixResult<Option<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!(
+                "write_atomic: expected 2 or 3 args (path, data, [opts]), got {}",
+                args.len()
+            ),
+        ));
+    }
+    let path = match &args[0] {
+        Value::String(s) if !s.is_empty() && !s.contains('\0') => s.clone(),
+        Value::String(_) => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                "write_atomic: path must be a non-empty string without NUL bytes".to_string(),
+            ));
+        }
+        other => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!("write_atomic: path must be a string, got {}", other.type_name()),
+            ));
+        }
+    };
+    // Strict: a string, bytes or a buffer. write_file's "stringify anything"
+    // would write `<bytes:N>`-style renderings of a wrong value atomically —
+    // a perfectly durable wrong answer.
+    let data: Vec<u8> = match &args[1] {
+        Value::String(s) => s.as_bytes().to_vec(),
+        Value::Bytes(b) => b.as_slice().to_vec(),
+        Value::Buffer(b) => b.borrow().as_slice().to_vec(),
+        other => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!(
+                    "write_atomic: data must be a string, bytes or buffer, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    let opts = parse_write_atomic_opts(&path, args.get(2))?;
+    write_atomic_impl(&path, &data, &opts, AtomicFault::None)?;
+    Ok(Some(Value::Nil))
+}
+
+fn write_atomic_error(path: &str, what: &str, error: &std::io::Error) -> MixError {
+    MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': {what}: {error}"),
+    }
+}
+
+fn write_atomic_impl(
+    path: &str,
+    data: &[u8],
+    opts: &WriteAtomicOpts,
+    fault: AtomicFault,
+) -> MixResult<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    if let Some(max) = opts.max_bytes
+        && data.len() > max
+    {
+        return Err(MixError::structured(
+            "WRITE_TOO_LARGE",
+            format!(
+                "write_atomic '{path}': {} bytes exceeds max_bytes {max}; nothing was written",
+                data.len()
+            ),
+        ));
+    }
+
+    // A symlink is followed to the file it names, so the LINK survives and its
+    // target is what gets replaced — write_file's semantics. Renaming over the
+    // link itself would silently turn it into a regular file.
+    let target: PathBuf = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
+            .map_err(|e| write_atomic_error(path, "resolving symlink", &e))?,
+        _ => PathBuf::from(path),
+    };
+    let existing = match std::fs::metadata(&target) {
+        Ok(meta) if meta.is_file() => Some(meta),
+        Ok(_) => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("write_atomic '{path}': target exists and is not a regular file"),
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(write_atomic_error(path, "stat target", &e)),
+    };
+    let name = target.file_name().ok_or_else(|| MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': path names no file"),
+    })?;
+    let dir: PathBuf = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+
+    // Final permissions: an explicit mode wins; otherwise an existing target
+    // keeps its own (including setuid/setgid/sticky); a brand-new file gets
+    // write_file's 0o666 & ~umask, by creating the temp with 0o666.
+    let final_mode = opts
+        .mode
+        .or_else(|| existing.as_ref().map(|meta| meta.permissions().mode() & 0o7777));
+
+    // Claim a temp name beside the target, O_EXCL, never following a symlink
+    // planted at that name. The visible name is kept short enough that the
+    // temp name cannot exceed NAME_MAX when the target's own name is long.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stem = name.to_string_lossy();
+    let mut cut = stem.len().min(200);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = &stem[..cut];
+    let mut claimed: Option<(PathBuf, std::fs::File)> = None;
+    for _ in 0..16 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let candidate = dir.join(format!(
+            ".{stem}.mixtmp-{}-{}-{nonce:08x}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(if final_mode.is_some() { 0o600 } else { 0o666 })
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                claimed = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(write_atomic_error(path, "creating temp file", &e)),
+        }
+    }
+    let (tmp_path, mut file) = claimed.ok_or_else(|| MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': could not claim a unique temp name"),
+    })?;
+
+    let staged = (|| -> Result<(), (&'static str, std::io::Error)> {
+        // Owner first, then mode: chown can clear setuid/setgid bits.
+        if let Some(meta) = &existing {
+            let mine = file.metadata().map_err(|e| ("stat temp file", e))?;
+            if mine.uid() != meta.uid() || mine.gid() != meta.gid() {
+                std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid())).map_err(
+                    |e| {
+                        (
+                            "cannot keep the existing owner (write_atomic will not silently \
+                             change who owns a file)",
+                            e,
+                        )
+                    },
+                )?;
+            }
+        }
+        if let Some(mode) = final_mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|e| ("setting mode", e))?;
+        }
+        if fault == AtomicFault::AfterPartialWrite {
+            file.write_all(&data[..data.len() / 2])
+                .map_err(|e| ("writing", e))?;
+            return Err(("writing", std::io::Error::other("injected short write")));
+        }
+        file.write_all(data).map_err(|e| ("writing", e))?;
+        if opts.durability != WriteDurability::None {
+            file.sync_all().map_err(|e| ("syncing temp file", e))?;
+        }
+        if fault == AtomicFault::BeforeRename {
+            return Err(("renaming", std::io::Error::other("injected rename failure")));
+        }
+        std::fs::rename(&tmp_path, &target).map_err(|e| ("renaming over target", e))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err((what, e)) = staged {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(write_atomic_error(path, what, &e));
+    }
+
+    if opts.durability == WriteDurability::Full {
+        let synced = std::fs::File::open(Path::new(&dir)).and_then(|d| d.sync_all());
+        if let Err(e) = synced {
+            // The new file IS in place; only its durability is unconfirmed.
+            return Err(write_atomic_error(
+                path,
+                "replaced, but syncing the directory failed (the new content is in place \
+                 and not yet known durable)",
+                &e,
+            ));
+        }
+    }
+    Ok(())
+}
+
 // --- JSON builtins (feature-gated) ---
 
 /// `jq(value, filter)` — run a jq filter over a Mix value. Single-value
@@ -23385,6 +23735,207 @@ mod chmod_tests {
             Some("VALUE_OUT_OF_RANGE")
         );
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// TODO-mix P3 crash consistency: whatever fails, and wherever, the target
+/// is the old complete file or the new complete file and no temp is left.
+/// Faults are injected at the two points a real short write (ENOSPC, EIO)
+/// or a failed rename would strike.
+#[cfg(test)]
+mod write_atomic_tests {
+    use super::{
+        AtomicFault, WriteAtomicOpts, WriteDurability, builtin_write_atomic, write_atomic_impl,
+    };
+    use crate::error::MixError;
+    use crate::value::Value;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tmpdir(suffix: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "cosmix-mix-write-atomic-{}-{}",
+            std::process::id(),
+            suffix
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".mixtmp-"))
+            .collect()
+    }
+
+    fn opts(durability: WriteDurability) -> WriteAtomicOpts {
+        WriteAtomicOpts {
+            durability,
+            mode: None,
+            max_bytes: None,
+        }
+    }
+
+    fn s(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn short_write_leaves_the_old_complete_file_and_no_temp() {
+        let d = tmpdir("short");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD-COMPLETE").unwrap();
+        for durability in [WriteDurability::None, WriteDurability::File, WriteDurability::Full] {
+            let err = write_atomic_impl(
+                &s(&target),
+                b"NEW-CONTENT-THAT-IS-LONGER",
+                &opts(durability),
+                AtomicFault::AfterPartialWrite,
+            )
+            .expect_err("an injected short write must fail the call");
+            assert!(format!("{err}").contains("writing"), "{err}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD-COMPLETE");
+            assert_eq!(leftovers(&d), Vec::<String>::new(), "{durability:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_rename_leaves_the_old_complete_file_and_no_temp() {
+        let d = tmpdir("rename");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD-COMPLETE").unwrap();
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::File),
+            AtomicFault::BeforeRename,
+        )
+        .expect_err("an injected rename failure must fail the call");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD-COMPLETE");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_first_write_leaves_no_file_at_all() {
+        let d = tmpdir("fresh");
+        let target = d.join("new-file");
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::None),
+            AtomicFault::AfterPartialWrite,
+        )
+        .expect_err("injected");
+        assert!(!target.exists(), "a failed create must not leave a partial file");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn success_replaces_completely_and_keeps_the_existing_mode() {
+        let d = tmpdir("ok");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        for durability in ["none", "file", "full"] {
+            let mut o = indexmap::IndexMap::new();
+            o.insert("durability".to_string(), Value::String(durability.to_string()));
+            builtin_write_atomic(vec![
+                Value::String(s(&target)),
+                Value::String(format!("NEW-{durability}")),
+                Value::map(o),
+            ])
+            .expect("write_atomic succeeds");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), format!("NEW-{durability}"));
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o640, "the existing mode must carry over ({durability})");
+        }
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn explicit_mode_is_exact_and_bytes_are_verbatim() {
+        let d = tmpdir("mode");
+        let target = d.join("secret");
+        let mut o = indexmap::IndexMap::new();
+        o.insert("mode".to_string(), Value::Number(0o600 as f64));
+        builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::Bytes(std::rc::Rc::new(vec![0xff, 0x00, 0x80])),
+            Value::map(o),
+        ])
+        .expect("write_atomic with mode");
+        assert_eq!(std::fs::read(&target).unwrap(), vec![0xff, 0x00, 0x80]);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_symlink_keeps_being_a_link_and_its_target_is_replaced() {
+        let d = tmpdir("link");
+        let real = d.join("real");
+        let link = d.join("link");
+        std::fs::write(&real, "OLD").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        builtin_write_atomic(vec![Value::String(s(&link)), Value::String("NEW".into())])
+            .expect("write through a symlink");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link itself must survive"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refusals_touch_nothing() {
+        let d = tmpdir("refuse");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        let code = |e: MixError| match e {
+            MixError::Structured(info) => info.code,
+            other => format!("{other}"),
+        };
+
+        let mut o = indexmap::IndexMap::new();
+        o.insert("max_bytes".to_string(), Value::Number(2.0));
+        let e = builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::String("TOO-LONG".into()),
+            Value::map(o),
+        ])
+        .unwrap_err();
+        assert_eq!(code(e), "WRITE_TOO_LARGE");
+
+        let mut o = indexmap::IndexMap::new();
+        o.insert("durability".to_string(), Value::String("fsync".into()));
+        let e = builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::String("X".into()),
+            Value::map(o),
+        ])
+        .unwrap_err();
+        assert_eq!(code(e), "OPTION_INVALID");
+
+        let e = builtin_write_atomic(vec![Value::String(s(&target)), Value::Number(1.0)])
+            .unwrap_err();
+        assert_eq!(code(e), "TYPE_MISMATCH");
+
+        let e = builtin_write_atomic(vec![Value::String(s(&d)), Value::String("X".into())])
+            .unwrap_err();
+        assert!(format!("{e}").contains("not a regular file"), "{e}");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
