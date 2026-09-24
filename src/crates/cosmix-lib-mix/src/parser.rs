@@ -1300,18 +1300,7 @@ impl Parser {
             | Token::HeredocString(_)
             | Token::CommandSub(_) => self.parse_expression(),
             Token::String(_) => {
-                let mut command = self.expect_identifier()?;
-                while self.peek() == &Token::Dot {
-                    if self.pos + 1 < self.tokens.len()
-                        && let Token::String(_) = &self.tokens[self.pos + 1].token
-                    {
-                        self.advance(); // skip '.'
-                        let part = self.expect_identifier()?;
-                        command = format!("{}.{}", command, part);
-                        continue;
-                    }
-                    break;
-                }
+                let command = self.parse_dotted_command_name()?;
                 Ok(Expr::StringLiteral(command))
             }
             _ => {
@@ -1633,22 +1622,21 @@ impl Parser {
     /// invocations across `send.await`). `async` is parsed as a contextual
     /// identifier — it is NOT a global reserved word, so existing
     /// scripts/vars named `async` keep working everywhere else.
-    fn parse_on(&mut self) -> MixResult<StmtKind> {
-        self.advance(); // skip 'on'
-
-        // Dotted command name, same shape as send/emit command parsing.
+    /// After a dot, keywords are names just as they are in field access.
+    fn parse_dotted_command_name(&mut self) -> MixResult<String> {
         let mut command = self.expect_identifier()?;
         while self.peek() == &Token::Dot {
-            if self.pos + 1 < self.tokens.len()
-                && let Token::String(_) = &self.tokens[self.pos + 1].token
-            {
-                self.advance(); // skip '.'
-                let part = self.expect_identifier()?;
-                command = format!("{}.{}", command, part);
-                continue;
-            }
-            break;
+            self.advance();
+            let part = self.expect_field_name()?;
+            command.push('.');
+            command.push_str(&part);
         }
+        Ok(command)
+    }
+
+    fn parse_on(&mut self) -> MixResult<StmtKind> {
+        self.advance(); // skip 'on'
+        let command = self.parse_dotted_command_name()?;
 
         // Optional trailer, in either order: a `desc "…"` doc-string and/or
         // the `async` modifier (SPEC 18 §10.3 Class C). Both are contextual

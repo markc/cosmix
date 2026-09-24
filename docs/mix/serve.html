@@ -1012,12 +1012,12 @@ fn kwin(m)
 end
 
 -- Multi-segment verbs must be QUOTED in `on` (a bare handler verb takes one dot).
-on "desktop.workspace.next"
+on desktop.workspace.next
   kwin("nextDesktop")
   reply(json_encode({ok: true, desktop: kwin("currentDesktop")}))
 end
 
-on "desktop.workspace.prev"
+on desktop.workspace.prev
   kwin("previousDesktop")
   reply(json_encode({ok: true, desktop: kwin("currentDesktop")}))
 end

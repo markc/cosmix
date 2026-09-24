@@ -835,6 +835,11 @@ metadata: a serve citizen surfaces it as the verb's <code>description</code> in 
 end
 </code></pre>
 <p>Legacy <code>done</code> still closes <code>on</code> (with a deprecation warning); prefer <code>end</code>.</p>
+<p>Dotted verbs accept keyword segments after a dot: <code>on a.next</code>, <code>on a.end.b</code>,
+<code>send svc a.if</code> and <code>send svc a.for.b</code> need no quotes. This also applies to
+<code>emit</code> and implicit sends in <code>address</code> blocks. As in field access, <code>fn</code> and
+<code>function</code> after a dot both name <code>function</code>; quote the whole verb to preserve
+a literal <code>fn</code> segment. Bare keywords retain their statement meaning.</p>
 <h3 id="the-event-map">The <code>$event</code> map</h3>
 <p>Inside a handler, the inbound message is available as <code>$event</code>, a map with four
 fields:</p>

@@ -502,6 +502,12 @@ end
 
 Legacy `done` still closes `on` (with a deprecation warning); prefer `end`.
 
+Dotted verbs accept keyword segments after a dot: `on a.next`, `on a.end.b`,
+`send svc a.if` and `send svc a.for.b` need no quotes. This also applies to
+`emit` and implicit sends in `address` blocks. As in field access, `fn` and
+`function` after a dot both name `function`; quote the whole verb to preserve
+a literal `fn` segment. Bare keywords retain their statement meaning.
+
 ### The `$event` map
 
 Inside a handler, the inbound message is available as `$event`, a map with four
