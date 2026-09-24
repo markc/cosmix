@@ -1198,10 +1198,18 @@ impl WaylandState {
         {
             return None;
         }
+        let current_workspace = self.workspace_current();
         let holds = |record: &SurfaceRecord| match spec.until {
             WaitUntil::Mapped => true,
             WaitUntil::Visible => record.layout.visible && !record.minimized,
-            WaitUntil::Presented => self.presented_since_map(record),
+            // Evidence of a shown frame is retained, so it is decided now:
+            // a window since minimised or moved off the current workspace is
+            // not presented, however recently it was shown.
+            WaitUntil::Presented => {
+                !record.minimized
+                    && super::workspaces::on_workspace(record, current_workspace)
+                    && self.presented_since_map(record)
+            }
             WaitUntil::Size { width, height } => geometry_size(record) == (width, height),
             WaitUntil::Focused => record.focused,
             WaitUntil::Unmapped | WaitUntil::Gone => false,

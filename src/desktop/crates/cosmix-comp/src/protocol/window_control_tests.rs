@@ -1503,6 +1503,41 @@ fn presented_needs_no_presentation_feedback_but_needs_a_shown_frame() {
     );
 }
 
+/// Shown evidence is retained, so the workspace gate is applied when the
+/// wait resolves: a window shown and then moved off the current workspace
+/// is not presented (as `wait_until_visible_times_out_off_workspace_…`
+/// pins for the feedback path).
+#[test]
+fn presented_shown_then_moved_off_workspace_times_out() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) = test_frame_report(
+        surface_id,
+        monotonic_micros(),
+        content_seq(&harness, &alpha),
+        true,
+    );
+    harness.server.state.frame_presented(frame, content);
+    let presented = wait_for(by_id(id, generation), WaitUntil::Presented, 30);
+    let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented.clone(), |_| {});
+    assert_eq!(rc, 0, "shown on the current workspace: {body}");
+
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented, |_| {});
+    assert_eq!(rc, 10, "moved off the current workspace: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["until"], "presented");
+}
+
 /// Waits learn nothing under a session lock (a named id's `gone` still
 /// resolves), a kill never lands under it, and a never-issued id is
 /// refused.
