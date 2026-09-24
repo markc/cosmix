@@ -182,6 +182,24 @@ fn fn_prefixed_names_still_need_quoting() {
     );
 }
 
+/// The QUOTED spelling of a once-refused name still works on its own — it
+/// was the documented way through before 0.92.0 and scripts use it. (The
+/// differential above also runs it, but only as the comparison side.)
+#[test]
+fn quoted_malformed_number_names_still_work() {
+    for name in ["svc-01", "node-007", "a-1.2.3"] {
+        let out = mix(&[
+            "-c",
+            &format!("send \"{name}\" ping timeout=1\nprint(to_string($rc))"),
+        ]);
+        assert!(
+            out.status.success(),
+            "the quoted form of {name:?} must work: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// The malformed-number leniency is confined to the bare send target:
 /// everywhere else a leading-zero or multi-dot number keeps its refusal
 /// verbatim — including a `$var-007` target and a hyphenated COMMAND.
