@@ -667,8 +667,9 @@ threads: `run_parallel` parses every job to plain owned data first, and the
 worker threads touch only process plumbing (argv, pipes, exit codes), marshalling
 results back on the caller's thread. There is deliberately **no** `parallel(list,
 fn)` that runs Mix functions concurrently — that would mean rebuilding the value
-model, and it is not planned. The killer use is `ssh_mix` fan-out: a fleet sweep
-that walked N nodes serially becomes one `run_parallel` of N ssh jobs. A job's
+model, and it is not planned. A fleet sweep that walked N nodes serially becomes
+one `run_parallel` of N ssh jobs; for Mix source, [`ssh_mix_many`](remote.md#ssh_mix_manyhosts-source-opts--map-host--result)
+is the same pool with `ssh_mix`'s `bindings`, `decode` and result shape kept. A job's
 `stream` flag is ignored (a parallel live tee would interleave into garbage).
 
 ### Which runner?

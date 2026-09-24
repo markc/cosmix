@@ -254,6 +254,7 @@ fn sensitive_builtins_stay_categorized() {
         ("ssh_run", Network),
         ("ssh_must", Network),
         ("ssh_mix", Network),
+        ("ssh_mix_many", Network),
         ("ssh_exec", Network),
         ("dns_lookup", Network),
         ("udp_send", Network),
@@ -579,6 +580,7 @@ fn operational_failure_annotations_match_what_the_builtins_do() {
     for (name, expected) in [
         ("ssh_exec", ReturnsResult),
         ("ssh_mix", ReturnsResult),
+        ("ssh_mix_many", ReturnsResult),
         ("ssh_run", ReturnsResult),
         ("run_argv", ReturnsResult),
         ("run_pipeline", ReturnsResult),

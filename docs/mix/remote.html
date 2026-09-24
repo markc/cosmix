@@ -697,6 +697,51 @@ ssh_mix("example.com", "print(1)", { bindings: {"bad-name": 1} })
 --   (must match [A-Za-z_][A-Za-z0-9_]*)
 </code></pre>
 <hr />
+<h2 id="ssh_mix_manyhosts-source-opts--map-host--result"><code>ssh_mix_many(hosts, source[, opts])</code> → map host → result</h2>
+<p><code>ssh_mix</code> on many hosts at once, through a bounded worker pool. Every host gets
+the same <code>source</code>, <code>bindings</code>, <code>env</code> and <code>decode</code>. The result is a <strong>map keyed
+by host, in input order</strong>, and each value is <strong>exactly</strong> the map <code>ssh_mix</code>
+would have returned for that host, so per-host handling code ports unchanged.</p>
+<pre><code class="language-mix">$hosts = ["alpha", "beta", "gamma"]
+$r = ssh_mix_many($hosts, &lt;&lt;EOF
+print(data_encode({host: hostname(), files: length(ls($path))}))
+EOF
+, {bindings: {path: "/srv"}, decode: "data", timeout: 10, max: 8})
+for each $h, $res in $r
+  if $res.ok then
+    print($h .. ": " .. $res.value.files .. " entries")
+  else
+    print($h .. ": FAILED " .. ($res.decode_error ?? $res.stderr))
+  end
+end
+</code></pre>
+<ul>
+<li><strong>opts are <code>ssh_mix</code>'s opts plus <code>max</code></strong> — concurrency, default 8, at most
+256 live workers (a larger <code>max</code> still runs every host, just no more than
+256 at once). These are <code>run_parallel</code>'s numbers; it is the same pool.</li>
+<li><strong>Everything is validated before anything runs.</strong> Every host is planned
+through <code>ssh_mix</code>'s own argument checks first, so a bad option, a bad
+binding or a bad host (empty, leading <code>-</code>, NUL) raises locally with no ssh
+spawned, and the message names the host.</li>
+<li><strong>One host's failure is data in its own map, never a raise.</strong> An
+unreachable host, a nonzero exit and a timeout all come back as <code>ok: false</code>
+exactly as <code>ssh_mix</code> reports them.</li>
+<li><strong><code>decode</code> is judged per host.</strong> Where <code>ssh_mix</code> <em>raises</em> — a stdout
+truncated by <code>max_output</code>, or stdout that does not parse — the fan-out
+records the refusal on that host alone: <code>ok: false</code>, a <code>decode_error</code>
+string, and no <code>value</code>. <code>exit_code</code> still shows what the remote did. A raise
+here would throw away every other host's answer, which is the failure a
+fan-out exists to avoid.</li>
+<li><strong><code>hosts</code> must be unique strings.</strong> Results are keyed by host, so a
+duplicate raises rather than silently overwriting the first answer.</li>
+<li><strong><code>timeout: 0</code> is refused.</strong> With no deadline one hung host would hold the
+whole batch, because the call waits for every worker.</li>
+<li><strong><code>mix lint</code> reads the body</strong> exactly as it does for <code>ssh_mix</code>, including
+the <code>bindings</code>/<code>env</code> names.</li>
+</ul>
+<p>This is the sugar over <code>run_parallel</code> + hand-built <code>["ssh", host, "/opt/cosmix/bin/mix", "-"]</code>
+jobs: those lose <code>bindings</code>, <code>decode</code> and the <code>host</code>/<code>ok</code> result shape.</p>
+<hr />
 <h2 id="ssh_exechost-argv-opts--map-v0300"><code>ssh_exec(host, argv[, opts])</code> → map (v0.30.0)</h2>
 <p>The remote analogue of <a href="/mix/system"><code>run_argv</code></a>: run an <strong>argv list</strong> on a remote
 node with truthful, injection-inert argv semantics. OpenSSH only accepts a remote
@@ -936,6 +981,10 @@ print("remote line count: " .. $r.stdout)
 <hr />
 <h2 id="patterns">Patterns</h2>
 <h3 id="fan-out-across-a-host-list-collect-results">Fan out across a host list, collect results</h3>
+<p>For Mix source on many nodes at once, use
+<a href="/mix/remote#ssh_mix_manyhosts-source-opts--map-host--result"><code>ssh_mix_many</code></a>: one
+concurrent call, results keyed by host. The serial form below still suits a
+shell command per host.</p>
 <p>A multi-statement lambda must be <strong>bound to a var</strong> before it's passed to a HOF (it won't parse inline) — see <a href="/mix/functions">functions</a>. For a large sweep, add <code>multiplex: true</code> to reuse connections per host — accepting the softer timeout bound.</p>
 <pre><code class="language-mix">$hosts = ["node1", "node2", "node3"]
 $check = function($h)
@@ -977,6 +1026,7 @@ end
 <tr><td>run on a <strong>remote</strong> host, branch on outcome</td><td><strong><code>ssh_run</code></strong> → result map</td></tr>
 <tr><td>run on a <strong>remote</strong> host, raise on failure</td><td><strong><code>ssh_must</code></strong> → stdout string</td></tr>
 <tr><td>run Mix <strong>source</strong> on a remote node, no quoting</td><td><strong><code>ssh_mix</code></strong> → result map (+ <code>.value</code> with <code>decode:</code>)</td></tr>
+<tr><td>run the same Mix <strong>source</strong> on <strong>many</strong> nodes concurrently</td><td><strong><code>ssh_mix_many</code></strong> → map host → <code>ssh_mix</code> result</td></tr>
 <tr><td>message a <strong>meshed</strong> node's broker (no shell)</td><td><a href="/mix/bus"><code>send</code> / <code>address</code></a></td></tr>
 </tbody></table>
 <hr />

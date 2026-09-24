@@ -319,6 +319,7 @@ builtin_table! {
     ("ssh_run", CapabilityClass::Network,         "system",  "Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy, stdout_truncated, stderr_truncated}; max_output optionally caps local capture bytes per stream (omitted: unbounded; 0 is REJECTED — unlike run_argv, where 0 means unbounded — omit the key instead). A cap that cuts mid-UTF-8-sequence makes the lossy decode insert U+FFFD, so utf8_lossy: true beside stdout_truncated: true may be local truncation damage, not remote garbage", contract!((host: string, cmd: any_of(string, list), opts?: map) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
     ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream (0 rejected; omit for unbounded); a truncated stdout REFUSES to decode (raises) — a truncated prefix can parse as a smaller, wrong value — so omit decode and inspect stdout/stdout_truncated to work with partial output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers). Every host is validated before any ssh spawns, so a bad option or host raises locally with nothing run. One host's failure is DATA in its own map, never a raise: unreachable, nonzero exit and timeout arrive as ok:false. decode is per host too: where ssh_mix raises (truncated stdout, unparseable stdout), that host alone gets ok:false, decode_error and no value. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch)", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
     ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
@@ -543,6 +544,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "ssh_run" => builtin_ssh_run(args),
         "ssh_must" => builtin_ssh_must(args),
         "ssh_mix" => builtin_ssh_mix(args),
+        "ssh_mix_many" => builtin_ssh_mix_many(args),
         "ssh_exec" => builtin_ssh_exec(args),
         "run_rc" => builtin_run_rc(args),
         "run_stream" => builtin_run_stream(args),
@@ -10581,7 +10583,44 @@ fn run_with_timeout(
     })
 }
 
+/// One fully validated ssh invocation, reduced to owned strings and
+/// integers. Everything that can raise on bad arguments has already
+/// raised by the time one exists, and it holds no `Value`, so it is `Send`:
+/// `ssh_mix_many` plans every host on the caller's thread and runs the
+/// plans on worker threads through the same [`exec_ssh_call`] the serial
+/// builtins use.
+struct SshCall {
+    host: String,
+    argv: Vec<String>,
+    stdin: Option<String>,
+    timeout: u64,
+    max_output: Option<usize>,
+}
+
+/// Run a planned ssh invocation. Safe to call from any thread — it touches
+/// no `Value` and no evaluator state (the process engine checks the global
+/// interrupt flag itself).
+fn exec_ssh_call(call: &SshCall) -> MixResult<(SshOutcome, std::time::Duration)> {
+    let started = std::time::Instant::now();
+    let outcome = run_with_timeout(
+        &call.argv,
+        call.stdin.as_deref(),
+        call.timeout,
+        "ssh_run",
+        call.max_output,
+    )?;
+    Ok((outcome, started.elapsed()))
+}
+
 fn builtin_ssh_run(args: Vec<Value>) -> MixResult<Option<Value>> {
+    let call = plan_ssh_run(args)?;
+    let (outcome, elapsed) = exec_ssh_call(&call)?;
+    Ok(Some(ssh_result_map(&call.host, outcome, elapsed)))
+}
+
+/// Validate `ssh_run(host, command[, opts])` arguments and build the ssh
+/// argv + stdin without running anything.
+fn plan_ssh_run(args: Vec<Value>) -> MixResult<SshCall> {
     if !(2..=3).contains(&args.len()) {
         return Err(MixError::RuntimeError {
             span: None,
@@ -10647,28 +10686,24 @@ fn builtin_ssh_run(args: Vec<Value>) -> MixResult<Option<Value>> {
             "sh -s"
         };
         let argv = build_ssh_argv(&host, interpreter, &opts);
-        let started = std::time::Instant::now();
-        let outcome = run_with_timeout(
-            &argv,
-            Some(&driver),
-            opts.timeout,
-            "ssh_run",
-            opts.max_output,
-        )?;
-        return Ok(Some(ssh_result_map(&host, outcome, started.elapsed())));
+        return Ok(SshCall {
+            host,
+            argv,
+            stdin: Some(driver),
+            timeout: opts.timeout,
+            max_output: opts.max_output,
+        });
     }
 
     let remote_cmd = build_remote_command(&args[1], &opts)?;
     let argv = build_ssh_argv(&host, &remote_cmd, &opts);
-    let started = std::time::Instant::now();
-    let outcome = run_with_timeout(
-        &argv,
-        opts.stdin.as_deref(),
-        opts.timeout,
-        "ssh_run",
-        opts.max_output,
-    )?;
-    Ok(Some(ssh_result_map(&host, outcome, started.elapsed())))
+    Ok(SshCall {
+        host,
+        argv,
+        stdin: opts.stdin,
+        timeout: opts.timeout,
+        max_output: opts.max_output,
+    })
 }
 
 /// Inspect an `ssh_run` result map and either return its `stdout`
@@ -10789,6 +10824,21 @@ const REMOTE_MIX_STDIN_CMD: &str = "/opt/cosmix/bin/mix -";
 /// Mix identifier names to strict-data-encoded values assigned before
 /// the caller source; no name is reserved and the source may rebind.
 fn builtin_ssh_mix(args: Vec<Value>) -> MixResult<Option<Value>> {
+    let (call, decode_mode) = plan_ssh_mix(args)?;
+    let (outcome, elapsed) = exec_ssh_call(&call)?;
+    let mut result = ssh_result_map(&call.host, outcome, elapsed);
+    // Optionally decode stdout into `value` on success.
+    if let (Some(mode), Value::Map(m)) = (decode_mode, &mut result) {
+        // CoW: freshly built by ssh_result_map above (sole owner) — in-place.
+        decode_ssh_stdout(Rc::make_mut(m), &mode)?;
+    }
+    Ok(Some(result))
+}
+
+/// Validate `ssh_mix(host, source[, opts])` and build its ssh invocation
+/// (bindings/env prefix + source as stdin) without running it. Returns the
+/// plan plus the `decode` mode the caller applies to the result.
+fn plan_ssh_mix(args: Vec<Value>) -> MixResult<(SshCall, Option<String>)> {
     if !(2..=3).contains(&args.len()) {
         return Err(MixError::RuntimeError {
             span: None,
@@ -10873,18 +10923,202 @@ fn builtin_ssh_mix(args: Vec<Value>) -> MixResult<Option<Value>> {
         Value::String(format!("{env_prefix}{bindings_prefix}{source}")),
     );
 
-    let mut result = builtin_ssh_run(vec![
+    let call = plan_ssh_run(vec![
         host,
         Value::String(REMOTE_MIX_STDIN_CMD.into()),
         Value::map(opts_map),
     ])?;
+    Ok((call, decode_mode))
+}
 
-    // Optionally decode stdout into `value` on success.
-    if let (Some(mode), Some(Value::Map(m))) = (decode_mode, result.as_mut()) {
-        // CoW: freshly built by ssh_run above (sole owner) — in-place.
-        decode_ssh_stdout(Rc::make_mut(m), &mode)?;
+/// An error's message without the `Runtime error:` rendering prefix, for
+/// recording an error as DATA in a result map.
+fn bare_error_message(e: &MixError) -> String {
+    match e {
+        MixError::RuntimeError { msg, .. } => msg.clone(),
+        MixError::Structured(info) => info.message.clone(),
+        other => other.to_string(),
     }
-    Ok(result)
+}
+
+/// Concurrency default and live-worker cap for `ssh_mix_many` — the same
+/// numbers as `run_parallel`, whose worker pool this mirrors.
+const SSH_MIX_MANY_DEFAULT_MAX: usize = 8;
+const SSH_MIX_MANY_MAX_WORKERS: usize = 256;
+
+/// `ssh_mix_many(hosts, source[, opts]) -> map host → ssh_result`
+///
+/// `ssh_mix` over many hosts at once. Every host is planned through
+/// [`plan_ssh_mix`] on this thread first — any argument/option error raises
+/// before a single ssh spawns, exactly as `ssh_mix` would — then the plans
+/// run on a bounded worker pool through the same [`exec_ssh_call`], and each
+/// outcome becomes the same `ssh_result` map `ssh_mix` returns. Results are
+/// keyed by host in INPUT order.
+///
+/// One host's failure is DATA in its own map (unreachable, nonzero exit,
+/// timeout), never a raise that would discard the others. That includes
+/// `decode`: where `ssh_mix` raises (truncated stdout, unparseable stdout),
+/// the fan-out records the refusal on that host alone — `ok: false`,
+/// `decode_error` set, no `value` — so one bad host cannot cost the caller
+/// every other host's answer.
+fn builtin_ssh_mix_many(args: Vec<Value>) -> MixResult<Option<Value>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let caller = "ssh_mix_many";
+    if !(2..=3).contains(&args.len()) {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "{caller}: expected 2 or 3 args (hosts, source, [opts]), got {}",
+                args.len()
+            ),
+        });
+    }
+    let hosts: Vec<String> = match &args[0] {
+        Value::List(l) => {
+            let mut out = Vec::with_capacity(l.len());
+            for (i, h) in l.iter().enumerate() {
+                match h {
+                    Value::String(s) => {
+                        if out.contains(s) {
+                            return Err(MixError::RuntimeError {
+                                span: None,
+                                msg: format!(
+                                    "{caller}: host {s:?} is listed twice — results are keyed by host"
+                                ),
+                            });
+                        }
+                        out.push(s.clone());
+                    }
+                    other => {
+                        return Err(MixError::RuntimeError {
+                            span: None,
+                            msg: format!(
+                                "{caller}: hosts[{i}] must be a string, got {}",
+                                other.type_name()
+                            ),
+                        });
+                    }
+                }
+            }
+            out
+        }
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("{caller}: hosts must be a list of strings, got {}", other.type_name()),
+            });
+        }
+    };
+    if !matches!(&args[1], Value::String(_)) {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{caller}: source must be a string"),
+        });
+    }
+    // Pull our one extra key (`max`) out; every other key goes to ssh_mix
+    // unchanged, so the option surface is ssh_mix's by construction.
+    let mut opts_map = match args.get(2) {
+        None => indexmap::IndexMap::new(),
+        Some(Value::Map(m)) => (**m).clone(),
+        Some(_) => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("{caller}: opts must be a map"),
+            });
+        }
+    };
+    let max = match opts_map.shift_remove("max") {
+        None => SSH_MIX_MANY_DEFAULT_MAX,
+        Some(v) => {
+            let n = extract_number(&v, InputPolicy::NumberOnly)
+                .and_then(|n| as_count("max", n, usize::MAX).ok())
+                .filter(|n| *n > 0);
+            n.ok_or_else(|| opt_invalid(caller, "max must be a positive integer"))?
+        }
+    };
+    // A disabled deadline would let one hung host park the whole batch
+    // (the pool waits for every worker) — the same refusal as run_parallel.
+    if matches!(opts_map.get("timeout"), Some(Value::Number(n)) if *n == 0.0) {
+        return Err(opt_invalid(
+            caller,
+            "timeout: 0 (no deadline) is refused — one hung host would park the whole batch",
+        ));
+    }
+    let opts_value = Value::map(opts_map);
+
+    let mut plans: Vec<SshCall> = Vec::with_capacity(hosts.len());
+    let mut decode_mode: Option<String> = None;
+    for host in &hosts {
+        let (call, mode) = plan_ssh_mix(vec![
+            Value::String(host.clone()),
+            args[1].clone(),
+            opts_value.clone(),
+        ])
+        .map_err(|e| match e {
+            // Say WHICH host a host-specific refusal (empty, leading '-',
+            // NUL) belongs to; structured errors keep their code untouched.
+            MixError::RuntimeError { span, msg } => MixError::RuntimeError {
+                span,
+                msg: format!("{caller}: host {host:?}: {msg}"),
+            },
+            other => other,
+        })?;
+        decode_mode = mode;
+        plans.push(call);
+    }
+
+    let n = plans.len();
+    let mut out = indexmap::IndexMap::with_capacity(n);
+    if n == 0 {
+        return Ok(Some(Value::map(out)));
+    }
+    // Worker pool — the run_parallel shape: workers pull the next index,
+    // write into a per-index slot, and MixError (!Send, it can carry a
+    // Value) is flattened to owned strings across the thread boundary.
+    #[allow(clippy::type_complexity)]
+    let slots: Vec<Mutex<Option<Result<(SshOutcome, std::time::Duration), (Option<String>, String)>>>> =
+        (0..n).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let workers = max.min(n).min(SSH_MIX_MANY_MAX_WORKERS);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let r = exec_ssh_call(&plans[i]).map_err(|e| match e {
+                    MixError::Structured(info) => (Some(info.code.clone()), info.message.clone()),
+                    other => (None, bare_error_message(&other)),
+                });
+                *slots[i].lock().expect("ssh_mix_many slot poisoned") = Some(r);
+            });
+        }
+    });
+
+    for (plan, slot) in plans.iter().zip(slots) {
+        let r = slot
+            .into_inner()
+            .expect("ssh_mix_many slot poisoned")
+            .expect("every host index is assigned exactly once");
+        // A local engine failure (no `ssh` binary, spawn/IO error) is the
+        // same for every host and is what ssh_mix raises too.
+        let (outcome, elapsed) = r.map_err(|(code, msg)| match code {
+            Some(code) => MixError::structured(&code, msg),
+            None => MixError::RuntimeError { span: None, msg },
+        })?;
+        let mut result = ssh_result_map(&plan.host, outcome, elapsed);
+        if let (Some(mode), Value::Map(m)) = (decode_mode.as_deref(), &mut result) {
+            let m = Rc::make_mut(m);
+            if let Err(e) = decode_ssh_stdout(m, mode) {
+                m.insert("ok".into(), Value::Bool(false));
+                m.insert("decode_error".into(), Value::String(bare_error_message(&e)));
+            }
+        }
+        out.insert(plan.host.clone(), result);
+    }
+    Ok(Some(Value::map(out)))
 }
 
 /// Decode a successful ssh_mix result's stdout into its `value` field.
@@ -22626,6 +22860,71 @@ mod ssh_helpers_tests {
             ])
             .contains("opts must be a map")
         );
+    }
+
+    fn ssh_mix_many_err(args: Vec<Value>) -> MixError {
+        builtin_ssh_mix_many(args).expect_err("must raise locally before any ssh")
+    }
+
+    #[test]
+    fn ssh_mix_many_validates_every_host_before_spawning() {
+        let src = Value::String("print(1)".into());
+        let hosts = |hs: &[&str]| Value::list(hs.iter().map(|h| Value::String((*h).into())).collect());
+        // Shape errors.
+        let e = ssh_mix_many_err(vec![Value::String("alpha".into()), src.clone()]);
+        assert!(e.to_string().contains("hosts must be a list"), "{e}");
+        let e = ssh_mix_many_err(vec![Value::list(vec![Value::Number(1.0)]), src.clone()]);
+        assert!(e.to_string().contains("hosts[0] must be a string"), "{e}");
+        let e = ssh_mix_many_err(vec![hosts(&["alpha", "alpha"]), src.clone()]);
+        assert!(e.to_string().contains("listed twice"), "{e}");
+        let e = ssh_mix_many_err(vec![hosts(&["alpha"]), Value::Number(1.0)]);
+        assert!(e.to_string().contains("source must be a string"), "{e}");
+        // A bad host LATER in the list still raises before the first host
+        // runs — and says which host.
+        let e = ssh_mix_many_err(vec![hosts(&["alpha", "-oProxyCommand=x"]), src.clone()]);
+        assert!(
+            e.to_string().contains("host \"-oProxyCommand=x\"")
+                && e.to_string().contains("must not begin with '-'"),
+            "{e}"
+        );
+        // ssh_mix's own option checks run per host (strict allowlist).
+        let e = ssh_mix_many_err(vec![
+            hosts(&["alpha"]),
+            src.clone(),
+            map_of(&[("bogus", Value::Number(1.0))]),
+        ]);
+        assert!(e.to_string().contains("unknown opts key"), "{e}");
+        // bindings keep ssh_mix's structured OPTION_INVALID.
+        let e = ssh_mix_many_err(vec![
+            hosts(&["alpha"]),
+            src.clone(),
+            map_of(&[("bindings", Value::list(vec![]))]),
+        ]);
+        assert_eq!(e.info().map(|i| i.code.as_str()), Some("OPTION_INVALID"), "{e}");
+    }
+
+    #[test]
+    fn ssh_mix_many_refuses_bad_max_and_a_disabled_deadline() {
+        let hosts = Value::list(vec![Value::String("alpha".into())]);
+        let src = Value::String("print(1)".into());
+        for bad in [Value::Number(0.0), Value::Number(1.5), Value::String("4".into())] {
+            let e = ssh_mix_many_err(vec![hosts.clone(), src.clone(), map_of(&[("max", bad)])]);
+            assert_eq!(e.info().map(|i| i.code.as_str()), Some("OPTION_INVALID"), "{e}");
+        }
+        let e = ssh_mix_many_err(vec![
+            hosts.clone(),
+            src.clone(),
+            map_of(&[("timeout", Value::Number(0.0))]),
+        ]);
+        assert!(e.to_string().contains("timeout: 0"), "{e}");
+    }
+
+    #[test]
+    fn ssh_mix_many_of_no_hosts_is_an_empty_map() {
+        let r = builtin_ssh_mix_many(vec![Value::list(vec![]), Value::String("print(1)".into())])
+            .expect("empty fan-out")
+            .expect("value");
+        assert!(matches!(&r, Value::Map(m) if m.is_empty()), "{r:?}");
     }
 
     #[test]

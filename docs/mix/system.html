@@ -1012,8 +1012,9 @@ single-threaded by construction and Mix <code>Value</code>s are never shared acr
 threads: <code>run_parallel</code> parses every job to plain owned data first, and the
 worker threads touch only process plumbing (argv, pipes, exit codes), marshalling
 results back on the caller's thread. There is deliberately <strong>no</strong> <code>parallel(list, fn)</code> that runs Mix functions concurrently — that would mean rebuilding the value
-model, and it is not planned. The killer use is <code>ssh_mix</code> fan-out: a fleet sweep
-that walked N nodes serially becomes one <code>run_parallel</code> of N ssh jobs. A job's
+model, and it is not planned. A fleet sweep that walked N nodes serially becomes
+one <code>run_parallel</code> of N ssh jobs; for Mix source, <a href="/mix/remote#ssh_mix_manyhosts-source-opts--map-host--result"><code>ssh_mix_many</code></a>
+is the same pool with <code>ssh_mix</code>'s <code>bindings</code>, <code>decode</code> and result shape kept. A job's
 <code>stream</code> flag is ignored (a parallel live tee would interleave into garbage).</p>
 <h3 id="which-runner">Which runner?</h3>
 <table><thead><tr><th>Need</th><th>Use</th></tr></thead><tbody>

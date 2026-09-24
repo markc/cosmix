@@ -2568,7 +2568,9 @@ fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
             return;
         };
         if let Expr::FunctionCall { name, args } = expr
-            && name == "ssh_mix"
+            // `ssh_mix_many` ships the same second argument to every host
+            // with the same bindings/env — one body, same analysis.
+            && (name == "ssh_mix" || name == "ssh_mix_many")
             && let Some(body) = args.get(1)
         {
             let body = match body {
