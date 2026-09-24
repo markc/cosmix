@@ -2797,23 +2797,32 @@ mod tests {
                      (stamp_id, account_id, item_id, label, attempts, last_error, created_at, \
                       created_us) \
                      VALUES (?1, 7, ?1, 'ham', 0, NULL, 0, ?2)",
-                    rusqlite::params![
-                        item.0.to_string(),
-                        crate::mailstore::retrain::event_us()
-                    ],
+                    rusqlite::params![item.0.to_string(), crate::mailstore::retrain::event_us()],
                 )
                 .map_err(|e| cosmix_mds::Error::Other(e.to_string()))?;
             Ok(())
         })
         .unwrap();
-        retrain_for_move(&mailstore, &classifier, 7, item, hash, Label::Spam, move_began)
-            .await
-            .unwrap();
+        retrain_for_move(
+            &mailstore,
+            &classifier,
+            7,
+            item,
+            hash,
+            Label::Spam,
+            move_began,
+        )
+        .await
+        .unwrap();
         let worker = crate::mailstore::retrain::RetrainOutboxWorker::new(
             Arc::clone(&mds),
             Arc::clone(&classifier),
         );
-        assert_eq!(worker.drain_once().await.unwrap(), 1, "newer IMAP row was cancelled");
+        assert_eq!(
+            worker.drain_once().await.unwrap(),
+            1,
+            "newer IMAP row was cancelled"
+        );
         let stats = classifier.peek_stats(&AccountId::new("7")).await.unwrap();
         assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 1));
     }

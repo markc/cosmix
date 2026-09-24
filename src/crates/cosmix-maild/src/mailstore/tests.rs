@@ -8831,14 +8831,22 @@ mod retrain_drain {
         )
         .await
         .unwrap();
-        assert_eq!(count_outbox(&mds, &set), 0, "inline label cancelled the row");
+        assert_eq!(
+            count_outbox(&mds, &set),
+            0,
+            "inline label cancelled the row"
+        );
 
         let worker = RetrainOutboxWorker::new(Arc::clone(&mds), Arc::clone(&cls));
         retrain::take_skipped_superseded();
         let applied = worker.apply_claimed(set, rows).await.unwrap();
         assert_eq!(applied, 0, "superseded row was applied");
         assert_eq!(retrain::take_skipped_superseded(), vec![claimed_rowid]);
-        assert_eq!(corpus_counts(&cls).await, (0, 1), "operator's ham must stand");
+        assert_eq!(
+            corpus_counts(&cls).await,
+            (0, 1),
+            "operator's ham must stand"
+        );
     }
 
     // A re-drag pair (out then in) after a successful drain must

@@ -2065,12 +2065,20 @@ mod tests {
         let args = serde_json::json!({"account_id": 3, "email_id": id, "class": "ham"});
         let (rc, body) = handle_train(&broken, &database, &store, &args).await;
         assert_eq!(rc, RC_ERROR, "body was: {body}");
-        assert_eq!(outbox_rows(&mds, &set), 1, "failed train cancelled the queued row");
+        assert_eq!(
+            outbox_rows(&mds, &set),
+            1,
+            "failed train cancelled the queued row"
+        );
 
         let args = serde_json::json!({"account_id": 3, "email_id": id});
         let (rc, body) = handle_untrain(&broken, &database, &store, &args).await;
         assert_eq!(rc, RC_ERROR, "body was: {body}");
-        assert_eq!(outbox_rows(&mds, &set), 1, "failed untrain cancelled the queued row");
+        assert_eq!(
+            outbox_rows(&mds, &set),
+            1,
+            "failed untrain cancelled the queued row"
+        );
     }
 
     /// Review MINOR-7: an unsupported key such as `dry_run` must refuse the
