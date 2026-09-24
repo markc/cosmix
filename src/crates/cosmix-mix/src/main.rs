@@ -1784,15 +1784,7 @@ fn main() {
     let handle = std::thread::Builder::new()
         .name("mix-eval".into())
         .stack_size(MAIN_STACK_SIZE)
-        .spawn(|| {
-            let code = real_main();
-            // spawn(argv, {die_with_parent: true}) children: SIGTERM their
-            // groups, grace, SIGKILL — on THIS thread, before it exits,
-            // because their PDEATHSIG is keyed to it and would otherwise
-            // SIGKILL them first with no chance to clean up (TODO-mix P2).
-            owned_spawns_sweep();
-            code
-        })
+        .spawn(eval_thread_main)
         .expect("spawn mix evaluation thread");
     let code = handle.join().unwrap_or(101);
     // A panicked evaluation thread never reached its sweep; PDEATHSIG has
@@ -1810,6 +1802,16 @@ fn main() {
 pub(crate) fn owned_spawns_sweep() {
     #[cfg(target_os = "linux")]
     cosmix_mix::builtins::owned_spawns::sweep();
+}
+
+/// The evaluation thread's body: run, then end `spawn(argv, {die_with_parent:
+/// true})` children — SIGTERM their groups, grace, SIGKILL — on THIS thread,
+/// before it exits, because their PDEATHSIG is keyed to it and would otherwise
+/// SIGKILL them first with no chance to clean up (TODO-mix P2).
+fn eval_thread_main() -> i32 {
+    let code = real_main();
+    owned_spawns_sweep();
+    code
 }
 
 fn real_main() -> i32 {
