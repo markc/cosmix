@@ -311,8 +311,11 @@ activation never changes the persisted mode.
   including a click elsewhere, which works as soon as the keyboard has landed
   — on Escape, at the next focus-cycle stop, or on a hide, a corner action or
   a mode change. If comp never grants the keyboard (a session lock, a higher
-  exclusive layer) the request lapses after 500 ms and the hold is released
-  with it, so the reveal then ends by the ordinary holder rules.
+  exclusive layer) the request lapses after 500 ms and the reveal it made
+  ends with it (its hold is released and the panel hides): an open panel
+  without the keyboard is one Escape cannot reach, since Escape goes to the
+  application. An edge that was already showing when activated is left as
+  it was.
 - **Pinned or docked edge, `focus=true`:** the page switch, then the same
   keyboard request (and the same exits); the panel keeps the page when focus
   leaves.

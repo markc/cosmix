@@ -450,7 +450,10 @@ fn update_model(
                 // granted, then on-demand; ends when focus leaves, on Escape
                 // or when the grant times out).
                 let at = command.at.clamp(runtime.model.last_update(), now);
-                if runtime.model.panel(*edge).mode == PanelMode::Hidden
+                let before = runtime.model.panel(*edge);
+                // This activation made the reveal (it was not already shown).
+                let revealed = before.mode == PanelMode::Hidden && !before.transient_revealed;
+                if before.mode == PanelMode::Hidden
                     && let Ok(update) = runtime.model.panel_input(*edge, at, PanelInput::Reveal)
                     && let Some(effect) = update.effect
                 {
@@ -460,7 +463,7 @@ fn update_model(
                     });
                 }
                 if *focus {
-                    runtime.model.request_keyboard_focus(*edge, at);
+                    runtime.model.request_activation_focus(*edge, at, revealed);
                 }
                 continue;
             }

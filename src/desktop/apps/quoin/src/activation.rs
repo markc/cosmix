@@ -136,6 +136,11 @@ impl ActivationTargets {
     }
 
     /// A focus change (or a gap that may have hidden one) starts a new round.
+    /// Wontfix (review NIT-6): an activation that moves focus costs one or
+    /// two more rounds (a `focus` read plus up to two `output` reads each).
+    /// They are event-driven, bounded and feed a report-only field; caching
+    /// surface outputs instead would need comp's output-change stream for
+    /// every surface, which is more state for no behavioural gain in v1.
     pub(crate) fn message(&mut self, message: &BusMessage) {
         if self.generation != Some(message.connection_generation) {
             return;

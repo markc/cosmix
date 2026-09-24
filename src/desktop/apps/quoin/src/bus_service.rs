@@ -503,6 +503,13 @@ fn service_bus(
             // Gated on the gate the model follows: the plane change above
             // already reached it, so an admitted activation's reveal is
             // command-driven and held by comp, never left to local grace.
+            // Wontfix (review NIT-5): the gate can close in the one frame
+            // between this check and the Model stage; the reveal then falls
+            // to local rules and stays up through its explicit-show flag
+            // until a hide, as `shell.panel.show` does. Closing that would
+            // mean deferring the reply to the Model stage for a window that
+            // only a comp gap or restart opens, and a panel left open is the
+            // safe side of it (never one that vanishes while typed into).
             crate::activation::dispatch_activate(
                 &request,
                 &frame.0,
@@ -4208,8 +4215,9 @@ mod tests {
         // The reveal maps the layer: its mode report, then the focus hold —
         // the literal `comp.panel.hold`, addressed to the comp instance.
         // Comp answers the hidden report with a re-stated conceal (nothing
-        // holds yet) and refuses the hold until the layer is mapped: the
-        // explicit reveal survives both.
+        // holds yet) — delivered after the mode report's ack and before any
+        // hold ack, since comp refuses the hold until the layer is mapped:
+        // the explicit reveal survives it (the anti-vanish invariant).
         comp.refuse_holds.set(true);
         map_left_layer(&mut app, "panel-left");
         let calls = pump(&mut app, &peer, &comp);
@@ -4270,9 +4278,10 @@ mod tests {
     }
 
     /// The grant never lands (a lock, a higher Exclusive layer): when the
-    /// request times out Quoin also releases the hold, and the reveal ends
-    /// by comp's ordinary rules instead of lingering until focus happens to
-    /// change.
+    /// request times out the reveal the activation made ends with it — the
+    /// model hides it and Quoin releases the hold — rather than leaving an
+    /// unfocused panel open that Escape (which goes to the application)
+    /// cannot reach.
     #[test]
     fn an_ungranted_activation_releases_its_hold_at_the_grant_timeout() {
         let comp = FakeComp::new(true);
