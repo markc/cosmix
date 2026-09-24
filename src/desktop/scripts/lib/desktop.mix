@@ -407,14 +407,32 @@ fn target_ok($target)
   return type($target) == "string" and re_match($target,"^[a-z][a-z0-9-]{1,30}(\\.[a-z][a-z0-9-]{0,23}\\.bus)?$")
 end
 
+-- The effective mesh posture: open (the default) unless the provider runs
+-- with COSMIX_MESH_OPEN=0, the opt-in lock. One definition, used by both the
+-- caller gate and desktop.capabilities, so the two can never disagree.
+fn mesh_open()
+  return env("COSMIX_MESH_OPEN", "1") != "0"
+end
+
 fn caller_allowed($ctx,$verb,$headers)
   if $headers.broker_origin == "local" then
     return type($headers.from) == "string" and re_match($headers.from,"^[a-z][a-z0-9-]{1,30}$")
   end
   if $headers.broker_origin != "mesh" then return false end
-  -- Transfer verbs ride the clipboard grants; history reads (previews and
-  -- entry fetch for pick-remote) ride the explicit history subset. Nothing
-  -- else is ever mesh-addressable.
+  -- FULL MESH ACCESS TO EVERY VERB (Mark, 2026-09-15; supersedes the
+  -- 2026-09-14 clipboard-only open posture): a mesh caller reaches EVERY verb
+  -- of this citizen — menu, rotate, capture, pick, clear, pause, open included
+  -- — on WG membership alone. `broker_origin` is set by noded from the source
+  -- IP and is not forgeable, so `broker_origin=="mesh"` already proves an
+  -- admitted WG peer; the WG /24 + signed inventory is the trust boundary.
+  -- What survives is correctness, not authorization: the `instance` staleness
+  -- fence in prepare() still applies to mesh callers exactly as to local ones.
+  if mesh_open() then return true end
+  -- Opt-in lock-down (COSMIX_MESH_OPEN=0): transfer verbs ride the clipboard
+  -- grants; history reads (previews and entry fetch for pick-remote) ride the
+  -- explicit history subset; every other verb is local-only; and each grant
+  -- needs the strict per-peer bridge attestation (grants + from=bridge-<peer>
+  -- + broker_service).
   $grants = []
   if contains(["desktop.capabilities","desktop.clipboard.read","desktop.clipboard.write"],$verb) then
     $grants = $ctx.mesh_nodes
@@ -423,15 +441,6 @@ fn caller_allowed($ctx,$verb,$headers)
   else
     return false
   end
-  -- AGENTIC-FIRST open posture (Mark, 2026-09-14): a mesh caller for one of the
-  -- mesh-addressable clipboard verbs above is trusted on WG membership alone.
-  -- `broker_origin` is set by noded from the source IP and is not forgeable, so
-  -- `broker_origin=="mesh"` already proves an admitted WG peer, and the WG /24 +
-  -- signed inventory is the trust boundary. The strict per-peer bridge
-  -- attestation below (grants + from=bridge-<peer> + broker_service) is retained
-  -- and re-armed by setting COSMIX_MESH_OPEN=0. `$grants` above still scopes
-  -- WHICH verbs are ever mesh-addressable; only the per-peer proof relaxes.
-  if env("COSMIX_MESH_OPEN", "1") != "0" then return true end
   if type($grants) != "list" or type($headers.broker_peer) != "string" or not contains($grants,$headers.broker_peer) then return false end
   return $headers.from == "bridge-" .. $headers.broker_peer and type($headers.broker_service) == "string" and re_match($headers.broker_service,"^[a-z][a-z0-9-]{1,30}$")
 end
@@ -460,8 +469,8 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.3.5", session:$ctx.session,
-      instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
+    return {rc:0, body:{api_version:1, implementation_version:"0.3.6", session:$ctx.session,
+      instance:$ctx.instance, access:(mesh_open() ? "mesh-open" : "registered-local-with-explicit-mesh-clipboard-grants"), mesh_open:mesh_open(), max_text_bytes:$ctx.max_bytes,
       -- history_mesh: granted peers may read history previews and entries.
       history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},
       clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8", history:history_capabilities($ctx)},
@@ -496,8 +505,8 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
     -- empty body, and a static row cannot carry the uuid minted at citizen
     -- start. So `instance` is OPTIONAL here — same reasoning as capture: the
     -- fence is a staleness guard for caller-held handles, not a trust
-    -- boundary (both verbs are local-only in caller_allowed, and any local
-    -- caller can read the live instance from desktop.capabilities). When a
+    -- boundary (any caller, local or mesh, can read the live instance from
+    -- desktop.capabilities). When a
     -- caller does send `instance`, it is still checked and a stale one is
     -- refused exactly as before.
     if not keys_subset($body, [], ["instance"]) then return error("INVALID_REQUEST", 10) end

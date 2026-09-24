@@ -539,9 +539,10 @@ starts with <code>desktop-vt1.desktop.clipboard.</code> is rewritten to service
 modifiers, old action and new target. No other action is rewritten, so a row
 such as <code>foo-bar.baz.qux</code> keeps first-segment routing.</p>
 <p>The clipboard rows work with no <code>args</code> because the clipboard citizen accepts an
-empty body for <code>desktop.clipboard.menu</code> and <code>desktop.clipboard.rotate</code> from a
-local caller. Since citizen 0.3.5, <code>instance</code> is optional on those two verbs.
-When a caller sends it, a stale value is still refused with rc 12.</p>
+empty body for <code>desktop.clipboard.menu</code> and <code>desktop.clipboard.rotate</code>. Since
+citizen 0.3.5, <code>instance</code> is optional on those two verbs. When a caller sends
+it, a stale value is still refused with rc 12. Since citizen 0.3.6, mesh
+callers reach both verbs too, like every other verb of the citizen.</p>
 <p>Rolling back to an inputd without this field is lossy. The older binary ignores
 <code>service</code> and routes by first segment, so the clipboard rows go to <code>desktop</code>,
 which has no such verb, and nothing is logged. Under the older binary, the next successful <code>input.bind</code>, or an
@@ -554,8 +555,51 @@ After rolling forward again, those rows must be rebound with <code>service</code
 <tr><td>RightCtrl+Down</td><td>108</td><td><code>desktop.clipboard.menu</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
 <tr><td>RightCtrl+Up</td><td>103</td><td><code>desktop.clipboard.rotate</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
 </tbody></table>
-<p>The default keymap only seeds a missing keymap file. A host with an existing
-file keeps its rows, apart from the legacy clipboard migration above. Other
+<p>The default keymap only seeds a missing keymap file, or one whose whole
+document is unusable. A document is unusable when its bytes are not UTF-8, are
+not JSON, are not a JSON object, lack a <code>physical</code> list, or lack an unsigned
+32-bit <code>version</code>. Since inputd 0.4.2, startup first renames such a file to
+<code>keymap.json.bad-YYYYmmdd-HHMMSS</code> in the same directory, then seeds the
+defaults. The rename never replaces an existing name. If the name is taken,
+even by a file created a moment earlier, inputd tries <code>-1</code>, <code>-2</code> and so on.
+The file is never deleted. inputd logs one line naming the reason and the
+backup path, and <code>input.query</code> in that process carries the path:</p>
+<pre><code class="language-json">{"mode":"normal","generation":0,"physical":[...],
+ "recovered_from":"/var/lib/cosmix/inputd/keymap.json.bad-20260924-101112"}
+</code></pre>
+<p>The field is absent when no recovery happened. It stays for the life of the
+process, even after a later successful <code>input.reload</code>.</p>
+<p>inputd checks that the file it renamed is the one that failed to parse. If the
+file was replaced in between, it renames the replacement back and loads that
+instead. The defaults are only created at a vacant path. If a file appears
+there before they are written, that file is left untouched.</p>
+<p>On a filesystem without an exclusive rename, inputd moves the file by linking
+the backup name and then unlinking the original. If the original changed in
+between, it drops the new link, leaves the file alone and does not seed.</p>
+<p>A keymap path that is a symlink to an unusable file is never recovered. The
+link and its target are left untouched, and the target must be fixed by hand.</p>
+<p>A file that cannot be read at all is never moved, because it may be valid.
+This covers a permission error, an I/O error, or a directory at the path.</p>
+<p>In these cases inputd serves the defaults in memory and does not write the
+keymap file:</p>
+<ul>
+<li>the file cannot be read;</li>
+<li>the unusable file cannot be renamed, or changed while being moved;</li>
+<li>the keymap path is a symlink to an unusable file;</li>
+<li>a file appears at the path while the defaults are being written.</li>
+</ul>
+<p><code>input.query</code> then carries <code>persist_disabled</code>, naming the path and the reason.
+<code>input.bind</code> and <code>input.unbind</code> still change the live keymap and return rc 0,
+but their reply adds <code>"persisted":false</code> and the same <code>persist_disabled</code>
+reason. A save that fails while writing is enabled adds <code>"persisted":false</code>
+and <code>persist_error</code> instead. A successful save leaves the reply unchanged.</p>
+<p><code>input.reload</code> never moves or rewrites the file. On a file that is still
+unusable it returns rc 10 with the reason, plus <code>persist_disabled</code> when
+writing is off, and the live keymap is unchanged. Once the file is fixed,
+<code>input.reload</code> loads it and turns writing back on. Its reply then carries
+<code>persist_reenabled</code> with the reason that no longer applies.</p>
+<p>A host with a usable file keeps its rows, apart from the legacy clipboard
+migration above. Other
 rows change only when they are rebound with <code>input.bind</code>, or when the file is
 edited and <code>input.reload</code> is sent. The <code>desktop-vt1</code> target suits a host whose
 clipboard citizen runs under that name. On a host whose citizen has another

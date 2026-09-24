@@ -442,9 +442,11 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/desktop-bus.md"><div class="prose"><h1 id="desktop-bus-capabilities">Desktop Bus capabilities</h1>
-<p>Status: API 1, implementation 0.2.0. Explicit clipboard grants use native ABP
-between noded instances, requiring noded 0.15.0 or newer at both ends.
-Automatic clipboard synchronisation is not implemented.</p>
+<p>Status: API 1, implementation 0.3.6. Every verb is open to mesh callers by
+default. Explicit grants apply only under the opt-in lock described below.
+Cross-node calls use native ABP between noded instances, requiring noded
+0.15.0 or newer at both ends. Automatic clipboard synchronisation is not
+implemented.</p>
 <p>The reusable scripts live in <code>src/desktop/scripts/</code>. One supervised Mix citizen
 belongs to one desktop session. It uses the Wayland display, runtime directory
 and session D-Bus inherited at launch; requests cannot select another session
@@ -474,18 +476,30 @@ mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix open desktop-b https://e
 </code></pre>
 <p>Targets may be local services or <code>service.node.bus</code> addresses. Cross-node
 messages use the existing noded ABP transport, without an alternative relay.
-To grant clipboard access to registered local citizens of node <code>alpha</code>, add
-<code>mesh_clipboard_nodes:["alpha"]</code> to the trusted provider configuration and
-restart it. The default grant list is empty. This grants capabilities/read/write;
-HTTP(S) opening remains local-only. Cross-mesh <code>@</code> addresses are refused.</p>
-<p>Both nodes need protected WireGuard endpoints, verified signed membership and
-D2 identities. The receiving noded must enforce admission. A provider grant
-never substitutes for broker admission. Example:</p>
+By default every verb is open to mesh callers (see below). The grant lists
+apply only when the provider runs with <code>COSMIX_MESH_OPEN=0</code>. Both lists are
+empty by default. In that mode:</p>
+<ul>
+<li><code>mesh_clipboard_nodes:["alpha"]</code> grants capabilities, read and write to node
+<code>alpha</code>'s registered local citizens.</li>
+<li><code>mesh_history_nodes:["alpha"]</code> also grants <code>desktop.clipboard.history</code> and
+<code>desktop.clipboard.entry</code>. It must be a subset of <code>mesh_clipboard_nodes</code>.</li>
+<li>Every other verb is local-only.</li>
+</ul>
+<p>Add the lists to the trusted provider configuration and restart it.
+Cross-mesh <code>@</code> addresses are refused.</p>
+<p>Under the open default, the citizen checks only that noded stamped the call
+<code>broker_origin=mesh</code>. Whatever noded itself requires to deliver a mesh call
+still applies; see <a href="/cos/noded">noded</a>. The lock needs more, because it relies on
+the attested <code>broker_peer</code> and <code>broker_service</code> stamps. noded supplies those
+only when both nodes have protected WireGuard endpoints, verified signed
+membership and D2 identities, and the receiving noded enforces admission. A
+provider grant never substitutes for broker admission. Example:</p>
 <pre><code class="language-text">mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-a desktop-b.beta.bus
 mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-b.beta.bus desktop-a
 </code></pre>
 <table><thead><tr><th>Verb</th><th>JSON request</th><th>Successful response</th></tr></thead><tbody>
-<tr><td><code>desktop.capabilities</code></td><td><code>{}</code></td><td>API/implementation version, session/instance, configured operations and limits</td></tr>
+<tr><td><code>desktop.capabilities</code></td><td><code>{}</code></td><td>API/implementation version, session/instance, access posture, configured operations and limits</td></tr>
 <tr><td><code>desktop.clipboard.read</code></td><td><code>{instance}</code></td><td><code>{instance,mime,text,bytes}</code></td></tr>
 <tr><td><code>desktop.clipboard.write</code></td><td><code>{instance,text}</code></td><td><code>{instance,accepted:true,bytes}</code></td></tr>
 <tr><td><code>desktop.open</code></td><td><code>{instance,url}</code></td><td><code>{instance,accepted:true}</code></td></tr>
@@ -504,7 +518,26 @@ request/data; 11 unavailable/helper failure; 12 stale session; 13 caller
 rejected; 20 timeout with ambiguous outcome. Transport errors remain separate.</p>
 <h2 id="trust-and-privacy-boundary">Trust and privacy boundary</h2>
 <p>Local calls require broker-stamped <code>broker_origin=local</code> and a canonical
-registered <code>from</code>. An opted-in mesh clipboard call requires <code>broker_origin=mesh</code>,
+registered <code>from</code>. A call stamped <code>broker_origin=mesh</code> reaches every verb,
+including <code>desktop.open</code>, <code>desktop.clipboard.menu</code> and
+<code>desktop.clipboard.rotate</code>, with no per-peer grant (citizen 0.3.6 and later).
+noded sets <code>broker_origin</code> from the source address, so the WireGuard mesh is
+the trust boundary. The <code>instance</code> fence still applies to mesh callers: a stale
+<code>instance</code> is refused with rc 12. Refusal with rc 13 is then reserved for two
+cases. The first is a call with no recognised broker origin. The second is a
+local policy gate, not a well-formedness check: a local call without a
+canonical registered <code>from</code> is refused. The same anonymous send from a mesh
+node is admitted, so locally the citizen is stricter than over the mesh.
+Local callers use a registered one-shot citizen instead, as <code>desktop-cli.mix</code>
+does. Whether to keep this gate is an open decision.</p>
+<p><code>desktop.capabilities</code> reports the posture it enforces. Under the open default
+it returns <code>access:"mesh-open"</code> and <code>mesh_open:true</code>. Under the lock it returns
+<code>access:"registered-local-with-explicit-mesh-clipboard-grants"</code> and
+<code>mesh_open:false</code>. Before citizen 0.3.6, <code>access</code> always carried the second
+string, and <code>mesh_open</code> was absent. <code>history_mesh.granted</code> counts the
+configured history grants in either posture, although only the lock uses them.</p>
+<p>Setting <code>COSMIX_MESH_OPEN=0</code> in the provider's environment re-arms the strict
+opt-in lock. A mesh call then requires a verb covered by a grant list,
 an allowed <code>broker_peer</code>, a canonical <code>broker_service</code>, and <code>from=bridge-&lt;peer&gt;</code>.
 noded supplies these only for a direct registered source received on a proven,
 currently authorised bridge connection. Anonymous sources and multi-hop relays
@@ -515,8 +548,13 @@ already queued or executing cannot be recalled. Session admission retains the
 existing inventory policy for overlapping D2 credentials. See <a href="/cos/noded">noded</a>.</p>
 <p>Broker taps can expose message bodies. Do not mistake suppressed helper logs
 for end-to-end clipboard confidentiality. Use an isolated/trusted broker for
-real clipboard data. No payload is deliberately written to disk, retained on
-topics or included in notifications by these scripts. Runtime-reserved verbs
+real clipboard data. Clipboard history IS written to disk: captured text is
+kept in <code>history.path</code> if configured, otherwise in
+<code>$XDG_STATE_HOME/cosmix/clipboard/history-&lt;session&gt;.json</code>, with
+<code>~/.local/state</code> used when <code>XDG_STATE_HOME</code> is unset. Pause capture with
+<code>desktop.clipboard.pause</code> and remove entries with <code>desktop.clipboard.clear</code>.
+No payload is retained on topics or included in notifications by these
+scripts. Runtime-reserved verbs
 (including <code>QUIT</code>) and lifecycle properties are provided by Mix and do not
 pass through the desktop handler checks.</p>
 <h2 id="application-registry-citizen-apps">Application registry citizen (<code>apps</code>)</h2>
@@ -570,7 +608,15 @@ malformed requests rc 10.</p>
 the author properties ride the SPEC-12 fall-through verbs instead.</p>
 <h2 id="verification">Verification</h2>
 <p><code>tests/desktop-test.mix</code> exercises production request validation and result
-handling without desktop effects. <code>tests/desktop-bus-test.mix</code> uses a real,
+handling without desktop effects. Run it with <code>COSMIX_MESH_OPEN=0</code> in the
+environment:</p>
+<pre><code class="language-text">env COSMIX_MESH_OPEN=0 mix src/desktop/scripts/tests/desktop-test.mix
+</code></pre>
+<p>Most of the file tests the locked posture, and without that setting it fails
+early, at the first grant check. The test opens the default posture itself for
+its full-mesh-access block and restores the setting afterwards. The locked
+checks for menu, rotate and capabilities run only when the setting is <code>0</code>.
+<code>tests/desktop-bus-test.mix</code> uses a real,
 isolated noded and two production citizens with synthetic helper programs;
 it requires a user systemd manager and the installed Mix/noded binaries.
 It does not read or replace the user's clipboard or open a real browser.

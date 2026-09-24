@@ -1,8 +1,10 @@
 # Desktop Bus capabilities
 
-Status: API 1, implementation 0.2.0. Explicit clipboard grants use native ABP
-between noded instances, requiring noded 0.15.0 or newer at both ends.
-Automatic clipboard synchronisation is not implemented.
+Status: API 1, implementation 0.3.6. Every verb is open to mesh callers by
+default. Explicit grants apply only under the opt-in lock described below.
+Cross-node calls use native ABP between noded instances, requiring noded
+0.15.0 or newer at both ends. Automatic clipboard synchronisation is not
+implemented.
 
 The reusable scripts live in `src/desktop/scripts/`. One supervised Mix citizen
 belongs to one desktop session. It uses the Wayland display, runtime directory
@@ -46,14 +48,26 @@ mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix open desktop-b https://e
 
 Targets may be local services or `service.node.bus` addresses. Cross-node
 messages use the existing noded ABP transport, without an alternative relay.
-To grant clipboard access to registered local citizens of node `alpha`, add
-`mesh_clipboard_nodes:["alpha"]` to the trusted provider configuration and
-restart it. The default grant list is empty. This grants capabilities/read/write;
-HTTP(S) opening remains local-only. Cross-mesh `@` addresses are refused.
+By default every verb is open to mesh callers (see below). The grant lists
+apply only when the provider runs with `COSMIX_MESH_OPEN=0`. Both lists are
+empty by default. In that mode:
 
-Both nodes need protected WireGuard endpoints, verified signed membership and
-D2 identities. The receiving noded must enforce admission. A provider grant
-never substitutes for broker admission. Example:
+- `mesh_clipboard_nodes:["alpha"]` grants capabilities, read and write to node
+  `alpha`'s registered local citizens.
+- `mesh_history_nodes:["alpha"]` also grants `desktop.clipboard.history` and
+  `desktop.clipboard.entry`. It must be a subset of `mesh_clipboard_nodes`.
+- Every other verb is local-only.
+
+Add the lists to the trusted provider configuration and restart it.
+Cross-mesh `@` addresses are refused.
+
+Under the open default, the citizen checks only that noded stamped the call
+`broker_origin=mesh`. Whatever noded itself requires to deliver a mesh call
+still applies; see [noded](noded.md). The lock needs more, because it relies on
+the attested `broker_peer` and `broker_service` stamps. noded supplies those
+only when both nodes have protected WireGuard endpoints, verified signed
+membership and D2 identities, and the receiving noded enforces admission. A
+provider grant never substitutes for broker admission. Example:
 
 ```text
 mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-a desktop-b.beta.bus
@@ -62,7 +76,7 @@ mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix copy desktop-b.beta.bus 
 
 | Verb | JSON request | Successful response |
 |---|---|---|
-| `desktop.capabilities` | `{}` | API/implementation version, session/instance, configured operations and limits |
+| `desktop.capabilities` | `{}` | API/implementation version, session/instance, access posture, configured operations and limits |
 | `desktop.clipboard.read` | `{instance}` | `{instance,mime,text,bytes}` |
 | `desktop.clipboard.write` | `{instance,text}` | `{instance,accepted:true,bytes}` |
 | `desktop.open` | `{instance,url}` | `{instance,accepted:true}` |
@@ -85,7 +99,28 @@ rejected; 20 timeout with ambiguous outcome. Transport errors remain separate.
 ## Trust and privacy boundary
 
 Local calls require broker-stamped `broker_origin=local` and a canonical
-registered `from`. An opted-in mesh clipboard call requires `broker_origin=mesh`,
+registered `from`. A call stamped `broker_origin=mesh` reaches every verb,
+including `desktop.open`, `desktop.clipboard.menu` and
+`desktop.clipboard.rotate`, with no per-peer grant (citizen 0.3.6 and later).
+noded sets `broker_origin` from the source address, so the WireGuard mesh is
+the trust boundary. The `instance` fence still applies to mesh callers: a stale
+`instance` is refused with rc 12. Refusal with rc 13 is then reserved for two
+cases. The first is a call with no recognised broker origin. The second is a
+local policy gate, not a well-formedness check: a local call without a
+canonical registered `from` is refused. The same anonymous send from a mesh
+node is admitted, so locally the citizen is stricter than over the mesh.
+Local callers use a registered one-shot citizen instead, as `desktop-cli.mix`
+does. Whether to keep this gate is an open decision.
+
+`desktop.capabilities` reports the posture it enforces. Under the open default
+it returns `access:"mesh-open"` and `mesh_open:true`. Under the lock it returns
+`access:"registered-local-with-explicit-mesh-clipboard-grants"` and
+`mesh_open:false`. Before citizen 0.3.6, `access` always carried the second
+string, and `mesh_open` was absent. `history_mesh.granted` counts the
+configured history grants in either posture, although only the lock uses them.
+
+Setting `COSMIX_MESH_OPEN=0` in the provider's environment re-arms the strict
+opt-in lock. A mesh call then requires a verb covered by a grant list,
 an allowed `broker_peer`, a canonical `broker_service`, and `from=bridge-<peer>`.
 noded supplies these only for a direct registered source received on a proven,
 currently authorised bridge connection. Anonymous sources and multi-hop relays
@@ -98,8 +133,13 @@ existing inventory policy for overlapping D2 credentials. See [noded](noded.md).
 
 Broker taps can expose message bodies. Do not mistake suppressed helper logs
 for end-to-end clipboard confidentiality. Use an isolated/trusted broker for
-real clipboard data. No payload is deliberately written to disk, retained on
-topics or included in notifications by these scripts. Runtime-reserved verbs
+real clipboard data. Clipboard history IS written to disk: captured text is
+kept in `history.path` if configured, otherwise in
+`$XDG_STATE_HOME/cosmix/clipboard/history-<session>.json`, with
+`~/.local/state` used when `XDG_STATE_HOME` is unset. Pause capture with
+`desktop.clipboard.pause` and remove entries with `desktop.clipboard.clear`.
+No payload is retained on topics or included in notifications by these
+scripts. Runtime-reserved verbs
 (including `QUIT`) and lifecycle properties are provided by Mix and do not
 pass through the desktop handler checks.
 
@@ -163,7 +203,18 @@ the author properties ride the SPEC-12 fall-through verbs instead.
 ## Verification
 
 `tests/desktop-test.mix` exercises production request validation and result
-handling without desktop effects. `tests/desktop-bus-test.mix` uses a real,
+handling without desktop effects. Run it with `COSMIX_MESH_OPEN=0` in the
+environment:
+
+```text
+env COSMIX_MESH_OPEN=0 mix src/desktop/scripts/tests/desktop-test.mix
+```
+
+Most of the file tests the locked posture, and without that setting it fails
+early, at the first grant check. The test opens the default posture itself for
+its full-mesh-access block and restores the setting afterwards. The locked
+checks for menu, rotate and capabilities run only when the setting is `0`.
+`tests/desktop-bus-test.mix` uses a real,
 isolated noded and two production citizens with synthetic helper programs;
 it requires a user systemd manager and the installed Mix/noded binaries.
 It does not read or replace the user's clipboard or open a real browser.
