@@ -76,6 +76,10 @@ where
                     return;
                 }
 
+                // Release the wl_surface for a fresh wrapper; see the
+                // `get_xdg_surface` guard in `wm_base.rs`.
+                super::wm_base::XdgSurfaceWrappers::unregister(&data.wl_surface, xdg_surface);
+
                 if compositor::get_role(&data.wl_surface).is_none() {
                     // No role assigned to the surface, we can exit early.
                     return;

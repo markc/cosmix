@@ -17,6 +17,7 @@ use smithay::{
     wayland::shell::wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer},
 };
 
+use super::dmabuf_ledger::DmabufLedgerSnapshot;
 use super::presentation::SourcePresentationLeaves;
 use super::presentation_stats::{OutputStats, PresentationLeaves};
 use super::{
@@ -100,6 +101,9 @@ pub(crate) struct CompSnapshot {
     pub(crate) input: InputSnapshot,
     #[cfg(feature = "xwayland")]
     pub(crate) xwayland: XwaylandSnapshot,
+    /// Observed linux-dmabuf import outcomes (volatile; filled only in read
+    /// snapshots, so the diff snapshot never sees them change).
+    pub(crate) dmabuf: DmabufLedgerSnapshot,
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
     full_tree: tokio::sync::OnceCell<SerialisedReply>,
@@ -487,6 +491,7 @@ impl CompSnapshot {
             "input" => self.input.select(tail),
             #[cfg(feature = "xwayland")]
             "xwayland" => self.xwayland.select(tail),
+            "dmabuf" => self.dmabuf.select(tail),
             "port" => self.port.select(tail),
             _ => None,
         }
@@ -511,6 +516,7 @@ impl CompSnapshot {
             "input" => self.input.node_kind(tail),
             #[cfg(feature = "xwayland")]
             "xwayland" => self.xwayland.node_kind(tail),
+            "dmabuf" => self.dmabuf.node_kind(tail),
             "port" => self.port.node_kind(tail),
             _ => None,
         }
@@ -634,6 +640,7 @@ flat_snapshot!(
 );
 #[cfg(feature = "xwayland")]
 flat_snapshot!(XwaylandSnapshot, enabled, persist_path, display);
+flat_snapshot!(DmabufLedgerSnapshot, accepted, failed, failures);
 flat_snapshot!(OutputWorkspaceSnapshot, current);
 
 impl WorkspacesSnapshot {
@@ -1287,6 +1294,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 .display_number
                 .map(|number| Arc::from(format!(":{number}"))),
         },
+        dmabuf: DmabufLedgerSnapshot::default(),
         port: PortSnapshot {
             level: "L2",
             event_seq: context.event_seq.load(Ordering::Acquire),
@@ -1358,6 +1366,9 @@ pub(super) fn read_snapshot(
         .unwrap_or_else(|e| e.into_inner())
         .counters;
     snapshot.occlusion.counters = counters;
+    if scopes.wants("dmabuf") {
+        snapshot.dmabuf = state.dmabuf_ledger.snapshot();
+    }
     let (enforced, held) = super::port_observation::panel_edge_counts(state);
     snapshot.input.corners.enforced = Some(enforced);
     snapshot.input.corners.held = Some(held);
@@ -2268,6 +2279,28 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "The X display this compositor's Xwayland serves (\":N\"); null until the \
          generation is ready and again after it goes down"
     ),
+    // Observed linux-dmabuf imports (TODO-comp C4): what the driver actually
+    // accepted, not what it advertised. In memory only — a comp restart
+    // starts from zero — and never diffed (a refusal storm would flood
+    // props.changed).
+    volatile!(
+        [L("dmabuf"), L("accepted")],
+        Number,
+        "linux-dmabuf imports comp accepted since this compositor started (reset on restart)"
+    ),
+    volatile!(
+        [L("dmabuf"), L("failed")],
+        Number,
+        "linux-dmabuf imports comp refused since this compositor started (reset on restart)"
+    ),
+    volatile!(
+        [L("dmabuf"), L("failures")],
+        List,
+        "The newest 16 refused imports, oldest first: {format (fourcc), modifier (hex), \
+         reason (invalid_metadata|descriptor_dup_failed|queue_full|worker_stopped|\
+         vulkan_rejected|probe_panicked|probe_retired), detail, at_us (CLOCK_MONOTONIC)}; \
+         not persisted"
+    ),
     // Presentation statistics are volatile: served by get/list/describe,
     // never diffed into props.changed (a watched 60 Hz client would flood
     // the topic). Times are CLOCK_MONOTONIC µs.
@@ -2635,6 +2668,8 @@ pub(crate) fn volatile_path(path: &str) -> bool {
         || path.starts_with("input.corners.held.")
         || path.split('.').any(|segment| segment == "presentation")
         || path.starts_with("occlusion.counters.")
+        || path == "dmabuf"
+        || path.starts_with("dmabuf.")
 }
 
 pub(super) fn service_requests(state: &mut WaylandState) {
@@ -3290,6 +3325,18 @@ mod tests {
                 persist_path: Arc::from("/tmp/fixture/etc/comp/xwayland-enabled.comp-nested"),
                 display: Some(Arc::from(":3")),
             },
+            // A read snapshot, with the volatile import ledger.
+            dmabuf: DmabufLedgerSnapshot {
+                accepted: 5,
+                failed: 1,
+                failures: vec![super::super::dmabuf_ledger::DmabufFailureRecord {
+                    format: "AR24".into(),
+                    modifier: "0x0000000000000000".into(),
+                    reason: "vulkan_rejected",
+                    detail: "fixture".into(),
+                    at_us: 9,
+                }],
+            },
             port: PortSnapshot {
                 level: "L2",
                 event_seq: 0,
@@ -3482,7 +3529,8 @@ mod tests {
             volatile += usize::from(descriptor.volatile);
         }
         // + 8: the four `input.corners.enforced.*` and four `held.*` counts.
-        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4 + 8);
+        // + 3: the `dmabuf.*` import ledger.
+        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4 + 8 + 3);
     }
 
     #[test]
@@ -3509,6 +3557,43 @@ mod tests {
             ["vsync", "hw_clock", "hw_completion"]
         );
         assert_eq!(presentation_flag_names(0x8), ["zero_copy"]);
+    }
+
+    #[test]
+    fn dmabuf_import_ledger_is_served_read_only_and_volatile() {
+        let snapshot = fixture();
+        let describe_json = |path: &str| {
+            let body = describe(&snapshot, &PropPath::new(path).unwrap())
+                .unwrap_or_else(|| panic!("describe {path}"));
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        for path in ["dmabuf.accepted", "dmabuf.failed", "dmabuf.failures"] {
+            let body = describe_json(path);
+            assert_eq!(body["volatile"], true, "{path}");
+            assert_eq!(body["mutable"], false, "{path}");
+            assert!(volatile_path(path), "{path}");
+        }
+        assert_eq!(describe_json("dmabuf.failures")["type"], "list");
+        assert_eq!(snapshot.select(&["dmabuf", "accepted"]), Some(json!(5)));
+        assert_eq!(snapshot.select(&["dmabuf", "failed"]), Some(json!(1)));
+        assert_eq!(
+            snapshot.select(&["dmabuf", "failures"]),
+            Some(json!([{
+                "format": "AR24",
+                "modifier": "0x0000000000000000",
+                "reason": "vulkan_rejected",
+                "detail": "fixture",
+                "at_us": 9
+            }]))
+        );
+        let leaves = snapshot
+            .leaf_paths()
+            .into_iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        for path in ["dmabuf.accepted", "dmabuf.failed", "dmabuf.failures"] {
+            assert!(leaves.iter().any(|leaf| leaf == path), "{path} listed");
+        }
     }
 
     #[test]

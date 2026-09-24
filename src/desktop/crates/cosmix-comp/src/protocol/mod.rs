@@ -1122,9 +1122,69 @@ fn assert_dmabuf_validation_off_protocol_thread() {
     }
 }
 
+/// One validation on the worker: run the probe (unless an earlier panic
+/// retired it), record the outcome in the import ledger, and answer whether
+/// the import is accepted. Split from the loop so the outcome-to-ledger
+/// mapping is testable without an `ImportNotifier`, which only smithay can
+/// construct.
+fn validate_and_record(
+    validator: &mut dyn ValidateDmabuf,
+    poisoned: &mut bool,
+    descriptor: DmabufDescriptor,
+    format: Format,
+    ledger: &dmabuf_ledger::DmabufImportLedger,
+) -> bool {
+    use dmabuf_ledger::DmabufFailureReason;
+    // A poisoned probe is never called again, but the loop keeps running:
+    // `ImportNotifier`'s destructor only logs, so a worker that returned
+    // would leave every queued client waiting on an event that can no longer
+    // arrive. Draining and refusing is what tells them.
+    if *poisoned {
+        ledger.record_failed(
+            format,
+            DmabufFailureReason::ProbeRetired,
+            "validation probe retired after an earlier panic",
+        );
+        return false;
+    }
+    match catch_unwind(AssertUnwindSafe(|| validator.validate(descriptor))) {
+        Err(_) => {
+            // An ordinary `Err` means this buffer is unusable; a panic means
+            // the probe itself is. Its state after an unwind is not something
+            // this compositor can reason about, so it is retired permanently
+            // rather than called again on the next client's descriptor.
+            *poisoned = true;
+            tracing::error!(
+                ?format,
+                "DMA-BUF validation probe panicked; refusing every further import"
+            );
+            ledger.record_failed(
+                format,
+                DmabufFailureReason::ProbePanicked,
+                "validation probe panicked",
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                ?format,
+                %error,
+                "Vulkan test import rejected DMA-BUF parameters"
+            );
+            ledger.record_failed(format, DmabufFailureReason::VulkanRejected, error);
+            false
+        }
+        Ok(Ok(())) => {
+            ledger.record_accepted();
+            true
+        }
+    }
+}
+
 fn spawn_dmabuf_validation_worker(
     mut validator: Box<dyn ValidateDmabuf>,
     wake: channel::Sender<()>,
+    ledger: dmabuf_ledger::DmabufImportLedger,
 ) -> Result<SyncSender<DmabufValidationRequest>, String> {
     let (sender, receiver) =
         mpsc::sync_channel::<DmabufValidationRequest>(DMABUF_VALIDATION_QUEUE_CAPACITY);
@@ -1143,45 +1203,18 @@ fn spawn_dmabuf_validation_worker(
                     notifier,
                     format,
                 } = request;
-                // A poisoned probe is never called again, but the loop keeps
-                // running: `ImportNotifier`'s destructor only logs, so a worker
-                // that returned here would leave every queued client waiting on
-                // an event that can no longer arrive. Draining and refusing is
-                // what tells them.
-                if poisoned {
-                    notifier.failed();
-                } else {
-                    match catch_unwind(AssertUnwindSafe(|| validator.validate(descriptor))) {
-                        Err(_) => {
-                            // An ordinary `Err` means this buffer is unusable; a
-                            // panic means the probe itself is. Its state after an
-                            // unwind is not something this compositor can reason
-                            // about, so it is retired permanently rather than
-                            // called again on the next client's descriptor.
-                            poisoned = true;
-                            tracing::error!(
-                                ?format,
-                                "DMA-BUF validation probe panicked; refusing every further import"
-                            );
-                            notifier.failed();
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                ?format,
-                                %error,
-                                "Vulkan test import rejected DMA-BUF parameters"
-                            );
-                            notifier.failed();
-                        }
-                        Ok(Ok(())) => {
-                            if let Err(error) = notifier.successful::<WaylandState>() {
-                                tracing::debug!(
-                                    %error,
-                                    "DMA-BUF client destroyed params during import"
-                                );
-                            }
-                        }
+                if validate_and_record(
+                    validator.as_mut(),
+                    &mut poisoned,
+                    descriptor,
+                    format,
+                    &ledger,
+                ) {
+                    if let Err(error) = notifier.successful::<WaylandState>() {
+                        tracing::debug!(%error, "DMA-BUF client destroyed params during import");
                     }
+                } else {
+                    notifier.failed();
                 }
                 // Both `failed` and `successful` only *queue* the event onto the
                 // client's connection; the protocol thread flushes solely from
@@ -3213,6 +3246,7 @@ impl ProtocolServer {
         // Spawned here rather than beside the other workers above because the
         // worker needs a handle onto this event loop: its outcomes are queued
         // from off-thread and only a dispatch cycle flushes them.
+        let dmabuf_ledger = dmabuf_ledger::DmabufImportLedger::default();
         let dmabuf_validation = match dmabuf_validator {
             Some(validator) => {
                 let (wake_sender, wake_source) = channel::channel::<()>();
@@ -3220,7 +3254,11 @@ impl ProtocolServer {
                     .handle()
                     .insert_source(wake_source, |_event, (), _state| {})
                     .map_err(|error| error.to_string())?;
-                Some(spawn_dmabuf_validation_worker(validator, wake_sender)?)
+                Some(spawn_dmabuf_validation_worker(
+                    validator,
+                    wake_sender,
+                    dmabuf_ledger.clone(),
+                )?)
             }
             None => None,
         };
@@ -3280,6 +3318,7 @@ impl ProtocolServer {
             supported_dmabuf_formats,
             capture_advertisements,
             dmabuf_validation,
+            dmabuf_ledger,
             data_device_state,
             xdg_activation_state,
             relative_pointer_state,
@@ -3344,6 +3383,7 @@ impl ProtocolServer {
             foreign_toplevel_identifiers: HashMap::new(),
             foreign_toplevel_nonce,
             buffer_history_surfaces: HashSet::new(),
+            buffer_bearing_surfaces: HashSet::new(),
             attach_history_surfaces: HashSet::new(),
             committed_surfaces: HashSet::new(),
             surface_objects: HashMap::new(),
@@ -6152,6 +6192,9 @@ struct WaylandState {
     /// the compositor runs without a probe, in which case metadata validation is
     /// the whole of the check.
     dmabuf_validation: Option<SyncSender<DmabufValidationRequest>>,
+    /// Observed import outcomes, shared with the validation worker; served
+    /// as the volatile `dmabuf.*` props (TODO-comp C4).
+    pub(crate) dmabuf_ledger: dmabuf_ledger::DmabufImportLedger,
     data_device_state: DataDeviceState,
     xdg_activation_state: XdgActivationState,
     /// Held, never read. `zwp_relative_pointer_v1` has no handler trait — the
@@ -6242,6 +6285,11 @@ struct WaylandState {
     /// Surfaces that have ever attached a non-null buffer. Layer-shell's
     /// AlreadyConstructed rule uses this narrower history.
     buffer_history_surfaces: HashSet<ObjectId>,
+    /// Surfaces whose last committed buffer assignment was a non-null buffer
+    /// (a later NULL attach + commit removes them). Smithay's
+    /// `SurfaceAttributes::current` cannot answer this once the commit path
+    /// has consumed the buffer; `get_xdg_surface` refuses these.
+    buffer_bearing_surfaces: HashSet<ObjectId>,
     /// Every surface that has received wl_surface.attach, including NULL.
     /// ext-session-lock rejects any prior attach history.
     attach_history_surfaces: HashSet<ObjectId>,
@@ -16138,6 +16186,7 @@ fn invalidate_keyboard_action<T>(action: &mut Option<T>) {
 }
 
 mod acquire_gate;
+pub(crate) mod dmabuf_ledger;
 mod explicit_sync;
 mod focus;
 mod handlers;

@@ -569,7 +569,12 @@ new role, so an id alone can name a different window than the one a script
 read. Every role assignment (including the role ending) takes a new,
 never-reused `generation`. Unmapping and remapping the same role (a null
 buffer, then a new one) keeps it; an X11 window that is associated again
-counts as a new role.
+counts as a new role. A client may also destroy its `xdg_toplevel` and
+`xdg_surface` and later wrap the same `wl_surface` in a fresh `xdg_surface`
+(Qt's hide→show does this); comp accepts it, and the new toplevel is a new
+role. A second `xdg_surface` is refused with `xdg_wm_base.role` only while an
+earlier one for that `wl_surface` is still alive, or when the surface carries
+a non-xdg role.
 Every surface row publishes it as `surfaces.s<id>.generation`, and window rows
 repeat it. X11 windows have no `windows.*` row yet, so read their generation
 from `surfaces.s<id>`. Treat `{id, generation}` as the window's identity:
@@ -1472,6 +1477,31 @@ clients.
 | `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
 | `wp_presentation` | 2 | Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below). |
 
+### DMA-BUF import observations
+
+The linux-dmabuf format table says what the driver *claims* to support.
+The `dmabuf.*` properties say what comp actually *accepted*, which is a
+different fact. Every `zwp_linux_buffer_params_v1` import that comp
+answers is counted. A request that Smithay refuses first with a protocol
+error, before comp sees the buffer, is not counted:
+
+- `dmabuf.accepted` counts accepted imports.
+- `dmabuf.failed` counts refused imports.
+- `dmabuf.failures` lists the newest 16 refusals, oldest first. Each is
+  `{format, modifier, reason, detail, at_us}`: the fourcc as four
+  characters, the modifier as `0x` plus 16 hex digits, a reason, the
+  refusing check's own message, and the CLOCK_MONOTONIC µs it happened.
+
+`reason` is one of `invalid_metadata` (comp's own size, plane or format
+checks), `vulkan_rejected` (the Vulkan test import on the renderer's
+device said no), `descriptor_dup_failed`, `queue_full`, `worker_stopped`,
+`probe_panicked` or `probe_retired` (refused because an earlier panic
+retired the probe). The leaves are read-only and volatile: `comp.props.get
+dmabuf` reads them, but they never appear in `props.changed`, because a
+refusal storm would flood the topic. They live in memory only and start
+from zero when comp starts. The advertised format set is not yet demoted
+from these observations.
+
 ### Presentation feedback
 
 `wp_presentation` reports when a client's commit was actually shown. The
@@ -1689,8 +1719,12 @@ band are supported.
 `DISPLAY` is never set globally. After the XWM owns `WM_S0`, the compositor
 atomically publishes a mode-0600 per-socket descriptor at
 `$XDG_RUNTIME_DIR/cosmix-comp/<WAYLAND_DISPLAY>.xwayland.env` containing
-`DISPLAY=:N` and the XWayland generation; launchers read it once and pass
-`DISPLAY` explicitly to each X client. A missing `Xwayland` binary or a
+`DISPLAY=:N` and the XWayland generation; launchers read it at each launch
+(the number can change when XWayland restarts) and pass `DISPLAY`
+explicitly to each X client. The desktop's `apps.launch` does exactly that
+(see the apps citizen in [desktop-bus](desktop-bus.md)). comp itself spawns
+no desktop applications, so setting `DISPLAY` in its own process would
+reach nothing but Xwayland. A missing `Xwayland` binary or a
 failed start degrades to a fully working native-Wayland compositor with a
 warning. An unexpected XWayland death destroys that generation's windows,
 removes the descriptor and arms a single 60-second one-shot restart backstop;
@@ -2166,6 +2200,19 @@ attach/commit ledger enforce `AlreadyConstructed`.
 The session-lock registry also exposes a narrow exact-surface retirement helper
 for KMS output replacement; it removes only the originating protocol object and
 does not alter the accepted lock generation.
+
+Smithay's `xdg_wm_base.get_xdg_surface` guard is narrowed. It still refuses
+a `wl_surface` with any non-xdg role, and one that a live `xdg_surface`
+still wraps. Once the previous `xdg_surface` is destroyed, a fresh one for
+the same `wl_surface` is accepted and may take the same xdg role again.
+Live wrappers are tracked per `wl_surface`, so a second `xdg_wm_base`
+binding cannot bypass the guard. The same request also enforces
+xdg-shell's rule that the `wl_surface` has no buffer attached or committed:
+either posts `xdg_wm_base.invalid_surface_state`. A client re-wrapping a
+surface must first commit a NULL buffer. `XdgShellHandler` gained an
+additive `surface_has_buffer` hook for this, because comp consumes
+committed buffers out of Smithay's surface state and answers from its own
+record instead.
 
 Smithay's `X11Surface` has one additive test-support setter
 (`set_wl_surface_offline`) that assigns the associated `wl_surface` directly.

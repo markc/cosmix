@@ -945,7 +945,12 @@ new role, so an id alone can name a different window than the one a script
 read. Every role assignment (including the role ending) takes a new,
 never-reused <code>generation</code>. Unmapping and remapping the same role (a null
 buffer, then a new one) keeps it; an X11 window that is associated again
-counts as a new role.
+counts as a new role. A client may also destroy its <code>xdg_toplevel</code> and
+<code>xdg_surface</code> and later wrap the same <code>wl_surface</code> in a fresh <code>xdg_surface</code>
+(Qt's hide→show does this); comp accepts it, and the new toplevel is a new
+role. A second <code>xdg_surface</code> is refused with <code>xdg_wm_base.role</code> only while an
+earlier one for that <code>wl_surface</code> is still alive, or when the surface carries
+a non-xdg role.
 Every surface row publishes it as <code>surfaces.s&lt;id&gt;.generation</code>, and window rows
 repeat it. X11 windows have no <code>windows.*</code> row yet, so read their generation
 from <code>surfaces.s&lt;id&gt;</code>. Treat <code>{id, generation}</code> as the window's identity:
@@ -1793,6 +1798,28 @@ clients.</p>
 <tr><td><code>zwlr_screencopy_manager_v1</code></td><td style="text-align: right">3</td><td>Compatibility output capture into exact-layout <code>wl_shm</code> buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion.</td></tr>
 <tr><td><code>wp_presentation</code></td><td style="text-align: right">2</td><td>Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below).</td></tr>
 </tbody></table>
+<h3 id="dma-buf-import-observations">DMA-BUF import observations</h3>
+<p>The linux-dmabuf format table says what the driver <em>claims</em> to support.
+The <code>dmabuf.*</code> properties say what comp actually <em>accepted</em>, which is a
+different fact. Every <code>zwp_linux_buffer_params_v1</code> import that comp
+answers is counted. A request that Smithay refuses first with a protocol
+error, before comp sees the buffer, is not counted:</p>
+<ul>
+<li><code>dmabuf.accepted</code> counts accepted imports.</li>
+<li><code>dmabuf.failed</code> counts refused imports.</li>
+<li><code>dmabuf.failures</code> lists the newest 16 refusals, oldest first. Each is
+<code>{format, modifier, reason, detail, at_us}</code>: the fourcc as four
+characters, the modifier as <code>0x</code> plus 16 hex digits, a reason, the
+refusing check's own message, and the CLOCK_MONOTONIC µs it happened.</li>
+</ul>
+<p><code>reason</code> is one of <code>invalid_metadata</code> (comp's own size, plane or format
+checks), <code>vulkan_rejected</code> (the Vulkan test import on the renderer's
+device said no), <code>descriptor_dup_failed</code>, <code>queue_full</code>, <code>worker_stopped</code>,
+<code>probe_panicked</code> or <code>probe_retired</code> (refused because an earlier panic
+retired the probe). The leaves are read-only and volatile: <code>comp.props.get dmabuf</code> reads them, but they never appear in <code>props.changed</code>, because a
+refusal storm would flood the topic. They live in memory only and start
+from zero when comp starts. The advertised format set is not yet demoted
+from these observations.</p>
 <h3 id="presentation-feedback">Presentation feedback</h3>
 <p><code>wp_presentation</code> reports when a client's commit was actually shown. The
 global is advertised only once a backend has wired a frame reporter, so no
@@ -2001,8 +2028,12 @@ band are supported.</p>
 <p><code>DISPLAY</code> is never set globally. After the XWM owns <code>WM_S0</code>, the compositor
 atomically publishes a mode-0600 per-socket descriptor at
 <code>$XDG_RUNTIME_DIR/cosmix-comp/&lt;WAYLAND_DISPLAY&gt;.xwayland.env</code> containing
-<code>DISPLAY=:N</code> and the XWayland generation; launchers read it once and pass
-<code>DISPLAY</code> explicitly to each X client. A missing <code>Xwayland</code> binary or a
+<code>DISPLAY=:N</code> and the XWayland generation; launchers read it at each launch
+(the number can change when XWayland restarts) and pass <code>DISPLAY</code>
+explicitly to each X client. The desktop's <code>apps.launch</code> does exactly that
+(see the apps citizen in <a href="/cos/desktop-bus">desktop-bus</a>). comp itself spawns
+no desktop applications, so setting <code>DISPLAY</code> in its own process would
+reach nothing but Xwayland. A missing <code>Xwayland</code> binary or a
 failed start degrades to a fully working native-Wayland compositor with a
 warning. An unexpected XWayland death destroys that generation's windows,
 removes the descriptor and arms a single 60-second one-shot restart backstop;
@@ -2438,6 +2469,18 @@ attach/commit ledger enforce <code>AlreadyConstructed</code>.
 The session-lock registry also exposes a narrow exact-surface retirement helper
 for KMS output replacement; it removes only the originating protocol object and
 does not alter the accepted lock generation.</p>
+<p>Smithay's <code>xdg_wm_base.get_xdg_surface</code> guard is narrowed. It still refuses
+a <code>wl_surface</code> with any non-xdg role, and one that a live <code>xdg_surface</code>
+still wraps. Once the previous <code>xdg_surface</code> is destroyed, a fresh one for
+the same <code>wl_surface</code> is accepted and may take the same xdg role again.
+Live wrappers are tracked per <code>wl_surface</code>, so a second <code>xdg_wm_base</code>
+binding cannot bypass the guard. The same request also enforces
+xdg-shell's rule that the <code>wl_surface</code> has no buffer attached or committed:
+either posts <code>xdg_wm_base.invalid_surface_state</code>. A client re-wrapping a
+surface must first commit a NULL buffer. <code>XdgShellHandler</code> gained an
+additive <code>surface_has_buffer</code> hook for this, because comp consumes
+committed buffers out of Smithay's surface state and answers from its own
+record instead.</p>
 <p>Smithay's <code>X11Surface</code> has one additive test-support setter
 (<code>set_wl_surface_offline</code>) that assigns the associated <code>wl_surface</code> directly.
 The xwayland-shell serial handshake owns the real association; the setter

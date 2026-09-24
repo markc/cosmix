@@ -26712,10 +26712,11 @@ fn a_rejected_upsert_for_a_role_destroyed_surface_converges_on_membership() {
 /// and the live role's configure serials consumed out from under it.
 ///
 /// So the sequence is refused at its first illegal request, before
-/// `data_init.init` gives the client an object at all. That the surface's role
-/// is *permanent* is what makes `get_role` the right predicate rather than a
-/// scan for a live role object; re-taking the same role through the **existing**
-/// `xdg_surface` stays legal and is covered separately.
+/// `data_init.init` gives the client an object at all. For an xdg role the
+/// predicate is "a live `xdg_surface` still wraps this `wl_surface`" — here
+/// the original wrapper is alive. Re-taking the same role through the
+/// **existing** `xdg_surface`, and through a fresh one once the old wrapper is
+/// destroyed, both stay legal and are covered separately.
 ///
 /// This fixture deliberately never sends `get_toplevel`. If it did, it could
 /// not tell an early refusal from a late one.
@@ -27313,13 +27314,16 @@ fn a_second_toplevel_on_one_xdg_surface_is_a_fatal_protocol_error() {
 }
 
 /// Destroying an `xdg_toplevel` frees the wrapper to take the role again, and
-/// does *not* free the `wl_surface` to be wrapped again.
+/// does *not* free the `wl_surface` to be wrapped again while that wrapper is
+/// still alive.
 ///
 /// Both halves matter and they pull in opposite directions, which is why they
-/// share a fixture. `get_xdg_surface` tests `get_role`, and a core role is
-/// permanent — `set_role` never clears `public_data.role` — so no scan for a
-/// *live* role object would refuse the second half here, and none should:
-/// re-wrapping a surface whose role is stamped forever is the violation.
+/// share a fixture. No live *role object* exists at the second half, so a scan
+/// for one would wave the fresh wrapper through; the guard instead asks
+/// whether a live `xdg_surface` still wraps the `wl_surface`, and wrapper 7
+/// does. (Once wrapper 7 is destroyed too, a fresh wrapper is legal — that is
+/// Qt's hide→show, pinned by
+/// [`destroying_the_xdg_surface_releases_the_wl_surface_for_a_fresh_wrapper`].)
 /// `has_active_role` is per-wrapper and *is* cleared by the role object's
 /// destructor, which is what keeps the first half legal.
 ///
@@ -27370,12 +27374,325 @@ fn destroying_a_role_object_frees_the_wrapper_but_never_the_surface() {
     assert_eq!(
         code,
         xdg_wm_base::Error::Role as u32,
-        "the wl_surface's role outlives its role object, so a fresh wrapper for \
-         it is still xdg_wm_base.role: {message}"
+        "wrapper 7 is still alive, so a second wrapper for the same wl_surface \
+         is xdg_wm_base.role: {message}"
     );
 
     drop(client);
     drop(runtime);
+}
+
+/// Destroying the `xdg_toplevel` AND its `xdg_surface` releases the
+/// `wl_surface`: a fresh `get_xdg_surface` on it is accepted, takes the
+/// toplevel role again, and maps.
+///
+/// This is Qt's hide→show (`FloatingWindow.visible = false` then `true`): it
+/// destroys both role objects, keeps the `wl_surface`, and later wraps it
+/// again. comp used to refuse the fresh wrapper with `xdg_wm_base.role`
+/// because the role stamp on the surface is permanent, which killed the client
+/// (TODO-cos, found 2026-09-16 on the QML clip panel). xdg_shell releases the
+/// surface for the same role once the role objects are gone, and wlroots,
+/// Mutter and KWin all accept the sequence.
+///
+/// The second map is asserted through the renderer channel, not just the
+/// absence of an error: an accepted-but-dead role would pass the first half.
+#[test]
+fn destroying_the_xdg_surface_releases_the_wl_surface_for_a_fresh_wrapper() {
+    const STRIDE: u32 = 16 * 4;
+    const HEIGHT: u32 = 16;
+    const POOL_BYTES: u32 = STRIDE * HEIGHT;
+
+    let runtime_dir =
+        env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required for the re-wrap oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-rewrap-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "rewrap-test".into(),
+            drm_adapter: synthetic_drm_adapter("rewrap-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        Default::default(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            f9_bus: None,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    // wl_surface 7, xdg_surface 8, xdg_toplevel 9, shm pool 11; configured.
+    let _pool = bring_up_shm_toplevel(&mut client, POOL_BYTES, "cosmix-rewrap-test");
+
+    let wait_for_map = |runtime: &WaylandRuntime, what: &str| {
+        let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+        loop {
+            let mapped = runtime
+                .drain_events()
+                .expect("protocol thread is alive")
+                .into_iter()
+                .any(|event| matches!(event, ProtocolEvent::SurfaceUpserted { .. }));
+            if mapped {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{what} must reach the renderer");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[12, 0, 16, HEIGHT, STRIDE, wl_shm::Format::Argb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the first map
+    wait_for_map(&runtime, "the first map");
+
+    // Hide, the way Qt does it: unmap, then destroy the role object and the
+    // wrapper, keeping the wl_surface.
+    send_request(&mut client, 7, 1, &words(&[0, 0, 0])); // wl_surface.attach(NULL)
+    send_request(&mut client, 7, 6, &[]); // commit: unmapped
+    send_request(&mut client, 9, 0, &[]); // xdg_toplevel.destroy
+    send_request(&mut client, 8, 0, &[]); // xdg_surface.destroy
+    send_display_request(&mut client, 0, 13);
+    let events = events_until_callback(&mut client, 13);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the hide half is plain legal teardown: {events:?}"
+    );
+    // Anything the hide produced is not the second map.
+    let _ = runtime.drain_events().expect("protocol thread is alive");
+
+    // Show: a fresh wrapper on the SAME wl_surface, the toplevel role again.
+    send_request(&mut client, 5, 2, &words(&[14, 7])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 14, 1, &words(&[15])); // xdg_surface.get_toplevel
+    send_request(&mut client, 7, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 16);
+    let events = events_until_callback(&mut client, 16);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "a fresh xdg_surface on a wl_surface whose previous wrapper is destroyed \
+         must be accepted, not refused as xdg_wm_base.role: {events:?}"
+    );
+    let serial = events
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 14 && *opcode == 0).then(|| word(body, 0)))
+        .expect("the fresh wrapper is configured after its initial commit");
+    send_request(&mut client, 14, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[17, 0, 16, HEIGHT, STRIDE, wl_shm::Format::Argb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[17, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the second map
+    send_display_request(&mut client, 0, 18);
+    let events = events_until_callback(&mut client, 18);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the second map must be accepted: {events:?}"
+    );
+    wait_for_map(&runtime, "the second map, through the fresh wrapper");
+
+    drop(client);
+    drop(runtime);
+}
+
+/// Map the harness toplevel, then hide it the way Qt does: optionally a NULL
+/// attach + commit, then destroy the `xdg_toplevel` and its `xdg_surface`,
+/// keeping the `wl_surface`. Returns the role generation the mapped window had.
+fn map_then_destroy_xdg_objects(harness: &mut KeybindingHarness, null_attach: bool) -> u64 {
+    map_initial_test_toplevel(harness);
+    let record = test_toplevel_record(harness);
+    assert!(record.mapped, "the first map must land");
+    let generation = record.generation;
+    if null_attach {
+        send_request(
+            &mut harness.client,
+            TEST_TOPLEVEL_SURFACE_ID,
+            1,
+            &words(&[0, 0, 0]),
+        ); // wl_surface.attach(NULL)
+        send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    }
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]); // xdg_toplevel.destroy
+    send_request(&mut harness.client, TEST_XDG_SURFACE_ID, 0, &[]); // xdg_surface.destroy
+    harness.dispatch_client();
+    harness.assert_client_connected("after the Qt-style hide");
+    generation
+}
+
+/// The re-wrapped toplevel is a NEW role: it maps with a fresh, larger
+/// role generation, so a script holding the old `{id, generation}` cannot
+/// act on the new window by accident (the manual's "Window identity" claim).
+#[test]
+fn a_rewrapped_toplevel_maps_as_a_new_role_generation() {
+    let mut harness = KeybindingHarness::new(false);
+    let before = map_then_destroy_xdg_objects(&mut harness, true);
+
+    let xdg_surface = harness.allocate_object_id();
+    let toplevel = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    ); // xdg_wm_base.get_xdg_surface on the same wl_surface
+    send_request(&mut harness.client, xdg_surface, 1, &words(&[toplevel])); // get_toplevel
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]); // initial commit
+    harness.dispatch_client();
+    harness.assert_client_connected("after re-wrapping the wl_surface");
+    let serial: u32 = test_toplevel_record(&harness)
+        .required_configure
+        .expect("the re-wrapped toplevel is configured")
+        .into();
+    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial])); // ack_configure
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after the second map");
+
+    let record = test_toplevel_record(&harness);
+    assert!(record.mapped, "the re-wrapped toplevel maps");
+    assert!(
+        record.generation > before,
+        "a re-wrapped toplevel is a new role: generation {} must exceed {before}",
+        record.generation
+    );
+}
+
+/// xdg_surface: "Creating an xdg_surface from a wl_surface which has a buffer
+/// attached or committed is a client error." Releasing the role on
+/// `xdg_surface.destroy` makes this reachable on a surface that already
+/// showed content, so both halves are refused at `get_xdg_surface`, before a
+/// wrapper exists: here the COMMITTED half — the client destroyed both xdg
+/// objects without first committing a NULL buffer.
+#[test]
+fn a_fresh_xdg_surface_on_a_surface_with_a_committed_buffer_is_refused() {
+    let mut harness = KeybindingHarness::new(false);
+    map_then_destroy_xdg_objects(&mut harness, false);
+
+    let xdg_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    ); // xdg_wm_base.get_xdg_surface
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, TEST_XDG_WM_BASE_ID, "{message}");
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::InvalidSurfaceState as u32,
+        "{message}"
+    );
+    assert_eq!(message, "wl_surface has a buffer attached or committed");
+}
+
+/// Smithay's DEFAULT `surface_has_buffer` (the helper any other user of the
+/// hook gets): an uncommitted NULL attach does not clear a committed buffer;
+/// only committing the NULL does. A roleless surface is used because comp
+/// leaves a roleless commit's buffer in `SurfaceAttributes::current`, which
+/// is exactly the state the default reads.
+#[test]
+fn smithay_default_buffer_check_ignores_an_uncommitted_null_attach() {
+    use smithay::wayland::shell::xdg::surface_has_attached_or_committed_buffer as has_buffer;
+    let mut harness = KeybindingHarness::new(false);
+    let surface_id = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface_id]),
+    ); // wl_compositor.create_surface
+    harness.dispatch_client();
+    let surface = test_toplevel_record(&harness)
+        .role
+        .wl_surface()
+        .client()
+        .expect("in-process client is live")
+        .object_from_protocol_id::<WlSurface>(&harness.server.state.display_handle, surface_id)
+        .expect("roleless wl_surface exists");
+    assert!(!has_buffer(&surface), "a fresh surface has no buffer");
+
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(&mut harness.client, surface_id, 1, &words(&[buffer, 0, 0])); // attach
+    harness.dispatch_client();
+    assert!(has_buffer(&surface), "a pending buffer counts");
+    send_request(&mut harness.client, surface_id, 6, &[]); // commit
+    harness.dispatch_client();
+    assert!(has_buffer(&surface), "a committed buffer counts");
+
+    send_request(&mut harness.client, surface_id, 1, &words(&[0, 0, 0])); // attach(NULL)
+    harness.dispatch_client();
+    assert!(
+        has_buffer(&surface),
+        "an UNCOMMITTED NULL attach must not hide the committed buffer"
+    );
+    send_request(&mut harness.client, surface_id, 6, &[]); // commit the NULL
+    harness.dispatch_client();
+    assert!(!has_buffer(&surface), "only a committed NULL clears it");
+}
+
+/// The ATTACHED half: the committed state is empty (NULL attach + commit),
+/// but a new buffer is attached and not yet committed when the client asks
+/// for the wrapper.
+#[test]
+fn a_fresh_xdg_surface_on_a_surface_with_a_pending_buffer_is_refused() {
+    let mut harness = KeybindingHarness::new(false);
+    map_then_destroy_xdg_objects(&mut harness, true);
+
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    ); // wl_surface.attach, NOT committed
+    let xdg_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    ); // xdg_wm_base.get_xdg_surface
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, TEST_XDG_WM_BASE_ID, "{message}");
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::InvalidSurfaceState as u32,
+        "{message}"
+    );
+    assert_eq!(message, "wl_surface has a buffer attached or committed");
 }
 
 /// Destroying an `xdg_surface` before its role object is `defunct_role_object`,
@@ -28542,6 +28859,148 @@ fn a_rejected_dmabuf_fails_that_import_only() {
         assert_eq!(*call, expected_probed_buffer(call.thread.clone()));
         assert_ne!(call.thread, "cosmix-wayland");
     }
+}
+
+/// The protocol thread's own recording sites reach the import ledger too
+/// (review MINOR-4): an import accepted by metadata validation alone (the
+/// harness has no probe) counts as accepted, and a buffer comp's metadata
+/// check refuses -- a stride smaller than a packed row, through the fallible
+/// `create` so the client survives -- is recorded as `invalid_metadata` with
+/// its format and the check's own message.
+#[test]
+fn protocol_thread_dmabuf_outcomes_reach_the_import_ledger() {
+    let mut harness = KeybindingHarness::new(false);
+    assert!(
+        harness.server.state.dmabuf_validation.is_none(),
+        "the harness runs without a probe, so metadata validation is the whole check"
+    );
+    let before = harness.server.state.dmabuf_ledger.snapshot();
+
+    harness.create_dmabuf_buffer_sized(64, 32);
+    let accepted = harness.server.state.dmabuf_ledger.snapshot();
+    assert_eq!(accepted.accepted, before.accepted + 1);
+    assert_eq!(accepted.failed, before.failed);
+
+    let params = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_LINUX_DMABUF_ID,
+        1,
+        &words(&[params]),
+    ); // zwp_linux_dmabuf_v1.create_params
+    let plane = anonymous_plane("cosmix-dmabuf-ledger-metadata", 4 * 32);
+    let modifier = u64::from(smithay::backend::allocator::Modifier::Linear);
+    send_request_with_fd(
+        &mut harness.client,
+        params,
+        1,
+        &words(&[0, 0, 4, (modifier >> 32) as u32, modifier as u32]),
+        plane.as_fd(),
+    ); // add: stride 4 for a 64-pixel row
+    send_request(
+        &mut harness.client,
+        params,
+        2,
+        &words(&[
+            64,
+            32,
+            smithay::backend::allocator::Fourcc::Argb8888 as u32,
+            0,
+        ]),
+    ); // create (fallible)
+    let events = harness.sync();
+    assert!(
+        events
+            .iter()
+            .any(|(object, opcode, _)| *object == params && *opcode == 1),
+        "comp answers `failed` for the bad stride: {events:?}"
+    );
+
+    let refused = harness.server.state.dmabuf_ledger.snapshot();
+    assert_eq!(refused.accepted, accepted.accepted);
+    assert_eq!(refused.failed, accepted.failed + 1);
+    let record = refused.failures.last().expect("the refusal is recorded");
+    assert_eq!(record.reason, "invalid_metadata");
+    assert_eq!(record.format, "AR24");
+    assert_eq!(record.modifier, "0x0000000000000000");
+    assert!(
+        record.detail.contains("stride 4 is smaller than packed row 256"),
+        "{}",
+        record.detail
+    );
+}
+
+/// Every probe outcome lands in the import ledger that `dmabuf.*` props
+/// serve (TODO-comp C4): an accept counts, a driver rejection keeps its
+/// format, modifier and the probe's own message, and a panic retires the
+/// probe so the next buffer is recorded as refused by the retired probe
+/// without the probe being called.
+#[test]
+fn every_dmabuf_probe_outcome_is_recorded_in_the_import_ledger() {
+    use super::dmabuf_ledger::DmabufImportLedger;
+    let (validator, calls) = ScriptedValidator::new(vec![
+        ProbeStep::Accept,
+        ProbeStep::Reject,
+        ProbeStep::Panic,
+        ProbeStep::Accept,
+    ]);
+    let mut validator: Box<dyn ValidateDmabuf> = Box::new(validator);
+    let ledger = DmabufImportLedger::default();
+    let mut poisoned = false;
+    let format = smithay::backend::allocator::Format {
+        code: smithay::backend::allocator::Fourcc::Argb8888,
+        modifier: smithay::backend::allocator::Modifier::Linear,
+    };
+    let descriptor = || DmabufDescriptor {
+        explicit_acquire: false,
+        width: VALIDATION_WIDTH,
+        height: VALIDATION_HEIGHT,
+        fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+        modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+        planes: vec![DmabufPlane {
+            fd: std::os::fd::OwnedFd::from(anonymous_plane(
+                "cosmix-dmabuf-ledger",
+                u64::from(VALIDATION_STRIDE) * u64::from(VALIDATION_HEIGHT),
+            )),
+            offset: 0,
+            stride: VALIDATION_STRIDE,
+        }],
+    };
+
+    let outcomes = (0..4)
+        .map(|_| {
+            validate_and_record(
+                validator.as_mut(),
+                &mut poisoned,
+                descriptor(),
+                format,
+                &ledger,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, [true, false, false, false]);
+    assert!(poisoned, "the panic retired the probe");
+    assert_eq!(
+        calls.lock().expect("probe call log mutex poisoned").len(),
+        3,
+        "the retired probe was not called for the fourth buffer"
+    );
+
+    let snapshot = ledger.snapshot();
+    assert_eq!((snapshot.accepted, snapshot.failed), (1, 3));
+    let reasons = snapshot
+        .failures
+        .iter()
+        .map(|record| record.reason)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        ["vulkan_rejected", "probe_panicked", "probe_retired"]
+    );
+    let rejected = &snapshot.failures[0];
+    assert_eq!(rejected.format, "AR24");
+    assert_eq!(rejected.modifier, "0x0000000000000000");
+    assert_eq!(rejected.detail, "scripted probe rejection");
 }
 
 /// The same rejection reached through `create_immed` must kill the client.

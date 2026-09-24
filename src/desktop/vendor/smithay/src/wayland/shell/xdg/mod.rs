@@ -1086,11 +1086,40 @@ impl Cacheable for SurfaceCachedState {
     }
 }
 
+/// Whether a non-null buffer is pending on `surface` (attached, not yet
+/// committed) or still in its committed state. Only a COMMITTED null attach
+/// clears the committed half: a pending, uncommitted null attach leaves the
+/// committed buffer in place, so it still counts.
+pub fn surface_has_attached_or_committed_buffer(surface: &wl_surface::WlSurface) -> bool {
+    use crate::wayland::compositor::{BufferAssignment, SurfaceAttributes};
+    compositor::with_states(surface, |states| {
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        if matches!(attributes.pending().buffer, Some(BufferAssignment::NewBuffer(_))) {
+            return true;
+        }
+        matches!(
+            attributes.current().buffer,
+            Some(BufferAssignment::NewBuffer(_))
+        )
+    })
+}
+
 /// Xdg Shell handler type
 #[allow(unused_variables)]
 pub trait XdgShellHandler {
     /// [XdgShellState] getter
     fn xdg_shell_state(&mut self) -> &mut XdgShellState;
+
+    /// Whether `surface` has a buffer attached (pending) or committed, which
+    /// makes `xdg_wm_base.get_xdg_surface` on it a client error.
+    ///
+    /// The default reads Smithay's own surface state
+    /// ([`surface_has_attached_or_committed_buffer`]). A compositor that
+    /// consumes committed buffers out of `SurfaceAttributes::current` must
+    /// override this with its own record of the last committed buffer.
+    fn surface_has_buffer(&mut self, surface: &wl_surface::WlSurface) -> bool {
+        surface_has_attached_or_committed_buffer(surface)
+    }
 
     /// A new shell client was instantiated
     fn new_client(&mut self, client: ShellClient) {}
