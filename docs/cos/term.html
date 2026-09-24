@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/</title>
+    <title>CosMix — cos/term</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,55 +441,115 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/README.md"><div class="prose"><h1 id="cos--component-docs">cos — component docs</h1>
-<p>Summary documentation for the <strong>cos</strong> daemon family, one page per component. The
-canonical home of these pages is
-<a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> in the public
-<a href="https://github.com/markc/cosmix">markc/cos</a> repo; add a page by dropping
-<code>COMPONENT.md</code> there. The same files render three ways:</p>
+        <div id="content-doc" data-prerendered="cos/term.md"><div class="prose"><h1 id="term--the-lightweight-terminal">term — the lightweight terminal</h1>
+<p>CosMix Term (<code>apps/term</code>, binary <code>term</code>) is the tabbed Mix terminal on iced
+and wgpu. It is the lightweight frontend over <code>cosmix-term-core</code>, the same
+toolkit-free core as the Bevy frontend CosMix BTerm (<code>bterm</code>). The two share
+the PTY, the VT grid, the tab and pane model, the glyph raster and the Bus
+handlers. Only the window differs.</p>
+<p>It registers the Bus name <code>term</code> and serves the <code>term.*</code> verbs. bterm
+registers <code>bterm</code> and serves <code>bterm.*</code>, so both can run at once. <code>mix --gui</code>
+still prefers bterm until term reaches full verb parity (decisions D6 and
+D10). Set <code>COSMIX_TERM_BIN</code> to the <code>term</code> binary to launch this one.</p>
+<h2 id="tabs-and-panes">Tabs and panes</h2>
+<p>The tab strip across the top shows one button per tab and a <code>+</code> that opens a
+new one. Clicking a tab selects it. Each tab holds a tree of split panes, and
+clicking a pane focuses it. When a tab has more than one pane, the focused
+pane's border takes the design's focus-ring colour. Every other border,
+including a tab's only pane, takes the plain border colour.
+All strip and border colours come from the <code>cosmix-design</code> tokens.</p>
+<p>Every tab is labelled <code>mix</code> for now, since the core does not yet take a title
+from the shell. The strip does not scroll or wrap. At the default window width, past about 17 tabs the <code>+</code>
+and the later tabs run off the right edge, although up to 32 terminals can be
+open. Ctrl+PageUp and Ctrl+PageDown still reach every tab.</p>
+<p>Every pane keeps a border of the same width whether or not it is focused, so
+moving focus never resizes a PTY. Split edges are placed on whole physical
+pixels, so a pane's grid is never drawn half a pixel off the display.</p>
+<p>Only the active tab's panes are drawn. A hidden tab keeps running and holds
+no grid buffers. When it is shown again every pane repaints in full.</p>
+<p>When a pane's shell exits, the pane closes. Closing the last pane of a tab
+closes the tab, and closing the last tab quits. A shell that exits on its own
+raises a desktop notification, as in bterm. Set <code>TERM_NOTIFY=0</code> to turn that
+off.</p>
+<h2 id="keys">Keys</h2>
+<p>The chords are bterm's. They need Ctrl and Shift, or Ctrl alone where shown.
+Any chord that also holds Alt or Super is left alone.</p>
+<table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
+<tr><td>Ctrl+Shift+T</td><td>new tab</td></tr>
+<tr><td>Ctrl+Shift+W</td><td>close the active tab</td></tr>
+<tr><td>Ctrl+PageDown / Ctrl+PageUp</td><td>next / previous tab</td></tr>
+<tr><td>Ctrl+Shift+E</td><td>split the focused pane side by side</td></tr>
+<tr><td>Ctrl+Shift+O</td><td>split the focused pane top and bottom</td></tr>
+<tr><td>Ctrl+Shift+X</td><td>close the focused pane</td></tr>
+<tr><td>Ctrl+Shift+arrows</td><td>focus the nearest pane in that direction</td></tr>
+<tr><td>Ctrl+Shift+Q</td><td>quit</td></tr>
+</tbody></table>
+<p>Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
+the repeats are dropped rather than sent to the shell.</p>
+<p>Everything else goes to the focused pane's shell. That means printable text
+in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
+Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>
+<h2 id="font-size">Font size</h2>
+<p>Font sizing follows foot. The window keeps its size and the grid gains or
+loses cells. Every pane is re-rasterised, and every shell is told its new
+size.</p>
+<table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
+<tr><td>Ctrl+plus, Ctrl+equal, Ctrl+keypad plus</td><td>one step larger</td></tr>
+<tr><td>Ctrl+minus, Ctrl+keypad minus</td><td>one step smaller</td></tr>
+<tr><td>Ctrl+0, Ctrl+keypad 0</td><td>back to the configured size</td></tr>
+<tr><td>Ctrl+wheel up / down</td><td>one step larger / smaller per notch</td></tr>
+</tbody></table>
+<p>A step is foot's half point, which is two thirds of a logical pixel. The
+size stays within the 6 to 48 pixel range that <code>font_px</code> accepts, and
+stepping stops at either end. These chords repeat when held. Touchpad
+scrolling counts 40 logical pixels of travel as one step.</p>
+<p>The zoomed size lasts for the life of the window. It applies to every tab and
+pane, including ones opened later. It survives moving the window to an output
+with a different scale. It is not written back to <code>term.conf.mix</code>, so a new
+window starts at the configured size.</p>
+<h2 id="configuration">Configuration</h2>
+<p><code>~/.config/cosmix/term.conf.mix</code> is shared with bterm. It sets <code>font_px</code>,
+<code>scrollback</code> and <code>cursor</code>. <code>TERM_FONT_PX</code> overrides <code>font_px</code> for one run,
+and <code>TERM_SPIKE_FONT</code> names a monospace font file.</p>
 <ul>
-<li><strong>Web</strong> — <a href="https://markc.github.io/cos/">markc.github.io/cos</a> serves this manual in the site's left-hand <strong>Components</strong> pane; any page deep-links as <code>#_man/PAGE.md</code>.</li>
-<li><strong>GitHub</strong> — browse <a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> directly; this file doubles as the directory README.</li>
-<li><strong>Local clone</strong> — plain markdown with relative links; any editor or viewer works.</li>
+<li><code>term --print-config</code> prints the resolved settings and exits.</li>
+<li><code>term --version</code> prints the version and build hash and does nothing else.</li>
 </ul>
-<p>These are <strong>summaries</strong> — what each component is and how to use it — not
-exhaustive manpages. For the language that drives these daemons, see the
-<a href="https://markc.github.io/mix/">mix manual</a>.</p>
-<h2 id="start-here">Start here</h2>
+<h2 id="bus">Bus</h2>
+<p>term serves the core's <code>term.*</code> surface under the mesh-open law, like
+bterm. <code>send term HELP</code> lists the full surface. A verb and the matching chord
+make the same change, and the window follows a verb straight away. Every body
+is a JSON object, and <code>{}</code> means no arguments.</p>
+<table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>term.tabs</code></td><td><code>{}</code></td><td>list tabs: id, active, title, cols, rows, child pid, revision</td></tr>
+<tr><td><code>term.tab.new</code></td><td><code>{}</code></td><td>open a tab and select it</td></tr>
+<tr><td><code>term.tab.select</code></td><td><code>{"id":N}</code></td><td>select tab N</td></tr>
+<tr><td><code>term.tab.close</code></td><td><code>{"id":N}</code></td><td>close tab N; closing the last tab quits</td></tr>
+<tr><td><code>term.panes</code></td><td><code>{}</code></td><td>list the active tab's panes: id, focus, cols, rows, child pid, geometry, tab, revision</td></tr>
+<tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
+<tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
+<tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
+<tr><td><code>term.snapshot</code></td><td><code>{}</code></td><td>read the focused pane's screen, size and cursor</td></tr>
+<tr><td><code>term.type</code></td><td><code>{"text":"..."}</code></td><td>type ASCII into the focused pane, as keys</td></tr>
+</tbody></table>
+<pre><code class="language-mix">send term term.tab.new
+send term term.pane.split dir=v
+send term term.panes
+</code></pre>
+<p><code>term.panes</code> reports each pane's geometry in logical pixels, relative to the
+pane area below the tab strip, as bterm does.</p>
+<p>With no broker, term prints that the Bus is unavailable and works as a
+plain terminal.</p>
+<h2 id="not-yet-in-this-frontend">Not yet in this frontend</h2>
 <ul>
-<li><strong><a href="/cos/overview">overview</a></strong> — what cos is, how the workspace is laid out, how it fits with bus and mix.</li>
-</ul>
-<h2 id="daemons">Daemons</h2>
-<ul>
-<li><strong><a href="/cos/noded">noded</a></strong> — the Bus broker; every node runs one.</li>
-<li><strong><a href="/cos/maild">maild</a></strong> — JMAP-native mail daemon (SMTP + IMAP + JMAP + spam).</li>
-<li><strong><a href="/cos/webd">webd</a></strong> — multi-vhost HTTPS + ACME; server-rendered web UI.</li>
-<li><strong><a href="/cos/dnsd">dnsd</a></strong> — authoritative WireGuard-mesh DNS.</li>
-<li><strong><a href="/cos/indexd">indexd</a></strong> — vector knowledge base / indexer.</li>
-<li><strong><a href="/cos/desktop">desktop</a></strong> — the CosMix desktop: <code>cosmix-comp</code> (Smithay + Bevy Wayland compositor), the <code>ctk</code> toolkit and the native apps.</li>
-<li><strong><a href="/cos/cosmix-comp">cosmix-comp</a></strong> — Wayland compositor and supported protocol globals.</li>
-<li><strong><a href="/cos/term">term</a></strong> — the lightweight iced + wgpu terminal: tabs, split panes, foot-style font sizing, the <code>term.*</code> Bus surface.</li>
-<li><strong><a href="/cos/quoin">quoin</a></strong> — corner-driven desktop panels with standalone SCTK and experimental compositor hosts.</li>
-<li><strong><a href="/cos/quoin-panel">quoin-panel</a></strong> — the Plasma-style bottom panel, launcher, calendar and notifications as Mix Scenes.</li>
-<li><strong><a href="/cos/cosmix-bg-showcase">cosmix-bg-showcase</a></strong> — shared Bloom, Shapes, Boing and Boids demos with native Bus controls.</li>
-<li><strong><a href="/cos/cosmix-capture">cosmix-capture</a></strong> — native Wayland screenshots and full-output MP4 recording controlled through Bus.</li>
-<li><strong><a href="/cos/cosmix-media">cosmix-media</a></strong> — native CTK MP3/MP4 player with PipeWire-compatible audio and Bus playback controls.</li>
-<li><strong><a href="/cos/cosmix-wallpaper">cosmix-wallpaper</a></strong> — GPU-rendered flocking background with window avoidance, pointer repulsion and native Bus preferences.</li>
-<li><strong><a href="/cos/agentd">agentd</a></strong> — agent supervision.</li>
-<li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power state.</li>
-<li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
-<li><strong><a href="/cos/dbusd">dbusd</a></strong> — the D-Bus boundary daemon: hosts the per-domain D-Bus adapters.</li>
-</ul>
-<h2 id="bridge--libraries">Bridge &amp; libraries</h2>
-<ul>
-<li><strong><a href="/cos/foreman">foreman</a></strong> — task runner, policy gate, verifier, and refinery operator runbook.</li>
-<li><strong><a href="/cos/mcp">mcp</a></strong> — the Claude Code MCP bridge.</li>
-<li><strong><a href="/cos/libraries">libraries</a></strong> — the shared <code>cosmix-lib-*</code> substrate crates.</li>
-</ul>
-<h2 id="see-also">See also</h2>
-<ul>
-<li>Repos: <a href="https://github.com/markc/cosmix">markc/cos</a> · <a href="https://github.com/markc/cosmix">markc/mix</a> · <a href="https://github.com/markc/cosmix">markc/bus</a>.</li>
-<li>The <a href="https://markc.github.io/mix/">mix manual</a> — the language and shell used to operate these daemons.</li>
+<li>Mouse reporting, wheel scrollback and selection. bterm has them, see
+<a href="/cos/term-mouse">term-mouse</a>.</li>
+<li>The app-control port: <code>app.describe</code>, <code>app.quit</code> and <code>app.controls.*</code> are
+not served yet.</li>
+<li>The native-session lane, see <a href="/cos/term-native-session">term-native-session</a>.
+bterm is still its only client.</li>
+<li>A verb for the font size. Until one exists, font size is set from the
+keyboard or the wheel only.</li>
 </ul></div></div>
     </div>
 

@@ -5,8 +5,185 @@
 //! deliberately: the two frontends must put the same bytes on the PTY, and the
 //! only way to know that is to compare them against the same encoder.
 
+use cosmix_term_core::panes::{Direction, SplitDir};
 use cosmix_term_core::terminal::Key as TerminalKey;
-use iced::keyboard::{Key, Modifiers, key::Named};
+use iced::keyboard::key::{Code, Named, Physical};
+use iced::keyboard::{Key, Modifiers};
+use iced::mouse::ScrollDelta;
+
+/// What a chord does to the terminal rather than to the shell in it.
+///
+/// Tabs and panes use bterm's chords exactly (T3 parity, `docs/cos/term.md`);
+/// the font chords are foot's (T4, `man 5 foot.ini` § key-bindings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    NewTab,
+    CloseTab,
+    Quit,
+    Split(SplitDir),
+    ClosePane,
+    Focus(Direction),
+    Cycle { forward: bool },
+    FontIncrease,
+    FontDecrease,
+    FontReset,
+}
+
+impl Action {
+    /// Whether holding the chord repeats it. Font steps do, as in foot; a
+    /// held Ctrl+Shift+T must not open a tab per autorepeat tick. A repeat of
+    /// a non-repeating chord is still CONSUMED — it never reaches the PTY as
+    /// a control code.
+    pub fn repeats(self) -> bool {
+        matches!(
+            self,
+            Self::FontIncrease | Self::FontDecrease | Self::FontReset
+        )
+    }
+}
+
+/// The terminal's own chord for a key press, if it is one.
+///
+/// `key` is the key with no modifiers applied and `modified` is the key with
+/// everything but Ctrl applied (iced's `key` and `modified_key`). Both are
+/// needed for foot's `Control+plus`: on a US layout plus is Shift+=, so `key`
+/// says "=" and `modified` says "+", while on a layout with a dedicated plus
+/// key `key` itself says "+". The keypad's plus and minus report as those
+/// characters in both, which covers `KP_Add` and `KP_Subtract`.
+///
+/// The keypad's zero does NOT: `key` is winit's `key_without_modifiers`,
+/// which ignores NumLock too, so it reports the level-0 keysym `KP_Insert`
+/// (`Named::Insert`). Only `modified` says "0". So minus and zero are matched
+/// on either — which is safe, because Shift is refused for both and no
+/// layout's unshifted `modified` says "0" or "-" on a key that means
+/// something else. With NumLock off both say Insert and nothing fires, as in
+/// foot, whose binding is on the `KP_0` keysym.
+///
+/// The letter chords (Ctrl+Shift+T and friends) read the layout's letter
+/// first and fall back to the PHYSICAL key when the layout has no Latin
+/// letter there — on a Cyrillic layout Ctrl+Shift+T says "е", and bterm,
+/// which matches Bevy's physical `KeyCode`, would still open a tab. Logical
+/// first so a Dvorak user's T is the key labelled T.
+///
+/// Alt and Super chords are never ours, exactly as in [`keys_for`].
+pub fn action_for(
+    key: &Key,
+    modified: &Key,
+    physical: Physical,
+    modifiers: Modifiers,
+) -> Option<Action> {
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    let shift = modifiers.shift();
+    let is = |candidate: &Key, text: &str| matches!(candidate.as_ref(), Key::Character(c) if c == text);
+    if is(modified, "+") || is(modified, "=") || is(key, "+") || is(key, "=") {
+        return Some(Action::FontIncrease);
+    }
+    if !shift && (is(key, "-") || is(modified, "-")) {
+        return Some(Action::FontDecrease);
+    }
+    if !shift && (is(key, "0") || is(modified, "0")) {
+        return Some(Action::FontReset);
+    }
+    match key.as_ref() {
+        Key::Character(_) if shift => Some(match chord_letter(key, physical)? {
+            't' => Action::NewTab,
+            'w' => Action::CloseTab,
+            'q' => Action::Quit,
+            'e' => Action::Split(SplitDir::Vertical),
+            'o' => Action::Split(SplitDir::Horizontal),
+            'x' => Action::ClosePane,
+            _ => return None,
+        }),
+        Key::Named(named) if shift => Some(Action::Focus(match named {
+            Named::ArrowLeft => Direction::Left,
+            Named::ArrowRight => Direction::Right,
+            Named::ArrowUp => Direction::Up,
+            Named::ArrowDown => Direction::Down,
+            _ => return None,
+        })),
+        Key::Named(Named::PageDown) => Some(Action::Cycle { forward: true }),
+        Key::Named(Named::PageUp) => Some(Action::Cycle { forward: false }),
+        _ => None,
+    }
+}
+
+/// The lowercase Latin letter a chord key stands for: the layout's own
+/// letter when it has one, else the physical key's US position.
+///
+/// The fallback is only for layouts with NO Latin letter on the key. A Latin
+/// layout that puts an accented letter there — Turkish F has "ğ" where US
+/// has E and "ö" where US has X — has its own e and x elsewhere, and those
+/// are its chords. Falling back there too would bind both keys, and
+/// Ctrl+Shift+ö would close a pane (round-2 review finding).
+fn chord_letter(key: &Key, physical: Physical) -> Option<char> {
+    if let Key::Character(c) = key.as_ref() {
+        if let Some(letter) = ascii_letter(c) {
+            return Some(letter.to_ascii_lowercase());
+        }
+        let mut chars = c.chars();
+        if let (Some(first), None) = (chars.next(), chars.next())
+            && first.is_alphabetic()
+            && is_latin(first)
+        {
+            return None;
+        }
+    }
+    let Physical::Code(code) = physical else {
+        return None;
+    };
+    Some(match code {
+        Code::KeyT => 't',
+        Code::KeyW => 'w',
+        Code::KeyQ => 'q',
+        Code::KeyE => 'e',
+        Code::KeyO => 'o',
+        Code::KeyX => 'x',
+        _ => return None,
+    })
+}
+
+/// Whether `c` is in a Latin-script block: Basic Latin, the Latin-1
+/// Supplement, Latin Extended-A and -B, and Latin Extended Additional.
+/// Callers check `is_alphabetic` too, so the symbols in those blocks (such as
+/// `×` and `÷`) never count as letters.
+fn is_latin(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x00FF | 0x0100..=0x024F | 0x1E00..=0x1EFF
+    )
+}
+
+/// Logical pixels of smooth (touchpad) scrolling that make one font step.
+/// A notched wheel reports whole lines and steps once per notch.
+pub const PIXELS_PER_STEP: f32 = 40.0;
+
+/// Ctrl+wheel -> font steps: positive grows, negative shrinks. Positive is
+/// iced's scroll-up, the direction foot calls `BTN_WHEEL_BACK` (its
+/// scrollback-up button), and foot binds `font-increase=Control+BTN_WHEEL_BACK`
+/// (`/etc/xdg/foot/foot.ini`), so the two agree.
+///
+/// Fractions accumulate in `pending` so a touchpad's stream of small deltas
+/// adds up to steps instead of rounding every one of them to zero; turning
+/// round discards what was accumulated the other way, so a reversal answers
+/// at once rather than first paying back the old direction.
+pub fn wheel_steps(pending: &mut f32, delta: ScrollDelta) -> i32 {
+    let amount = match delta {
+        ScrollDelta::Lines { y, .. } => y,
+        ScrollDelta::Pixels { y, .. } => y / PIXELS_PER_STEP,
+    };
+    if !amount.is_finite() || amount == 0.0 {
+        return 0;
+    }
+    if amount.signum() != pending.signum() {
+        *pending = 0.0;
+    }
+    *pending += amount;
+    let steps = pending.trunc();
+    *pending -= steps;
+    steps as i32
+}
 
 /// The keys one press sends, in order. Empty means "not ours" — Alt and Super
 /// chords are left unhandled rather than swallowed, so a future accelerator
@@ -156,6 +333,214 @@ mod tests {
         assert!(bytes(&Key::Named(Named::F5), None, Modifiers::CTRL).is_empty());
         assert!(bytes(&character("é"), Some("é"), Modifiers::CTRL).is_empty());
         assert!(bytes(&Key::Unidentified, None, Modifiers::empty()).is_empty());
+    }
+
+    fn named(named: Named) -> Key {
+        Key::Named(named)
+    }
+
+    /// `action_for` with no physical key, so every case below is decided by
+    /// the logical keys alone — the layout-independent fallback has its own
+    /// test.
+    fn act(key: &Key, modified: &Key, modifiers: Modifiers) -> Option<Action> {
+        action_for(
+            key,
+            modified,
+            Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+            modifiers,
+        )
+    }
+
+    /// Review finding: on a Cyrillic layout the T key's unmodified character
+    /// is "е", and matching the character alone left every tab chord dead.
+    /// bterm matches the physical key, so the same press must work here.
+    #[test]
+    fn letter_chords_fall_back_to_the_physical_key_on_non_latin_layouts() {
+        let cyrillic = [
+            ("е", "Е", Code::KeyT, Action::NewTab),
+            ("ц", "Ц", Code::KeyW, Action::CloseTab),
+            ("й", "Й", Code::KeyQ, Action::Quit),
+            ("у", "У", Code::KeyE, Action::Split(SplitDir::Vertical)),
+            ("щ", "Щ", Code::KeyO, Action::Split(SplitDir::Horizontal)),
+            ("ч", "Ч", Code::KeyX, Action::ClosePane),
+        ];
+        for (plain, shifted, code, action) in cyrillic {
+            let key = character(plain);
+            assert_eq!(
+                act(&key, &character(shifted), ctrl_shift()),
+                None,
+                "without the physical key there is nothing to go on"
+            );
+            assert_eq!(
+                action_for(&key, &character(shifted), Physical::Code(code), ctrl_shift()),
+                Some(action),
+                "{code:?}"
+            );
+        }
+        // The layout's own Latin letter wins over the position: on Dvorak the
+        // key labelled T sits where QWERTY has K.
+        assert_eq!(
+            action_for(&character("t"), &character("T"), Physical::Code(Code::KeyK), ctrl_shift()),
+            Some(Action::NewTab)
+        );
+        // Turkish F (round-2 finding): accented Latin letters sit on the US
+        // E and X positions, and the layout has its own e and x elsewhere.
+        // The accented keys must NOT fire; the layout's letters must.
+        assert_eq!(
+            action_for(&character("ğ"), &character("Ğ"), Physical::Code(Code::KeyE), ctrl_shift()),
+            None,
+            "Ctrl+Shift+ğ split a pane"
+        );
+        assert_eq!(
+            action_for(&character("ö"), &character("Ö"), Physical::Code(Code::KeyX), ctrl_shift()),
+            None,
+            "Ctrl+Shift+ö closed a pane"
+        );
+        for (letter, code, action) in [
+            ("e", Code::KeyQ, Action::Split(SplitDir::Vertical)),
+            ("x", Code::KeyB, Action::ClosePane),
+        ] {
+            assert_eq!(
+                action_for(&character(letter), &character(&letter.to_uppercase()), Physical::Code(code), ctrl_shift()),
+                Some(action),
+                "the layout's own {letter}"
+            );
+        }
+        // Other Latin blocks too: Extended-B (ǝ) and Extended Additional (ẽ).
+        for accented in ["ǝ", "ẽ"] {
+            assert_eq!(
+                action_for(&character(accented), &character(accented), Physical::Code(Code::KeyT), ctrl_shift()),
+                None,
+                "{accented}"
+            );
+        }
+        // Greek, like Cyrillic, has no Latin letter and still falls back.
+        assert_eq!(
+            action_for(&character("τ"), &character("Τ"), Physical::Code(Code::KeyT), ctrl_shift()),
+            Some(Action::NewTab)
+        );
+        // A physical fallback must not invent chords: an unmapped position
+        // on a non-Latin layout is nothing.
+        assert_eq!(
+            action_for(&character("к"), &character("К"), Physical::Code(Code::KeyR), ctrl_shift()),
+            None
+        );
+    }
+
+    fn ctrl_shift() -> Modifiers {
+        Modifiers::CTRL | Modifiers::SHIFT
+    }
+
+    /// bterm's chords, one for one: T3 parity is the same keys doing the same
+    /// thing, and the Shift+letter case arrives as the unmodified letter.
+    #[test]
+    fn tab_and_pane_chords_match_bterm() {
+        let cases = [
+            ("t", Action::NewTab),
+            ("w", Action::CloseTab),
+            ("q", Action::Quit),
+            ("e", Action::Split(SplitDir::Vertical)),
+            ("o", Action::Split(SplitDir::Horizontal)),
+            ("x", Action::ClosePane),
+        ];
+        for (letter, action) in cases {
+            let key = character(letter);
+            assert_eq!(act(&key, &character(&letter.to_uppercase()), ctrl_shift()), Some(action));
+            // Without Shift it is the shell's Ctrl+letter, not ours.
+            assert_eq!(act(&key, &key, Modifiers::CTRL), None, "Ctrl+{letter}");
+        }
+        for (arrow, direction) in [
+            (Named::ArrowLeft, Direction::Left),
+            (Named::ArrowRight, Direction::Right),
+            (Named::ArrowUp, Direction::Up),
+            (Named::ArrowDown, Direction::Down),
+        ] {
+            let key = named(arrow);
+            assert_eq!(act(&key, &key, ctrl_shift()), Some(Action::Focus(direction)));
+            assert_eq!(act(&key, &key, Modifiers::CTRL), None);
+        }
+        let down = named(Named::PageDown);
+        let up = named(Named::PageUp);
+        assert_eq!(act(&down, &down, Modifiers::CTRL), Some(Action::Cycle { forward: true }));
+        assert_eq!(act(&up, &up, Modifiers::CTRL), Some(Action::Cycle { forward: false }));
+        // bterm cycles on Ctrl+PageUp/PageDown WITHOUT Shift only.
+        assert_eq!(act(&down, &down, ctrl_shift()), None);
+        // Tab chords never repeat: a held Ctrl+Shift+T is one tab.
+        assert!(!Action::NewTab.repeats());
+        assert!(!Action::ClosePane.repeats());
+    }
+
+    /// foot's font-increase / font-decrease / font-reset bindings, including
+    /// the keypad and the US-layout "plus is Shift+=" case.
+    #[test]
+    fn font_chords_match_foot() {
+        let plus = character("+");
+        let equal = character("=");
+        let minus = character("-");
+        let zero = character("0");
+        // Control+equal.
+        assert_eq!(act(&equal, &equal, Modifiers::CTRL), Some(Action::FontIncrease));
+        // Control+plus on US: key "=" with Shift, modified "+".
+        assert_eq!(act(&equal, &plus, ctrl_shift()), Some(Action::FontIncrease));
+        // Control+plus on a layout with a plus key, and Control+KP_Add.
+        assert_eq!(act(&plus, &plus, Modifiers::CTRL), Some(Action::FontIncrease));
+        // Control+minus and Control+KP_Subtract.
+        assert_eq!(act(&minus, &minus, Modifiers::CTRL), Some(Action::FontDecrease));
+        // Control+0.
+        assert_eq!(act(&zero, &zero, Modifiers::CTRL), Some(Action::FontReset));
+        // Control+KP_0 as winit really reports it with NumLock on: the
+        // unmodified key is the level-0 keysym KP_Insert, only the modified
+        // key is "0" (review finding: the first cut faked "0" in both).
+        let insert = named(Named::Insert);
+        assert_eq!(act(&insert, &zero, Modifiers::CTRL), Some(Action::FontReset));
+        // NumLock off: Insert in both, and nothing fires — as in foot.
+        assert_eq!(act(&insert, &insert, Modifiers::CTRL), None);
+        // Shift+0 is ")" on US: Ctrl+Shift+0 must not reset.
+        assert_eq!(act(&zero, &character(")"), ctrl_shift()), None);
+        // Without Ctrl, or with Alt, these are text.
+        assert_eq!(act(&equal, &equal, Modifiers::empty()), None);
+        assert_eq!(act(&minus, &minus, Modifiers::CTRL | Modifiers::ALT), None);
+        assert_eq!(act(&zero, &zero, Modifiers::CTRL | Modifiers::LOGO), None);
+        // Font steps repeat when held, as in foot.
+        assert!(Action::FontIncrease.repeats());
+        assert!(Action::FontDecrease.repeats());
+    }
+
+    /// The chord must beat the shell encoder: without the action table,
+    /// Ctrl+Shift+T is Ctrl-T on the PTY. This pins that the two tables
+    /// overlap, so the dispatcher's "action first" order is load-bearing.
+    #[test]
+    fn a_tab_chord_would_otherwise_reach_the_shell_as_a_control_code() {
+        let key = character("t");
+        assert_eq!(bytes(&key, Some("T"), ctrl_shift()), &[20]);
+        assert!(act(&key, &character("T"), ctrl_shift()).is_some());
+    }
+
+    #[test]
+    fn a_notched_wheel_steps_once_per_notch_in_its_direction() {
+        let mut pending = 0.0;
+        assert_eq!(wheel_steps(&mut pending, ScrollDelta::Lines { x: 0.0, y: 1.0 }), 1);
+        assert_eq!(wheel_steps(&mut pending, ScrollDelta::Lines { x: 0.0, y: 3.0 }), 3);
+        assert_eq!(wheel_steps(&mut pending, ScrollDelta::Lines { x: 0.0, y: -1.0 }), -1);
+        assert_eq!(wheel_steps(&mut pending, ScrollDelta::Lines { x: 1.0, y: 0.0 }), 0);
+        assert_eq!(wheel_steps(&mut pending, ScrollDelta::Lines { x: 0.0, y: f32::NAN }), 0);
+    }
+
+    #[test]
+    fn smooth_scrolling_accumulates_and_a_reversal_starts_fresh() {
+        let mut pending = 0.0;
+        let small = ScrollDelta::Pixels { x: 0.0, y: PIXELS_PER_STEP / 4.0 };
+        assert_eq!(wheel_steps(&mut pending, small), 0);
+        assert_eq!(wheel_steps(&mut pending, small), 0);
+        assert_eq!(wheel_steps(&mut pending, small), 0);
+        assert_eq!(wheel_steps(&mut pending, small), 1, "four quarters are one step");
+        // Three quarters forward, then back: the reversal does not have to
+        // pay back the forward remainder before it shrinks anything.
+        for _ in 0..3 {
+            wheel_steps(&mut pending, small);
+        }
+        let back = ScrollDelta::Pixels { x: 0.0, y: -PIXELS_PER_STEP };
+        assert_eq!(wheel_steps(&mut pending, back), -1);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 pub mod bus;
 pub mod config;
 pub mod control;
+pub mod font;
 pub mod metrics;
 pub mod native_session;
 pub mod panes;

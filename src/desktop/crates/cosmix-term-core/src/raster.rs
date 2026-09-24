@@ -1,5 +1,5 @@
 use crate::terminal::Screen;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use swash::{
     FontRef,
     scale::{Render, ScaleContext, Source, image::Image},
@@ -167,7 +167,9 @@ fn bands_into(rows: &[bool], cell_height: u32, out: &mut Vec<DamageBand>) {
 
 pub struct Raster {
     cursor: crate::config::Cursor,
-    data: Vec<u8>,
+    /// The font file, shared with every raster [`Raster::resized`] from this
+    /// one: a zoom step reuses the bytes instead of reading the file again.
+    data: Arc<[u8]>,
     context: ScaleContext,
     cache: HashMap<(char, bool, [u8; 3]), Option<Image>>,
     /// Cell dimensions in PHYSICAL device pixels: the texture is rasterised at
@@ -184,9 +186,6 @@ pub struct Raster {
 }
 impl Raster {
     pub fn new(scale: f32, logical_px: f32, cursor: crate::config::Cursor) -> Result<Self, String> {
-        let scale = scale.clamp(0.5, 8.0);
-        // Startup resolves logical size once; scale makes it physical for HiDPI.
-        let px = logical_px * scale;
         let path = if let Some(path) = std::env::var_os("TERM_SPIKE_FONT") {
             PathBuf::from(path)
         } else {
@@ -206,6 +205,35 @@ impl Raster {
         };
         let data = std::fs::read(&path)
             .map_err(|e| format!("font {}: {e}; set TERM_SPIKE_FONT", path.display()))?;
+        let raster = Self::from_font(data.into(), scale, logical_px, cursor)?;
+        eprintln!(
+            "DIAGNOSTIC font={} scale={} cell={}x{} (physical px); bold=regular+brighter colour",
+            path.display(),
+            raster.scale,
+            raster.width,
+            raster.height
+        );
+        Ok(raster)
+    }
+
+    /// The same font at another scale or size: no file read and no
+    /// DIAGNOSTIC line. This is the runtime path — a held Ctrl+= steps the
+    /// size at key-repeat rate, and [`Raster::new`] would re-read the font
+    /// file and print a line on every step. The glyph cache starts empty,
+    /// because every cached glyph was rasterised at the old size.
+    pub fn resized(&self, scale: f32, logical_px: f32) -> Result<Self, String> {
+        Self::from_font(self.data.clone(), scale, logical_px, self.cursor)
+    }
+
+    fn from_font(
+        data: Arc<[u8]>,
+        scale: f32,
+        logical_px: f32,
+        cursor: crate::config::Cursor,
+    ) -> Result<Self, String> {
+        let scale = scale.clamp(0.5, 8.0);
+        // Startup resolves logical size once; scale makes it physical for HiDPI.
+        let px = logical_px * scale;
         let font = FontRef::from_index(&data, 0)
             .ok_or("Invalid font; set TERM_SPIKE_FONT to a TTF/OTF font")?;
         let metrics = font.metrics(&[]).scale(px);
@@ -222,10 +250,6 @@ impl Raster {
         if width > 512 || height > 1024 {
             return Err("font metrics exceed cell limits".into());
         }
-        eprintln!(
-            "DIAGNOSTIC font={} scale={scale} cell={width}x{height} (physical px); bold=regular+brighter colour",
-            path.display()
-        );
         Ok(Self {
             cursor,
             data,
@@ -505,6 +529,24 @@ mod tests {
     use crate::config::Cursor;
     use crate::terminal::Cell;
     use std::time::Instant;
+
+    /// A zoom step must be the same raster `new` would build, without
+    /// reading the font again: the bytes are shared, not re-read or copied.
+    #[test]
+    fn resized_matches_new_and_shares_the_font_bytes() {
+        let base = Raster::new(1.0, 13.0, Cursor::Block).expect("a monospace font");
+        for (scale, px) in [(1.0, 17.0), (2.5, 13.0), (1.25, 9.5)] {
+            let resized = base.resized(scale, px).unwrap();
+            let fresh = Raster::new(scale, px, Cursor::Block).unwrap();
+            assert_eq!(
+                (resized.width, resized.height, resized.baseline, resized.scale),
+                (fresh.width, fresh.height, fresh.baseline, fresh.scale),
+                "{px} px @ {scale}"
+            );
+            assert_eq!(resized.cursor, Cursor::Block, "the cursor style carries over");
+            assert!(Arc::ptr_eq(&resized.data, &base.data), "the font file was read again");
+        }
+    }
 
     fn screen(cols: usize, rows: usize, fill: char) -> Screen {
         Screen {

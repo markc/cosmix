@@ -7,7 +7,7 @@ pub enum SplitDir {
     Vertical,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Left,
     Right,
@@ -32,7 +32,7 @@ pub enum PaneTree {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Geometry {
     pub x: f32,
     pub y: f32,

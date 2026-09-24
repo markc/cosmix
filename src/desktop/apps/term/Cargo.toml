@@ -57,6 +57,9 @@ cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets" }
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 libc = "0.2.189"
 serde_json = "1"
+# Only for the completion-note channel `cosmix_term_core::bus::start` takes;
+# the core already links tokio, so this adds no crate to the graph.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 # NOT a dependency this crate calls — a feature-unification fix, and the whole
 # reason iced-on-wgpu and Bevy can share one workspace.
 #
