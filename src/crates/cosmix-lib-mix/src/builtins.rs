@@ -23387,7 +23387,7 @@ mod ssh_helpers_tests {
     #[test]
     fn send_mail_host_engages_the_network_capability_only_from_opts() {
         let msg = mail_msg(&[]);
-        assert!(!conditional_cap_engaged("send_mail", &[msg.clone()], "host"));
+        assert!(!conditional_cap_engaged("send_mail", std::slice::from_ref(&msg), "host"));
         assert!(!conditional_cap_engaged(
             "send_mail",
             &[msg.clone(), map_of(&[("timeout", Value::Number(5.0))])],
