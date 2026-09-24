@@ -1,0 +1,67 @@
+-- desktop-workspace -- the workspace-switching citizen. Registers Bus service
+-- `desktop` and answers desktop.workspace.*, which inputd's default
+-- RightCtrl+Left / RightCtrl+Right rows fire, by forwarding to cosmix-comp:
+--
+--   desktop.workspace.next     {}   -> comp.workspace.switch {index:"next", wrap:true}
+--   desktop.workspace.prev     {}   -> comp.workspace.switch {index:"prev", wrap:true}
+--   desktop.workspace.set      {n}  -> comp.workspace.switch {index:n, wrap:true}
+--   desktop.workspace.current  {}   -> comp.props.get {path:"workspaces"}
+--
+-- Replies: switches {ok, from, to}; current {ok, desktop, count}; failures
+-- {ok:false, error[, comp]} with rc >= 10 (bands in lib/workspace.mix).
+--
+-- Run: mix --serve desktop-workspace.mix --name desktop
+-- lib/workspace.mix must sit beside this file in lib/.
+-- COSMIX_DESKTOP_COMP_SERVICE names the comp service (default `comp`).
+-- Validation and reply shaping live in lib/workspace.mix (pure, unit-tested);
+-- this file is only the Bus surface. Mesh callers reach every verb with no
+-- authorization gate; only well-formedness is checked.
+$w = require("lib/workspace.mix")
+
+fn respond($event)
+  $plan = $w.prepare($event.command, $event.body)
+  if $plan.send == nil then
+    return $plan
+  end
+  $s = $plan.send
+  $b = nil
+  try
+    $b = json_encode($s.body)
+  catch $e
+    return {rc: 10, body: {ok: false, error: "internal: " .. to_string($e)}}
+  end
+  -- Handlers are serialised: without a budget one wedged comp would queue
+  -- every later keypress behind it. send itself never raises.
+  send $s.service $s.verb body=$b timeout=3
+  $got_rc = $rc
+  $got_result = $result
+  $got_reply = $reply
+  try
+    return $w.finish($plan, $got_rc, $got_result, $got_reply)
+  catch $e
+    return {rc: 10, body: {ok: false, error: "internal: " .. to_string($e)}}
+  end
+end
+
+-- `next` is a Mix keyword, so these verbs are quoted in `on` and must be
+-- quoted in `send` too (send desktop "desktop.workspace.next") until the
+-- parser fix lands.
+on "desktop.workspace.next" desc "body {} -> {ok, from, to}; next workspace, wrapping; RightCtrl+Right"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end
+
+on "desktop.workspace.prev" desc "body {} -> {ok, from, to}; previous workspace, wrapping; RightCtrl+Left"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end
+
+on "desktop.workspace.set" desc "body {n: 1..16} -> {ok, from, to}; switch to workspace n"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end
+
+on "desktop.workspace.current" desc "body {} -> {ok, desktop, count}"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end
