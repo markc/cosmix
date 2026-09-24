@@ -55,6 +55,26 @@ impl PaintState {
     pub fn grid(&self) -> (usize, usize) {
         (self.cols, self.rows)
     }
+
+    /// Retarget incremental painting to a byte-for-byte copy of the last
+    /// painted buffer, preserving geometry, cursor and damage bookkeeping.
+    ///
+    /// The caller must copy the entire buffer, including any stride padding,
+    /// without changing its layout or contents before calling this method.
+    /// Byte equality cannot be checked here: the old allocation may be gone.
+    /// Subsequent geometry changes are still detected by [`Raster::paint`].
+    /// An invalidated or never-painted state remains invalidated.
+    pub fn rebind(&mut self, dst: &[u8]) {
+        if self.cols == 0 || self.rows == 0 {
+            return;
+        }
+        debug_assert_eq!(dst.len(), self.buffer.1, "rebind requires a complete copy");
+        debug_assert!(
+            dst.len() >= self.cols * self.rows * self.cell.0 as usize * self.cell.1 as usize * 4,
+            "rebind must preserve the painted geometry"
+        );
+        self.buffer = (dst.as_ptr() as usize, dst.len());
+    }
     /// Forget what was drawn, so the next paint repaints every row.
     ///
     /// **Required** when the caller changes which terminal it is painting, or
@@ -376,6 +396,8 @@ impl Raster {
     /// different buffer, so it is a mitigation and not a guarantee. On any
     /// doubt, and whenever the painted terminal changes, call
     /// [`PaintState::invalidate`].
+    /// A byte-for-byte copy can instead use [`PaintState::rebind`] to retain
+    /// incremental painting at its new address.
     pub fn paint<'a>(
         &mut self,
         screen: &Screen,
@@ -957,6 +979,43 @@ mod tests {
         );
         assert!(!second.contains(&0x5a));
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn rebind_preserves_cursor_damage_and_invalidation() {
+        let mut raster = raster_with(Cursor::Block);
+        let mut state = PaintState::default();
+        let mut grid = screen(4, 3, 'M');
+        grid.cursor_visible = true;
+        grid.cursor = (1, 1);
+        let stride = 4 * raster.width as usize * 4;
+        let mut first = vec![0; stride * 3 * raster.height as usize];
+        raster.paint(&grid, &mut first, stride, &mut state, &[]);
+        let mut copied = first.clone();
+        state.rebind(&copied);
+        grid.cursor_visible = false;
+        assert_eq!(
+            raster.paint(&grid, &mut copied, stride, &mut state, &[false; 3]),
+            &[DamageBand {
+                y: raster.height,
+                height: raster.height,
+            }]
+        );
+        let mut reference = Surface::default();
+        raster.render_into(&grid, &[], &mut reference);
+        assert_eq!(copied, reference.rgba());
+
+        state.invalidate();
+        let mut rebound = copied.clone();
+        state.rebind(&rebound);
+        assert_eq!(state.grid(), (0, 0));
+        assert_eq!(
+            raster.paint(&grid, &mut rebound, stride, &mut state, &[false; 3]),
+            &[DamageBand {
+                y: 0,
+                height: 3 * raster.height,
+            }]
+        );
     }
 
     /// The cursor is drawn by INVERTING, so it must only ever land on a row

@@ -177,8 +177,6 @@ fn run(settings: config::Settings) -> Result<(), String> {
         grids: HashMap::new(),
         modifiers: iced::keyboard::Modifiers::empty(),
         wheel: 0.0,
-        #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-        cached: HashMap::new(),
     };
 
     // `BootFn` is `Fn`, not `FnOnce`, and the state is not cloneable — the
@@ -298,8 +296,6 @@ struct State {
     modifiers: iced::keyboard::Modifiers,
     /// Fractional Ctrl+wheel travel not yet worth a font step.
     wheel: f32,
-    #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-    cached: HashMap<u64, (u64, iced::widget::image::Handle)>,
 }
 
 #[derive(Debug, Clone)]
@@ -660,11 +656,11 @@ fn renderer(
 
 #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
 fn renderer(
-    state: &State,
-    id: u64,
-    _frame: Arc<Mutex<frame::Frame>>,
+    _state: &State,
+    _id: u64,
+    frame: Arc<Mutex<frame::Frame>>,
 ) -> iced::widget::Image<iced::widget::image::Handle> {
-    cpu_grid::view(state.cached.get(&id).map(|(_, handle)| handle))
+    cpu_grid::view(&frame)
 }
 
 /// Apply a tab or pane chord to the tab set, returning what to tear down.
@@ -730,8 +726,6 @@ impl State {
         let visible = shape.visible();
         self.painter.retain(&visible);
         self.grids.retain(|id, _| visible.contains(id));
-        #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-        self.cached.retain(|id, _| visible.contains(id));
         self.shape = shape;
         self.relayout();
         self.repaint();
@@ -758,9 +752,7 @@ impl State {
             #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
             if painted {
                 let frame = self.painter.frame(id);
-                if let Some(cached) = cpu_grid::refresh(self.cached.remove(&id), &frame) {
-                    self.cached.insert(id, cached);
-                }
+                cpu_grid::refresh(&frame);
             }
         }
     }
@@ -1040,8 +1032,6 @@ mod tests {
             grids: HashMap::new(),
             modifiers: iced::keyboard::Modifiers::empty(),
             wheel: 0.0,
-            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-            cached: HashMap::new(),
         };
         (state, reaper)
     }
