@@ -33,6 +33,7 @@ cd $COSMIX/src/desktop && cargo build --workspace --release
 #   the gate also covers feature-gated binaries when present: build them with
 #   the extra commands in src/tools/version_flag_gate.mix's Usage header
 cd $COSMIX/src && mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
+cd $COSMIX/src && mix tools/version_flag_gate_selftest.mix   # no build needed: proves each gate FAIL branch still fires
 cd $COSMIX/src && cargo test --workspace                # core workspace; desktop is EXCLUDED (src/Cargo.toml)
 cd $COSMIX/src/desktop && cargo test --workspace --no-fail-fast   # ctk, quoin, comp, term: its own workspace
 cd $COSMIX/src/desktop && cargo test -p ctk --lib --features bus,theme app_control::
@@ -86,8 +87,8 @@ defaults. Never hardcode an install path.
   explicitly after the macro. The default scope is the whole argv up to `--`,
   so a value literally spelled `-V` or `--version` must follow `--` (clap's
   `--flag=-V` form also works); binaries whose options take free strings
-  with no `--` escape use `exit_on_version!(leading)`, which reads only
-  argv[1]. The crate's `build.rs` calls `cosmix_buildinfo::emit()` so the sha
+  with no `--` escape use `exit_on_version!(leading)`, which reads argv[1]
+  for the flag and argv[2] for `--json`. The crate's `build.rs` calls `cosmix_buildinfo::emit()` so the sha
   is real. A new binary is covered by `src/tools/version_flag_gate.mix`
   automatically; it fails until the binary conforms.
 - Public-safe architecture specifications belong in `docs/spec/`. Read their

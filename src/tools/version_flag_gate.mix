@@ -47,9 +47,15 @@
 #
 # --expect-sha overrides the checkout's HEAD, for binaries built elsewhere.
 #
+# Self-test (no build needed; proves every FAIL branch still fires):
+#   mix tools/version_flag_gate_selftest.mix
+#
 # Negative control (must exit 1): build a commit from before the contract in a
 # scratch worktree and point this gate at it, e.g.
 #   git worktree add /tmp/vfg-base 5b1991fe && cd /tmp/vfg-base/src && cargo build --release --workspace && mix $COSMIX/src/tools/version_flag_gate.mix --src /tmp/vfg-base/src
+# That builds only the core workspace, so it proves the core half; desktop
+# binaries left in a shared target dir from a newer build fail on the sha
+# (stale), which proves only the freshness check, not the desktop contract.
 #
 # Exit 0 = every built binary conforms; 1 = at least one FAIL; 2 = usage.
 
@@ -110,18 +116,43 @@ $expect = slice($expect, 0, 12)
 # uses a transient systemd scope whose cgroup pids.max is 1 instead: the
 # process itself is the one task, and any thread or child it tries to create
 # fails with EAGAIN either way.
+# An arm is used only after a dry run of it (wrapping /bin/true, in the same
+# scrubbed environment the real runs get) succeeds: a root host with the
+# systemd-run binary but no reachable systemd must SKIP the probe, not
+# false-FAIL every binary. The chosen arm is printed so a log shows which
+# one was exercised.
 $starve = nil
 $starve_label = ""
+$arm = nil
+$arm_name = ""
 $prlimit = which("prlimit")
 $systemd_run = which("systemd-run")
-if uid() != 0 and $prlimit != nil then
-    $starve = [$prlimit, "--nproc=1:1", "--"]
+$me = uid()
+if $me != 0 and $prlimit != nil then
+    $arm = [$prlimit, "--nproc=1:1", "--"]
+    $arm_name = "prlimit --nproc=1 (non-root, uid ${me})"
     $starve_label = "--version under nproc=1"
-elif uid() == 0 and $systemd_run != nil then
-    $starve = [$systemd_run, "--scope", "--quiet", "--collect", "-p", "TasksMax=1", "--"]
+elif $me == 0 and $systemd_run != nil then
+    $arm = [$systemd_run, "--scope", "--quiet", "--collect", "-p", "TasksMax=1", "--"]
+    $arm_name = "systemd-run --scope -p TasksMax=1 (root)"
     $starve_label = "--version under TasksMax=1"
-else
+end
+if $arm == nil then
     print("NOTE thread-starvation probe skipped: need prlimit (non-root) or systemd-run (root)")
+else
+    $dry_cmd = []
+    for $w in $arm
+        push($dry_cmd, $w)
+    end
+    push($dry_cmd, "/bin/true")
+    $dry = run_argv($dry_cmd, {timeout: 15, clear_env: true, env: {PATH: "/usr/bin:/bin"}, stdin: {null: true}})
+    if $dry.ok and $dry.stderr == "" then
+        $starve = $arm
+        print("PROBE thread-starvation arm: " + $arm_name)
+    else
+        $dry_err = split(trim($dry.stderr), "\n")[0]
+        print("NOTE thread-starvation probe skipped: " + $arm_name + " is unusable here (exit ${dry.exit_code}): " + $dry_err)
+    end
 end
 
 $workspaces = [$src + "/Cargo.toml", $src + "/desktop/Cargo.toml"]
