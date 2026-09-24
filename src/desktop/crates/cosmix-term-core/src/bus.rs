@@ -1026,16 +1026,16 @@ mod tests {
         })
     }
 
-    /// Run serve() on its own thread with a recording peer; the caller feeds
-    /// commands and reads replies.
-    fn serving(
-        set: &Arc<Mutex<TabSet>>,
-        cleanup: &Cleanup,
-    ) -> (
+    /// Command feed, recorded (verb, rc, body) replies, and the serve thread.
+    type Serving = (
         tokio::sync::mpsc::Sender<BoundedIncomingEvent>,
         std::sync::mpsc::Receiver<(String, u8, String)>,
         std::thread::JoinHandle<()>,
-    ) {
+    );
+
+    /// Run serve() on its own thread with a recording peer; the caller feeds
+    /// commands and reads replies.
+    fn serving(set: &Arc<Mutex<TabSet>>, cleanup: &Cleanup) -> Serving {
         let (commands_tx, commands) = tokio::sync::mpsc::channel(4);
         let (replies_tx, replies) = std::sync::mpsc::channel();
         let (set, cleanup) = (set.clone(), cleanup.clone());
