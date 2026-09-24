@@ -179,8 +179,10 @@ existing variable of that name — and once a top-level `send` has created them,
 that is the script's global, so a `send` inside a function or an `on` handler
 overwrites it too. In a `mix --serve` citizen whose async handlers interleave,
 handler A can `send`, yield, and read back the `$rc`/`$result`/`$reply` of
-handler B's send. (`$event` does NOT have this problem: each handler invocation
-gets its own.) Until these get per-invocation binding, read them immediately
+handler B's send. (`$event` is only partly different: a handler BODY's own
+`$event` is per-invocation, but a function called from that body reads a
+shared global `$event` and has the same interleaving hazard — pass `$event`
+into the function as an argument.) Until these get per-invocation binding, read them immediately
 after the `send`, or capture the reply with the expression form —
 `$r = send svc cmd` — and copy `$rc` into a local before the next await.
 

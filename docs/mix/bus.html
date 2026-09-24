@@ -581,8 +581,10 @@ existing variable of that name — and once a top-level <code>send</code> has cr
 that is the script's global, so a <code>send</code> inside a function or an <code>on</code> handler
 overwrites it too. In a <code>mix --serve</code> citizen whose async handlers interleave,
 handler A can <code>send</code>, yield, and read back the <code>$rc</code>/<code>$result</code>/<code>$reply</code> of
-handler B's send. (<code>$event</code> does NOT have this problem: each handler invocation
-gets its own.) Until these get per-invocation binding, read them immediately
+handler B's send. (<code>$event</code> is only partly different: a handler BODY's own
+<code>$event</code> is per-invocation, but a function called from that body reads a
+shared global <code>$event</code> and has the same interleaving hazard — pass <code>$event</code>
+into the function as an argument.) Until these get per-invocation binding, read them immediately
 after the <code>send</code>, or capture the reply with the expression form —
 <code>$r = send svc cmd</code> — and copy <code>$rc</code> into a local before the next await.</p>
 <p><strong>A wrong verb name answers at once.</strong> A <code>mix --serve</code> citizen (or any script
