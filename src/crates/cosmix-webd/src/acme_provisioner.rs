@@ -5245,7 +5245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vhost_set_event_for_existing_vhost_with_cert_is_no_op() {
+    async fn vhost_set_event_for_existing_vhost_with_cert_adopts_without_issuing() {
         // V-O1.2 — A `VhostSet` carrying a populated `cert_blob_id`
         // (set by a prior run, persisted across restart) must
         // short-circuit `issue_one` via the coverage split, BUT the
