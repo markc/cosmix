@@ -926,7 +926,10 @@ sequence watermark across every topic, and <code>port.lost_count</code> is cumul
 separate bounded lanes; both abandon a sink wait after two seconds.</p>
 <p>Window rows add seven read-only leaves. <code>generation</code> is the window's role
 generation (below). <code>window_x</code>/<code>window_y</code> are the window-geometry origin and
-<code>window_width</code>/<code>window_height</code> its extent, all in logical pixels. Use all four
+<code>window_width</code>/<code>window_height</code> its extent, all in logical pixels. The origin
+stands its buffer on a whole physical pixel, so <code>window_x</code>/<code>window_y</code> can be
+fractional at a fractional scale and are integers at scale 1 (see
+<a href="/cos/cosmix-comp#whole-pixel-placement">Whole-pixel placement</a>). Use all four
 for window screenshots that exclude client-side shadow margins. <code>x</code>/<code>y</code> remain
 the buffer origin and <code>width</code>/<code>height</code> the buffer extent, including those margins.
 Without explicit client geometry, all four <code>window_*</code> fields use the effective
@@ -1213,23 +1216,58 @@ windows and is empty while a session lock is active.</p>
 (<code>{"error":"invalid_args",field,allowed}</code>).</p>
 <h4 id="whole-pixel-placement">Whole-pixel placement</h4>
 <p>At a fractional output scale a logical origin can fall between physical
-pixels: x = 1 at 2.5 is physical 2.5. The renderer projects each window edge
-to a whole pixel on its own, so a 795-wide window there spans 1987 pixels
-while its fractional-scale client drew <code>round(795 x 2.5)</code> = 1988, and the
-content is resampled and blurs. comp therefore places every Wayland
-toplevel's buffer origin on a whole physical pixel: the cascade slot a new
-window opens in, <code>comp.window.place</code>, interactive move and resize, a clamp
-after the output shrinks, a change in the client's window-geometry inset, and
-a nested host scale change. The snap moves the buffer by at most half a
-physical pixel. The reported <code>window_x</code>/<code>window_y</code> and the <code>windows.s&lt;id&gt;</code>
-position leaves are the snapped values, so they can be fractional in logical
-units.</p>
-<p>On the grid, both edges of the buffer project exactly, so the drawn width is
-the client's <code>round(width x scale)</code> buffer and it is sampled 1:1. A neighbour
-placed at the reported origin plus the window's logical size projects its
-left edge to the same physical pixel as this window's right edge, with no
-seam and no overlap. The same rule applies at scale 1, where it rounds a
+pixels: x = 1 at 2.5 is physical 2.5. The KMS renderer projects each window
+edge to a whole pixel on its own, so a 795-wide window there spans 1987
+pixels while its fractional-scale client drew <code>round(795 x 2.5)</code> = 1988, and
+the content is resampled and blurs. comp therefore stands every xdg
+toplevel's BUFFER origin on a whole physical pixel. The snap moves the buffer
+by at most half a physical pixel. It applies in these places:</p>
+<ul>
+<li>the cascade slot a new window opens in;</li>
+<li><code>comp.window.place</code>;</li>
+<li>interactive move and resize;</li>
+<li>the clamp after the output shrinks;</li>
+<li>every commit that changes the client's window-geometry inset, whichever
+buffer path it arrives on (none, SHM or DMA-BUF), and the inset comp derives
+from subsurface bounds;</li>
+<li>a return from maximised or fullscreen;</li>
+<li>a nested host scale change.</li>
+</ul>
+<p>The reported <code>window_x</code>/<code>window_y</code> and the <code>windows.s&lt;id&gt;</code> position leaves are
+the snapped values. They can be fractional in logical units at a fractional
+scale, and they are integers at scale 1, where the same rule rounds a
 fractional pointer-driven origin to a whole pixel.</p>
+<p><strong>Re-snaps start from where comp meant the window to be.</strong> comp remembers the
+unsnapped origin it last placed a window at. A later inset change or scale
+change derives the new whole-pixel origin from that anchor, never from an
+already snapped value. So a GTK window whose shadow inset changes on every
+focus change stays put, and a scale change from 2.5 to 1.25 and back returns
+the window to the same pixel. The anchor is dropped once anything else moves
+the window.</p>
+<p><strong>Constraints choose between the two nearest grid points.</strong></p>
+<ul>
+<li><code>comp.window.place</code> validates the snapped origin, not the requested one.
+When the nearest grid point would put the window wholly off every output,
+it takes the grid point on the other side.</li>
+<li>The output-shrink clamp takes the nearest grid point that is still inside
+the clamp. The window does not slide under a panel or lose the room it was
+clamped to fit. If the clamp interval is narrower than a pixel, the clamped
+origin stays unsnapped.</li>
+<li>A left or top edge drag keeps the STATIONARY edge on the physical pixel it
+started on. The moving origin takes whichever grid point preserves it, so
+the far edge does not wobble as the drag crosses odd sizes.</li>
+</ul>
+<p><strong>What 1:1 means, and where.</strong> On the grid, both edges of the buffer project
+exactly. On KMS the drawn width is then the client's <code>round(width x scale)</code>
+buffer, sampled 1:1. The nested compositor renders through the host camera's
+scale without this edge projection, so it still resamples a window whose
+logical width is odd at 2.5. Nested pixel gates cannot prove sharpness at a
+fractional scale. A neighbour placed at the REPLIED origin plus the window's
+logical size projects its left edge to this window's right edge, with no seam
+and no overlap. Placing it at the REQUESTED origin plus the width can overlap
+by one pixel. With a client-side-decorated window only the buffer is on the
+grid; its visible window-geometry edges sit at the client's integer logical
+inset from it and can fall between pixels.</p>
 <p>Three kinds of surface are left alone:</p>
 <ul>
 <li>X11 windows keep integer X coordinates.</li>
@@ -2307,7 +2345,10 @@ is the output's physical buffer: at scale 2.5 a 320x240 logical output
 advertises and delivers 800x600, and a logical region is projected to
 physical pixels. On nested, the extent is the host window's own swapchain
 size, not the truncated logical size times the scale (a 2762-pixel-wide host
-at 2.5 is 1104.8 logical, reported as 1104). What a client does with the frame
+at 2.5 is 1104.8 logical, reported as 1104). The nested scene itself is laid
+out on that truncated 1104-wide canvas, so the last physical pixel or two at
+the right or bottom of such a frame are background that no client can draw
+into. The strip is cosmetic and is not a capture error. What a client does with the frame
 is its own business. grim composes its image at the output's integer
 <code>wl_output.scale</code>, which is 1 on nested and <code>ceil(scale)</code> on KMS, so by
 default it downsamples a nested frame to the logical size and upsamples a KMS

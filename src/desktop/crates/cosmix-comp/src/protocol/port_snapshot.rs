@@ -2040,13 +2040,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("window_x")],
         Number,
-        "Window-geometry x origin (x/y are the buffer origin, CSD shadow included)",
+        "Window-geometry x origin (x/y are the buffer origin, CSD shadow included); the buffer stands on a whole physical pixel, so this can be fractional at a fractional scale (1.2 at 2.5x) and is an integer at scale 1",
         format = "logical_px"
     ),
     descriptor!(
         &[L("windows"), S, L("window_y")],
         Number,
-        "Window-geometry y origin",
+        "Window-geometry y origin; fractional at a fractional scale like window_x, an integer at scale 1",
         format = "logical_px"
     ),
     descriptor!(
