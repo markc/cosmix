@@ -571,6 +571,50 @@ impl BackendData {
         data.reconcile_client_output::<D>(display, mapped_surfaces);
     }
 
+    /// Register an additional admitted output for protocol geometry tests.
+    /// Live KMS deliberately exposes only selected_client_output(); tests of
+    /// secondary-output reflow must explicitly construct a multi-output registry.
+    #[cfg(all(test, feature = "bus"))]
+    pub(crate) fn register_test_kms_client_output<D>(
+        &mut self,
+        display: &DisplayHandle,
+        key: &OutputKey,
+    ) -> Output
+    where
+        D: GlobalDispatch<WlOutput, WlOutputData> + 'static,
+    {
+        let Self::Kms(data) = self else {
+            panic!("KMS output fixture requires the KMS backend");
+        };
+        assert!(!data.client_outputs.outputs.contains_key(key));
+        let selected = data
+            .topology
+            .output(key.clone())
+            .expect("admitted output")
+            .selected
+            .clone();
+        let output = Output::new(
+            key.connector_name.clone(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "CosMix".into(),
+                model: key.connector_name.clone(),
+            },
+        );
+        configure_output_state(&output, &selected);
+        let global = output.create_global::<D>(display);
+        data.client_outputs.outputs.insert(
+            key.clone(),
+            KmsClientOutput {
+                selected,
+                output: output.clone(),
+                global,
+            },
+        );
+        output
+    }
+
     pub(crate) fn output_size(&self) -> (u32, u32) {
         match self {
             Self::Winit(data) => data.output_size,

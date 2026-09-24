@@ -201,6 +201,7 @@ fn targeted_buttons_obey_kms_delivery_and_quarantine_gates() {
                 .kms_session_lock_gate
                 .quarantine_current_input([], [BTN_LEFT]);
         }
+        let before = harness.server.state.injection.events;
         let reply = harness.server.state.service_input_op(&InputOp::Targeted {
             id,
             generation,
@@ -211,7 +212,11 @@ fn targeted_buttons_obey_kms_delivery_and_quarantine_gates() {
             }),
         });
         if blocked {
-            assert_eq!(reply.wire_json()["reason"], "not_presentable");
+            // Deferred unlock keeps session_lock_active() true; targeted
+            // input rejects that before the surface-presentability check.
+            assert_eq!(reply.wire_json()["error"], "target_unfocusable");
+            assert_eq!(reply.wire_json()["reason"], "session_lock");
+            assert_eq!(harness.server.state.injection.events, before);
         } else {
             assert!(matches!(&reply, ControlReply::Body(_)), "{reply:?}");
             assert_eq!(reply.wire_json()["target"], Value::Null);
@@ -292,16 +297,23 @@ fn targeted_key_and_button_focus_without_raising_when_requested() {
     let (id, generation) = window_id_and_generation(&harness, &alpha);
     let z = harness.server.state.surfaces[&alpha].layout.z;
     // The cursor is outside Alpha: a targeted button must not click Beta.
-    let _ = inject(
+    let (rc, moved) = inject(
         &mut harness,
         &ingress,
         &runtime,
         move_op(PointerMoveTarget::Output {
             output: None,
-            x: 320.0,
+            x: 310.0,
             y: 20.0,
         }),
     );
+    assert_eq!(rc, 0, "{moved}");
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    assert_eq!(
+        moved["target"],
+        json!({"id": beta_id, "generation": beta_generation})
+    );
+    assert_eq!(harness.server.state.cursor_position, (310.0, 20.0));
     let _ = harness.sync();
     for op in [
         InputOp::Key {
@@ -343,6 +355,17 @@ fn targeted_key_and_button_focus_without_raising_when_requested() {
             .and_then(|target| target.owned_surface())
             .map(|surface| surface.id()),
         Some(alpha.clone())
+    );
+    assert_eq!(harness.server.state.cursor_position, (310.0, 20.0));
+    assert_eq!(
+        harness
+            .server
+            .state
+            .pointer
+            .current_focus()
+            .and_then(|target| target.owned_surface())
+            .map(|surface| surface.id()),
+        Some(beta.clone())
     );
     let op = crate::port::parse_input_op(
         "comp.input.key",

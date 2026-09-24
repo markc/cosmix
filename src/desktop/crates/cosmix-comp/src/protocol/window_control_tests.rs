@@ -47,15 +47,26 @@ fn explicit_fullscreen_reflows_when_secondary_changes_or_disappears() {
     topology.connectors.extend(secondary.connectors);
     topology.selections.extend(secondary.selections);
     submit_kms_security_lifecycle(&mut harness, KmsTopologyLifecycleEvent::Initial(topology));
+    // Live KMS exposes only its selected client output, even when the reducer
+    // admits two connectors. Construct the secondary client output explicitly
+    // to exercise reflow while the primary output's geometry stays unchanged.
+    let display = harness.server.state.display_handle.clone();
+    let output = harness
+        .server
+        .state
+        .backend
+        .register_test_kms_client_output::<WaylandState>(&display, &second);
     map_initial_test_toplevel(&mut harness);
     let object = test_toplevel_record(&harness).role.wl_surface().id();
-    let output = port_snapshot::project_outputs(&harness.server.state)
+    let outputs = port_snapshot::project_outputs(&harness.server.state)
         .unwrap()
-        .keys
-        .into_iter()
-        .find(|(output, _)| output.name() == "Test-B")
-        .unwrap()
-        .0;
+        .keys;
+    assert_eq!(outputs.len(), 2);
+    assert!(outputs.iter().any(|(candidate, _)| candidate == &output));
+    assert_ne!(
+        harness.server.state.backend.default_output(),
+        Some(output.clone())
+    );
     harness
         .server
         .state
@@ -67,6 +78,10 @@ fn explicit_fullscreen_reflows_when_secondary_changes_or_disappears() {
             "test",
         )
         .unwrap();
+    assert_eq!(
+        test_toplevel_record(&harness).fullscreen_output,
+        Some(output.clone())
+    );
     let traffic = harness.sync();
     commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
     let previous_output = harness.server.state.logical_output_rect();
@@ -95,6 +110,7 @@ fn explicit_fullscreen_reflows_when_secondary_changes_or_disappears() {
         KmsTopologyLifecycleEvent::Initial(kms_security_test_snapshot(&first, 41)),
     );
     let traffic = harness.sync();
+    assert!(harness.server.state.backend.port_output(&output).is_none());
     assert_eq!(harness.server.state.logical_output_rect(), previous_output);
     assert_eq!(harness.server.state.usable_output_rect(), previous_usable);
     assert!(test_toplevel_record(&harness).fullscreen_output.is_none());
