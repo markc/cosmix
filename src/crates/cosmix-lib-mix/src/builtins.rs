@@ -11032,7 +11032,7 @@ fn send_mail_subject(subject: &str) -> MixResult<String> {
 #[cfg(feature = "crypto")]
 fn send_mail_rfc2047(subject: &str) -> MixResult<String> {
     match builtin_rfc2047_encode(vec![Value::String(subject.to_string())])? {
-        Some(Value::String(s)) => Ok(s.replace(" =?", "\n =?")),
+        Some(Value::String(ref s)) => Ok(s.replace(" =?", "\n =?")),
         _ => Err(MixError::RuntimeError {
             span: None,
             msg: "send_mail: rfc2047_encode returned a non-string".into(),
