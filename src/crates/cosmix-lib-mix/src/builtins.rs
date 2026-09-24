@@ -4284,16 +4284,25 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
 ///
 /// # Safety
 /// Call only in a post-fork child (the pre_exec window).
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")
+))]
 unsafe fn raw_fork() -> libc::pid_t {
-    // Every argument after the flags is 0: no new stack (copy-on-write, as
-    // fork), no tid pointers, no TLS — so the per-arch argument order of
-    // clone(2) does not matter.
+    // On these three arches clone(2) takes (flags, newsp, parent_tid,
+    // child_tid, tls). Every argument after the flags is 0: no new stack
+    // (copy-on-write, as fork), no tid pointers, no TLS. Not every arch
+    // agrees — s390x swaps the first two (CLONE_BACKWARDS2) — so the raw
+    // path is limited to arches whose order is known.
     unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0) as libc::pid_t }
 }
 
-/// Non-Linux unix: no raw clone; fall back to fork (atfork caveat applies).
-#[cfg(not(target_os = "linux"))]
+/// Elsewhere (other unix, other Linux arches): fall back to fork; the
+/// atfork caveat above applies there.
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")
+)))]
 unsafe fn raw_fork() -> libc::pid_t {
     unsafe { libc::fork() }
 }
