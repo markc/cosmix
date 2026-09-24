@@ -1538,20 +1538,29 @@ mod tests {
         );
     }
 
-    /// Run one frame on a helper thread. A `FocusedInput` or `AcquireFocus`
-    /// that bubbles into an entity `WindowTraversal` cannot leave spins
-    /// Bevy's propagation loop forever (no cycle check); a frame that does
-    /// not return in time is that defect, not a slow machine.
-    fn update_within(app: App, limit: Duration) -> App {
+    /// Run a test body on a helper thread and fail if it does not finish in
+    /// time. A `FocusedInput` or `AcquireFocus` that bubbles into an entity
+    /// `WindowTraversal` cannot leave spins Bevy's propagation loop forever
+    /// (no cycle check); a body that does not return is that defect, not a
+    /// slow machine. `App` is not `Send`, so the body builds its own.
+    fn run_within(limit: Duration, body: impl FnOnce() + Send + 'static) {
+        use std::sync::mpsc::RecvTimeoutError;
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut app = app;
-            app.update();
-            let _ = tx.send(app);
+        let handle = std::thread::spawn(move || {
+            body();
+            let _ = tx.send(());
         });
         match rx.recv_timeout(limit) {
-            Ok(app) => app,
-            Err(_) => panic!("app.update() did not return within {limit:?}: focused-input propagation is looping"),
+            // Finished, or panicked (the sender dropped): surface the body's
+            // own outcome.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if let Err(payload) = handle.join() {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "test body did not finish within {limit:?}: focused-input propagation is looping"
+            ),
         }
     }
 
@@ -1581,36 +1590,38 @@ mod tests {
     /// end, which means the bubble that follows stops at the anchor.
     #[test]
     fn keys_reach_the_input_focus_entity_without_a_primary_window() {
-        let (mut app, window) = dispatch_app();
-        let mut real_primary = app
-            .world_mut()
-            .query_filtered::<Entity, (With<PrimaryWindow>, With<Window>)>();
-        assert_eq!(real_primary.iter(app.world()).count(), 0);
+        run_within(Duration::from_secs(10), || {
+            let (mut app, window) = dispatch_app();
+            let mut real_primary = app
+                .world_mut()
+                .query_filtered::<Entity, (With<PrimaryWindow>, With<Window>)>();
+            assert_eq!(real_primary.iter(app.world()).count(), 0);
 
-        let field = field_in_window(&mut app, window);
-        app.insert_resource(InputFocus::from_entity(field));
-        app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(window);
-        app.finish();
-        app.cleanup();
+            let field = field_in_window(&mut app, window);
+            app.insert_resource(InputFocus::from_entity(field));
+            app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(window);
+            app.finish();
+            app.cleanup();
 
-        emit_keyboard(
-            &mut app,
-            window,
-            &map_key(30, Keysym::a, Some("a".to_owned())),
-            ButtonState::Pressed,
-            false,
-        );
-        let mut app = update_within(app, Duration::from_secs(5));
-        assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
-        assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+            emit_keyboard(
+                &mut app,
+                window,
+                &map_key(30, Keysym::a, Some("a".to_owned())),
+                ButtonState::Pressed,
+                false,
+            );
+            app.update();
+            assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
 
-        // A second install must not add a second anchor: two primary windows
-        // silence Bevy's dispatcher exactly as none does.
-        install_focus_dispatch(&mut app);
-        let mut anchors = app
-            .world_mut()
-            .query_filtered::<Entity, With<PrimaryWindow>>();
-        assert_eq!(anchors.iter(app.world()).count(), 1);
+            // A second install must not add a second anchor: two primary
+            // windows silence Bevy's dispatcher exactly as none does.
+            install_focus_dispatch(&mut app);
+            let mut anchors = app
+                .world_mut()
+                .query_filtered::<Entity, With<PrimaryWindow>>();
+            assert_eq!(anchors.iter(app.world()).count(), 1);
+        });
     }
 
     /// With nothing focused the dispatcher falls back to the anchor, and a
@@ -1618,29 +1629,31 @@ mod tests {
     /// end at the anchor rather than loop, and neither may move the focus.
     #[test]
     fn unfocused_key_and_acquire_focus_end_at_the_anchor() {
-        let (mut app, window) = dispatch_app();
-        let loose = app.world_mut().spawn_empty().id();
-        app.finish();
-        app.cleanup();
-        let mut anchors = app
-            .world_mut()
-            .query_filtered::<Entity, With<PrimaryWindow>>();
-        let anchor = anchors.single(app.world()).unwrap();
+        run_within(Duration::from_secs(10), || {
+            let (mut app, window) = dispatch_app();
+            let loose = app.world_mut().spawn_empty().id();
+            app.finish();
+            app.cleanup();
+            let mut anchors = app
+                .world_mut()
+                .query_filtered::<Entity, With<PrimaryWindow>>();
+            let anchor = anchors.single(app.world()).unwrap();
 
-        emit_keyboard(
-            &mut app,
-            window,
-            &map_key(30, Keysym::a, Some("a".to_owned())),
-            ButtonState::Pressed,
-            false,
-        );
-        app.world_mut().trigger(AcquireFocus {
-            focused_entity: loose,
-            window: anchor,
+            emit_keyboard(
+                &mut app,
+                window,
+                &map_key(30, Keysym::a, Some("a".to_owned())),
+                ButtonState::Pressed,
+                false,
+            );
+            app.world_mut().trigger(AcquireFocus {
+                focused_entity: loose,
+                window: anchor,
+            });
+            app.update();
+            assert!(app.world().resource::<FocusedKeys>().0.is_empty());
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
         });
-        let app = update_within(app, Duration::from_secs(5));
-        assert!(app.world().resource::<FocusedKeys>().0.is_empty());
-        assert_eq!(app.world().resource::<InputFocus>().get(), None);
     }
 
     /// A field focused in one panel window must not receive keys typed into
@@ -1648,37 +1661,39 @@ mod tests {
     /// on a different window, and kept when it sits on the field's own.
     #[test]
     fn focus_in_another_window_is_cleared_before_keys_dispatch() {
-        let (mut app, window) = dispatch_app();
-        let other = app.world_mut().spawn(Window::default()).id();
-        let field = field_in_window(&mut app, window);
-        app.insert_resource(InputFocus::from_entity(field));
-        app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(other);
-        app.finish();
-        app.cleanup();
+        run_within(Duration::from_secs(10), || {
+            let (mut app, window) = dispatch_app();
+            let other = app.world_mut().spawn(Window::default()).id();
+            let field = field_in_window(&mut app, window);
+            app.insert_resource(InputFocus::from_entity(field));
+            app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(other);
+            app.finish();
+            app.cleanup();
 
-        emit_keyboard(
-            &mut app,
-            other,
-            &map_key(30, Keysym::a, Some("a".to_owned())),
-            ButtonState::Pressed,
-            false,
-        );
-        let mut app = update_within(app, Duration::from_secs(5));
-        assert!(app.world().resource::<FocusedKeys>().0.is_empty());
-        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+            emit_keyboard(
+                &mut app,
+                other,
+                &map_key(30, Keysym::a, Some("a".to_owned())),
+                ButtonState::Pressed,
+                false,
+            );
+            app.update();
+            assert!(app.world().resource::<FocusedKeys>().0.is_empty());
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
 
-        app.insert_resource(InputFocus::from_entity(field));
-        app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(window);
-        emit_keyboard(
-            &mut app,
-            window,
-            &map_key(30, Keysym::a, Some("a".to_owned())),
-            ButtonState::Pressed,
-            false,
-        );
-        let app = update_within(app, Duration::from_secs(5));
-        assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
-        assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+            app.insert_resource(InputFocus::from_entity(field));
+            app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(window);
+            emit_keyboard(
+                &mut app,
+                window,
+                &map_key(30, Keysym::a, Some("a".to_owned())),
+                ButtonState::Pressed,
+                false,
+            );
+            app.update();
+            assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+        });
     }
 
     fn pointer_app() -> (App, Entity, OutputKey) {
