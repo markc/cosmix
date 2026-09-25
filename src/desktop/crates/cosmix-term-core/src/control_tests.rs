@@ -52,16 +52,20 @@ fn t15_control_input_returns_to_live_screen() {
         pane.lock().unwrap().scroll_view(crate::terminal::ScrollRequest::Top);
         assert!(pane.lock().unwrap().display_offset() > 0);
         listener.block_control_writes(true);
-        let body = json!({"target":target,"request_id":"t15-type",
+        let body = json!({"target":target,"request_id":"1",
             "foreground_generation":listener.foreground_generation().to_string(),"text":"x"});
-        assert_eq!(call(owner.client(), &parent.name, "term.type", body).await.0, 0);
+        let reply = call(owner.client(), &parent.name, "term.type", body).await;
+        assert_eq!(reply.0, 0, "{reply:?}");
         assert_eq!(pane.lock().unwrap().display_offset(), 0);
         pane.lock().unwrap().scroll_view(crate::terminal::ScrollRequest::Top);
         let offset = pane.lock().unwrap().display_offset();
         assert!(offset > 0);
-        let body = json!({"target":target,"request_id":"t15-stale",
+        let body = json!({"target":target,"request_id":"2",
             "foreground_generation":"0","text":"refused"});
-        assert_ne!(call(owner.client(), &parent.name, "term.type", body).await.0, 0);
+        assert_eq!(
+            call(owner.client(), &parent.name, "term.type", body).await.1["error_code"],
+            "STALE_GENERATION"
+        );
         assert_eq!(pane.lock().unwrap().display_offset(), offset);
         listener.block_control_writes(false);
     });
