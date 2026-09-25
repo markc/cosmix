@@ -1,5 +1,6 @@
 -- Stateless Bus helpers shared by scene behaviours. No loading or popup state.
-fn context($default_name)
+-- Not `context`: $module.context() resolves to the shell`s context command.
+fn scene_context($default_name)
   $name = env("SCENE_NAME", $default_name)
   $generation = to_number(env("SCENE_GENERATION", ""))
   $me = serve_name()

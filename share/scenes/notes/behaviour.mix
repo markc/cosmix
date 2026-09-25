@@ -2,7 +2,7 @@
 $LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
 $r = require($LIB .. "/runtime.mix")
 $m = require($LIB .. "/models.mix")
-$ctx = $r.context("notes")
+$ctx = $r.scene_context("notes")
 $NOTIFY = env("NOTIFY_SERVICE", "notify")
 $state = {notes: [], sequence: 0, queued: false, ready: false, model: $m.notes([])}
 

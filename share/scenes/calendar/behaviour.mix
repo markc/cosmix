@@ -3,7 +3,7 @@ $LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") ..
 $r = require($LIB .. "/runtime.mix")
 $m = require($LIB .. "/models.mix")
 $p = require($LIB .. "/data.mix")
-$ctx = $r.context("calendar")
+$ctx = $r.scene_context("calendar")
 $APPS = env("APPS_SERVICE", "apps")
 $state = {offset: 0, clock_armed: false, ready: false, model: $m.calendar(time(), 0)}
 
