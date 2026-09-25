@@ -235,10 +235,10 @@ mod tests {
     #[test]
     fn a_run_gets_the_environment_and_streams_output() {
         let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("fake-mix");
-        write(dir.path(), "fake-mix", "#!/bin/sh\necho \"$CED_BUFFER $CED_REV $CED_ORIGIN $CED_SEL_START-$CED_SEL_END\"\necho oops >&2\nexit 3\n");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // `/bin/sh` stands in for mix and runs the macro file itself: never
+        // exec a file this test just wrote (ETXTBSY races other tests' forks).
+        let fake = Path::new("/bin/sh");
+        write(dir.path(), "m.mix", "echo \"$CED_BUFFER $CED_REV $CED_ORIGIN $CED_SEL_START-$CED_SEL_END\"\necho oops >&2\nexit 3\n");
         let def = MacroDef { stem: "m".into(), label: "M".into(), chord: None, path: dir.path().join("m.mix") };
         let env = MacroEnv {
             buffer: "b2_x".into(),
@@ -249,7 +249,7 @@ mod tests {
             sel_start: 3,
             sel_end: 9,
         };
-        let events: Vec<_> = iced::futures::executor::block_on(spawn_with(&fake, &def, &env).collect());
+        let events: Vec<_> = iced::futures::executor::block_on(spawn_with(fake, &def, &env).collect());
         assert!(events.contains(&MacroEvent::Line { stem: "m".into(), text: "b2_x 7 agent:macro.m 3-9".into(), stderr: false }));
         assert!(events.contains(&MacroEvent::Line { stem: "m".into(), text: "oops".into(), stderr: true }));
         assert_eq!(events.last(), Some(&MacroEvent::Exit { stem: "m".into(), code: Some(3) }));

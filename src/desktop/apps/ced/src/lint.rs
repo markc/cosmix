@@ -119,22 +119,22 @@ mod tests {
     }
 
     /// Exit 1 (diagnostics) is a result, exit 2 an error, and the text
-    /// arrives on stdin: a stand-in `mix` built from `sh` proves all three.
+    /// arrives on stdin. The stand-in `mix` is `/bin/sh` running a script
+    /// named `lint` in the cwd (`sh lint --json -`): executing a file this
+    /// test just wrote races other tests' forks for ETXTBSY.
     #[test]
     fn exit_codes_and_stdin() {
         let dir = tempfile::tempdir().unwrap();
-        let fake = dir.path().join("mix");
+        let fake = std::path::Path::new("/bin/sh");
         std::fs::write(
-            &fake,
-            "#!/bin/sh\n[ \"$1 $2 $3\" = \"lint --json -\" ] || exit 2\nbody=$(cat)\ncase \"$body\" in\n  bad*) echo nope >&2; exit 2;;\n  warn*) echo '{\"schema_version\":2,\"diagnostics\":[]}'; exit 1;;\n  *) printf '{\"schema_version\":2,\"diagnostics\":[],\"cwd\":\"%s\"}' \"$(pwd)\";;\nesac\n",
+            dir.path().join("lint"),
+            "[ \"$1 $2\" = \"--json -\" ] || exit 2\nbody=$(cat)\ncase \"$body\" in\n  bad*) echo nope >&2; exit 2;;\n  warn*) echo '{\"schema_version\":2,\"diagnostics\":[]}'; exit 1;;\n  *) printf '{\"schema_version\":2,\"diagnostics\":[],\"cwd\":\"%s\"}' \"$(pwd)\";;\nesac\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let ok = run_with(&fake, &tag(), "x = 1\n", Some(dir.path())).unwrap();
+        let ok = run_with(fake, &tag(), "x = 1\n", Some(dir.path())).unwrap();
         assert!(ok.contains(&*dir.path().to_string_lossy()), "cwd is the file's directory: {ok}");
-        assert!(run_with(&fake, &tag(), "warn\n", None).unwrap().contains("schema_version"));
-        let err = run_with(&fake, &tag(), "bad\n", None).unwrap_err();
+        assert!(run_with(fake, &tag(), "warn\n", Some(dir.path())).unwrap().contains("schema_version"));
+        let err = run_with(fake, &tag(), "bad\n", Some(dir.path())).unwrap_err();
         assert!(err.contains("exit 2") && err.contains("nope"), "{err}");
     }
 
