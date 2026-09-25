@@ -79,6 +79,17 @@ impl Grid {
             self.height,
         )
         .expect("validated native grid dimensions");
+        // Mirror the image path (raster.rs Pipeline::draw): tiny-skia's
+        // identity fill rounds negative local bounds differently from its
+        // transformed path, so a negative origin under a combined identity
+        // transform must take the fallback, or grids and images diverge.
+        let effective = transform.pre_scale(
+            bounds.width / self.width as f32,
+            bounds.height / self.height as f32,
+        );
+        if effective.is_identity() && (bounds.x < 0.0 || bounds.y < 0.0) {
+            return false;
+        }
         let copied = crate::raster::native_placement(
             bounds,
             transform,
