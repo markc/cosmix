@@ -12,10 +12,10 @@ fn sf_families_discoverable(fonts: &mut FontCx) -> bool {
     let missing: Vec<_> = ["SF Pro Text", "SF Pro Display", "SF Mono"]
         .into_iter()
         .filter(|family| {
-            !fonts
+            fonts
                 .collection
                 .family_by_name(family)
-                .is_some_and(|family| !family.fonts().is_empty())
+                .is_none_or(|family| family.fonts().is_empty())
         })
         .collect();
     if !missing.is_empty() {
