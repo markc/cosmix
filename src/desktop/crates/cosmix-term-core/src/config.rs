@@ -30,7 +30,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            font_px: 13.0,
+            font_px: cosmix_design::default_typography(cosmix_design::TypographyRole::Terminal)
+                .font_size as f32,
             // Preserve the history limit previously passed to Crosswords::new.
             scrollback: 1000,
             cursor: Cursor::Underline,
@@ -158,6 +159,17 @@ fn term_for_probe(available: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_font_size_is_the_terminal_design_role() {
+        assert_eq!(
+            Config::default().font_px,
+            cosmix_design::default_typography(cosmix_design::TypographyRole::Terminal).font_size
+                as f32
+        );
+        assert_eq!(parse("font_px: 21.333").unwrap().font_px, 21.333);
+        assert!(valid_font(Config::default().font_px));
+    }
 
     #[test]
     fn optional_keys_and_example() {

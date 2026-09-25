@@ -185,8 +185,8 @@ mod tests {
     const PANE: u64 = 1;
 
     fn painter() -> Painter {
-        Painter::new(1.0, FontSize::new(13.0), Cursor::Underline)
-            .expect("a monospace font; set TERM_SPIKE_FONT to point at one")
+        Painter::for_test(1.0, FontSize::new(13.0), Cursor::Underline)
+            .expect("DejaVu Sans Mono fixture")
     }
 
     fn screen() -> Screen {
@@ -305,7 +305,7 @@ mod tests {
         assert_ne!(old.generation(), next.generation());
 
         let mut reference = cosmix_term_core::raster::Surface::default();
-        let mut raster = Raster::new(1.0, 13.0, Cursor::Underline).expect("a monospace font");
+        let mut raster = Raster::for_test(1.0, 13.0, Cursor::Underline).expect("a monospace font");
         raster.render_into(&grid, &[], &mut reference);
         assert_eq!(pixels(&next).as_ref(), native(reference.rgba()));
     }
@@ -318,7 +318,7 @@ mod tests {
         assert!(painter.repaint(PANE, &grid, &[]));
         refresh(&frame);
         let mut history = Vec::new();
-        let mut raster = Raster::new(1.0, 13.0, Cursor::Underline).expect("a monospace font");
+        let mut raster = Raster::for_test(1.0, 13.0, Cursor::Underline).expect("a monospace font");
 
         for generation in 2..=9 {
             // Keep each presented handle, including the first, across later
@@ -421,7 +421,7 @@ mod tests {
     fn idle_guard_matches_core_cursor_and_geometry_damage() {
         let mut painter = painter();
         let frame = painter.frame(PANE);
-        let mut raster = Raster::new(1.0, 13.0, Cursor::Underline).expect("a monospace font");
+        let mut raster = Raster::for_test(1.0, 13.0, Cursor::Underline).expect("a monospace font");
         let mut reference = cosmix_term_core::raster::Surface::default();
         let mut check = |grid: &Screen, dirty: &[bool]| {
             let changed = !raster.render_into(grid, dirty, &mut reference).is_empty();

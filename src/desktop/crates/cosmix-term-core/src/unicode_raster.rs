@@ -26,7 +26,11 @@ pub(super) struct Face {
 
 impl Face {
     fn new(data: Arc<[u8]>) -> Option<Self> {
-        let font = FontRef::from_index(&data, 0)?;
+        Self::at_index(data, 0)
+    }
+
+    fn at_index(data: Arc<[u8]>, index: u32) -> Option<Self> {
+        let font = FontRef::from_index(&data, index as usize)?;
         let (offset, key) = (font.offset, font.key);
         Some(Self { data, offset, key })
     }
@@ -58,9 +62,9 @@ pub(super) const EMOJI_PATHS: &[&str] = &[
 ];
 
 impl Fonts {
-    pub(super) fn discover(primary: Arc<[u8]>) -> Option<Arc<Self>> {
+    pub(super) fn discover(primary: Arc<[u8]>, index: u32) -> Option<Arc<Self>> {
         Some(Arc::new(Self {
-            primary: Face::new(primary)?,
+            primary: Face::at_index(primary, index)?,
             fallbacks: OnceLock::new(),
         }))
     }

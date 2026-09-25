@@ -405,8 +405,9 @@ band over deterministic varied grids, scales 1/1.25/1.5/2.5, bold and wide or
 combining characters (still cell-clipped), both cursor styles, partial final
 rows, partial repaint sequences, odd padding and nonzero unaligned buffer
 origins. Synthetic masks exercise all 256 coverage values and each clipping
-edge, including fully clipped glyphs. Tests require an installed monospace
-font or `TERM_SPIKE_FONT`, as existing raster tests do.
+edge, including fully clipped glyphs. Pixel oracles and raster benchmarks pin
+the installed DejaVu Sans Mono fixture explicitly, independent of desktop
+font discovery and `TERM_SPIKE_FONT`.
 
 The ignored `cpu_grid::bench::raster_warm_spans_bench` sits beside the existing
 phase probes. It measures the same padded 2250×1250, scale-2.5 fixture for
@@ -1160,3 +1161,37 @@ Remaining assumptions and validation limits:
   iced/winit and the compositor. The host tests do not establish live IME,
   clipboard, Wayland presentation or GPU-driver behaviour. Performance and
   visual font quality still require cluster gates and a live desktop check.
+
+## Terminal default typography
+
+Both terminal frontends read the `cosmix-design` **terminal** role: **SF Mono,
+Light (300), normal style, 21.3333 logical pixels (16pt)**. Fonts are not bundled.
+Primary discovery uses fontdb's ordered family query: SF Mono → DejaVu Sans
+Mono → Noto Sans Mono → system monospace, choosing the nearest available
+weight. If discovery yields no usable face, the existing DejaVu/Liberation/
+Noto/JetBrains file paths remain the last resort. Each selected path and face
+index is validated with Swash and shared by ASCII and Unicode rendering,
+including after zoom or an output-scale change. Cell advance, line height and
+baseline come from that face's metrics; output scale is applied once.
+
+`TERM_SPIKE_FONT=/path/to/font.ttf` (TTF, OTF or collection) takes precedence
+over discovery; an invalid override reports an error. Within a collection,
+the selected face index is retained. This changes only the primary face:
+the existing lazy Unicode, symbols and colour-emoji fallback is unchanged.
+
+Set `font_px: 21.333` in `$XDG_CONFIG_HOME/cosmix/term.conf.mix` (or
+`~/.config/cosmix/term.conf.mix`) to override the size. Fractions are accepted
+throughout the inclusive 6–48 logical-pixel range. A valid `TERM_FONT_PX`
+overrides the file. Omit `font_px` to follow the design token; an existing
+configured size continues to win. Zoom reset returns to that configured size.
+
+The core's `raster::primary_font_tests` check the loaded family, weight, style,
+face index and metrics, including a temporary free-font collection whose
+chosen face is index 1. They write one headless row at 2.5× to
+`src/desktop/target/font-probes/term-row-sf-2.5x.png` and
+`src/desktop/target/font-probes/term-row-free-2.5x.png`, printing each path
+with `--nocapture`. The SF test explicitly skips when
+`/usr/share/fonts/apple-fonts` is absent. The free test excludes SF from its
+database without changing installed files. Pixel oracles and benchmarks use
+`Raster::for_test` / `Painter::for_test` to pin DejaVu Sans Mono regardless of
+the desktop default or process environment.

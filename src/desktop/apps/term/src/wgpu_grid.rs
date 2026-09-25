@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn range_upload_layout_repairs_a_texture_after_coalesced_paints() {
-        let mut painter = Painter::new(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
+        let mut painter = Painter::for_test(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
         let mut screen = Screen {
             clusters: Default::default(),
             cols: 90,
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn emoji_spacer_damage_uploads_both_columns() {
-        let mut painter = Painter::new(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
+        let mut painter = Painter::for_test(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
         let mut screen = cosmix_term_core::terminal::Terminal::from_test_vt(8, 3, " 👩‍💻".as_bytes())
             .screen(false);
         screen.cursor_visible = false;

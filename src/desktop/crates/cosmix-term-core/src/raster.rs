@@ -1,13 +1,19 @@
 use crate::terminal::{Cell, CellWidth, Screen};
+#[path = "primary_font.rs"]
+mod primary_font;
+#[cfg(test)]
+#[path = "primary_font_tests.rs"]
+mod primary_font_tests;
 #[path = "unicode_raster.rs"]
 mod unicode;
 use unicode::{Fonts, Pixels, UnicodeRaster};
 #[cfg(test)]
 #[path = "raster_unicode_tests.rs"]
 mod unicode_tests;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
+#[cfg(test)]
+use swash::FontRef;
 use swash::{
-    FontRef,
     scale::{Render, ScaleContext, Source, image::Image},
     zeno::Format,
 };
@@ -396,34 +402,26 @@ pub struct Raster {
 }
 impl Raster {
     pub fn new(scale: f32, logical_px: f32, cursor: crate::config::Cursor) -> Result<Self, String> {
-        let path = if let Some(path) = std::env::var_os("TERM_SPIKE_FONT") {
-            PathBuf::from(path)
-        } else {
-            [
-                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-                "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-                "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
-                "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-                "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
-                "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-            ]
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|p| p.is_file())
-            .ok_or("No monospace font found; set TERM_SPIKE_FONT=/path/to/font.ttf")?
-        };
-        let data = std::fs::read(&path)
-            .map_err(|e| format!("font {}: {e}; set TERM_SPIKE_FONT", path.display()))?;
-        let raster = Self::from_font(data.into(), scale, logical_px, cursor)?;
+        let override_path = std::env::var_os("TERM_SPIKE_FONT");
+        let primary = primary_font::discover(override_path.as_deref().map(Path::new))?;
+        let raster = Self::from_font(primary.data, primary.index, scale, logical_px, cursor)?;
         eprintln!(
-            "DIAGNOSTIC font={} scale={} cell={}x{} (physical px); bold=regular+brighter colour",
-            path.display(),
+            "DIAGNOSTIC font={} face={} scale={} cell={}x{} (physical px); bold=regular+brighter colour",
+            primary.path.display(),
+            primary.index,
             raster.scale,
             raster.width,
             raster.height
         );
         Ok(raster)
+    }
+
+    /// Fixed DejaVu face for pixel oracles and repeatable benchmarks. Ignores
+    /// desktop discovery and process environment; requires the free fixture.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(scale: f32, logical_px: f32, cursor: crate::config::Cursor) -> Result<Self, String> {
+        let primary = primary_font::fixture()?;
+        Self::from_font(primary.data, primary.index, scale, logical_px, cursor)
     }
 
     /// The same font at another scale or size: no file read and no
@@ -443,11 +441,12 @@ impl Raster {
 
     fn from_font(
         data: Arc<[u8]>,
+        index: u32,
         scale: f32,
         logical_px: f32,
         cursor: crate::config::Cursor,
     ) -> Result<Self, String> {
-        let fonts = Fonts::discover(data.clone()).ok_or("Invalid primary font")?;
+        let fonts = Fonts::discover(data.clone(), index).ok_or("Invalid primary font")?;
         Self::from_fonts(data, fonts, scale, logical_px, cursor)
     }
 
@@ -461,8 +460,7 @@ impl Raster {
         let scale = scale.clamp(0.5, 8.0);
         // Startup resolves logical size once; scale makes it physical for HiDPI.
         let px = logical_px * scale;
-        let font = FontRef::from_index(&data, 0)
-            .ok_or("Invalid font; set TERM_SPIKE_FONT to a TTF/OTF font")?;
+        let font = fonts.primary.font();
         let metrics = font.metrics(&[]).scale(px);
         let advance = font
             .glyph_metrics(&[])
@@ -1654,7 +1652,7 @@ mod tests {
     fn destination_format_switch_repaints_clean_rows_and_preserves_padding() {
         for scale in [1.0, 1.25, 2.5] {
             for cursor in [Cursor::Block, Cursor::Underline] {
-                let mut raster = Raster::new(scale, 13.0, cursor).unwrap();
+                let mut raster = Raster::for_test(scale, 13.0, cursor).unwrap();
                 let mut grid = screen(3, 5, 'M');
                 grid.cursor_visible = true;
                 grid.cursor = (1, 4);
@@ -1705,10 +1703,10 @@ mod tests {
     /// reading the font again: the bytes are shared, not re-read or copied.
     #[test]
     fn resized_matches_new_and_shares_the_font_bytes() {
-        let base = Raster::new(1.0, 13.0, Cursor::Block).expect("a monospace font");
+        let base = Raster::for_test(1.0, 13.0, Cursor::Block).expect("DejaVu Sans Mono");
         for (scale, px) in [(1.0, 17.0), (2.5, 13.0), (1.25, 9.5)] {
             let resized = base.resized(scale, px).unwrap();
-            let fresh = Raster::new(scale, px, Cursor::Block).unwrap();
+            let fresh = Raster::for_test(scale, px, Cursor::Block).unwrap();
             assert_eq!(
                 (
                     resized.width,
@@ -1763,8 +1761,7 @@ mod tests {
     /// whole cell and `Underline` only its last row, so a test about
     /// inversion landing on the right row must say which one it means.
     pub(super) fn raster_with(cursor: Cursor) -> Raster {
-        Raster::new(1.0, 13.0, cursor)
-            .expect("a monospace font; set TERM_SPIKE_FONT to point at one")
+        Raster::for_test(1.0, 13.0, cursor).expect("DejaVu Sans Mono")
     }
 
     /// Compare entire guarded allocations, including padding and untouched

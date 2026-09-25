@@ -30,7 +30,7 @@ fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
         (2.25, 41),
         (2.5, 41),
     ] {
-        let mut raster = Raster::new(scale, 13.0, Cursor::Underline).unwrap();
+        let mut raster = Raster::for_test(scale, 13.0, Cursor::Underline).unwrap();
         raster.height = cell_height;
         let screen = Screen {
             clusters: Default::default(),
@@ -121,7 +121,7 @@ fn tiny_skia_frame_bench() {
             .into_iter()
             .enumerate()
         {
-            let mut raster = Raster::new(2.5, 13.0, Cursor::Underline).unwrap();
+            let mut raster = Raster::for_test(2.5, 13.0, Cursor::Underline).unwrap();
             // Padded cells make the requested physical extent exact independently
             // of the installed font; glyph rendering still uses the real 2.5x font.
             raster.width = 25;
@@ -285,7 +285,7 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
     use iced_tiny_skia::window::compositor::{PresentHistory, physical_damage};
     for scale in [1.0, 1.25, 2.5] {
         let mut scale = scale;
-        let mut raster = Raster::new(scale, 13.0, Cursor::Block).unwrap();
+        let mut raster = Raster::for_test(scale, 13.0, Cursor::Block).unwrap();
         let mut screen = Screen {
             clusters: Default::default(),
             cols: 9,
@@ -487,7 +487,7 @@ fn raster_warm_spans_bench() {
     use cosmix_term_core::raster::PaintState;
     use std::hint::black_box;
 
-    let mut raster = Raster::new(2.5, 13.0, Cursor::Underline).unwrap();
+    let mut raster = Raster::for_test(2.5, 13.0, Cursor::Underline).unwrap();
     raster.width = 25;
     raster.height = 50;
     for spaces in [false, true] {
@@ -587,7 +587,7 @@ fn tiny_skia_foot_phases_bench() {
         );
     }
 
-    let mut raster = Raster::new(2.5, 13.0, Cursor::Underline).unwrap();
+    let mut raster = Raster::for_test(2.5, 13.0, Cursor::Underline).unwrap();
     raster.width = 25;
     raster.height = 50;
     let mut screen = Screen {

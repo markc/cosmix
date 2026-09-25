@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn unicode_band_snapshots_retain_text_and_expand_spacer_damage() {
-        let mut raster = Raster::new(1.25, 13.0, Cursor::Block).unwrap();
+        let mut raster = Raster::for_test(1.25, 13.0, Cursor::Block).unwrap();
         let mut surface = Surface::default();
         let mut screen = cosmix_term_core::terminal::Terminal::from_test_vt(
             8,
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn bands_preserve_pixels_ids_and_cursor_damage_across_boundaries() {
-        let mut raster = Raster::new(2.5, 13.0, Cursor::Block).unwrap();
+        let mut raster = Raster::for_test(2.5, 13.0, Cursor::Block).unwrap();
         let mut surface = Surface::default();
         let mut screen = Screen {
             clusters: Default::default(),

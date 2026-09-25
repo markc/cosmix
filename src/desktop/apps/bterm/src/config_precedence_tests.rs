@@ -7,7 +7,7 @@ fn env_over_file_over_default() {
         resolve_config(defaults, None, "xterm-256color")
             .config
             .font_px,
-        13.0
+        defaults.font_px
     );
     let file: config::Config = cosmix_config::from_conf_mix_str("font_px: 18").unwrap();
     assert_eq!(

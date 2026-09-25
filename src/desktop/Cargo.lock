@@ -3501,12 +3501,15 @@ dependencies = [
 name = "cosmix-term-core"
 version = "0.6.5"
 dependencies = [
+ "cosmix-design",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
  "ed25519-dalek",
+ "fontdb",
  "libc",
+ "png",
  "rio-vt",
  "serde",
  "serde_json",

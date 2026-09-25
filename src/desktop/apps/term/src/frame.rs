@@ -121,6 +121,15 @@ pub struct Painter {
 }
 
 impl Painter {
+    #[cfg(test)]
+    pub(crate) fn for_test(scale: f32, font: FontSize, cursor: Cursor) -> Result<Self, String> {
+        Ok(Self {
+            raster: Raster::for_test(scale, font.current(), cursor)?,
+            font,
+            frames: HashMap::new(),
+        })
+    }
+
     pub fn new(scale: f32, font: FontSize, cursor: Cursor) -> Result<Self, String> {
         Ok(Self {
             raster: Raster::new(scale, font.current(), cursor)?,
@@ -328,8 +337,8 @@ mod tests {
     }
 
     fn painter_at(px: f32) -> Painter {
-        Painter::new(1.0, FontSize::new(px), Cursor::Underline)
-            .expect("a monospace font; set TERM_SPIKE_FONT to point at one")
+        Painter::for_test(1.0, FontSize::new(px), Cursor::Underline)
+            .expect("DejaVu Sans Mono fixture")
     }
 
     /// The whole point of the frontend, as an assertion: repeated repaints
@@ -404,7 +413,7 @@ mod tests {
         let _ = painter.repaint(PANE, &grid, &[]);
         let cell = painter.cell();
 
-        let other = Raster::new(1.0, 12.9, Cursor::Underline).expect("a monospace font");
+        let other = Raster::for_test(1.0, 12.9, Cursor::Underline).expect("a monospace font");
         assert_eq!(
             (other.width, other.height),
             cell,
@@ -683,7 +692,7 @@ mod tests {
 
         assert!(painter.set_scale(2.0).unwrap());
         assert_eq!(painter.font().current(), zoomed);
-        let expected = Raster::new(2.0, zoomed, Cursor::Underline).unwrap();
+        let expected = Raster::for_test(2.0, zoomed, Cursor::Underline).unwrap();
         assert_eq!(painter.cell(), (expected.width, expected.height));
         assert!(!painter.set_scale(2.0).unwrap(), "same scale, no rebuild");
     }

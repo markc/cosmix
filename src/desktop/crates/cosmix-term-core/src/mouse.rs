@@ -271,7 +271,7 @@ mod tests {
     fn scroll_and_history_clear_pixels_match_a_fresh_render() {
         use crate::{config::Cursor, raster::{Raster, Surface}};
         let (term, _rx) = history();
-        let mut raster = Raster::new(1.0, 13.0, Cursor::Block).unwrap();
+        let mut raster = Raster::for_test(1.0, 13.0, Cursor::Block).unwrap();
         let mut incremental = Surface::default();
         let mut check = || {
             let snapshot = term.grid_snapshot();

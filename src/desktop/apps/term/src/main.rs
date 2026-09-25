@@ -1517,7 +1517,7 @@ mod tests {
         let tabs = Arc::new(Mutex::new(layout::test_tabs()));
         tabs.lock().unwrap().set_wake(waker.fd.waker());
         let state = State {
-            painter: Painter::new(1.0, FontSize::new(13.0), config::Cursor::Underline)
+            painter: Painter::for_test(1.0, FontSize::new(13.0), config::Cursor::Underline)
                 .expect("a monospace font"),
             tabs,
             cleanup,
@@ -2277,7 +2277,7 @@ mod tests {
             assert!(!state.needs_paint());
             assert_eq!(generation(&state, id), before + 1);
             assert_eq!(generation(&state, neighbour), neighbour_generation);
-            let mut fresh = Painter::new(
+            let mut fresh = Painter::for_test(
                 state.painter.scale(),
                 state.painter.font(),
                 config::Cursor::Underline,
