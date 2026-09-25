@@ -31,7 +31,8 @@
 //! 3. fsync the directory;
 //! 4. write `meta.json.tmp` with `gen: g+1`, fsync, rename over `<rid>.meta.json`;
 //! 5. fsync the directory (the switch is durable — ack [`RecSignal::switch_done`]);
-//! 6. unlink `<rid>.<g>.snap` / `.log`, fsync the directory.
+//! 6. unlink `<rid>.<g>.snap` / `.log` — and those of any older generation a
+//!    failed switch left behind — then fsync the directory.
 //!
 //! # Generation hand-off: the actor owns the boundary (codex round-2 N4)
 //! The actor is strictly serial, so in ONE step it sets `R = buffer.rev()`,
@@ -655,6 +656,7 @@ pub enum Fault {
 }
 
 type FaultHook = Box<dyn FnMut(Fault) -> bool + Send>;
+type IoFaultHook = Box<dyn FnMut(u8) -> bool + Send>;
 
 struct RidFiles {
     generation: u64,
@@ -674,7 +676,12 @@ pub struct Writer {
     files: HashMap<String, RidFiles>,
     logged: HashSet<String>,
     sync_due: Option<Instant>,
+    /// Generations of a rid, other than its current one, whose files may
+    /// still be on disk (a failed switch, or one retired by a switch whose
+    /// retire step has not run): the next durable switch retires them all.
+    stray: HashMap<String, Vec<u64>>,
     fault: Option<FaultHook>,
+    io_fault: Option<IoFaultHook>,
     crashed: bool,
     strict: bool,
 }
@@ -718,7 +725,9 @@ impl Writer {
             files: HashMap::new(),
             logged: HashSet::new(),
             sync_due: None,
+            stray: HashMap::new(),
             fault: None,
+            io_fault: None,
             crashed: false,
             strict: true,
         }
@@ -732,6 +741,20 @@ impl Writer {
     #[doc(hidden)]
     pub fn set_fault(&mut self, hook: impl FnMut(Fault) -> bool + Send + 'static) {
         self.fault = Some(Box::new(hook));
+    }
+
+    /// Test hook: the directory fsync of switch step `n` (3 or 5) fails with
+    /// an I/O error where `hook(n)` returns true (no crash).
+    #[doc(hidden)]
+    pub fn set_io_fault(&mut self, hook: impl FnMut(u8) -> bool + Send + 'static) {
+        self.io_fault = Some(Box::new(hook));
+    }
+
+    fn io_fault(&mut self, step: u8) -> std::io::Result<()> {
+        match self.io_fault.as_mut() {
+            Some(hook) if hook(step) => Err(std::io::Error::other(format!("injected failure at switch step {step}"))),
+            _ => Ok(()),
+        }
     }
 
     /// Test hook: a stale-generation Append is debug-asserted unreachable;
@@ -818,14 +841,15 @@ impl Writer {
 
     fn switch(&mut self, rid: &str, generation: u64, rev: u64, text: &Arc<str>, meta: &RecoveryMeta) {
         if let Err(e) = self.try_switch(rid, generation, rev, text, meta) {
+            if self.current_gen(rid) != Some(generation) {
+                self.stray.entry(rid.to_string()).or_default().push(generation);
+            }
             self.fail(rid, Some(generation), &format!("switch to generation {generation}"), &e);
         }
     }
 
     /// The frozen six steps (module docs). `Ok` also when a fault stopped it.
     fn try_switch(&mut self, rid: &str, generation: u64, rev: u64, text: &str, meta: &RecoveryMeta) -> std::io::Result<()> {
-        let prev = self.files.get(rid).map(|f| f.generation).filter(|g| *g != generation);
-
         // 1. the snapshot, via a synced temp file
         let snap = self.dir.join(format!("{rid}.{generation}.snap"));
         let tmp = self.dir.join(format!("{rid}.{generation}.snap.tmp"));
@@ -857,6 +881,7 @@ impl Writer {
         }
 
         // 3.
+        self.io_fault(3)?;
         self.fsync_dir()?;
         if self.fault(Fault::SwitchStep(3)) {
             return Ok(());
@@ -884,6 +909,9 @@ impl Writer {
             },
         );
         if let Some(old) = retired {
+            if old.generation != generation {
+                self.stray.entry(rid.to_string()).or_default().push(old.generation);
+            }
             // Records of the retired log are covered by the new snapshot.
             let _ = self.shared.stats.unsynced.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(old.unsynced))
@@ -894,6 +922,7 @@ impl Writer {
         }
 
         // 5. durable: acknowledge
+        self.io_fault(5)?;
         self.fsync_dir()?;
         self.shared.set_failed(rid, false);
         self.logged.remove(rid);
@@ -904,15 +933,26 @@ impl Writer {
             return Ok(());
         }
 
-        // 6. retire the old generation (a failure here only leaves orphans
-        // for the restore sweep: the switch itself is complete)
-        if let Some(old) = prev {
-            let retire = remove_if_exists(&self.dir.join(format!("{rid}.{old}.snap")))
-                .and_then(|()| remove_if_exists(&self.dir.join(format!("{rid}.{old}.log"))))
-                .and_then(|()| self.fsync_dir());
+        // 6. retire every older generation still on disk — the previous one
+        // and any a failed switch left (Opus m8). A failure here only leaves
+        // orphans for the restore sweep: the switch itself is complete.
+        let old: Vec<u64> = self.stray.remove(rid).unwrap_or_default().into_iter().filter(|g| *g != generation).collect();
+        let mut kept = Vec::new();
+        let any = !old.is_empty();
+        for g in old {
+            let retire = remove_if_exists(&self.dir.join(format!("{rid}.{g}.snap")))
+                .and_then(|()| remove_if_exists(&self.dir.join(format!("{rid}.{g}.snap.tmp"))))
+                .and_then(|()| remove_if_exists(&self.dir.join(format!("{rid}.{g}.log"))));
             if let Err(e) = retire {
-                tracing::warn!("cosmix-editd: retiring recovery generation {old} of {rid}: {e}");
+                tracing::warn!("cosmix-editd: retiring recovery generation {g} of {rid}: {e}");
+                kept.push(g);
             }
+        }
+        if !kept.is_empty() {
+            self.stray.insert(rid.to_string(), kept);
+        }
+        if any && let Err(e) = self.fsync_dir() {
+            tracing::warn!("cosmix-editd: retiring recovery generations of {rid}: {e}");
         }
         self.fault(Fault::SwitchStep(6));
         Ok(())
@@ -978,6 +1018,7 @@ impl Writer {
     /// directory. A failure deletes nothing further (a restore may bring the
     /// buffer back; never the reverse).
     fn discard(&mut self, rid: &str) {
+        self.stray.remove(rid);
         if let Some(f) = self.files.remove(rid) {
             let _ = self.shared.stats.unsynced.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_sub(f.unsynced))

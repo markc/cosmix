@@ -394,7 +394,8 @@ the text at some rev plus an append-only log of every edit after it. A
 Files are never truncated or rewritten in place. A new generation (on the
 clean → dirty transition, when the log outgrows the snapshot, after a write
 failure, and at every restore) is written in full, fsynced, and only then
-named by the meta; the old one is deleted afterwards. A crash at any moment
+named by the meta; the old one — and any a failed switch left behind — is
+deleted afterwards. A crash at any moment
 leaves the meta naming a complete generation.
 
 **The loss window.**
@@ -404,9 +405,11 @@ leaves the meta naming a complete generation.
 - **SIGTERM:** none. The daemon drains the queue and syncs before it exits
   (within the 10 s shutdown budget), then logs each dirty buffer as
   `keeping (in recovery files)`.
-- **Degraded** (the 8 MiB write queue overflowed, or a write failed): loss is
-  bounded by the last completed sync. The daemon repairs itself by writing a
-  fresh generation at once; meanwhile `recovery.ok` is `false`, `volatile` is
+- **Degraded** (the 8 MiB write queue overflowed, or a write failed): a crash
+  loses everything since the last completed sync, and that window keeps
+  growing while the failure persists — records are dropped, not queued, until
+  a repair generation is durable. The daemon writes that fresh generation at
+  once (and again at each later edit while writes fail); meanwhile `recovery.ok` is `false`, `volatile` is
   `true`, and `lifecycle.recovery_unsynced` counts what is at risk.
 - **Not recovered:** undo and redo history, anchors, selections and holders.
   A restored buffer starts at rev 0 with an empty log.

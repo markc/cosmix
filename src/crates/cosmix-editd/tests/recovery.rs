@@ -687,6 +687,34 @@ fn restore_sweeps_orphans() {
 }
 
 #[test]
+fn a_switch_after_failed_ones_retires_every_older_generation() {
+    // Opus m8: a switch whose step-5 directory fsync fails has already made
+    // its generation current; one failing at step 3 never did. The next
+    // durable switch must retire both, and the one before them.
+    for failing in [3u8, 5] {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path();
+        let mut w = writer(dir);
+        w.handle(switch(1, 0, "base"));
+        w.set_io_fault(move |step| step == failing);
+        w.handle(switch(2, 1, "base+1"));
+        assert!(!w.crashed());
+        assert!(w.shared().is_failed(RID), "step {failing}: the failed switch degrades the rid");
+        w.set_io_fault(|_| false);
+        w.handle(switch(3, 2, "base+1+2"));
+        let left = rid_files(dir, RID);
+        assert_eq!(
+            left,
+            vec![format!("{RID}.3.log"), format!("{RID}.3.snap"), format!("{RID}.meta.json")],
+            "step {failing}: only the new generation is left"
+        );
+        assert_eq!(meta_of(dir, RID).generation, 3);
+        let r = restore_one(dir).unwrap();
+        assert_eq!(r.text, "base+1+2");
+    }
+}
+
+#[test]
 fn a_failed_restore_switch_keeps_the_old_generation() {
     let t = tempfile::tempdir().unwrap();
     {
