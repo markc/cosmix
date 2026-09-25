@@ -9,7 +9,8 @@ use rio_vt::{
     },
     selection::Selection,
 };
-use std::time::Instant;
+
+const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
 
 fn point(term: &Crosswords<Listener>, col: u16, row: u16) -> Pos {
     Pos::new(
@@ -78,12 +79,17 @@ impl Terminal {
         if text.is_empty() {
             return Ok(());
         }
+        // Bound the clipboard payload before allocating its encoded copy.
+        // Bracket delimiters are framing, outside this human-paste limit.
+        if text.len() > MAX_PASTE_BYTES {
+            return Err("Paste exceeds 16 MiB limit".into());
+        }
         let term = self.grid.lock();
         let bytes = encode_paste(text, term.mode().contains(Mode::BRACKETED_PASTE));
         let mut writes = self.listener.writes.lock().unwrap();
         Listener::revoke_writer(&mut writes);
         self.listener
-            .enqueue(&mut writes, bytes, Some(Instant::now()), None)?;
+            .enqueue(&mut writes, bytes, None, None, false)?;
         drop(writes);
         drop(term);
         self.listener.follow_input();
@@ -105,7 +111,13 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
         }
     }
     let mut bytes = b"\x1b[200~".to_vec();
-    bytes.extend(payload);
+    // Like Rio's frontend, strip ESC and ETX too: ESC introduces arbitrary
+    // terminal sequences and some shells terminate bracketed paste on ^C.
+    bytes.extend(
+        payload
+            .into_iter()
+            .filter(|byte| !matches!(byte, 0x1b | 0x03)),
+    );
     bytes.extend_from_slice(b"\x1b[201~");
     bytes
 }
@@ -115,6 +127,7 @@ mod tests {
     use super::super::MouseModifiers;
     use super::*;
     use rio_vt::{event::Msg, performer::handler::Processor};
+    use std::time::Instant;
 
     fn select(term: &Terminal, start: (u16, u16), end: (u16, u16)) {
         term.selection_start(start.0, start.1, SelectionSide::Left, SelectionType::Simple);
@@ -258,6 +271,80 @@ mod tests {
             encode_paste("a\x1b[201~b\x1b[200~c\x1b[20\x1b[201~1~d", true),
             b"\x1b[200~abcd\x1b[201~"
         );
+        assert_eq!(
+            encode_paste("a\x1b[31mé\x03\t\nb", true),
+            "\x1b[200~a[31mé\t\nb\x1b[201~".as_bytes()
+        );
+        assert_eq!(
+            encode_paste("a\x1b[31mé\x03\t\nb", false),
+            "a\x1b[31mé\x03\t\rb".as_bytes()
+        );
+    }
+
+    #[test]
+    fn selecting_a_wide_trailing_cell_highlights_the_copied_glyph() {
+        let term = Terminal::from_test_vt(8, 3, "a界b".as_bytes());
+        let base = term.grid_snapshot().screen;
+        select(&term, (2, 0), (2, 0));
+        assert_eq!(term.selection_finish().as_deref(), Some("界"));
+        let selected = term.grid_snapshot();
+        for (i, (before, after)) in base.cells.iter().zip(&selected.screen.cells).enumerate() {
+            let expected = if (1..=2).contains(&i) {
+                (before.bg, before.fg)
+            } else {
+                (before.fg, before.bg)
+            };
+            assert_eq!((after.fg, after.bg), expected, "cell {i}");
+        }
+        assert_eq!(selected.dirty_rows, [true, false, false]);
+    }
+
+    #[test]
+    fn paste_and_local_input_do_not_spend_or_depend_on_the_control_budget() {
+        let term = Terminal::from_test_vt(8, 3, b"\x1b[?2004h");
+        let rx = term.listener.test_input_receiver();
+        let text = "x".repeat(1024 * 1024);
+        term.paste(&text).unwrap();
+        {
+            let writes = term.listener.writes.lock().unwrap();
+            assert_eq!(writes.control_bytes, 0);
+            assert_eq!(writes.pending.len(), 1, "paste is one FIFO entry");
+            assert!(
+                writes.pending[0].key.is_none(),
+                "paste is not a key-latency sample"
+            );
+            assert!(writes.pending[0].permit.is_none());
+        }
+        let control = "c".repeat(8192);
+        for _ in 0..8 {
+            term.listener.bus_text(&control).unwrap();
+        }
+        assert_eq!(term.listener.writes.lock().unwrap().control_bytes, 65536);
+        assert_eq!(
+            term.listener.bus_text("c").unwrap_err(),
+            "PTY input queue full"
+        );
+        // Neither a full control lane nor a draining paste refuses human keys
+        // or parser replies. They retain their place after the whole paste.
+        term.key(super::super::Key::Char('k'), Instant::now())
+            .unwrap();
+        term.listener.type_text("typed").unwrap();
+        term.listener.write(b"reply".to_vec(), None).unwrap();
+        // Even another human paste is independent of the control budget.
+        term.paste("second").unwrap();
+        let input = || match rx.try_recv().unwrap() {
+            Msg::Input(bytes) => bytes.into_owned(),
+            _ => panic!("expected input"),
+        };
+        assert_eq!(input(), encode_paste(&text, true));
+        for _ in 0..8 {
+            assert_eq!(input(), control.as_bytes());
+        }
+        assert_eq!(input(), b"k");
+        assert_eq!(input(), b"typed");
+        assert_eq!(input(), b"reply");
+        assert_eq!(input(), encode_paste("second", true));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -286,9 +373,17 @@ mod tests {
         term.paste("").unwrap();
         assert!(term.display_offset() > 0);
         assert!(
-            term.paste(&"x".repeat(65536)).is_err(),
+            term.paste(&"x".repeat(MAX_PASTE_BYTES + 1)).is_err(),
             "queue refuses a whole oversized paste"
         );
         assert!(term.display_offset() > 0);
+        assert!(rx.try_recv().is_err(), "rejection sends no partial paste");
+        term.paste(&"x".repeat(MAX_PASTE_BYTES)).unwrap();
+        let Msg::Input(bytes) = rx.try_recv().unwrap() else {
+            panic!("expected input")
+        };
+        assert_eq!(bytes.len(), MAX_PASTE_BYTES + 12);
+        assert_eq!(&bytes[..6], b"\x1b[200~");
+        assert_eq!(&bytes[bytes.len() - 6..], b"\x1b[201~");
     }
 }

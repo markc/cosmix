@@ -1,13 +1,14 @@
 //! Clipboard tasks and pointer gestures; selection itself lives in term-core.
 
 use crate::{Action, Message, State, input, layout};
-use cosmix_term_core::terminal::{MouseModifiers, SelectionSide, SelectionType};
+use cosmix_term_core::terminal::{MouseModifiers, SelectionSide, SelectionType, Terminal};
 use iced::{
     Point, Task,
     mouse::{Button, Event},
 };
 use std::{
     cell::Cell,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -19,9 +20,11 @@ struct Hit {
     side: SelectionSide,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Press {
     pane: u64,
+    terminal: Arc<Mutex<Terminal>>,
+    last: Hit,
     button: u8,
     local: bool,
     origin: Point,
@@ -35,6 +38,28 @@ pub(super) struct MouseState {
 }
 
 impl MouseState {
+    /// End a cancelled grab exactly once, even after its pane has left the
+    /// tab tree. Keep the original terminal alive until the release is sent.
+    fn cancel(&mut self) -> bool {
+        self.clicks = None;
+        let Some(press) = self.pressed.take() else {
+            return false;
+        };
+        let terminal = press.terminal.lock().expect("terminal");
+        if !press.local {
+            terminal.mouse_button(
+                press.last.col,
+                press.last.row,
+                press.button,
+                false,
+                press.mods,
+            );
+        } else if press.button == 0 {
+            terminal.selection_clear();
+        }
+        true
+    }
+
     fn click(&mut self, hit: Hit, at: Instant) -> SelectionType {
         let count = self.clicks.map_or(1, |(last, when, count)| {
             if last.pane == hit.pane
@@ -67,11 +92,17 @@ pub(super) struct MouseEvents {
 impl MouseEvents {
     pub fn new(state: &State) -> Self {
         Self {
-            grabbed: Cell::new(state.mouse.pressed.map(|press| match press.button {
-                0 => Button::Left,
-                1 => Button::Middle,
-                _ => Button::Right,
-            })),
+            grabbed: Cell::new(
+                state
+                    .mouse
+                    .pressed
+                    .as_ref()
+                    .map(|press| match press.button {
+                        0 => Button::Left,
+                        1 => Button::Middle,
+                        _ => Button::Right,
+                    }),
+            ),
             last: Cell::new(state.pointer.get().and_then(|p| state.hit(p, None))),
         }
     }
@@ -89,15 +120,20 @@ impl MouseEvents {
         let hit = state.hit(position, None);
         match event {
             Event::ButtonPressed(button) if button_code(*button).is_some() => {
-                hit?;
-                if self.grabbed.get().is_none() {
-                    self.grabbed.set(Some(*button));
+                if hit.is_none() && self.grabbed.get().is_none() {
+                    return None;
                 }
+                // A new button press replaces a cancelled Wayland grab,
+                // including when the new press uses a different button.
+                self.grabbed.set(hit.map(|_| *button));
             }
             Event::ButtonReleased(button) if button_code(*button).is_some() => {
                 if self.grabbed.get() != Some(*button) {
                     return None;
                 }
+                self.grabbed.set(None);
+            }
+            Event::ButtonPressed(_) if self.grabbed.get().is_some() => {
                 self.grabbed.set(None);
             }
             Event::CursorMoved { .. } => {
@@ -134,6 +170,25 @@ fn read(pane: u64, primary: bool) -> Task<Message> {
 }
 
 impl State {
+    pub(super) fn cancel_mouse_gesture(&mut self) {
+        self.paint_requested |= self.mouse.cancel();
+    }
+
+    pub(super) fn cancel_hidden_gesture(&mut self) {
+        let hidden = self.mouse.pressed.as_ref().is_some_and(|press| {
+            !self
+                .tabs
+                .lock()
+                .expect("tabs")
+                .leaves()
+                .iter()
+                .any(|pane| pane.id == press.pane)
+        });
+        if hidden {
+            self.cancel_mouse_gesture();
+        }
+    }
+
     /// Clamp an active drag to its original pane even outside its rectangle.
     fn hit(&self, position: Point, target: Option<u64>) -> Option<Hit> {
         let tree = self.shape.tree.as_ref()?;
@@ -197,8 +252,12 @@ impl State {
         };
         tabs.user_activity();
         drop(tabs);
-        if let Err(error) = terminal.lock().expect("terminal").paste(&text) {
-            eprintln!("term: paste: {error}");
+        match terminal.lock().expect("terminal").paste(&text) {
+            Ok(()) => self.paste_notice = None,
+            Err(error) => {
+                eprintln!("term: paste: {error}");
+                self.paste_notice = Some(error);
+            }
         }
     }
 
@@ -215,13 +274,13 @@ impl State {
         };
         match event {
             Event::ButtonPressed(button) => {
+                // A compositor may cancel the grab without a button-up.
+                if self.mouse.pressed.is_some() {
+                    self.cancel_mouse_gesture();
+                }
                 let Some(button) = button_code(button) else {
                     return Task::none();
                 };
-                // One gesture owns the pointer until its matching release.
-                if self.mouse.pressed.is_some() {
-                    return Task::none();
-                }
                 let Some(hit) = self.hit(position, None) else {
                     return Task::none();
                 };
@@ -231,16 +290,27 @@ impl State {
                 };
                 tabs.user_activity();
                 tabs.focus(hit.pane);
+                let local = mods.shift || !terminal.lock().expect("terminal").mouse_reporting();
+                if local && button == 0 {
+                    for pane in tabs.control_panes() {
+                        if pane.id != hit.pane
+                            && let Some(other) = tabs.pane_by_id(pane.id)
+                        {
+                            other.lock().expect("terminal").selection_clear();
+                        }
+                    }
+                }
                 drop(tabs);
-                let terminal = terminal.lock().expect("terminal");
-                let local = mods.shift || !terminal.mouse_reporting();
                 self.mouse.pressed = Some(Press {
                     pane: hit.pane,
+                    terminal: terminal.clone(),
+                    last: hit,
                     button,
                     local,
                     origin: position,
                     mods,
                 });
+                let terminal = terminal.lock().expect("terminal");
                 if !local {
                     self.mouse.clicks = None;
                     terminal.mouse_button(hit.col, hit.row, button, true, mods);
@@ -254,23 +324,31 @@ impl State {
                 }
             }
             Event::CursorMoved { .. } | Event::ButtonReleased(_) => {
-                let press = self.mouse.pressed;
+                let press = self.mouse.pressed.clone();
                 let released = matches!(event, Event::ButtonReleased(_));
-                if let Event::ButtonReleased(button) = event {
-                    if press.is_none_or(|press| Some(press.button) != button_code(button)) {
-                        return Task::none();
-                    }
-                    self.mouse.pressed = None;
+                if let Event::ButtonReleased(button) = event
+                    && press
+                        .as_ref()
+                        .is_none_or(|press| Some(press.button) != button_code(button))
+                {
+                    return Task::none();
                 }
-                let Some(hit) = self.hit(position, press.map(|p| p.pane)) else {
-                    self.mouse.pressed = None;
+                let Some(hit) = self.hit(position, press.as_ref().map(|p| p.pane)) else {
+                    self.cancel_mouse_gesture();
                     return Task::none();
                 };
                 let tabs = self.tabs.lock().expect("tabs");
                 let Some(terminal) = tabs.pane_by_id(hit.pane) else {
+                    drop(tabs);
+                    self.cancel_mouse_gesture();
                     return Task::none();
                 };
                 drop(tabs);
+                if released {
+                    self.mouse.pressed = None;
+                } else if let Some(press) = self.mouse.pressed.as_mut() {
+                    press.last = hit;
+                }
                 let terminal = terminal.lock().expect("terminal");
                 if let Some(press) = press {
                     if press.local && press.button == 0 {

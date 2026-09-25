@@ -72,6 +72,7 @@ struct Pending {
     remaining: usize,
     key: Option<Instant>,
     permit: Option<Arc<crate::control::Permit>>,
+    control: bool,
 }
 #[derive(Default)]
 struct Writes {
@@ -81,7 +82,9 @@ struct Writes {
     group: i32,
     sender: Option<channel::Sender<Msg>>,
     pending: VecDeque<Pending>,
-    bytes: usize,
+    // Only Bus/control input consumes the bounded admission budget. Human
+    // input and VT replies must remain admissible while a paste drains.
+    control_bytes: usize,
     foreground: u64,
     owner: Option<(String, Arc<crate::control::Permit>)>,
 }
@@ -128,11 +131,24 @@ impl Listener {
         }
         self.wake();
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_input_receiver(&self) -> channel::Receiver<Msg> {
         let (sender, receiver) = channel::channel();
         self.writes.lock().unwrap().sender = Some(sender);
         receiver
+    }
+    /// Capture queued PTY input without exposing Rio types to frontend tests.
+    #[cfg(feature = "test-support")]
+    pub fn test_input_reader(&self) -> impl Fn() -> Option<Vec<u8>> + use<> {
+        let receiver = self.test_input_receiver();
+        move || {
+            while let Ok(message) = receiver.try_recv() {
+                if let Msg::Input(bytes) = message {
+                    return Some(bytes.into_owned());
+                }
+            }
+            None
+        }
     }
     #[cfg(test)]
     pub(crate) fn block_control_writes(&self, block: bool) {
@@ -153,7 +169,7 @@ impl Listener {
             return Ok(());
         }
         let mut writes = self.writes.lock().unwrap();
-        self.enqueue(&mut writes, bytes, key, None)
+        self.enqueue(&mut writes, bytes, key, None, false)
     }
     fn enqueue(
         &self,
@@ -161,6 +177,7 @@ impl Listener {
         bytes: Vec<u8>,
         key: Option<Instant>,
         permit: Option<Arc<crate::control::Permit>>,
+        control: bool,
     ) -> Result<(), String> {
         if bytes.is_empty() {
             return Ok(());
@@ -168,7 +185,8 @@ impl Listener {
         if self.quit.load(Ordering::Acquire) {
             return Err("terminal closing".into());
         }
-        if bytes.len() + writes.bytes > 65536 {
+        let control = control || permit.is_some();
+        if control && bytes.len() > 65536_usize.saturating_sub(writes.control_bytes) {
             return Err("PTY input queue full".into());
         }
         let sender = writes.sender.as_ref().ok_or("PTY unavailable")?.clone();
@@ -177,11 +195,14 @@ impl Listener {
         sender
             .send(Msg::Input(Cow::Owned(bytes)))
             .map_err(|e| e.to_string())?;
-        writes.bytes += len;
+        if control {
+            writes.control_bytes += len;
+        }
         writes.pending.push_back(Pending {
             remaining: len,
             key,
             permit,
+            control,
         });
         Ok(())
     }
@@ -191,13 +212,20 @@ impl Listener {
     // key() which revokes unconditionally: a no-op write must not invalidate
     // a live control writer.
     pub fn type_text(&self, text: &str) -> Result<(), String> {
+        self.type_text_in_lane(text, false)
+    }
+    /// Legacy diagnostic Bus input is still bounded, even without a permit.
+    pub(crate) fn bus_text(&self, text: &str) -> Result<(), String> {
+        self.type_text_in_lane(text, true)
+    }
+    fn type_text_in_lane(&self, text: &str, control: bool) -> Result<(), String> {
         let bytes = encode_text(text)?;
         if bytes.is_empty() {
             return Ok(());
         }
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        self.enqueue(&mut writes, bytes, Some(Instant::now()), None)?;
+        self.enqueue(&mut writes, bytes, Some(Instant::now()), None, control)?;
         drop(writes);
         self.follow_input();
         Ok(())
@@ -207,7 +235,7 @@ impl Listener {
         Self::revoke_writer(&mut writes);
         let bytes = encode(key);
         let sends_bytes = !bytes.is_empty();
-        self.enqueue(&mut writes, bytes, Some(at), None)?;
+        self.enqueue(&mut writes, bytes, Some(at), None, false)?;
         drop(writes);
         if sends_bytes {
             self.follow_input();
@@ -278,6 +306,7 @@ impl Listener {
             bytes,
             Some(Instant::now()),
             Some(permit.clone()),
+            true,
         )
         .map_err(|_| "RESOURCE_LIMIT")?;
         writes.owner = Some((actor.into(), permit));
@@ -451,10 +480,13 @@ impl Write for MeteredPty {
             }
             pending.remaining -= consumed;
             left -= consumed;
+            let control = pending.control;
             if pending.remaining == 0 {
                 writes.pending.pop_front();
             }
-            writes.bytes -= consumed;
+            if control {
+                writes.control_bytes -= consumed;
+            }
         }
         Ok(n)
     }
@@ -1076,10 +1108,18 @@ impl Terminal {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 if selection.is_some_and(|range| {
-                    range.contains(rio_vt::crosswords::pos::Pos::new(
+                    let point = rio_vt::crosswords::pos::Pos::new(
                         rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
                         Column(x),
-                    ))
+                    );
+                    // Rio's contains_square membership, without its block
+                    // cursor exception (our painter owns cursor rendering).
+                    range.contains(point)
+                        || (matches!(square.wide(), rio_vt::crosswords::square::Wide::Wide)
+                            && range.contains(rio_vt::crosswords::pos::Pos::new(
+                                point.row,
+                                point.col + 1,
+                            )))
                 }) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
@@ -1478,6 +1518,25 @@ mod tests {
         assert!(thread.is_finished(), "Machine shutdown must finish");
         drop(thread.join().unwrap());
     }
+    #[test]
+    fn machine_delivers_large_paste_before_the_following_key_and_vt_reply() {
+        let mut f = GridFixture::new();
+        f.child
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        f.feed(b"\x1b[?2004h", |t| t.mode().contains(Mode::BRACKETED_PASTE));
+        let text = "p".repeat(1024 * 1024);
+        f.terminal.paste(&text).unwrap();
+        f.terminal.key(Key::Char('k'), Instant::now()).unwrap();
+        // Real parser reply, while the paste is blocked on the socket's
+        // small send buffer. Machine must retain one atomic write buffer.
+        f.feed(b"\x1b[6nZ", |t| cell(t, 0, 0) == 'Z');
+        let expected = format!("\x1b[200~{text}\x1b[201~k\x1b[1;1R");
+        let mut received = vec![0; expected.len()];
+        f.child.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected.as_bytes());
+    }
+
     type FixtureThread = JoinHandle<(Machine<FixturePty, Listener>, rio_vt::performer::State)>;
 
     /// A real Terminal whose PTY is a socketpair: grid, Machine, Listener and

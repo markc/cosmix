@@ -64,7 +64,7 @@ impl Terminal {
         Listener::revoke_writer(&mut writes);
         match self
             .listener
-            .enqueue(&mut writes, bytes, Some(Instant::now()), None)
+            .enqueue(&mut writes, bytes, Some(Instant::now()), None, false)
         {
             Ok(()) => {
                 drop(writes);

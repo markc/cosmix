@@ -189,6 +189,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
         scroll_pane: None,
         pointer: std::cell::Cell::new(None),
         mouse: clipboard::MouseState::default(),
+        paste_notice: None,
         last_redraw: None,
         force_paint: false,
         paint_requested: true,
@@ -317,6 +318,7 @@ struct State {
     /// Window coordinates survive a tab change beneath a stationary pointer.
     pointer: std::cell::Cell<Option<iced::Point>>,
     mouse: clipboard::MouseState,
+    paste_notice: Option<String>,
     last_redraw: Option<std::time::Instant>,
     force_paint: bool,
     paint_requested: bool,
@@ -478,6 +480,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.modifiers = modifiers;
         }
         Message::SelectTab(id) => {
+            state.cancel_mouse_gesture();
             let mut tabs = state.tabs.lock().expect("tabs");
             tabs.user_activity();
             tabs.select(id);
@@ -512,7 +515,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // is never delivered; a latched Ctrl would turn every later wheel
             // into a zoom.
             iced::window::Event::Unfocused => {
-                state.mouse = clipboard::MouseState::default();
+                state.cancel_mouse_gesture();
                 state.modifiers = iced::keyboard::Modifiers::empty();
                 state.wheel = 0.0;
                 state.scroll_wheel = 0.0;
@@ -671,6 +674,10 @@ fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
         )
     };
     let mut strip: Row<'_, Message> = Row::new().spacing(4.0).padding([3.0, 6.0]);
+    // Put failures first so a long tab list cannot push the notice offscreen.
+    if let Some(notice) = &state.paste_notice {
+        strip = strip.push(text(notice).size(13.0).color(tokens.text));
+    }
     for label in &state.shape.tabs {
         strip = strip
             .push(tab(label.title.clone(), label.active).on_press(Message::SelectTab(label.id)));
@@ -895,6 +902,7 @@ impl State {
     /// that needs it. Painting waits for the widget's redraw event.
     fn sync(&mut self) -> Task<Message> {
         let (removed, notes) = self.tabs.lock().expect("tabs").reap_exited();
+        self.cancel_hidden_gesture();
         self.cleanup.submit(removed);
         if let Some(notify) = &self.notify {
             for note in notes {
@@ -968,6 +976,9 @@ impl State {
             Action::FontDecrease => self.zoom(FontSize::decrease),
             Action::FontReset => self.zoom(FontSize::reset),
             _ => {
+                if !matches!(action, Action::Scroll(_)) {
+                    self.cancel_mouse_gesture();
+                }
                 let removed = apply(&mut self.tabs.lock().expect("tabs"), action);
                 self.cleanup.submit(removed);
                 if matches!(action, Action::Scroll(_)) {
@@ -1393,6 +1404,7 @@ mod tests {
             scroll_pane: None,
             pointer: std::cell::Cell::new(None),
             mouse: clipboard::MouseState::default(),
+            paste_notice: None,
             last_redraw: None,
             force_paint: false,
             paint_requested: true,
@@ -1457,6 +1469,200 @@ mod tests {
         );
         assert_eq!(terminal.lock().unwrap().selection_text(), None);
         assert_eq!(state.clipboard_action(Action::Copy).units(), 0);
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(terminal);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_reported_gestures_release_the_original_pane_once() {
+        use cosmix_term_core::terminal::Terminal;
+        use iced::{
+            Point,
+            mouse::{Button, Event},
+        };
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let original = state.shape.active_pane;
+        let original_tab = state.tabs.lock().unwrap().active_id();
+        let terminal = state.tabs.lock().unwrap().pane_by_id(original).unwrap();
+        *terminal.lock().unwrap() = Terminal::from_test_vt(8, 3, b"\x1b[?1002;1006h");
+        let input = terminal.lock().unwrap().listener.test_input_reader();
+        state.grids.insert(original, (8, 3));
+        let (cw, ch) = state.painter.logical_cell();
+        let border = layout::border(state.painter.scale());
+        let start = Point::new(
+            border + cw * 0.1,
+            layout::strip_height(state.painter.scale()) + border + ch * 0.5,
+        );
+        let end = Point::new(start.x + cw * 3.0, start.y + ch);
+        let begin = |state: &mut State| {
+            let _ = state.mouse_event(Event::ButtonPressed(Button::Left), start, Instant::now());
+            assert_eq!(input().unwrap(), b"\x1b[<0;1;1M");
+            let _ = state.mouse_event(Event::CursorMoved { position: end }, end, Instant::now());
+            assert_eq!(input().unwrap(), b"\x1b[<32;4;2M");
+        };
+        begin(&mut state);
+        state.modifiers = iced::keyboard::Modifiers::SHIFT;
+        let _ = update(&mut state, Message::Window(iced::window::Event::Unfocused));
+        assert_eq!(
+            input().unwrap(),
+            b"\x1b[<0;4;2m",
+            "release uses press modifiers and last cell"
+        );
+        let _ = state.mouse_event(Event::ButtonReleased(Button::Left), start, Instant::now());
+        assert!(input().is_none(), "late release is not duplicated");
+
+        // Both supported and unknown new buttons terminate the stale grab.
+        for button in [Button::Left, Button::Right, Button::Other(8)] {
+            begin(&mut state);
+            let events = clipboard::MouseEvents::new(&state);
+            let next = events
+                .message(&state, &Event::ButtonPressed(button), Some(start))
+                .unwrap();
+            let _ = update(&mut state, next);
+            assert_eq!(input().unwrap(), b"\x1b[<0;4;2m");
+            if button != Button::Other(8) {
+                let code = if button == Button::Left { 0 } else { 2 };
+                assert_eq!(input().unwrap(), format!("\x1b[<{code};1;1M").as_bytes());
+                let release = events
+                    .message(&state, &Event::ButtonReleased(button), Some(start))
+                    .unwrap();
+                let _ = update(&mut state, release);
+                assert_eq!(input().unwrap(), format!("\x1b[<{code};1;1m").as_bytes());
+            }
+            assert!(input().is_none());
+        }
+
+        begin(&mut state);
+        let tree = state.shape.tree.take();
+        let _ = state.mouse_event(Event::ButtonReleased(Button::Left), start, Instant::now());
+        assert_eq!(
+            input().unwrap(),
+            b"\x1b[<0;4;2m",
+            "missing hit still releases"
+        );
+        state.shape.tree = tree;
+
+        // A tab switch releases immediately, before the next layout sync.
+        let second = state.tabs.lock().unwrap().open().unwrap();
+        state.tabs.lock().unwrap().select(original_tab);
+        begin(&mut state);
+        let _ = update(&mut state, Message::SelectTab(second));
+        assert_eq!(input().unwrap(), b"\x1b[<0;4;2m");
+        state.tabs.lock().unwrap().select(original_tab);
+
+        // External tab mutations are noticed by sync as well.
+        begin(&mut state);
+        state.tabs.lock().unwrap().select(second);
+        let _ = state.sync();
+        assert_eq!(input().unwrap(), b"\x1b[<0;4;2m");
+        state.tabs.lock().unwrap().select(original_tab);
+        let _ = state.sync();
+        begin(&mut state);
+        // Remove from the tree before sync: Press retains the terminal until
+        // its release, rather than trying to resolve the now-absent pane ID.
+        let removed = state.tabs.lock().unwrap().close_active().1.unwrap();
+        let _ = state.sync();
+        assert_eq!(input().unwrap(), b"\x1b[<0;4;2m");
+        state.cleanup.submit(vec![removed]);
+        state.cancel_mouse_gesture();
+        assert!(input().is_none());
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(terminal);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_local_drag_clears_and_a_new_pane_selection_is_exclusive() {
+        use cosmix_term_core::terminal::{SelectionSide, SelectionType, Terminal};
+        use iced::{
+            Point,
+            mouse::{Button, Event},
+        };
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let first = state.shape.active_pane;
+        let second = state
+            .tabs
+            .lock()
+            .unwrap()
+            .split_active(SplitDir::Vertical)
+            .unwrap();
+        let _ = state.sync();
+        let terminals: Vec<_> = [first, second]
+            .into_iter()
+            .map(|id| {
+                let terminal = state.tabs.lock().unwrap().pane_by_id(id).unwrap();
+                *terminal.lock().unwrap() = Terminal::from_test_vt(8, 3, b"abcdefgh");
+                state.grids.insert(id, (8, 3));
+                terminal
+            })
+            .collect();
+        terminals[0].lock().unwrap().selection_start(
+            0,
+            0,
+            SelectionSide::Left,
+            SelectionType::Lines,
+        );
+        assert!(terminals[0].lock().unwrap().selection_text().is_some());
+        let scale = state.painter.scale();
+        let bounds = layout::content(state.window.width, state.window.height, scale);
+        let rect = layout::panes(state.shape.tree.as_ref().unwrap(), bounds, scale)
+            .into_iter()
+            .find(|(id, _)| *id == second)
+            .unwrap()
+            .1;
+        let (cw, ch) = state.painter.logical_cell();
+        let start = Point::new(
+            rect.x + layout::border(scale) + cw * 0.1,
+            rect.y + layout::border(scale) + ch * 0.5,
+        );
+        let end = Point::new(start.x + cw * 3.8, start.y);
+        let _ = state.mouse_event(Event::ButtonPressed(Button::Left), start, Instant::now());
+        assert_eq!(terminals[0].lock().unwrap().selection_text(), None);
+        let _ = state.mouse_event(Event::CursorMoved { position: end }, end, Instant::now());
+        assert_eq!(
+            terminals[1].lock().unwrap().selection_text().as_deref(),
+            Some("abcd")
+        );
+        let _ = update(&mut state, Message::Window(iced::window::Event::Unfocused));
+        assert_eq!(terminals[1].lock().unwrap().selection_text(), None);
+        assert_eq!(
+            state
+                .mouse_event(Event::ButtonReleased(Button::Left), end, Instant::now())
+                .units(),
+            0
+        );
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(terminals);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_paste_has_a_visible_notice_and_sends_nothing() {
+        use cosmix_term_core::terminal::Terminal;
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let id = state.shape.active_pane;
+        let terminal = state.tabs.lock().unwrap().pane_by_id(id).unwrap();
+        *terminal.lock().unwrap() = Terminal::from_test_vt(8, 3, b"");
+        let input = terminal.lock().unwrap().listener.test_input_reader();
+        state.paste(id, Some("x".repeat(16 * 1024 * 1024 + 1)));
+        assert_eq!(
+            state.paste_notice.as_deref(),
+            Some("Paste exceeds 16 MiB limit")
+        );
+        assert!(input().is_none());
+        state.paste(id, Some("ok".into()));
+        assert_eq!(input().unwrap(), b"ok");
+        assert!(state.paste_notice.is_none());
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
         drop(terminal);
