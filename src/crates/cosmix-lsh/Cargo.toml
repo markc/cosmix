@@ -14,6 +14,9 @@ name = "cosmix_lsh"
 # compile with no path rewrites (vendor/README.md). Library names stay
 # `lsh` / `stdext`.
 lsh = { package = "cosmix-msedit-lsh", path = "vendor/lsh" }
+# The runtime's API takes stdext arenas; the adapter owns them (callers only
+# see `Vec<Span>`).
+stdext = { package = "cosmix-msedit-stdext", path = "vendor/stdext" }
 
 [dev-dependencies]
 proptest = "1"

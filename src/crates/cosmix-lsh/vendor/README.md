@@ -35,6 +35,24 @@ Only `cosmix-lsh` (the parent crate) depends on them.
    removed; x86/x86_64 (AVX2/SSE2), aarch64 (NEON) and the fallback remain.
 3. Every vendored `.rs` file gains a line naming its upstream path; three
    upstream files had no licence header and say so.
+4. **Deterministic register allocation** (`lsh/src/compiler/backend.rs`,
+   `compute_intervals`; ced Stage E1b): live intervals are sorted by
+   `(start, vreg_id)` instead of `start` alone. Upstream's equal-start order
+   came from a `HashMap`, whose iteration order is seeded per process, so the
+   bytecode changed from run to run. Harmless inside msedit's build script;
+   fatal for a committed `defs.rs` with a freshness test.
+
+## Adapted, not vendored (`cosmix-lsh/src/`)
+
+`highlighter.rs` and `cache.rs` are rewritten from `edit-lsh/` rather than
+patched, so the differences are listed in their module docs: the
+`LineSource` swap, plain byte scanning for newlines, owned `Vec<Span>`
+output with the runtime's sentinel dropped, a fix for multi-chunk lines of
+`MAX_LINE_LEN` or more (upstream left the read offset mid-line, shifting every
+later line number by one), `INTERVAL` pinned to 1024, and a frontier state so
+time-sliced seeks progress below one interval per call. `defs.rs` is the
+generator's output with its Mermaid IR dump removed (it prints node
+addresses) and `Hash` added to `HighlightKind`'s derives.
 
 The lsh regex compiler still panics on unsupported patterns (upstream TODO);
 it only runs in `examples/gen.rs` and `tests/defs_fresh.rs`, never at runtime.

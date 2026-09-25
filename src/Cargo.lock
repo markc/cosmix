@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.96.0"
+version = "0.96.1"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1609,6 +1609,7 @@ name = "cosmix-lsh"
 version = "0.1.0"
 dependencies = [
  "cosmix-msedit-lsh",
+ "cosmix-msedit-stdext",
  "proptest",
 ]
 

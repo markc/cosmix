@@ -59,7 +59,7 @@ path. `crate::…` paths are rewritten to `crate::vendor::msedit::…` / `super:
 
 | Here | Upstream path | Changes |
 |---|---|---|
-| `unicode/mod.rs` | `crates/edit/src/unicode/mod.rs` | header only |
+| `unicode/mod.rs` | `crates/edit/src/unicode/mod.rs` | patched (7) |
 | `unicode/measurement.rs` | `crates/edit/src/unicode/measurement.rs` | patched (6) |
 | `unicode/tables.rs` | `crates/edit/src/unicode/tables.rs` | header only (generated UCD tables, Unicode 16.0.0) |
 | `navigation.rs` | `crates/edit/src/buffer/navigation.rs` | header + path |
@@ -70,6 +70,10 @@ path. `crate::…` paths are rewritten to `crate::vendor::msedit::…` / `super:
 6. **Per-measurement ambiguous width** (`measurement.rs`): upstream's
    process-global `static mut AMBIGUOUS_WIDTH` + `setup_ambiguous_width`
    became a `MeasurementConfig` field set by `with_ambiguous_width(1|2)`.
+7. **Grapheme-join lookups re-exported** (`unicode/mod.rs`, ced E1a):
+   `ucd_grapheme_cluster_{lookup,joins,joins_done}` are `pub(crate)` so
+   `crate::view` finds cluster boundaries (restart points, the gap
+   straddle) with exactly the tables the measurement code uses.
 
 `simd/memchr2.rs` is **not** vendored after all: nothing in measurement or
 navigation calls it (upstream only uses it from the TUI buffer and the VT
