@@ -283,3 +283,8 @@ typography role and the chrome the `Ui` role.
   list, recent files, hidden files toggle); there is no portal picker.
 - End-to-end key-to-photon latency is not measured yet; `ced.stats` reports
   ced's own stages (`model_us`, `view_us`, `next_frame_us`).
+- A recovered **scratch** buffer with CRLF line endings, reattached by its
+  recovery id, is edited as LF: Enter inserts `\n` (the service's list row
+  carries no line-ending field yet). Path buffers are unaffected.
+- A save by another client that does not change the file's disk state shows
+  in ced's dirty marker only when the tab next gains focus.

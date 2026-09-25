@@ -471,7 +471,7 @@ fn run_fixture(name: &str, fx: &Value) {
             }
             "server_op" => {
                 ids.insert(body["id"].as_str().unwrap().to_string(), net.ids.clone().next_id());
-                let step = net.mirror.server_op(server_op_of(&body["op"]), intent_of(body.get("intent")), &mut net.ids);
+                let (step, _) = net.mirror.server_op(server_op_of(&body["op"]), intent_of(body.get("intent")), &mut net.ids);
                 net.process(step);
             }
             "send" => {
@@ -666,9 +666,11 @@ fn refused(code: wire::ErrorCode, reason: &str) -> wire::Refusal {
 
 /// Queue a server op and hand its request to the fake; the reply is pending.
 fn server(net: &mut Net, op: ServerOp) -> String {
-    let s = net.mirror.server_op(op, Intent::ui(1), &mut net.ids);
+    let (s, id) = net.mirror.server_op(op, Intent::ui(1), &mut net.ids);
     net.process(s);
-    net.send_next(false, None).op_id.unwrap()
+    let sent = net.send_next(false, None).op_id.unwrap();
+    assert_eq!(sent, id, "server_op returns the id it sends");
+    id
 }
 
 #[test]
@@ -741,7 +743,7 @@ fn server_ops_report_their_outcome_by_op_id() {
     net.deliver_all();
     assert_eq!(net.mirror.take_outcomes(), vec![(save, mirror::Outcome::Done)]);
     // Queued behind nothing but detached before it went out: refused.
-    let s = net.mirror.server_op(ServerOp::Undo { lane: LaneArg::Own }, Intent::ui(1), &mut net.ids);
+    let (s, _) = net.mirror.server_op(ServerOp::Undo { lane: LaneArg::Own }, Intent::ui(1), &mut net.ids);
     net.process(s);
     let queued = net.outbox.remove(0).op_id.unwrap();
     let _ = net.mirror.epoch_changed();
@@ -888,7 +890,7 @@ fn run_script(initial: &str, script: &[Act]) -> Result<(), TestCaseError> {
                 net.process(s);
             }
             Act::MirrorUndo if live => {
-                let s = net.mirror.server_op(ServerOp::Undo { lane: LaneArg::Own }, Intent::ui(1), &mut net.ids);
+                let (s, _) = net.mirror.server_op(ServerOp::Undo { lane: LaneArg::Own }, Intent::ui(1), &mut net.ids);
                 net.process(s);
             }
             Act::AgentInsert(p, t) => {

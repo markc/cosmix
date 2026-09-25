@@ -793,10 +793,11 @@ impl Mirror {
     }
 
     /// Queue a non-optimistic request (sent when the pipeline is empty).
-    pub fn server_op(&mut self, op: ServerOp, intent: Intent, ids: &mut OpIdGen) -> Step {
+    /// Returns its op id: [`Mirror::take_outcomes`] reports it by this id.
+    pub fn server_op(&mut self, op: ServerOp, intent: Intent, ids: &mut OpIdGen) -> (Step, String) {
         let op_id = ids.next_id();
-        self.queue_server(QServer { op, intent, op_id, verb: None, expect: None });
-        Step::default()
+        self.queue_server(QServer { op, intent, op_id: op_id.clone(), verb: None, expect: None });
+        (Step::default(), op_id)
     }
 
     /// An `edit.changed` event for THIS buffer (the controller filters by

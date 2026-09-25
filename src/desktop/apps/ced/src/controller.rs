@@ -123,6 +123,14 @@ const OP_WAIT_MS: u64 = 90_000;
 /// `edit.open` deadlines before the tab says the service is silent.
 const OPEN_WARN_AFTER: u32 = 3;
 
+/// A Bus `ced.action` waiting on its server op's outcome.
+struct OpWait {
+    /// The Bus command to answer, and the action id it named.
+    id: u64,
+    action: String,
+    tab: TabId,
+}
+
 /// Controller-private per-tab state.
 #[derive(Default)]
 struct TabX {
@@ -269,7 +277,7 @@ pub struct Controller {
     ui_pending: HashMap<u64, (u64, String)>,
     /// Bus `ced.action`s answered from their server op's outcome, by op id
     /// (Opus m4), and the one being dispatched right now.
-    op_waits: HashMap<String, (u64, String)>,
+    op_waits: HashMap<String, OpWait>,
     op_cmd: Option<(u64, String)>,
 }
 
@@ -711,6 +719,21 @@ impl Controller {
         for w in waiters {
             self.finish_waiter(w, Err(("cancelled", "the tab was closed".to_string())), fx);
         }
+        // Its server ops die with the mirror: answer their Bus callers now,
+        // not with a TIMEOUT that says they may yet complete (round-2 N1).
+        let ops: Vec<String> = self.op_waits.iter().filter(|(_, w)| w.tab == id).map(|(op, _)| op.clone()).collect();
+        for op in ops {
+            let msg = "The tab was closed before this completed";
+            let r = wire::Refusal {
+                error_code: wire::ErrorCode::Conflict,
+                message: msg.into(),
+                reason: Some("detached".into()),
+                buffer: None,
+                rev: None,
+                context: Default::default(),
+            };
+            self.answer_op(&op, Outcome::Refused(r), fx);
+        }
         if self.active == Some(id) {
             self.active = self.tabs.last().map(|t| t.id);
         }
@@ -883,7 +906,7 @@ impl Controller {
                 }
             }
             Some(TimerFor::OpWait(op_id)) => {
-                if let Some((id, action)) = self.op_waits.remove(&op_id) {
+                if let Some(OpWait { id, action, .. }) = self.op_waits.remove(&op_id) {
                     let msg = format!("{action} is still queued or in flight after {} s; it may yet complete", OP_WAIT_MS / 1000);
                     fx.push(Effect::Respond { id, rc: 10, body: refusal("TIMEOUT", msg, Some("timeout")) });
                 }
@@ -1222,8 +1245,12 @@ impl Controller {
                 // the refusal as its `ced.action` reply (Opus m4).
                 if matches!(intent.by, Invoker::Ui) {
                     fx.push(Effect::Prompt(Prompt::DiskModified { tab, intent }));
-                    continue;
+                } else {
+                    // No dialog backs "save anyway?": state what happened.
+                    let text = "An agent's save was refused: the file changed on disk".to_string();
+                    fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text } });
                 }
+                continue;
             }
             fx.push(Effect::Notice { tab: Some(tab), notice: n });
         }
@@ -1371,12 +1398,11 @@ impl Controller {
         if matches!(m.phase(), Phase::Detached { .. }) {
             return Err("the buffer is detached".into());
         }
-        // The id `server_op` is about to hand out: a Bus `ced.action` being
-        // dispatched is answered from this op's outcome, not now.
-        let op_id = self.ids.clone().next_id();
-        let step = m.server_op(op, intent, &mut self.ids);
-        if let Some(cmd) = self.op_cmd.take() {
-            self.op_waits.insert(op_id.clone(), cmd);
+        // A Bus `ced.action` being dispatched is answered from this op's
+        // outcome, not now.
+        let (step, op_id) = m.server_op(op, intent, &mut self.ids);
+        if let Some((id, action)) = self.op_cmd.take() {
+            self.op_waits.insert(op_id.clone(), OpWait { id, action, tab });
             self.timer(OP_WAIT_MS, TimerFor::OpWait(op_id), fx);
         }
         self.drive(tab, step, fx);
@@ -1385,7 +1411,7 @@ impl Controller {
 
     /// Answer the Bus `ced.action` waiting on server op `op_id`, if any.
     fn answer_op(&mut self, op_id: &str, outcome: Outcome, fx: &mut Vec<Effect>) {
-        let Some((id, action)) = self.op_waits.remove(op_id) else { return };
+        let Some(OpWait { id, action, .. }) = self.op_waits.remove(op_id) else { return };
         self.timers.retain(|_, t| !matches!(t, TimerFor::OpWait(x) if x == op_id));
         let (rc, body) = match outcome {
             Outcome::Done => (0, ok_body(&verbs::ActionReply { id: action, ok: true, result: None })),
@@ -1787,7 +1813,7 @@ impl Controller {
                     Ok(_) if queued => {}
                     Ok(result) => reply(fx, ok_body(&verbs::ActionReply { id: r.id, ok: true, result })),
                     Err((c, m)) => {
-                        self.op_waits.retain(|_, (i, _)| *i != id);
+                        self.op_waits.retain(|_, w| w.id != id);
                         refuse(fx, c, m, None)
                     }
                 }
@@ -2261,6 +2287,8 @@ mod tests {
         // A Bus caller's disk_modified goes to the caller, never a prompt.
         let fx = refused_reply(&mut c, req, "CONFLICT", "disk_modified");
         assert!(!fx.iter().any(|e| matches!(e, Effect::Prompt(_))), "no prompt for a Bus save: {fx:?}");
+        let asks = |e: &Effect| matches!(e, Effect::Notice { notice: Notice::Message { text, .. }, .. } if text == cosmix_edit_client::mirror::MSG_SAVE_DISK_MODIFIED);
+        assert!(!fx.iter().any(asks), "round-2 N2: no unanswerable 'save anyway?' for the human");
         let (rc, v) = response(&fx);
         assert_eq!((rc, v["reason"].as_str()), (10, Some("disk_modified")));
 
@@ -2270,6 +2298,31 @@ mod tests {
                            "file_bytes": 12, "disk": "clean", "durable": true, "warning": null});
         let (rc, v) = response(&reply(&mut c, req, saved));
         assert_eq!((rc, v["id"].as_str(), v["ok"].as_bool()), (0, Some("file.save"), Some(true)));
+    }
+
+    #[test]
+    fn closing_a_tab_answers_its_waiting_bus_actions_at_once() {
+        // Round-2 N1: not a 90 s TIMEOUT saying the op may yet complete.
+        let mut c = ctl();
+        live(&mut c);
+        let save = BusCommand { id: 41, ..cmd("ced.action", json!({"id": "file.save"})) };
+        let fx = c.on_bus_command(save);
+        sent(&fx, "edit.save");
+        let fx = c.on_bus_command(BusCommand { id: 42, ..cmd("ced.action", json!({"id": "file.close", "args": {"force": true}})) });
+        let (req, _) = sent(&fx, "edit.close");
+        let fx = reply(&mut c, req, json!({"closed": true}));
+        let answer = |id: u64| {
+            fx.iter()
+                .find_map(|e| match e {
+                    Effect::Respond { id: i, rc, body } if *i == id => Some((*rc, serde_json::from_str::<Value>(body).unwrap())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no answer to {id} in {fx:?}"))
+        };
+        let (rc, v) = answer(41);
+        assert_eq!((rc, v["error_code"].as_str(), v["reason"].as_str()), (10, Some("CONFLICT"), Some("detached")));
+        assert_eq!(answer(42).0, 0);
+        assert!(c.op_waits.is_empty() && !c.timers.values().any(|t| matches!(t, TimerFor::OpWait(_))), "timer dropped too");
     }
 
     #[test]
