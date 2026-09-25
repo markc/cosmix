@@ -123,12 +123,12 @@ fn tab_inserts_to_the_next_stop_or_a_tab() {
 fn multi_line_tab_and_outdent_are_one_multi_item_edit() {
     let src = "one\n\ntwo\nthree\n";
     // Selection from inside line 1 to the start of line 4: lines 1..=3.
-    let mut m = model(1, 10);
+    let mut m = model(1, 9);
     let (s, e) = run(src, &mut m, EditCommand::Tab);
     assert_eq!(e.items.len(), 2, "empty lines are not indented: {:?}", e.items);
     assert_eq!(s, "    one\n\n    two\nthree\n");
-    assert_eq!(e.caret_after, Selection { anchor: 5, head: 18 });
-    let mut m = model(0, 18);
+    assert_eq!(e.caret_after, Selection { anchor: 5, head: 17 });
+    let mut m = model(0, 17);
     let (back, e) = run(&s, &mut m, EditCommand::Outdent);
     assert_eq!(e.items.len(), 2);
     assert_eq!(back, src);
@@ -338,8 +338,8 @@ fn resync_then_clamp_keeps_offsets_valid() {
     assert_eq!(m.composition, None);
     let text = Text::from_text("héllo\nx").unwrap();
     m.clamp(&text);
-    assert_eq!((m.sel.anchor, m.sel.head), (7, 7));
-    assert_eq!(m.markers.changed[0].0, 7..7);
+    assert_eq!((m.sel.anchor, m.sel.head), (8, 8));
+    assert_eq!(m.markers.changed[0].0, 8..8);
     assert_eq!(m.scroll.first_line, 2);
     let mut m = model(2, 2);
     m.clamp(&text);

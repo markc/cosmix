@@ -435,7 +435,9 @@ where
                     shell.capture_event();
                 }
             }
-            Event::InputMethod(ev) if self.view.focused => match ev {
+            // Opened/Closed always (a reset begun on focus loss must end);
+            // text only while focused.
+            Event::InputMethod(ev) => match ev {
                 input_method::Event::Opened => st.ime.opened(),
                 input_method::Event::Closed => {
                     let had = st.ime.active();
@@ -446,13 +448,13 @@ where
                     shell.request_redraw();
                 }
                 input_method::Event::Preedit(s, _) => {
-                    if st.ime.preedit(s) {
+                    if self.view.focused && st.ime.preedit(s) {
                         shell.publish(EditorMsg::Preedit(s.clone()));
                     }
                     shell.request_redraw();
                 }
                 input_method::Event::Commit(s) => {
-                    if st.ime.commit() && !s.is_empty() {
+                    if self.view.focused && st.ime.commit() && !s.is_empty() {
                         shell.publish(EditorMsg::ImeCommit(s.clone()));
                     }
                     shell.capture_event();
