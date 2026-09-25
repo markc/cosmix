@@ -79,6 +79,13 @@ impl Families {
         audio: true,
     };
 
+    /// Only the `tokio-sleep` sleep pump selects on native events
+    /// (evaluator.rs `sleep()`); without the feature it has no caller.
+    #[cfg(feature = "tokio-sleep")]
+    pub fn any(self) -> bool {
+        self.filesystem || self.children || self.net || self.audio
+    }
+
     fn source(self, command: &str) -> bool {
         match command {
             "net.changed" => self.net,

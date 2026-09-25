@@ -1453,6 +1453,7 @@ dependencies = [
  "libc",
  "mail-auth",
  "md-5",
+ "notify",
  "proptest",
  "pulldown-cmark",
  "quick-xml 0.41.0",

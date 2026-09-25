@@ -99,8 +99,10 @@ page.
 ### Stage B legacy handover
 
 `scene-panel`, `scene-launcher`, `scene-calendar` and `scene-notes` were
-mounted by `quoin-panel.mix`, and a load by either owner takes a page from
-the other. While the `SCENES_LEGACY_SERVICE` registration (default
+mounted by `quoin-panel.mix`. Quoin's seats are owner-exclusive: whichever
+citizen holds a page keeps it, and the other one's load of that page is
+refused (`SUBPANEL_COLLISION`) until the holder unloads or disconnects.
+Neither owner can take a page from the other. While the `SCENES_LEGACY_SERVICE` registration (default
 `quoin-panel`) is present, a scene on one of those pages installs and enables
 normally but is not mounted: its diagnostic is `SCENES_LEGACY_HELD` with the
 holder name, and `enable`/`reload` reply rc 10 with it. That registration
@@ -112,9 +114,17 @@ legacy page that is still unmounted (a load that timed out, or a
 disconnect) is retried on every later broker snapshot and `shell.panel.changed`
 notice. For a failure no later event would retry, the loader starts one local
 `task_start` backoff (1, 2 … 32 s, then it stops and leaves the diagnostic until
-nothing is owed); it never self-emits over the Bus. A loader page
-already mounted is not unloaded if the legacy citizen reappears, but no
-reload or remount will take a page while it is registered. Do not run both.
+nothing is owed); it never self-emits over the Bus.
+
+The guard only stops the loader racing a live legacy citizen. It does not
+stop the reverse. If `quoin-panel` starts again while the loader holds the
+pages, the loader keeps them mounted (it never unloads for the legacy
+citizen), and the legacy citizen's own loads are refused by the seat rule, so
+it runs with no pages. While it stays registered the loader also will not
+reload or remount those pages, so their accepted content stays as it was.
+**Operator rule: do not run both.** Stop and disable the legacy unit before
+enabling the templates; starting it again is not a rollback until the
+loader's four scenes are disabled.
 
 `scenes.changed` publishes a change-only inventory with a loader revision.
 Subscribers should take `scenes.list` after subscribing and repeat that

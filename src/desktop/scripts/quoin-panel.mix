@@ -78,6 +78,7 @@ $state = {
   -- re-subscribe delays after the link socket or PipeWire's server goes away
   net_watch: nil, net_started: 0, net_retry: 5, net_retrying: false,
   audio_watch: nil, audio_started: 0, audio_retry: 5, audio_retrying: false, audio_unavailable: false,
+  status_refreshing: false,
   notes: [], notes_open: false, peeked: [],
   launcher_open: false, calendar_open: false,
   query: "", category: "", apps: [], apps_loaded: false,
@@ -473,10 +474,18 @@ fn fetch_notes()
   $state.notes = sort_by($out, function ($n) = $n.created_at)
 end
 
-fn fetch_status()
-  fetch_net()
-  fetch_vol()
-  fetch_notes()
+-- net_state() and audio_state() block for up to 2 s each, so a sync path
+-- (init, panel.refresh) never calls them: it queues this one local task
+-- instead. Single in flight; never a Bus self-emit.
+fn refresh_status()
+  if $state.status_refreshing then return end
+  $state.status_refreshing = true
+  try
+    task_start("status.refresh", "{}")
+  catch $message
+    $state.status_refreshing = false
+    note("status refresh not scheduled: " .. to_string($message))
+  end
 end
 
 fn fetch_apps()
@@ -1055,6 +1064,43 @@ fn close_launcher($scene_action = false)
   return hide_popup("left")
 end
 
+-- Scene clicks reply AFTER their effect is applied, like Quoin's applied
+-- replies: a caller that reads state after the reply sees the popup already
+-- closed or opened. rc 0 carries the applied popup flags; a release the host
+-- did not confirm is release_failed (22), as for the agent verbs.
+fn popup_flags()
+  return {launcher: $state.launcher_open, calendar: $state.calendar_open, notes: $state.notes_open}
+end
+
+fn reply_popups($released, $edge)
+  if not $released then
+    reply(22, json_encode({error: "release_failed", open: false, edge: $edge}))
+    return
+  end
+  reply(0, json_encode(popup_flags()))
+end
+
+-- Launch, then dismiss the popup on $edge, then reply. A failed launch still
+-- closes the popup (the click was a dismissal too) and replies with the
+-- upstream rc under context, the same shape launcher.launch uses; the send
+-- globals are captured before the close overwrites them.
+fn launch_and_close($id, $edge)
+  send $APPS apps.launch body=json_encode({id: $id}) timeout=3
+  $launch_rc = $rc
+  $launch_reply = $reply
+  $released = $edge == "left" ? close_launcher(true) : close_calendar(true)
+  render_panel()
+  if not rc_ok($launch_rc) then
+    reply($launch_rc < 0 ? 20 : 21, json_encode({error: $launch_rc < 0 ? "apps_transport" : "apps_refused", rc: $launch_rc, reply: $launch_reply, launched: $id, released: $released}))
+    return
+  end
+  if not $released then
+    reply(22, json_encode({error: "release_failed", open: false, edge: $edge, launched: $id}))
+    return
+  end
+  reply(0, json_encode({launched: $id}))
+end
+
 fn close_calendar($scene_action = false)
   $was_open = $state.calendar_open
   $state.calendar_open = false
@@ -1403,18 +1449,25 @@ on popups.state desc "popup flags {}; return {launcher,calendar,notes}"
 end
 
 on launcher desc "toggle the application launcher"
-  reply(0, "")
   if $state.launcher_open then
-    close_launcher()
-  else
-    if close_popups() != nil then return end
-    $state.launcher_open = true
-    bump_popups()
-    $state.query = ""
-    $state.category = ""
-    render_launcher()
+    $released = close_launcher()
+    render_panel()
+    reply_popups($released, "left")
+    return
   end
+  $blocked = close_popups()
+  if $blocked != nil then
+    render_panel()
+    reply_popups(false, $blocked)
+    return
+  end
+  $state.launcher_open = true
+  bump_popups()
+  $state.query = ""
+  $state.category = ""
+  render_launcher()
   render_panel()
+  reply(0, json_encode(popup_flags()))
 end
 
 on filter desc "launcher search text changed"
@@ -1433,24 +1486,23 @@ on cat desc "launcher: filter by the clicked category chip"
 end
 
 on launch desc "launch the clicked application"
-  reply(0, "")
   $a = $event.args
-  if $a == nil or type($a) != "map" or $a.item == nil then return end
-  $id = $a.item.id
-  if $id != nil then
-    rpc($APPS, "apps.launch", {id: $id})
-    close_launcher(true)
-    render_panel()
+  $id = nil
+  if $a != nil and type($a) == "map" and type($a.item) == "map" then $id = $a.item.id end
+  if $id == nil then
+    reply(0, json_encode({launched: nil}))
+    return
   end
+  launch_and_close($id, "left")
 end
 
 on launch_first desc "launch the first search match (Enter in the search field)"
-  reply(0, "")
-  if length($state.apps) > 0 then
-    rpc($APPS, "apps.launch", {id: $state.apps[0].id})
-    close_launcher(true)
-    render_panel()
+  -- No match: nothing to launch and nothing to dismiss.
+  if length($state.apps) == 0 then
+    reply(0, json_encode({launched: nil}))
+    return
   end
+  launch_and_close($state.apps[0].id, "left")
 end
 
 on ws desc "switch to the clicked workspace" async
@@ -1496,17 +1548,24 @@ on tray desc "activate the clicked tray item" async
 end
 
 on calendar desc "toggle the calendar"
-  reply(0, "")
   if $state.calendar_open then
-    close_calendar()
-  else
-    if close_popups() != nil then return end
-    $state.calendar_open = true
-    bump_popups()
-    $state.cal_offset = 0
-    render_calendar()
+    $released = close_calendar()
+    render_panel()
+    reply_popups($released, "right")
+    return
   end
+  $blocked = close_popups()
+  if $blocked != nil then
+    render_panel()
+    reply_popups(false, $blocked)
+    return
+  end
+  $state.calendar_open = true
+  bump_popups()
+  $state.cal_offset = 0
+  render_calendar()
   render_panel()
+  reply(0, json_encode(popup_flags()))
 end
 
 on cal_prev desc "calendar: previous month"
@@ -1528,30 +1587,45 @@ on cal_today desc "calendar: back to the current month"
 end
 
 on open_calendar desc "open the desktop's calendar application"
-  reply(0, "")
   -- A .desktop entry in the Calendar category wins; Thunderbird's calendar
   -- tab is the fallback on a desktop that has no dedicated calendar app.
   $apps = rpc($APPS, "apps.list", {category: "Calendar"})
   if $apps != nil and type($apps) == "list" and length($apps) > 0 then
-    rpc($APPS, "apps.launch", {id: $apps[0].id})
-  elif which("thunderbird") != nil then
-    spawn(["thunderbird", "-calendar"], {detach: true})
+    launch_and_close($apps[0].id, "right")
+    return
   end
-  close_calendar(true)
+  $launched = nil
+  if which("thunderbird") != nil then
+    spawn(["thunderbird", "-calendar"], {detach: true})
+    $launched = "thunderbird"
+  end
+  $released = close_calendar(true)
   render_panel()
+  if not $released then
+    reply(22, json_encode({error: "release_failed", open: false, edge: "right", launched: $launched}))
+    return
+  end
+  reply(0, json_encode({launched: $launched}))
 end
 
 on notes desc "toggle the notifications popup"
-  reply(0, "")
   if $state.notes_open then
-    close_notes()
-  else
-    if close_popups() != nil then return end
-    $state.notes_open = true
-    bump_popups()
-    render_notes()
+    $released = close_notes()
+    render_panel()
+    reply_popups($released, "right")
+    return
   end
+  $blocked = close_popups()
+  if $blocked != nil then
+    render_panel()
+    reply_popups(false, $blocked)
+    return
+  end
+  $state.notes_open = true
+  bump_popups()
+  render_notes()
   render_panel()
+  reply(0, json_encode(popup_flags()))
 end
 
 on note_close desc "dismiss the clicked notification"
@@ -1629,7 +1703,8 @@ on panel.refresh desc "rebuild every scene now (reveals only the open popup)"
   reply(0, "")
   fetch_windows()
   fetch_tray()
-  fetch_status()
+  fetch_notes()
+  refresh_status()
   render_panel()
   render_launcher()
   render_calendar()
@@ -1780,6 +1855,17 @@ on audio.retry async
   end
 end
 
+on status.refresh async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    fetch_net()
+    fetch_vol()
+  finally
+    $state.status_refreshing = false
+  end
+  schedule()
+end
+
 -- ── init ────────────────────────────────────────────────────────────────
 subscribe($COMP .. ".props.changed")
 subscribe($TRAY .. ".item.added")
@@ -1796,7 +1882,8 @@ fetch_windows()
 fetch_tray()
 -- Subscribe before the first read, so a change in between is not lost.
 start_status()
-fetch_status()
+fetch_notes()
+refresh_status()
 -- A popup that was open when Quoin or this citizen went down comes back as
 -- a pinned edge with no content (the modes persist; the scenes do not).
 -- Release exactly the popup pins this panel recorded (show_popup/hide_popup

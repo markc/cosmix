@@ -525,8 +525,10 @@ explicitly authored panel name to the installation name, so
 page.</p>
 <h3 id="stage-b-legacy-handover">Stage B legacy handover</h3>
 <p><code>scene-panel</code>, <code>scene-launcher</code>, <code>scene-calendar</code> and <code>scene-notes</code> were
-mounted by <code>quoin-panel.mix</code>, and a load by either owner takes a page from
-the other. While the <code>SCENES_LEGACY_SERVICE</code> registration (default
+mounted by <code>quoin-panel.mix</code>. Quoin's seats are owner-exclusive: whichever
+citizen holds a page keeps it, and the other one's load of that page is
+refused (<code>SUBPANEL_COLLISION</code>) until the holder unloads or disconnects.
+Neither owner can take a page from the other. While the <code>SCENES_LEGACY_SERVICE</code> registration (default
 <code>quoin-panel</code>) is present, a scene on one of those pages installs and enables
 normally but is not mounted: its diagnostic is <code>SCENES_LEGACY_HELD</code> with the
 holder name, and <code>enable</code>/<code>reload</code> reply rc 10 with it. That registration
@@ -538,9 +540,16 @@ legacy page that is still unmounted (a load that timed out, or a
 disconnect) is retried on every later broker snapshot and <code>shell.panel.changed</code>
 notice. For a failure no later event would retry, the loader starts one local
 <code>task_start</code> backoff (1, 2 … 32 s, then it stops and leaves the diagnostic until
-nothing is owed); it never self-emits over the Bus. A loader page
-already mounted is not unloaded if the legacy citizen reappears, but no
-reload or remount will take a page while it is registered. Do not run both.</p>
+nothing is owed); it never self-emits over the Bus.</p>
+<p>The guard only stops the loader racing a live legacy citizen. It does not
+stop the reverse. If <code>quoin-panel</code> starts again while the loader holds the
+pages, the loader keeps them mounted (it never unloads for the legacy
+citizen), and the legacy citizen's own loads are refused by the seat rule, so
+it runs with no pages. While it stays registered the loader also will not
+reload or remount those pages, so their accepted content stays as it was.
+<strong>Operator rule: do not run both.</strong> Stop and disable the legacy unit before
+enabling the templates; starting it again is not a rollback until the
+loader's four scenes are disabled.</p>
 <p><code>scenes.changed</code> publishes a change-only inventory with a loader revision.
 Subscribers should take <code>scenes.list</code> after subscribing and repeat that
 snapshot after reconnection/gaps. Invalid edits leave accepted content visible.

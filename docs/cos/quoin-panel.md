@@ -209,10 +209,12 @@ names instead. In this repository only `tests/panel-bus-test.mix` (the legacy
 citizen's own gate) and `tests/scene-template-test.mix` (which reads the
 legacy builders for its drift check) still name `quoin-panel.mix`.
 `quoin-shot.mix` and `tests/panel-test.mix` use `lib/panel.mix`, not this
-citizen, and are unaffected. The loader refuses to mount the four pages
-while a service named `quoin-panel` (`SCENES_LEGACY_SERVICE`) is registered,
-so the two can never fight over a page; stopping the legacy unit is the
-handover event. The private session installer seeds the chosen set, carries
+citizen, and are unaffected. The loader will not mount the four pages
+while a service named `quoin-panel` (`SCENES_LEGACY_SERVICE`) is registered;
+stopping the legacy unit is the handover event. That guard is one-way: a
+legacy citizen started again later finds the pages held by the loader and
+its loads are refused, so it runs without pages. Do not run both. The exact
+rules are in [the loader's legacy handover](scenes-loader.md#stage-b-legacy-handover). The private session installer seeds the chosen set, carries
 any outstanding legacy popup pins into the loader's recovery records, stops
 the legacy unit and keeps it for rollback.
 
@@ -247,8 +249,9 @@ nothing of its own.
   The network subscription recovers the same way. A host without `pactl`
   hides the applet for good (`AUDIO_UNAVAILABLE`, no retry).
   See [desktop status events](../mix/system.md#desktop-status-events--net_watch-audio_watch).
-  Behaviours use the same sources through `lib/runtime.mix`'s `status_watch`,
-  `status_net`, `status_volume`, `status_fields` and `status_closed`.
+  Behaviours subscribe with `net_watch`/`audio_watch` themselves and re-read
+  through `lib/runtime.mix`'s `status_net` and `status_volume`, from an async
+  handler: each read can block for up to 2 s.
 
 ## Legacy host update loop
 
@@ -318,6 +321,23 @@ no escape for it) gets an invisible word joiner between `$` and `{`.
 host sends them `{scene, node, kind, value?, item?}`). `panel.refresh`
 rebuilds every open scene on demand.
 
+The popup clicks reply after their effect is applied, so a caller that reads
+state after the reply sees the popup already opened or closed:
+
+- `launcher`, `calendar`, `notes` reply rc 0 with the popup flags
+  `{launcher, calendar, notes}`. If releasing an edge is refused, they reply
+  rc 22 `{error: "release_failed", open: false, edge}`.
+- `launch`, `launch_first` and `open_calendar` launch, then dismiss the popup
+  (a shell-revealed one too), then reply rc 0 `{launched}`. A failed launch
+  still dismisses and replies rc 20 `apps_transport` or rc 21 `apps_refused`
+  with `{rc, reply, launched, released}`. A refused release is rc 22 with
+  `launched`. `launch_first` with no match, and `open_calendar` with no calendar
+  application and no Thunderbird, launch nothing.
+
+The other scene handlers (`filter`, `cat`, `cal_*`, `note_close`,
+`notes_clear`, and the async `ws`, `task`, `tray`, `vol_mute`, `peek`)
+acknowledge the click first and change only what they re-render.
+
 "Open calendar app" launches the first application in the `Calendar`
 category, falling back to `thunderbird -calendar`.
 
@@ -326,7 +346,8 @@ category, falling back to `thunderbird -calendar`.
 Send these to `quoin-panel` with a JSON object body (an absent body means
 `{}`). Success replies are JSON objects with rc 0. Bad arguments return rc 10
 with `{error: "invalid_request", detail: "..."}`; unknown fields are rejected.
-The scene click handlers above keep their toggle behaviour.
+The scene click handlers above keep their toggle behaviour and reply as
+described there.
 
 | Verb | Arguments | Reply |
 |---|---|---|

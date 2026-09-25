@@ -1097,7 +1097,10 @@ Each wake drains every queued datagram into **one** `net.changed` batch:
 (`links[]`: `ifname, index, up, operstate, loopback, wireless`; `addresses[]`:
 `ifname, index, family, address, prefix`). A dump the kernel marks interrupted is
 retried; three in a row raise `NET_STATE_INCONSISTENT`. The whole call, retries
-included, answers within 2 s or raises `NET_STATE_IO`.
+included, answers within 2 s or raises `NET_STATE_IO`. Like `audio_state()` it
+blocks the evaluator while it waits, so a serve citizen calls both from an
+`async` handler (a `task_start` task), not from a sync request path. Only a
+dump reply carrying the request's sequence number is read.
 
 If the subscription socket itself fails (a poll error, or a receive error other
 than an overrun), the handle delivers one batch with
@@ -1127,8 +1130,9 @@ connecting would otherwise be an event. `kind` is `new`, `change` or `remove`;
 
 The volume itself is `audio_state([opts]) -> {ok, volume, level, muted, reason?}`:
 one `wpctl get-volume @DEFAULT_AUDIO_SINK@` with a 2 s deadline. `level` is
-`round(volume * 100)`. No default sink, a missing `wpctl` or a timeout is
-`ok:false` with a `reason`, not an error. The deadline holds on every path,
+`round(volume * 100)`. No default sink, a `wpctl` that is missing or cannot
+start, unreadable output or a timeout is `ok:false` with a `reason`, not an
+error. The deadline holds on every path,
 including a kernel without `pidfd_open`. Call it once per batch: a burst of
 notices costs one read.
 
@@ -1166,7 +1170,7 @@ mode. Refusals raise with `{error_code, message}`:
 | `NET_WATCH_IO`, `NET_STATE_IO` | Netlink socket or dump failure. |
 | `NET_STATE_INCONSISTENT` | Dump interrupted three times running. |
 | `AUDIO_UNAVAILABLE` | `pactl` not on PATH. |
-| `AUDIO_WATCH_IO`, `AUDIO_STATE_IO` | Could not start or reap the child. |
+| `AUDIO_WATCH_IO` | Could not start or reap the `pactl` child. (`audio_state` never raises: a `wpctl` that cannot start or be read is `ok:false` with a reason.) |
 | `*_UNSUPPORTED` | Platform is not Linux. |
 | `NATIVE_CLOSED` | This evaluator's native registrations have retired. |
 

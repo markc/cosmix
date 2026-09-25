@@ -297,12 +297,14 @@ fn candidate($s, $name, $dir)
 end
 
 -- Stage B handover: the legacy panel citizen (quoin-panel.mix) mounts these
--- pages itself and a load by either owner takes the page from the other.
--- While its service is registered, a loader scene on one of its pages stays
+-- pages itself. Quoin's seats are owner-exclusive, so neither owner can take
+-- a page the other holds (the load is refused). While its service is registered, a loader scene on one of its pages stays
 -- installed and enabled but unmounted; the registration disappearing is the
 -- event that mounts it (services() rescans). A mount that then fails stays
 -- owed: later services snapshots and panel notices retry it
 -- (legacy_handover), and the citizen adds a local task_start backoff.
+-- One-way: a legacy citizen that returns is not given the pages back and its
+-- own loads fail; do not run both (docs/cos/scenes-loader.md).
 $LEGACY_PAGES = ["scene-panel", "scene-launcher", "scene-calendar", "scene-notes"]
 
 fn legacy_guard($s, $page)

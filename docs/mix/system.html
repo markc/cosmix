@@ -1397,7 +1397,10 @@ the link on every scan, IPv6 re-announces addresses on every lifetime refresh.</
 (<code>links[]</code>: <code>ifname, index, up, operstate, loopback, wireless</code>; <code>addresses[]</code>:
 <code>ifname, index, family, address, prefix</code>). A dump the kernel marks interrupted is
 retried; three in a row raise <code>NET_STATE_INCONSISTENT</code>. The whole call, retries
-included, answers within 2 s or raises <code>NET_STATE_IO</code>.</p>
+included, answers within 2 s or raises <code>NET_STATE_IO</code>. Like <code>audio_state()</code> it
+blocks the evaluator while it waits, so a serve citizen calls both from an
+<code>async</code> handler (a <code>task_start</code> task), not from a sync request path. Only a
+dump reply carrying the request's sequence number is read.</p>
 <p>If the subscription socket itself fails (a poll error, or a receive error other
 than an overrun), the handle delivers one batch with
 <code>closed: {error_code: "NET_WATCH_IO", message}</code> and <code>overflow:true</code>, then stays
@@ -1418,8 +1421,9 @@ connecting would otherwise be an event. <code>kind</code> is <code>new</code>, <
 <code>index</code> is nil for <code>server</code>. Changes coalesce per facility and index.</p>
 <p>The volume itself is <code>audio_state([opts]) -&gt; {ok, volume, level, muted, reason?}</code>:
 one <code>wpctl get-volume @DEFAULT_AUDIO_SINK@</code> with a 2 s deadline. <code>level</code> is
-<code>round(volume * 100)</code>. No default sink, a missing <code>wpctl</code> or a timeout is
-<code>ok:false</code> with a <code>reason</code>, not an error. The deadline holds on every path,
+<code>round(volume * 100)</code>. No default sink, a <code>wpctl</code> that is missing or cannot
+start, unreadable output or a timeout is <code>ok:false</code> with a <code>reason</code>, not an
+error. The deadline holds on every path,
 including a kernel without <code>pidfd_open</code>. Call it once per batch: a burst of
 notices costs one read.</p>
 <p><strong>Why a child and not a library.</strong> No PipeWire client crate is in the
@@ -1452,7 +1456,7 @@ mode. Refusals raise with <code>{error_code, message}</code>:</p>
 <tr><td><code>NET_WATCH_IO</code>, <code>NET_STATE_IO</code></td><td>Netlink socket or dump failure.</td></tr>
 <tr><td><code>NET_STATE_INCONSISTENT</code></td><td>Dump interrupted three times running.</td></tr>
 <tr><td><code>AUDIO_UNAVAILABLE</code></td><td><code>pactl</code> not on PATH.</td></tr>
-<tr><td><code>AUDIO_WATCH_IO</code>, <code>AUDIO_STATE_IO</code></td><td>Could not start or reap the child.</td></tr>
+<tr><td><code>AUDIO_WATCH_IO</code></td><td>Could not start or reap the <code>pactl</code> child. (<code>audio_state</code> never raises: a <code>wpctl</code> that cannot start or be read is <code>ok:false</code> with a reason.)</td></tr>
 <tr><td><code>*_UNSUPPORTED</code></td><td>Platform is not Linux.</td></tr>
 <tr><td><code>NATIVE_CLOSED</code></td><td>This evaluator's native registrations have retired.</td></tr>
 </tbody></table>

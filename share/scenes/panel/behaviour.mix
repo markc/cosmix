@@ -29,7 +29,7 @@ end
 $state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes_count: 0,
   net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
   open: {launcher: false, calendar: false, notes: false}, peeked: [], peek_busy: false,
-  icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false,
+  icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false, status_refreshing: false,
   net_watch: nil, net_started: 0, net_retry: 5, net_retrying: false,
   audio_watch: nil, audio_started: 0, audio_retry: 5, audio_retrying: false, audio_unavailable: false,
   model: nil}
@@ -282,7 +282,31 @@ end
 fn resync()
   $r.call($COMP, "comp.props.watch", {})
   sync_popups()
-  apply_status()
+  refresh_status()
+  schedule()
+end
+
+-- net_state() and audio_state() block for up to 2 s each, so a sync path
+-- (init, bus.connected, a props gap) never calls them: it queues this one
+-- local task instead. Single in flight, like the clock; never a Bus self-emit.
+fn refresh_status()
+  if $state.status_refreshing then return end
+  $state.status_refreshing = true
+  try
+    task_start("status.refresh", "{}")
+  catch $message
+    $state.status_refreshing = false
+    eprint("panel: status refresh not scheduled: " .. to_string($message))
+  end
+end
+
+on status.refresh async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    apply_status()
+  finally
+    $state.status_refreshing = false
+  end
   schedule()
 end
 

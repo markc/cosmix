@@ -194,6 +194,24 @@ fn addr(body: &[u8], removed: bool) -> Option<Record> {
     })
 }
 
+/// Whether every message in a datagram carries sequence number `seq`, i.e.
+/// answers our request. Framing errors are left for `parse` to report.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn replies_to(buf: &[u8], seq: u32) -> bool {
+    let mut o = 0;
+    while o + NLMSG_HDRLEN <= buf.len() {
+        let len = u32_at(buf, o) as usize;
+        if len < NLMSG_HDRLEN {
+            return true;
+        }
+        if u32_at(buf, o + 8) != seq {
+            return false;
+        }
+        o += align(len);
+    }
+    true
+}
+
 /// Decode one netlink datagram. Pure: fixture bytes in, records out.
 pub(crate) fn parse(buf: &[u8]) -> Parsed {
     let mut out = Parsed::default();
@@ -891,6 +909,11 @@ mod linux {
             set_option(fd.as_raw_fd(), libc::SO_RCVTIMEO, &timeout);
             match receive(fd.as_raw_fd(), buf, 0) {
                 Received::Data(n) => {
+                    // A datagram that answers some other request is not
+                    // this dump's; the deadline still bounds the wait.
+                    if !replies_to(&buf[..n], seq) {
+                        continue;
+                    }
                     let parsed = parse(&buf[..n]);
                     if let Some(errno) = parsed.error {
                         return Err(refusal(
@@ -1156,21 +1179,19 @@ mod linux {
     }
 
     /// One `wpctl get-volume @DEFAULT_AUDIO_SINK@`, bounded by a 2 s
-    /// deadline (a wedged PipeWire must not hang the evaluator).
+    /// deadline (a wedged PipeWire must not hang the evaluator). The contract
+    /// is failure[returns_result]: every way the read fails, including wpctl
+    /// failing to start at all, is `ok:false` with a reason, never a raise.
     pub(crate) fn audio_state(opts: &AudioOptions) -> MixResult<serde_json::Value> {
         let mut command = command("wpctl", &opts.runtime_dir);
         command
             .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
             .stderr(Stdio::piped());
         arm_parent_death(&mut command);
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(parse_wpctl(false, "", "wpctl not found on PATH"));
-            }
-            Err(e) => return Err(refusal("AUDIO_STATE_IO", format!("wpctl: {e}"))),
-        };
-        bounded_output(child, std::time::Duration::from_secs(2), true)
+        Ok(match command.spawn() {
+            Ok(child) => bounded_output(child, std::time::Duration::from_secs(2), true),
+            Err(e) => wpctl_unavailable(&e),
+        })
     }
 
     fn timed_out(limit: std::time::Duration) -> serde_json::Value {
@@ -1181,16 +1202,27 @@ mod linux {
         )
     }
 
+    fn collected(output: std::io::Result<std::process::Output>) -> serde_json::Value {
+        match output {
+            Ok(output) => parse_wpctl(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+            ),
+            Err(e) => parse_wpctl(false, "", &format!("wpctl output unreadable: {e}")),
+        }
+    }
+
     /// Collect `child`'s output within `limit` on every path, killing its
     /// process group when the limit passes. A pidfd waits in poll(2); without
     /// one (pre-5.3 kernel, EMFILE, a seccomp filter — or `use_pidfd` false in
     /// tests) a waiter thread collects the output and the caller waits on a
-    /// channel with the same limit. Never an unbounded `wait`.
+    /// channel with the same limit. Never an unbounded `wait`, never a raise.
     pub(crate) fn bounded_output(
         mut child: Child,
         limit: std::time::Duration,
         use_pidfd: bool,
-    ) -> MixResult<serde_json::Value> {
+    ) -> serde_json::Value {
         let deadline = std::time::Instant::now() + limit;
         let pid = child.id() as i32;
         let fd = if use_pidfd {
@@ -1217,30 +1249,23 @@ mod linux {
                 }
                 kill_group(&mut child);
                 let _ = child.wait();
-                return Ok(parse_wpctl(false, "", &format!("wpctl wait failed: {e}")));
+                return parse_wpctl(false, "", &format!("wpctl wait failed: {e}"));
             }
             if rc == 0 {
                 kill_group(&mut child);
                 let _ = child.wait();
-                return Ok(timed_out(limit));
+                return timed_out(limit);
             }
             break;
         }
-        let output = child
-            .wait_with_output()
-            .map_err(|e| refusal("AUDIO_STATE_IO", format!("wpctl: {e}")))?;
-        Ok(parse_wpctl(
-            output.status.success(),
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        ))
+        collected(child.wait_with_output())
     }
 
     fn waiter_output(
         child: Child,
         deadline: std::time::Instant,
         limit: std::time::Duration,
-    ) -> MixResult<serde_json::Value> {
+    ) -> serde_json::Value {
         let pid = child.id() as i32;
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = thread::Builder::new()
@@ -1255,15 +1280,10 @@ mod linux {
                 libc::kill(-pid, libc::SIGKILL);
                 libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
-            return Err(refusal("AUDIO_STATE_IO", format!("wpctl waiter: {e}")));
+            return parse_wpctl(false, "", &format!("wpctl waiter could not start: {e}"));
         }
         match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-            Ok(Ok(output)) => Ok(parse_wpctl(
-                output.status.success(),
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
-            )),
-            Ok(Err(e)) => Err(refusal("AUDIO_STATE_IO", format!("wpctl: {e}"))),
+            Ok(output) => collected(output),
             Err(_) => {
                 // Still running at the deadline means still unreaped, so the
                 // group id is the child's (only a child exiting in this very
@@ -1272,9 +1292,20 @@ mod linux {
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }
-                Ok(timed_out(limit))
+                timed_out(limit)
             }
         }
+    }
+}
+
+/// `audio_state()` when wpctl cannot even start: a missing binary, a
+/// permission error, EMFILE/EAGAIN from fork. All are state, not errors.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn wpctl_unavailable(e: &std::io::Error) -> serde_json::Value {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        parse_wpctl(false, "", "wpctl not found on PATH")
+    } else {
+        parse_wpctl(false, "", &format!("wpctl could not start: {e}"))
     }
 }
 
@@ -1520,6 +1551,15 @@ mod tests {
         assert_eq!(parsed.error, Some(libc::EPERM));
         let ack = parse(&message(NLMSG_ERROR, 0, &0i32.to_ne_bytes()));
         assert!(ack.error.is_none());
+        // A dump only accepts datagrams answering its own sequence number.
+        assert!(replies_to(&good, 7));
+        let mut two = good.clone();
+        two.extend(message(NLMSG_DONE, 0, &0i32.to_ne_bytes()));
+        assert!(replies_to(&two, 7));
+        assert!(!replies_to(&good, 8));
+        let mut foreign = two.clone();
+        foreign[good.len() + 8..good.len() + 12].copy_from_slice(&9u32.to_ne_bytes());
+        assert!(!replies_to(&foreign, 7), "one foreign message taints the datagram");
         // No errno negates to i32::MIN's magnitude: untrusted, not a panic.
         let parsed = parse(&message(NLMSG_ERROR, 0, &i32::MIN.to_ne_bytes()));
         assert!(parsed.overflow && parsed.error.is_none());
@@ -1728,6 +1768,22 @@ mod tests {
         assert!(!q.source_ready_for_test("audio:1"));
     }
 
+    /// Review GLM m3: audio_state is failure[returns_result]; wpctl failing to
+    /// start in any way is a state with a reason, never a raise.
+    #[test]
+    fn wpctl_start_failures_are_state_not_errors() {
+        use std::io::{Error, ErrorKind};
+        let missing = wpctl_unavailable(&Error::from(ErrorKind::NotFound));
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["reason"], "wpctl not found on PATH");
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::WouldBlock, ErrorKind::Other] {
+            let v = wpctl_unavailable(&Error::from(kind));
+            assert_eq!(v["ok"], false, "{kind:?}");
+            assert_eq!(v["level"], 0.0);
+            assert!(v["reason"].as_str().unwrap().starts_with("wpctl could not start: "), "{v}");
+        }
+    }
+
     #[test]
     fn receive_timeout_never_becomes_block_forever() {
         use std::time::Duration;
@@ -1754,7 +1810,7 @@ mod tests {
         for use_pidfd in [true, false] {
             let started = Instant::now();
             let limit = Duration::from_millis(200);
-            let v = linux::bounded_output(spawn("sleep 30"), limit, use_pidfd).unwrap();
+            let v = linux::bounded_output(spawn("sleep 30"), limit, use_pidfd);
             assert_eq!(v["ok"], false, "pidfd={use_pidfd}");
             assert!(
                 v["reason"].as_str().unwrap().contains("timed out after 0.2 s"),
@@ -1768,8 +1824,7 @@ mod tests {
                 spawn("echo 'Volume: 0.25 [MUTED]'"),
                 Duration::from_secs(10),
                 use_pidfd,
-            )
-            .unwrap();
+            );
             assert_eq!(v["ok"], true, "pidfd={use_pidfd}: {v}");
             assert_eq!(v["level"], 25.0);
             assert_eq!(v["muted"], true);

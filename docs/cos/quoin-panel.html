@@ -623,10 +623,12 @@ names instead. In this repository only <code>tests/panel-bus-test.mix</code> (th
 citizen's own gate) and <code>tests/scene-template-test.mix</code> (which reads the
 legacy builders for its drift check) still name <code>quoin-panel.mix</code>.
 <code>quoin-shot.mix</code> and <code>tests/panel-test.mix</code> use <code>lib/panel.mix</code>, not this
-citizen, and are unaffected. The loader refuses to mount the four pages
-while a service named <code>quoin-panel</code> (<code>SCENES_LEGACY_SERVICE</code>) is registered,
-so the two can never fight over a page; stopping the legacy unit is the
-handover event. The private session installer seeds the chosen set, carries
+citizen, and are unaffected. The loader will not mount the four pages
+while a service named <code>quoin-panel</code> (<code>SCENES_LEGACY_SERVICE</code>) is registered;
+stopping the legacy unit is the handover event. That guard is one-way: a
+legacy citizen started again later finds the pages held by the loader and
+its loads are refused, so it runs without pages. Do not run both. The exact
+rules are in <a href="/cos/scenes-loader#stage-b-legacy-handover">the loader's legacy handover</a>. The private session installer seeds the chosen set, carries
 any outstanding legacy popup pins into the loader's recovery records, stops
 the legacy unit and keeps it for rollback.</p>
 <h2 id="data-sources">Data sources</h2>
@@ -658,8 +660,9 @@ subscribes again after 5 s, doubling to at most 5 minutes until it succeeds
 The network subscription recovers the same way. A host without <code>pactl</code>
 hides the applet for good (<code>AUDIO_UNAVAILABLE</code>, no retry).
 See <a href="/mix/system#desktop-status-events--net_watch-audio_watch">desktop status events</a>.
-Behaviours use the same sources through <code>lib/runtime.mix</code>'s <code>status_watch</code>,
-<code>status_net</code>, <code>status_volume</code>, <code>status_fields</code> and <code>status_closed</code>.</li>
+Behaviours subscribe with <code>net_watch</code>/<code>audio_watch</code> themselves and re-read
+through <code>lib/runtime.mix</code>'s <code>status_net</code> and <code>status_volume</code>, from an async
+handler: each read can block for up to 2 s.</li>
 </ul>
 <h2 id="legacy-host-update-loop">Legacy host update loop</h2>
 <p>The citizen subscribes to <code>&lt;comp&gt;.props.changed</code> (windows and workspaces),
@@ -720,13 +723,30 @@ no escape for it) gets an invisible word joiner between <code>$</code> and <code
 <code>note_close</code>, <code>notes_clear</code>, <code>vol_mute</code>, <code>peek</code> are scene handlers (the
 host sends them <code>{scene, node, kind, value?, item?}</code>). <code>panel.refresh</code>
 rebuilds every open scene on demand.</p>
+<p>The popup clicks reply after their effect is applied, so a caller that reads
+state after the reply sees the popup already opened or closed:</p>
+<ul>
+<li><code>launcher</code>, <code>calendar</code>, <code>notes</code> reply rc 0 with the popup flags
+<code>{launcher, calendar, notes}</code>. If releasing an edge is refused, they reply
+rc 22 <code>{error: "release_failed", open: false, edge}</code>.</li>
+<li><code>launch</code>, <code>launch_first</code> and <code>open_calendar</code> launch, then dismiss the popup
+(a shell-revealed one too), then reply rc 0 <code>{launched}</code>. A failed launch
+still dismisses and replies rc 20 <code>apps_transport</code> or rc 21 <code>apps_refused</code>
+with <code>{rc, reply, launched, released}</code>. A refused release is rc 22 with
+<code>launched</code>. <code>launch_first</code> with no match, and <code>open_calendar</code> with no calendar
+application and no Thunderbird, launch nothing.</li>
+</ul>
+<p>The other scene handlers (<code>filter</code>, <code>cat</code>, <code>cal_*</code>, <code>note_close</code>,
+<code>notes_clear</code>, and the async <code>ws</code>, <code>task</code>, <code>tray</code>, <code>vol_mute</code>, <code>peek</code>)
+acknowledge the click first and change only what they re-render.</p>
 <p>"Open calendar app" launches the first application in the <code>Calendar</code>
 category, falling back to <code>thunderbird -calendar</code>.</p>
 <h3 id="agent-verbs">Agent verbs</h3>
 <p>Send these to <code>quoin-panel</code> with a JSON object body (an absent body means
 <code>{}</code>). Success replies are JSON objects with rc 0. Bad arguments return rc 10
 with <code>{error: "invalid_request", detail: "..."}</code>; unknown fields are rejected.
-The scene click handlers above keep their toggle behaviour.</p>
+The scene click handlers above keep their toggle behaviour and reply as
+described there.</p>
 <table><thead><tr><th>Verb</th><th>Arguments</th><th>Reply</th></tr></thead><tbody>
 <tr><td><code>launcher.open</code></td><td><code>{query?, category?}</code></td><td>Same as <code>launcher.state</code></td></tr>
 <tr><td><code>launcher.close</code></td><td><code>{}</code></td><td><code>{open: false}</code></td></tr>
