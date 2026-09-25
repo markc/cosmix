@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/overview</title>
+    <title>CosMix — cos/edit</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,74 +441,389 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/overview.md"><div class="prose"><h1 id="cos--overview">cos — overview</h1>
-<p><strong>cos</strong> is the cosmix daemon family: every Rust crate that runs a node in a
-cosmix mesh, plus the substrate libraries they share. Where
-<a href="https://github.com/markc/cosmix">mix</a> is the language you drive the mesh <em>with</em>,
-cos is what actually <em>runs</em> on each node — a set of long-running daemons that
-speak the Bus mesh protocol, expose their state as typed property namespaces,
-and are operable from the outside by agents and scripts.</p>
-<p>This page is the orientation: what cos is, how the workspace is laid out, how it
-fits with its sibling repos, and where to go next.</p>
-<h2 id="what-cos-is">What cos is</h2>
-<p>A single Cargo workspace of ~33 crates, split three ways:</p>
-<ul>
-<li><strong>Daemons</strong> — the long-running services: an Bus broker, a mail server, a web server, an authoritative DNS server, a knowledge indexer, and an agent supervisor — with the Wayland compositor and native apps in the sibling <code>src/desktop/</code> workspace.</li>
-<li><strong>Helpers &amp; adapters</strong> — CLI subcrates and integration shims the daemons lean on (the MCP bridge, the Claude SDK adapter, the mail data store, the mail auth / rules / spam subcrates).</li>
-<li><strong>Libraries</strong> — the shared substrate (<code>cosmix-lib-*</code>): property store, mesh peering, node identity, WireGuard config, logging, agent runtime pieces, and protocol codecs.</li>
-</ul>
-<p>Every daemon is built to be <strong>legible</strong> (query its state as structured data),
-<strong>modifiable</strong> (write its config through structured channels, not ad-hoc file
-edits), and <strong>reconstructible</strong> (build and run it from a clean clone). Those
-three criteria are the substrate's design filter — the point of cos is a system
-an AI agent can observe, change, and rebuild.</p>
-<h2 id="the-components">The components</h2>
-<p>Pick any component in the sidebar for its own page.</p>
-<h3 id="daemons">Daemons</h3>
-<ul>
-<li><strong><a href="/cos/noded">noded</a></strong> — the Bus broker. Every mesh node runs one; it routes <code>service.node.bus</code> addresses across the mesh.</li>
-<li><strong><a href="/cos/maild">maild</a></strong> — JMAP-native mail daemon (SMTP + IMAP + JMAP, Bayesian spam classifier, Sieve-style rules).</li>
-<li><strong><a href="/cos/webd">webd</a></strong> — multi-vhost HTTPS with automatic ACME certificates; server-rendered web UI over Datastar SSE.</li>
-<li><strong><a href="/cos/dnsd">dnsd</a></strong> — authoritative WireGuard-mesh DNS, zones generated from the mesh inventory.</li>
-<li><strong><a href="/cos/indexd">indexd</a></strong> — vector knowledge base; auto-indexes workspaces on commit and powers agent recall.</li>
-<li><strong><a href="/cos/desktop">desktop</a></strong> — the CosMix desktop: <code>cosmix-comp</code> (Smithay + Bevy Wayland compositor), the <code>ctk</code> toolkit and the native apps; protocol coverage on <a href="/cos/cosmix-comp">cosmix-comp</a>.</li>
-<li><strong><a href="/cos/agentd">agentd</a></strong> — agent supervision.</li>
-<li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power-source state.</li>
-<li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
-<li><strong><a href="/cos/dbusd">dbusd</a></strong> — the D-Bus boundary daemon; per-domain adapters translate D-Bus to Bus verbs/props in both directions.</li>
-<li><strong><a href="/cos/edit">edit</a></strong> — the <code>edit</code> Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo); the core of ced.</li>
-</ul>
-<h3 id="bridge--libraries">Bridge &amp; libraries</h3>
-<ul>
-<li><strong><a href="/cos/mcp">mcp</a></strong> — the Claude Code MCP bridge; exposes cosmix surfaces as MCP tools plus a knowledge / skill-learning loop.</li>
-<li><strong><a href="/cos/libraries">libraries</a></strong> — the shared <code>cosmix-lib-*</code> substrate crates.</li>
-</ul>
-<h2 id="how-it-fits--bus--mix--cos">How it fits — bus ← mix ← cos</h2>
-<p>cos is one of three public sibling repos with a one-way dependency order:</p>
-<ul>
-<li><strong><a href="https://github.com/markc/cosmix">bus</a></strong> — the Bus protocol family. Depends on nothing.</li>
-<li><strong><a href="https://github.com/markc/cosmix">mix</a></strong> — the language. Depends on bus.</li>
-<li><strong>cos</strong> — the daemon family. Depends on both: its config, DNS, mail, and agent crates consume the mix strict-data parser, and every daemon speaks Bus.</li>
-</ul>
-<p>Neither sibling depends on cos. Build bus and mix first (see
-<a href="/cos/overview#build">Build &amp; install</a>); the workspace clones expect sibling checkouts at
-<code>$COSMIX</code> and <code>$COSMIX</code>.</p>
-<h2 id="building">Building</h2>
-<pre><code class="language-sh"># cos depends on two sibling checkouts under $HOME
-git clone https://github.com/markc/cosmix $COSMIX
-git clone https://github.com/markc/cosmix $COSMIX
-git clone https://github.com/markc/cosmix $COSMIX
-
-# build the whole daemon family (release)
-cd $COSMIX/src &amp;&amp; cargo build --workspace --release
+        <div id="content-doc" data-prerendered="cos/edit.md"><div class="prose"><h1 id="cosmix-editd--the-edit-citizen">cosmix-editd — the <code>edit</code> citizen</h1>
+<p><strong><code>cosmix-editd</code> registers the Bus service <code>edit</code>: shared text buffers that
+humans and agents edit together.</strong> A buffer has a revision number, a log of
+who changed what, a separate undo lane for each origin, named anchors that
+follow the text, atomic saves, and a change feed a mirror can follow exactly.
+It is the core of <strong>ced</strong>, the Cosmix editor. The ced app (E1) is one
+frontend of this daemon. An agent that sends <code>edit.*</code> verbs is another, and
+both have the same standing.</p>
+<p>The text engine is <code>cosmix-edit-core</code>. That crate is pure Rust with no Bus
+code and no async runtime. It builds on a vendored subset of Microsoft's
+<a href="https://github.com/microsoft/edit">msedit</a> (MIT): the gap buffer and the SIMD
+line scanner. See <a href="/cos/libraries">libraries</a>.</p>
+<blockquote>
+<p><strong>Volatile.</strong> Buffers live in memory only. If the daemon stops, crashes or
+restarts, every unsaved edit is lost. <code>edit.info</code> says so
+(<code>"volatile": true</code>), as does the <code>lifecycle.volatile</code> prop. On SIGTERM the
+daemon logs each dirty buffer (id, path, rev) and exits within 10 s. Crash
+recovery files are planned for E1. Save often, or <code>edit.save</code> from your
+script.</p>
+</blockquote>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-editd serve        # registers `edit`, READY=1 once registered
+/opt/cosmix/bin/cosmix-editd --version    # cosmix-editd &lt;semver&gt; (&lt;sha12&gt;, built …)
 </code></pre>
-<p>Each daemon reads a small root-owned bootstrap config
-(<code>/etc/cosmix/&lt;daemon&gt;/config.toml</code>) before it contacts the mesh, then joins the
-Bus broker and exposes its runtime state through property namespaces.</p>
-<h2 id="see-also">See also</h2>
+<p>The public <code>src/_etc/systemd-user/cosmix-editd.service</code> is a user unit with
+<code>Type=notify</code> and <code>WantedBy=default.target</code>. It is not tied to a graphical
+session, because agents use the daemon headless. The daemon runs as the user
+whose files it edits: <code>~/…</code> paths expand against the daemon's <code>HOME</code>.</p>
+<h2 id="conventions">Conventions</h2>
 <ul>
-<li><strong><a href="/cos/">the component index</a></strong> — every page in this manual.</li>
-<li>Repos: <a href="https://github.com/markc/cosmix">markc/cos</a> · <a href="https://github.com/markc/cosmix">markc/mix</a> · <a href="https://github.com/markc/cosmix">markc/bus</a>.</li>
+<li><strong>Arguments</strong> are a JSON object, which is the body a Mix <code>send</code> builds from
+<code>key=value</code> args. Nested maps and lists are written directly:
+<code>ops=[{op: "insert", at: "end", text: "x"}]</code>. <strong>Never add <code>body=</code></strong> to an
+<code>edit</code> send, because it switches Mix to header routing and the other args
+stop reaching the daemon as a JSON body.</li>
+<li><strong>Success</strong> is <code>rc 0</code>. A <strong>refusal</strong> is <code>rc 10</code> with a body shaped
+<code>{"error_code","message","reason"?,"buffer"?,"rev"?,…}</code>. On a plain kv send,
+Mix puts that body's raw JSON text in <code>$result</code>, so read the fields from
+<code>$reply</code>, for example <code>$reply.error_code</code> and <code>$reply.rev</code>.</li>
+<li><strong>Codes:</strong> <code>INVALID_ARGUMENT NOT_FOUND CONFLICT RESOURCE_LIMIT IO_ERROR UNKNOWN_VERB FORBIDDEN INTERNAL</code>. <code>CONFLICT</code> reasons: <code>stale_rev overlap history_trimmed undo_conflict dirty disk_modified path_open exists</code>. A
+<code>CONFLICT</code> always carries the buffer's current <code>rev</code>.</li>
+<li><strong>Refusal precedence.</strong> When several checks would fail, the first in this
+order is reported: unknown verb → argument shape → unstamped mutation →
+mesh lock → buffer/epoch lookup → op_id duplicate (returns the original
+reply) → CAS → position resolution → limits → I/O.</li>
+<li><strong>Buffer ids</strong> look like <code>b3_9f2c41a7</code>. The suffix is the daemon <strong>epoch</strong>,
+8 hex digits chosen fresh at each start. Every reply that names a buffer
+also carries <code>epoch</code>. After a restart, an old id gets <code>NOT_FOUND</code>
+<code>epoch_mismatch</code>.</li>
+<li><strong>Mesh-open.</strong> Local and mesh callers reach every verb. With
+<code>COSMIX_MESH_OPEN=0</code> in the daemon's environment (read once at start),
+mutating verbs from a non-local broker are refused with <code>FORBIDDEN</code>
+<code>mesh_locked</code>. A mutating request that did not come through a broker
+(no <code>broker_origin</code>) is refused with <code>INVALID_ARGUMENT</code> <code>unstamped</code>.</li>
+</ul>
+<h2 id="wire-forms">Wire forms</h2>
+<pre><code class="language-text">BUFFER := "b&lt;N&gt;_&lt;epoch&gt;"
+POS    := &lt;byte offset&gt; | {"line":L,"col":C?} | {"anchor":"name"} | "start" | "end"
+RANGE  := [s, e] | {"start":POS,"end":POS} | {"lines":[a,b]} | {"anchor":"name"} | "all"
+SEL    := RANGE | {"anchor":POS,"head":POS}                 (explicit direction)
+POINT  := {"offset":N,"line":L,"col":C}                     (every position in a reply)
+OP     := {"op":"insert","at":POS,"text":S}
+        | {"op":"delete","range":RANGE}
+        | {"op":"replace","range":RANGE,"text":S}
+EDIT   := {"offset":N,"delete":N,"insert":S}                (application order, sequential coordinates)
+</code></pre>
+<ul>
+<li><strong>Offsets</strong> are UTF-8 byte offsets and must fall on a char boundary
+(otherwise <code>not_char_boundary</code>).</li>
+<li><strong><code>line</code> and <code>col</code> start at 1.</strong> <code>col</code> counts every Unicode scalar value from
+the start of the line, <code>\r</code> included. A line ends at <code>\n</code> alone, so every
+char boundary of a CRLF file is addressable. <code>{line}</code> alone means col 1.</li>
+<li><strong><code>{"lines":[a,b]}</code></strong> runs from the start of line a to the start of line
+b+1, so it includes b's <code>\n</code>. When b is the last line it runs to the end of
+the buffer.</li>
+<li><code>bytes</code> always means text bytes, with any BOM excluded.</li>
+</ul>
+<h2 id="origins-lanes-and-the-kind-rule">Origins, lanes and the kind rule</h2>
+<p>Every edit records an <strong>origin</strong> <code>kind:label</code>, where kind is <code>human</code>, <code>agent</code>
+or <code>tool</code> and label matches <code>^[A-Za-z0-9._@/+-]{1,64}$</code>.</p>
+<ul>
+<li>A mutating verb takes an optional <code>origin</code> claim. For <code>edit.undo</code> and
+<code>edit.redo</code> the claim is <code>as</code>, because there <code>origin</code> names the lane to undo.
+Without a claim the origin is derived from the attested caller:
+<code>agent:&lt;from&gt;</code> for a registered local service,
+<code>agent:&lt;service&gt;@&lt;peer&gt;</code> for a mesh caller, and <code>agent:anon</code> for an
+anonymous one-shot.</li>
+<li><strong>The kind is attested; the label is free.</strong> <code>human:</code> is honoured only for
+a <em>local registered</em> caller, which is what a frontend is. <code>tool:</code> is never
+honoured, since <code>tool:disk</code> (external reload) and <code>tool:editd</code> are the
+daemon's own. Any other claim keeps its label with kind <code>agent</code>, and the
+reply says <code>"origin_downgraded": true</code>. So an anonymous <code>origin="human:x"</code>
+edits as <code>agent:x</code>. A human frontend on another node edits as <code>agent:</code> until
+attested remote identities exist.</li>
+<li><strong>Lanes.</strong> Each origin has its own undo and redo stacks. <code>edit.undo</code> undoes
+<strong>your own lane</strong> by default. <code>origin="agent:foo"</code> undoes that lane, and
+<code>origin="*"</code> undoes whichever lane holds the newest group. Mark's Ctrl+Z
+never eats an agent's edit, and an agent's undo never eats his.</li>
+<li>Undo is checked in full before anything changes. If another origin has
+since edited the same text, the undo is refused with <code>CONFLICT</code>
+<code>undo_conflict</code>, which names the intervening rev. In that case nothing
+changes: no rev, no event, and the stacks stay as they were.</li>
+<li><code>coalesce: true</code> on a single-edit request merges it into your top undo
+group when it directly continues your previous edit. This is how keystrokes
+are grouped. Each keystroke still gets its own rev.</li>
+<li><strong>Anonymous callers share <code>agent:anon</code></strong>, including its lane and its op_id
+space. Pass <code>origin=agent:&lt;name&gt;</code> to get a lane of your own.</li>
+</ul>
+<h2 id="concurrency-cas-and-base_rev">Concurrency: CAS and <code>base_rev</code></h2>
+<p>Every text mutation (<code>insert delete replace apply</code>) takes at most one of these.
+Passing both is refused with <code>INVALID_ARGUMENT</code> <code>both_cas</code>:</p>
+<ul>
+<li><strong>Neither</strong>: the request applies to the current text. The last writer wins,
+by the caller's choice.</li>
+<li><strong><code>expect_rev: N</code></strong>: the request applies only if the buffer is at rev N.
+Otherwise it is refused with <code>CONFLICT</code> <code>stale_rev</code>, carrying the current
+<code>rev</code>. This is the agent idiom: <code>find</code> or <code>get</code>, then edit with the rev you
+read.</li>
+<li><strong><code>base_rev: N</code></strong> (for optimistic frontends): the positions are <strong>byte
+offsets in the text at rev N</strong>. Line/col, anchor and line-range positions
+are refused with <code>base_rev_needs_offsets</code>. editd transforms the ranges
+through every edit since N and applies them. If an intervening edit
+overlapped them, the request is refused with <code>CONFLICT</code> <code>overlap</code>. If rev N
+has already been trimmed from the log, it is refused with
+<code>history_trimmed</code>. The reply says <code>"rebased": true</code> when a transform
+happened.</li>
+<li><strong>Tie priority is server order.</strong> When two inserts land at the same point,
+the one the server applied first comes first.</li>
+</ul>
+<p><strong>Transactions</strong> (<code>edit.apply</code>). Every op refers to the same base text. Ranges
+that overlap within one request are refused with <code>overlap_in_txn</code>, and
+nothing applies. Two non-empty ranges with the same start always count as
+overlapping. An insert at a range's start or end is allowed. Inserts at the
+same offset read in request order. An insert at a range's start reads
+<strong>before</strong> that range's replacement text.</p>
+<p><strong>op_id retries.</strong> A mutating request may carry
+<code>op_id</code> (<code>^[A-Za-z0-9._:-]{1,64}$</code>). A retry with the same caller, origin,
+verb and op_id returns the original reply marked <code>"duplicate": true</code>, and
+applies nothing. Only successful replies are cached, 1,024 per buffer, so a
+refused request can be retried with its op_id.</p>
+<h2 id="verbs">Verbs</h2>
+<p><code>read_only</code> in the manifest: <code>ping info list get find anchor.get history props.*</code>.
+<code>HELP</code> lists the manifest.</p>
+<table><thead><tr><th>Verb</th><th>Args</th><th>Reply</th></tr></thead><tbody>
+<tr><td><code>edit.ping</code></td><td>—</td><td><code>{pong, service:"edit", schema:"edit.v1", epoch}</code></td></tr>
+<tr><td><code>edit.info</code></td><td>—</td><td>name, schema, epoch, <code>props_level:"L2"</code>, build provenance, <code>buffers</code>, <code>dirty</code>, <code>volatile:true</code>, <code>mesh_open</code>, <code>event_seq</code>, <code>publisher_loss</code>, <code>limits</code></td></tr>
+<tr><td><code>edit.list</code></td><td>—</td><td><code>{epoch, buffers:[{buffer, path, opened_as, name, language, rev, saved_rev, dirty, disk, lines, bytes, holders}]}</code></td></tr>
+<tr><td><code>edit.open</code></td><td><code>path?</code> (absolute or <code>~/…</code>), <code>create?</code>, <code>language?</code>, <code>origin?</code></td><td><code>{buffer, epoch, path, opened_as, name, language, rev:0, lines, bytes, eol, bom, disk, reopened, created}</code></td></tr>
+<tr><td><code>edit.close</code></td><td><code>buffer</code>, <code>force?</code></td><td><code>{buffer, closed, holders}</code></td></tr>
+<tr><td><code>edit.save</code></td><td><code>buffer</code>, <code>path?</code> (save-as), <code>expect_rev?</code>, <code>force?</code></td><td><code>{buffer, epoch, path, rev, saved_rev, file_bytes, disk:"clean", durable, warning}</code></td></tr>
+<tr><td><code>edit.reload</code></td><td><code>buffer</code>, <code>force?</code>, <code>expect_rev?</code></td><td>a mutation reply, or <code>{buffer, rev, unchanged:true}</code></td></tr>
+<tr><td><code>edit.get</code></td><td><code>buffer</code>, <code>range?</code>=<code>"all"</code>, <code>numbered?</code>, <code>expect_rev?</code>, <code>snapshot?</code></td><td><code>{buffer, epoch, rev, text | lines, start, end, bytes_total, lines_total, truncated, next, snapshot}</code></td></tr>
+<tr><td><code>edit.insert</code></td><td><code>buffer</code>, <code>at</code>, <code>text</code> + common</td><td>mutation reply</td></tr>
+<tr><td><code>edit.delete</code></td><td><code>buffer</code>, <code>range</code> + common</td><td>mutation reply</td></tr>
+<tr><td><code>edit.replace</code></td><td><code>buffer</code>, <code>range</code>, <code>text</code> + common</td><td>mutation reply</td></tr>
+<tr><td><code>edit.apply</code></td><td><code>buffer</code>, <code>ops:[OP…]</code> + common</td><td>mutation reply</td></tr>
+<tr><td><code>edit.find</code></td><td><code>buffer</code>, <code>pattern</code>, <code>regex?</code>, <code>case?</code>=true, <code>range?</code>, <code>groups?</code>, <code>limit?</code>=1000, <code>from?</code></td><td><code>{buffer, rev, matches:[{start, end, text, text_truncated, groups, groups_truncated}], truncated, next}</code></td></tr>
+<tr><td><code>edit.select</code></td><td><code>buffer</code>, <code>ranges:[SEL…]</code></td><td><code>{buffer, rev, origin, origin_downgraded, selections:[{anchor, head}]}</code></td></tr>
+<tr><td><code>edit.cursor</code></td><td><code>buffer</code>, <code>at</code></td><td>same as <code>select</code></td></tr>
+<tr><td><code>edit.anchor.set</code></td><td><code>buffer</code>, <code>name</code>, <code>at?</code> | <code>range?</code>, <code>bias?</code></td><td><code>{buffer, rev, anchors:[…]}</code></td></tr>
+<tr><td><code>edit.anchor.get</code></td><td><code>buffer</code>, <code>name?</code></td><td><code>{buffer, rev, anchors:[{name, start, end, bias, collapsed_rev}]}</code></td></tr>
+<tr><td><code>edit.anchor.clear</code></td><td><code>buffer</code>, <code>name</code></td><td><code>{buffer, cleared}</code></td></tr>
+<tr><td><code>edit.undo</code> / <code>edit.redo</code></td><td><code>buffer</code>, <code>origin?</code> (lane: own / <code>"*"</code> / <code>kind:label</code>), <code>as?</code>, <code>expect_rev?</code>, <code>op_id?</code></td><td>mutation reply + <code>lane</code>, <code>undid</code> / <code>redid</code> = <code>[first_rev, last_rev]</code></td></tr>
+<tr><td><code>edit.history</code></td><td><code>buffer</code>, <code>since_rev?</code>=0, <code>limit?</code>=100</td><td><code>{buffer, rev, oldest_rev, entries:[{rev, origin, lane, kind, of, op_id, time, via, edits, edits_elided, text_bytes}], truncated, next}</code></td></tr>
+<tr><td><code>edit.props.get|list|describe|watch</code></td><td>SPEC-07 props</td><td>see <a href="/cos/edit#props">Props</a></td></tr>
+</tbody></table>
+<p>"Common" means <code>expect_rev | base_rev</code>, <code>coalesce</code>, <code>cursor</code> (post-edit
+coordinates), <code>op_id</code>, <code>origin</code>. The mutating verbs are <code>open close save reload insert delete replace apply select cursor anchor.set anchor.clear undo redo</code>, and all of them take <code>origin</code> and <code>op_id</code>. <code>select</code>, <code>cursor</code> and
+anchors do not bump the rev.</p>
+<p><strong>Mutation reply.</strong> The reply is compact and bounded, whatever the size of the
+transaction. It never includes the edit list, which lives in the <code>edit</code> event
+and in <code>edit.history</code>:</p>
+<pre><code class="language-json">{"buffer":"b3_9f2c41a7","epoch":"9f2c41a7","rev":43,"base_rev":42,"origin":"agent:ctl-90",
+ "origin_downgraded":false,"op_id":"k-118","duplicate":false,"rebased":false,
+ "edit_count":1,"inserted_bytes":5,"deleted_bytes":3,
+ "changed_span":{"start":{"offset":120,"line":12,"col":1},"end":{"offset":125,"line":12,"col":6}},
+ "changed":[{"start":{"offset":120,"line":12,"col":1},"end":{"offset":125,"line":12,"col":6}}],
+ "changed_truncated":false,
+ "cursor":{"offset":125,"line":12,"col":6},"dirty":true,"lines":204,"bytes":8123,
+ "history_trimmed_to":null}
+</code></pre>
+<ul>
+<li><code>changed</code> lists at most 64 inserted spans, in the new text's coordinates.
+Past that, <code>changed_truncated</code> is <code>true</code>, and <code>changed_span</code> still gives the
+envelope of every change.</li>
+<li>When an edit trims the log, <code>history_trimmed_to</code> is set to the oldest rev
+still kept. Undo reach is the retained log: 100,000 entries or 32 MiB of
+edit text.</li>
+</ul>
+<p><strong>Open, holders and close.</strong> Opening a path that is already open returns the
+same buffer (<code>reopened: true</code>) and adds your caller key to <code>holders</code>. A buffer
+binds to the canonical path resolved at open, so a later retarget of a symlink
+is not followed. <code>edit.open</code> without a path creates a scratch buffer.
+<code>create: true</code> opens a missing file as an empty buffer with <code>disk:"none"</code>.
+<code>close</code> removes your key. The buffer is freed when no holders remain and it is
+clean. Closing the last holder of a dirty buffer is refused with <code>CONFLICT</code>
+<code>dirty</code>. <code>force: true</code> frees the buffer <strong>and discards unsaved text</strong>. In E0,
+holders are never reaped when an agent crashes.</p>
+<p><strong>Paging.</strong> <code>get</code>, <code>find</code> and <code>history</code> stop at a 4 MiB encoded reply and
+return <code>truncated</code> plus <code>next</code>; resume from there. To read a consistent
+multi-page copy, pass <code>snapshot: true</code> on the first <code>get</code>. editd freezes that
+rev and returns <code>"snapshot":"s7"</code>, and later pages pass <code>snapshot:"s7"</code>. The
+snapshot is released after the final page, on close, or by LRU eviction (at
+most 2 per buffer). A released token gets <code>NOT_FOUND</code> <code>snapshot_expired</code>.
+<code>numbered: true</code> returns <code>lines:[{line, text, cont}]</code>, where a line split
+across pages continues with <code>cont: true</code>.</p>
+<p><strong>Replace-all</strong> is <code>find</code> plus one <code>apply</code> with <code>expect_rev</code>, a Mix idiom
+rather than a verb.</p>
+<h2 id="anchors">Anchors</h2>
+<p>A named anchor (<code>^[A-Za-z0-9._-]{1,64}$</code>, at most 1,024 per buffer, shared by
+all origins) is a point or a range that follows the text as it changes. An
+edit <code>(p, delete dd, insert ii)</code> maps a point <code>a</code> like this:</p>
+<table><thead><tr><th>Case</th><th>Result</th></tr></thead><tbody>
+<tr><td>pure insert at <code>p &lt; a</code></td><td><code>a</code> moves right by <code>ii</code></td></tr>
+<tr><td>pure insert exactly at <code>a</code></td><td><code>bias:"before"</code> (default): stays · <code>bias:"after"</code>: moves right by <code>ii</code></td></tr>
+<tr><td>a delete starting at or after <code>a</code></td><td>unchanged</td></tr>
+<tr><td>a delete that contains <code>a</code> (<code>p &lt; a &lt; p+dd</code>)</td><td><code>a</code> collapses to <code>p</code>, and <code>collapsed_rev</code> records when</td></tr>
+<tr><td>a delete or replace wholly before <code>a</code></td><td><code>a</code> moves by <code>ii − dd</code></td></tr>
+</tbody></table>
+<p>Range anchors do not expand: text typed exactly at either end stays outside
+the range. Selections follow the same rules. The editing origin's carets use
+<code>after</code> and every other origin's carets use <code>before</code>, so your caret moves
+with your typing and not with someone else's.</p>
+<h2 id="props">Props</h2>
+<p>The daemon has an SPEC-07 read surface, <code>edit.props.get|list|describe|watch</code>.
+<code>props_level</code> is <code>L2</code>.</p>
+<pre><code>lifecycle.props_level  lifecycle.epoch  lifecycle.volatile
+lifecycle.event_seq  lifecycle.publisher_loss                (transient)
+buffer_count
+buffers.&lt;bid&gt;.path | opened_as | name | language | eol | bom | dirty | saved_rev | disk | holders
+buffers.&lt;bid&gt;.rev | lines | bytes | origin_last              (transient)
+</code></pre>
+<p><code>disk</code> is one of <code>clean modified deleted none unwatched</code>. Cursors and anchors
+are not props; use the verbs. <code>edit.props.watch</code> replies with the
+<code>edit.props.changed</code> topic, the domain topic <code>edit.changed</code>, and the bootstrap
+recipe below.</p>
+<h2 id="the-change-feed">The change feed</h2>
+<table><thead><tr><th>Topic</th><th>Inner command</th><th>Body</th></tr></thead><tbody>
+<tr><td><code>edit.props.changed</code></td><td><code>props.changed</code></td><td>SPEC-07 <code>{path, old, new, ts, cause}</code></td></tr>
+<tr><td><code>edit.changed</code></td><td><code>edit.changed</code></td><td>one event, below</td></tr>
+</tbody></table>
+<pre><code class="language-json">{"event":"edit","epoch":"9f2c41a7","buffer":"b3_9f2c41a7","rev":43,"base_rev":42,"origin":"agent:ctl-90","lane":"agent:ctl-90","kind":"edit","of":null,"op_id":"k-118","edits":[{"offset":120,"delete":3,"insert":"hello"}],"event_seq":1207}
+{"event":"cursor","epoch":"…","buffer":"…","rev":43,"origin":"human:ced","selections":[{"anchor":130,"head":130}],"event_seq":1208}
+{"event":"anchor","epoch":"…","buffer":"…","rev":43,"name":"fn_render","start":98,"end":240,"event_seq":1209}
+{"event":"disk","epoch":"…","buffer":"…","rev":43,"disk":"modified","event_seq":1210}
+{"event":"open","epoch":"…","buffer":"…","path":"/home/u/x.mix","rev":0,"event_seq":1211}
+{"event":"close","epoch":"…","buffer":"…","event_seq":1212}
+{"event":"resync","epoch":"…","buffers":["b3_9f2c41a7"],"reason":"oversized","rev":44,"event_seq":1213}
+</code></pre>
+<p><code>kind</code> on an <code>edit</code> event is <code>edit</code>, <code>undo</code>, <code>redo</code> or <code>reload</code>. <code>event_seq</code>
+increases by one per event for the life of the daemon. An anchor event with
+<code>start: null</code> means the anchor was cleared.</p>
+<p><strong>Mirror rule.</strong></p>
+<ol>
+<li>Subscribe to <code>edit.changed</code>.</li>
+<li><code>edit.get snapshot:true</code> to fetch the text and its rev.</li>
+<li>Apply the <code>edit</code> events whose <code>base_rev</code> equals your rev, applying each
+event's <code>edits</code> in list order.</li>
+<li>Refetch and resume from the new rev if any of these happens:
+<ul>
+<li>an event's <code>base_rev</code> does not match your rev,</li>
+<li><code>event_seq</code> skips a number,</li>
+<li>a <code>resync</code> event names your buffer (or <code>"all"</code>),</li>
+<li><code>epoch</code> changes.</li>
+</ul>
+</li>
+</ol>
+<p>Loss is always announced:</p>
+<ul>
+<li>An event larger than 256 KiB (for example a big paste, or undoing a big
+delete) is replaced by <code>resync {reason:"oversized"}</code>.</li>
+<li>An event dropped from the publish queue or lost to a send failure marks its
+buffer <code>resync_pending</code>. The resync is retried with backoff (250 ms,
+doubling, capped at 30 s) until delivered, and goes out ahead of later
+events.</li>
+<li>Every Bus reconnect publishes <code>resync {buffers:"all", reason:"reconnect"}</code>.</li>
+</ul>
+<p>In Mix: <code>subscribe("edit.changed")</code> plus <code>on edit.changed … end</code>.
+<code>$event.args</code> is the event.</p>
+<h2 id="files">Files</h2>
+<ul>
+<li>
+<p><strong>Load.</strong> Files are UTF-8. Anything else is refused with <code>INVALID_ARGUMENT</code>
+<code>not_utf8</code>. A BOM and the line-ending style are detected and preserved.
+The size is checked before the file is read. The language is detected from
+the name (<code>*.mix</code> → <code>mix</code>, <code>*.conf.mix</code> → <code>mix-data</code>, <code>scene.mix</code> → <code>scene</code>,
+<code>rs</code> → <code>rust</code>, and so on); <code>edit.open language=</code> overrides it.</p>
+</li>
+<li>
+<p><strong>Save</strong> writes a temp file beside the target, fsyncs it, then <strong>rechecks
+the destination immediately before replacing it</strong>:</p>
+<ul>
+<li>For a plain save, the file on disk must still be the one this buffer last
+loaded or saved (same dev/inode/size/mtime), or be absent if it was never
+saved. Anything else is refused with <code>CONFLICT</code> <code>disk_modified</code>, and
+<code>force: true</code> overwrites anyway.</li>
+<li>For save-as (<code>path=</code>), a target that exists is refused with <code>CONFLICT</code>
+<code>exists</code> unless you pass <code>force</code>. A target open in another buffer is
+refused with <code>path_open</code>.</li>
+</ul>
+<p>The save then renames the temp file over the target and fsyncs the
+directory. If that directory fsync fails after the rename, the reply says
+<code>durable: false</code> and carries a <code>warning</code>.</p>
+</li>
+<li>
+<p><strong>The honest guarantee.</strong> A save is an atomic replacement guarded by a
+precondition, not a filesystem compare-and-swap. A writer that lands between
+the final check and the rename is overwritten, which is the same window
+every mainstream editor has. Writing the canonical target keeps a symlink
+intact. Hard links to the old inode are detached.</p>
+</li>
+<li>
+<p><strong>External changes.</strong> editd watches each open file's parent directory
+through inotify; it does not poll. When the file changes on disk:</p>
+<ul>
+<li>A <strong>clean</strong> buffer reloads with a minimal edit (the common prefix and
+suffix are kept). The reload is logged as one <code>reload</code> entry in lane
+<code>tool:disk</code> and can be undone.</li>
+<li>A <strong>dirty</strong> buffer becomes <code>disk:"modified"</code> and keeps your text. Use
+<code>edit.reload force=true</code> to take the disk version, or <code>edit.save force=true</code> to overwrite it.</li>
+<li>A deleted file becomes <code>disk:"deleted"</code>.</li>
+</ul>
+<p>A replaced or removed parent directory is re-watched by path. If the watch
+fails (inotify limit, network filesystem), <code>disk</code> becomes <code>unwatched</code> and
+the save-time check still protects the file.</p>
+</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<table><thead><tr><th>Limit</th><th>Value</th></tr></thead><tbody>
+<tr><td>Buffer text / lines</td><td>64 MiB / 2,000,000</td></tr>
+<tr><td>Inserted text per request / ops per <code>apply</code></td><td>1 MiB / 10,000</td></tr>
+<tr><td>Undo log per buffer</td><td>100,000 entries or 32 MiB of edit text</td></tr>
+<tr><td>Open buffers</td><td>256</td></tr>
+<tr><td>All buffers + logs + snapshots</td><td>1 GiB</td></tr>
+<tr><td>Reply / event (encoded)</td><td>4 MiB / 256 KiB</td></tr>
+<tr><td><code>find</code> matches</td><td>1,000 default, 10,000 max; 4 KiB text per match</td></tr>
+<tr><td>Anchors / selection origins / selections per origin</td><td>1,024 / 64 / 16</td></tr>
+<tr><td>Queued commands per buffer</td><td>256, and a full queue is refused at once with <code>RESOURCE_LIMIT</code> <code>busy</code></td></tr>
+</tbody></table>
+<p>Exceeding a limit is refused with <code>RESOURCE_LIMIT</code>, and the buffer is left
+untouched. Each buffer runs in its own task, so a slow regex on one buffer
+never delays another.</p>
+<h2 id="a-mix-session">A Mix session</h2>
+<pre><code class="language-mix">send edit edit.open path="~/notes/todo.md"
+$b = $result.buffer
+send edit edit.find buffer=$b pattern="alpha"
+$m = $result.matches[0]
+send edit edit.replace buffer=$b range={start: $m.start.offset, end: $m.end.offset} text="beta" expect_rev=$result.rev
+if $rc == 10 and $reply.error_code == "CONFLICT" then
+  print("someone edited first; buffer is now at rev " .. to_string($reply.rev))
+end
+send edit edit.insert buffer=$b at={line: 2, col: 1} text="-- note\n" origin="agent:tidy" op_id="t1"
+send edit edit.apply buffer=$b ops=[{op: "insert", at: "end", text: "tail\n"}, {op: "delete", range: {lines: [1, 1]}}]
+send edit edit.undo buffer=$b origin="agent:tidy"          -- only tidy's edit is undone
+send edit edit.anchor.set buffer=$b name="mark1" at={line: 3}
+send edit edit.get buffer=$b numbered=true
+send edit edit.save buffer=$b
+</code></pre>
+<p>The same session, with the change feed and an external write checked, is the
+end-to-end test <code>src/crates/cosmix-editd/tests/edit-bus-test.mix</code>. It runs a
+private broker, the real daemon and one-shot Mix clients:</p>
+<pre><code class="language-sh">COSMIX=$PWD mix src/crates/cosmix-editd/tests/edit-bus-test.mix --bin src/target/release/cosmix-editd
+</code></pre>
+<h2 id="install">Install</h2>
+<pre><code class="language-sh">cp src/_etc/systemd-user/cosmix-editd.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cosmix-editd     # returns once READY=1
+mix -c 'send edit edit.info
+print($result.version)'
+</code></pre>
+<h2 id="not-in-e0">Not in E0</h2>
+<p>The following arrive in E1 or later, each with its first consumer:</p>
+<ul>
+<li>diagnostics</li>
+<li>syntax highlighting</li>
+<li>Unicode width and word navigation</li>
+<li><code>edit.run</code></li>
+<li>crash-recovery files</li>
+<li>reaping the holders of crashed agents</li>
+<li>lossy loading of non-UTF-8 files</li>
+<li>attested remote human frontends</li>
+<li>merging overlapping edits instead of refusing them</li>
+<li>per-buffer topics</li>
 </ul></div></div>
     </div>
 

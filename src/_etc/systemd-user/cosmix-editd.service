@@ -1,0 +1,27 @@
+# ~/.config/systemd/user/cosmix-editd.service
+#
+# The `edit` Bus citizen: shared text buffers for humans and agents (the core
+# of ced). It runs as the session user because it reads and writes that user's
+# files; agents drive it headless, so it is wanted by default.target rather
+# than tied to a graphical session.
+#
+# VOLATILE: buffers live in memory only. Stopping or restarting this unit
+# discards unsaved text (SIGTERM logs every dirty buffer before exit).
+#
+# Install:  cp this -> ~/.config/systemd/user/cosmix-editd.service
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now cosmix-editd
+
+[Unit]
+Description=Cosmix edit citizen (shared text buffers for humans and agents)
+Documentation=https://cosmix.dev/cos/edit
+
+[Service]
+Type=notify
+ExecStart=/opt/cosmix/bin/cosmix-editd serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=default.target
