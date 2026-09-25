@@ -439,6 +439,9 @@ mod tests {
                 exit_condition: bevy::window::ExitCondition::DontExit,
                 ..default()
             },
+        ))
+        // Bevy's plugin tuples stop at 15 elements; the rest go in a second call.
+        .add_plugins((
             bevy::picking::DefaultPickingPlugins,
             bevy::clipboard::ClipboardPlugin,
             bevy::text::TextPlugin,
@@ -485,7 +488,8 @@ mod tests {
                 world
                     .resource::<cosmix_scene_bevy::SceneStore>()
                     .list(seats, &frame.geometry.output)
-                    .is_empty()
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
             );
             for edge in Edge::ALL {
                 assert!(frame.panel(edge).page_ids.is_empty());

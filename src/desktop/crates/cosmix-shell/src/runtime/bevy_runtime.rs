@@ -9,6 +9,7 @@ use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy::prelude::{Mut, Res, ResMut, Resource, Time, World};
 use bevy::time::Real;
+#[cfg(test)]
 use std::time::Duration;
 
 use crate::chrome::QuoinCommittedMotionModes;
