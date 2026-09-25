@@ -235,3 +235,164 @@ fn tiny_skia_frame_bench() {
         }
     }
 }
+
+/// Isolated costs, not additive frame timings. No window/presentation is
+/// created. Keep allocations outside the timer except where explicitly named.
+#[test]
+#[ignore = "release-only headless performance measurement"]
+fn tiny_skia_foot_phases_bench() {
+    use cosmix_term_core::raster::PaintState;
+    use std::hint::black_box;
+
+    fn measure(label: &str, mut work: impl FnMut()) {
+        let mut samples = Vec::new();
+        for n in 0..220 {
+            let start = Instant::now();
+            work();
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            if n >= 20 {
+                samples.push(ms);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "phase {label}: mean={:.3} p50={:.3} p99={:.3} ms",
+            samples.iter().sum::<f64>() / samples.len() as f64,
+            samples[100],
+            samples[198]
+        );
+    }
+
+    let mut raster = Raster::new(2.5, 13.0, Cursor::Underline).unwrap();
+    raster.width = 25;
+    raster.height = 50;
+    let mut screen = Screen {
+        cols: 90,
+        rows: 25,
+        cursor: (0, 12),
+        cursor_visible: false,
+        cells: (0..2250)
+            .map(|i| Cell {
+                c: char::from(b'!' + (i % 90) as u8),
+                fg: [210, 220, 230],
+                bg: [20, 25, 30],
+                bold: false,
+            })
+            .collect(),
+        updated: Instant::now(),
+    };
+    let mut rgba = vec![0; 2250 * 1250 * 4];
+    let mut state = PaintState::default();
+    for echo in [true, false] {
+        let mut dirty = vec![!echo; 25];
+        dirty[12] = true;
+        measure(
+            if echo {
+                "paint warm echo (90 cells)"
+            } else {
+                "paint warm full (2250 cells)"
+            },
+            || {
+                raster.paint(&screen, &mut rgba, 2250 * 4, &mut state, &dirty);
+                black_box(&rgba);
+            },
+        );
+    }
+    measure("paint cold full + new raster (90 distinct keys)", || {
+        let mut cold = raster.resized(2.5, 13.0).unwrap();
+        cold.width = 25;
+        cold.height = 50;
+        cold.paint(&screen, &mut rgba, 2250 * 4, &mut state, &[]);
+        black_box(&rgba);
+    });
+    for cell in &mut screen.cells {
+        cell.c = ' ';
+    }
+    measure("paint spaces full (background only)", || {
+        raster.paint(&screen, &mut rgba, 2250 * 4, &mut state, &[]);
+        black_box(&rgba);
+    });
+
+    // Same loop as iced_tiny_skia::raster::Cache::allocate, with the load,
+    // allocation and id lookup excluded. Alpha is opaque, as in production.
+    let mut native = tiny_skia::Pixmap::new(2250, 1250).unwrap();
+    measure("RGBA to native premultiplied BGRA loop full", || {
+        for (src, dst) in black_box(&rgba).chunks_exact(4).zip(native.pixels_mut()) {
+            *dst = tiny_skia::ColorU8::from_rgba(src[2], src[1], src[0], src[3]).premultiply();
+        }
+        black_box(native.data());
+    });
+    let mut target = tiny_skia::Pixmap::new(2250, 1250).unwrap();
+    for rows in [50, 200, 1250] {
+        measure(&format!("native copy {rows} pixel rows"), || {
+            let len = 2250 * rows * 4;
+            target.data_mut()[..len].copy_from_slice(black_box(&native.data()[..len]));
+            black_box(target.data());
+        });
+    }
+    measure("native scroll copy_within 24 rows", || {
+        target.data_mut().copy_within(2250 * 50 * 4.., 0);
+        black_box(target.data());
+    });
+    measure("tiny-skia draw_pixmap identity full", || {
+        target.draw_pixmap(
+            0,
+            0,
+            native.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            tiny_skia::Transform::identity(),
+            None,
+        );
+        black_box(target.data());
+    });
+    // Exercise the real image-cache miss, including image::load and allocation.
+    let mut renderer = Renderer::new(Font::default(), Pixels(13.0));
+    let viewport = Viewport::with_physical_size(Size::new(2250, 1250), 2.5);
+    let bounds = Rectangle::with_size(viewport.logical_size());
+    let mut mask = tiny_skia::Mask::new(2250, 1250).unwrap();
+    let pixels = Bytes::from(rgba);
+    measure(
+        "measure_image new id full (load + allocation + convert)",
+        || {
+            let handle = Handle::from_rgba(2250, 1250, pixels.clone());
+            black_box(renderer.measure_image(&handle));
+            // Empty damage still trims the image cache; avoid an unbounded cache
+            // without charging a draw to the conversion measurement.
+            renderer.draw(
+                &mut target.as_mut(),
+                &mut mask,
+                &viewport,
+                &[],
+                Color::BLACK,
+            );
+        },
+    );
+    let handle = Handle::from_rgba(2250, 1250, pixels);
+    renderer.reset(bounds);
+    black_box(renderer.measure_image(&handle));
+    let mut image = iced::advanced::image::Image::new(handle.clone());
+    image.filter_method = image::FilterMethod::Nearest;
+    renderer.draw_image(image, bounds, bounds);
+    measure("iced cached image draw full", || {
+        black_box(renderer.measure_image(&handle));
+        renderer.draw(
+            &mut target.as_mut(),
+            &mut mask,
+            &viewport,
+            &[bounds],
+            Color::BLACK,
+        );
+        black_box(target.data());
+    });
+    renderer.reset(bounds);
+    measure("iced empty layer clear full", || {
+        renderer.draw(
+            &mut target.as_mut(),
+            &mut mask,
+            &viewport,
+            &[bounds],
+            Color::BLACK,
+        );
+        black_box(target.data());
+    });
+}
