@@ -230,6 +230,8 @@ try
   end
   check($edits[5].origin == "tool:disk" and $edits[1].op_id == "t1", "reload origin / op_id: " .. json_encode($edits))
   check(length(filter($events, fn($e) = $e.event == "resync")) == 0, "unexpected resync: " .. json_encode($events))
+  -- disk stayed clean throughout (clean load, save, clean external reload): no transition, no disk event
+  check(length(filter($events, fn($e) = $e.event == "disk")) == 0, "disk event without a transition: " .. json_encode($events))
 
   -- SIGTERM with a dirty buffer: editd logs it (id, path, rev) and exits
   -- within the 10 s budget (buffers are volatile; the log is the record).
