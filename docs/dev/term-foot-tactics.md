@@ -376,7 +376,7 @@ intent**, and snapshot the latest state once. Continue processing input while
 waiting for a frame callback. Preserve any Rio synchronous-update handling;
 test partial writes with and without the application using that protocol.
 
-### Rank 6 implementation awaiting cluster validation
+### Rank 6 implemented (2026-09-25)
 
 The shared Raster painter now coalesces equal-background cells within each
 dirty row and fills each pixel-row span through a safe `[u8; 4]` slice and
@@ -408,9 +408,23 @@ phase probes. It measures the same padded 2250×1250, scale-2.5 fixture for
 glyphs and spaces, with background runs of 90, 7 and 1 cells; 20 warmups and
 200 samples report mean/p50/p99 milliseconds. Setup and colour changes are
 outside the timer. Run it in release mode serially with the existing probes
-using the reproduction command above. No build or runtime test was run for
-this implementation locally; the ≥1.5 ms warm-full-paint saving is a target,
-not a measured result. Swash's Outline/Alpha image layout (one byte per mask
+using the reproduction command above. ("Padded" refers to the cell padding
+described at the top of this report, not buffer stride; the bench stride is
+exactly `width * 4`.)
+
+Measured on cbc3 (release, serial, `--include-ignored`, commit 818d96b1),
+core 108 passed and term tiny-skia 45 passed, clippy clean on both:
+
+| Probe | Before (foot-tactics) | Rank 6 |
+|---|---:|---:|
+| Warm full paint, 2250 glyph cells | 3.98 ms | **1.23 ms** |
+| Background only (spaces) | 2.05 ms | **0.37 ms** |
+| Four-row bands, full redraw | 11.58 ms | **7.00 ms** |
+| Four-row bands, echo | 1.77 ms | **1.24 ms** |
+
+The before column is from the merge validation run on a different host, so
+compare the phase probes rather than read the totals as exact; the full
+redraw target of < 8 ms is met by rank 6 alone. Swash's Outline/Alpha image layout (one byte per mask
 pixel) and representable grid/buffer size arithmetic remain existing caller
 and library assumptions.
 

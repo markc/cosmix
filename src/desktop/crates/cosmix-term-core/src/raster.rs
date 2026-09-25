@@ -909,7 +909,12 @@ mod tests {
                     glyph.placement.top = top;
                     glyph.placement.width = 256;
                     glyph.placement.height = 9;
-                    glyph.data = (0..256 * 9).map(|i| i as u8).collect();
+                    // Each row is a different rotation of 0..=255, so every row
+                    // still holds all alpha values but sampling the wrong source
+                    // row under vertical clipping changes the output.
+                    glyph.data = (0..9usize)
+                        .flat_map(|row| (0..256usize).map(move |col| (col + row * 37) as u8))
+                        .collect();
                     raster.cache.insert(('M', true, fg), Some(glyph));
                     let mut grid = screen(3, 3, 'M');
                     for cell in &mut grid.cells {
@@ -920,6 +925,23 @@ mod tests {
                     compare_painters(&mut raster, &mut grid, 1);
                 }
             }
+        }
+        // Zero-width and zero-height masks draw nothing in either painter.
+        raster.width = 7;
+        raster.height = 5;
+        for (mask_width, mask_height) in [(0, 9), (256, 0), (0, 0)] {
+            let mut glyph = Image::default();
+            glyph.placement.width = mask_width;
+            glyph.placement.height = mask_height;
+            glyph.data = vec![255; (mask_width * mask_height) as usize];
+            raster.cache.insert(('M', true, [9, 9, 9]), Some(glyph));
+            let mut grid = screen(3, 3, 'M');
+            for cell in &mut grid.cells {
+                cell.fg = [9, 9, 9];
+                cell.bg = [200, 100, 50];
+                cell.bold = true;
+            }
+            compare_painters(&mut raster, &mut grid, 1);
         }
     }
 
