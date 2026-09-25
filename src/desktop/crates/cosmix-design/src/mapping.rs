@@ -869,15 +869,35 @@ fn resolve_type_record(
     errors: &mut Vec<DesignDiagnostic>,
 ) -> Option<ResolvedTypeRecord> {
     let path = format!("design.v1.typography.records.{name}");
-    let metric = resolve_metric_reference(
-        metrics,
-        &source.type_step,
-        AuthoredMetricKind::Step,
-        &path,
-        errors,
-    )?;
-    let font_size = metric.resolved().value;
-    if source.family.trim().is_empty() || !(1..=1000).contains(&source.weight) {
+    let font_size = match (source.logical_px, source.type_step.is_empty()) {
+        (Some(px), true) if px.is_finite() && px > 0.0 => px,
+        (None, false) => {
+            resolve_metric_reference(
+                metrics,
+                &source.type_step,
+                AuthoredMetricKind::Step,
+                &path,
+                errors,
+            )?
+            .resolved()
+            .value
+        }
+        _ => {
+            errors.push(DesignDiagnostic::error(
+                "invalid-typography",
+                path,
+                "typography requires exactly one positive logical_px or type_step",
+            ));
+            return None;
+        }
+    };
+    if source.family.trim().is_empty()
+        || source
+            .fallbacks
+            .iter()
+            .any(|family| family.trim().is_empty())
+        || !(1..=1000).contains(&source.weight)
+    {
         errors.push(DesignDiagnostic::error(
             "invalid-typography",
             path,
@@ -898,6 +918,8 @@ fn resolve_type_record(
     }
     Some(ResolvedTypeRecord {
         family: source.family.clone(),
+        fallbacks: source.fallbacks.clone(),
+        generic: source.generic,
         font_size_metric: source.type_step.clone(),
         font_size,
         weight: source.weight,
@@ -3573,6 +3595,9 @@ mod tests {
             "button.md".into(),
             TypeRecordSource {
                 family: "sans".into(),
+                fallbacks: Vec::new(),
+                generic: Default::default(),
+                logical_px: None,
                 type_step: "type.zero".into(),
                 weight: 500,
                 line_height: None,

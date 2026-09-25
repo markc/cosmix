@@ -354,11 +354,14 @@ fn sync_node_to_cell(cell: &ResolvedButtonCell, node: &mut Node) {
 
 /// Returns true only when the font was actually rewritten, so callers holding
 /// a `Mut<TextFont>` can keep Bevy's change tick honest.
-fn apply_label_font(typography: &CtkTypography, size: ButtonSize, font: &mut TextFont) -> bool {
-    let want_size = FontSize::Px(label_font_size(typography, size));
+fn apply_label_font(typography: &CtkTypography, _size: ButtonSize, font: &mut TextFont) -> bool {
+    // Compact geometry is still a primary control label, so it uses the UI
+    // token too. Secondary copy explicitly opts into CtkTextRole::Small.
+    let want_size = FontSize::Px(typography.role_size(crate::theme::CtkTextRole::Ui));
+    let want_weight = typography.role_weight(crate::theme::CtkTextRole::Ui);
     let source_drift =
         typography.effective_family.is_some() && !matches!(font.font, FontSource::SansSerif);
-    if font.font_size != want_size || source_drift {
+    if font.font_size != want_size || source_drift || font.weight != want_weight {
         if typography.effective_family.is_some() {
             // Match apply_ctk_typography's source ownership: once CTK has a
             // resolved generic mapping, stamp SansSerif. Never revert it when
@@ -367,6 +370,7 @@ fn apply_label_font(typography: &CtkTypography, size: ButtonSize, font: &mut Tex
             font.font = FontSource::SansSerif;
         }
         font.font_size = want_size;
+        font.weight = want_weight;
         return true;
     }
     false
@@ -1208,6 +1212,7 @@ mod tests {
         let font = app.world().get::<TextFont>(label).unwrap();
         assert_eq!(font.font, FontSource::SansSerif);
         assert_eq!(font.font_size, FontSize::Px(16.0));
+        assert_eq!(font.weight.0, 300);
 
         *app.world_mut().get_mut::<TextFont>(label).unwrap() = TextFont::from_font_size(99.0);
         app.update();

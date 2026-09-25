@@ -1217,6 +1217,11 @@ fn text(commands: &mut Commands, value: &str, size: f32, dim: bool) -> Entity {
         .spawn((
             Text::new(value),
             TextFont::from_font_size(size),
+            if dim {
+                ctk::theme::CtkTextRole::Small
+            } else {
+                ctk::theme::CtkTextRole::Ui
+            },
             bevy::feathers::theme::ThemeTextColor(if dim {
                 tokens::TEXT_DIM
             } else {

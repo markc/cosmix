@@ -6,6 +6,8 @@ pub mod config;
 mod corner_menu;
 mod demos;
 mod desktop_font;
+#[cfg(test)]
+mod font_tests;
 mod holders;
 mod hotspot;
 mod keyboard;
@@ -325,14 +327,13 @@ fn setup(
         .and_then(|scheme| Scheme::from_name(&scheme))
         .unwrap_or(Scheme::Ocean);
     let mut spec = ThemeSpec::from_scheme(scheme, Mode::Dark);
-    // Match the host desktop's UI font where it can be read; otherwise CTK's
-    // built-in typography stands (a machine with no KDE config still looks
-    // right). Point sizes are converted to logical px; output scale is applied
-    // downstream, so this stays scale-free.
+    // Optional Plasma import overrides the shared desktop font tokens.
     if let Some(font) = desktop_font::detect() {
         spec.typography = TypographySpec {
             family: font.family,
             body_px: font.body_px,
+            weight: font.weight,
+            ..Default::default()
         };
     }
     *theme = UiTheme(create_dark_theme());
@@ -513,7 +514,8 @@ fn left_page(commands: &mut Commands, page: &str) -> Entity {
         let copy = commands
             .spawn((
                 Text::new(body),
-                TextFont::from_font_size(12.0),
+                TextFont::default(),
+                ctk::theme::CtkTextRole::Small,
                 bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
             ))
             .id();
@@ -526,14 +528,16 @@ fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: boo
     let heading = commands
         .spawn((
             Text::new(title),
-            TextFont::from_font_size(14.0),
+            TextFont::default(),
+            ctk::theme::CtkTextRole::Ui,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
         ))
         .id();
     let copy = commands
         .spawn((
             Text::new(body),
-            TextFont::from_font_size(12.0),
+            TextFont::default(),
+            ctk::theme::CtkTextRole::Small,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
         ))
         .id();
@@ -566,14 +570,16 @@ fn bottom_launcher(commands: &mut Commands) -> Entity {
     let apps = commands
         .spawn((
             Text::new("Konsole  ·  Dolphin  ·  Kate"),
-            TextFont::from_font_size(13.0),
+            TextFont::default(),
+            ctk::theme::CtkTextRole::Ui,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
         ))
         .id();
     let clock = commands
         .spawn((
             Text::new("--:--:-- UTC"),
-            TextFont::from_font_size(13.0),
+            TextFont::default(),
+            ctk::theme::CtkTextRole::Mono,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
             // A proportional face makes clock digits jitter each second; the
             // monospace role keeps them on a fixed advance while staying
@@ -601,14 +607,16 @@ fn bottom_power(commands: &mut Commands) -> Entity {
     let heading = commands
         .spawn((
             Text::new("Power"),
-            TextFont::from_font_size(14.0),
+            TextFont::default(),
+            ctk::theme::CtkTextRole::Ui,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
         ))
         .id();
     let reading = commands
         .spawn((
             Text::new("Power unavailable"),
-            TextFont::from_font_size(13.0),
+            TextFont::default(),
+            ctk::theme::CtkTextRole::Small,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
             QuoinPowerText,
         ))

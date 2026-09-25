@@ -152,6 +152,7 @@ pub fn spawn_menu(
                         item.label
                     )),
                     TextFont::from_font_size(14.0),
+                    ctk::theme::CtkTextRole::Ui,
                     bevy::feathers::theme::ThemeTextColor(if item.checked {
                         tokens::TEXT_DIM
                     } else {

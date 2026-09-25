@@ -310,6 +310,11 @@ design: {
     },
     typography: {
       records: {
+        ui: { family: "SF Pro Text", fallbacks: ["Inter", "Noto Sans", "DejaVu Sans"], generic: "sans_serif", logical_px: 14.666666666666666, weight: 300 },
+        ui_display: { family: "SF Pro Display", fallbacks: ["Inter", "Noto Sans", "DejaVu Sans"], generic: "sans_serif", logical_px: 14.666666666666666, weight: 300 },
+        small: { family: "SF Pro Text", fallbacks: ["Inter", "Noto Sans", "DejaVu Sans"], generic: "sans_serif", logical_px: 10.666666666666666, weight: 400 },
+        mono: { family: "SF Mono", fallbacks: ["DejaVu Sans Mono", "Noto Sans Mono"], generic: "monospace", logical_px: 16, weight: 300 },
+        terminal: { family: "SF Mono", fallbacks: ["DejaVu Sans Mono", "Noto Sans Mono"], generic: "monospace", logical_px: 21.333333333333332, weight: 300 },
         "button.md": { family: "Noto Sans", type_step: "type.body", weight: 400 },
         "button.sm": { family: "Noto Sans", type_step: "type.compact", weight: 400 }
       }

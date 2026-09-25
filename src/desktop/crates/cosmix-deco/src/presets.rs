@@ -16,16 +16,17 @@ use crate::theme::{
     ShadowSpec, TitleAlign,
 };
 
-/// The desktop's UI face, and therefore the title face in every chrome style.
+/// The desktop's display face, used for titles in every chrome style.
 ///
 /// Chrome typography is a property of the desktop, not of the chrome style: a
 /// window that looks Windows-ish should still be lettered like everything else
 /// on the machine. All three presets share the family, size and weight below;
 /// only geometry and colour differ between them.
 ///
-/// A host without this family is not misconfigured — the compositor degrades to
-/// the platform UI family and finally to its own embedded face.
-pub const DEFAULT_TITLE_FONT_FAMILY: &str = "SF Pro Text";
+/// The compositor replaces these compatibility defaults with the shared
+/// `ui_display` token, resolving its free chain before platform and embedded
+/// rescue. This pure geometry crate does not perform font discovery.
+pub const DEFAULT_TITLE_FONT_FAMILY: &str = "SF Pro Display";
 /// Point size for [`DEFAULT_TITLE_FONT_FAMILY`] (converted to logical px at
 /// 96 dpi; output scale is applied later by the compositor).
 pub const DEFAULT_TITLE_SIZE_PT: f32 = 11.0;

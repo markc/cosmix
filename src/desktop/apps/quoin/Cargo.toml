@@ -54,10 +54,15 @@ cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-
 tempfile = "3"
 
 [dev-dependencies]
+fontique = "0.9"
+parley = "=0.9.0"
+swash = "=0.2.10"
+ttf-parser = "=0.25.1"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # The driverless bridge + peer used by `bus_service`'s App-level tests. Only
 # the dev targets enable it (Cargo's v2+ resolver does not unify
 # dev-dependency features into `cargo build`), so no shipped binary links it.
-ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }
+ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support", "menus"] }
 
 [build-dependencies]
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
