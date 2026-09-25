@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(listing.lines().count(), 1);
         assert!(listing.contains("title=xid=7"));
         assert!(set.lock().unwrap().active_tab().title.len() <= 256);
-        assert!(set.lock().unwrap().revision > before);
+        assert_eq!(set.lock().unwrap().revision, before);
         assert!(
             handle(
                 &set,

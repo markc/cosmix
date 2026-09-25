@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",

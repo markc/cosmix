@@ -216,8 +216,8 @@ impl TabSet {
             });
             if tab.title != title {
                 tab.title = title;
-                self.revision += 1;
-                tab.revision = self.revision;
+                // Retitles use the event sequence below, never the layout
+                // revision that frontends use to rebuild their pane trees.
                 changed.push((tab.id, tab.active_pane));
             }
         }
@@ -1104,6 +1104,38 @@ mod tests {
         drop(removed);
         drop(tabs.shutdown());
     }
+    #[test]
+    fn retitles_advance_events_without_invalidating_layout() {
+        use rio_vt::event::{EventListener, RioEvent, WindowId};
+        let Some(mut tabs) = fixture() else {
+            return;
+        };
+        let id = tabs.active_id();
+        let listener = tabs.active_terminal().lock().unwrap().listener.clone();
+        let mut events = tabs.observe();
+        let mut event_revision = tabs.watch();
+        let layout_revision = (tabs.revision, tabs.active_tab().revision);
+        for title in ["pinned", "", "another pin"] {
+            listener.send_event(RioEvent::Title("program".into()), WindowId::from(0));
+            tabs.set_title(id, title.into()).unwrap();
+            assert_eq!(
+                tabs.active_tab().title,
+                if title.is_empty() { "program" } else { title }
+            );
+            assert_eq!((tabs.revision, tabs.active_tab().revision), layout_revision);
+            for topic in ["tabs.changed", "title.changed"] {
+                let event = events.try_recv().unwrap();
+                event_revision += 1;
+                assert_eq!(event.topic, topic);
+                assert_eq!(event.kind, "retitled");
+                assert_eq!(event.tab, id);
+                assert_eq!(event.revision, event_revision);
+            }
+            assert!(events.try_recv().is_err());
+        }
+        drop(tabs.shutdown());
+    }
+
     fn fixture() -> Option<TabSet> {
         if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
             eprintln!("SKIP tab PTY test: /opt/cosmix/bin/mix unavailable");

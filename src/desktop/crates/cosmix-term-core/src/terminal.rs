@@ -968,7 +968,12 @@ impl Terminal {
         let mut bytes = 0;
         let mut truncated = false;
         let count = if contents { rows + history } else { 0 };
-        for y in (-(offset as i32) - history as i32..rows as i32 - offset as i32).take(count) {
+        // Spend the budget on the newest rows first, preserving the viewport
+        // before recent history. Restore oldest-first output after capture.
+        for y in (-(offset as i32) - history as i32..rows as i32 - offset as i32)
+            .rev()
+            .take(count)
+        {
             let row = &term.grid[Line(y)];
             let mut line = Vec::new();
             let mut line_bytes = 2; // JSON-escaped newline.
@@ -996,6 +1001,7 @@ impl Terminal {
             lines.push(line);
         }
         drop(term);
+        lines.reverse();
         TextSnapshot {
             cols,
             rows,
@@ -1482,14 +1488,32 @@ mod tests {
     fn snapshot_byte_budget_bounds_wide_unicode_history_and_releases_grid() {
         let mut f = GridFixture::new();
         f.terminal.resize(3000, 24, 0, 0);
-        let row = format!("{}\r\n", "𝐀".repeat(3000));
-        let mut input = row.repeat(120).into_bytes();
+        let mut expected: Vec<String> = (0..120)
+            .map(|n| format!("{n:04}{}", "𝐀".repeat(2996)))
+            .collect();
+        let mut input = format!("{}\r\n", expected.join("\r\n")).into_bytes();
         input.push(b'Z');
+        expected.push(format!("Z{}", " ".repeat(2999)));
         f.feed(&input, |t| cell(t, 23, 0) == 'Z');
         let snapshot = f.terminal.capture_snapshot(true, 10000);
         assert!(snapshot.truncated);
         let returned = snapshot.lines.len();
-        assert!(returned > 0 && returned < 124);
+        assert!(returned > 24 && returned < 121);
+        let retained: Vec<String> = snapshot
+            .lines
+            .iter()
+            .map(|row| row.iter().collect())
+            .collect();
+        assert_eq!(retained, expected[expected.len() - returned..]);
+        let encoded_bytes: usize = retained
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap().len())
+            .sum(); // JSON quotes cost the same two bytes as an escaped newline.
+        let omitted = &expected[expected.len() - returned - 1];
+        assert!(encoded_bytes <= SNAPSHOT_TEXT_BYTES);
+        assert!(
+            encoded_bytes + serde_json::to_string(omitted).unwrap().len() > SNAPSHOT_TEXT_BYTES
+        );
         // Rendering owns only the captured data; it needs none of these locks.
         let _grid = f.terminal.grid.lock();
         let _stats = f.terminal.stats.lock().unwrap();

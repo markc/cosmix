@@ -139,7 +139,8 @@ Snapshot text represents empty grid cells as spaces, preserving column positions
 and trailing blank cells in both history and viewport rows. Text is limited to
 512 KiB of encoded bytes (including allowance for JSON escaping), leaving
 metadata and transport headroom below the MCP 1 MiB and Bus 8 MiB limits.
-Only complete rows are returned, oldest first; the header reports
+The budget keeps the newest complete rows: the viewport first, then as much
+recent history as fits. Retained rows are returned oldest first; the header reports
 `truncated=true` when the byte budget omits rows and `lines_returned=N`
 counts history and viewport rows actually returned. A row larger than the
 budget returns no text rows. With `contents:false`, the count is zero and
@@ -150,7 +151,9 @@ Pinned and OSC titles have control characters and Unicode line/paragraph
 separators stripped and are capped at 256 UTF-8 bytes on a character boundary.
 An empty sanitised pin clears it. Titles may contain spaces; tab-list readers
 should delimit the title at the final ` cols=` field, rather than tokenising
-it on whitespace. Effective title changes bump the tab-set revision.
+it on whitespace. Effective title changes advance the separate event revision
+via `tabs.changed` and `title.changed` with `kind=retitled`; they leave the
+tab-set and pane-layout revisions unchanged, so pane geometry stays valid.
 Completion notifications use the same sanitised, possibly program-set label.
 Explicit cwd paths follow symlinks and resolve `..` normally.
 
