@@ -29,6 +29,8 @@ use super::SceneStore;
 mod icons;
 #[cfg(test)]
 mod layout_tests;
+#[cfg(test)]
+mod model_patch_tests;
 use icons::IconCache;
 
 #[derive(Resource)]

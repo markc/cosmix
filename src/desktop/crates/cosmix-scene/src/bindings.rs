@@ -183,6 +183,12 @@ pub fn reevaluate(
             "model patch path must contain map keys",
         )]);
     }
+    // A sequence of individually small patches must not grow an unbounded
+    // model before conversion/evaluation. The host also bounds authored ports
+    // and metadata together with this model before committing a revision.
+    if serde_json::to_vec(&next.model).map_or(true, |v| v.len() > crate::MAX_DOCUMENT_BYTES) {
+        return Err(vec![Diagnostic::error("model-path", 1, "aggregate model too large")]);
+    }
     let old = tree.clone();
     let mut diagnostics = Vec::new();
     let mut evaluated = Vec::new();
@@ -408,7 +414,16 @@ pub(crate) fn set_port(ports: &mut indexmap::IndexMap<String, JsonValue>, port: 
 }
 
 fn apply_model_patch(model: &mut JsonValue, parts: &[&str], value: &JsonValue) -> bool {
-    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+    if parts.is_empty() {
+        if value.is_null() {
+            *model = json!({});
+            return true;
+        }
+        if !value.is_object() { return false; }
+        *model = value.clone();
+        return true;
+    }
+    if parts.iter().any(|p| p.is_empty()) {
         return false;
     }
     if !model.is_object() {

@@ -1,5 +1,11 @@
 -- Bus-only dependencies for panel-bus-test.mix. No desktop or app effects.
-$edges = {left: {pinned: false, visible: false}, right: {pinned: false, visible: false}, bottom: {pinned: false, visible: false}}
+$edges = {left: {pinned: false, visible: false, mode:"hidden", page:nil, pages:[]}, right: {pinned: false, visible: false, mode:"hidden", page:nil, pages:[]}, bottom: {pinned: false, visible: false, mode:"hidden", page:nil, pages:[]}}
+$applied_state = {revision:0}
+$scene_data = require("../lib/scenes.mix")
+fn applied()
+  $applied_state.revision = $applied_state.revision + 1
+  publish(serve_name() .. ".panel.changed", json_encode({generation:1, revision:$applied_state.revision, panels:$edges}), {command:"shell.panel.changed"})
+end
 $lists = 0
 $loads = 0
 $launches = []
@@ -11,6 +17,7 @@ $pins = 0
 
 on fixture.mode
   $mode = $event.args
+  applied()
   reply(0, "{}")
 end
 
@@ -21,6 +28,11 @@ end
 
 on "shell.scene.load"
   if $mode.load_refused ?? false then reply(14, "{}"); return end
+  $doc = $scene_data.document($event.body)
+  $edge = $doc.window.edge ?? "right"
+  $page = $doc.window.panel ?? ("scene-" .. $doc.name)
+  if not contains($edges[$edge].pages, $page) then $edges[$edge].pages = push($edges[$edge].pages, $page) end
+  applied()
   if contains($event.body, "name: launcher\n") then $launcher_scene = $event.body end
   if contains($event.body, "name: notes\n") then $notes_loads = $notes_loads + 1 end
   if $mode.restart_once ?? false then
@@ -32,30 +44,53 @@ on "shell.scene.load"
 end
 on "shell.panel.page.set"
   if $mode.page_refused ?? false then reply(14, "{}"); return end
+  $edges[$event.args.edge].page = $event.args.id
+  applied()
   reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.show"
   if $mode.show_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].visible = true
+  applied()
   reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.pin"
+  if $mode.show_refused ?? false then reply(14, "{}"); return end
   $pins = $pins + 1
   $edges[$event.args.edge].pinned = true
+  $edges[$event.args.edge].mode = "docked"
+  $edges[$event.args.edge].visible = true
+  applied()
   reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.unpin"
   if $mode.release_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].pinned = false
+  $edges[$event.args.edge].mode = "hidden"
+  applied()
   reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.hide"
   if $mode.hide_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].visible = false
+  applied()
   reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.props.get"
-  reply($mode.host_rc ?? 0, json_encode($edges[after($event.args.path, "panels.")]))
+  if $event.args.path == nil then
+    reply($mode.host_rc ?? 0, json_encode({panels:$edges}))
+  else
+    reply($mode.host_rc ?? 0, json_encode($edges[after($event.args.path, "panels.")]))
+  end
+end
+on "shell.panel.mode"
+  if ($mode.release_refused ?? false) or ($mode.hide_refused ?? false) then reply(14, "{}"); return end
+  $edge = $event.args.edge
+  $edges[$edge].mode = $event.args.mode
+  $edges[$edge].pinned = $event.args.mode != "hidden"
+  $edges[$edge].visible = $event.args.mode != "hidden"
+  applied()
+  reply($mode.host_rc ?? 0, "{}")
 end
 on "comp.windows.list"
   reply(0, json_encode({windows: []}))

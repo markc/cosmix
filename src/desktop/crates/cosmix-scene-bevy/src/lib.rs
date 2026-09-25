@@ -37,6 +37,7 @@ impl Plugin for ScenePlugin {
 
 pub(crate) struct SceneEntry {
     document: SceneDocument,
+    bindings: cosmix_scene::bindings::BindingSet,
     pub tree: ResolvedScene,
     revision: u64,
     pub mounted: Option<render::Mounted>,
@@ -121,7 +122,7 @@ impl SceneStore {
             Ok((reply, summary)) => {
                 if let Some(summary) = summary {
                     let wire = format!("---\ncommand: shell.scene.changed\n---\n{summary}");
-                    if let Err(error) = bridge.try_publish_topic("shell.scene.changed", false, wire)
+                    if let Err(error) = bridge.try_publish_topic(format!("{}.scene.changed", bridge.service_name()), false, wire)
                     {
                         warn!("scene summary publish failed: {error}");
                     }
@@ -129,6 +130,7 @@ impl SceneStore {
                 (0, reply.to_string())
             }
             Err(error) => {
+                let error = refusal(error);
                 if changes_scene {
                     let name = error["scene"].as_str().or_else(|| args["scene"].as_str());
                     let revision = name
@@ -142,7 +144,7 @@ impl SceneStore {
                     let summary =
                         json!({"scene":name,"revision":revision,"ops":0,"diagnostics":diagnostics});
                     let wire = format!("---\ncommand: shell.scene.changed\n---\n{summary}");
-                    if let Err(error) = bridge.try_publish_topic("shell.scene.changed", false, wire)
+                    if let Err(error) = bridge.try_publish_topic(format!("{}.scene.changed", bridge.service_name()), false, wire)
                     {
                         warn!("scene summary publish failed: {error}");
                     }
@@ -171,6 +173,13 @@ impl SceneStore {
     ) -> Result<(Value, Option<Value>), Value> {
         let name = args["scene"].as_str().unwrap_or_default();
         match verb {
+            SceneVerb::Validate => {
+                let document = cosmix_scene::parse(body).map_err(|d| json!({"diagnostics":d}))?;
+                check_size(&document)?;
+                let diagnostics = cosmix_scene::lint(&document);
+                let tree = cosmix_scene::resolve(&document).map_err(|d| json!({"diagnostics":d}))?;
+                Ok((json!({"scene":tree.name,"valid":true,"diagnostics":diagnostics}), None))
+            }
             SceneVerb::Load => {
                 let document = cosmix_scene::parse(body).map_err(|d| json!({"diagnostics":d}))?;
                 self.accept(document, mount, true)
@@ -206,6 +215,8 @@ impl SceneStore {
                     .ok_or_else(|| json!({"error":"unknown scene"}))?;
                 let value = if verb == SceneVerb::Watch {
                     json!({"scene":name,"revision":entry.revision,"digest":digest(&entry.tree)})
+                } else if args["format"] == "source" {
+                    json!({"scene":name,"revision":entry.revision,"source":cosmix_scene::to_source(&entry.document)})
                 } else if let Some(path) = args["path"].as_str() {
                     let (id, port) = path
                         .split_once('.')
@@ -228,6 +239,31 @@ impl SceneStore {
                     .get(name)
                     .ok_or_else(|| json!({"error":"unknown scene"}))?;
                 let mut document = entry.document.clone();
+                let path = args["path"].as_str().unwrap_or_default();
+                let value = args.get("value")
+                    .ok_or_else(|| json!({"error":"value is required"}))?;
+                if path == "model" || path.starts_with("model.") {
+                    let result = cosmix_scene::bindings::reevaluate(&entry.tree, &entry.bindings, path, value)
+                        .map_err(|d| json!({"scene":name,"diagnostics":d}))?;
+                    document.model = Some(result.tree.model.clone());
+                    check_size(&document)?;
+                    if render::page_id(&result.tree) != render::page_id(&entry.tree)
+                        || render::scene_edge(&result.tree) != render::scene_edge(&entry.tree) {
+                        return Err(json!({"scene":name,"error_code":"SUBPANEL_COLLISION",
+                            "message":"model patch cannot move a scene mount; unload before moving it"}));
+                    }
+                    // Commit only after all validation. Keep compiled bindings,
+                    // the loader receipt and last-good ports from reevaluate.
+                    let entry = self.scenes.get_mut(name).unwrap();
+                    let revision = self.revisions.entry(name.into()).or_default();
+                    *revision += 1;
+                    entry.revision = *revision;
+                    entry.document = document;
+                    entry.tree = result.tree;
+                    let reply = json!({"scene":name,"revision":*revision,"digest":digest(&entry.tree)});
+                    let summary = json!({"scene":name,"revision":*revision,"ops":result.changed.len(),"diagnostics":result.diagnostics});
+                    return Ok((reply, Some(summary)));
+                }
                 let (id, port) = args["path"]
                     .as_str()
                     .and_then(|p| p.split_once('.'))
@@ -249,12 +285,7 @@ impl SceneStore {
                 } else {
                     node.ports.insert(port.into(), value.clone());
                 }
-                if serialised_document(&document).len() > cosmix_scene::MAX_DOCUMENT_BYTES {
-                    return Err(json!({"scene":name,"diagnostics":[{
-                        "severity":"error", "code":"document-too-large", "line":1,
-                        "message":"patched document exceeds 256 KiB"
-                    }]}));
-                }
+                check_size(&document)?;
                 self.accept(document, mount, false)
             }
             SceneVerb::Unload => {
@@ -327,11 +358,13 @@ impl SceneStore {
         mount: Option<&mut SceneMount<'_>>,
         loading: bool,
     ) -> Result<(Value, Option<Value>), Value> {
+        check_size(&document)?;
         let diagnostics = cosmix_scene::lint(&document);
         if diagnostics.iter().any(|d| d.severity == Severity::Error) {
             return Err(json!({"scene":document.name,"diagnostics":diagnostics}));
         }
         let tree = cosmix_scene::resolve(&document).map_err(|d| json!({"diagnostics":d}))?;
+        let bindings = cosmix_scene::bindings::compile(&document).map_err(|d| json!({"diagnostics":d}))?;
         // A declared mount address is unique across scenes, including scenes
         // from the same citizen. Content revisions cannot rename a live seat;
         // unload first so the old carousel entry is removed transactionally.
@@ -385,6 +418,7 @@ impl SceneStore {
             tree.name.clone(),
             SceneEntry {
                 document,
+                bindings,
                 tree,
                 revision,
                 mounted,
@@ -399,42 +433,107 @@ fn digest(tree: &ResolvedScene) -> String {
     format!("{:x}", Sha256::digest(serde_json::to_vec(tree).unwrap()))
 }
 
-// Measure the complete canonical AMP document, including metadata and JSON
-// escaping, rather than the patch or the original source retained by P1.
-fn serialised_document(document: &SceneDocument) -> String {
-    let mut wire = format!(
-        "---\nscene: 1\nname: {}\ncitizen: {}\n",
-        document.name, document.citizen
-    );
-    for (key, value) in [
-        ("window", &document.window),
-        ("subscribe", &document.subscribe),
-        ("targets", &document.targets),
-        ("model", &document.model),
-    ] {
-        if let Some(value) = value {
-            wire.push_str(&format!("{key}: {value}\n"));
-        }
+#[cfg(test)]
+pub(crate) use cosmix_scene::to_source as serialised_document;
+
+fn check_size(document: &SceneDocument) -> Result<(), Value> {
+    if cosmix_scene::to_source(document).len() > cosmix_scene::MAX_DOCUMENT_BYTES {
+        return Err(json!({"scene":document.name,"error_code":"DOCUMENT_TOO_LARGE",
+            "message":"aggregate document and model exceeds 256 KiB",
+            "diagnostics":[{"severity":"Error","code":"document-too-large","line":1,
+                "message":"aggregate document and model exceeds 256 KiB"}]}));
     }
-    wire.push_str("---\n```mix\n");
-    for (id, node) in &document.nodes {
-        let mut value = serde_json::Map::new();
-        value.insert("widget".into(), json!(node.widget));
-        value.extend(
-            node.ports
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
-        wire.push_str(&format!("{}: {}\n", json!(id), Value::Object(value)));
+    Ok(())
+}
+
+fn refusal(mut error: Value) -> Value {
+    if error.get("error_code").is_none() {
+        error["error_code"] = json!("SCENE_REFUSED");
     }
-    wire.push_str("```\n");
-    wire
+    if error.get("message").is_none() {
+        error["message"] = error.get("error").cloned()
+            .unwrap_or_else(|| json!("scene validation failed"));
+    }
+    error
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     const FIXTURE: &str = include_str!("../../cosmix-scene/tests/fixtures/conformance.scene.md");
+
+    const MODEL_SCENE: &str = r#"---
+scene: 1
+name: model-test
+citizen: scene-behaviour
+model: {"caption":"first","rows":[{"id":"one","cells":["one"]}]}
+---
+```mix
+root: {widget: "column", children: ["caption", "rows"]}
+caption: {widget: "text", text: "= $model.caption"}
+rows: {widget: "list", rows: "= $model.rows", row: "item", row_height: 24}
+item: {widget: "text", text: "{cells[0]}"}
+```
+"#;
+
+    #[test]
+    fn model_patch_is_transactional_and_retains_bindings_and_last_good_values() {
+        let mut store = SceneStore::default();
+        store.request(SceneVerb::Load, MODEL_SCENE, &Value::Null).unwrap();
+        let bindings = store.scenes["model-test"].bindings.clone();
+        store.request(SceneVerb::Patch, "", &json!({"scene":"model-test","path":"model.caption","value":"second"})).unwrap();
+        assert_eq!(store.scenes["model-test"].tree.nodes["caption"].ports["text"], "second");
+        assert_eq!(store.scenes["model-test"].document.model.as_ref().unwrap()["caption"], "second");
+        assert_eq!(store.scenes["model-test"].bindings, bindings);
+        // A failed expression keeps its last-good port, while accepting model
+        // data and returning an evaluation diagnostic, per core binding policy.
+        let (_, summary) = store.request(SceneVerb::Patch, "", &json!({"scene":"model-test","path":"model","value":{"caption":7,"rows":[]}})).unwrap();
+        assert_eq!(store.scenes["model-test"].tree.nodes["caption"].ports["text"], "second");
+        assert!(!summary.unwrap()["diagnostics"].as_array().unwrap().is_empty());
+        let before = store.scenes["model-test"].tree.clone();
+        let revision = store.scenes["model-test"].revision;
+        for (path, value) in [("model..caption", json!("bad")), ("model.rows.child", json!("bad")), ("model", json!(7)),
+            ("model", json!({"large":"x".repeat(cosmix_scene::MAX_DOCUMENT_BYTES)}))] {
+            assert!(store.request(SceneVerb::Patch, "", &json!({"scene":"model-test","path":path,"value":value})).is_err());
+            assert_eq!(store.scenes["model-test"].tree, before);
+            assert_eq!(store.scenes["model-test"].revision, revision);
+        }
+    }
+
+    #[test]
+    fn cumulative_model_bounds_source_export_and_validation_have_no_side_effects() {
+        let mut store = SceneStore::default();
+        store.request(SceneVerb::Validate, MODEL_SCENE, &Value::Null).unwrap();
+        assert!(store.scenes.is_empty());
+        assert!(store.revisions.is_empty());
+        store.request(SceneVerb::Load, MODEL_SCENE, &Value::Null).unwrap();
+        store.request(SceneVerb::Patch, "", &json!({"scene":"model-test","path":"model.a","value":"x".repeat(150_000)})).unwrap();
+        let revision = store.scenes["model-test"].revision;
+        assert!(store.request(SceneVerb::Patch, "", &json!({"scene":"model-test","path":"model.b","value":"x".repeat(150_000)})).is_err());
+        assert_eq!(store.scenes["model-test"].revision, revision);
+        let (export, _) = store.request(SceneVerb::Get, "", &json!({"scene":"model-test","format":"source"})).unwrap();
+        let document = cosmix_scene::parse(export["source"].as_str().unwrap()).unwrap();
+        assert_eq!(document.nodes["caption"].ports["text"], "= $model.caption");
+        assert_eq!(document.model, store.scenes["model-test"].document.model);
+        assert_eq!(document.nodes["item"].ports["text"], "{cells[0]}");
+        // Authored behaviour is event routing only; it cannot revoke loader seats.
+        store.scenes.get_mut("model-test").unwrap().owner = Some(SceneOwner {citizen:"scenes".into(), accepted_at:1});
+        assert!(store.unload_owned_by("scene-behaviour").is_empty());
+        assert!(store.scenes.contains_key("model-test"));
+    }
+
+    #[test]
+    fn model_patch_cannot_move_a_live_mount_address() {
+        let mut store = SceneStore::default();
+        let source = "---\nscene: 1\nname: edge-binding\ncitizen: behaviour\nmodel: {\"edge\":\"right\"}\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"= $model.edge\"}\n```\n";
+        store.request(SceneVerb::Load, source, &Value::Null).unwrap();
+        let before = store.scenes["edge-binding"].tree.clone();
+        let revision = store.scenes["edge-binding"].revision;
+        let error = store.request(SceneVerb::Patch, "", &json!({"scene":"edge-binding", "path":"model.edge", "value":"left"})).unwrap_err();
+        assert_eq!(error["error_code"], "SUBPANEL_COLLISION");
+        assert_eq!(store.scenes["edge-binding"].tree, before);
+        assert_eq!(store.scenes["edge-binding"].revision, revision);
+    }
 
     #[test]
     fn inventory_requires_the_render_reservation_and_reports_unowned_watch() {

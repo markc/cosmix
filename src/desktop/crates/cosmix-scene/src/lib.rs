@@ -15,6 +15,8 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub mod bindings;
+mod serialize;
+pub use serialize::to_source;
 #[cfg(test)]
 mod binding_tests;
 #[cfg(test)]

@@ -1,5 +1,15 @@
 # quoin-panel
 
+Stage A keeps this citizen and its existing page IDs running alongside the
+[scenes loader](scenes-loader.md). New templates use distinct names until
+Stage B. Page selection and popup release now advance through pending
+operations on `<host>.panel.changed` applied-state notifications, with no
+select/hide sleep loops. Open/close replies acknowledge desired state;
+`shown` reflects the last applied host snapshot. Saved popup pins are cleared
+only after an applied release. Refresh bursts enqueue one `panel.flush` Bus
+event instead of a 100 ms sleep loop. The legacy network/audio clock polling
+is reserved for Stage C's native event sources.
+
 The Quoin bottom panel, application launcher, calendar and notifications
 popup, written as [Mix Scenes](scenes.md). One Mix citizen
 (`src/desktop/scripts/quoin-panel.mix`, Bus name `quoin-panel`) owns four
@@ -61,10 +71,10 @@ already in flight does not leave a closed popup open. Every popup pin the
 panel makes is recorded in `$XDG_STATE_HOME/cosmix/quoin-panel-pins.json`; at
 start the citizen releases exactly those edges (a popup open when Quoin or
 the citizen went down would otherwise return as a pinned native page). A
-record is only dropped after a single applied `shell.props.get` subtree snapshot
+record is only dropped after an applied `shell.panel.changed` subtree snapshot
 confirms both `pinned == false` and `visible == false`. An enqueue acknowledgement
-is insufficient. The existing bounded hide loop is retained; failure or an
-unconfirmed release leaves the record for the existing startup/recovery pass.
+is insufficient. A pending operation waits for that event; an unconfirmed
+release leaves the record for startup/reconnection recovery.
 The file remains a bare JSON array of edge strings. Its explicit compatibility
 rule is that legacy Bus `unpin` releases both persistent modes, including dock
 reservations migrated from legacy `pinned: true`. No version conversion is
@@ -74,10 +84,10 @@ Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.
 
-Once every five minutes the clock tick also re-seeds the compositor watch
-and refetches windows, tray and notifications — a backstop for an event
-missed while comp restarted, not a poll (every change still arrives as an
-event).
+Broker registration changes and `bus.connected` now re-seed the compositor
+watch and remount a returning shell. The previous five-minute recovery pass
+is removed. The clock still reads network/audio status once per minute until
+Stage C supplies their native event sources.
 
 ## Limits
 
@@ -126,9 +136,9 @@ other query values and categories must be strings. Open truncates the query
 to 128 characters and validates category against the launcher chips (case
 sensitive; `""` means all). Search accepts any apps category string.
 An already-open calendar retains its navigated month. Every open retries the
-render. `open` records intent; `shown` records whether the latest render had
-its load, page selection, reveal and pin accepted, not a compositor frame
-confirmation. A failed close returns rc 22 with
+render. `open` records intent; `shown` records the last applied host snapshot,
+so an accepted open may initially reply with `shown:false`. A refused close
+returns rc 22 with
 `{error: "release_failed", open: false, edge}`. Repeated closes retry pending
 pin records, without releasing an edge another popup is using.
 Popup switches also return rc 22 if releasing the previous popup fails;

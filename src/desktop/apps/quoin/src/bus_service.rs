@@ -44,6 +44,8 @@ struct ShellBusState {
     citizen_snapshot: Option<(u64, u64, u64)>,
     citizen_snapshot_retry: bool,
     frame: u64,
+    applied_panels: Value,
+    panel_revision: u64,
 }
 
 impl Default for ShellBusState {
@@ -60,6 +62,8 @@ impl Default for ShellBusState {
             citizen_snapshot: None,
             citizen_snapshot_retry: false,
             frame: 0,
+            applied_panels: Value::Null,
+            panel_revision: 0,
         }
     }
 }
@@ -119,12 +123,34 @@ impl Plugin for ShellBusPlugin {
                     .after(service_bus),
             )
             .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(Update, publish_panel_state.in_set(ShellRuntimeSet::Presentation))
             .add_systems(
                 Update,
                 crate::holders::report_holders
                     .in_set(ShellRuntimeSet::Presentation)
                     .after(service_bus),
             );
+    }
+}
+
+/// Publish the applied frame, after Model and scene reconciliation, rather
+/// than command enqueue acceptance. No timer and no idle publication.
+fn publish_panel_state(
+    bridge: Res<BusBridge>,
+    frame: Res<ShellFrameState>,
+    mut state: ResMut<ShellBusState>,
+) {
+    if state.live_generation.is_none() { return; }
+    let snapshot = Value::from(&ShellProps(&frame.0).snapshot());
+    let panels = &snapshot["panels"];
+    if *panels == state.applied_panels { return; }
+    let revision = state.panel_revision.saturating_add(1);
+    let body = json!({"generation":state.live_generation,"revision":revision,"panels":panels});
+    let wire = format!("---\ncommand: shell.panel.changed\n---\n{body}");
+    let topic = format!("{}.panel.changed", bridge.service_name());
+    if bridge.try_publish_topic(&topic, true, wire).is_ok() {
+        state.applied_panels = panels.clone();
+        state.panel_revision = revision;
     }
 }
 
@@ -240,6 +266,7 @@ fn service_bus(
                     state.ready_logged = true;
                 }
                 state.live_generation = Some(generation);
+                state.applied_panels = Value::Null;
                 request_citizen_snapshot(&bridge, &mut state);
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
@@ -386,7 +413,7 @@ fn service_bus(
                 let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
                     (
                         10,
-                        json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
+                        json!({"error_code":"SCENE_PROVENANCE", "message":format!("scene caller provenance: {error:?}")}).to_string(),
                     )
                 } else if state
                     .live_generation
@@ -394,7 +421,7 @@ fn service_bus(
                 {
                     (
                         10,
-                        json!({"error":"scene request belongs to a stale Quoin connection"})
+                        json!({"error_code":"SCENE_STALE_CONNECTION", "message":"scene request belongs to a stale Quoin connection"})
                             .to_string(),
                     )
                 } else {
@@ -882,7 +909,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -2609,6 +2636,41 @@ mod tests {
             "---\nscene: 1\nname: {name}\ncitizen: authored-metadata\nwindow: {{\"kind\":\"edge\",\"edge\":\"{edge}\"}}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"
         );
         req
+    }
+
+    #[test]
+    fn panel_notifications_report_applied_pages_and_suppress_idle_duplicates() {
+        let (mut app, peer) = mounted_bus_app();
+        peer.drain_publishes(); // Discard the initial empty applied snapshot.
+        peer.send(scene_load("event-page", "scenes", "right"));
+        app.update();
+        let notices = peer.drain_publishes();
+        let notice = notices.iter().find(|p| p.headers.get("name").is_some_and(|n| n == "quoin.panel.changed")).unwrap();
+        let (_, body) = notice.body.split_once("\n---\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert!(body["panels"]["right"]["pages"].as_array().unwrap().contains(&json!("scene-event-page")));
+        let revision = body["revision"].as_u64().unwrap();
+        app.update();
+        assert!(peer.drain_publishes().iter().all(|p| p.headers.get("name").is_none_or(|n| n != "quoin.panel.changed")));
+        peer.deliver_event(BusBridgeEvent::Connection {state:BusConnectionState::Connected, generation:2});
+        app.update();
+        let notices = peer.drain_publishes();
+        let notice = notices.iter().find(|p| p.headers.get("name").is_some_and(|n| n == "quoin.panel.changed")).unwrap();
+        let (_, body) = notice.body.split_once("\n---\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["generation"], 2);
+        assert!(body["revision"].as_u64().unwrap() > revision);
+    }
+
+    #[test]
+    fn behaviour_disconnect_does_not_remove_loader_owned_scene() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "frozen", "scenes", "right");
+        peer.deliver_message(services_registered_change(1,
+            &["scenes", "authored-metadata"], &["scenes"]));
+        app.update();
+        assert_eq!(app.world().resource::<cosmix_scene_bevy::SceneStore>().scenes_owned_by("scenes"), ["frozen"]);
+        assert!(app.world().resource::<ShellFrameState>().0.panel(Edge::Right).page_ids.iter().any(|id| id == "scene-frozen"));
     }
 
     fn load_scene(

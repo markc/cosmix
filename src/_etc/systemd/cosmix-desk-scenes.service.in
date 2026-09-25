@@ -1,0 +1,21 @@
+# Example only. The private session installer substitutes these placeholders.
+# Run as the desktop user, in the same Bus and display session as Quoin.
+[Unit]
+Description=CosMix scenes loader (Stage A)
+After=cosmix-noded.service
+
+[Service]
+Type=simple
+User=@DESKTOP_USER@
+Group=@DESKTOP_GROUP@
+EnvironmentFile=@DESKTOP_ENV_FILE@
+Environment=COSMIX=@COSMIX_ROOT@
+Environment=SCENES_TEMPLATES=@COSMIX_ROOT@/share/scenes
+ExecStart=@COSMIX_BIN@/mix --serve @COSMIX_BIN@/scenes.mix --name scenes
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

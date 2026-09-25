@@ -35,6 +35,21 @@ Lint reports bounded-document, schema, graph, template, row and header
 diagnostics. `orphan-node` is a warning; other violations are errors. The
 resolver returns diagnostics for unknown families rather than panicking.
 
+`to_source(&SceneDocument)` serialises the authored AMP document, including
+model, optional headers, expressions and template nodes. It does not serialise
+the flattened resolved tree. Strict Mix escaping preserves literal `${...}`,
+leading `~`, backticks (including fence-looking text), Unicode and control
+characters. Quoin exposes this as `shell.scene.get {scene,format:"source"}`.
+
+`bindings::reevaluate` accepts `model` to replace a complete model map (null
+clears it), as well as `model.*` map paths. Both individual patch values and the
+aggregate model are bounded before evaluation. The host retains the compiled
+binding set, commits authored model/resolved tree/revision together, and checks
+the complete canonical document bound before accepting a patch. A refused
+patch leaves the prior revision intact.
+The host also refuses model patches that move the scene's mount page or edge,
+preserving the loading citizen's existing reservation.
+
 `diff(old, new)` emits `Remove`, `Insert { parent, index }`, `SetPort`,
 `Reparent`, and scene-level `SetScene` operations for name, citizen, window
 and subscribe changes. A dropped port emits `SetPort` with JSON `null` to

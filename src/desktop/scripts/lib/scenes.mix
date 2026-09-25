@@ -1,0 +1,687 @@
+-- Scene loader state machine. Plain handlers serialize all mutations; only a
+-- crash deadline yields, outside this module, with a generation fence.
+-- Bus/process I/O is injected so tests exercise this exact reconciliation path.
+
+fn valid_name($name)
+  if type($name) != "string" or len($name) == 0 or len($name) > 64 then return false end
+  for each $c in split($name, "")
+    if not contains("abcdefghijklmnopqrstuvwxyz0123456789-_", $c) then return false end
+  end
+  return not starts_with($name, "-") and not starts_with($name, "_")
+end
+
+fn fail($code, $message, $context)
+  raise($code, $message, $context)
+end
+
+fn bounded_read($path, $cap)
+  $v = bytes_to_string(read_file_bytes($path, $cap + 1))
+  if bytes_len(string_to_bytes($v)) > $cap then fail("SCENES_LIMIT", "file exceeds size limit", {file:$path}) end
+  return $v
+end
+
+fn regular($path)
+  return exists($path, {follow_symlinks:false}) and stat($path, {follow_symlinks:false}).is_file
+end
+
+fn document($source)
+  -- The host's core parser remains authoritative; this only reads the AMP
+  -- metadata needed to route and preserve models, without evaluating code.
+  $lines = split($source, "\n")
+  if $lines[0] != "---" then fail("SCENES_DOCUMENT", "expected AMP scene envelope", {}) end
+  $headers = {}
+  $end = 0
+  for $i = 1 to len($lines) - 1
+    if $lines[$i] == "---" then
+      $end = $i
+      break
+    end
+    $parts = split($lines[$i], ":")
+    $key = trim($parts[0])
+    if len($parts) > 1 then
+      if has_key($headers, $key) then fail("SCENES_DOCUMENT", "duplicate header", {line:$i + 1}) end
+      $headers[$key] = trim(join(slice($parts, 1), ":"))
+    end
+  end
+  if $end == 0 or $headers.scene != "1" or not valid_name($headers.name) then
+    fail("SCENES_DOCUMENT", "invalid scene header", {line:1})
+  end
+  $window = $headers.window == nil ? {} : json_parse($headers.window)
+  $model = $headers.model == nil ? {} : json_parse($headers.model)
+  $mount = $window
+  if $headers.window == nil then
+    -- Match Quoin's first-window fallback using strict data, never execution.
+    $inside = false
+    $data = ""
+    for each $line in slice($lines, $end + 1)
+      if trim($line) == "```mix" then
+        $inside = true
+      elif $inside and trim($line) == "```" then
+        break
+      elif $inside then
+        $data = $data .. $line .. "\n"
+      end
+    end
+    $nodes = data_parse($data)
+    if type($nodes) == "map" then
+      for each $id in keys($nodes)
+        if $nodes[$id].widget == "window" then
+          $mount = $nodes[$id]
+          break
+        end
+      end
+    end
+  end
+  return {name:$headers.name, citizen:$headers.citizen, window:$window, model:$model,
+          mount:$mount, headers:$headers, body:join(slice($lines, $end + 1), "\n")}
+end
+
+fn with_model($source, $model)
+  $doc = document($source)
+  $doc.headers.model = json_encode($model)
+  $out = "---\n"
+  for each $key in keys($doc.headers)
+    $out = $out .. $key .. ": " .. $doc.headers[$key] .. "\n"
+  end
+  return $out .. "---\n" .. $doc.body
+end
+
+fn initial($root, $templates, $host, $me, $io)
+  $sequence = 0
+  if exists($root .. "/.generation", {follow_symlinks:false}) then
+    if not regular($root .. "/.generation") then fail("SCENES_GENERATION", "generation counter must be a regular file", {}) end
+    $sequence = data_parse(bounded_read($root .. "/.generation", 64)).value
+    if type($sequence) != "number" or $sequence < 0 or floor($sequence) != $sequence or $sequence > 9007199254740990 then
+      fail("SCENES_GENERATION", "invalid generation counter", {})
+    end
+  end
+  return {root:$root, templates:$templates, host:$host, me:$me, io:$io,
+    desired:{schema_version:1, enabled:[], origins:{}, recovery:{}}, state_digest:"",
+    scenes:{}, panels:{}, panel_revision:0, panel_generation:nil, open:nil,
+    host_live:false, services:nil, connection:nil, revision:0, published:"",
+    sequence:$sequence, diagnostic:nil, response:{}, rc:0}
+end
+
+fn inventory($s)
+  $rows = []
+  for each $name in sort(keys($s.scenes))
+    $e = $s.scenes[$name]
+    push($rows, {name:$name, installed:$e.installed, enabled:$e.enabled, mounted:$e.mounted,
+      revision:$e.revision, generation:$e.generation, behaviour:$e.status, ready:$e.ready,
+      template:$s.desired.origins[$name], diagnostic:$e.diagnostic, diagnostics:$e.diagnostics, exit:$e.exit,
+      attempted_digest:$e.attempted, accepted_digest:$e.digest,
+      journal:"journalctl -u cosmix-desk-scenes.service", open:$s.open == $name, pending:$e.pending})
+  end
+  return {needs_setup:len($s.desired.enabled) == 0, scenes:$rows, diagnostic:$s.diagnostic}
+end
+
+fn changed($s)
+  $view = inventory($s)
+  $digest = hash_sha256(json_encode($view))
+  if $s.published != $digest then
+    $s.revision = $s.revision + 1
+    $view.revision = $s.revision
+    if $s.io.notify($view) then $s.published = $digest end
+  end
+  return $s
+end
+
+fn entry($name)
+  return {name:$name, installed:true, enabled:false, mounted:false, revision:0,
+    source:nil, model:nil, digest:"", attempted:"", behaviour_digest:"", meta_digest:"",
+    generation:0, pid:nil, retiring:nil, status:"disabled", ready:false, crashes:0, started:0,
+    diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, pending:false}
+end
+
+fn persist($s)
+  $source = data_encode($s.desired, true) .. "\n"
+  write_atomic($s.root .. "/state.conf.mix", $source, {durability:"full", mode:0o600, max_bytes:65536})
+  $s.state_digest = hash_sha256($source)
+  return $s
+end
+
+fn read_state($s)
+  $path = $s.root .. "/state.conf.mix"
+  if not exists($path, {follow_symlinks:false}) then return $s end
+  if not regular($path) then fail("SCENES_STATE", "state must be a regular file", {file:$path}) end
+  $text = bounded_read($path, 65536)
+  $digest = hash_sha256($text)
+  if $digest == $s.state_digest then return $s end
+  $v = data_parse($text)
+  if type($v) != "map" or $v.schema_version != 1 or type($v.enabled) != "list" or type($v.origins) != "map" then
+    fail("SCENES_STATE", "invalid state schema", {file:$path})
+  end
+  if len($v.enabled) > 128 or len(keys($v.origins)) > 128 then fail("SCENES_LIMIT", "too many scenes", {}) end
+  for each $n in $v.enabled
+    if not valid_name($n) then fail("SCENES_NAME", "invalid enabled scene name", {name:$n}) end
+  end
+  for each $n in keys($v.origins)
+    if not valid_name($n) or not valid_name($v.origins[$n]) then fail("SCENES_NAME", "invalid template origin", {}) end
+  end
+  if $v.recovery == nil then $v.recovery = {} end
+  if type($v.recovery) != "map" then fail("SCENES_STATE", "invalid recovery map", {}) end
+  for each $edge in keys($v.recovery)
+    $r = $v.recovery[$edge]
+    if not contains(["left", "right", "top", "bottom"], $edge) or type($r) != "map" or not valid_name($r.name) or type($r.page) != "string" or not contains(["hidden", "pinned", "docked"], $r.mode) then
+      fail("SCENES_STATE", "invalid popup recovery record", {edge:$edge})
+    end
+  end
+  $s.desired = $v
+  $s.state_digest = $digest
+  return $s
+end
+
+fn invalidate($s, $name)
+  $e = $s.scenes[$name]
+  if $e.status == "disabled" and $e.pid == nil and not $e.ready and not $e.pending then return $s end
+  -- Invalidate before stop; a queued exit/model can never revive this epoch.
+  $old = $e.generation
+  $e.generation = 0
+  $e.ready = false
+  $e.pending = false
+  if $e.pid != nil then
+    $s.io.stop($e.pid, {name:$name, generation:$old})
+    $e.retiring = {pid:$e.pid, generation:$old}
+  end
+  $e.pid = nil
+  $e.status = "disabled"
+  $s.scenes[$name] = $e
+  return $s
+end
+
+fn start($s, $name)
+  $e = $s.scenes[$name]
+  if not $e.enabled or not $e.mounted or $e.pid != nil or $e.retiring != nil then return $s end
+  $path = $s.root .. "/" .. $name .. "/behaviour.mix"
+  if not regular($path) then
+    $e.status = "static"
+    $e.ready = true
+  else
+    -- A prior spawn may have failed after persisting its allocation. Never
+    -- reuse that token just because its caller did not receive updated state.
+    if regular($s.root .. "/.generation") then
+      $persisted = data_parse(bounded_read($s.root .. "/.generation", 64)).value
+      if type($persisted) != "number" or $persisted < 0 or floor($persisted) != $persisted then fail("SCENES_GENERATION", "invalid generation counter", {}) end
+      if $persisted > $s.sequence then $s.sequence = $persisted end
+    end
+    if $s.sequence >= 9007199254740990 then fail("SCENES_GENERATION", "generation counter exhausted", {}) end
+    $s.sequence = $s.sequence + 1
+    write_atomic($s.root .. "/.generation", data_encode({value:$s.sequence}), {durability:"full", mode:0o600, max_bytes:64})
+    $e.generation = $s.sequence
+    $e.ready = false
+    $e.pid = $s.io.launch($path, $name, $e.generation, $s.host, $s.me)
+    $e.status = "starting"
+    $e.started = monotonic()
+  end
+  $s.scenes[$name] = $e
+  return $s
+end
+
+fn candidate($s, $name, $dir)
+  if stat($dir, {follow_symlinks:false}).is_symlink or not regular($dir .. "/scene.mix") or not regular($dir .. "/template.conf.mix") then
+    fail("SCENES_FILES", "scene and metadata must be regular files in a real directory", {file:$dir})
+  end
+  $source = bounded_read($dir .. "/scene.mix", 262144)
+  $doc = document($source)
+  if $doc.name != $name then fail("SCENES_NAME", "document name must match installation directory", {name:$name, scene:$doc.name}) end
+  for each $route in [$doc.mount.panel, $doc.mount.edge]
+    if type($route) == "string" and starts_with(trim($route), "=") then
+      fail("SCENES_MOUNT", "managed popup page and edge must be static", {name:$name})
+    end
+  end
+  -- Stage A cannot capture any of the legacy host's seats, even if free.
+  $page = $doc.mount.panel
+  if type($page) != "string" or trim($page) == "" then $page = "scene-" .. $name end
+  if contains(["scene-panel", "scene-launcher", "scene-calendar", "scene-notes", "settings.appearance"], $page) then
+    fail("SCENES_STAGE_A", "legacy page is reserved until Stage B; use a distinct scene/page name", {page:$page})
+  end
+  $meta_text = bounded_read($dir .. "/template.conf.mix", 65536)
+  try
+    $meta = data_parse($meta_text)
+  catch $message, $error
+    fail("SCENES_METADATA", "invalid strict template metadata", {file:$dir .. "/template.conf.mix", upstream:{error_code:$error.code, message:$message}})
+  end
+  if type($meta) != "map" then fail("SCENES_METADATA", "template metadata must be strict map data", {file:$dir .. "/template.conf.mix"}) end
+  $behaviour = ""
+  if exists($dir .. "/behaviour.mix", {follow_symlinks:false}) then
+    if not regular($dir .. "/behaviour.mix") then fail("SCENES_FILES", "behaviour must be a regular file", {}) end
+    $behaviour = hash_sha256(bounded_read($dir .. "/behaviour.mix", 262144))
+    if $doc.citizen != "scene-" .. $name then fail("SCENES_CITIZEN", "document citizen must address its behaviour", {expected:"scene-" .. $name}) end
+  end
+  $edge = $doc.mount.edge
+  if not contains(["left", "top", "bottom"], $edge) then $edge = "right" end
+  return {source:$source, model:$doc.model, page:$page, edge:$edge,
+    digest:hash_sha256($source), behaviour_digest:$behaviour, meta_digest:hash_sha256($meta_text)}
+end
+
+fn reconcile_one($s, $name, $force)
+  if not has_key($s.scenes, $name) then $s.scenes[$name] = entry($name) end
+  $e = $s.scenes[$name]
+  $dir = $s.root .. "/" .. $name
+  $e.installed = is_dir($dir) and regular($dir .. "/scene.mix")
+  $e.enabled = contains($s.desired.enabled, $name)
+  $s.scenes[$name] = $e
+  if not $e.enabled or not $e.installed then
+    $s = invalidate($s, $name)
+    if $s.open == $name then $s.open = nil end
+    try
+      $s = drive_popups($s)
+    catch $message, $error
+      $s.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+    $e = $s.scenes[$name]
+    if $e.mounted then
+      $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
+      $e.mounted = false
+    end
+    $s.scenes[$name] = $e
+    return $s
+  end
+  if not $s.host_live then return $s end
+  try
+    $s.scenes[$name].attempted = hash_sha256(bounded_read($dir .. "/scene.mix", 262144))
+    $c = candidate($s, $name, $dir)
+    $e.attempted = $c.digest
+    $s.scenes[$name] = $e
+    if $c.behaviour_digest != "" and ($force or $c.behaviour_digest != $e.behaviour_digest) then
+      $s.io.check($dir .. "/behaviour.mix")
+    end
+    if $force or $c.digest != $e.digest or not $e.mounted then
+      $model = $e.model ?? $c.model
+      $r = $s.io.rpc($s.host, "shell.scene.load", with_model($c.source, $model))
+      $e.source = $c.source
+      $e.model = $model
+      $e.revision = $r.revision
+      $e.mounted = true
+      $e.digest = $c.digest
+      $e.page = $c.page
+      $e.edge = $c.edge
+    end
+    $restart = $force or $e.behaviour_digest != $c.behaviour_digest
+    $e.meta_digest = $c.meta_digest
+    $e.diagnostic = nil
+    $s.scenes[$name] = $e
+    if $restart then
+      $s = invalidate($s, $name)
+      $s.scenes[$name].behaviour_digest = $c.behaviour_digest
+      $s.scenes[$name].crashes = 0
+    end
+    if $s.scenes[$name].status != "crash_loop" and $s.scenes[$name].status != "backoff" then $s = start($s, $name) end
+  catch $message, $error
+    $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details,
+      file:$error.details.file ?? ($dir .. "/scene.mix"), attempted_digest:$s.scenes[$name].attempted,
+      last_good_revision:$s.scenes[$name].revision}
+  end
+  return $s
+end
+
+fn rescan($s, $force)
+  try
+    $s = read_state($s)
+    $s.diagnostic = nil
+  catch $message, $error
+    $s.diagnostic = {error_code:$error.code, message:$message, context:$error.details, file:$s.root .. "/state.conf.mix"}
+    return $s
+  end
+  $names = keys($s.scenes)
+  for each $n in $s.desired.enabled
+    if not contains($names, $n) then push($names, $n) end
+  end
+  if is_dir($s.root) then
+    for each $n in ls($s.root)
+      if valid_name($n) and is_dir($s.root .. "/" .. $n) and not contains($names, $n) then push($names, $n) end
+    end
+  end
+  if len($names) > 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
+  for each $n in $names
+    $s = reconcile_one($s, $n, $force)
+  end
+  return $s
+end
+
+fn filesystem($s, $batch)
+  if $batch.overflow then return rescan($s, false) end
+  $names = []
+  for each $change in $batch.changes
+    for each $path in [$change.path, $change.old_path]
+      if $path == nil then continue end
+      if $path == $s.root or $path == $s.root .. "/state.conf.mix" then return rescan($s, false) end
+      if not starts_with($path, $s.root .. "/") then continue end
+      $parts = split(substr($path, len($s.root) + 1), "/")
+      if valid_name($parts[0]) and (len($parts) == 1 or (len($parts) == 2 and contains(["scene.mix", "behaviour.mix", "template.conf.mix"], $parts[1]))) then
+        if not contains($names, $parts[0]) then push($names, $parts[0]) end
+      end
+    end
+  end
+  for each $name in $names
+    $s = reconcile_one($s, $name, false)
+  end
+  return $s
+end
+
+fn exited($s, $event)
+  $name = $event.tag.name
+  $e = $s.scenes[$name]
+  if $e != nil and $e.retiring != nil and $e.retiring.pid == $event.pid and $e.retiring.generation == $event.tag.generation then
+    $s.scenes[$name].retiring = nil
+    return start($s, $name)
+  end
+  if $e == nil or $e.generation != $event.tag.generation or $e.pid != $event.pid then return $s end
+  $e.pid = nil
+  $e.ready = false
+  $e.exit = {exit_code:$event.exit_code, signal:$event.signal}
+  if monotonic() - $e.started > 60 then $e.crashes = 0 end
+  $e.crashes = $e.crashes + 1
+  $e.status = $e.crashes >= 5 ? "crash_loop" : "backoff"
+  $e.diagnostic = {error_code:"SCENES_BEHAVIOUR_EXIT", message:"behaviour exited; mounted content retained", context:$e.exit}
+  $s.scenes[$name] = $e
+  return $s
+end
+
+fn restart($s, $name, $generation)
+  $e = $s.scenes[$name]
+  if $e == nil or not $e.enabled or $e.generation != $generation or $e.status != "backoff" then return $s end
+  return start($s, $name)
+end
+
+fn rewrite_install($source, $name)
+  $d = document($source)
+  $d.headers.name = $name
+  $d.headers.citizen = "scene-" .. $name
+  if $d.window.panel != nil then
+    $d.window.panel = "scene-" .. $name
+    $d.headers.window = json_encode($d.window)
+  end
+  $text = "---\n"
+  for each $key in keys($d.headers)
+    $text = $text .. $key .. ": " .. $d.headers[$key] .. "\n"
+  end
+  return $text .. "---\n" .. $d.body
+end
+
+fn stage($s, $template, $name)
+  if not valid_name($template) then fail("SCENES_TEMPLATE", "invalid template name", {}) end
+  $src = $s.templates .. "/" .. $template
+  if not is_dir($src) or stat($src, {follow_symlinks:false}).is_symlink then fail("SCENES_TEMPLATE", "shipped template is unavailable", {template:$template}) end
+  -- Templates are data and optional code, not filesystem aliases.
+  for each $path in walk($src, {follow_symlinks:false, include_dirs:true})
+    if stat($path, {follow_symlinks:false}).is_symlink then fail("SCENES_FILES", "template contains symlink", {file:$path}) end
+  end
+  $dst = $s.root .. "/.stage-" .. uuid()
+  copy_tree($src, $dst)
+  try
+    write_atomic($dst .. "/scene.mix", rewrite_install(bounded_read($dst .. "/scene.mix", 262144), $name))
+    $c = candidate($s, $name, $dst)
+    $s.io.rpc($s.host, "shell.scene.validate", $c.source)
+    if $c.behaviour_digest != "" then $s.io.check($dst .. "/behaviour.mix") end
+  catch $message, $error
+    remove_dir($dst)
+    raise($error.code, $message, $error.details)
+  end
+  return $dst
+end
+
+fn known($s, $name)
+  if not valid_name($name) then fail("SCENES_NAME", "expected a safe scene name", {name:$name}) end
+  if not has_key($s.scenes, $name) then fail("SCENES_NOT_FOUND", "scene is not installed", {name:$name}) end
+end
+
+fn drive_popups($s)
+  -- Recovery records survive loader/host restarts. Restore saved state only
+  -- while the edge still selects our page; never hide another owner's page.
+  for each $edge in keys($s.desired.recovery)
+    $r = $s.desired.recovery[$edge]
+    if $s.open == $r.name then continue end
+    $p = $s.panels[$edge]
+    if $p == nil then continue end
+    if $p.page != $r.page or ($p.mode == $r.mode and ($r.mode != "hidden" or not $p.visible)) then
+      $s.desired.recovery = delete($s.desired.recovery, $edge)
+      $s = persist($s)
+    elif $r.phase != "restoring" then
+      $s.io.rpc($s.host, "shell.panel.mode", {edge:$edge, mode:$r.mode})
+      if $r.previous != nil and contains($p.pages, $r.previous) then
+        $s.io.rpc($s.host, "shell.panel.page.set", {edge:$edge, id:$r.previous})
+      end
+      $s.desired.recovery[$edge].phase = "restoring"
+      $s = persist($s)
+    end
+  end
+  if $s.open == nil then return $s end
+  $e = $s.scenes[$s.open]
+  if $e == nil or not $e.enabled or not $e.mounted or not $e.ready then return $s end
+  -- Other popup release is an applied-state prerequisite for the next open.
+  for each $edge in keys($s.desired.recovery)
+    if $s.desired.recovery[$edge].name != $s.open then return $s end
+  end
+  $p = $s.panels[$e.edge]
+  if $p == nil or not contains($p.pages, $e.page) then return $s end
+  if $s.desired.recovery[$e.edge] == nil then
+    $s.desired.recovery[$e.edge] = {name:$s.open, page:$e.page, previous:$p.page, mode:$p.mode, phase:"select"}
+    $s = persist($s)
+    $s.io.rpc($s.host, "shell.panel.page.set", {edge:$e.edge, id:$e.page})
+  elif $p.page == $e.page and $s.desired.recovery[$e.edge].phase == "select" then
+    $s.io.rpc($s.host, "shell.panel.mode", {edge:$e.edge, mode:"pinned"})
+    $s.desired.recovery[$e.edge].phase = "pinning"
+    $s = persist($s)
+  elif $p.page == $e.page and $p.visible and $p.mode == "pinned" then
+    $s.scenes[$s.open].pending = false
+  end
+  return $s
+end
+
+fn panel_changed($s, $event)
+  if type($event.panels) != "map" then return $s end
+  if $s.panel_generation == $event.generation and $event.revision <= $s.panel_revision then return $s end
+  $s.panel_generation = $event.generation
+  $s.panel_revision = $event.revision
+  $s.panels = $event.panels
+  return drive_popups($s)
+end
+
+fn services($s, $names, $reconnect)
+  if type($names) != "list" then fail("SCENES_SNAPSHOT", "expected full service registration snapshot", {}) end
+  for each $name in $names
+    if type($name) != "string" then fail("SCENES_SNAPSHOT", "malformed service snapshot", {}) end
+  end
+  $live = contains($names, $s.host)
+  $returning = $live and (not $s.host_live or $reconnect)
+  $s.host_live = $live
+  $s.services = $names
+  if not $live or $reconnect then
+    for each $name in keys($s.scenes)
+      $s.scenes[$name].mounted = false
+    end
+  end
+  if $returning then
+    -- A broker reconnect need not mean Quoin restarted. Recover the actual
+    -- loader-owned mounts so an offline disable cannot leave an old seat up.
+    $hosted = $s.io.rpc($s.host, "shell.scenes.list", {})
+    if type($hosted) != "list" then fail("SCENES_SNAPSHOT", "expected host scene inventory", {}) end
+    for each $row in $hosted
+      if type($row) != "map" then fail("SCENES_SNAPSHOT", "malformed host scene inventory", {}) end
+      if $row.owner == $s.me then
+        if not valid_name($row.name) then fail("SCENES_SNAPSHOT", "invalid hosted scene name", {}) end
+        if has_key($s.scenes, $row.name) then
+          $s.scenes[$row.name].mounted = true
+        else
+          $s.io.rpc($s.host, "shell.scene.unload", {scene:$row.name})
+        end
+      end
+    end
+    -- Remount accepted content/models first, even if current disk edits are
+    -- malformed. A reconnect must not replace last-good with template defaults.
+    for each $name in keys($s.scenes)
+      $e = $s.scenes[$name]
+      if $e.enabled and $e.installed and $e.source != nil then
+        try
+          $r = $s.io.rpc($s.host, "shell.scene.load", with_model($e.source, $e.model))
+          $s.scenes[$name].mounted = true
+          $s.scenes[$name].revision = $r.revision
+        catch $message, $error
+          $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+        end
+      end
+    end
+    $s = rescan($s, false)
+    $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
+    $s.panels = $snapshot.panels ?? {}
+    $s.panel_generation = nil
+    $s.panel_revision = 0
+    for each $edge in keys($s.desired.recovery)
+      $s.desired.recovery[$edge].phase = $s.desired.recovery[$edge].name == $s.open ? "select" : "recover"
+    end
+    $s = drive_popups($s)
+  end
+  return $s
+end
+
+fn request($s, $verb, $args)
+  $previous_desired = $s.desired
+  $s.rc = 0
+  $s.response = {}
+  try
+    if type($args) != "map" then fail("SCENES_ARGUMENT", "arguments must be a map", {}) end
+    if $verb == "list" then
+      $s.response = inventory($s)
+      return $s
+    end
+    if $verb == "install" then
+      $name = $args.name ?? $args.template
+      if not valid_name($name) then fail("SCENES_NAME", "invalid installation name", {}) end
+      if exists($s.root .. "/" .. $name, {follow_symlinks:false}) then fail("SCENES_COLLISION", "installation already exists", {name:$name}) end
+      if len(keys($s.scenes)) >= 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
+      $tmp = stage($s, $args.template, $name)
+      -- Exclusive reservation closes the check/rename collision window.
+      -- The only visible intermediate is an empty, disabled directory.
+      try
+        mkdir($s.root .. "/" .. $name, {parents:false})
+      catch $message, $error
+        remove_dir($tmp)
+        fail("SCENES_COLLISION", "installation name was claimed during staging", {name:$name, upstream:$message})
+      end
+      rename($tmp, $s.root .. "/" .. $name)
+      $s.desired.origins[$name] = $args.template
+      if $args.enable == true and not contains($s.desired.enabled, $name) then $s.desired.enabled = push($s.desired.enabled, $name) end
+      $s = persist($s)
+      $s = reconcile_one($s, $name, false)
+      $s.response = {name:$name, installed:true, enabled:$args.enable == true}
+      if $s.scenes[$name].diagnostic != nil then
+        $s.rc = 10
+        $s.response = $s.scenes[$name].diagnostic
+      end
+      return $s
+    end
+    $name = $args.name
+    known($s, $name)
+    $e = $s.scenes[$name]
+    if not $e.installed and not contains(["disable", "remove", "reset"], $verb) then fail("SCENES_NOT_FOUND", "scene document is missing", {name:$name}) end
+    if $verb == "enable" or $verb == "disable" then
+      $enable = $verb == "enable"
+      if $enable and not contains($s.desired.enabled, $name) then $s.desired.enabled = push($s.desired.enabled, $name) end
+      if not $enable then
+        $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $name)
+        if $s.open == $name then $s.open = nil end
+      end
+      $s = persist($s)
+      $s = reconcile_one($s, $name, false)
+      $s = drive_popups($s)
+    elif $verb == "reload" then
+      $s = reconcile_one($s, $name, true)
+    elif $verb == "remove" or $verb == "reset" then
+      $tmp = nil
+      if $verb == "reset" then
+        $origin = $s.desired.origins[$name]
+        if $origin == nil then fail("SCENES_NO_ORIGIN", "reset requires a recorded shipped template origin", {name:$name}) end
+        $tmp = stage($s, $origin, $name)
+      end
+      $backup = $s.root .. "/.recovery/" .. $name .. "-" .. uuid()
+      mkdir(dirname($backup))
+      if $s.open == $name then $s.open = nil end
+      $s = drive_popups($s)
+      $s = invalidate($s, $name)
+      if $verb == "remove" then
+        $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $name)
+        $s = persist($s)
+        $s = reconcile_one($s, $name, false)
+        if is_dir($s.root .. "/" .. $name) then rename($s.root .. "/" .. $name, $backup) end
+        $s.scenes = delete($s.scenes, $name)
+        $s.desired.origins = delete($s.desired.origins, $name)
+        $s = persist($s)
+      else
+        if is_dir($s.root .. "/" .. $name) then rename($s.root .. "/" .. $name, $backup) end
+        try
+          rename($tmp, $s.root .. "/" .. $name)
+        catch $message, $error
+          if is_dir($backup) then rename($backup, $s.root .. "/" .. $name) end
+          raise($error.code, $message, $error.details)
+        end
+        $s.scenes[$name].model = nil
+        $s = reconcile_one($s, $name, true)
+        if $s.scenes[$name].diagnostic != nil then
+          $s.scenes[$name].model = $e.model
+          $s.rc = 10
+          $s.response = $s.scenes[$name].diagnostic
+          $s.response.recovery = $backup
+          return $s
+        end
+      end
+      $s.response = {name:$name, recovery:$backup}
+      return $s
+    elif $verb == "ready" or $verb == "model" then
+      if not $e.enabled or $e.pid == nil or type($args.generation) != "number" or $e.generation != $args.generation then
+        fail("SCENES_STALE_GENERATION", "behaviour generation is no longer current", {name:$name})
+      end
+      if $verb == "ready" then
+        $s.scenes[$name].diagnostic = nil
+        $s.scenes[$name].ready = true
+        $s.scenes[$name].status = "running"
+        $s.response = {name:$name, generation:$e.generation, publish_model:true}
+      else
+        if not has_key($args, "value") or type($args.value) != "map" then fail("SCENES_MODEL", "value must be the complete model map", {}) end
+        if bytes_len(string_to_bytes(json_encode($args.value))) > 262144 then fail("SCENES_LIMIT", "model exceeds limit", {}) end
+        if not deep_eq($args.value, $e.model) then
+          $r = $s.io.rpc($s.host, "shell.scene.patch", {scene:$name, path:"model", value:$args.value})
+          $s.scenes[$name].model = $args.value
+          $s.scenes[$name].revision = $r.revision
+        end
+        $s.scenes[$name].diagnostic = nil
+      end
+      $s = drive_popups($s)
+    elif contains(["open", "close", "toggle"], $verb) then
+      if not $e.enabled then fail("SCENES_DISABLED", "scene is disabled", {name:$name}) end
+      $opening = $verb == "open" or ($verb == "toggle" and $s.open != $name)
+      if $opening then
+        $s.open = $name
+        $s.scenes[$name].pending = true
+      elif $s.open == $name then
+        $s.open = nil
+        $s.scenes[$name].pending = false
+      end
+      $s = drive_popups($s)
+      $s.response = {name:$name, open:$s.open == $name, pending:$s.scenes[$name].pending}
+    else
+      fail("SCENES_VERB", "unknown scenes verb", {verb:$verb})
+    end
+    if $s.scenes[$name].diagnostic != nil and contains(["reload", "enable"], $verb) then
+      $s.rc = 10
+      $s.response = $s.scenes[$name].diagnostic
+    elif len(keys($s.response)) == 0 then
+      $s.response = {name:$name, accepted:true, revision:$s.scenes[$name].revision}
+    end
+  catch $message, $error
+    $s.rc = 10
+    $s.response = {error_code:$error.code, message:$message, context:$error.details}
+    if type($args) == "map" and has_key($s.scenes, $args.name ?? "") and contains(["SCENES_UPSTREAM", "SCENES_TRANSPORT"], $error.code) then
+      $s.scenes[$args.name].diagnostic = $s.response
+    end
+    -- Failed persistence must not leave an uncommitted desire in memory.
+    -- A full-durability write can fail after rename; reread the real file.
+    $s.desired = $previous_desired
+    $s.state_digest = ""
+    try
+      $s = read_state($s)
+    catch $ignored
+    end
+  end
+  return $s
+end
