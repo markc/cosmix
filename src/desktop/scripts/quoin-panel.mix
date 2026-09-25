@@ -1022,6 +1022,14 @@ fn hide_popup($edge)
   if not $p.popup_release_confirmed($confirmed) then return false end
   $kept = $p.released_popup_pins(read_pins(), $edge, $confirmed)
   write_pins($kept)
+  -- Released (unpinned, mode hidden) but still showing: an explicit
+  -- shell.panel.show reveal outlives the release, unlike a pointer reveal.
+  -- Dismiss it only while one of our own pages is on the edge.
+  $now = $state.applied_panels[$edge] ?? {}
+  if $now.visible == true and contains(["scene-launcher", "scene-calendar", "scene-notes"], $now.page ?? "") then
+    if not panel_verb("shell.panel.hide", $edge, nil) then return false end
+    if (($state.applied_panels[$edge] ?? {}).visible ?? false) == true then return false end
+  end
   return true
 end
 
