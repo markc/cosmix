@@ -4,6 +4,11 @@
 //! Stage E1e replaces the widget's body WITHOUT changing the signature (a
 //! change needs the lead's sign-off — E1f composes it).
 
+mod draw;
+mod ime;
+mod input;
+pub mod layout;
+pub mod lines;
 pub mod widget;
 
 use cosmix_edit_client::highlight::HlClass;
@@ -61,6 +66,40 @@ pub struct Palette {
     pub note: iced::Color,
     /// Indexed by `HlClass as usize`.
     pub highlight: [iced::Color; HL_CLASSES],
+}
+
+/// How the view is drawn beyond the text and colours: the Mono font at the
+/// current zoom, the measurement settings and the View toggles. Built by the
+/// app from the theme and `ced.conf.mix` every frame (E1f addition, additive
+/// to the frozen `EditorWidget::new`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditorView {
+    pub font: iced::Font,
+    /// Text size, logical px (the Mono role, config `font_px`, zoom).
+    pub px: f32,
+    /// Line height as a multiple of `px`.
+    pub line_height: f32,
+    pub measure: cosmix_edit_core::view::MeasureCfg,
+    pub whitespace: bool,
+    pub line_numbers: bool,
+    pub remote_carets: bool,
+    /// The window has focus and no chrome field holds the keyboard.
+    pub focused: bool,
+}
+
+impl Default for EditorView {
+    fn default() -> Self {
+        Self {
+            font: iced::Font::MONOSPACE,
+            px: 16.0,
+            line_height: 1.3,
+            measure: cosmix_edit_core::view::MeasureCfg { tab_size: 4, ambiguous_wide: false },
+            whitespace: false,
+            line_numbers: true,
+            remote_carets: true,
+            focused: true,
+        }
+    }
 }
 
 /// Number of [`HlClass`] variants.
