@@ -3299,7 +3299,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.96.0"
+version = "0.96.1"
 dependencies = [
  "futures-util",
  "indexmap",
@@ -3350,6 +3350,7 @@ name = "cosmix-lsh"
 version = "0.1.0"
 dependencies = [
  "cosmix-msedit-lsh",
+ "cosmix-msedit-stdext",
 ]
 
 [[package]]

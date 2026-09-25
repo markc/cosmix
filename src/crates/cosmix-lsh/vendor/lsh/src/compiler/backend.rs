@@ -753,7 +753,12 @@ impl<'a> LivenessAnalysis<'a> {
             .map(|(vreg_id, (start, end))| LiveInterval { vreg_id, start, end })
             .collect();
 
-        intervals.sort_by_key(|i| i.start);
+        // cosmix patch (cosmix-lsh/vendor/README.md patch 4): tie-break on the
+        // vreg id. Upstream sorted by `start` alone, so equal starts kept the
+        // HashMap's per-process iteration order and the register allocation
+        // (hence the bytecode) differed between runs; `defs.rs` is committed
+        // and checked for freshness, so it must be deterministic.
+        intervals.sort_by_key(|i| (i.start, i.vreg_id));
         intervals
     }
 

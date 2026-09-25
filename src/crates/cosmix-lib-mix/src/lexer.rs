@@ -1346,7 +1346,367 @@ pub enum TokenClass {
 /// [`TokenClass::Error`] span to the end of that line, and lexing resumes on
 /// the next line. Spans are byte ranges, non-overlapping, in order; bytes not
 /// covered (whitespace) are plain.
+///
+/// It drives the real [`Lexer`] token by token (so it tracks every lexer rule
+/// exactly) and adds what `tokenize` throws away: comments become spans, and a
+/// token that fails to lex is rewound and marked instead of ending the run.
 pub fn highlight(source: &str, flavor: MixFlavor) -> Vec<(std::ops::Range<usize>, TokenClass)> {
-    let _ = (source, flavor);
-    todo!("ced E1b")
+    let mut lx = match flavor {
+        MixFlavor::Script => Lexer::new(source),
+        MixFlavor::Data => Lexer::for_data(source),
+    };
+    // Byte offset of every char index (the lexer counts chars), plus the end.
+    let mut byte_at: Vec<usize> = source.char_indices().map(|(b, _)| b).collect();
+    byte_at.push(source.len());
+
+    // Openers (`"`, `'`, `$(`, `<<TAG`) already seen to run unterminated to
+    // the end of the source. A later one of the same kind cannot close either,
+    // so it is marked without rescanning — otherwise every such opener would
+    // rescan to EOF and a pathological buffer would cost O(n²).
+    let mut unterminated: Vec<String> = Vec::new();
+
+    let mut spans = Vec::new();
+    loop {
+        lx.skip_whitespace_no_newline();
+        let start = lx.pos;
+        let Some(ch) = lx.peek() else { break };
+        if ch == '\n' {
+            lx.advance();
+            continue;
+        }
+        if ch == '#' || (ch == '-' && lx.peek_ahead(1) == Some('-')) {
+            lx.skip_comment();
+            spans.push((byte_at[start]..byte_at[lx.pos], TokenClass::Comment));
+            continue;
+        }
+
+        let (line, column) = (lx.line, lx.column);
+        let opener = opener_key(&lx, ch);
+        let known_bad = opener.as_ref().is_some_and(|k| unterminated.contains(k));
+        lx.token_start = start;
+        let lexed = if known_bad { None } else { Some(lx.next_token_at(ch, line, column)) };
+        let class = match lexed {
+            Some(Ok(tok)) => classify(&tok.token, ch),
+            failed => {
+                // Only the opener itself running out is monotone: a `"…${`
+                // with no `}` says nothing about a later plain `"…"`.
+                let opener_ran_out = matches!(&failed, Some(Err(MixError::LexerError { msg, .. }))
+                    if !msg.contains("interpolation"));
+                if opener_ran_out
+                    && lx.pos >= lx.source.len()
+                    && let Some(key) = opener
+                {
+                    unterminated.push(key);
+                }
+                // Rewind, then mark the rest of this line (newline excluded);
+                // lexing resumes on the next line.
+                lx.pos = start;
+                lx.line = line;
+                lx.column = column;
+                while lx.peek().is_some_and(|c| c != '\n') {
+                    lx.advance();
+                }
+                TokenClass::Error
+            }
+        };
+        if lx.pos <= start {
+            // Every arm above consumes at least one char; never spin if not.
+            lx.advance();
+        }
+        // A heredoc hands back its closing newline, so `pos` never runs past
+        // the source, but clamp anyway: this function must not panic.
+        let end = lx.pos.min(byte_at.len() - 1);
+        spans.push((byte_at[start]..byte_at[end], class));
+    }
+    spans
+}
+
+/// The opener of a construct that may run past its line (and so, when
+/// unterminated, to the end of the source), as a memo key for `highlight`.
+fn opener_key(lx: &Lexer, ch: char) -> Option<String> {
+    match (ch, lx.peek_ahead(1)) {
+        ('"', _) => Some("\"".to_string()),
+        ('\'', _) => Some("'".to_string()),
+        ('$', Some('(')) => Some("$(".to_string()),
+        ('<', Some('<')) => {
+            let mut key = "<<".to_string();
+            let mut i = 2;
+            while let Some(c) = lx.peek_ahead(i).filter(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                key.push(c);
+                i += 1;
+            }
+            Some(key)
+        }
+        _ => None,
+    }
+}
+
+/// The class of a token that lexed from a source starting with `first`.
+fn classify(token: &Token, first: char) -> TokenClass {
+    match token {
+        Token::Number(_) => TokenClass::Number,
+        // A bare word lexes to `String` too; only a quote makes it a literal.
+        // A digit-led `String` is a segment of a hyphenated send target.
+        Token::String(_) if first == '"' || first == '\'' => TokenClass::String,
+        Token::String(_) => TokenClass::Identifier,
+        Token::InterpString(_) | Token::HeredocString(_) => TokenClass::String,
+        Token::Variable(_) | Token::CommandSub(_) => TokenClass::Variable,
+        Token::True | Token::False | Token::Nil => TokenClass::Constant,
+        Token::If
+        | Token::Then
+        | Token::Else
+        | Token::Elif
+        | Token::End
+        | Token::For
+        | Token::Each
+        | Token::In
+        | Token::To
+        | Token::Step
+        | Token::Next
+        | Token::While
+        | Token::Done
+        | Token::Loop
+        | Token::Break
+        | Token::Continue
+        | Token::Function
+        | Token::Return
+        | Token::Select
+        | Token::When
+        | Token::Otherwise
+        | Token::And
+        | Token::Or
+        | Token::Not
+        | Token::Parse
+        | Token::With
+        | Token::Send
+        | Token::Address
+        | Token::Emit
+        | Token::On
+        | Token::Try
+        | Token::Catch
+        | Token::Finally
+        | Token::Die
+        | Token::Export
+        | Token::Alias
+        | Token::Print
+        | Token::Eprint
+        | Token::Source
+        | Token::Include
+        | Token::Sh
+        | Token::Label
+        | Token::StrEq
+        | Token::StrNe => TokenClass::Keyword,
+        Token::Plus
+        | Token::Minus
+        | Token::Star
+        | Token::Slash
+        | Token::Percent
+        | Token::Power
+        | Token::Eq
+        | Token::NotEq
+        | Token::Gt
+        | Token::Lt
+        | Token::GtEq
+        | Token::LtEq
+        | Token::DotDot
+        | Token::NilCoalesce
+        | Token::Question
+        | Token::Pipe
+        | Token::AndAnd
+        | Token::OrOr
+        | Token::Assign
+        | Token::Bang => TokenClass::Operator,
+        Token::LParen
+        | Token::RParen
+        | Token::LBracket
+        | Token::RBracket
+        | Token::LBrace
+        | Token::RBrace
+        | Token::Colon
+        | Token::Comma
+        | Token::Dot
+        | Token::Tilde
+        | Token::Semicolon
+        | Token::Newline
+        | Token::Eof => TokenClass::Punctuation,
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::{MixFlavor, TokenClass, highlight};
+    use TokenClass::*;
+    use proptest::prelude::*;
+
+    fn classes(src: &str, flavor: MixFlavor) -> Vec<(&str, TokenClass)> {
+        highlight(src, flavor).into_iter().map(|(r, c)| (&src[r], c)).collect()
+    }
+
+    #[test]
+    fn golden_sample_covers_every_class() {
+        let src = "-- head\n\
+                   $x = 0x1F + 2 # trailing\n\
+                   if not $x then print(\"a ${x}\", 'b') end\n\
+                   $m = {k: [1, 2.5]}; $s = $(ls)\n\
+                   & bad token\n\
+                   $z = nil ?? false\n";
+        let want = vec![
+            ("-- head", Comment),
+            ("$x", Variable),
+            ("=", Operator),
+            ("0x1F", Number),
+            ("+", Operator),
+            ("2", Number),
+            ("# trailing", Comment),
+            ("if", Keyword),
+            ("not", Keyword),
+            ("$x", Variable),
+            ("then", Keyword),
+            ("print", Keyword),
+            ("(", Punctuation),
+            ("\"a ${x}\"", String),
+            (",", Punctuation),
+            ("'b'", String),
+            (")", Punctuation),
+            ("end", Keyword),
+            ("$m", Variable),
+            ("=", Operator),
+            ("{", Punctuation),
+            ("k", Identifier),
+            (":", Punctuation),
+            ("[", Punctuation),
+            ("1", Number),
+            (",", Punctuation),
+            ("2.5", Number),
+            ("]", Punctuation),
+            ("}", Punctuation),
+            (";", Punctuation),
+            ("$s", Variable),
+            ("=", Operator),
+            ("$(ls)", Variable),
+            ("& bad token", Error),
+            ("$z", Variable),
+            ("=", Operator),
+            ("nil", Constant),
+            ("??", Operator),
+            ("false", Constant),
+        ];
+        let got = classes(src, MixFlavor::Script);
+        assert_eq!(got, want);
+        for class in [Keyword, Identifier, Variable, String, Number, Constant, Comment, Operator, Punctuation, Error] {
+            assert!(got.iter().any(|(_, c)| *c == class), "{class:?} is covered");
+        }
+    }
+
+    #[test]
+    fn unterminated_strings_mark_their_line_and_resume() {
+        for q in ['"', '\''] {
+            let src = format!("$a = {q}open\n$b = 1\n");
+            let open = format!("{q}open");
+            assert_eq!(
+                classes(&src, MixFlavor::Script),
+                vec![("$a", Variable), ("=", Operator), (open.as_str(), Error), ("$b", Variable), ("=", Operator), ("1", Number)],
+            );
+        }
+        let src = "$h = <<EOF\nbody\n$c = 2";
+        assert_eq!(
+            classes(src, MixFlavor::Script),
+            vec![("$h", Variable), ("=", Operator), ("<<EOF", Error), ("body", Identifier), ("$c", Variable), ("=", Operator), ("2", Number)],
+        );
+    }
+
+    #[test]
+    fn a_multi_line_string_or_heredoc_is_one_span() {
+        let src = "$h = <<EOF\nline ${x}\nEOF\nprint($h, \"two\nlines\")\n";
+        assert_eq!(
+            classes(src, MixFlavor::Script),
+            vec![
+                ("$h", Variable),
+                ("=", Operator),
+                ("<<EOF\nline ${x}\nEOF", String),
+                ("print", Keyword),
+                ("(", Punctuation),
+                ("$h", Variable),
+                (",", Punctuation),
+                ("\"two\nlines\"", String),
+                (")", Punctuation),
+            ],
+        );
+    }
+
+    #[test]
+    fn data_flavor_uses_the_strict_data_rules() {
+        // The JSON `\uXXXX` escape is decoded only in data, where a lone
+        // surrogate is a lex error; in a script it is literal text.
+        let src = "{a: \"\\ud83d\\ude00\", b: \"\\ud800\"}\n";
+        let script = classes(src, MixFlavor::Script);
+        assert!(script.iter().all(|(_, c)| *c != Error), "{script:?}");
+        let data = classes(src, MixFlavor::Data);
+        assert_eq!(data[..4], [("{", Punctuation), ("a", Identifier), (":", Punctuation), ("\"\\ud83d\\ude00\"", String)]);
+        assert_eq!(data.last(), Some(&("\"\\ud800\"}", Error)));
+    }
+
+    #[test]
+    fn byte_ranges_follow_multibyte_text_and_crlf() {
+        // A comment runs to the `\n`, so under CRLF it keeps its `\r`.
+        let src = "$a = \"🎉 ü\" -- ☃\r\n$b = 1\r\n";
+        assert_eq!(
+            classes(src, MixFlavor::Script),
+            vec![
+                ("$a", Variable),
+                ("=", Operator),
+                ("\"🎉 ü\"", String),
+                ("-- ☃\r", Comment),
+                ("$b", Variable),
+                ("=", Operator),
+                ("1", Number),
+            ],
+        );
+    }
+
+    #[test]
+    fn repeated_unterminated_openers_stay_linear() {
+        // Each of these runs to the end of the source; without the memo every
+        // line would rescan the rest of the buffer (O(n²)).
+        for line in ["x <<A", "y $(z"] {
+            let src = format!("{line}\n").repeat(40_000);
+            let t = std::time::Instant::now();
+            let spans = highlight(&src, MixFlavor::Script);
+            assert_eq!(spans.iter().filter(|(_, c)| *c == Error).count(), 40_000);
+            assert!(t.elapsed().as_secs() < 5, "{line:?} took {:?}", t.elapsed());
+        }
+    }
+
+    fn check_spans(src: &str, flavor: MixFlavor) -> Result<(), TestCaseError> {
+        let spans = highlight(src, flavor);
+        let mut prev = 0;
+        for (r, _) in &spans {
+            prop_assert!(r.start >= prev && r.start < r.end && r.end <= src.len(), "{r:?} after {prev} in {src:?}");
+            prop_assert!(src.is_char_boundary(r.start) && src.is_char_boundary(r.end));
+            prev = r.end;
+        }
+        Ok(())
+    }
+
+    const PIECES: &[&str] = &[
+        "\"", "'", "${", "}", "$(", ")", "<<EOF", "EOF", "\n", "\r\n", "\\", "\\u{", "\\ud800", "--", "#", "$x", " ", "0x",
+        "0o9", "07", "1e", ".5", "&", "|", "~", "é", "🎉", "if", "end", "send a-1.2", "{", "[", "]", ":", ",", ";", "\t",
+    ];
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+        #[test]
+        fn never_panics_on_arbitrary_text(src in any::<std::string::String>()) {
+            check_spans(&src, MixFlavor::Script)?;
+            check_spans(&src, MixFlavor::Data)?;
+        }
+
+        #[test]
+        fn never_panics_on_mix_shaped_text(parts in proptest::collection::vec(0..PIECES.len(), 0..80)) {
+            let src: std::string::String = parts.iter().map(|&i| PIECES[i]).collect();
+            check_spans(&src, MixFlavor::Script)?;
+            check_spans(&src, MixFlavor::Data)?;
+        }
+    }
 }
