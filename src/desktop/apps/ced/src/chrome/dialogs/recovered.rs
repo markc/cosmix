@@ -10,7 +10,7 @@ use crate::app::Msg;
 use crate::chrome::Look;
 
 /// One offered buffer (the controller's row).
-pub use crate::chrome::pending::RecoveredRow as RecoveredBuffer;
+pub use crate::controller::RecoveredRow as RecoveredBuffer;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recovered {

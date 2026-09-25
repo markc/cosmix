@@ -12,7 +12,6 @@ pub mod find;
 pub mod infobar;
 pub mod menu;
 pub mod output;
-pub mod pending;
 pub mod problems;
 pub mod status;
 pub mod tabs;

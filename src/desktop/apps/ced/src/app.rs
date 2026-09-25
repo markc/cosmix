@@ -42,8 +42,7 @@ use crate::chrome::output::Output;
 use crate::chrome::timer::{TimerKey, Timers};
 use crate::chrome::{self, Look, MENU_H, STATUS_H, TABS_H};
 use crate::config::{self, Config, FONT_PX_MAX, FONT_PX_MIN};
-use crate::chrome::pending::{ControllerExt, Prompt};
-use crate::controller::{Controller, Effect, Tab};
+use crate::controller::{Controller, Effect, Prompt, Tab};
 use crate::dirs::{AppDirs, COMPONENT};
 use crate::editor::widget::EditorWidget;
 use crate::editor::{EditorMsg, EditorView, LayoutReport};
@@ -415,6 +414,7 @@ impl App {
                     let read = if primary { iced::clipboard::read_primary() } else { iced::clipboard::read() };
                     tasks.push(read.map(move |text| Msg::Paste(intent.clone(), text)));
                 }
+                Effect::Prompt(prompt) => self.on_prompt(prompt),
                 // The controller debounces session writes itself.
                 Effect::SaveSession => self.save_session(),
                 Effect::Quit => {
@@ -871,9 +871,6 @@ impl App {
                 self.timers.arm(TimerKey::ClearMarkers(tab), MARKER_CLEAR_MS);
             }
             self.find.status = None;
-        }
-        for prompt in self.controller.take_prompts() {
-            self.on_prompt(prompt);
         }
         let mut tasks = Vec::new();
         let mut lint_now = Vec::new();
