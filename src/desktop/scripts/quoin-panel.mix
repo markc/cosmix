@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.2.1
 -- quoin-panel -- the Quoin bottom panel and its popups, written as Mix
 -- Scenes after Plasma's default panel. One citizen owns four scenes:
 --

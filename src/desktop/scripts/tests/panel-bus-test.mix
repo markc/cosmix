@@ -4,7 +4,11 @@
 $root = env("COSMIX")
 if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
 $scripts = $root .. "/src/desktop/scripts"
-$mix = "/opt/cosmix/bin/mix"
+-- The gate points these at freshly built binaries; the defaults are the system install.
+$mix = env("COSMIX_TEST_MIX") ?? ""
+if $mix == "" then $mix = "/opt/cosmix/bin/mix" end
+$noded = env("COSMIX_TEST_NODED") ?? ""
+if $noded == "" then $noded = "/opt/cosmix/bin/cosmix-noded" end
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-panel-bus-test.XXXXXXXX"]))
 $tag = uuid()
 $node = $tmp .. "/node.conf.mix"
@@ -53,7 +57,7 @@ try
     $port = random(47000, 47999)
     write_file($node, json_encode({node: "panel-bus-test-" .. $tag, wg_ip: "", mesh: "panel-bus-test.invalid",
       noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
-    $noded_pid = spawn(["/opt/cosmix/bin/cosmix-noded", "serve", "--listen", "127.0.0.1:" .. to_string($port),
+    $noded_pid = spawn([$noded, "serve", "--listen", "127.0.0.1:" .. to_string($port),
       "--node", "panel-bus-test-" .. $tag, "--no-monitor", "--no-log"],
       {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
     sleep(0.5)

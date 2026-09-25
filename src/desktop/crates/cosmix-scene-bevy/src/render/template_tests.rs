@@ -240,7 +240,6 @@ fn renderer_failure_retains_applied_revision_and_readable_diagnostics() {
     store.request(SceneVerb::Patch, "", &json!({
         "scene":"repeated", "path":"model.prefix", "value":"retry "
     })).unwrap();
-    drop(store);
     reconcile(&mut world);
     let entry = &world.resource::<SceneStore>().scenes["repeated"];
     let mounted = entry.mounted.as_ref().unwrap();

@@ -1788,6 +1788,9 @@ mod tests {
                 "name":name, "page":page, "edge":edge,
                 "citizen":"authored-metadata", "owner":"loader", "revision":watched["revision"],
                 "digest":watched["digest"], "registered":registered,
+                // Unrendered in this headless fixture: nothing applied yet,
+                // no diagnostics, no published model.
+                "applied_revision":0, "diagnostics":[], "model_generation":null,
             }));
         }
         assert_eq!(app.world().resource::<ShellFrameState>().0, before);
@@ -2785,10 +2788,12 @@ mod tests {
             let mut replies = Vec::new();
             // Drive the model's native animation frames, discarding every
             // notice. There is no client-side notification continuation.
+            // Both drains read one channel and discard the other kind, so
+            // take responses first; the remaining notices are then dropped.
             for _ in 0..120 {
                 app.update();
-                peer.drain_publishes();
                 replies.extend(peer.drain_responses());
+                peer.drain_publishes();
                 if !replies.is_empty() { break; }
             }
             assert_eq!(replies.len(), 1, "{verb}");
