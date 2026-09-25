@@ -1628,14 +1628,27 @@ impl Parser {
         let mut command = self.expect_identifier()?;
         while self.peek() == &Token::Dot {
             self.advance();
-            let part = if keyword_lexeme(self.peek()).is_some()
-                || matches!(self.peek(), Token::Function)
-            {
+            let part = if let Some(keyword) = keyword_lexeme(self.peek()) {
+                self.advance();
+                keyword.to_string()
+            } else if matches!(self.peek(), Token::Function) {
                 let start = self.tokens[self.pos].offset;
-                let literal = self.source[start..]
+                // Parser::new accepts source and tokens independently. Only
+                // Function needs source text to distinguish its two spellings.
+                let source = self.source.get(start..).ok_or_else(|| MixError::ParseError {
+                    msg: "function command segment offset is outside parser source".to_string(),
+                    span: self.peek_span(),
+                })?;
+                let literal = source
                     .iter()
                     .take_while(|c| c.is_alphanumeric() || **c == '_')
                     .collect::<String>();
+                if !matches!(literal.as_str(), "fn" | "function") {
+                    return Err(MixError::ParseError {
+                        msg: "function command segment disagrees with parser source: expected `fn` or `function`".to_string(),
+                        span: self.peek_span(),
+                    });
+                }
                 self.advance();
                 literal
             } else {

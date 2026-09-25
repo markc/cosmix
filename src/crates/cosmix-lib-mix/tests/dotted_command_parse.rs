@@ -1,7 +1,27 @@
 //! Keywords after a command-name dot are literal name segments.
 use cosmix_mix::ast::{Expr, StmtKind};
+use cosmix_mix::error::MixError;
 use cosmix_mix::lexer::Lexer;
 use cosmix_mix::parser::Parser;
+
+#[test]
+fn function_command_segment_rejects_mismatched_source() {
+    for source in ["", "on a.", "on a.other\nend", "on a.fn_extra\nend", "on a.function2\nend"] {
+        let tokens = Lexer::new("on a.fn\nend").tokenize().unwrap();
+        let error = Parser::new(tokens, source).parse_program().unwrap_err();
+        assert!(
+            matches!(error, MixError::ParseError { ref msg, .. } if msg.contains("function command segment")),
+            "{source:?}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn unambiguous_keyword_command_segment_uses_token_spelling() {
+    let tokens = Lexer::new("on a.next\nend").tokenize().unwrap();
+    let program = Parser::new(tokens, "").parse_program().unwrap();
+    assert!(matches!(&program[0].kind, StmtKind::On { command, .. } if command == "a.next"));
+}
 
 #[test]
 fn keyword_segments_in_handlers_and_sends_are_literal() {
