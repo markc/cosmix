@@ -27,6 +27,7 @@
 //! lease is returned when the actor ends (drop, including a panic unwind).
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1100,10 +1101,19 @@ impl Actor {
     }
 
     /// Read the bound file and decode it (BOM, UTF-8, limits) off the runtime.
-    async fn read_disk(&self) -> Result<(DiskIdentity, String, FileMeta), Refusal> {
-        let Some(path) = self.path.clone() else {
+    /// Borrows nothing across the await (a `Buffer` is `Send`, not `Sync`).
+    fn read_disk(&self) -> impl Future<Output = Result<(DiskIdentity, String, FileMeta), Refusal>> + Send + 'static {
+        let path = self.path.clone();
+        let bid = self.bid.clone();
+        async move { read_disk(path, bid).await }
+    }
+}
+
+async fn read_disk(path: Option<PathBuf>, bid: BufferId) -> Result<(DiskIdentity, String, FileMeta), Refusal> {
+    {
+        let Some(path) = path else {
             return Err(refusal(ErrorCode::InvalidArgument, Some(reason::SCRATCH_NEEDS_PATH), "a scratch buffer has no file")
-                .buffer(&self.bid));
+                .buffer(&bid));
         };
         let shown = path.display().to_string();
         let read = blocking(move || -> Result<(DiskIdentity, String, FileMeta), Refusal> {
@@ -1119,9 +1129,14 @@ impl Actor {
             Ok((id, text, meta))
         })
         .await?;
-        read.map_err(|e| self.with_ctx(e))
+        read.map_err(|mut e| {
+            e.buffer.get_or_insert(bid);
+            e
+        })
     }
+}
 
+impl Actor {
     async fn reload(&mut self, r: ReloadReq, caller: &Caller) -> Result<String, Refusal> {
         if self.path.is_none() {
             return Err(refusal(
