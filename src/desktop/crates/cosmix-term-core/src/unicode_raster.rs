@@ -20,6 +20,8 @@ const MAX_LAYERS: usize = 128;
 
 pub(super) struct Face {
     data: Arc<[u8]>,
+    #[cfg(test)]
+    pub(super) index: u32,
     offset: u32,
     key: CacheKey,
 }
@@ -32,7 +34,13 @@ impl Face {
     fn at_index(data: Arc<[u8]>, index: u32) -> Option<Self> {
         let font = FontRef::from_index(&data, index as usize)?;
         let (offset, key) = (font.offset, font.key);
-        Some(Self { data, offset, key })
+        Some(Self {
+            data,
+            #[cfg(test)]
+            index,
+            offset,
+            key,
+        })
     }
 
     pub(super) fn font(&self) -> FontRef<'_> {
@@ -51,6 +59,7 @@ pub(super) struct Fonts {
 
 #[derive(Default)]
 struct Fallbacks {
+    coverage: Vec<Face>,
     emoji: Option<Face>,
     symbols: Option<Face>,
 }
@@ -80,6 +89,10 @@ impl Fonts {
             SHARED
                 .get_or_init(|| {
                     Arc::new(Fallbacks {
+                        coverage: super::primary_font::coverage()
+                            .into_iter()
+                            .filter_map(|face| Face::at_index(face.data, face.index))
+                            .collect(),
                         emoji: optional(EMOJI_PATHS),
                         symbols: optional(&[
                             "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
@@ -93,9 +106,9 @@ impl Fonts {
     }
 
     #[cfg(test)]
-    pub(super) fn without_fallbacks(primary: Arc<[u8]>) -> Arc<Self> {
+    pub(super) fn without_fallbacks(primary: Arc<[u8]>, index: u32) -> Arc<Self> {
         Arc::new(Self {
-            primary: Face::new(primary).unwrap(),
+            primary: Face::at_index(primary, index).unwrap(),
             fallbacks: OnceLock::from(Arc::new(Fallbacks::default())),
         })
     }
@@ -209,6 +222,7 @@ impl UnicodeRaster {
                 ]
                 .into_iter()
                 .flatten()
+                .chain(&self.fonts.fallbacks().coverage)
                 .any(|face| face.key == key)
             }));
             let bytes = image.layers.iter().map(Layer::bytes).sum::<usize>();
@@ -244,20 +258,15 @@ impl UnicodeRaster {
         // Only a non-ASCII cache miss reaches this path in production.
         // All rasters share these immutable bytes and stable font identities.
         let fallbacks = self.fonts.fallbacks();
-        let faces = if emoji {
-            [
-                fallbacks.emoji.as_ref(),
-                primary,
-                fallbacks.symbols.as_ref(),
-            ]
-        } else {
-            [
-                primary,
-                fallbacks.emoji.as_ref(),
-                fallbacks.symbols.as_ref(),
-            ]
-        };
-        for face in faces.into_iter().flatten() {
+        let faces = emoji
+            .then_some(fallbacks.emoji.as_ref())
+            .flatten()
+            .into_iter()
+            .chain(primary)
+            .chain(&fallbacks.coverage)
+            .chain((!emoji).then_some(fallbacks.emoji.as_ref()).flatten())
+            .chain(fallbacks.symbols.as_ref());
+        for face in faces {
             let font = face.font();
             if !covers(font, text, script) {
                 continue;
@@ -683,6 +692,86 @@ fn tofu(width: u32, height: u32) -> ClusterImage {
 mod tests {
     use super::*;
     use crate::raster::{PixelFormat, paint_cluster};
+
+    #[test]
+    fn sf_primary_uses_dejavu_coverage_and_keeps_ascii_and_emoji_priority() {
+        use fontdb::{Database, Family, Query};
+        let mut db = Database::new();
+        db.load_system_fonts();
+        if db
+            .query(&Query {
+                families: &[Family::Name("SF Mono")],
+                ..Query::default()
+            })
+            .is_none()
+        {
+            eprintln!("SKIP SF coverage probe: fontdb cannot find SF Mono");
+            return;
+        }
+        let primary = super::super::primary_font::from_database(&mut db).unwrap();
+        let mut raster = crate::raster::Raster::from_font(
+            primary.data,
+            primary.index,
+            2.5,
+            crate::config::Config::default().font_px,
+            crate::config::Cursor::Underline,
+        )
+        .unwrap();
+        let fonts = raster.unicode.fonts.clone();
+        let dejavu = fonts
+            .fallbacks()
+            .coverage
+            .first()
+            .expect("DejaVu coverage fixture");
+        let family: String = dejavu
+            .font()
+            .localized_strings()
+            .find_by_id(swash::StringId::TypographicFamily, None)
+            .unwrap()
+            .chars()
+            .collect();
+        assert_eq!(family, "DejaVu Sans Mono");
+        for text in ["∀", "≡", "↵", "M", "0"] {
+            let expected = if text.is_ascii() {
+                fonts.primary.key
+            } else {
+                dejavu.key
+            };
+            if !text.is_ascii() {
+                assert!(!covers(fonts.primary.font(), text, Script::Latin));
+            }
+            let image = raster.unicode.image(
+                text,
+                1,
+                raster.px,
+                (raster.width, raster.height),
+                raster.baseline,
+            );
+            assert_eq!(
+                image.font,
+                Some(expected),
+                "{text}: selected face (not tofu)"
+            );
+            assert!(
+                image.layers.iter().any(|layer| match &layer.pixels {
+                    Pixels::Mask(data) | Pixels::Color(data) => data.iter().any(|v| *v != 0),
+                }),
+                "{text}: non-empty ink"
+            );
+        }
+        if let Some(emoji) = &fonts.fallbacks().emoji {
+            for text in ["❤\u{fe0f}", "😀"] {
+                let image = raster.unicode.image(
+                    text,
+                    2,
+                    raster.px,
+                    (raster.width, raster.height),
+                    raster.baseline,
+                );
+                assert_eq!(image.font, Some(emoji.key), "{text}: emoji priority");
+            }
+        }
+    }
 
     #[test]
     fn area_downscale_preserves_fixture_average_and_premultiplication() {

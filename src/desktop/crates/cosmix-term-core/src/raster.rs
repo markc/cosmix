@@ -11,8 +11,6 @@ use unicode::{Fonts, Pixels, UnicodeRaster};
 #[path = "raster_unicode_tests.rs"]
 mod unicode_tests;
 use std::{collections::HashMap, path::Path, sync::Arc};
-#[cfg(test)]
-use swash::FontRef;
 use swash::{
     scale::{Render, ScaleContext, Source, image::Image},
     zeno::Format,
@@ -419,15 +417,19 @@ impl Raster {
     /// Fixed DejaVu face for pixel oracles and repeatable benchmarks. Ignores
     /// desktop discovery and process environment; requires the free fixture.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn for_test(scale: f32, logical_px: f32, cursor: crate::config::Cursor) -> Result<Self, String> {
+    pub fn for_test(
+        scale: f32,
+        logical_px: f32,
+        cursor: crate::config::Cursor,
+    ) -> Result<Self, String> {
         let primary = primary_font::fixture()?;
         Self::from_font(primary.data, primary.index, scale, logical_px, cursor)
     }
 
     /// The same font at another scale or size: no file read and no
     /// DIAGNOSTIC line. This is the runtime path — a held Ctrl+= steps the
-    /// size at key-repeat rate, and [`Raster::new`] would re-read the font
-    /// file and print a line on every step. The glyph cache starts empty,
+    /// size at key-repeat rate. This preserves font identities and avoids
+    /// override file reads and discovery diagnostics. The glyph cache starts empty,
     /// because every cached glyph was rasterised at the old size.
     pub fn resized(&self, scale: f32, logical_px: f32) -> Result<Self, String> {
         Self::from_fonts(
@@ -1076,7 +1078,7 @@ impl Raster {
                 if self.cache.len() >= 4096 {
                     self.cache.clear();
                 }
-                let font = FontRef::from_index(&self.data, 0).unwrap();
+                let font = self.unicode.fonts.primary.font();
                 let mut scaler = self.context.builder(font).size(self.px).hint(true).build();
                 let glyph = Render::new(&[Source::Outline])
                     .format(Format::Alpha)

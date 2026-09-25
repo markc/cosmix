@@ -449,7 +449,10 @@ fn pair_damage_cursor_extras_selection_and_breakup_match_full_oracle() {
 #[test]
 fn missing_fonts_and_invalid_ids_have_bounded_tofu_and_negative_cache() {
     let mut raster = raster_with(Cursor::Block);
-    raster.unicode = UnicodeRaster::new(Fonts::without_fallbacks(raster.data.clone()));
+    raster.unicode = UnicodeRaster::new(Fonts::without_fallbacks(
+        raster.data.clone(),
+        raster.unicode.fonts.primary.index,
+    ));
     let mut grid = screen(4, 2, ' ');
     grid.cells[1].c = '\u{10ffff}';
     grid.cells[1].width = CellWidth::Wide;

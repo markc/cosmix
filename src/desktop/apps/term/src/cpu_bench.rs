@@ -484,12 +484,25 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
 #[test]
 #[ignore = "release-only rank-6 warm-paint measurement"]
 fn raster_warm_spans_bench() {
+    warm_spans_bench(13.0, Some((25, 50)));
+}
+
+#[test]
+#[ignore = "release-only production-size warm-paint measurement"]
+fn raster_warm_spans_default_font_bench() {
+    warm_spans_bench(cosmix_term_core::config::Config::default().font_px, None);
+}
+
+fn warm_spans_bench(logical_px: f32, padded_cell: Option<(u32, u32)>) {
     use cosmix_term_core::raster::PaintState;
     use std::hint::black_box;
 
-    let mut raster = Raster::for_test(2.5, 13.0, Cursor::Underline).unwrap();
-    raster.width = 25;
-    raster.height = 50;
+    let mut raster = Raster::for_test(2.5, logical_px, Cursor::Underline).unwrap();
+    if let Some((width, height)) = padded_cell {
+        raster.width = width;
+        raster.height = height;
+    }
+    let (width, height) = (90 * raster.width as usize, 25 * raster.height as usize);
     for spaces in [false, true] {
         for run_cells in [90, 7, 1] {
             let mut screen = Screen {
@@ -515,7 +528,7 @@ fn raster_warm_spans_bench() {
                     .collect(),
                 updated: Instant::now(),
             };
-            let mut pixels = vec![0; 2250 * 1250 * 4];
+            let mut pixels = vec![0; width * height * 4];
             let mut state = PaintState::default();
             let mut samples = Vec::with_capacity(200);
             for n in 0..220 {
@@ -528,7 +541,7 @@ fn raster_warm_spans_bench() {
                 black_box(raster.paint(
                     black_box(&screen),
                     &mut pixels,
-                    2250 * 4,
+                    width * 4,
                     &mut state,
                     &[true; 25],
                 ));
@@ -540,7 +553,7 @@ fn raster_warm_spans_bench() {
             }
             samples.sort_by(f64::total_cmp);
             eprintln!(
-                "rank6 warm {} bg_run={run_cells} cells 2250x1250 scale=2.5: mean={:.3} p50={:.3} p99={:.3} ms",
+                "rank6 warm {} bg_run={run_cells} cells {width}x{height} scale=2.5 font_px={logical_px}: mean={:.3} p50={:.3} p99={:.3} ms",
                 if spaces { "spaces" } else { "glyphs" },
                 samples.iter().sum::<f64>() / samples.len() as f64,
                 samples[100],

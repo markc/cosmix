@@ -61,6 +61,10 @@ The original two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
 `cpu_grid::bench::tiny_skia_foot_phases_bench`. `--test-threads=1` matters:
 running performance tests concurrently would contaminate their results.
 Rank 6 adds `cpu_grid::bench::raster_warm_spans_bench` (described below).
+`cpu_grid::bench::raster_warm_spans_default_font_bench` adds the same DejaVu
+workload at `Config::default().font_px` (21.3333), scale 2.5, with actual font
+cell metrics and a matching target size. The original 13px, 25×50-cell
+benchmarks remain for comparison; the new variant has no recorded timings yet.
 These historical measurements used the then-default wgpu build; both this report and
 [term-rendering.md](term-rendering.md) use explicit tiny-skia feature
 selection for CPU measurements. Only the term release test target and its dependencies were
@@ -1167,17 +1171,26 @@ Remaining assumptions and validation limits:
 Both terminal frontends read the `cosmix-design` **terminal** role: **SF Mono,
 Light (300), normal style, 21.3333 logical pixels (16pt)**. Fonts are not bundled.
 Primary discovery uses fontdb's ordered family query: SF Mono → DejaVu Sans
-Mono → Noto Sans Mono → system monospace, choosing the nearest available
-weight. If discovery yields no usable face, the existing DejaVu/Liberation/
+Mono → Noto Sans Mono → system monospace. If a Light query returns Thin or
+ExtraLight, that family is queried again at Regular (400); faces lighter
+than the role are rejected, including through the system monospace alias.
+If discovery yields no usable face, the existing DejaVu/Liberation/
 Noto/JetBrains file paths remain the last resort. Each selected path and face
-index is validated with Swash and shared by ASCII and Unicode rendering,
+index is validated with Swash: positive units per em and `M`/`0` advances,
+plus non-empty rendered outlines for both glyphs. Unusable faces are removed
+and selection continues. The discovered primary bytes are cached process-wide
+and shared by ASCII and Unicode rendering,
 including after zoom or an output-scale change. Cell advance, line height and
 baseline come from that face's metrics; output scale is applied once.
 
 `TERM_SPIKE_FONT=/path/to/font.ttf` (TTF, OTF or collection) takes precedence
 over discovery; an invalid override reports an error. Within a collection,
-the selected face index is retained. This changes only the primary face:
-the existing lazy Unicode, symbols and colour-emoji fallback is unchanged.
+the selected face index is retained. Overrides are checked before the system
+primary cache. Both frontends reuse the loaded faces on scale changes.
+Unicode coverage tries the primary, DejaVu Sans Mono, Noto Sans Mono, emoji,
+then symbols. Emoji-presentation clusters (including VS16) still try emoji
+first. Coverage, emoji and symbol faces are loaded lazily and shared across
+rasters in the process.
 
 Set `font_px: 21.333` in `$XDG_CONFIG_HOME/cosmix/term.conf.mix` (or
 `~/.config/cosmix/term.conf.mix`) to override the size. Fractions are accepted
@@ -1190,8 +1203,12 @@ face index and metrics, including a temporary free-font collection whose
 chosen face is index 1. They write one headless row at 2.5× to
 `src/desktop/target/font-probes/term-row-sf-2.5x.png` and
 `src/desktop/target/font-probes/term-row-free-2.5x.png`, printing each path
-with `--nocapture`. The SF test explicitly skips when
-`/usr/share/fonts/apple-fonts` is absent. The free test excludes SF from its
+with `--nocapture`. SF tests explicitly skip when fontdb cannot find the
+`SF Mono` family. The free test excludes SF from its
 database without changing installed files. Pixel oracles and benchmarks use
 `Raster::for_test` / `Painter::for_test` to pin DejaVu Sans Mono regardless of
-the desktop default or process environment.
+the desktop default or process environment. The fixture and its Bold sibling
+are resolved by family through fontdb, with legacy file paths as a last resort.
+Regressions cover below-Light matching, damaged candidates, shared discovery,
+collection indices in test painters, and DejaVu coverage for ∀, ≡ and ↵ with
+an SF primary while retaining SF ASCII and emoji priority.
