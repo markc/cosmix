@@ -25,11 +25,20 @@
 //! Watch failure (inotify limit, network fs) → warn once, `disk: unwatched`;
 //! the save-time revalidation still guards saves.
 //!
+//! An ANCESTOR watch is an inode watch too: its own replacement (a rename
+//! away, a delete) is detected the same way — the ancestor's inode is recorded
+//! when it is armed, any event on its own path (and every rescan) re-checks
+//! it, and a changed inode drops that watch and re-arms every target that was
+//! waiting under it from the top (nearest existing ancestor again).
+//!
 //! Implementation: notify's callback only forwards into a channel; one plain
-//! thread (blocking `recv`, so event-driven) applies events under the table
-//! lock. It never calls back into the notify event loop from that loop's own
-//! thread. Any event on a watched directory's own path re-checks the
-//! directory's inode, so a missed or coalesced self-event still re-arms.
+//! thread (blocking `recv`, so event-driven) owns the table and applies both
+//! notify events and the router's bind/unbind/rebind requests, in order. The
+//! router only SENDS a request — the filesystem work of arming (metadata,
+//! inotify registration) never runs on the router's task. The thread never
+//! calls back into the notify event loop from that loop's own thread. Any
+//! event on a watched directory's own path re-checks the directory's inode,
+//! so a missed or coalesced self-event still re-arms.
 //! Access events (open, read-close) are ignored: the actor's own hashing reads
 //! must not wake it again.
 
@@ -102,13 +111,27 @@ struct Inner {
     armed: HashMap<PathBuf, (u64, u64)>,
     /// Ancestor directory → missing target directories waiting under it.
     ancestors: HashMap<PathBuf, BTreeSet<PathBuf>>,
+    /// The inode each ancestor watch was armed on.
+    ancestor_ids: HashMap<PathBuf, (u64, u64)>,
     warned: bool,
 }
 
+/// Work for the watch thread, in arrival order.
+enum Msg {
+    Event(notify::Result<notify::Event>),
+    Bind { bid: BufferId, file: PathBuf, signal: Arc<DiskSignal> },
+    Unbind { bid: BufferId },
+    Rebind { bid: BufferId, file: PathBuf },
+    /// Answered once everything sent before it is applied (tests, `armed_dirs`).
+    Sync(std::sync::mpsc::Sender<()>),
+}
+
 /// The shared watch service. `add`/`remove`/`rebind` are called by the router
-/// (the only writer of path bindings); events arrive on the watch thread.
+/// (the only writer of path bindings) and only enqueue: the watch thread
+/// applies them, interleaved in order with the watcher's events.
 #[derive(Clone)]
 pub struct Watch {
+    tx: std::sync::mpsc::Sender<Msg>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -124,13 +147,14 @@ fn relevant(kind: &EventKind) -> bool {
 }
 
 impl Watch {
-    /// Start the watcher and its event thread. A watcher that cannot be
-    /// created (no inotify) leaves every buffer `unwatched`.
+    /// Start the watcher and its thread. A watcher that cannot be created (no
+    /// inotify) leaves every buffer `unwatched`.
     pub fn start() -> Watch {
         let inner = Arc::new(Mutex::new(Inner::default()));
-        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let events = tx.clone();
         match notify::recommended_watcher(move |res| {
-            let _ = tx.send(res);
+            let _ = events.send(Msg::Event(res));
         }) {
             Ok(watcher) => inner.lock().expect("watch table").watcher = Some(watcher),
             Err(error) => tracing::warn!("cosmix-editd: no file watcher ({error}); every buffer is unwatched"),
@@ -139,45 +163,66 @@ impl Watch {
         std::thread::Builder::new()
             .name("editd-watch".into())
             .spawn(move || {
-                // Ends when the watcher (the only sender) is dropped.
-                while let Ok(res) = rx.recv() {
+                // Ends when every sender is gone: the `Watch` handles and the
+                // watcher (owned by `Inner`, dropped with the last handle).
+                while let Ok(msg) = rx.recv() {
                     let Some(inner) = thread_inner.upgrade() else { break };
                     let mut guard = inner.lock().expect("watch table");
-                    match res {
-                        Ok(event) => guard.handle(&event),
-                        Err(error) => tracing::warn!("cosmix-editd: watch error: {error}"),
+                    match msg {
+                        Msg::Event(Ok(event)) => guard.handle(&event),
+                        Msg::Event(Err(error)) => tracing::warn!("cosmix-editd: watch error: {error}"),
+                        Msg::Bind { bid, file, signal } => guard.bind(&bid, &file, signal),
+                        Msg::Unbind { bid } => guard.unbind(&bid),
+                        Msg::Rebind { bid, file } => {
+                            if let Some(bound) = guard.files.get(&bid) {
+                                let signal = bound.signal.clone();
+                                guard.unbind(&bid);
+                                guard.bind(&bid, &file, signal);
+                            }
+                        }
+                        Msg::Sync(done) => {
+                            let _ = done.send(());
+                        }
                     }
                 }
             })
             .expect("spawn the watch thread");
-        Watch { inner }
+        Watch { tx, inner }
     }
 
     /// Bind `bid` to `file`: watch its parent directory (refcounted).
     pub fn add(&self, bid: &str, file: &Path, signal: Arc<DiskSignal>) {
-        let mut inner = self.inner.lock().expect("watch table");
-        inner.bind(bid, file, signal);
+        let _ = self.tx.send(Msg::Bind { bid: bid.to_string(), file: file.to_path_buf(), signal });
     }
 
     /// Unbind `bid`; the directory watch goes when its last buffer does.
     pub fn remove(&self, bid: &str) {
-        let mut inner = self.inner.lock().expect("watch table");
-        inner.unbind(bid);
+        let _ = self.tx.send(Msg::Unbind { bid: bid.to_string() });
     }
 
     /// Move `bid`'s binding to `file` (save-as), keeping its signal.
     pub fn rebind(&self, bid: &str, file: &Path) {
-        let mut inner = self.inner.lock().expect("watch table");
-        if let Some(bound) = inner.files.get(bid) {
-            let signal = bound.signal.clone();
-            inner.unbind(bid);
-            inner.bind(bid, file, signal);
+        let _ = self.tx.send(Msg::Rebind { bid: bid.to_string(), file: file.to_path_buf() });
+    }
+
+    /// Wait until every request sent so far has been applied (blocking; tests).
+    pub fn sync(&self) {
+        let (done, wait) = std::sync::mpsc::channel();
+        if self.tx.send(Msg::Sync(done)).is_ok() {
+            let _ = wait.recv();
         }
     }
 
     /// Directories currently watched on themselves (tests, `info`).
     pub fn armed_dirs(&self) -> Vec<PathBuf> {
+        self.sync();
         self.inner.lock().expect("watch table").armed.keys().cloned().collect()
+    }
+
+    /// Ancestor directories currently watched for missing targets (tests).
+    pub fn ancestor_dirs(&self) -> Vec<PathBuf> {
+        self.sync();
+        self.inner.lock().expect("watch table").ancestors.keys().cloned().collect()
     }
 }
 
@@ -230,6 +275,7 @@ impl Inner {
                 targets.remove(target);
                 if targets.is_empty() {
                     self.ancestors.remove(&anc);
+                    self.ancestor_ids.remove(&anc);
                     if !self.armed.contains_key(&anc) {
                         self.unwatch(&anc);
                     }
@@ -288,13 +334,21 @@ impl Inner {
         let mut anc = dir.parent();
         for _ in 0..WATCH_ANCESTOR_DEPTH {
             let Some(a) = anc else { break };
-            if dir_id(a).is_some() {
+            if let Some(id) = dir_id(a) {
                 let a = a.to_path_buf();
+                if self.ancestor_ids.get(&a).is_some_and(|recorded| *recorded != id) {
+                    // A stale ancestor watch whose replacement was not seen
+                    // yet: never join it (it watches the old inode).
+                    self.check_ancestor(&a);
+                }
                 if self.ancestors.get(&a).is_some_and(|t| t.contains(dir)) {
                     return;
                 }
                 let fresh = !self.ancestors.contains_key(&a) && !self.armed.contains_key(&a);
                 if !fresh || self.watch(&a).is_ok() {
+                    // The inode this watch sees: its replacement is detected
+                    // by `check_ancestor`.
+                    self.ancestor_ids.entry(a.clone()).or_insert(id);
                     self.ancestors.entry(a.clone()).or_default().insert(dir.to_path_buf());
                     // Watch, THEN look: the next level may have appeared
                     // before the ancestor watch existed, and would never
@@ -322,6 +376,10 @@ impl Inner {
             for dir in dirs {
                 self.check_dir(&dir);
             }
+            let ancestors: Vec<PathBuf> = self.ancestors.keys().cloned().collect();
+            for anc in ancestors {
+                self.check_ancestor(&anc);
+            }
             return;
         }
         if !relevant(&event.kind) {
@@ -335,6 +393,9 @@ impl Inner {
             }
             if self.armed.contains_key(path) {
                 self.check_dir(path);
+            }
+            if self.ancestors.contains_key(path) {
+                self.check_ancestor(path);
             }
             let hit: Vec<PathBuf> = path
                 .parent()
@@ -358,6 +419,24 @@ impl Inner {
         self.unwatch(dir);
         self.signal_dir(dir, DiskSignal::raise);
         self.rearm(dir);
+    }
+
+    /// An ancestor watch's path may no longer be the inode it watches (moved
+    /// away, deleted): drop it and re-arm every target waiting under it from
+    /// scratch, which finds the nearest existing ancestor again.
+    fn check_ancestor(&mut self, anc: &Path) {
+        let Some(recorded) = self.ancestor_ids.get(anc).copied() else { return };
+        if dir_id(anc) == Some(recorded) {
+            return;
+        }
+        let targets = self.ancestors.remove(anc).unwrap_or_default();
+        self.ancestor_ids.remove(anc);
+        if !self.armed.contains_key(anc) {
+            self.unwatch(anc);
+        }
+        for target in targets {
+            self.rearm(&target);
+        }
     }
 }
 
@@ -425,6 +504,43 @@ mod tests {
         }
 
         // A later external write through the new directory is detected.
+        let _ = signal.take();
+        std::fs::write(&file, "three").unwrap();
+        assert!(raised(&signal).await, "writes after re-arming are detected");
+    }
+
+    #[tokio::test]
+    async fn replaced_ancestor_watch_rearms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let a = root.join("a");
+        let b = a.join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        let file = b.join("f.txt");
+        std::fs::write(&file, "one").unwrap();
+        let watch = Watch::start();
+        let signal = DiskSignal::new();
+        watch.add("b1_00000000", &file, signal.clone());
+        assert!(raised(&signal).await);
+
+        // Delete a/b: the buffer waits on the ancestor `a`.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !watch.ancestor_dirs().contains(&a) {
+            let woke = tokio::time::timeout_at(deadline, signal.notify.notified()).await;
+            assert!(woke.is_ok(), "never fell back to the ancestor");
+        }
+
+        // Rename the ANCESTOR away and rebuild a/b/f.txt under a new `a`: the
+        // stale ancestor watch must be replaced, and the target re-armed.
+        std::fs::rename(&a, root.join("old-a")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(&file, "two").unwrap();
+        while dir_id(&b).is_none() || dir_id(&b) != watch.inner.lock().unwrap().armed.get(&b).copied() {
+            let woke = tokio::time::timeout_at(deadline, signal.notify.notified()).await;
+            assert!(woke.is_ok(), "a replaced ancestor never re-armed its target");
+        }
         let _ = signal.take();
         std::fs::write(&file, "three").unwrap();
         assert!(raised(&signal).await, "writes after re-arming are detected");

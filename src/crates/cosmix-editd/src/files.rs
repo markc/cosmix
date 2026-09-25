@@ -120,8 +120,29 @@ fn bad_path(message: impl Into<String>) -> Refusal {
 ///
 /// An existing path resolves to its canonical target (symlinks followed). A
 /// missing file resolves through its canonical parent, so `create: true` and
-/// save-as bind the same spelling a later open of the created file will.
+/// save-as bind the same spelling a later open of the created file will. A
+/// DANGLING symlink resolves to the link's own path, so a save replaces the
+/// link with a regular file (the one case where a symlink is not kept).
+///
+/// Both the given spelling and the result must JSON-encode within
+/// `PATH_MAX_ENCODED_BYTES` (they are repeated in replies, props and events).
 pub fn resolve_path(path: &str) -> Result<PathBuf, Refusal> {
+    let max = crate::limits::PATH_MAX_ENCODED_BYTES;
+    let too_long = |what: &str, n: usize| bad_path(format!("{what} encodes to {n} bytes; the limit is {max}"));
+    let given = crate::events::encoded_len(&path);
+    if given > max {
+        return Err(too_long("the path", given));
+    }
+    let resolved = resolve_unbounded(path)?;
+    let shown = resolved.display().to_string();
+    let n = crate::events::encoded_len(&shown);
+    if n > max {
+        return Err(too_long("the resolved path", n));
+    }
+    Ok(resolved)
+}
+
+fn resolve_unbounded(path: &str) -> Result<PathBuf, Refusal> {
     let expanded = if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var_os("HOME").ok_or_else(|| bad_path("HOME is not set, so ~/ cannot be resolved"))?;
         PathBuf::from(home).join(rest)
@@ -232,7 +253,23 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `force` skips the step-3 comparison and is passed only for a PLAIN save
 /// with `force: true`; a forced save-as passes `false` with
 /// `Expect::Identity(<the stat it observed>)`, so nothing newer is overwritten.
+///
+/// The new `base` is the WRITTEN inode's own metadata, read through the temp
+/// file's descriptor after its fsync (a rename changes neither its inode nor
+/// its mtime) — never a post-rename `stat` of the path, which could observe
+/// another writer's replacement and adopt its identity for our content.
 pub fn save(dest: &Path, bytes: &[u8], expect: Expect, force: bool) -> Result<Saved, Refusal> {
+    save_with(dest, bytes, expect, force, || {})
+}
+
+/// [`save`] with a hook run right after the rename (tests race it).
+fn save_with(
+    dest: &Path,
+    bytes: &[u8],
+    expect: Expect,
+    force: bool,
+    after_rename: impl FnOnce(),
+) -> Result<Saved, Refusal> {
     let shown = dest.display().to_string();
     let (Some(dir), Some(name)) = (dest.parent(), dest.file_name()) else {
         return Err(bad_path(format!("{shown} does not name a file")));
@@ -247,18 +284,22 @@ pub fn save(dest: &Path, bytes: &[u8], expect: Expect, force: bool) -> Result<Sa
     let existing_mode = std::fs::metadata(dest).ok().map(|m| m.permissions().mode() & 0o7777);
 
     // 2. Temp file (new files get 0o666 & !umask from the kernel), fsync.
-    let written = (|| -> std::io::Result<()> {
+    let written = (|| -> std::io::Result<Stat> {
         let mut file = OpenOptions::new().write(true).create_new(true).mode(0o666).open(&tmp)?;
         if let Some(mode) = existing_mode {
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
         file.write_all(bytes)?;
-        file.sync_all()
+        file.sync_all()?;
+        Ok(Stat::of(&file.metadata()?))
     })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(write_err(e));
-    }
+    let written = match written {
+        Ok(stat) => stat,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(write_err(e));
+        }
+    };
 
     // 3. Revalidate the destination immediately before replacing it.
     if !force {
@@ -281,21 +322,20 @@ pub fn save(dest: &Path, bytes: &[u8], expect: Expect, force: bool) -> Result<Sa
         }
     }
 
-    // 4. Replace, then make the rename durable.
+    // 4. Replace, then make the rename durable. From here the save HAS
+    // happened: nothing below can turn it into a failed save.
     if let Err(e) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(write_err(e));
     }
+    after_rename();
     let (durable, warning) = match File::open(dir).and_then(|d| d.sync_all()) {
         Ok(()) => (true, None),
         Err(e) => (false, Some(format!("saved, but fsync of {} failed: {e}", dir.display()))),
     };
 
-    // 5. The new base: what we just wrote.
-    let now = stat(dest).map_err(write_err)?.ok_or_else(|| {
-        write_err(std::io::Error::new(std::io::ErrorKind::NotFound, "vanished right after the rename"))
-    })?;
-    Ok(Saved { base: DiskIdentity::from_parts(now, bytes), file_bytes: bytes.len(), durable, warning })
+    // 5. The new base: the inode we wrote (see the doc above).
+    Ok(Saved { base: DiskIdentity::from_parts(written, bytes), file_bytes: bytes.len(), durable, warning })
 }
 
 #[cfg(test)]
@@ -370,6 +410,39 @@ mod tests {
         save(&canonical, b"forced", Expect::Identity(base), true).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"forced");
         assert!(temp_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn save_base_is_the_written_inode_not_a_later_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.txt");
+        std::fs::write(&dest, "old").unwrap();
+        let base = identity(&dest).unwrap().unwrap();
+        // Another writer replaces the file right after our rename.
+        let theirs = dir.path().join("theirs");
+        let saved = save_with(&dest, b"mine", Expect::Identity(base), false, || {
+            std::fs::write(&theirs, "their content").unwrap();
+            std::fs::rename(&theirs, &dest).unwrap();
+        })
+        .unwrap();
+        let now = stat(&dest).unwrap().unwrap();
+        assert_ne!(saved.base.stat(), now, "the save adopted the other writer's identity");
+        assert_eq!(saved.base.size, 4);
+        assert_eq!(saved.base.blake3, *blake3::hash(b"mine").as_bytes());
+
+        // The path vanishing after the rename is still a completed save.
+        let saved = save_with(&dest, b"again", Expect::Identity(identity(&dest).unwrap().unwrap()), false, || {
+            std::fs::remove_file(&dest).unwrap();
+        });
+        assert!(saved.is_ok(), "{saved:?}");
+    }
+
+    #[test]
+    fn overlong_paths_are_bad_path() {
+        let long = format!("/tmp/{}", "\u{1}".repeat(200)); // 6 encoded bytes each
+        let err = resolve_path(&long).unwrap_err();
+        assert_eq!(err.reason.as_deref(), Some("bad_path"));
+        assert!(crate::refusal::render(&err).1.len() < 4096, "the refusal does not echo the path");
     }
 
     #[test]

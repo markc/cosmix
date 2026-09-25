@@ -18,13 +18,18 @@
 //!    `starts.try_reserve(peak_lines.saturating_sub(starts.len()))` and a
 //!    pre-reserved scratch vector for the largest insert's line starts. Any
 //!    failure → RESOURCE_LIMIT with the text untouched.
-//! 2. [`Text::commit`] applies the sequence and cannot fail or allocate: every
-//!    gap-buffer `replace` finds its memory committed (asserted via
-//!    `commit_calls` in debug builds), and the line index is spliced in place
-//!    (`copy_within` into reserved capacity; no `Vec::splice`, no temporaries).
+//! 2. [`Text::commit`] applies the sequence and cannot fail: every gap-buffer
+//!    `replace` finds its memory committed (asserted via `commit_calls` in
+//!    debug builds; a `replace` error, which phase 1 makes impossible, panics
+//!    in every build rather than let the line index diverge from the text),
+//!    and the line index is spliced in place (`copy_within` into reserved
+//!    capacity; no `Vec::splice`, no temporaries). Text commit allocates
+//!    nothing.
 //!
-//! Callers (the buffer façade) reserve their own log/lane vectors in phase 1 too.
-//! Heap OOM for ordinary allocations aborts the process (E0 is volatile).
+//! Callers (the buffer façade) reserve their own log/lane vectors in phase 1
+//! too. The rest of the façade's phase 2 still makes ordinary allocations (the
+//! `changed` list, a selection map entry); heap OOM for those aborts the
+//! process (E0 is volatile).
 //!
 //! `prepare` also refuses (INTERNAL) a sequence that is not in the §3.4
 //! canonical shape — every step lying at or before the previous step's offset
@@ -370,7 +375,9 @@ impl Text {
         for e in &prepared.sequence {
             let end = e.offset + e.delete;
             let replaced = self.gap.replace(e.offset..end, e.insert.as_bytes());
-            debug_assert!(replaced.is_ok(), "phase 1 committed the memory");
+            // Unreachable after phase 1; if it ever happens, stop before the
+            // line index is spliced for text that did not change.
+            assert!(replaced.is_ok(), "phase 1 committed the memory: {replaced:?}");
             self.splice_lines(e.offset, end, &e.insert);
         }
         debug_assert_eq!(self.gap.commit_calls(), commits_before, "phase 2 committed memory");

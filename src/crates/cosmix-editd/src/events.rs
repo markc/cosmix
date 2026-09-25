@@ -13,7 +13,14 @@
 //!   (`RESYNC_BACKOFF_BASE_MS` ×2, cap `RESYNC_BACKOFF_CAP_MS`) until delivered.
 //! - On every supervised-client reconnect edge (`subscribe_state`) publish
 //!   `resync {buffers: "all", reason: "reconnect"}`.
-//! - `event_seq` is daemon-session monotonic; every event carries `epoch`.
+//! - `event_seq` is daemon-session monotonic and counts `edit.changed`
+//!   frames ONLY (contiguous: 1, 2, 3, …); `edit.props.changed` frames carry
+//!   none. Every event carries `epoch`.
+//! - Published means ACCEPTED BY EVERY SUBSCRIBER: the sink awaits noded's
+//!   `topic.publish` result, and a refusal or any `dropped` recipient counts
+//!   as a lost event (resync owed), not as a delivery.
+//! - An owed resync is detached from the pending set while it is in flight, so
+//!   a loss recorded meanwhile stays owed; a failed attempt merges it back.
 //!
 //! Mirror rule (documented for clients): apply `edit` events whose `base_rev`
 //! equals the mirror's rev, in list order; on a `base_rev` mismatch, an
@@ -75,16 +82,34 @@ impl EventSink for BusSink {
             let wire = out.message.to_wire();
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                self.0.send_with_headers("noded", "topic.publish", &headers, &wire),
+                self.0.call_with_headers_raw("noded", "topic.publish", &headers, &wire),
             )
             .await
             {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok((rc, body, error))) => publish_outcome(rc, &body, error.as_deref()),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err("topic.publish timed out".to_string()),
             }
         })
     }
+}
+
+/// noded's `topic.publish` answer → delivered to every subscriber, or not.
+/// `rc 0` with `dropped > 0` means some subscriber's outbound queue was full:
+/// that subscriber lost the frame, so it is a loss like any send failure.
+/// (`refused` recipients were never eligible to see it; not a loss.)
+pub fn publish_outcome(rc: u8, body: &str, error: Option<&str>) -> Result<(), String> {
+    if rc != 0 {
+        return Err(format!("topic.publish refused (rc {rc}): {}", error.filter(|e| !e.is_empty()).unwrap_or(body)));
+    }
+    let dropped = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("dropped").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    if dropped > 0 {
+        return Err(format!("topic.publish dropped the frame for {dropped} subscriber(s)"));
+    }
+    Ok(())
 }
 
 enum Item {
@@ -237,6 +262,17 @@ impl Publisher {
     /// Queue one SPEC-07 `props.changed` leaf change.
     pub fn props_changed(&self, buffer: Option<&str>, path: &PropPath, old: &PropValue, new: &PropValue) {
         let message = cosmix_props_core::publish::build_props_changed_message(path, old, new, "edit");
+        if message.body.len() > MAX_EVENT_BYTES {
+            // Inputs are bounded so this cannot happen; if it ever does, the
+            // loss is announced like any other, never published oversized.
+            {
+                let mut state = self.state.lock().expect("publisher state");
+                Self::mark_lost(&mut state, buffer.map(str::to_string).as_ref());
+            }
+            self.loss.fetch_add(1, Ordering::AcqRel);
+            self.wake.notify_one();
+            return;
+        }
         let bytes = message.body.len() + 256;
         self.enqueue(Queued { item: Item::Props { buffer: buffer.map(str::to_string), message }, bytes });
     }
@@ -274,31 +310,25 @@ impl Publisher {
         self.event_seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    /// The owed resync (not yet cleared), if any.
-    fn owed(&self) -> Option<(bool, bool, BTreeSet<BufferId>)> {
-        let state = self.state.lock().expect("publisher state");
+    /// Detach the owed resync, if any: from here on a new loss is owed anew,
+    /// never erased by this resync's completion.
+    fn take_owed(&self) -> Option<(bool, bool, BTreeSet<BufferId>)> {
+        let mut state = self.state.lock().expect("publisher state");
         if !state.reconnect && !state.pending.all && state.pending.buffers.is_empty() {
             return None;
         }
-        Some((state.reconnect, state.pending.all, state.pending.buffers.clone()))
+        let reconnect = std::mem::take(&mut state.reconnect);
+        let all = std::mem::take(&mut state.pending.all);
+        Some((reconnect, all, std::mem::take(&mut state.pending.buffers)))
     }
 
-    fn clear_owed(&self, reconnect: bool, all: bool, buffers: &BTreeSet<BufferId>) {
+    /// A detached resync that did not get through is owed again (merged with
+    /// anything owed since).
+    fn restore_owed(&self, reconnect: bool, all: bool, buffers: BTreeSet<BufferId>) {
         let mut state = self.state.lock().expect("publisher state");
-        if reconnect {
-            state.reconnect = false;
-        }
-        if reconnect || all {
-            state.pending.all = false;
-        }
-        if reconnect || all {
-            // `all` covers every buffer named before this resync was built.
-            state.pending.buffers.retain(|b| !buffers.contains(b));
-        } else {
-            for b in buffers {
-                state.pending.buffers.remove(b);
-            }
-        }
+        state.reconnect |= reconnect;
+        state.pending.all |= all;
+        state.pending.buffers.extend(buffers);
     }
 
     fn event_message(event: &Event) -> BusMessage {
@@ -316,7 +346,7 @@ impl Publisher {
         let mut backoff = base;
         loop {
             // 1. An owed resync goes out ahead of every later event.
-            if let Some((reconnect, all, buffers)) = self.owed() {
+            if let Some((reconnect, all, buffers)) = self.take_owed() {
                 let seq = self.next_seq();
                 let resync = Event::Resync(ResyncEvent {
                     epoch: self.epoch.clone(),
@@ -333,11 +363,9 @@ impl Publisher {
                 message.set("event_seq", &seq.to_string());
                 let out = Outgoing { topic: TOPIC_CHANGED, message };
                 match sink.publish(&out).await {
-                    Ok(()) => {
-                        self.clear_owed(reconnect, all, &buffers);
-                        backoff = base;
-                    }
+                    Ok(()) => backoff = base,
                     Err(error) => {
+                        self.restore_owed(reconnect, all, buffers);
                         tracing::warn!("cosmix-editd: resync publish failed ({error}); retrying in {backoff:?}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(cap);
@@ -358,18 +386,17 @@ impl Publisher {
                 self.wake.notified().await;
                 continue;
             };
-            let seq = self.next_seq();
             let (buffer, out) = match queued.item {
                 Item::Event { buffer, mut event } => {
+                    // Only `edit.changed` frames consume a number, so a
+                    // subscriber of that topic alone sees no gaps.
+                    let seq = self.next_seq();
                     set_seq(&mut event, seq);
                     let mut message = Self::event_message(&event);
                     message.set("event_seq", &seq.to_string());
                     (buffer, Outgoing { topic: TOPIC_CHANGED, message })
                 }
-                Item::Props { buffer, mut message } => {
-                    message.set("event_seq", &seq.to_string());
-                    (buffer, Outgoing { topic: TOPIC_PROPS_CHANGED, message })
-                }
+                Item::Props { buffer, message } => (buffer, Outgoing { topic: TOPIC_PROPS_CHANGED, message }),
             };
             if let Err(error) = sink.publish(&out).await {
                 tracing::warn!("cosmix-editd: publish failed ({error}); resync owed");
@@ -525,6 +552,83 @@ mod tests {
         let sent = sink.sent.lock().unwrap();
         assert_eq!(sent[0].1["event"], "resync", "the owed resync goes first");
         assert_eq!(sent[0].1["buffers"], serde_json::json!(["b2_9f2c41a7"]));
+    }
+
+    #[tokio::test]
+    async fn props_frames_do_not_consume_event_seq() {
+        let p = Publisher::new("9f2c41a7");
+        let sink = start(&p);
+        let path = PropPath::new("buffers.b1_9f2c41a7.dirty").unwrap();
+        for rev in 1..=3 {
+            p.props_changed(Some("b1_9f2c41a7"), &path, &false.into(), &true.into());
+            p.event(Some("b1_9f2c41a7"), edit_event("b1_9f2c41a7", rev, "x".into()));
+        }
+        assert!(sink.wait_for(|s| s.len() == 6).await);
+        let sent = sink.sent.lock().unwrap();
+        let seqs: Vec<u64> = sent.iter().filter(|(t, _)| t == TOPIC_CHANGED).map(|(_, b)| b["event_seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3], "an edit.changed-only subscriber sees no gaps");
+        assert_eq!(p.event_seq(), 3);
+    }
+
+    /// Fails the first `fail` publishes; on the first resync it sees, records
+    /// a NEW loss for `buffer` (as if a later event dropped mid-flight).
+    struct LossDuringResync {
+        inner: RecordingSink,
+        publisher: Mutex<Option<Arc<Publisher>>>,
+        buffer: &'static str,
+    }
+
+    impl EventSink for LossDuringResync {
+        fn publish<'a>(&'a self, out: &'a Outgoing) -> SinkFuture<'a> {
+            Box::pin(async move {
+                let is_resync = out.message.body.contains("\"event\":\"resync\"");
+                if is_resync && let Some(p) = self.publisher.lock().unwrap().take() {
+                    let mut state = p.state.lock().unwrap();
+                    Publisher::mark_lost(&mut state, Some(&self.buffer.to_string()));
+                }
+                self.inner.publish(out).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loss_during_a_resync_stays_owed() {
+        let p = Publisher::new("9f2c41a7");
+        let sink = Arc::new(LossDuringResync {
+            inner: RecordingSink::default(),
+            publisher: Mutex::new(Some(p.clone())),
+            buffer: "b1_9f2c41a7",
+        });
+        // The first event's send fails: resync owed for b1.
+        sink.inner.fail_next.store(1, Ordering::Release);
+        tokio::spawn(p.clone().run(sink.clone()));
+        p.event(Some("b1_9f2c41a7"), edit_event("b1_9f2c41a7", 1, "a".into()));
+        let resyncs = |s: &[(String, serde_json::Value)]| s.iter().filter(|(_, b)| b["event"] == "resync").count();
+        assert!(sink.inner.wait_for(|s| resyncs(s) >= 2).await, "the loss recorded mid-resync was erased");
+    }
+
+    #[tokio::test]
+    async fn a_failed_resync_is_owed_again() {
+        let p = Publisher::new("9f2c41a7");
+        let sink = Arc::new(RecordingSink::default());
+        // The event and the first two resync attempts fail.
+        sink.fail_next.store(3, Ordering::Release);
+        tokio::spawn(p.clone().run(sink.clone()));
+        p.event(Some("b1_9f2c41a7"), edit_event("b1_9f2c41a7", 1, "a".into()));
+        assert!(sink.wait_for(|s| !s.is_empty()).await);
+        let sent = sink.sent.lock().unwrap();
+        assert_eq!(sent[0].1["event"], "resync");
+        assert_eq!(sent[0].1["buffers"], serde_json::json!(["b1_9f2c41a7"]));
+    }
+
+    #[test]
+    fn publish_outcome_counts_drops_as_loss() {
+        assert!(publish_outcome(0, r#"{"seq":4,"delivered":2,"refused":0,"dropped":0,"eligible":2}"#, None).is_ok());
+        assert!(publish_outcome(0, r#"{"seq":4,"delivered":1,"refused":1,"dropped":0,"eligible":2}"#, None).is_ok());
+        let e = publish_outcome(0, r#"{"seq":5,"delivered":1,"refused":0,"dropped":1,"eligible":2}"#, None).unwrap_err();
+        assert!(e.contains("dropped"), "{e}");
+        assert!(publish_outcome(10, r#"{"error": "payload_too_large", "limit": 1048576}"#, None).is_err());
+        assert!(publish_outcome(10, "", Some("topic.publish requires 'name' header")).is_err());
     }
 
     #[tokio::test]
