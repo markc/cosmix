@@ -159,7 +159,7 @@ async fn serve_atomic_replacement_and_repeated_saves_keep_file_watch_alive() {
         std::fs::write(&tmp, format!("revision {n}")).unwrap();
         std::fs::rename(&tmp, &file).unwrap();
         let batch = delivered(&mut e, &file, "moved").await;
-        let Value::Map(m) = batch else {
+        let Value::Map(m) = &batch else {
             panic!("batch")
         };
         assert!(matches!(m.get("watch"), Some(Value::String(_))));
@@ -359,7 +359,8 @@ async fn serve_managed_child_exits_are_reaped_and_generation_tagged() {
         .await
         .unwrap()
         .unwrap();
-    let Value::Map(exit) = e.get_global("exit").unwrap() else {
+    let exit_value = e.get_global("exit").unwrap();
+    let Value::Map(exit) = &exit_value else {
         panic!("exit map")
     };
     assert_eq!(exit["tag"].to_mix_string(), "scene:7");
@@ -480,7 +481,8 @@ async fn managed_signal_delivery_and_shutdown_have_one_reaper() {
         .await
         .unwrap()
         .unwrap();
-    let Value::Map(exit) = e.get_global("exit").unwrap() else {
+    let exit_value = e.get_global("exit").unwrap();
+    let Value::Map(exit) = &exit_value else {
         panic!("exit map")
     };
     assert_eq!(exit["signal"].to_number(), Some(15.0));
