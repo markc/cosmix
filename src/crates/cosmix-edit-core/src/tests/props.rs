@@ -166,7 +166,7 @@ proptest! {
         let mut b = buf(&base);
         let r = b.apply(req(ops.iter().map(|o| o.3.clone()).collect()), &o("agent:a"), via(), 0);
         if overlaps(&ops) {
-            let e = r.err().expect("overlapping ops must be refused");
+            let e = r.expect_err("overlapping ops must be refused");
             prop_assert_eq!(e.reason, Some(crate::error::reason::OVERLAP_IN_TXN));
             prop_assert_eq!(text(&b), base);
             return Ok(());
