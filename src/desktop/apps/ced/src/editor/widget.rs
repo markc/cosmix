@@ -3,6 +3,10 @@
 //! `iced::advanced::Widget` of plan §4.2 (virtualised cell-grid text,
 //! selection, carets, markers, IME, clipboard, scrolling) that also emits
 //! [`EditorMsg::Layout`](super::EditorMsg::Layout) each frame.
+//!
+//! [`EditorWidget::with`] (E1f, additive) is what the app calls: it adds the
+//! [`EditorView`] — font, zoom, measurement and View toggles — that the frozen
+//! `new` has no parameter for.
 
 use cosmix_edit_client::diag::Diagnostics;
 use cosmix_edit_client::highlight::Highlight;
@@ -10,7 +14,7 @@ use cosmix_edit_client::model::EditorModel;
 use cosmix_edit_core::text::Text;
 use iced::Element;
 
-use super::{EditorMsg, Palette};
+use super::{EditorMsg, EditorView, Palette};
 
 pub struct EditorWidget;
 
@@ -23,9 +27,20 @@ impl EditorWidget {
         palette: &'a Palette,
         diagnostics: &'a Diagnostics,
     ) -> Element<'a, EditorMsg> {
+        Self::with(text, model, highlight, palette, diagnostics, &EditorView::default())
+    }
+
+    pub fn with<'a>(
+        text: &'a Text,
+        model: &'a EditorModel,
+        highlight: &'a Highlight,
+        palette: &'a Palette,
+        diagnostics: &'a Diagnostics,
+        view: &EditorView,
+    ) -> Element<'a, EditorMsg> {
         let _ = (model, highlight, diagnostics);
         let background = palette.background;
-        iced::widget::container(iced::widget::text(format!("{} bytes", text.len())))
+        iced::widget::container(iced::widget::text(format!("{} bytes", text.len())).font(view.font).size(view.px))
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
             .style(move |_theme| iced::widget::container::Style {
