@@ -126,7 +126,7 @@ try
   $o = ok('edit.open path=$a.path', {path: $file})
   $b = $o.buffer
   check(ends_with($b, "_" .. $epoch) and $o.rev == 0 and $o.path == $file and not $o.reopened, "open: " .. json_encode($o))
-  check($o.disk == "clean" and $o.eol == "lf" and $o.bytes == 32, "open file state: " .. json_encode($o))
+  check($o.disk == "clean" and $o.eol == "lf" and $o.bytes == 33 and $o.lines == 4,"open file state: " .. json_encode($o))
   $o2 = ok('edit.open path=$a.path', {path: $file})
   check($o2.buffer == $b and $o2.reopened, "reopen: " .. json_encode($o2))
   refused('edit.open path="relative/x.txt"', {}, "INVALID_ARGUMENT", nil)
