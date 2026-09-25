@@ -20,6 +20,16 @@ pub enum Edge {
 impl Edge {
     pub const ALL: [Self; 4] = [Self::Left, Self::Bottom, Self::Right, Self::Top];
 
+    /// Stable lowercase name used on the wire and in configuration.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Bottom => "bottom",
+            Self::Right => "right",
+            Self::Top => "top",
+        }
+    }
+
     pub const fn index(self) -> usize {
         match self {
             Self::Left => 0,

@@ -275,6 +275,28 @@ discovery. Live panel state is read through the uniform
 `shell.props.{get,list,describe}` surface under
 `panels.<edge>.{visible,pinned,mode,width_px,page,pages,output}`.
 
+`shell.panel.state {edge}` returns those seven leaves in one JSON object,
+plus the host's `keyboard_focused` and `keyboard_requested` booleans for that
+edge. `edge` is `left`, `bottom`, `right` or `top`; an invalid or missing edge
+returns rc 10 with `{"error":"edge must be left, bottom, right or top"}`.
+
+`shell.scenes.list` takes no arguments and returns a JSON array sorted by
+scene name: `[{name,page,edge,citizen,owner,revision,digest,registered}]`. `page` is
+the sub-panel page id (`scene-<name>`, or the document's explicit panel id).
+`registered` means a seat is reserved with the scene's verified owner,
+acceptance receipt, edge and current host output; `edge` is that seat's edge,
+or null when no matching seat exists. `panel.state.pages` shows a newly reserved
+page after the next frame. An owned scene whose seat is removed or replaced
+by another owner or receipt is removed on the next frame.
+`citizen` is the document's routing `citizen:` metadata; `owner` is the
+broker-verified loader, or null for an unowned scene.
+`revision` and `digest` match `shell.scene.watch`.
+An empty store returns `[]`. Both reads return rc 0 on success, are open to
+mesh callers, and do not change scenes, panels or keyboard focus.
+
+From a Mix script: `send shell shell.scenes.list` and
+`send shell shell.panel.state edge="left"`; read `$reply` and `$rc`.
+
 `mode` is the precise mode signal: `hidden`, `pinned` (a persistent overlay
 that reserves no space) or `docked` (reserves its full thickness), independent
 of transient visibility. `pinned` is a read-compatibility shim: true for either

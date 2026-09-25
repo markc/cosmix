@@ -99,6 +99,7 @@ pub struct CompletionNote {
 pub struct Tab {
     pub id: u64,
     pub title: String,
+    user_title: Option<String>,
     pub tree: PaneTree,
     pub active_pane: u64,
     pub revision: u64,
@@ -119,6 +120,28 @@ pub struct TabSet {
     /// Fired once when the last tab goes, whichever thread closed it. The
     /// Bus loop waits on this instead of re-polling `is_empty()`.
     emptied: Arc<tokio::sync::Notify>,
+    titles_changed: Arc<tokio::sync::Notify>,
+    observer: Option<tokio::sync::mpsc::Sender<Change>>,
+    watching: bool,
+    event_revision: u64,
+}
+
+/// Small invalidation records, ordered independently of the legacy layout
+/// revision (whose existing reply semantics remain unchanged).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Change {
+    pub topic: &'static str,
+    pub tab: u64,
+    pub pane: u64,
+    pub kind: &'static str,
+    pub revision: u64,
+}
+
+impl Change {
+    pub(crate) fn body(&self) -> serde_json::Value {
+        serde_json::json!({"tab": self.tab, "pane": self.pane,
+            "kind": self.kind, "revision": self.revision})
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -149,6 +172,120 @@ pub struct TabInfo {
 }
 
 impl TabSet {
+    pub(crate) fn observe(&mut self) -> tokio::sync::mpsc::Receiver<Change> {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        self.observer = Some(tx);
+        rx
+    }
+    pub(crate) fn watch(&mut self) -> u64 {
+        self.watching = true;
+        self.event_revision
+    }
+    pub(crate) fn is_watching(&self) -> bool {
+        self.watching
+    }
+    fn changed(&mut self, topic: &'static str, tab: u64, pane: u64, kind: &'static str) {
+        self.event_revision += 1;
+        if self.watching
+            && let Some(sender) = &self.observer
+        {
+            // Never block a UI/PTY mutation on a broker. Gaps in the shared
+            // event revision tell subscribers to read current state again.
+            let _ = sender.try_send(Change {
+                topic,
+                tab,
+                pane,
+                kind,
+                revision: self.event_revision,
+            });
+        }
+    }
+    pub(crate) fn titles_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.titles_changed.clone()
+    }
+    pub(crate) fn refresh_titles(&mut self) {
+        let mut changed = Vec::new();
+        for tab in &mut self.tabs {
+            let title = tab.user_title.clone().unwrap_or_else(|| {
+                let title = self.metadata[&tab.active_pane].control.title();
+                if title.is_empty() {
+                    "mix".into()
+                } else {
+                    title
+                }
+            });
+            if tab.title != title {
+                tab.title = title;
+                // Retitles use the event sequence below, never the layout
+                // revision that frontends use to rebuild their pane trees.
+                changed.push((tab.id, tab.active_pane));
+            }
+        }
+        for (tab, pane) in changed {
+            self.changed("tabs.changed", tab, pane, "retitled");
+            self.changed("title.changed", tab, pane, "retitled");
+            self.notify();
+        }
+    }
+    pub(crate) fn set_title(&mut self, id: u64, title: String) -> Result<(), String> {
+        let tab = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .ok_or_else(|| format!("not-found: tab id={id}"))?;
+        let title = crate::terminal::sanitise_title(&title);
+        tab.user_title = (!title.is_empty()).then_some(title);
+        self.refresh_titles();
+        Ok(())
+    }
+    pub(crate) fn move_tab(&mut self, id: u64, index: u64) -> Result<usize, String> {
+        let from = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == id)
+            .ok_or_else(|| format!("not-found: tab id={id}"))?;
+        let index = index.min((self.tabs.len() - 1) as u64) as usize;
+        if from != index {
+            let active = self.active_id();
+            let tab = self.tabs.remove(from);
+            let pane = tab.active_pane;
+            self.tabs.insert(index, tab);
+            self.active = self.tabs.iter().position(|tab| tab.id == active).unwrap();
+            self.revision += 1;
+            self.tabs[index].revision = self.revision;
+            self.changed("tabs.changed", id, pane, "moved");
+            self.notify();
+        }
+        Ok(index)
+    }
+    /// Select a pane without changing either tab or pane focus. Supplying
+    /// both selectors asserts membership; stale IDs never fall back.
+    pub(crate) fn resolve(
+        &self,
+        pane: Option<u64>,
+        tab: Option<u64>,
+    ) -> Result<(u64, u64), String> {
+        if let Some(tab) = tab
+            && !self.tabs.iter().any(|t| t.id == tab)
+        {
+            return Err(format!("not-found: tab id={tab}"));
+        }
+        if let Some(pane) = pane {
+            let owner = self
+                .control_tab(pane)
+                .ok_or_else(|| format!("not-found: pane id={pane}"))?;
+            if tab.is_some_and(|tab| tab != owner) {
+                return Err("invalid-argument: pane does not belong to tab".into());
+            }
+            return Ok((owner, pane));
+        }
+        let selected = match tab {
+            Some(id) => self.tabs.iter().find(|t| t.id == id).unwrap(),
+            None if self.is_empty() => return Err("application closing".into()),
+            None => self.active_tab(),
+        };
+        Ok((selected.id, selected.active_pane))
+    }
     pub fn user_activity(&self) {
         if let Some(native) = &self.native {
             native.activity();
@@ -218,16 +355,36 @@ impl TabSet {
             closing: false,
             pending: Arc::new(AtomicUsize::new(0)),
             emptied: Arc::new(tokio::sync::Notify::new()),
+            titles_changed: Arc::new(tokio::sync::Notify::new()),
+            observer: None,
+            watching: false,
+            event_revision: 0,
         };
         set.open_with(start)?;
         Ok(set)
     }
 
     pub fn open(&mut self) -> Result<u64, String> {
+        self.open_options(None, None)
+    }
+
+    pub(crate) fn open_options(
+        &mut self,
+        cwd: Option<String>,
+        title: Option<String>,
+    ) -> Result<u64, String> {
+        if let Some(cwd) = &cwd {
+            crate::terminal::validate_cwd(cwd)?;
+        }
         let settings = self.settings;
         let native = self.native.clone();
         let id = self.next_pane_id;
-        self.open_with(move || Terminal::start_session(settings, native.as_ref(), id))
+        let tab =
+            self.open_with(move || Terminal::start_session_in(settings, native.as_ref(), id, cwd))?;
+        if let Some(title) = title {
+            self.set_title(tab, title)?;
+        }
+        Ok(tab)
     }
 
     pub(crate) fn open_with(
@@ -249,12 +406,17 @@ impl TabSet {
         self.tabs.push(Tab {
             id,
             title: "mix".into(),
+            user_title: None,
             tree: PaneTree::Leaf(pane),
             active_pane,
             revision: self.revision + 1,
         });
         self.revision += 1;
         self.active = self.tabs.len() - 1;
+        self.changed("tabs.changed", id, active_pane, "added");
+        self.changed("pane.changed", id, active_pane, "added");
+        self.changed("tabs.changed", id, active_pane, "selected");
+        self.changed("pane.changed", id, active_pane, "selected");
         self.notify();
         Ok(id)
     }
@@ -291,6 +453,7 @@ impl TabSet {
         if let Some(wake) = &self.wake {
             terminal.set_wake(wake.clone());
         }
+        terminal.listener.watch_title(self.titles_changed.clone());
         self.metadata.insert(
             id,
             PaneInfo {
@@ -394,8 +557,16 @@ impl TabSet {
         if self.is_empty() {
             return Vec::new();
         }
-        let tab = self.active_tab();
-        tab.tree
+        self.leaves_in(self.active_id()).expect("active tab exists")
+    }
+    pub(crate) fn leaves_in(&self, id: u64) -> Result<Vec<PaneInfo>, String> {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .ok_or_else(|| format!("not-found: tab id={id}"))?;
+        Ok(tab
+            .tree
             .leaves(Geometry {
                 x: 0.0,
                 y: 0.0,
@@ -408,7 +579,7 @@ impl TabSet {
                 info.active = pane.id == tab.active_pane;
                 info
             })
-            .collect()
+            .collect())
     }
     pub fn geometry(&mut self, id: u64, geometry: Geometry) {
         if let Some(info) = self.metadata.get_mut(&id) {
@@ -428,7 +599,11 @@ impl TabSet {
         tab.active_pane = id;
         self.revision += 1;
         tab.revision = self.revision;
+        let tab_id = tab.id;
         self.invalidate_geometry(self.active);
+        self.changed("pane.changed", tab_id, id, "added");
+        self.changed("pane.changed", tab_id, id, "selected");
+        self.refresh_titles();
         self.notify();
         Ok(id)
     }
@@ -438,8 +613,10 @@ impl TabSet {
         }
         if self.tabs[self.active].active_pane != id {
             self.invalidate_control_focus();
+            self.changed("pane.changed", self.active_id(), id, "selected");
         }
         self.tabs[self.active].active_pane = id;
+        self.refresh_titles();
         self.notify();
         true
     }
@@ -502,7 +679,8 @@ impl TabSet {
             return self.close(self.tabs[index].id);
         };
         tab.tree = tree;
-        if tab.active_pane == id {
+        let focus_changed = tab.active_pane == id;
+        if focus_changed {
             tab.active_pane = sibling.expect("non-final pane has a sibling");
         }
         let count = tab.tree.leaves(Geometry::default()).len();
@@ -510,7 +688,14 @@ impl TabSet {
         self.pending.fetch_add(1, Ordering::AcqRel);
         self.revision += 1;
         tab.revision = self.revision;
+        let tab_id = tab.id;
+        let selected = tab.active_pane;
         self.invalidate_geometry(index);
+        self.changed("pane.changed", tab_id, id, "removed");
+        if focus_changed {
+            self.changed("pane.changed", tab_id, selected, "selected");
+        }
+        self.refresh_titles();
         self.notify();
         (
             Outcome::Remaining(count),
@@ -549,6 +734,10 @@ impl TabSet {
             pending: self.pending.clone(),
         });
         self.revision += 1;
+        for pane in &ids {
+            self.changed("pane.changed", id, *pane, "removed");
+        }
+        self.changed("tabs.changed", id, tab.active_pane, "removed");
         if index < self.active {
             self.active -= 1;
         }
@@ -564,6 +753,18 @@ impl TabSet {
         }
         if was_active {
             self.invalidate_control_focus();
+            self.changed(
+                "tabs.changed",
+                self.active_id(),
+                self.active_tab().active_pane,
+                "selected",
+            );
+            self.changed(
+                "pane.changed",
+                self.active_id(),
+                self.active_tab().active_pane,
+                "selected",
+            );
         }
         self.notify();
         (Outcome::Remaining(self.tabs.len()), removed)
@@ -575,6 +776,8 @@ impl TabSet {
         };
         if self.active != index {
             self.invalidate_control_focus();
+            self.changed("tabs.changed", id, self.tabs[index].active_pane, "selected");
+            self.changed("pane.changed", id, self.tabs[index].active_pane, "selected");
         }
         self.active = index;
         self.invalidate_control_focus();
@@ -633,8 +836,14 @@ impl TabSet {
     }
     pub fn resized(&mut self, id: u64, cols: u16, rows: u16) {
         if let Some(info) = self.metadata.get_mut(&id) {
+            if info.cols == usize::from(cols) && info.rows == usize::from(rows) {
+                return;
+            }
             info.cols = usize::from(cols);
             info.rows = usize::from(rows);
+            if let Some(tab) = self.control_tab(id) {
+                self.changed("pane.changed", tab, id, "resized");
+            }
         }
     }
     pub fn cycle(&mut self, forward: bool) {
@@ -642,9 +851,24 @@ impl TabSet {
             return;
         }
         let offset = if forward { 1 } else { self.tabs.len() - 1 };
+        let previous = self.active;
         self.invalidate_control_focus();
         self.active = (self.active + offset) % self.tabs.len();
         self.invalidate_control_focus();
+        if self.active != previous {
+            self.changed(
+                "tabs.changed",
+                self.active_id(),
+                self.active_tab().active_pane,
+                "selected",
+            );
+            self.changed(
+                "pane.changed",
+                self.active_id(),
+                self.active_tab().active_pane,
+                "selected",
+            );
+        }
         self.notify();
     }
     /// Install the change callback on every pane, current and future. Call it
@@ -663,6 +887,7 @@ impl TabSet {
         }
     }
     pub fn reap_exited(&mut self) -> (Vec<Removed>, Vec<CompletionNote>) {
+        self.refresh_titles();
         // One pass captures the identity of every self-exited pane before any
         // close mutates the tree; a second closes them. Notes are gathered
         // here, not derived from `Removed` (which is identity-free), and only
@@ -879,6 +1104,38 @@ mod tests {
         drop(removed);
         drop(tabs.shutdown());
     }
+    #[test]
+    fn retitles_advance_events_without_invalidating_layout() {
+        use rio_vt::event::{EventListener, RioEvent, WindowId};
+        let Some(mut tabs) = fixture() else {
+            return;
+        };
+        let id = tabs.active_id();
+        let listener = tabs.active_terminal().lock().unwrap().listener.clone();
+        let mut events = tabs.observe();
+        let mut event_revision = tabs.watch();
+        let layout_revision = (tabs.revision, tabs.active_tab().revision);
+        for title in ["pinned", "", "another pin"] {
+            listener.send_event(RioEvent::Title("program".into()), WindowId::from(0));
+            tabs.set_title(id, title.into()).unwrap();
+            assert_eq!(
+                tabs.active_tab().title,
+                if title.is_empty() { "program" } else { title }
+            );
+            assert_eq!((tabs.revision, tabs.active_tab().revision), layout_revision);
+            for topic in ["tabs.changed", "title.changed"] {
+                let event = events.try_recv().unwrap();
+                event_revision += 1;
+                assert_eq!(event.topic, topic);
+                assert_eq!(event.kind, "retitled");
+                assert_eq!(event.tab, id);
+                assert_eq!(event.revision, event_revision);
+            }
+            assert!(events.try_recv().is_err());
+        }
+        drop(tabs.shutdown());
+    }
+
     fn fixture() -> Option<TabSet> {
         if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
             eprintln!("SKIP tab PTY test: /opt/cosmix/bin/mix unavailable");

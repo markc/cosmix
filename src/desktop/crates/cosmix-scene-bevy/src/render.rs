@@ -264,17 +264,17 @@ pub fn reconcile(world: &mut World) {
             let edge = scene_edge(&entry.tree);
             // Production ingress reserved this exact name before replying.
             // Rendering never creates or steals a registry seat.
-            if let Some(owner) = &entry.owner {
+            if entry.owner.is_some() {
                 let valid = world
                     .get_resource::<cosmix_shell::runtime::SubPanelRegistryState>()
-                    .and_then(|registry| registry.0.seat(&page_id(&entry.tree)))
-                    .is_some_and(|seat| {
-                        seat.owner == owner.citizen
-                            && seat.accepted_at == owner.accepted_at
-                            && seat.edge == edge
-                            && world
-                                .get_resource::<cosmix_shell::runtime::ShellFrameState>()
-                                .is_some_and(|frame| seat.output == frame.0.geometry.output)
+                    .is_some_and(|registry| {
+                        world
+                            .get_resource::<cosmix_shell::runtime::ShellFrameState>()
+                            .is_some_and(|frame| {
+                                entry
+                                    .matching_seat(&registry.0, &frame.0.geometry.output)
+                                    .is_some()
+                            })
                     });
                 if !valid {
                     warn!(

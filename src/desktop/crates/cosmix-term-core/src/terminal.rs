@@ -85,8 +85,29 @@ pub struct Listener {
     writes: Arc<Mutex<Writes>>,
     stats: Stats,
     pub quit: Arc<AtomicBool>,
+    title: Arc<Mutex<String>>,
+    title_changed: Arc<OnceLock<Arc<tokio::sync::Notify>>>,
 }
 impl Listener {
+    pub(crate) fn title(&self) -> String {
+        self.title.lock().unwrap().clone()
+    }
+    pub(crate) fn watch_title(&self, notify: Arc<tokio::sync::Notify>) {
+        let _ = self.title_changed.set(notify);
+    }
+    fn set_title(&self, title: String) {
+        let title = sanitise_title(&title);
+        let mut current = self.title.lock().unwrap();
+        if *current == title {
+            return;
+        }
+        *current = title;
+        drop(current);
+        if let Some(notify) = self.title_changed.get() {
+            notify.notify_one();
+        }
+        self.wake();
+    }
     #[cfg(test)]
     pub(crate) fn block_control_writes(&self, block: bool) {
         self.writes.lock().unwrap().block_control = block;
@@ -229,6 +250,8 @@ impl Listener {
 impl EventListener for Listener {
     fn send_event(&self, event: RioEvent, _: WindowId) {
         match event {
+            RioEvent::Title(title) | RioEvent::TitleWithSubtitle(title, _) => self.set_title(title),
+            RioEvent::ResetTitle => self.set_title(String::new()),
             RioEvent::PtyWrite(_, text) => {
                 if let Err(e) = self.write(text.into_bytes(), None) {
                     eprintln!("PTY reply failed: {e}");
@@ -512,6 +535,21 @@ struct LaunchSettings<'a> {
     environment: Vec<(String, String)>,
 }
 
+pub(crate) fn validate_cwd(cwd: &str) -> Result<(), String> {
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err("invalid-argument: cwd must be an absolute existing directory".into());
+    }
+    let path = std::ffi::CString::new(cwd)
+        .map_err(|_| "invalid-argument: cwd contains NUL".to_string())?;
+    // SAFETY: path is NUL-terminated and alive for this effective-ID check.
+    if unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) } != 0
+    {
+        return Err("invalid-argument: cwd is not searchable by the current user".into());
+    }
+    Ok(())
+}
+
 fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<String, String> {
     term_cwd
         .filter(|dir| {
@@ -530,20 +568,94 @@ fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<St
         .ok_or_else(|| "HOME is required".into())
 }
 
+/// Titles are single-line labels, bounded in UTF-8 bytes at both ingest points.
+pub(crate) fn sanitise_title(title: &str) -> String {
+    let mut out = String::new();
+    for c in title
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        if out.len() + c.len_utf8() > 256 {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+// Reserve ample space for metadata, identity and transport headers below the
+// MCP 1 MiB and Bus 8 MiB limits. Budget JSON-escaped bytes too, even though
+// the native reply body is plain text.
+const SNAPSHOT_TEXT_BYTES: usize = 512 * 1024;
+
+pub(crate) struct TextSnapshot {
+    cols: usize,
+    rows: usize,
+    cursor: (usize, usize),
+    pid: i32,
+    summary: String,
+    contents: bool,
+    lines: Vec<Vec<char>>,
+    truncated: bool,
+}
+
+impl TextSnapshot {
+    pub(crate) fn render(self) -> String {
+        let mut out = format!(
+            "cols={} rows={} cursor={},{} child_pid={} truncated={} lines_returned={}\n{}\n",
+            self.cols,
+            self.rows,
+            self.cursor.0,
+            self.cursor.1,
+            self.pid,
+            self.truncated,
+            self.lines.len(),
+            self.summary
+        );
+        if self.contents {
+            out.push_str("--- screen ---\n");
+            for line in self.lines {
+                out.extend(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+}
+
 impl Terminal {
     pub fn start_session(
         settings: crate::config::Settings,
         native: Option<&crate::native_session::NativeSession>,
         pane_id: u64,
     ) -> Result<Self, String> {
+        Self::start_session_in(settings, native, pane_id, None)
+    }
+
+    pub(crate) fn start_session_in(
+        settings: crate::config::Settings,
+        native: Option<&crate::native_session::NativeSession>,
+        pane_id: u64,
+        cwd: Option<String>,
+    ) -> Result<Self, String> {
+        if let Some(cwd) = &cwd {
+            validate_cwd(cwd)?;
+        }
+        let explicit_cwd = cwd.is_some();
         Self::start_session_with_launch(
             settings,
             native,
             pane_id,
             LaunchSettings {
                 program: MIX_BIN,
-                home: std::env::var("HOME").ok(),
-                cwd: std::env::var("TERM_CWD").ok(),
+                // Explicit cwd must never silently fall back to HOME, even
+                // when a directory disappears between validation and chdir.
+                home: if explicit_cwd {
+                    None
+                } else {
+                    std::env::var("HOME").ok()
+                },
+                cwd: cwd.or_else(|| std::env::var("TERM_CWD").ok()),
                 environment: Vec::new(),
             },
         )
@@ -601,6 +713,8 @@ impl Terminal {
             writes: Arc::new(Mutex::new(Writes::default())),
             stats: stats.clone(),
             quit: Arc::new(AtomicBool::new(false)),
+            title: Arc::new(Mutex::new(String::new())),
+            title_changed: Arc::new(OnceLock::new()),
         };
         let grid = Arc::new(FairMutex::new(Crosswords::new(
             CrosswordsSize::new(80, 24),
@@ -845,23 +959,71 @@ impl Terminal {
         }
     }
     pub fn snapshot(&self) -> String {
-        let s = self.screen(false);
-        let mut out = format!(
-            "cols={} rows={} cursor={},{} child_pid={}\n{}\n--- screen ---\n",
-            s.cols,
-            s.rows,
-            s.cursor.0,
-            s.cursor.1,
-            self.pid,
-            self.stats.lock().unwrap().summary()
-        );
-        for row in s.cells.chunks(s.cols) {
-            for cell in row {
-                out.push(cell.c);
+        self.snapshot_with(true, 0)
+    }
+    pub fn snapshot_with(&self, contents: bool, scrollback_lines: usize) -> String {
+        self.capture_snapshot(contents, scrollback_lines).render()
+    }
+    pub(crate) fn capture_snapshot(&self, contents: bool, scrollback_lines: usize) -> TextSnapshot {
+        use rio_vt::crosswords::{grid::Dimensions, pos::Line};
+        // One grid lock makes history and viewport a coherent capture, without
+        // moving the scroll offset or consuming the renderer's damage.
+        let term = self.grid.lock();
+        let cols = term.columns();
+        let rows = term.screen_lines();
+        let cursor = term.grid.cursor.pos;
+        let offset = term.display_offset();
+        let history = scrollback_lines
+            .min(10000)
+            .min(term.grid.history_size().saturating_sub(offset));
+        let mut lines = Vec::new();
+        let mut bytes = 0;
+        let mut truncated = false;
+        let count = if contents { rows + history } else { 0 };
+        // Spend the budget on the newest rows first, preserving the viewport
+        // before recent history. Restore oldest-first output after capture.
+        for y in (-(offset as i32) - history as i32..rows as i32 - offset as i32)
+            .rev()
+            .take(count)
+        {
+            let row = &term.grid[Line(y)];
+            let mut line = Vec::new();
+            let mut line_bytes = 2; // JSON-escaped newline.
+            for x in 0..cols {
+                // Rio stores untouched cells as NUL; text snapshots use spaces
+                // so blank cells preserve columns without leaking that sentinel.
+                let c = row[Column(x)].c();
+                let c = if c == '\0' { ' ' } else { c };
+                line_bytes += match c {
+                    '\\' | '"' => 2,
+                    '\u{0000}'..='\u{001f}' => 6,
+                    _ => c.len_utf8(),
+                };
+                if bytes + line_bytes > SNAPSHOT_TEXT_BYTES {
+                    truncated = true;
+                    break;
+                }
+                line.push(c);
             }
-            out.push('\n');
+            if truncated || bytes + line_bytes > SNAPSHOT_TEXT_BYTES {
+                truncated = true;
+                break;
+            }
+            bytes += line_bytes;
+            lines.push(line);
         }
-        out
+        drop(term);
+        lines.reverse();
+        TextSnapshot {
+            cols,
+            rows,
+            cursor: (cursor.col.0, cursor.row.0.max(0) as usize),
+            pid: self.pid,
+            summary: self.stats.lock().unwrap().summary(),
+            contents,
+            lines,
+            truncated,
+        }
     }
     pub fn resize(&self, cols: u16, rows: u16, width: u16, height: u16) {
         self.grid
@@ -943,6 +1105,34 @@ mod tests {
     use rio_vt::crosswords::{Mode, grid::Scroll};
     use std::os::{fd::AsRawFd, unix::net::UnixStream};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn explicit_cwd_refuses_a_directory_without_search_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root can search a mode-000 directory; exercise the effective-user
+        // refusal only where the permission restriction actually applies.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "term-c6-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = validate_cwd(path.to_str().unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .starts_with("invalid-argument: cwd is not searchable")
+        );
+    }
 
     #[test]
     fn launch_directory_selects_valid_cwd_or_home() {
@@ -1039,6 +1229,8 @@ mod tests {
             writes: Arc::new(Mutex::new(Writes::default())),
             stats: Arc::new(Mutex::new(Metrics::default())),
             quit: Arc::new(AtomicBool::new(false)),
+            title: Arc::new(Mutex::new(String::new())),
+            title_changed: Arc::new(OnceLock::new()),
         };
         let grid = Arc::new(FairMutex::new(Crosswords::new(
             CrosswordsSize::new(80, 24),
@@ -1122,6 +1314,8 @@ mod tests {
                 writes: Arc::new(Mutex::new(Writes::default())),
                 stats: stats.clone(),
                 quit: Arc::new(AtomicBool::new(false)),
+                title: Arc::new(Mutex::new(String::new())),
+                title_changed: Arc::new(OnceLock::new()),
             };
             let grid = Arc::new(FairMutex::new(Crosswords::new(
                 CrosswordsSize::new(80, 24),
@@ -1287,6 +1481,142 @@ mod tests {
         assert!(all(&f.settled_snapshot().dirty_rows), "scroll-back");
         // Still scrolled back: repainted whole, and still no self-wake.
         assert!(all(&f.quiet_snapshot().dirty_rows), "scrolled view");
+    }
+
+    #[test]
+    fn snapshot_blank_cells_are_spaces_and_preserve_columns() {
+        let mut f = GridFixture::new();
+        f.feed(b"A\x1b[3CB", |t| cell(t, 0, 4) == 'B');
+        let snapshot = f.terminal.snapshot();
+        let text = snapshot.split_once("--- screen ---\n").unwrap().1;
+        let rows = text.lines().collect::<Vec<_>>();
+        assert!(!text.contains('\0'));
+        assert_eq!(rows.len(), 24);
+        assert!(rows.iter().all(|row| row.chars().count() == 80));
+        assert_eq!(rows[0], format!("A   B{}", " ".repeat(75)));
+        assert!(rows[1..].iter().all(|row| *row == " ".repeat(80)));
+    }
+
+    #[test]
+    fn snapshot_byte_budget_bounds_wide_unicode_history_and_releases_grid() {
+        let mut f = GridFixture::new();
+        f.terminal.resize(3000, 24, 0, 0);
+        let mut expected: Vec<String> = (0..120)
+            .map(|n| format!("{n:04}{}", "𝐀".repeat(2996)))
+            .collect();
+        let mut input = format!("{}\r\n", expected.join("\r\n")).into_bytes();
+        input.push(b'Z');
+        expected.push(format!("Z{}", " ".repeat(2999)));
+        f.feed(&input, |t| cell(t, 23, 0) == 'Z');
+        let snapshot = f.terminal.capture_snapshot(true, 10000);
+        assert!(snapshot.truncated);
+        let returned = snapshot.lines.len();
+        assert!(returned > 24 && returned < 121);
+        let retained: Vec<String> = snapshot
+            .lines
+            .iter()
+            .map(|row| row.iter().collect())
+            .collect();
+        assert_eq!(retained, expected[expected.len() - returned..]);
+        let encoded_bytes: usize = retained
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap().len())
+            .sum(); // JSON quotes cost the same two bytes as an escaped newline.
+        let omitted = &expected[expected.len() - returned - 1];
+        assert!(encoded_bytes <= SNAPSHOT_TEXT_BYTES);
+        assert!(
+            encoded_bytes + serde_json::to_string(omitted).unwrap().len() > SNAPSHOT_TEXT_BYTES
+        );
+        // Rendering owns only the captured data; it needs none of these locks.
+        let _grid = f.terminal.grid.lock();
+        let _stats = f.terminal.stats.lock().unwrap();
+        let reply = snapshot.render();
+        let text = reply.split_once("--- screen ---\n").unwrap().1;
+        assert_eq!(text.lines().count(), returned);
+        assert!(text.lines().all(|line| line.chars().count() == 3000));
+        assert!(reply.contains(&format!("truncated=true lines_returned={returned}")));
+        assert!(serde_json::to_string(&reply).unwrap().len() < 1024 * 1024);
+        assert!(reply.len() < SNAPSHOT_TEXT_BYTES + 4096);
+    }
+
+    #[test]
+    fn titles_strip_controls_and_cap_utf8_at_ingest() {
+        assert_eq!(sanitise_title("a\n\r\t\x1b\u{0085}\u{2028}\u{2029}b"), "ab");
+        assert_eq!(sanitise_title(&"𝐀".repeat(100)), "𝐀".repeat(64));
+        let f = GridFixture::new();
+        f.terminal.listener.send_event(
+            RioEvent::Title(format!("bad\n{}", "𝐀".repeat(100))),
+            WindowId::from(0),
+        );
+        let title = f.terminal.listener.title();
+        assert!(!title.contains('\n'));
+        assert!(title.len() <= 256);
+    }
+
+    #[test]
+    fn snapshot_history_caps_at_available_lines_and_preserves_viewport() {
+        use rio_vt::crosswords::grid::Dimensions;
+        let mut f = GridFixture::new();
+        let mut bytes = Vec::new();
+        for n in 0..40 {
+            bytes.extend_from_slice(format!("line{n:02}\r\n").as_bytes());
+        }
+        bytes.push(b'Z');
+        f.feed(&bytes, |t| cell(t, 23, 0) == 'Z');
+        f.settled_snapshot();
+        let lines = |n| {
+            f.terminal
+                .snapshot_with(true, n)
+                .split_once("--- screen ---\n")
+                .unwrap()
+                .1
+                .lines()
+                .map(str::trim_end)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let history = f.terminal.grid.lock().grid.history_size();
+        assert_eq!(history, 17);
+        assert_eq!(lines(0).len(), 24);
+        assert_eq!(lines(3).len(), 27);
+        assert_eq!(lines(10000).len(), 41);
+        assert_eq!(lines(10000)[0], "line00");
+        assert_eq!(lines(10000)[40], "Z");
+        assert!(
+            !f.terminal
+                .snapshot_with(false, 10000)
+                .contains("--- screen ---")
+        );
+        f.quiet_snapshot();
+        f.terminal.grid.lock().scroll_display(Scroll::Delta(5));
+        f.settled_snapshot();
+        assert_eq!(lines(10000).len(), 36);
+        assert_eq!(lines(10000)[0], "line00");
+        assert_eq!(lines(0)[0], "line12");
+        assert_eq!(f.terminal.grid.lock().display_offset(), 5);
+        f.quiet_snapshot();
+    }
+
+    #[test]
+    fn osc_titles_wake_without_taking_the_tab_set_lock() {
+        let mut f = GridFixture::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        f.terminal.listener.watch_title(notify.clone());
+        f.feed(b"\x1b]2;program title\x07X", |t| cell(t, 0, 0) == 'X');
+        assert_eq!(f.terminal.listener.title(), "program title");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), notify.notified())
+                .await
+                .unwrap();
+        });
+        f.terminal
+            .listener
+            .send_event(RioEvent::ResetTitle, WindowId::from(0));
+        assert_eq!(f.terminal.listener.title(), "");
     }
 
     #[test]
