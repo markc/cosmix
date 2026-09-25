@@ -85,6 +85,9 @@ pub struct EditorView {
     pub remote_carets: bool,
     /// The window has focus and no chrome field holds the keyboard.
     pub focused: bool,
+    /// Find highlight-all: view byte ranges, ascending (≤ 1000; the
+    /// controller's `find_matches`). Drawn as a tint under the selection.
+    pub matches: Vec<std::ops::Range<usize>>,
 }
 
 impl Default for EditorView {
@@ -98,6 +101,7 @@ impl Default for EditorView {
             line_numbers: true,
             remote_carets: true,
             focused: true,
+            matches: Vec::new(),
         }
     }
 }
