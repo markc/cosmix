@@ -195,7 +195,8 @@ where
             return;
         }
         if let Event::InputMethod(event) = event
-            && self.ime.is_enabled()
+            && (self.ime.is_enabled()
+                || matches!(event, iced::advanced::input_method::Event::Closed))
             && let Some(callback) = &self.on_ime
         {
             shell.publish(callback(event));

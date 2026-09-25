@@ -38,15 +38,32 @@ pub(crate) struct ClusterInterner {
     ids: HashMap<Arc<str>, u32>,
     bytes: usize,
     saturated: bool,
+    // Nonzero only for a retry: at most one cluster per visible cell.
+    capture_capacity: usize,
 }
 
 impl ClusterInterner {
     /// Only between captures: no ID already written into this frame is reused.
     /// Old Screens keep their own table alive, and PaintState keeps identity.
     pub(crate) fn begin_capture(&mut self) {
-        if self.saturated {
+        if self.saturated
+            || self.capture_capacity != 0
+            || self.ids.len() >= MAX_ENTRIES * 3 / 4
+            || self.bytes >= MAX_BYTES * 3 / 4
+        {
             *self = Self::default();
         }
+    }
+
+    pub(crate) fn saturated(&self) -> bool {
+        self.saturated
+    }
+
+    pub(crate) fn restart_capture(&mut self, cells: usize) {
+        *self = Self {
+            capture_capacity: cells,
+            ..Self::default()
+        };
     }
 
     pub(crate) fn intern(&mut self, text: &str) -> u32 {
@@ -56,7 +73,9 @@ impl ClusterInterner {
         if let Some(id) = self.ids.get(text) {
             return *id;
         }
-        if self.ids.len() >= MAX_ENTRIES || self.bytes + text.len() > MAX_BYTES {
+        let entries = MAX_ENTRIES.max(self.capture_capacity);
+        let bytes = MAX_BYTES.max(self.capture_capacity.saturating_mul(MAX_CLUSTER_BYTES));
+        if self.ids.len() >= entries || self.bytes + text.len() > bytes {
             self.saturated = true;
             return MISSING_CLUSTER;
         }
@@ -73,6 +92,26 @@ impl ClusterInterner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_water_marks_reset_before_saturation() {
+        for large in [false, true] {
+            let mut interner = ClusterInterner::default();
+            let old = interner.snapshot.clone();
+            for i in 0..if large { 800 } else { MAX_ENTRIES * 3 / 4 } {
+                let text = if large {
+                    format!("{i:04}{}", "x".repeat(996))
+                } else {
+                    format!("e{i}")
+                };
+                assert_ne!(interner.intern(&text), MISSING_CLUSTER);
+            }
+            assert!(!interner.saturated());
+            interner.begin_capture();
+            assert!(!Arc::ptr_eq(&old.identity, &interner.snapshot.identity));
+            assert_eq!(interner.intern("fresh"), 1);
+        }
+    }
 
     #[test]
     fn retained_frames_survive_append_and_bounded_rebuild() {

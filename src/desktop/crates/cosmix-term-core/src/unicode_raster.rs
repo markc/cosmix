@@ -1,5 +1,8 @@
 //! Shaping and colour glyphs, deliberately separate from the ASCII mask loop.
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use swash::{
     CacheKey, FontRef,
     scale::{Render, ScaleContext, Source, StrikeWith, image::Content},
@@ -39,6 +42,11 @@ impl Face {
 
 pub(super) struct Fonts {
     pub(super) primary: Face,
+    fallbacks: OnceLock<Arc<Fallbacks>>,
+}
+
+#[derive(Default)]
+struct Fallbacks {
     emoji: Option<Face>,
     symbols: Option<Face>,
 }
@@ -51,28 +59,40 @@ pub(super) const EMOJI_PATHS: &[&str] = &[
 
 impl Fonts {
     pub(super) fn discover(primary: Arc<[u8]>) -> Option<Arc<Self>> {
+        Some(Arc::new(Self {
+            primary: Face::new(primary)?,
+            fallbacks: OnceLock::new(),
+        }))
+    }
+
+    fn fallbacks(&self) -> &Fallbacks {
+        static SHARED: OnceLock<Arc<Fallbacks>> = OnceLock::new();
         fn optional(paths: &[&str]) -> Option<Face> {
             paths
                 .iter()
                 .find_map(|path| Face::new(std::fs::read(path).ok()?.into()))
         }
-        Some(Arc::new(Self {
-            primary: Face::new(primary)?,
-            emoji: optional(EMOJI_PATHS),
-            symbols: optional(&[
-                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-                "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-                "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
-            ]),
-        }))
+        self.fallbacks.get_or_init(|| {
+            SHARED
+                .get_or_init(|| {
+                    Arc::new(Fallbacks {
+                        emoji: optional(EMOJI_PATHS),
+                        symbols: optional(&[
+                            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+                            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+                            "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+                        ]),
+                    })
+                })
+                .clone()
+        })
     }
 
     #[cfg(test)]
     pub(super) fn without_fallbacks(primary: Arc<[u8]>) -> Arc<Self> {
         Arc::new(Self {
             primary: Face::new(primary).unwrap(),
-            emoji: None,
-            symbols: None,
+            fallbacks: OnceLock::from(Arc::new(Fallbacks::default())),
         })
     }
 }
@@ -112,7 +132,7 @@ pub(super) struct ClusterImage {
 }
 
 #[derive(Default)]
-struct Variants([Option<ClusterImage>; 4]);
+struct Variants([Option<ClusterImage>; 2]);
 
 pub(super) struct UnicodeRaster {
     pub(super) fonts: Arc<Fonts>,
@@ -139,11 +159,24 @@ impl UnicodeRaster {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// One borrowed lookup on the warm paint path, with no key allocation.
+    pub(super) fn get(
+        &self,
+        text: &str,
+        span: usize,
+        px: f32,
+        cell: (u32, u32),
+        baseline: i32,
+    ) -> Option<&ClusterImage> {
+        if self.geometry != Some((px.to_bits(), cell.0, cell.1, baseline)) {
+            return None;
+        }
+        self.cache.get(text)?.0[usize::from(span == 2)].as_ref()
+    }
+
     pub(super) fn image(
         &mut self,
         text: &str,
-        bold: bool,
         span: usize,
         px: f32,
         cell: (u32, u32),
@@ -155,7 +188,7 @@ impl UnicodeRaster {
             self.bytes = 0;
             self.geometry = Some(geometry);
         }
-        let variant = usize::from(bold) * 2 + usize::from(span == 2);
+        let variant = usize::from(span == 2);
         if self.cache.get(text).is_none_or(|v| v.0[variant].is_none()) {
             #[cfg(test)]
             {
@@ -167,8 +200,8 @@ impl UnicodeRaster {
             debug_assert!(image.font.is_none_or(|key| {
                 [
                     Some(&self.fonts.primary),
-                    self.fonts.emoji.as_ref(),
-                    self.fonts.symbols.as_ref(),
+                    self.fonts.fallbacks().emoji.as_ref(),
+                    self.fonts.fallbacks().symbols.as_ref(),
                 ]
                 .into_iter()
                 .flatten()
@@ -204,17 +237,20 @@ impl UnicodeRaster {
         let emoji = !text.contains('\u{fe0e}')
             && (text.contains('\u{fe0f}') || (span == 2 && text.chars().any(|c| c.is_emoji())));
         let primary = Some(&self.fonts.primary);
+        // Only a non-ASCII cache miss reaches this path in production.
+        // All rasters share these immutable bytes and stable font identities.
+        let fallbacks = self.fonts.fallbacks();
         let faces = if emoji {
             [
-                self.fonts.emoji.as_ref(),
+                fallbacks.emoji.as_ref(),
                 primary,
-                self.fonts.symbols.as_ref(),
+                fallbacks.symbols.as_ref(),
             ]
         } else {
             [
                 primary,
-                self.fonts.emoji.as_ref(),
-                self.fonts.symbols.as_ref(),
+                fallbacks.emoji.as_ref(),
+                fallbacks.symbols.as_ref(),
             ]
         };
         for face in faces.into_iter().flatten() {
@@ -537,8 +573,8 @@ fn fit(layers: &mut [Layer], width: u32, height: u32) -> bool {
     true
 }
 
-/// Bilinear sampling in premultiplied space; mask and colour channels follow
-/// the same weights, so transparent RGB cannot create a coloured fringe.
+/// Area sampling for reductions, bilinear for enlargement. Both operate in
+/// premultiplied space, so transparent RGB cannot create a coloured fringe.
 fn resize_pixels(layer: &mut Layer, width: u32, height: u32) {
     if width == layer.width && height == layer.height {
         return;
@@ -551,27 +587,57 @@ fn resize_pixels(layer: &mut Layer, width: u32, height: u32) {
         return;
     }
     let mut out = vec![0; width as usize * height as usize * channels];
-    for y in 0..height {
-        let sy = ((y as f32 + 0.5) * layer.height as f32 / height as f32 - 0.5)
-            .clamp(0.0, (layer.height - 1) as f32);
-        for x in 0..width {
-            let sx = ((x as f32 + 0.5) * layer.width as f32 / width as f32 - 0.5)
-                .clamp(0.0, (layer.width - 1) as f32);
-            let (x0, y0) = (sx as u32, sy as u32);
-            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-            let sample = |x: u32, y: u32, c: usize| {
-                f32::from(
-                    data[(y.min(layer.height - 1) as usize * layer.width as usize
-                        + x.min(layer.width - 1) as usize)
-                        * channels
-                        + c],
-                )
-            };
-            for c in 0..channels {
-                let a = sample(x0, y0, c) * (1.0 - fx) + sample(x0 + 1, y0, c) * fx;
-                let b = sample(x0, y0 + 1, c) * (1.0 - fx) + sample(x0 + 1, y0 + 1, c) * fx;
-                out[(y as usize * width as usize + x as usize) * channels + c] =
-                    (a * (1.0 - fy) + b * fy).round() as u8;
+    if width < layer.width || height < layer.height {
+        // Integrate every covered source pixel, including fractional edge
+        // coverage. A 2x2 sample aliases badly when reducing a bitmap strike.
+        let scale_x = f64::from(layer.width) / f64::from(width);
+        let scale_y = f64::from(layer.height) / f64::from(height);
+        for y in 0..height {
+            let top = f64::from(y) * scale_y;
+            let bottom = f64::from(y + 1) * scale_y;
+            for x in 0..width {
+                let left = f64::from(x) * scale_x;
+                let right = f64::from(x + 1) * scale_x;
+                let mut sum = [0.0; 4];
+                for sy in top.floor() as u32..(bottom.ceil() as u32).min(layer.height) {
+                    let wy = bottom.min(f64::from(sy + 1)) - top.max(f64::from(sy));
+                    for sx in left.floor() as u32..(right.ceil() as u32).min(layer.width) {
+                        let wx = right.min(f64::from(sx + 1)) - left.max(f64::from(sx));
+                        let at = (sy as usize * layer.width as usize + sx as usize) * channels;
+                        for c in 0..channels {
+                            sum[c] += f64::from(data[at + c]) * wx * wy;
+                        }
+                    }
+                }
+                let at = (y as usize * width as usize + x as usize) * channels;
+                for c in 0..channels {
+                    out[at + c] = (sum[c] / (scale_x * scale_y)).round() as u8;
+                }
+            }
+        }
+    } else {
+        for y in 0..height {
+            let sy = ((y as f32 + 0.5) * layer.height as f32 / height as f32 - 0.5)
+                .clamp(0.0, (layer.height - 1) as f32);
+            for x in 0..width {
+                let sx = ((x as f32 + 0.5) * layer.width as f32 / width as f32 - 0.5)
+                    .clamp(0.0, (layer.width - 1) as f32);
+                let (x0, y0) = (sx as u32, sy as u32);
+                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+                let sample = |x: u32, y: u32, c: usize| {
+                    f32::from(
+                        data[(y.min(layer.height - 1) as usize * layer.width as usize
+                            + x.min(layer.width - 1) as usize)
+                            * channels
+                            + c],
+                    )
+                };
+                for c in 0..channels {
+                    let a = sample(x0, y0, c) * (1.0 - fx) + sample(x0 + 1, y0, c) * fx;
+                    let b = sample(x0, y0 + 1, c) * (1.0 - fx) + sample(x0 + 1, y0 + 1, c) * fx;
+                    out[(y as usize * width as usize + x as usize) * channels + c] =
+                        (a * (1.0 - fy) + b * fy).round() as u8;
+                }
             }
         }
     }
@@ -613,6 +679,65 @@ fn tofu(width: u32, height: u32) -> ClusterImage {
 mod tests {
     use super::*;
     use crate::raster::{PixelFormat, paint_cluster};
+
+    #[test]
+    fn area_downscale_preserves_fixture_average_and_premultiplication() {
+        // Thin coloured stripes alias under centre/2x2 sampling. Include
+        // transparency and use a nonintegral ratio to exercise edge weights.
+        let source: Vec<u8> = (0..31 * 23)
+            .flat_map(|i| match i % 7 {
+                0 => [240, 0, 0, 255],
+                1 => [0, 100, 0, 128],
+                2 => [0, 0, 60, 64],
+                _ => [0, 0, 0, 0],
+            })
+            .collect();
+        for (width, height) in [(3, 2), (1, 1), (7, 5)] {
+            let mut layer = Layer {
+                x: 0,
+                y: 0,
+                width: 31,
+                height: 23,
+                pixels: Pixels::Color(source.clone()),
+                scale: 1.0,
+            };
+            resize_pixels(&mut layer, width, height);
+            let Pixels::Color(result) = layer.pixels else {
+                unreachable!()
+            };
+            for c in 0..4 {
+                let mean = |pixels: &[u8]| {
+                    pixels.chunks_exact(4).map(|p| f64::from(p[c])).sum::<f64>()
+                        / (pixels.len() / 4) as f64
+                };
+                assert!((mean(&source) - mean(&result)).abs() <= 0.51, "channel {c}");
+            }
+            assert!(
+                result
+                    .chunks_exact(4)
+                    .all(|p| p[..3].iter().all(|c| *c <= p[3]))
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_fonts_are_lazy_and_shared_between_rasters() {
+        let mut first = crate::raster::tests::raster_with(crate::config::Cursor::Block);
+        let mut second = crate::raster::tests::raster_with(crate::config::Cursor::Block);
+        assert!(first.unicode.fonts.fallbacks.get().is_none());
+        assert!(second.unicode.fonts.fallbacks.get().is_none());
+        first.render(&crate::raster::tests::screen(8, 2, 'M'));
+        assert!(
+            first.unicode.fonts.fallbacks.get().is_none(),
+            "ASCII must not load fallbacks"
+        );
+        first.render(&crate::raster::tests::screen(8, 2, 'é'));
+        second.render(&crate::raster::tests::screen(8, 2, 'é'));
+        assert!(Arc::ptr_eq(
+            first.unicode.fonts.fallbacks.get().unwrap(),
+            second.unicode.fonts.fallbacks.get().unwrap(),
+        ));
+    }
 
     #[test]
     fn straight_png_is_premultiplied_once_before_resampling() {
@@ -698,7 +823,6 @@ mod tests {
         );
         let image = resized.unicode.image(
             "e\u{301}",
-            false,
             1,
             resized.px,
             (resized.width, resized.height),
@@ -708,7 +832,6 @@ mod tests {
         let misses = resized.unicode.misses;
         resized.unicode.image(
             "e\u{301}",
-            false,
             1,
             resized.px,
             (resized.width, resized.height),

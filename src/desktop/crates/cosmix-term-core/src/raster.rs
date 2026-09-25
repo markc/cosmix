@@ -842,14 +842,22 @@ impl Raster {
                         screen.clusters.get(cell.extra).unwrap_or("")
                     };
                     let span = cell_span(cells, col);
-                    let image = self.unicode.image(
+                    let image = match self.unicode.get(
                         text,
-                        cell.bold,
                         span,
                         self.px,
                         (self.width, self.height),
                         self.baseline,
-                    );
+                    ) {
+                        Some(image) => image,
+                        None => self.unicode.image(
+                            text,
+                            span,
+                            self.px,
+                            (self.width, self.height),
+                            self.baseline,
+                        ),
+                    };
                     paint_cluster(
                         image,
                         rgba,
@@ -1146,6 +1154,10 @@ fn paint_cluster(
                 Pixels::Mask(mask) => {
                     for (&a, pixel) in mask[source..source + count].iter().zip(pixels) {
                         if a == 0 {
+                            continue;
+                        }
+                        if a == 255 {
+                            *pixel = [fg[0] as u8, fg[1] as u8, fg[2] as u8, 255];
                             continue;
                         }
                         let a = u32::from(a);

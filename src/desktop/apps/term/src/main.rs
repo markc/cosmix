@@ -18,6 +18,7 @@
 
 mod clipboard;
 mod frame;
+mod ime;
 mod input;
 mod keys;
 mod layout;
@@ -201,6 +202,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
         paste_notice: None,
         last_redraw: None,
         ime_preedit: None,
+        ime: ime::Composition::default(),
         keyboard_focus: true,
         force_paint: false,
         paint_requested: true,
@@ -338,6 +340,7 @@ struct State {
     paste_notice: Option<String>,
     last_redraw: Option<std::time::Instant>,
     ime_preedit: Option<iced::advanced::input_method::Preedit>,
+    ime: ime::Composition,
     keyboard_focus: bool,
     force_paint: bool,
     paint_requested: bool,
@@ -473,6 +476,13 @@ fn waker_spawn_failed(error: &std::io::Error) {
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
+    state.sync_ime();
+    let task = update_message(state, message);
+    state.sync_ime();
+    task
+}
+
+fn update_message(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Paint(at) => {
             if state.last_redraw != Some(at) {
@@ -488,12 +498,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Scale(scale) => state.rescale(scale),
         Message::Keys(keys) => state.send_keys(keys),
         Message::Ime(event) => {
+            use iced::advanced::input_method::{Event, Preedit};
+            // Closed acknowledges the disable even after window focus loss.
+            if matches!(event, Event::Closed) {
+                state.ime.closed();
+                state.ime_preedit = None;
+                return Task::none();
+            }
             if !state.keyboard_focus {
                 return Task::none();
             }
-            use iced::advanced::input_method::{Event, Preedit};
             match event {
                 Event::Preedit(content, selection) => {
+                    let tabs = state.tabs.lock().expect("tabs");
+                    let active = (!tabs.is_empty()).then(|| tabs.active_tab().active_pane);
+                    if !state.ime.preedit(active) {
+                        state.ime_preedit = None;
+                        return Task::none();
+                    }
                     state.ime_preedit = Some(Preedit {
                         content,
                         selection,
@@ -502,10 +524,24 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 Event::Commit(text) => {
                     state.ime_preedit = None;
-                    state.send_keys(input::text_keys(&text));
+                    // Resolve and validate the target under the same lock;
+                    // a Bus focus mutation cannot race the owner check.
+                    let tabs = state.tabs.lock().expect("tabs");
+                    let active = (!tabs.is_empty()).then(|| tabs.active_tab().active_pane);
+                    if state.ime.commit(active) {
+                        tabs.user_activity();
+                        let terminal = tabs.active_terminal();
+                        if let Err(error) = terminal
+                            .lock()
+                            .expect("terminal")
+                            .keys(&input::text_keys(&text), Instant::now())
+                        {
+                            eprintln!("term input: {error}");
+                        }
+                    }
                 }
-                Event::Closed => state.ime_preedit = None,
-                Event::Opened => {}
+                Event::Closed => unreachable!(),
+                Event::Opened => state.ime.opened(),
             }
         }
         Message::Action(action) => return state.act(action),
@@ -561,6 +597,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // into a zoom.
             iced::window::Event::Unfocused => {
                 state.keyboard_focus = false;
+                state.ime.cancel();
                 state.ime_preedit = None;
                 state.cancel_mouse_gesture();
                 state.modifiers = iced::keyboard::Modifiers::empty();
@@ -686,12 +723,14 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_mouse(move |event, position| mouse.message(state, event, position))
     .input_method(
         match ime_cursor {
-            Some(cursor) if state.keyboard_focus => iced::advanced::input_method::InputMethod::Enabled {
-                // Runtime composition overlay; only Commit goes to the PTY.
-                cursor,
-                purpose: iced::advanced::input_method::Purpose::Terminal,
-                preedit: state.ime_preedit.clone(),
-            },
+            Some(cursor) if state.keyboard_focus && state.ime.enabled() => {
+                iced::advanced::input_method::InputMethod::Enabled {
+                    // Runtime composition overlay; only Commit goes to the PTY.
+                    cursor,
+                    purpose: iced::advanced::input_method::Purpose::Terminal,
+                    preedit: state.ime_preedit.clone(),
+                }
+            }
             _ => iced::advanced::input_method::InputMethod::Disabled,
         },
         |event| Message::Ime(event.clone()),
@@ -979,6 +1018,7 @@ impl State {
     /// that needs it. Painting waits for the widget's redraw event.
     fn sync(&mut self) -> Task<Message> {
         let (removed, notes) = self.tabs.lock().expect("tabs").reap_exited();
+        self.sync_ime();
         self.cancel_hidden_gesture();
         self.cleanup.submit(removed);
         if let Some(notify) = &self.notify {
@@ -1175,6 +1215,17 @@ impl State {
             );
             self.tabs.lock().expect("tabs").resized(id, cols, rows);
             self.grids.insert(id, (cols, rows));
+        }
+    }
+
+    fn sync_ime(&mut self) {
+        if !self.ime.has_owner() {
+            return;
+        }
+        let tabs = self.tabs.lock().expect("tabs");
+        let active = (!tabs.is_empty()).then(|| tabs.active_tab().active_pane);
+        if self.ime.focus(active) {
+            self.ime_preedit = None;
         }
     }
 
@@ -1485,6 +1536,7 @@ mod tests {
             paste_notice: None,
             last_redraw: None,
             ime_preedit: None,
+            ime: ime::Composition::default(),
             keyboard_focus: true,
             force_paint: false,
             paint_requested: true,
@@ -1522,6 +1574,80 @@ mod tests {
         state.cleanup.submit(removed);
         drop(state);
         reaper.join().unwrap();
+    }
+
+    #[test]
+    fn ime_focus_switch_and_owner_close_drop_queued_commit_before_wake() {
+        use cosmix_term_core::terminal::Terminal;
+        use iced::advanced::input_method::Event;
+        for change in ["pane", "tab", "close"] {
+            let (mut state, reaper) = test_state();
+            let _ = state.sync();
+            let (owner, original_tab, first, second, second_id) = {
+                let mut tabs = state.tabs.lock().unwrap();
+                let owner = tabs.active_tab().active_pane;
+                let original_tab = tabs.active_id();
+                let first = tabs.active_terminal();
+                let second_id = tabs.split_active(SplitDir::Vertical).unwrap();
+                let second = tabs.active_terminal();
+                tabs.focus(owner);
+                (owner, original_tab, first, second, second_id)
+            };
+            *first.lock().unwrap() = Terminal::from_test_vt(8, 3, b"");
+            *second.lock().unwrap() = Terminal::from_test_vt(8, 3, b"");
+            let read_first = first.lock().unwrap().listener.test_input_reader();
+            let _ = update(&mut state, Message::Ime(Event::Opened));
+            let _ = update(
+                &mut state,
+                Message::Ime(Event::Preedit("draft".into(), None)),
+            );
+            // Same mutation routes used by the Bus, without delivering Wake.
+            let target = {
+                let mut tabs = state.tabs.lock().unwrap();
+                match change {
+                    "pane" => {
+                        assert!(tabs.focus(second_id));
+                    }
+                    "tab" => {
+                        tabs.open().unwrap();
+                    }
+                    _ => {
+                        let removed = tabs.close_active().1.unwrap();
+                        state.cleanup.submit(vec![removed]);
+                    }
+                }
+                tabs.active_terminal()
+            };
+            if change == "tab" {
+                *target.lock().unwrap() = Terminal::from_test_vt(8, 3, b"");
+            }
+            let read_target = target.lock().unwrap().listener.test_input_reader();
+            let _ = update(&mut state, Message::Ime(Event::Commit("stale".into())));
+            assert_eq!(read_first(), None, "{change}");
+            assert_eq!(read_target(), None, "{change}");
+            assert!(state.ime_preedit.is_none());
+            assert!(!state.ime.enabled());
+            let _ = update(&mut state, Message::Ime(Event::Closed));
+            let _ = update(&mut state, Message::Ime(Event::Opened));
+            let _ = update(&mut state, Message::Ime(Event::Preedit("new".into(), None)));
+            let _ = update(&mut state, Message::Ime(Event::Commit("new".into())));
+            assert_eq!(read_target().as_deref(), Some(b"new".as_slice()));
+            // Explicit tab selection must clear preedit before its Wake too.
+            if change == "tab" {
+                let _ = update(
+                    &mut state,
+                    Message::Ime(Event::Preedit("again".into(), None)),
+                );
+                let _ = update(&mut state, Message::SelectTab(original_tab));
+                assert!(!state.ime.enabled());
+                assert!(state.ime_preedit.is_none());
+                assert_eq!(state.tabs.lock().unwrap().active_tab().active_pane, owner);
+            }
+            let removed = state.tabs.lock().unwrap().shutdown();
+            state.cleanup.submit(removed);
+            drop(state);
+            reaper.join().unwrap();
+        }
     }
 
     #[test]

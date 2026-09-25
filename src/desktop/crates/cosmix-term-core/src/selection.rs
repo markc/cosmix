@@ -119,19 +119,21 @@ fn selection_text(term: &Crosswords<Listener>) -> Option<String> {
             return term.bounds_to_string(start, end);
         }
         let next = Pos::new(end.row + 1i32, Column(0));
+        let mut text = term.bounds_to_string(start, next);
         // A selected LeadingSpacer-only row belongs to this cluster, not a
         // blank line. Avoid Rio's blank-soft-wrap newline in that case too.
-        if start.row == end.row
-            && (start.col.0..end.col.0).all(|x| {
-                let cell = term.grid[Pos::new(start.row, Column(x))];
-                !cell.has_extras() && matches!(cell.c(), '\0' | ' ')
-            })
+        let boundary_start = if start.row == end.row { start.col.0 } else { 0 };
+        // Rio deferred this blank row, then flushed it immediately before
+        // the next lead. Remove only that last, spurious newline; earlier
+        // blank rows and buffered spaces still belong to the selection.
+        if (boundary_start..end.col.0).all(|x| {
+            let cell = term.grid[Pos::new(end.row, Column(x))];
+            !cell.has_extras() && matches!(cell.c(), '\0' | ' ')
+        }) && let Some(at) = text.rfind('\n')
         {
-            let mut text = " ".repeat(end.col.0 - start.col.0);
-            text.extend(term.grid.cell_text(next));
-            return text;
+            text.remove(at);
         }
-        term.bounds_to_string(start, next)
+        text
     };
     if selection.ty == SelectionType::Block {
         if !(range.start.row.0..=range.end.row.0)
@@ -144,11 +146,15 @@ fn selection_text(term: &Crosswords<Listener>) -> Option<String> {
             let start = Pos::new(Line(y), range.start.col);
             let end = Pos::new(Line(y), range.end.col);
             let end = if continuation(end) {
-                if y == range.end.row.0 || range.start.col.0 != 0 {
+                let next_owns_lead = start.col.0 == 0
+                    || matches!(
+                        term.grid[Pos::new(start.row + 1i32, start.col)].wide(),
+                        Wide::Spacer
+                    );
+                if y == range.end.row.0 || !next_owns_lead {
                     end
                 } else {
-                    // A full-width block already includes that lead on its
-                    // next selected row. Do not extract it twice.
+                    // Rio widens a trailing spacer to its lead too.
                     Pos::new(end.row, end.col - 1)
                 }
             } else {
@@ -274,6 +280,57 @@ mod tests {
             term.scroll_view(super::super::ScrollRequest::Top);
             select(&term, (0, 0), (3, 0));
             assert_eq!(term.selection_text(), Some(format!("abc{text}")));
+        }
+    }
+
+    #[test]
+    fn block_starting_on_wrapped_trailing_spacer_copies_cluster_once() {
+        let term = Terminal::from_test_vt(4, 3, "abc👩‍💻!".as_bytes());
+        term.selection_start(1, 0, SelectionSide::Left, SelectionType::Block);
+        term.selection_update(3, 1, SelectionSide::Right);
+        assert_eq!(term.selection_text().as_deref(), Some("bc\n👩‍💻!"));
+    }
+
+    #[test]
+    fn capture_retries_more_than_4096_distinct_visible_clusters_without_tofu() {
+        let texts: Vec<_> = (0..5000)
+            .map(|i| {
+                // Four combining marks encode 16^4 distinct one-cell clusters.
+                let mut text = String::from("e");
+                for shift in [0, 4, 8, 12] {
+                    text.push(char::from_u32(0x300 + ((i >> shift) & 15)).unwrap());
+                }
+                text
+            })
+            .collect();
+        let term = Terminal::from_test_vt(100, 50, texts.concat().as_bytes());
+        let old = term.clusters.lock().unwrap().snapshot.clone();
+        let first = term.grid_snapshot().screen;
+        assert!(!std::sync::Arc::ptr_eq(
+            &old.identity,
+            &first.clusters.identity
+        ));
+        for screen in [&first, &term.screen(false)] {
+            for (cell, expected) in screen.cells.iter().zip(&texts) {
+                assert_eq!(screen.clusters.get(cell.extra), Some(expected.as_str()));
+            }
+        }
+        // An idle capture must remain correct and retained snapshots readable.
+        assert_eq!(
+            first.clusters.get(first.cells[4999].extra),
+            Some(texts[4999].as_str())
+        );
+    }
+
+    #[test]
+    fn blank_leading_spacer_repair_preserves_preceding_rows() {
+        for (input, end, expected) in [
+            ("a\r\n   👩‍💻", 1, "a\n   👩‍💻"),
+            ("a\r\n\r\n   👩‍💻", 2, "a\n\n   👩‍💻"),
+        ] {
+            let term = Terminal::from_test_vt(4, 5, input.as_bytes());
+            select(&term, (0, 0), (3, end));
+            assert_eq!(term.selection_text().as_deref(), Some(expected));
         }
     }
 
@@ -476,21 +533,23 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_wide_trailing_cell_highlights_the_copied_glyph() {
-        let term = Terminal::from_test_vt(8, 3, "a界b".as_bytes());
-        let base = term.grid_snapshot().screen;
-        select(&term, (2, 0), (2, 0));
-        assert_eq!(term.selection_finish().as_deref(), Some("界"));
-        let selected = term.grid_snapshot();
-        for (i, (before, after)) in base.cells.iter().zip(&selected.screen.cells).enumerate() {
-            let expected = if (1..=2).contains(&i) {
-                (before.bg, before.fg)
-            } else {
-                (before.fg, before.bg)
-            };
-            assert_eq!((after.fg, after.bg), expected, "cell {i}");
+    fn selecting_either_wide_half_highlights_both_cells() {
+        for col in [1, 2] {
+            let term = Terminal::from_test_vt(8, 3, "a界b".as_bytes());
+            let base = term.grid_snapshot().screen;
+            select(&term, (col, 0), (col, 0));
+            assert_eq!(term.selection_finish().as_deref(), Some("界"));
+            let selected = term.grid_snapshot();
+            for (i, (before, after)) in base.cells.iter().zip(&selected.screen.cells).enumerate() {
+                let expected = if (1..=2).contains(&i) {
+                    (before.bg, before.fg)
+                } else {
+                    (before.fg, before.bg)
+                };
+                assert_eq!((after.fg, after.bg), expected, "cell {i}");
+            }
+            assert_eq!(selected.dirty_rows, [true, false, false]);
         }
-        assert_eq!(selected.dirty_rows, [true, false, false]);
     }
 
     #[test]

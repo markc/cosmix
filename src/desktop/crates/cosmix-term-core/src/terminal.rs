@@ -1114,67 +1114,86 @@ impl Terminal {
         clusters.begin_capture();
         let offset = term.display_offset();
         let selection = term.selection.as_ref().and_then(|s| s.to_range(&term));
-        for y in 0..rows {
-            let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
-            for x in 0..cols {
-                let square = &row[Column(x)];
-                let style = term.grid.style_of(square);
-                let mut fg = colour(style.fg);
-                let mut bg = colour(style.bg);
-                let bold = style.flags.contains(StyleFlags::BOLD);
-                if bold {
-                    fg = fg.map(|v| v.saturating_add(40));
-                }
-                if style.flags.contains(StyleFlags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                if selection.is_some_and(|range| {
-                    let point = rio_vt::crosswords::pos::Pos::new(
-                        rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
-                        Column(x),
-                    );
-                    // Rio's contains_square membership, without its block
-                    // cursor exception (our painter owns cursor rendering).
-                    range.contains(point)
-                        || (matches!(square.wide(), rio_vt::crosswords::square::Wide::Wide)
-                            && range.contains(rio_vt::crosswords::pos::Pos::new(
-                                point.row,
-                                point.col + 1,
-                            )))
-                }) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                cells.push(Cell {
-                    c: square.c(),
-                    extra: if square
-                        .extras_id_checked()
-                        .and_then(|id| term.grid.extras_table.get(id))
-                        .is_some_and(|extras| !extras.zerowidth.is_empty())
-                    {
-                        let pos = rio_vt::crosswords::pos::Pos::new(
+        for attempt in 0..2 {
+            cells.clear();
+            for y in 0..rows {
+                let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
+                for x in 0..cols {
+                    let square = &row[Column(x)];
+                    let style = term.grid.style_of(square);
+                    let mut fg = colour(style.fg);
+                    let mut bg = colour(style.bg);
+                    let bold = style.flags.contains(StyleFlags::BOLD);
+                    if bold {
+                        fg = fg.map(|v| v.saturating_add(40));
+                    }
+                    if style.flags.contains(StyleFlags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    if selection.is_some_and(|range| {
+                        let point = rio_vt::crosswords::pos::Pos::new(
                             rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
                             Column(x),
                         );
-                        // Bound our temporary string even for pathological VT extras.
-                        let text: String = term
-                            .grid
-                            .cell_text(pos)
-                            .take(super::clusters::MAX_CLUSTER_BYTES + 1)
-                            .collect();
-                        clusters.intern(&text)
-                    } else {
-                        0
-                    },
-                    width: match square.wide() {
-                        rio_vt::crosswords::square::Wide::Narrow => CellWidth::Narrow,
-                        rio_vt::crosswords::square::Wide::Wide => CellWidth::Wide,
-                        rio_vt::crosswords::square::Wide::Spacer => CellWidth::Spacer,
-                        rio_vt::crosswords::square::Wide::LeadingSpacer => CellWidth::LeadingSpacer,
-                    },
-                    fg,
-                    bg,
-                    bold,
-                });
+                        // Rio's contains_square membership, without its block
+                        // cursor exception (our painter owns cursor rendering).
+                        range.contains(point)
+                            || (matches!(square.wide(), rio_vt::crosswords::square::Wide::Wide)
+                                && range.contains(rio_vt::crosswords::pos::Pos::new(
+                                    point.row,
+                                    point.col + 1,
+                                )))
+                            || (matches!(square.wide(), rio_vt::crosswords::square::Wide::Spacer)
+                                && x > 0
+                                && range.contains(rio_vt::crosswords::pos::Pos::new(
+                                    point.row,
+                                    point.col - 1,
+                                )))
+                    }) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    cells.push(Cell {
+                        c: square.c(),
+                        extra: if square
+                            .extras_id_checked()
+                            .and_then(|id| term.grid.extras_table.get(id))
+                            .is_some_and(|extras| !extras.zerowidth.is_empty())
+                        {
+                            let pos = rio_vt::crosswords::pos::Pos::new(
+                                rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
+                                Column(x),
+                            );
+                            // Bound our temporary string even for pathological VT extras.
+                            let text: String = term
+                                .grid
+                                .cell_text(pos)
+                                .take(super::clusters::MAX_CLUSTER_BYTES + 1)
+                                .collect();
+                            clusters.intern(&text)
+                        } else {
+                            0
+                        },
+                        width: match square.wide() {
+                            rio_vt::crosswords::square::Wide::Narrow => CellWidth::Narrow,
+                            rio_vt::crosswords::square::Wide::Wide => CellWidth::Wide,
+                            rio_vt::crosswords::square::Wide::Spacer => CellWidth::Spacer,
+                            rio_vt::crosswords::square::Wide::LeadingSpacer => {
+                                CellWidth::LeadingSpacer
+                            }
+                        },
+                        fg,
+                        bg,
+                        bold,
+                    });
+                }
+            }
+            if attempt == 0 && clusters.saturated() {
+                // No partially interned frame escapes. Keep the grid locked and
+                // redo once with room for every visible cell; new identity forces
+                // a full repaint even when Rio reports no row damage.
+                clusters.restart_capture(cols * rows);
+            } else {
+                break;
             }
         }
         let pos = term.grid.cursor.pos;

@@ -92,7 +92,6 @@ pub(super) fn paint_emoji_reference(
             };
             let image = backend.image(
                 text,
-                cell.bold,
                 span,
                 raster.px,
                 (raster.width, raster.height),
@@ -230,6 +229,68 @@ pub(super) fn transition(grid: &mut Screen, dirty: &mut [bool], value: u64, fram
 }
 
 #[test]
+fn noto_french_flag_golden_regions_and_two_cell_clip() {
+    // Independent golden: the installed Noto French flag is blue/white/red,
+    // read left-to-right. Independently rasterised with ImageMagick/Pango's
+    // font_desc="Noto Color Emoji 109", its quarter/centre/three-quarter samples are (0,40,153),
+    // (255,255,255), (235,36,51). No UnicodeRaster::image/reference oracle.
+    // Allow strike shading/resampling, but reject tofu, swapped channels,
+    // monochrome masks, wrong placement, or painting outside the VT box.
+    let mut raster = raster_with(Cursor::Block).resized(2.0, 13.0).unwrap();
+    raster.width = 20;
+    raster.height = 32;
+    let mut grid = Terminal::from_test_vt(6, 3, "\r\n  🇫🇷".as_bytes()).screen(false);
+    grid.cursor_visible = false;
+    for cell in &mut grid.cells {
+        cell.bg = [17, 29, 43];
+    }
+    let pixels = raster.render(&grid);
+    let stride = 6 * 20 * 4;
+    let mean = |cx: usize| -> [u32; 3] {
+        let mut sum = [0; 3];
+        for y in 46..50 {
+            for x in cx - 1..=cx + 1 {
+                for c in 0..3 {
+                    sum[c] += u32::from(pixels[y * stride + x * 4 + c]);
+                }
+            }
+        }
+        sum.map(|v| v / 12)
+    };
+    let blue = mean(50);
+    let white = mean(60);
+    let red = mean(70);
+    for (actual, golden) in [
+        (blue, [0, 40, 153]),
+        (white, [255; 3]),
+        (red, [235, 36, 51]),
+    ] {
+        for c in 0..3 {
+            assert!(
+                actual[c].abs_diff(golden[c]) <= 20,
+                "{actual:?} != {golden:?}"
+            );
+        }
+    }
+    assert!(
+        blue[2] >= 70 && blue[2] > blue[0] + 40 && blue[2] > blue[1] + 20,
+        "{blue:?}"
+    );
+    assert!(white.iter().all(|c| *c >= 200), "{white:?}");
+    assert!(
+        red[0] >= 150 && red[1] < 100 && red[2] + 60 < red[0],
+        "{red:?}"
+    );
+    for y in 0..96 {
+        for x in 0..120 {
+            if !(40..80).contains(&x) || !(32..64).contains(&y) {
+                assert_eq!(&pixels[y * stride + x * 4..][..4], &[17, 29, 43, 255]);
+            }
+        }
+    }
+}
+
+#[test]
 fn noto_clusters_ligate_and_paint_colour_in_both_halves() {
     for scale in [1.0, 1.25, 1.5, 2.5] {
         let mut raster = raster_with(Cursor::Block).resized(scale, 13.0).unwrap();
@@ -241,7 +302,6 @@ fn noto_clusters_ligate_and_paint_colour_in_both_halves() {
             grid.cells[2].bg = [73, 53, 33];
             let image = raster.unicode.image(
                 text,
-                false,
                 2,
                 raster.px,
                 (raster.width, raster.height),
@@ -492,7 +552,6 @@ fn a_space_base_does_not_hide_its_combining_mark() {
     grid.cursor_visible = false;
     let image = raster.unicode.image(
         " \u{301}",
-        false,
         1,
         raster.px,
         (raster.width, raster.height),
@@ -538,7 +597,8 @@ fn interner_generation_invalidates_reused_ids_but_append_does_not() {
 fn cached_ascii_and_emoji_paint_benchmark() {
     use std::time::Instant;
     let mut raster = raster_with(Cursor::Block).resized(2.5, 13.0).unwrap();
-    for text in ["M".repeat(90), "👩‍💻".repeat(45)] {
+    for text in ["M".repeat(90), "👩‍💻".repeat(45), "┌─┬┐│└┴┘⣿⠿".repeat(9)]
+    {
         let mut grid = Terminal::from_test_vt(90, 25, text.repeat(25).as_bytes()).screen(false);
         grid.cursor_visible = false;
         let mut surface = Surface::default();

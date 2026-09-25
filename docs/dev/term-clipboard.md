@@ -44,12 +44,14 @@ Copy includes the complete Rio cell text: combining marks, variation selectors,
 ZWJ sequences, flag partners and skin tones. Selecting only the trailing half
 of a wide cluster copies that cluster once. The local extraction adapter repairs
 Rio `932c1a7`'s wrapped `LeadingSpacer` boundary by extracting the next row's
-complete lead cell; it never edits or vendors Rio. A selection containing only
-that boundary does not gain a spurious blank line.
+complete lead cell; it never edits or vendors Rio. A blank row ending at
+that boundary does not gain a spurious newline, even when earlier rows are
+selected. Rectangular copy includes a wrapped cluster once when the next
+selected row starts on either its lead or its trailing spacer.
 
 `Terminal::capture` swaps each selected cell's resolved foreground/background
 after applying bold and inverse attributes. Selecting a wide character's
-trailing cell also highlights its leading cell, matching copied text.
+lead or trailing cell highlights both halves, matching copied text.
 It compares the previous consuming
 capture's range with the current range and dirties their visible rows. This
 also catches parser-driven selection changes. Both painters consume the same
@@ -81,8 +83,11 @@ Ctrl chords retain their existing encodings. Each seat event is queued as one
 human FIFO entry, so replies cannot split an emoji sequence. The widget handles
 iced IME events directly, enables the terminal input-method purpose, and lets
 the runtime display preedit near the last captured caret. Preedit is never sent
-to the shell; only a commit is. Losing focus clears composition and disables
-IME input. The Bus `encode_text` contract remains ASCII-only.
+to the shell; only a commit is. Composition records its owner pane. Changing
+pane/tab focus, closing that pane or losing window focus clears preedit and
+disables IME until the runtime acknowledges the reset. A commit is accepted
+only for the active owner, so queued commits cannot reach another pane.
+The Bus `encode_text` contract remains ASCII-only.
 PRIMARY requires compositor primary-selection
 support; missing clipboard offers produce no input. Clipboard writes have no
 success acknowledgement in iced, so end-to-end Wayland delivery still needs a
@@ -111,6 +116,6 @@ These are deliberately deferred, rather than part of this fix pass:
 The Unicode regressions cover byte-at-a-time parser input, capture and copy of
 `👩‍💻`, `🇦🇺`, `👍🏽`, `❤️`, `é` and a space with a combining mark, trailing-half
 and wrapped selections, scrollback, UTF-8 bracketed paste with ESC/ETX stripping,
-keyboard queue atomicity and IME preedit/commit. They are added for the cluster
-gates and have not been run locally. Rendering, font and resource limits are in
+keyboard queue atomicity and IME preedit/commit. The cluster runs these gates.
+Rendering, font and resource limits are in
 [the Unicode rendering section](term-foot-tactics.md#unicode-clusters-and-colour-emoji).
