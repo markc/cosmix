@@ -653,6 +653,14 @@ serve/supervisor line carries a structured `service = <svc>` field, so the
 process name `cosmix-mix` never obscures which citizen logged. Tail a citizen's
 logs with `journalctl` filtered on that field.
 
+Independently of logging, every fatal or reverted serve outcome also prints one
+line to **stderr**: `mix --serve <svc>: <what>: <error>`. That covers an
+unreadable script, lex and parse errors, a refused initial connect or
+registration (for example a service name the broker rejects: names are 2–31
+characters, `[a-z][a-z0-9-]*`), an uncaught init error, and a reverted
+`RELOAD`. A citizen launched by another program (stderr redirected to a file,
+no terminal, no journal capture) therefore never exits 1 silently.
+
 ---
 
 ## Running under systemd

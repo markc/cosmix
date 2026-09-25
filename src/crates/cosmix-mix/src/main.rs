@@ -1190,6 +1190,14 @@ fn init_serve_tracing() -> cosmix_log::LogHandle {
 ///    systemd rather than spinning silently.
 ///
 /// Returns a process exit code (the caller `process::exit`s it).
+/// Mix installs no tracing subscriber, so a serve failure that only reached
+/// `tracing` was invisible: exit 1 and no output anywhere. Every fatal or
+/// reverted serve outcome also prints one stderr line (the unit journal when
+/// run under systemd, the caller's terminal or log file otherwise).
+fn serve_stderr(service_name: &str, what: &str, error: &dyn std::fmt::Display) {
+    eprintln!("mix --serve {service_name}: {what}: {error}");
+}
+
 fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
     // Held for the entire serve lifetime: owns the journald/stderr
     // subscriber guards + the live-reload handle. Dropping it on
@@ -1218,6 +1226,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                 error = %e,
                 "serve: cannot read script"
             );
+            serve_stderr(service_name, "cannot read script", &e);
             return 1;
         }
     };
@@ -1229,6 +1238,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(service = %service_name, error = %e, "serve: cannot build runtime");
+            serve_stderr(service_name, "cannot build runtime", &e);
             return 1;
         }
     };
@@ -1249,6 +1259,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                         error = %format!("{e}"),
                         "serve: lex error"
                     );
+                    serve_stderr(service_name, "lex error", &e);
                     return 1;
                 }
             };
@@ -1261,6 +1272,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                         error = %format!("{e}"),
                         "serve: parse error"
                     );
+                    serve_stderr(service_name, "parse error", &e);
                     return 1;
                 }
             }
@@ -1302,6 +1314,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     error = %e,
                     "serve: initial broker connect failed; exiting non-zero (SPEC 18 §3.1)"
                 );
+                serve_stderr(service_name, "initial broker connect/register failed", &e);
                 return 1;
             }
         };
@@ -1445,6 +1458,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                                 error = %msg,
                                 "serve: script error"
                             );
+                            serve_stderr(service_name, "script error", &msg);
                             ServeOutcome::Error
                         }
                     }
@@ -1465,6 +1479,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                 Err(e) => {
                     tracing::error!(service = %service_name, error = %e,
                         "serve: reload REVERTED — script re-read failed; old script resumes");
+                    serve_stderr(service_name, "reload reverted (script re-read failed; old script resumes)", &e);
                     continue;
                 }
             };
@@ -1476,6 +1491,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                 Err(e) => {
                     tracing::error!(service = %service_name, error = %format!("{e}"),
                         "serve: reload REVERTED — source no longer parses (changed since validation?); old script resumes");
+                    serve_stderr(service_name, "reload reverted (source no longer parses; old script resumes)", &e);
                     continue;
                 }
             };
@@ -1566,6 +1582,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     tracing::error!(service = %service_name, error = %format!("{e}"),
                         aborted = drained.aborted, synth_sent = drained.synth_sent, swept,
                         "serve: reload REVERTED — new init body failed; old script resumes with state intact");
+                    serve_stderr(service_name, "reload reverted (new init body failed; old script resumes)", &e);
                 }
             }
         };

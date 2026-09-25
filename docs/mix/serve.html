@@ -960,6 +960,13 @@ they fall back to stderr too when there's no journal socket at all. Every
 serve/supervisor line carries a structured <code>service = &lt;svc&gt;</code> field, so the
 process name <code>cosmix-mix</code> never obscures which citizen logged. Tail a citizen's
 logs with <code>journalctl</code> filtered on that field.</p>
+<p>Independently of logging, every fatal or reverted serve outcome also prints one
+line to <strong>stderr</strong>: <code>mix --serve &lt;svc&gt;: &lt;what&gt;: &lt;error&gt;</code>. That covers an
+unreadable script, lex and parse errors, a refused initial connect or
+registration (for example a service name the broker rejects: names are 2–31
+characters, <code>[a-z][a-z0-9-]*</code>), an uncaught init error, and a reverted
+<code>RELOAD</code>. A citizen launched by another program (stderr redirected to a file,
+no terminal, no journal capture) therefore never exits 1 silently.</p>
 <hr />
 <h2 id="running-under-systemd">Running under systemd</h2>
 <p>A resident citizen is a normal SPEC-10 daemon: a <code>sysusers.d</code> <code>u cosmix-&lt;svc&gt;</code>
