@@ -523,7 +523,9 @@ Versions: cosmix-term **0.2.5**, cosmix-term-core **0.5.2**.
 The vendor README records the tarball SHA-256, upstream revision, patch
 removal conditions and routing/test commands. `cargo tree -p cosmix-term
 --no-default-features --features tiny-skia -i iced_tiny_skia` confirms the
-vendored path. The term test-only dependency now explicitly enables Wayland:
+vendored path. Extracting the pristine import commit and comparing it recursively
+against the downloaded tarball produced no differences. The term test-only
+dependency now explicitly enables Wayland:
 without that feature, default-wgpu tests compile softbuffer with no Linux
 backend and fail before reaching app tests.
 

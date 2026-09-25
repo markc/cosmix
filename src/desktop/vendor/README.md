@@ -11,7 +11,9 @@ separate commit. Verify routing from `src/desktop` with
 `cargo tree -p cosmix-term --no-default-features --features tiny-skia -i iced_tiny_skia`.
 
 Local patch: `raster.rs` records all-alpha-255 once during native pixel
-conversion. Fully opaque draws with an exactly unit, integer-translation net
+conversion. The generic Pattern draw dominated terminal CPU frame time even
+for an opaque 1:1 image; native row copies remove that cost while retaining
+iced's image cache and buffer ownership. Fully opaque draws with an exactly unit, integer-translation net
 transform copy native rows with `copy_from_slice`, clipped using the same
 26.6 edge rounding as tiny-skia's non-antialiased rectangular mask.
 No Pattern shader or mask is used by the copy. Non-unit opacity,
