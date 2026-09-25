@@ -295,7 +295,15 @@ impl Inner {
                 }
                 let fresh = !self.ancestors.contains_key(&a) && !self.armed.contains_key(&a);
                 if !fresh || self.watch(&a).is_ok() {
-                    self.ancestors.entry(a).or_default().insert(dir.to_path_buf());
+                    self.ancestors.entry(a.clone()).or_default().insert(dir.to_path_buf());
+                    // Watch, THEN look: the next level may have appeared
+                    // before the ancestor watch existed, and would never
+                    // produce the event we are waiting for.
+                    let next = dir.ancestors().take_while(|p| *p != a).last();
+                    if next.is_some_and(|n| dir_id(n).is_some()) {
+                        self.stop_waiting(dir);
+                        self.rearm(dir);
+                    }
                     return;
                 }
                 break;
