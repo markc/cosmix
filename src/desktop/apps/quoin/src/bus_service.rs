@@ -101,6 +101,10 @@ impl Plugin for ShellBusPlugin {
             .init_resource::<cosmix_scene_bevy::SceneEvents>()
             .init_resource::<crate::config::ShellConfig>()
             .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
+            // Holder reporting still arms retry deadlines after the native
+            // pages are gone. Embedded hosts also run report_holders, even
+            // without a HolderClient, so its required resource lives here.
+            .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_message::<cosmix_shell::runtime::ShellResizeResult>()
             .add_systems(
                 Update,

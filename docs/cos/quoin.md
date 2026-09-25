@@ -24,6 +24,10 @@ restores ordinary reveal and mode behaviour. Saved modes, sizes and deferred
 page selections remain available for late registration. Removing the final
 page again suppresses visibility and reservation.
 
+Empty startup retains the shared Bus, holder retry deadlines, theme and scene
+runtime in both hosts. A headless regression exercises the production embedded
+assembly through startup and repeated updates without registering any scenes.
+
 Settings/Appearance is already a Mix scene. For now Quoin loads it **only** if
 an edge's panel list declares `settings.appearance`, at that slot on that edge.
 It need not be the primary, and no edge is required to declare it. For example,

@@ -1173,6 +1173,9 @@ mod tests {
             .add_message::<bevy::window::RequestRedraw>()
             .insert_resource(store)
             .add_systems(Update, persist_transitions.in_set(ShellRuntimeSet::Host));
+        // The saving edge must have content: empty edges deliberately ignore
+        // ResizeStarted, so resizing one cannot produce a persistence event.
+        cosmix_shell::runtime::register_shell_page(app.world_mut(), Edge::Bottom, "saving-panel");
         resize_command(
             &mut app,
             ShellCommandKind::ResizeCommit {
@@ -1180,6 +1183,7 @@ mod tests {
                 thickness_px: 160.0,
             },
         );
+        assert_eq!(app.world().resource::<StateStore>().writes(), 1);
         let saved = StateStore::load(Some(path.clone()));
         assert_eq!(
             saved.lock_saved().outputs["connector:DP-1"].edges[Edge::Left.index()].page,
@@ -1203,6 +1207,7 @@ mod tests {
                 thickness_px: 170.0,
             },
         );
+        assert_eq!(app.world().resource::<StateStore>().writes(), 2);
         let saved = StateStore::load(Some(path));
         assert!(
             saved.lock_saved().outputs["connector:DP-1"].edges[Edge::Left.index()]

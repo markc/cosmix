@@ -89,8 +89,23 @@ impl EmbeddedQuoinPlugin {
 impl Plugin for EmbeddedQuoinPlugin {
     fn build(&self, app: &mut App) {
         let config = crate::config::startup_config(false);
-        let registry = crate::startup_page_registry(&config);
         let store = crate::state::StateStore::startup(false);
+        let bus = BusBridgeConfig::new("shell", resolve_noded_url());
+        self.configure(app, config, store, bus);
+    }
+}
+
+impl EmbeddedQuoinPlugin {
+    /// Shared production assembly; callers supply startup I/O so the full
+    /// application can also be exercised without a display or a live broker.
+    fn configure(
+        &self,
+        app: &mut App,
+        config: crate::config::ShellConfig,
+        store: crate::state::StateStore,
+        mut bus: BusBridgeConfig,
+    ) {
+        let registry = crate::startup_page_registry(&config);
         // The placeholder model restores nothing: comp has not named the
         // output yet, and claiming under a placeholder identity would take
         // the migrated legacy entry away from the real connector. `prepare`
@@ -125,7 +140,6 @@ impl Plugin for EmbeddedQuoinPlugin {
             name: PLACEHOLDER_OUTPUT.into(),
             size: Vec2::new(1920.0, 1080.0),
         });
-        let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
         crate::hotspot::install(app, &mut bus, self.comp_service.clone());
         crate::hotspot::arm_first_run(app, store.first_run());
         bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
@@ -401,6 +415,86 @@ fn present(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_plugins_update_headlessly_without_scenes() {
+        use bevy::asset::AssetApp;
+
+        let mut app = App::new();
+        // Headless Bevy platform services: keep real input, picking, text and
+        // UI schedules, without a window, renderer or display event loop.
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin::default(),
+            bevy::transform::TransformPlugin,
+            bevy::camera::CameraPlugin,
+            ImagePlugin::default(),
+            bevy::image::TextureAtlasPlugin,
+            bevy::mesh::MeshPlugin,
+            bevy::input::InputPlugin,
+            bevy::input_focus::InputFocusPlugin,
+            bevy::input_focus::InputDispatchPlugin,
+            bevy::window::WindowPlugin {
+                primary_window: None,
+                exit_condition: bevy::window::ExitCondition::DontExit,
+                ..default()
+            },
+            bevy::picking::DefaultPickingPlugins,
+            bevy::clipboard::ClipboardPlugin,
+            bevy::text::TextPlugin,
+            bevy::ui::UiPlugin,
+            bevy::ui_widgets::UiWidgetsPlugins,
+        ))
+        // Feathers loads shader assets even without a RenderApp.
+        .init_asset::<bevy::shader::Shader>()
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(250),
+        ));
+
+        // Call the production assembly used by Plugin::build, including
+        // configure_content shared with standalone startup. Only startup I/O
+        // differs: no saved state, empty config, and an unsupported URL scheme
+        // so the real BusBridgePlugin cannot contact an operator's broker.
+        EmbeddedQuoinPlugin::default().configure(
+            &mut app,
+            crate::config::ShellConfig::default(),
+            crate::state::StateStore::load(None),
+            BusBridgeConfig::new("quoin-headless-test", "unsupported://headless"),
+        );
+        app.finish();
+        app.cleanup();
+
+        for step in 0..12 {
+            if step == 1 {
+                // Exercise both the startup placeholder and the host's first
+                // real output observation, including its intro and settings.
+                *app.world_mut().resource_mut::<EmbeddedOutput>() = EmbeddedOutput {
+                    size: Vec2::new(1000.0, 800.0),
+                    name: "test-output".into(),
+                    active: true,
+                    ..default()
+                };
+            }
+            // Bevy's default error handler panics on a missing system resource.
+            // Do not seed Quoin resources here or skip any application systems.
+            app.update();
+            let world = app.world();
+            let frame = &world.resource::<ShellFrameState>().0;
+            let seats = &world.resource::<cosmix_shell::runtime::SubPanelRegistryState>().0;
+            assert!(
+                world
+                    .resource::<cosmix_scene_bevy::SceneStore>()
+                    .list(seats, &frame.geometry.output)
+                    .is_empty()
+            );
+            for edge in Edge::ALL {
+                assert!(frame.panel(edge).page_ids.is_empty());
+                assert!(!frame.panel(edge).mapped);
+                assert_eq!(frame.panel(edge).exclusive_zone_px, 0.0);
+            }
+            assert!(world.resource::<EmbeddedPanelRegions>().0.is_empty());
+        }
+    }
 
     /// A legacy v2 state file as today's Quoin writes it, for the migration
     /// path (mirrors `state`'s `v2_source` fixture).
