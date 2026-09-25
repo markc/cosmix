@@ -22,6 +22,7 @@ are the cos-side substrate.
 | `cosmix-lib-props-store` | The SPEC 12 substrate mutation surface — namespace specs, lifecycle, records + events, hooks, capabilities, the in-memory and SQLite storage backends, per-row audit HMAC, and the mutation router. Pairs with `cosmix-lib-props-core` (the SPEC 07 read surface) in the bus repo. |
 | `cosmix-lib-log-props` | The SPEC 12 `<svc>.log` namespace + a per-daemon `LogHandle` watcher that mirrors log config through the property surface. |
 | `cosmix-lib-files` | Pure core of the files-as-truth markdown corpus manager (daemon: `cosmix-filesd`). Surgical byte-preserving frontmatter writer, atomic write-then-rename, BLAKE3 content hashing, UUIDv7 identity, `[[wikilink]]`/link extraction, index SQL schema, and the reconcile diff. Also the generic live-filesystem layer for the file manager. |
+| `cosmix-edit-core` | The text engine behind the [edit](edit.md) citizen and the ced editor: gap-buffer text with a line index, byte-offset / line-col positions, all-or-nothing transactions, revision CAS and `base_rev` transforms, per-origin undo lanes, anchors, selections and search. Pure Rust, no Bus and no async runtime. Vendors a subset of Microsoft [msedit](https://github.com/microsoft/edit) (MIT, Copyright (c) Microsoft Corporation): the gap buffer and SIMD line scanner, with provenance and licence in `src/vendor/msedit/`. |
 
 ## Mesh & identity
 

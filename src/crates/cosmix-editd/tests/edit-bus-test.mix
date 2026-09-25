@@ -1,0 +1,269 @@
+-- End-to-end: a private noded + the real cosmix-editd, driven by one-shot
+-- Mix clients speaking plain `send edit edit.<verb> key=value …` with nested
+-- map/list literals (the kv → JSON body shape the edit.v1 DTOs expect), and
+-- a subscriber citizen recording the `edit.changed` feed (plan §6.3).
+-- Nothing here can reach the host Bus: private TCP port, private unix
+-- socket, admission off, HOME and runtime dirs inside the temp dir.
+--
+-- Run: COSMIX=<checkout> mix src/crates/cosmix-editd/tests/edit-bus-test.mix [--bin PATH]
+-- Binaries: --bin (or COSMIX_TEST_EDITD) for editd, default
+-- $COSMIX/src/target/release/cosmix-editd; COSMIX_TEST_MIX / COSMIX_TEST_NODED
+-- point at freshly built mix / noded, defaults are the system install.
+$root = env("COSMIX")
+if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
+$argv = args()
+$editd = env("COSMIX_TEST_EDITD") ?? ""
+if length($argv) >= 2 and $argv[0] == "--bin" then $editd = $argv[1] end
+if $editd == "" then $editd = $root .. "/src/target/release/cosmix-editd" end
+$mix = env("COSMIX_TEST_MIX") ?? ""
+if $mix == "" then $mix = "/opt/cosmix/bin/mix" end
+$noded = env("COSMIX_TEST_NODED") ?? ""
+if $noded == "" then $noded = "/opt/cosmix/bin/cosmix-noded" end
+for each $bin in [$editd, $mix, $noded]
+  if not exists($bin) then raise("TEST_CONFIG", "missing binary " .. $bin) end
+end
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-edit-bus-test.XXXXXXXX"]))
+$tag = uuid()
+$node = $tmp .. "/node.conf.mix"
+$env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
+  HOME: $tmp, XDG_STATE_HOME: $tmp, XDG_RUNTIME_DIR: $tmp, RUST_LOG: "cosmix_editd=debug"}
+$editd_pid = nil
+$obs_pid = nil
+$noded_pid = nil
+$file = $tmp .. "/work/sample.txt"
+
+-- The subscriber: records every edit.changed body in arrival order.
+write_file($tmp .. "/observer.mix", join([
+  '$events = []',
+  'subscribe("edit.changed")',
+  "on edit.changed",
+  '  push($events, $event.args)',
+  "end",
+  "on obs.events",
+  '  reply(0, json_encode($events))',
+  "end"
+], "\n") .. "\n")
+
+fn check($condition, $message)
+  if not $condition then raise("EDIT_BUS_TEST", $message) end
+end
+-- One-shot client. `$line` is literal Mix source after `send edit` (so the
+-- nested literals are parsed by Mix exactly as a user would type them);
+-- runtime values come in as `$a`, decoded from argv.
+fn ed($line, $a)
+  write_file($tmp .. "/step.mix", "$a = json_parse($1)\nsend edit " .. $line ..
+    " timeout=15\nprint(json_encode({rc: $rc, result: $result, reply: $reply}))\n")
+  return json_parse(run_argv_must([$mix, $tmp .. "/step.mix", json_encode($a)], {clear_env: true, env: $env, timeout: 25}))
+end
+-- A call that must succeed; returns the reply body.
+fn ok($line, $a)
+  $r = ed($line, $a)
+  check($r.rc == 0, $line .. " failed: " .. json_encode($r))
+  return $r.reply
+end
+-- A call that must be refused with rc 10 + this error_code/reason.
+fn refused($line, $a, $code, $reason)
+  $r = ed($line, $a)
+  check($r.rc == 10, $line .. " not refused: " .. json_encode($r))
+  check($r.reply.error_code == $code, $line .. " wrong error_code: " .. json_encode($r.reply))
+  if $reason != nil then check($r.reply.reason == $reason, $line .. " wrong reason: " .. json_encode($r.reply)) end
+  return $r.reply
+end
+fn observed()
+  $r = json_parse(run_argv_must([$mix, "-c", "send edit-observer obs.events timeout=15\nprint(json_encode($reply))"],
+    {clear_env: true, env: $env, timeout: 25}))
+  return $r ?? []
+end
+fn text_of($b)
+  return ok('edit.get buffer=$a.b', {b: $b}).text
+end
+
+try
+  mkdir($tmp .. "/work")
+  write_file($file, "alpha one\nsecond line\nthird line\n")
+  -- Retry an exited broker on a fresh port (bounded to five attempts).
+  $broker_alive = false
+  for each $attempt in range(1, 5)
+    $port = random(48000, 48999)
+    write_file($node, json_encode({node: "edit-bus-test-" .. $tag, wg_ip: "", mesh: "edit-bus-test.invalid",
+      noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
+    $noded_pid = spawn([$noded, "serve", "--listen", "127.0.0.1:" .. to_string($port),
+      "--node", "edit-bus-test-" .. $tag, "--no-monitor", "--no-log"],
+      {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+    sleep(0.5)
+    $broker_alive = run_argv(["kill", "-0", "--", to_string($noded_pid)]).ok
+    if $broker_alive then break end
+  end
+  check($broker_alive, "broker exhausted port retries")
+
+  -- Observer first, so the feed is recorded from editd's first event.
+  $obs_pid = spawn([$mix, "--serve", $tmp .. "/observer.mix", "--name", "edit-observer"],
+    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/observer.log"}, stderr: "stdout"})
+  $obs_ready = false
+  for each $i in range(1, 80)
+    if run_argv([$mix, "-c", "send edit-observer obs.events timeout=5\nif $rc != 0 then exit(1) end"],
+      {clear_env: true, env: $env, timeout: 10}).ok then $obs_ready = true; break end
+    sleep(0.2)
+  end
+  check($obs_ready, "observer did not register")
+
+  $editd_pid = spawn([$editd, "serve"],
+    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/editd.log"}, stderr: "stdout"})
+  -- Harness startup wait (bounded), not a backend poll.
+  $ping = nil
+  for each $i in range(1, 80)
+    $r = ed('edit.ping', {})
+    if $r.rc == 0 then $ping = $r.reply; break end
+    sleep(0.2)
+  end
+  check($ping != nil, "editd did not register")
+  check($ping.pong and $ping.service == "edit" and $ping.schema == "edit.v1", "ping shape: " .. json_encode($ping))
+  $epoch = $ping.epoch
+  $info = ok('edit.info', {})
+  check($info.volatile and $info.schema == "edit.v1" and $info.epoch == $epoch and $info.buffers == 0, "info: " .. json_encode($info))
+
+  -- open, reopen (same buffer, one holder key)
+  $o = ok('edit.open path=$a.path', {path: $file})
+  $b = $o.buffer
+  check(ends_with($b, "_" .. $epoch) and $o.rev == 0 and $o.path == $file and not $o.reopened, "open: " .. json_encode($o))
+  check($o.disk == "clean" and $o.eol == "lf" and $o.bytes == 33 and $o.lines == 4,"open file state: " .. json_encode($o))
+  $o2 = ok('edit.open path=$a.path', {path: $file})
+  check($o2.buffer == $b and $o2.reopened, "reopen: " .. json_encode($o2))
+  refused('edit.open path="relative/x.txt"', {}, "INVALID_ARGUMENT", nil)
+  refused('edit.open path=$a.path', {path: $tmp .. "/work/missing.txt"}, "NOT_FOUND", nil)
+
+  -- find + replace with expect_rev (the replace-all idiom's first step)
+  $f = ok('edit.find buffer=$a.b pattern="alpha"', {b: $b})
+  check(length($f.matches) == 1 and $f.matches[0].start.offset == 0 and $f.matches[0].end.offset == 5, "find: " .. json_encode($f))
+  $m = $f.matches[0]
+  $r1 = ok('edit.replace buffer=$a.b range={start: $a.s, end: $a.e} text="beta" expect_rev=$a.rev',
+    {b: $b, s: $m.start.offset, e: $m.end.offset, rev: $f.rev})
+  check($r1.rev == 1 and $r1.base_rev == 0 and $r1.origin == "agent:anon" and not $r1.origin_downgraded and $r1.dirty, "replace: " .. json_encode($r1))
+
+  -- anchor on line 3 ("third"), offset 21 now
+  $an = ok('edit.anchor.set buffer=$a.b name="mark1" at={line: 3}', {b: $b})
+  check($an.anchors[0].name == "mark1" and $an.anchors[0].start.offset == 21, "anchor.set: " .. json_encode($an))
+
+  -- op_id retry: the second send is the first reply, inserted once
+  $i1 = ok('edit.insert buffer=$a.b at={line: 2, col: 1} text="-- note\n" origin="agent:test-a" op_id="t1"', {b: $b})
+  check($i1.rev == 2 and $i1.origin == "agent:test-a" and $i1.op_id == "t1" and not $i1.duplicate, "insert: " .. json_encode($i1))
+  $i2 = ok('edit.insert buffer=$a.b at={line: 2, col: 1} text="-- note\n" origin="agent:test-a" op_id="t1"', {b: $b})
+  check($i2.rev == 2 and $i2.duplicate, "duplicate: " .. json_encode($i2))
+  check(text_of($b) == "beta one\n-- note\nsecond line\nthird line\n", "duplicate inserted twice")
+
+  -- stale CAS → CONFLICT carrying the current rev
+  $st = refused('edit.insert buffer=$a.b at=0 text="x" expect_rev=0', {b: $b}, "CONFLICT", "stale_rev")
+  check($st.rev == 2 and $st.buffer == $b, "stale_rev context: " .. json_encode($st))
+  refused('edit.insert buffer=$a.b at=0 text="x" expect_rev=2 base_rev=2', {b: $b}, "INVALID_ARGUMENT", "both_cas")
+
+  -- a second origin, then undo only test-a's lane
+  $i3 = ok('edit.insert buffer=$a.b at="end" text="b-line\n" origin="agent:test-b"', {b: $b})
+  check($i3.rev == 3, "insert b: " .. json_encode($i3))
+  $u = ok('edit.undo buffer=$a.b origin="agent:test-a"', {b: $b})
+  check($u.rev == 4 and $u.lane == "agent:test-a" and deep_eq($u.undid, [2, 2]), "undo: " .. json_encode($u))
+  check(text_of($b) == "beta one\nsecond line\nthird line\nb-line\n", "per-origin undo touched the other lane")
+
+  -- a transaction from an anonymous caller claiming human: → downgraded
+  $ap = ok('edit.apply buffer=$a.b ops=[{op: "insert", at: "end", text: "tail\n"}, {op: "delete", range: {lines: [1, 1]}}] origin="human:x"', {b: $b})
+  check($ap.rev == 5 and $ap.origin == "agent:x" and $ap.origin_downgraded and $ap.edit_count == 2, "apply: " .. json_encode($ap))
+  $expect = "second line\nthird line\nb-line\ntail\n"
+  check(text_of($b) == $expect, "apply text")
+  refused('edit.apply buffer=$a.b ops=[{op: "delete", range: [0, 4]}, {op: "delete", range: [2, 6]}]', {b: $b}, "INVALID_ARGUMENT", "overlap_in_txn")
+
+  -- the anchor followed the text: 21 → (undo of the note) 21 → (line 1 deleted) 12
+  $ag = ok('edit.anchor.get buffer=$a.b name="mark1"', {b: $b})
+  check($ag.anchors[0].start.offset == 12 and $ag.anchors[0].start.line == 2 and $ag.anchors[0].start.col == 1, "anchor moved: " .. json_encode($ag))
+
+  $g = ok('edit.get buffer=$a.b numbered=true', {b: $b})
+  check($g.rev == 5 and $g.text == nil and not $g.truncated, "numbered get: " .. json_encode($g))
+  $want = ["second line", "third line", "b-line", "tail"]
+  for each $k in range(0, 3)
+    check($g.lines[$k].line == $k + 1 and $g.lines[$k].text == $want[$k] and not $g.lines[$k].cont, "numbered line " .. to_string($k + 1) .. ": " .. json_encode($g.lines))
+  end
+
+  $h = ok('edit.history buffer=$a.b', {b: $b})
+  check(length($h.entries) == 5 and $h.entries[1].op_id == "t1" and $h.entries[1].origin == "agent:test-a", "history: " .. json_encode($h))
+  check($h.entries[3].kind == "undo" and $h.entries[1].via.broker_origin == "local", "history kinds/via: " .. json_encode($h.entries))
+
+  -- last holder + dirty → CONFLICT dirty; then save and compare bytes
+  $l = ok('edit.list', {})
+  check(length($l.buffers) == 1 and deep_eq($l.buffers[0].holders, ["anon"]) and $l.buffers[0].dirty, "list: " .. json_encode($l))
+  refused('edit.close buffer=$a.b', {b: $b}, "CONFLICT", "dirty")
+  refused('edit.bogus buffer=$a.b', {b: $b}, "UNKNOWN_VERB", nil)
+  $sv = ok('edit.save buffer=$a.b expect_rev=5', {b: $b})
+  check($sv.saved_rev == 5 and $sv.disk == "clean" and $sv.durable and $sv.file_bytes == length($expect), "save: " .. json_encode($sv))
+  check(read_file($file) == $expect and read_file($file) == text_of($b), "saved bytes differ from edit.get")
+
+  -- an external write reloads the clean buffer (event-driven in editd;
+  -- this bounded loop is the harness waiting for the observable result)
+  write_file($file, "external change\nsecond line\n")
+  $reloaded = false
+  for each $i in range(1, 100)
+    if text_of($b) == "external change\nsecond line\n" then $reloaded = true; break end
+    sleep(0.1)
+  end
+  check($reloaded, "external change never reloaded the clean buffer: " .. read_file($tmp .. "/editd.log"))
+  $l2 = ok('edit.list', {})
+  check($l2.buffers[0].rev == 6 and not $l2.buffers[0].dirty and $l2.buffers[0].disk == "clean", "after reload: " .. json_encode($l2))
+  $c = ok('edit.close buffer=$a.b', {b: $b})
+  check($c.closed and length($c.holders) == 0, "close: " .. json_encode($c))
+  refused('edit.get buffer=$a.b', {b: $b}, "NOT_FOUND", nil)
+
+  -- the feed: contiguous event_seq, rev chain 1..6 with base_rev = rev - 1
+  $events = []
+  for each $i in range(1, 100)
+    $events = observed()
+    if length($events) > 0 and $events[length($events) - 1].event == "close" then break end
+    sleep(0.1)
+  end
+  check(length($events) > 0 and $events[length($events) - 1].event == "close", "feed never reached close: " .. json_encode($events))
+  for each $k in range(1, length($events) - 1)
+    check($events[$k].event_seq == $events[$k - 1].event_seq + 1, "event_seq gap: " .. json_encode($events))
+    check($events[$k].epoch == $epoch, "epoch changed mid-feed")
+  end
+  check($events[0].event == "open" and $events[0].buffer == $b, "feed did not start with open: " .. json_encode($events[0]))
+  $edits = filter($events, fn($e) = $e.event == "edit")
+  check(length($edits) == 6, "expected 6 edit events (duplicate must not emit): " .. json_encode($edits))
+  $kinds = ["edit", "edit", "edit", "undo", "edit", "reload"]
+  for each $k in range(0, 5)
+    check($edits[$k].rev == $k + 1 and $edits[$k].base_rev == $k and $edits[$k].kind == $kinds[$k], "rev chain: " .. json_encode($edits[$k]))
+  end
+  check($edits[5].origin == "tool:disk" and $edits[1].op_id == "t1", "reload origin / op_id: " .. json_encode($edits))
+  check(length(filter($events, fn($e) = $e.event == "resync")) == 0, "unexpected resync: " .. json_encode($events))
+  -- disk stayed clean throughout (clean load, save, clean external reload): no transition, no disk event
+  check(length(filter($events, fn($e) = $e.event == "disk")) == 0, "disk event without a transition: " .. json_encode($events))
+
+  -- SIGTERM with a dirty buffer: editd logs it (id, path, rev) and exits
+  -- within the 10 s budget (buffers are volatile; the log is the record).
+  $file2 = $tmp .. "/work/dirty.txt"
+  write_file($file2, "keep\n")
+  $b2 = ok('edit.open path=$a.path', {path: $file2}).buffer
+  check(ok('edit.insert buffer=$a.b at="end" text="unsaved\n"', {b: $b2}).dirty, "second buffer not dirty")
+  $t0 = time()
+  run_argv_must(["kill", "-TERM", "--", to_string($editd_pid)])
+  $exited = false
+  for each $i in range(1, 110)
+    if not process_alive($editd_pid) then $exited = true; break end
+    sleep(0.1)
+  end
+  $took = time() - $t0
+  check($exited, "editd still running 11 s after SIGTERM")
+  $editd_pid = nil
+  check($took <= 10, "editd took " .. to_string($took) .. " s to exit after SIGTERM")
+  $log = re_replace(read_file($tmp .. "/editd.log"), "\x1b\\[[0-9;]*m", "")
+  check(contains($log, "discarding unsaved buffer " .. $b2 .. " (" .. $file2 .. ") at rev 1"), "SIGTERM did not log the dirty buffer: " .. $log)
+  check(not contains($log, "discarding unsaved buffer " .. $b .. " "), "SIGTERM logged a closed buffer")
+  print("PASS edit Bus surface: open/reopen, find+replace CAS, op_id dedup, stale_rev, per-origin undo, human: downgrade, apply, anchors, numbered get, history, dirty close, save bytes, external reload, contiguous edit.changed feed, SIGTERM dirty-buffer log + exit within budget")
+catch $err
+  for each $log in ["noded.log", "observer.log", "editd.log"]
+    if exists($tmp .. "/" .. $log) then print("--- " .. $log .. "\n" .. read_file($tmp .. "/" .. $log)) end
+  end
+  raise("EDIT_BUS_TEST", to_string($err))
+finally
+  for each $child in [$editd_pid, $obs_pid, $noded_pid]
+    if $child != nil then $_kill = run_argv(["kill", "--", to_string($child)], {timeout: 10}) end
+  end
+  if starts_with($tmp, "/tmp/cosmix-edit-bus-test.") then
+    $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end
