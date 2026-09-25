@@ -1390,7 +1390,7 @@ impl Controller {
         let (rc, body) = match outcome {
             Outcome::Done => (0, ok_body(&verbs::ActionReply { id: action, ok: true, result: None })),
             Outcome::Refused(r) => {
-                let code = serde_json::to_value(&r.error_code).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                let code = serde_json::to_value(r.error_code).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
                 (10, refusal(&code, r.message, r.reason.as_deref()))
             }
         };

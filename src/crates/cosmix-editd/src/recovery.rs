@@ -751,10 +751,12 @@ impl Writer {
     }
 
     fn io_fault(&mut self, step: u8) -> std::io::Result<()> {
-        match self.io_fault.as_mut() {
-            Some(hook) if hook(step) => Err(std::io::Error::other(format!("injected failure at switch step {step}"))),
-            _ => Ok(()),
+        if let Some(hook) = self.io_fault.as_mut()
+            && hook(step)
+        {
+            return Err(std::io::Error::other(format!("injected failure at switch step {step}")));
         }
+        Ok(())
     }
 
     /// Test hook: a stale-generation Append is debug-asserted unreachable;
