@@ -710,7 +710,7 @@ Isolated phase probes from the same run (not additive frame costs):
 | iced cached full image draw | 1.515 | 1.447 | 2.128 |
 | iced empty-layer full clear | 0.516 | 0.486 | 0.720 |
 
-## Rank 3 implementation (cluster validation pending)
+## Rank 3 implemented (2026-09-25)
 
 The tiny-skia arm now paints each persistent four-row band directly in BGRA
 channel order and records a native grid primitive. `Raster::paint` and the
@@ -752,13 +752,28 @@ regression also checks clean generations produce no damage, while new
 generations, movement and changed clips do. A test-only copy of
 the old whole-band transport preserves the frame benchmark's RGBA reference.
 
-Expected, **not measured**, against the T16 merge table: remove nearly all of
-the 3.849 ms full / 0.474 ms echo prepare+convert stages, leaving constant-sized
-primitive recording. Paint+handle should remain near 5.259 / 0.323 ms and draw
-near 2.461 / 0.384 ms. The simple total estimate is about 7.7 ms full and
-1.3 ms echo; allocation, mask/clear and host scheduling variability can move
-it. The <8 ms and ~1.8 ms targets are not claimed as passed. No Cargo build,
-test, check or clippy run was performed for this change; no versions are bumped.
+The grid honours its widget clip (`layout.bounds() ∩ viewport`) as well as
+the layer clip, unlike ordinary images, which use only the layer clip. That is
+intended: the term widget is sized to exactly `cols × cell_width`, its origin
+is snapped, and the copy uses 26.6 edge rounding, so the widget clip lands on
+the grid edges and crops nothing in practice.
+
+Measured on the build cluster (release, serial, `--include-ignored`), four-row
+bands at 2250×1250, scale 2.5, age 3. Both configurations passed every gate:
+term-core, term tiny-skia and default wgpu suites, the vendor
+`image,wayland` suite, and clippy `-D warnings` for both feature sets.
+
+| Build | Echo mean ms | Full redraw mean ms | Full paint+handle / prepare+convert / render |
+|---|---:|---:|---|
+| T16 merge (foot-tactics) | 1.770 | 11.578 | 5.259 / 3.849 / 2.461 |
+| Rank 3 alone (cbc2, 4b884fe5) | 0.473 | 6.384 | 4.549 / 0.001 / 1.829 |
+| Ranks 3 + 6 (cbc3, 2a487869) | **0.370** | **3.742** | 1.971 / 0.001 / 1.765 |
+
+Prepare+convert is gone, as designed; with rank 6's faster paint the full
+redraw is well inside the < 8 ms target and echo is under 0.4 ms. The T16
+merge row is from a different host, so the totals are indicative; the phase
+columns show where the time went. No versions are bumped here; they are set
+when the branch is rebased onto main.
 
 Unenforced assumptions/contracts: arbitrary external producers of `grid::Grid`
 must supply premultiplied BGRA (the constructor validates shape, not channels);

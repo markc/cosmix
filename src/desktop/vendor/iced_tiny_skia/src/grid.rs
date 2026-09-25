@@ -8,12 +8,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// must supply premultiplied channels; opaque terminal pixels satisfy this
 /// without arithmetic. Unlike an image, this is not a SourceOver operation.
 /// Clones retain immutable generation-owned bytes, including in age history.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Grid {
     generation: u64,
     pixels: Bytes,
     width: u32,
     height: u32,
+}
+
+impl std::fmt::Debug for Grid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Grid")
+            .field("generation", &self.generation)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("byte_len", &self.pixels.len())
+            .finish()
+    }
 }
 
 impl Grid {
@@ -122,6 +133,113 @@ impl PartialEq for Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_draw_intersects_widget_clip_and_restores_image_mask() {
+        use crate::core::Renderer as _;
+        use crate::core::image::Renderer as _;
+
+        let layer_clip = Rectangle {
+            x: 4.0,
+            y: 4.0,
+            width: 24.0,
+            height: 24.0,
+        };
+        let widget_clip = Rectangle {
+            x: 8.0,
+            y: 8.0,
+            width: 4.0,
+            height: 4.0,
+        };
+        let grid_bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 16.0,
+            height: 16.0,
+        };
+        let image_bounds = Rectangle {
+            x: 20.0,
+            y: 0.0,
+            width: 16.0,
+            height: 32.0,
+        };
+        let grid =
+            Grid::new(16, 16, Bytes::from([0, 255, 0, 255].repeat(16 * 16)))
+                .unwrap();
+        // Translucency prevents the ordinary image's opaque-copy shortcut;
+        // crossing the layer boundary forces it to consume the shared mask.
+        let handle = crate::core::image::Handle::from_rgba(
+            16,
+            32,
+            [255, 0, 0, 128].repeat(16 * 32),
+        );
+        for scale in [1.0, 1.25] {
+            let viewport = crate::graphics::Viewport::with_physical_size(
+                crate::core::Size::new(48, 48),
+                scale,
+            );
+            let full = Rectangle::with_size(viewport.logical_size());
+            let mut renderer = crate::Renderer::new(
+                crate::core::Font::default(),
+                crate::core::Pixels(13.0),
+            );
+            renderer.reset(full);
+            renderer.with_layer(layer_clip, |renderer| {
+                renderer.draw_grid(grid.clone(), grid_bounds, widget_clip);
+                let mut image = crate::core::Image::new(handle.clone());
+                image.filter_method = crate::core::image::FilterMethod::Nearest;
+                renderer.draw_image(image, image_bounds, layer_clip);
+            });
+            assert_eq!(
+                crate::raster::native_placement(
+                    grid_bounds,
+                    tiny_skia::Transform::from_scale(scale, scale),
+                    16,
+                    16,
+                )
+                .is_some(),
+                scale == 1.0,
+                "exercise native copy at 1.0 and masked fallback at 1.25"
+            );
+            let mut actual = tiny_skia::Pixmap::new(48, 48).unwrap();
+            let mut mask = tiny_skia::Mask::new(48, 48).unwrap();
+            renderer.draw(
+                &mut actual.as_mut(),
+                &mut mask,
+                &viewport,
+                &[full],
+                crate::core::Color::TRANSPARENT,
+            );
+
+            // Independent per-pixel BGRA oracle: all edges are integral at
+            // both scales, and the two solid-colour regions do not overlap.
+            // The grid paints only [8,12) squared. The image paints only
+            // [20,28) x [4,28), even though it is outside the widget clip.
+            for y in 0..48 {
+                for x in 0..48 {
+                    let lx = (x as f32 + 0.5) / scale;
+                    let ly = (y as f32 + 0.5) / scale;
+                    let expected = if (8.0..12.0).contains(&lx)
+                        && (8.0..12.0).contains(&ly)
+                    {
+                        [0, 255, 0, 255]
+                    } else if (20.0..28.0).contains(&lx)
+                        && (4.0..28.0).contains(&ly)
+                    {
+                        [0, 0, 128, 128]
+                    } else {
+                        [0, 0, 0, 0]
+                    };
+                    let offset = (y * 48 + x) * 4;
+                    assert_eq!(
+                        &actual.data()[offset..offset + 4],
+                        &expected,
+                        "scale={scale} pixel=({x},{y})"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn layer_damage_tracks_native_generation_placement_and_clip() {

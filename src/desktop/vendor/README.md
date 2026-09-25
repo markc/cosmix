@@ -54,10 +54,25 @@ fractional clips, translucent overlapping images, movement, resize, cursor
 crossing/hiding, invalidation and unknown age. Existing retained-handle tests
 now exercise native generations. The ignored frame benchmark retains the old
 whole-pane RGBA transport as a test-only reference and times native bands.
-These added tests are **not run in the rank-3 worktree**; cluster validation
-is required. Retire this extension when upstream provides equivalent immutable
+These tests pass on the build cluster (vendor `image,wayland` suite plus the
+term tiny-skia and default suites, 2026-09-25). Retire this extension when upstream provides equivalent immutable
 native storage, generation-aware damage, clipping and draw-order semantics;
 retain all pixel and history regressions when updating.
+
+Rank-3 review follow-up: `Grid` has a manual `Debug` implementation reporting
+only generation, width, height and byte length, avoiding native buffer dumps
+through image/layer diagnostics. Keep this until upstream offers equivalent
+bounded diagnostics. The vendored regression
+`grid::tests::layer_draw_intersects_widget_clip_and_restores_image_mask`
+uses `Renderer::draw` with a widget clip strictly inside its layer clip, then
+a translucent ordinary image in the same layer crossing the layer boundary.
+At scales 1.0 (native copy) and 1.25 (masked fallback), an independent BGRA
+pixel oracle requires untouched pixels outside the widget clip and image
+coverage limited only by the layer clip. Dropping the widget intersection
+paints extra grid pixels; removing mask restoration suppresses the subsequent
+image at 1.25. Retain this test on upstream updates; run it with the vendored
+image-feature test command below. It has not been run locally; cluster
+validation, including mutation checks, is required.
 
 T16 integration resolves cumulative band edges in physical coordinates before
 the upstream image-size division and truncation. Edges within 0.001 pixel of
