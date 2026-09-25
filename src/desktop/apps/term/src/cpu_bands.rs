@@ -1,0 +1,211 @@
+use super::*;
+
+/// Four terminal rows bound conversion and retained-buffer copies on echo,
+/// without creating a widget for every physical scanline.
+const ROWS_PER_BAND: usize = 4;
+
+#[derive(Default)]
+pub struct Surface {
+    pub(super) tiles: Vec<PixelBand>,
+    bands: Vec<DamageBand>,
+    width: u32,
+    height: u32,
+    cell: (u32, u32),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmix_term_core::{config::Cursor, terminal::Cell};
+    use std::time::Instant;
+
+    #[test]
+    fn bands_preserve_pixels_ids_and_cursor_damage_across_boundaries() {
+        let mut raster = Raster::new(2.5, 13.0, Cursor::Block).unwrap();
+        let mut surface = Surface::default();
+        let mut screen = Screen {
+            cols: 13,
+            rows: 11,
+            cursor: (2, 3),
+            cursor_visible: true,
+            cells: vec![
+                Cell {
+                    c: 'M',
+                    fg: [200, 210, 220],
+                    bg: [10, 20, 30],
+                    bold: false
+                };
+                143
+            ],
+            updated: Instant::now(),
+        };
+        surface.paint(&mut raster, &screen, &[]);
+        surface.cache_handle(1);
+        let retained = surface.images(2.5);
+        let before = surface.rgba();
+        screen.cursor.1 = 4;
+        surface.paint(&mut raster, &screen, &[false; 11]);
+        surface.cache_handle(2);
+        let next = surface.images(2.5);
+        assert_ne!(next[0].0.id(), retained[0].0.id());
+        assert_ne!(next[1].0.id(), retained[1].0.id());
+        assert_eq!(next[2].0.id(), retained[2].0.id());
+        let old: Vec<u8> = retained
+            .iter()
+            .flat_map(|(handle, _)| {
+                let Handle::Rgba { pixels, .. } = handle else {
+                    unreachable!()
+                };
+                pixels.iter().copied()
+            })
+            .collect();
+        assert_eq!(before, old, "retained image pixels were mutated");
+        assert_eq!(surface.rgba(), raster.render(&screen));
+
+        // Several paints before handle refresh must not lose earlier changes.
+        screen.cursor_visible = false;
+        for row in [0, 7, 10] {
+            screen.cells[row * 13].bg = [80, 90, 100];
+            let mut dirty = [false; 11];
+            dirty[row] = true;
+            surface.paint(&mut raster, &screen, &dirty);
+        }
+        surface.cache_handle(3);
+        assert_eq!(surface.rgba(), raster.render(&screen));
+        let stable = surface.images(2.5);
+        assert!(surface.paint(&mut raster, &screen, &[false; 11]).is_empty());
+        surface.cache_handle(4);
+        assert_eq!(
+            stable.iter().map(|p| p.0.id()).collect::<Vec<_>>(),
+            surface
+                .images(2.5)
+                .iter()
+                .map(|p| p.0.id())
+                .collect::<Vec<_>>()
+        );
+
+        // Malformed snapshots, shrink, column changes and invalidation all
+        // owe complete valid pixels, including the final partial band.
+        screen.cells.truncate(13 * 6);
+        surface.paint(&mut raster, &screen, &[false; 11]);
+        assert_eq!(surface.rgba(), raster.render(&screen));
+        screen.cols = 6;
+        surface.paint(&mut raster, &screen, &[false; 11]);
+        assert_eq!(surface.rgba(), raster.render(&screen));
+        surface.invalidate();
+        surface.paint(&mut raster, &screen, &[false; 11]);
+        assert_eq!(surface.rgba(), raster.render(&screen));
+        screen.rows = 0;
+        surface.paint(&mut raster, &screen, &[]);
+        surface.cache_handle(5);
+        assert!(surface.images(2.5).is_empty());
+    }
+}
+
+impl Surface {
+    #[cfg(test)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    #[cfg(test)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tiles.is_empty()
+    }
+
+    pub fn invalidate(&mut self) {
+        for tile in &mut self.tiles {
+            tile.invalidate();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn rgba(&self) -> Vec<u8> {
+        self.tiles
+            .iter()
+            .flat_map(|tile| tile.rgba.iter().copied())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn allocation(&self) -> *const u8 {
+        self.tiles
+            .first()
+            .map_or(std::ptr::null(), |tile| tile.rgba.as_ptr())
+    }
+
+    pub fn paint(&mut self, raster: &mut Raster, screen: &Screen, dirty: &[bool]) -> &[DamageBand] {
+        self.bands.clear();
+        let (width, height) = raster.target_size(screen);
+        let rows = height as usize / raster.height as usize;
+        if (self.width, self.height, self.cell) != (width, height, (raster.width, raster.height)) {
+            self.invalidate();
+        }
+        self.width = width;
+        self.height = height;
+        self.cell = (raster.width, raster.height);
+        self.tiles
+            .resize_with(rows.div_ceil(ROWS_PER_BAND), PixelBand::default);
+        let valid_damage = rows == screen.rows && dirty.len() == rows;
+        for (index, tile) in self.tiles.iter_mut().enumerate() {
+            let first = index * ROWS_PER_BAND;
+            let end = (first + ROWS_PER_BAND).min(rows);
+            // Keep the original cell columns and translate only the row and
+            // cursor origin. Core PaintState then erases the old cursor even
+            // when it moves to another band or disappears on a resize.
+            let part = Screen {
+                cols: screen.cols,
+                rows: end - first,
+                cursor: (screen.cursor.0, screen.cursor.1.saturating_sub(first)),
+                cursor_visible: screen.cursor_visible && (first..end).contains(&screen.cursor.1),
+                cells: screen.cells[first * screen.cols..end * screen.cols].to_vec(),
+                updated: screen.updated,
+            };
+            let dirty = if valid_damage {
+                &dirty[first..end]
+            } else {
+                &[]
+            };
+            let discard = dirty.len() != part.rows || dirty.iter().all(|row| *row);
+            for damage in tile.paint_inner(raster, &part, dirty, discard) {
+                self.bands.push(DamageBand {
+                    y: first as u32 * raster.height + damage.y,
+                    height: damage.height,
+                });
+            }
+        }
+        &self.bands
+    }
+
+    pub fn cache_handle(&mut self, generation: u64) {
+        for tile in &mut self.tiles {
+            // paint releases the handle only for a potentially changed band.
+            // Unchanged bands MUST keep their id across pane generations.
+            if tile.cached.is_none() {
+                tile.cache_handle(generation);
+            }
+        }
+    }
+
+    pub(super) fn images(&self, scale: f32) -> Vec<(Handle, iced::Rectangle)> {
+        let mut y = 0;
+        self.tiles
+            .iter()
+            .filter_map(|tile| {
+                let bounds = iced::Rectangle {
+                    x: 0.0,
+                    y: y as f32 / scale,
+                    width: tile.width as f32 / scale,
+                    height: tile.height as f32 / scale,
+                };
+                y += tile.height;
+                tile.cached
+                    .as_ref()
+                    .map(|(_, handle)| (handle.clone(), bounds))
+            })
+            .collect()
+    }
+}

@@ -656,11 +656,11 @@ fn renderer(
 
 #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
 fn renderer(
-    _state: &State,
+    state: &State,
     _id: u64,
     frame: Arc<Mutex<frame::Frame>>,
-) -> iced::widget::Image<iced::widget::image::Handle> {
-    cpu_grid::view(&frame)
+) -> cpu_grid::Grid {
+    cpu_grid::view(&frame, state.painter.scale())
 }
 
 /// Apply a tab or pane chord to the tab set, returning what to tear down.
