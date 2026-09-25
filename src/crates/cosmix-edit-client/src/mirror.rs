@@ -80,7 +80,8 @@
 //!   `read-<n>` id that is not in the body. A read's deadline re-sends it.
 //! - Local ops and server ops leave in the order they were queued (one FIFO
 //!   across both), so an undo pressed before more typing undoes only what was
-//!   typed before it: §3.3's "drain first", order-preserving.
+//!   typed before it and never the later typing: §3.3's "drain first",
+//!   order-preserving (lead decision, 2026-09-26).
 //! - After a snapshot, an in-flight op whose reply rev is past the snapshot
 //!   stays in flight with `present == false`; its echo then folds as a remote
 //!   edit and acks it. Its items are not in the snapshot's coordinates, so it
@@ -124,6 +125,9 @@ pub const MSG_UNDO_INCOMPLETE: &str = "Undo did not complete — press again";
 pub const MSG_REDO_INCOMPLETE: &str = "Redo did not complete — press again";
 pub const MSG_REPLACE_INCOMPLETE: &str = "Replace did not complete — try again";
 pub const MSG_SAVE_UNCERTAIN: &str = "The save may not have completed — save again";
+/// A save refused `disk_modified` (the file changed on disk): the chrome
+/// asks before a forced save.
+pub const MSG_SAVE_DISK_MODIFIED: &str = "The file changed on disk since it was opened — save anyway?";
 pub const MSG_KEEP_INTERRUPTED: &str =
     "Transfer interrupted; the shared buffer holds a partial copy of yours — Retry, Undo remaining or Save mine as…";
 
@@ -1060,6 +1064,14 @@ impl Mirror {
         Step::default()
     }
 
+    /// Forget the recorded conflict(s) of remote rev `rev` (the infobar's
+    /// dismiss). `true` when one was removed.
+    pub fn dismiss_conflict(&mut self, rev: u64) -> bool {
+        let before = self.conflicts.len();
+        self.conflicts.retain(|c| c.rev != rev);
+        self.conflicts.len() != before
+    }
+
     // ── internals ────────────────────────────────────────────────────────────
 
     fn push_delta(&mut self, step: &mut Step, edits: Vec<Edit>, origin: Option<cosmix_edit_core::origin::Origin>, kind: DeltaKind) {
@@ -1673,6 +1685,7 @@ impl Mirror {
                     ServerOp::ApplyAt { .. } if why == Some(reason::STALE_REV) => {
                         "The text changed before the replace was applied; nothing was replaced".to_string()
                     }
+                    ServerOp::Save { .. } if why == Some(reason::DISK_MODIFIED) => MSG_SAVE_DISK_MODIFIED.to_string(),
                     _ => r.message.clone(),
                 };
                 self.clear_slot();

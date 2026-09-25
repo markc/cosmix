@@ -40,6 +40,10 @@ use crate::editor::{EditorMsg, LayoutReport};
 use crate::session::{RECENT_MAX, Session, SessionTab};
 use crate::verbs::{self, PhaseW, code};
 
+mod ui;
+
+pub use ui::{Prompt, RecoveredRow};
+
 /// One tab = one buffer view.
 pub struct Tab {
     pub id: TabId,
@@ -85,6 +89,9 @@ pub enum Effect {
     SaveSession,
     /// Detach and exit (plan D13).
     Quit,
+    /// Ask the human (a dialog); the answer comes back as an action or a
+    /// [`Controller`] method (see [`Prompt`]). Added in E1d for E1f.
+    Prompt(Prompt),
 }
 
 /// `ced.wait` longest deadline.
@@ -118,6 +125,16 @@ struct TabX {
     layout: Option<LayoutReport>,
     /// Pending `line[:col]` from `path:line:col` or `ced.open {line, col}`.
     goto: Option<(usize, usize)>,
+    /// `keep_as_new`: text to insert (by this intent) once the buffer is live.
+    fill: Option<(String, Intent)>,
+    /// `file.close {save:true}`: close once the save has landed.
+    close_after_save: Option<Intent>,
+    /// Who asked for the last save (a `disk_modified` refusal prompts them).
+    save_intent: Option<Intent>,
+    /// A find / replace waiting for the pipeline to go idle.
+    find: Option<ui::FindJob>,
+    /// An outstanding lint capture and the deltas since (plan §4.10).
+    lint: Option<ui::LintCapture>,
 }
 
 /// What a request the controller sent is for.
@@ -127,8 +144,12 @@ enum Req {
     /// Scratch-tab reattach: find the buffer by `recovery_id`.
     List { tab: TabId },
     Info,
-    Close { tab: TabId, cmd: Option<(u64, String)> },
+    Close { tab: TabId, cmd: Option<(u64, String)>, intent: Intent },
     Select,
+    Find { tab: TabId, job: Box<ui::FindJob> },
+    /// `edit.list` at start for the recovered-buffers prompt.
+    Recovered,
+    Discard,
 }
 
 enum TimerFor {
@@ -198,6 +219,12 @@ pub struct Controller {
     config_path: Option<String>,
     session_path: Option<String>,
     stats: Stats,
+    /// `set_layout`: the last frame's geometry (`ced.layout`).
+    layout: Option<verbs::LayoutReply>,
+    frames: ui::Frames,
+    /// Recovered buffers offered at start, and their epoch.
+    recovered: Vec<wire::BufferSummary>,
+    recovered_epoch: String,
 }
 
 fn refusal(code: &str, message: impl Into<String>, reason: Option<&str>) -> String {
@@ -253,6 +280,31 @@ fn reply_result(rc: u8, body: &str) -> Result<Value, wire::Refusal> {
         rev: None,
         context: Default::default(),
     }))
+}
+
+/// An `edit.open`-shaped reply for a buffer known from `edit.list` (scratch
+/// reattach, recovered buffers): the list row carries everything the mirror
+/// needs except eol/bom, which a snapshot does not depend on.
+fn open_reply_of(epoch: &str, b: &wire::BufferSummary) -> wire::OpenReply {
+    wire::OpenReply {
+        buffer: b.buffer.clone(),
+        epoch: epoch.to_string(),
+        path: b.path.clone(),
+        opened_as: b.opened_as.clone(),
+        name: b.name.clone(),
+        language: b.language.clone(),
+        rev: b.rev,
+        lines: b.lines,
+        bytes: b.bytes,
+        eol: wire::Eol::Lf,
+        bom: false,
+        disk: b.disk,
+        reopened: true,
+        created: false,
+        recovery_id: b.recovery_id.clone(),
+        recovered: b.recovered,
+        recovered_from: None,
+    }
 }
 
 fn line_comment(language: &str) -> Option<&'static str> {
@@ -343,6 +395,10 @@ impl Controller {
             config_path: None,
             session_path: None,
             stats: Stats::default(),
+            layout: None,
+            frames: ui::Frames::default(),
+            recovered: Vec::new(),
+            recovered_epoch: String::new(),
         }
     }
 
@@ -381,6 +437,8 @@ impl Controller {
             fx.push(Effect::Subscribe { topic: topic.to_string() });
         }
         self.send_info(&mut fx);
+        let out = Outgoing { verb: "edit.list".into(), body: "{}".into(), op_id: None, deadline_ms: DEADLINE_MS };
+        self.send(out, Req::Recovered, &mut fx);
         if let Some(s) = self.restore.take() {
             let mut ids = Vec::new();
             for st in &s.tabs {
@@ -446,7 +504,7 @@ impl Controller {
     /// A menu / key / Bus action on `tab` (default: the active tab).
     pub fn on_action(&mut self, tab: Option<TabId>, action: ActionId, intent: Intent) -> Vec<Effect> {
         let mut fx = Vec::new();
-        if let Err((_, msg)) = self.action(tab, action, intent, &mut fx) {
+        if let Err((_, msg)) = self.action_args(tab, action, None, intent, &mut fx) {
             fx.push(Effect::Notice { tab, notice: Notice::Message { level: Level::Warn, text: msg } });
         }
         self.eval_waiters(&mut fx);
@@ -573,7 +631,7 @@ impl Controller {
     }
 
     /// The tab a Bus request names (`tab` or `buffer`), else the active one.
-    fn select_tab(&self, sel: &verbs::TabSel) -> Result<TabId, String> {
+    fn resolve_tab(&self, sel: &verbs::TabSel) -> Result<TabId, String> {
         if let Some(t) = sel.tab {
             return self.tab(t).map(|t| t.id).ok_or_else(|| format!("no tab {t}"));
         }
@@ -662,7 +720,7 @@ impl Controller {
                     self.note_epoch(&info.epoch, fx);
                 }
             }
-            Some(Req::Close { tab, cmd }) => {
+            Some(Req::Close { tab, cmd, intent }) => {
                 if rc < 10 {
                     self.close_tab(tab, fx);
                     if let Some((id, action)) = cmd {
@@ -678,14 +736,17 @@ impl Controller {
                             rc: 10,
                             body: refusal(code::CONFLICT, message, Some(if dirty { "dirty" } else { "refused" })),
                         }),
-                        None => fx.push(Effect::Notice {
-                            tab: Some(tab),
-                            notice: Notice::Message {
-                                level: Level::Warn,
-                                text: if dirty { "Unsaved changes — save, or close with Discard".into() } else { message },
-                            },
-                        }),
+                        None if dirty => fx.push(Effect::Prompt(Prompt::CloseDirty { tab, intent })),
+                        None => fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: message } }),
                     }
+                }
+            }
+            Some(Req::Find { tab, job }) => self.on_find_reply(tab, *job, rc, body, fx),
+            Some(Req::Recovered) => self.on_recovered_list(rc, body, fx),
+            Some(Req::Discard) => {
+                if rc >= 10 {
+                    let msg = reply_result(rc, body).err().map(|r| r.message).unwrap_or_default();
+                    fx.push(Effect::Notice { tab: None, notice: Notice::Message { level: Level::Warn, text: msg } });
                 }
             }
             Some(Req::Select) | None => {}
@@ -706,8 +767,10 @@ impl Controller {
                 self.send_open(tab, path, reattach, fx);
             }
             Some(Req::List { tab }) => self.send_list(tab, fx),
-            Some(Req::Close { tab, cmd: Some((id, _)) }) => {
-                let _ = tab;
+            Some(Req::Find { tab, .. }) => {
+                fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: "The search timed out".into() } })
+            }
+            Some(Req::Close { cmd: Some((id, _)), .. }) => {
                 fx.push(Effect::Respond { id, rc: 10, body: refusal(code::UNAVAILABLE, "edit.close timed out", Some("timeout")) });
             }
             _ => {}
@@ -872,25 +935,7 @@ impl Controller {
         let row = list.as_ref().and_then(|l| l.buffers.iter().find(|b| Some(&b.recovery_id) == rid.as_ref()).map(|b| (l, b)));
         match row {
             Some((l, b)) => {
-                let open = wire::OpenReply {
-                    buffer: b.buffer.clone(),
-                    epoch: l.epoch.clone(),
-                    path: b.path.clone(),
-                    opened_as: b.opened_as.clone(),
-                    name: b.name.clone(),
-                    language: b.language.clone(),
-                    rev: b.rev,
-                    lines: b.lines,
-                    bytes: b.bytes,
-                    eol: wire::Eol::Lf,
-                    bom: false,
-                    disk: b.disk,
-                    reopened: true,
-                    created: false,
-                    recovery_id: b.recovery_id.clone(),
-                    recovered: b.recovered,
-                    recovered_from: None,
-                };
+                let open = open_reply_of(&l.epoch, b);
                 let reattach = self.x.get(&tab).is_some_and(|x| x.reattaching);
                 self.attach(tab, reattach, &open, fx);
             }
@@ -1044,12 +1089,27 @@ impl Controller {
                 resynced |= d.kind == DeltaKind::Resync;
             }
         }
+        if let Some(c) = self.x.get_mut(&tab).and_then(|x| x.lint.as_mut()) {
+            for d in &step.deltas {
+                c.record(d);
+            }
+        }
         if resynced {
             self.stats.snapshot_recoveries += 1;
         }
         for n in step.notices {
             if matches!(n, Notice::Conflict(_)) {
                 self.stats.conflicts += 1;
+            }
+            if matches!(&n, Notice::Message { text, .. } if text == cosmix_edit_client::mirror::MSG_SAVE_DISK_MODIFIED) {
+                let x = self.x.get_mut(&tab);
+                let intent = x.and_then(|x| {
+                    x.close_after_save = None;
+                    x.save_intent.take()
+                });
+                let intent = intent.unwrap_or_else(|| Intent::ui(tab));
+                fx.push(Effect::Prompt(Prompt::DiskModified { tab, intent }));
+                continue;
             }
             fx.push(Effect::Notice { tab: Some(tab), notice: n });
         }
@@ -1087,7 +1147,34 @@ impl Controller {
         if live && let Some(g) = self.x.get_mut(&tab).and_then(|x| x.goto.take()) {
             self.goto(tab, g);
         }
+        if live && let Some((text, intent)) = self.x.get_mut(&tab).and_then(|x| x.fill.take()) {
+            let len = self.tab(tab).and_then(|t| t.mirror.as_ref()).map_or(0, |m| m.text().len());
+            let e = cosmix_edit_client::types::LocalEdit {
+                items: vec![(len..len, text)],
+                coalesce: false,
+                caret_after: Selection { anchor: 0, head: 0 },
+            };
+            if let Some(i) = self.tabs.iter().position(|t| t.id == tab)
+                && let Some(m) = self.tabs[i].mirror.as_mut()
+            {
+                match m.local_edit(e, intent, &mut self.ids) {
+                    Ok(step) => return self.drive(tab, step, fx),
+                    Err(e) => fx.push(Effect::Notice {
+                        tab: Some(tab),
+                        notice: Notice::Message { level: Level::Error, text: format!("the copy could not be inserted: {e:?}") },
+                    }),
+                }
+            }
+        }
         if idle {
+            if let Some(job) = self.x.get_mut(&tab).and_then(|x| x.find.take()) {
+                self.start_find(tab, job, fx);
+            }
+            let saved = self.tab(tab).and_then(|t| t.mirror.as_ref()).is_some_and(|m| !m.meta().dirty);
+            if let Some(intent) = self.x.get_mut(&tab).and_then(|x| x.close_after_save.take_if(|_| saved)) {
+                self.close(tab, false, None, intent, fx);
+                return;
+            }
             self.maybe_publish(tab, fx);
         }
     }
@@ -1236,7 +1323,7 @@ impl Controller {
             }
             ActionId::FileClose => {
                 let t = need(tab)?;
-                self.close(t, false, None, fx);
+                self.close(t, false, None, intent, fx);
                 Ok(None)
             }
             ActionId::FileExit => {
@@ -1323,7 +1410,7 @@ impl Controller {
     /// Close a tab: `edit.close` (refused `dirty` when this is the last
     /// holder of unsaved text — plan D13); a detached or failed tab closes
     /// locally.
-    fn close(&mut self, tab: TabId, force: bool, cmd: Option<(u64, String)>, fx: &mut Vec<Effect>) {
+    fn close(&mut self, tab: TabId, force: bool, cmd: Option<(u64, String)>, intent: Intent, fx: &mut Vec<Effect>) {
         let buffer = self
             .tab(tab)
             .and_then(|t| t.mirror.as_ref())
@@ -1337,7 +1424,7 @@ impl Controller {
                     op_id: None,
                     deadline_ms: DEADLINE_MS,
                 };
-                self.send(out, Req::Close { tab, cmd }, fx);
+                self.send(out, Req::Close { tab, cmd, intent }, fx);
             }
             None => {
                 self.close_tab(tab, fx);
@@ -1419,7 +1506,7 @@ impl Controller {
             }
             "ced.focus" => {
                 let sel = parse!(verbs::TabSel);
-                match self.select_tab(&sel) {
+                match self.resolve_tab(&sel) {
                     Ok(t) => {
                         self.active = Some(t);
                         if let Some(x) = self.x.get_mut(&t) {
@@ -1433,7 +1520,7 @@ impl Controller {
             }
             "ced.state" => {
                 let r = parse!(verbs::StateReq);
-                match self.select_tab(&r.sel).map(|t| self.state_reply(t, r.text)) {
+                match self.resolve_tab(&r.sel).map(|t| self.state_reply(t, r.text)) {
                     Ok(Ok(s)) => reply(fx, ok_body(&s)),
                     Ok(Err((c, m))) => refuse(fx, c, m, None),
                     Err(e) => refuse(fx, code::NOT_FOUND, e, None),
@@ -1441,7 +1528,7 @@ impl Controller {
             }
             "ced.type" => {
                 let r = parse!(verbs::TypeReq);
-                let t = match self.select_tab(&r.sel) {
+                let t = match self.resolve_tab(&r.sel) {
                     Ok(t) => t,
                     Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
                 };
@@ -1455,7 +1542,7 @@ impl Controller {
             }
             "ced.select" => {
                 let r = parse!(verbs::SelectReq);
-                let t = match self.select_tab(&r.sel) {
+                let t = match self.resolve_tab(&r.sel) {
                     Ok(t) => t,
                     Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
                 };
@@ -1483,7 +1570,7 @@ impl Controller {
                 };
                 let tab = match (r.sel.tab, &r.sel.buffer) {
                     (None, None) => self.active,
-                    _ => match self.select_tab(&r.sel) {
+                    _ => match self.resolve_tab(&r.sel) {
                         Ok(t) => Some(t),
                         Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
                     },
@@ -1492,12 +1579,12 @@ impl Controller {
                 if action == ActionId::FileClose {
                     let force = r.args.as_ref().and_then(|a| a.get("force")).and_then(Value::as_bool).unwrap_or(false);
                     match tab {
-                        Some(t) => self.close(t, force, Some((id, r.id.clone())), fx),
+                        Some(t) => self.close(t, force, Some((id, r.id.clone())), intent, fx),
                         None => refuse(fx, code::NOT_FOUND, "no tab is open".into(), None),
                     }
                     return;
                 }
-                match self.action(tab, action, intent, fx) {
+                match self.action_args(tab, action, r.args.as_ref(), intent, fx) {
                     Ok(result) => reply(fx, ok_body(&verbs::ActionReply { id: r.id, ok: true, result })),
                     Err((c, m)) => refuse(fx, c, m, None),
                 }
@@ -1524,10 +1611,13 @@ impl Controller {
                     return refuse(fx, code::UNAVAILABLE, "ced.layout needs a window (this instance is --headless)".into(), Some("headless"));
                 }
                 let sel = parse!(verbs::TabSel);
-                let t = match self.select_tab(&sel) {
+                let t = match self.resolve_tab(&sel) {
                     Ok(t) => t,
                     Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
                 };
+                if let Some(l) = self.layout.clone().filter(|l| l.tab == t) {
+                    return reply(fx, ok_body(&l));
+                }
                 match self.x.get(&t).and_then(|x| x.layout) {
                     Some(l) => {
                         let rect = |r: [f32; 4]| verbs::Rect { x: r[0], y: r[1], w: r[2], h: r[3] };
@@ -1559,10 +1649,10 @@ impl Controller {
                     fx,
                     ok_body(&verbs::StatsReply {
                         keys: s.keys,
-                        frames: 0,
+                        frames: self.frames.count,
                         model_us: verbs::Percentiles::default(),
-                        view_us: verbs::Percentiles::default(),
-                        next_frame_us: verbs::Percentiles::default(),
+                        view_us: ui::percentiles(&self.frames.view_us),
+                        next_frame_us: ui::percentiles(&self.frames.next_frame_us),
                         events: s.events,
                         history_recoveries: s.history_recoveries,
                         snapshot_recoveries: s.snapshot_recoveries,
@@ -1691,7 +1781,7 @@ impl Controller {
         if r.timeout_ms == 0 || r.timeout_ms > WAIT_MAX_MS {
             return refuse(fx, code::INVALID_ARGUMENT, format!("timeout_ms must be 1..={WAIT_MAX_MS}"));
         }
-        let tab = match self.select_tab(&r.sel) {
+        let tab = match self.resolve_tab(&r.sel) {
             Ok(t) => t,
             Err(e) => return fx.push(Effect::Respond { id: cmd, rc: 10, body: refusal(code::NOT_FOUND, e, None) }),
         };
@@ -1832,5 +1922,39 @@ mod tests {
             assert!(fx.contains(&Effect::Subscribe { topic: t.into() }), "{t}");
         }
         assert!(fx.iter().any(|e| matches!(e, Effect::Send { out, .. } if out.verb == "edit.info")));
+    }
+
+    #[test]
+    fn recovered_buffers_prompt_once_and_frames_feed_stats() {
+        let mut c = ctl();
+        let fx = c.start();
+        let req = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { req, out } if out.verb == "edit.list" => Some(*req),
+                _ => None,
+            })
+            .expect("edit.list at start");
+        let row = |b: &str, recovered: bool, holders: Vec<String>| {
+            json!({"buffer": b, "path": null, "opened_as": null, "name": null, "language": "text", "rev": 0,
+                   "saved_rev": null, "dirty": true, "disk": "none", "lines": 1, "bytes": 5, "holders": holders,
+                   "recovery_id": "5f0c2a9e1b7d4c33", "recovered": recovered})
+        };
+        let body = json!({"epoch": "0000e1e1", "buffers": [row("b1_0000e1e1", true, vec![]), row("b2_0000e1e1", false, vec![]),
+                                                            row("b3_0000e1e1", true, vec!["local:x".into()])]});
+        let fx = c.on_incoming(Incoming::Reply { req, rc: 0, body: body.to_string() });
+        let prompts: Vec<_> = fx.iter().filter_map(|e| match e { Effect::Prompt(p) => Some(p.clone()), _ => None }).collect();
+        assert_eq!(prompts.len(), 1);
+        let Prompt::Recovered { buffers } = &prompts[0] else { panic!("{prompts:?}") };
+        assert_eq!(buffers.iter().map(|b| b.buffer.as_str()).collect::<Vec<_>>(), ["b1_0000e1e1"]);
+        let fx = c.discard_recovered("b1_0000e1e1");
+        assert!(fx.iter().any(|e| matches!(e, Effect::Send { out, .. } if out.verb == "edit.close" && out.body.contains("\"force\":true"))));
+        for v in 1..=100 {
+            c.record_frame(v, Some(v * 10));
+        }
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.stats", json!({}))));
+        assert_eq!(rc, 0);
+        assert_eq!((v["frames"].as_u64(), v["view_us"]["p99"].as_u64(), v["next_frame_us"]["max"].as_u64()), (Some(100), Some(99), Some(1000)));
+        assert!(c.edit_info().is_none());
     }
 }
