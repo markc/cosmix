@@ -3003,7 +3003,7 @@ pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
 /// allowed and are gated by `policy` at dispatch, as usual.
 ///
 /// Synchronous: the evaluator's async expression path is driven on a
-/// fresh current-thread tokio runtime inside this call (a pure-policy
+/// reused thread-local current-thread tokio runtime (a pure-policy
 /// program never pends on a handler — the Db/Jmap/Bus seam builtins
 /// raise "not available" when no handler is registered), so it must
 /// not be called from within an async execution context. This is a
@@ -3058,6 +3058,13 @@ fn checked_mode_expr(source: &str) -> MixResult<Expr> {
     Ok(expr.clone())
 }
 
+thread_local! {
+    // Expression evaluators/globals remain fresh, but thousands of bindings
+    // share one driver instead of rebuilding Tokio's I/O and timer machinery.
+    static EXPR_RUNTIME: std::cell::OnceCell<tokio::runtime::Runtime> =
+        const { std::cell::OnceCell::new() };
+}
+
 fn eval_checked_expr(
     expr: &Expr,
     globals: &[(&str, Value)],
@@ -3078,36 +3085,44 @@ fn eval_checked_expr(
         eval.set_global(name, value.clone());
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| MixError::RuntimeError {
-            span: None,
-            msg: format!("eval_expr_string: {}", e),
-        })?;
     // The timer cancels pending work, but Tokio polls the inner future first:
     // a CPU-bound builtin can return Ready after expiry without a timeout.
     // Reject that result too, including when it is the final expression.
     let fut = eval.eval_expr(expr);
-    rt.block_on(async move {
-        match deadline {
-            Some(deadline) => {
-                let result = tokio::time::timeout_at(deadline.into(), fut).await;
-                if std::time::Instant::now() >= deadline {
-                    return Err(MixError::RuntimeError {
-                        span: None,
-                        msg: "eval_expr_string: time limit exceeded".into(),
-                    });
-                }
-                result.unwrap_or_else(|_| {
-                    Err(MixError::RuntimeError {
-                        span: None,
-                        msg: "eval_expr_string: time limit exceeded".into(),
-                    })
-                })
-            }
-            None => fut.await,
+    EXPR_RUNTIME.with(|runtime| {
+        if runtime.get().is_none() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| MixError::RuntimeError {
+                    span: None,
+                    msg: format!("eval_expr_string: {e}"),
+                })?;
+            // Leave the cell empty on construction failure so a subsequent
+            // revision can recover after temporary resource pressure clears.
+            let _ = runtime.set(rt);
         }
+        let rt = runtime.get().unwrap();
+        rt.block_on(async move {
+            match deadline {
+                Some(deadline) => {
+                    let result = tokio::time::timeout_at(deadline.into(), fut).await;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(MixError::RuntimeError {
+                            span: None,
+                            msg: "eval_expr_string: time limit exceeded".into(),
+                        });
+                    }
+                    result.unwrap_or_else(|_| {
+                        Err(MixError::RuntimeError {
+                            span: None,
+                            msg: "eval_expr_string: time limit exceeded".into(),
+                        })
+                    })
+                }
+                None => fut.await,
+            }
+        })
     })
 }
 
@@ -5102,7 +5117,8 @@ impl Evaluator {
             // the yield point.
             let bus_handler = self.globals.borrow().bus_handler.clone();
             let native = self.globals.borrow().native_events.queue.clone();
-            if bus_handler.is_none() && !self.globals.borrow().native_events.has_sources() {
+            let has_native_sources = self.globals.borrow_mut().native_events.has_sources();
+            if bus_handler.is_none() && !has_native_sources {
                 break "no_handler";
             }
             // Race the inbound-message wait against a `quit()` wake. A
@@ -11188,9 +11204,14 @@ impl Evaluator {
                                 // the comments, don't just rearrange the code.
                                 let handler = { self.globals.borrow().bus_handler.clone() };
                                 let native = self.globals.borrow().native_events.queue.clone();
+                                let (filesystem, children) = {
+                                    let g = self.globals.borrow();
+                                    (g.handlers.contains_key("fs.changed"),
+                                     g.handlers.contains_key("proc.exited"))
+                                };
                                 let outcome: SleepOutcome = tokio::select! {
                                     _ = tokio::time::sleep_until(deadline) => SleepOutcome::Deadline,
-                                    event = native.next(None) => SleepOutcome::Event(Some(event?)),
+                                    event = native.next_selected(None, filesystem, children), if filesystem || children => SleepOutcome::Event(Some(event?)),
                                     event = async {
                                         match &handler {
                                             Some(h) if !transport_closed => h.next_incoming().await,

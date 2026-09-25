@@ -348,6 +348,8 @@ pub(crate) fn evaluate_budgeted(
     if let Some(item) = item {
         globals.push(("item", to_mix(item)));
     }
+    // Mix reuses its thread-local Tokio driver; globals, policy and fuel remain
+    // isolated per expression. The revision budget still covers every row.
     let result = eval_expr_string(
         &binding.source,
         &globals,

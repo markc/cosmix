@@ -51,6 +51,9 @@ Quoin runs that preflight for loads, port patches and model-only patches
 before committing a revision. A template failure preserves the authored
 document, resolved tree, compiled bindings and revision. Results that cross
 the shared deadline are rejected even when the final expression never yields.
+The renderer retains the prepared instances with that accepted revision and
+applies them without evaluating again. Mix expression evaluation reuses one
+Tokio runtime per calling thread; each call still has fresh globals and limits.
 
 Lint reports bounded-document, schema, graph, template, row and header
 diagnostics. `orphan-node` is a warning; other violations are errors. The

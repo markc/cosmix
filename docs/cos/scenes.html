@@ -544,10 +544,14 @@ Empty model and binding fields are omitted from resolved-tree serialisation.</p>
 </tbody></table>
 <p>Calling <code>time()</code> is allowed but emits a <code>binding-nondeterministic</code> warning;
 it is not a policy violation.</p>
-<p><code>shell.scene.watch {scene}</code> returns <code>{scene,revision,digest}</code>. Subscribe to
+<p><code>shell.scene.watch {scene}</code> returns
+<code>{scene,revision,digest,applied_revision,diagnostics}</code>. Subscribe to
 <code>shell.scene.changed</code> for summaries <code>{scene,revision,ops,diagnostics}</code>;
 fetch the complete tree with <code>get</code>. Revisions increase on accepted loads and
-patches. Digests are SHA-256 of the serialised resolved tree.</p>
+patches. Digests are SHA-256 of the serialised resolved tree. <code>applied_revision</code>
+is the last revision applied by the renderer (zero before first application).
+Watch replies and scene inventory retain render diagnostics for state-based
+resynchronisation; notifications are hints, not proof of application.</p>
 <p>UI handlers are directed Bus requests to the document's citizen with
 <code>{scene,node,kind,value?,item?}</code>. Kinds are <code>click</code>, <code>change</code> and <code>submit</code>.
 Requests time out after two seconds; unavailable citizens are logged at most
@@ -570,11 +574,13 @@ content, and changing an item's ID always creates fresh content.
 Each template evaluation pass shares a 250 ms / 16,384-node budget across all
 lists. Ingress preflights templates before committing a revision or mount;
 failure returns <code>{error_code:"scene_template",message,scene,diagnostics}</code>.
-Model-only patch paths must call the same <code>render::validate_templates</code> on the
-candidate resolved tree. Rendering also enforces the budget: a render-time
-deadline failure logs its diagnostic and retains the previously rendered tree,
-retrying only on a new revision. That late deadline failure is not a loader
-status event; a first render has no prior tree.
+Loads, port patches and model-only patches retain those prepared instances with
+the accepted revision. Rendering applies them directly, including when display
+scale changes; there is no second expression evaluation or deadline. Expression
+evaluations reuse a thread-local Tokio runtime while keeping globals, policy and
+limits isolated. A renderer state failure retains the last applied revision and
+a readable <code>scene-render</code> diagnostic in watch/inventory replies. A new accepted
+revision clears that diagnostic and permits another application attempt.
 Nested-list rendering remains outside this renderer's supported template path.
 Clicks on repeated rows use the owning list's handler and node ID, with the
 complete row in <code>item</code>; descendant row handlers cannot redirect that click.

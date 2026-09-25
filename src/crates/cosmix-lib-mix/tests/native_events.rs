@@ -242,14 +242,11 @@ async fn nonserve_wait_and_serve_refusal_use_structured_errors() {
     assert!(v.to_mix_string().contains("ready"));
     e.set_serve_runtime(Rc::new(Runtime));
     let err = exec(&mut e, "fs_wait($h)").await.unwrap_err();
-    assert!(err.to_string().contains("FS_WAIT_SERVE"));
+    assert!(matches!(err, cosmix_mix::MixError::Structured(info) if info.code == "FS_WAIT_SERVE"));
     exec(&mut e, "fs_unwatch($h)").await.unwrap();
+    let error = exec(&mut e, "fs_unwatch($h)").await.unwrap_err();
     assert!(
-        exec(&mut e, "fs_unwatch($h)")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("FS_WATCH_HANDLE")
+        matches!(error, cosmix_mix::MixError::Structured(info) if info.code == "FS_WATCH_HANDLE")
     );
     let caught = exec(
         &mut e,
@@ -329,12 +326,9 @@ async fn failed_candidate_cleanup_preserves_old_generation_then_success_retires_
         .drain_class_c_for_shutdown(Duration::ZERO, false)
         .await;
     replacement.close_native_events();
+    let error = exec(&mut replacement, "fs_watch($root)").await.unwrap_err();
     assert!(
-        exec(&mut replacement, "fs_watch($root)")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("NATIVE_CLOSED")
+        matches!(error, cosmix_mix::MixError::Structured(info) if info.code == "NATIVE_CLOSED")
     );
 }
 
@@ -448,8 +442,220 @@ async fn idle_serve_pump_has_no_clock_wakeups() {
 #[test]
 fn managed_child_fixture() {
     if std::env::var_os("MIX_NATIVE_CHILD_FIXTURE").is_some() {
+        if let Some(path) = std::env::var_os("MIX_NATIVE_CHILD_ESCAPE") {
+            use std::io::Write;
+            // Join the parent's group after exec, escaping the spawn-time one.
+            assert_eq!(
+                unsafe { libc::setpgid(0, libc::getpgid(libc::getppid())) },
+                0
+            );
+            let mut ready = std::os::unix::net::UnixStream::connect(path).unwrap();
+            ready.write_all(b"ready").unwrap();
+        }
         std::thread::park();
     }
+}
+
+#[test]
+fn shutdown_reaps_a_managed_leader_that_left_its_process_group() {
+    let d = Directory::new();
+    let socket = d.0.join("ready.sock");
+    let (pid_tx, pid_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let mut e = Evaluator::new();
+            e.set_global("exe", Value::String(std::env::current_exe().unwrap().to_str().unwrap().into()));
+            e.set_global("socket", Value::String(socket.to_str().unwrap().into()));
+            exec(&mut e, r#"$pid = spawn([$exe, "--exact", "managed_child_fixture"], {
+                exit_event: true, env: {MIX_NATIVE_CHILD_FIXTURE: "1", MIX_NATIVE_CHILD_ESCAPE: $socket}
+            })"#).await.unwrap();
+            let pid = e.get_global("pid").unwrap().to_number().unwrap() as i32;
+            pid_tx.send(pid).unwrap();
+            let (mut ready, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+            let mut bytes = [0; 5];
+            use tokio::io::AsyncReadExt;
+            tokio::time::timeout(Duration::from_secs(5), ready.read_exact(&mut bytes)).await.unwrap().unwrap();
+            assert_eq!(&bytes, b"ready");
+            assert_ne!(unsafe { libc::getpgid(pid) }, pid);
+            e.close_native_events();
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+            done_tx.send(()).unwrap();
+        });
+    });
+    let pid = pid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let done = done_rx.recv_timeout(Duration::from_secs(10));
+    if done.is_err() {
+        // Watchdog cleanup also makes the unfixed regression fail without
+        // leaving a blocked monitor or an orphan behind in the test process.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    let joined = worker.join();
+    assert!(done.is_ok(), "shutdown waited for an escaped, live leader");
+    joined.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn plain_pump_finishes_after_the_last_managed_exit_without_quit() {
+    let mut e = Evaluator::new();
+    exec(
+        &mut e,
+        r#"
+        $exits = 0
+        on proc.exited
+            $exits = $exits + 1
+        end
+        spawn(["/bin/true"], {exit_event: true})
+    "#,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(e.get_global("exits").unwrap().to_number(), Some(1.0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sleep_with_child_handler_preserves_batches_for_fs_wait() {
+    let d = Directory::new();
+    let mut e = Evaluator::new();
+    e.set_global("root", Value::String(d.0.to_str().unwrap().into()));
+    exec(
+        &mut e,
+        r#"
+        $exits = 0
+        on proc.exited
+            $exits = $exits + 1
+        end
+        $h = fs_watch($root, {events: ["created"]})
+    "#,
+    )
+    .await
+    .unwrap();
+    std::fs::write(d.0.join("kept"), "x").unwrap();
+    exec(
+        &mut e,
+        "spawn([\"/bin/true\"], {exit_event: true})\nsleep(0.1)",
+    )
+    .await
+    .unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(5), exec(&mut e, "fs_wait($h)"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(batch.to_mix_string().contains("kept"));
+    // If the child was delayed, finish through the native pump without a timer.
+    if e.get_global("exits").unwrap().to_number() != Some(1.0) {
+        tokio::time::timeout(Duration::from_secs(5), exec(&mut e, "fs_unwatch($h)"))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(e.get_global("exits").unwrap().to_number(), Some(1.0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn overlapping_watches_keep_independent_filters_and_survive_peer_unwatch() {
+    let d = Directory::new();
+    let mut e = Evaluator::new();
+    e.set_global("root", Value::String(d.0.to_str().unwrap().into()));
+    exec(
+        &mut e,
+        r#"
+        $a = fs_watch($root, {events: ["created"]})
+        $b = fs_watch($root, {events: ["deleted"]})
+    "#,
+    )
+    .await
+    .unwrap();
+    let file = d.0.join("shared");
+    std::fs::write(&file, "x").unwrap();
+    let created = tokio::time::timeout(Duration::from_secs(5), exec(&mut e, "fs_wait($a)"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(created.to_mix_string().contains("created"));
+    exec(&mut e, "fs_unwatch($a)").await.unwrap();
+    std::fs::remove_file(file).unwrap();
+    let deleted = tokio::time::timeout(Duration::from_secs(5), exec(&mut e, "fs_wait($b)"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deleted.to_mix_string().contains("deleted"));
+    assert!(!deleted.to_mix_string().contains("created"));
+}
+
+#[test]
+fn shared_fs_registry_fixture() {
+    if std::env::var_os("MIX_SHARED_FS_FIXTURE").is_none() {
+        return;
+    }
+    fn inotify_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target.as_os_str() == "anon_inode:inotify")
+            .count()
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let d = Directory::new();
+        let mut e = Evaluator::new();
+        e.set_global("root", Value::String(d.0.to_str().unwrap().into()));
+        let instances = inotify_count();
+        let threads = std::fs::read_dir("/proc/self/task").unwrap().count();
+        for _ in 0..128 {
+            exec(&mut e, "fs_watch($root)").await.unwrap();
+        }
+        assert_eq!(inotify_count(), instances + 1);
+        // notify owns one event-loop thread; reconciliation owns one worker.
+        // Both are per registry, regardless of the number of watch handles.
+        assert_eq!(
+            std::fs::read_dir("/proc/self/task").unwrap().count(),
+            threads + 2
+        );
+        let error = exec(&mut e, "fs_watch($root)").await.unwrap_err();
+        let cosmix_mix::MixError::Structured(info) = error else {
+            panic!("structured limit")
+        };
+        assert_eq!(info.code, "FS_WATCH_LIMIT");
+        e.close_native_events();
+    });
+}
+
+#[test]
+fn all_watch_handles_share_one_inotify_instance_and_worker_pair() {
+    // Isolate /proc counts from the other concurrently running native tests.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "shared_fs_registry_fixture", "--nocapture"])
+        .env("MIX_SHARED_FS_FIXTURE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 async fn blocked_child(e: &mut Evaluator) -> i32 {

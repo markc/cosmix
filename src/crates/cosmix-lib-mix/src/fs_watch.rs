@@ -63,8 +63,10 @@ mod linux {
         event::{AccessKind, AccessMode, ModifyKind, RenameMode},
     };
     use std::{
-        collections::BTreeSet,
+        cell::RefCell,
+        collections::{BTreeMap, BTreeSet},
         path::{Path, PathBuf},
+        rc::Rc,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -73,12 +75,18 @@ mod linux {
         thread,
     };
 
+    type WatchReply = mpsc::SyncSender<Result<(), (String, String)>>;
+
     enum Input {
         Event(notify::Result<notify::Event>),
+        Add(String, Options, String, WatchReply),
+        Remove(String, mpsc::SyncSender<()>),
         Stop,
     }
 
-    pub(crate) struct Watch {
+    /// One inotify instance/event-loop thread and one reconciliation worker
+    /// shared by all handles in this evaluator generation.
+    pub(crate) struct Registry {
         tx: mpsc::SyncSender<Input>,
         stopped: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
@@ -114,7 +122,7 @@ mod linux {
     }
 
     struct State {
-        watcher: notify::INotifyWatcher,
+        watcher: Rc<RefCell<Directories>>,
         dirs: BTreeSet<PathBuf>,
         root: PathBuf,
         parent: PathBuf,
@@ -124,9 +132,16 @@ mod linux {
         handle: String,
     }
 
-    impl State {
+    struct Directories {
+        watcher: notify::INotifyWatcher,
+        refs: BTreeMap<PathBuf, usize>,
+        queue: Arc<Queue>,
+    }
+
+    impl Directories {
         fn add(&mut self, path: &Path) -> MixResult<()> {
-            if self.dirs.contains(path) {
+            if let Some(count) = self.refs.get_mut(path) {
+                *count += 1;
                 return Ok(());
             }
             self.queue
@@ -147,6 +162,38 @@ mod linux {
                 self.queue.directories.fetch_sub(1, Ordering::SeqCst);
                 return Err(notify_error(e));
             }
+            self.refs.insert(path.into(), 1);
+            Ok(())
+        }
+
+        fn remove(&mut self, path: &Path) {
+            let Some(count) = self.refs.get_mut(path) else {
+                return;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.refs.remove(path);
+                let _ = self.watcher.unwatch(path);
+                self.queue.directories.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        fn refresh(&mut self, path: &Path) -> MixResult<()> {
+            // Reinstall even when another handle retains this pathname: the
+            // kernel may have forgotten its old inode after a missed delete.
+            let _ = self.watcher.unwatch(path);
+            self.watcher
+                .watch(path, notify::RecursiveMode::NonRecursive)
+                .map_err(notify_error)
+        }
+    }
+
+    impl State {
+        fn add(&mut self, path: &Path) -> MixResult<()> {
+            if self.dirs.contains(path) {
+                return Ok(());
+            }
+            self.watcher.borrow_mut().add(path)?;
             self.dirs.insert(path.to_owned());
             Ok(())
         }
@@ -189,9 +236,8 @@ mod linux {
             }
             let stale: Vec<_> = self.dirs.difference(&wanted).cloned().collect();
             for path in stale {
-                let _ = self.watcher.unwatch(&path);
+                self.watcher.borrow_mut().remove(&path);
                 self.dirs.remove(&path);
-                self.queue.directories.fetch_sub(1, Ordering::SeqCst);
             }
             Ok(())
         }
@@ -242,14 +288,17 @@ mod linux {
             // the kernel removed its inode watch. Rebuild registrations, not
             // just the desired path set, before claiming ongoing coverage.
             for path in std::mem::take(&mut self.dirs) {
-                let _ = self.watcher.unwatch(&path);
-                self.queue.directories.fetch_sub(1, Ordering::SeqCst);
+                let mut watcher = self.watcher.borrow_mut();
+                watcher.remove(&path);
+                if watcher.refs.contains_key(&path) {
+                    let _ = watcher.refresh(&path);
+                }
             }
             self.add(&self.parent.clone())?;
             self.reconcile()
         }
 
-        fn event(&mut self, event: notify::Result<notify::Event>) {
+        fn event(&mut self, event: &notify::Result<notify::Event>) {
             let event = match event {
                 Ok(e) => e,
                 Err(_) => {
@@ -259,6 +308,15 @@ mod linux {
                 }
             };
             let rescan = event.need_rescan();
+            if !rescan
+                && !event.paths.is_empty()
+                && !event
+                    .paths
+                    .iter()
+                    .any(|p| self.relevant(p) || self.root.starts_with(p))
+            {
+                return;
+            }
             if rescan {
                 let _ = self.recover();
                 self.overflow();
@@ -286,9 +344,12 @@ mod linux {
                     .cloned()
                     .collect();
                 for d in stale {
-                    let _ = self.watcher.unwatch(&d);
+                    let mut watcher = self.watcher.borrow_mut();
+                    watcher.remove(&d);
+                    if watcher.refs.contains_key(&d) {
+                        let _ = watcher.refresh(&d);
+                    }
                     self.dirs.remove(&d);
-                    self.queue.directories.fetch_sub(1, Ordering::SeqCst);
                 }
             }
             if structural || rescan {
@@ -329,18 +390,19 @@ mod linux {
 
     impl Drop for State {
         fn drop(&mut self) {
-            self.queue
-                .directories
-                .fetch_sub(self.dirs.len(), Ordering::SeqCst);
+            for path in &self.dirs {
+                self.watcher.borrow_mut().remove(path);
+            }
         }
     }
 
-    impl Watch {
-        pub fn new(
+    impl State {
+        fn new(
             path: &str,
             opts: Options,
             handle: String,
             queue: Arc<Queue>,
+            watcher: Rc<RefCell<Directories>>,
         ) -> MixResult<Self> {
             let path = Path::new(path);
             let meta = std::fs::symlink_metadata(path).map_err(io_error)?;
@@ -353,12 +415,29 @@ mod linux {
             // Canonicalise the parent only; the leaf identity is its directory entry.
             let root = path.canonicalize().map_err(io_error)?;
             let parent = root.parent().unwrap_or(&root).to_owned();
+            let mut state = Self {
+                watcher,
+                dirs: BTreeSet::new(),
+                root,
+                parent: parent.clone(),
+                directory: meta.is_dir(),
+                opts,
+                queue,
+                handle,
+            };
+            state.add(&parent)?;
+            state.reconcile()?;
+            Ok(state)
+        }
+    }
+
+    impl Registry {
+        pub fn new(queue: Arc<Queue>) -> MixResult<Self> {
             let (tx, rx) = mpsc::sync_channel(256);
             let lost = Arc::new(AtomicBool::new(false));
             let callback_tx = tx.clone();
             let callback_lost = lost.clone();
             let callback_queue = queue.clone();
-            let callback_handle = handle.clone();
             let watcher = notify::INotifyWatcher::new(
                 move |e: notify::Result<notify::Event>| {
                     // Enumeration produces open/read-close notices. They are
@@ -377,7 +456,7 @@ mod linux {
                     if let Err(mpsc::TrySendError::Full(_)) = callback_tx.try_send(Input::Event(e))
                     {
                         callback_lost.store(true, Ordering::Release);
-                        callback_queue.change(&callback_handle, None, true);
+                        callback_queue.overflow_watches();
                         // If the worker drained the queue between try_send and the
                         // flag store, leave a fresh wake so it reconciles the gap.
                         let _ = callback_tx
@@ -387,36 +466,57 @@ mod linux {
                 notify::Config::default(),
             )
             .map_err(notify_error)?;
-            let mut state = State {
-                watcher,
-                dirs: BTreeSet::new(),
-                root,
-                parent: parent.clone(),
-                directory: meta.is_dir(),
-                opts,
-                queue,
-                handle,
-            };
-            state.add(&parent)?;
-            state.reconcile()?;
             let stopped = Arc::new(AtomicBool::new(false));
             let worker_stopped = stopped.clone();
             let worker = thread::Builder::new()
                 .name("mix-inotify".into())
                 .spawn(move || {
+                    let watcher = Rc::new(RefCell::new(Directories {
+                        watcher,
+                        refs: BTreeMap::new(),
+                        queue: queue.clone(),
+                    }));
+                    let mut states = BTreeMap::<String, State>::new();
                     while let Ok(input) = rx.recv() {
                         if worker_stopped.load(Ordering::Acquire) {
                             break;
                         }
                         match input {
                             Input::Stop => break,
-                            Input::Event(e) => state.event(e),
+                            Input::Event(e) => {
+                                for state in states.values_mut() {
+                                    state.event(&e);
+                                }
+                            }
+                            Input::Add(path, opts, handle, reply) => {
+                                let result = State::new(
+                                    &path,
+                                    opts,
+                                    handle.clone(),
+                                    queue.clone(),
+                                    watcher.clone(),
+                                )
+                                .map(|state| {
+                                    states.insert(handle, state);
+                                })
+                                .map_err(|e| match e {
+                                    crate::MixError::Structured(info) => (info.code, info.message),
+                                    error => ("FS_WATCH_IO".into(), error.to_string()),
+                                });
+                                let _ = reply.send(result);
+                            }
+                            Input::Remove(handle, reply) => {
+                                states.remove(&handle);
+                                let _ = reply.send(());
+                            }
                         }
                         if lost.swap(false, Ordering::AcqRel) {
-                            let _ = state.recover();
-                            // Deliver a rescan AFTER coverage is repaired, even if
-                            // the callback's earlier overflow was already consumed.
-                            state.overflow();
+                            for state in states.values_mut() {
+                                let _ = state.recover();
+                                // Report AFTER repair, even if the earlier hint
+                                // was already consumed by the evaluator.
+                                state.overflow();
+                            }
                         }
                     }
                 })
@@ -428,13 +528,32 @@ mod linux {
             })
         }
 
+        pub fn watch(&self, path: &str, opts: Options, handle: String) -> MixResult<()> {
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.tx
+                .send(Input::Add(path.into(), opts, handle, tx))
+                .map_err(|_| refusal("FS_WATCH_IO", "watch worker stopped"))?;
+            rx.recv()
+                .map_err(|_| refusal("FS_WATCH_IO", "watch worker stopped"))?
+                // MixError can carry thread-local Values. Only transfer the
+                // owned code/message across the worker boundary.
+                .map_err(|(code, message)| refusal(&code, message))
+        }
+
+        pub fn unwatch(&self, handle: &str) {
+            let (tx, rx) = mpsc::sync_channel(1);
+            if self.tx.send(Input::Remove(handle.into(), tx)).is_ok() {
+                let _ = rx.recv();
+            }
+        }
+
         #[cfg(test)]
         pub fn inject(&self, event: notify::Result<notify::Event>) {
             self.tx.send(Input::Event(event)).unwrap();
         }
     }
 
-    impl Drop for Watch {
+    impl Drop for Registry {
         fn drop(&mut self) {
             self.stopped.store(true, Ordering::Release);
             // A full queue already supplies the worker's wake. Cancellation
@@ -448,21 +567,23 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::Watch;
+pub(crate) use linux::Registry;
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) struct Watch;
+pub(crate) struct Registry;
 #[cfg(not(target_os = "linux"))]
-impl Watch {
-    pub fn new(
-        _: &str,
-        _: Options,
-        _: String,
-        _: std::sync::Arc<crate::native_events::Queue>,
-    ) -> MixResult<Self> {
+impl Registry {
+    pub fn new(_: std::sync::Arc<crate::native_events::Queue>) -> MixResult<Self> {
         Err(refusal(
             "FS_WATCH_UNSUPPORTED",
             "fs_watch requires Linux inotify; there is no polling fallback",
         ))
     }
+    pub fn watch(&self, _: &str, _: Options, _: String) -> MixResult<()> {
+        Err(refusal(
+            "FS_WATCH_UNSUPPORTED",
+            "fs_watch requires Linux inotify; there is no polling fallback",
+        ))
+    }
+    pub fn unwatch(&self, _: &str) {}
 }

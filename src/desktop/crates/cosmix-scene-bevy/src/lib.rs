@@ -40,6 +40,8 @@ pub(crate) struct SceneEntry {
     bindings: cosmix_scene::bindings::BindingSet,
     pub tree: ResolvedScene,
     revision: u64,
+    prepared: render::PreparedLists,
+    render_error: Option<Value>,
     pub mounted: Option<render::Mounted>,
     owner: Option<SceneOwner>,
 }
@@ -100,6 +102,8 @@ impl SceneStore {
                         "citizen": entry.document.citizen,
                         "owner": entry.owner.as_ref().map(|owner| &owner.citizen),
                         "revision": entry.revision,
+                        "applied_revision": entry.mounted.as_ref().map_or(0, |m| m.revision),
+                        "diagnostics": entry.render_error.as_ref().map(|e| &e["diagnostics"]).cloned().unwrap_or_else(|| json!([])),
                         "digest": digest(&entry.tree),
                         "registered": seat.is_some(),
                     })
@@ -215,7 +219,9 @@ impl SceneStore {
                     .get(name)
                     .ok_or_else(|| json!({"error":"unknown scene"}))?;
                 let value = if verb == SceneVerb::Watch {
-                    json!({"scene":name,"revision":entry.revision,"digest":digest(&entry.tree)})
+                    json!({"scene":name,"revision":entry.revision,"digest":digest(&entry.tree),
+                        "applied_revision":entry.mounted.as_ref().map_or(0, |m| m.revision),
+                        "diagnostics":entry.render_error.as_ref().map(|e| &e["diagnostics"]).cloned().unwrap_or_else(|| json!([]))})
                 } else if args["format"] == "source" {
                     json!({"scene":name,"revision":entry.revision,"source":cosmix_scene::to_source(&entry.document)})
                 } else if let Some(path) = args["path"].as_str() {
@@ -248,7 +254,7 @@ impl SceneStore {
                         .map_err(|d| json!({"scene":name,"diagnostics":d}))?;
                     document.model = Some(result.tree.model.clone());
                     check_size(&document)?;
-                    render::validate_templates(&result.tree)?;
+                    let prepared = render::validate_templates(&result.tree)?;
                     if render::page_id(&result.tree) != render::page_id(&entry.tree)
                         || render::scene_edge(&result.tree) != render::scene_edge(&entry.tree) {
                         return Err(json!({"scene":name,"error_code":"SUBPANEL_COLLISION",
@@ -262,6 +268,8 @@ impl SceneStore {
                     entry.revision = *revision;
                     entry.document = document;
                     entry.tree = result.tree;
+                    entry.prepared = prepared;
+                    entry.render_error = None;
                     let reply = json!({"scene":name,"revision":*revision,"digest":digest(&entry.tree)});
                     let summary = json!({"scene":name,"revision":*revision,"ops":result.changed.len(),"diagnostics":result.diagnostics});
                     return Ok((reply, Some(summary)));
@@ -366,7 +374,7 @@ impl SceneStore {
             return Err(json!({"scene":document.name,"diagnostics":diagnostics}));
         }
         let tree = cosmix_scene::resolve(&document).map_err(|d| json!({"diagnostics":d}))?;
-        render::validate_templates(&tree)?;
+        let prepared = render::validate_templates(&tree)?;
         let bindings = cosmix_scene::bindings::compile(&document).map_err(|d| json!({"diagnostics":d}))?;
         // A declared mount address is unique across scenes, including scenes
         // from the same citizen. Content revisions cannot rename a live seat;
@@ -424,6 +432,8 @@ impl SceneStore {
                 bindings,
                 tree,
                 revision,
+                prepared,
+                render_error: None,
                 mounted,
                 owner,
             },

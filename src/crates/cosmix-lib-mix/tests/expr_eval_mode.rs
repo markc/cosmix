@@ -32,6 +32,21 @@ use cosmix_mix::{
 };
 
 #[test]
+fn reused_expression_runtime_keeps_globals_and_deadlines_per_call() {
+    for value in 0..16 {
+        let result = eval_expr_string("$item", &[("item", Value::Number(value as f64))],
+            None, EvalLimits::default()).unwrap();
+        assert_eq!(result.to_number(), Some(value as f64));
+        let missing = eval_expr_string("$item", &[], None, EvalLimits::default()).unwrap_err();
+        assert!(missing.to_string().contains("undefined variable"), "globals leaked between expressions");
+        assert!(eval_expr_string("42", &[], None, EvalLimits {
+            time_limit: Some(std::time::Duration::ZERO), ..Default::default()
+        }).is_err());
+        assert_eq!(eval_expr_string("42", &[], None, EvalLimits::default()).unwrap().to_number(), Some(42.0));
+    }
+}
+
+#[test]
 fn expired_expression_budget_rejects_ready_futures() {
     // These complete without yielding. A Tokio timeout alone polls them to
     // Ready and accepts them even with an already-exhausted budget.

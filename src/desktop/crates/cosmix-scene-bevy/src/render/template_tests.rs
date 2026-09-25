@@ -92,9 +92,12 @@ fn exact_old_captures_match_static_scene_and_live_model_trees() {
 }
 
 fn sample(flow: &str) -> ResolvedScene {
-    resolve(
-        &format!(
-            r#"---
+    resolve(&sample_source(flow), None)
+}
+
+fn sample_source(flow: &str) -> String {
+    format!(
+        r#"---
 scene: 1
 name: repeated
 citizen: scene-example
@@ -106,9 +109,132 @@ row: {{widget: "row", children: ["label"], on_click: "ignored", hidden: "= $mode
 label: {{widget: "text", text: "= $model.prefix .. $item.cells[0]"}}
 ```
 "#
-        ),
-        None,
     )
+}
+
+#[test]
+fn accepted_templates_are_prepared_once_for_load_patch_and_scale_reapply() {
+    use cosmix_shell::runtime::SceneVerb;
+    PREPARE_COUNT.with(|n| n.set(0));
+    let mut store = SceneStore::default();
+    store
+        .request(SceneVerb::Load, &sample_source("horizontal"), &Value::Null)
+        .unwrap();
+    assert_eq!(PREPARE_COUNT.with(|n| n.get()), 1);
+    let mut world = World::new();
+    world.insert_resource(store);
+    // Ingress's wall-clock budget is long gone. Render must still apply the
+    // accepted instances, rather than start another budgeted evaluation pass.
+    std::thread::sleep(Duration::from_millis(300));
+    reconcile(&mut world);
+    assert_eq!(PREPARE_COUNT.with(|n| n.get()), 1);
+    let entry = &world.resource::<SceneStore>().scenes["repeated"];
+    assert_eq!(entry.mounted.as_ref().unwrap().revision, entry.revision);
+    let list = entry.mounted.as_ref().unwrap().nodes["root"].root;
+    let row = world.get::<FlowRows>(list).unwrap().0["a@b:c"];
+    let label = world.get::<RowInstances>(row).unwrap().views["label"]
+        .0
+        .label
+        .unwrap();
+    assert_eq!(world.get::<Text>(label).unwrap().0, "live Alpha");
+    world
+        .resource_mut::<SceneStore>()
+        .request(
+            SceneVerb::Patch,
+            "",
+            &json!({
+                "scene":"repeated", "path":"model.prefix", "value":"patched "
+            }),
+        )
+        .unwrap();
+    assert_eq!(PREPARE_COUNT.with(|n| n.get()), 2);
+    reconcile(&mut world);
+    assert_eq!(world.get::<Text>(label).unwrap().0, "patched Alpha");
+    // Forcing a scale reapply must reuse the same accepted instances too.
+    world.remove_resource::<IconScale>();
+    reconcile(&mut world);
+    assert_eq!(PREPARE_COUNT.with(|n| n.get()), 2);
+    assert_eq!(world.get::<Text>(label).unwrap().0, "patched Alpha");
+    let entry = &world.resource::<SceneStore>().scenes["repeated"];
+    assert_eq!(entry.mounted.as_ref().unwrap().revision, entry.revision);
+}
+
+#[test]
+fn template_refusal_keeps_prepared_instances_and_revision_for_model_and_port_patches() {
+    use cosmix_shell::runtime::SceneVerb;
+    let mut store = SceneStore::default();
+    store
+        .request(SceneVerb::Load, &sample_source("horizontal"), &Value::Null)
+        .unwrap();
+    let before = store.scenes["repeated"].prepared["root"].instances.clone();
+    let tree = store.scenes["repeated"].tree.clone();
+    let revision = store.scenes["repeated"].revision;
+    // A number is invalid for the row's bool port. Even though reevaluate
+    // retains its last-good value, template preflight must refuse the candidate.
+    for (path, value) in [("model.hide", json!(7)), ("row.hidden", json!("= 7"))] {
+        let error = store
+            .request(
+                SceneVerb::Patch,
+                "",
+                &json!({
+                    "scene":"repeated", "path":path, "value":value
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error["error_code"], "scene_template");
+        assert!(!error["diagnostics"].as_array().unwrap().is_empty());
+        assert_eq!(store.scenes["repeated"].revision, revision);
+        assert_eq!(store.scenes["repeated"].tree, tree);
+        assert_eq!(store.scenes["repeated"].prepared["root"].instances, before);
+    }
+}
+
+#[test]
+fn renderer_failure_retains_applied_revision_and_readable_diagnostics() {
+    use cosmix_shell::runtime::SceneVerb;
+    let mut store = SceneStore::default();
+    store
+        .request(SceneVerb::Load, &sample_source("horizontal"), &Value::Null)
+        .unwrap();
+    let mut world = World::new();
+    world.insert_resource(store);
+    reconcile(&mut world);
+    let mounted = world.resource::<SceneStore>().scenes["repeated"]
+        .mounted
+        .as_ref()
+        .unwrap();
+    let revision = mounted.revision;
+    let page = mounted.page;
+    world
+        .resource_mut::<SceneStore>()
+        .request(
+            SceneVerb::Patch,
+            "",
+            &json!({
+                "scene":"repeated", "path":"model.prefix", "value":"pending "
+            }),
+        )
+        .unwrap();
+    // Simulate loss of renderer-owned ECS state after ingress accepted it.
+    world.despawn(page);
+    reconcile(&mut world);
+    let mut store = world.resource_mut::<SceneStore>();
+    let (watch, _) = store
+        .request(SceneVerb::Watch, "", &json!({"scene":"repeated"}))
+        .unwrap();
+    assert_eq!(watch["applied_revision"], revision);
+    assert_eq!(watch["revision"], revision + 1);
+    assert_eq!(watch["diagnostics"][0]["code"], "scene-render");
+    assert_eq!(
+        store.scenes["repeated"].mounted.as_ref().unwrap().revision,
+        revision
+    );
+    let rows = store.list(
+        &Default::default(),
+        &cosmix_shell::core::OutputKey::new("test-output").unwrap(),
+    );
+    assert_eq!(rows[0]["applied_revision"], revision);
+    assert_eq!(rows[0]["diagnostics"], watch["diagnostics"]);
 }
 
 fn mounted(world: &mut World, tree: &ResolvedScene) -> Mounted {

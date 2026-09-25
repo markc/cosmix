@@ -49,7 +49,9 @@ dispatched handler may still finish; a waiting `fs_wait` wakes with cancellation
 `fs_wait(handle) -> batch` suspends outside serve mode, without polling. Dropping
 the waiting evaluation does not consume an event. In `--serve`, use `on fs.changed`:
 `fs_wait` is refused so there cannot be competing consumers. Expression mode
-also denies `fs_wait`.
+also denies `fs_wait`. In a plain script, a top-level `sleep()` dispatches native
+events only for families with a registered handler. An unrelated handler (or
+only `on proc.exited`) leaves filesystem batches available to `fs_wait`.
 
 Each batch is `{watch, changes:[{path,kind,old_path?}], overflow}`. Paths are
 absolute, with parent symlinks resolved during registration. Changes coalesce
@@ -70,8 +72,12 @@ security boundary against concurrent path/symlink substitution. Moving or deleti
 the stable parent itself requires a new registration. Pseudo-filesystems which
 do not emit inotify events cannot be observed by this API.
 
-Per evaluator: at most 128 handles, 8192 directory registrations and 4096 pending
-coalesced changes. Each source also has a bounded 256-record backend queue.
+Per evaluator: at most 128 handles, 8192 distinct directory registrations and
+4096 pending coalesced changes. All handles share one inotify instance and its
+event-loop thread, one reconciliation worker and a bounded 256-record backend
+queue. Overlapping handles share directory registrations; removing one handle
+does not remove coverage needed by another. The instance and workers retire
+after the last handle is removed or the evaluator closes its native sources.
 Kernel/queue loss, directory limits or later observation failures set sticky
 `overflow:true`; the bit clears only when that batch is delivered. A newly
 watched directory also sets overflow because files may have appeared before its

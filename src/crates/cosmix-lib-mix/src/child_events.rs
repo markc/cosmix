@@ -21,6 +21,7 @@ mod linux {
         pub pid: u32,
         pidfd: Arc<OwnedFd>,
         cancel: UnixStream,
+        completed: Arc<std::sync::atomic::AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
@@ -52,6 +53,8 @@ mod linux {
             let slot = Arc::new(std::sync::Mutex::new(Some(child)));
             let worker_slot = slot.clone();
             let worker_fd = pidfd.clone();
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_completed = completed.clone();
             let worker = thread::Builder::new().name("mix-child-exit".into()).spawn(move || {
                 let mut child = worker_slot.lock().unwrap().take().unwrap();
                 let mut fds = [
@@ -68,8 +71,21 @@ mod linux {
                 // End remaining descendants before reaping the leader, even on
                 // a natural exit. The unreaped PID pins the process-group identity.
                 unsafe { libc::kill(-pid, libc::SIGKILL); }
+                // The leader may have left its original process group. Signal
+                // its retained identity too before the blocking reap; a group
+                // kill alone cannot bound cancellation by the child's death.
+                if cancelled {
+                    unsafe {
+                        libc::syscall(libc::SYS_pidfd_send_signal, worker_fd.as_raw_fd(),
+                            libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0);
+                    }
+                }
                 let result = child.wait();
                 crate::builtins::unregister_managed_pid(pid);
+                // Publish completion before waking the consumer. Pruning joins
+                // this worker, so its terminal record is queued before the
+                // registry decides whether any sources remain.
+                worker_completed.store(true, std::sync::atomic::Ordering::Release);
                 if !cancelled {
                     match result {
                         Ok(status) => queue.child(serde_json::json!({
@@ -87,6 +103,7 @@ mod linux {
                     pid: pid as u32,
                     pidfd,
                     cancel,
+                    completed,
                     worker: Some(worker),
                 }),
                 Err(e) => {
@@ -101,7 +118,7 @@ mod linux {
         }
 
         pub fn finished(&self) -> bool {
-            self.worker.as_ref().is_none_or(|w| w.is_finished())
+            self.completed.load(std::sync::atomic::Ordering::Acquire)
         }
 
         pub fn signal(&self, signal: i32) -> bool {

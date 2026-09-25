@@ -5,7 +5,7 @@ use crate::{
     evaluator::IncomingEvent,
     value::Value,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -50,6 +50,16 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
+    #[cfg(target_os = "linux")]
+    pub fn overflow_watches(&self) {
+        let mut p = self.pending.lock().unwrap();
+        for watch in p.watches.values_mut() {
+            watch.overflow = true;
+        }
+        drop(p);
+        self.ready.notify_waiters();
+    }
+
     pub fn change(&self, handle: &str, change: Option<Change>, overflow: bool) {
         let mut p = self.pending.lock().unwrap();
         let count = p.count;
@@ -112,6 +122,17 @@ impl Queue {
     }
 
     pub async fn next(&self, watch: Option<&str>) -> MixResult<IncomingEvent> {
+        self.next_selected(watch, true, true).await
+    }
+
+    /// A sleep yield point only consumes families with an actual handler.
+    /// In particular, an unrelated handler cannot steal a later fs_wait batch.
+    pub async fn next_selected(
+        &self,
+        watch: Option<&str>,
+        filesystem: bool,
+        children: bool,
+    ) -> MixResult<IncomingEvent> {
         loop {
             let ready = self.ready.notified();
             tokio::pin!(ready);
@@ -135,7 +156,7 @@ impl Queue {
                     let ready: Vec<_> = p
                         .watches
                         .iter()
-                        .filter(|(_, w)| !w.changes.is_empty() || w.overflow)
+                        .filter(|(_, w)| filesystem && (!w.changes.is_empty() || w.overflow))
                         .map(|(h, _)| h.clone())
                         .collect();
                     let h = ready
@@ -143,7 +164,8 @@ impl Queue {
                         .find(|h| p.last_watch.as_ref().is_none_or(|last| *h > last))
                         .or_else(|| ready.first())
                         .cloned();
-                    if (p.prefer_child || h.is_none())
+                    if children
+                        && (p.prefer_child || h.is_none())
                         && let Some(body) = p.children.pop_front()
                     {
                         p.prefer_child = false;
@@ -192,7 +214,8 @@ pub(crate) fn json_value(v: serde_json::Value) -> Value {
 pub(crate) struct NativeEvents {
     pub queue: Arc<Queue>,
     pumping: Rc<Cell<bool>>,
-    watches: BTreeMap<String, crate::fs_watch::Watch>,
+    watches: BTreeSet<String>,
+    filesystem: Option<crate::fs_watch::Registry>,
     children: Vec<crate::child_events::ChildWatch>,
 }
 
@@ -210,7 +233,8 @@ impl NativeEvents {
     pub fn pumping(&self) -> bool {
         self.pumping.get()
     }
-    pub fn has_sources(&self) -> bool {
+    pub fn has_sources(&mut self) -> bool {
+        self.children.retain(|c| !c.finished());
         !self.watches.is_empty()
             || !self.children.is_empty()
             || !self.queue.pending.lock().unwrap().children.is_empty()
@@ -224,19 +248,30 @@ impl NativeEvents {
             ));
         }
         let h = format!("fs:{}", NEXT_HANDLE.fetch_add(1, Ordering::Relaxed));
+        if self.filesystem.is_none() {
+            self.filesystem = Some(crate::fs_watch::Registry::new(self.queue.clone())?);
+        }
         self.queue
             .pending
             .lock()
             .unwrap()
             .watches
             .insert(h.clone(), PendingWatch::default());
-        match crate::fs_watch::Watch::new(path, opts, h.clone(), self.queue.clone()) {
-            Ok(w) => {
-                self.watches.insert(h.clone(), w);
+        match self
+            .filesystem
+            .as_ref()
+            .unwrap()
+            .watch(path, opts, h.clone())
+        {
+            Ok(()) => {
+                self.watches.insert(h.clone());
                 Ok(h)
             }
             Err(e) => {
                 self.remove_pending(&h);
+                if self.watches.is_empty() {
+                    self.filesystem = None;
+                }
                 Err(e)
             }
         }
@@ -252,14 +287,19 @@ impl NativeEvents {
     }
 
     pub fn unwatch(&mut self, h: &str) -> MixResult<()> {
-        let Some(w) = self.watches.remove(h) else {
+        if !self.watches.remove(h) {
             return Err(refusal(
                 "FS_WATCH_HANDLE",
                 "unknown or retired watch handle",
             ));
-        };
+        }
         self.remove_pending(h); // rejects callbacks racing worker shutdown
-        drop(w);
+        if let Some(filesystem) = &self.filesystem {
+            filesystem.unwatch(h);
+        }
+        if self.watches.is_empty() {
+            self.filesystem = None;
+        }
         Ok(())
     }
 
@@ -294,7 +334,9 @@ impl NativeEvents {
     }
 
     pub fn signal_child(&self, pid: u32, signal: i32) -> Option<bool> {
-        if let Some(child) = self.children.iter().find(|c| c.pid == pid) {
+        // A freshly admitted child can reuse a reaped worker's PID before
+        // that old worker finishes publishing its terminal record.
+        if let Some(child) = self.children.iter().rev().find(|c| c.pid == pid) {
             return Some(child.signal(signal));
         }
         // A reaped child's event may still be queued after slot reclamation.
@@ -318,6 +360,7 @@ impl NativeEvents {
         }
         self.queue.ready.notify_waiters();
         self.watches.clear();
+        self.filesystem = None;
         self.children.clear();
     }
 }
@@ -416,7 +459,8 @@ mod tests {
         let registry = NativeEvents {
             queue: q.clone(),
             pumping: Rc::new(Cell::new(false)),
-            watches: BTreeMap::new(),
+            watches: BTreeSet::new(),
+            filesystem: None,
             children: Vec::new(),
         };
         registry.remove_pending("test");
@@ -445,6 +489,34 @@ mod tests {
         assert_eq!(v["changes"][0]["kind"], "moved");
     }
 
+    #[tokio::test]
+    async fn selecting_child_events_does_not_consume_a_waiters_filesystem_batch() {
+        let q = queue();
+        q.change("test", Some(change("kept".into())), false);
+        q.child(serde_json::json!({"pid": 42}));
+        let child = q.next_selected(None, false, true).await.unwrap();
+        assert_eq!(child.command, "proc.exited");
+        let batch = q.next(Some("test")).await.unwrap();
+        assert!(batch.body.contains("kept"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shared_directories_are_counted_once_and_released_after_last_handle() {
+        let mut r = NativeEvents::default();
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let opts = || crate::fs_watch::Options::parse(None).unwrap();
+        let first = r.watch(root.to_str().unwrap(), opts()).unwrap();
+        let directories = r.queue.directories.load(Ordering::SeqCst);
+        let second = r.watch(root.to_str().unwrap(), opts()).unwrap();
+        assert_eq!(r.queue.directories.load(Ordering::SeqCst), directories);
+        r.unwatch(&first).unwrap();
+        assert_eq!(r.queue.directories.load(Ordering::SeqCst), directories);
+        r.unwatch(&second).unwrap();
+        assert_eq!(r.queue.directories.load(Ordering::SeqCst), 0);
+        assert!(r.filesystem.is_none());
+    }
+
     #[test]
     fn worker_boundary_is_owned_send_sync_data() {
         fn send_sync<T: Send + Sync>() {}
@@ -463,8 +535,9 @@ mod tests {
                 crate::fs_watch::Options::parse(None).unwrap(),
             )
             .unwrap_err();
-        assert!(err.to_string().contains("FS_WATCH_LIMIT"));
+        assert!(matches!(err, MixError::Structured(info) if info.code == "FS_WATCH_LIMIT"));
         assert!(r.watches.is_empty());
+        assert!(r.filesystem.is_none());
         assert!(r.queue.pending.lock().unwrap().watches.is_empty());
         r.queue.directories.store(0, Ordering::SeqCst);
     }
@@ -488,13 +561,32 @@ mod tests {
                 },
             )
             .unwrap();
-        r.watches[&h].inject(Ok(
+        let other = r
+            .watch(
+                path.to_str().unwrap(),
+                crate::fs_watch::Options {
+                    recursive: true,
+                    events: vec![],
+                },
+            )
+            .unwrap();
+        r.filesystem.as_ref().unwrap().inject(Ok(
             notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
         ));
         let ev = tokio::time::timeout(std::time::Duration::from_secs(5), r.queue.next(Some(&h)))
             .await
             .unwrap()
             .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&ev.body).unwrap();
+        assert_eq!(body["overflow"], true);
+        assert!(body["changes"].as_array().unwrap().is_empty());
+        let ev = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.queue.next(Some(&other)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let body: serde_json::Value = serde_json::from_str(&ev.body).unwrap();
         assert_eq!(body["overflow"], true);
         assert!(body["changes"].as_array().unwrap().is_empty());
@@ -521,7 +613,9 @@ mod tests {
             ) {
                 Ok(_) => assert!(r.watches.len() <= MAX_WATCHES),
                 Err(e) => {
-                    assert!(e.to_string().contains("FS_WATCH_LIMIT"));
+                    assert!(
+                        matches!(e, MixError::Structured(info) if info.code == "FS_WATCH_LIMIT")
+                    );
                     refused = true;
                     break;
                 }

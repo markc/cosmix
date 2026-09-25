@@ -485,7 +485,9 @@ dispatched handler may still finish; a waiting <code>fs_wait</code> wakes with c
 <code>fs_wait(handle) -&gt; batch</code> suspends outside serve mode, without polling. Dropping
 the waiting evaluation does not consume an event. In <code>--serve</code>, use <code>on fs.changed</code>:
 <code>fs_wait</code> is refused so there cannot be competing consumers. Expression mode
-also denies <code>fs_wait</code>.</p>
+also denies <code>fs_wait</code>. In a plain script, a top-level <code>sleep()</code> dispatches native
+events only for families with a registered handler. An unrelated handler (or
+only <code>on proc.exited</code>) leaves filesystem batches available to <code>fs_wait</code>.</p>
 <p>Each batch is <code>{watch, changes:[{path,kind,old_path?}], overflow}</code>. Paths are
 absolute, with parent symlinks resolved during registration. Changes coalesce
 per path at delivery; a close-write does not erase a pending paired rename.
@@ -503,8 +505,12 @@ symlinks are refused; discovered directory symlinks are skipped. This is not a
 security boundary against concurrent path/symlink substitution. Moving or deleting
 the stable parent itself requires a new registration. Pseudo-filesystems which
 do not emit inotify events cannot be observed by this API.</p>
-<p>Per evaluator: at most 128 handles, 8192 directory registrations and 4096 pending
-coalesced changes. Each source also has a bounded 256-record backend queue.
+<p>Per evaluator: at most 128 handles, 8192 distinct directory registrations and
+4096 pending coalesced changes. All handles share one inotify instance and its
+event-loop thread, one reconciliation worker and a bounded 256-record backend
+queue. Overlapping handles share directory registrations; removing one handle
+does not remove coverage needed by another. The instance and workers retire
+after the last handle is removed or the evaluator closes its native sources.
 Kernel/queue loss, directory limits or later observation failures set sticky
 <code>overflow:true</code>; the bit clears only when that batch is delivered. A newly
 watched directory also sets overflow because files may have appeared before its

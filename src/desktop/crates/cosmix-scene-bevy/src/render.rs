@@ -241,7 +241,7 @@ fn hover(mut query: Query<(&Hovered, &SceneHover, &mut BackgroundColor), Changed
 }
 
 pub(crate) struct Mounted {
-    revision: u64,
+    pub(crate) revision: u64,
     tree: ResolvedScene,
     page: Entity,
     edge: Edge,
@@ -284,6 +284,11 @@ pub fn reconcile(world: &mut World) {
             destroy(world, mounted);
         }
         for entry in store.scenes.values_mut() {
+            // Retain failures as readable state. A new accepted revision clears
+            // the diagnostic and retries; repeated frames are not a retry loop.
+            if entry.render_error.is_some() {
+                continue;
+            }
             let edge = scene_edge(&entry.tree);
             // Production ingress reserved this exact name before replying.
             // Rendering never creates or steals a registry seat.
@@ -307,14 +312,6 @@ pub fn reconcile(world: &mut World) {
                     continue;
                 }
             }
-            if entry.mounted.as_ref().is_some_and(|m| m.edge != edge) {
-                // Reparent the existing page when its edge changes: fields survive.
-                let m = entry.mounted.as_mut().unwrap();
-                world.entity_mut(m.page).remove::<ChildOf>();
-                cosmix_shell::chrome::unmount_page(world, m.edge, &page_id(&m.tree));
-                m.edge = edge;
-                m.registered = false;
-            }
             let mounted = entry.mounted.get_or_insert_with(|| Mounted {
                 revision: 0,
                 tree: ResolvedScene {
@@ -334,14 +331,39 @@ pub fn reconcile(world: &mut World) {
                 nodes: BTreeMap::new(),
             });
             if mounted.revision != entry.revision || scale_changed {
-                if mount_config(&mounted.tree) != mount_config(&entry.tree) {
-                    mounted.registered = false;
+                let mount_changed = mount_config(&mounted.tree) != mount_config(&entry.tree);
+                match apply_prepared(world, mounted, &entry.tree, &entry.prepared) {
+                    Ok(()) => {
+                        mounted.revision = entry.revision;
+                        if mount_changed {
+                            mounted.registered = false;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(scene = entry.tree.name, "render failed: {error}");
+                        // Watch/list expose the retained error and last applied
+                        // revision even if every change notification is lost.
+                        if let Some(bridge) = world.get_resource::<BusBridge>() {
+                            let summary = json!({"scene":entry.tree.name,
+                                "revision":entry.revision,"applied_revision":mounted.revision,
+                                "ops":0,"diagnostics":error["diagnostics"]});
+                            let wire = format!("---\ncommand: shell.scene.changed\n---\n{summary}");
+                            let _ = bridge.try_publish_topic(
+                                format!("{}.scene.changed", bridge.service_name()), false, wire);
+                        }
+                        entry.render_error = Some(error);
+                        continue;
+                    }
                 }
-                apply(world, mounted, &entry.tree);
-                mounted.revision = entry.revision;
             }
-            // A bounded template refusal can retain the last rendered tree.
-            // Retry only on the next accepted revision, never every frame.
+            if mounted.edge != edge {
+                // Reparent only after application succeeds. The page ID is
+                // stable across accepted revisions; its contents retain focus.
+                world.entity_mut(mounted.page).remove::<ChildOf>();
+                cosmix_shell::chrome::unmount_page(world, mounted.edge, &page_id(&mounted.tree));
+                mounted.edge = edge;
+                mounted.registered = false;
+            }
             if !mounted.registered {
                 let config = mount_config(&entry.tree);
                 let title = config
@@ -494,17 +516,30 @@ fn template_ids(tree: &ResolvedScene) -> BTreeSet<String> {
     ids
 }
 
+// Direct-tree test fixtures use the same prepare/apply split as ingress.
+#[cfg(test)]
 fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
+    if let Ok(lists) = validate_templates(tree) {
+        apply_prepared(world, mounted, tree, &lists).unwrap();
+    }
+}
+
+fn apply_prepared(
+    world: &mut World,
+    mounted: &mut Mounted,
+    tree: &ResolvedScene,
+    lists: &PreparedLists,
+) -> Result<(), Value> {
+    // All fallible expression work belongs to ingress. Check renderer-owned
+    // entity state before mutation, and report a real application failure.
+    if world.get_entity(mounted.page).is_err()
+        || mounted.nodes.values().any(|view| world.get_entity(view.root).is_err()) {
+        return Err(json!({"scene":tree.name,"error_code":"scene_render",
+            "message":"scene render entities are missing",
+            "diagnostics":[{"severity":"Error","code":"scene-render","line":1,
+                "message":"scene render entities are missing"}]}));
+    }
     icons::begin_revision(world);
-    // Evaluate before touching entities, with one bound across ALL instances.
-    // A refusal leaves the mounted revision intact, never half a repeated row.
-    let lists = match prepare_lists(tree) {
-        Ok(lists) => lists,
-        Err(error) => {
-            warn!(scene = tree.name, "{}: {}", error.code, error.message);
-            return;
-        }
-    };
     let ops = cosmix_scene::diff(&mounted.tree, tree);
     let templates = template_ids(tree);
     let remove: Vec<_> = mounted
@@ -614,6 +649,7 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
         }
     }
     mounted.tree = tree.clone();
+    Ok(())
 }
 
 fn spawn(world: &mut World, tree: &ResolvedScene, id: &str, node: &SceneNode) -> View {
@@ -1026,11 +1062,13 @@ fn update(
 }
 
 #[derive(Clone)]
-struct ListData {
+pub(crate) struct ListData {
     tree: ResolvedScene,
     node: String,
     instances: BTreeMap<String, BTreeMap<String, SceneNode>>,
 }
+
+pub(crate) type PreparedLists = BTreeMap<String, ListData>;
 
 fn horizontal(node: &SceneNode) -> bool {
     text(node, "flow") == "horizontal"
@@ -1039,6 +1077,8 @@ fn horizontal(node: &SceneNode) -> bool {
 fn prepare_lists(
     tree: &ResolvedScene,
 ) -> Result<BTreeMap<String, ListData>, cosmix_scene::Diagnostic> {
+    #[cfg(test)]
+    PREPARE_COUNT.with(|n| n.set(n.get() + 1));
     let set = BindingSet {
         // Resolved expressions were already policy-checked by scene core.
         bindings: tree
@@ -1095,10 +1135,15 @@ fn prepare_lists(
     Ok(lists)
 }
 
+#[cfg(test)]
+thread_local! {
+    static PREPARE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Ingress preflight, before committing a revision or reserving its mount.
 /// Model-only patch paths must call this on the candidate resolved tree too.
-pub(crate) fn validate_templates(tree: &ResolvedScene) -> Result<(), Value> {
-    prepare_lists(tree).map(|_| ()).map_err(|diagnostic| {
+pub(crate) fn validate_templates(tree: &ResolvedScene) -> Result<PreparedLists, Value> {
+    prepare_lists(tree).map_err(|diagnostic| {
         json!({
             "error_code": "scene_template",
             "message": diagnostic.message,

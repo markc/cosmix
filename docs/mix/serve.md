@@ -35,11 +35,16 @@ The legacy `spawn(...,{die_with_parent:true})` lifetime rule still applies when
 `exit_event` is absent. With `exit_event:true`, children use generation ownership:
 there can be old and candidate processes alive during candidate initialisation.
 Do not have them contend for an exclusive resource without an application-level
-handover. Registry retirement SIGKILLs the managed process group and reaps its
-leader; scripts needing a graceful stop should send their own stop request before
+handover. Registry retirement SIGKILLs the managed process group and also signals
+the leader through its retained pidfd before reaping it, even if the leader has
+left that group. Scripts needing a graceful stop should send their own stop request before
 retirement. When a leader exits naturally, remaining members of that group are
 also ended before the leader is reaped. Descendants that deliberately leave the
 group are outside this guarantee.
+
+Completed child monitors are pruned when checking native-source liveness.
+A plain script's event pump exits once its last managed child exit is delivered
+and no filesystem watches or Bus handler remain; no explicit `quit()` is needed.
 
 ```mix
 $pid = spawn(["worker", "scene.mix"], {exit_event: true, tag: "scene:12"})

@@ -116,10 +116,14 @@ Empty model and binding fields are omitted from resolved-tree serialisation.
 Calling `time()` is allowed but emits a `binding-nondeterministic` warning;
 it is not a policy violation.
 
-`shell.scene.watch {scene}` returns `{scene,revision,digest}`. Subscribe to
+`shell.scene.watch {scene}` returns
+`{scene,revision,digest,applied_revision,diagnostics}`. Subscribe to
 `shell.scene.changed` for summaries `{scene,revision,ops,diagnostics}`;
 fetch the complete tree with `get`. Revisions increase on accepted loads and
-patches. Digests are SHA-256 of the serialised resolved tree.
+patches. Digests are SHA-256 of the serialised resolved tree. `applied_revision`
+is the last revision applied by the renderer (zero before first application).
+Watch replies and scene inventory retain render diagnostics for state-based
+resynchronisation; notifications are hints, not proof of application.
 
 UI handlers are directed Bus requests to the document's citizen with
 `{scene,node,kind,value?,item?}`. Kinds are `click`, `change` and `submit`.
@@ -145,11 +149,13 @@ content, and changing an item's ID always creates fresh content.
 Each template evaluation pass shares a 250 ms / 16,384-node budget across all
 lists. Ingress preflights templates before committing a revision or mount;
 failure returns `{error_code:"scene_template",message,scene,diagnostics}`.
-Model-only patch paths must call the same `render::validate_templates` on the
-candidate resolved tree. Rendering also enforces the budget: a render-time
-deadline failure logs its diagnostic and retains the previously rendered tree,
-retrying only on a new revision. That late deadline failure is not a loader
-status event; a first render has no prior tree.
+Loads, port patches and model-only patches retain those prepared instances with
+the accepted revision. Rendering applies them directly, including when display
+scale changes; there is no second expression evaluation or deadline. Expression
+evaluations reuse a thread-local Tokio runtime while keeping globals, policy and
+limits isolated. A renderer state failure retains the last applied revision and
+a readable `scene-render` diagnostic in watch/inventory replies. A new accepted
+revision clears that diagnostic and permits another application attempt.
 Nested-list rendering remains outside this renderer's supported template path.
 Clicks on repeated rows use the owning list's handler and node ID, with the
 complete row in `item`; descendant row handlers cannot redirect that click.
