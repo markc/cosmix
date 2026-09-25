@@ -120,21 +120,18 @@ impl Default for Shared {
 
 impl Shared {
     fn log_diagnostic(&mut self, id: Option<u64>, message: &str) -> bool {
-        // One global fallback line per outage; independent transitions per pane.
-        if (id.is_none() && self.last_diagnostic.contains_key(&None))
-            || self
-                .last_diagnostic
-                .get(&id)
-                .is_some_and(|last| last == message)
+        // Suppress repeats, but always report a changed cause, including the
+        // eventual connect failure after a provisional startup timeout.
+        if self
+            .last_diagnostic
+            .get(&id)
+            .is_some_and(|last| last == message)
         {
             return false;
         }
         match id {
             Some(id) => eprintln!("term native session pane {id}: {message}"),
-            None if message.contains("graphics-only") => {
-                eprintln!("term native session: {message}")
-            }
-            None => eprintln!("term native session: panes are graphics-only: {message}"),
+            None => eprintln!("term native session: {message}"),
         }
         self.last_diagnostic.insert(id, message.into());
         true
@@ -368,7 +365,9 @@ impl NativeSession {
             );
             // Share the actor's outage latch, including slow startup. A pane
             // opened while it connects must not emit a second fallback line.
-            shared.log_diagnostic(None, "no usable launch grant; pane is graphics-only");
+            if !shared.last_diagnostic.contains_key(&None) {
+                shared.log_diagnostic(None, "no usable launch grant; pane is graphics-only");
+            }
             shared.status.insert(id, reason);
             None
         };
@@ -1649,7 +1648,10 @@ pub(crate) mod tests {
     fn diagnostic_transitions_are_per_outage_and_per_pane() {
         let mut shared = Shared::default();
         assert!(shared.log_diagnostic(None, "startup timed out"));
+        assert!(shared.log_diagnostic(None, "broker/profile unavailable"));
         assert!(!shared.log_diagnostic(None, "broker/profile unavailable"));
+        assert!(shared.log_diagnostic(None, "launch pool held: waiting for user presence"));
+        assert!(shared.log_diagnostic(None, "broker/profile unavailable"));
         assert!(shared.log_diagnostic(Some(2), "detached"));
         assert!(shared.log_diagnostic(Some(3), "detached"));
         assert!(!shared.log_diagnostic(Some(2), "detached"));

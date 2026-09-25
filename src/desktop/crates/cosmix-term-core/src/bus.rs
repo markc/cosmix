@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — unless explicit pane/tab selectors are supplied, they act on the active tab/pane of the instance holding this name at delivery time; both iced term and Bevy bterm also start target-bound control (instance/incarnation/pane_generation) on the allocated native-session route: list/session/tabs/panes/snapshot/type, execute, exec.result/cancel, task.submit/result/cancel, operation, props.get/set and tab/pane mutations. Use the allocated route HELP for target envelopes. These are not targetless verbs on this global name. Requires local noded >= 0.16.8 native ingress, COSMIX_RUN=/run/cosmix and socket directory 0755; unavailable ingress leaves graphics working. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {cwd?:<absolute existing directory>, title?:<string>}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {tab?:<integer>}: list selected tab (default active tab) pane ids, focus, dimensions, child pids and logical geometry (last layout only; hidden tabs may be stale or zero)\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {pane?:<integer>, tab?:<integer>, contents?:<boolean=true>, scrollback_lines?:<integer=0, max 10000>}: read-only selected live screen (offset zero, default active); buffered history above the live screen is capped at available lines; text has a 512 KiB encoded-byte budget, returns complete oldest-first rows with truncated and lines_returned; formatting happens after releasing capture locks; pane+tab must agree; contents=false omits text but keeps dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.scroll {pane?:<integer>, lines?:<signed integer>, page?:<signed integer>, to?:top|bottom}: exactly one of lines/page/to; positive lines or pages move up into history; pages overlap by one row; viewport only, snapshots stay live; returns JSON {pane,display_offset,history_lines}; stale pane is not-found; changed offsets publish pane.changed kind=scrolled when watching\nterm.type {pane?:<integer>, \"text\":\"<string>\"}: ASCII synthetic keys to the selected pane without changing focus (default active pane) through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nterm.tab.title {id:<integer>, title:<string>}: pin a user title (controls stripped, max 256 UTF-8 bytes); empty after sanitising clears the pin and restores the active pane OSC title\nterm.tab.move {id:<integer>, index:<integer>}: reorder tab, clamping index to 0..len-1; focus is preserved\nterm.props.watch {}: first subscribe through noded topic.subscribe to term.tabs.changed, term.pane.changed and term.title.changed; then call this verb to enable caller-free publishing and return JSON {topics,revision}; then read current state. Bodies are {tab,pane,kind,revision}; revision is a separate monotonic event sequence, not the legacy layout revision. Bounded best-effort delivery; on a gap or reconnect read current state.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type, scroll) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
+pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — unless explicit pane/tab selectors are supplied, they act on the active tab/pane of the instance holding this name at delivery time; both iced term and Bevy bterm also start target-bound control (instance/incarnation/pane_generation) on the allocated native-session route: list/session/tabs/panes/snapshot/type, execute, exec.result/cancel, task.submit/result/cancel, operation, props.get/set and tab/pane mutations. Use the allocated route HELP for target envelopes. These are not targetless verbs on this global name. Requires local noded >= 0.16.8 native ingress, COSMIX_RUN=/run/cosmix and socket directory 0755; unavailable ingress leaves graphics working. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {cwd?:<absolute existing directory>, title?:<string>}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {tab?:<integer>}: list selected tab (default active tab) pane ids, focus, dimensions, child pids and logical geometry (last layout only; hidden tabs may be stale or zero)\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {pane?:<integer>, tab?:<integer>, contents?:<boolean=true>, scrollback_lines?:<integer=0, max 10000>}: read-only selected live screen (offset zero, default active); buffered history above the live screen is capped at available lines; text has a 512 KiB encoded-byte budget, returns complete oldest-first rows with truncated and lines_returned; formatting happens after releasing capture locks; pane+tab must agree; contents=false omits text but keeps dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.scroll {pane?:<integer>, lines?:<signed integer>, page?:<signed integer>, to?:top|bottom}: exactly one of lines/page/to; positive lines or pages move up into history; pages overlap by one row; viewport only, snapshots stay live; returns JSON {pane,display_offset,history_lines}; stale pane is not-found; changed offsets publish pane.changed kind=scrolled when watching\nterm.type {pane?:<integer>, \"text\":\"<string>\"}: ASCII synthetic keys to the selected pane without changing focus (default active pane) through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nterm.tab.title {id:<integer>, title:<string>}: pin a user title (controls stripped, max 256 UTF-8 bytes); empty after sanitising clears the pin and restores the active pane OSC title\nterm.tab.move {id:<integer>, index:<integer>}: reorder tab, clamping index to 0..len-1; focus is preserved\nterm.props.watch {}: first subscribe through noded topic.subscribe to term.tabs.changed, term.pane.changed and term.title.changed; then call this verb to enable caller-free publishing and return JSON {topics,revision}; then read current state. Bodies are {tab,pane,kind,revision}; revision is a separate monotonic event sequence, not the legacy layout revision. Bounded best-effort delivery; on a gap or reconnect read current state.\nBefore the first tab attaches, mutating verbs return non-zero rc with error starting. Retry after attach, including with the same request_id; starting refusals are not cached.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type, scroll) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
 /// The one spelling the handlers in this crate are written in.
 ///
 /// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global Bus
@@ -527,6 +527,10 @@ fn dispatch(
         }
     }
     let result = handle(service, set, cleanup, verb, body);
+    // Startup refusals performed no mutation: the same request may be retried.
+    if result.as_ref().is_err_and(|error| error == "starting") {
+        return result;
+    }
     if let Some(args) = parsed {
         let id = args["request_id"].as_str().expect("filtered as string");
         replies.put(id.to_owned(), verb, args, result.clone());
@@ -562,6 +566,9 @@ fn handle(
         panic!("test verb: panic outside the tab-set lock");
     }
     let mut tabs = set.lock().unwrap();
+    if tabs.is_starting() && mutates(verb) {
+        return Err("starting".into());
+    }
     tabs.refresh_titles();
     #[cfg(test)]
     if verb == "term.test.panic_locked" {
@@ -1396,6 +1403,88 @@ mod tests {
     ) -> Result<String, String> {
         super::handle(CANONICAL, set, cleanup, verb, body)
     }
+    #[test]
+    fn startup_mutations_are_retryable_and_attach_notifies_watchers() {
+        let settings = crate::config::Settings {
+            config: crate::config::Config::default(),
+            term: "xterm-256color",
+        };
+        let set = Mutex::new(TabSet::starting(settings));
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let mut replies = ReplyCache::default();
+        let mut events = set.lock().unwrap().observe();
+        assert!(handle(&set, &cleanup, "term.props.watch", "{}").is_ok());
+        for (verb, args) in [
+            ("term.tab.new", serde_json::json!({})),
+            ("term.tab.select", serde_json::json!({"id":1})),
+            ("term.tab.close", serde_json::json!({"id":1})),
+            ("term.pane.split", serde_json::json!({"dir":"h"})),
+            ("term.pane.select", serde_json::json!({"id":1})),
+            ("term.pane.close", serde_json::json!({})),
+            ("term.type", serde_json::json!({"text":"hello"})),
+            ("term.scroll", serde_json::json!({"lines":1})),
+            ("term.tab.title", serde_json::json!({"id":1,"title":"test"})),
+            ("term.tab.move", serde_json::json!({"id":1,"index":0})),
+        ] {
+            let mut args = args;
+            args["request_id"] = verb.into();
+            assert!(mutates(verb));
+            assert_eq!(
+                dispatch(true, &set, &cleanup, &mut replies, verb, &args.to_string()),
+                Err("starting".into()),
+                "{verb}"
+            );
+            assert!(replies.lookup(verb, verb, &args).is_none());
+            assert!(set.lock().unwrap().is_empty());
+        }
+        assert!(
+            set.lock()
+                .unwrap()
+                .split_active(crate::panes::SplitDir::Horizontal)
+                .is_err()
+        );
+        let ready = TabSet::with_initial(settings, None, || {
+            Ok(crate::terminal::Terminal::from_test_vt(80, 24, b""))
+        })
+        .unwrap();
+        set.lock().unwrap().finish_startup(ready);
+        for (index, (topic, kind)) in [
+            ("tabs.changed", "added"),
+            ("pane.changed", "added"),
+            ("tabs.changed", "selected"),
+            ("pane.changed", "selected"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = events.try_recv().expect("startup layout notification");
+            assert_eq!(
+                (
+                    event.topic,
+                    event.kind,
+                    event.tab,
+                    event.pane,
+                    event.revision
+                ),
+                (topic, kind, 1, 1, index as u64 + 1)
+            );
+        }
+        assert!(
+            dispatch(
+                true,
+                &set,
+                &cleanup,
+                &mut replies,
+                "term.tab.select",
+                r#"{"id":1,"request_id":"term.tab.select"}"#
+            )
+            .is_ok()
+        );
+        cleanup.submit(set.lock().unwrap().shutdown());
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn diagnostic_lane_has_no_protected_controls() {
         for verb in [

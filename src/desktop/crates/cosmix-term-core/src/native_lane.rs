@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 pub struct NativeLane {
     supervisor: Option<Supervisor>,
     control: Option<Arc<Control>>,
+    startup_error: Option<String>,
 }
 
 impl NativeLane {
@@ -40,16 +41,21 @@ impl NativeLane {
                     tabs::TabSet::with_initial_notifier(settings, native, titles, move || {
                         crate::terminal::Terminal::start_session(settings, launch.as_ref(), 1)
                     });
-                match ready {
-                    Ok(ready) => tabs.lock().unwrap().finish_startup(ready),
-                    Err(error) => {
-                        eprintln!("term first pane: {error}");
-                        tabs.lock().unwrap().shutdown();
-                    }
-                }
+                lane.attach(&tabs, ready);
                 lane.install_control(tabs, cleanup);
                 lane
             })
+    }
+
+    fn attach(&mut self, tabs: &Mutex<tabs::TabSet>, ready: Result<tabs::TabSet, String>) {
+        match ready {
+            Ok(ready) => tabs.lock().unwrap().finish_startup(ready),
+            Err(error) => {
+                eprintln!("term first pane: {error}");
+                self.startup_error = Some(format!("term first pane: {error}"));
+                tabs.lock().unwrap().shutdown();
+            }
+        }
     }
 
     /// Called after TabSet::shutdown, which serialises with native layout
@@ -58,6 +64,10 @@ impl NativeLane {
         if let Some(control) = &self.control {
             control.release_cleanup();
         }
+    }
+
+    pub fn startup_result(&self) -> Result<(), String> {
+        self.startup_error.clone().map_or(Ok(()), Err)
     }
 
     pub fn start() -> Self {
@@ -73,6 +83,7 @@ impl NativeLane {
                 })
                 .ok(),
             control: None,
+            startup_error: None,
         }
     }
 
@@ -96,5 +107,30 @@ impl Drop for NativeLane {
         // Normal exit releases Control's Cleanup sender before reaper.join().
         // Dropping Control here also covers partial setup failures.
         drop(self.control.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_pane_failure_survives_teardown_as_an_error() {
+        let settings = config::Settings {
+            config: config::Config::default(),
+            term: "xterm-256color",
+        };
+        let tabs = Mutex::new(tabs::TabSet::starting(settings));
+        let mut lane = NativeLane::from_startup(Err("fixture offline".into()));
+        let ready =
+            tabs::TabSet::with_initial(settings, None, || Err("fixture spawn failed".into()));
+        lane.attach(&tabs, ready);
+        assert!(!tabs.lock().unwrap().is_starting());
+        assert!(tabs.lock().unwrap().is_empty());
+        lane.release_cleanup();
+        assert_eq!(
+            lane.startup_result(),
+            Err("term first pane: fixture spawn failed".into())
+        );
     }
 }

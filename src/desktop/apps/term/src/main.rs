@@ -244,7 +244,9 @@ fn run(settings: config::Settings) -> Result<(), String> {
     native.release_cleanup();
     drop(cleanup);
     let _ = reaper.join();
+    let startup = native.startup_result();
     drop(native);
+    startup?;
     result.map_err(|error| error.to_string())
 }
 

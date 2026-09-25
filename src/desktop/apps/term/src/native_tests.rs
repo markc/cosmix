@@ -54,30 +54,34 @@ fn native_lane_round_trip() {
                 .to_string_lossy()
                 .into_owned()
         };
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native_tests::native_lane_round_trip",
-                "--nocapture",
-            ])
-            .env("TERM_C7_FIXTURE", &broker.endpoint)
-            .env("TERM_C7_URL", &broker.url)
-            .env("HOME", root)
-            .env("COSMIX_SRC", root)
-            .env("COSMIX_NODE_CONFIG", config)
-            .env("COSMIX_BROKER_ACCOUNT", account)
-            .env("COSMIX_MESH_OPEN", "1")
-            .env("COSMIX_TERM_POLICY", "default-open")
-            .env("MIX_STATS", "off")
-            .env("MIX_EDITOR", "owned")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for ending in ["close", "shutdown"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native_tests::native_lane_round_trip",
+                    "--nocapture",
+                ])
+                .env("TERM_C7_FIXTURE", &broker.endpoint)
+                .env("TERM_C7_ENDING", ending)
+                .env("TERM_C7_URL", &broker.url)
+                .env("HOME", root)
+                .env("COSMIX_SRC", root)
+                .env("COSMIX_NODE_CONFIG", &config)
+                .env("COSMIX_BROKER_ACCOUNT", &account)
+                .env("COSMIX_MESH_OPEN", "1")
+                .env("COSMIX_TERM_POLICY", "default-open")
+                .env("MIX_STATS", "off")
+                .env("MIX_EDITOR", "owned")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         return;
     }
 
@@ -173,6 +177,37 @@ fn native_lane_round_trip() {
         })).await;
         assert!(matches!(tokio::time::timeout(Duration::from_secs(3), events.next()).await
             .expect("native pane selection must wake iced's subscription"), Some(Message::Wake)));
+        let generation = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = call(client.client(), &child.name, "shell.status", shell_target.clone()).await;
+                if status["status"]["snapshot"]["phase"] == "prompt-ready" {
+                    break status["status"]["snapshot"]["prompt_generation"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        let pending = call(client.client(), &parent.name, "term.execute", json!({
+            "target":target,"request_id":"3","request_epoch":list["request_epoch"],
+            "prompt_generation":generation,"source":"print(run_argv([\"sleep\", \"30\"]))"
+        })).await;
+        assert_eq!(pending["status"], "accepted");
+        let pending_result = call(client.client(), &parent.name, "term.exec.result", json!({
+            "target":target,"operation_id":pending["operation_id"]})).await;
+        assert_ne!(pending_result["state"], "finished", "execution must still be in flight");
+        if std::env::var("TERM_C7_ENDING").unwrap() == "close" {
+            call(client.client(), &parent.name, "term.pane.close", json!({
+                "target":target,"request_id":"4","request_epoch":list["request_epoch"]})).await;
+        } else {
+            cleanup.submit(tabs.lock().unwrap().shutdown());
+        }
+        let (rc, body, _) = tokio::time::timeout(Duration::from_secs(6),
+            client.client().call_with_headers_raw(&parent.name, "term.execute", &Default::default(),
+                &json!({"target":target,"request_id":"5","request_epoch":list["request_epoch"],
+                    "prompt_generation":generation,"source":"print(\"must not run\")"}).to_string())
+        ).await.unwrap().unwrap();
+        assert_ne!(rc, 0);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error_code"], "FORBIDDEN");
+        assert!(tabs.lock().unwrap().is_empty());
         client.client().close().await;
     });
     cleanup.submit(tabs.lock().unwrap().shutdown());
@@ -285,6 +320,10 @@ fn unavailable_ingress_logs_once_across_retries() {
             assert!(output.status.success(), "{stderr}");
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
             assert_eq!(stderr.matches("graphics-only").count(), 1, "{stderr}");
+            assert!(
+                stderr.contains("broker/profile unavailable"),
+                "eventual cause missing: {stderr}"
+            );
             assert!(
                 stderr.contains(if mode == "missing" {
                     "broker/profile unavailable"

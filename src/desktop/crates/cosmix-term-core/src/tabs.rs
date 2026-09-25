@@ -401,10 +401,17 @@ impl TabSet {
         ready.emptied = self.emptied.clone();
         ready.observer = self.observer.take();
         ready.watching = self.watching;
+        ready.event_revision = self.event_revision;
         if let Some(wake) = ready.wake.clone() {
             ready.set_wake(wake);
         }
         *self = ready;
+        let tab = self.active_id();
+        let pane = self.active_tab().active_pane;
+        self.changed("tabs.changed", tab, pane, "added");
+        self.changed("pane.changed", tab, pane, "added");
+        self.changed("tabs.changed", tab, pane, "selected");
+        self.changed("pane.changed", tab, pane, "selected");
         self.notify();
     }
 
@@ -472,6 +479,9 @@ impl TabSet {
         &mut self,
         start: impl FnOnce() -> Result<Terminal, String> + std::panic::UnwindSafe,
     ) -> Result<Pane, String> {
+        if self.starting {
+            return Err("starting".into());
+        }
         if self.closing {
             return Err("application closing".into());
         }
