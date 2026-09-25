@@ -349,8 +349,11 @@ fn arb_text() -> impl Strategy<Value = String> {
     prop::collection::vec(alphabet(), 0..32).prop_map(|v| v.into_iter().collect())
 }
 
+/// A line's content range and its `(boundary, cells)` points, in order.
+type OracleLine = (Range<usize>, Vec<(usize, usize)>);
+
 /// For each line of `s`: `(content range, [(boundary, cells)])` in order.
-fn oracle_lines(s: &str, cfg: &MeasureCfg) -> Vec<(Range<usize>, Vec<(usize, usize)>)> {
+fn oracle_lines(s: &str, cfg: &MeasureCfg) -> Vec<OracleLine> {
     let cells = oracle_cells(s, cfg);
     let mut bounds: Vec<_> = cells.keys().copied().collect();
     bounds.sort_unstable();
