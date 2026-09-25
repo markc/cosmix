@@ -2852,6 +2852,15 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "publish",
     "serve_name",
     "script_version",
+    "fs_watch",
+    "fs_unwatch",
+    "fs_wait",
+    "net_watch",
+    "net_unwatch",
+    "net_state",
+    "audio_watch",
+    "audio_unwatch",
+    "audio_state",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -2963,6 +2972,14 @@ pub const MAX_EXPR_DEPTH: usize = 256;
 pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
     "task_start",
     "fs_wait",
+    // Native desktop sources: threads, sockets and child processes owned by
+    // the evaluator generation, and bounded waits on host daemons.
+    "net_watch",
+    "net_unwatch",
+    "net_state",
+    "audio_watch",
+    "audio_unwatch",
+    "audio_state",
     "sleep",     // Pure-classed, pends on the tokio timer
     "readline",  // Env-classed but blocking on host input
     "read_stdin",
@@ -11066,6 +11083,39 @@ impl Evaluator {
                         let ev = self.await_with_class_c_yield(queue.next(Some(arg))).await??;
                         return Ok(parse_event_args(&ev.body));
                     }
+                    if matches!(name.as_str(), "net_watch" | "net_unwatch" | "net_state"
+                        | "audio_watch" | "audio_unwatch" | "audio_state") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        return match name.as_str() {
+                            "net_watch" => {
+                                let groups = crate::desktop_events::net_groups(eval_args.first())?;
+                                let h = self.globals.borrow_mut().native_events.net_watch(groups)?;
+                                Ok(Value::String(h))
+                            }
+                            "audio_watch" => {
+                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), true)?;
+                                let h = self.globals.borrow_mut().native_events.audio_watch(opts)?;
+                                Ok(Value::String(h))
+                            }
+                            "net_unwatch" | "audio_unwatch" => {
+                                let family = if name == "net_unwatch" { "net" } else { "audio" };
+                                let Some(Value::String(h)) = eval_args.first() else {
+                                    return Err(crate::native_events::refusal(
+                                        &format!("{}_WATCH_ARGUMENT", family.to_uppercase()),
+                                        "handle must be a string",
+                                    ));
+                                };
+                                self.globals.borrow_mut().native_events.source_unwatch(family, h)?;
+                                Ok(Value::Nil)
+                            }
+                            "net_state" => Ok(crate::native_events::json_value(crate::desktop_events::net_state()?)),
+                            _ => {
+                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), false)?;
+                                Ok(crate::native_events::json_value(crate::desktop_events::audio_state(&opts)?))
+                            }
+                        };
+                    }
                     if name == "spawn" && matches!(eval_args.first(), Some(Value::List(_))) {
                         self.check_capability(name)?;
                         return crate::builtins::spawn_argv_native(eval_args, Some(&mut self.globals.borrow_mut().native_events))
@@ -11231,14 +11281,18 @@ impl Evaluator {
                                 // the comments, don't just rearrange the code.
                                 let handler = { self.globals.borrow().bus_handler.clone() };
                                 let native = self.globals.borrow().native_events.queue.clone();
-                                let (filesystem, children) = {
+                                let families = {
                                     let g = self.globals.borrow();
-                                    (g.handlers.contains_key("fs.changed"),
-                                     g.handlers.contains_key("proc.exited"))
+                                    crate::native_events::Families {
+                                        filesystem: g.handlers.contains_key("fs.changed"),
+                                        children: g.handlers.contains_key("proc.exited"),
+                                        net: g.handlers.contains_key("net.changed"),
+                                        audio: g.handlers.contains_key("audio.changed"),
+                                    }
                                 };
                                 let outcome: SleepOutcome = tokio::select! {
                                     _ = tokio::time::sleep_until(deadline) => SleepOutcome::Deadline,
-                                    event = native.next_selected(None, filesystem, children), if filesystem || children => SleepOutcome::Event(Some(event?)),
+                                    event = native.next_selected(None, families), if families.any() => SleepOutcome::Event(Some(event?)),
                                     event = async {
                                         match &handler {
                                             Some(h) if !transport_closed => h.next_incoming().await,

@@ -743,3 +743,139 @@ async fn managed_exit_async_handler_uses_existing_scheduler_and_drain() {
         })
         .await;
 }
+
+fn text(e: &Evaluator, name: &str) -> String {
+    e.get_global(name)
+        .map(|v| v.to_mix_string())
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn net_handles_snapshot_and_refusals() {
+    let mut e = Evaluator::new();
+    exec(
+        &mut e,
+        r#"
+        $h = net_watch({events: ["link"]})
+        $loopback = false
+        for $link in net_state().links
+            if $link.loopback then $loopback = true end
+        end
+        net_unwatch($h)
+        try
+            net_unwatch($h)
+        catch $message, $info
+            $again = $info.error_code
+        end
+        try
+            net_watch({recursive: true})
+        catch $message, $info
+            $options = $info.error_code
+        end
+        $other = net_watch()
+        try
+            audio_unwatch($other)
+        catch $message, $info
+            $cross = $info.error_code
+        end
+        net_unwatch($other)
+        -- No PipeWire at this path: an ordinary ok:false state, not an error.
+        $vol = audio_state({runtime_dir: "/nonexistent-mix-audio-test"})
+    "#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(e.get_global("loopback"), Some(Value::Bool(true)));
+    assert_eq!(text(&e, "again"), "NET_WATCH_HANDLE");
+    assert_eq!(text(&e, "options"), "NET_WATCH_OPTIONS");
+    assert_eq!(text(&e, "cross"), "AUDIO_WATCH_HANDLE");
+    let Some(Value::Map(vol)) = e.get_global("vol") else {
+        panic!("audio_state returns a map")
+    };
+    // PIPEWIRE_RUNTIME_DIR in the test environment would still reach a
+    // server; either way the answer is a state map, never a raise.
+    match vol.get("ok") {
+        Some(Value::Bool(false)) => {
+            assert!(matches!(vol.get("reason"), Some(Value::String(s)) if !s.is_empty()))
+        }
+        Some(Value::Bool(true)) => assert!(matches!(vol.get("level"), Some(Value::Number(_)))),
+        other => panic!("audio_state ok must be a bool, got {other:?}"),
+    }
+    e.close_native_events();
+    let err = exec(&mut e, "net_watch()").await.unwrap_err();
+    assert!(
+        matches!(err, cosmix_mix::MixError::Structured(info) if info.code == "NATIVE_CLOSED")
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn idle_net_watch_pump_has_no_clock_wakeups() {
+    use std::{
+        future::Future,
+        pin::pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Wake, Waker},
+    };
+    struct Counter(AtomicUsize);
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let mut e = Evaluator::new();
+    e.set_serve_runtime(Rc::new(Runtime));
+    exec(
+        &mut e,
+        "$h = net_watch({events: [\"link\"]})\non net.changed\n    quit()\nend",
+    )
+    .await
+    .unwrap();
+    let count = Arc::new(Counter(AtomicUsize::new(0)));
+    let waker = Waker::from(count.clone());
+    {
+        let mut pump = pin!(e.run_event_pump());
+        assert!(
+            pump.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_secs(86400)).await;
+        assert_eq!(count.0.load(Ordering::Relaxed), 0);
+    }
+    e.close_native_events();
+}
+
+#[test]
+fn desktop_source_contracts_capabilities_and_expression_denial() {
+    use cosmix_mix::CapabilityClass::{Env, Process};
+    for (name, capability, arities) in [
+        ("net_watch", Env, &[0, 1][..]),
+        ("net_unwatch", Env, &[1][..]),
+        ("net_state", Env, &[0][..]),
+        ("audio_watch", Process, &[0, 1][..]),
+        ("audio_unwatch", Process, &[1][..]),
+        ("audio_state", Process, &[0, 1][..]),
+    ] {
+        let info = cosmix_mix::builtins::builtin_info_of(name).unwrap();
+        assert_eq!(info.capability, capability, "{name}");
+        for n in 0..3 {
+            assert_eq!(info.contract.accepts_arity(n), arities.contains(&n), "{name}/{n}");
+        }
+        assert!(cosmix_mix::evaluator::EXPR_MODE_DENIED_BUILTINS.contains(&name));
+        assert!(cosmix_mix::expr_mode_check(&format!("{name}()")).is_err());
+    }
+    let source = "$n = net_watch({events: [\"link\"]})\nnet_unwatch($n)\n$a = audio_watch()\naudio_unwatch($a)\n$s = net_state()\n$v = audio_state()";
+    let stmts = Parser::new(Lexer::new(source).tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    let report = cosmix_mix::analyzer::analyze(&stmts, None, &Default::default());
+    assert!(!report.diagnostics.iter().any(|d| d.code == "MIX-E1102"));
+    assert!(report.capabilities.contains(&"env"));
+    assert!(report.capabilities.contains(&"process"));
+}

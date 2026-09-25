@@ -32,14 +32,64 @@ struct PendingWatch {
     overflow: bool,
 }
 
+/// A net/audio handle's coalesced records (desktop_events.rs). Keyed by the
+/// source's own identity (link index, address, facility#index): last wins.
+#[derive(Default)]
+struct PendingSource {
+    command: &'static str,
+    changes: BTreeMap<String, serde_json::Value>,
+    overflow: bool,
+    closed: Option<serde_json::Value>,
+}
+
+impl PendingSource {
+    fn ready(&self) -> bool {
+        !self.changes.is_empty() || self.overflow || self.closed.is_some()
+    }
+}
+
 #[derive(Default)]
 struct Pending {
     watches: BTreeMap<String, PendingWatch>,
+    sources: BTreeMap<String, PendingSource>,
     children: VecDeque<serde_json::Value>,
     count: usize,
     closed: bool,
     last_watch: Option<String>,
-    prefer_child: bool,
+    last_source: Option<String>,
+    /// Round-robin over filesystem (0), child (1) and net/audio (2) records.
+    turn: usize,
+}
+
+/// Which native families a consumer can dispatch. A sleep yield point only
+/// takes records whose command has a registered handler.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Families {
+    pub filesystem: bool,
+    pub children: bool,
+    pub net: bool,
+    pub audio: bool,
+}
+
+impl Families {
+    pub const ALL: Self = Self {
+        filesystem: true,
+        children: true,
+        net: true,
+        audio: true,
+    };
+
+    pub fn any(self) -> bool {
+        self.filesystem || self.children || self.net || self.audio
+    }
+
+    fn source(self, command: &str) -> bool {
+        match command {
+            "net.changed" => self.net,
+            "audio.changed" => self.audio,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -100,6 +150,75 @@ impl Queue {
         self.ready.notify_waiters();
     }
 
+    /// Coalesce a net/audio batch. Records beyond the per-handle bound are
+    /// dropped and the handle's next batch says overflow (re-read state).
+    pub fn source(&self, handle: &str, changes: Vec<(String, serde_json::Value)>, overflow: bool) {
+        let mut p = self.pending.lock().unwrap();
+        let Some(s) = p.sources.get_mut(handle) else {
+            return;
+        };
+        s.overflow |= overflow;
+        for (key, change) in changes {
+            if s.changes.contains_key(&key)
+                || s.changes.len() < crate::desktop_events::MAX_SOURCE_PENDING
+            {
+                s.changes.insert(key, change);
+            } else {
+                s.overflow = true;
+            }
+        }
+        drop(p);
+        self.ready.notify_waiters();
+    }
+
+    /// The source died on its own (event stream exited, socket error). One
+    /// terminal batch carries `closed`; the handle stays until unwatched.
+    pub fn source_closed(&self, handle: &str, reason: serde_json::Value) {
+        let mut p = self.pending.lock().unwrap();
+        let Some(s) = p.sources.get_mut(handle) else {
+            return;
+        };
+        s.overflow = true;
+        s.closed = Some(reason);
+        drop(p);
+        self.ready.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_source_for_test(&self, handle: &str, command: &'static str) {
+        self.pending.lock().unwrap().sources.insert(
+            handle.into(),
+            PendingSource {
+                command,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_ready_for_test(&self, handle: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .sources
+            .get(handle)
+            .is_some_and(PendingSource::ready)
+    }
+
+    fn take_source(p: &mut Pending, handle: &str) -> Option<IncomingEvent> {
+        let s = p.sources.get_mut(handle)?;
+        if !s.ready() {
+            return None;
+        }
+        let changes: Vec<_> = std::mem::take(&mut s.changes).into_values().collect();
+        let overflow = std::mem::take(&mut s.overflow);
+        let mut body = serde_json::json!({"watch": handle, "changes": changes, "overflow": overflow});
+        if let Some(closed) = s.closed.take() {
+            body["closed"] = closed;
+        }
+        Some(event(s.command, body))
+    }
+
     fn take_watch(p: &mut Pending, handle: &str) -> Option<serde_json::Value> {
         let w = p.watches.get_mut(handle)?;
         if w.changes.is_empty() && !w.overflow {
@@ -122,7 +241,7 @@ impl Queue {
     }
 
     pub async fn next(&self, watch: Option<&str>) -> MixResult<IncomingEvent> {
-        self.next_selected(watch, true, true).await
+        self.next_selected(watch, Families::ALL).await
     }
 
     /// A sleep yield point only consumes families with an actual handler.
@@ -130,8 +249,7 @@ impl Queue {
     pub async fn next_selected(
         &self,
         watch: Option<&str>,
-        filesystem: bool,
-        children: bool,
+        families: Families,
     ) -> MixResult<IncomingEvent> {
         loop {
             let ready = self.ready.notified();
@@ -151,12 +269,15 @@ impl Queue {
                         return Ok(event("fs.changed", body));
                     }
                 } else {
-                    // Round-robin handles and alternate source families so a
-                    // continuously written root cannot starve another watch.
+                    // Round-robin handles and rotate source families so a
+                    // continuously written root (or a flapping link) cannot
+                    // starve another watch or family.
                     let ready: Vec<_> = p
                         .watches
                         .iter()
-                        .filter(|(_, w)| filesystem && (!w.changes.is_empty() || w.overflow))
+                        .filter(|(_, w)| {
+                            families.filesystem && (!w.changes.is_empty() || w.overflow)
+                        })
                         .map(|(h, _)| h.clone())
                         .collect();
                     let h = ready
@@ -164,17 +285,39 @@ impl Queue {
                         .find(|h| p.last_watch.as_ref().is_none_or(|last| *h > last))
                         .or_else(|| ready.first())
                         .cloned();
-                    if children
-                        && (p.prefer_child || h.is_none())
-                        && let Some(body) = p.children.pop_front()
-                    {
-                        p.prefer_child = false;
-                        return Ok(event("proc.exited", body));
-                    }
-                    if let Some(h) = h {
-                        p.last_watch = Some(h.clone());
-                        p.prefer_child = true;
-                        return Ok(event("fs.changed", Self::take_watch(&mut p, &h).unwrap()));
+                    let ready: Vec<_> = p
+                        .sources
+                        .iter()
+                        .filter(|(_, s)| families.source(s.command) && s.ready())
+                        .map(|(h, _)| h.clone())
+                        .collect();
+                    let s = ready
+                        .iter()
+                        .find(|h| p.last_source.as_ref().is_none_or(|last| *h > last))
+                        .or_else(|| ready.first())
+                        .cloned();
+                    let child = families.children && !p.children.is_empty();
+                    for step in 0..3 {
+                        let family = (p.turn + step) % 3;
+                        if family == 0
+                            && let Some(h) = &h
+                        {
+                            p.last_watch = Some(h.clone());
+                            p.turn = 1;
+                            return Ok(event("fs.changed", Self::take_watch(&mut p, h).unwrap()));
+                        }
+                        if family == 1 && child {
+                            p.turn = 2;
+                            let body = p.children.pop_front().unwrap();
+                            return Ok(event("proc.exited", body));
+                        }
+                        if family == 2
+                            && let Some(s) = &s
+                        {
+                            p.last_source = Some(s.clone());
+                            p.turn = 0;
+                            return Ok(Self::take_source(&mut p, s).unwrap());
+                        }
                     }
                 }
             }
@@ -217,6 +360,7 @@ pub(crate) struct NativeEvents {
     watches: BTreeSet<String>,
     filesystem: Option<crate::fs_watch::Registry>,
     children: Vec<crate::child_events::ChildWatch>,
+    desktop: BTreeMap<String, crate::desktop_events::Source>,
 }
 
 impl NativeEvents {
@@ -237,7 +381,79 @@ impl NativeEvents {
         self.children.retain(|c| !c.finished());
         !self.watches.is_empty()
             || !self.children.is_empty()
+            || !self.desktop.is_empty()
             || !self.queue.pending.lock().unwrap().children.is_empty()
+    }
+
+    /// `net_watch`: one rtnetlink subscription per handle.
+    pub fn net_watch(&mut self, groups: u32) -> MixResult<String> {
+        self.source_watch("net", "net.changed", move |queue, h| {
+            crate::desktop_events::NetSource::new(queue, h, groups)
+                .map(crate::desktop_events::Source::Net)
+        })
+    }
+
+    /// `audio_watch`: one managed `pactl subscribe` child per handle.
+    pub fn audio_watch(&mut self, opts: crate::desktop_events::AudioOptions) -> MixResult<String> {
+        self.source_watch("audio", "audio.changed", move |queue, h| {
+            crate::desktop_events::AudioSource::new(queue, h, opts)
+                .map(crate::desktop_events::Source::Audio)
+        })
+    }
+
+    fn source_watch(
+        &mut self,
+        family: &str,
+        command: &'static str,
+        start: impl FnOnce(Arc<Queue>, String) -> MixResult<crate::desktop_events::Source>,
+    ) -> MixResult<String> {
+        self.ensure_open()?;
+        if self.desktop.len() >= crate::desktop_events::MAX_SOURCES {
+            return Err(refusal(
+                &format!("{}_WATCH_LIMIT", family.to_uppercase()),
+                "maximum 16 net/audio watch handles per evaluator",
+            ));
+        }
+        let h = format!("{family}:{}", NEXT_HANDLE.fetch_add(1, Ordering::Relaxed));
+        // Register the pending slot first: the source may publish at once.
+        self.queue.pending.lock().unwrap().sources.insert(
+            h.clone(),
+            PendingSource {
+                command,
+                ..Default::default()
+            },
+        );
+        match start(self.queue.clone(), h.clone()) {
+            Ok(source) => {
+                self.desktop.insert(h.clone(), source);
+                Ok(h)
+            }
+            Err(e) => {
+                self.remove_source_pending(&h);
+                Err(e)
+            }
+        }
+    }
+
+    fn remove_source_pending(&self, h: &str) {
+        self.queue.pending.lock().unwrap().sources.remove(h);
+        self.queue.ready.notify_waiters();
+    }
+
+    /// `net_unwatch` / `audio_unwatch`. A handle of the other family is
+    /// refused, not cancelled.
+    pub fn source_unwatch(&mut self, family: &str, h: &str) -> MixResult<()> {
+        if !h.starts_with(&format!("{family}:")) || !self.desktop.contains_key(h) {
+            return Err(refusal(
+                &format!("{}_WATCH_HANDLE", family.to_uppercase()),
+                "unknown or retired watch handle",
+            ));
+        }
+        // Drop pending first: records the worker publishes while it is
+        // being cancelled find no slot and are discarded.
+        self.remove_source_pending(h);
+        self.desktop.remove(h); // cancels and joins the worker
+        Ok(())
     }
     pub fn watch(&mut self, path: &str, opts: crate::fs_watch::Options) -> MixResult<String> {
         self.ensure_open()?;
@@ -355,6 +571,7 @@ impl NativeEvents {
             let mut p = self.queue.pending.lock().unwrap();
             p.closed = true;
             p.watches.clear();
+            p.sources.clear();
             p.children.clear();
             p.count = 0;
         }
@@ -362,6 +579,7 @@ impl NativeEvents {
         self.watches.clear();
         self.filesystem = None;
         self.children.clear();
+        self.desktop.clear();
     }
 }
 
@@ -462,6 +680,7 @@ mod tests {
             watches: BTreeSet::new(),
             filesystem: None,
             children: Vec::new(),
+            desktop: BTreeMap::new(),
         };
         registry.remove_pending("test");
         q.change("test", Some(change("late".into())), true);
@@ -494,10 +713,197 @@ mod tests {
         let q = queue();
         q.change("test", Some(change("kept".into())), false);
         q.child(serde_json::json!({"pid": 42}));
-        let child = q.next_selected(None, false, true).await.unwrap();
+        let children = Families {
+            children: true,
+            ..Default::default()
+        };
+        let child = q.next_selected(None, children).await.unwrap();
         assert_eq!(child.command, "proc.exited");
         let batch = q.next(Some("test")).await.unwrap();
         assert!(batch.body.contains("kept"));
+    }
+
+    fn with_source(q: &Queue, handle: &str, command: &'static str) {
+        q.pending.lock().unwrap().sources.insert(
+            handle.into(),
+            PendingSource {
+                command,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn net(index: u32, up: bool) -> (String, serde_json::Value) {
+        (
+            format!("link:{index}"),
+            serde_json::json!({"kind": "link", "index": index, "up": up}),
+        )
+    }
+
+    #[tokio::test]
+    async fn source_batches_coalesce_by_key_and_bound_with_sticky_overflow() {
+        let q = queue();
+        with_source(&q, "net:1", "net.changed");
+        // A burst: link 3 flaps down then up; the batch holds the last word.
+        q.source("net:1", vec![net(3, false), net(4, true)], false);
+        q.source("net:1", vec![net(3, true)], false);
+        let ev = q.next(None).await.unwrap();
+        assert_eq!(ev.command, "net.changed");
+        let body: serde_json::Value = serde_json::from_str(&ev.body).unwrap();
+        assert_eq!(body["watch"], "net:1");
+        assert_eq!(body["overflow"], false);
+        let changes = body["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|c| c["index"] == 3 && c["up"] == true));
+        for n in 0..crate::desktop_events::MAX_SOURCE_PENDING as u32 + 5 {
+            q.source("net:1", vec![net(n, true)], false);
+        }
+        let body: serde_json::Value =
+            serde_json::from_str(&q.next(None).await.unwrap().body).unwrap();
+        assert_eq!(
+            body["changes"].as_array().unwrap().len(),
+            crate::desktop_events::MAX_SOURCE_PENDING
+        );
+        assert_eq!(body["overflow"], true);
+        // Overflow is reported once, then cleared.
+        q.source("net:1", vec![net(1, true)], false);
+        let body: serde_json::Value =
+            serde_json::from_str(&q.next(None).await.unwrap().body).unwrap();
+        assert_eq!(body["overflow"], false);
+    }
+
+    #[tokio::test]
+    async fn closed_source_delivers_one_terminal_batch() {
+        let q = queue();
+        with_source(&q, "audio:1", "audio.changed");
+        q.source_closed(
+            "audio:1",
+            serde_json::json!({"error_code": "AUDIO_SOURCE_EXITED"}),
+        );
+        let ev = q.next(None).await.unwrap();
+        assert_eq!(ev.command, "audio.changed");
+        let body: serde_json::Value = serde_json::from_str(&ev.body).unwrap();
+        assert_eq!(body["closed"]["error_code"], "AUDIO_SOURCE_EXITED");
+        assert_eq!(body["overflow"], true);
+        assert!(!q.pending.lock().unwrap().sources["audio:1"].ready());
+    }
+
+    #[tokio::test]
+    async fn sleep_selection_leaves_unhandled_source_families_queued() {
+        let q = queue();
+        with_source(&q, "net:1", "net.changed");
+        with_source(&q, "audio:2", "audio.changed");
+        q.source("net:1", vec![net(3, true)], false);
+        q.source("audio:2", vec![("sink#1".into(), serde_json::json!({}))], false);
+        let audio_only = Families {
+            audio: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            q.next_selected(None, audio_only).await.unwrap().command,
+            "audio.changed"
+        );
+        assert!(q.pending.lock().unwrap().sources["net:1"].ready());
+        // With nothing selectable left, the wait pends instead of stealing.
+        let mut wait = std::pin::pin!(q.next_selected(None, audio_only));
+        let waker = Waker::from(Arc::new(Wakes::default()));
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+    }
+
+    #[tokio::test]
+    async fn families_rotate_so_a_flapping_link_cannot_starve_filesystem_or_exits() {
+        let q = queue();
+        with_source(&q, "net:1", "net.changed");
+        q.change("test", Some(change("a".into())), false);
+        q.child(serde_json::json!({"pid": 1}));
+        q.source("net:1", vec![net(3, true)], false);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let ev = q.next(None).await.unwrap();
+            seen.push(ev.command);
+            // The link keeps flapping between deliveries.
+            q.source("net:1", vec![net(3, true)], false);
+        }
+        seen.sort();
+        assert_eq!(seen, ["fs.changed", "net.changed", "proc.exited"]);
+    }
+
+    #[tokio::test]
+    async fn removing_a_source_wakes_waiters_and_drops_late_records() {
+        let q = queue();
+        with_source(&q, "net:1", "net.changed");
+        let mut wait = std::pin::pin!(q.next(None));
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "idle source schedules no work");
+        // NativeEvents implements Drop, so no struct-update construction.
+        let mut registry = NativeEvents::default();
+        registry.queue = q.clone();
+        registry.remove_source_pending("net:1");
+        assert!(wakes.0.load(Ordering::Relaxed) > 0);
+        q.source("net:1", vec![net(3, true)], true);
+        q.source_closed("net:1", serde_json::json!({}));
+        assert!(q.pending.lock().unwrap().sources.is_empty());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+    }
+
+    #[test]
+    fn source_handles_are_family_checked_and_closed_registry_refuses() {
+        let mut r = NativeEvents::default();
+        let err = r.source_unwatch("net", "audio:1").unwrap_err();
+        assert!(matches!(err, MixError::Structured(info) if info.code == "NET_WATCH_HANDLE"));
+        let err = r.source_unwatch("audio", "audio:1").unwrap_err();
+        assert!(matches!(err, MixError::Structured(info) if info.code == "AUDIO_WATCH_HANDLE"));
+        r.close();
+        let err = r
+            .net_watch(crate::desktop_events::RTMGRP_LINK)
+            .unwrap_err();
+        assert!(matches!(err, MixError::Structured(info) if info.code == "NATIVE_CLOSED"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn net_watch_unwatch_and_close_join_their_workers() {
+        let mut r = NativeEvents::default();
+        let h = r.net_watch(crate::desktop_events::RTMGRP_LINK).unwrap();
+        assert!(h.starts_with("net:"));
+        assert!(r.has_sources());
+        r.source_unwatch("net", &h).unwrap();
+        assert!(!r.has_sources());
+        assert!(r.queue.pending.lock().unwrap().sources.is_empty());
+        let err = r.source_unwatch("net", &h).unwrap_err();
+        assert!(matches!(err, MixError::Structured(info) if info.code == "NET_WATCH_HANDLE"));
+        let mut handles = Vec::new();
+        for _ in 0..crate::desktop_events::MAX_SOURCES {
+            handles.push(r.net_watch(crate::desktop_events::RTMGRP_LINK).unwrap());
+        }
+        let err = r
+            .net_watch(crate::desktop_events::RTMGRP_LINK)
+            .unwrap_err();
+        assert!(matches!(err, MixError::Structured(info) if info.code == "NET_WATCH_LIMIT"));
+        // close() cancels every worker (Drop joins) and retires the slots.
+        r.close();
+        assert!(r.desktop.is_empty());
+        assert!(r.queue.pending.lock().unwrap().sources.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn net_state_reports_loopback() {
+        let v = crate::desktop_events::net_state().unwrap();
+        let links = v["links"].as_array().unwrap();
+        assert!(
+            links
+                .iter()
+                .any(|l| l["loopback"] == true && l["ifname"].is_string())
+        );
+        assert!(v["addresses"].is_array());
     }
 
     #[test]

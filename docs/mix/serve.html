@@ -452,13 +452,15 @@ long-lived, addressable Mix process that <em>is</em> a service. The full normati
 contract is <strong>SPEC 18</strong> (the Mix Citizen Runtime); this page is the operational
 view — what the flag does, what the runtime injects, and how a citizen behaves.</p>
 <h2 id="native-events-and-generation-lifetime">Native events and generation lifetime</h2>
-<p><code>on fs.changed</code>, <code>on proc.exited</code> and <code>on bus.connected</code> use the ordinary event
+<p><code>on fs.changed</code>, <code>on proc.exited</code>, <code>on net.changed</code>, <code>on audio.changed</code> and
+<code>on bus.connected</code> use the ordinary event
 envelope: payloads are in <strong><code>$event.args</code></strong>, with <code>command</code>, <code>headers</code> and <code>body</code>
 available as usual. Plain handlers remain serial; async handlers use the
 existing concurrent scheduling and drain rules. Native notifications also enter
 the existing top-level yield points. No native source uses a polling loop or a
 timer to discover change; an idle pump parks on readiness notifications.</p>
-<p>Filesystem watches and managed children belong to an evaluator generation.
+<p>Filesystem watches, net/audio watches and managed children belong to an
+evaluator generation.
 Workers exchange owned Rust records with a bounded registry; Mix values are
 created only on the evaluation thread. Reload builds a separate candidate
 registry. A failed candidate is drained and closed, leaving the old watches and
@@ -493,7 +495,8 @@ on bus.connected
 end
 </code></pre>
 <p>See <a href="/mix/io#native-filesystem-events">filesystem events</a>,
-<a href="/mix/system#managed-child-exit-events">managed spawn</a>, and
+<a href="/mix/system#managed-child-exit-events">managed spawn</a>,
+<a href="/mix/system#desktop-status-events--net_watch-audio_watch">network and audio events</a>, and
 <a href="/mix/bus#connection-events">connection events</a>.</p>
 <h2 id="first-substrate">First, "substrate"</h2>
 <p><strong>The substrate is Cosmix itself</strong> — the agent-operable computing environment,

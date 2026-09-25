@@ -449,8 +449,9 @@ applied state reads. <code>&lt;host&gt;.panel.changed</code> notifications are i
 hints; dropping one cannot strand an operation. Open replies acknowledge desired state;
 <code>shown</code> reflects the last applied host snapshot. Saved popup pins are cleared
 only after an applied release. Refresh bursts use one local 10 ms coalescing
-deadline in the calling handler, with no Bus loopback continuation. The legacy network/audio clock polling
-is reserved for Stage C's native event sources.</p>
+deadline in the calling handler, with no Bus loopback continuation. Network
+and volume arrive as Stage C's native events (<code>net_watch</code>, <code>audio_watch</code>); the
+minute clock only redraws displayed time.</p>
 <p>The Quoin bottom panel, application launcher, calendar and notifications
 popup, written as <a href="/cos/scenes">Mix Scenes</a>. One Mix citizen
 (<code>src/desktop/scripts/quoin-panel.mix</code>, Bus name <code>quoin-panel</code>) owns four
@@ -540,10 +541,18 @@ windows are shown.</li>
 when an application publishes a StatusNotifierItem.</li>
 <li><strong>Notifications</strong> — the <code>notify</code> adapter (<code>notify.list</code>,
 <code>notify.close</code>).</li>
-<li><strong>Network</strong> — <code>/sys/class/net/*/operstate</code> (no D-Bus).</li>
-<li><strong>Volume</strong> — PipeWire's default sink through <code>wpctl</code>; the applet is hidden
-when there is no default sink. Click toggles mute. <code>PIPEWIRE_RUNTIME_DIR</code>
-points at the login session's runtime directory.</li>
+<li><strong>Network</strong> — any non-loopback link with operstate <code>up</code>, read with
+<code>net_state()</code> (an rtnetlink dump, no D-Bus) at start and on every
+<code>net.changed</code> batch from a <code>net_watch({events:["link"]})</code> subscription.</li>
+<li><strong>Volume</strong> — PipeWire's default sink through <code>audio_state()</code> (one <code>wpctl</code>
+call), re-read on every <code>audio.changed</code> batch from <code>audio_watch</code>; the applet
+is hidden when there is no default sink. Click toggles mute.
+<code>PIPEWIRE_RUNTIME_DIR</code> points at the login session's runtime directory. If
+PipeWire's server goes away the subscription reports <code>closed</code> and the panel
+subscribes again after 5 s, doubling to at most 5 minutes until it succeeds.
+See <a href="/mix/system#desktop-status-events--net_watch-audio_watch">desktop status events</a>.
+Behaviours use the same sources through <code>lib/runtime.mix</code>'s <code>status_watch</code>,
+<code>status_net</code>, <code>status_volume</code>, <code>status_fields</code> and <code>status_closed</code>.</li>
 </ul>
 <h2 id="legacy-host-update-loop">Legacy host update loop</h2>
 <p>The citizen subscribes to <code>&lt;comp&gt;.props.changed</code> (windows and workspaces),
@@ -588,9 +597,9 @@ are remounted. A missing host at init leaves the citizen available until the
 host appears. Panel notices include settled width, so resize motion emits
 only the final width; reveal/conceal reports mapping changes, not each frame.
 The previous five-minute recovery pass
-is removed. The clock still reads network/audio status once per minute until
-Stage C supplies their native event sources. Stage A keeps this legacy host
-citizen running; the extracted behaviours above do not inherit those polls.
+is removed, and so is the clock's once-a-minute network/audio read: those
+applets follow <code>net.changed</code> / <code>audio.changed</code>. Stage A keeps this legacy host
+citizen running.
 Panel migration belongs to Stage B.</p>
 <h2 id="limits">Limits</h2>
 <p>The launcher shows at most 500 applications (the host's list cap) and the

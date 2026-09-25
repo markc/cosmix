@@ -78,3 +78,69 @@ fn item_id($event)
   if type($args.item) != "map" or type($args.item.id) != "string" then return nil end
   return $args.item.id
 end
+
+-- Status sources for panel-style behaviours: network and volume, pushed by
+-- the kernel (rtnetlink) and PipeWire (pactl subscribe) -- never polled.
+-- Subscribe first, read second: keep the handles in the behaviour's state,
+-- and in `on net.changed` / `on audio.changed` re-read with status_net() /
+-- status_volume() and publish the fields (events are hints, state is truth).
+-- A mix without the builtins gets nil handles and an error string.
+fn status_watch($runtime_dir)
+  $out = {net: nil, audio: nil, error: nil}
+  if not has_builtin("net_watch") then
+    $out.error = "this mix has no net_watch/audio_watch"
+    return $out
+  end
+  try
+    $out.net = net_watch({events: ["link"]})
+  catch $message
+    $out.error = "net_watch: " .. to_string($message)
+  end
+  try
+    $out.audio = audio_watch({runtime_dir: $runtime_dir})
+  catch $message
+    $out.error = "audio_watch: " .. to_string($message)
+  end
+  return $out
+end
+
+-- {up, wireless}: any non-loopback link whose operstate is "up".
+fn status_net()
+  $up = false
+  $wireless = false
+  try
+    for each $link in net_state().links
+      if $link.loopback != true and $link.operstate == "up" then
+        $up = true
+        if $link.wireless == true then $wireless = true end
+      end
+    end
+  catch $e
+    return {up: false, wireless: false}
+  end
+  return {up: $up, wireless: $wireless}
+end
+
+-- {ok, level, muted} for the default sink; ok:false hides the applet.
+fn status_volume($runtime_dir)
+  try
+    $v = audio_state({runtime_dir: $runtime_dir})
+    if $v.ok == true then
+      return {ok: true, level: $v.level, muted: $v.muted == true}
+    end
+  catch $e
+  end
+  return {ok: false, level: 0, muted: false}
+end
+
+-- Both model fields at once, ready for publish_model.
+fn status_fields($runtime_dir)
+  return {net: status_net(), vol: status_volume($runtime_dir)}
+end
+
+-- An audio.changed batch whose pactl stream ended (PipeWire restarted or not
+-- up yet): audio_unwatch the handle and subscribe again after a delay, from
+-- an async handler (task_start + sleep), never a Bus self-emit.
+fn status_closed($event)
+  return type(event_args($event).closed) == "map"
+end
