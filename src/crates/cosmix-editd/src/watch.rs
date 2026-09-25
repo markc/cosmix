@@ -114,6 +114,9 @@ struct Inner {
     /// The inode each ancestor watch was armed on.
     ancestor_ids: HashMap<PathBuf, (u64, u64)>,
     warned: bool,
+    /// Test hook: runs between `rearm`'s existence check and its watch call.
+    #[cfg(test)]
+    before_watch: Option<Box<dyn FnMut(&Path) + Send>>,
 }
 
 /// Work for the watch thread, in arrival order.
@@ -310,24 +313,37 @@ impl Inner {
     /// Watch `dir` by path if it exists, else the nearest existing ancestor.
     fn rearm(&mut self, dir: &Path) {
         if let Some(id) = dir_id(dir) {
+            #[cfg(test)]
+            if let Some(hook) = self.before_watch.as_mut() {
+                hook(dir);
+            }
             match self.watch(dir) {
                 Ok(()) => {
+                    // The inode actually watched: the path may have been
+                    // replaced since `id` was read.
+                    let id = dir_id(dir).unwrap_or(id);
                     self.armed.insert(dir.to_path_buf(), id);
                     self.stop_waiting(dir);
                     self.signal_dir(dir, |s| {
                         s.set_unwatched(false);
                         s.raise();
                     });
+                    return;
                 }
+                // Gone between the check and the watch (a rename or delete
+                // racing the arm): not a watch failure — wait on an ancestor
+                // like any missing directory, below. Marking it unwatched
+                // here left nothing armed to see the directory come back.
+                Err(_) if dir_id(dir).is_none() => {}
                 Err(error) => {
                     if !self.warned {
                         self.warned = true;
                         tracing::warn!("cosmix-editd: cannot watch {} ({error}); buffers there are unwatched", dir.display());
                     }
                     self.signal_dir(dir, |s| s.set_unwatched(true));
+                    return;
                 }
             }
-            return;
         }
         // The directory is gone: its files are deleted; wait on an ancestor.
         self.signal_dir(dir, DiskSignal::raise);
@@ -504,6 +520,48 @@ mod tests {
         }
 
         // A later external write through the new directory is detected.
+        let _ = signal.take();
+        std::fs::write(&file, "three").unwrap();
+        assert!(raised(&signal).await, "writes after re-arming are detected");
+    }
+
+    /// The flaky `replaced_parent_directory_rearms_through_dispatch` race,
+    /// made deterministic: the directory is renamed away between `rearm`'s
+    /// existence check and its inotify registration. It must fall back to
+    /// the ancestor wait (not `unwatched` with nothing armed), so its return
+    /// is still seen.
+    #[tokio::test]
+    async fn directory_vanishing_mid_arm_waits_on_an_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = root.join("sub");
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one").unwrap();
+        let watch = Watch::start();
+        let away = root.join("old");
+        let mut fired = false;
+        watch.inner.lock().unwrap().before_watch = Some(Box::new(move |d: &Path| {
+            if !fired && d.ends_with("sub") {
+                fired = true;
+                std::fs::rename(d, &away).unwrap();
+            }
+        }));
+        let signal = DiskSignal::new();
+        watch.add("b1_00000000", &file, signal.clone());
+        assert!(raised(&signal).await, "the buffer rechecks (its file is gone)");
+        assert_eq!(watch.ancestor_dirs(), vec![root.clone()], "waiting on the parent, not given up");
+        assert!(!signal.is_unwatched());
+
+        let fresh = root.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        std::fs::write(fresh.join("a.txt"), "two").unwrap();
+        std::fs::rename(&fresh, &dir).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while dir_id(&dir) != watch.inner.lock().unwrap().armed.get(&dir).copied() {
+            let woke = tokio::time::timeout_at(deadline, signal.notify.notified()).await;
+            assert!(woke.is_ok(), "the returned directory was never armed");
+        }
         let _ = signal.take();
         std::fs::write(&file, "three").unwrap();
         assert!(raised(&signal).await, "writes after re-arming are detected");
