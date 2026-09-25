@@ -516,7 +516,7 @@ impl Raster {
                 }
                 let left = first * self.width as usize * 4;
                 let right = end * self.width as usize * 4;
-                let pixel = destination_pixel(bg);
+                let pixel = destination_pixel(format.colour(bg));
                 for cy in y..y + self.height as usize {
                     // [u8; 4] has byte alignment: arbitrary slice origins and
                     // odd padded strides are valid, without unsafe casts.
@@ -558,9 +558,12 @@ impl Raster {
                     }
                     let count = (gx1 - gx0) as usize;
                     let x = col * self.width as usize + (left + gx0) as usize;
-                    let fg = cell.fg.map(u32::from);
-                    let bg = cell.bg.map(u32::from);
-                    let opaque = destination_pixel(cell.fg);
+                    // Reorder colours once per glyph, never in the mask loop;
+                    // the blend is per channel, so reordering first is exact.
+                    // The cache key above keeps the original foreground.
+                    let fg = format.colour(cell.fg).map(u32::from);
+                    let bg = format.colour(cell.bg).map(u32::from);
+                    let opaque = destination_pixel(format.colour(cell.fg));
                     for gy in gy0..gy1 {
                         let mask_start = gy as usize * p.width as usize + gx0 as usize;
                         let mask = &glyph.data[mask_start..mask_start + count];
@@ -619,8 +622,9 @@ impl Raster {
         bands_into(dirty_rows, self.height, &mut state.bands);
         &state.bands
     }
-    // Frozen pre-rank-6 painter: deliberately retains independent per-pixel
-    // RGBA writes and clipping as the byte-equality oracle.
+    // Frozen pre-rank-6 painter (with rank 3's per-cell colour reorder):
+    // deliberately retains independent per-pixel writes and clipping as the
+    // byte-equality oracle.
     #[cfg(test)]
     fn paint_reference<'a>(
         &mut self,
@@ -629,7 +633,12 @@ impl Raster {
         stride: usize,
         state: &'a mut PaintState,
         dirty: &[bool],
+        format: PixelFormat,
     ) -> &'a [DamageBand] {
+        if state.format != format {
+            state.invalidate();
+            state.format = format;
+        }
         state.bands.clear();
         // `Screen`'s fields are public, so a cell array shorter than
         // `cols * rows` is constructible even though `Terminal::capture` never
@@ -882,6 +891,27 @@ mod tests {
     /// rows, as well as damage. The slice begins at a nonzero physical origin
     /// in a larger canvas; Raster itself has no origin argument.
     fn compare_painters(raster: &mut Raster, grid: &mut Screen, padding: usize) {
+        // Both destination orders: the fast painter must honour the format
+        // exactly as the reference does (a merge once dropped it silently).
+        // The frame sequence mutates the grid, so restore it between passes.
+        let cursor = (grid.cursor, grid.cursor_visible);
+        let colours: Vec<_> = grid.cells.iter().map(|cell| (cell.fg, cell.bg)).collect();
+        for format in [PixelFormat::Rgba, PixelFormat::Bgra] {
+            (grid.cursor, grid.cursor_visible) = cursor;
+            for (cell, &(fg, bg)) in grid.cells.iter_mut().zip(&colours) {
+                cell.fg = fg;
+                cell.bg = bg;
+            }
+            compare_painters_in(raster, grid, padding, format);
+        }
+    }
+
+    fn compare_painters_in(
+        raster: &mut Raster,
+        grid: &mut Screen,
+        padding: usize,
+        format: PixelFormat,
+    ) {
         let (width, height) = raster.target_size(grid);
         let stride = width as usize * 4 + padding + 28;
         let origin = 2 * stride + 12 + 1; // also deliberately byte-unaligned
@@ -908,14 +938,14 @@ mod tests {
                     }
                 }
             }
-            let bands = raster.paint(
-                grid, &mut fast[origin..origin + len], stride, &mut fast_state, &dirty,
+            let bands = raster.paint_format(
+                grid, &mut fast[origin..origin + len], stride, &mut fast_state, &dirty, format,
             ).to_vec();
             let reference = raster.paint_reference(
-                grid, &mut slow[origin..origin + len], stride, &mut slow_state, &dirty,
+                grid, &mut slow[origin..origin + len], stride, &mut slow_state, &dirty, format,
             );
-            assert_eq!(bands, reference, "damage frame={frame}");
-            assert_eq!(fast, slow, "pixels frame={frame} scale={}", raster.scale);
+            assert_eq!(bands, reference, "damage frame={frame} {format:?}");
+            assert_eq!(fast, slow, "pixels frame={frame} scale={} {format:?}", raster.scale);
             assert!(fast[..origin].iter().all(|&b| b == 0x5a));
             assert!(fast[origin + len..].iter().all(|&b| b == 0x5a));
             for row in 0..height as usize {
