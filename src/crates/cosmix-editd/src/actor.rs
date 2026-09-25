@@ -154,7 +154,7 @@ impl BufVerb {
 }
 
 pub enum ActorMsg {
-    Cmd { verb: BufVerb, caller: Caller, reply: oneshot::Sender<Reply> },
+    Cmd { verb: Box<BufVerb>, caller: Caller, reply: oneshot::Sender<Reply> },
     /// From the router: the last holder is closing (or `force`).
     Close { force: bool, reply: oneshot::Sender<Reply> },
 }
@@ -1376,7 +1376,7 @@ pub async fn run(mut a: ActorInit) {
             msg = a.rx.recv() => match msg {
                 None => break,
                 Some(ActorMsg::Cmd { verb, caller, reply }) => {
-                    let body = serve(&mut actor, verb, &caller).await;
+                    let body = serve(&mut actor, *verb, &caller).await;
                     let _ = reply.send(body);
                 }
                 Some(ActorMsg::Close { force, reply }) => {

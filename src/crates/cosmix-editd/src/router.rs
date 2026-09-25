@@ -1078,7 +1078,7 @@ impl Editd {
             Err(r) => return refused(r),
         };
         let (reply, rx) = oneshot::channel();
-        match tx.try_send(ActorMsg::Cmd { verb, caller, reply }) {
+        match tx.try_send(ActorMsg::Cmd { verb: Box::new(verb), caller, reply }) {
             Ok(()) => {
                 let bid = bid.to_string();
                 Box::pin(async move { rx.await.unwrap_or_else(|_| render(&unknown_buffer(&bid))) })
