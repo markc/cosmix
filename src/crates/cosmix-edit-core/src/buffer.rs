@@ -51,7 +51,7 @@ use crate::limits::{
     MAX_REQUEST_TEXT_BYTES, MAX_SELECTION_ORIGINS, MAX_SELECTIONS_PER_ORIGIN, REGEX_SIZE_LIMIT,
 };
 use crate::origin::{Origin, OriginKind, Via};
-use crate::ot::{Edit, Priority, invert, post_ranges, transform_range, transform_range_side};
+use crate::ot::{Edit, Priority, RawEdit, post_ranges, post_ranges_raw, transform_range, transform_raw};
 use crate::pos::{NamedPos, Point, PosSpec, RangeSpec};
 use crate::search::{FindQuery, FindResult, Match};
 use crate::text::{Text, count_newlines, oom};
@@ -153,6 +153,118 @@ struct Commit<'a> {
     coalesce: bool,
     cursor: Option<PosSpec>,
     rebased: bool,
+}
+
+/// One entry of the history an undo transforms through, as raw edits
+/// (rewritten when an undo/redo pair inside the window cancels).
+struct Red<'a> {
+    entry: &'a LogEntry,
+    edits: Vec<RawEdit>,
+}
+
+/// A member's inverse item during composition.
+struct Composed<P> {
+    range: Range<usize>,
+    payload: P,
+    member: u64,
+}
+
+/// Composes the inverses of a group's consecutive entries (oldest first; each
+/// with its raw edits and one payload per edit) into one item list in reading
+/// order, in the coordinates after the last member.
+///
+/// Older items are transformed through each newer member; the member's own
+/// inverse items are then merged in. Two restored texts that land on one
+/// offset are ordered by where the newer member's edit lay relative to the
+/// older item when it applied (`transform_raw`'s side flag), which is their
+/// original reading order — so a run of backspaces AND a run of forward
+/// deletes both restore correctly. `Err((item_member, entry_rev))` on overlap.
+fn compose_members<P>(members: Vec<(u64, Vec<RawEdit>, Vec<P>)>) -> Result<Vec<Composed<P>>, (u64, u64)> {
+    let mut items: Vec<Composed<P>> = Vec::new();
+    for (rev, edits, payloads) in members {
+        let k = edits.len();
+        // sides[item * k + i]: edit i's region lay left of (point) item.
+        let mut sides = vec![false; items.len() * k];
+        for (idx, it) in items.iter_mut().enumerate() {
+            for (i, ed) in edits.iter().enumerate() {
+                let (r, left) =
+                    transform_raw(it.range.clone(), *ed, Priority::ThroughFirst).map_err(|_| (it.member, rev))?;
+                it.range = r;
+                sides[idx * k + i] = left;
+            }
+        }
+        let mut payloads: Vec<Option<P>> = payloads.into_iter().map(Some).collect();
+        // Reading order is reverse application order (see `ot::invert`).
+        let new: Vec<(usize, Composed<P>)> = post_ranges_raw(&edits)
+            .into_iter()
+            .enumerate()
+            .rev()
+            .map(|(i, range)| {
+                let payload = payloads[i].take().expect("one payload per edit");
+                (i, Composed { range, payload, member: rev })
+            })
+            .collect();
+        let mut merged = Vec::with_capacity(items.len() + new.len());
+        let mut old = items.into_iter().enumerate().peekable();
+        let mut new = new.into_iter().peekable();
+        loop {
+            let take_new = match (old.peek(), new.peek()) {
+                (None, None) => break,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (Some((idx, o)), Some((i, n))) => {
+                    if o.range.start != n.range.start {
+                        n.range.start < o.range.start
+                    } else {
+                        match (o.range.is_empty(), n.range.is_empty()) {
+                            (true, true) => sides[idx * k + i],
+                            (true, false) => false,
+                            (false, true) => true,
+                            (false, false) => return Err((o.member, rev)),
+                        }
+                    }
+                }
+            };
+            if take_new {
+                merged.extend(new.next().map(|(_, n)| n));
+            } else {
+                merged.extend(old.next().map(|(_, o)| o));
+            }
+        }
+        items = merged;
+    }
+    Ok(items)
+}
+
+/// Rewrites `rest` (the entries after `group`) as if `group` had never been
+/// applied, for an undo/redo of `group` that cancels against it. Each entry's
+/// edits are transformed through the group's inverse (the inverse's inserts
+/// yield at a tie, `SelfFirst`, mirroring the `ThroughFirst` the undo used),
+/// and the inverse is carried forward through the entry. `None` when any
+/// entry touches the group's text: then the pair is not cancelled.
+fn exclude<'a>(group: &[Red<'a>], rest: &[Red<'a>]) -> Option<Vec<Red<'a>>> {
+    let members = group.iter().map(|r| (r.entry.rev, r.edits.clone(), r.edits.iter().map(|e| e.dd).collect())).collect();
+    let mut inv: Vec<(Range<usize>, usize)> =
+        compose_members(members).ok()?.into_iter().map(|c| (c.range, c.payload)).collect();
+    let mut out = Vec::with_capacity(rest.len());
+    for s in rest {
+        let seq: Vec<RawEdit> = inv.iter().rev().map(|(r, len)| RawEdit { p: r.start, dd: r.len(), ii: *len }).collect();
+        let mut edits = Vec::with_capacity(s.edits.len());
+        for ed in &s.edits {
+            let mut r = ed.p..ed.p + ed.dd;
+            for iv in &seq {
+                r = transform_raw(r, *iv, Priority::SelfFirst).ok()?.0;
+            }
+            edits.push(RawEdit { p: r.start, dd: ed.dd, ii: ed.ii });
+        }
+        for (r, _) in &mut inv {
+            for ed in &s.edits {
+                *r = transform_raw(r.clone(), *ed, Priority::ThroughFirst).ok()?.0;
+            }
+        }
+        out.push(Red { entry: s.entry, edits });
+    }
+    Some(out)
 }
 
 /// An undo/redo item being composed: current range, text it restores, text
@@ -915,17 +1027,44 @@ impl Buffer {
         err
     }
 
+    fn entry(&self, rev: u64) -> Option<&LogEntry> {
+        self.log.after(rev.saturating_sub(1)).next().filter(|e| e.rev == rev)
+    }
+
+    /// The history an undo of a group ending at `last` transforms through:
+    /// every later entry, except that an undo/redo whose target entries are
+    /// still in the list CANCELS against them. The entries between the pair
+    /// are rewritten to exclude the cancelled edits ([`exclude`]). Without
+    /// this, "edit, fix the edit, undo the fix, undo the edit" would refuse:
+    /// the fix overlaps the edit's text even though it was itself undone.
+    /// A pair that cannot be excluded cleanly stays in the list (the undo may
+    /// then refuse — conservative, never wrong).
+    fn reduced_after(&self, last: u64) -> Vec<Red<'_>> {
+        let mut red: Vec<Red<'_>> = Vec::new();
+        for entry in self.log.after(last) {
+            if let EntryKind::Undo { of } | EntryKind::Redo { of } = &entry.kind {
+                let (a, b) = (*of.start(), *of.end());
+                let n = usize::try_from(b.saturating_sub(a).saturating_add(1)).unwrap_or(usize::MAX);
+                if let Some(pos) = red.iter().position(|r| r.entry.rev == a) {
+                    let whole = red
+                        .get(pos..pos.saturating_add(n))
+                        .is_some_and(|g| g.iter().zip(a..=b).all(|(r, rev)| r.entry.rev == rev));
+                    if whole && let Some(rest) = exclude(&red[pos..pos + n], &red[pos + n..]) {
+                        red.truncate(pos);
+                        red.extend(rest);
+                        continue;
+                    }
+                }
+            }
+            red.push(Red { entry, edits: entry.edits.iter().map(RawEdit::of).collect() });
+        }
+        red
+    }
+
     /// The preflight of `history` steps 1-4: the group's inverse in current
     /// coordinates, in reading order, verified against the current text.
-    ///
-    /// Items are composed in ONE forward pass over the log from the group's
-    /// oldest member: items already collected are transformed through each
-    /// later entry; a member's own inverse items are merged in after it.
-    /// Two restored texts that land on one offset are ordered by where the
-    /// newer member's edit lay relative to the older item when it applied
-    /// (`transform_range_side`), which is their original reading order — this
-    /// is what makes both a run of backspaces AND a run of forward deletes
-    /// restore in the right order.
+    /// Members compose with [`compose_members`]; the result is transformed
+    /// through [`Self::reduced_after`].
     fn compose_inverse(&self, group: &Group, lane: &Origin) -> Result<Vec<UndoItem>, CoreError> {
         let first = *group.start();
         let last = *group.end();
@@ -934,67 +1073,34 @@ impl Buffer {
                 .conflict(reason::HISTORY_TRIMMED, format!("rev {first} is older than the retained history"))
                 .with("oldest_rev", self.oldest_rev()));
         }
-        let mut items: Vec<UndoItem> = Vec::new();
-        for entry in self.log.after(first - 1) {
-            let member = entry.rev <= last;
-            let mut sides: Vec<Vec<bool>> = Vec::new();
+        let members = self
+            .log
+            .after(first - 1)
+            .take_while(|e| e.rev <= last)
+            .map(|e| {
+                let payloads = e
+                    .edits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ed)| (e.deleted.get(i).cloned().unwrap_or_default(), ed.insert.clone()))
+                    .collect();
+                (e.rev, e.edits.iter().map(RawEdit::of).collect(), payloads)
+            })
+            .collect();
+        let composed = compose_members(members)
+            .map_err(|(member, rev)| self.undo_conflict(lane, member, self.entry(rev)))?;
+        let mut items: Vec<UndoItem> = composed
+            .into_iter()
+            .map(|c| UndoItem { range: c.range, restore: c.payload.0, expect: c.payload.1, member: c.member })
+            .collect();
+        for r in self.reduced_after(last) {
             for it in &mut items {
-                let mut side = Vec::new();
-                for edit in &entry.edits {
-                    let (r, left) = transform_range_side(it.range.clone(), edit, Priority::ThroughFirst)
-                        .map_err(|_| self.undo_conflict(lane, it.member, Some(entry)))?;
-                    it.range = r;
-                    if member && it.range.is_empty() {
-                        side.push(left);
-                    }
-                }
-                if member {
-                    sides.push(side);
+                for ed in &r.edits {
+                    it.range = transform_raw(it.range.clone(), *ed, Priority::ThroughFirst)
+                        .map_err(|_| self.undo_conflict(lane, it.member, Some(r.entry)))?
+                        .0;
                 }
             }
-            if !member {
-                continue;
-            }
-            let k = entry.edits.len();
-            let inv = invert(entry);
-            let new: Vec<(usize, UndoItem)> = inv
-                .items
-                .into_iter()
-                .enumerate()
-                .map(|(j, (range, restore))| {
-                    let edit_idx = k - 1 - j;
-                    let expect = entry.edits[edit_idx].insert.clone();
-                    (edit_idx, UndoItem { range, restore, expect, member: entry.rev })
-                })
-                .collect();
-            let mut merged = Vec::with_capacity(items.len() + new.len());
-            let mut old = items.into_iter().zip(sides).peekable();
-            let mut new = new.into_iter().peekable();
-            loop {
-                let take_new = match (old.peek(), new.peek()) {
-                    (None, None) => break,
-                    (Some(_), None) => false,
-                    (None, Some(_)) => true,
-                    (Some((o, side)), Some((edit_idx, n))) => {
-                        if o.range.start != n.range.start {
-                            n.range.start < o.range.start
-                        } else {
-                            match (o.range.is_empty(), n.range.is_empty()) {
-                                (true, true) => side.get(*edit_idx).copied().unwrap_or(false),
-                                (true, false) => false,
-                                (false, true) => true,
-                                (false, false) => return Err(self.undo_conflict(lane, o.member, Some(entry))),
-                            }
-                        }
-                    }
-                };
-                if take_new {
-                    merged.extend(new.next().map(|(_, n)| n));
-                } else {
-                    merged.extend(old.next().map(|(o, _)| o));
-                }
-            }
-            items = merged;
         }
 
         // Step 3: the union must itself be overlap-free.

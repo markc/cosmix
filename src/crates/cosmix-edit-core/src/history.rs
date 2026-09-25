@@ -7,7 +7,12 @@
 //!    ([`crate::ot::invert`]) and transform it through EVERY log entry after
 //!    that member (including the group's own later members), so every item ends
 //!    in current-rev coordinates. Overlap → CONFLICT `undo_conflict` (context
-//!    `intervening_rev`, `intervening_origin`).
+//!    `intervening_rev`, `intervening_origin`). (E0a sharpening: an undo/redo
+//!    entry in that window whose target entries are also in it cancels
+//!    against them, the entries between being rewritten to exclude them —
+//!    otherwise "edit, fix it, undo the fix, undo the edit" refuses, because
+//!    the fix overlaps the edit's text although it was itself undone. See
+//!    `Buffer::reduced_after`.)
 //! 3. Union the items into one RangeSet in READING order. Two items
 //!    overlapping under the §3.4 rule → `undo_conflict`. Equal-offset inserts
 //!    keep list order. (E0a sharpening: the plan said "newest member first",

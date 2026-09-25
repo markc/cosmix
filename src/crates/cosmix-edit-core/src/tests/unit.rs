@@ -281,6 +281,28 @@ fn undo_runs_restore_original_order() {
 }
 
 #[test]
+fn linear_undo_through_an_undone_overlapping_edit() {
+    // rev 2 rewrites rev 1's text; once rev 2 is undone, rev 1 must still undo,
+    // even with another origin's edit in between (pair cancellation).
+    let a = o("agent:a");
+    let mut b = buf("hello world");
+    edit(&mut b, "agent:a", vec![ins(5, " big")]);
+    edit(&mut b, "agent:a", vec![rep(6, 9, "huge")]);
+    edit(&mut b, "agent:x", vec![ins(0, ">")]);
+    b.undo(LaneSel::Own, &a, via(), 0).unwrap();
+    assert_eq!(text(&b), ">hello big world");
+    b.undo(LaneSel::Own, &a, via(), 0).unwrap();
+    assert_eq!(text(&b), ">hello world");
+    b.redo(LaneSel::Own, &a, via(), 0).unwrap();
+    assert_eq!(text(&b), ">hello big world");
+    b.redo(LaneSel::Own, &a, via(), 0).unwrap();
+    assert_eq!(text(&b), ">hello huge world");
+    b.undo(LaneSel::Own, &a, via(), 0).unwrap();
+    b.undo(LaneSel::Own, &a, via(), 0).unwrap();
+    assert_eq!(text(&b), ">hello world");
+}
+
+#[test]
 fn undo_own_other_lane_and_global() {
     let mut b = buf("0123456789");
     let (a, x) = (o("agent:a"), o("agent:x"));

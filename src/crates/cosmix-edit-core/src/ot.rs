@@ -60,19 +60,30 @@ pub struct Overlap;
 
 /// Transform one range through one later edit (rules in the module docs).
 pub fn transform_range(r: Range<usize>, through: &Edit, prio: Priority) -> Result<Range<usize>, Overlap> {
-    transform_range_side(r, through, prio).map(|(r, _)| r)
+    transform_raw(r, RawEdit::of(through), prio).map(|(r, _)| r)
 }
 
-/// [`transform_range`] that also reports whether the edit's region lies to
-/// the LEFT of the range (the range shifted). Undo composition uses it to
-/// order restored texts that end up at one offset.
-pub(crate) fn transform_range_side(
-    r: Range<usize>,
-    through: &Edit,
-    prio: Priority,
-) -> Result<(Range<usize>, bool), Overlap> {
+/// An edit reduced to its shape: offset, deleted length, inserted length.
+/// Transforms only ever need the lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawEdit {
+    pub p: usize,
+    pub dd: usize,
+    pub ii: usize,
+}
+
+impl RawEdit {
+    pub(crate) fn of(e: &Edit) -> Self {
+        Self { p: e.offset, dd: e.delete, ii: e.insert.len() }
+    }
+}
+
+/// [`transform_range`] on a [`RawEdit`], also reporting whether the edit's
+/// region lies to the LEFT of the range (the range shifted). Undo
+/// composition uses that to order restored texts that land on one offset.
+pub(crate) fn transform_raw(r: Range<usize>, through: RawEdit, prio: Priority) -> Result<(Range<usize>, bool), Overlap> {
     let (s, e) = (r.start, r.end);
-    let (p, dd, ii) = (through.offset, through.delete, through.insert.len());
+    let RawEdit { p, dd, ii } = through;
     let pe = p + dd;
     if pe < s || (pe == s && dd > 0) {
         Ok((s - dd + ii..e - dd + ii, true))
@@ -112,14 +123,19 @@ pub fn transform_set(set: &RangeSet, through: &[Edit], prio: Priority) -> Result
 /// previous one) nothing overlaps; a later edit at the same point reads
 /// before an earlier one, so ties shift (`ThroughFirst`).
 pub(crate) fn post_ranges(edits: &[Edit]) -> Vec<Range<usize>> {
+    post_ranges_raw(&edits.iter().map(RawEdit::of).collect::<Vec<_>>())
+}
+
+/// [`post_ranges`] on raw edits.
+pub(crate) fn post_ranges_raw(edits: &[RawEdit]) -> Vec<Range<usize>> {
     edits
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let mut r = e.offset..e.offset + e.insert.len();
+            let mut r = e.p..e.p + e.ii;
             for later in &edits[i + 1..] {
-                match transform_range(r.clone(), later, Priority::ThroughFirst) {
-                    Ok(t) => r = t,
+                match transform_raw(r.clone(), *later, Priority::ThroughFirst) {
+                    Ok((t, _)) => r = t,
                     Err(Overlap) => debug_assert!(false, "non-canonical edit sequence"),
                 }
             }
