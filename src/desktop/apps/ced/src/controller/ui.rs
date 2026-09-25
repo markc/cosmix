@@ -9,12 +9,14 @@
 //! re-evaluated and the effects are returned for the host to perform.
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::path::PathBuf;
 
 use cosmix_edit_client::highlight::ResultTag;
 use cosmix_edit_client::mirror::{Mirror, Phase, ServerOp};
 use cosmix_edit_client::types::{Intent, Level, Notice, Outgoing, TabId, ViewDelta};
-use cosmix_edit_core::anchor::Selection;
+use cosmix_edit_core::anchor::{Bias, Selection, map_point};
+use cosmix_edit_core::ot::Edit;
 use cosmix_edit_core::limits::{FIND_MAX_LIMIT, MAX_OPS_PER_TXN, MAX_REQUEST_TEXT_BYTES};
 use cosmix_edit_core::wire;
 use serde_json::{Value, json};
@@ -385,6 +387,13 @@ impl Controller {
         fx: &mut Vec<Effect>,
     ) -> Result<Option<Value>, (&'static str, String)> {
         let tab = tab.or(self.active);
+        if window_only(action, args) {
+            if self.headless {
+                return Err((code::UNAVAILABLE, format!("{} needs a window (this instance is --headless)", action.id())));
+            }
+            fx.push(Effect::WindowAction { tab, action, args: args.cloned(), intent });
+            return Ok(None);
+        }
         let arg_str = |k: &str| args.and_then(|a| a.get(k)).and_then(Value::as_str).map(str::to_string);
         let arg_bool = |k: &str| args.and_then(|a| a.get(k)).and_then(Value::as_bool).unwrap_or(false);
         let need = || tab.ok_or((code::NOT_FOUND, "no tab is open".to_string()));
@@ -450,6 +459,10 @@ impl Controller {
                     rev: None,
                     refound: false,
                 };
+                let query = MatchQuery { pattern: job.pattern.clone(), regex: job.regex, case: job.case };
+                if self.x.get(&t).is_none_or(|x| x.match_query.as_ref() != Some(&query)) {
+                    self.set_query(t, Some(query), fx);
+                }
                 self.start_find(t, job, fx);
                 Ok(None)
             }
@@ -463,7 +476,7 @@ impl Controller {
             }
             ActionId::ViewClearMarkers => {
                 if let Some(t) = tab.and_then(|t| self.tab_mut(t)) {
-                    t.editor.markers.changed.clear();
+                    t.editor.clear_markers();
                 }
                 if let Some(x) = tab.and_then(|t| self.x.get_mut(&t)) {
                     x.agent_since_focus = false;
@@ -695,6 +708,192 @@ impl Controller {
             })
             .collect();
         fx.push(Effect::Prompt(Prompt::Recovered { buffers }));
+    }
+}
+
+/// A highlight-all query (the find bar's pattern and options).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchQuery {
+    pub pattern: String,
+    pub regex: bool,
+    /// `true` = case-sensitive.
+    pub case: bool,
+}
+
+/// Highlight-all keeps at most this many ranges (plan §4.4).
+const MATCHES_MAX: usize = 1000;
+/// Highlight-all refreshes this long after the last edit.
+const REMATCH_DEBOUNCE_MS: u64 = 100;
+/// Mix relex: this long after the last delta (plan §4.3).
+const RELEX_DEBOUNCE_MS: u64 = 150;
+
+/// Actions only the window can perform: dialogs, the find bar, zoom, panels,
+/// help — and the args-taking ones when their args are missing (the window
+/// then asks the human for them).
+fn window_only(action: ActionId, args: Option<&Value>) -> bool {
+    let has = |k: &str| args.and_then(|a| a.get(k)).is_some_and(|v| !v.is_null());
+    match action {
+        ActionId::SearchFind
+        | ActionId::ViewZoomIn
+        | ActionId::ViewZoomOut
+        | ActionId::ViewZoomReset
+        | ActionId::ViewWhitespace
+        | ActionId::ViewLineNumbers
+        | ActionId::ViewRemoteCarets
+        | ActionId::ViewProblems
+        | ActionId::ViewOutput
+        | ActionId::ViewReloadSettings
+        | ActionId::HelpKeys
+        | ActionId::HelpAbout => true,
+        ActionId::FileOpen => !has("paths"),
+        ActionId::FileSaveAs => !has("path"),
+        ActionId::SearchGotoLine => !has("line"),
+        ActionId::SearchFindNext | ActionId::SearchFindPrev => !has("pattern"),
+        ActionId::SearchReplace | ActionId::SearchReplaceAll => !has("pattern") || !has("replacement"),
+        _ => false,
+    }
+}
+
+/// `r` through one applied edit, or `None` when the edit touched it (a match
+/// an edit changed is no longer known to match).
+fn map_match(r: &Range<usize>, e: &Edit) -> Option<Range<usize>> {
+    let (p, end) = (e.offset, e.offset + e.delete);
+    let touches = if e.delete > 0 { p < r.end && end > r.start } else { p > r.start && p < r.end };
+    if touches {
+        return None;
+    }
+    let s = map_point(r.start, Bias::After, e).0;
+    let t = map_point(r.end, Bias::Before, e).0;
+    (s <= t).then_some(s..t)
+}
+
+impl Controller {
+    /// Set (or clear, `None`) the tab's highlight-all query. The controller
+    /// runs `edit.find` (≤ 1000 matches) once the pipeline is idle, maps the
+    /// ranges through every delta (dropping any an edit touched) and refreshes
+    /// 100 ms after the last edit. Read them with [`Controller::find_matches`].
+    /// `search.find_next` / `find_prev` / `replace*` set it too.
+    pub fn set_match_query(&mut self, tab: TabId, query: Option<MatchQuery>) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        self.set_query(tab, query, &mut fx);
+        fx
+    }
+
+    /// The tab's highlight-all ranges (view byte ranges, ascending).
+    pub fn find_matches(&self, tab: TabId) -> &[Range<usize>] {
+        self.x.get(&tab).map_or(&[], |x| x.matches.as_slice())
+    }
+
+    /// A Mix relex finished (see [`Effect::Relex`]); stale tags are dropped
+    /// by `Highlight::mix_result`.
+    pub fn on_relex(&mut self, tab: TabId, tag: ResultTag, spans: Vec<(Range<usize>, cosmix_edit_client::highlight::TokenClass)>) {
+        if let Some(t) = self.tab_mut(tab) {
+            t.highlight.mix_result(tag, spans);
+        }
+    }
+
+    pub(super) fn set_query(&mut self, tab: TabId, query: Option<MatchQuery>, fx: &mut Vec<Effect>) {
+        let Some(x) = self.x.get_mut(&tab) else { return };
+        x.matches.clear();
+        x.match_query = query;
+        if x.match_query.is_some() {
+            self.request_matches(tab, fx);
+        }
+    }
+
+    /// Ask for the current query's matches now if idle, else when idle.
+    pub(super) fn request_matches(&mut self, tab: TabId, fx: &mut Vec<Effect>) {
+        let Some(query) = self.x.get(&tab).and_then(|x| x.match_query.clone()) else { return };
+        let Some(m) = self.tab(tab).and_then(|t| t.mirror.as_ref()) else { return };
+        if !m.is_idle() {
+            if let Some(x) = self.x.get_mut(&tab) {
+                x.rematch_due = true;
+            }
+            return;
+        }
+        let body = json!({"buffer": m.buffer(), "pattern": query.pattern, "regex": query.regex, "case": query.case, "limit": MATCHES_MAX});
+        let out = Outgoing { verb: "edit.find".into(), body: body.to_string(), op_id: None, deadline_ms: DEADLINE_MS };
+        self.send(out, Req::Matches { tab, query }, fx);
+    }
+
+    pub(super) fn on_matches_reply(&mut self, tab: TabId, query: MatchQuery, rc: u8, body: &str, fx: &mut Vec<Effect>) {
+        let _ = fx;
+        let Some(view_rev) = self.tab(tab).and_then(|t| t.mirror.as_ref()).map(Mirror::rev) else { return };
+        let Some(x) = self.x.get_mut(&tab) else { return };
+        if x.match_query.as_ref() != Some(&query) {
+            return; // superseded
+        }
+        let Ok(reply) = reply_result(rc, body).and_then(|v| {
+            serde_json::from_value::<wire::FindReply>(v).map_err(|e| wire::Refusal {
+                error_code: wire::ErrorCode::Internal,
+                message: e.to_string(),
+                reason: None,
+                buffer: None,
+                rev: None,
+                context: Default::default(),
+            })
+        }) else {
+            x.matches.clear();
+            return;
+        };
+        if reply.rev != view_rev {
+            x.rematch_due = true;
+            return;
+        }
+        x.matches = reply.matches.iter().map(|m| m.start.offset..m.end.offset).collect();
+    }
+
+    /// Per-delta bookkeeping: highlight-all ranges follow the text (or are
+    /// dropped and refreshed), and a Mix buffer schedules its relex.
+    pub(super) fn after_deltas(&mut self, tab: TabId, deltas: &[ViewDelta], is_mix: bool, fx: &mut Vec<Effect>) {
+        let mut arm_rematch = false;
+        let mut arm_relex = false;
+        if let Some(x) = self.x.get_mut(&tab) {
+            if x.match_query.is_some() {
+                for d in deltas {
+                    if d.kind == cosmix_edit_client::types::DeltaKind::Resync {
+                        x.matches.clear();
+                    } else {
+                        x.matches = x
+                            .matches
+                            .iter()
+                            .filter_map(|r| d.edits.iter().try_fold(r.clone(), |r, e| map_match(&r, e)))
+                            .collect();
+                    }
+                }
+                arm_rematch = !x.rematch_timer;
+                x.rematch_timer = true;
+            }
+            if is_mix && !x.relex_timer {
+                x.relex_timer = true;
+                arm_relex = true;
+            }
+        }
+        if arm_rematch {
+            self.timer(REMATCH_DEBOUNCE_MS, super::TimerFor::Rematch(tab), fx);
+        }
+        if arm_relex {
+            self.timer(RELEX_DEBOUNCE_MS, super::TimerFor::Relex(tab), fx);
+        }
+    }
+
+    /// The relex debounce fired: hand the text at this gen to the host.
+    pub(super) fn relex_due(&mut self, tab: TabId, fx: &mut Vec<Effect>) {
+        if let Some(x) = self.x.get_mut(&tab) {
+            x.relex_timer = false;
+        }
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else { return };
+        let Some(m) = t.mirror.as_ref() else { return };
+        let tag = ResultTag {
+            epoch: m.epoch().to_string(),
+            buffer: m.buffer().to_string(),
+            view_gen: m.view_gen(),
+            language: t.highlight.language().to_string(),
+            cfg: 0,
+        };
+        if let Some((tag, source)) = t.highlight.mix_request(m.text(), tag) {
+            fx.push(Effect::Relex { tab, tag, source });
+        }
     }
 }
 

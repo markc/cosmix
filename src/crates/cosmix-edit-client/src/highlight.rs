@@ -39,6 +39,12 @@ use cosmix_lsh::defs::HighlightKind;
 use cosmix_lsh::highlighter::{Highlighter, HighlighterState, Span};
 use cosmix_lsh::runtime::Language;
 
+/// The Mix lexer's token class (what [`run_mix`] yields and
+/// [`Highlight::mix_result`] takes), re-exported so frontends can carry relex
+/// results without depending on `cosmix-lib-mix` themselves.
+#[cfg(feature = "mix")]
+pub use cosmix_mix::lexer::TokenClass;
+
 use crate::model::line_of;
 use crate::types::{DeltaKind, ViewDelta};
 
