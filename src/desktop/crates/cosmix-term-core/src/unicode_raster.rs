@@ -723,11 +723,12 @@ mod tests {
             .coverage
             .first()
             .expect("DejaVu coverage fixture");
-        let family: String = dejavu
-            .font()
-            .localized_strings()
+        // DejaVu has no typographic-family name (ID 16); use the family (ID 1).
+        let strings = dejavu.font().localized_strings();
+        let family: String = strings
             .find_by_id(swash::StringId::TypographicFamily, None)
-            .unwrap()
+            .or_else(|| strings.find_by_id(swash::StringId::Family, None))
+            .expect("coverage face family")
             .chars()
             .collect();
         assert_eq!(family, "DejaVu Sans Mono");
