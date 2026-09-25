@@ -179,10 +179,12 @@ fn ordinary_keyword_uses_still_parse() {
          print($m.if)",
     );
     let kinds: Vec<&str> = prog.iter().map(|s| s.kind.trace_name()).collect();
-    assert_eq!(kinds.len(), 7, "{kinds:?}");
+    assert_eq!(kinds.len(), 6, "{kinds:?}");
     assert!(matches!(prog[1].kind, StmtKind::If { .. }));
     assert!(matches!(prog[2].kind, StmtKind::For { .. }));
     assert!(matches!(prog[3].kind, StmtKind::Select { .. }));
+    assert!(matches!(&prog[4].kind, StmtKind::On { command, .. } if command == "topic.delivery"));
+    assert!(matches!(prog[5].kind, StmtKind::Print { .. }));
 
     // `send … end`-terminated forms on one line keep ending the block.
     let prog = parse("if true then send svc a.b x=1 end");
