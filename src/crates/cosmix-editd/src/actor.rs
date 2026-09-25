@@ -22,9 +22,13 @@
 //!   an `op_id` ("op_ids must be unique per caller").
 //!
 //! Byte budget: the actor holds one lease covering its text + retained log
-//! text + live snapshots. A text mutation leases `Buffer::apply_cost` (the
-//! simulated peak) BEFORE applying and reconciles to the real total after; the
-//! lease is returned when the actor ends (drop, including a panic unwind).
+//! text + live snapshots. Every growth is leased BEFORE it happens: a text
+//! mutation leases `Buffer::apply_cost`, an undo/redo `Buffer::undo_cost` (the
+//! simulated peaks), a reload the old + new text, a snapshot its size, and an
+//! open its ACTUAL loaded size (the router's stat-time lease is topped up, or
+//! the open is refused with nothing kept). After a change the lease is
+//! reconciled down to the real total; it is returned when the actor ends
+//! (drop, including a panic unwind).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -36,7 +40,7 @@ use cosmix_edit_core::anchor::{AnchorSpec, Selection};
 use cosmix_edit_core::buffer::{Applied, Buffer, Cas, Eol, FileMeta, LaneSel, OpSpec, TxnRequest};
 use cosmix_edit_core::error::{ErrorCode, reason};
 use cosmix_edit_core::history::EntryKind;
-use cosmix_edit_core::limits::{FIND_DEFAULT_LIMIT, FIND_MAX_LIMIT, HISTORY_ENTRY_TEXT_MAX, REPLY_CHANGED_MAX};
+use cosmix_edit_core::limits::{FIND_DEFAULT_LIMIT, HISTORY_ENTRY_TEXT_MAX, REPLY_CHANGED_MAX};
 use cosmix_edit_core::origin::{Origin, Via};
 use cosmix_edit_core::pos::{NamedPos, Point, PosSpec, RangeSpec, SelSpec};
 use cosmix_edit_core::search::FindQuery;
@@ -195,13 +199,21 @@ impl Lease {
         }
     }
 
-    /// Hold exactly `target` bytes (best effort when growing past the cap).
+    /// Hold exactly `target` bytes. Every growth path leases its peak BEFORE
+    /// it changes anything, so after a change the target only ever shrinks;
+    /// growing here would mean a path skipped its lease, which is reported
+    /// (and still leased when it fits) rather than silently absorbed.
     fn reconcile(&mut self, target: u64) {
         if target < self.held {
             self.budget.release(self.held - target);
             self.held = target;
-        } else if target > self.held && self.budget.try_lease(target - self.held) {
-            self.held = target;
+        } else if target > self.held {
+            let short = target - self.held;
+            if self.budget.try_lease(short) {
+                self.held = target;
+            } else {
+                tracing::error!("cosmix-editd: {short} bytes grew without a lease and do not fit the budget");
+            }
         }
     }
 }
@@ -652,6 +664,15 @@ impl Actor {
         );
     }
 
+    /// Record the disk state; a `disk` event goes out on transitions only
+    /// (plan §4.7), whatever caused them (watcher, save, reload).
+    fn set_disk(&mut self, disk: DiskState) {
+        if self.disk != disk {
+            self.disk = disk;
+            self.publish_disk();
+        }
+    }
+
     fn selections_of(&self, origin: &Origin) -> Vec<Selection> {
         self.buffer.selections().find(|(o, _)| *o == origin).map(|(_, s)| s.to_vec()).unwrap_or_default()
     }
@@ -735,7 +756,8 @@ impl Actor {
             _ => Cas::Latest,
         };
         let req = TxnRequest { ops, cas, coalesce: args.coalesce, cursor: args.cursor, op_id: args.meta.op_id };
-        let cost = self.buffer.apply_cost(&req).map_err(|e| self.core(e))? as u64;
+        // The preview resolves (and may rebase) every op: heavy like `apply`.
+        let cost = heavy(|| self.buffer.apply_cost(&req)).map_err(|e| self.core(e))? as u64;
         if !self.lease.take(cost) {
             return Err(crate::refusal::budget(cost).buffer(&self.bid).rev(self.buffer.rev()));
         }
@@ -760,13 +782,14 @@ impl Actor {
             Some("*") => LaneSel::All,
             Some(lane) => LaneSel::Lane(lane.parse::<Origin>().map_err(|e| self.core(e))?),
         };
-        let result = heavy(|| {
-            if redo {
-                self.buffer.redo(sel, &caller.origin, caller.via.clone(), now_ms())
-            } else {
-                self.buffer.undo(sel, &caller.origin, caller.via.clone(), now_ms())
-            }
-        });
+        // Lease the undo's peak growth before applying it, exactly like a text
+        // mutation: a refused lease changes nothing.
+        let cost = heavy(|| self.buffer.undo_cost(&sel, &caller.origin, redo)).map_err(|e| self.core(e))? as u64;
+        if !self.lease.take(cost) {
+            return Err(crate::refusal::budget(cost).buffer(&self.bid).rev(self.buffer.rev()));
+        }
+        let result =
+            heavy(|| self.buffer.undo_redo_op(sel, &caller.origin, caller.via.clone(), now_ms(), redo, r.op_id.clone()));
         self.reconcile();
         let applied = result.map_err(|e| self.core(e))?;
         self.publish_edit(&applied);
@@ -806,7 +829,7 @@ impl Actor {
                 if !self.lease.take(size) {
                     return Err(crate::refusal::budget(size).buffer(&self.bid).rev(self.buffer.rev()));
                 }
-                let text = self.buffer.snapshot();
+                let text = heavy(|| self.buffer.snapshot());
                 let token = format!("s{}", self.snapshot_seq.fetch_add(1, Ordering::AcqRel) + 1);
                 self.snapshots.push_back(Snap { token: token.clone(), rev: self.buffer.rev(), text });
                 self.reconcile();
@@ -835,8 +858,12 @@ impl Actor {
             (rev, text, lines, start, end, truncated, totals.0, totals.1)
         };
         let next = truncated.then_some(end.offset);
-        if let (Some(i), false) = (snap_index, truncated) {
-            // The final page of a snapshot read releases it.
+        if let (Some(i), false) = (snap_index, truncated)
+            && end.offset == bytes_total
+        {
+            // The page that reaches the snapshot's END releases it. A page
+            // that only completes an explicit sub-range keeps it for the next
+            // range (abandoned snapshots age out: MAX_SNAPSHOTS_PER_BUFFER).
             self.snapshots.remove(i);
             self.reconcile();
         }
@@ -863,7 +890,8 @@ impl Actor {
             case: r.case,
             range: r.range,
             groups: r.groups,
-            limit: r.limit.unwrap_or(FIND_DEFAULT_LIMIT).clamp(1, FIND_MAX_LIMIT),
+            // The core owns the rule: 0 = default, capped at FIND_MAX_LIMIT.
+            limit: r.limit.unwrap_or(FIND_DEFAULT_LIMIT),
             from: r.from,
         };
         let found = heavy(|| self.buffer.find(&q, MAX_REPLY_BYTES - FIND_OVERHEAD)).map_err(|e| self.core(e))?;
@@ -1019,7 +1047,7 @@ impl Actor {
             }
         };
         self.stale(r.expect_rev)?;
-        let bytes = self.buffer.to_bytes(&self.meta);
+        let bytes = heavy(|| self.buffer.to_bytes(&self.meta));
         let saved = match &save_as {
             None => {
                 let dest = self.path.clone().unwrap_or_default();
@@ -1085,7 +1113,7 @@ impl Actor {
         self.base = Some(saved.base);
         self.observed = Some(saved.base.stat());
         self.buffer.mark_saved();
-        self.disk = if self.signal.is_unwatched() { DiskState::Unwatched } else { DiskState::Clean };
+        self.set_disk(if self.signal.is_unwatched() { DiskState::Unwatched } else { DiskState::Clean });
         self.push_state();
         Ok(json(&SaveReply {
             buffer: self.bid.clone(),
@@ -1094,7 +1122,7 @@ impl Actor {
             rev: self.buffer.rev(),
             saved_rev: self.buffer.rev(),
             file_bytes: saved.file_bytes,
-            disk: DiskState::Clean,
+            disk: self.disk,
             durable: saved.durable,
             warning: saved.warning,
         }))
@@ -1170,7 +1198,6 @@ impl Actor {
         self.observed = Some(id.stat());
         self.meta = meta;
         self.buffer.mark_saved();
-        self.disk = if self.signal.is_unwatched() { DiskState::Unwatched } else { DiskState::Clean };
         let body = match applied {
             Some(applied) => {
                 self.publish_edit(&applied);
@@ -1183,6 +1210,7 @@ impl Actor {
                 unchanged: true,
             })),
         };
+        self.set_disk(if self.signal.is_unwatched() { DiskState::Unwatched } else { DiskState::Clean });
         self.push_state();
         Ok(body)
     }
@@ -1191,7 +1219,6 @@ impl Actor {
     /// `watch`). Our own saves are swallowed by the `base` comparison.
     async fn recheck(&mut self) {
         let Some(path) = self.path.clone() else { return };
-        let before = self.disk;
         let probe = path.clone();
         let stat = match blocking(move || files::stat(&probe)).await {
             Ok(Ok(stat)) => stat,
@@ -1255,11 +1282,9 @@ impl Actor {
         if matches!(disk, DiskState::Unwatched) && !self.signal.is_unwatched() {
             disk = DiskState::Clean;
         }
-        let rev_before = self.pushed.as_ref().map(|p| p.rev);
-        self.disk = disk;
-        if disk != before || rev_before != Some(self.buffer.rev()) {
-            self.publish_disk();
-        }
+        // A clean external reload is announced by its `edit` event; the disk
+        // state did not change, so no `disk` event.
+        self.set_disk(disk);
         self.push_state();
     }
 }
@@ -1352,6 +1377,13 @@ async fn init(a: &ActorInit) -> Result<(Actor, bool), Refusal> {
         origin_last: None,
         pushed: None,
     };
+    // Admit what was actually loaded, not what `stat` saw at open: a file
+    // that grew in between tops the lease up or the open is refused (the
+    // actor drops, returning everything it held).
+    let footprint = actor.footprint();
+    if footprint > actor.lease.held && !actor.lease.take(footprint - actor.lease.held) {
+        return Err(crate::refusal::budget(footprint - actor.lease.held).with("bytes", footprint));
+    }
     actor.reconcile();
     Ok((actor, created))
 }
@@ -1452,6 +1484,45 @@ mod tests {
         let mut other = key("k0");
         other.caller = CallerKey::Local("ced".into());
         assert!(cache.get(&other).is_none(), "another caller's op_id is a different key");
+    }
+
+    fn load_init(path: PathBuf, budget: &Arc<Budget>, leased: u64) -> ActorInit {
+        let (to_router, _) = mpsc::unbounded_channel();
+        let (_, rx) = mpsc::channel(1);
+        ActorInit {
+            bid: "b1_00000000".into(),
+            epoch: "00000000".into(),
+            init: Init::Load { path, opened_as: "x".into(), create: false, language: None },
+            budget: budget.clone(),
+            leased,
+            publisher: Publisher::new("00000000"),
+            to_router,
+            signal: DiskSignal::new(),
+            snapshot_seq: Arc::new(AtomicU64::new(0)),
+            rx,
+        }
+    }
+
+    #[tokio::test]
+    async fn open_admits_the_loaded_size_not_the_stat_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grew.txt");
+        std::fs::write(&path, "x".repeat(1_000)).unwrap();
+        // The router leased 100 bytes when it stat'd the file; it then grew
+        // to 1,000, which the 500-byte budget cannot hold.
+        let budget = Arc::new(Budget::new(500));
+        assert!(budget.try_lease(100));
+        let err = init(&load_init(path.clone(), &budget, 100)).await.err().expect("an uncharged load was admitted");
+        assert_eq!((err.error_code, err.reason.as_deref()), (ErrorCode::ResourceLimit, Some("budget")));
+        assert_eq!(budget.used(), 0, "the refused open returned its lease");
+
+        // With room, the lease is topped up to the real size.
+        let budget = Arc::new(Budget::new(5_000));
+        assert!(budget.try_lease(100));
+        let (actor, _) = init(&load_init(path, &budget, 100)).await.ok().unwrap();
+        assert_eq!(budget.used(), 1_000);
+        drop(actor);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

@@ -633,7 +633,6 @@ async fn watcher_reloads_clean_and_flags_deleted() {
     let b = h.open(&f).await;
     std::fs::write(&f, "two\n").unwrap();
     h.event(|e| e["event"] == "edit" && e["kind"] == "reload" && e["buffer"] == b.as_str()).await;
-    h.event(|e| e["event"] == "disk" && e["buffer"] == b.as_str()).await;
     assert_eq!(h.text(&b).await, "two\n");
     let hist = h.ok("edit.history", json!({"buffer": b})).await;
     assert!(hist["entries"].as_array().unwrap().iter().any(|e| e["kind"] == "reload" && e["origin"] == "tool:disk"));
@@ -652,6 +651,18 @@ async fn watcher_reloads_clean_and_flags_deleted() {
     // Delete.
     std::fs::remove_file(&f).unwrap();
     h.event(|e| e["event"] == "disk" && e["disk"] == "deleted").await;
+    // Two clean external reloads and a save, and the only disk event so far
+    // is this transition: `disk` events are transitions (plan §4.7).
+    let disk: Vec<Value> = h
+        .sink
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(t, e)| t == "edit.changed" && e["event"] == "disk" && e["buffer"] == b.as_str())
+        .map(|(_, e)| e["disk"].clone())
+        .collect();
+    assert_eq!(disk, vec![json!("deleted")], "redundant disk events");
     // Recreate.
     std::fs::write(&f, "four\n").unwrap();
     h.event(|e| e["event"] == "edit" && e["kind"] == "reload" && e["buffer"] == b.as_str() && e["edits"].to_string().contains("four")).await;
@@ -701,8 +712,23 @@ async fn events_are_contiguous_and_oversized_resyncs() {
         assert_eq!(e["rev"], i as u64 + 1);
         assert_eq!(e["epoch"], EPOCH);
     }
-    let seqs: Vec<u64> = h.sink.sent.lock().unwrap().iter().filter_map(|(_, e)| e["event_seq"].as_u64()).collect();
-    assert!(seqs.windows(2).all(|w| w[1] > w[0]), "event_seq strictly increasing");
+    // edit.changed frames alone number 1, 2, 3, … (props frames interleave
+    // but consume no numbers), and info / props.watch report that counter.
+    let seqs: Vec<u64> = h
+        .sink
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(t, _)| t == "edit.changed")
+        .map(|(_, e)| e["event_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>(), "edit.changed event_seq has gaps");
+    assert!(h.sink.sent.lock().unwrap().iter().any(|(t, _)| t == "edit.props.changed"), "props frames were interleaved");
+    let last = *seqs.last().unwrap();
+    assert_eq!(h.ok("edit.info", json!({})).await["event_seq"], last);
+    assert_eq!(h.ok("edit.props.watch", json!({})).await["event_seq"], last);
+    assert_eq!(h.ok("edit.props.get", json!({})).await["lifecycle"]["event_seq"], last);
 
     h.ok("edit.insert", json!({"buffer": b, "at": 0, "text": "p".repeat(300 * 1024)})).await;
     let r = h.event(|e| e["event"] == "resync" && e["reason"] == "oversized").await;
@@ -843,4 +869,100 @@ async fn large_file_open_edit_get_latency() {
     eprintln!("large file (64 MiB, 2M lines): open {open_ms} ms, edit {edit_ms} ms, first page {get_ms} ms");
     assert_eq!(page["lines_total"], lines + 1);
     assert!(open_ms < 1_000 && edit_ms < 1_000 && get_ms < 1_000, "over the 1 s ceiling");
+}
+
+// ── Stage R regressions ─────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undo_growth_is_leased_before_it_applies() {
+    let h = start_with(Config { budget_cap: 300_000, ..config() });
+    let b = h.scratch().await;
+    // Insert 100 KB (text + log: 200 KB), delete it all (log: +100 KB).
+    h.ok("edit.insert", json!({"buffer": b, "at": 0, "text": "x".repeat(100_000)})).await;
+    h.ok("edit.delete", json!({"buffer": b, "range": "all"})).await;
+    let before = h.editd.budget().used();
+    // Undoing the delete needs 100 KB of text + 100 KB of log: over the cap.
+    let r = h.call("edit.undo", json!({"buffer": b})).await;
+    refused(&r, "RESOURCE_LIMIT", Some("budget"));
+    assert_eq!(h.text(&b).await, "", "a refused undo changes nothing");
+    assert_eq!(h.editd.budget().used(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undo_and_redo_echo_their_op_id() {
+    let h = start();
+    let b = h.scratch().await;
+    h.ok("edit.insert", json!({"buffer": b, "at": 0, "text": "abc"})).await;
+    let u = h.ok("edit.undo", json!({"buffer": b, "op_id": "u-7"})).await;
+    assert_eq!(u["op_id"], "u-7");
+    h.event(|e| e["event"] == "edit" && e["kind"] == "undo" && e["op_id"] == "u-7").await;
+    let r = h.ok("edit.redo", json!({"buffer": b, "op_id": "r-7"})).await;
+    assert_eq!(r["op_id"], "r-7");
+    let hist = h.ok("edit.history", json!({"buffer": b})).await;
+    let ids: Vec<Value> = hist["entries"].as_array().unwrap().iter().map(|e| e["op_id"].clone()).collect();
+    assert_eq!(ids, vec![Value::Null, json!("u-7"), json!("r-7")]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_inputs_are_bounded() {
+    let h = start();
+    let r = h.call("edit.open", json!({"language": "x".repeat(3 << 20)})).await;
+    refused(&r, "INVALID_ARGUMENT", Some("bad_args"));
+    assert!(r.1["message"].as_str().unwrap().len() < 256, "the refusal does not echo the input");
+    let deep = format!("/{}", "d/".repeat(600));
+    refused(&h.call("edit.open", json!({"path": deep, "create": true})).await, "INVALID_ARGUMENT", Some("bad_path"));
+    let s = h.scratch().await;
+    refused(&h.call("edit.save", json!({"buffer": s, "path": deep})).await, "INVALID_ARGUMENT", Some("bad_path"));
+
+    // Holders are capped: the 33rd distinct caller is refused, a repeat is not.
+    let f = h.file("held.txt", "h\n");
+    let limit = cosmix_editd::limits::MAX_HOLDERS;
+    for i in 0..limit {
+        let (rc, v) = h.call_as(Who::Local(&format!("c{i}")), "edit.open", json!({"path": f})).await;
+        assert_eq!(rc, 0, "{v}");
+    }
+    refused(&h.call_as(Who::Local("one-too-many"), "edit.open", json!({"path": f})).await, "RESOURCE_LIMIT", Some("limit"));
+    assert_eq!(h.call_as(Who::Local("c0"), "edit.open", json!({"path": f})).await.0, 0);
+    let list = h.ok("edit.list", json!({})).await;
+    let held = list["buffers"].as_array().unwrap().iter().find(|e| e["path"] == f.display().to_string()).unwrap().clone();
+    assert_eq!(held["holders"].as_array().unwrap().len(), limit);
+
+    // A mesh caller with an absurd service name is listed by a bounded key,
+    // and its close still finds its own hold.
+    let long = "s".repeat(4_000);
+    let mesh = Who::Mesh(&long, "beta");
+    let v = h.call_as(mesh, "edit.open", json!({})).await.1;
+    let sb = v["buffer"].as_str().unwrap().to_string();
+    let list = h.ok("edit.list", json!({})).await;
+    let entry = list["buffers"].as_array().unwrap().iter().find(|e| e["buffer"] == sb.as_str()).unwrap().clone();
+    let key = entry["holders"][0].as_str().unwrap().to_string();
+    assert!(key.len() <= cosmix_editd::limits::HOLDER_KEY_MAX, "{} bytes", key.len());
+    assert_eq!(h.call_as(mesh, "edit.close", json!({"buffer": sb})).await.1["closed"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_survives_a_completed_sub_range() {
+    let h = start();
+    let f = h.file("s.txt", "0123456789");
+    let b = h.open(&f).await;
+    let first = h.ok("edit.get", json!({"buffer": b, "snapshot": true, "range": [0, 4]})).await;
+    assert_eq!((first["text"].as_str(), first["truncated"].as_bool()), (Some("0123"), Some(false)));
+    let token = first["snapshot"].as_str().unwrap().to_string();
+    h.ok("edit.insert", json!({"buffer": b, "at": 0, "text": "EDIT"})).await;
+    // The first range completed, but the snapshot was not read to its end.
+    let second = h.ok("edit.get", json!({"buffer": b, "snapshot": token, "range": [4, 10]})).await;
+    assert_eq!(second["text"], "456789");
+    assert_eq!(second["rev"], first["rev"]);
+    // That page reached the end: released.
+    refused(&h.call("edit.get", json!({"buffer": b, "snapshot": token})).await, "NOT_FOUND", Some("snapshot_expired"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_limit_zero_means_the_default() {
+    let h = start();
+    let b = h.scratch().await;
+    h.ok("edit.insert", json!({"buffer": b, "at": 0, "text": "aaaa"})).await;
+    let v = h.ok("edit.find", json!({"buffer": b, "pattern": "a", "limit": 0})).await;
+    assert_eq!(v["matches"].as_array().unwrap().len(), 4);
+    assert_eq!(v["truncated"], false);
 }

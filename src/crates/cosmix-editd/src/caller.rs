@@ -150,6 +150,29 @@ pub fn derived_label(key: &CallerKey) -> String {
     Origin::truncate_label(&clean, &hash.as_str()[..8])
 }
 
+/// The key as listed in `holders`: [`CallerKey`]'s text; past
+/// `HOLDER_KEY_MAX` bytes, or holding a character JSON must escape, a
+/// sanitized prefix + `+` + 8 hex of blake3(full key). Its ENCODED size is
+/// bounded (the list/props budgets) and it is deterministic, so a caller's
+/// close still matches its own open.
+pub fn holder_key(key: &CallerKey) -> String {
+    let full = key.to_string();
+    let max = crate::limits::HOLDER_KEY_MAX;
+    let escapes = |c: char| c.is_control() || matches!(c, '"' | '\\');
+    if full.len() <= max && !full.chars().any(escapes) {
+        return full;
+    }
+    let mut prefix = String::new();
+    for c in full.chars().map(|c| if escapes(c) { '_' } else { c }) {
+        if prefix.len() + c.len_utf8() > max - 9 {
+            break;
+        }
+        prefix.push(c);
+    }
+    let hash = blake3::hash(full.as_bytes()).to_hex();
+    format!("{prefix}+{}", &hash.as_str()[..8])
+}
+
 /// `COSMIX_MESH_OPEN`, read once at start: only `0` locks mutations to local callers.
 pub fn mesh_open_from_env() -> bool {
     std::env::var("COSMIX_MESH_OPEN").map(|v| v.trim() != "0").unwrap_or(true)
@@ -252,6 +275,21 @@ mod tests {
         assert_eq!(label, derived_label(&key));
         let other = CallerKey::Mesh { service: long, peer: "q".repeat(40) };
         assert_ne!(label, derived_label(&other));
+    }
+
+    #[test]
+    fn holder_keys_are_bounded_stable_and_distinct() {
+        assert_eq!(holder_key(&CallerKey::Local("ced".into())), "local:ced");
+        assert_eq!(holder_key(&CallerKey::Anon), "anon");
+        let long = CallerKey::Mesh { service: "s".repeat(4_000), peer: "beta".into() };
+        let key = holder_key(&long);
+        assert!(key.len() <= crate::limits::HOLDER_KEY_MAX, "{}", key.len());
+        assert_eq!(key, holder_key(&long), "stable");
+        let other = CallerKey::Mesh { service: "s".repeat(4_000), peer: "gamma".into() };
+        assert_ne!(key, holder_key(&other), "distinct");
+        // Characters JSON must escape are rewritten, so the encoded size is bounded too.
+        let odd = holder_key(&CallerKey::Local("a\"b\\c\u{1}".into()));
+        assert_eq!(crate::events::encoded_len(&odd), odd.len() + 2, "{odd}");
     }
 
     #[test]

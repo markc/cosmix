@@ -25,9 +25,14 @@
 //!   `Loaded` → `Bound` and every waiter gets the same buffer; `Failed(refusal)`
 //!   → slot removed, lease released, every waiter gets the same refusal.
 //!   `Closing` waiters re-run as fresh opens once the close completes.
+//!   Parked waiters join the initiator's open: ITS `create` / `language`
+//!   decide the buffer (a parked `create:false` opener may receive a buffer
+//!   the initiator created).
 //! - save-as `P`: `ReserveSaveAs(P)`: absent → `SaveAs`, anything else →
 //!   CONFLICT `path_open`. After the rename `CommitSaveAs(old, P)` removes
-//!   `old`, binds `P`, moves the watch — one inbox step. Any failure →
+//!   `old` whatever its state, binds `P` — as `Closing` if a close is in
+//!   flight, so that close now concerns `P` — moves the watch, and re-runs any
+//!   opens parked on `old` as fresh opens; one inbox step. Any failure →
 //!   `ReleaseSaveAs(P)`. An open of `P` while `SaveAs` → CONFLICT `path_open`.
 //! - `edit.close`: `Closing`, forward to the actor; the actor stops, releases
 //!   its lease, reports `Closed`; the slot is removed and waiters served.
@@ -64,7 +69,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::actor::{ActorInit, ActorMsg, BufVerb, Init};
 use crate::caller::{self, Caller};
 use crate::events::{EventSink, Publisher};
-use crate::limits::{ACTOR_INBOX, MAX_BUFFERS, MAX_EVENT_BYTES, MAX_REPLY_BYTES, MAX_TOTAL_BYTES, ROUTER_INBOX};
+use crate::limits::{
+    ACTOR_INBOX, LANGUAGE_MAX, MAX_BUFFERS, MAX_EVENT_BYTES, MAX_HOLDERS, MAX_REPLY_BYTES, MAX_TOTAL_BYTES, ROUTER_INBOX,
+};
 use crate::props::{BufferProps, EditProps, buffer_leaves};
 use crate::refusal::{RefusalExt, bad_args, busy, refusal, render, router_busy, unknown_buffer};
 use crate::watch::{DiskSignal, Watch};
@@ -290,12 +297,25 @@ impl Router {
                 let _ = reply.send(result);
             }
             ToRouter::CommitSaveAs { bid, old, new, reply } => {
+                // The old path's slot moves with the buffer WHATEVER its state:
+                // a close queued during the save left it `Closing`, and that
+                // close now concerns the new path. Opens parked on the old path
+                // re-run as fresh opens — it is no longer this buffer's file.
+                let mut rerun = Vec::new();
                 if let Some(old) = &old
-                    && matches!(self.paths.get(old), Some(PathSlot::Bound { bid: b }) if *b == bid)
+                    && self.paths.get(old).is_some_and(|slot| *slot.bid() == bid)
+                    && let Some(PathSlot::Closing { waiters, .. } | PathSlot::Loading { waiters, .. }) =
+                        self.paths.remove(old)
                 {
-                    self.paths.remove(old);
+                    rerun = waiters;
                 }
-                self.paths.insert(new.clone(), PathSlot::Bound { bid: bid.clone() });
+                let closing = self.entries.get(&bid).is_some_and(|e| e.closing);
+                let slot = if closing {
+                    PathSlot::Closing { bid: bid.clone(), waiters: vec![] }
+                } else {
+                    PathSlot::Bound { bid: bid.clone() }
+                };
+                self.paths.insert(new.clone(), slot);
                 if let Some(entry) = self.entries.get_mut(&bid) {
                     let had_path = entry.path.replace(new.clone()).is_some();
                     if had_path {
@@ -305,6 +325,9 @@ impl Router {
                     }
                 }
                 let _ = reply.send(());
+                for w in rerun {
+                    self.open(w);
+                }
             }
             ToRouter::ReleaseSaveAs { path } => {
                 if matches!(self.paths.get(&path), Some(PathSlot::SaveAs { .. })) {
@@ -454,6 +477,9 @@ impl Router {
     }
 
     fn reopen(&mut self, bid: &str, w: OpenWaiter) {
+        if let Some(r) = self.holder_refusal(bid, &w.caller) {
+            return send(w.reply, Err(r));
+        }
         self.add_holder(bid, &w.caller);
         send(w.reply, self.open_reply(bid, true, false));
     }
@@ -471,10 +497,8 @@ impl Router {
         {
             waiters = parked;
         }
-        self.actors.write().expect("actor table").insert(bid.clone(), tx);
-        if let Some(path) = &path {
-            self.watch.add(&bid, path, signal);
-        }
+        // The `open` event is queued BEFORE the buffer becomes reachable, so
+        // none of the buffer's own events can precede it.
         self.publisher.event(
             Some(&bid),
             Event::Open(OpenEvent {
@@ -485,12 +509,31 @@ impl Router {
                 event_seq: 0,
             }),
         );
+        self.actors.write().expect("actor table").insert(bid.clone(), tx);
+        if let Some(path) = &path {
+            self.watch.add(&bid, path, signal);
+        }
         self.publish_count(self.buffer_count.saturating_sub(1), self.buffer_count);
         self.publish_props(&bid, None, Some((&props, &[])));
         for (i, w) in waiters.into_iter().enumerate() {
+            if let Some(r) = self.holder_refusal(&bid, &w.caller) {
+                send(w.reply, Err(r));
+                continue;
+            }
             self.add_holder(&bid, &w.caller);
             send(w.reply, self.open_reply(&bid, i > 0, created && i == 0));
         }
+    }
+
+    /// RESOURCE_LIMIT `limit` when `holder` would be one holder too many
+    /// (holders are listed in `edit.list` and props, so they are bounded).
+    fn holder_refusal(&self, bid: &str, holder: &str) -> Option<Refusal> {
+        let entry = self.entries.get(bid)?;
+        (entry.holders.len() >= MAX_HOLDERS && !entry.holders.iter().any(|h| h == holder)).then(|| {
+            refusal(ErrorCode::ResourceLimit, Some(reason::LIMIT), format!("{MAX_HOLDERS} callers already hold {bid}"))
+                .buffer(bid)
+                .with("limit", MAX_HOLDERS)
+        })
     }
 
     fn failed(&mut self, bid: BufferId, refusal: Refusal) {
@@ -786,6 +829,41 @@ fn check_cas(cas: &CasArgs) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// A `language` override is an id, not free text (it is repeated in every
+/// list entry and props leaf of the buffer).
+fn check_language(language: Option<&str>) -> Result<(), Refusal> {
+    match language {
+        Some(l)
+            if l.is_empty()
+                || l.len() > LANGUAGE_MAX
+                || !l.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'#' | b'-')) =>
+        {
+            Err(bad_args(format!(
+                "language must match ^[A-Za-z0-9._+#-]{{1,{LANGUAGE_MAX}}}$ (got {} bytes)",
+                l.len()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The last line of defence for every reply: an encoded body over
+/// `MAX_REPLY_BYTES` is never sent (inputs are bounded so none should be).
+fn bounded(reply: Reply) -> Reply {
+    if reply.1.len() <= MAX_REPLY_BYTES {
+        return reply;
+    }
+    tracing::error!("cosmix-editd: a {}-byte reply exceeded MAX_REPLY_BYTES", reply.1.len());
+    render(
+        &refusal(
+            ErrorCode::ResourceLimit,
+            Some(reason::LIMIT),
+            format!("the reply would be {} bytes; the limit is {MAX_REPLY_BYTES}", reply.1.len()),
+        )
+        .with("limit", MAX_REPLY_BYTES),
+    )
+}
+
 fn check_name(name: &str) -> Result<(), Refusal> {
     if is_valid_name(name) {
         Ok(())
@@ -951,8 +1029,14 @@ impl Editd {
     }
 
     /// Checks 1-6 of the precedence, synchronously and in call order, then the
-    /// hand-off; the returned future only awaits the owner's answer.
+    /// hand-off; the returned future only awaits the owner's answer (and
+    /// bounds it: see [`bounded`]).
     pub fn submit(&self, cmd: &IncomingCommand) -> ReplyFuture {
+        let reply = self.route(cmd);
+        Box::pin(async move { bounded(reply.await) })
+    }
+
+    fn route(&self, cmd: &IncomingCommand) -> ReplyFuture {
         let verb = cmd.command.as_str();
         let args = resolve_args(cmd).unwrap_or_else(|| json!({}));
         let named_buffer = args.get("buffer").and_then(Value::as_str).map(str::to_string);
@@ -1004,6 +1088,9 @@ impl Editd {
                 if let Err(r) = check_op_id(req.meta.op_id.as_deref()) {
                     return refused(r);
                 }
+                if let Err(r) = check_language(req.language.as_deref()) {
+                    return refused(r);
+                }
                 let caller = match caller::resolve(cmd, req.meta.origin.as_deref(), mutating, self.mesh_open) {
                     Ok(c) => c,
                     Err(r) => return refused(r),
@@ -1025,7 +1112,7 @@ impl Editd {
                 if let Err(r) = self.lookup(&req.buffer) {
                     return refused(r);
                 }
-                let (bid, force, key) = (req.buffer, req.force, caller.key.to_string());
+                let (bid, force, key) = (req.buffer, req.force, caller::holder_key(&caller.key));
                 self.to_router(move |reply| RouterCmd::Close { bid, force, caller: key, reply })
             }
             _ => {
@@ -1112,7 +1199,7 @@ impl Editd {
             };
             let (tx, rx) = oneshot::channel();
             let waiter = OpenWaiter {
-                caller: caller.key.to_string(),
+                caller: caller::holder_key(&caller.key),
                 canonical,
                 opened_as: req.path.clone(),
                 size,
@@ -1162,6 +1249,162 @@ mod tests {
         });
         assert_eq!(wins, 333);
         assert_eq!(b.used(), 999);
+    }
+
+    fn test_router() -> (Router, mpsc::UnboundedReceiver<ToRouter>) {
+        let (internal_tx, internal_rx) = mpsc::unbounded_channel();
+        let router = Router {
+            epoch: "00000000".into(),
+            paths: PathTable::new(),
+            budget: Arc::new(Budget::new(MAX_TOTAL_BYTES)),
+            buffer_count: 1,
+            next_buffer: 1,
+            mesh_open: true,
+            entries: BTreeMap::new(),
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            publisher: Publisher::new("00000000"),
+            watch: Watch::start(),
+            internal_tx,
+            snapshot_seq: Arc::new(AtomicU64::new(0)),
+        };
+        (router, internal_rx)
+    }
+
+    #[tokio::test]
+    async fn save_as_carries_a_queued_close_to_the_new_path() {
+        let (mut router, mut internal) = test_router();
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        let bid = "b1_00000000".to_string();
+        let (tx, mut actor_rx) = mpsc::channel(ACTOR_INBOX);
+        router.entries.insert(
+            bid.clone(),
+            Entry {
+                path: Some(old.clone()),
+                holders: vec!["t".into()],
+                props: None,
+                signal: DiskSignal::new(),
+                tx,
+                closing: false,
+                pending: vec![],
+            },
+        );
+        router.paths.insert(old.clone(), PathSlot::Bound { bid: bid.clone() });
+
+        // A close queued while the save-as A → B is in flight.
+        let (close_tx, _close_rx) = oneshot::channel();
+        router.close(bid.clone(), false, "t".into(), close_tx);
+        assert!(matches!(router.paths.get(&old), Some(PathSlot::Closing { .. })));
+        assert!(matches!(actor_rx.try_recv(), Ok(ActorMsg::Close { .. })));
+        // An open of A parks on the close.
+        let (open_tx, open_rx) = oneshot::channel();
+        router.open(OpenWaiter {
+            caller: "o".into(),
+            canonical: Some(old.clone()),
+            opened_as: None,
+            size: Some(0),
+            create: false,
+            language: None,
+            reply: open_tx,
+        });
+
+        let (commit_tx, _commit_rx) = oneshot::channel();
+        router.internal(ToRouter::CommitSaveAs { bid: bid.clone(), old: Some(old.clone()), new: new.clone(), reply: commit_tx });
+        assert!(matches!(router.paths.get(&new), Some(PathSlot::Closing { .. })), "the close moved with the buffer");
+        assert!(
+            matches!(router.paths.get(&old), Some(PathSlot::Loading { bid: b, .. }) if *b != bid),
+            "the parked open of A re-ran as a fresh open"
+        );
+
+        // The close is refused (the buffer is dirty): B is bound again.
+        let (reply, _r) = oneshot::channel();
+        let dirty = refusal(ErrorCode::Conflict, Some(reason::DIRTY), "dirty").buffer(&bid);
+        router.internal(ToRouter::CloseDecided { bid: bid.clone(), result: Err(dirty), reply });
+        assert!(matches!(router.paths.get(&new), Some(PathSlot::Bound { bid: b }) if *b == bid));
+
+        // The re-run open of A is answered (A is gone from disk: not found)
+        // instead of waiting on a slot nobody will ever clear.
+        let mut open_rx = open_rx;
+        let pump = async {
+            loop {
+                tokio::select! {
+                    reply = &mut open_rx => break reply.unwrap(),
+                    Some(msg) = internal.recv() => router.internal(msg),
+                }
+            }
+        };
+        let (rc, body) = tokio::time::timeout(std::time::Duration::from_secs(10), pump).await.expect("the open of A hung");
+        assert_eq!(rc, 10, "{body}");
+        assert!(body.contains("file_not_found"), "{body}");
+        assert!(!router.paths.contains_key(&old));
+    }
+
+    #[test]
+    fn worst_case_list_and_props_fit_the_reply_budget() {
+        use crate::limits::{HOLDER_KEY_MAX, PATH_MAX_ENCODED_BYTES};
+        // Control characters encode as 6 bytes: the longest encoding per byte.
+        let path = format!("/{}", "\u{1}".repeat((PATH_MAX_ENCODED_BYTES - 3) / 6));
+        assert!(crate::events::encoded_len(&path) <= PATH_MAX_ENCODED_BYTES);
+        let holders: Vec<String> = (0..MAX_HOLDERS).map(|i| format!("{i:0>width$}", width = HOLDER_KEY_MAX)).collect();
+        let props = BufferProps {
+            path: Some(path.clone()),
+            opened_as: Some(path.clone()),
+            name: Some(path.clone()),
+            language: "x".repeat(LANGUAGE_MAX),
+            eol: cosmix_edit_core::buffer::Eol::Mixed,
+            bom: true,
+            dirty: true,
+            saved_rev: Some(u64::MAX),
+            disk: DiskState::Unwatched,
+            rev: u64::MAX,
+            lines: usize::MAX,
+            bytes: usize::MAX,
+            origin_last: Some(format!("agent:{}", "l".repeat(64))),
+        };
+        let buffers: Vec<BufferSummary> = (0..MAX_BUFFERS)
+            .map(|i| BufferSummary {
+                buffer: format!("b{}_00000000", u64::MAX - i as u64),
+                path: props.path.clone(),
+                opened_as: props.opened_as.clone(),
+                name: props.name.clone(),
+                language: props.language.clone(),
+                rev: props.rev,
+                saved_rev: props.saved_rev,
+                dirty: props.dirty,
+                disk: props.disk,
+                lines: props.lines,
+                bytes: props.bytes,
+                holders: holders.clone(),
+            })
+            .collect();
+        let list = json_of(&ListReply { epoch: "00000000".into(), buffers: buffers.clone() });
+        assert!(list.len() < MAX_REPLY_BYTES, "worst-case edit.list is {} bytes", list.len());
+        let tree: BTreeMap<BufferId, (BufferProps, Vec<String>)> =
+            buffers.iter().map(|b| (b.buffer.clone(), (props.clone(), holders.clone()))).collect();
+        let tree = EditProps::build("00000000", u64::MAX, u64::MAX, &tree);
+        let got = cosmix_props_core::bus::dispatch_props(&tree, "get", None, true);
+        assert!(got.body.len() < MAX_REPLY_BYTES, "worst-case props.get is {} bytes", got.body.len());
+        // The largest single props leaf (holders) is far under the event budget.
+        let leaves = buffer_leaves("b1_00000000", &props, &holders);
+        let null = cosmix_props_core::PropValue::Null;
+        for (path, value, _) in &leaves {
+            let m = cosmix_props_core::publish::build_props_changed_message(path, &null, value, "edit");
+            assert!(m.body.len() < MAX_EVENT_BYTES / 8, "{path:?}: {} bytes", m.body.len());
+        }
+    }
+
+    #[test]
+    fn language_and_reply_bounds() {
+        assert!(check_language(Some("rust")).is_ok());
+        assert!(check_language(Some("c++")).is_ok());
+        assert!(check_language(None).is_ok());
+        assert_eq!(check_language(Some(&"x".repeat(3 << 20))).unwrap_err().reason.as_deref(), Some("bad_args"));
+        assert!(check_language(Some("has space")).is_err());
+        assert!(check_language(Some("")).is_err());
+        let (rc, body) = bounded((0, "x".repeat(MAX_REPLY_BYTES + 1)));
+        assert_eq!(rc, 10);
+        assert!(body.contains("RESOURCE_LIMIT"), "{body}");
+        assert_eq!(bounded((0, "{}".into())), (0, "{}".to_string()));
     }
 
     #[test]

@@ -9,6 +9,8 @@ use cosmix_edit_core::error::{CoreError, ErrorCode, reason};
 use cosmix_edit_core::wire::Refusal;
 use serde_json::Map;
 
+use crate::limits::MAX_REFUSAL_BYTES;
+
 /// Every refusal uses this rc.
 pub const REFUSAL_RC: u8 = 10;
 
@@ -38,11 +40,31 @@ pub fn from_core(err: CoreError, buffer: Option<&str>) -> Refusal {
     }
 }
 
-/// `(rc, body)` for the Bus response.
+/// `(rc, body)` for the Bus response, bounded by `MAX_REFUSAL_BYTES`: an
+/// oversized refusal keeps its code, reason, rev and (a real-sized) buffer,
+/// with the message shortened and any large context value dropped.
 pub fn render(r: &Refusal) -> (u8, String) {
     // Serializing this plain struct cannot fail; "" would still be a refusal (rc 10).
-    (REFUSAL_RC, serde_json::to_string(r).unwrap_or_default())
+    let body = serde_json::to_string(r).unwrap_or_default();
+    if body.len() <= MAX_REFUSAL_BYTES {
+        return (REFUSAL_RC, body);
+    }
+    let mut cut = r.clone();
+    let mut end = MESSAGE_KEEP.min(cut.message.len());
+    while !cut.message.is_char_boundary(end) {
+        end -= 1;
+    }
+    cut.message.truncate(end);
+    cut.message.push_str(" …(truncated)");
+    cut.context.retain(|_, v| crate::events::encoded_len(v) <= CONTEXT_VALUE_KEEP);
+    // A buffer id echoed from bad arguments can be any size; real ids are short.
+    cut.buffer = cut.buffer.filter(|b| b.len() <= CONTEXT_VALUE_KEEP);
+    (REFUSAL_RC, serde_json::to_string(&cut).unwrap_or_default())
 }
+
+/// What an oversized refusal keeps of its message, and of each context value.
+const MESSAGE_KEEP: usize = 4096;
+const CONTEXT_VALUE_KEEP: usize = 1024;
 
 /// Builder sugar: name the buffer, the current rev, or an extra context field.
 pub trait RefusalExt: Sized {
@@ -144,6 +166,23 @@ mod tests {
         assert_eq!(v["error_code"], "IO_ERROR");
         assert_eq!(v["errno"], 28);
         assert_eq!(v["kind"], "StorageFull");
+    }
+
+    #[test]
+    fn oversized_refusals_are_cut_to_the_bound() {
+        let r = refusal(ErrorCode::InvalidArgument, Some(reason::BAD_ARGS), "\u{1}".repeat(1 << 20))
+            .buffer("b1_00000000")
+            .rev(3)
+            .with("big", "x".repeat(1 << 20))
+            .with("small", 7);
+        let (rc, body) = render(&r);
+        assert_eq!(rc, REFUSAL_RC);
+        assert!(body.len() <= MAX_REFUSAL_BYTES, "{} bytes", body.len());
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((v["error_code"].as_str(), v["reason"].as_str()), (Some("INVALID_ARGUMENT"), Some("bad_args")));
+        assert_eq!((v["buffer"].as_str(), v["rev"].as_u64()), (Some("b1_00000000"), Some(3)));
+        assert!(v.get("big").is_none());
+        assert_eq!(v["small"], 7);
     }
 
     #[test]
