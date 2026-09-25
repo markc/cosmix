@@ -488,7 +488,14 @@ fn service_bus(
             };
             (rc, body, None)
         } else if request.command == "shell.scenes.list" {
-            (0, content.scenes.list(&content.registry.0).to_string(), None)
+            (
+                0,
+                content
+                    .scenes
+                    .list(&content.registry.0, &frame.0.geometry.output)
+                    .to_string(),
+                None,
+            )
         } else if matches!(
             request.command.as_str(),
             "shell.sub.register" | "shell.sub.remove"
@@ -1377,12 +1384,7 @@ fn leaf(path: String, value: PropValue) -> (PropPath, PropValue) {
 }
 
 pub(crate) fn edge_name(edge: Edge) -> &'static str {
-    match edge {
-        Edge::Left => "left",
-        Edge::Bottom => "bottom",
-        Edge::Right => "right",
-        Edge::Top => "top",
-    }
+    edge.as_str()
 }
 
 #[cfg(test)]
@@ -1664,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_state_rejects_unknown_missing_and_non_string_edges_like_show() {
+    fn panel_state_edge_errors_match_show_for_stamped_callers() {
         let frame = test_frame();
         for args in [json!({"edge":"diagonal"}), json!({}), json!({"edge":42})] {
             let mut state = request("shell.panel.state");
@@ -1715,7 +1717,14 @@ mod tests {
         let (bridge, peer) = test_bridge("shell");
         let mut app = bus_app(bridge);
         for (name, edge) in [("zeta", "left"), ("alpha", "right")] {
-            peer.send(scene_load(name, "loader", edge));
+            let mut load = scene_load(name, "loader", edge);
+            if name == "alpha" {
+                load.body = load.body.replace(
+                    "\"kind\":\"edge\"",
+                    "\"kind\":\"edge\",\"panel\":\"custom-id\"",
+                );
+            }
+            peer.send(load);
             app.update();
             let replies = peer.drain_responses();
             assert_eq!(replies.len(), 1);
@@ -1735,9 +1744,9 @@ mod tests {
         assert_eq!(replies[0].rc, 0);
         let rows: Value = serde_json::from_str(&replies[0].body).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 2);
-        for (index, name, edge, registered) in [
-            (0, "alpha", json!("right"), true),
-            (1, "zeta", Value::Null, false),
+        for (index, name, page, edge, registered) in [
+            (0, "alpha", "custom-id", json!("right"), true),
+            (1, "zeta", "scene-zeta", Value::Null, false),
         ] {
             let mut watch = local("shell.scene.watch");
             watch.body = json!({"scene":name}).to_string();
@@ -1748,8 +1757,8 @@ mod tests {
             assert_eq!(replies[0].rc, 0);
             let watched: Value = serde_json::from_str(&replies[0].body).unwrap();
             assert_eq!(rows[index], json!({
-                "name":name, "page":format!("scene-{name}"), "edge":edge,
-                "owner":"authored-metadata", "revision":watched["revision"],
+                "name":name, "page":page, "edge":edge,
+                "citizen":"authored-metadata", "owner":"loader", "revision":watched["revision"],
                 "digest":watched["digest"], "registered":registered,
             }));
         }

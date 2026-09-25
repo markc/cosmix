@@ -281,11 +281,16 @@ edge. `edge` is `left`, `bottom`, `right` or `top`; an invalid or missing edge
 returns rc 10 with `{"error":"edge must be left, bottom, right or top"}`.
 
 `shell.scenes.list` takes no arguments and returns a JSON array sorted by
-scene name: `[{name,page,edge,owner,revision,digest,registered}]`. `page` is
+scene name: `[{name,page,edge,citizen,owner,revision,digest,registered}]`. `page` is
 the sub-panel page id (`scene-<name>`, or the document's explicit panel id).
-`edge` is the registered seat's edge, or null when no seat exists;
-`registered` says whether that seat exists. `owner` is the document's
-`citizen:` metadata. `revision` and `digest` match `shell.scene.watch`.
+`registered` means a seat is reserved with the scene's verified owner,
+acceptance receipt, edge and current host output; `edge` is that seat's edge,
+or null when no matching seat exists. `panel.state.pages` shows a newly reserved
+page after the next frame. An owned scene whose seat is removed or replaced
+by another owner or receipt is removed on the next frame.
+`citizen` is the document's routing `citizen:` metadata; `owner` is the
+broker-verified loader, or null for an unowned scene.
+`revision` and `digest` match `shell.scene.watch`.
 An empty store returns `[]`. Both reads return rc 0 on success, are open to
 mesh callers, and do not change scenes, panels or keyboard focus.
 

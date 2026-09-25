@@ -688,11 +688,16 @@ plus the host's <code>keyboard_focused</code> and <code>keyboard_requested</code
 edge. <code>edge</code> is <code>left</code>, <code>bottom</code>, <code>right</code> or <code>top</code>; an invalid or missing edge
 returns rc 10 with <code>{"error":"edge must be left, bottom, right or top"}</code>.</p>
 <p><code>shell.scenes.list</code> takes no arguments and returns a JSON array sorted by
-scene name: <code>[{name,page,edge,owner,revision,digest,registered}]</code>. <code>page</code> is
+scene name: <code>[{name,page,edge,citizen,owner,revision,digest,registered}]</code>. <code>page</code> is
 the sub-panel page id (<code>scene-&lt;name&gt;</code>, or the document's explicit panel id).
-<code>edge</code> is the registered seat's edge, or null when no seat exists;
-<code>registered</code> says whether that seat exists. <code>owner</code> is the document's
-<code>citizen:</code> metadata. <code>revision</code> and <code>digest</code> match <code>shell.scene.watch</code>.
+<code>registered</code> means a seat is reserved with the scene's verified owner,
+acceptance receipt, edge and current host output; <code>edge</code> is that seat's edge,
+or null when no matching seat exists. <code>panel.state.pages</code> shows a newly reserved
+page after the next frame. An owned scene whose seat is removed or replaced
+by another owner or receipt is removed on the next frame.
+<code>citizen</code> is the document's routing <code>citizen:</code> metadata; <code>owner</code> is the
+broker-verified loader, or null for an unowned scene.
+<code>revision</code> and <code>digest</code> match <code>shell.scene.watch</code>.
 An empty store returns <code>[]</code>. Both reads return rc 0 on success, are open to
 mesh callers, and do not change scenes, panels or keyboard focus.</p>
 <p>From a Mix script: <code>send shell shell.scenes.list</code> and

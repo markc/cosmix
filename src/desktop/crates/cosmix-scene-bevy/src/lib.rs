@@ -6,7 +6,7 @@ pub use render::{Events as SceneEvents, reconcile as reconcile_scene_mounts};
 
 use bevy::prelude::*;
 use cosmix_scene::{ResolvedScene, SceneDocument, Severity};
-use cosmix_shell::core::{OutputKey, SubPanelRegistry};
+use cosmix_shell::core::{OutputKey, SubPanelRegistry, SubPanelSeat};
 use cosmix_shell::runtime::{SceneVerb, ShellRuntimeSet};
 use ctk::bus::BusBridge;
 use serde_json::{Value, json};
@@ -43,6 +43,23 @@ pub(crate) struct SceneEntry {
     owner: Option<SceneOwner>,
 }
 
+impl SceneEntry {
+    /// The reservation must match the loader, receipt, edge and host output.
+    fn matching_seat<'a>(
+        &self,
+        registry: &'a SubPanelRegistry,
+        output: &OutputKey,
+    ) -> Option<&'a SubPanelSeat> {
+        let owner = self.owner.as_ref()?;
+        registry.seat(&render::page_id(&self.tree)).filter(|seat| {
+            seat.owner == owner.citizen
+                && seat.accepted_at == owner.accepted_at
+                && seat.edge == render::scene_edge(&self.tree)
+                && seat.output == *output
+        })
+    }
+}
+
 #[derive(Clone)]
 struct SceneOwner {
     citizen: String,
@@ -66,20 +83,21 @@ pub struct SceneStore {
 }
 
 impl SceneStore {
-    /// Read-only inventory in scene-name order. Ownership here is authored
-    /// metadata, not the broker identity used for lifetime management.
-    pub fn list(&self, registry: &SubPanelRegistry) -> Value {
+    /// Read-only inventory in scene-name order for the host output.
+    /// `citizen` is authored routing metadata; `owner` is the verified loader.
+    pub fn list(&self, registry: &SubPanelRegistry, output: &OutputKey) -> Value {
         Value::Array(
             self.scenes
                 .iter()
                 .map(|(name, entry)| {
                     let page = render::page_id(&entry.tree);
-                    let seat = registry.seat(&page);
+                    let seat = entry.matching_seat(registry, output);
                     json!({
                         "name": name,
                         "page": page,
-                        "edge": seat.map(|seat| format!("{:?}", seat.edge).to_lowercase()),
-                        "owner": entry.document.citizen,
+                        "edge": seat.map(|seat| seat.edge.as_str()),
+                        "citizen": entry.document.citizen,
+                        "owner": entry.owner.as_ref().map(|owner| &owner.citizen),
                         "revision": entry.revision,
                         "digest": digest(&entry.tree),
                         "registered": seat.is_some(),
@@ -417,6 +435,70 @@ fn serialised_document(document: &SceneDocument) -> String {
 mod tests {
     use super::*;
     const FIXTURE: &str = include_str!("../../cosmix-scene/tests/fixtures/conformance.scene.md");
+
+    #[test]
+    fn inventory_requires_the_render_reservation_and_reports_unowned_watch() {
+        use cosmix_shell::core::Edge;
+
+        let mut store = SceneStore::default();
+        store
+            .request(SceneVerb::Load, FIXTURE, &Value::Null)
+            .unwrap();
+        let output = OutputKey::new("test-output").unwrap();
+        let mut registry = SubPanelRegistry::default();
+        let watched = store
+            .request(SceneVerb::Watch, "", &json!({"scene":"conformance"}))
+            .unwrap()
+            .0;
+        let row = &store.list(&registry, &output)[0];
+        assert_eq!(row["owner"], Value::Null);
+        assert_eq!(row["registered"], false);
+        assert_eq!(row["revision"], watched["revision"]);
+        assert_eq!(row["digest"], watched["digest"]);
+
+        let entry = store.scenes.get_mut("conformance").unwrap();
+        entry.owner = Some(SceneOwner {
+            citizen: "loader".into(),
+            accepted_at: 7,
+        });
+        let page = render::page_id(&entry.tree);
+        let edge = render::scene_edge(&entry.tree);
+        let other_edge = if edge == Edge::Left {
+            Edge::Right
+        } else {
+            Edge::Left
+        };
+        for (owner, receipt, seat_edge, seat_output, registered) in [
+            ("loader", 7, edge, output.clone(), true),
+            ("other", 7, edge, output.clone(), false),
+            ("loader", 8, edge, output.clone(), false),
+            ("loader", 7, other_edge, output.clone(), false),
+            (
+                "loader",
+                7,
+                edge,
+                OutputKey::new("other-output").unwrap(),
+                false,
+            ),
+        ] {
+            registry.forget(&page);
+            registry
+                .mount(&page, seat_output, seat_edge, owner, receipt)
+                .unwrap();
+            let rows = store.list(&registry, &output);
+            assert_eq!(rows[0]["registered"], registered);
+            assert_eq!(
+                rows[0]["edge"],
+                if registered {
+                    json!(edge.as_str())
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(rows[0]["owner"], "loader");
+        }
+    }
+
     #[test]
     fn cumulative_patch_size_is_transactional() {
         let mut store = SceneStore::default();
