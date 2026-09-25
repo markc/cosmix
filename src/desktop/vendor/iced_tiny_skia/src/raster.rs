@@ -18,12 +18,17 @@ impl Pipeline {
         }
     }
 
-    pub fn load(&self, handle: &raster::Handle) -> Result<raster::Allocation, raster::Error> {
+    pub fn load(
+        &self,
+        handle: &raster::Handle,
+    ) -> Result<raster::Allocation, raster::Error> {
         let mut cache = self.cache.borrow_mut();
         let image = cache.allocate(handle)?;
 
         #[allow(unsafe_code)]
-        Ok(unsafe { raster::allocate(handle, Size::new(image.width(), image.height())) })
+        Ok(unsafe {
+            raster::allocate(handle, Size::new(image.width(), image.height()))
+        })
     }
 
     pub fn dimensions(&self, handle: &raster::Handle) -> Option<Size<u32>> {
@@ -50,26 +55,27 @@ impl Pipeline {
             return;
         };
 
+        let width_scale = bounds.width / image.width() as f32;
+        let height_scale = bounds.height / image.height() as f32;
+        let effective = transform.pre_scale(width_scale, height_scale);
+        // Test the combined transform: image scaling can cancel output scale.
+        let negative_identity = effective.is_identity() && (bounds.x < 0.0 || bounds.y < 0.0);
+
         // Resolve cumulative logical edges in physical space before upstream's
         // per-image scaling and truncation. Float cancellation at fractional
         // output scales must not turn a native-size band into a resampled one.
-        if image.opaque && opacity == 1.0 {
-            if let Some(placed) = native_placement(bounds, transform, image.width(), image.height()) {
-                if copy_opaque(image.pixmap(), pixels, placed, clip_bounds) {
-                    return;
-                }
-            }
+        if !cfg!(feature = "reference-raster") && image.opaque && opacity == 1.0 && !negative_identity
+            && let Some(placed) = native_placement(bounds, transform, image.width(), image.height())
+            && copy_opaque(image.pixmap(), pixels, placed, clip_bounds)
+        {
+            return;
         }
 
-        let width_scale = bounds.width / image.width() as f32;
-        let height_scale = bounds.height / image.height() as f32;
-
-        let transform = transform.pre_scale(width_scale, height_scale);
+        let transform = effective;
 
         // tiny-skia's identity fill_rect rounds negative local bounds
         // differently from its transformed path; retain that edge behaviour.
-        let negative_identity = transform.is_identity() && (bounds.x < 0.0 || bounds.y < 0.0);
-        if image.opaque && opacity == 1.0 && !negative_identity {
+        if !cfg!(feature = "reference-raster") && image.opaque && opacity == 1.0 && !negative_identity {
             let placed = transform.pre_translate(
                 (bounds.x / width_scale) as i32 as f32,
                 (bounds.y / height_scale) as i32 as f32,
@@ -110,7 +116,10 @@ struct Cache {
 }
 
 impl Cache {
-    pub fn allocate(&mut self, handle: &raster::Handle) -> Result<&Entry, raster::Error> {
+    pub fn allocate(
+        &mut self,
+        handle: &raster::Handle,
+    ) -> Result<&Entry, raster::Error> {
         let id = handle.id();
 
         if let hash_map::Entry::Vacant(entry) = self.entries.entry(id) {
@@ -127,14 +136,17 @@ impl Cache {
                 return Err(raster::Error::Empty);
             }
 
-            let mut buffer = vec![0u32; image.width() as usize * image.height() as usize];
+            let mut buffer =
+                vec![0u32; image.width() as usize * image.height() as usize];
 
             let mut opaque = true;
             for (i, pixel) in image.pixels().enumerate() {
                 let [r, g, b, a] = pixel.0;
                 opaque &= a == 255;
 
-                buffer[i] = bytemuck::cast(tiny_skia::ColorU8::from_rgba(b, g, r, a).premultiply());
+                buffer[i] = bytemuck::cast(
+                    tiny_skia::ColorU8::from_rgba(b, g, r, a).premultiply(),
+                );
             }
 
             let _ = entry.insert(Some(Entry {
@@ -195,7 +207,6 @@ fn native_placement(
 ) -> Option<tiny_skia::Transform> {
     if transform.kx != 0.0 || transform.ky != 0.0
         || transform.sx <= 0.0 || transform.sy <= 0.0
-        || (transform.is_identity() && (bounds.x < 0.0 || bounds.y < 0.0))
     {
         return None;
     }
@@ -205,7 +216,8 @@ fn native_placement(
         (bounds.x + bounds.width) * transform.sx + transform.tx,
         (bounds.y + bounds.height) * transform.sy + transform.ty,
     ];
-    if !edges.iter().all(|v| v.is_finite() && (v - v.round()).abs() <= 0.001) {
+    if !edges.iter().all(|v| v.is_finite()
+        && (v - v.round()).abs() <= (v.abs().max(1.0) * f32::EPSILON * 4.0).min(0.01)) {
         return None;
     }
     let [left, top, right, bottom] = edges.map(f32::round);
@@ -269,6 +281,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn engine_unmasked_native_image_remains_under_later_clipped_overlay() {
+        use crate::core::{Renderer as _, image::Renderer as _};
+        let viewport = crate::graphics::Viewport::with_physical_size(Size::new(15, 15), 1.0);
+        let clip = Rectangle::with_size(viewport.logical_size());
+        let bounds = Rectangle { x: 2.0, y: 3.0, width: 7.0, height: 5.0 };
+        let overlay = Rectangle { x: 4.0, y: 4.0, width: 3.0, height: 2.0 };
+        let bytes: Vec<_> = (0..35).flat_map(|i|
+            [(i * 53) as u8, (i * 97) as u8, (i * 13) as u8, 255]).collect();
+        let handle = raster::Handle::from_rgba(7, 5, bytes.clone());
+        let mut renderer = crate::Renderer::new(crate::core::Font::default(), crate::core::Pixels(13.0));
+        renderer.reset(clip);
+        renderer.draw_image(raster::Image::new(handle), bounds, clip);
+        renderer.start_layer(overlay);
+        renderer.fill_quad(crate::core::renderer::Quad { bounds: clip, ..Default::default() }, crate::core::Color::WHITE);
+        renderer.end_layer();
+        let mut pixels = tiny_skia::Pixmap::new(15, 15).unwrap();
+        let mut mask = tiny_skia::Mask::new(15, 15).unwrap();
+        renderer.draw(&mut pixels.as_mut(), &mut mask, &viewport, &[clip], crate::core::Color::BLACK);
+        for y in 0..15usize {
+            for x in 0..15usize {
+                let expected = if (4..7).contains(&x) && (4..6).contains(&y) {
+                    [255; 4]
+                } else if (2..9).contains(&x) && (3..8).contains(&y) {
+                    let i = ((y - 3) * 7 + x - 2) * 4;
+                    [bytes[i + 2], bytes[i + 1], bytes[i], 255]
+                } else { [0, 0, 0, 255] };
+                assert_eq!(&pixels.data()[(y * 15 + x) * 4..(y * 15 + x + 1) * 4], &expected,
+                    "pixel {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_scale_negative_origin_preserves_upstream_pixels() {
+        let handle = raster::Handle::from_rgba(7, 5,
+            (0..35).flat_map(|i| [(i * 53) as u8, (i * 97) as u8, (i * 13) as u8, 255]).collect::<Vec<_>>());
+        for scale in [1.0, 2.0, 4.0] {
+            for origin in [-0.5, -1.0, -3.0] {
+                let bounds = Rectangle { x: origin, y: 0.0, width: 7.0 / scale, height: 5.0 / scale };
+                let clip = Rectangle::with_size(Size::new(15.0, 15.0));
+                let mut actual = tiny_skia::Pixmap::new(15, 15).unwrap();
+                let mut expected = actual.clone();
+                let mut fast = Pipeline::new();
+                let mut original = Pipeline::new();
+                let _ = original.load(&handle).unwrap();
+                original.cache.borrow_mut().entries.get_mut(&handle.id()).unwrap().as_mut().unwrap().opaque = false;
+                for (pipeline, target) in [(&mut fast, &mut actual), (&mut original, &mut expected)] {
+                    pipeline.draw(&handle, raster::FilterMethod::Nearest, bounds, 1.0,
+                        &mut target.as_mut(), tiny_skia::Transform::from_scale(scale, scale), None, clip);
+                }
+                assert_eq!(actual.data(), expected.data(), "scale={scale} origin={origin}");
+            }
+        }
+    }
+
+    #[test]
+    fn large_coordinates_tolerate_roundoff_but_not_fractional_placement() {
+        let bounds = Rectangle { x: 4096.0005, y: 8192.001, width: 7.0, height: 5.0 };
+        assert!(native_placement(bounds, tiny_skia::Transform::identity(), 7, 5).is_some());
+        assert!(native_placement(Rectangle { x: 4096.25, ..bounds }, tiny_skia::Transform::identity(), 7, 5).is_none());
+        assert!(native_placement(Rectangle { x: 0.0, y: 0.0, width: 7.0, height: 5.0 },
+            tiny_skia::Transform::from_scale(2.0, 2.0), 7, 5).is_none());
+    }
+
+    #[test]
     fn cumulative_band_edges_use_native_copy_at_seven_scales() {
         for scale in [1.0, 1.1, 1.25, 1.5, 1.75, 2.25, 2.5] {
             for offset in [0.0, 1.0, 3.0, 17.0, 30.0] {
@@ -293,7 +370,8 @@ mod tests {
 
     #[test]
     fn pipeline_matches_forced_fallback_for_placement_and_fractional_clips() {
-        let handle = raster::Handle::from_rgba(7, 5, [255, 0, 113, 255].repeat(35));
+        let handle = raster::Handle::from_rgba(7, 5,
+            (0..35).flat_map(|i| [(i * 53) as u8, (i * 97) as u8, (i * 13) as u8, 255]).collect::<Vec<_>>());
         for origin in [-3.0, 0.0, 4.0] {
             for edge in [-2.51, -2.5, -2.49, 0.0, 0.49, 0.5, 0.51, 1.25, 2.5] {
                 for transform in [
@@ -354,7 +432,7 @@ mod tests {
                     0,
                     0,
                     source.as_ref(),
-                    &Default::default(),
+                    &tiny_skia::PixmapPaint::default(),
                     tiny_skia::Transform::from_translate(x as f32, y as f32),
                     Some(&mask),
                 );
@@ -377,7 +455,7 @@ mod tests {
     fn scaled_translucent_and_fractional_draws_keep_original_path() {
         for alpha in [128, 255] {
             let handle = raster::Handle::from_rgba(7, 5, [31, 113, 241, alpha].repeat(35));
-            for scale in [1.0, 1.25, 1.5, 2.5] {
+            for scale in [1.0, 1.25, 1.5, 2.0, 2.5] {
                 for offset in [0.0, 0.25] {
                     for opacity in [0.5, 1.0] {
                         let bounds = Rectangle {

@@ -179,6 +179,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
         wheel: 0.0,
         last_redraw: None,
         force_paint: false,
+        paint_requested: true,
     };
 
     // `BootFn` is `Fn`, not `FnOnce`, and the state is not cloneable — the
@@ -300,6 +301,7 @@ struct State {
     wheel: f32,
     last_redraw: Option<std::time::Instant>,
     force_paint: bool,
+    paint_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -437,6 +439,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Wake => {
+            state.paint_requested = true;
             state.waker.pending.store(false, Ordering::Release);
             return state.sync();
         }
@@ -536,8 +539,12 @@ fn view(state: &State) -> Element<'_, Message> {
     // The keyboard rides the widget tree, not a subscription: see `keys.rs`.
     // It wraps the strip as well, so a key pressed while the pointer is over
     // a tab still reaches the terminal.
-    let content = keys::keys(column![tab_strip(state, scale), panes], on_key)
-        .on_redraw(state.last_redraw, Message::Paint);
+    let mut content = keys::keys(column![tab_strip(state, scale), panes], on_key);
+    // Clean chrome redraws must not publish Paint: iced would rebuild the UI
+    // and dispatch RedrawRequested a second time for no terminal change.
+    if state.needs_paint() {
+        content = content.on_redraw(state.last_redraw, Message::Paint);
+    }
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -622,7 +629,7 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
             .width(Length::Fixed(f32::from(cols) * cell_width))
             .height(Length::Fixed(f32::from(rows) * cell_height))
             .into(),
-        // Not sized or not painted yet: the next wake does both.
+        // Not sized or painted yet: sync sizes it, then the next redraw paints.
         _ => space().into(),
     };
     let frame_colour = frame_colour(&state.shape, id, tokens);
@@ -744,9 +751,15 @@ impl State {
         Task::none()
     }
 
+    fn needs_paint(&self) -> bool {
+        self.paint_requested || self.force_paint
+            || self.shape.visible().iter().any(|id| self.painter.existing(*id).is_none())
+    }
+
     /// Rasterise every visible pane by its damaged rows (all rows, for a
     /// frame that was invalidated or is new).
     fn repaint(&mut self) {
+        self.paint_requested = false;
         let terminals: Vec<_> = {
             let tabs = self.tabs.lock().expect("tabs");
             self.shape
@@ -884,6 +897,9 @@ impl State {
         // suppress the retry. Terminal locks are taken without the set lock,
         // as everywhere else in this frontend.
         for (id, (cols, rows), terminal) in resize {
+            // Do not wait for the asynchronous resize wake to paint geometry
+            // already changed by this UI turn.
+            self.paint_requested = true;
             // Physical pixels to the PTY: ioctl TIOCSWINSZ's ws_xpixel is
             // what a full-screen program asks for when it wants real geometry.
             terminal.lock().expect("terminal").resize(
@@ -1052,6 +1068,7 @@ mod tests {
             wheel: 0.0,
             last_redraw: None,
             force_paint: false,
+            paint_requested: true,
         };
         (state, reaper)
     }
@@ -1130,6 +1147,11 @@ mod tests {
                 .unwrap()
                 .generation()
         };
+        assert!(!state.needs_paint(), "clean chrome redraws must not request Paint");
+        let _ = update(&mut state, Message::Wake);
+        assert!(state.needs_paint(), "a wake must arm the next redraw");
+        let _ = update(&mut state, Message::Paint(std::time::Instant::now()));
+        assert!(!state.needs_paint(), "painting consumes the request");
         let before = [generation(&state, ids[0]), generation(&state, ids[1])];
         let terminal = state.tabs.lock().unwrap().pane_by_id(ids[0]).unwrap();
         let (cols, rows) = state.grids[&ids[0]];

@@ -41,7 +41,7 @@ wgpu = ["iced/wgpu", "naga27-termcolor"]
 # at all, like foot, and cheap for sparse updates. Build it ALONE —
 # `--no-default-features --features tiny-skia` — because with both compiled
 # in, main.rs takes the wgpu grid and iced_renderer puts wgpu first.
-tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes"]
+tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes", "dep:iced_tiny_skia", "dep:tiny-skia"]
 # Not meant to be selected on its own; `wgpu` pulls it in. It exists as a
 # feature so the compatibility dependency stays optional.
 naga27-termcolor = ["dep:naga27"]
@@ -95,8 +95,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # T3): naga 27 leaves the graph and takes the conflict with it.
 naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
 
-[dev-dependencies]
-# Tests compile this dependency even with the default wgpu renderer. Its
-# softbuffer dependency needs a platform backend independently of iced's arm.
-iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image", "wayland"] }
-tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# Cargo does not support optional dev-dependencies. These test helpers are
+# optional normal dependencies tied to the CPU arm; clean wgpu tests omit them.
+iced_tiny_skia = { version = "=0.14.1", optional = true, default-features = false, features = ["image", "wayland"] }
+tiny-skia = { version = "0.11", optional = true, default-features = false, features = ["std", "simd"] }

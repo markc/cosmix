@@ -8,7 +8,7 @@ Painting drops the band's own handle before `Bytes::try_into_mut()`.
 With no outstanding handle clones, painting reclaims the allocation without
 copying and updates only damaged rows through `Raster::paint` and a per-band
 `PaintState`. In normal draw/present use, iced tiny-skia's renderer layers
-(`Layer.images`) and compositor history (`surface.layer_stack`) retain handle
+(`Layer.images`) and compositor history (`surface.history.layers`) retain handle
 clones. Painting a partially dirty band then makes one memcpy and calls
 `PaintState::rebind` on that byte-for-byte copy, preserving incremental
 dirty-row painting. A completely dirty band allocates zeroed replacement
@@ -31,9 +31,22 @@ nearest filtering and snapped physical origins. Each band's logical top and
 bottom come from cumulative physical row boundaries, so the rectangles tile
 without accumulating rounding error. The vendored renderer transforms those
 cumulative edges into physical pixels before upstream's image-size division
-and truncation. Edges within 0.001 pixel of integers with exactly native-size
+and truncation. Edges within four relative f32 epsilons (capped at 0.01 physical
+pixel) of integers with exactly native-size
 rounded extents use an integer-translation copy for opaque images; other
-draws retain the generic path. No half-pixel placement bias is added.
+draws retain the generic path. The widget corrects round-off before upstream's
+source-space truncation too, using each band's cumulative origin and pixel
+size. The seven-scale pixel test also runs with both vendor copy shortcuts
+disabled (`--features tiny-skia,iced_tiny_skia/reference-raster`).
+No half-pixel placement bias is added.
+
+Empty damage still submits an empty softbuffer present after `on_pre_present`,
+so unchanged `NextFrame` animations retain Wayland frame pacing. Every
+successful commit advances history, even if it carries no damage. Unit tests
+cover first frame, older/unknown buffer ages, A → B → A, background changes,
+configuration resets and empty commits. These are headless lifecycle checks;
+they do not measure live compositor timing. Clean chrome redraws publish no
+`Paint` message; wakes, missing frames and explicit invalidation arm painting.
 The default is `wgpu`; selecting both renderer features also uses wgpu. It
 retains the core Vec-backed `Surface`, incremental damage uploads and
 persistent GPU texture.

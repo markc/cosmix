@@ -35,6 +35,8 @@ license = "MIT"
 repository = "https://github.com/iced-rs/iced"
 
 [features]
+# Verification arm: exercise upstream draw_pixmap, including widget placement.
+reference-raster = []
 default = [
     "x11",
     "wayland",
@@ -97,6 +99,9 @@ features = [
 default-features = false
 
 [lints.clippy]
+# Upstream drawing APIs pass rendering context explicitly (up to 13 args).
+# Keep those signatures intact while checking this vendor with -D warnings.
+too_many_arguments = "allow"
 default_trait_access = "deny"
 filter_map_next = "deny"
 from_over_into = "deny"

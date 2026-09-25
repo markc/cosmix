@@ -490,20 +490,22 @@ pre-change tree; the wgpu default remains unchanged.
   damage bounds; the copy invokes neither Pattern nor a mask. Renderer-wide
   clip-mask preparation is still present for generic drawing. Fractional net
   scale/translation, rotation and non-opaque draws use the original path.
-  Negative local bounds with an identity transform also keep upstream's
+  Negative local bounds with an identity transform after image scaling also keep upstream's
   specialised rectangle rounding; tests exposed a different edge footprint
   there. Translated negative physical origins are supported by the copy.
 - **Rank 4:** `window/compositor.rs` passes outward-rounded physical rectangles
   to `present_with_damage`. Damage includes both age repair and changes from
   the displayed frame, covering A → B → A with rotating buffers. Background
   changes invalidate retained histories so older buffers owe a full clear.
-  Empty damage drops the acquired buffer without advancing history or calling
-  pre-present. Softbuffer's Wayland implementation changes ages and swaps
-  buffers on presentation, not acquisition/drop. Avoiding pre-present avoids
-  requesting a callback without a commit. Resize/unknown age still repaint
+  Empty damage calls pre-present and commits empty damage, preserving Wayland
+  callback pacing for unchanged `NextFrame` animations. Softbuffer's Wayland
+  implementation changes ages and swaps buffers on every successful commit;
+  history advances with it. Failed commits do not enter history. Resize/unknown age still repaint
   fully. Old Wayland surface versions can expand damage within softbuffer.
 - **Rank 2:** the app's existing root input widget publishes a paint message
-  from `RedrawRequested`. iced-winit drains widget messages, rebuilds the UI,
+  from `RedrawRequested` only after a wake, for a missing frame or explicit
+  invalidation. Clean chrome/hover redraws publish nothing and do not force
+  another UI rebuild. iced-winit drains widget messages, rebuilds the UI,
   then draws within that same redraw; a timestamp guard prevents its retry
   from painting twice. Wake messages continue lifecycle/layout work but no
   longer snapshot or paint. Each visible pane consumes `take_damage` before
@@ -526,10 +528,10 @@ The vendor README records the tarball SHA-256, upstream revision, patch
 removal conditions and routing/test commands. `cargo tree -p cosmix-term
 --no-default-features --features tiny-skia -i iced_tiny_skia` confirms the
 vendored path. Extracting the pristine import commit and comparing it recursively
-against the downloaded tarball produced no differences. The term test-only
-dependency now explicitly enables Wayland:
-without that feature, default-wgpu tests compile softbuffer with no Linux
-backend and fail before reaching app tests.
+against the downloaded tarball produced no differences. Cargo cannot make a
+dev-dependency optional, so the two CPU test helpers are optional normal
+dependencies selected by `tiny-skia`. Clean wgpu tests omit both; the CPU arm
+explicitly enables softbuffer's Wayland backend.
 
 ### Before/after measurements
 

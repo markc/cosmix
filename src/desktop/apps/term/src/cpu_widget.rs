@@ -48,19 +48,48 @@ pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
         let Some(_) = renderer.measure_image(handle) else {
             continue;
         };
-        let bounds = Rectangle {
+        let mut bounds = Rectangle {
             x: relative.x + x,
             y: relative.y + y,
             ..*relative
         };
-        // Preserve cumulative edges for the vendored renderer, which resolves
-        // physical placement before testing for an integer-aligned 1:1 copy.
+        // Cumulative edges avoid accumulated rounding, but upstream's fallback
+        // divides by each image's pixel size then truncates to i32. Correct
+        // round-off at that division too; do not rely on the vendor shortcut.
+        bounds.x = truncating_origin(bounds.x, bounds.width, handle, true, scale);
+        bounds.y = truncating_origin(bounds.y, bounds.height, handle, false, scale);
         if bounds.intersects(&clip) {
             let mut image = iced::advanced::image::Image::new(handle.clone());
             image.filter_method = image::FilterMethod::Nearest;
             renderer.draw_image(image, bounds, clip);
         }
     }
+}
+
+fn truncating_origin(
+    origin: f32,
+    extent: f32,
+    handle: &Handle,
+    horizontal: bool,
+    scale: f32,
+) -> f32 {
+    let Handle::Rgba { width, height, .. } = handle else {
+        return origin;
+    };
+    let pixels = if horizontal { *width } else { *height };
+    let pixel_size = extent / pixels as f32;
+    let target = (origin * scale).round();
+    let mut logical = target * pixel_size;
+    // Multiplication followed by division can round toward zero. One ULP
+    // away from zero restores the intended source-space integer origin.
+    if (logical / pixel_size).trunc() != target {
+        logical = if target >= 0.0 {
+            logical.next_up()
+        } else {
+            logical.next_down()
+        };
+    }
+    logical
 }
 
 impl<Message, Theme, R> Widget<Message, Theme, R> for Grid

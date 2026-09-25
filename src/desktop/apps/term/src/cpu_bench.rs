@@ -12,7 +12,7 @@ use iced_tiny_skia::{
 use std::time::Instant;
 
 #[test]
-fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
+fn band_widget_matches_exact_pixels_at_seven_scales_and_offsets() {
     for (scale, cell_height) in [
         (1.0, 20),
         (1.1, 41),
@@ -56,27 +56,8 @@ fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
         assert_eq!(last.y + last.height, baseline.height as f32 / scale);
         for offset in [0.0, 1.0, 3.0, 17.0, 30.0] {
             let origin = iced::Point::new(offset / scale, offset / scale);
-            let bounds = Rectangle {
-                x: origin.x,
-                y: origin.y,
-                width: baseline.width as f32 / scale,
-                height: baseline.height as f32 / scale,
-            };
             let mut renderer = Renderer::new(Font::default(), Pixels(13.0));
             let mut mask = tiny_skia::Mask::new(800, height).unwrap();
-            let mut whole = tiny_skia::Pixmap::new(800, height).unwrap();
-            renderer.reset(clip);
-            let mut image =
-                iced::advanced::image::Image::new(baseline.cached.as_ref().unwrap().1.clone());
-            image.filter_method = image::FilterMethod::Nearest;
-            renderer.draw_image(image, bounds, clip);
-            renderer.draw(
-                &mut whole.as_mut(),
-                &mut mask,
-                &viewport,
-                &[clip],
-                Color::BLACK,
-            );
             renderer.reset(clip);
             widget::draw_images(&mut renderer, &surface.images(scale), origin, scale, clip);
             let mut bands = tiny_skia::Pixmap::new(800, height).unwrap();
