@@ -42,7 +42,7 @@ use crate::verbs::{self, PhaseW, code};
 
 mod ui;
 
-pub use ui::{Prompt, RecoveredRow};
+pub use ui::{MatchQuery, Prompt, RecoveredRow};
 
 /// One tab = one buffer view.
 pub struct Tab {
@@ -92,6 +92,17 @@ pub enum Effect {
     /// Ask the human (a dialog); the answer comes back as an action or a
     /// [`Controller`] method (see [`Prompt`]). Added in E1d for E1f.
     Prompt(Prompt),
+    /// A window-only action (dialogs, find bar, zoom, panels, help, and the
+    /// args-taking actions called without their args): the window performs it
+    /// and then calls [`Controller::ui_done`] with `token` and the outcome.
+    /// A Bus `ced.action` that caused it is answered only from `ui_done` (or
+    /// with a `TIMEOUT` refusal after 10 s) — never before the window acted.
+    /// Never emitted headless (those refuse UNAVAILABLE).
+    UiAction { tab: Option<TabId>, action: ActionId, args: Option<Value>, intent: Intent, token: u64 },
+    /// Run a Mix relex off the UI thread:
+    /// `cosmix_edit_client::highlight::run_mix(&tag.language, &source)`, then
+    /// hand the spans to [`Controller::on_relex`] with the same tag.
+    Relex { tab: TabId, tag: cosmix_edit_client::highlight::ResultTag, source: std::sync::Arc<str> },
 }
 
 /// `ced.wait` longest deadline.
@@ -135,6 +146,12 @@ struct TabX {
     find: Option<ui::FindJob>,
     /// An outstanding lint capture and the deltas since (plan §4.10).
     lint: Option<ui::LintCapture>,
+    relex_timer: bool,
+    /// Highlight-all: the query, its matches (view ranges), refresh state.
+    match_query: Option<ui::MatchQuery>,
+    matches: Vec<Range<usize>>,
+    rematch_due: bool,
+    rematch_timer: bool,
 }
 
 /// What a request the controller sent is for.
@@ -147,6 +164,7 @@ enum Req {
     Close { tab: TabId, cmd: Option<(u64, String)>, intent: Intent },
     Select,
     Find { tab: TabId, job: Box<ui::FindJob> },
+    Matches { tab: TabId, query: ui::MatchQuery },
     /// `edit.list` at start for the recovered-buffers prompt.
     Recovered,
     Discard,
@@ -157,6 +175,14 @@ enum TimerFor {
     Wait(u64),
     Publish(TabId),
     Session,
+    /// Mix relex debounce (150 ms after the last delta).
+    Relex(TabId),
+    /// Highlight-all refresh debounce (100 ms after the last delta).
+    Rematch(TabId),
+    /// Change markers clear 2 s after the tab gains focus (plan §4.5).
+    ClearMarkers(TabId),
+    /// A Bus `ced.action` waiting on the window's `ui_done`.
+    UiDeadline(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +251,9 @@ pub struct Controller {
     /// Recovered buffers offered at start, and their epoch.
     recovered: Vec<wire::BufferSummary>,
     recovered_epoch: String,
+    /// `UiAction` tokens: the next one, and the Bus commands awaiting `ui_done`.
+    next_ui_token: u64,
+    ui_pending: HashMap<u64, (u64, String)>,
 }
 
 fn refusal(code: &str, message: impl Into<String>, reason: Option<&str>) -> String {
@@ -304,15 +333,6 @@ fn open_reply_of(epoch: &str, b: &wire::BufferSummary) -> wire::OpenReply {
         recovery_id: b.recovery_id.clone(),
         recovered: b.recovered,
         recovered_from: None,
-    }
-}
-
-fn line_comment(language: &str) -> Option<&'static str> {
-    match language {
-        "mix" | "scene" | "mix-data" => Some("--"),
-        "rust" | "c" | "cpp" | "go" | "javascript" => Some("//"),
-        "shell" | "python" | "toml" | "yaml" => Some("#"),
-        _ => None,
     }
 }
 
@@ -399,6 +419,8 @@ impl Controller {
             frames: ui::Frames::default(),
             recovered: Vec::new(),
             recovered_epoch: String::new(),
+            next_ui_token: 0,
+            ui_pending: HashMap::new(),
         }
     }
 
@@ -523,6 +545,9 @@ impl Controller {
             }
             EditorMsg::ImeCommit(text) => {
                 self.stats.keys += 1;
+                if let Some(t) = self.tab_mut(tab) {
+                    t.editor.set_preedit(false);
+                }
                 if let Err(e) = self.command(tab, EditCommand::Insert(text), Intent::ui(tab), &mut fx) {
                     fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: e } });
                 }
@@ -544,13 +569,18 @@ impl Controller {
                 }
             }
             EditorMsg::Paste { primary } => fx.push(Effect::ClipboardRead { primary, intent: Intent::ui(tab) }),
-            EditorMsg::Preedit(_) => {}
+            EditorMsg::Preedit(s) => {
+                if let Some(t) = self.tab_mut(tab) {
+                    t.editor.set_preedit(!s.is_empty());
+                }
+            }
             EditorMsg::Focus(focused) => {
                 if focused {
                     self.active = Some(tab);
                     if let Some(x) = self.x.get_mut(&tab) {
                         x.agent_since_focus = false;
                     }
+                    self.timer(2_000, TimerFor::ClearMarkers(tab), &mut fx);
                 }
             }
             EditorMsg::Layout(r) => {
@@ -742,6 +772,7 @@ impl Controller {
                 }
             }
             Some(Req::Find { tab, job }) => self.on_find_reply(tab, *job, rc, body, fx),
+            Some(Req::Matches { tab, query }) => self.on_matches_reply(tab, query, rc, body, fx),
             Some(Req::Recovered) => self.on_recovered_list(rc, body, fx),
             Some(Req::Discard) => {
                 if rc >= 10 {
@@ -797,6 +828,21 @@ impl Controller {
             Some(TimerFor::Session) => {
                 self.session_timer = false;
                 fx.push(Effect::SaveSession);
+            }
+            Some(TimerFor::Relex(tab)) => self.relex_due(tab, fx),
+            Some(TimerFor::Rematch(tab)) => {
+                if let Some(x) = self.x.get_mut(&tab) {
+                    x.rematch_timer = false;
+                }
+                self.request_matches(tab, fx);
+            }
+            Some(TimerFor::UiDeadline(token)) => self.ui_timeout(token, fx),
+            Some(TimerFor::ClearMarkers(tab)) => {
+                if self.active == Some(tab)
+                    && let Some(t) = self.tab_mut(tab)
+                {
+                    t.editor.clear_markers();
+                }
             }
             None => {}
         }
@@ -1086,8 +1132,15 @@ impl Controller {
                 t.editor.apply_delta(d);
                 t.highlight.apply_delta(m.text(), d);
                 t.diagnostics.apply_delta(d);
-                resynced |= d.kind == DeltaKind::Resync;
+                if d.kind == DeltaKind::Resync {
+                    t.editor.clamp(m.text());
+                    resynced = true;
+                }
             }
+        }
+        let is_mix = t.highlight.is_mix();
+        if !step.deltas.is_empty() {
+            self.after_deltas(tab, &step.deltas, is_mix, fx);
         }
         if let Some(c) = self.x.get_mut(&tab).and_then(|x| x.lint.as_mut()) {
             for d in &step.deltas {
@@ -1170,6 +1223,9 @@ impl Controller {
             if let Some(job) = self.x.get_mut(&tab).and_then(|x| x.find.take()) {
                 self.start_find(tab, job, fx);
             }
+            if self.x.get_mut(&tab).is_some_and(|x| std::mem::take(&mut x.rematch_due)) {
+                self.request_matches(tab, fx);
+            }
             let saved = self.tab(tab).and_then(|t| t.mirror.as_ref()).is_some_and(|m| !m.meta().dirty);
             if let Some(intent) = self.x.get_mut(&tab).and_then(|x| x.close_after_save.take_if(|_| saved)) {
                 self.close(tab, false, None, intent, fx);
@@ -1181,11 +1237,15 @@ impl Controller {
 
     fn edit_cfg(&self, tab: &Tab) -> EditCfg {
         let (language, eol) = tab.mirror.as_ref().map(|m| (m.meta().language.clone(), m.meta().eol)).unwrap_or(("text".into(), wire::Eol::Lf));
+        let insert_spaces = self.config.insert_spaces.get(&language).copied().unwrap_or(false);
+        // With spaces, one indent = `tab_size` spaces: pass the language's
+        // indent width in the editing cfg (E1e contract).
+        let tab_size = if insert_spaces { self.config.indent_width(&language) } else { self.config.tab_size };
         EditCfg {
-            measure: MeasureCfg { tab_size: self.config.tab_size.clamp(1, 16), ambiguous_wide: self.config.ambiguous_wide },
-            insert_spaces: self.config.insert_spaces.get(&language).copied().unwrap_or(false),
+            measure: MeasureCfg { tab_size: tab_size.clamp(1, 16), ambiguous_wide: self.config.ambiguous_wide },
+            insert_spaces,
             eol: if eol == wire::Eol::Crlf { "\r\n" } else { "\n" },
-            line_comment: line_comment(&language),
+            line_comment: cosmix_edit_client::model::line_comment_for(&language),
         }
     }
 
@@ -1202,6 +1262,7 @@ impl Controller {
             }
             return Ok(());
         };
+        let caret_after = edit.caret_after;
         let step = m.local_edit(edit, intent, &mut self.ids).map_err(|e| match e {
             cosmix_edit_client::mirror::MirrorError::NotLive => "The buffer is reconnecting — try again in a moment".to_string(),
             cosmix_edit_client::mirror::MirrorError::TooLarge { items, bytes } => {
@@ -1210,6 +1271,11 @@ impl Controller {
             cosmix_edit_client::mirror::MirrorError::Invalid(m) => m,
         })?;
         self.drive(tab, step, fx);
+        // The issuing view's selection is the edit's `caret_after`: mapping
+        // alone cannot express a moved or re-indented block (E1e contract).
+        if let Some(t) = self.tab_mut(tab) {
+            t.editor.sel = caret_after;
+        }
         self.caret_moved(tab, fx);
         Ok(())
     }
@@ -1576,6 +1642,11 @@ impl Controller {
                     },
                 };
                 let intent = Intent::bus(tab.unwrap_or(0), &cmd.caller_key);
+                if !self.headless && ui::window_only(action, r.args.as_ref()) {
+                    // Full mesh access: the window performs it, and the
+                    // reply waits for the window's `ui_done`.
+                    return self.ui_dispatch(tab, action, r.args.clone(), intent, Some((id, r.id.clone())), fx);
+                }
                 if action == ActionId::FileClose {
                     let force = r.args.as_ref().and_then(|a| a.get("force")).and_then(Value::as_bool).unwrap_or(false);
                     match tab {
@@ -1922,6 +1993,95 @@ mod tests {
             assert!(fx.contains(&Effect::Subscribe { topic: t.into() }), "{t}");
         }
         assert!(fx.iter().any(|e| matches!(e, Effect::Send { out, .. } if out.verb == "edit.info")));
+    }
+
+    fn sent(fx: &[Effect], verb: &str) -> (u64, Value) {
+        fx.iter()
+            .find_map(|e| match e {
+                Effect::Send { req, out } if out.verb == verb => Some((*req, serde_json::from_str(&out.body).unwrap())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {verb} in {fx:?}"))
+    }
+
+    fn reply(c: &mut Controller, req: u64, body: Value) -> Vec<Effect> {
+        c.on_incoming(Incoming::Reply { req, rc: 0, body: body.to_string() })
+    }
+
+    /// Open a tab on a hand-driven `edit`, type over the Bus, ack by the echo.
+    #[test]
+    fn bus_typing_uses_the_callers_lane_and_acks_by_echo() {
+        let mut c = ctl();
+        c.start();
+        let fx = c.on_bus_command(cmd("ced.open", json!({"paths": ["/nonexistent/ced-e1d/x.txt"]})));
+        let (req, _) = sent(&fx, "edit.open");
+        let open = json!({"buffer": "b1_0000e1e1", "epoch": "0000e1e1", "path": "/nonexistent/ced-e1d/x.txt", "opened_as": null,
+                          "name": "x.txt", "language": "text", "rev": 0, "lines": 2, "bytes": 12, "eol": "lf", "bom": false,
+                          "disk": "clean", "reopened": false, "created": false, "recovery_id": "5f0c2a9e1b7d4c33",
+                          "recovered": false, "recovered_from": null});
+        let fx = reply(&mut c, req, open);
+        let (rc, v) = response(&fx);
+        assert_eq!((rc, v["tabs"][0]["buffer"].as_str()), (0, Some("b1_0000e1e1")));
+        let (req, get) = sent(&fx, "edit.get");
+        assert_eq!(get["snapshot"], true);
+        let p = |o: usize, col: usize| json!({"offset": o, "line": 1, "col": col});
+        let page = json!({"buffer": "b1_0000e1e1", "epoch": "0000e1e1", "rev": 0, "text": "hello world\n", "lines": null,
+                          "start": p(0, 1), "end": p(12, 13), "bytes_total": 12, "lines_total": 2, "truncated": false,
+                          "next": null, "snapshot": "s1"});
+        reply(&mut c, req, page);
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.wait", json!({"phase": "live", "timeout_ms": 1000}))));
+        assert_eq!((rc, v["phase"].as_str()), (0, Some("live")));
+
+        let fx = c.on_bus_command(cmd("ced.type", json!({"text": "!"})));
+        let (rc, v) = response(&fx);
+        assert_eq!((rc, v["pending"].as_u64()), (0, Some(1)));
+        let (req, ins) = sent(&fx, "edit.insert");
+        assert_eq!(ins["origin"], "agent:ced.local_tester", "a Bus caller types in its own lane");
+        assert_eq!((ins["at"].as_u64(), ins["base_rev"].as_u64()), (Some(0), Some(0)));
+        let op_id = ins["op_id"].as_str().unwrap().to_string();
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.state", json!({"text": true}))));
+        assert_eq!((rc, v["text"].as_str(), v["inflight"].as_bool()), (0, Some("!hello world\n"), Some(true)));
+        assert_eq!(v["selection"]["head"]["offset"].as_u64(), Some(1), "caret_after of the issuing view");
+
+        reply(&mut c, req, json!({"buffer": "b1_0000e1e1", "epoch": "0000e1e1", "rev": 1, "op_id": op_id}));
+        let ev = json!({"event": "edit", "epoch": "0000e1e1", "buffer": "b1_0000e1e1", "rev": 1, "base_rev": 0,
+                        "origin": "agent:ced.local_tester", "lane": "agent:ced.local_tester", "kind": "edit", "of": null,
+                        "op_id": op_id, "edits": [{"offset": 0, "delete": 0, "insert": "!"}], "event_seq": 1});
+        c.on_incoming(Incoming::Topic { topic: "edit.changed".into(), body: ev.to_string() });
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.wait", json!({"idle": true, "timeout_ms": 1000}))));
+        assert_eq!((rc, v["rev"].as_u64()), (0, Some(1)));
+        let (_, v) = response(&c.on_bus_command(cmd("ced.state", json!({}))));
+        assert_eq!(v["text_hash"].as_str().unwrap(), blake3::hash(b"!hello world\n").to_hex().as_str());
+        assert_eq!((v["pending"].as_u64(), v["inflight"].as_bool()), (Some(0), Some(false)));
+
+        // A window-only action over the Bus: headless refuses; with a window
+        // the reply waits for ui_done, or times out.
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.action", json!({"id": "view.zoom_in"}))));
+        assert_eq!((rc, v["error_code"].as_str()), (10, Some("UNAVAILABLE")));
+        let mut gui = Controller::new(Config::default(), 2, false);
+        let fx = gui.on_bus_command(cmd("ced.action", json!({"id": "search.find"})));
+        let token = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::UiAction { action: ActionId::SearchFind, token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("a UiAction");
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Respond { .. })), "no reply before the window acts");
+        let fx = gui.ui_done(token, Ok(json!({"opened": "find"})));
+        let (rc, v) = response(&fx);
+        assert_eq!((rc, v["ok"].as_bool(), v["result"]["opened"].as_str()), (0, Some(true), Some("find")));
+        assert!(gui.ui_done(token, Ok(Value::Null)).is_empty(), "a token answers once");
+        let fx = gui.on_bus_command(cmd("ced.action", json!({"id": "help.about"})));
+        let timer = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::Timer { id, ms } if *ms == 10_000 => Some(*id),
+                _ => None,
+            })
+            .expect("a deadline");
+        let (rc, v) = response(&gui.on_incoming(Incoming::Timer { id: timer }));
+        assert_eq!((rc, v["error_code"].as_str(), v["reason"].as_str()), (10, Some("TIMEOUT"), Some("timeout")));
     }
 
     #[test]
