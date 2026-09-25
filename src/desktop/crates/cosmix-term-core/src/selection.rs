@@ -146,11 +146,15 @@ fn selection_text(term: &Crosswords<Listener>) -> Option<String> {
             let start = Pos::new(Line(y), range.start.col);
             let end = Pos::new(Line(y), range.end.col);
             let end = if continuation(end) {
+                // The wrapped cluster's lead sits at column 0 of the next row
+                // and its spacer at column 1; only those two starts re-read it.
+                // A spacer elsewhere belongs to a different wide character.
                 let next_owns_lead = start.col.0 == 0
-                    || matches!(
-                        term.grid[Pos::new(start.row + 1i32, start.col)].wide(),
-                        Wide::Spacer
-                    );
+                    || (start.col.0 == 1
+                        && matches!(
+                            term.grid[Pos::new(start.row + 1i32, start.col)].wide(),
+                            Wide::Spacer
+                        ));
                 if y == range.end.row.0 || !next_owns_lead {
                     end
                 } else {
@@ -289,6 +293,17 @@ mod tests {
         term.selection_start(1, 0, SelectionSide::Left, SelectionType::Block);
         term.selection_update(3, 1, SelectionSide::Right);
         assert_eq!(term.selection_text().as_deref(), Some("bc\n👩‍💻!"));
+    }
+
+    #[test]
+    fn block_starting_mid_row_keeps_a_wrapped_wide_char_whose_spacer_is_elsewhere() {
+        // Six columns: "abcde" then 界 wraps to row 1 (LeadingSpacer at 5),
+        // and row 1 holds 界 a 語 ! — so row 1 col 5 is 語's trailing spacer,
+        // not the wrapped 界's. Columns 4-5 must keep 界 on the first line.
+        let term = Terminal::from_test_vt(6, 3, "abcde界a語!".as_bytes());
+        term.selection_start(4, 0, SelectionSide::Left, SelectionType::Block);
+        term.selection_update(5, 1, SelectionSide::Right);
+        assert_eq!(term.selection_text().as_deref(), Some("e界\n語!"));
     }
 
     #[test]
