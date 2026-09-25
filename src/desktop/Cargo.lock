@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bterm"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "bytes",
  "cosmix-design",
@@ -3477,15 +3477,17 @@ dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-term-core",
  "iced",
+ "iced_tiny_skia",
  "libc",
  "naga 27.0.3",
  "serde_json",
+ "tiny-skia 0.11.4",
  "tokio",
 ]
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.6.1"
+version = "0.6.3"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
@@ -5643,8 +5645,6 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c267596d742714b1853cc10c3983a367762816fc4836bd3b79f76ce76787d6f8"
 dependencies = [
  "bytemuck",
  "cosmic-text",

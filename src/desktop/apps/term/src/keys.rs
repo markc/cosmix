@@ -28,12 +28,17 @@ use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
 type KeyHandler<'a, Message> = Box<dyn Fn(&iced::keyboard::Event) -> Option<Message> + 'a>;
 type PointerHandler<'a, Message> = Box<dyn Fn(iced::Point) -> Option<Message> + 'a>;
+type Redraw<Message> = (
+    Option<std::time::Instant>,
+    fn(std::time::Instant) -> Message,
+);
 
 /// Wraps `content` and reports every key press it sees, losslessly.
 pub struct Keys<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_press: KeyHandler<'a, Message>,
     on_pointer: Option<PointerHandler<'a, Message>>,
+    redraw: Option<Redraw<Message>>,
 }
 
 /// Wrap `content` so `on_press` sees every keyboard event.
@@ -45,12 +50,24 @@ pub fn keys<'a, Message, Theme, Renderer>(
         content: content.into(),
         on_press: Box::new(on_press),
         on_pointer: None,
+        redraw: None,
     }
 }
 
 impl<'a, Message, Theme, Renderer> Keys<'a, Message, Theme, Renderer> {
     pub fn on_pointer(mut self, callback: impl Fn(iced::Point) -> Option<Message> + 'a) -> Self {
         self.on_pointer = Some(Box::new(callback));
+        self
+    }
+
+    /// iced drains widget messages and rebuilds the UI before drawing. The
+    /// last handled timestamp prevents its redraw retry from painting twice.
+    pub fn on_redraw(
+        mut self,
+        last: Option<std::time::Instant>,
+        message: fn(std::time::Instant) -> Message,
+    ) -> Self {
+        self.redraw = Some((last, message));
         self
     }
 }
@@ -117,6 +134,12 @@ where
             && let Some(message) = callback(*position)
         {
             shell.publish(message);
+        }
+        if let Event::Window(iced::window::Event::RedrawRequested(at)) = event
+            && let Some((last, message)) = self.redraw
+            && last != Some(*at)
+        {
+            shell.publish(message(*at));
         }
         self.content.as_widget_mut().update(
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,

@@ -34,8 +34,8 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
     term.damage_event_in_flight = false;
 }
 
-/// Rows changed since the last `rearm_damage`, plus a changed cursor's row (rio's
-/// damage covers where the cursor was, not where it is). Scrolled-back views
+/// Rows changed since the last `rearm_damage`. Cursor changes are added by
+/// capture, relative to the last consuming read. Scrolled-back views
 /// are repainted whole: rio reports their damage in scrollback coordinates.
 ///
 /// rio's `damage()` is not read-only. In insert mode (IRM) it calls
@@ -44,7 +44,6 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
 /// schedule the next. Insert mode repaints whole anyway, so skip the call.
 fn dirty_rows(term: &mut Crosswords<Listener>, previous_offset: usize) -> Vec<bool> {
     let mut dirty = vec![false; term.screen_lines()];
-    let cursor = term.grid.cursor.pos.row.0.max(0) as usize;
     if term.display_offset() != previous_offset
         || term.display_offset() != 0
         || term.mode().contains(rio_vt::crosswords::Mode::INSERT)
@@ -52,7 +51,6 @@ fn dirty_rows(term: &mut Crosswords<Listener>, previous_offset: usize) -> Vec<bo
         dirty.fill(true);
         return dirty;
     }
-    let changed = term.peek_damage_event().is_some();
     match term.damage() {
         TermDamage::Partial(lines) => {
             for line in lines {
@@ -62,9 +60,6 @@ fn dirty_rows(term: &mut Crosswords<Listener>, previous_offset: usize) -> Vec<bo
             }
         }
         _ => dirty.fill(true),
-    }
-    if changed && let Some(row) = dirty.get_mut(cursor) {
-        *row = true;
     }
     dirty
 }
@@ -556,6 +551,7 @@ pub struct Terminal {
     /// Updated only by consuming captures, under the grid lock.
     captured_offset: Mutex<usize>,
     damage: Mutex<Receiver<()>>,
+    captured_cursor: Mutex<Option<((usize, usize), bool)>>,
     pub pid: i32,
     thread: Option<JoinHandle<(Machine<MeteredPty, Listener>, rio_vt::performer::State)>>,
 }
@@ -714,6 +710,7 @@ impl Terminal {
             grid,
             captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
+            captured_cursor: Mutex::new(None),
             pid: 0,
             thread: None,
         }
@@ -945,6 +942,7 @@ impl Terminal {
             grid,
             captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
+            captured_cursor: Mutex::new(None),
             pid,
             thread: Some(thread),
         })
@@ -971,8 +969,8 @@ impl Terminal {
 
     /// Move only the viewport and capture offset/history atomically for Bus replies.
     pub(crate) fn scroll_view_state(&self, request: ScrollRequest) -> (usize, usize, bool) {
-        use rio_vt::crosswords::grid::Scroll;
         use rio_vt::crosswords::grid::Dimensions;
+        use rio_vt::crosswords::grid::Scroll;
         let mut term = self.grid.lock();
         // Rio's PageUp/PageDown move by rows, but terminal pages overlap by
         // one row. Delta also preserves that contract at either history edge.
@@ -1084,10 +1082,23 @@ impl Terminal {
         );
         let cursor_visible =
             cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+        let mut previous = self.captured_cursor.lock().unwrap();
         if let Some(dirty) = dirty {
             *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
+            if *previous != Some((cursor, cursor_visible)) {
+                for ((_, row), visible) in previous
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once((cursor, cursor_visible)))
+                {
+                    if visible && let Some(row) = dirty.get_mut(row) {
+                        *row = true;
+                    }
+                }
+            }
         }
         if consume {
+            *previous = Some((cursor, cursor_visible));
             *self.captured_offset.lock().unwrap() = term.display_offset();
             // Both operations must remain under this same grid lock. reset_damage
             // alone does not re-arm Machine's damage notification latch.
@@ -1495,6 +1506,7 @@ mod tests {
                 grid,
                 captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
+                captured_cursor: Mutex::new(None),
                 pid: 0,
                 thread: None,
             };
@@ -1581,7 +1593,7 @@ mod tests {
         assert_eq!(
             f.quiet_snapshot().dirty_rows.iter().positions(),
             Vec::<usize>::new(),
-            "an idle grid has no dirty rows"
+            "an unchanged cursor does not dirty an idle grid"
         );
         f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
         assert_eq!(
@@ -1791,7 +1803,7 @@ mod tests {
         f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
         assert!(f.terminal.take_damage());
         let _ = f.terminal.screen(true);
-        // screen(true) consumed the row and cursor damage.
+        // screen(true) consumed both row damage and cursor movement.
         assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
     }
 

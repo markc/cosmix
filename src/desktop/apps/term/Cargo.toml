@@ -1,10 +1,10 @@
 [package]
 name = "cosmix-term"
-version = "0.2.4"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "CosMix Wayland terminal on iced + tiny-skia (lightweight frontend; wgpu behind a feature)"
+description = "CosMix Wayland terminal on iced + tiny-skia (banded CPU renderer; optional wgpu)"
 
 [[bin]]
 name = "term"
@@ -21,20 +21,21 @@ display = "CosMix Term"
 engine = "iced"
 
 [features]
-# Default renderer: tiny-skia (Mark, 2026-09-25, sweep decision 28). The
-# 2026-09-24 T5 retake measured it at ~57-63 MB PSS and 0 GEM against wgpu's
-# ~43 MB PSS + 113-121 MB GEM (iGPU GEM is system RAM), and wgpu's GEM is its
-# own swapchain, so it cannot get under the 80 MB gate at desktop sizes.
+# Default renderer: tiny-skia (Mark, 2026-09-25): "typing in the test term
+# feels much better". Native-copy benchmark at 2250x1250: echo ~1.7 ms,
+# full redraw ~11.5 ms; see docs/dev/term-foot-tactics.md.
+# Clean GPU build: --no-default-features --features wgpu.
 default = ["tiny-skia"]
-# iced's CPU rasteriser into `wl_shm`: no DRM fd at all, like foot.
-tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes"]
-# The shader-widget path, kept buildable: one persistent wgpu texture,
-# damage-band uploads. `--features wgpu` on top of the default selects it —
-# when both are compiled in, main.rs takes the wgpu grid and iced_renderer
-# puts wgpu first. `--no-default-features --features wgpu` is the clean arm
-# for measurement. `naga27-termcolor` rides along: see that dependency for
-# why iced-on-wgpu cannot share a build with Bevy without it.
+# Integrated native-copy regression instrumentation; absent from normal builds.
+raster-probe = ["tiny-skia", "iced_tiny_skia/raster-probe"]
+# The shader-widget path: one persistent wgpu texture, damage-band uploads.
+# `naga27-termcolor` rides along: see that dependency for why iced-on-wgpu
+# cannot share a build with Bevy without it.
 wgpu = ["iced/wgpu", "naga27-termcolor"]
+# iced's CPU rasteriser into `wl_shm`, banded (src/cpu_bands.rs): no DRM fd
+# at all, like foot, and cheap for sparse updates. With both features compiled
+# in, main.rs takes the wgpu grid and iced_renderer puts wgpu first.
+tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes", "dep:iced_tiny_skia", "dep:tiny-skia"]
 # Not meant to be selected on its own; `wgpu` pulls it in. It exists as a
 # feature so the compatibility dependency stays optional.
 naga27-termcolor = ["dep:naga27"]
@@ -87,6 +88,11 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # Retire this when iced moves to wgpu 29 (TODO-term D3's iced 0.15 question, at
 # T3): naga 27 leaves the graph and takes the conflict with it.
 naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
+
+# Cargo does not support optional dev-dependencies. These test helpers are
+# optional normal dependencies tied to the CPU arm; clean wgpu tests omit them.
+iced_tiny_skia = { version = "=0.14.1", optional = true, default-features = false, features = ["image", "wayland"] }
+tiny-skia = { version = "0.11", optional = true, default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]
 cosmix-term-core = { path = "../../crates/cosmix-term-core", features = ["test-support"] }

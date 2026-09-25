@@ -90,6 +90,14 @@ receive the wheel first; otherwise the alternate screen can translate it to curs
 example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
 to change the font size. The `scrollback` setting controls history depth.
 
+Viewport changes mark only the affected pane dirty and arm the next redraw.
+Wheel scrolling, history keys and Bus `term.scroll` share this path: wakes
+coalesce without painting intermediate views, then the redraw repaints every
+row of the changed viewport, including when returning to the live bottom.
+Clean neighbouring panes keep their frames. The four-row tiny-skia bands use
+the viewport's translated cursor visibility, so an off-screen live cursor
+does not appear in history.
+
 ## Font size
 
 Font sizing follows foot. The window keeps its size and the grid gains or

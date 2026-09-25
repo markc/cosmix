@@ -184,6 +184,9 @@ fn run(settings: config::Settings) -> Result<(), String> {
         scroll_wheel: 0.0,
         scroll_pane: None,
         pointer: std::cell::Cell::new(None),
+        last_redraw: None,
+        force_paint: false,
+        paint_requested: true,
     };
 
     // `BootFn` is `Fn`, not `FnOnce`, and the state is not cloneable — the
@@ -202,23 +205,23 @@ fn run(settings: config::Settings) -> Result<(), String> {
         update,
         view,
     )
-        .executor::<SingleThread>()
-        .title(DISPLAY_NAME)
-        .subscription(subscription)
-        .theme(iced::Theme::Dark)
-        .style(|state: &State, _theme| iced::theme::Style {
-            background_color: state.tokens.surface,
-            text_color: state.tokens.text,
-        })
-        .window(iced::window::Settings {
-            size: Size::new(900.0, 560.0),
-            platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: format!("dev.cosmix.{SERVICE}"),
-                ..Default::default()
-            },
+    .executor::<SingleThread>()
+    .title(DISPLAY_NAME)
+    .subscription(subscription)
+    .theme(iced::Theme::Dark)
+    .style(|state: &State, _theme| iced::theme::Style {
+        background_color: state.tokens.surface,
+        text_color: state.tokens.text,
+    })
+    .window(iced::window::Settings {
+        size: Size::new(900.0, 560.0),
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: format!("dev.cosmix.{SERVICE}"),
             ..Default::default()
-        })
-        .run();
+        },
+        ..Default::default()
+    })
+    .run();
 
     // Same teardown ordering as bterm: shut the tabs (which releases the Bus
     // loop through `emptied`), let the Bus thread finish its bounded replies,
@@ -308,6 +311,9 @@ struct State {
     scroll_pane: Option<u64>,
     /// Window coordinates survive a tab change beneath a stationary pointer.
     pointer: std::cell::Cell<Option<iced::Point>>,
+    last_redraw: Option<std::time::Instant>,
+    force_paint: bool,
+    paint_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +321,7 @@ enum Message {
     /// Something in the core changed: PTY output, a resize, a pane exit, a
     /// Bus mutation.
     Wake,
+    Paint(std::time::Instant),
     /// Keys to put on the PTY, from the widget tree — NOT from an event
     /// subscription, which drops them under load (see `keys.rs`).
     Keys(Vec<cosmix_term_core::terminal::Key>),
@@ -357,7 +364,9 @@ fn wakes() -> impl iced::futures::Stream<Item = Message> {
         // Only reachable if the wiring order in `run` changes. The window
         // would come up and then never repaint, which reads as a hung shell
         // rather than a broken terminal — so say which it is.
-        eprintln!("term: wake descriptor not installed before the event loop; the grid cannot repaint");
+        eprintln!(
+            "term: wake descriptor not installed before the event loop; the grid cannot repaint"
+        );
         return receiver;
     };
     // Re-arm before publishing anywhere: if a previous subscription was torn
@@ -367,7 +376,7 @@ fn wakes() -> impl iced::futures::Stream<Item = Message> {
     waker.pending.store(false, Ordering::Release);
     // Also re-arm the descriptor: any wake the dropped receiver was holding
     // is gone, so ask for one unconditionally rather than wait for the next
-    // PTY byte. A spurious repaint finds no damage and costs nothing.
+    // PTY byte. Redraw checks per-pane damage before snapshotting or painting.
     waker.fd.waker()();
     if waker.polling.swap(true, Ordering::AcqRel) {
         return receiver; // The one poll thread is already running.
@@ -394,7 +403,10 @@ fn wakes() -> impl iced::futures::Stream<Item = Message> {
                 // instead, and say so — a terminal that stops repainting is a
                 // visible failure; one that pins a core is a mystery.
                 if fds.revents & libc::POLLIN == 0 {
-                    eprintln!("term: wake descriptor failed (revents {}); repaints have stopped", fds.revents);
+                    eprintln!(
+                        "term: wake descriptor failed (revents {}); repaints have stopped",
+                        fds.revents
+                    );
                     return;
                 }
                 // Drain BEFORE publishing, never after: a change that lands
@@ -433,7 +445,14 @@ fn waker_spawn_failed(error: &std::io::Error) {
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
+        Message::Paint(at) => {
+            if state.last_redraw != Some(at) {
+                state.last_redraw = Some(at);
+                state.repaint();
+            }
+        }
         Message::Wake => {
+            state.paint_requested = true;
             state.waker.pending.store(false, Ordering::Release);
             return state.sync();
         }
@@ -461,7 +480,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             tabs.user_activity();
             tabs.focus(id);
         }
-        Message::Pointer => {},
+        Message::Pointer => {}
         Message::Wheel(id, delta) => {
             if state.modifiers.control() {
                 let steps = input::wheel_steps(&mut state.wheel, delta);
@@ -519,7 +538,8 @@ fn on_key_screen(event: &iced::keyboard::Event, alternate: bool) -> Option<Messa
             ..
         } => {
             if let Some(action) = input::action_on_screen(
-                input::action_for(key, modified_key, *physical_key, *modifiers), alternate,
+                input::action_for(key, modified_key, *physical_key, *modifiers),
+                alternate,
             ) {
                 // A repeat of a non-repeating chord is swallowed, not passed
                 // through: it must not turn into a control code either.
@@ -544,36 +564,56 @@ fn view(state: &State) -> Element<'_, Message> {
     // The keyboard rides the widget tree, not a subscription: see `keys.rs`.
     // It wraps the strip as well, so a key pressed while the pointer is over
     // a tab still reaches the terminal.
-    let pane_bounds = state.shape.tree.as_ref()
-        .map(|tree| layout::panes(tree, bounds, scale)).unwrap_or_default();
+    let pane_bounds = state
+        .shape
+        .tree
+        .as_ref()
+        .map(|tree| layout::panes(tree, bounds, scale))
+        .unwrap_or_default();
     let hovered = move |position: iced::Point| {
         let (id, pane) = pane_bounds.iter().find(|(_, pane)| {
-            position.x >= pane.x && position.x < pane.x + pane.w
-                && position.y >= pane.y && position.y < pane.y + pane.h
+            position.x >= pane.x
+                && position.x < pane.x + pane.w
+                && position.y >= pane.y
+                && position.y < pane.y + pane.h
         })?;
         let grid = *state.grids.get(id)?;
         let (col, row) = input::pointer_cell(
             iced::Point::new(position.x - pane.x, position.y - pane.y),
-            layout::border(scale), state.painter.logical_cell(), grid,
+            layout::border(scale),
+            state.painter.logical_cell(),
+            grid,
         );
         Some((*id, col, row))
     };
     let last = std::cell::Cell::new(state.pointer.get().and_then(&hovered));
-    let content = keys::keys(column![tab_strip(state, scale), panes], move |event| {
+    let mut content = keys::keys(column![tab_strip(state, scale), panes], move |event| {
         let message = on_key(event);
         // Ordinary typing must not acquire an extra terminal/grid lock just
         // to decide who owns a scrollback chord.
         if matches!(message, Some(Message::Action(Action::Scroll(_)))) {
             let tabs = state.tabs.lock().expect("tabs");
-            if !tabs.is_empty() && tabs.active_terminal().lock().expect("terminal").alternate_screen() {
+            if !tabs.is_empty()
+                && tabs
+                    .active_terminal()
+                    .lock()
+                    .expect("terminal")
+                    .alternate_screen()
+            {
                 return on_key_screen(event, true);
             }
         }
         message
-    }).on_pointer(move |position| {
+    })
+    .on_pointer(move |position| {
         let cell = hovered(position);
         pointer_message(&state.pointer, &last, cell, position)
     });
+    // Clean chrome redraws must not publish Paint: iced would rebuild the UI
+    // and dispatch RedrawRequested a second time for no terminal change.
+    if state.needs_paint() {
+        content = content.on_redraw(state.last_redraw, Message::Paint);
+    }
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -602,9 +642,8 @@ fn pointer_message(
 fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
     let tokens = state.tokens;
     let tab = |label: String, active: bool| {
-        button(text(label).size(13.0))
-            .padding([3.0, 12.0])
-            .style(move |_theme: &iced::Theme, status: button::Status| {
+        button(text(label).size(13.0)).padding([3.0, 12.0]).style(
+            move |_theme: &iced::Theme, status: button::Status| {
                 let (background, text_color) = if active {
                     (tokens.primary, tokens.primary_text)
                 } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -621,11 +660,13 @@ fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
                     },
                     ..button::Style::default()
                 }
-            })
+            },
+        )
     };
     let mut strip: Row<'_, Message> = Row::new().spacing(4.0).padding([3.0, 6.0]);
     for label in &state.shape.tabs {
-        strip = strip.push(tab(label.title.clone(), label.active).on_press(Message::SelectTab(label.id)));
+        strip = strip
+            .push(tab(label.title.clone(), label.active).on_press(Message::SelectTab(label.id)));
     }
     strip = strip.push(tab("+".into(), false).on_press(Message::Action(Action::NewTab)));
     container(strip)
@@ -641,7 +682,12 @@ fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
 /// The active tab's panes as nested rows and columns, split with the same
 /// function that sized their PTYs (`layout::split`), so a pane's widget and
 /// its grid always agree on its rectangle.
-fn pane_tree<'a>(state: &'a State, node: &Node, bounds: Geometry, scale: f32) -> Element<'a, Message> {
+fn pane_tree<'a>(
+    state: &'a State,
+    node: &Node,
+    bounds: Geometry,
+    scale: f32,
+) -> Element<'a, Message> {
     match node {
         Node::Leaf(id) => pane(state, *id, bounds, scale),
         Node::Split {
@@ -672,7 +718,7 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
             .width(Length::Fixed(f32::from(cols) * cell_width))
             .height(Length::Fixed(f32::from(rows) * cell_height))
             .into(),
-        // Not sized or not painted yet: the next wake does both.
+        // Not sized or painted yet: sync sizes it, then the next redraw paints.
         _ => space().into(),
     };
     let frame_colour = frame_colour(&state.shape, id, tokens);
@@ -722,12 +768,8 @@ fn renderer(
 }
 
 #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-fn renderer(
-    _state: &State,
-    _id: u64,
-    frame: Arc<Mutex<frame::Frame>>,
-) -> iced::widget::Image<iced::widget::image::Handle> {
-    cpu_grid::view(&frame)
+fn renderer(state: &State, _id: u64, frame: Arc<Mutex<frame::Frame>>) -> cpu_grid::Grid {
+    cpu_grid::view(&frame, state.painter.scale())
 }
 
 /// Apply a tab or pane chord to the tab set, returning what to tear down.
@@ -808,7 +850,8 @@ impl State {
         let Some(&grid) = self.grids.get(&id) else {
             return;
         };
-        let lines = input::scroll_steps(&mut self.scroll_wheel, delta, self.painter.logical_cell().1);
+        let lines =
+            input::scroll_steps(&mut self.scroll_wheel, delta, self.painter.logical_cell().1);
         if lines == 0 {
             return;
         }
@@ -831,13 +874,15 @@ impl State {
             ctrl: self.modifiers.control(),
         };
         if !terminal.mouse_scroll(col, row, lines, mods) {
+            let before = terminal.display_offset();
             terminal.scroll_wheel(lines, mods);
+            self.paint_requested |= terminal.display_offset() != before;
         }
     }
 
     /// Everything a wake can mean, in one place: reap exited shells, follow
     /// the tab set's shape (a Bus verb may have changed it), size any pane
-    /// that needs it, and repaint each visible pane by its damaged rows.
+    /// that needs it. Painting waits for the widget's redraw event.
     fn sync(&mut self) -> Task<Message> {
         let (removed, notes) = self.tabs.lock().expect("tabs").reap_exited();
         self.cleanup.submit(removed);
@@ -858,13 +903,23 @@ impl State {
         self.grids.retain(|id, _| visible.contains(id));
         self.shape = shape;
         self.relayout();
-        self.repaint();
         Task::none()
+    }
+
+    fn needs_paint(&self) -> bool {
+        self.paint_requested
+            || self.force_paint
+            || self
+                .shape
+                .visible()
+                .iter()
+                .any(|id| self.painter.existing(*id).is_none())
     }
 
     /// Rasterise every visible pane by its damaged rows (all rows, for a
     /// frame that was invalidated or is new).
     fn repaint(&mut self) {
+        self.paint_requested = false;
         let terminals: Vec<_> = {
             let tabs = self.tabs.lock().expect("tabs");
             self.shape
@@ -874,7 +929,15 @@ impl State {
                 .collect()
         };
         for (id, terminal) in terminals {
-            let snapshot = terminal.lock().expect("terminal").grid_snapshot();
+            let terminal = terminal.lock().expect("terminal");
+            // Consume before capture: a write racing capture is either in
+            // this snapshot, or publishes a token after its locked rearm.
+            let dirty = terminal.take_damage();
+            if !dirty && !self.force_paint && self.painter.existing(id).is_some() {
+                continue;
+            }
+            let snapshot = terminal.grid_snapshot();
+            drop(terminal);
             #[allow(unused_variables)]
             let painted = self
                 .painter
@@ -885,6 +948,7 @@ impl State {
                 cpu_grid::refresh(&frame);
             }
         }
+        self.force_paint = false;
     }
 
     fn act(&mut self, action: Action) -> Task<Message> {
@@ -895,6 +959,9 @@ impl State {
             _ => {
                 let removed = apply(&mut self.tabs.lock().expect("tabs"), action);
                 self.cleanup.submit(removed);
+                if matches!(action, Action::Scroll(_)) {
+                    self.paint_requested = true;
+                }
                 if action == Action::Quit {
                     return iced::exit();
                 }
@@ -942,15 +1009,12 @@ impl State {
     }
 
     /// The cell size changed under the same window: forget every pane's
-    /// grid so `relayout` resizes them all, then repaint NOW. The PTY resize
-    /// is synchronous, so the snapshots already have the new size; waiting
-    /// for the next wake instead would let `view` lay out the new grid size
-    /// over the old surface, which keeps its dimensions through `invalidate`
-    /// — one stretched frame per zoom step (review finding).
+    /// grid so `relayout` resizes them all. The redraw widget repaints before
+    /// iced draws the rebuilt view, so no stretched intermediate is presented.
     fn reflow(&mut self) {
         self.grids.clear();
         self.relayout();
-        self.repaint();
+        self.force_paint = true;
     }
 
     /// Size every visible pane from the window and tell each PTY that moved.
@@ -996,6 +1060,9 @@ impl State {
         // suppress the retry. Terminal locks are taken without the set lock,
         // as everywhere else in this frontend.
         for (id, (cols, rows), terminal) in resize {
+            // Do not wait for the asynchronous resize wake to paint geometry
+            // already changed by this UI turn.
+            self.paint_requested = true;
             // Physical pixels to the PTY: ioctl TIOCSWINSZ's ws_xpixel is
             // what a full-screen program asks for when it wants real geometry.
             terminal.lock().expect("terminal").resize(
@@ -1042,7 +1109,10 @@ mod tests {
             font_px: 13.0,
             ..config::Config::default()
         };
-        assert_eq!(resolve_config(base, Some("18.5"), "xterm").config.font_px, 18.5);
+        assert_eq!(
+            resolve_config(base, Some("18.5"), "xterm").config.font_px,
+            18.5
+        );
         for rejected in ["5.9", "48.1", "", "eighteen", "nan", "inf"] {
             assert_eq!(
                 resolve_config(base, Some(rejected), "xterm").config.font_px,
@@ -1093,11 +1163,26 @@ mod tests {
                     Some(Message::Action(Action::Scroll(actual))) if actual == request
                 ));
                 assert!(matches!(
-                    on_key(&press(Key::Named(named), Key::Named(named), Modifiers::empty(), None, repeat)),
+                    on_key(&press(
+                        Key::Named(named),
+                        Key::Named(named),
+                        Modifiers::empty(),
+                        None,
+                        repeat
+                    )),
                     Some(Message::Keys(_))
                 ));
                 assert!(matches!(
-                    on_key_screen(&press(Key::Named(named), Key::Named(named), Modifiers::SHIFT, None, repeat), true),
+                    on_key_screen(
+                        &press(
+                            Key::Named(named),
+                            Key::Named(named),
+                            Modifiers::SHIFT,
+                            None,
+                            repeat
+                        ),
+                        true
+                    ),
                     Some(Message::Keys(_))
                 ));
             }
@@ -1108,15 +1193,38 @@ mod tests {
     fn pointer_motion_emits_only_for_a_new_pane_or_cell() {
         let pointer = std::cell::Cell::new(None);
         let last = std::cell::Cell::new(None);
-        assert!(pointer_message(&pointer, &last, Some((1, 0, 0)), iced::Point::new(2.0, 2.0)).is_some());
+        assert!(
+            pointer_message(&pointer, &last, Some((1, 0, 0)), iced::Point::new(2.0, 2.0)).is_some()
+        );
         for pixel in 3..8 {
-            assert!(pointer_message(&pointer, &last, Some((1, 0, 0)), iced::Point::new(pixel as f32, 2.0)).is_none());
+            assert!(
+                pointer_message(
+                    &pointer,
+                    &last,
+                    Some((1, 0, 0)),
+                    iced::Point::new(pixel as f32, 2.0)
+                )
+                .is_none()
+            );
         }
         assert_eq!(pointer.get(), Some(iced::Point::new(7.0, 2.0)));
         // A narrower cell after zoom/layout uses the newest pixel, not x=2.
-        assert_eq!(input::pointer_cell(pointer.get().unwrap(), 0.0, (4.0, 4.0), (80, 24)), (1, 0));
-        assert!(pointer_message(&pointer, &last, Some((1, 1, 0)), iced::Point::new(9.0, 2.0)).is_some());
-        assert!(pointer_message(&pointer, &last, Some((2, 1, 0)), iced::Point::new(90.0, 2.0)).is_some());
+        assert_eq!(
+            input::pointer_cell(pointer.get().unwrap(), 0.0, (4.0, 4.0), (80, 24)),
+            (1, 0)
+        );
+        assert!(
+            pointer_message(&pointer, &last, Some((1, 1, 0)), iced::Point::new(9.0, 2.0)).is_some()
+        );
+        assert!(
+            pointer_message(
+                &pointer,
+                &last,
+                Some((2, 1, 0)),
+                iced::Point::new(90.0, 2.0)
+            )
+            .is_some()
+        );
         assert!(pointer_message(&pointer, &last, None, iced::Point::ORIGIN).is_some());
         assert!(pointer_message(&pointer, &last, None, iced::Point::ORIGIN).is_none());
     }
@@ -1127,17 +1235,42 @@ mod tests {
     fn the_dispatcher_puts_chords_before_the_shell_and_filters_repeats() {
         use iced::keyboard::Modifiers;
         let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
-        let tab = |repeat| on_key(&press(character("t"), character("T"), ctrl_shift, Some("T"), repeat));
+        let tab = |repeat| {
+            on_key(&press(
+                character("t"),
+                character("T"),
+                ctrl_shift,
+                Some("T"),
+                repeat,
+            ))
+        };
 
         assert!(matches!(tab(false), Some(Message::Action(Action::NewTab))));
         // A held Ctrl+Shift+T is one tab: the repeat is swallowed, and it is
         // NOT handed to the encoder, which would send Ctrl-T to the shell.
-        assert!(tab(true).is_none(), "a repeated tab chord must be swallowed");
+        assert!(
+            tab(true).is_none(),
+            "a repeated tab chord must be swallowed"
+        );
 
         // Font steps repeat when held, as in foot.
-        let grow = |repeat| on_key(&press(character("="), character("="), Modifiers::CTRL, None, repeat));
-        assert!(matches!(grow(false), Some(Message::Action(Action::FontIncrease))));
-        assert!(matches!(grow(true), Some(Message::Action(Action::FontIncrease))));
+        let grow = |repeat| {
+            on_key(&press(
+                character("="),
+                character("="),
+                Modifiers::CTRL,
+                None,
+                repeat,
+            ))
+        };
+        assert!(matches!(
+            grow(false),
+            Some(Message::Action(Action::FontIncrease))
+        ));
+        assert!(matches!(
+            grow(true),
+            Some(Message::Action(Action::FontIncrease))
+        ));
 
         // Not a chord: the shell gets it, repeats included.
         for repeat in [false, true] {
@@ -1148,7 +1281,13 @@ mod tests {
         }
         // Ctrl+T without Shift is the shell's Ctrl-T, not a chord.
         assert!(matches!(
-            on_key(&press(character("t"), character("t"), Modifiers::CTRL, None, false)),
+            on_key(&press(
+                character("t"),
+                character("t"),
+                Modifiers::CTRL,
+                None,
+                false
+            )),
             Some(Message::Keys(_))
         ));
         // Modifier state is tracked for Ctrl+wheel.
@@ -1161,7 +1300,10 @@ mod tests {
     #[test]
     fn the_focus_ring_shows_only_when_there_is_more_than_one_pane() {
         let tokens = theme::tokens();
-        assert_ne!(tokens.ring, tokens.border, "the test needs two distinct tokens");
+        assert_ne!(
+            tokens.ring, tokens.border,
+            "the test needs two distinct tokens"
+        );
         let lone = Shape {
             tabs: Vec::new(),
             tree: Some(Node::Leaf(7)),
@@ -1209,16 +1351,19 @@ mod tests {
             scroll_wheel: 0.0,
             scroll_pane: None,
             pointer: std::cell::Cell::new(None),
+            last_redraw: None,
+            force_paint: false,
+            paint_requested: true,
         };
         (state, reaper)
     }
 
     /// Review finding: a zoom used to relayout and then only WAKE, so the
     /// next `view` laid the new grid size over the old surface — one
-    /// stretched frame per step. After the zoom returns, every visible frame
-    /// must already be exactly its grid in the new cell size.
+    /// stretched frame per step. After the pre-draw paint, every visible frame
+    /// must be exactly its grid in the new cell size.
     #[test]
-    fn a_zoom_repaints_before_the_next_view() {
+    fn a_zoom_repaints_before_the_next_draw() {
         let (mut state, reaper) = test_state();
         let _ = state.sync();
         let _ = state.act(Action::Split(SplitDir::Vertical));
@@ -1227,11 +1372,15 @@ mod tests {
 
         let before = state.painter.cell();
         state.zoom(|font| font.step_by(6));
+        let _ = update(&mut state, Message::Paint(std::time::Instant::now()));
         let cell = state.painter.cell();
         assert_ne!(cell, before, "six steps must change the cell");
         for id in state.shape.visible() {
             let (cols, rows) = state.grids[&id];
-            let frame = state.painter.existing(id).expect("a visible pane has a frame");
+            let frame = state
+                .painter
+                .existing(id)
+                .expect("a visible pane has a frame");
             let frame = frame.lock().unwrap();
             assert_eq!(
                 (frame.surface().width(), frame.surface().height()),
@@ -1240,6 +1389,94 @@ mod tests {
             );
         }
 
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn wakes_coalesce_at_redraw_and_leave_the_clean_neighbour_untouched() {
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let _ = state.act(Action::Split(SplitDir::Vertical));
+        let _ = state.sync();
+        let ids = state.shape.visible();
+        assert_eq!(ids.len(), 2);
+        // Let startup output settle, bounded by a deadline; consume it only
+        // at redraws, exactly as the running app does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut quiet = 0;
+        while quiet < 5 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY startup did not settle"
+            );
+            let _ = update(&mut state, Message::Paint(std::time::Instant::now()));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let tabs = state.tabs.lock().unwrap();
+            let changed = ids
+                .iter()
+                .any(|id| tabs.pane_by_id(*id).unwrap().lock().unwrap().take_damage());
+            quiet = if changed { 0 } else { quiet + 1 };
+            if changed {
+                state.force_paint = true;
+            }
+        }
+        let generation = |state: &State, id| {
+            state
+                .painter
+                .existing(id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .generation()
+        };
+        assert!(
+            !state.needs_paint(),
+            "clean chrome redraws must not request Paint"
+        );
+        let _ = update(&mut state, Message::Wake);
+        assert!(state.needs_paint(), "a wake must arm the next redraw");
+        let _ = update(&mut state, Message::Paint(std::time::Instant::now()));
+        assert!(!state.needs_paint(), "painting consumes the request");
+        let before = [generation(&state, ids[0]), generation(&state, ids[1])];
+        let terminal = state.tabs.lock().unwrap().pane_by_id(ids[0]).unwrap();
+        let (cols, rows) = state.grids[&ids[0]];
+        terminal.lock().unwrap().resize(cols - 1, rows, 0, 0);
+        for _ in 0..20 {
+            let _ = update(&mut state, Message::Wake);
+        }
+        assert_eq!(
+            [generation(&state, ids[0]), generation(&state, ids[1])],
+            before,
+            "wakes must not paint intermediate states"
+        );
+        let at = std::time::Instant::now();
+        let _ = update(&mut state, Message::Paint(at));
+        assert_eq!(generation(&state, ids[0]), before[0] + 1);
+        assert_eq!(
+            generation(&state, ids[1]),
+            before[1],
+            "clean neighbour repainted"
+        );
+        let _ = update(&mut state, Message::Paint(at));
+        assert_eq!(
+            generation(&state, ids[0]),
+            before[0] + 1,
+            "redraw retry painted twice"
+        );
+        let neighbour = state.tabs.lock().unwrap().pane_by_id(ids[1]).unwrap();
+        assert!(
+            neighbour
+                .lock()
+                .unwrap()
+                .grid_snapshot()
+                .dirty_rows
+                .iter()
+                .all(|dirty| !dirty),
+            "unchanged cursor dirtied the clean neighbour"
+        );
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
         drop(state);
@@ -1256,15 +1493,22 @@ mod tests {
         let _ = state.sync();
         let start = state.painter.font().current();
         let travel = |fraction: f32| {
-            Message::Wheel(0, ScrollDelta::Pixels {
-                x: 0.0,
-                y: input::PIXELS_PER_STEP * fraction,
-            })
+            Message::Wheel(
+                0,
+                ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: input::PIXELS_PER_STEP * fraction,
+                },
+            )
         };
 
         let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
         let _ = update(&mut state, travel(0.75));
-        assert_eq!(state.painter.font().current(), start, "three quarters is not a step");
+        assert_eq!(
+            state.painter.font().current(),
+            start,
+            "three quarters is not a step"
+        );
         let _ = update(&mut state, Message::Modifiers(Modifiers::empty()));
         let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
         let _ = update(&mut state, travel(0.5));
@@ -1274,7 +1518,11 @@ mod tests {
             "a new gesture of half a step zoomed: the old three quarters carried over"
         );
         let _ = update(&mut state, travel(0.5));
-        assert_ne!(state.painter.font().current(), start, "a whole step within one gesture zooms");
+        assert_ne!(
+            state.painter.font().current(),
+            start,
+            "a whole step within one gesture zooms"
+        );
 
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
@@ -1296,20 +1544,39 @@ mod tests {
         let terminal = state.tabs.lock().unwrap().pane_by_id(left).unwrap();
         fill_history(&terminal);
         state.pointer.set(Some(iced::Point::new(10.0, 40.0)));
-        let half = ScrollDelta::Pixels { x: 0.0, y: state.painter.logical_cell().1 / 2.0 };
+        let half = ScrollDelta::Pixels {
+            x: 0.0,
+            y: state.painter.logical_cell().1 / 2.0,
+        };
         let _ = update(&mut state, Message::Wheel(left, half));
         assert_eq!(state.scroll_pane, Some(left));
         assert_eq!(state.scroll_wheel, 0.5);
         assert_eq!(active_pane(&state.tabs.lock().unwrap()), right);
         let _ = update(&mut state, Message::Wheel(left, half));
-        assert_eq!(terminal.lock().unwrap().display_offset(), 1, "two half-cell deltas scroll the hovered pane");
+        assert_eq!(
+            terminal.lock().unwrap().display_offset(),
+            1,
+            "two half-cell deltas scroll the hovered pane"
+        );
         let other = state.tabs.lock().unwrap().pane_by_id(right).unwrap();
         assert_eq!(other.lock().unwrap().display_offset(), 0);
         assert_eq!(active_pane(&state.tabs.lock().unwrap()), right);
-        let _ = update(&mut state, Message::Wheel(left, ScrollDelta::Lines { x: 0.0, y: -1.0 }));
+        let _ = update(
+            &mut state,
+            Message::Wheel(left, ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+        );
         assert_eq!(terminal.lock().unwrap().display_offset(), 0);
         let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
-        let _ = update(&mut state, Message::Wheel(left, ScrollDelta::Pixels { x: 0.0, y: input::PIXELS_PER_STEP / 2.0 }));
+        let _ = update(
+            &mut state,
+            Message::Wheel(
+                left,
+                ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: input::PIXELS_PER_STEP / 2.0,
+                },
+            ),
+        );
         assert_eq!(state.wheel, 0.5);
         assert_eq!(state.scroll_wheel, 0.0);
         let _ = update(&mut state, Message::Modifiers(Modifiers::empty()));
@@ -1328,7 +1595,9 @@ mod tests {
     }
 
     fn fill_history(terminal: &Arc<Mutex<cosmix_term_core::terminal::Terminal>>) {
-        let text = (0..120).map(|n| format!("history-{n}\r\n")).collect::<String>();
+        let text = (0..120)
+            .map(|n| format!("history-{n}\r\n"))
+            .collect::<String>();
         let mut terminal = terminal.lock().unwrap();
         let screen = terminal.grid_snapshot().screen;
         // Replace the live pane with an isolated grid, keeping its dimensions.
@@ -1342,35 +1611,101 @@ mod tests {
     }
 
     #[test]
-    fn viewport_pixels_match_fresh_painter_after_up_and_down() {
+    fn viewport_redraw_repaints_fully_and_matches_fresh_pixels() {
         use cosmix_term_core::terminal::ScrollRequest;
         let (mut state, reaper) = test_state();
         let _ = state.sync();
+        let _ = state.act(Action::Split(SplitDir::Vertical));
+        let _ = state.sync();
         let id = state.shape.active_pane;
+        for pane in state.shape.visible() {
+            let terminal = state.tabs.lock().unwrap().pane_by_id(pane).unwrap();
+            fill_history(&terminal);
+        }
         let terminal = state.tabs.lock().unwrap().pane_by_id(id).unwrap();
-        fill_history(&terminal);
-        #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-        let frame = state.painter.frame(id);
-        let mut paint = || {
-            let snapshot = terminal.lock().unwrap().grid_snapshot();
-            state.painter.repaint(id, &snapshot.screen, &snapshot.dirty_rows);
-            let mut fresh = Painter::new(state.painter.scale(), state.painter.font(), config::Cursor::Underline).unwrap();
-            fresh.repaint(id, &snapshot.screen, &vec![true; snapshot.screen.rows]);
-            assert_eq!(state.painter.frame(id).lock().unwrap().surface().rgba(), fresh.frame(id).lock().unwrap().surface().rgba());
-            // Keep a handle alive across the next paint to exercise tiny-skia's
-            // copy/rebind path as well as the wgpu arm's persistent Vec.
-            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-            cpu_grid::refresh(&state.painter.frame(id));
+        let _ = update(&mut state, Message::Paint(std::time::Instant::now()));
+        let neighbour = state
+            .shape
+            .visible()
+            .into_iter()
+            .find(|pane| *pane != id)
+            .unwrap();
+        let generation = |state: &State, pane| {
+            state
+                .painter
+                .existing(pane)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .generation()
         };
-        paint();
-        #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-        let _retained = cpu_grid::view(&frame);
-        terminal.lock().unwrap().scroll_view(ScrollRequest::PageUp);
-        assert!(terminal.lock().unwrap().display_offset() > 0);
-        paint();
-        terminal.lock().unwrap().scroll_view(ScrollRequest::Bottom);
-        assert_eq!(terminal.lock().unwrap().display_offset(), 0);
-        paint();
+        let neighbour_generation = generation(&state, neighbour);
+        state
+            .pointer
+            .set(Some(iced::Point::new(state.window.width - 10.0, 40.0)));
+        for request in [
+            ScrollRequest::PageUp,
+            ScrollRequest::Top,
+            ScrollRequest::Bottom,
+        ] {
+            assert!(!state.needs_paint());
+            let before = generation(&state, id);
+            // Wheel, keyboard action, and the core entry used by term.scroll.
+            match request {
+                ScrollRequest::PageUp => {
+                    let _ = update(
+                        &mut state,
+                        Message::Wheel(id, iced::mouse::ScrollDelta::Lines { x: 0.0, y: 3.0 }),
+                    );
+                    assert!(state.needs_paint(), "wheel must arm redraw");
+                }
+                ScrollRequest::Top => {
+                    let _ = update(&mut state, Message::Action(Action::Scroll(request)));
+                    assert!(state.needs_paint(), "scroll chord must arm redraw");
+                }
+                _ => terminal.lock().unwrap().scroll_view(request),
+            }
+            // The same coalesced wake path serves Bus viewport changes.
+            for _ in 0..3 {
+                let _ = update(&mut state, Message::Wake);
+            }
+            assert!(state.needs_paint());
+            assert_eq!(generation(&state, id), before, "wakes must not paint");
+            let screen = terminal.lock().unwrap().screen(false);
+            if request == ScrollRequest::Bottom {
+                assert_eq!(terminal.lock().unwrap().display_offset(), 0);
+                assert!(screen.cursor_visible);
+            } else {
+                assert!(terminal.lock().unwrap().display_offset() > 0);
+                assert!(!screen.cursor_visible);
+            }
+            // Retain old CPU band handles across the viewport change.
+            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+            let _retained = cpu_grid::view(&state.painter.frame(id), state.painter.scale());
+            let at = std::time::Instant::now();
+            let _ = update(&mut state, Message::Paint(at));
+            assert!(!state.needs_paint());
+            assert_eq!(generation(&state, id), before + 1);
+            assert_eq!(generation(&state, neighbour), neighbour_generation);
+            let mut fresh = Painter::new(
+                state.painter.scale(),
+                state.painter.font(),
+                config::Cursor::Underline,
+            )
+            .unwrap();
+            fresh.repaint(id, &screen, &vec![true; screen.rows]);
+            assert_eq!(
+                state.painter.frame(id).lock().unwrap().surface().rgba(),
+                fresh.frame(id).lock().unwrap().surface().rgba(),
+                "the next redraw must repaint the whole viewport, including all bands",
+            );
+            let _ = update(&mut state, Message::Paint(at));
+            assert_eq!(
+                generation(&state, id),
+                before + 1,
+                "redraw retry painted twice"
+            );
+        }
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
         drop(state);
@@ -1409,7 +1744,11 @@ mod tests {
         assert_eq!(tabs.list().len(), 2);
         assert_ne!(tabs.active_id(), first_tab, "a new tab is selected");
         apply(&mut tabs, Action::Cycle { forward: true });
-        assert_eq!(tabs.active_id(), first_tab, "cycling wraps back to the first tab");
+        assert_eq!(
+            tabs.active_id(),
+            first_tab,
+            "cycling wraps back to the first tab"
+        );
 
         let removed = apply(&mut tabs, Action::ClosePane);
         assert_eq!(removed.len(), 1, "the closed pane's terminal is torn down");
@@ -1420,13 +1759,19 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert_eq!(tabs.list().len(), 1);
 
-        assert!(apply(&mut tabs, Action::FontIncrease).is_empty(), "not a tab operation");
+        assert!(
+            apply(&mut tabs, Action::FontIncrease).is_empty(),
+            "not a tab operation"
+        );
         assert_eq!(tabs.list().len(), 1);
 
         let removed = apply(&mut tabs, Action::Quit);
         assert!(!removed.is_empty());
         assert!(tabs.is_empty());
-        assert!(apply(&mut tabs, Action::NewTab).is_empty(), "nothing opens after quit");
+        assert!(
+            apply(&mut tabs, Action::NewTab).is_empty(),
+            "nothing opens after quit"
+        );
         assert!(tabs.is_empty());
     }
 }

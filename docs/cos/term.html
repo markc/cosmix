@@ -514,6 +514,13 @@ cell height per line, matching bterm. Applications that enable mouse reporting
 receive the wheel first; otherwise the alternate screen can translate it to cursor keys (for
 example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
 to change the font size. The <code>scrollback</code> setting controls history depth.</p>
+<p>Viewport changes mark only the affected pane dirty and arm the next redraw.
+Wheel scrolling, history keys and Bus <code>term.scroll</code> share this path: wakes
+coalesce without painting intermediate views, then the redraw repaints every
+row of the changed viewport, including when returning to the live bottom.
+Clean neighbouring panes keep their frames. The four-row tiny-skia bands use
+the viewport's translated cursor visibility, so an off-screen live cursor
+does not appear in history.</p>
 <h2 id="font-size">Font size</h2>
 <p>Font sizing follows foot. The window keeps its size and the grid gains or
 loses cells. Every pane is re-rasterised, and every shell is told its new

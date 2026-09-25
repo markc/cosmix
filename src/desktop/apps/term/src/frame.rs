@@ -3,7 +3,7 @@
 //! A [`Frame`] is created per visible pane and lives while that pane is on
 //! screen. The VT loop rasterises into it in place and appends the damaged
 //! bands; the renderer consumes them. The wgpu arm keeps one Vec-backed
-//! surface; tiny-skia shares its Bytes-backed surface with its image handle,
+//! surface; tiny-skia shares each Bytes-backed row band with its image handle,
 //! reclaiming it for painting or copying if iced still holds it. Reusing
 //! storage matters: the Bevy terminal's `Image::new`-per-damaged-frame
 //! is where 320 MB of its 344 MB of mapped GEM went
@@ -53,8 +53,8 @@ impl Frame {
     }
 
     /// Damage since the last call, coalesced, and cleared.
-    // The CPU arm uploads nothing — tiny-skia blits the whole handle — so only
-    // the wgpu arm and the tests consume bands.
+    // The CPU arm tracks damage in its per-band handles; only the wgpu arm
+    // and the tests consume this separate upload list.
     #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
     pub fn take_damage(&mut self) -> Vec<DamageBand> {
         coalesce(std::mem::take(&mut self.damage))
@@ -251,9 +251,8 @@ impl Painter {
             }
             return false;
         }
-        // Coalesced on the way IN, not only on the way out: the CPU arm never
-        // drains bands (tiny-skia re-blits the whole handle), so without this
-        // the list would grow for the life of the process. Merging bounds it
+        // Coalesced on the way IN, not only on the way out: several paints
+        // can arrive before refresh drains damage. Merging bounds the list
         // to at most one entry per two rows however long presentation stalls.
         frame.damage = coalesce(std::mem::take(&mut frame.damage));
         frame.generation += 1;
@@ -314,7 +313,16 @@ mod tests {
         let (pointer, capacity, generation) = {
             let frame = shared.lock().unwrap();
             (
-                frame.surface().rgba().as_ptr(),
+                {
+                    #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+                    {
+                        frame.surface().allocation()
+                    }
+                    #[cfg(not(all(feature = "tiny-skia", not(feature = "wgpu"))))]
+                    {
+                        frame.surface().rgba().as_ptr()
+                    }
+                },
                 frame.surface().rgba().len(),
                 frame.generation(),
             )
@@ -327,7 +335,16 @@ mod tests {
         {
             let frame = shared.lock().unwrap();
             assert_eq!(
-                frame.surface().rgba().as_ptr(),
+                {
+                    #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+                    {
+                        frame.surface().allocation()
+                    }
+                    #[cfg(not(all(feature = "tiny-skia", not(feature = "wgpu"))))]
+                    {
+                        frame.surface().rgba().as_ptr()
+                    }
+                },
                 pointer,
                 "a repaint reallocated the grid buffer"
             );
@@ -441,10 +458,7 @@ mod tests {
         let mut frame = shared.lock().unwrap();
         assert_eq!(
             frame.take_damage(),
-            vec![
-                band(0, cell_height),
-                band(4 * cell_height, cell_height)
-            ]
+            vec![band(0, cell_height), band(4 * cell_height, cell_height)]
         );
         assert_eq!(frame.take_damage(), vec![], "damage is consumed once");
     }
@@ -506,7 +520,10 @@ mod tests {
         let _ = painter.repaint(2, &grid, &[]);
 
         painter.retain(&[2]);
-        assert!(painter.existing(1).is_none(), "the hidden pane kept its frame");
+        assert!(
+            painter.existing(1).is_none(),
+            "the hidden pane kept its frame"
+        );
         assert!(painter.existing(2).is_some());
 
         // Back on screen with nothing dirty: still a whole repaint.
@@ -535,7 +552,10 @@ mod tests {
         for _ in 0..5 {
             painter.zoom(FontSize::increase).unwrap();
         }
-        assert!(painter.cell().1 > before.1, "six steps up must grow the cell");
+        assert!(
+            painter.cell().1 > before.1,
+            "six steps up must grow the cell"
+        );
         assert_eq!(
             painter.cell(),
             painter_at(painter.font().current()).cell(),
@@ -550,7 +570,10 @@ mod tests {
 
         assert!(painter.zoom(FontSize::reset).unwrap());
         assert_eq!(painter.cell(), before);
-        assert!(!painter.zoom(FontSize::reset).unwrap(), "a no-op zoom rebuilds nothing");
+        assert!(
+            !painter.zoom(FontSize::reset).unwrap(),
+            "a no-op zoom rebuilds nothing"
+        );
     }
 
     /// T4: the zoom survives a scale change. Rebuilding from the configured

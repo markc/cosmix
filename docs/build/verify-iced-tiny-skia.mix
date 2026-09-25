@@ -1,0 +1,47 @@
+-- version: 0.1.0
+-- Usage: mix docs/build/verify-iced-tiny-skia.mix pristine|fixes REV
+-- Read-only verification of a committed vendor tree; retains evidence in /tmp.
+function verify_condition($ok, $message)
+    if not $ok then
+        print("FAIL: " .. $message)
+        exit(1)
+    end
+end
+function command($argv)
+    $result = run_argv($argv, {timeout: 120})
+    verify_condition($result.ok, $result.stderr)
+    return trim($result.stdout)
+end
+$arguments = args()
+verify_condition(length($arguments) == 2, "expected pristine|fixes REV")
+$expect = $arguments[0]
+$revision = $arguments[1]
+verify_condition($expect == "pristine" or $expect == "fixes", "unknown expectation")
+$root = command(["git", "rev-parse", "--show-toplevel"])
+$base = "da00c947"
+$prefix = "src/desktop/vendor/iced_tiny_skia"
+$scratch = command(["mktemp", "-d", "/tmp/iced-provenance-XXXXXXXX"])
+$archive = $scratch .. "/upstream.crate"
+command(["curl", "--fail", "--silent", "--show-error", "--location", "https://static.crates.io/crates/iced_tiny_skia/iced_tiny_skia-0.14.1.crate", "--output", $archive])
+$sum = command(["sha256sum", $archive])
+verify_condition(contains($sum, "c267596d742714b1853cc10c3983a367762816fc4836bd3b79f76ce76787d6f8  "), "archive checksum")
+command(["mkdir", $scratch .. "/upstream", $scratch .. "/tracked"])
+command(["tar", "-xzf", $archive, "--strip-components=1", "-C", $scratch .. "/upstream"])
+$metadata = json_parse(read_file($scratch .. "/upstream/.cargo_vcs_info.json"))
+$sha = $metadata.git.sha1
+$readme = read_file($root .. "/src/desktop/vendor/README.md")
+verify_condition(contains($readme, "| upstream commit | `" .. $sha .. "` |"), "README provenance row")
+command(["git", "-C", $root, "archive", "--format=tar", "--output=" .. $scratch .. "/tracked.tar", $revision .. ":" .. $prefix])
+command(["tar", "-xf", $scratch .. "/tracked.tar", "-C", $scratch .. "/tracked"])
+$diff = run_argv(["git", "diff", "--no-index", $scratch .. "/upstream", $scratch .. "/tracked"], {stdout: {file: $scratch .. "/pristine.diff"}})
+command(["git", "-C", $root, "merge-base", "--is-ancestor", $base, $revision])
+$fixes = command(["git", "-C", $root, "log", "--reverse", "--oneline", $base .. ".." .. $revision, "--", $prefix])
+if $expect == "pristine" then
+    verify_condition($diff.exit_code == 0 and $fixes == "", "pristine requires empty diff AND fix list")
+else
+    verify_condition($diff.exit_code == 1 and $fixes != "", "fixes requires nonempty diff AND fix list")
+end
+$tree = command(["cargo", "tree", "--manifest-path", $root .. "/src/desktop/Cargo.toml", "-p", "cosmix-term", "--no-default-features", "--features", "tiny-skia", "-i", "iced_tiny_skia"])
+verify_condition(contains($tree, "(" .. $root .. "/src/desktop/vendor/iced_tiny_skia)"), "cargo tree must resolve vendor path")
+print($fixes)
+print("verdict=0 EXPECT=" .. $expect .. " evidence=" .. $scratch)

@@ -1,5 +1,129 @@
 # Vendored upstream sources
 
+## iced_tiny_skia 0.14.1
+
+| Provenance | Value |
+|---|---|
+| version | `0.14.1` |
+| source | `https://static.crates.io/crates/iced_tiny_skia/iced_tiny_skia-0.14.1.crate` |
+| sha256 | `c267596d742714b1853cc10c3983a367762816fc4836bd3b79f76ce76787d6f8` |
+| upstream commit | `0ecf60664df7b8ac7d7aef5f7279d5323027f693` |
+| upstream path | `tiny_skia` |
+| imported | 2026-09-25, pristine commit `da00c947` |
+| licence | MIT, declared in the archive's Cargo manifests; no LICENSE file was shipped |
+
+The complete archive is imported byte-for-byte in its own commit. The local
+patch touches `src/raster.rs` (opaque cache/copy and tests), `src/lib.rs`
+(verification counter export), `src/engine.rs`
+(rectangular clip passed to the raster pipeline), `src/window/compositor.rs`
+(damage, present history and tests), and `Cargo.toml` (the verification-only
+`reference-raster` and `raster-probe` features and an allowance for upstream's
+argument-heavy drawing APIs under clippy). No other upstream source is reformatted.
+
+Local patch: `raster.rs` records all-alpha-255 once during native pixel
+conversion. The generic Pattern draw dominated terminal CPU frame time even
+for an opaque 1:1 image; native row copies remove that cost while retaining
+iced's image cache and buffer ownership. Fully opaque draws with an exactly unit, integer-translation net
+transform copy native rows with `copy_from_slice`, clipped using the same
+26.6 edge rounding as tiny-skia's non-antialiased rectangular mask.
+No Pattern shader or mask is used by the copy. Non-unit opacity,
+rotation and scaling retain the original draw. Negative local bounds under
+an identity transform AFTER image scaling also retain it: tiny-skia's specialised `fill_rect`
+rounding extends these edges differently from its transformed path. Translated
+negative physical origins still use the copy and are pixel-tested.
+Cache ids, conversion format and immutable image ownership are unchanged.
+
+T16 integration resolves cumulative band edges in physical coordinates before
+the upstream image-size division and truncation. Edge tolerance is four f32
+epsilons relative to coordinate size, capped at 0.01 physical pixel. Edges
+qualify only when their rounded extent equals the source image size;
+the copy receives an exact integer translation. Seven-scale regression tests
+check this eligibility, and term checks the rendered pixels against exact
+placement. The widget also corrects truncation round-off using cumulative
+origins and each image's pixel size, so fallback placement is seam-free too.
+`reference-raster` disables BOTH copy shortcuts to verify that guarantee.
+Draw extents come directly from the image's integer pixel dimensions divided
+by output scale. Subtracting logical band edges here would amplify rounding
+error in the fallback origin correction and reject lower bands for native copy.
+The integrated pane regression checks exact pixels and, with `raster-probe`,
+counts successful native-placement copies for every band, including the final
+partial band, at 1.25/1.5/1.75/2.0/2.25/2.5 scales and nonzero origins.
+The thread-local counter is absent from normal builds. Run its test separately
+from `reference-raster`, which intentionally takes no native copies:
+
+```text
+cargo test -p cosmix-term --release --features raster-probe band_widget_matches_exact
+cargo test -p cosmix-term --release --features iced_tiny_skia/reference-raster band_widget_matches_exact
+```
+
+`window/compositor.rs` submits outward-rounded, surface-clamped physical
+damage, combining acquired-buffer repair with changes from the displayed
+frame. Empty damage still calls `on_pre_present` and `present_with_damage([])`:
+the hook requests the Wayland frame callback and the commit delivers it.
+Otherwise unchanged `NextFrame` animations lose vsync pacing and spin. Each
+successful commit, including empty damage, advances history along with
+softbuffer's buffer ages; failed commits do not enter history. Unknown ages,
+resize and background changes retain full redraw. Older Wayland surface
+versions may still expand damage inside softbuffer.
+
+Run pixel and physical-damage tests with
+`cargo test --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --lib`;
+run term's release CPU tests and ignored benchmark for integrated coverage.
+Remove each local change only when upstream supplies equivalent opaque-copy,
+cumulative-edge placement (including negative scale cancellation and the
+fallback arm), physical damage and paced empty-commit lifecycle handling.
+Retain the regressions when checking an update.
+
+### iced update procedure and pristine re-verification
+
+Follow the ordered procedure below, adapting the Smithay checklist to this
+crate; Smithay's baseline and its ten tests do not apply to iced.
+
+1. Before editing, enumerate every vendor fix with
+   `git log --reverse --oneline da00c947..HEAD -- vendor/iced_tiny_skia/`
+   from `src/desktop`. Read every listed commit, including merge resolutions.
+   The `fixes` check below requires both a nonempty list and a nonempty diff.
+2. Import the next tarball as a separate pristine commit. Update the table,
+   desktop patch routing, consumer version pins and lockfiles, and the
+   verification script's version and checksum. Keep the old baseline until
+   step 4. Audit this section's
+   version-specific claims and patch shape. Compare the table's upstream SHA
+   to the tarball's own `.cargo_vcs_info.json`, not an assumed tag.
+3. Check dependency routing with the command below. Its output MUST contain
+   `(…/src/desktop/vendor/iced_tiny_skia)`; exit 0 alone proves nothing. The
+   verification script asserts that exact local path as well as provenance.
+   Commit the import and metadata together and require a clean scoped status.
+4. Roll the baseline forward in its own commit, verify `EXPECT=pristine`
+   against that baseline, then reapply the enumerated fixes. Keep tests when
+   an upstream implementation replaces a fix; do not drop an entire fix/test
+   commit. Review the complete diff against the archive for unexpected files.
+5. Re-verify with `EXPECT=fixes` and run the regression commands. Both the
+   baseline and patched tree must be checked; an empty test filter is failure.
+
+From `src/desktop`, the explicit routing and regression commands are:
+
+```text
+cargo tree -p cosmix-term --no-default-features --features tiny-skia -i iced_tiny_skia
+cargo test --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --lib
+cargo clippy --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --all-targets -- -D warnings
+cargo test -p cosmix-term --release --no-default-features --features tiny-skia
+cargo test -p cosmix-term --release --no-default-features --features tiny-skia,iced_tiny_skia/reference-raster band_widget_matches_exact
+```
+
+From the repository root, `EXPECT` is an explicit positional argument to the
+Mix verifier (unset/unknown fails). These commands download and checksum the
+archive, check the provenance row, export the requested committed tree, compare
+all files, assert the fix-list expectation, and assert the cargo-tree path:
+
+```text
+mix docs/build/verify-iced-tiny-skia.mix pristine da00c947
+mix docs/build/verify-iced-tiny-skia.mix fixes HEAD
+```
+
+Success prints `verdict=0 EXPECT=pristine|fixes` and an evidence directory
+containing `pristine.diff`. `fixes` requires diff exit 1, `pristine` requires
+exit 0; diff errors never pass. Inspect the diff against the patch shape above.
+
 ## Smithay libinput: opt-in dispatch fairness
 
 `smithay/src/backend/libinput/mod.rs` adds `set_dispatch_budget` for comp's
