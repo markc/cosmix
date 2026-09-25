@@ -395,7 +395,8 @@ mod tests {
     #[test]
     fn shell_keys_snap_to_bottom_but_empty_keys_and_vt_replies_do_not() {
         let (term, rx) = history();
-        for key in [Key::Char('x'), Key::Enter, Key::PageUp, Key::Control('c')] {
+        // Non-ASCII text is real shell input now (UTF-8), so it snaps too.
+        for key in [Key::Char('x'), Key::Char('é'), Key::Enter, Key::PageUp, Key::Control('c')] {
             term.scroll_view(ScrollRequest::Top);
             term.grid_snapshot();
             term.key(key, Instant::now()).unwrap();
@@ -405,7 +406,8 @@ mod tests {
             assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| !dirty));
         }
         term.scroll_view(ScrollRequest::Top);
-        term.key(Key::Char('é'), Instant::now()).unwrap();
+        // A key that encodes to nothing (a C1 control as a char) must not snap.
+        term.key(Key::Char('\u{85}'), Instant::now()).unwrap();
         assert_eq!(term.grid.lock().display_offset(), 57);
         assert!(rx.try_recv().is_err());
         term.listener.write(b"reply".to_vec(), None).unwrap();

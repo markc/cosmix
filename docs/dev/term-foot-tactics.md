@@ -1073,6 +1073,10 @@ the emoji face; VS15 retains normal font priority. `CharCluster::map` checks
 whole-cluster coverage, ignoring joiners/selectors as independent visible-glyph
 requirements. `ShapeContext` shapes the full text with advances and offsets,
 then verifies the result before caching it. No font can move terminal columns.
+For a space with combining marks, empty glyph layers are discarded and visible
+ink is shifted horizontally into the cell if necessary: fonts without a space
+mark anchor can otherwise place the accent beyond the cell clip. Its baseline
+is preserved; this correction runs only on Unicode cache misses.
 
 The ASCII glyph loop, background spans and mask blend arithmetic are retained.
 `paint_reference` is unchanged as the frozen ASCII oracle. Unicode has a

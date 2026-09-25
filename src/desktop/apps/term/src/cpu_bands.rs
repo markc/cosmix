@@ -170,7 +170,7 @@ mod tests {
         assert_ne!(surface.rgba(), old);
         assert_eq!(surface.rgba(), raster.render(&screen));
         for ((handle, _), bytes) in retained.iter().zip(old_handles) {
-            assert_eq!(handle.pixels(), bytes);
+            assert_eq!(&handle.pixels()[..], bytes.as_slice());
         }
         screen.cursor = (2, 3);
         screen.cursor_visible = true;

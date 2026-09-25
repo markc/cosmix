@@ -156,7 +156,7 @@ impl UnicodeRaster {
             self.geometry = Some(geometry);
         }
         let variant = usize::from(bold) * 2 + usize::from(span == 2);
-        if !self.cache.get(text).is_some_and(|v| v.0[variant].is_some()) {
+        if self.cache.get(text).is_none_or(|v| v.0[variant].is_none()) {
             #[cfg(test)]
             {
                 self.misses += 1;
@@ -261,6 +261,24 @@ impl UnicodeRaster {
             }
             if !valid {
                 continue;
+            }
+            // A space may have no mark anchor. In that case shaping places
+            // its combining glyph after the space advance, outside this VT
+            // cell. Keep the visible ink inside the cell without moving its
+            // baseline or changing the plain ASCII painter.
+            if text.starts_with(' ') && text.len() > 1 {
+                layers.retain(|layer| layer.width != 0 && layer.height != 0);
+                if let Some(left) = layers.iter().map(|layer| layer.x).min() {
+                    let right = layers
+                        .iter()
+                        .map(|layer| layer.x as f32 + layer.width as f32 * layer.scale)
+                        .fold(f32::MIN, f32::max)
+                        .ceil() as i32;
+                    let shift = (cell.0 as i32 * span as i32 - right).min(0).max(-left);
+                    for layer in &mut layers {
+                        layer.x += shift;
+                    }
+                }
             }
             // The VT, never the shaper's advance, determines the clip box.
             if (colour || emoji) && !fit(&mut layers, cell.0 * span as u32, cell.1) {

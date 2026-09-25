@@ -552,7 +552,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             iced::window::Event::Resized(size) => state.resize(size),
             iced::window::Event::Rescaled(scale) => state.rescale(scale),
-            iced::window::Event::Focused => state.tabs.lock().expect("tabs").user_activity(),
+            iced::window::Event::Focused => {
+                state.tabs.lock().expect("tabs").user_activity();
+                state.keyboard_focus = true;
+            }
             // A release that happens while another window has the keyboard
             // is never delivered; a latched Ctrl would turn every later wheel
             // into a zoom.
@@ -565,7 +568,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.scroll_wheel = 0.0;
             }
             iced::window::Event::CloseRequested => return iced::exit(),
-            iced::window::Event::Focused => state.keyboard_focus = true,
             _ => {}
         },
     }
