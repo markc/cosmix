@@ -82,7 +82,8 @@ fn lsh_invalidates_from_the_touched_line() {
 
 #[test]
 fn cold_seek_is_time_sliced() {
-    let lines = 2_000_000;
+    // 2 M lines, the editd maximum: the last one is empty.
+    let lines = 2_000_000 - 1;
     let s = "x = 1\n".repeat(lines);
     let text = Text::from_text(&s).unwrap();
     let mut h = Highlight::for_language("python", None);
