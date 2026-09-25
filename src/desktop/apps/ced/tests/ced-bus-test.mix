@@ -56,9 +56,13 @@ end
 -- runtime values come in as `$a`, decoded from argv. The send timeout
 -- covers ced.wait's 30 s ceiling.
 fn call($svc, $line, $a)
-  write_file($tmp .. "/step.mix", "$a = json_parse($1)\nsend " .. $svc .. " " .. $line ..
-    " timeout=40\nprint(json_encode({rc: $rc, result: $result, reply: $reply}))\n")
-  return json_parse(run_argv_must([$mix, $tmp .. "/step.mix", json_encode($a)], {clear_env: true, env: $env, timeout: 50}))
+  $src = "$a = json_parse($1)\nsend " .. $svc .. " " .. $line ..
+    " timeout=40\nprint(json_encode({rc: $rc, result: $result, reply: $reply}))\n"
+  write_file($tmp .. "/step.mix", $src)
+  $run = run_argv([$mix, $tmp .. "/step.mix", json_encode($a)], {clear_env: true, env: $env, timeout: 50})
+  check($run.ok, "client step failed (exit " .. to_string($run.exit_code) .. "): " .. $run.stderr .. $run.stdout ..
+    "\n--- step.mix\n" .. $src .. "--- args " .. json_encode($a))
+  return json_parse($run.stdout)
 end
 fn ok_in($svc, $line, $a)
   $r = call($svc, $line, $a)
