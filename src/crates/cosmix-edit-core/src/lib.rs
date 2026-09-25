@@ -27,5 +27,12 @@ pub mod wire;
 
 mod vendor;
 
+// editd moves each buffer into its own actor task: `Text` and `Buffer` must be `Send`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<text::Text>();
+    assert_send::<buffer::Buffer>();
+};
+
 #[cfg(test)]
 mod tests;

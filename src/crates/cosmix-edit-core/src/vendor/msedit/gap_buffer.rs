@@ -87,6 +87,14 @@ pub struct GapBuffer {
     buffer: BackingBuffer,
 }
 
+// SAFETY (cosmix patch): `GapBuffer` exclusively owns its allocation — the
+// `text` NonNull points into the mmap reservation (or the `Vec`) held by its
+// own `buffer`, which is released only in `BackingBuffer::drop`. No other
+// handle aliases it and there is no interior mutability, so moving the
+// buffer to another thread is sound. Deliberately NOT `Sync`: `&GapBuffer`
+// sharing is not needed and is left unasserted.
+unsafe impl Send for GapBuffer {}
+
 impl GapBuffer {
     pub fn new(small: bool) -> io::Result<Self> {
         let reserve;
