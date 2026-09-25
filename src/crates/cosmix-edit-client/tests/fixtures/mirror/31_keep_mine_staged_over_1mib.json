@@ -1,14 +1,20 @@
 {
-  "name": "keep mine > 1 MiB: staged transfer (mirror-side)",
-  "about": "The restored text is empty and ced's copy is 1.4 MiB: delete the (empty) span is skipped, then consecutive <= 1 MiB inserts chained by expect_rev, each its own undo group, op_ids c<run>-keep<k>-<i>. Server-side steps depend on E1d's chunking, so E1d writes them when it implements the transfer; Stage S freezes the scenario and the expectations.",
-  "server_side": false,
+  "name": "keep mine > 1 MiB: staged transfer",
+  "about": "The restored text is empty and ced's copy is 1.4 MiB: the (empty) delete stage is skipped, then consecutive <= 1 MiB inserts chained by expect_rev, each its own undo group, op_ids c<run>-keep<k>-<seq>. E1d chunking: cut at the last newline in the second half of each 1 MiB window (else a char boundary) — 116508 lines (1048572 bytes), then 43492 lines (391428 bytes). Each insert's event exceeds the 256 KiB event budget, so it arrives as `resync oversized`, recovered through history (elided) and a snapshot; the next stage is queued once the previous one's reply AND its effect are in (the completion barrier), with expect_rev = that reply's rev.",
   "path": "/fixture/doc.txt",
   "initial": {"repeat": ["abcdefgh\n", 160000]},
   "run_id": 1,
   "steps": [
     {"epoch_change": {"new_epoch": "0000e1e2", "text": ""}},
     {"action": {"keep_mine": {}}},
+    {"send": {"id": "K1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b2_0000e1e2", "at": 0, "text": {"repeat": ["abcdefgh\n", 116508]}, "expect_rev": 0, "origin": "human:ced", "op_id": "c00000001-keep1-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_all": {}},
+    {"send": {"id": "K2", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b2_0000e1e2", "at": 1048572, "text": {"repeat": ["abcdefgh\n", 43492]}, "expect_rev": 1, "origin": "human:ced", "op_id": "c00000001-keep1-000002"},
+      "expect": {"rc": 0, "rev": 2}}},
     {"deliver_all": {}}
   ],
-  "expect": {"server_text": {"repeat": ["abcdefgh\n", 160000]}, "converged": true, "detached": false}
+  "expect": {"server_text": {"repeat": ["abcdefgh\n", 160000]}, "server_rev": 2, "converged": true, "conflicts": 0, "detached": false}
 }

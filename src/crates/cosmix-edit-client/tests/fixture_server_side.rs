@@ -42,6 +42,17 @@ fn text_of(v: &Value) -> String {
     }
 }
 
+/// Request args with every `{"repeat": ["unit", n]}` expanded (fixture 31
+/// carries 1 MiB texts this way).
+fn expand(v: &Value) -> Value {
+    match v {
+        Value::Object(o) if o.len() == 1 && o.contains_key("repeat") => Value::String(text_of(v)),
+        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), expand(v))).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(expand).collect()),
+        _ => v.clone(),
+    }
+}
+
 fn check_expect(name: &str, what: &str, reply: &cosmix_edit_client::fake::FakeReply, expect: &Value) {
     let Some(exp) = expect.as_object() else { return };
     if let Some(rc) = exp.get("rc") {
@@ -95,17 +106,17 @@ fn run(name: &str, fx: &Value) {
                 if body.get("truncate_reply") == Some(&Value::Bool(true)) {
                     fake.truncate_next_reply = true;
                 }
-                let args = body.get("server_args").unwrap_or(&body["args"]);
-                let reply = fake.handle(body["caller"].as_str().unwrap_or("local:ced"), body["verb"].as_str().unwrap(), args);
+                let args = expand(body.get("server_args").unwrap_or(&body["args"]));
+                let reply = fake.handle(body["caller"].as_str().unwrap_or("local:ced"), body["verb"].as_str().unwrap(), &args);
                 check_expect(name, &what, &reply, &body["expect"]);
             }
             "arrive" => {
                 let id = body["id"].as_str().unwrap();
                 let sent = lost.remove(id).unwrap_or_else(|| panic!("{name}: {what}: {id} was not lost"));
-                let _ = fake.handle(sent["caller"].as_str().unwrap_or("local:ced"), sent["verb"].as_str().unwrap(), &sent["args"]);
+                let _ = fake.handle(sent["caller"].as_str().unwrap_or("local:ced"), sent["verb"].as_str().unwrap(), &expand(&sent["args"]));
             }
             "agent" => {
-                let reply = fake.handle(body["caller"].as_str().unwrap(), body["verb"].as_str().unwrap(), &body["args"]);
+                let reply = fake.handle(body["caller"].as_str().unwrap(), body["verb"].as_str().unwrap(), &expand(&body["args"]));
                 check_expect(name, &what, &reply, &body["expect"]);
             }
             "evict_dedup" => fake.evict_dedup(),

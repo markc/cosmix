@@ -1,7 +1,7 @@
 //! The Controller (ced E1 plan §2): tabs, the global `event_seq`, the op-id
 //! generator, `ced.*` verbs, `ced.wait` waiters, reattach. iced-free — the GUI
 //! (`app.rs`) and `--headless` (`headless.rs`) drive the same Controller.
-//! Stage S freezes the signatures; Stage E1d implements them.
+//! Stage S froze the signatures; Stage E1d implements them.
 //!
 //! Contracts:
 //! - Every `edit.changed` event is routed to its buffer's mirror; the global
@@ -17,15 +17,28 @@
 //!   controller transition; a one-shot deadline timer; cancelled on tab close
 //!   / Bus loss. Never a loop.
 
+use std::collections::HashMap;
+use std::ops::Range;
+use std::time::Instant;
+
 use cosmix_edit_client::diag::Diagnostics;
 use cosmix_edit_client::highlight::Highlight;
-use cosmix_edit_client::mirror::Mirror;
-use cosmix_edit_client::model::EditorModel;
-use cosmix_edit_client::types::{Incoming, Intent, Notice, Outgoing, TabId};
+use cosmix_edit_client::mirror::{DetachReason, LaneArg, Mirror, Phase, ServerOp, Step};
+use cosmix_edit_client::model::{EditCfg, EditCommand, EditorModel};
+use cosmix_edit_client::types::{DeltaKind, Incoming, Intent, Level, Notice, OpIdGen, Outgoing, TabId, UI_ORIGIN};
+use cosmix_edit_core::anchor::Selection;
+use cosmix_edit_core::pos::{NamedPos, PosSpec};
+use cosmix_edit_core::text::Text;
+use cosmix_edit_core::view::MeasureCfg;
+use cosmix_edit_core::wire;
+use serde::Serialize;
+use serde_json::{Value, json};
 
 use crate::actions::ActionId;
 use crate::config::Config;
-use crate::editor::EditorMsg;
+use crate::editor::{EditorMsg, LayoutReport};
+use crate::session::{RECENT_MAX, Session, SessionTab};
+use crate::verbs::{self, PhaseW, code};
 
 /// One tab = one buffer view.
 pub struct Tab {
@@ -74,65 +87,1750 @@ pub enum Effect {
     Quit,
 }
 
+/// `ced.wait` longest deadline.
+const WAIT_MAX_MS: u64 = 30_000;
+/// `ced.state` refuses to inline more text than this.
+const STATE_TEXT_MAX: usize = 4 * 1024 * 1024;
+/// Selection publish: 200 ms after the last caret move, at most one per second.
+const PUBLISH_DEBOUNCE_MS: u64 = 200;
+const PUBLISH_MIN_GAP_MS: u64 = 1_000;
+/// Session writes: 1 s after the last change.
+const SESSION_DEBOUNCE_MS: u64 = 1_000;
+/// Deadlines for the controller's own requests (plan §2).
+const DEADLINE_MS: u64 = 5_000;
+const DEADLINE_LONG_MS: u64 = 30_000;
+
+/// Controller-private per-tab state.
+#[derive(Default)]
+struct TabX {
+    recovery_id: Option<String>,
+    /// `edit.open` answered (success or failure) at least once.
+    opened: bool,
+    /// Waiting for a reattach open/list.
+    reattaching: bool,
+    open_error: Option<String>,
+    /// The caret/selection last published with `edit.select`.
+    published: Option<Selection>,
+    last_publish: Option<Instant>,
+    publish_timer: bool,
+    /// Another origin edited since the tab was last focused.
+    agent_since_focus: bool,
+    layout: Option<LayoutReport>,
+    /// Pending `line[:col]` from `path:line:col` or `ced.open {line, col}`.
+    goto: Option<(usize, usize)>,
+}
+
+/// What a request the controller sent is for.
+enum Req {
+    Mirror { tab: TabId, op_id: String },
+    Open { tab: TabId, reattach: bool },
+    /// Scratch-tab reattach: find the buffer by `recovery_id`.
+    List { tab: TabId },
+    Info,
+    Close { tab: TabId, cmd: Option<(u64, String)> },
+    Select,
+}
+
+enum TimerFor {
+    Retry(TabId),
+    Wait(u64),
+    Publish(TabId),
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaitCond {
+    Rev(u64),
+    Idle,
+    Epoch(String),
+    Phase(PhaseW),
+}
+
+struct Waiter {
+    id: u64,
+    cmd: u64,
+    tab: TabId,
+    cond: WaitCond,
+    since: Instant,
+    timeout_ms: u64,
+}
+
+/// A `ced.open` / `ced.new` answered once every tab it opened has an answer.
+struct PendingOpen {
+    cmd: u64,
+    tabs: Vec<TabId>,
+    new: bool,
+}
+
+#[derive(Default)]
+struct Stats {
+    keys: u64,
+    events: u64,
+    history_recoveries: u64,
+    snapshot_recoveries: u64,
+    conflicts: u64,
+    retries: u64,
+    uncertain: u64,
+}
+
 pub struct Controller {
-    _private: (),
+    config: Config,
+    headless: bool,
+    ids: OpIdGen,
+    tabs: Vec<Tab>,
+    x: HashMap<TabId, TabX>,
+    active: Option<TabId>,
+    next_tab: TabId,
+    next_req: u64,
+    next_timer: u64,
+    next_waiter: u64,
+    reqs: HashMap<u64, Req>,
+    timers: HashMap<u64, TimerFor>,
+    last_event_seq: Option<u64>,
+    edit_epoch: Option<String>,
+    edit_info: verbs::EditInfo,
+    waiters: Vec<Waiter>,
+    opens: Vec<PendingOpen>,
+    recent: Vec<String>,
+    /// Tabs to reattach at `start` (from session.json).
+    restore: Option<Session>,
+    session_timer: bool,
+    config_path: Option<String>,
+    session_path: Option<String>,
+    stats: Stats,
+}
+
+fn refusal(code: &str, message: impl Into<String>, reason: Option<&str>) -> String {
+    serde_json::to_string(&verbs::Refusal {
+        error_code: code.to_string(),
+        message: message.into(),
+        reason: reason.map(str::to_string),
+    })
+    .unwrap_or_default()
+}
+
+fn ok_body<T: Serialize>(v: &T) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "{}".into())
+}
+
+/// `failed`: the tab's open was refused (no mirror) — detached.
+fn phase_w(m: Option<&Mirror>, failed: bool) -> PhaseW {
+    match m.map(Mirror::phase) {
+        Some(Phase::Live) => PhaseW::Live,
+        Some(Phase::Bootstrapping { .. }) => PhaseW::Bootstrapping,
+        Some(Phase::Recovering { .. }) => PhaseW::Recovering,
+        Some(Phase::Detached { .. }) => PhaseW::Detached,
+        None if failed => PhaseW::Detached,
+        None => PhaseW::Bootstrapping,
+    }
+}
+
+fn text_string(t: &Text) -> String {
+    let mut s = String::with_capacity(t.len());
+    t.read(0..t.len(), &mut s);
+    s
+}
+
+fn disk_str(d: wire::DiskState) -> String {
+    serde_json::to_value(d).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+fn kind_str(k: wire::KindW) -> String {
+    serde_json::to_value(k).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+/// A Bus reply body as the mirror wants it: rc 0 → the JSON body; a
+/// refusal → the `{error_code, message, reason, …}` body.
+fn reply_result(rc: u8, body: &str) -> Result<Value, wire::Refusal> {
+    if rc < 10 {
+        return Ok(if body.trim().is_empty() { Value::Null } else { serde_json::from_str(body).unwrap_or(Value::Null) });
+    }
+    Err(serde_json::from_str::<wire::Refusal>(body).unwrap_or_else(|_| wire::Refusal {
+        error_code: wire::ErrorCode::Internal,
+        message: body.to_string(),
+        reason: None,
+        buffer: None,
+        rev: None,
+        context: Default::default(),
+    }))
+}
+
+fn line_comment(language: &str) -> Option<&'static str> {
+    match language {
+        "mix" | "scene" | "mix-data" => Some("--"),
+        "rust" | "c" | "cpp" | "go" | "javascript" => Some("//"),
+        "shell" | "python" | "toml" | "yaml" => Some("#"),
+        _ => None,
+    }
+}
+
+/// Resolve an editd POS on the view text (byte offset, `{line, col}` with
+/// editd's col = scalars incl. `\r`, 1-based, or `start`/`end`).
+fn resolve_pos(text: &Text, p: &PosSpec) -> Result<usize, String> {
+    match p {
+        PosSpec::Offset(o) => {
+            if *o > text.len() || !text.is_char_boundary(*o) {
+                return Err(format!("offset {o} is outside the text or not on a char boundary"));
+            }
+            Ok(*o)
+        }
+        PosSpec::Named(NamedPos::Start) => Ok(0),
+        PosSpec::Named(NamedPos::End) => Ok(text.len()),
+        PosSpec::LineCol { line, col } => offset_of_line_col(text, *line, col.unwrap_or(1)),
+        PosSpec::Anchor { .. } => Err("anchors are not supported by ced.select".into()),
+    }
+}
+
+fn offset_of_line_col(text: &Text, line: usize, col: usize) -> Result<usize, String> {
+    let r = text.line_range(line).ok_or_else(|| format!("line {line} is outside 1..={}", text.line_count()))?;
+    if col == 0 {
+        return Err("col is 1-based".into());
+    }
+    let mut s = String::new();
+    text.read(r.clone(), &mut s);
+    let mut chars = s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len()));
+    chars.nth(col - 1).map(|i| r.start + i).ok_or_else(|| format!("col {col} is past the end of line {line}"))
+}
+
+/// `path:line[:col]` → (path, line, col) when the suffix parses.
+fn split_line_col(p: &str) -> (String, Option<(usize, usize)>) {
+    let mut parts = p.rsplitn(3, ':');
+    let last = parts.next();
+    let mid = parts.next();
+    let head = parts.next();
+    match (head, mid, last) {
+        (Some(h), Some(l), Some(c)) if !h.is_empty() => {
+            if let (Ok(l), Ok(c)) = (l.parse::<usize>(), c.parse::<usize>()) {
+                return (h.to_string(), Some((l, c)));
+            }
+            if let Ok(line) = c.parse::<usize>() {
+                return (format!("{h}:{l}"), Some((line, 1)));
+            }
+            (p.to_string(), None)
+        }
+        (None, Some(h), Some(l)) if !h.is_empty() => match l.parse::<usize>() {
+            Ok(line) => (h.to_string(), Some((line, 1))),
+            Err(_) => (p.to_string(), None),
+        },
+        _ => (p.to_string(), None),
+    }
 }
 
 impl Controller {
     /// `run_id`: random per process start (op ids); `headless`: no window.
     pub fn new(config: Config, run_id: u32, headless: bool) -> Self {
-        let _ = (config, run_id, headless);
-        todo!("ced E1d")
+        Self {
+            config,
+            headless,
+            ids: OpIdGen::new(run_id),
+            tabs: Vec::new(),
+            x: HashMap::new(),
+            active: None,
+            next_tab: 1,
+            next_req: 0,
+            next_timer: 0,
+            next_waiter: 0,
+            reqs: HashMap::new(),
+            timers: HashMap::new(),
+            last_event_seq: None,
+            edit_epoch: None,
+            edit_info: verbs::EditInfo { epoch: None, version: None, volatile: None },
+            waiters: Vec::new(),
+            opens: Vec::new(),
+            recent: Vec::new(),
+            restore: None,
+            session_timer: false,
+            config_path: None,
+            session_path: None,
+            stats: Stats::default(),
+        }
+    }
+
+    /// Tabs to reopen at [`Controller::start`] (the host loads session.json).
+    pub fn set_session(&mut self, session: Session) {
+        self.recent = session.recent.clone();
+        self.restore = Some(session);
+    }
+
+    /// Paths reported by `ced.info`.
+    pub fn set_paths(&mut self, config_path: Option<String>, session_path: Option<String>) {
+        self.config_path = config_path;
+        self.session_path = session_path;
+    }
+
+    /// The session to persist now.
+    pub fn session(&self) -> Session {
+        let tabs: Vec<SessionTab> = self
+            .tabs
+            .iter()
+            .map(|t| SessionTab {
+                path: t.path.clone(),
+                recovery_id: if t.path.is_none() { self.x.get(&t.id).and_then(|x| x.recovery_id.clone()) } else { None },
+                caret: t.editor.sel.head,
+                first_line: t.editor.scroll.first_line.max(1),
+            })
+            .collect();
+        let active = self.active.and_then(|a| self.tabs.iter().position(|t| t.id == a));
+        Session { version: crate::session::VERSION, active, tabs, recent: self.recent.clone() }
     }
 
     /// The Bus came up: subscribe topics, ping `edit`, reattach the session.
     pub fn start(&mut self) -> Vec<Effect> {
-        todo!("ced E1d")
+        let mut fx = Vec::new();
+        for topic in [wire::TOPIC_CHANGED, "theme.changed", "noded.props.changed"] {
+            fx.push(Effect::Subscribe { topic: topic.to_string() });
+        }
+        self.send_info(&mut fx);
+        if let Some(s) = self.restore.take() {
+            let mut ids = Vec::new();
+            for st in &s.tabs {
+                let id = self.new_tab(st.path.clone());
+                if let Some(x) = self.x.get_mut(&id) {
+                    x.recovery_id = st.recovery_id.clone();
+                }
+                if let Some(t) = self.tab_mut(id) {
+                    t.editor.sel = Selection { anchor: st.caret, head: st.caret };
+                    t.editor.scroll.first_line = st.first_line.max(1);
+                }
+                ids.push(id);
+                match (&st.path, &st.recovery_id) {
+                    (Some(p), _) => self.send_open(id, Some(p.clone()), false, &mut fx),
+                    (None, Some(_)) => self.send_list(id, &mut fx),
+                    (None, None) => self.send_open(id, None, false, &mut fx),
+                }
+            }
+            self.active = s.active.and_then(|i| ids.get(i).copied()).or(ids.first().copied());
+        }
+        fx
     }
 
     /// A transport delivery (reply, topic, timer, deadline, connection edge).
     pub fn on_incoming(&mut self, incoming: Incoming) -> Vec<Effect> {
-        let _ = incoming;
-        todo!("ced E1d")
+        let mut fx = Vec::new();
+        match incoming {
+            Incoming::Reply { req, rc, body } => self.on_reply(req, rc, &body, &mut fx),
+            Incoming::Deadline { req } => self.on_deadline(req, &mut fx),
+            Incoming::Timer { id } => self.on_timer(id, &mut fx),
+            Incoming::Topic { topic, body } => self.on_topic(&topic, &body, &mut fx),
+            Incoming::Connection { up } => {
+                if up {
+                    // The reconnect edge: loss may have happened before any
+                    // event reached us (plan §3.6, GLM F11).
+                    self.last_event_seq = None;
+                    for id in self.tab_ids() {
+                        if let Some(step) = self.tab_mut(id).and_then(|t| t.mirror.as_mut()).map(Mirror::suspect) {
+                            self.drive(id, step, &mut fx);
+                        }
+                    }
+                    self.send_info(&mut fx);
+                } else {
+                    let all: Vec<u64> = self.waiters.iter().map(|w| w.id).collect();
+                    for w in all {
+                        self.finish_waiter(w, Err(("cancelled", "the Bus connection was lost".to_string())), &mut fx);
+                    }
+                }
+            }
+        }
+        self.eval_waiters(&mut fx);
+        fx
     }
 
     /// A `ced.*` / `app.*` Bus request.
     pub fn on_bus_command(&mut self, cmd: BusCommand) -> Vec<Effect> {
-        let _ = cmd;
-        todo!("ced E1d")
+        let mut fx = Vec::new();
+        self.bus_command(&cmd, &mut fx);
+        self.eval_waiters(&mut fx);
+        fx
     }
 
     /// A menu / key / Bus action on `tab` (default: the active tab).
     pub fn on_action(&mut self, tab: Option<TabId>, action: ActionId, intent: Intent) -> Vec<Effect> {
-        let _ = (tab, action, intent);
-        todo!("ced E1d")
+        let mut fx = Vec::new();
+        if let Err((_, msg)) = self.action(tab, action, intent, &mut fx) {
+            fx.push(Effect::Notice { tab, notice: Notice::Message { level: Level::Warn, text: msg } });
+        }
+        self.eval_waiters(&mut fx);
+        fx
     }
 
     /// A message from a tab's editor widget (window input: `Intent::ui`).
     pub fn on_editor(&mut self, tab: TabId, msg: EditorMsg) -> Vec<Effect> {
-        let _ = (tab, msg);
-        todo!("ced E1d")
+        let mut fx = Vec::new();
+        match msg {
+            EditorMsg::Command(c) => {
+                self.stats.keys += 1;
+                if let Err(e) = self.command(tab, c, Intent::ui(tab), &mut fx) {
+                    fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: e } });
+                }
+            }
+            EditorMsg::ImeCommit(text) => {
+                self.stats.keys += 1;
+                if let Err(e) = self.command(tab, EditCommand::Insert(text), Intent::ui(tab), &mut fx) {
+                    fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: e } });
+                }
+            }
+            EditorMsg::Scrolled(s) => {
+                if let Some(t) = self.tab_mut(tab) {
+                    t.editor.scroll = s;
+                }
+                self.session_changed(&mut fx);
+            }
+            EditorMsg::Copy | EditorMsg::Cut => {
+                if let Some(text) = self.selected_text(tab) {
+                    fx.push(Effect::ClipboardWrite { text, primary: false });
+                    if matches!(msg, EditorMsg::Cut)
+                        && let Err(e) = self.command(tab, EditCommand::Delete, Intent::ui(tab), &mut fx)
+                    {
+                        fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: e } });
+                    }
+                }
+            }
+            EditorMsg::Paste { primary } => fx.push(Effect::ClipboardRead { primary, intent: Intent::ui(tab) }),
+            EditorMsg::Preedit(_) => {}
+            EditorMsg::Focus(focused) => {
+                if focused {
+                    self.active = Some(tab);
+                    if let Some(x) = self.x.get_mut(&tab) {
+                        x.agent_since_focus = false;
+                    }
+                }
+            }
+            EditorMsg::Layout(r) => {
+                if let Some(x) = self.x.get_mut(&tab) {
+                    x.layout = Some(r);
+                }
+            }
+        }
+        self.eval_waiters(&mut fx);
+        fx
     }
 
     /// A clipboard read completed for `intent` (applies to `intent.tab`'s
     /// selection as it is now; dropped with a notice if that tab is gone).
     pub fn on_paste(&mut self, intent: Intent, text: Option<String>) -> Vec<Effect> {
-        let _ = (intent, text);
-        todo!("ced E1d")
+        let mut fx = Vec::new();
+        let tab = intent.tab;
+        let live = self.tab(tab).and_then(|t| t.mirror.as_ref()).is_some_and(|m| matches!(m.phase(), Phase::Live));
+        match text {
+            Some(text) if live && !text.is_empty() => {
+                if let Err(e) = self.command(tab, EditCommand::Insert(text), intent, &mut fx) {
+                    fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: e } });
+                }
+            }
+            Some(_) if !live => fx.push(Effect::Notice {
+                tab: None,
+                notice: Notice::Message { level: Level::Warn, text: "The paste was dropped: its tab is closed or detached".into() },
+            }),
+            _ => {}
+        }
+        self.eval_waiters(&mut fx);
+        fx
     }
 
     /// Open paths (argv, `ced.open`, file drop, dialog). `path:line[:col]`
     /// suffixes are honoured when that file does not exist.
     pub fn open_paths(&mut self, paths: &[String], intent: Intent) -> Vec<Effect> {
-        let _ = (paths, intent);
-        todo!("ced E1d")
+        let _ = intent;
+        let mut fx = Vec::new();
+        self.open_many(paths, None, &mut fx);
+        fx
     }
 
     pub fn tabs(&self) -> &[Tab] {
-        todo!("ced E1d")
+        &self.tabs
     }
 
     pub fn active(&self) -> Option<TabId> {
-        todo!("ced E1d")
+        self.active
+    }
+
+    /// Another origin edited this tab since it was last focused (tab `◆`).
+    pub fn agent_since_focus(&self, tab: TabId) -> bool {
+        self.x.get(&tab).is_some_and(|x| x.agent_since_focus)
+    }
+
+    // ── tabs ─────────────────────────────────────────────────────────────────
+
+    fn tab_ids(&self) -> Vec<TabId> {
+        self.tabs.iter().map(|t| t.id).collect()
+    }
+
+    fn tab(&self, id: TabId) -> Option<&Tab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    fn new_tab(&mut self, path: Option<String>) -> TabId {
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let highlight = Highlight::for_language("text", path.as_deref().map(std::path::Path::new));
+        self.tabs.push(Tab { id, mirror: None, editor: EditorModel::default(), highlight, diagnostics: Diagnostics::default(), path });
+        self.x.insert(id, TabX::default());
+        id
+    }
+
+    /// The tab a Bus request names (`tab` or `buffer`), else the active one.
+    fn select_tab(&self, sel: &verbs::TabSel) -> Result<TabId, String> {
+        if let Some(t) = sel.tab {
+            return self.tab(t).map(|t| t.id).ok_or_else(|| format!("no tab {t}"));
+        }
+        if let Some(b) = &sel.buffer {
+            return self
+                .tabs
+                .iter()
+                .find(|t| t.mirror.as_ref().is_some_and(|m| m.buffer() == b))
+                .map(|t| t.id)
+                .ok_or_else(|| format!("no tab shows buffer {b}"));
+        }
+        self.active.ok_or_else(|| "no tab is open".to_string())
+    }
+
+    fn close_tab(&mut self, id: TabId, fx: &mut Vec<Effect>) {
+        self.tabs.retain(|t| t.id != id);
+        self.x.remove(&id);
+        let waiters: Vec<u64> = self.waiters.iter().filter(|w| w.tab == id).map(|w| w.id).collect();
+        for w in waiters {
+            self.finish_waiter(w, Err(("cancelled", "the tab was closed".to_string())), fx);
+        }
+        if self.active == Some(id) {
+            self.active = self.tabs.last().map(|t| t.id);
+        }
+        self.session_changed(fx);
+    }
+
+    // ── requests ─────────────────────────────────────────────────────────────
+
+    fn send(&mut self, out: Outgoing, req: Req, fx: &mut Vec<Effect>) {
+        self.next_req += 1;
+        self.reqs.insert(self.next_req, req);
+        fx.push(Effect::Send { req: self.next_req, out });
+    }
+
+    fn timer(&mut self, ms: u64, what: TimerFor, fx: &mut Vec<Effect>) -> u64 {
+        self.next_timer += 1;
+        self.timers.insert(self.next_timer, what);
+        fx.push(Effect::Timer { id: self.next_timer, ms });
+        self.next_timer
+    }
+
+    fn send_info(&mut self, fx: &mut Vec<Effect>) {
+        let out = Outgoing { verb: "edit.info".into(), body: "{}".into(), op_id: None, deadline_ms: DEADLINE_MS };
+        self.send(out, Req::Info, fx);
+    }
+
+    fn send_open(&mut self, tab: TabId, path: Option<String>, reattach: bool, fx: &mut Vec<Effect>) {
+        let body = match &path {
+            Some(p) => json!({"path": p, "origin": UI_ORIGIN}),
+            None => json!({"origin": UI_ORIGIN}),
+        };
+        let out = Outgoing { verb: "edit.open".into(), body: body.to_string(), op_id: None, deadline_ms: DEADLINE_LONG_MS };
+        self.send(out, Req::Open { tab, reattach }, fx);
+    }
+
+    fn send_list(&mut self, tab: TabId, fx: &mut Vec<Effect>) {
+        let out = Outgoing { verb: "edit.list".into(), body: "{}".into(), op_id: None, deadline_ms: DEADLINE_MS };
+        self.send(out, Req::List { tab }, fx);
+    }
+
+    fn on_reply(&mut self, req: u64, rc: u8, body: &str, fx: &mut Vec<Effect>) {
+        match self.reqs.remove(&req) {
+            Some(Req::Mirror { tab, op_id }) => {
+                let result = reply_result(rc, body);
+                if let Ok(v) = &result
+                    && let Some(ep) = v.get("epoch").and_then(Value::as_str)
+                {
+                    self.note_epoch(ep, fx);
+                }
+                if let Some(step) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()).map(|m| m.on_reply(&op_id, result)) {
+                    self.drive(tab, step, fx);
+                }
+            }
+            Some(Req::Open { tab, reattach }) => self.on_open_reply(tab, reattach, rc, body, fx),
+            Some(Req::List { tab }) => self.on_list_reply(tab, rc, body, fx),
+            Some(Req::Info) => {
+                if rc < 10
+                    && let Ok(info) = serde_json::from_str::<wire::InfoReply>(body)
+                {
+                    self.edit_info = verbs::EditInfo {
+                        epoch: Some(info.epoch.clone()),
+                        version: Some(info.version.clone()),
+                        volatile: Some(info.volatile),
+                    };
+                    self.note_epoch(&info.epoch, fx);
+                }
+            }
+            Some(Req::Close { tab, cmd }) => {
+                if rc < 10 {
+                    self.close_tab(tab, fx);
+                    if let Some((id, action)) = cmd {
+                        fx.push(Effect::Respond { id, rc: 0, body: ok_body(&verbs::ActionReply { id: action, ok: true, result: None }) });
+                    }
+                } else {
+                    let r = reply_result(rc, body).err();
+                    let message = r.as_ref().map(|r| r.message.clone()).unwrap_or_else(|| body.to_string());
+                    let dirty = r.as_ref().and_then(|r| r.reason.as_deref()) == Some("dirty");
+                    match cmd {
+                        Some((id, _)) => fx.push(Effect::Respond {
+                            id,
+                            rc: 10,
+                            body: refusal(code::CONFLICT, message, Some(if dirty { "dirty" } else { "refused" })),
+                        }),
+                        None => fx.push(Effect::Notice {
+                            tab: Some(tab),
+                            notice: Notice::Message {
+                                level: Level::Warn,
+                                text: if dirty { "Unsaved changes — save, or close with Discard".into() } else { message },
+                            },
+                        }),
+                    }
+                }
+            }
+            Some(Req::Select) | None => {}
+        }
+    }
+
+    fn on_deadline(&mut self, req: u64, fx: &mut Vec<Effect>) {
+        match self.reqs.remove(&req) {
+            Some(Req::Mirror { tab, op_id }) => {
+                self.stats.uncertain += 1;
+                if let Some(step) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()).map(|m| m.on_deadline(&op_id)) {
+                    self.drive(tab, step, fx);
+                }
+            }
+            Some(Req::Open { tab, reattach }) => {
+                // Opening is idempotent for a path; ask again.
+                let path = self.tab(tab).and_then(|t| t.path.clone());
+                self.send_open(tab, path, reattach, fx);
+            }
+            Some(Req::List { tab }) => self.send_list(tab, fx),
+            Some(Req::Close { tab, cmd: Some((id, _)) }) => {
+                let _ = tab;
+                fx.push(Effect::Respond { id, rc: 10, body: refusal(code::UNAVAILABLE, "edit.close timed out", Some("timeout")) });
+            }
+            _ => {}
+        }
+    }
+
+    fn on_timer(&mut self, id: u64, fx: &mut Vec<Effect>) {
+        match self.timers.remove(&id) {
+            Some(TimerFor::Retry(tab)) => {
+                if let Some(step) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()).map(Mirror::on_retry) {
+                    self.drive(tab, step, fx);
+                }
+            }
+            Some(TimerFor::Wait(w)) => {
+                let ms = self.waiters.iter().find(|x| x.id == w).map(|x| x.timeout_ms).unwrap_or(0);
+                self.finish_waiter(w, Err(("timeout", format!("ced.wait timed out after {ms} ms"))), fx);
+            }
+            Some(TimerFor::Publish(tab)) => {
+                if let Some(x) = self.x.get_mut(&tab) {
+                    x.publish_timer = false;
+                }
+                self.maybe_publish(tab, fx);
+            }
+            Some(TimerFor::Session) => {
+                self.session_timer = false;
+                fx.push(Effect::SaveSession);
+            }
+            None => {}
+        }
+    }
+
+    fn on_topic(&mut self, topic: &str, body: &str, fx: &mut Vec<Effect>) {
+        match topic {
+            wire::TOPIC_CHANGED => {
+                let Ok(ev) = serde_json::from_str::<wire::Event>(body) else { return };
+                self.on_edit_event(ev, fx);
+            }
+            // `edit` (re)appearing in services.registered may be a restart:
+            // ask it its epoch (plan §3.6).
+            "noded.props.changed" if body.contains("services.registered") && body.contains("\"edit\"") => {
+                self.send_info(fx);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_edit_event(&mut self, ev: wire::Event, fx: &mut Vec<Effect>) {
+        self.stats.events += 1;
+        let (epoch, seq) = match &ev {
+            wire::Event::Edit(e) => (e.epoch.clone(), e.event_seq),
+            wire::Event::Cursor(e) => (e.epoch.clone(), e.event_seq),
+            wire::Event::Anchor(e) => (e.epoch.clone(), e.event_seq),
+            wire::Event::Disk(e) => (e.epoch.clone(), e.event_seq),
+            wire::Event::Open(e) => (e.epoch.clone(), e.event_seq),
+            wire::Event::Close(e) => (e.epoch.clone(), e.event_seq),
+            wire::Event::Resync(e) => (e.epoch.clone(), e.event_seq),
+        };
+        if self.note_epoch(&epoch, fx) {
+            self.last_event_seq = Some(seq);
+            return;
+        }
+        // The global event_seq: any gap may have been ours (plan §3.6).
+        if let Some(last) = self.last_event_seq
+            && seq != last + 1
+        {
+            for id in self.tab_ids() {
+                if let Some(step) = self.tab_mut(id).and_then(|t| t.mirror.as_mut()).map(Mirror::suspect) {
+                    self.stats.history_recoveries += 1;
+                    self.drive(id, step, fx);
+                }
+            }
+        }
+        self.last_event_seq = Some(seq);
+        let buffer = match &ev {
+            wire::Event::Edit(e) => Some(e.buffer.clone()),
+            wire::Event::Cursor(e) => Some(e.buffer.clone()),
+            wire::Event::Disk(e) => Some(e.buffer.clone()),
+            wire::Event::Close(e) => Some(e.buffer.clone()),
+            wire::Event::Resync(_) => None,
+            _ => return,
+        };
+        for id in self.tab_ids() {
+            let step = match self.tab_mut(id).and_then(|t| t.mirror.as_mut()) {
+                Some(m) if buffer.as_deref().is_none_or(|b| b == m.buffer()) => m.on_event(&ev),
+                _ => continue,
+            };
+            if let wire::Event::Edit(e) = &ev
+                && !(e.origin == UI_ORIGIN || e.origin.starts_with("agent:ced."))
+                && self.active != Some(id)
+                && let Some(x) = self.x.get_mut(&id)
+            {
+                x.agent_since_focus = true;
+            }
+            self.drive(id, step, fx);
+        }
+    }
+
+    /// Record the daemon's epoch; `true` when it CHANGED (every tab reattaches).
+    fn note_epoch(&mut self, epoch: &str, fx: &mut Vec<Effect>) -> bool {
+        match &self.edit_epoch {
+            Some(e) if e == epoch => false,
+            None => {
+                self.edit_epoch = Some(epoch.to_string());
+                false
+            }
+            Some(_) => {
+                self.edit_epoch = Some(epoch.to_string());
+                self.edit_info.epoch = Some(epoch.to_string());
+                self.last_event_seq = None;
+                for id in self.tab_ids() {
+                    let stale = self.tab(id).and_then(|t| t.mirror.as_ref()).is_some_and(|m| m.epoch() != epoch);
+                    if stale {
+                        self.reattach(id, fx);
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Plan §3.8: reopen the tab's buffer in the new daemon session.
+    fn reattach(&mut self, tab: TabId, fx: &mut Vec<Effect>) {
+        let Some(x) = self.x.get_mut(&tab) else { return };
+        if x.reattaching {
+            return;
+        }
+        x.reattaching = true;
+        if let Some(step) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()).map(Mirror::epoch_changed) {
+            self.drive(tab, step, fx);
+        }
+        let path = self.tab(tab).and_then(|t| t.path.clone());
+        match path {
+            Some(p) => self.send_open(tab, Some(p), true, fx),
+            None => self.send_list(tab, fx),
+        }
+    }
+
+    fn on_open_reply(&mut self, tab: TabId, reattach: bool, rc: u8, body: &str, fx: &mut Vec<Effect>) {
+        if self.tab(tab).is_none() {
+            return;
+        }
+        match reply_result(rc, body) {
+            Ok(v) => match serde_json::from_value::<wire::OpenReply>(v) {
+                Ok(open) => self.attach(tab, reattach, &open, fx),
+                Err(e) => self.open_failed(tab, format!("bad edit.open reply: {e}"), fx),
+            },
+            Err(r) => {
+                let msg = match r.reason.as_deref() {
+                    Some(reason) => format!("{} ({reason})", r.message),
+                    None => r.message.clone(),
+                };
+                self.open_failed(tab, msg, fx);
+            }
+        }
+    }
+
+    /// A scratch tab reattaches by `recovery_id` (plan §3.8); with no match it
+    /// becomes a fresh scratch buffer and keeps its text as a detached copy.
+    fn on_list_reply(&mut self, tab: TabId, rc: u8, body: &str, fx: &mut Vec<Effect>) {
+        let rid = self.x.get(&tab).and_then(|x| x.recovery_id.clone());
+        let list = reply_result(rc, body).ok().and_then(|v| serde_json::from_value::<wire::ListReply>(v).ok());
+        let row = list.as_ref().and_then(|l| l.buffers.iter().find(|b| Some(&b.recovery_id) == rid.as_ref()).map(|b| (l, b)));
+        match row {
+            Some((l, b)) => {
+                let open = wire::OpenReply {
+                    buffer: b.buffer.clone(),
+                    epoch: l.epoch.clone(),
+                    path: b.path.clone(),
+                    opened_as: b.opened_as.clone(),
+                    name: b.name.clone(),
+                    language: b.language.clone(),
+                    rev: b.rev,
+                    lines: b.lines,
+                    bytes: b.bytes,
+                    eol: wire::Eol::Lf,
+                    bom: false,
+                    disk: b.disk,
+                    reopened: true,
+                    created: false,
+                    recovery_id: b.recovery_id.clone(),
+                    recovered: b.recovered,
+                    recovered_from: None,
+                };
+                let reattach = self.x.get(&tab).is_some_and(|x| x.reattaching);
+                self.attach(tab, reattach, &open, fx);
+            }
+            None => {
+                let reattach = self.x.get(&tab).is_some_and(|x| x.reattaching);
+                self.send_open(tab, None, reattach, fx);
+            }
+        }
+    }
+
+    fn attach(&mut self, tab: TabId, reattach: bool, open: &wire::OpenReply, fx: &mut Vec<Effect>) {
+        self.note_epoch(&open.epoch, fx);
+        let reattaching = reattach && self.tab(tab).is_some_and(|t| t.mirror.is_some());
+        let step = if reattaching {
+            let Some(m) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()) else { return };
+            m.reattach(open)
+        } else {
+            match Mirror::bootstrap(open) {
+                Ok((m, step)) => {
+                    let path = open.path.clone();
+                    if let Some(t) = self.tab_mut(tab) {
+                        t.highlight = Highlight::for_language(&open.language, path.as_deref().map(std::path::Path::new));
+                        t.mirror = Some(m);
+                        if t.path.is_none() {
+                            t.path = path;
+                        }
+                    }
+                    step
+                }
+                Err(e) => {
+                    self.open_failed(tab, format!("{e:?}"), fx);
+                    return;
+                }
+            }
+        };
+        if let Some(x) = self.x.get_mut(&tab) {
+            x.recovery_id = Some(open.recovery_id.clone());
+            x.opened = true;
+            x.reattaching = false;
+            x.open_error = None;
+        }
+        if let Some(p) = &open.path {
+            self.recent.retain(|r| r != p);
+            self.recent.insert(0, p.clone());
+            self.recent.truncate(RECENT_MAX);
+        }
+        self.drive(tab, step, fx);
+        self.check_opens(fx);
+        self.session_changed(fx);
+    }
+
+    fn open_failed(&mut self, tab: TabId, msg: String, fx: &mut Vec<Effect>) {
+        if let Some(x) = self.x.get_mut(&tab) {
+            x.opened = true;
+            x.reattaching = false;
+            x.open_error = Some(msg.clone());
+        }
+        fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Error, text: msg } });
+        self.check_opens(fx);
+    }
+
+    /// Answer every `ced.open` / `ced.new` whose tabs have all had an answer.
+    fn check_opens(&mut self, fx: &mut Vec<Effect>) {
+        let mut i = 0;
+        while i < self.opens.len() {
+            let done = self.opens[i].tabs.iter().all(|t| self.x.get(t).is_none_or(|x| x.opened));
+            if !done {
+                i += 1;
+                continue;
+            }
+            let p = self.opens.remove(i);
+            let row = |c: &Controller, t: TabId| {
+                let tab = c.tab(t);
+                verbs::OpenedTab {
+                    tab: t,
+                    buffer: tab.and_then(|t| t.mirror.as_ref()).map(|m| m.buffer().to_string()),
+                    path: tab.and_then(|t| t.path.clone()),
+                }
+            };
+            let body = if p.new {
+                let r = row(self, p.tabs[0]);
+                ok_body(&verbs::NewReply { tab: r.tab, buffer: r.buffer })
+            } else {
+                let tabs = p.tabs.iter().map(|&t| row(self, t)).collect();
+                ok_body(&verbs::OpenReply { tabs })
+            };
+            fx.push(Effect::Respond { id: p.cmd, rc: 0, body });
+        }
+    }
+
+    /// Open (or focus) each path; `cmd` answers when all have an answer.
+    fn open_many(&mut self, paths: &[String], cmd: Option<(u64, Option<(usize, usize)>)>, fx: &mut Vec<Effect>) -> Vec<TabId> {
+        let mut ids = Vec::new();
+        for raw in paths {
+            let (path, goto) = if std::path::Path::new(raw).exists() { (raw.clone(), None) } else { split_line_col(raw) };
+            let goto = cmd.and_then(|(_, g)| g).or(goto);
+            let path = std::path::absolute(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(path);
+            let existing = self.tabs.iter().find(|t| t.path.as_deref() == Some(path.as_str())).map(|t| t.id);
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = self.new_tab(Some(path.clone()));
+                    self.send_open(id, Some(path), false, fx);
+                    id
+                }
+            };
+            if let Some(g) = goto {
+                self.goto(id, g);
+            }
+            self.active = Some(id);
+            ids.push(id);
+        }
+        if let Some((cmd, _)) = cmd {
+            self.opens.push(PendingOpen { cmd, tabs: ids.clone(), new: false });
+            self.check_opens(fx);
+        }
+        self.session_changed(fx);
+        ids
+    }
+
+    /// Move the caret to `line:col` now if the text is there, else once it is.
+    fn goto(&mut self, tab: TabId, (line, col): (usize, usize)) {
+        let Some(t) = self.tab_mut(tab) else { return };
+        let at = t.mirror.as_ref().filter(|m| matches!(m.phase(), Phase::Live)).map(|m| offset_of_line_col(m.text(), line, col));
+        match at {
+            Some(Ok(o)) => {
+                t.editor.sel = Selection { anchor: o, head: o };
+                t.editor.scroll.first_line = line.saturating_sub(5).max(1);
+            }
+            Some(Err(_)) => {}
+            None => {
+                if let Some(x) = self.x.get_mut(&tab) {
+                    x.goto = Some((line, col));
+                }
+            }
+        }
+    }
+
+    // ── the mirror ↔ editor bridge ───────────────────────────────────────────
+
+    /// Feed a mirror step to the editor side and the transport; drain the
+    /// scheduler; react to detaches, drains and pending gotos.
+    fn drive(&mut self, tab: TabId, step: Step, fx: &mut Vec<Effect>) {
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else { return };
+        let mut resynced = false;
+        if let Some(m) = &t.mirror {
+            for d in &step.deltas {
+                t.editor.apply_delta(d);
+                t.highlight.apply_delta(m.text(), d);
+                t.diagnostics.apply_delta(d);
+                resynced |= d.kind == DeltaKind::Resync;
+            }
+        }
+        if resynced {
+            self.stats.snapshot_recoveries += 1;
+        }
+        for n in step.notices {
+            if matches!(n, Notice::Conflict(_)) {
+                self.stats.conflicts += 1;
+            }
+            fx.push(Effect::Notice { tab: Some(tab), notice: n });
+        }
+        for out in step.out {
+            let op_id = out.op_id.clone().unwrap_or_default();
+            self.send(out, Req::Mirror { tab, op_id }, fx);
+        }
+        let mut outs = Vec::new();
+        let mut retry = None;
+        let mut detached_epoch = false;
+        let mut idle = false;
+        let mut live = false;
+        if let Some(m) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()) {
+            while let Some(o) = m.next_outgoing() {
+                outs.push(o);
+            }
+            retry = m.take_retry_timer();
+            detached_epoch = matches!(m.phase(), Phase::Detached { reason: DetachReason::EpochChanged });
+            idle = m.is_idle();
+            live = matches!(m.phase(), Phase::Live);
+        }
+        for out in outs {
+            let op_id = out.op_id.clone().unwrap_or_default();
+            self.send(out, Req::Mirror { tab, op_id }, fx);
+        }
+        if let Some(ms) = retry {
+            self.stats.retries += 1;
+            self.timer(ms, TimerFor::Retry(tab), fx);
+        }
+        if detached_epoch && !self.x.get(&tab).is_some_and(|x| x.reattaching) {
+            // `epoch_mismatch` seen by the mirror itself: learn the new epoch.
+            self.send_info(fx);
+            self.reattach(tab, fx);
+        }
+        if live && let Some(g) = self.x.get_mut(&tab).and_then(|x| x.goto.take()) {
+            self.goto(tab, g);
+        }
+        if idle {
+            self.maybe_publish(tab, fx);
+        }
+    }
+
+    fn edit_cfg(&self, tab: &Tab) -> EditCfg {
+        let (language, eol) = tab.mirror.as_ref().map(|m| (m.meta().language.clone(), m.meta().eol)).unwrap_or(("text".into(), wire::Eol::Lf));
+        EditCfg {
+            measure: MeasureCfg { tab_size: self.config.tab_size.clamp(1, 16), ambiguous_wide: self.config.ambiguous_wide },
+            insert_spaces: self.config.insert_spaces.get(&language).copied().unwrap_or(false),
+            eol: if eol == wire::Eol::Crlf { "\r\n" } else { "\n" },
+            line_comment: line_comment(&language),
+        }
+    }
+
+    /// Run an editing / motion command on `tab` for `intent`.
+    fn command(&mut self, tab: TabId, c: EditCommand, intent: Intent, fx: &mut Vec<Effect>) -> Result<(), String> {
+        let Some(i) = self.tabs.iter().position(|t| t.id == tab) else { return Err(format!("no tab {tab}")) };
+        let cfg = self.edit_cfg(&self.tabs[i]);
+        let t = &mut self.tabs[i];
+        let Some(m) = t.mirror.as_mut() else { return Err("the buffer is not open yet".into()) };
+        let before = t.editor.sel;
+        let Some(edit) = t.editor.command(m.text(), &cfg, c) else {
+            if t.editor.sel != before {
+                self.caret_moved(tab, fx);
+            }
+            return Ok(());
+        };
+        let step = m.local_edit(edit, intent, &mut self.ids).map_err(|e| match e {
+            cosmix_edit_client::mirror::MirrorError::NotLive => "The buffer is reconnecting — try again in a moment".to_string(),
+            cosmix_edit_client::mirror::MirrorError::TooLarge { items, bytes } => {
+                format!("Too large for one undoable edit ({items} places, {bytes} bytes)")
+            }
+            cosmix_edit_client::mirror::MirrorError::Invalid(m) => m,
+        })?;
+        self.drive(tab, step, fx);
+        self.caret_moved(tab, fx);
+        Ok(())
+    }
+
+    fn selected_text(&self, tab: TabId) -> Option<String> {
+        let t = self.tab(tab)?;
+        let m = t.mirror.as_ref()?;
+        let s = t.editor.sel;
+        let r: Range<usize> = s.anchor.min(s.head)..s.anchor.max(s.head);
+        if r.is_empty() || r.end > m.text().len() {
+            return None;
+        }
+        let mut out = String::new();
+        m.text().read(r, &mut out);
+        Some(out)
+    }
+
+    fn server_op(&mut self, tab: TabId, op: ServerOp, intent: Intent, fx: &mut Vec<Effect>) -> Result<(), String> {
+        let Some(m) = self.tabs.iter_mut().find(|t| t.id == tab).and_then(|t| t.mirror.as_mut()) else {
+            return Err("the buffer is not open".into());
+        };
+        if matches!(m.phase(), Phase::Detached { .. }) {
+            return Err("the buffer is detached".into());
+        }
+        let step = m.server_op(op, intent, &mut self.ids);
+        self.drive(tab, step, fx);
+        Ok(())
+    }
+
+    // ── selection publishing (plan §3.3) ─────────────────────────────────────
+
+    fn caret_moved(&mut self, tab: TabId, fx: &mut Vec<Effect>) {
+        let arm = self.x.get_mut(&tab).is_some_and(|x| {
+            let arm = !x.publish_timer;
+            x.publish_timer = true;
+            arm
+        });
+        if arm {
+            self.timer(PUBLISH_DEBOUNCE_MS, TimerFor::Publish(tab), fx);
+        }
+        self.session_changed(fx);
+    }
+
+    fn maybe_publish(&mut self, tab: TabId, fx: &mut Vec<Effect>) {
+        let Some(t) = self.tab(tab) else { return };
+        let Some(m) = t.mirror.as_ref().filter(|m| m.is_idle()) else { return };
+        let sel = t.editor.sel;
+        let buffer = m.buffer().to_string();
+        let len = m.text().len();
+        let Some(x) = self.x.get_mut(&tab) else { return };
+        if x.published == Some(sel) || x.publish_timer || sel.anchor.max(sel.head) > len {
+            return;
+        }
+        if let Some(last) = x.last_publish {
+            let gap = last.elapsed().as_millis() as u64;
+            if gap < PUBLISH_MIN_GAP_MS {
+                x.publish_timer = true;
+                self.timer(PUBLISH_MIN_GAP_MS - gap, TimerFor::Publish(tab), fx);
+                return;
+            }
+        }
+        x.published = Some(sel);
+        x.last_publish = Some(Instant::now());
+        let body = json!({"buffer": buffer, "ranges": [{"anchor": sel.anchor, "head": sel.head}], "origin": UI_ORIGIN});
+        let out = Outgoing { verb: "edit.select".into(), body: body.to_string(), op_id: None, deadline_ms: DEADLINE_MS };
+        self.send(out, Req::Select, fx);
+    }
+
+    fn session_changed(&mut self, fx: &mut Vec<Effect>) {
+        if !self.session_timer {
+            self.session_timer = true;
+            self.timer(SESSION_DEBOUNCE_MS, TimerFor::Session, fx);
+        }
+    }
+
+    // ── actions ──────────────────────────────────────────────────────────────
+
+    /// `Ok(result)` when handled here; `Err((code, message))` otherwise.
+    fn action(&mut self, tab: Option<TabId>, action: ActionId, intent: Intent, fx: &mut Vec<Effect>) -> Result<Option<Value>, (&'static str, String)> {
+        let need = |t: Option<TabId>| t.ok_or((code::NOT_FOUND, "no tab is open".to_string()));
+        let tab = tab.or(self.active);
+        let edit = |c: &mut Controller, t: TabId, cmd: EditCommand, intent: Intent, fx: &mut Vec<Effect>| {
+            c.command(t, cmd, intent, fx).map(|()| None).map_err(|e| (code::CONFLICT, e))
+        };
+        let conflict = |e: String| (code::CONFLICT, e);
+        match action {
+            ActionId::FileNew => {
+                let id = self.new_tab(None);
+                self.send_open(id, None, false, fx);
+                self.active = Some(id);
+                Ok(Some(json!({"tab": id})))
+            }
+            ActionId::FileSave => {
+                let t = need(tab)?;
+                self.server_op(t, ServerOp::Save { path: None, force: false }, intent, fx).map_err(conflict)?;
+                Ok(None)
+            }
+            ActionId::FileSaveAll => {
+                for t in self.tab_ids() {
+                    let dirty = self.tab(t).and_then(|t| t.mirror.as_ref()).is_some_and(|m| m.meta().dirty && m.meta().path.is_some());
+                    if dirty {
+                        let _ = self.server_op(t, ServerOp::Save { path: None, force: false }, intent.clone(), fx);
+                    }
+                }
+                Ok(None)
+            }
+            ActionId::FileReload => {
+                let t = need(tab)?;
+                self.server_op(t, ServerOp::Reload { force: false }, intent, fx).map_err(conflict)?;
+                Ok(None)
+            }
+            ActionId::FileClose => {
+                let t = need(tab)?;
+                self.close(t, false, None, fx);
+                Ok(None)
+            }
+            ActionId::FileExit => {
+                fx.push(Effect::SaveSession);
+                fx.push(Effect::Quit);
+                Ok(None)
+            }
+            ActionId::EditUndo | ActionId::EditRedo | ActionId::EditUndoAny | ActionId::EditUndoOther => {
+                let t = need(tab)?;
+                let lane = match action {
+                    ActionId::EditUndoAny => LaneArg::Any,
+                    ActionId::EditUndoOther => {
+                        let lane = self
+                            .tab(t)
+                            .and_then(|t| t.mirror.as_ref())
+                            .and_then(|m| m.last_remote().map(|r| r.lane.clone()))
+                            .ok_or((code::CONFLICT, "no other origin has edited this buffer".to_string()))?;
+                        LaneArg::Lane(lane)
+                    }
+                    _ => LaneArg::Own,
+                };
+                let op = if action == ActionId::EditRedo { ServerOp::Redo { lane } } else { ServerOp::Undo { lane } };
+                self.server_op(t, op, intent, fx).map_err(conflict)?;
+                Ok(None)
+            }
+            ActionId::EditCopy | ActionId::EditCut => {
+                let t = need(tab)?;
+                let text = self.selected_text(t);
+                if let Some(text) = &text {
+                    fx.push(Effect::ClipboardWrite { text: text.clone(), primary: false });
+                    if action == ActionId::EditCut {
+                        edit(self, t, EditCommand::Delete, intent, fx)?;
+                    }
+                }
+                Ok(text.map(Value::String))
+            }
+            ActionId::EditPaste => {
+                let t = need(tab)?;
+                let intent = Intent { tab: t, ..intent };
+                fx.push(Effect::ClipboardRead { primary: false, intent });
+                Ok(None)
+            }
+            ActionId::EditSelectAll => edit(self, need(tab)?, EditCommand::SelectAll, intent, fx),
+            ActionId::EditDuplicateLine => edit(self, need(tab)?, EditCommand::DuplicateLine, intent, fx),
+            ActionId::EditDeleteLine => edit(self, need(tab)?, EditCommand::DeleteLine, intent, fx),
+            ActionId::EditMoveLineUp => edit(self, need(tab)?, EditCommand::MoveLineUp, intent, fx),
+            ActionId::EditMoveLineDown => edit(self, need(tab)?, EditCommand::MoveLineDown, intent, fx),
+            ActionId::EditToggleComment => edit(self, need(tab)?, EditCommand::ToggleComment, intent, fx),
+            ActionId::EditIndent => edit(self, need(tab)?, EditCommand::Tab, intent, fx),
+            ActionId::EditOutdent => edit(self, need(tab)?, EditCommand::Outdent, intent, fx),
+            ActionId::EditDeleteWordLeft => edit(self, need(tab)?, EditCommand::DeleteWordLeft, intent, fx),
+            ActionId::EditDeleteWordRight => edit(self, need(tab)?, EditCommand::DeleteWordRight, intent, fx),
+            ActionId::EditOverwrite => {
+                let t = need(tab)?;
+                let on = self.tab_mut(t).map(|t| {
+                    t.editor.overwrite = !t.editor.overwrite;
+                    t.editor.overwrite
+                });
+                Ok(on.map(Value::Bool))
+            }
+            ActionId::TabsNext | ActionId::TabsPrev => {
+                let n = self.tabs.len();
+                if n == 0 {
+                    return Err((code::NOT_FOUND, "no tab is open".into()));
+                }
+                let i = self.active.and_then(|a| self.tabs.iter().position(|t| t.id == a)).unwrap_or(0);
+                let j = if action == ActionId::TabsNext { (i + 1) % n } else { (i + n - 1) % n };
+                self.active = Some(self.tabs[j].id);
+                self.session_changed(fx);
+                Ok(Some(json!({"tab": self.tabs[j].id})))
+            }
+            ActionId::TabsGoto(k) => {
+                let t = self.tabs.get(k as usize - 1).map(|t| t.id).ok_or((code::NOT_FOUND, format!("no tab {k}")))?;
+                self.active = Some(t);
+                self.session_changed(fx);
+                Ok(Some(json!({"tab": t})))
+            }
+            // The rest are the chrome's (dialogs, find bar, zoom, panels):
+            // the window handles them before they reach the controller.
+            _ => Err((code::UNAVAILABLE, format!("{} is handled by the window", action.id()))),
+        }
+    }
+
+    /// Close a tab: `edit.close` (refused `dirty` when this is the last
+    /// holder of unsaved text — plan D13); a detached or failed tab closes
+    /// locally.
+    fn close(&mut self, tab: TabId, force: bool, cmd: Option<(u64, String)>, fx: &mut Vec<Effect>) {
+        let buffer = self
+            .tab(tab)
+            .and_then(|t| t.mirror.as_ref())
+            .filter(|m| !matches!(m.phase(), Phase::Detached { .. }))
+            .map(|m| m.buffer().to_string());
+        match buffer {
+            Some(b) => {
+                let out = Outgoing {
+                    verb: "edit.close".into(),
+                    body: json!({"buffer": b, "force": force, "origin": UI_ORIGIN}).to_string(),
+                    op_id: None,
+                    deadline_ms: DEADLINE_MS,
+                };
+                self.send(out, Req::Close { tab, cmd }, fx);
+            }
+            None => {
+                self.close_tab(tab, fx);
+                if let Some((id, action)) = cmd {
+                    fx.push(Effect::Respond { id, rc: 0, body: ok_body(&verbs::ActionReply { id: action, ok: true, result: None }) });
+                }
+            }
+        }
+    }
+
+    // ── the ced.v1 port ──────────────────────────────────────────────────────
+
+    fn bus_command(&mut self, cmd: &BusCommand, fx: &mut Vec<Effect>) {
+        let body: Value = serde_json::from_str(&cmd.body).unwrap_or_else(|_| json!({}));
+        macro_rules! parse {
+            ($t:ty) => {
+                match serde_json::from_value::<$t>(body.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return fx.push(Effect::Respond {
+                            id: cmd.id,
+                            rc: 10,
+                            body: refusal(code::INVALID_ARGUMENT, format!("{}: {e}", cmd.verb), Some("bad_args")),
+                        });
+                    }
+                }
+            };
+        }
+        let id = cmd.id;
+        let reply = |fx: &mut Vec<Effect>, body: String| fx.push(Effect::Respond { id, rc: 0, body });
+        let refuse = |fx: &mut Vec<Effect>, code: &str, msg: String, reason: Option<&str>| {
+            fx.push(Effect::Respond { id, rc: 10, body: refusal(code, msg, reason) })
+        };
+        match cmd.verb.as_str() {
+            "ced.ping" => reply(
+                fx,
+                ok_body(&verbs::PingReply {
+                    pong: true,
+                    service: verbs::SERVICE.into(),
+                    schema: verbs::SCHEMA.into(),
+                    pid: std::process::id(),
+                    headless: self.headless,
+                }),
+            ),
+            "ced.info" => {
+                let info = cosmix_buildinfo::build_info!();
+                reply(
+                    fx,
+                    ok_body(&verbs::InfoReply {
+                        version: info.version.into(),
+                        git_sha: info.git_sha.into(),
+                        build_time: info.build_time.into(),
+                        headless: self.headless,
+                        tabs: self.tabs.len(),
+                        edit: self.edit_info.clone(),
+                        config_path: self.config_path.clone(),
+                        session_path: self.session_path.clone(),
+                    }),
+                )
+            }
+            "ced.open" => {
+                let r = parse!(verbs::OpenReq);
+                if r.paths.is_empty() {
+                    return refuse(fx, code::INVALID_ARGUMENT, "ced.open needs at least one path".into(), Some("bad_args"));
+                }
+                let goto = r.line.map(|l| (l, r.col.unwrap_or(1)));
+                self.open_many(&r.paths, Some((id, goto)), fx);
+            }
+            "ced.new" => {
+                let t = self.new_tab(None);
+                self.send_open(t, None, false, fx);
+                self.active = Some(t);
+                self.opens.push(PendingOpen { cmd: id, tabs: vec![t], new: true });
+                self.session_changed(fx);
+            }
+            "ced.tabs" => {
+                let tabs = self.tabs.iter().map(|t| self.tab_row(t)).collect();
+                reply(fx, ok_body(&verbs::TabsReply { active: self.active, tabs }));
+            }
+            "ced.focus" => {
+                let sel = parse!(verbs::TabSel);
+                match self.select_tab(&sel) {
+                    Ok(t) => {
+                        self.active = Some(t);
+                        if let Some(x) = self.x.get_mut(&t) {
+                            x.agent_since_focus = false;
+                        }
+                        self.session_changed(fx);
+                        reply(fx, ok_body(&verbs::FocusReply { tab: t }));
+                    }
+                    Err(e) => refuse(fx, code::NOT_FOUND, e, None),
+                }
+            }
+            "ced.state" => {
+                let r = parse!(verbs::StateReq);
+                match self.select_tab(&r.sel).map(|t| self.state_reply(t, r.text)) {
+                    Ok(Ok(s)) => reply(fx, ok_body(&s)),
+                    Ok(Err((c, m))) => refuse(fx, c, m, None),
+                    Err(e) => refuse(fx, code::NOT_FOUND, e, None),
+                }
+            }
+            "ced.type" => {
+                let r = parse!(verbs::TypeReq);
+                let t = match self.select_tab(&r.sel) {
+                    Ok(t) => t,
+                    Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
+                };
+                match self.command(t, EditCommand::Insert(r.text), Intent::bus(t, &cmd.caller_key), fx) {
+                    Ok(()) => {
+                        let pending = self.tab(t).and_then(|t| t.mirror.as_ref()).map_or(0, Mirror::pending);
+                        reply(fx, ok_body(&verbs::TypeReply { tab: t, pending }));
+                    }
+                    Err(e) => refuse(fx, code::CONFLICT, e, None),
+                }
+            }
+            "ced.select" => {
+                let r = parse!(verbs::SelectReq);
+                let t = match self.select_tab(&r.sel) {
+                    Ok(t) => t,
+                    Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
+                };
+                let res = self.tab(t).and_then(|t| t.mirror.as_ref()).ok_or("the buffer is not open".to_string()).and_then(|m| {
+                    let a = resolve_pos(m.text(), &r.anchor)?;
+                    let h = resolve_pos(m.text(), &r.head)?;
+                    Ok((a, h, m.text().point(a), m.text().point(h)))
+                });
+                match res {
+                    Ok((a, h, pa, ph)) => {
+                        if let Some(t) = self.tab_mut(t) {
+                            t.editor.sel = Selection { anchor: a, head: h };
+                            t.editor.preferred_cells = None;
+                        }
+                        self.caret_moved(t, fx);
+                        reply(fx, ok_body(&verbs::SelectReply { selection: verbs::SelectionP { anchor: pa, head: ph } }));
+                    }
+                    Err(e) => refuse(fx, code::INVALID_ARGUMENT, e, Some("bad_position")),
+                }
+            }
+            "ced.action" => {
+                let r = parse!(verbs::ActionReq);
+                let Some(action) = ActionId::from_id(&r.id) else {
+                    return refuse(fx, code::NOT_FOUND, format!("unknown action {}", r.id), Some("unknown_action"));
+                };
+                let tab = match (r.sel.tab, &r.sel.buffer) {
+                    (None, None) => self.active,
+                    _ => match self.select_tab(&r.sel) {
+                        Ok(t) => Some(t),
+                        Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
+                    },
+                };
+                let intent = Intent::bus(tab.unwrap_or(0), &cmd.caller_key);
+                if action == ActionId::FileClose {
+                    let force = r.args.as_ref().and_then(|a| a.get("force")).and_then(Value::as_bool).unwrap_or(false);
+                    match tab {
+                        Some(t) => self.close(t, force, Some((id, r.id.clone())), fx),
+                        None => refuse(fx, code::NOT_FOUND, "no tab is open".into(), None),
+                    }
+                    return;
+                }
+                match self.action(tab, action, intent, fx) {
+                    Ok(result) => reply(fx, ok_body(&verbs::ActionReply { id: r.id, ok: true, result })),
+                    Err((c, m)) => refuse(fx, c, m, None),
+                }
+            }
+            "ced.actions" => {
+                let actions = ActionId::all()
+                    .into_iter()
+                    .map(|a| verbs::ActionRow {
+                        id: a.id(),
+                        label: a.label(),
+                        menu: a.menu().label().to_string(),
+                        keys: crate::keymap::chords_for(a).into_iter().map(str::to_string).collect(),
+                        enabled: true,
+                    })
+                    .collect();
+                reply(fx, ok_body(&verbs::ActionsReply { actions }));
+            }
+            "ced.wait" => {
+                let r = parse!(verbs::WaitReq);
+                self.register_waiter(id, r, fx);
+            }
+            "ced.layout" => {
+                if self.headless {
+                    return refuse(fx, code::UNAVAILABLE, "ced.layout needs a window (this instance is --headless)".into(), Some("headless"));
+                }
+                let sel = parse!(verbs::TabSel);
+                let t = match self.select_tab(&sel) {
+                    Ok(t) => t,
+                    Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
+                };
+                match self.x.get(&t).and_then(|x| x.layout) {
+                    Some(l) => {
+                        let rect = |r: [f32; 4]| verbs::Rect { x: r[0], y: r[1], w: r[2], h: r[3] };
+                        let zero = verbs::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+                        reply(
+                            fx,
+                            ok_body(&verbs::LayoutReply {
+                                tab: t,
+                                window: zero,
+                                menubar: zero,
+                                tabstrip: zero,
+                                editor: rect(l.editor),
+                                gutter_w: l.gutter_w,
+                                line_height: l.line_height,
+                                cell_w: l.cell_w,
+                                first_line: l.first_line,
+                                visible_rows: l.visible_rows,
+                                caret: rect(l.caret),
+                                statusbar: zero,
+                            }),
+                        )
+                    }
+                    None => refuse(fx, code::UNAVAILABLE, "no frame has been laid out for this tab yet".into(), Some("no_frame")),
+                }
+            }
+            "ced.stats" => {
+                let s = &self.stats;
+                reply(
+                    fx,
+                    ok_body(&verbs::StatsReply {
+                        keys: s.keys,
+                        frames: 0,
+                        model_us: verbs::Percentiles::default(),
+                        view_us: verbs::Percentiles::default(),
+                        next_frame_us: verbs::Percentiles::default(),
+                        events: s.events,
+                        history_recoveries: s.history_recoveries,
+                        snapshot_recoveries: s.snapshot_recoveries,
+                        conflicts: s.conflicts,
+                        retries: s.retries,
+                        uncertain: s.uncertain,
+                    }),
+                )
+            }
+            "app.describe" => {
+                let view = self
+                    .active
+                    .and_then(|a| self.tab(a))
+                    .map(|t| self.tab_name(t))
+                    .unwrap_or_default();
+                reply(
+                    fx,
+                    ok_body(&verbs::DescribeReply {
+                        contract: "ctk-app-control.v0".into(),
+                        app: "ced".into(),
+                        title: "CosMix Editor".into(),
+                        view,
+                        engine: "iced".into(),
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        description: "The CosMix Editor: an iced editor over the edit Bus service".into(),
+                        controls: Vec::new(),
+                        verbs: verbs::VERBS.iter().map(|(v, _)| v.to_string()).collect(),
+                    }),
+                )
+            }
+            "app.quit" => {
+                reply(fx, ok_body(&verbs::QuitReply { quitting: true }));
+                fx.push(Effect::SaveSession);
+                fx.push(Effect::Quit);
+            }
+            "INFO" | "HELP" => {
+                let verbs: Vec<&str> = verbs::VERBS.iter().map(|(v, _)| *v).collect();
+                reply(fx, json!({"service": verbs::SERVICE, "schema": verbs::SCHEMA, "verbs": verbs}).to_string());
+            }
+            other => refuse(fx, code::UNKNOWN_VERB, format!("unknown verb {other}"), None),
+        }
+    }
+
+    fn tab_name(&self, t: &Tab) -> String {
+        t.mirror
+            .as_ref()
+            .and_then(|m| m.meta().name.clone())
+            .or_else(|| t.path.as_ref().map(|p| p.rsplit('/').next().unwrap_or(p).to_string()))
+            .unwrap_or_else(|| format!("untitled-{}", t.id))
+    }
+
+    fn tab_row(&self, t: &Tab) -> verbs::TabRow {
+        let m = t.mirror.as_ref();
+        verbs::TabRow {
+            tab: t.id,
+            buffer: m.map(|m| m.buffer().to_string()),
+            epoch: m.map(|m| m.epoch().to_string()),
+            path: t.path.clone(),
+            name: self.tab_name(t),
+            language: m.map_or_else(|| "text".into(), |m| m.meta().language.clone()),
+            rev: m.map_or(0, Mirror::rev),
+            dirty: m.is_some_and(|m| m.meta().dirty),
+            disk: m.map_or_else(|| "none".into(), |m| disk_str(m.meta().disk)),
+            pending: m.map_or(0, Mirror::pending),
+            conflicts: m.map_or(0, |m| m.conflicts().len()),
+            recovered: m.is_some_and(|m| m.meta().recovered),
+            phase: self.phase_of(t.id),
+        }
+    }
+
+    fn phase_of(&self, tab: TabId) -> PhaseW {
+        let failed = self.x.get(&tab).is_some_and(|x| x.open_error.is_some());
+        phase_w(self.tab(tab).and_then(|t| t.mirror.as_ref()), failed)
+    }
+
+    fn state_reply(&self, tab: TabId, with_text: bool) -> Result<verbs::StateReply, (&'static str, String)> {
+        let t = self.tab(tab).ok_or((code::NOT_FOUND, format!("no tab {tab}")))?;
+        let Some(m) = t.mirror.as_ref() else {
+            let msg = self.x.get(&tab).and_then(|x| x.open_error.clone()).unwrap_or_else(|| "the buffer is still opening".into());
+            return Err((code::UNAVAILABLE, msg));
+        };
+        let text = text_string(m.text());
+        if with_text && text.len() > STATE_TEXT_MAX {
+            return Err((code::INVALID_ARGUMENT, format!("the text is {} bytes (ced.state inlines at most {STATE_TEXT_MAX})", text.len())));
+        }
+        let len = m.text().len();
+        let sel = t.editor.sel;
+        Ok(verbs::StateReply {
+            tab,
+            buffer: Some(m.buffer().to_string()),
+            rev: m.rev(),
+            view_gen: m.view_gen(),
+            phase: self.phase_of(tab),
+            pending: m.pending(),
+            inflight: m.inflight().is_some(),
+            text_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+            bytes: len,
+            lines: m.text().line_count(),
+            selection: verbs::SelectionP { anchor: m.text().point(sel.anchor.min(len)), head: m.text().point(sel.head.min(len)) },
+            first_line: t.editor.scroll.first_line.max(1),
+            last_remote: m.last_remote().map(|r| verbs::LastRemote {
+                origin: r.origin.clone(),
+                lane: r.lane.clone(),
+                rev: r.rev,
+                kind: kind_str(r.kind),
+            }),
+            conflicts: m
+                .conflicts()
+                .iter()
+                .map(|c| verbs::ConflictRow { rev: c.rev, remote_origin: c.remote_origin.clone(), lines: [c.lines.0, c.lines.1], texts: c.texts.clone() })
+                .collect(),
+            detached_copy: m.detached_copy().is_some(),
+            text: with_text.then_some(text),
+        })
+    }
+
+    // ── ced.wait (plan §4.8): event-driven, never a loop ─────────────────────
+
+    fn register_waiter(&mut self, cmd: u64, r: verbs::WaitReq, fx: &mut Vec<Effect>) {
+        let refuse = |fx: &mut Vec<Effect>, code: &str, msg: String| fx.push(Effect::Respond { id: cmd, rc: 10, body: refusal(code, msg, Some("bad_args")) });
+        let conds = [r.rev.map(WaitCond::Rev), r.idle.filter(|i| *i).map(|_| WaitCond::Idle), r.epoch.clone().map(WaitCond::Epoch), r.phase.map(WaitCond::Phase)];
+        let mut given = conds.into_iter().flatten();
+        let (Some(cond), None) = (given.next(), given.next()) else {
+            return refuse(fx, code::INVALID_ARGUMENT, "ced.wait takes exactly one of rev / idle / epoch / phase".into());
+        };
+        if r.timeout_ms == 0 || r.timeout_ms > WAIT_MAX_MS {
+            return refuse(fx, code::INVALID_ARGUMENT, format!("timeout_ms must be 1..={WAIT_MAX_MS}"));
+        }
+        let tab = match self.select_tab(&r.sel) {
+            Ok(t) => t,
+            Err(e) => return fx.push(Effect::Respond { id: cmd, rc: 10, body: refusal(code::NOT_FOUND, e, None) }),
+        };
+        self.next_waiter += 1;
+        let w = Waiter { id: self.next_waiter, cmd, tab, cond, since: Instant::now(), timeout_ms: r.timeout_ms };
+        let wid = w.id;
+        self.waiters.push(w);
+        // Evaluated at registration; replies at once when it already holds.
+        self.eval_waiters(fx);
+        if self.waiters.iter().any(|w| w.id == wid) {
+            self.timer(r.timeout_ms, TimerFor::Wait(wid), fx);
+        }
+    }
+
+    fn waiter_holds(&self, w: &Waiter) -> bool {
+        let m = self.tab(w.tab).and_then(|t| t.mirror.as_ref());
+        match &w.cond {
+            WaitCond::Rev(r) => m.is_some_and(|m| m.rev() >= *r && matches!(m.phase(), Phase::Live)),
+            WaitCond::Idle => m.is_some_and(Mirror::is_idle),
+            WaitCond::Epoch(e) => m.is_some_and(|m| m.epoch() == e),
+            WaitCond::Phase(p) => {
+                let opened = self.x.get(&w.tab).is_some_and(|x| x.opened);
+                (m.is_some() || opened) && self.phase_of(w.tab) == *p
+            }
+        }
+    }
+
+    /// Re-evaluate every waiter (after every controller transition).
+    fn eval_waiters(&mut self, fx: &mut Vec<Effect>) {
+        let ready: Vec<u64> = self.waiters.iter().filter(|w| self.waiter_holds(w)).map(|w| w.id).collect();
+        for w in ready {
+            self.finish_waiter(w, Ok(()), fx);
+        }
+    }
+
+    fn finish_waiter(&mut self, wid: u64, outcome: Result<(), (&str, String)>, fx: &mut Vec<Effect>) {
+        let Some(i) = self.waiters.iter().position(|w| w.id == wid) else { return };
+        let w = self.waiters.remove(i);
+        self.timers.retain(|_, t| !matches!(t, TimerFor::Wait(x) if *x == wid));
+        let body = match outcome {
+            Ok(()) => {
+                let m = self.tab(w.tab).and_then(|t| t.mirror.as_ref());
+                ok_body(&verbs::WaitReply {
+                    tab: w.tab,
+                    rev: m.map_or(0, Mirror::rev),
+                    phase: self.phase_of(w.tab),
+                    epoch: m.map(|m| m.epoch().to_string()),
+                    waited_ms: w.since.elapsed().as_millis() as u64,
+                })
+            }
+            Err((reason, msg)) => {
+                return fx.push(Effect::Respond { id: w.cmd, rc: 10, body: refusal(code::CONFLICT, msg, Some(reason)) });
+            }
+        };
+        fx.push(Effect::Respond { id: w.cmd, rc: 0, body });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_line_col_suffixes() {
+        assert_eq!(split_line_col("/a/b.mix:12:3"), ("/a/b.mix".into(), Some((12, 3))));
+        assert_eq!(split_line_col("/a/b.mix:12"), ("/a/b.mix".into(), Some((12, 1))));
+        assert_eq!(split_line_col("/a/b.mix"), ("/a/b.mix".into(), None));
+        assert_eq!(split_line_col("/a/b:c.mix"), ("/a/b:c.mix".into(), None));
+        assert_eq!(split_line_col("/a/b:c.mix:7"), ("/a/b:c.mix".into(), Some((7, 1))));
+    }
+
+    #[test]
+    fn line_col_uses_editd_columns() {
+        let t = Text::from_text("ab\r\né x\n").unwrap();
+        assert_eq!(offset_of_line_col(&t, 1, 1), Ok(0));
+        assert_eq!(offset_of_line_col(&t, 1, 4), Ok(3)); // after the \r
+        assert!(offset_of_line_col(&t, 1, 5).is_err());
+        assert_eq!(offset_of_line_col(&t, 2, 2), Ok(6)); // é is 2 bytes
+        assert_eq!(resolve_pos(&t, &PosSpec::Named(NamedPos::End)), Ok(t.len()));
+        assert!(resolve_pos(&t, &PosSpec::Offset(5)).is_err()); // inside é
+    }
+
+    #[test]
+    fn refusals_have_the_fixture_shape() {
+        let v: Value = serde_json::from_str(&refusal(code::CONFLICT, "ced.wait timed out after 5000 ms", Some("timeout"))).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/verbs/refusal.timeout.json")).unwrap();
+        assert_eq!(v, fixture);
+    }
+
+    fn ctl() -> Controller {
+        Controller::new(Config::default(), 1, true)
+    }
+
+    fn cmd(verb: &str, body: Value) -> BusCommand {
+        BusCommand { id: 7, verb: verb.into(), body: body.to_string(), caller_key: "local:tester".into() }
+    }
+
+    fn response(fx: &[Effect]) -> (u8, Value) {
+        fx.iter()
+            .find_map(|e| match e {
+                Effect::Respond { rc, body, .. } => Some((*rc, serde_json::from_str(body).unwrap())),
+                _ => None,
+            })
+            .expect("a response")
+    }
+
+    #[test]
+    fn tabless_verbs_answer_without_a_tab() {
+        let mut c = ctl();
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.ping", json!({}))));
+        assert_eq!(rc, 0);
+        assert_eq!(v["schema"], "ced.v1");
+        assert_eq!(v["headless"], true);
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.tabs", json!({}))));
+        assert_eq!((rc, v["tabs"].as_array().unwrap().len()), (0, 0));
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.layout", json!({}))));
+        assert_eq!((rc, v["reason"].as_str()), (10, Some("headless")));
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.state", json!({}))));
+        assert_eq!((rc, v["error_code"].as_str()), (10, Some("NOT_FOUND")));
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.wait", json!({"idle": true, "rev": 3, "timeout_ms": 10}))));
+        assert_eq!((rc, v["reason"].as_str()), (10, Some("bad_args")));
+        let (rc, v) = response(&c.on_bus_command(cmd("app.describe", json!({}))));
+        assert_eq!((rc, v["contract"].as_str()), (0, Some("ctk-app-control.v0")));
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.actions", json!({}))));
+        assert_eq!(rc, 0);
+        assert!(v["actions"].as_array().unwrap().iter().any(|a| a["id"] == "edit.undo"));
+        let (rc, _) = response(&c.on_bus_command(cmd("ced.nope", json!({}))));
+        assert_eq!(rc, 10);
+        let fx = c.on_bus_command(cmd("app.quit", json!({})));
+        assert!(fx.contains(&Effect::Quit));
+    }
+
+    #[test]
+    fn start_subscribes_and_asks_edit_its_epoch() {
+        let mut c = ctl();
+        let fx = c.start();
+        for t in ["edit.changed", "theme.changed", "noded.props.changed"] {
+            assert!(fx.contains(&Effect::Subscribe { topic: t.into() }), "{t}");
+        }
+        assert!(fx.iter().any(|e| matches!(e, Effect::Send { out, .. } if out.verb == "edit.info")));
     }
 }
