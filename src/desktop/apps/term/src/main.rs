@@ -77,7 +77,11 @@ fn main() {
              Keys: Ctrl+Shift+T/W new/close tab, Ctrl+PageUp/PageDown change tab,\n\
              \x20     Ctrl+Shift+E/O split side by side/stacked, Ctrl+Shift+X close pane,\n\
              \x20     Ctrl+Shift+arrows move focus, Ctrl+Shift+Q quit,\n\
+             \x20     Ctrl+Tab / Ctrl+Shift+Tab next / previous pane (wrap),\n\
              \x20     Ctrl+plus/equal/minus/0 (and Ctrl+wheel) font size\n\
+             \x20     Wheel scrolls; Shift forces history; Shift+PageUp/PageDown page history\n\
+             \x20     Shift+Home/End history top/bottom (primary screen only)\n\
+             \x20     Input returns to bottom; bare Tab goes to the shell\n\
              TERM_NOTIFY=0: no desktop notification when a pane's shell exits\n\
              --version: print version and build hash, and nothing else\n\
              --print-config: print resolved startup settings and exit\n\
@@ -177,6 +181,9 @@ fn run(settings: config::Settings) -> Result<(), String> {
         grids: HashMap::new(),
         modifiers: iced::keyboard::Modifiers::empty(),
         wheel: 0.0,
+        scroll_wheel: 0.0,
+        scroll_pane: None,
+        pointer: std::cell::Cell::new(None),
         last_redraw: None,
         force_paint: false,
         paint_requested: true,
@@ -198,23 +205,23 @@ fn run(settings: config::Settings) -> Result<(), String> {
         update,
         view,
     )
-        .executor::<SingleThread>()
-        .title(DISPLAY_NAME)
-        .subscription(subscription)
-        .theme(iced::Theme::Dark)
-        .style(|state: &State, _theme| iced::theme::Style {
-            background_color: state.tokens.surface,
-            text_color: state.tokens.text,
-        })
-        .window(iced::window::Settings {
-            size: Size::new(900.0, 560.0),
-            platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: format!("dev.cosmix.{SERVICE}"),
-                ..Default::default()
-            },
+    .executor::<SingleThread>()
+    .title(DISPLAY_NAME)
+    .subscription(subscription)
+    .theme(iced::Theme::Dark)
+    .style(|state: &State, _theme| iced::theme::Style {
+        background_color: state.tokens.surface,
+        text_color: state.tokens.text,
+    })
+    .window(iced::window::Settings {
+        size: Size::new(900.0, 560.0),
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: format!("dev.cosmix.{SERVICE}"),
             ..Default::default()
-        })
-        .run();
+        },
+        ..Default::default()
+    })
+    .run();
 
     // Same teardown ordering as bterm: shut the tabs (which releases the Bus
     // loop through `emptied`), let the Bus thread finish its bounded replies,
@@ -299,6 +306,11 @@ struct State {
     modifiers: iced::keyboard::Modifiers,
     /// Fractional Ctrl+wheel travel not yet worth a font step.
     wheel: f32,
+    /// History and zoom gestures never share fractional travel.
+    scroll_wheel: f32,
+    scroll_pane: Option<u64>,
+    /// Window coordinates survive a tab change beneath a stationary pointer.
+    pointer: std::cell::Cell<Option<iced::Point>>,
     last_redraw: Option<std::time::Instant>,
     force_paint: bool,
     paint_requested: bool,
@@ -318,7 +330,8 @@ enum Message {
     Modifiers(iced::keyboard::Modifiers),
     SelectTab(u64),
     FocusPane(u64),
-    Wheel(iced::mouse::ScrollDelta),
+    Wheel(u64, iced::mouse::ScrollDelta),
+    Pointer,
     Window(iced::window::Event),
     /// The window's device-pixel ratio, answered by the runtime.
     Scale(f32),
@@ -447,6 +460,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Keys(keys) => state.send_keys(keys),
         Message::Action(action) => return state.act(action),
         Message::Modifiers(modifiers) => {
+            if modifiers != state.modifiers {
+                state.scroll_wheel = 0.0;
+            }
             // Letting go of Ctrl ends a Ctrl+wheel gesture: travel short of a
             // step must not carry into the next one and zoom early.
             if !modifiers.control() {
@@ -464,14 +480,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             tabs.user_activity();
             tabs.focus(id);
         }
-        Message::Wheel(delta) => {
-            // Ctrl+wheel is font size (T4). A bare wheel is not handled yet:
-            // mouse reporting and scrollback are not part of this frontend.
+        Message::Pointer => {}
+        Message::Wheel(id, delta) => {
             if state.modifiers.control() {
                 let steps = input::wheel_steps(&mut state.wheel, delta);
                 if steps != 0 {
                     state.zoom(|font| font.step_by(steps));
                 }
+            } else {
+                state.scroll(id, delta);
             }
         }
         Message::Window(event) => match event {
@@ -493,6 +510,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             iced::window::Event::Unfocused => {
                 state.modifiers = iced::keyboard::Modifiers::empty();
                 state.wheel = 0.0;
+                state.scroll_wheel = 0.0;
             }
             iced::window::Event::CloseRequested => return iced::exit(),
             _ => {}
@@ -505,6 +523,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 /// shell encoder — without that order, Ctrl+Shift+T would reach the PTY as a
 /// Ctrl-T (`input::tests::a_tab_chord_would_otherwise_reach_the_shell_as_a_control_code`).
 fn on_key(event: &iced::keyboard::Event) -> Option<Message> {
+    on_key_screen(event, false)
+}
+
+fn on_key_screen(event: &iced::keyboard::Event, alternate: bool) -> Option<Message> {
     match event {
         iced::keyboard::Event::KeyPressed {
             key,
@@ -515,7 +537,10 @@ fn on_key(event: &iced::keyboard::Event) -> Option<Message> {
             repeat,
             ..
         } => {
-            if let Some(action) = input::action_for(key, modified_key, *physical_key, *modifiers) {
+            if let Some(action) = input::action_on_screen(
+                input::action_for(key, modified_key, *physical_key, *modifiers),
+                alternate,
+            ) {
                 // A repeat of a non-repeating chord is swallowed, not passed
                 // through: it must not turn into a control code either.
                 return (!*repeat || action.repeats()).then_some(Message::Action(action));
@@ -539,7 +564,51 @@ fn view(state: &State) -> Element<'_, Message> {
     // The keyboard rides the widget tree, not a subscription: see `keys.rs`.
     // It wraps the strip as well, so a key pressed while the pointer is over
     // a tab still reaches the terminal.
-    let mut content = keys::keys(column![tab_strip(state, scale), panes], on_key);
+    let pane_bounds = state
+        .shape
+        .tree
+        .as_ref()
+        .map(|tree| layout::panes(tree, bounds, scale))
+        .unwrap_or_default();
+    let hovered = move |position: iced::Point| {
+        let (id, pane) = pane_bounds.iter().find(|(_, pane)| {
+            position.x >= pane.x
+                && position.x < pane.x + pane.w
+                && position.y >= pane.y
+                && position.y < pane.y + pane.h
+        })?;
+        let grid = *state.grids.get(id)?;
+        let (col, row) = input::pointer_cell(
+            iced::Point::new(position.x - pane.x, position.y - pane.y),
+            layout::border(scale),
+            state.painter.logical_cell(),
+            grid,
+        );
+        Some((*id, col, row))
+    };
+    let last = std::cell::Cell::new(state.pointer.get().and_then(&hovered));
+    let mut content = keys::keys(column![tab_strip(state, scale), panes], move |event| {
+        let message = on_key(event);
+        // Ordinary typing must not acquire an extra terminal/grid lock just
+        // to decide who owns a scrollback chord.
+        if matches!(message, Some(Message::Action(Action::Scroll(_)))) {
+            let tabs = state.tabs.lock().expect("tabs");
+            if !tabs.is_empty()
+                && tabs
+                    .active_terminal()
+                    .lock()
+                    .expect("terminal")
+                    .alternate_screen()
+            {
+                return on_key_screen(event, true);
+            }
+        }
+        message
+    })
+    .on_pointer(move |position| {
+        let cell = hovered(position);
+        pointer_message(&state.pointer, &last, cell, position)
+    });
     // Clean chrome redraws must not publish Paint: iced would rebuild the UI
     // and dispatch RedrawRequested a second time for no terminal change.
     if state.needs_paint() {
@@ -555,13 +624,26 @@ fn view(state: &State) -> Element<'_, Message> {
         .into()
 }
 
+type HoveredCell = Option<(u64, u16, u16)>;
+
+fn pointer_message(
+    pointer: &std::cell::Cell<Option<iced::Point>>,
+    last: &std::cell::Cell<HoveredCell>,
+    hovered: HoveredCell,
+    position: iced::Point,
+) -> Option<Message> {
+    // Keep pixel coordinates even when no application update is needed. A queued
+    // Pointer message must never overwrite a newer coalesced position.
+    pointer.set(Some(position));
+    (last.replace(hovered) != hovered).then_some(Message::Pointer)
+}
+
 /// One button per tab and a `+`, as bterm. Every colour is a design token.
 fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
     let tokens = state.tokens;
     let tab = |label: String, active: bool| {
-        button(text(label).size(13.0))
-            .padding([3.0, 12.0])
-            .style(move |_theme: &iced::Theme, status: button::Status| {
+        button(text(label).size(13.0)).padding([3.0, 12.0]).style(
+            move |_theme: &iced::Theme, status: button::Status| {
                 let (background, text_color) = if active {
                     (tokens.primary, tokens.primary_text)
                 } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -578,11 +660,13 @@ fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
                     },
                     ..button::Style::default()
                 }
-            })
+            },
+        )
     };
     let mut strip: Row<'_, Message> = Row::new().spacing(4.0).padding([3.0, 6.0]);
     for label in &state.shape.tabs {
-        strip = strip.push(tab(label.title.clone(), label.active).on_press(Message::SelectTab(label.id)));
+        strip = strip
+            .push(tab(label.title.clone(), label.active).on_press(Message::SelectTab(label.id)));
     }
     strip = strip.push(tab("+".into(), false).on_press(Message::Action(Action::NewTab)));
     container(strip)
@@ -598,7 +682,12 @@ fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
 /// The active tab's panes as nested rows and columns, split with the same
 /// function that sized their PTYs (`layout::split`), so a pane's widget and
 /// its grid always agree on its rectangle.
-fn pane_tree<'a>(state: &'a State, node: &Node, bounds: Geometry, scale: f32) -> Element<'a, Message> {
+fn pane_tree<'a>(
+    state: &'a State,
+    node: &Node,
+    bounds: Geometry,
+    scale: f32,
+) -> Element<'a, Message> {
     match node {
         Node::Leaf(id) => pane(state, *id, bounds, scale),
         Node::Split {
@@ -653,7 +742,7 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
         });
     mouse_area(outer)
         .on_press(Message::FocusPane(id))
-        .on_scroll(Message::Wheel)
+        .on_scroll(move |delta| Message::Wheel(id, delta))
         .into()
 }
 
@@ -720,11 +809,77 @@ fn apply(tabs: &mut TabSet, action: Action) -> Vec<Removed> {
             tabs.cycle(forward);
             Vec::new()
         }
+        Action::CyclePane { forward } => {
+            let ids: Vec<_> = tabs.leaves().iter().map(|pane| pane.id).collect();
+            if let Some(id) = input::cycle_pane(&ids, tabs.active_tab().active_pane, forward) {
+                tabs.focus(id);
+            }
+            Vec::new()
+        }
+        Action::Scroll(request) => {
+            tabs.active_terminal()
+                .lock()
+                .expect("terminal")
+                .scroll_view(request);
+            Vec::new()
+        }
         Action::FontIncrease | Action::FontDecrease | Action::FontReset => Vec::new(),
     }
 }
 
 impl State {
+    fn scroll(&mut self, id: u64, delta: iced::mouse::ScrollDelta) {
+        if self.scroll_pane != Some(id) {
+            self.scroll_wheel = 0.0;
+            self.scroll_pane = Some(id);
+        }
+        let Some(position) = self.pointer.get() else {
+            return;
+        };
+        let Some(tree) = &self.shape.tree else {
+            return;
+        };
+        let scale = self.painter.scale();
+        let bounds = layout::content(self.window.width, self.window.height, scale);
+        let Some((_, pane)) = layout::panes(tree, bounds, scale)
+            .into_iter()
+            .find(|(pane, _)| *pane == id)
+        else {
+            return;
+        };
+        let Some(&grid) = self.grids.get(&id) else {
+            return;
+        };
+        let lines =
+            input::scroll_steps(&mut self.scroll_wheel, delta, self.painter.logical_cell().1);
+        if lines == 0 {
+            return;
+        }
+        let (col, row) = input::pointer_cell(
+            iced::Point::new(position.x - pane.x, position.y - pane.y),
+            layout::border(scale),
+            self.painter.logical_cell(),
+            grid,
+        );
+        let tabs = self.tabs.lock().expect("tabs");
+        let Some(terminal) = tabs.pane_by_id(id) else {
+            return;
+        };
+        tabs.user_activity();
+        drop(tabs);
+        let terminal = terminal.lock().expect("terminal");
+        let mods = cosmix_term_core::terminal::MouseModifiers {
+            shift: self.modifiers.shift(),
+            alt: self.modifiers.alt(),
+            ctrl: self.modifiers.control(),
+        };
+        if !terminal.mouse_scroll(col, row, lines, mods) {
+            let before = terminal.display_offset();
+            terminal.scroll_wheel(lines, mods);
+            self.paint_requested |= terminal.display_offset() != before;
+        }
+    }
+
     /// Everything a wake can mean, in one place: reap exited shells, follow
     /// the tab set's shape (a Bus verb may have changed it), size any pane
     /// that needs it. Painting waits for the widget's redraw event.
@@ -752,8 +907,13 @@ impl State {
     }
 
     fn needs_paint(&self) -> bool {
-        self.paint_requested || self.force_paint
-            || self.shape.visible().iter().any(|id| self.painter.existing(*id).is_none())
+        self.paint_requested
+            || self.force_paint
+            || self
+                .shape
+                .visible()
+                .iter()
+                .any(|id| self.painter.existing(*id).is_none())
     }
 
     /// Rasterise every visible pane by its damaged rows (all rows, for a
@@ -799,6 +959,9 @@ impl State {
             _ => {
                 let removed = apply(&mut self.tabs.lock().expect("tabs"), action);
                 self.cleanup.submit(removed);
+                if matches!(action, Action::Scroll(_)) {
+                    self.paint_requested = true;
+                }
                 if action == Action::Quit {
                     return iced::exit();
                 }
@@ -928,7 +1091,7 @@ impl State {
         let terminal = terminal.lock().expect("terminal");
         let at = Instant::now();
         for key in keys {
-            if let Err(error) = terminal.listener.key(key, at) {
+            if let Err(error) = terminal.key(key, at) {
                 eprintln!("term input: {error}");
             }
         }
@@ -946,7 +1109,10 @@ mod tests {
             font_px: 13.0,
             ..config::Config::default()
         };
-        assert_eq!(resolve_config(base, Some("18.5"), "xterm").config.font_px, 18.5);
+        assert_eq!(
+            resolve_config(base, Some("18.5"), "xterm").config.font_px,
+            18.5
+        );
         for rejected in ["5.9", "48.1", "", "eighteen", "nan", "inf"] {
             assert_eq!(
                 resolve_config(base, Some(rejected), "xterm").config.font_px,
@@ -981,23 +1147,130 @@ mod tests {
         iced::keyboard::Key::Character(c.into())
     }
 
+    #[test]
+    fn scroll_chords_and_repeats_never_reach_the_shell() {
+        use cosmix_term_core::terminal::ScrollRequest;
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        for (named, request) in [
+            (Named::PageUp, ScrollRequest::PageUp),
+            (Named::PageDown, ScrollRequest::PageDown),
+            (Named::Home, ScrollRequest::Top),
+            (Named::End, ScrollRequest::Bottom),
+        ] {
+            for repeat in [false, true] {
+                assert!(matches!(
+                    on_key(&press(Key::Named(named), Key::Named(named), Modifiers::SHIFT, None, repeat)),
+                    Some(Message::Action(Action::Scroll(actual))) if actual == request
+                ));
+                assert!(matches!(
+                    on_key(&press(
+                        Key::Named(named),
+                        Key::Named(named),
+                        Modifiers::empty(),
+                        None,
+                        repeat
+                    )),
+                    Some(Message::Keys(_))
+                ));
+                assert!(matches!(
+                    on_key_screen(
+                        &press(
+                            Key::Named(named),
+                            Key::Named(named),
+                            Modifiers::SHIFT,
+                            None,
+                            repeat
+                        ),
+                        true
+                    ),
+                    Some(Message::Keys(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_motion_emits_only_for_a_new_pane_or_cell() {
+        let pointer = std::cell::Cell::new(None);
+        let last = std::cell::Cell::new(None);
+        assert!(
+            pointer_message(&pointer, &last, Some((1, 0, 0)), iced::Point::new(2.0, 2.0)).is_some()
+        );
+        for pixel in 3..8 {
+            assert!(
+                pointer_message(
+                    &pointer,
+                    &last,
+                    Some((1, 0, 0)),
+                    iced::Point::new(pixel as f32, 2.0)
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(pointer.get(), Some(iced::Point::new(7.0, 2.0)));
+        // A narrower cell after zoom/layout uses the newest pixel, not x=2.
+        assert_eq!(
+            input::pointer_cell(pointer.get().unwrap(), 0.0, (4.0, 4.0), (80, 24)),
+            (1, 0)
+        );
+        assert!(
+            pointer_message(&pointer, &last, Some((1, 1, 0)), iced::Point::new(9.0, 2.0)).is_some()
+        );
+        assert!(
+            pointer_message(
+                &pointer,
+                &last,
+                Some((2, 1, 0)),
+                iced::Point::new(90.0, 2.0)
+            )
+            .is_some()
+        );
+        assert!(pointer_message(&pointer, &last, None, iced::Point::ORIGIN).is_some());
+        assert!(pointer_message(&pointer, &last, None, iced::Point::ORIGIN).is_none());
+    }
+
     /// `on_key` is the dispatcher that decides chord versus shell and
     /// filters repeats; review finding: nothing exercised it.
     #[test]
     fn the_dispatcher_puts_chords_before_the_shell_and_filters_repeats() {
         use iced::keyboard::Modifiers;
         let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
-        let tab = |repeat| on_key(&press(character("t"), character("T"), ctrl_shift, Some("T"), repeat));
+        let tab = |repeat| {
+            on_key(&press(
+                character("t"),
+                character("T"),
+                ctrl_shift,
+                Some("T"),
+                repeat,
+            ))
+        };
 
         assert!(matches!(tab(false), Some(Message::Action(Action::NewTab))));
         // A held Ctrl+Shift+T is one tab: the repeat is swallowed, and it is
         // NOT handed to the encoder, which would send Ctrl-T to the shell.
-        assert!(tab(true).is_none(), "a repeated tab chord must be swallowed");
+        assert!(
+            tab(true).is_none(),
+            "a repeated tab chord must be swallowed"
+        );
 
         // Font steps repeat when held, as in foot.
-        let grow = |repeat| on_key(&press(character("="), character("="), Modifiers::CTRL, None, repeat));
-        assert!(matches!(grow(false), Some(Message::Action(Action::FontIncrease))));
-        assert!(matches!(grow(true), Some(Message::Action(Action::FontIncrease))));
+        let grow = |repeat| {
+            on_key(&press(
+                character("="),
+                character("="),
+                Modifiers::CTRL,
+                None,
+                repeat,
+            ))
+        };
+        assert!(matches!(
+            grow(false),
+            Some(Message::Action(Action::FontIncrease))
+        ));
+        assert!(matches!(
+            grow(true),
+            Some(Message::Action(Action::FontIncrease))
+        ));
 
         // Not a chord: the shell gets it, repeats included.
         for repeat in [false, true] {
@@ -1008,7 +1281,13 @@ mod tests {
         }
         // Ctrl+T without Shift is the shell's Ctrl-T, not a chord.
         assert!(matches!(
-            on_key(&press(character("t"), character("t"), Modifiers::CTRL, None, false)),
+            on_key(&press(
+                character("t"),
+                character("t"),
+                Modifiers::CTRL,
+                None,
+                false
+            )),
             Some(Message::Keys(_))
         ));
         // Modifier state is tracked for Ctrl+wheel.
@@ -1021,7 +1300,10 @@ mod tests {
     #[test]
     fn the_focus_ring_shows_only_when_there_is_more_than_one_pane() {
         let tokens = theme::tokens();
-        assert_ne!(tokens.ring, tokens.border, "the test needs two distinct tokens");
+        assert_ne!(
+            tokens.ring, tokens.border,
+            "the test needs two distinct tokens"
+        );
         let lone = Shape {
             tabs: Vec::new(),
             tree: Some(Node::Leaf(7)),
@@ -1066,6 +1348,9 @@ mod tests {
             grids: HashMap::new(),
             modifiers: iced::keyboard::Modifiers::empty(),
             wheel: 0.0,
+            scroll_wheel: 0.0,
+            scroll_pane: None,
+            pointer: std::cell::Cell::new(None),
             last_redraw: None,
             force_paint: false,
             paint_requested: true,
@@ -1147,7 +1432,10 @@ mod tests {
                 .unwrap()
                 .generation()
         };
-        assert!(!state.needs_paint(), "clean chrome redraws must not request Paint");
+        assert!(
+            !state.needs_paint(),
+            "clean chrome redraws must not request Paint"
+        );
         let _ = update(&mut state, Message::Wake);
         assert!(state.needs_paint(), "a wake must arm the next redraw");
         let _ = update(&mut state, Message::Paint(std::time::Instant::now()));
@@ -1205,10 +1493,13 @@ mod tests {
         let _ = state.sync();
         let start = state.painter.font().current();
         let travel = |fraction: f32| {
-            Message::Wheel(ScrollDelta::Pixels {
-                x: 0.0,
-                y: input::PIXELS_PER_STEP * fraction,
-            })
+            Message::Wheel(
+                0,
+                ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: input::PIXELS_PER_STEP * fraction,
+                },
+            )
         };
 
         let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
@@ -1239,6 +1530,188 @@ mod tests {
         reaper.join().unwrap();
     }
 
+    #[test]
+    fn wheel_targets_the_hovered_pane_without_focus_or_zoom_travel_leaking() {
+        use iced::keyboard::Modifiers;
+        use iced::mouse::ScrollDelta;
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let left = state.shape.active_pane;
+        let _ = state.act(Action::Split(SplitDir::Vertical));
+        let _ = state.sync();
+        let right = state.shape.active_pane;
+        assert_ne!(left, right);
+        let terminal = state.tabs.lock().unwrap().pane_by_id(left).unwrap();
+        fill_history(&terminal);
+        state.pointer.set(Some(iced::Point::new(10.0, 40.0)));
+        let half = ScrollDelta::Pixels {
+            x: 0.0,
+            y: state.painter.logical_cell().1 / 2.0,
+        };
+        let _ = update(&mut state, Message::Wheel(left, half));
+        assert_eq!(state.scroll_pane, Some(left));
+        assert_eq!(state.scroll_wheel, 0.5);
+        assert_eq!(active_pane(&state.tabs.lock().unwrap()), right);
+        let _ = update(&mut state, Message::Wheel(left, half));
+        assert_eq!(
+            terminal.lock().unwrap().display_offset(),
+            1,
+            "two half-cell deltas scroll the hovered pane"
+        );
+        let other = state.tabs.lock().unwrap().pane_by_id(right).unwrap();
+        assert_eq!(other.lock().unwrap().display_offset(), 0);
+        assert_eq!(active_pane(&state.tabs.lock().unwrap()), right);
+        let _ = update(
+            &mut state,
+            Message::Wheel(left, ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+        );
+        assert_eq!(terminal.lock().unwrap().display_offset(), 0);
+        let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
+        let _ = update(
+            &mut state,
+            Message::Wheel(
+                left,
+                ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: input::PIXELS_PER_STEP / 2.0,
+                },
+            ),
+        );
+        assert_eq!(state.wheel, 0.5);
+        assert_eq!(state.scroll_wheel, 0.0);
+        let _ = update(&mut state, Message::Modifiers(Modifiers::empty()));
+        let _ = update(&mut state, Message::Wheel(left, half));
+        assert_eq!(state.wheel, 0.0);
+        assert_eq!(state.scroll_wheel, 0.5);
+        // A different pane starts a new accumulation, even without movement
+        // (for example a tab change beneath the pointer).
+        let _ = update(&mut state, Message::Wheel(right, half));
+        assert_eq!(state.scroll_pane, Some(right));
+        assert_eq!(state.scroll_wheel, 0.5);
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    fn fill_history(terminal: &Arc<Mutex<cosmix_term_core::terminal::Terminal>>) {
+        let text = (0..120)
+            .map(|n| format!("history-{n}\r\n"))
+            .collect::<String>();
+        let mut terminal = terminal.lock().unwrap();
+        let screen = terminal.grid_snapshot().screen;
+        // Replace the live pane with an isolated grid, keeping its dimensions.
+        // Dropping the old terminal stops its reader; shell startup output can
+        // never race the fixture or the subsequent pixel comparisons.
+        *terminal = cosmix_term_core::terminal::Terminal::from_test_vt(
+            screen.cols,
+            screen.rows,
+            text.as_bytes(),
+        );
+    }
+
+    #[test]
+    fn viewport_redraw_repaints_fully_and_matches_fresh_pixels() {
+        use cosmix_term_core::terminal::ScrollRequest;
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let _ = state.act(Action::Split(SplitDir::Vertical));
+        let _ = state.sync();
+        let id = state.shape.active_pane;
+        for pane in state.shape.visible() {
+            let terminal = state.tabs.lock().unwrap().pane_by_id(pane).unwrap();
+            fill_history(&terminal);
+        }
+        let terminal = state.tabs.lock().unwrap().pane_by_id(id).unwrap();
+        let _ = update(&mut state, Message::Paint(std::time::Instant::now()));
+        let neighbour = state
+            .shape
+            .visible()
+            .into_iter()
+            .find(|pane| *pane != id)
+            .unwrap();
+        let generation = |state: &State, pane| {
+            state
+                .painter
+                .existing(pane)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .generation()
+        };
+        let neighbour_generation = generation(&state, neighbour);
+        state
+            .pointer
+            .set(Some(iced::Point::new(state.window.width - 10.0, 40.0)));
+        for request in [
+            ScrollRequest::PageUp,
+            ScrollRequest::Top,
+            ScrollRequest::Bottom,
+        ] {
+            assert!(!state.needs_paint());
+            let before = generation(&state, id);
+            // Wheel, keyboard action, and the core entry used by term.scroll.
+            match request {
+                ScrollRequest::PageUp => {
+                    let _ = update(
+                        &mut state,
+                        Message::Wheel(id, iced::mouse::ScrollDelta::Lines { x: 0.0, y: 3.0 }),
+                    );
+                    assert!(state.needs_paint(), "wheel must arm redraw");
+                }
+                ScrollRequest::Top => {
+                    let _ = update(&mut state, Message::Action(Action::Scroll(request)));
+                    assert!(state.needs_paint(), "scroll chord must arm redraw");
+                }
+                _ => terminal.lock().unwrap().scroll_view(request),
+            }
+            // The same coalesced wake path serves Bus viewport changes.
+            for _ in 0..3 {
+                let _ = update(&mut state, Message::Wake);
+            }
+            assert!(state.needs_paint());
+            assert_eq!(generation(&state, id), before, "wakes must not paint");
+            let screen = terminal.lock().unwrap().screen(false);
+            if request == ScrollRequest::Bottom {
+                assert_eq!(terminal.lock().unwrap().display_offset(), 0);
+                assert!(screen.cursor_visible);
+            } else {
+                assert!(terminal.lock().unwrap().display_offset() > 0);
+                assert!(!screen.cursor_visible);
+            }
+            // Retain old CPU band handles across the viewport change.
+            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+            let _retained = cpu_grid::view(&state.painter.frame(id), state.painter.scale());
+            let at = std::time::Instant::now();
+            let _ = update(&mut state, Message::Paint(at));
+            assert!(!state.needs_paint());
+            assert_eq!(generation(&state, id), before + 1);
+            assert_eq!(generation(&state, neighbour), neighbour_generation);
+            let mut fresh = Painter::new(
+                state.painter.scale(),
+                state.painter.font(),
+                config::Cursor::Underline,
+            )
+            .unwrap();
+            fresh.repaint(id, &screen, &vec![true; screen.rows]);
+            assert_eq!(
+                state.painter.frame(id).lock().unwrap().surface().rgba(),
+                fresh.frame(id).lock().unwrap().surface().rgba(),
+                "the next redraw must repaint the whole viewport, including all bands",
+            );
+            let _ = update(&mut state, Message::Paint(at));
+            assert_eq!(
+                generation(&state, id),
+                before + 1,
+                "redraw retry painted twice"
+            );
+        }
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
     fn active_pane(tabs: &TabSet) -> u64 {
         tabs.active_tab().active_pane
     }
@@ -1255,6 +1728,12 @@ mod tests {
         assert_eq!(tabs.leaves().len(), 2);
         let right = active_pane(&tabs);
         assert_ne!(right, left, "a split focuses the new pane");
+
+        apply(&mut tabs, Action::CyclePane { forward: true });
+        assert_eq!(active_pane(&tabs), left);
+        apply(&mut tabs, Action::CyclePane { forward: false });
+        assert_eq!(active_pane(&tabs), right);
+        assert_eq!(tabs.active_id(), first_tab);
 
         apply(&mut tabs, Action::Focus(Direction::Left));
         assert_eq!(active_pane(&tabs), left);

@@ -6,7 +6,7 @@
 //! only way to know that is to compare them against the same encoder.
 
 use cosmix_term_core::panes::{Direction, SplitDir};
-use cosmix_term_core::terminal::Key as TerminalKey;
+use cosmix_term_core::terminal::{Key as TerminalKey, ScrollRequest};
 use iced::keyboard::key::{Code, Named, Physical};
 use iced::keyboard::{Key, Modifiers};
 use iced::mouse::ScrollDelta;
@@ -24,9 +24,11 @@ pub enum Action {
     ClosePane,
     Focus(Direction),
     Cycle { forward: bool },
+    CyclePane { forward: bool },
     FontIncrease,
     FontDecrease,
     FontReset,
+    Scroll(ScrollRequest),
 }
 
 impl Action {
@@ -37,7 +39,7 @@ impl Action {
     pub fn repeats(self) -> bool {
         matches!(
             self,
-            Self::FontIncrease | Self::FontDecrease | Self::FontReset
+            Self::FontIncrease | Self::FontDecrease | Self::FontReset | Self::Scroll(_)
         )
     }
 }
@@ -72,10 +74,20 @@ pub fn action_for(
     physical: Physical,
     modifiers: Modifiers,
 ) -> Option<Action> {
-    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+    if modifiers.alt() || modifiers.logo() {
         return None;
     }
+    if !modifiers.control() {
+        return if modifiers.shift() {
+            scroll_request(key).map(Action::Scroll)
+        } else {
+            None
+        };
+    }
     let shift = modifiers.shift();
+    if matches!(key, Key::Named(Named::Tab)) {
+        return Some(Action::CyclePane { forward: !shift });
+    }
     let is = |candidate: &Key, text: &str| matches!(candidate.as_ref(), Key::Character(c) if c == text);
     if is(modified, "+") || is(modified, "=") || is(key, "+") || is(key, "=") {
         return Some(Action::FontIncrease);
@@ -107,6 +119,45 @@ pub fn action_for(
         Key::Named(Named::PageUp) => Some(Action::Cycle { forward: false }),
         _ => None,
     }
+}
+
+fn scroll_request(key: &Key) -> Option<ScrollRequest> {
+    Some(match key {
+        Key::Named(Named::PageUp) => ScrollRequest::PageUp,
+        Key::Named(Named::PageDown) => ScrollRequest::PageDown,
+        Key::Named(Named::Home) => ScrollRequest::Top,
+        Key::Named(Named::End) => ScrollRequest::Bottom,
+        _ => return None,
+    })
+}
+
+/// Alternate-screen applications own the scrollback chords too.
+pub fn action_on_screen(action: Option<Action>, alternate: bool) -> Option<Action> {
+    action.filter(|action| !alternate || !matches!(action, Action::Scroll(_)))
+}
+
+/// Layout order is the pane tree's first-child/second-child traversal.
+pub fn cycle_pane(ids: &[u64], active: u64, forward: bool) -> Option<u64> {
+    let current = ids.iter().position(|id| *id == active)?;
+    let next = if forward { (current + 1) % ids.len() } else { (current + ids.len() - 1) % ids.len() };
+    Some(ids[next])
+}
+
+/// Mouse-area positions are relative to the pane's outer border, in logical
+/// pixels. Clamp the border and spare right/bottom pixels to the nearest cell.
+pub fn pointer_cell(
+    position: iced::Point,
+    border: f32,
+    cell: (f32, f32),
+    grid: (u16, u16),
+) -> (u16, u16) {
+    let index = |value: f32, size: f32, count: u16| {
+        (((value - border).max(0.0) / size) as u16).min(count.saturating_sub(1))
+    };
+    (
+        index(position.x, cell.0, grid.0),
+        index(position.y, cell.1, grid.1),
+    )
 }
 
 /// The lowercase Latin letter a chord key stands for: the layout's own
@@ -155,7 +206,7 @@ fn is_latin(c: char) -> bool {
     )
 }
 
-/// Logical pixels of smooth (touchpad) scrolling that make one font step.
+/// Logical pixels of smooth (touchpad) scrolling that make one wheel step.
 /// A notched wheel reports whole lines and steps once per notch.
 pub const PIXELS_PER_STEP: f32 = 40.0;
 
@@ -169,9 +220,14 @@ pub const PIXELS_PER_STEP: f32 = 40.0;
 /// round discards what was accumulated the other way, so a reversal answers
 /// at once rather than first paying back the old direction.
 pub fn wheel_steps(pending: &mut f32, delta: ScrollDelta) -> i32 {
+    scroll_steps(pending, delta, PIXELS_PER_STEP)
+}
+
+/// Scrollback touchpad travel uses logical cell height, as bterm does.
+pub fn scroll_steps(pending: &mut f32, delta: ScrollDelta, cell_height: f32) -> i32 {
     let amount = match delta {
         ScrollDelta::Lines { y, .. } => y,
-        ScrollDelta::Pixels { y, .. } => y / PIXELS_PER_STEP,
+        ScrollDelta::Pixels { y, .. } => y / cell_height,
     };
     if !amount.is_finite() || amount == 0.0 {
         return 0;
@@ -431,6 +487,34 @@ mod tests {
         Modifiers::CTRL | Modifiers::SHIFT
     }
 
+    #[test]
+    fn shift_navigation_scrolls_plain_navigation_is_shell_input_and_ctrl_cycles() {
+        for (key, request, shell) in [
+            (Named::PageUp, ScrollRequest::PageUp, b"\x1b[5~".as_slice()),
+            (Named::PageDown, ScrollRequest::PageDown, b"\x1b[6~".as_slice()),
+            (Named::Home, ScrollRequest::Top, b"\x1b[H".as_slice()),
+            (Named::End, ScrollRequest::Bottom, b"\x1b[F".as_slice()),
+        ] {
+            let key = named(key);
+            assert_eq!(act(&key, &key, Modifiers::SHIFT), Some(Action::Scroll(request)));
+            assert!(Action::Scroll(request).repeats());
+            assert_eq!(act(&key, &key, Modifiers::empty()), None);
+            assert_eq!(bytes(&key, None, Modifiers::empty()), shell);
+            assert_eq!(act(&key, &key, Modifiers::SHIFT | Modifiers::ALT), None);
+        }
+        let up = named(Named::PageUp);
+        assert_eq!(act(&up, &up, Modifiers::CTRL), Some(Action::Cycle { forward: false }));
+    }
+
+    #[test]
+    fn pointer_coordinates_exclude_the_border_and_clamp_spare_pixels() {
+        let cell = (8.0, 16.0);
+        assert_eq!(pointer_cell(iced::Point::new(1.2, 1.2), 1.2, cell, (80, 24)), (0, 0));
+        assert_eq!(pointer_cell(iced::Point::new(25.3, 33.3), 1.2, cell, (80, 24)), (3, 2));
+        assert_eq!(pointer_cell(iced::Point::ORIGIN, 1.2, cell, (80, 24)), (0, 0));
+        assert_eq!(pointer_cell(iced::Point::new(900.0, 500.0), 1.2, cell, (80, 24)), (79, 23));
+    }
+
     /// bterm's chords, one for one: T3 parity is the same keys doing the same
     /// thing, and the Shift+letter case arrives as the unmodified letter.
     #[test]
@@ -504,6 +588,55 @@ mod tests {
         // Font steps repeat when held, as in foot.
         assert!(Action::FontIncrease.repeats());
         assert!(Action::FontDecrease.repeats());
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_panes_but_bare_tab_stays_with_the_shell() {
+        let tab = named(Named::Tab);
+        assert_eq!(act(&tab, &tab, Modifiers::CTRL), Some(Action::CyclePane { forward: true }));
+        assert_eq!(act(&tab, &tab, ctrl_shift()), Some(Action::CyclePane { forward: false }));
+        assert_eq!(act(&tab, &tab, Modifiers::empty()), None);
+        assert_eq!(bytes(&tab, Some("\t"), Modifiers::empty()), b"\t");
+        for modifier in [Modifiers::ALT, Modifiers::LOGO] {
+            assert_eq!(act(&tab, &tab, Modifiers::CTRL | modifier), None);
+            assert_eq!(act(&tab, &tab, ctrl_shift() | modifier), None);
+        }
+        assert!(!Action::CyclePane { forward: true }.repeats());
+        let ids = [9, 3, 17]; // Layout order, deliberately not numeric order.
+        assert_eq!(cycle_pane(&ids, 9, true), Some(3));
+        assert_eq!(cycle_pane(&ids, 17, true), Some(9));
+        assert_eq!(cycle_pane(&ids, 9, false), Some(17));
+        assert_eq!(cycle_pane(&ids, 17, false), Some(3));
+        assert_eq!(cycle_pane(&[9], 9, false), Some(9));
+        assert_eq!(cycle_pane(&[], 9, true), None);
+    }
+
+    #[test]
+    fn alternate_screen_owns_shift_navigation() {
+        for (named_key, expected) in [
+            (Named::PageUp, &b"\x1b[5~"[..]),
+            (Named::PageDown, &b"\x1b[6~"[..]),
+            (Named::Home, &b"\x1b[H"[..]),
+            (Named::End, &b"\x1b[F"[..]),
+        ] {
+            let key = named(named_key);
+            let action = act(&key, &key, Modifiers::SHIFT);
+            assert!(matches!(action_on_screen(action, false), Some(Action::Scroll(_))));
+            assert_eq!(action_on_screen(action, true), None);
+            assert_eq!(bytes(&key, None, Modifiers::SHIFT), expected);
+        }
+    }
+
+    #[test]
+    fn touchpad_history_uses_cell_height_while_zoom_keeps_forty_pixels() {
+        for height in [13.0, 17.0, 24.0] {
+            let mut pending = 0.0;
+            let half = ScrollDelta::Pixels { x: 0.0, y: height / 2.0 };
+            assert_eq!(scroll_steps(&mut pending, half, height), 0);
+            assert_eq!(scroll_steps(&mut pending, half, height), 1);
+            assert_eq!(scroll_steps(&mut pending, ScrollDelta::Pixels { x: 0.0, y: -height }, height), -1);
+        }
+        assert_eq!(wheel_steps(&mut 0.0, ScrollDelta::Pixels { x: 0.0, y: 40.0 }), 1);
     }
 
     /// The chord must beat the shell encoder: without the action table,

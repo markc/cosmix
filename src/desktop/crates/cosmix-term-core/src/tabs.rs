@@ -184,7 +184,7 @@ impl TabSet {
     pub(crate) fn is_watching(&self) -> bool {
         self.watching
     }
-    fn changed(&mut self, topic: &'static str, tab: u64, pane: u64, kind: &'static str) {
+    pub(crate) fn changed(&mut self, topic: &'static str, tab: u64, pane: u64, kind: &'static str) {
         self.event_revision += 1;
         if self.watching
             && let Some(sender) = &self.observer

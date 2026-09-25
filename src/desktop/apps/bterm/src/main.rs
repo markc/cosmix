@@ -882,14 +882,14 @@ fn keyboard(
     let terminal = active.lock().unwrap();
     let mut sent = false;
     if let Some(key) = key {
-        if let Err(e) = terminal.listener.key(key, at) {
+        if let Err(e) = terminal.key(key, at) {
             eprintln!("input: {e}");
         } else {
             sent = true;
         }
     } else if !ctrl && let Some(text) = &event.input.text {
         for c in text.chars().filter(|c| c.is_ascii() && !c.is_control()) {
-            if let Err(e) = terminal.listener.key(TerminalKey::Char(c), at) {
+            if let Err(e) = terminal.key(TerminalKey::Char(c), at) {
                 eprintln!("input: {e}");
             } else {
                 sent = true;

@@ -26,6 +26,8 @@ use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
+type KeyHandler<'a, Message> = Box<dyn Fn(&iced::keyboard::Event) -> Option<Message> + 'a>;
+type PointerHandler<'a, Message> = Box<dyn Fn(iced::Point) -> Option<Message> + 'a>;
 type Redraw<Message> = (
     Option<std::time::Instant>,
     fn(std::time::Instant) -> Message,
@@ -34,23 +36,30 @@ type Redraw<Message> = (
 /// Wraps `content` and reports every key press it sees, losslessly.
 pub struct Keys<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
-    on_press: fn(&iced::keyboard::Event) -> Option<Message>,
+    on_press: KeyHandler<'a, Message>,
+    on_pointer: Option<PointerHandler<'a, Message>>,
     redraw: Option<Redraw<Message>>,
 }
 
 /// Wrap `content` so `on_press` sees every keyboard event.
 pub fn keys<'a, Message, Theme, Renderer>(
     content: impl Into<Element<'a, Message, Theme, Renderer>>,
-    on_press: fn(&iced::keyboard::Event) -> Option<Message>,
+    on_press: impl Fn(&iced::keyboard::Event) -> Option<Message> + 'a,
 ) -> Keys<'a, Message, Theme, Renderer> {
     Keys {
         content: content.into(),
-        on_press,
+        on_press: Box::new(on_press),
+        on_pointer: None,
         redraw: None,
     }
 }
 
-impl<Message, Theme, Renderer> Keys<'_, Message, Theme, Renderer> {
+impl<'a, Message, Theme, Renderer> Keys<'a, Message, Theme, Renderer> {
+    pub fn on_pointer(mut self, callback: impl Fn(iced::Point) -> Option<Message> + 'a) -> Self {
+        self.on_pointer = Some(Box::new(callback));
+        self
+    }
+
     /// iced drains widget messages and rebuilds the UI before drawing. The
     /// last handled timestamp prevents its redraw retry from painting twice.
     pub fn on_redraw(
@@ -120,6 +129,12 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Event::Mouse(iced::mouse::Event::CursorMoved { position }) = event
+            && let Some(callback) = &self.on_pointer
+            && let Some(message) = callback(*position)
+        {
+            shell.publish(message);
+        }
         if let Event::Window(iced::window::Event::RedrawRequested(at)) = event
             && let Some((last, message)) = self.redraw
             && last != Some(*at)

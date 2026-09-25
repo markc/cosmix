@@ -39,7 +39,7 @@ off.
 
 ## Keys
 
-The chords are bterm's. They need Ctrl and Shift, or Ctrl alone where shown.
+Tab and pane chords need Ctrl and Shift, or Ctrl alone where shown.
 Any chord that also holds Alt or Super is left alone.
 
 | Keys | Action |
@@ -47,6 +47,7 @@ Any chord that also holds Alt or Super is left alone.
 | Ctrl+Shift+T | new tab |
 | Ctrl+Shift+W | close the active tab |
 | Ctrl+PageDown / Ctrl+PageUp | next / previous tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | next / previous pane in the current tab, in layout order, wrapping at either end |
 | Ctrl+Shift+E | split the focused pane side by side |
 | Ctrl+Shift+O | split the focused pane top and bottom |
 | Ctrl+Shift+X | close the focused pane |
@@ -56,9 +57,46 @@ Any chord that also holds Alt or Super is left alone.
 Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
 the repeats are dropped rather than sent to the shell.
 
+Pane cycling changes only keyboard focus within the current tab, following
+the split tree's first pane before its second pane. Bare Tab still goes to
+the shell.
+
 Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.
+
+## Scrollback
+
+| Input | Action |
+|---|---|
+| Wheel up / down | scroll the pane under the pointer |
+| Shift+wheel | force local history instead of application mouse reporting |
+| Shift+PageUp / Shift+PageDown | scroll the focused pane by one page (rows minus one) |
+| Shift+Home / Shift+End | jump to the top / bottom of the focused pane's history |
+
+Scrollback keys repeat when held and apply only on the primary screen. On the
+alternate screen, Shift+PageUp/PageDown/Home/End go to the application as
+PageUp/PageDown/Home/End. Plain PageUp and
+PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
+Accepted keyboard input, pasted or Bus `term.type` text (including control-lane
+typing), and mouse button or wheel reports return the viewport to the live bottom.
+Motion-only reports (including button drags), empty or rejected input, and
+automatic VT replies leave it alone. A live cursor is shown
+in a scrolled viewport only when its translated row remains on screen.
+
+Each wheel notch scrolls one line. Touchpad travel accumulates at one logical
+cell height per line, matching bterm. Applications that enable mouse reporting
+receive the wheel first; otherwise the alternate screen can translate it to cursor keys (for
+example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
+to change the font size. The `scrollback` setting controls history depth.
+
+Viewport changes mark only the affected pane dirty and arm the next redraw.
+Wheel scrolling, history keys and Bus `term.scroll` share this path: wakes
+coalesce without painting intermediate views, then the redraw repaints every
+row of the changed viewport, including when returning to the live bottom.
+Clean neighbouring panes keep their frames. The four-row tiny-skia bands use
+the viewport's translated cursor visibility, so an off-screen live cursor
+does not appear in history.
 
 ## Font size
 
@@ -111,8 +149,9 @@ is a JSON object, and `{}` means no arguments.
 | `term.pane.split` | `{"dir":"v"}` or `{"dir":"h"}` | split the focused pane side by side (`v`) or top and bottom (`h`) |
 | `term.pane.select` | `{"id":N}` | focus pane N in the active tab |
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |
-| `term.snapshot` | `{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}` (all optional) | read a pane anywhere; default is the focused pane in the selected/active tab; `contents` defaults true; history defaults 0, accepts 0–10000, capped at history above the current viewport |
+| `term.snapshot` | `{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}` (all optional) | read a pane anywhere; default is the focused pane in the selected/active tab; `contents` defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero) |
 | `term.type` | `{"pane":N,"text":"..."}` (`pane` optional) | type ASCII as keys into that pane, default focused pane; does not change focus |
+| `term.scroll` | `{"pane":N,"lines":3}` or `{"page":-1}` or `{"to":"top"}` | move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed `lines`, signed `page`, or `to` (`top`/`bottom`) |
 | `term.props.watch` | `{}` | subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON `{topics,revision}`), then read state |
 
 ```mix
@@ -134,15 +173,15 @@ error, never the active pane. With both snapshot selectors, the pane must
 belong to the tab or the call returns `invalid-argument`. `contents:false`
 returns the usual metadata and diagnostic timings without the screen marker
 or text. Scrollback is prepended after the screen marker, oldest first;
-`rows` still describes the viewport. Reading never moves the scroll offset.
+`rows` still describes the live screen. Reading never moves the scroll offset.
 Snapshot text represents empty grid cells as spaces, preserving column positions
-and trailing blank cells in both history and viewport rows. Text is limited to
+and trailing blank cells in both history and live-screen rows. Text is limited to
 512 KiB of encoded bytes (including allowance for JSON escaping), leaving
 metadata and transport headroom below the MCP 1 MiB and Bus 8 MiB limits.
-The budget keeps the newest complete rows: the viewport first, then as much
+The budget keeps the newest complete rows: the live screen first, then as much
 recent history as fits. Retained rows are returned oldest first; the header reports
 `truncated=true` when the byte budget omits rows and `lines_returned=N`
-counts history and viewport rows actually returned. A row larger than the
+counts history and live-screen rows actually returned. A row larger than the
 budget returns no text rows. With `contents:false`, the count is zero and
 `truncated=false`. Capture copies bounded rows under the grid lock; text
 formatting runs after releasing the grid, terminal and tab-set locks.
@@ -156,6 +195,17 @@ via `tabs.changed` and `title.changed` with `kind=retitled`; they leave the
 tab-set and pane-layout revisions unchanged, so pane geometry stays valid.
 Completion notifications use the same sanitised, possibly program-set label.
 Explicit cwd paths follow symlinks and resolve `..` normally.
+
+`term.scroll` (or `bterm.scroll` on bterm) returns JSON
+`{"pane":N,"display_offset":D,"history_lines":H}`. Positive lines/pages move
+up into history; negative values move down, clamped to available history.
+Each page is rows minus one, matching the keyboard chords. Integers must fit
+signed 64 bits; zero is a no-op. Stale pane IDs return `not-found`.
+Scrolling leaves snapshot content on the live screen and never sends PTY input.
+When watching, an offset change publishes `term.pane.changed` (or
+`bterm.pane.changed`) with `kind=scrolled`; a clamped no-op publishes nothing.
+Like other mutations it supports `request_id` replay and is refused on the
+strict diagnostic-only targetless lane.
 
 Existing replies keep their key=value format. New title replies are
 `retitled id=N tab=N pane=P revision=R`; move replies are
@@ -191,6 +241,9 @@ frontend layout: hidden tabs can report stale values after a window resize,
 or zeros after geometry invalidation. Select the tab and allow a frontend
 layout before relying on its geometry. Grid dimensions describe the current
 PTY grid and do not promise an up-to-date window layout.
+
+`term.snapshot` always reads the live screen, even while a human views history.
+It does not move that viewport or consume pending repaint damage.
 
 With no broker, term prints that the Bus is unavailable and works as a
 plain terminal.
