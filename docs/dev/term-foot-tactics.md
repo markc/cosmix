@@ -52,9 +52,10 @@ print(run_argv(["cargo", "test", "-p", "cosmix-term", "--release",
     "--", "--ignored", "--nocapture", "--test-threads=1"], {timeout: 600}))
 ```
 
-The two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
+The original two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
 `cpu_grid::bench::tiny_skia_foot_phases_bench`. `--test-threads=1` matters:
-running the two performance tests concurrently would contaminate their results.
+running performance tests concurrently would contaminate their results.
+Rank 6 adds `cpu_grid::bench::raster_warm_spans_bench` (described below).
 The default feature remains wgpu; both this report and
 [term-rendering.md](term-rendering.md) use explicit tiny-skia feature
 selection for CPU measurements. Only the term release test target and its dependencies were
@@ -374,6 +375,58 @@ Do not debounce keyboard delivery or discard PTY bytes. Coalesce **render
 intent**, and snapshot the latest state once. Continue processing input while
 waiting for a frame callback. Preserve any Rio synchronous-update handling;
 test partial writes with and without the application using that protocol.
+
+### Rank 6 implemented (2026-09-25)
+
+The shared Raster painter now coalesces equal-background cells within each
+dirty row and fills each pixel-row span through a safe `[u8; 4]` slice and
+`fill`. This removes per-cell/per-pixel background stores without adding a
+dependency or requiring pointer/stride alignment. Glyph bounds are clipped
+once to their cell, then mask and destination row slices are zipped. Zero
+coverage skips the store; full coverage copies the foreground; intermediate
+coverage retains the original unsigned integer expression and division by
+255. Foreground/background constants are hoisted out of the mask loop.
+
+Filling backgrounds before glyphs is equivalent because glyphs remain
+strictly cell-clipped. Each covered pixel is visited once and still contains
+its cell background, so the blend can use the hoisted background directly.
+Background fills are never omitted. `destination_pixel` is the optimised
+loops' single colour-order boundary for rank 3 integration; the public API
+and the rank 7 cache key/eviction policy are unchanged.
+
+The original painter is retained as test-only `paint_reference`, including
+its independent RGBA stores. Differential tests compare every byte and damage
+band over deterministic varied grids, scales 1/1.25/1.5/2.5, bold and wide or
+combining characters (still cell-clipped), both cursor styles, partial final
+rows, partial repaint sequences, odd padding and nonzero unaligned buffer
+origins. Synthetic masks exercise all 256 coverage values and each clipping
+edge, including fully clipped glyphs. Tests require an installed monospace
+font or `TERM_SPIKE_FONT`, as existing raster tests do.
+
+The ignored `cpu_grid::bench::raster_warm_spans_bench` sits beside the existing
+phase probes. It measures the same padded 2250×1250, scale-2.5 fixture for
+glyphs and spaces, with background runs of 90, 7 and 1 cells; 20 warmups and
+200 samples report mean/p50/p99 milliseconds. Setup and colour changes are
+outside the timer. Run it in release mode serially with the existing probes
+using the reproduction command above. ("Padded" refers to the cell padding
+described at the top of this report, not buffer stride; the bench stride is
+exactly `width * 4`.)
+
+Measured on cbc3 (release, serial, `--include-ignored`, commit 818d96b1),
+core 108 passed and term tiny-skia 45 passed, clippy clean on both:
+
+| Probe | Before (foot-tactics) | Rank 6 |
+|---|---:|---:|
+| Warm full paint, 2250 glyph cells | 3.98 ms | **1.23 ms** |
+| Background only (spaces) | 2.05 ms | **0.37 ms** |
+| Four-row bands, full redraw | 11.58 ms | **7.00 ms** |
+| Four-row bands, echo | 1.77 ms | **1.24 ms** |
+
+The before column is from the merge validation run on a different host, so
+compare the phase probes rather than read the totals as exact; the full
+redraw target of < 8 ms is met by rank 6 alone. Swash's Outline/Alpha image layout (one byte per mask
+pixel) and representable grid/buffer size arithmetic remain existing caller
+and library assumptions.
 
 ## The direct path and its architecture cost
 
