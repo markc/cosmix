@@ -1096,7 +1096,13 @@ Each wake drains every queued datagram into **one** `net.changed` batch:
 `net_state() -> {links, addresses}` is the same information from a netlink dump
 (`links[]`: `ifname, index, up, operstate, loopback, wireless`; `addresses[]`:
 `ifname, index, family, address, prefix`). A dump the kernel marks interrupted is
-retried; three in a row raise `NET_STATE_INCONSISTENT`.
+retried; three in a row raise `NET_STATE_INCONSISTENT`. The whole call, retries
+included, answers within 2 s or raises `NET_STATE_IO`.
+
+If the subscription socket itself fails (a poll error, or a receive error other
+than an overrun), the handle delivers one batch with
+`closed: {error_code: "NET_WATCH_IO", message}` and `overflow:true`, then stays
+silent: unwatch it and subscribe again when you choose to.
 
 The socket is raw libc: three fixed headers and a few attributes do not justify
 linking a netlink crate into every Mix build. `net_*` are **Env** class
@@ -1122,7 +1128,8 @@ connecting would otherwise be an event. `kind` is `new`, `change` or `remove`;
 The volume itself is `audio_state([opts]) -> {ok, volume, level, muted, reason?}`:
 one `wpctl get-volume @DEFAULT_AUDIO_SINK@` with a 2 s deadline. `level` is
 `round(volume * 100)`. No default sink, a missing `wpctl` or a timeout is
-`ok:false` with a `reason`, not an error. Call it once per batch: a burst of
+`ok:false` with a `reason`, not an error. The deadline holds on every path,
+including a kernel without `pidfd_open`. Call it once per batch: a burst of
 notices costs one read.
 
 **Why a child and not a library.** No PipeWire client crate is in the
@@ -1136,7 +1143,10 @@ evaluator retirement SIGKILLs the group and reaps it. If `pactl` exits by itself
 `closed: {error_code: "AUDIO_SOURCE_EXITED", message, exit_code}` and
 `overflow:true`, then stays silent: unwatch it and subscribe again when you
 choose to (a behaviour typically retries after a delay from an async handler).
-If the Mix process itself is SIGKILLed, `pactl` ends at its next write.
+If the Mix process itself is SIGKILLed, the `mix` binary's children carry
+`PR_SET_PDEATHSIG(SIGKILL)` and die with it; in an embedder that has not made
+its evaluator thread the owned-children host, `pactl` ends at its next write.
+`AUDIO_UNAVAILABLE` (no `pactl`) will not change by retrying; treat it as final.
 `audio_*` are **Process** class (they run programs).
 
 ### Limits and refusals

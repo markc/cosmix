@@ -79,10 +79,6 @@ impl Families {
         audio: true,
     };
 
-    pub fn any(self) -> bool {
-        self.filesystem || self.children || self.net || self.audio
-    }
-
     fn source(self, command: &str) -> bool {
         match command {
             "net.changed" => self.net,

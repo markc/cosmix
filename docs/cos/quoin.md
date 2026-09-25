@@ -462,8 +462,11 @@ them), `step_px`, `range_px`, `edge` (the edge that declares
 topic `<service>.settings.changed` when any field changes: a scheme chosen
 over the Bus or from the chrome dots, an ingested motion, a settled resize, or
 the page changing hands. A notice is sent again after every reconnect. It is
-not sent on idle updates or on a timer. `revision` is the last published
-notice's revision.
+not sent on idle updates or on a timer. In a `get` reply `revision` is the
+last published notice's revision while the body is the live state, so a reply
+that follows a write in the same update carries revision N with content the
+next notice (N+1) will repeat. Do not fence on it: a reply is never older than
+its revision, and the notice that follows it is always sent.
 
 `shell.debug.status` exposes process-lifetime request/rejection counts,
 accepted mutation counts, maximum dispatch time in microseconds, pending reply

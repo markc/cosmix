@@ -20,9 +20,29 @@ $state = $loader.initial($ROOT, $TEMPLATES, $HOST, $ME, $io)
 $state.legacy = env("SCENES_LEGACY_SERVICE", "quoin-panel")
 $ROOT = $state.root
 
+$state.handover_delay = 1
+$state.handover_armed = false
+
+-- An owed legacy handover is retried on every services snapshot and panel
+-- notice. For a failure no later event would retry (an rpc timeout on an
+-- idle desktop), one local task backs off 1, 2 .. 32 s and then stops until
+-- nothing is owed: a page that keeps failing is a diagnostic, not a poll.
+-- Never a Bus self-emit, and at most one task in flight.
+fn schedule_handover($s)
+  if len($loader.legacy_handover_pending($s)) == 0 then
+    $s.handover_delay = 1
+    return $s
+  end
+  if $s.handover_armed or $s.handover_delay > 32 then return $s end
+  $s.handover_armed = true
+  task_start("scenes.handover", json_encode({delay:$s.handover_delay}))
+  $s.handover_delay = $s.handover_delay * 2
+  return $s
+end
+
 fn refresh_services($s, $reconnect)
   $r = $s.io.rpc("noded", "noded.props.get", {})
-  return $loader.services($s, (($r ?? {}).services ?? {}).registered, $reconnect)
+  return schedule_handover($loader.services($s, (($r ?? {}).services ?? {}).registered, $reconnect))
 end
 
 on fs.changed
@@ -73,7 +93,7 @@ on "shell.panel.changed"
       if $event.headers.gap == "true" then
         $state = refresh_services($state, true)
       else
-        $state = $loader.panel_changed($state, $event.args)
+        $state = schedule_handover($loader.panel_changed($state, $event.args))
       end
     catch $message, $error
       $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
@@ -141,6 +161,23 @@ on scenes.restart
       $state.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
     end
   end
+  $state = $loader.changed($state)
+end
+
+on scenes.handover async
+  if len(keys($event.headers)) != 0 then return end
+  sleep($event.args.delay ?? 1)
+end
+
+on scenes.handover
+  if len(keys($event.headers)) != 0 then return end
+  $state.handover_armed = false
+  try
+    $state = $loader.legacy_handover($state)
+  catch $message, $error
+    $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+  end
+  $state = schedule_handover($state)
   $state = $loader.changed($state)
 end
 

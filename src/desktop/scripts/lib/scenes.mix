@@ -148,7 +148,7 @@ fn entry($name)
   return {name:$name, installed:true, enabled:false, mounted:false, revision:0,
     source:nil, model:nil, digest:"", attempted:"", behaviour_digest:"", meta_digest:"",
     generation:0, pid:nil, retiring:nil, status:"disabled", ready:false, crashes:0, started:0, restart_at:nil,
-    diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, pending:false}
+    diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, pending:false, legacy_page:false}
 end
 
 fn persist($s)
@@ -300,7 +300,9 @@ end
 -- pages itself and a load by either owner takes the page from the other.
 -- While its service is registered, a loader scene on one of its pages stays
 -- installed and enabled but unmounted; the registration disappearing is the
--- event that mounts it (services() rescans), with no wait loop.
+-- event that mounts it (services() rescans). A mount that then fails stays
+-- owed: later services snapshots and panel notices retry it
+-- (legacy_handover), and the citizen adds a local task_start backoff.
 $LEGACY_PAGES = ["scene-panel", "scene-launcher", "scene-calendar", "scene-notes"]
 
 fn legacy_guard($s, $page)
@@ -342,6 +344,7 @@ fn reconcile_one($s, $name, $force)
     $s.scenes[$name].attempted = hash_sha256(bounded_read($dir .. "/scene.mix", 262144))
     $c = candidate($s, $name, $dir)
     $e.attempted = $c.digest
+    $e.legacy_page = contains($LEGACY_PAGES, $c.page)
     $s.scenes[$name] = $e
     if $c.behaviour_digest != "" and ($force or $c.behaviour_digest != $e.behaviour_digest) then
       $s.io.check($dir .. "/behaviour.mix")
@@ -406,6 +409,27 @@ fn rescan($s, $force)
   if len($names) > 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
   for each $n in $names
     $s = reconcile_safe($s, $n, $force)
+  end
+  return $s
+end
+
+-- The handover is owed, not a one-shot: while the host is live and the
+-- legacy citizen is absent, every enabled, installed legacy-page scene that
+-- is still unmounted (a transient load failure, a seat the host has not yet
+-- released) is retried on each services snapshot and panel notice.
+fn legacy_handover_pending($s)
+  $names = []
+  if not $s.host_live or type($s.services) != "list" or contains($s.services, $s.legacy) then return $names end
+  for each $name in sort(keys($s.scenes))
+    $e = $s.scenes[$name]
+    if $e.enabled and $e.installed and not $e.mounted and $e.legacy_page == true then push($names, $name) end
+  end
+  return $names
+end
+
+fn legacy_handover($s)
+  for each $name in legacy_handover_pending($s)
+    $s = reconcile_safe($s, $name, false)
   end
   return $s
 end
@@ -685,7 +709,9 @@ fn panel_changed($s, $event)
   $s = panel_snapshot($s)
   $s.panel_generation = $event.generation
   $s.panel_revision = $event.revision
-  return $s
+  -- The host releasing the legacy citizen's pages shows up here; retry an
+  -- owed handover that the seat rule refused.
+  return legacy_handover($s)
 end
 
 fn services($s, $names, $reconnect)
@@ -750,7 +776,15 @@ fn services($s, $names, $reconnect)
       return $s
     end
   end
-  if $released and $live and not $returning then $s = rescan($s, false) end
+  -- Release rescans the disk; every later snapshot retries an owed handover
+  -- (state, not the edge: the first mount after release may have failed).
+  if $live and not $returning then
+    if $released then
+      $s = rescan($s, false)
+    else
+      $s = legacy_handover($s)
+    end
+  end
   -- A native exit proves the process is gone, but the broker may still be
   -- retiring its name. A fresh registry read in start closes that handover.
   if $live then

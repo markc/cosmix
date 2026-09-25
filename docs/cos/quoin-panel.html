@@ -587,9 +587,14 @@ the last accepted model; <code>panel.refresh</code> queues one rebuild.</p>
 only redraws the time. Network and volume are event-driven: <code>net_watch</code>
 (rtnetlink link changes) and <code>audio_watch</code> (a <code>pactl subscribe</code> stream) wake
 the behaviour, which re-reads <code>net_state()</code> / <code>audio_state()</code> through the
-<code>status_*</code> helpers in <code>lib/runtime.mix</code>. A closed audio stream re-subscribes
-after 5 s, doubling to 300 s (a reconnect backoff, not a poll). A mix without
-these builtins shows the network offline and hides volume. Nothing polls.</p>
+<code>status_*</code> helpers in <code>lib/runtime.mix</code>; a link event re-reads only the
+network and an audio event only the volume. A closed link socket or audio
+stream from the live handle re-subscribes after 5 s, doubling to 300 s (a
+reconnect backoff, not a poll); a subscription that outlived the current delay
+starts again from 5 s. A host without <code>pactl</code> (<code>AUDIO_UNAVAILABLE</code>) hides
+volume for the behaviour's life with no retry, and only <code>NET_WATCH_IO</code> /
+<code>AUDIO_WATCH_IO</code> refusals are retried. A mix without these builtins shows the
+network offline and hides volume. Nothing polls.</p>
 <p><code>scene-template-test.mix</code> captures the exact legacy <code>panel_doc</code> output for
 empty, busy (focused/minimised/no-workspace/overlay windows, three
 workspaces, open launcher, peeked), tray-change (removed and added items,
@@ -648,7 +653,10 @@ call), re-read on every <code>audio.changed</code> batch from <code>audio_watch<
 is hidden when there is no default sink. Click toggles mute.
 <code>PIPEWIRE_RUNTIME_DIR</code> points at the login session's runtime directory. If
 PipeWire's server goes away the subscription reports <code>closed</code> and the panel
-subscribes again after 5 s, doubling to at most 5 minutes until it succeeds.
+subscribes again after 5 s, doubling to at most 5 minutes until it succeeds
+(back to 5 s when the lost subscription had been up longer than the delay).
+The network subscription recovers the same way. A host without <code>pactl</code>
+hides the applet for good (<code>AUDIO_UNAVAILABLE</code>, no retry).
 See <a href="/mix/system#desktop-status-events--net_watch-audio_watch">desktop status events</a>.
 Behaviours use the same sources through <code>lib/runtime.mix</code>'s <code>status_watch</code>,
 <code>status_net</code>, <code>status_volume</code>, <code>status_fields</code> and <code>status_closed</code>.</li>

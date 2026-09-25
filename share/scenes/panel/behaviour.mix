@@ -30,7 +30,8 @@ $state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes
   net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
   open: {launcher: false, calendar: false, notes: false}, peeked: [], peek_busy: false,
   icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false,
-  net_watch: nil, audio_watch: nil, audio_retry: 5, audio_retrying: false,
+  net_watch: nil, net_started: 0, net_retry: 5, net_retrying: false,
+  audio_watch: nil, audio_started: 0, audio_retry: 5, audio_retrying: false, audio_unavailable: false,
   model: nil}
 
 -- ── status: network + volume, pushed by the kernel and PipeWire ─────────
@@ -43,23 +44,57 @@ fn start_status()
     eprint("panel: status events unavailable: this mix has no net_watch/audio_watch")
     return
   end
-  if $state.net_watch == nil then
-    try
-      $state.net_watch = net_watch({events: ["link"]})
-    catch $message
-      eprint("panel: net_watch failed: " .. to_string($message))
-    end
-  end
+  start_net()
   start_audio()
 end
 
+-- Only an I/O failure is retried (a local backoff); any other refusal (the
+-- handle limit, a retired evaluator) is terminal and logged once.
+fn start_net()
+  if $state.net_watch != nil then return end
+  try
+    $state.net_watch = net_watch({events: ["link"]})
+    $state.net_started = monotonic()
+  catch $message, $error
+    eprint("panel: net_watch failed: " .. to_string($message))
+    if $error.code == "NET_WATCH_IO" then retry_net() end
+  end
+end
+
+-- A host without pactl (AUDIO_UNAVAILABLE) will never answer: the volume
+-- applet stays hidden for this behaviour's life, with no retry timer.
 fn start_audio()
-  if $state.audio_watch != nil then return end
+  if $state.audio_watch != nil or $state.audio_unavailable then return end
   try
     $state.audio_watch = audio_watch({runtime_dir: $PW_RUNTIME})
-  catch $message
+    $state.audio_started = monotonic()
+  catch $message, $error
     eprint("panel: audio_watch failed: " .. to_string($message))
-    retry_audio()
+    if $error.code == "AUDIO_UNAVAILABLE" then
+      $state.audio_unavailable = true
+    elif $error.code == "AUDIO_WATCH_IO" then
+      retry_audio()
+    end
+  end
+end
+
+-- A subscription that outlived the current delay was a working one, so the
+-- server (or the link socket) only restarted: come back after the shortest
+-- delay instead of a stale doubled one.
+fn reset_if_lived($started, $delay)
+  return monotonic() - $started >= $delay ? 5 : $delay
+end
+
+-- The link socket failed: subscribe again after a delay doubling to five
+-- minutes. A reconnect backoff, not a state poll.
+fn retry_net()
+  if $state.net_retrying then return end
+  $state.net_retrying = true
+  try
+    task_start("net.retry", "{}")
+  catch $message
+    $state.net_retrying = false
+    eprint("panel: net retry not scheduled: " .. to_string($message))
   end
 end
 
@@ -83,9 +118,19 @@ fn toggle_mute()
 end
 
 
-fn apply_status()
+-- Each source re-reads only its own state: a link event forks no wpctl and
+-- an audio event runs no netlink dump.
+fn apply_net()
   $state.net = has_builtin("net_state") ? $r.status_net() : {up: false, wireless: false}
+end
+
+fn apply_volume()
   $state.vol = $state.audio_watch != nil ? $r.status_volume($PW_RUNTIME) : {ok: false, level: 0, muted: false}
+end
+
+fn apply_status()
+  apply_net()
+  apply_volume()
 end
 
 -- ── service state (events are hints; these reads are the truth) ─────────
@@ -343,7 +388,7 @@ end
 
 on vol_mute async
   $out = toggle_mute()
-  apply_status()
+  apply_volume()
   schedule()
   $r.respond($out)
 end
@@ -443,18 +488,23 @@ on bus.connected
   if $state.ready then resync() end
 end
 
+-- A closed batch from the live handle re-subscribes after the backoff; one
+-- from an older handle (already replaced) changes nothing.
 on net.changed async
   if len(keys($event.headers)) != 0 then return end
   $batch = type($event.args) == "map" ? $event.args : {}
   if type($batch.closed) == "map" then
     eprint("panel: net_watch ended: " .. to_string($batch.closed.message))
+    if $batch.watch != $state.net_watch then return end
     try
       net_unwatch($batch.watch)
     catch $e
     end
     $state.net_watch = nil
+    $state.net_retry = reset_if_lived($state.net_started, $state.net_retry)
+    retry_net()
   end
-  apply_status()
+  apply_net()
   schedule()
 end
 
@@ -463,20 +513,33 @@ on audio.changed async
   $batch = type($event.args) == "map" ? $event.args : {}
   if type($batch.closed) == "map" then
     eprint("panel: audio events ended: " .. to_string($batch.closed.message))
-    if $batch.watch == $state.audio_watch then
-      try
-        audio_unwatch($batch.watch)
-      catch $e
-      end
-      $state.audio_watch = nil
+    if $batch.watch != $state.audio_watch then return end
+    try
+      audio_unwatch($batch.watch)
+    catch $e
     end
-    apply_status()
+    $state.audio_watch = nil
+    $state.audio_retry = reset_if_lived($state.audio_started, $state.audio_retry)
+    apply_volume()
     schedule()
     retry_audio()
     return
   end
   $state.audio_retry = 5
-  apply_status()
+  apply_volume()
+  schedule()
+end
+
+on net.retry async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    sleep($state.net_retry)
+    $state.net_retry = min($state.net_retry * 2, 300)
+  finally
+    $state.net_retrying = false
+  end
+  start_net()
+  apply_net()
   schedule()
 end
 
@@ -489,7 +552,7 @@ on audio.retry async
     $state.audio_retrying = false
   end
   start_audio()
-  apply_status()
+  apply_volume()
   schedule()
 end
 

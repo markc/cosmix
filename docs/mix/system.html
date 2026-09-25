@@ -1396,7 +1396,12 @@ the link on every scan, IPv6 re-announces addresses on every lifetime refresh.</
 <p><code>net_state() -&gt; {links, addresses}</code> is the same information from a netlink dump
 (<code>links[]</code>: <code>ifname, index, up, operstate, loopback, wireless</code>; <code>addresses[]</code>:
 <code>ifname, index, family, address, prefix</code>). A dump the kernel marks interrupted is
-retried; three in a row raise <code>NET_STATE_INCONSISTENT</code>.</p>
+retried; three in a row raise <code>NET_STATE_INCONSISTENT</code>. The whole call, retries
+included, answers within 2 s or raises <code>NET_STATE_IO</code>.</p>
+<p>If the subscription socket itself fails (a poll error, or a receive error other
+than an overrun), the handle delivers one batch with
+<code>closed: {error_code: "NET_WATCH_IO", message}</code> and <code>overflow:true</code>, then stays
+silent: unwatch it and subscribe again when you choose to.</p>
 <p>The socket is raw libc: three fixed headers and a few attributes do not justify
 linking a netlink crate into every Mix build. <code>net_*</code> are <strong>Env</strong> class
 (read-only observation of the host).</p>
@@ -1414,7 +1419,8 @@ connecting would otherwise be an event. <code>kind</code> is <code>new</code>, <
 <p>The volume itself is <code>audio_state([opts]) -&gt; {ok, volume, level, muted, reason?}</code>:
 one <code>wpctl get-volume @DEFAULT_AUDIO_SINK@</code> with a 2 s deadline. <code>level</code> is
 <code>round(volume * 100)</code>. No default sink, a missing <code>wpctl</code> or a timeout is
-<code>ok:false</code> with a <code>reason</code>, not an error. Call it once per batch: a burst of
+<code>ok:false</code> with a <code>reason</code>, not an error. The deadline holds on every path,
+including a kernel without <code>pidfd_open</code>. Call it once per batch: a burst of
 notices costs one read.</p>
 <p><strong>Why a child and not a library.</strong> No PipeWire client crate is in the
 workspace, and libpipewire would bring a C library and its main loop into every
@@ -1427,7 +1433,10 @@ evaluator retirement SIGKILLs the group and reaps it. If <code>pactl</code> exit
 <code>closed: {error_code: "AUDIO_SOURCE_EXITED", message, exit_code}</code> and
 <code>overflow:true</code>, then stays silent: unwatch it and subscribe again when you
 choose to (a behaviour typically retries after a delay from an async handler).
-If the Mix process itself is SIGKILLed, <code>pactl</code> ends at its next write.
+If the Mix process itself is SIGKILLed, the <code>mix</code> binary's children carry
+<code>PR_SET_PDEATHSIG(SIGKILL)</code> and die with it; in an embedder that has not made
+its evaluator thread the owned-children host, <code>pactl</code> ends at its next write.
+<code>AUDIO_UNAVAILABLE</code> (no <code>pactl</code>) will not change by retrying; treat it as final.
 <code>audio_*</code> are <strong>Process</strong> class (they run programs).</p>
 <h3 id="limits-and-refusals">Limits and refusals</h3>
 <p>At most 16 net and audio handles together per evaluator, and 1024 distinct

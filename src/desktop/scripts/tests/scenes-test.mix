@@ -4,7 +4,7 @@ $l = require("../lib/scenes.mix")
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-scenes-test.XXXXXXXX"]))
 $log = $tmp .. "/calls"
 $checks = {count:0}
-$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, names:["test-shell"]}
+$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, load_error:nil, names:["test-shell"]}
 write_file($log, "")
 
 fn check($ok, $message)
@@ -31,6 +31,7 @@ fn rpc($host, $verb, $body)
   if contains(["shell.scene.load", "shell.scene.validate"], $verb) then
     $source = type($body) == "map" ? $body.source : $body
     $d = $l.document($source)
+    if $d.name == $host_state.load_error then raise("SCENES_UPSTREAM", "load timed out", {rpc:"shell.scene.load"}) end
     if contains($source, "BROKEN") then raise("SCENES_UPSTREAM", "invalid document", {rc:10, upstream:{diagnostics:[{line:7, code:"mix-parse"}]}}) end
     return {revision:len(calls("shell.scene.load")), scene:$d.name}
   end
@@ -227,6 +228,36 @@ try
   $s = $l.services($s, ["test-shell", "quoin-panel"], false)
   check($s.scenes.panel.mounted, "a returning legacy citizen does not unmount the loader's page")
   $s = $l.services($s, ["test-shell"], false)
+  -- Review M2: the handover is owed until a mount succeeds. The first load
+  -- after release fails; a later services snapshot mounts it, and so does a
+  -- panel notice (the host applying the legacy citizen's disconnect).
+  $s = $l.services($s, ["test-shell", "quoin-panel"], false)
+  $s = $l.request($s, "install", {template:"template", name:"calendar", enable:true})
+  check($s.rc == 10 and $s.response.error_code == "SCENES_LEGACY_HELD" and not $s.scenes.calendar.mounted and $s.scenes.calendar.legacy_page, "legacy-held calendar is owed a handover")
+  $host_state.load_error = "calendar"
+  $s = $l.services($s, ["test-shell"], false)
+  check(not $s.scenes.calendar.mounted and $s.scenes.calendar.diagnostic.error_code == "SCENES_UPSTREAM" and deep_eq($l.legacy_handover_pending($s), ["calendar"]), "a failed handover load stays owed: " .. json_encode($s.scenes.calendar.diagnostic))
+  $loads = len(calls("shell.scene.load"))
+  $s = $l.services($s, ["test-shell"], false)
+  check(not $s.scenes.calendar.mounted and len(calls("shell.scene.load")) == $loads + 1, "every services snapshot retries the owed handover")
+  $host_state.load_error = nil
+  $s = $l.services($s, ["test-shell"], false)
+  check($s.scenes.calendar.mounted and $s.scenes.calendar.diagnostic == nil and len($l.legacy_handover_pending($s)) == 0, "a later services snapshot mounts the owed page")
+  $loads = len(calls("shell.scene.load"))
+  $s = $l.services($s, ["test-shell"], false)
+  check(len(calls("shell.scene.load")) == $loads, "a mounted handover is not retried")
+  $s = $l.request($s, "disable", {name:"calendar"})
+  $s = $l.services($s, ["test-shell", "quoin-panel"], false)
+  $s = $l.request($s, "enable", {name:"calendar"})
+  check($s.rc == 10 and not $s.scenes.calendar.mounted, "re-enabled calendar held again")
+  $host_state.load_error = "calendar"
+  $s = $l.services($s, ["test-shell"], false)
+  check(not $s.scenes.calendar.mounted, "second release fails its first load")
+  $host_state.load_error = nil
+  $s = panel_notice($s, {generation:7, revision:1, panels:$host_state.panels})
+  check($s.scenes.calendar.mounted and $s.scenes.calendar.diagnostic == nil, "a panel notice retries the owed handover")
+  $s = $l.request($s, "remove", {name:"calendar"})
+  check($s.rc == 0 and $s.scenes.calendar == nil, "calendar fixture removed")
   $s = $l.request($s, "remove", {name:"panel"})
   check($s.rc == 0 and $s.scenes.panel == nil, "handed-over fixture removed")
   $s = $l.request($s, "enable", {name:"example"})

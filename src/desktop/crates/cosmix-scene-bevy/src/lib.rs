@@ -356,6 +356,37 @@ impl SceneStore {
             .collect()
     }
 
+    /// Whether a Load of `source` would pass the document checks `accept`
+    /// makes (parse, size, lint errors, resolve, templates, bindings). The
+    /// ownership, seat and model-authority checks stay the load's own; this
+    /// lets a host refuse to give a page up for a document that cannot take it.
+    pub fn document_acceptable(source: &str) -> bool {
+        let Ok(document) = cosmix_scene::parse(source) else {
+            return false;
+        };
+        check_size(&document).is_ok()
+            && !cosmix_scene::lint(&document)
+                .iter()
+                .any(|d| d.severity == Severity::Error)
+            && cosmix_scene::resolve(&document)
+                .is_ok_and(|tree| render::validate_templates(&tree).is_ok())
+            && cosmix_scene::bindings::compile(&document).is_ok()
+    }
+
+    /// Whether a scene named `name`, or one mounting `page`, belongs to
+    /// anyone but `owner` (an unowned entry counts as someone else's). A
+    /// host fallback stands aside on this, not only on the seat: a seat can
+    /// go (`sub.remove`) while the other owner's entry still names the page.
+    pub fn claimed_by_other(&self, name: &str, page: &str, owner: &str) -> bool {
+        self.scenes.iter().any(|(entry_name, entry)| {
+            (entry_name == name || render::page_id(&entry.tree) == page)
+                && entry
+                    .owner
+                    .as_ref()
+                    .is_none_or(|entry_owner| entry_owner.citizen != owner)
+        })
+    }
+
     /// Unload every scene owned by `citizen`, returning the scene names.
     ///
     /// The owner-disconnect half of sub-panel ownership (panel doc §3): the

@@ -105,7 +105,14 @@ the other. While the `SCENES_LEGACY_SERVICE` registration (default
 normally but is not mounted: its diagnostic is `SCENES_LEGACY_HELD` with the
 holder name, and `enable`/`reload` reply rc 10 with it. That registration
 disappearing from the broker snapshot triggers one rescan, which mounts the
-held scenes and starts their behaviours; there is no wait loop. A loader page
+held scenes and starts their behaviours. The handover is state, not that one
+edge: while the legacy citizen stays absent, an enabled, installed scene on a
+legacy page that is still unmounted (a load that timed out, or a
+`SUBPANEL_COLLISION` because Quoin had not yet applied the old citizen's
+disconnect) is retried on every later broker snapshot and `shell.panel.changed`
+notice. For a failure no later event would retry, the loader starts one local
+`task_start` backoff (1, 2 … 32 s, then it stops and leaves the diagnostic until
+nothing is owed); it never self-emits over the Bus. A loader page
 already mounted is not unloaded if the legacy citizen reappears, but no
 reload or remount will take a page while it is registered. Do not run both.
 

@@ -33,7 +33,8 @@
 //! when the loader loads that template (`quoin-settings`, page
 //! `settings.appearance`), [`yield_to_external`] unloads the built-in so the
 //! external load takes the page, and [`maintain`] stands aside for as long as
-//! another owner holds it. When that owner goes (disable, remove, loader
+//! another owner holds it — its seat, or a scene entry that still names the
+//! page after a `sub.remove` took the seat alone. When that owner goes (disable, remove, loader
 //! disconnect) the built-in returns, so the page never silently disappears.
 //! Either way the effects stay here: `shell.settings.{scheme,motion,size}`
 //! plus the `shell.settings.get` snapshot and `shell.settings.changed`
@@ -180,11 +181,15 @@ fn maintain(
     }
     // Another owner holds the page (the loader-managed template, admitted by
     // `yield_to_external`): stand aside without retiring, and come back when
-    // it goes. The registry is state, so no timer is involved either way.
+    // it goes. Its scene entry counts as holding the page even without the
+    // seat — a `sub.remove` drops the seat alone, and loading over the entry
+    // would take that owner's scene and undo the removal. The registry and
+    // the store are state, so no timer is involved either way.
     if registry
         .0
         .seat(SETTINGS_APPEARANCE)
         .is_some_and(|seat| seat.owner != OWNER)
+        || scenes.claimed_by_other(SCENE_NAME, SETTINGS_APPEARANCE, OWNER)
     {
         settings.rendered = None;
         settings.edge = None;
@@ -396,7 +401,9 @@ pub(crate) fn snapshot(
 /// built-in is not loaded — ordinary ownership rules then apply. A template
 /// authored for another edge than the declaration is refused (the page stays
 /// with the fallback) rather than mounted where the configuration does not
-/// put it. Returns the refusal, or `None` to proceed with the load.
+/// put it, and a document that would fail validation never unloads the
+/// built-in (the load then refuses it on its own). Returns the refusal, or
+/// `None` to proceed with the load.
 ///
 /// The built-in is reset, not retired, so a load that is refused after this
 /// point simply lets `maintain` load the fallback again.
@@ -446,6 +453,12 @@ pub(crate) fn yield_to_external(
             })
             .to_string(),
         ));
+    }
+    // Validate before unloading: a document the load would refuse anyway must
+    // not take the page down first (built-in unloaded, load refused, fallback
+    // back two updates later). Leave the refusal to the load itself.
+    if !SceneStore::document_acceptable(source) {
+        return None;
     }
     let accepted_at = settings.as_deref().map_or(0, |settings| settings.receipt);
     let mut mount = SceneMount {
@@ -1458,6 +1471,27 @@ mod tests {
         assert_eq!(seat(&app), Some((Edge::Right, OWNER.to_owned())));
         assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
 
+        // Review n4: a document the load refuses (an unknown port is a lint
+        // error) never unloads the built-in first — the page stays up through
+        // the very update that refuses it.
+        let broken = TEMPLATE.replacen(
+            "\"text\":\"Appearance\"",
+            "\"bogus_port\":1,\"text\":\"Appearance\"",
+            1,
+        );
+        assert_ne!(broken, TEMPLATE, "the fixture edit must apply");
+        assert!(!SceneStore::document_acceptable(&broken));
+        assert!(SceneStore::document_acceptable(TEMPLATE));
+        peer.send(load(broken));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10, "{}", replies[0].body);
+        assert_eq!(seat(&app), Some((Edge::Right, OWNER.to_owned())));
+        assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
+        let settings = app.world().resource::<SettingsScene>();
+        assert!(settings.rendered.is_some() && !settings.yielded);
+
         peer.send(load(TEMPLATE.to_owned()));
         app.update();
         app.update();
@@ -1484,6 +1518,81 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
         assert_eq!(seat(&app), Some((Edge::Right, OWNER.to_owned())));
+        assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
+        assert!(!app.world().resource::<SettingsScene>().retired);
+    }
+
+    /// Review M1: `shell.sub.remove` of the loader's page drops its seat at
+    /// the Model stage, while the loader's `quoin-settings` entry lingers
+    /// until the next reconcile sweeps unseated scenes. For as long as that
+    /// entry exists the fallback must not register a seat of its own or load
+    /// over it — that load would take the loader's scene (a Load takes its
+    /// owner from the mount) and fence its model writes. Once the entry is
+    /// gone the page has no owner and the fallback returns, as it does after
+    /// an unload (the page never silently disappears).
+    #[test]
+    fn fallback_never_takes_the_loader_scene_after_a_sub_remove() {
+        let mut app = settings_test_app(r#"{panels: {right: ["settings.appearance"]}}"#);
+        let (bridge, peer) = ctk::bus::test_bridge("settings-test");
+        app.insert_resource(bridge)
+            .add_plugins(crate::bus_service::ShellBusPlugin);
+        app.update();
+        let seat = |app: &App| {
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat(SETTINGS_APPEARANCE)
+                .map(|seat| seat.owner.clone())
+        };
+        let owned_by = |app: &App, owner: &str| {
+            app.world().resource::<SceneStore>().scenes_owned_by(owner)
+        };
+        let mut load = verb_request(
+            "shell.scene.load",
+            json!({"source": TEMPLATE, "model_generation": 1}),
+        );
+        load.from = "scenes".to_owned();
+        peer.send(load);
+        app.update();
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(seat(&app).as_deref(), Some("scenes"));
+        assert_eq!(owned_by(&app, "scenes"), vec![SCENE_NAME.to_owned()]);
+
+        peer.send(verb_request(
+            "shell.sub.remove",
+            json!({"name": SETTINGS_APPEARANCE}),
+        ));
+        let mut entry_outlived_seat = false;
+        for _ in 0..6 {
+            app.update();
+            let loader_entry = !owned_by(&app, "scenes").is_empty();
+            entry_outlived_seat |= loader_entry && seat(&app).is_none();
+            if loader_entry {
+                assert_ne!(
+                    seat(&app).as_deref(),
+                    Some(OWNER),
+                    "the fallback reserved the page while the loader's entry names it"
+                );
+                assert!(
+                    owned_by(&app, OWNER).is_empty(),
+                    "the fallback took the loader's scene"
+                );
+            }
+        }
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert!(
+            entry_outlived_seat,
+            "the window this test guards (entry without seat) never opened"
+        );
+        // The unseated sweep dropped the loader's entry; the page is free and
+        // the fallback serves it again.
+        assert!(owned_by(&app, "scenes").is_empty());
+        assert_eq!(seat(&app).as_deref(), Some(OWNER));
         assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
         assert!(!app.world().resource::<SettingsScene>().retired);
     }

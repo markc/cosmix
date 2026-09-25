@@ -789,7 +789,8 @@ async fn net_handles_snapshot_and_refusals() {
     assert_eq!(text(&e, "again"), "NET_WATCH_HANDLE");
     assert_eq!(text(&e, "options"), "NET_WATCH_OPTIONS");
     assert_eq!(text(&e, "cross"), "AUDIO_WATCH_HANDLE");
-    let Some(Value::Map(vol)) = e.get_global("vol") else {
+    let vol_value = e.get_global("vol").expect("vol is set");
+    let Value::Map(vol) = &vol_value else {
         panic!("audio_state returns a map")
     };
     // PIPEWIRE_RUNTIME_DIR in the test environment would still reach a

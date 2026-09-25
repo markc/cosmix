@@ -168,9 +168,14 @@ The clock is one `task_start` wall-clock deadline per displayed minute and
 only redraws the time. Network and volume are event-driven: `net_watch`
 (rtnetlink link changes) and `audio_watch` (a `pactl subscribe` stream) wake
 the behaviour, which re-reads `net_state()` / `audio_state()` through the
-`status_*` helpers in `lib/runtime.mix`. A closed audio stream re-subscribes
-after 5 s, doubling to 300 s (a reconnect backoff, not a poll). A mix without
-these builtins shows the network offline and hides volume. Nothing polls.
+`status_*` helpers in `lib/runtime.mix`; a link event re-reads only the
+network and an audio event only the volume. A closed link socket or audio
+stream from the live handle re-subscribes after 5 s, doubling to 300 s (a
+reconnect backoff, not a poll); a subscription that outlived the current delay
+starts again from 5 s. A host without `pactl` (`AUDIO_UNAVAILABLE`) hides
+volume for the behaviour's life with no retry, and only `NET_WATCH_IO` /
+`AUDIO_WATCH_IO` refusals are retried. A mix without these builtins shows the
+network offline and hides volume. Nothing polls.
 
 `scene-template-test.mix` captures the exact legacy `panel_doc` output for
 empty, busy (focused/minimised/no-workspace/overlay windows, three
@@ -237,7 +242,10 @@ nothing of its own.
   is hidden when there is no default sink. Click toggles mute.
   `PIPEWIRE_RUNTIME_DIR` points at the login session's runtime directory. If
   PipeWire's server goes away the subscription reports `closed` and the panel
-  subscribes again after 5 s, doubling to at most 5 minutes until it succeeds.
+  subscribes again after 5 s, doubling to at most 5 minutes until it succeeds
+  (back to 5 s when the lost subscription had been up longer than the delay).
+  The network subscription recovers the same way. A host without `pactl`
+  hides the applet for good (`AUDIO_UNAVAILABLE`, no retry).
   See [desktop status events](../mix/system.md#desktop-status-events--net_watch-audio_watch).
   Behaviours use the same sources through `lib/runtime.mix`'s `status_watch`,
   `status_net`, `status_volume`, `status_fields` and `status_closed`.

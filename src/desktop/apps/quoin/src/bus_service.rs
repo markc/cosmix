@@ -662,7 +662,9 @@ fn service_bus(
                     });
                     if request.command == "shell.settings.get" {
                         // A read: the snapshot the template behaviour builds
-                        // its model from; `revision` is the last notice's.
+                        // its model from; `revision` is the last notice's
+                        // while the body is live, so it may be newer than
+                        // that notice (documented in docs/cos/quoin.md).
                         let mut body = crate::settings::snapshot(
                             scheme,
                             config,

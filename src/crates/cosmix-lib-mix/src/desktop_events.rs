@@ -221,7 +221,11 @@ pub(crate) fn parse(buf: &[u8]) -> Parsed {
                 } else {
                     let code = u32_at(body, 0) as i32;
                     if code != 0 {
-                        out.error = Some(-code);
+                        // i32::MIN has no errno: untrusted framing, not a panic.
+                        match code.checked_neg() {
+                            Some(errno) => out.error = Some(errno),
+                            None => out.overflow = true,
+                        }
                     }
                 }
             }
@@ -809,9 +813,15 @@ mod linux {
                     // ENOBUFS: the kernel dropped notifications. Keep
                     // draining; the batch says overflow so state is re-read.
                     Received::Overrun | Received::Truncated => overflow = true,
-                    Received::Failed(_) => {
-                        overflow = true;
-                        break;
+                    // A readable socket whose every recv fails would wake the
+                    // evaluator with overflow forever. End the source instead;
+                    // the behaviour decides whether to subscribe again.
+                    Received::Failed(e) => {
+                        queue.source_closed(
+                            &handle,
+                            serde_json::json!({"error_code": "NET_WATCH_IO", "message": format!("netlink receive failed: {e}")}),
+                        );
+                        return;
                     }
                 }
             }
@@ -832,7 +842,13 @@ mod linux {
         }
     }
 
-    fn dump(fd: &OwnedFd, kind: u16, seq: u32, buf: &mut [u8]) -> MixResult<(Vec<Record>, bool)> {
+    fn dump(
+        fd: &OwnedFd,
+        kind: u16,
+        seq: u32,
+        buf: &mut [u8],
+        deadline: std::time::Instant,
+    ) -> MixResult<(Vec<Record>, bool)> {
         // nlmsghdr + ifinfomsg (16 bytes) or ifaddrmsg (8 bytes), family AF_UNSPEC.
         let body = if kind == RTM_GETLINK { 16 } else { 8 };
         let len = NLMSG_HDRLEN + body;
@@ -862,6 +878,17 @@ mod linux {
         let mut records = Vec::new();
         let mut interrupted = false;
         loop {
+            // Every recv gets only what is left of the one overall deadline.
+            let Some((secs, micros)) =
+                receive_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            else {
+                return Err(refusal("NET_STATE_IO", "netlink dump timed out"));
+            };
+            let timeout = libc::timeval {
+                tv_sec: secs as libc::time_t,
+                tv_usec: micros as libc::suseconds_t,
+            };
+            set_option(fd.as_raw_fd(), libc::SO_RCVTIMEO, &timeout);
             match receive(fd.as_raw_fd(), buf, 0) {
                 Received::Data(n) => {
                     let parsed = parse(&buf[..n]);
@@ -891,20 +918,21 @@ mod linux {
         }
     }
 
+    /// `net_state()` answers within this, all retries included.
+    const NET_STATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// Links and addresses from a dump. A dump the kernel marks interrupted
     /// (NLM_F_DUMP_INTR: the tables changed underneath it) is retried.
     pub(crate) fn net_state() -> MixResult<serde_json::Value> {
         let mut buf = vec![0u8; 64 * 1024];
+        // A dump reply is immediate; the deadline only bounds a wedged kernel.
+        // It covers every attempt together, so the evaluator waits at most
+        // this long however the dumps fail.
+        let deadline = std::time::Instant::now() + NET_STATE_DEADLINE;
         for _ in 0..3 {
             let fd = route_socket(0).map_err(|e| refusal("NET_STATE_IO", e.to_string()))?;
-            // A dump reply is immediate; the deadline only bounds a wedged kernel.
-            let timeout = libc::timeval {
-                tv_sec: 5,
-                tv_usec: 0,
-            };
-            set_option(fd.as_raw_fd(), libc::SO_RCVTIMEO, &timeout);
-            let (links, a) = dump(&fd, RTM_GETLINK, 1, &mut buf)?;
-            let (addrs, b) = dump(&fd, RTM_GETADDR, 2, &mut buf)?;
+            let (links, a) = dump(&fd, RTM_GETLINK, 1, &mut buf, deadline)?;
+            let (addrs, b) = dump(&fd, RTM_GETADDR, 2, &mut buf, deadline)?;
             if a || b {
                 continue;
             }
@@ -938,6 +966,42 @@ mod linux {
         command
     }
 
+    /// `PR_SET_PDEATHSIG(SIGKILL)` on the child, as `spawn(argv,
+    /// {die_with_parent:true})` arms it: if the evaluator thread that owns the
+    /// source dies without dropping it (a SIGKILLed or panicking behaviour),
+    /// the kernel kills the child instead of leaving an orphan holding a pulse
+    /// connection. The `getppid` check closes the fork→prctl race.
+    ///
+    /// The kernel signals when the creating THREAD ends, so this is armed only
+    /// on the owned-children host thread (the mix binary's evaluator, which
+    /// lives as long as the process); elsewhere the drop path alone owns it.
+    fn arm_parent_death(command: &mut Command) {
+        if !crate::builtins::owned_spawns::enabled_here() {
+            return;
+        }
+        let parent = std::process::id() as libc::pid_t;
+        // SAFETY: prctl, getppid and _exit are raw syscalls, safe in the
+        // post-fork pre-exec window: no locks, no allocation.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(0);
+                }
+                Ok(())
+            });
+        }
+    }
+
     fn spawn_error(program: &str, e: std::io::Error) -> crate::MixError {
         if e.kind() == std::io::ErrorKind::NotFound {
             refusal(
@@ -969,6 +1033,7 @@ mod linux {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .process_group(0);
+            arm_parent_death(&mut command);
             let mut child = command.spawn().map_err(|e| spawn_error("pactl", e))?;
             let pid = child.id() as i32;
             // Only this source reaps it; process_alive must not steal the status.
@@ -1097,38 +1162,69 @@ mod linux {
         command
             .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
             .stderr(Stdio::piped());
-        let mut child = match command.spawn() {
+        arm_parent_death(&mut command);
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(parse_wpctl(false, "", "wpctl not found on PATH"));
             }
             Err(e) => return Err(refusal("AUDIO_STATE_IO", format!("wpctl: {e}"))),
         };
+        bounded_output(child, std::time::Duration::from_secs(2), true)
+    }
+
+    fn timed_out(limit: std::time::Duration) -> serde_json::Value {
+        parse_wpctl(
+            false,
+            "",
+            &format!("wpctl timed out after {} s", limit.as_secs_f64()),
+        )
+    }
+
+    /// Collect `child`'s output within `limit` on every path, killing its
+    /// process group when the limit passes. A pidfd waits in poll(2); without
+    /// one (pre-5.3 kernel, EMFILE, a seccomp filter — or `use_pidfd` false in
+    /// tests) a waiter thread collects the output and the caller waits on a
+    /// channel with the same limit. Never an unbounded `wait`.
+    pub(crate) fn bounded_output(
+        mut child: Child,
+        limit: std::time::Duration,
+        use_pidfd: bool,
+    ) -> MixResult<serde_json::Value> {
+        let deadline = std::time::Instant::now() + limit;
         let pid = child.id() as i32;
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
-        if fd >= 0 {
-            let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
-            let mut pfd = libc::pollfd {
-                fd: pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            loop {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                let rc = unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) };
-                if rc < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
+        let fd = if use_pidfd {
+            unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
+        } else {
+            -1
+        };
+        if fd < 0 {
+            return waiter_output(child, deadline, limit);
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let rc = unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                if rc == 0 {
-                    kill_group(&mut child);
-                    let _ = child.wait();
-                    return Ok(parse_wpctl(false, "", "wpctl timed out after 2 s"));
-                }
-                break;
+                kill_group(&mut child);
+                let _ = child.wait();
+                return Ok(parse_wpctl(false, "", &format!("wpctl wait failed: {e}")));
             }
+            if rc == 0 {
+                kill_group(&mut child);
+                let _ = child.wait();
+                return Ok(timed_out(limit));
+            }
+            break;
         }
         let output = child
             .wait_with_output()
@@ -1139,6 +1235,63 @@ mod linux {
             &String::from_utf8_lossy(&output.stderr),
         ))
     }
+
+    fn waiter_output(
+        child: Child,
+        deadline: std::time::Instant,
+        limit: std::time::Duration,
+    ) -> MixResult<serde_json::Value> {
+        let pid = child.id() as i32;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = thread::Builder::new()
+            .name("mix-wpctl-wait".into())
+            .spawn(move || {
+                let _ = tx.send(child.wait_with_output());
+            });
+        if let Err(e) = waiter {
+            // The closure (and the Child in it) is gone; the pid is still
+            // unreaped, so its group cannot have been reused.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return Err(refusal("AUDIO_STATE_IO", format!("wpctl waiter: {e}")));
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(Ok(output)) => Ok(parse_wpctl(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+            )),
+            Ok(Err(e)) => Err(refusal("AUDIO_STATE_IO", format!("wpctl: {e}"))),
+            Err(_) => {
+                // Still running at the deadline means still unreaped, so the
+                // group id is the child's (only a child exiting in this very
+                // instant could be reaped first). The waiter then finishes on
+                // its own; nothing joins it.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+                Ok(timed_out(limit))
+            }
+        }
+    }
+}
+
+/// `SO_RCVTIMEO` as `(seconds, microseconds)` for what is left of a deadline,
+/// or `None` once it has passed. A zero timeval means "block forever", so a
+/// sub-microsecond remainder rounds up to one microsecond.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn receive_timeout(left: std::time::Duration) -> Option<(u64, u32)> {
+    if left.is_zero() {
+        return None;
+    }
+    let (secs, micros) = (left.as_secs(), left.subsec_micros());
+    Some(if secs == 0 && micros == 0 {
+        (0, 1)
+    } else {
+        (secs, micros)
+    })
 }
 
 /// The `net_state()` value, from dumped records. Pure apart from the two
@@ -1367,6 +1520,9 @@ mod tests {
         assert_eq!(parsed.error, Some(libc::EPERM));
         let ack = parse(&message(NLMSG_ERROR, 0, &0i32.to_ne_bytes()));
         assert!(ack.error.is_none());
+        // No errno negates to i32::MIN's magnitude: untrusted, not a panic.
+        let parsed = parse(&message(NLMSG_ERROR, 0, &i32::MIN.to_ne_bytes()));
+        assert!(parsed.overflow && parsed.error.is_none());
         let mut dump = message(RTM_NEWLINK, NLM_F_DUMP_INTR, &good[NLMSG_HDRLEN..]);
         dump.extend(message(NLMSG_DONE, 0, &0i32.to_ne_bytes()));
         let parsed = parse(&dump);
@@ -1497,8 +1653,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn reaped(pid: i32) -> bool {
         let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == -1 }
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
     }
 
     #[cfg(target_os = "linux")]
@@ -1570,6 +1726,54 @@ mod tests {
         assert!(reaped(source.pid), "the stream's own exit is reaped by its reader");
         drop(source);
         assert!(!q.source_ready_for_test("audio:1"));
+    }
+
+    #[test]
+    fn receive_timeout_never_becomes_block_forever() {
+        use std::time::Duration;
+        assert_eq!(receive_timeout(Duration::ZERO), None);
+        assert_eq!(receive_timeout(Duration::from_nanos(1)), Some((0, 1)));
+        assert_eq!(receive_timeout(Duration::from_millis(1500)), Some((1, 500_000)));
+        assert_eq!(receive_timeout(Duration::from_secs(2)), Some((2, 0)));
+    }
+
+    /// Review m5: the deadline holds with and without a pidfd, and a prompt
+    /// child's output still comes back on both paths.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_output_enforces_its_limit_on_every_path() {
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+        let spawn = |script: &str| {
+            let mut c = fixture(script);
+            c.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .process_group(0);
+            c.spawn().unwrap()
+        };
+        for use_pidfd in [true, false] {
+            let started = Instant::now();
+            let limit = Duration::from_millis(200);
+            let v = linux::bounded_output(spawn("sleep 30"), limit, use_pidfd).unwrap();
+            assert_eq!(v["ok"], false, "pidfd={use_pidfd}");
+            assert!(
+                v["reason"].as_str().unwrap().contains("timed out after 0.2 s"),
+                "pidfd={use_pidfd}: {v}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "pidfd={use_pidfd}: the wait outlived its limit"
+            );
+            let v = linux::bounded_output(
+                spawn("echo 'Volume: 0.25 [MUTED]'"),
+                Duration::from_secs(10),
+                use_pidfd,
+            )
+            .unwrap();
+            assert_eq!(v["ok"], true, "pidfd={use_pidfd}: {v}");
+            assert_eq!(v["level"], 25.0);
+            assert_eq!(v["muted"], true);
+        }
     }
 
     #[test]
