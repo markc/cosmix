@@ -5,8 +5,19 @@ use cosmix_client::{BrokerAccount, NodedClient, UnixConnectOptions, UnixConnectO
 use serde_json::{Value, json};
 use std::time::Duration;
 
+fn mix_available() -> bool {
+    let available = std::path::Path::new("/opt/cosmix/bin/mix").is_file();
+    if !available {
+        eprintln!("skipping native PTY test: Mix is not installed");
+    }
+    available
+}
+
 #[test]
 fn native_lane_round_trip() {
+    if !mix_available() {
+        return;
+    }
     // Isolate shell startup configuration from other tests and the operator's
     // Mix rc. No process-wide environment mutation alongside PTY threads.
     if std::env::var_os("TERM_C7_FIXTURE").is_none() {
@@ -70,18 +81,15 @@ fn native_lane_round_trip() {
         return;
     }
 
-    let mut lane = NativeLane::start();
-    let tabs = Arc::new(Mutex::new(
-        lane.open_tabs(config::Settings {
-            config: config::Config::default(),
-            term: "xterm-256color",
-        })
-        .unwrap(),
-    ));
+    let settings = config::Settings {
+        config: config::Config::default(),
+        term: "xterm-256color",
+    };
+    let tabs = Arc::new(Mutex::new(TabSet::starting(settings)));
     let (cleanup, reaper) = tabs::Cleanup::start().unwrap();
-    lane.install_control(tabs.clone(), cleanup.clone());
     let wake = WakeFd::new().unwrap();
     tabs.lock().unwrap().set_wake(wake.waker());
+    let lane = NativeLane::start_background(tabs.clone(), settings, cleanup.clone()).unwrap();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let mut options = UnixConnectOptions::new(BrokerAccount {
             // SAFETY: process credentials, shared with the fixture broker.
@@ -146,15 +154,30 @@ fn native_lane_round_trip() {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !wake.drain() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }).await.expect("native execution must wake iced");
+        // Existing PTYs retain their first OnceLock waker. This fresh fd is
+        // exclusively the TabSet structural waker: late prompt bytes cannot
+        // satisfy the assertion. Exercise iced's actual subscription stream.
+        let structural = Arc::new(Waker {
+            fd: WakeFd::new().unwrap(), pending: AtomicBool::new(false),
+            sender: Mutex::new(None), polling: AtomicBool::new(false),
+        });
+        assert!(WAKER.set(structural.clone()).is_ok());
+        tabs.lock().unwrap().set_structure_wake_for_test(structural.fd.waker());
+        use iced::futures::StreamExt;
+        let mut events = wakes();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(3), events.next()).await.unwrap(), Some(Message::Wake)));
+        structural.pending.store(false, Ordering::Release);
+        assert!(tokio::time::timeout(Duration::from_millis(100), events.next()).await.is_err());
+        call(client.client(), &parent.name, "term.pane.select", json!({
+            "target":target,"request_id":"2","request_epoch":list["request_epoch"]
+        })).await;
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(3), events.next()).await
+            .expect("native pane selection must wake iced's subscription"), Some(Message::Wake)));
         client.client().close().await;
     });
     cleanup.submit(tabs.lock().unwrap().shutdown());
-    drop(lane);
+    let lane = lane.join().unwrap();
+    lane.release_cleanup();
     drop(cleanup);
     // Bounded assertion catches retaining Control's cleanup sender on exit.
     let (done, completion) = std::sync::mpsc::channel();
@@ -165,6 +188,7 @@ fn native_lane_round_trip() {
     completion
         .recv_timeout(Duration::from_secs(10))
         .expect("cleanup worker stopped");
+    drop(lane);
 }
 
 async fn call(client: &NodedClient, name: &str, verb: &str, body: Value) -> Value {
@@ -181,43 +205,95 @@ async fn call(client: &NodedClient, name: &str, verb: &str, body: Value) -> Valu
 
 #[test]
 fn native_start_failure_keeps_graphics_tabs() {
-    let mut lane = NativeLane::from_startup(Err("fixture ingress unavailable".into()));
-    let mut tabs = lane
-        .open_tabs(config::Settings {
-            config: config::Config::default(),
-            term: "xterm-256color",
+    if !mix_available() {
+        return;
+    }
+    let settings = config::Settings {
+        config: config::Config::default(),
+        term: "xterm-256color",
+    };
+    let tabs = Arc::new(Mutex::new(TabSet::starting(settings)));
+    let (cleanup, reaper) = tabs::Cleanup::start().unwrap();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (entered, started) = std::sync::mpsc::channel();
+    let lane =
+        NativeLane::start_background_with(tabs.clone(), settings, cleanup.clone(), move || {
+            entered.send(()).unwrap();
+            blocked
+                .recv_timeout(Duration::from_secs(3))
+                .expect("UI must remain free to release startup");
+            Err("fixture ingress unavailable".into())
         })
         .unwrap();
-    assert_eq!(tabs.list().len(), 1);
-    assert!(
-        tabs.session_status()["diagnostic"]
-            .as_str()
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(tabs.try_lock().unwrap().is_starting());
+    release.send(()).unwrap();
+    let lane = lane.join().unwrap();
+    assert_eq!(tabs.lock().unwrap().list().len(), 1);
+    let pane = tabs.lock().unwrap().active_terminal();
+    for ch in "print(\"C7_FALLBACK_\" + \"OK\")".chars() {
+        pane.lock()
             .unwrap()
-            .contains("graphics-only")
-    );
-    drop(tabs.shutdown());
+            .key(
+                cosmix_term_core::terminal::Key::Char(ch),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+    }
+    pane.lock()
+        .unwrap()
+        .key(
+            cosmix_term_core::terminal::Key::Enter,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if pane.lock().unwrap().snapshot().contains("C7_FALLBACK_OK") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "graphics-only shell must remain usable"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    cleanup.submit(tabs.lock().unwrap().shutdown());
+    lane.release_cleanup();
+    drop(cleanup);
+    reaper.join().unwrap();
+    drop(lane);
 }
 
 #[test]
 fn unavailable_ingress_logs_once_across_retries() {
+    if !mix_available() {
+        return;
+    }
     if std::env::var_os("TERM_C7_OFFLINE").is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native_tests::unavailable_ingress_logs_once_across_retries",
-                "--nocapture",
-            ])
-            .env("TERM_C7_OFFLINE", "1")
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{stderr}");
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        assert_eq!(
-            stderr.matches("broker/profile unavailable").count(),
-            1,
-            "{stderr}"
-        );
+        for mode in ["missing", "stalled"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native_tests::unavailable_ingress_logs_once_across_retries",
+                    "--nocapture",
+                ])
+                .env("TERM_C7_OFFLINE", mode)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            assert_eq!(stderr.matches("graphics-only").count(), 1, "{stderr}");
+            assert!(
+                stderr.contains(if mode == "missing" {
+                    "broker/profile unavailable"
+                } else {
+                    "native startup deadline elapsed"
+                }),
+                "{stderr}"
+            );
+        }
         return;
     }
     let mut options = UnixConnectOptions::new(BrokerAccount {
@@ -231,6 +307,17 @@ fn unavailable_ingress_logs_once_across_retries() {
             .join("bus.sock"),
     );
     options.require_native_session = true;
+    let stalled_root = std::env::temp_dir().join(format!("term-c7-stalled-{}", std::process::id()));
+    let stalled_path = stalled_root.join("bus.sock");
+    let stalled = if std::env::var("TERM_C7_OFFLINE").unwrap() == "stalled" {
+        std::fs::create_dir(&stalled_root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stalled_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        options.endpoint = Some(stalled_path.clone());
+        Some(std::os::unix::net::UnixListener::bind(&stalled_path).unwrap())
+    } else {
+        None
+    };
     let mut lane =
         NativeLane::from_startup(cosmix_term_core::native_session::Supervisor::with_options(
             options,
@@ -254,4 +341,9 @@ fn unavailable_ingress_logs_once_across_retries() {
     );
     drop(tabs.shutdown());
     drop(lane);
+    if stalled.is_some() {
+        drop(stalled);
+        std::fs::remove_file(stalled_path).unwrap();
+        std::fs::remove_dir(stalled_root).unwrap();
+    }
 }

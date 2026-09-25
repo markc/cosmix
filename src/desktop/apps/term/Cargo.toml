@@ -95,6 +95,7 @@ iced_tiny_skia = { version = "=0.14.1", optional = true, default-features = fals
 tiny-skia = { version = "0.11", optional = true, default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 term-native-test-broker = { path = "../../crates/cosmix-term-core/tests/support" }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus" }

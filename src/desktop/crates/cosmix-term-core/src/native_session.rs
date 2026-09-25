@@ -99,7 +99,7 @@ struct Shared {
     panes: HashMap<u64, std::sync::Weak<PaneState>>,
     status: HashMap<u64, String>,
     diagnostic: String,
-    last_diagnostic: Option<String>,
+    last_diagnostic: HashMap<Option<u64>, String>,
 }
 
 impl Default for Shared {
@@ -113,8 +113,35 @@ impl Default for Shared {
             panes: HashMap::new(),
             status: HashMap::new(),
             diagnostic: "native session starting; no ready launch grant".into(),
-            last_diagnostic: None,
+            last_diagnostic: HashMap::new(),
         }
+    }
+}
+
+impl Shared {
+    fn log_diagnostic(&mut self, id: Option<u64>, message: &str) -> bool {
+        // One global fallback line per outage; independent transitions per pane.
+        if (id.is_none() && self.last_diagnostic.contains_key(&None))
+            || self
+                .last_diagnostic
+                .get(&id)
+                .is_some_and(|last| last == message)
+        {
+            return false;
+        }
+        match id {
+            Some(id) => eprintln!("term native session pane {id}: {message}"),
+            None if message.contains("graphics-only") => {
+                eprintln!("term native session: {message}")
+            }
+            None => eprintln!("term native session: panes are graphics-only: {message}"),
+        }
+        self.last_diagnostic.insert(id, message.into());
+        true
+    }
+
+    fn available(&mut self) {
+        self.last_diagnostic.remove(&None);
     }
 }
 
@@ -296,6 +323,7 @@ impl NativeSession {
             *state.binding.lock().unwrap() = None;
         }
         shared.status.remove(&id);
+        shared.last_diagnostic.remove(&Some(id));
         drop(shared);
         let _ = self.0.send(Request::Close(id, None));
     }
@@ -319,6 +347,7 @@ impl NativeSession {
                 .status
                 .insert(id, "grant delivered; awaiting child enrolment".into());
             shared.diagnostic = "preparing next pane launch grant".into();
+            shared.available();
             drop(ready.key); // zeroize-on-drop; no actor copy survives handoff
             Some((
                 PaneSession {
@@ -337,11 +366,9 @@ impl NativeSession {
                 "unbound (graphics-only): no usable ready grant; {}",
                 shared.diagnostic
             );
-            // Keep per-pane diagnostics queryable, but do not repeat the
-            // actor's already-reported ingress failure for every opened pane.
-            if shared.last_diagnostic.as_ref() != Some(&shared.diagnostic) {
-                eprintln!("term pane {id}: {reason}");
-            }
+            // Share the actor's outage latch, including slow startup. A pane
+            // opened while it connects must not emit a second fallback line.
+            shared.log_diagnostic(None, "no usable launch grant; pane is graphics-only");
             shared.status.insert(id, reason);
             None
         };
@@ -360,8 +387,16 @@ impl Supervisor {
     /// One bounded wait before the FIRST TabSet open only. Taking the receiver
     /// makes repeated calls no-ops; later pane opens never wait for the actor.
     pub fn wait_startup(&mut self) {
-        if let Some(startup) = self.startup.take() {
-            let _ = startup.recv_timeout(STARTUP_BUDGET);
+        if let Some(startup) = self.startup.take()
+            && startup.recv_timeout(STARTUP_BUDGET).is_err()
+        {
+            let mut shared = self.handle.1.lock().unwrap();
+            if shared.ready.is_none() {
+                shared.log_diagnostic(
+                    None,
+                    "native startup deadline elapsed; no ready launch grant",
+                );
+            }
         }
     }
     pub fn start() -> Result<Self, String> {
@@ -709,10 +744,7 @@ impl Actor {
         let message = message.into();
         let mut shared = self.shared.lock().unwrap();
         // Reconnect retries must not flood stderr on a graphics-only desktop.
-        if shared.last_diagnostic.as_ref() != Some(&message) {
-            eprintln!("term native session: {message}");
-            shared.last_diagnostic = Some(message.clone());
-        }
+        shared.log_diagnostic(id, &message);
         if let Some(id) = id {
             if let Some(status) = shared.status.get_mut(&id) {
                 *status = message;
@@ -900,6 +932,7 @@ impl Actor {
                         deadline,
                     });
                     shared.diagnostic = "next pane launch grant ready".into();
+                    shared.available();
                     if let Some(startup) = self.startup.take() {
                         let _ = startup.send(());
                     }
@@ -964,13 +997,22 @@ impl Actor {
                 None,
                 "broker/profile unavailable; opening panes unbound (graphics-only)",
             );
+            if let Some(startup) = self.startup.take() {
+                let _ = startup.send(());
+            }
             return;
         };
-        connection.client().set_verbs(crate::control::verb_manifest());
+        connection
+            .client()
+            .set_verbs(crate::control::verb_manifest());
         let public_key = HexBytes(self.key.verifying_key().to_bytes());
         let hello = match bounded(connection.session_hello()).await {
             Ok(hello) => hello,
-            Err(_) => {
+            Err(error) => {
+                self.diagnostic(None, format!("session hello unavailable: {error}"));
+                if let Some(startup) = self.startup.take() {
+                    let _ = startup.send(());
+                }
                 close_connection(&connection).await;
                 return;
             }
@@ -1041,7 +1083,10 @@ impl Actor {
                 self.renew_parent().await;
             }
             Err(error) => {
-                eprintln!("term identity recovery: {error}");
+                self.diagnostic(None, format!("identity recovery unavailable: {error}"));
+                if let Some(startup) = self.startup.take() {
+                    let _ = startup.send(());
+                }
                 close_connection(&connection).await;
             }
         }
@@ -1599,6 +1644,21 @@ mod enforcement_tests;
 pub(crate) mod tests {
     use super::*;
     use term_native_test_broker::Broker;
+
+    #[test]
+    fn diagnostic_transitions_are_per_outage_and_per_pane() {
+        let mut shared = Shared::default();
+        assert!(shared.log_diagnostic(None, "startup timed out"));
+        assert!(!shared.log_diagnostic(None, "broker/profile unavailable"));
+        assert!(shared.log_diagnostic(Some(2), "detached"));
+        assert!(shared.log_diagnostic(Some(3), "detached"));
+        assert!(!shared.log_diagnostic(Some(2), "detached"));
+        assert!(shared.log_diagnostic(Some(2), "attached"));
+        assert!(shared.log_diagnostic(Some(2), "detached"));
+        shared.available();
+        assert!(shared.log_diagnostic(None, "broker/profile unavailable"));
+        assert!(!shared.log_diagnostic(None, "broker/profile unavailable"));
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()

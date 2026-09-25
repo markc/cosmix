@@ -181,11 +181,14 @@ mutation-time rechecks still apply.
 The lane requires local noded 0.16.8 or later with native ingress enabled,
 `COSMIX_RUN=/run/cosmix` and a traversable socket directory (0755). If ingress
 is unavailable, graphics still start and the supervisor reports the reason
-once rather than repeating it for each pane or reconnect retry.
-Startup's first-pane readiness wait runs before the iced event loop; subsequent
-native work runs on the actor/PTY workers and wakes the existing iced eventfd
-subscription. Both frontends share control ownership and stop the native actor
-before releasing the cleanup worker on exit. See
+once per outage rather than repeating it for each pane or reconnect retry.
+Iced shows its window without waiting for noded: account lookup, connection,
+and the bounded first-pane readiness wait run on a startup worker. The first
+shell appears when that worker finishes, with a native grant if ready, or as
+a graphics-only shell otherwise. Native work wakes the existing iced eventfd
+subscription. Both frontends release Control's cleanup sender on exit, reap
+the panes while the native actor can still acknowledge each revoke, then stop
+the actor. See
 [native-session control](term-native-control.md) for discovery and request
 envelopes.
 

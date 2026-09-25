@@ -147,10 +147,8 @@ fn run(settings: config::Settings) -> Result<(), String> {
         FontSize::new(settings.config.font_px),
         settings.config.cursor,
     )?;
-    let mut native = NativeLane::start();
-    let tabs = Arc::new(Mutex::new(native.open_tabs(settings)?));
+    let tabs = Arc::new(Mutex::new(TabSet::starting(settings)));
     let (cleanup, reaper) = tabs::Cleanup::start().map_err(|e| format!("cleanup worker: {e}"))?;
-    native.install_control(tabs.clone(), cleanup.clone());
 
     // One eventfd for the whole frontend: every PTY, resize, pane exit and
     // Bus mutation (including the native lane) coalesces onto it. The UI
@@ -165,6 +163,8 @@ fn run(settings: config::Settings) -> Result<(), String> {
     WAKER
         .set(waker.clone())
         .map_err(|_| "wake descriptor installed twice".to_owned())?;
+    let native = NativeLane::start_background(tabs.clone(), settings, cleanup.clone())
+        .map_err(|e| format!("native startup worker: {e}"))?;
 
     // Completion notifications, exactly as bterm: a pane whose shell exits on
     // its own is reaped on the UI thread and handed to the Bus thread, which
@@ -233,15 +233,18 @@ fn run(settings: config::Settings) -> Result<(), String> {
     .run();
 
     // Same teardown ordering as bterm: shut the tabs (which releases the Bus
-    // loop through `emptied`), finish bounded Bus replies and stop the native
-    // actor. Both the Bus thread and native Control own Cleanup senders; all
-    // must be released before joining the reaper.
+    // loop through `emptied`), finish bounded Bus replies, then reap each
+    // pane while the native actor is still serving its revoke acknowledgements.
     let removed = tabs.lock().expect("tabs").shutdown();
     cleanup.submit(removed);
     let _ = bus.join();
-    drop(native);
+    let native = native
+        .join()
+        .map_err(|_| "native startup worker panicked")?;
+    native.release_cleanup();
     drop(cleanup);
     let _ = reaper.join();
+    drop(native);
     result.map_err(|error| error.to_string())
 }
 
@@ -905,6 +908,9 @@ impl State {
         let shape = {
             let tabs = self.tabs.lock().expect("tabs");
             if tabs.is_empty() {
+                if tabs.is_starting() {
+                    return Task::none();
+                }
                 return iced::exit();
             }
             Shape::of(&tabs)

@@ -116,6 +116,7 @@ pub struct TabSet {
     metadata: PaneMetadata,
     wake: Option<Wake>,
     closing: bool,
+    starting: bool,
     pending: Arc<AtomicUsize>,
     /// Fired once when the last tab goes, whichever thread closed it. The
     /// Bus loop waits on this instead of re-polling `is_empty()`.
@@ -342,8 +343,32 @@ impl TabSet {
         native: Option<crate::native_session::NativeSession>,
         start: impl FnOnce() -> Result<Terminal, String> + std::panic::UnwindSafe,
     ) -> Result<Self, String> {
-        let mut set = Self {
+        Self::with_initial_notifier(
+            settings,
             native,
+            Arc::new(tokio::sync::Notify::new()),
+            start,
+        )
+    }
+
+    pub(crate) fn with_initial_notifier(
+        settings: crate::config::Settings,
+        native: Option<crate::native_session::NativeSession>,
+        titles_changed: Arc<tokio::sync::Notify>,
+        start: impl FnOnce() -> Result<Terminal, String> + std::panic::UnwindSafe,
+    ) -> Result<Self, String> {
+        let mut set = Self::starting(settings);
+        set.starting = false;
+        set.native = native;
+        set.titles_changed = titles_changed;
+        set.open_with(start)?;
+        Ok(set)
+    }
+
+    /// Empty window state while the startup worker prepares the first shell.
+    pub fn starting(settings: crate::config::Settings) -> Self {
+        Self {
+            native: None,
             settings,
             tabs: Vec::new(),
             active: 0,
@@ -353,15 +378,34 @@ impl TabSet {
             metadata: PaneMetadata::default(),
             wake: None,
             closing: false,
+            starting: true,
             pending: Arc::new(AtomicUsize::new(0)),
             emptied: Arc::new(tokio::sync::Notify::new()),
             titles_changed: Arc::new(tokio::sync::Notify::new()),
             observer: None,
             watching: false,
             event_revision: 0,
-        };
-        set.open_with(start)?;
-        Ok(set)
+        }
+    }
+
+    pub fn is_starting(&self) -> bool {
+        self.starting
+    }
+
+    pub(crate) fn finish_startup(&mut self, mut ready: Self) {
+        if self.closing {
+            drop(ready.shutdown());
+            return;
+        }
+        ready.wake = self.wake.take();
+        ready.emptied = self.emptied.clone();
+        ready.observer = self.observer.take();
+        ready.watching = self.watching;
+        if let Some(wake) = ready.wake.clone() {
+            ready.set_wake(wake);
+        }
+        *self = ready;
+        self.notify();
     }
 
     pub fn open(&mut self) -> Result<u64, String> {
@@ -373,6 +417,9 @@ impl TabSet {
         cwd: Option<String>,
         title: Option<String>,
     ) -> Result<u64, String> {
+        if self.starting {
+            return Err("terminal starting".into());
+        }
         if let Some(cwd) = &cwd {
             crate::terminal::validate_cwd(cwd)?;
         }
@@ -881,6 +928,12 @@ impl TabSet {
         }
         self.wake = Some(wake);
     }
+
+    /// Isolate structural notifications from PTY output in frontend tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_structure_wake_for_test(&mut self, wake: Wake) {
+        self.wake = Some(wake);
+    }
     fn notify(&self) {
         if let Some(wake) = &self.wake {
             wake();
@@ -916,6 +969,9 @@ impl TabSet {
 
     pub fn shutdown(&mut self) -> Vec<Removed> {
         self.closing = true;
+        self.starting = false;
+        self.emptied.notify_one();
+        self.notify();
         let mut removed = Vec::new();
         while let Some(tab) = self.tabs.last() {
             removed.extend(self.close(tab.id).1);
@@ -927,6 +983,24 @@ impl TabSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn closing_during_startup_cannot_reopen_the_window() {
+        let settings = crate::config::Settings {
+            config: crate::config::Config::default(),
+            term: "xterm-256color",
+        };
+        let mut tabs = TabSet::starting(settings);
+        assert!(tabs.open().is_err());
+        drop(tabs.shutdown());
+        let ready =
+            TabSet::with_initial(settings, None, || Ok(Terminal::from_test_vt(80, 24, b"")))
+                .unwrap();
+        tabs.finish_startup(ready);
+        assert!(tabs.is_empty());
+        assert!(!tabs.is_starting());
+        assert!(tabs.open().is_err());
+    }
+
     #[test]
     fn split_close_and_last_pane_outcomes() {
         let Some(mut tabs) = fixture() else {

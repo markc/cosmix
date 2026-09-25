@@ -400,9 +400,10 @@ fn main() {
     // Cleanup (this one and the bus thread's, via join) must be released
     // before reaper.join(), or it hangs forever.
     let _ = bus.join();
-    drop(native);
+    native.release_cleanup();
     drop(cleanup);
     let _ = reaper.join();
+    drop(native);
 }
 fn setup(
     mut commands: Commands,
