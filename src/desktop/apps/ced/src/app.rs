@@ -42,7 +42,7 @@ use crate::chrome::output::Output;
 use crate::chrome::timer::{TimerKey, Timers};
 use crate::chrome::{self, Look, MENU_H, STATUS_H, TABS_H};
 use crate::config::{self, Config, FONT_PX_MAX, FONT_PX_MIN};
-use crate::controller::{Controller, Effect, Prompt, Tab};
+use crate::controller::{Controller, Effect, MatchQuery, Prompt, Tab};
 use crate::dirs::{AppDirs, COMPONENT};
 use crate::editor::widget::EditorWidget;
 use crate::editor::{EditorMsg, EditorView, LayoutReport};
@@ -79,6 +79,8 @@ pub enum Msg {
     Info(InfoAction),
     Paste(Intent, Option<String>),
     Lint(TabId, cosmix_edit_client::highlight::ResultTag, Result<String, String>),
+    /// A Mix relex finished off the UI thread.
+    Relex(TabId, cosmix_edit_client::highlight::ResultTag, Vec<(std::ops::Range<usize>, cosmix_edit_client::highlight::TokenClass)>),
     GotoOffset(usize),
     JumpLastRemote,
     ClosePanel,
@@ -352,6 +354,10 @@ impl App {
                 let effects = self.controller.on_lint(tab, tag, result);
                 self.perform(effects)
             }
+            Msg::Relex(tab, tag, spans) => {
+                self.controller.on_relex(tab, tag, spans);
+                Task::none()
+            }
             Msg::GotoOffset(offset) => self.move_caret(offset),
             Msg::JumpLastRemote => {
                 let at = self.active_tab().and_then(|t| t.mirror.as_ref()?.last_remote()?.span.clone()).map(|s| s.start);
@@ -415,6 +421,8 @@ impl App {
                     tasks.push(read.map(move |text| Msg::Paste(intent.clone(), text)));
                 }
                 Effect::Prompt(prompt) => self.on_prompt(prompt),
+                Effect::WindowAction { tab, action, args, intent } => tasks.push(self.on_window_action(tab, action, args, intent)),
+                Effect::Relex { tab, tag, source } => tasks.push(Task::perform(relex(tag, source), move |(tag, spans)| Msg::Relex(tab, tag, spans))),
                 // The controller debounces session writes itself.
                 Effect::SaveSession => self.save_session(),
                 Effect::Quit => {
@@ -451,7 +459,7 @@ impl App {
                 Task::none()
             }
             TimerKey::Lint(tab) => self.start_lint(tab),
-            TimerKey::FindHighlight => Task::none(),
+            TimerKey::FindHighlight => self.push_match_query(),
             TimerKey::ClearMarkers(tab) => {
                 if self.controller.active() == Some(tab) && self.window_focused {
                     let effects = self.controller.on_action(Some(tab), ActionId::ViewClearMarkers, Intent::ui(tab));
@@ -507,6 +515,9 @@ impl App {
                 return self.perform(effects);
             }
             ActionId::SearchReplaceAll => {
+                if self.find.pattern.is_empty() {
+                    return self.on_ui_action(ActionId::SearchReplace);
+                }
                 let effects = self.controller.on_action_args(tab, action, Some(self.find.replace_args()), intent);
                 return self.perform(effects);
             }
@@ -599,14 +610,65 @@ impl App {
             FindMsg::ReplaceAll => self.on_ui_action(ActionId::SearchReplaceAll),
             FindMsg::Close => {
                 self.field_focused = false;
-                Task::none()
+                self.timers.cancel(TimerKey::FindHighlight);
+                self.push_match_query()
             }
-            FindMsg::Pattern(_) => {
+            FindMsg::Pattern(_) | FindMsg::ToggleCase | FindMsg::ToggleRegex | FindMsg::ToggleWord => {
                 self.timers.arm(TimerKey::FindHighlight, 100);
                 Task::none()
             }
-            _ => Task::none(),
+            FindMsg::Replacement(_) => Task::none(),
         }
+    }
+
+    /// Hand the find bar's query to the controller for highlight-all (None
+    /// when the bar is closed or empty).
+    fn push_match_query(&mut self) -> Task<Msg> {
+        let Some(tab) = self.controller.active() else { return Task::none() };
+        let query = (self.find.open && !self.find.pattern.is_empty()).then(|| {
+            let (pattern, regex) = crate::chrome::find::wire_pattern(&self.find.pattern, self.find.regex, self.find.word);
+            MatchQuery { pattern, regex, case: self.find.case }
+        });
+        let effects = self.controller.set_match_query(tab, query);
+        self.perform(effects)
+    }
+
+    /// A window-only action the controller routed here (from `ced.action`
+    /// over the Bus, or missing the args only a human can give): perform it
+    /// as the window would, keeping the caller's intent for anything it
+    /// starts (Save As).
+    fn on_window_action(&mut self, tab: Option<TabId>, action: ActionId, args: Option<serde_json::Value>, intent: Intent) -> Task<Msg> {
+        let mut selected = Task::none();
+        if let Some(t) = tab
+            && Some(t) != self.controller.active()
+        {
+            let effects = self.controller.select_tab(t);
+            selected = self.perform(effects);
+        }
+        let arg = |k: &str| args.as_ref().and_then(|a| a.get(k)).and_then(|v| v.as_str()).map(str::to_owned);
+        let task = match action {
+            ActionId::FileSaveAs => match self.controller.active() {
+                Some(t) => {
+                    let name = self.tab(t).map(chrome::tabs::display_name);
+                    self.open_dialog(FileMode::SaveAs { tab: t, intent }, name)
+                }
+                None => Task::none(),
+            },
+            ActionId::SearchFind | ActionId::SearchFindNext | ActionId::SearchFindPrev | ActionId::SearchReplace | ActionId::SearchReplaceAll => {
+                let replace = matches!(action, ActionId::SearchReplace | ActionId::SearchReplaceAll);
+                let opened = self.on_ui_action(if replace { ActionId::SearchReplace } else { ActionId::SearchFind });
+                // After opening: the caller's pattern beats the selection seed.
+                if let Some(p) = arg("pattern") {
+                    self.find.pattern = p;
+                }
+                if let Some(r) = arg("replacement") {
+                    self.find.replacement = r;
+                }
+                opened
+            }
+            other => self.on_ui_action(other),
+        };
+        Task::batch([selected, task])
     }
 
     fn on_escape(&mut self) -> Task<Msg> {
@@ -616,7 +678,7 @@ impl App {
         if self.find.open {
             self.find.open = false;
             self.field_focused = false;
-            return Task::none();
+            return self.push_match_query();
         }
         if self.panel.take().is_some() {
             return Task::none();
@@ -1247,6 +1309,29 @@ impl App {
             config_path: self.dirs.as_ref().map(|d| d.config_file().display().to_string()),
             macros: &self.macros,
         }
+    }
+}
+
+/// A Mix relex (`Effect::Relex`) on its own thread, so a large buffer never
+/// stalls the UI thread or the one-thread task pool.
+fn relex(
+    tag: cosmix_edit_client::highlight::ResultTag,
+    source: std::sync::Arc<str>,
+) -> impl std::future::Future<
+    Output = (cosmix_edit_client::highlight::ResultTag, Vec<(std::ops::Range<usize>, cosmix_edit_client::highlight::TokenClass)>),
+> + Send
++ 'static {
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    let language = tag.language.clone();
+    let spawned = std::thread::Builder::new().name("ced-relex".into()).spawn(move || {
+        let _ = tx.send(cosmix_edit_client::highlight::run_mix(&language, &source));
+    });
+    async move {
+        let spans = match spawned {
+            Ok(_) => rx.await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        (tag, spans)
     }
 }
 
