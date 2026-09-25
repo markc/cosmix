@@ -1725,6 +1725,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn key_event(key: Named, modifiers: keyboard::Modifiers) -> Event {
         Event::Keyboard(keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key),
@@ -2110,7 +2111,10 @@ mod tests {
         assert_eq!(messages, [Host::Act(9)]);
     }
 
+    // iced_core implements `Renderer` for `()` only with debug assertions,
+    // like the other UserInterface tests here: run without --release.
     #[test]
+    #[cfg(debug_assertions)]
     fn open_operation_opens_the_named_bar_entry_by_keyboard() {
         let bar = || {
             Menu::<'_, u8, iced_core::Theme, ()>::bar(vec![
