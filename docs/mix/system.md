@@ -1028,6 +1028,138 @@ false
 
 `kill(pid, 9)` sends SIGKILL; pass any signal number you need.
 
+## Desktop status events — net_watch, audio_watch
+
+A status applet needs to know when the network or the volume changes. Reading
+`/sys/class/net/*/operstate` on a timer, or running `wpctl get-volume` every
+minute, is polling: late when something changes and wasted work when nothing
+does. These builtins subscribe instead. They share the
+[native-event](serve.md#native-events-and-generation-lifetime) machinery of
+`fs_watch` and managed `spawn`: opaque evaluator-owned handles, coalesced
+batches in `$event.args`, sticky overflow, cancellation on unwatch, retirement
+with the evaluator generation, and no clock anywhere.
+
+```mix
+$net = net_watch()
+$audio = audio_watch({runtime_dir: env("XDG_RUNTIME_DIR")})
+
+fn network_summary()
+  $up = false
+  for each $link in net_state().links
+    if $link.up and not $link.loopback then $up = true end
+  end
+  return $up
+end
+
+on net.changed
+  -- The batch says what moved; net_state() says what is true now.
+  print("network up: " .. to_string(network_summary()))
+end
+on audio.changed
+  if type($event.args.closed) == "map" then
+    print("audio source ended: " .. $event.args.closed.message)
+  else
+    $vol = audio_state({runtime_dir: env("XDG_RUNTIME_DIR")})
+    print($vol.ok ? to_string($vol.level) .. "%" .. ($vol.muted ? " muted" : "") : "no sink")
+  end
+end
+```
+
+**Events are hints, state is truth.** A batch tells a behaviour *that* something
+changed and roughly what; the model is rebuilt from `net_state()` /
+`audio_state()`. Always re-read on `overflow:true`.
+
+### Network: `net_watch([opts]) -> handle`
+
+One rtnetlink socket per handle, subscribed to `RTMGRP_LINK`,
+`RTMGRP_IPV4_IFADDR` and `RTMGRP_IPV6_IFADDR`, read by a thread blocked in
+poll(2) with no timeout. `opts.events` narrows it to `["link"]` or `["addr"]`.
+Each wake drains every queued datagram into **one** `net.changed` batch:
+
+```
+{watch, overflow, closed?, changes: [
+  {kind: "link", ifname, index, up, operstate, loopback, wireless, removed},
+  {kind: "addr", ifname, index, up, family: "inet"|"inet6", address, prefix, removed}
+]}
+```
+
+- `up` on a link is *operationally* up: operstate `up`, or — for drivers that
+  report `unknown`, such as `lo` and WireGuard — `IFF_UP` and `IFF_RUNNING`
+  together. On an address it means present (`false` with `removed:true`).
+- Records coalesce per link index and per address within a batch: a link that
+  flaps down and up in one burst arrives once, with its last state.
+- Announcements that change nothing are dropped — wireless drivers re-announce
+  the link on every scan, IPv6 re-announces addresses on every lifetime refresh.
+- A kernel overrun (`ENOBUFS`), a truncated or malformed message sets
+  `overflow:true`; the next repeat is then delivered rather than suppressed.
+
+`net_state() -> {links, addresses}` is the same information from a netlink dump
+(`links[]`: `ifname, index, up, operstate, loopback, wireless`; `addresses[]`:
+`ifname, index, family, address, prefix`). A dump the kernel marks interrupted is
+retried; three in a row raise `NET_STATE_INCONSISTENT`.
+
+The socket is raw libc: three fixed headers and a few attributes do not justify
+linking a netlink crate into every Mix build. `net_*` are **Env** class
+(read-only observation of the host).
+
+### Audio: `audio_watch([opts]) -> handle`
+
+PipeWire publishes changes through its pulse-compatible server, and
+`pactl subscribe` prints one line per change and otherwise blocks. Each handle
+owns one such child: its stdout is read by a thread blocked in read(2), and each
+read becomes one `audio.changed` batch:
+
+```
+{watch, overflow, closed?, changes: [{facility, kind, index}]}
+```
+
+`facility` is `sink`, `source`, `server`, `card` by default (`opts.facilities`
+may name any of `sink source sink-input source-output module client sample-cache
+server card`); `client` is left out by default because every pulse client
+connecting would otherwise be an event. `kind` is `new`, `change` or `remove`;
+`index` is nil for `server`. Changes coalesce per facility and index.
+
+The volume itself is `audio_state([opts]) -> {ok, volume, level, muted, reason?}`:
+one `wpctl get-volume @DEFAULT_AUDIO_SINK@` with a 2 s deadline. `level` is
+`round(volume * 100)`. No default sink, a missing `wpctl` or a timeout is
+`ok:false` with a `reason`, not an error. Call it once per batch: a burst of
+notices costs one read.
+
+**Why a child and not a library.** No PipeWire client crate is in the
+workspace, and libpipewire would bring a C library and its main loop into every
+Mix build. A long-lived subscription child is an event stream — the process is
+idle until the server has news — so this is not polling. Its lifecycle is owned:
+the child runs in its own process group with `LC_ALL=C` (the parser reads
+English) and `XDG_RUNTIME_DIR` from `opts.runtime_dir` when given; unwatch or
+evaluator retirement SIGKILLs the group and reaps it. If `pactl` exits by itself
+(PipeWire restarted, no server yet), the handle delivers one batch with
+`closed: {error_code: "AUDIO_SOURCE_EXITED", message, exit_code}` and
+`overflow:true`, then stays silent: unwatch it and subscribe again when you
+choose to (a behaviour typically retries after a delay from an async handler).
+If the Mix process itself is SIGKILLed, `pactl` ends at its next write.
+`audio_*` are **Process** class (they run programs).
+
+### Limits and refusals
+
+At most 16 net and audio handles together per evaluator, and 1024 distinct
+pending records per handle (beyond that the batch sets overflow). A top-level
+`sleep()` in a plain script dispatches these only when `on net.changed` /
+`on audio.changed` is registered. All six builtins are denied in expression
+mode. Refusals raise with `{error_code, message}`:
+
+| Code | Meaning |
+|---|---|
+| `NET_WATCH_OPTIONS`, `AUDIO_OPTIONS` | Invalid options. |
+| `NET_WATCH_ARGUMENT`, `AUDIO_WATCH_ARGUMENT` | Handle is not a string. |
+| `NET_WATCH_HANDLE`, `AUDIO_WATCH_HANDLE` | Unknown, retired, or other-family handle. |
+| `NET_WATCH_LIMIT`, `AUDIO_WATCH_LIMIT` | 16-handle limit reached. |
+| `NET_WATCH_IO`, `NET_STATE_IO` | Netlink socket or dump failure. |
+| `NET_STATE_INCONSISTENT` | Dump interrupted three times running. |
+| `AUDIO_UNAVAILABLE` | `pactl` not on PATH. |
+| `AUDIO_WATCH_IO`, `AUDIO_STATE_IO` | Could not start or reap the child. |
+| `*_UNSUPPORTED` | Platform is not Linux. |
+| `NATIVE_CLOSED` | This evaluator's native registrations have retired. |
+
 ## Environment, identity & the working directory
 
 ```
@@ -1664,9 +1796,10 @@ unbounded and nothing can interrupt it.
 
 Each system builtin carries a [capability class](capabilities.md) used by the
 [`--serve`](bus.md) sandbox's `check_capability` gate: `env` / `pid` /
-`hostname` / `cwd` / `platform` / `which` are **Env** (read-only inspection);
+`hostname` / `cwd` / `platform` / `which` / `net_watch` / `net_unwatch` /
+`net_state` are **Env** (read-only inspection);
 `run` / `run_rc` / `run_stream` / `spawn` / `kill` / `process_alive` / `chdir` /
-`exit` (and `panic` — see [errors](errors.md)) are **Process** (they touch the
+`audio_watch` / `audio_unwatch` / `audio_state` / `exit` (and `panic` — see [errors](errors.md)) are **Process** (they touch the
 OS process table or filesystem CWD); `shell_quote` / `sql_quote` / `sanitize` /
 `random_password` / `uuid` / hashes / `base64_*` are **Pure**. An embedding
 daemon can deny the Process class to run untrusted Mix without it spawning

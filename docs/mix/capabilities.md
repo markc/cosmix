@@ -33,8 +33,8 @@ There are **nine** classes, no more — `Bus` is the newest, added in 0.20.3 for
 | **FsRead** | Reads or observes the filesystem. | `fs_watch` `fs_unwatch` `fs_wait` `read_file` `read_file_bytes` `read_lines` `read_json` `read_jsonl` `load_data` `exists` `is_file` `is_dir` `ls` `glob` `walk` `stat` `line_count` |
 | **FsWrite** | Mutates the filesystem. | `write_file` `write_new` `append_file` `mkdir` `flock` `funlock` `chmod` `chown` `sqlopen` `sqlexec` `sqlclose` |
 | **Network** | Talks to the network (arbitrary outbound). | `http_get` `http_post` `http_request` `dns_lookup` `ssh_run` `ssh_must` `ssh_mix` |
-| **Process** | Controls other processes / process lifecycle. | `run` `run_rc` `run_stream` `spawn` `kill` `process_alive` `chdir` `exit` `panic` |
-| **Env** | Reads host/environment info or stdin. | `env` `cwd` `hostname` `pid` `platform` `which` `readline` `read_stdin` |
+| **Process** | Controls other processes / process lifecycle. | `run` `run_rc` `run_stream` `spawn` `kill` `process_alive` `audio_watch` `audio_unwatch` `audio_state` `chdir` `exit` `panic` |
+| **Env** | Reads host/environment info or stdin. | `env` `cwd` `hostname` `pid` `platform` `which` `net_watch` `net_unwatch` `net_state` `readline` `read_stdin` |
 | **Db** | Host-injected, *mediated* database seam. | `db_query` `db_exec` |
 | **Jmap** | Host-injected, *mediated* JMAP seam. | `jmap` `jmap_upload` |
 | **Bus** | Host-injected, *mediated* delegated-Bus seam. | `bus_call` |

@@ -13,14 +13,16 @@ view — what the flag does, what the runtime injects, and how a citizen behaves
 
 ## Native events and generation lifetime
 
-`on fs.changed`, `on proc.exited` and `on bus.connected` use the ordinary event
+`on fs.changed`, `on proc.exited`, `on net.changed`, `on audio.changed` and
+`on bus.connected` use the ordinary event
 envelope: payloads are in **`$event.args`**, with `command`, `headers` and `body`
 available as usual. Plain handlers remain serial; async handlers use the
 existing concurrent scheduling and drain rules. Native notifications also enter
 the existing top-level yield points. No native source uses a polling loop or a
 timer to discover change; an idle pump parks on readiness notifications.
 
-Filesystem watches and managed children belong to an evaluator generation.
+Filesystem watches, net/audio watches and managed children belong to an
+evaluator generation.
 Workers exchange owned Rust records with a bounded registry; Mix values are
 created only on the evaluation thread. Reload builds a separate candidate
 registry. A failed candidate is drained and closed, leaving the old watches and
@@ -60,7 +62,8 @@ end
 ```
 
 See [filesystem events](io.md#native-filesystem-events),
-[managed spawn](system.md#managed-child-exit-events), and
+[managed spawn](system.md#managed-child-exit-events),
+[network and audio events](system.md#desktop-status-events--net_watch-audio_watch), and
 [connection events](bus.md#connection-events).
 
 ## First, "substrate"

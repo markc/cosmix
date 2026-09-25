@@ -108,7 +108,10 @@ contains `{error_code,message}` (`code` remains an alias). Codes:
 | `NATIVE_CONSUMER` | Attempted to enter a second event pump in this evaluator. |
 
 See [serve lifecycle](serve.md#native-events-and-generation-lifetime) for reload
-and shutdown ownership. These examples specify the new API; the older version
+and shutdown ownership. Network and audio changes have their own subscriptions
+(`net_watch`, `audio_watch`) — see
+[desktop status events](system.md#desktop-status-events--net_watch-audio_watch);
+do not watch `/sys/class/net`, which does not emit inotify events. These examples specify the new API; the older version
 claims at the top of this page do not apply to this section.
 
 ## Reading files

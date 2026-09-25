@@ -10,6 +10,7 @@ pub mod evaluator;
 pub mod interrupt;
 pub mod lexer;
 pub mod lint_docs;
+mod desktop_events;
 mod fs_watch;
 mod native_events;
 mod child_events;

@@ -28,9 +28,10 @@
 --
 -- Event-driven: the taskbar and pager rebuild on the compositor's
 -- props.changed topic, the tray and notifications on their adapters'
--- events. The one clock is the wall clock itself: a local async task started
--- once by init sleeps to each minute boundary, one wake per minute, never a
--- poll of anyone's state.
+-- events, the network applet on rtnetlink link changes (net_watch) and the
+-- volume applet on PipeWire change notices (audio_watch). The one clock is
+-- the wall clock itself: a local async task started once by init sleeps to
+-- each minute boundary for the displayed time, never a poll of anyone's state.
 $p = require("lib/panel.mix")
 
 -- Our own Bus name goes into every scene document's `citizen:` field, which
@@ -65,6 +66,9 @@ $C = {
 $state = {
   windows: [], ws_count: 1, ws_current: 1, tray: [],
   net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
+  -- status event sources: watch handles (nil = not subscribed) and the
+  -- audio re-subscribe delay after PipeWire's server goes away
+  net_watch: nil, audio_watch: nil, audio_retry: 5, audio_retrying: false,
   notes: [], notes_open: false, peeked: [],
   launcher_open: false, calendar_open: false,
   query: "", category: "", apps: [], apps_loaded: false,
@@ -330,45 +334,82 @@ fn fetch_tray()
   $state.tray = $r.items
 end
 
--- Network: any non-loopback interface whose operstate is "up" (the kernel's
--- own answer, read from sysfs -- no D-Bus, per the dbusd-boundary ADR).
+-- Network: any non-loopback link whose operstate is "up" (the kernel's own
+-- answer, from an rtnetlink dump -- no D-Bus, per the dbusd-boundary ADR).
+-- Re-read on every net.changed batch: events are hints, state is truth.
 fn fetch_net()
   $up = false
   $wireless = false
   try
-    for each $name in ls("/sys/class/net")
-      if $name != "lo" then
-        $dir = "/sys/class/net/" .. $name
-        $oper = ""
-        try
-          $oper = trim(read_file($dir .. "/operstate"))
-        catch $e
-        end
-        if $oper == "up" then
-          $up = true
-          if is_dir($dir .. "/wireless") then $wireless = true end
-        end
+    for each $link in net_state().links
+      if $link.loopback != true and $link.operstate == "up" then
+        $up = true
+        if $link.wireless == true then $wireless = true end
       end
     end
   catch $e
+    note("net_state failed: " .. to_string($e))
   end
   $state.net = {up: $up, wireless: $wireless}
 end
 
--- Volume: PipeWire's default sink via wpctl ("Volume: 0.40 [MUTED]"). No
+-- Volume: PipeWire's default sink (one wpctl call inside audio_state). No
 -- default sink -> the applet is hidden rather than showing a false 0 %.
 fn fetch_vol()
-  $r = run_argv(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
-  if not $r.ok then
+  $v = {ok: false}
+  try
+    $v = audio_state({runtime_dir: $PW_RUNTIME})
+  catch $e
+    note("audio_state failed: " .. to_string($e))
+  end
+  if $v.ok != true then
     $state.vol = {ok: false, level: 0, muted: false}
     return
   end
-  $m = re_find($r.stdout, "Volume:\\s*([0-9.]+)")
-  if length($m) == 0 then
-    $state.vol = {ok: false, level: 0, muted: false}
+  $state.vol = {ok: true, level: $v.level, muted: $v.muted == true}
+end
+
+-- Subscribe to link changes and PipeWire change notices. An interpreter
+-- without these builtins (older than the Stage C release) shows the network
+-- applet offline and hides volume, and says so in the log: there is no
+-- polling fallback.
+fn start_status()
+  if not has_builtin("net_watch") then
+    note("status events unavailable: this mix has no net_watch/audio_watch")
     return
   end
-  $state.vol = {ok: true, level: round(to_number($m[0].groups[0]) * 100), muted: index_of($r.stdout, "MUTED") >= 0}
+  if $state.net_watch == nil then
+    try
+      $state.net_watch = net_watch({events: ["link"]})
+    catch $message
+      note("net_watch failed: " .. to_string($message))
+    end
+  end
+  start_audio()
+end
+
+fn start_audio()
+  if $state.audio_watch != nil then return end
+  try
+    $state.audio_watch = audio_watch({runtime_dir: $PW_RUNTIME})
+  catch $message
+    note("audio_watch failed: " .. to_string($message))
+    retry_audio()
+  end
+end
+
+-- PipeWire's server went away (session restart) or is not up yet: subscribe
+-- again after a delay that doubles to five minutes. This is a reconnect
+-- backoff, not a state poll; a delivered change resets it.
+fn retry_audio()
+  if $state.audio_retrying then return end
+  $state.audio_retrying = true
+  try
+    task_start("audio.retry", "{}")
+  catch $message
+    $state.audio_retrying = false
+    note("audio retry not scheduled: " .. to_string($message))
+  end
 end
 
 -- Notifications come from the adapter's props tree (notify.props.get):
@@ -1611,8 +1652,6 @@ on clock.run async
     while true
       sleep($p.seconds_to_next_minute(time()))
       try
-        fetch_net()
-        fetch_vol()
         render_panel()
         -- the calendar's "today" and header clock stay current while it is
         -- registered, open or not; it is revealed only while open
@@ -1623,6 +1662,60 @@ on clock.run async
     end
   finally
     $state.clock_running = false
+  end
+end
+
+-- Native status sources (local events: no headers). A batch only says that
+-- something changed; the applets re-read state, and schedule() coalesces the
+-- rebuild with any other pending change.
+on net.changed async
+  if len(keys($event.headers)) != 0 then return end
+  if type($event.args) == "map" and type($event.args.closed) == "map" then
+    note("net_watch ended: " .. to_string($event.args.closed.message))
+    try
+      net_unwatch($event.args.watch)
+    catch $e
+    end
+    $state.net_watch = nil
+  end
+  fetch_net()
+  schedule()
+end
+
+on audio.changed async
+  if len(keys($event.headers)) != 0 then return end
+  $batch = type($event.args) == "map" ? $event.args : {}
+  if type($batch.closed) == "map" then
+    note("audio events ended: " .. to_string($batch.closed.message))
+    if $batch.watch == $state.audio_watch then
+      try
+        audio_unwatch($batch.watch)
+      catch $e
+      end
+      $state.audio_watch = nil
+    end
+    $state.vol = {ok: false, level: 0, muted: false}
+    schedule()
+    retry_audio()
+    return
+  end
+  $state.audio_retry = 5
+  fetch_vol()
+  schedule()
+end
+
+on audio.retry async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    sleep($state.audio_retry)
+    $state.audio_retry = min($state.audio_retry * 2, 300)
+  finally
+    $state.audio_retrying = false
+  end
+  start_audio()
+  if $state.audio_watch != nil then
+    fetch_vol()
+    schedule()
   end
 end
 
@@ -1640,6 +1733,8 @@ $state.applied_panels = ($initial_panels ?? {}).panels ?? {}
 rpc($COMP, "comp.props.watch", {})
 fetch_windows()
 fetch_tray()
+-- Subscribe before the first read, so a change in between is not lost.
+start_status()
 fetch_status()
 -- A popup that was open when Quoin or this citizen went down comes back as
 -- a pinned edge with no content (the modes persist; the scenes do not).

@@ -538,7 +538,10 @@ contains <code>{error_code,message}</code> (<code>code</code> remains an alias).
 <tr><td><code>NATIVE_CONSUMER</code></td><td>Attempted to enter a second event pump in this evaluator.</td></tr>
 </tbody></table>
 <p>See <a href="/mix/serve#native-events-and-generation-lifetime">serve lifecycle</a> for reload
-and shutdown ownership. These examples specify the new API; the older version
+and shutdown ownership. Network and audio changes have their own subscriptions
+(<code>net_watch</code>, <code>audio_watch</code>) — see
+<a href="/mix/system#desktop-status-events--net_watch-audio_watch">desktop status events</a>;
+do not watch <code>/sys/class/net</code>, which does not emit inotify events. These examples specify the new API; the older version
 claims at the top of this page do not apply to this section.</p>
 <h2 id="reading-files">Reading files</h2>
 <pre><code>read_file(path)          -&gt; string   (whole file; errors if not UTF-8)
