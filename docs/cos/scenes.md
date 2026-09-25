@@ -299,8 +299,18 @@ filtered launchers, the 500-row cap, empty/full notifications, leap day, a
 non-leap century and year rollover. Scheduled Taffy tests cover horizontal
 natural widths, gap/alignment, and real VirtualList rebind/reorder identity;
 the Bus bridge test checks the outgoing citizen, command and item body.
-These are cluster gates, not a claim of live GPU screenshot acceptance. Panel,
-tray, settings and live migration remain later stages.
+These are cluster gates, not a claim of live GPU screenshot acceptance.
+
+Stage B adds the bottom panel (`share/scenes/panel`, page `scene-panel`) with
+empty, busy, tray-change and task-cap captures in their own
+`panel-cases.json`. Its pager, tasks and tray are horizontal-flow lists, so
+the old builder's generated button nodes become list instances and node IDs
+no longer match one to one; the Mix gate instead evaluates the template's
+bindings against each captured model and compares visible trees by shape,
+with each list's click handler applied to its instances. A Rust renderer
+comparison of those cases (normalising horizontal instances) is still to be
+added. Settings and live migration are the remaining Stage B work; see
+[quoin-panel](quoin-panel.md#stage-b-the-panel-template).
 
 Absolute image `src` paths load PNG and SVG directly, rasterised or resized
 at `UiScale` multiplied by the primary window's scale factor, or `UiScale`

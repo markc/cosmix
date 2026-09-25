@@ -108,7 +108,7 @@ fn initial($root, $templates, $host, $me, $io)
   return {root:$root, templates:$templates, host:$host, me:$me, io:$io,
     desired:{schema_version:1, enabled:[], origins:{}, recovery:{}}, state_digest:"",
     scenes:{}, retiring:{}, panels:{}, panel_revision:0, panel_generation:nil, open:nil,
-    host_live:false, sync_needed:true, services:nil, connection:nil, revision:0, published:"",
+    host_live:false, sync_needed:true, services:nil, legacy:"quoin-panel", connection:nil, revision:0, published:"",
     sequence:$sequence, diagnostic:nil, response:{}, rc:0}
 end
 
@@ -275,12 +275,8 @@ fn candidate($s, $name, $dir)
       fail("SCENES_MOUNT", "managed popup page and edge must be static", {name:$name})
     end
   end
-  -- Stage A cannot capture any of the legacy host's seats, even if free.
   $page = $doc.mount.panel
   if type($page) != "string" or trim($page) == "" then $page = "scene-" .. $name end
-  if contains(["scene-panel", "scene-launcher", "scene-calendar", "scene-notes", "settings.appearance"], $page) then
-    fail("SCENES_STAGE_A", "legacy page is reserved until Stage B; use a distinct scene/page name", {page:$page})
-  end
   $meta_text = bounded_read($dir .. "/template.conf.mix", 65536)
   try
     $meta = data_parse($meta_text)
@@ -298,6 +294,19 @@ fn candidate($s, $name, $dir)
   if not contains(["left", "top", "bottom"], $edge) then $edge = "right" end
   return {source:$source, model:$doc.model, page:$page, edge:$edge,
     digest:hash_sha256($source), behaviour_digest:$behaviour, meta_digest:hash_sha256($meta_text)}
+end
+
+-- Stage B handover: the legacy panel citizen (quoin-panel.mix) mounts these
+-- pages itself and a load by either owner takes the page from the other.
+-- While its service is registered, a loader scene on one of its pages stays
+-- installed and enabled but unmounted; the registration disappearing is the
+-- event that mounts it (services() rescans), with no wait loop.
+$LEGACY_PAGES = ["scene-panel", "scene-launcher", "scene-calendar", "scene-notes"]
+
+fn legacy_guard($s, $page)
+  if contains($LEGACY_PAGES, $page) and type($s.services) == "list" and contains($s.services, $s.legacy) then
+    fail("SCENES_LEGACY_HELD", "the legacy panel citizen still owns this page; stop it to hand over", {page:$page, holder:$s.legacy})
+  end
 end
 
 fn reconcile_one($s, $name, $force)
@@ -338,6 +347,7 @@ fn reconcile_one($s, $name, $force)
       $s.io.check($dir .. "/behaviour.mix")
     end
     if $force or $c.digest != $e.digest or not $e.mounted then
+      legacy_guard($s, $c.page)
       $model = $e.model ?? $c.model
       $r = load_managed($s, $c.source, $model, $e.generation)
       $e.source = $c.source
@@ -667,6 +677,8 @@ fn services($s, $names, $reconnect)
   end
   $live = contains($names, $s.host)
   $returning = $live and (not $s.host_live or $reconnect or $s.sync_needed)
+  -- The legacy panel citizen leaving is the handover event for its pages.
+  $released = type($s.services) == "list" and contains($s.services, $s.legacy) and not contains($names, $s.legacy)
   $s.host_live = $live
   $s.services = $names
   if not $live or $reconnect then
@@ -699,6 +711,7 @@ fn services($s, $names, $reconnect)
       $e = $s.scenes[$name]
       if $e.enabled and $e.installed and $e.source != nil then
         try
+          legacy_guard($s, $e.page)
           $r = load_managed($s, $e.source, $e.model, $e.generation)
           $s.scenes[$name].mounted = true
           $s.scenes[$name].revision = $r.revision
@@ -719,6 +732,7 @@ fn services($s, $names, $reconnect)
       return $s
     end
   end
+  if $released and $live and not $returning then $s = rescan($s, false) end
   -- A native exit proves the process is gone, but the broker may still be
   -- retiring its name. A fresh registry read in start closes that handover.
   if $live then

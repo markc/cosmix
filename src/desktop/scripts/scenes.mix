@@ -1,6 +1,9 @@
 -- version: 0.1.0
--- Stage A: coexists with quoin-panel; no legacy page takeover or auto-enable.
--- Requires W1 native fs events, managed exits/stops and bus.connected.
+-- Stage B: owns the panel/launcher/calendar/notes pages once seeded and
+-- enabled; while the legacy quoin-panel citizen (SCENES_LEGACY_SERVICE) is
+-- registered those scenes stay unmounted, and its departure mounts them.
+-- Never auto-enables. Requires W1 native fs events, managed exits/stops and
+-- bus.connected.
 $loader = require("lib/scenes.mix")
 $io = require("lib/scenes-io.mix")
 $ROOT = env("SCENES_DIR", env("XDG_CONFIG_HOME", env("HOME") .. "/.config") .. "/cosmix/scenes")
@@ -14,6 +17,7 @@ mkdir($ROOT)
 if not stat($ROOT, {follow_symlinks:false}).is_dir then raise("SCENES_FILES", "scene root must be a real directory", {}) end
 if not flock($ROOT .. "/.loader.lock") then raise("SCENES_LOCKED", "another loader owns this scenes directory", {}) end
 $state = $loader.initial($ROOT, $TEMPLATES, $HOST, $ME, $io)
+$state.legacy = env("SCENES_LEGACY_SERVICE", "quoin-panel")
 $ROOT = $state.root
 
 fn refresh_services($s, $reconnect)

@@ -26,6 +26,14 @@
 --      TRAY_SERVICE (tray), NOTIFY_SERVICE (notify) -- a nested dev desktop
 --      points these elsewhere. Manual: docs/cos/quoin-panel.md.
 --
+-- RETIRED BY SCENE PHASE 1 STAGE B. Every duty here now has a file-backed
+-- replacement: the scenes loader (scenes.mix) plus share/scenes/{panel,
+-- launcher,calendar,notes}, on the same page IDs. This citizen stays in the
+-- tree only as rollback material until live parity passes; never run it next
+-- to a loader that has those scenes enabled (the loader keeps them unmounted
+-- while this service is registered). Callers and the migration are listed in
+-- docs/cos/quoin-panel.md.
+--
 -- Event-driven: the taskbar and pager rebuild on the compositor's
 -- props.changed topic, the tray and notifications on their adapters'
 -- events. The one clock is the wall clock itself: a local async task started

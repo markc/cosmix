@@ -1,0 +1,181 @@
+---
+scene: 1
+name: panel
+citizen: scene-fixture
+window: {"chrome":false,"edge":"bottom","h":52,"kind":"edge","title":"Panel"}
+---
+```mix
+root: {"align":"center","background":"#202326f2","children":["launcher_btn","gap1","pager","gap2","tasks","fill","status","clock","peek"],"fill":true,"gap":4,"padding":4,"widget":"row"}
+launcher_btn: {"align":"center","children":["launcher_icon"],"height":40,"hover":"#ffffff1a","on_click":"launcher","padding":6,"radius":8,"widget":"row"}
+launcher_icon: {"h":28,"src":"/usr/share/icons/example-dark/start-here-kde.svg","w":28,"widget":"image"}
+gap1: {"size":6,"widget":"spacer"}
+pager: {"align":"center","children":["ws_1"],"gap":3,"widget":"row"}
+ws_1: {"align":"center","background":"#3daee9","children":["ws_1_t"],"height":30,"hover":"#ffffff1a","justify":"center","on_click":"ws","padding":8,"radius":6,"widget":"row"}
+ws_1_t: {"bold":true,"color":"#0b1f2b","size":12,"text":"1","widget":"text"}
+gap2: {"size":8,"widget":"spacer"}
+tasks: {"align":"center","children":["t_1","t_2","t_3","t_4","t_5","t_6","t_7","t_8","t_9","t_10","t_11","t_12","t_13","t_14","t_15","t_16","t_17","t_18","t_19","t_20","t_21","t_22","t_23","t_24","t_25","t_26","t_27","t_28","t_29","t_30","t_31","t_32","t_33","t_34","t_35","t_36","t_37","t_38","t_39","t_40","t_41","t_42","t_43","t_44","t_45","t_46","t_47","t_48","t_49","t_50"],"gap":4,"widget":"row"}
+t_1: {"align":"center","background":"#ffffff0f","children":["t_1_i","t_1_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_1_i: {"size":0,"widget":"spacer"}
+t_1_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 1","widget":"text","width":170}
+t_2: {"align":"center","background":"#ffffff0f","children":["t_2_i","t_2_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_2_i: {"size":0,"widget":"spacer"}
+t_2_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 2","widget":"text","width":170}
+t_3: {"align":"center","background":"#3daee940","children":["t_3_i","t_3_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_3_i: {"size":0,"widget":"spacer"}
+t_3_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 3","widget":"text","width":170}
+t_4: {"align":"center","background":"#ffffff0f","children":["t_4_i","t_4_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_4_i: {"size":0,"widget":"spacer"}
+t_4_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 4","widget":"text","width":170}
+t_5: {"align":"center","background":"#ffffff0f","children":["t_5_i","t_5_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_5_i: {"size":0,"widget":"spacer"}
+t_5_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 5","widget":"text","width":170}
+t_6: {"align":"center","background":"#ffffff0f","children":["t_6_i","t_6_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_6_i: {"size":0,"widget":"spacer"}
+t_6_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 6","widget":"text","width":170}
+t_7: {"align":"center","children":["t_7_i","t_7_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_7_i: {"size":0,"widget":"spacer"}
+t_7_l: {"color":"#6e7680","elide":true,"size":13,"text":"Window 7","widget":"text","width":170}
+t_8: {"align":"center","background":"#ffffff0f","children":["t_8_i","t_8_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_8_i: {"size":0,"widget":"spacer"}
+t_8_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 8","widget":"text","width":170}
+t_9: {"align":"center","background":"#ffffff0f","children":["t_9_i","t_9_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_9_i: {"size":0,"widget":"spacer"}
+t_9_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 9","widget":"text","width":170}
+t_10: {"align":"center","background":"#ffffff0f","children":["t_10_i","t_10_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_10_i: {"size":0,"widget":"spacer"}
+t_10_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 10","widget":"text","width":170}
+t_11: {"align":"center","background":"#ffffff0f","children":["t_11_i","t_11_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_11_i: {"size":0,"widget":"spacer"}
+t_11_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 11","widget":"text","width":170}
+t_12: {"align":"center","background":"#ffffff0f","children":["t_12_i","t_12_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_12_i: {"size":0,"widget":"spacer"}
+t_12_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 12","widget":"text","width":170}
+t_13: {"align":"center","background":"#ffffff0f","children":["t_13_i","t_13_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_13_i: {"size":0,"widget":"spacer"}
+t_13_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 13","widget":"text","width":170}
+t_14: {"align":"center","children":["t_14_i","t_14_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_14_i: {"size":0,"widget":"spacer"}
+t_14_l: {"color":"#6e7680","elide":true,"size":13,"text":"Window 14","widget":"text","width":170}
+t_15: {"align":"center","background":"#ffffff0f","children":["t_15_i","t_15_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_15_i: {"size":0,"widget":"spacer"}
+t_15_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 15","widget":"text","width":170}
+t_16: {"align":"center","background":"#ffffff0f","children":["t_16_i","t_16_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_16_i: {"size":0,"widget":"spacer"}
+t_16_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 16","widget":"text","width":170}
+t_17: {"align":"center","background":"#ffffff0f","children":["t_17_i","t_17_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_17_i: {"size":0,"widget":"spacer"}
+t_17_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 17","widget":"text","width":170}
+t_18: {"align":"center","background":"#ffffff0f","children":["t_18_i","t_18_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_18_i: {"size":0,"widget":"spacer"}
+t_18_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 18","widget":"text","width":170}
+t_19: {"align":"center","background":"#ffffff0f","children":["t_19_i","t_19_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_19_i: {"size":0,"widget":"spacer"}
+t_19_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 19","widget":"text","width":170}
+t_20: {"align":"center","background":"#ffffff0f","children":["t_20_i","t_20_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_20_i: {"size":0,"widget":"spacer"}
+t_20_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 20","widget":"text","width":170}
+t_21: {"align":"center","children":["t_21_i","t_21_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_21_i: {"size":0,"widget":"spacer"}
+t_21_l: {"color":"#6e7680","elide":true,"size":13,"text":"Window 21","widget":"text","width":170}
+t_22: {"align":"center","background":"#ffffff0f","children":["t_22_i","t_22_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_22_i: {"size":0,"widget":"spacer"}
+t_22_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 22","widget":"text","width":170}
+t_23: {"align":"center","background":"#ffffff0f","children":["t_23_i","t_23_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_23_i: {"size":0,"widget":"spacer"}
+t_23_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 23","widget":"text","width":170}
+t_24: {"align":"center","background":"#ffffff0f","children":["t_24_i","t_24_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_24_i: {"size":0,"widget":"spacer"}
+t_24_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 24","widget":"text","width":170}
+t_25: {"align":"center","background":"#ffffff0f","children":["t_25_i","t_25_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_25_i: {"size":0,"widget":"spacer"}
+t_25_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 25","widget":"text","width":170}
+t_26: {"align":"center","background":"#ffffff0f","children":["t_26_i","t_26_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_26_i: {"size":0,"widget":"spacer"}
+t_26_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 26","widget":"text","width":170}
+t_27: {"align":"center","background":"#ffffff0f","children":["t_27_i","t_27_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_27_i: {"size":0,"widget":"spacer"}
+t_27_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 27","widget":"text","width":170}
+t_28: {"align":"center","children":["t_28_i","t_28_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_28_i: {"size":0,"widget":"spacer"}
+t_28_l: {"color":"#6e7680","elide":true,"size":13,"text":"Window 28","widget":"text","width":170}
+t_29: {"align":"center","background":"#ffffff0f","children":["t_29_i","t_29_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_29_i: {"size":0,"widget":"spacer"}
+t_29_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 29","widget":"text","width":170}
+t_30: {"align":"center","background":"#ffffff0f","children":["t_30_i","t_30_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_30_i: {"size":0,"widget":"spacer"}
+t_30_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 30","widget":"text","width":170}
+t_31: {"align":"center","background":"#ffffff0f","children":["t_31_i","t_31_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_31_i: {"size":0,"widget":"spacer"}
+t_31_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 31","widget":"text","width":170}
+t_32: {"align":"center","background":"#ffffff0f","children":["t_32_i","t_32_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_32_i: {"size":0,"widget":"spacer"}
+t_32_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 32","widget":"text","width":170}
+t_33: {"align":"center","background":"#ffffff0f","children":["t_33_i","t_33_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_33_i: {"size":0,"widget":"spacer"}
+t_33_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 33","widget":"text","width":170}
+t_34: {"align":"center","background":"#ffffff0f","children":["t_34_i","t_34_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_34_i: {"size":0,"widget":"spacer"}
+t_34_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 34","widget":"text","width":170}
+t_35: {"align":"center","children":["t_35_i","t_35_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_35_i: {"size":0,"widget":"spacer"}
+t_35_l: {"color":"#6e7680","elide":true,"size":13,"text":"Window 35","widget":"text","width":170}
+t_36: {"align":"center","background":"#ffffff0f","children":["t_36_i","t_36_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_36_i: {"size":0,"widget":"spacer"}
+t_36_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 36","widget":"text","width":170}
+t_37: {"align":"center","background":"#ffffff0f","children":["t_37_i","t_37_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_37_i: {"size":0,"widget":"spacer"}
+t_37_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 37","widget":"text","width":170}
+t_38: {"align":"center","background":"#ffffff0f","children":["t_38_i","t_38_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_38_i: {"size":0,"widget":"spacer"}
+t_38_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 38","widget":"text","width":170}
+t_39: {"align":"center","background":"#ffffff0f","children":["t_39_i","t_39_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_39_i: {"size":0,"widget":"spacer"}
+t_39_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 39","widget":"text","width":170}
+t_40: {"align":"center","background":"#ffffff0f","children":["t_40_i","t_40_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_40_i: {"size":0,"widget":"spacer"}
+t_40_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 40","widget":"text","width":170}
+t_41: {"align":"center","background":"#ffffff0f","children":["t_41_i","t_41_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_41_i: {"size":0,"widget":"spacer"}
+t_41_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 41","widget":"text","width":170}
+t_42: {"align":"center","children":["t_42_i","t_42_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_42_i: {"size":0,"widget":"spacer"}
+t_42_l: {"color":"#6e7680","elide":true,"size":13,"text":"Window 42","widget":"text","width":170}
+t_43: {"align":"center","background":"#ffffff0f","children":["t_43_i","t_43_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_43_i: {"size":0,"widget":"spacer"}
+t_43_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 43","widget":"text","width":170}
+t_44: {"align":"center","background":"#ffffff0f","children":["t_44_i","t_44_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_44_i: {"size":0,"widget":"spacer"}
+t_44_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 44","widget":"text","width":170}
+t_45: {"align":"center","background":"#ffffff0f","children":["t_45_i","t_45_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_45_i: {"size":0,"widget":"spacer"}
+t_45_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 45","widget":"text","width":170}
+t_46: {"align":"center","background":"#ffffff0f","children":["t_46_i","t_46_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_46_i: {"size":0,"widget":"spacer"}
+t_46_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 46","widget":"text","width":170}
+t_47: {"align":"center","background":"#ffffff0f","children":["t_47_i","t_47_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_47_i: {"size":0,"widget":"spacer"}
+t_47_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 47","widget":"text","width":170}
+t_48: {"align":"center","background":"#ffffff0f","children":["t_48_i","t_48_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_48_i: {"size":0,"widget":"spacer"}
+t_48_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 48","widget":"text","width":170}
+t_49: {"align":"center","children":["t_49_i","t_49_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_49_i: {"size":0,"widget":"spacer"}
+t_49_l: {"color":"#6e7680","elide":true,"size":13,"text":"Window 49","widget":"text","width":170}
+t_50: {"align":"center","background":"#ffffff0f","children":["t_50_i","t_50_l"],"gap":8,"height":40,"hover":"#ffffff1a","on_click":"task","padding":8,"radius":6,"widget":"row"}
+t_50_i: {"size":0,"widget":"spacer"}
+t_50_l: {"color":"#fcfcfc","elide":true,"size":13,"text":"Window 50","widget":"text","width":170}
+fill: {"widget":"spacer"}
+status: {"align":"center","children":["st_notes","st_vol","st_net"],"gap":2,"widget":"row"}
+st_notes: {"align":"center","background":"#3daee940","children":["st_notes_i"],"gap":4,"height":36,"hover":"#ffffff1a","on_click":"notes","padding":7,"radius":6,"widget":"row"}
+st_notes_i: {"h":20,"src":"/usr/share/icons/example-dark/notification-inactive.svg","w":20,"widget":"image"}
+st_vol: {"align":"center","children":["st_vol_i"],"height":36,"hover":"#ffffff1a","on_click":"vol_mute","padding":7,"radius":6,"widget":"row"}
+st_vol_i: {"h":20,"src":"/usr/share/icons/example-dark/audio-volume-high.svg","w":20,"widget":"image"}
+st_net: {"align":"center","children":["st_net_i"],"height":36,"hover":"#ffffff1a","padding":7,"radius":6,"widget":"row"}
+st_net_i: {"h":20,"src":"/usr/share/icons/example-dark/network-offline.svg","w":20,"widget":"image"}
+clock: {"align":"center","children":["clock_col"],"height":44,"hover":"#ffffff1a","on_click":"calendar","padding":10,"radius":8,"widget":"row"}
+clock_col: {"align":"center","children":["clock_time","clock_date"],"gap":0,"widget":"column"}
+clock_time: {"bold":true,"color":"#fcfcfc","size":19,"text":"11:59 pm","widget":"text"}
+clock_date: {"color":"#a1a9b1","size":11,"text":"Thu 31 Dec","widget":"text"}
+peek: {"align":"center","children":["peek_i"],"height":44,"hover":"#ffffff1a","on_click":"peek","padding":6,"radius":6,"widget":"row"}
+peek_i: {"h":20,"src":"/usr/share/icons/example-dark/user-desktop.svg","w":20,"widget":"image"}
+```

@@ -1,8 +1,10 @@
 # Scenes loader
 
 `mix --serve scenes.mix --name scenes` owns file-backed scene lifecycles.
-This is Stage A: it runs beside `quoin-panel.mix`, starts with no enabled
-scenes, and reports `needs_setup:true` until scenes are explicitly enabled.
+It starts with no enabled scenes and reports `needs_setup:true` until scenes
+are explicitly enabled. From Stage B it owns the bottom panel, launcher,
+calendar and notes pages once they are seeded and enabled, replacing
+`quoin-panel.mix` (see [the legacy handover](#stage-b-legacy-handover)).
 The Scene Editor gallery and recovery chord are later work; this loader does
 not claim to implement them.
 
@@ -42,6 +44,7 @@ Environment overrides:
 | `SCENES_DIR` | User scene root; default `$XDG_CONFIG_HOME/cosmix/scenes` |
 | `SCENES_TEMPLATES` | Shipped template root; otherwise `$COSMIX/share/scenes`, or discover the checkout from the script |
 | `SCENE_HOST` | Quoin service; default `shell` |
+| `SCENES_LEGACY_SERVICE` | Legacy panel citizen whose registration holds the four legacy pages; default `quoin-panel` |
 
 The native Mix binary is resolved from the running interpreter. Behaviour
 children inherit the session and existing `COMP_SERVICE`, `APPS_SERVICE`,
@@ -79,12 +82,23 @@ diagnostics also report file, attempted digest and last-good revision.
 | `scenes.model` | `{name,generation,value}` → acceptance/revision; `value` is a complete map, submitted by the loader as `shell.scene.patch {scene,path:"model",generation,value}` |
 | `scenes.open` / `scenes.close` / `scenes.toggle` | `{name}` → `{name,open,pending}`; desired popup state, with applied completion reported through `scenes.changed` |
 
-Stage A refuses the reserved pages `scene-panel`, `scene-launcher`,
-`scene-calendar`, `scene-notes` and `settings.appearance`. For example,
-install `{template:"launcher",name:"preview-launcher"}`. Installation
-rewrites the scene name, behaviour routing citizen and an explicitly authored
-panel name to the distinct installation name. This does not migrate existing
-legacy registrations.
+Installation rewrites the scene name, behaviour routing citizen and an
+explicitly authored panel name to the installation name, so
+`{template:"launcher",name:"preview-launcher"}` mounts a second, distinct
+page.
+
+### Stage B legacy handover
+
+`scene-panel`, `scene-launcher`, `scene-calendar` and `scene-notes` were
+mounted by `quoin-panel.mix`, and a load by either owner takes a page from
+the other. While the `SCENES_LEGACY_SERVICE` registration (default
+`quoin-panel`) is present, a scene on one of those pages installs and enables
+normally but is not mounted: its diagnostic is `SCENES_LEGACY_HELD` with the
+holder name, and `enable`/`reload` reply rc 10 with it. That registration
+disappearing from the broker snapshot triggers one rescan, which mounts the
+held scenes and starts their behaviours; there is no wait loop. A loader page
+already mounted is not unloaded if the legacy citizen reappears, but no
+reload or remount will take a page while it is registered. Do not run both.
 
 `scenes.changed` publishes a change-only inventory with a loader revision.
 Subscribers should take `scenes.list` after subscribing and repeat that
@@ -197,12 +211,12 @@ behaviour disconnect and applied panel notices.
 The build cluster runs the Rust gates and native W1/Quoin integration tests.
 
 The private session installer must install the loader, helpers and templates;
-render the example unit in the desktop session; supply the matching native Mix
-binary and Quoin; and leave the existing panel unit running during Stage A.
-Stage B must explicitly seed the chosen set, retain popup recovery and rollback
-material, stop the old citizen, and only then hand over the existing page IDs.
-Readiness checks must consume service/readiness/applied-state events. No private
-installer is changed by this public workstream.
+render the example unit in the desktop session; and supply the matching native
+Mix binary and Quoin. For Stage B it explicitly seeds the chosen set (never a
+fresh install's default), retains popup recovery and rollback material, and
+stops the old citizen; the loader's handover rule above then mounts the
+existing page IDs. Readiness checks must consume service/readiness/applied-state
+events. No private installer is changed by this public workstream.
 
 Limits and remaining operational assumptions: at most 128 installed scene
 records, 256 KiB per scene/behaviour file and runtime model, and 64 KiB state or
