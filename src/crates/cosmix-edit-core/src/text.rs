@@ -12,6 +12,7 @@
 //!    - `lines_i = lines_{i-1} - newlines(deleted span_i) + newlines(insert_i)`,
 //!      the deleted span's newlines read from the unmodified line index;
 //!    - `required_commit = max need_i`, `peak_len = max len_i`, `peak_lines = max lines_i`.
+//!
 //!    It checks `peak_len <= MAX_BUFFER_BYTES`, `peak_lines <= MAX_LINES`, then
 //!    `ensure_commit(required_commit)`,
 //!    `starts.try_reserve(peak_lines.saturating_sub(starts.len()))` and a

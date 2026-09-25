@@ -86,6 +86,7 @@ pub struct Lane {
 #[derive(Debug, Default)]
 pub struct OpLog {
     pub(crate) entries: std::collections::VecDeque<LogEntry>,
+    #[allow(dead_code)] // Stage S stub; E0a's undo/redo read it.
     pub(crate) lanes: BTreeMap<Origin, Lane>,
     pub(crate) text_bytes: usize,
 }
