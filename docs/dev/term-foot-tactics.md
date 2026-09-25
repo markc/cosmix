@@ -1,8 +1,12 @@
 # term: foot tactics investigation
 
-2026-09-25. Initial investigation followed by implemented ranks 1, 2 and 4
+2026-09-25. Initial investigation followed by implemented ranks 1, 2, 3, 4 and 6
 and the T16 merge validation below. Opening measurements describe the original
-tree; the implementation section holds the newer numbers.
+tree; the implementation section holds the newer numbers. The current default
+is **tiny-skia**, accepted by Mark after testing: "typing in the test term
+feels much better". At 2250×1250 the native-copy benchmark measured echo
+around **1.7 ms** and full redraw around **11.5 ms**. The optional clean wgpu
+build is `--no-default-features --features wgpu`.
 
 The largest measured opportunity is the CPU image pipeline, not missing glyph
 caching. The existing banded path costs about 6.4 ms for one changed row and
@@ -14,7 +18,8 @@ that will never be presented. These are substantial CPU opportunities without
 requiring a GPU. Shared scheduling, damage and raster improvements also benefit
 wgpu, which still runs the same CPU glyph painter.
 
-Keep wgpu as the interim default. This investigation establishes an optimisation
+The initial investigation kept wgpu as the interim default (superseded by the
+acceptance above). It established an optimisation
 direction, not foot-equivalent latency. No matched live foot/term latency
 measurement or softbuffer presentation timing was obtained in this pass.
 
@@ -56,10 +61,10 @@ The original two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
 `cpu_grid::bench::tiny_skia_foot_phases_bench`. `--test-threads=1` matters:
 running performance tests concurrently would contaminate their results.
 Rank 6 adds `cpu_grid::bench::raster_warm_spans_bench` (described below).
-The default feature remains wgpu; both this report and
+These historical measurements used the then-default wgpu build; both this report and
 [term-rendering.md](term-rendering.md) use explicit tiny-skia feature
 selection for CPU measurements. Only the term release test target and its dependencies were
-built. No workspace build, installation, renderer-default change or push.
+built in that investigation. No workspace build, installation or push was made.
 
 Hardware: Intel Core Ultra 5 125H; normal desktop workload; DejaVu Sans Mono,
 13 logical px at scale 2.5. Cells are deliberately padded to 25×50 physical px,
@@ -515,10 +520,10 @@ pane count and workload against foot, tiny-skia and wgpu on the same compositor:
   glyphs and zoom. Compare wgpu upload bytes and CPU paint counts after shared
   changes; a CPU copy microbenchmark is not a wgpu performance result.
 
-The existing wgpu default (`apps/term/Cargo.toml:34`) should remain meanwhile
-because the CPU arm still misses a 60 Hz budget for one changed pane before
-presentation. Reconsider that default after the native CPU path passes these
-gates and the actual full-screen typing workload is retested. The goal is a
+The investigation's interim wgpu recommendation applied while the CPU arm
+missed a 60 Hz budget for one changed pane before presentation. The native-copy
+implementation and Mark's typing retest have since restored tiny-skia as the
+default. The goal is a
 CPU terminal that avoids the unnecessary work, with wgpu retaining the shared
 gains rather than hiding their absence.
 
@@ -533,7 +538,7 @@ behaviour.
 
 This follow-up implements the approved narrow CPU path and shared redraw
 scheduling. The investigation and original measurements above describe the
-pre-change tree; the wgpu default remains unchanged.
+pre-change tree; wgpu was still the default at this implementation stage.
 
 - **Rank 1:** pristine crates.io `iced_tiny_skia` 0.14.1 import in its own
   commit, followed by a separate local patch. `raster.rs` records opacity
@@ -543,20 +548,22 @@ pre-change tree; the wgpu default remains unchanged.
   damage bounds; the copy invokes neither Pattern nor a mask. Renderer-wide
   clip-mask preparation is still present for generic drawing. Fractional net
   scale/translation, rotation and non-opaque draws use the original path.
-  Negative local bounds with an identity transform also keep upstream's
+  Negative local bounds with an identity transform after image scaling also keep upstream's
   specialised rectangle rounding; tests exposed a different edge footprint
   there. Translated negative physical origins are supported by the copy.
 - **Rank 4:** `window/compositor.rs` passes outward-rounded physical rectangles
   to `present_with_damage`. Damage includes both age repair and changes from
   the displayed frame, covering A → B → A with rotating buffers. Background
   changes invalidate retained histories so older buffers owe a full clear.
-  Empty damage drops the acquired buffer without advancing history or calling
-  pre-present. Softbuffer's Wayland implementation changes ages and swaps
-  buffers on presentation, not acquisition/drop. Avoiding pre-present avoids
-  requesting a callback without a commit. Resize/unknown age still repaint
+  Empty damage calls pre-present and commits empty damage, preserving Wayland
+  callback pacing for unchanged `NextFrame` animations. Softbuffer's Wayland
+  implementation changes ages and swaps buffers on every successful commit;
+  history advances with it. Failed commits do not enter history. Resize/unknown age still repaint
   fully. Old Wayland surface versions can expand damage within softbuffer.
 - **Rank 2:** the app's existing root input widget publishes a paint message
-  from `RedrawRequested`. iced-winit drains widget messages, rebuilds the UI,
+  from `RedrawRequested` only after a wake, for a missing frame or explicit
+  invalidation. Clean chrome/hover redraws publish nothing and do not force
+  another UI rebuild. iced-winit drains widget messages, rebuilds the UI,
   then draws within that same redraw; a timestamp guard prevents its retry
   from painting twice. Wake messages continue lifecycle/layout work but no
   longer snapshot or paint. Each visible pane consumes `take_damage` before
@@ -579,10 +586,11 @@ The vendor README records the tarball SHA-256, upstream revision, patch
 removal conditions and routing/test commands. `cargo tree -p cosmix-term
 --no-default-features --features tiny-skia -i iced_tiny_skia` confirms the
 vendored path. Extracting the pristine import commit and comparing it recursively
-against the downloaded tarball produced no differences. The term test-only
-dependency now explicitly enables Wayland:
-without that feature, default-wgpu tests compile softbuffer with no Linux
-backend and fail before reaching app tests.
+against the downloaded tarball produced no differences. Cargo cannot make a
+dev-dependency optional, so the two CPU test helpers are optional normal
+dependencies selected by `tiny-skia`. Clean wgpu tests omit these direct test
+dependencies (winit may still use tiny-skia for decorations); the CPU arm
+explicitly enables softbuffer's Wayland backend.
 
 ### Before/after measurements
 
@@ -650,12 +658,14 @@ cargo test -p cosmix-term --release --no-default-features --features tiny-skia -
   still dirty cursor rows. No foot-parity or live CPU-percentage claim is made.
 
 The existing teletypewriter unused-variable warning remains unrelated. There
-is no deployment, renderer-default change or push in this implementation.
+was no deployment or push in this implementation. The later default decision
+is recorded at the top of this report.
 
 ## T16 merge validation (2026-09-25)
 
 Merged `term/skia-perf` at `49cd1e7a` into `term/foot-tactics`, preserving
-term 0.2.5, core 0.5.2 and the wgpu default. Cumulative band edges feed the
+term 0.2.5, core 0.5.2 and the then-current wgpu default. This is the historical
+merge result before the review fixes and C6 integration below. Cumulative band edges feed the
 vendored native-copy path directly. It resolves physical edges before image
 scaling/truncation, tolerates at most 0.001 pixel of floating-point round-off,
 and requires rounded extents to equal the image dimensions. The resulting
@@ -737,14 +747,16 @@ the old pixels and repaint. Old generations can outlive any number of frames.
 The app retains no additional history or converted native cache. This removes
 conversion/cache allocation, not every allocation in a changed frame.
 
-Cluster gates remain the term default-wgpu and tiny-skia suites, both ignored
-CPU benchmarks serialised, the core format regression, and the vendor suite
+Cluster gates cover the term tiny-skia suite (now the default) and clean wgpu
+suite (`--no-default-features --features wgpu`), ignored CPU benchmarks
+serialised, the core format regression, and the vendor suite
 with `image,wayland`. The new ordinary rotating-target test compares every
 repaired frame to a fresh old RGBA+convert draw at scales 1.0, 1.25 and 2.5;
 it covers clipping, translucent overlays, moving panes, resize/partial final
 bands, cursor changes, invalidation and age loss. The existing seven-scale
-fixture now asserts old/new rendered equality as well as exact physical
-placement. Existing storage/generation tests retain earlier native bytes across
+fixture checks exact physical placement against RGBA-painted reference bytes;
+the rotating-target test checks old/new rendered equality. Existing
+storage/generation tests retain earlier native bytes across
 updates. The core test checks both cursor styles, padded strides and switching
 formats with otherwise clean damage. Vendor tests cover constructor validation,
 generation equality and native-copy/fallback equivalence. The vendor layer
@@ -772,8 +784,8 @@ term-core, term tiny-skia and default wgpu suites, the vendor
 Prepare+convert is gone, as designed; with rank 6's faster paint the full
 redraw is well inside the < 8 ms target and echo is under 0.4 ms. The T16
 merge row is from a different host, so the totals are indicative; the phase
-columns show where the time went. No versions are bumped here; they are set
-when the branch is rebased onto main.
+columns show where the time went. The main integration retains term 0.2.5 and
+core 0.6.2 without another version bump.
 
 Unenforced assumptions/contracts: arbitrary external producers of `grid::Grid`
 must supply premultiplied BGRA (the constructor validates shape, not channels);
@@ -787,3 +799,98 @@ and benchmark conditions as the merge
 table. Headless regressions do not establish live Wayland lifecycle, timing,
 memory pressure, compositor damage or input-to-visible latency. No age bound
 or renderer-history release timing is assumed for storage safety.
+
+## Review fixes and C6 landing preparation (2026-09-25)
+
+This section and the final fractional-band measurements below record main's
+image-handle implementation before the rank-3 integration described at the end.
+
+The round-one fixes check negative origins against the transform after image
+scaling, use coordinate-relative tolerance, and retain a widget-side correction
+for upstream truncation. The exact-pixel regression covers seven scales with
+both native copies enabled and both disabled by `reference-raster`.
+Empty damage now presents an empty commit with its pre-present hook, preserving
+Wayland frame pacing. Shared history tests cover first frame, buffer age greater
+than one, A → B → A, background changes, resize/scale reconfiguration, empty
+commits and failed presents. Varied-colour image tests cover negative scale
+cancellation, scaling, translucency, no mask and a later clipped overlay.
+Clean redraws publish no paint message; wakes, missing frames, resizes and
+explicit invalidation arm the next redraw. The vendor README includes the
+provenance table, ordered bump procedure and executable pristine/fixes checks.
+
+C6 from `origin/main` is retained: pane/tab selectors, bounded scrollback
+snapshots and `props.watch`. Combined versions are **term 0.2.5**, **term-core
+0.6.2**, and main's unchanged **bterm 0.9.3**. Tiny-skia is the accepted default;
+wgpu remains available with `--no-default-features --features wgpu`. This
+preparation makes local commits only, with no installation or push.
+
+The core's nested Mix end-to-end proof requires a completely clean committed
+checkout; running it during merge resolution fails its provenance guard before
+the fixtures run. Run that proof after committing. Live Wayland presentation
+timing remains unmeasured; the pacing regression here exercises the production
+history and submission path with a fake present callback.
+
+## Final fractional-band fix (2026-09-25)
+
+Band draw extents now use the source image's integer physical dimensions
+divided by output scale. The cumulative origins and fallback truncation
+correction remain. This avoids amplifying the subtraction error in lower
+bands' logical heights without widening the vendor's native-copy tolerance.
+
+The integrated 61-row pane regression checks exact reference pixels and,
+with `--features raster-probe`, counts every successful native-placement copy.
+All 16 bands, including the final partial band, qualify at scales 1.25, 1.5,
+1.75, 2.0, 2.25 and 2.5 with 41-pixel cells and five pane offsets. Existing
+1.0/1.1 and 20-pixel fixtures remain covered. The same pixel test passes with
+`--features iced_tiny_skia/reference-raster`, disabling both copy shortcuts.
+Temporarily removing the extent fix makes the counter assertion fail (12 of
+16 native copies at scale 1.1), confirming it detects the regression.
+
+Release gates: instrumented CPU **42 passed, 2 ignored**, clean wgpu
+**34 passed**, vendor **9 passed**, and the forced-fallback pane test passed.
+Clippy with `--all-targets -- -D warnings` passed for both term renderer
+configurations and the instrumented vendor. The existing teletypewriter
+dependency warning is unchanged. The two edited term Rust files pass rustfmt;
+the crate-wide format check reports pre-existing formatting in other files.
+Versions are unchanged. No further review round, deployment or push is part
+of this fix.
+
+The final serial CPU run with `--include-ignored --nocapture --test-threads=1`
+passed **44 tests**, including both benchmarks, without overlapping builds
+or probe instrumentation. Frame fixture: 2250×1250, scale 2.5, buffer age 3,
+20 warm-ups and 200 samples; these are headless costs, excluding presentation.
+
+| Path | Case | Mean ms | p50 ms | p99 ms |
+|---|---|---:|---:|---:|
+| Whole image | echo | 6.679 | 6.529 | 7.685 |
+| Whole image | full | 9.807 | 9.664 | 11.879 |
+| Four-row bands | echo | 1.746 | 1.677 | 2.449 |
+| Four-row bands | full | 11.136 | 11.129 | 12.189 |
+
+Whole-image and banded final pixels match. Banded echo still meets the 2 ms
+mean target; full redraw remains above 8 ms. The benchmark fixture is unchanged;
+the taller 41-pixel-cell regression establishes routing for the lower bands.
+
+## Rank 3/main integration (2026-09-25)
+
+The default tiny-skia arm retains native BGRA grid generations and
+`Renderer::draw_grid`. Main's integer-extent fix is applied at grid submission:
+width and height come from each grid's integer pixel dimensions divided by
+output scale; cumulative band origins and snapping remain. RGBA matching,
+`measure_image` cache touches, the generic image-renderer widget and
+`truncating_origin` are removed from this path: grids have no image-cache entry
+and native placement resolves their physical edges directly.
+
+`raster-probe` counts successful grid native copies as well as the existing
+ordinary-image shortcut. The expanded 61-row exact-pixel regression and its
+every-band counter assertion are retained, including lower and partial bands
+at fractional scales. The separate rotating-target regression retains the
+RGBA-pipeline comparison. `reference-raster` continues to disable the two
+ordinary-image shortcuts only; it does not disable grid copies or prove the
+grid fallback. The vendor grid tests exercise non-native-size fallback directly.
+
+Both histories and their measurements above are retained; none measures this
+merged tree. Term stays at 0.2.5 and core at 0.6.2. Tiny-skia is the default,
+clean wgpu uses `--no-default-features --features wgpu`, and enabling both
+selects wgpu. Merge resolution is source-checked only; build, regression and
+clippy validation of this integration remain for the cluster.

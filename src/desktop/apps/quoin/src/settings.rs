@@ -327,12 +327,7 @@ fn scheme_hex(scheme: Scheme) -> String {
 }
 
 fn edge_name(edge: Edge) -> &'static str {
-    match edge {
-        Edge::Left => "left",
-        Edge::Bottom => "bottom",
-        Edge::Right => "right",
-        Edge::Top => "top",
-    }
+    edge.as_str()
 }
 
 // ── the scene's Bus verbs ────────────────────────────────────────────────

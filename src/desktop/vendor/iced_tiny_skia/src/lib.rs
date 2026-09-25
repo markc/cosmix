@@ -14,6 +14,9 @@ pub mod grid;
 #[cfg(feature = "image")]
 mod raster;
 
+#[cfg(all(feature = "image", feature = "raster-probe"))]
+pub use raster::take_native_copy_count;
+
 #[cfg(feature = "svg")]
 mod vector;
 

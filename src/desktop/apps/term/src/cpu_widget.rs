@@ -42,13 +42,14 @@ pub(super) fn draw_images(
     let x = (origin.x * scale).round() / scale;
     let y = (origin.y * scale).round() / scale;
     for (handle, relative) in images {
+        // Subtracting logical edges loses precision for lower bands. Use the
+        // grid's integer pixel dimensions so every band stays native-sized.
         let bounds = Rectangle {
             x: relative.x + x,
             y: relative.y + y,
-            ..*relative
+            width: handle.width() as f32 / scale,
+            height: handle.height() as f32 / scale,
         };
-        // Preserve cumulative edges for the vendored renderer, which resolves
-        // physical placement before testing for an integer-aligned 1:1 copy.
         if bounds.intersects(&clip) {
             renderer.draw_grid(handle.clone(), bounds, clip);
         }

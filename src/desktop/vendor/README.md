@@ -2,13 +2,27 @@
 
 ## iced_tiny_skia 0.14.1
 
-Pristine import from `https://static.crates.io/crates/iced_tiny_skia/iced_tiny_skia-0.14.1.crate`,
-SHA-256 `c267596d742714b1853cc10c3983a367762816fc4836bd3b79f76ce76787d6f8`.
-The archive's `.cargo_vcs_info.json` records upstream commit
-`0ecf60664df7b8ac7d7aef5f7279d5323027f693`, path `tiny_skia`.
-The complete archive is imported byte-for-byte, before local patches in a
-separate commit. Verify routing from `src/desktop` with
-`cargo tree -p cosmix-term --no-default-features --features tiny-skia -i iced_tiny_skia`.
+| Provenance | Value |
+|---|---|
+| version | `0.14.1` |
+| source | `https://static.crates.io/crates/iced_tiny_skia/iced_tiny_skia-0.14.1.crate` |
+| sha256 | `c267596d742714b1853cc10c3983a367762816fc4836bd3b79f76ce76787d6f8` |
+| upstream commit | `0ecf60664df7b8ac7d7aef5f7279d5323027f693` |
+| upstream path | `tiny_skia` |
+| imported | 2026-09-25, pristine commit `da00c947` |
+| licence | MIT, declared in the archive's Cargo manifests; no LICENSE file was shipped |
+
+The complete archive is imported byte-for-byte in its own commit. The local
+patch touches `src/raster.rs` (opaque image cache/copy, shared placement/copy
+helpers, image/grid verification counter and tests), `src/lib.rs`
+(native grid module/draw API and verification counter export), `src/grid.rs`
+(new immutable native grid primitive, copy/fallback and tests), `src/layer.rs`
+(ordered image/grid sublayer and generation-aware damage), `src/engine.rs`
+(grid dispatch, widget clipping/mask restoration and rectangular clip passed
+to the raster pipeline), `src/window/compositor.rs`
+(damage, present history and tests), and `Cargo.toml` (the verification-only
+`reference-raster` and `raster-probe` features and an allowance for upstream's
+argument-heavy drawing APIs under clippy). No other upstream source is reformatted.
 
 Local patch: `raster.rs` records all-alpha-255 once during native pixel
 conversion. The generic Pattern draw dominated terminal CPU frame time even
@@ -18,7 +32,7 @@ transform copy native rows with `copy_from_slice`, clipped using the same
 26.6 edge rounding as tiny-skia's non-antialiased rectangular mask.
 No Pattern shader or mask is used by the copy. Non-unit opacity,
 rotation and scaling retain the original draw. Negative local bounds under
-an identity transform also retain it: tiny-skia's specialised `fill_rect`
+an identity transform AFTER image scaling also retain it: tiny-skia's specialised `fill_rect`
 rounding extends these edges differently from its transformed path. Translated
 negative physical origins still use the copy and are pixel-tested.
 Ordinary image cache ids, conversion format and immutable ownership are unchanged.
@@ -47,9 +61,10 @@ Source semantics are deliberate, not a transparent-image replacement API.
 Rank-3 regressions: `grid::tests` checks shape/generation/shared ownership and
 copy/fallback pixel equality with the RGBA image pipeline. A layer regression
 checks no damage for a retained generation and damage for generation, placement
-or clip changes; term's seven-scale
-fixture compares old RGBA+convert pixels with native bands, including partial
-final bands and nonzero origins. Its ordinary rotating-target regression adds
+or clip changes; term's expanded fractional-scale
+fixture compares native bands with exact BGRA placement from RGBA-painted
+reference bytes, including partial final bands and nonzero origins. Its
+ordinary rotating-target regression compares against the RGBA image pipeline and adds
 fractional clips, translucent overlapping images, movement, resize, cursor
 crossing/hiding, invalidation and unknown age. Existing retained-handle tests
 now exercise native generations. The ignored frame benchmark retains the old
@@ -75,27 +90,107 @@ image-feature test command below. It has not been run locally; cluster
 validation, including mutation checks, is required.
 
 T16 integration resolves cumulative band edges in physical coordinates before
-the upstream image-size division and truncation. Edges within 0.001 pixel of
-integers qualify only when their rounded extent equals the source image size;
+any fallback size division and truncation. Edge tolerance is four f32
+epsilons relative to coordinate size, capped at 0.01 physical pixel. Edges
+qualify only when their rounded extent equals the source image size;
 the copy receives an exact integer translation. Seven-scale regression tests
 check this eligibility, and term checks the rendered pixels against exact
-placement. This avoids both accumulated seams and a half-pixel origin bias.
+placement. Main's former image widget also corrected truncation round-off
+and touched every image cache entry. The native grid widget needs neither:
+it submits immutable grid bytes directly with cumulative origins. Draw extents
+come directly from the grid's integer pixel dimensions divided by output
+scale, porting main's fractional-band fix without the image-only correction.
+The ordinary-image pipeline retains main's negative-identity guard and both
+copy shortcuts; `reference-raster` disables those two image shortcuts only.
+It leaves grid native copies enabled. Non-native-size grid fallback is covered
+by `grid::tests`, not by switching `reference-raster` on.
+The integrated pane regression checks exact pixels and, with `raster-probe`,
+counts successful grid native-placement copies for every band, including the final
+partial band, at 1.25/1.5/1.75/2.0/2.25/2.5 scales and nonzero origins.
+The shared thread-local counter records successful image and grid native
+placement/copy, excluding image secondary copies and either fallback, and is
+absent from normal builds. The pane test resets it immediately before drawing
+only grids. Run it with `raster-probe`. The second command checks feature
+compatibility only: this pane test still exercises native grids, while vendor
+raster tests cover ordinary-image fallback:
+
+```text
+cargo test -p cosmix-term --release --features raster-probe band_widget_matches_exact
+cargo test -p cosmix-term --release --features iced_tiny_skia/reference-raster band_widget_matches_exact
+```
 
 `window/compositor.rs` submits outward-rounded, surface-clamped physical
 damage, combining acquired-buffer repair with changes from the displayed
-frame. Empty damage drops the acquired buffer without presenting, advancing
-history or calling `on_pre_present`. Softbuffer's Wayland buffer rotates and
-updates ages only in `present_with_damage`; dropping its borrowing buffer
-leaves the back buffer available for the next acquire. Avoiding pre-present
-also avoids arming a frame callback without a surface commit. Unknown ages,
+frame. Empty damage still calls `on_pre_present` and `present_with_damage([])`:
+the hook requests the Wayland frame callback and the commit delivers it.
+Otherwise unchanged `NextFrame` animations lose vsync pacing and spin. Each
+successful commit, including empty damage, advances history along with
+softbuffer's buffer ages; failed commits do not enter history. Unknown ages,
 resize and background changes retain full redraw. Older Wayland surface
 versions may still expand damage inside softbuffer.
 
 Run pixel and physical-damage tests with
 `cargo test --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --lib`;
 run term's release CPU tests and ignored benchmark for integrated coverage.
-Remove each local change when upstream supplies equivalent opaque-copy and
-damage/lifecycle handling; retain the regressions when checking an update.
+Remove each local change only when upstream supplies equivalent opaque-copy,
+native grid storage/damage/clipping, cumulative-edge placement (including
+negative scale cancellation and the image fallback arm), physical damage and
+paced empty-commit lifecycle handling.
+Retain the regressions when checking an update.
+
+### iced update procedure and pristine re-verification
+
+Follow the ordered procedure below, adapting the Smithay checklist to this
+crate; Smithay's baseline and its ten tests do not apply to iced.
+
+1. Before editing, enumerate every vendor fix with
+   `git log --reverse --oneline da00c947..HEAD -- vendor/iced_tiny_skia/`
+   from `src/desktop`. Read every listed commit, including merge resolutions.
+   The `fixes` check below requires both a nonempty list and a nonempty diff.
+2. Import the next tarball as a separate pristine commit. Update the table,
+   desktop patch routing, consumer version pins and lockfiles, and the
+   verification script's version and checksum. Keep the old baseline until
+   step 4. Audit this section's
+   version-specific claims and patch shape. Compare the table's upstream SHA
+   to the tarball's own `.cargo_vcs_info.json`, not an assumed tag.
+3. Check dependency routing with the command below. Its output MUST contain
+   `(…/src/desktop/vendor/iced_tiny_skia)`; exit 0 alone proves nothing. The
+   verification script asserts that exact local path as well as provenance.
+   Commit the import and metadata together and require a clean scoped status.
+4. Roll the baseline forward in its own commit, verify `EXPECT=pristine`
+   against that baseline, then reapply the enumerated fixes. Keep tests when
+   an upstream implementation replaces a fix; do not drop an entire fix/test
+   commit. Review the complete diff against the archive for unexpected files.
+5. Re-verify with `EXPECT=fixes` and run the regression commands. Both the
+   baseline and patched tree must be checked; an empty test filter is failure.
+
+From `src/desktop`, the explicit routing and regression commands are:
+
+```text
+cargo tree -p cosmix-term --no-default-features --features tiny-skia -i iced_tiny_skia
+cargo test --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --lib
+cargo clippy --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --all-targets -- -D warnings
+cargo test -p cosmix-term --release --no-default-features --features tiny-skia
+cargo test -p cosmix-term --release --no-default-features --features tiny-skia,iced_tiny_skia/reference-raster band_widget_matches_exact
+```
+
+From the repository root, `EXPECT` is an explicit positional argument to the
+Mix verifier (unset/unknown fails). These commands download and checksum the
+archive, check the provenance row, export the requested committed tree, compare
+all files, assert the fix-list expectation, and assert the cargo-tree path:
+
+```text
+mix docs/build/verify-iced-tiny-skia.mix pristine da00c947
+mix docs/build/verify-iced-tiny-skia.mix fixes HEAD
+```
+
+Success prints `verdict=0 EXPECT=pristine|fixes` and an evidence directory
+containing `pristine.diff`. `fixes` requires diff exit 1, `pristine` requires
+exit 0; diff errors never pass. Inspect the diff against the patch shape above.
+There is no file allowlist or patch manifest: the script compares the entire
+committed vendor tree (including added `src/grid.rs`) and lists its Git history.
+It does not verify uncommitted merge resolutions; run `fixes` on the eventual
+merge commit. No script change is needed for the grid extension.
 
 ## Smithay libinput: opt-in dispatch fairness
 

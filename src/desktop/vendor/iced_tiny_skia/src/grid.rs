@@ -79,7 +79,7 @@ impl Grid {
             self.height,
         )
         .expect("validated native grid dimensions");
-        crate::raster::native_placement(
+        let copied = crate::raster::native_placement(
             bounds,
             transform,
             self.width,
@@ -87,7 +87,12 @@ impl Grid {
         )
         .is_some_and(|placed| {
             crate::raster::copy_opaque(pixmap, target, placed, clip)
-        })
+        });
+        #[cfg(feature = "raster-probe")]
+        if copied {
+            crate::raster::record_native_copy();
+        }
+        copied
     }
 
     pub(crate) fn draw_fallback(

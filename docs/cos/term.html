@@ -458,8 +458,8 @@ clicking a pane focuses it. When a tab has more than one pane, the focused
 pane's border takes the design's focus-ring colour. Every other border,
 including a tab's only pane, takes the plain border colour.
 All strip and border colours come from the <code>cosmix-design</code> tokens.</p>
-<p>Every tab is labelled <code>mix</code> for now, since the core does not yet take a title
-from the shell. The strip does not scroll or wrap. At the default window width, past about 17 tabs the <code>+</code>
+<p>Each tab shows its focused pane's program-set OSC title, falling back to <code>mix</code>.
+A user-pinned title overrides OSC updates until cleared. The strip does not scroll or wrap. At the default window width, past about 17 tabs the <code>+</code>
 and the later tabs run off the right edge, although up to 32 terminals can be
 open. Ctrl+PageUp and Ctrl+PageDown still reach every tab.</p>
 <p>Every pane keeps a border of the same width whether or not it is focused, so
@@ -522,22 +522,88 @@ make the same change, and the window follows a verb straight away. Every body
 is a JSON object, and <code>{}</code> means no arguments.</p>
 <table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
 <tr><td><code>term.tabs</code></td><td><code>{}</code></td><td>list tabs: id, active, title, cols, rows, child pid, revision</td></tr>
-<tr><td><code>term.tab.new</code></td><td><code>{}</code></td><td>open a tab and select it</td></tr>
+<tr><td><code>term.tab.new</code></td><td><code>{"cwd":"/absolute/directory","title":"build"}</code> (both optional)</td><td>open and select a tab; explicit cwd must exist, be searchable by the current user and never falls back; title pins the tab label</td></tr>
+<tr><td><code>term.tab.title</code></td><td><code>{"id":N,"title":"build"}</code></td><td>pin a label; empty string clears the pin and restores the focused pane's program-set OSC title (default <code>mix</code>)</td></tr>
+<tr><td><code>term.tab.move</code></td><td><code>{"id":N,"index":0}</code></td><td>reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane</td></tr>
 <tr><td><code>term.tab.select</code></td><td><code>{"id":N}</code></td><td>select tab N</td></tr>
 <tr><td><code>term.tab.close</code></td><td><code>{"id":N}</code></td><td>close tab N; closing the last tab quits</td></tr>
-<tr><td><code>term.panes</code></td><td><code>{}</code></td><td>list the active tab's panes: id, focus, cols, rows, child pid, geometry, tab, revision</td></tr>
+<tr><td><code>term.panes</code></td><td><code>{"tab":N}</code> (optional)</td><td>list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision</td></tr>
 <tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
 <tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
-<tr><td><code>term.snapshot</code></td><td><code>{}</code></td><td>read the focused pane's screen, size and cursor</td></tr>
-<tr><td><code>term.type</code></td><td><code>{"text":"..."}</code></td><td>type ASCII into the focused pane, as keys</td></tr>
+<tr><td><code>term.snapshot</code></td><td><code>{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}</code> (all optional)</td><td>read a pane anywhere; default is the focused pane in the selected/active tab; <code>contents</code> defaults true; history defaults 0, accepts 0–10000, capped at history above the current viewport</td></tr>
+<tr><td><code>term.type</code></td><td><code>{"pane":N,"text":"..."}</code> (<code>pane</code> optional)</td><td>type ASCII as keys into that pane, default focused pane; does not change focus</td></tr>
+<tr><td><code>term.props.watch</code></td><td><code>{}</code></td><td>subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON <code>{topics,revision}</code>), then read state</td></tr>
 </tbody></table>
 <pre><code class="language-mix">send term term.tab.new
 send term term.pane.split dir=v
 send term term.panes
+send term term.tab.new cwd="/tmp" title="build"
+send term term.tab.title id=1 title="logs"
+send term term.tab.move id=1 index=0
+send term term.panes tab=1
+send term term.snapshot pane=1 contents=true scrollback_lines=100
+send term term.type pane=1 text="pwd\n"
+send term term.props.watch
 </code></pre>
+<p>The same surface is served by bterm as <code>bterm.*</code>. The target-bound native
+session lane is unchanged. Explicit stale tab/pane IDs return a <code>not-found</code>
+error, never the active pane. With both snapshot selectors, the pane must
+belong to the tab or the call returns <code>invalid-argument</code>. <code>contents:false</code>
+returns the usual metadata and diagnostic timings without the screen marker
+or text. Scrollback is prepended after the screen marker, oldest first;
+<code>rows</code> still describes the viewport. Reading never moves the scroll offset.
+Snapshot text represents empty grid cells as spaces, preserving column positions
+and trailing blank cells in both history and viewport rows. Text is limited to
+512 KiB of encoded bytes (including allowance for JSON escaping), leaving
+metadata and transport headroom below the MCP 1 MiB and Bus 8 MiB limits.
+The budget keeps the newest complete rows: the viewport first, then as much
+recent history as fits. Retained rows are returned oldest first; the header reports
+<code>truncated=true</code> when the byte budget omits rows and <code>lines_returned=N</code>
+counts history and viewport rows actually returned. A row larger than the
+budget returns no text rows. With <code>contents:false</code>, the count is zero and
+<code>truncated=false</code>. Capture copies bounded rows under the grid lock; text
+formatting runs after releasing the grid, terminal and tab-set locks.</p>
+<p>Pinned and OSC titles have control characters and Unicode line/paragraph
+separators stripped and are capped at 256 UTF-8 bytes on a character boundary.
+An empty sanitised pin clears it. Titles may contain spaces; tab-list readers
+should delimit the title at the final <code> cols=</code> field, rather than tokenising
+it on whitespace. Effective title changes advance the separate event revision
+via <code>tabs.changed</code> and <code>title.changed</code> with <code>kind=retitled</code>; they leave the
+tab-set and pane-layout revisions unchanged, so pane geometry stays valid.
+Completion notifications use the same sanitised, possibly program-set label.
+Explicit cwd paths follow symlinks and resolve <code>..</code> normally.</p>
+<p>Existing replies keep their key=value format. New title replies are
+<code>retitled id=N tab=N pane=P revision=R</code>; move replies are
+<code>moved id=N index=I tab=N pane=P revision=R</code>. Tab creation still replies
+<code>opened id=N tab=N pane=P revision=R binding=...</code>. All mutations, including
+title/move and pane-selected typing, accept <code>request_id</code>; a retry with the
+same verb and arguments replays the original success or refusal. Different
+arguments with the same ID are a conflict. The JSON envelope limit remains
+8192 bytes. Index must be an integer; invalid optional argument
+types are refused.</p>
+<p>Watch publishes <code>&lt;service&gt;.tabs.changed</code> (added, removed, moved, selected,
+retitled), <code>&lt;service&gt;.pane.changed</code> (added, removed, selected, resized) and
+<code>&lt;service&gt;.title.changed</code> (retitled). Each body is
+<code>{tab,pane,kind,revision}</code>; the embedded Bus command is the topic suffix.
+Events cover local UI actions and Bus mutations. OSC updates wake the core;
+multiple updates before it handles the wake may coalesce to the latest title.
+Pinned titles hide OSC updates until cleared. Unchanged values and replayed
+mutations produce no new events. There is no timer or caller identity lease.</p>
+<p>The watch revision is a separate monotonic event sequence, preserving the
+older layout revision in verb replies. Publishing uses a bounded 256-record
+queue and a serial, best-effort Bus sender. Subscribe before enabling watch,
+then read current state; on a revision gap or reconnect read state again.
+The watch response gives the current event revision. Events are not retained
+by noded; publication failures are logged at most once per 30 seconds and
+do not block terminal input. A dropped final event may remain undetectable
+until a later revision arrives; read state whenever freshness is required.</p>
 <p><code>term.panes</code> reports each pane's geometry in logical pixels, relative to the
-pane area below the tab strip, as bterm does.</p>
+pane area below the tab strip, as bterm does. Geometry is from the last
+frontend layout: hidden tabs can report stale values after a window resize,
+or zeros after geometry invalidation. Select the tab and allow a frontend
+layout before relying on its geometry. Grid dimensions describe the current
+PTY grid and do not promise an up-to-date window layout.</p>
 <p>With no broker, term prints that the Bus is unavailable and works as a
 plain terminal.</p>
 <h2 id="not-yet-in-this-frontend">Not yet in this frontend</h2>

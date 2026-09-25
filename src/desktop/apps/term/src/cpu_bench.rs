@@ -16,14 +16,18 @@ use rgba_reference::RgbaBand;
 use std::time::Instant;
 
 #[test]
-fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
+fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
     for (scale, cell_height) in [
         (1.0, 20),
         (1.1, 41),
         (1.25, 20),
+        (1.25, 41),
         (1.5, 20),
+        (1.5, 41),
         (1.75, 41),
+        (2.0, 41),
         (2.25, 20),
+        (2.25, 41),
         (2.5, 41),
     ] {
         let mut raster = Raster::new(scale, 13.0, Cursor::Underline).unwrap();
@@ -60,36 +64,28 @@ fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
         assert_eq!(last.y + last.height, baseline.height as f32 / scale);
         for offset in [0.0, 1.0, 3.0, 17.0, 30.0] {
             let origin = iced::Point::new(offset / scale, offset / scale);
-            let bounds = Rectangle {
-                x: origin.x,
-                y: origin.y,
-                width: baseline.width as f32 / scale,
-                height: baseline.height as f32 / scale,
-            };
             let mut renderer = Renderer::new(Font::default(), Pixels(13.0));
             let mut mask = tiny_skia::Mask::new(800, height).unwrap();
-            let mut whole = tiny_skia::Pixmap::new(800, height).unwrap();
-            renderer.reset(clip);
-            let mut image =
-                iced::advanced::image::Image::new(baseline.cached.as_ref().unwrap().1.clone());
-            image.filter_method = image::FilterMethod::Nearest;
-            renderer.draw_image(image, bounds, clip);
-            renderer.draw(
-                &mut whole.as_mut(),
-                &mut mask,
-                &viewport,
-                &[clip],
-                Color::BLACK,
-            );
             renderer.reset(clip);
             widget::draw_images(&mut renderer, &surface.images(scale), origin, scale, clip);
             let mut bands = tiny_skia::Pixmap::new(800, height).unwrap();
+            #[cfg(feature = "raster-probe")]
+            let _ = iced_tiny_skia::take_native_copy_count();
             renderer.draw(
                 &mut bands.as_mut(),
                 &mut mask,
                 &viewport,
                 &[clip],
                 Color::BLACK,
+            );
+            // One full-pane region draws every native grid band exactly once.
+            // Count successful native placement/copy, never draw_fallback;
+            // pixel equality alone cannot prove routing.
+            #[cfg(feature = "raster-probe")]
+            assert_eq!(
+                iced_tiny_skia::take_native_copy_count(),
+                images.len(),
+                "native copies at scale={scale} cell_height={cell_height} offset={offset}"
             );
             // Compare to exact physical placement, not the old image widget:
             // its float-to-i32 truncation can itself shift a pane by a pixel.
@@ -107,11 +103,6 @@ fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
             assert!(
                 exact.data() == bands.data(),
                 "band seam at scale={scale} offset={offset}"
-            );
-            assert_eq!(
-                whole.data(),
-                bands.data(),
-                "old RGBA+convert versus native at scale={scale} offset={offset}"
             );
         }
     }
