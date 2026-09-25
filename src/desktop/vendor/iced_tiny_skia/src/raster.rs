@@ -11,10 +11,15 @@ std::thread_local! {
     static NATIVE_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Return and reset this thread's successful native-placement copy count.
+/// Return and reset this thread's successful image/grid native-placement copy count.
 #[cfg(feature = "raster-probe")]
 pub fn take_native_copy_count() -> usize {
     NATIVE_COPIES.with(|count| count.replace(0))
+}
+
+#[cfg(feature = "raster-probe")]
+pub(crate) fn record_native_copy() {
+    NATIVE_COPIES.with(|count| count.set(count.get() + 1));
 }
 
 #[derive(Debug)]
@@ -80,7 +85,7 @@ impl Pipeline {
             && copy_opaque(image.pixmap(), pixels, placed, clip_bounds)
         {
             #[cfg(feature = "raster-probe")]
-            NATIVE_COPIES.with(|count| count.set(count.get() + 1));
+            record_native_copy();
             return;
         }
 
@@ -212,7 +217,7 @@ impl Entry {
 }
 
 // Only absorb float round-off, not genuine fractional placement or scaling.
-fn native_placement(
+pub(crate) fn native_placement(
     bounds: Rectangle,
     transform: tiny_skia::Transform,
     width: u32,
@@ -242,7 +247,8 @@ fn native_placement(
 
 /// Native premultiplied pixels; only exact translations qualify. Rectangle
 /// coverage matches the non-antialiased mask's 26.6 scan conversion.
-fn copy_opaque(
+/// Also used by native Source grids, where replacing alpha is intentional.
+pub(crate) fn copy_opaque(
     image: tiny_skia::PixmapRef<'_>,
     target: &mut tiny_skia::PixmapMut<'_>,
     transform: tiny_skia::Transform,

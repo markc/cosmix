@@ -1,6 +1,6 @@
 use super::*;
 
-/// Four terminal rows bound conversion and retained-buffer copies on echo,
+/// Four terminal rows bound retained-buffer copies and damage on echo,
 /// without creating a widget for every physical scanline.
 const ROWS_PER_BAND: usize = 4;
 
@@ -34,10 +34,15 @@ impl Surface {
     }
 
     #[cfg(test)]
+    // Preserve the shared Frame tests' RGBA oracle; runtime has no readback.
     pub fn rgba(&self) -> Vec<u8> {
         self.tiles
             .iter()
-            .flat_map(|tile| tile.rgba.iter().copied())
+            .flat_map(|tile| {
+                tile.native
+                    .chunks_exact(4)
+                    .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            })
             .collect()
     }
 
@@ -45,7 +50,7 @@ impl Surface {
     pub fn allocation(&self) -> *const u8 {
         self.tiles
             .first()
-            .map_or(std::ptr::null(), |tile| tile.rgba.as_ptr())
+            .map_or(std::ptr::null(), |tile| tile.native.as_ptr())
     }
 
     pub fn paint(&mut self, raster: &mut Raster, screen: &Screen, dirty: &[bool]) -> &[DamageBand] {
@@ -157,16 +162,16 @@ mod tests {
         surface.paint(&mut raster, &screen, &[false; 11]);
         surface.cache_handle(2);
         let next = surface.images(2.5);
-        assert_ne!(next[0].0.id(), retained[0].0.id());
-        assert_ne!(next[1].0.id(), retained[1].0.id());
-        assert_eq!(next[2].0.id(), retained[2].0.id());
+        assert_ne!(next[0].0.generation(), retained[0].0.generation());
+        assert_ne!(next[1].0.generation(), retained[1].0.generation());
+        assert_eq!(next[2].0.generation(), retained[2].0.generation());
         let old: Vec<u8> = retained
             .iter()
             .flat_map(|(handle, _)| {
-                let Handle::Rgba { pixels, .. } = handle else {
-                    unreachable!()
-                };
-                pixels.iter().copied()
+                handle
+                    .pixels()
+                    .chunks_exact(4)
+                    .flat_map(|p| [p[2], p[1], p[0], p[3]])
             })
             .collect();
         assert_eq!(before, old, "retained image pixels were mutated");
@@ -186,11 +191,11 @@ mod tests {
         assert!(surface.paint(&mut raster, &screen, &[false; 11]).is_empty());
         surface.cache_handle(4);
         assert_eq!(
-            stable.iter().map(|p| p.0.id()).collect::<Vec<_>>(),
+            stable.iter().map(|p| p.0.generation()).collect::<Vec<_>>(),
             surface
                 .images(2.5)
                 .iter()
-                .map(|p| p.0.id())
+                .map(|p| p.0.generation())
                 .collect::<Vec<_>>()
         );
 

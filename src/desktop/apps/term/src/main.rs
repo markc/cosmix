@@ -1,6 +1,6 @@
 //! CosMix Term — the lightweight frontend: iced 0.14 on its own winit/Wayland
-//! backend (D2/D3), drawing `cosmix-term-core`'s grid through one persistent
-//! wgpu texture per visible pane (D7).
+//! backend (D2/D3), drawing `cosmix-term-core`'s grid through native tiny-skia
+//! bands by default, or one persistent wgpu texture per visible pane (D7).
 //!
 //! Tabs and split panes at parity with bterm (T3): the same tab and pane
 //! model (`cosmix_term_core::tabs`), the same chords, and the same `term.*`
@@ -12,8 +12,8 @@
 //!
 //! The two things that are requirements rather than optimisations, because
 //! they are what the whole lane is for: the grid is re-rasterised **by damaged
-//! row**, and it is rasterised **into one buffer per pane that lives while
-//! the pane is on screen**. See `frame.rs` and
+//! row**, and it is rasterised **into persistent storage per visible pane**
+//! (four-row CPU bands or a whole-pane wgpu buffer). See `frame.rs` and
 //! `cosmix_term_core::raster::render_into`.
 
 mod frame;
@@ -29,7 +29,7 @@ mod wgpu_grid;
 mod cpu_grid;
 
 #[cfg(not(any(feature = "wgpu", feature = "tiny-skia")))]
-compile_error!("term needs a renderer: enable the `wgpu` (default) or `tiny-skia` feature");
+compile_error!("term needs a renderer: enable the `tiny-skia` (default) or `wgpu` feature");
 
 use cosmix_term_core::{
     bus, config,
@@ -72,7 +72,7 @@ fn main() {
     session_fd::quarantine_inherited();
     if std::env::args().any(|arg| arg == "--help") {
         println!(
-            "{DISPLAY_NAME}: tabbed Wayland Mix terminal (iced + wgpu frontend)\n\
+            "{DISPLAY_NAME}: tabbed Wayland Mix terminal (iced frontend)\n\
              Font: TERM_SPIKE_FONT=/path/to/font.ttf, TERM_FONT_PX=<6..48>\n\
              Keys: Ctrl+Shift+T/W new/close tab, Ctrl+PageUp/PageDown change tab,\n\
              \x20     Ctrl+Shift+E/O split side by side/stacked, Ctrl+Shift+X close pane,\n\

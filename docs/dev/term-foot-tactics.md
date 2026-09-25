@@ -1,6 +1,6 @@
 # term: foot tactics investigation
 
-2026-09-25. Initial investigation followed by implemented ranks 1, 2 and 4
+2026-09-25. Initial investigation followed by implemented ranks 1, 2, 3, 4 and 6
 and the T16 merge validation below. Opening measurements describe the original
 tree; the implementation section holds the newer numbers. The current default
 is **tiny-skia**, accepted by Mark after testing: "typing in the test term
@@ -57,9 +57,10 @@ print(run_argv(["cargo", "test", "-p", "cosmix-term", "--release",
     "--", "--ignored", "--nocapture", "--test-threads=1"], {timeout: 600}))
 ```
 
-The two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
+The original two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
 `cpu_grid::bench::tiny_skia_foot_phases_bench`. `--test-threads=1` matters:
-running the two performance tests concurrently would contaminate their results.
+running performance tests concurrently would contaminate their results.
+Rank 6 adds `cpu_grid::bench::raster_warm_spans_bench` (described below).
 These historical measurements used the then-default wgpu build; both this report and
 [term-rendering.md](term-rendering.md) use explicit tiny-skia feature
 selection for CPU measurements. Only the term release test target and its dependencies were
@@ -380,6 +381,58 @@ intent**, and snapshot the latest state once. Continue processing input while
 waiting for a frame callback. Preserve any Rio synchronous-update handling;
 test partial writes with and without the application using that protocol.
 
+### Rank 6 implemented (2026-09-25)
+
+The shared Raster painter now coalesces equal-background cells within each
+dirty row and fills each pixel-row span through a safe `[u8; 4]` slice and
+`fill`. This removes per-cell/per-pixel background stores without adding a
+dependency or requiring pointer/stride alignment. Glyph bounds are clipped
+once to their cell, then mask and destination row slices are zipped. Zero
+coverage skips the store; full coverage copies the foreground; intermediate
+coverage retains the original unsigned integer expression and division by
+255. Foreground/background constants are hoisted out of the mask loop.
+
+Filling backgrounds before glyphs is equivalent because glyphs remain
+strictly cell-clipped. Each covered pixel is visited once and still contains
+its cell background, so the blend can use the hoisted background directly.
+Background fills are never omitted. `destination_pixel` is the optimised
+loops' single colour-order boundary for rank 3 integration; the public API
+and the rank 7 cache key/eviction policy are unchanged.
+
+The original painter is retained as test-only `paint_reference`, including
+its independent RGBA stores. Differential tests compare every byte and damage
+band over deterministic varied grids, scales 1/1.25/1.5/2.5, bold and wide or
+combining characters (still cell-clipped), both cursor styles, partial final
+rows, partial repaint sequences, odd padding and nonzero unaligned buffer
+origins. Synthetic masks exercise all 256 coverage values and each clipping
+edge, including fully clipped glyphs. Tests require an installed monospace
+font or `TERM_SPIKE_FONT`, as existing raster tests do.
+
+The ignored `cpu_grid::bench::raster_warm_spans_bench` sits beside the existing
+phase probes. It measures the same padded 2250×1250, scale-2.5 fixture for
+glyphs and spaces, with background runs of 90, 7 and 1 cells; 20 warmups and
+200 samples report mean/p50/p99 milliseconds. Setup and colour changes are
+outside the timer. Run it in release mode serially with the existing probes
+using the reproduction command above. ("Padded" refers to the cell padding
+described at the top of this report, not buffer stride; the bench stride is
+exactly `width * 4`.)
+
+Measured on cbc3 (release, serial, `--include-ignored`, commit 818d96b1),
+core 108 passed and term tiny-skia 45 passed, clippy clean on both:
+
+| Probe | Before (foot-tactics) | Rank 6 |
+|---|---:|---:|
+| Warm full paint, 2250 glyph cells | 3.98 ms | **1.23 ms** |
+| Background only (spaces) | 2.05 ms | **0.37 ms** |
+| Four-row bands, full redraw | 11.58 ms | **7.00 ms** |
+| Four-row bands, echo | 1.77 ms | **1.24 ms** |
+
+The before column is from the merge validation run on a different host, so
+compare the phase probes rather than read the totals as exact; the full
+redraw target of < 8 ms is met by rank 6 alone. Swash's Outline/Alpha image layout (one byte per mask
+pixel) and representable grid/buffer size arithmetic remain existing caller
+and library assumptions.
+
 ## The direct path and its architecture cost
 
 There are three materially different designs:
@@ -667,7 +720,90 @@ Isolated phase probes from the same run (not additive frame costs):
 | iced cached full image draw | 1.515 | 1.447 | 2.128 |
 | iced empty-layer full clear | 0.516 | 0.486 | 0.720 |
 
+## Rank 3 implemented (2026-09-25)
+
+The tiny-skia arm now paints each persistent four-row band directly in BGRA
+channel order and records a native grid primitive. `Raster::paint` and the
+core `Surface` still default to RGBA for wgpu; `paint_format` selects BGRA
+explicitly and invalidates all rows if the destination format changes. Only
+the per-cell colour/write boundary changes; fill and glyph-blend loop structure,
+rounding, glyph cache keys and cursor operations are retained for the parallel
+rank-6 work. All raster output is opaque, making the native bytes already
+premultiplied without a post-paint traversal.
+
+`grid::Grid` in the vendored renderer holds immutable `Bytes` and a fresh
+generation token. It shares the existing image sublayer's ordering and damage
+expansion, but never enters the RGBA image cache. Unchanged bands keep their
+generation. The rank-1 placement and clipped native copy are reused; generic
+placement draws the native pixmap without conversion. Grid bounds, widget clip,
+layer clip and damage remain distinct. Renderer-wide clear/mask work remains.
+Paint-once scheduling, clean-pane skipping and `present_with_damage` are unchanged.
+
+Storage is generation-owned, not an unsafe two-frame ping-pong. The app drops
+its cached generation before requesting mutable bytes. Sole ownership permits
+in-place reuse. Any retained widget or history forces fresh storage; partial
+updates copy unchanged rows and rebind paint state, fully dirty bands discard
+the old pixels and repaint. Old generations can outlive any number of frames.
+The app retains no additional history or converted native cache. This removes
+conversion/cache allocation, not every allocation in a changed frame.
+
+Cluster gates cover the term tiny-skia suite (now the default) and clean wgpu
+suite (`--no-default-features --features wgpu`), ignored CPU benchmarks
+serialised, the core format regression, and the vendor suite
+with `image,wayland`. The new ordinary rotating-target test compares every
+repaired frame to a fresh old RGBA+convert draw at scales 1.0, 1.25 and 2.5;
+it covers clipping, translucent overlays, moving panes, resize/partial final
+bands, cursor changes, invalidation and age loss. The existing seven-scale
+fixture checks exact physical placement against RGBA-painted reference bytes;
+the rotating-target test checks old/new rendered equality. Existing
+storage/generation tests retain earlier native bytes across
+updates. The core test checks both cursor styles, padded strides and switching
+formats with otherwise clean damage. Vendor tests cover constructor validation,
+generation equality and native-copy/fallback equivalence. The vendor layer
+regression also checks clean generations produce no damage, while new
+generations, movement and changed clips do. A test-only copy of
+the old whole-band transport preserves the frame benchmark's RGBA reference.
+
+The grid honours its widget clip (`layout.bounds() ∩ viewport`) as well as
+the layer clip, unlike ordinary images, which use only the layer clip. That is
+intended: the term widget is sized to exactly `cols × cell_width`, its origin
+is snapped, and the copy uses 26.6 edge rounding, so the widget clip lands on
+the grid edges and crops nothing in practice.
+
+Measured on the build cluster (release, serial, `--include-ignored`), four-row
+bands at 2250×1250, scale 2.5, age 3. Both configurations passed every gate:
+term-core, term tiny-skia and default wgpu suites, the vendor
+`image,wayland` suite, and clippy `-D warnings` for both feature sets.
+
+| Build | Echo mean ms | Full redraw mean ms | Full paint+handle / prepare+convert / render |
+|---|---:|---:|---|
+| T16 merge (foot-tactics) | 1.770 | 11.578 | 5.259 / 3.849 / 2.461 |
+| Rank 3 alone (cbc2, 4b884fe5) | 0.473 | 6.384 | 4.549 / 0.001 / 1.829 |
+| Ranks 3 + 6 (cbc3, 2a487869) | **0.370** | **3.742** | 1.971 / 0.001 / 1.765 |
+
+Prepare+convert is gone, as designed; with rank 6's faster paint the full
+redraw is well inside the < 8 ms target and echo is under 0.4 ms. The T16
+merge row is from a different host, so the totals are indicative; the phase
+columns show where the time went. The main integration retains term 0.2.5 and
+core 0.6.2 without another version bump.
+
+Unenforced assumptions/contracts: arbitrary external producers of `grid::Grid`
+must supply premultiplied BGRA (the constructor validates shape, not channels);
+term's opaque writes satisfy that contract. `PaintState::rebind` still relies
+on a complete byte-for-byte copy, as before. Upstream iced's current single-CPU
+renderer alias and layer ordering are source-audited and must be revisited on
+an upgrade. The CPU-only build requires dependency feature unification not to
+enable iced's wgpu arm independently of term's feature; both-feature term builds
+continue selecting wgpu. Performance estimates assume the same font, hardware
+and benchmark conditions as the merge
+table. Headless regressions do not establish live Wayland lifecycle, timing,
+memory pressure, compositor damage or input-to-visible latency. No age bound
+or renderer-history release timing is assumed for storage safety.
+
 ## Review fixes and C6 landing preparation (2026-09-25)
+
+This section and the final fractional-band measurements below record main's
+image-handle implementation before the rank-3 integration described at the end.
 
 The round-one fixes check negative origins against the transform after image
 scaling, use coordinate-relative tolerance, and retain a widget-side correction
@@ -734,3 +870,27 @@ or probe instrumentation. Frame fixture: 2250×1250, scale 2.5, buffer age 3,
 Whole-image and banded final pixels match. Banded echo still meets the 2 ms
 mean target; full redraw remains above 8 ms. The benchmark fixture is unchanged;
 the taller 41-pixel-cell regression establishes routing for the lower bands.
+
+## Rank 3/main integration (2026-09-25)
+
+The default tiny-skia arm retains native BGRA grid generations and
+`Renderer::draw_grid`. Main's integer-extent fix is applied at grid submission:
+width and height come from each grid's integer pixel dimensions divided by
+output scale; cumulative band origins and snapping remain. RGBA matching,
+`measure_image` cache touches, the generic image-renderer widget and
+`truncating_origin` are removed from this path: grids have no image-cache entry
+and native placement resolves their physical edges directly.
+
+`raster-probe` counts successful grid native copies as well as the existing
+ordinary-image shortcut. The expanded 61-row exact-pixel regression and its
+every-band counter assertion are retained, including lower and partial bands
+at fractional scales. The separate rotating-target regression retains the
+RGBA-pipeline comparison. `reference-raster` continues to disable the two
+ordinary-image shortcuts only; it does not disable grid copies or prove the
+grid fallback. The vendor grid tests exercise non-native-size fallback directly.
+
+Both histories and their measurements above are retained; none measures this
+merged tree. Term stays at 0.2.5 and core at 0.6.2. Tiny-skia is the default,
+clean wgpu uses `--no-default-features --features wgpu`, and enabling both
+selects wgpu. Merge resolution is source-checked only; build, regression and
+clippy validation of this integration remain for the cluster.

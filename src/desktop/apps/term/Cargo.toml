@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -89,9 +89,10 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # T3): naga 27 leaves the graph and takes the conflict with it.
 naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
 
-# Cargo does not support optional dev-dependencies. These test helpers are
-# optional normal dependencies tied to the CPU arm; clean wgpu tests omit them.
+# Native grid renderer, also used by the offscreen CPU tests.
 iced_tiny_skia = { version = "=0.14.1", optional = true, default-features = false, features = ["image", "wayland"] }
+# Cargo does not support optional dev-dependencies. This CPU test helper is
+# an optional normal dependency; clean wgpu tests omit it.
 tiny-skia = { version = "0.11", optional = true, default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]

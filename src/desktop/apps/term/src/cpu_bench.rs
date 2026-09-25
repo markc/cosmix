@@ -2,13 +2,17 @@
 //! damage grouping. Unlike Headless::screenshot this retains the target and
 //! does not add a full-window screenshot allocation and BGRA→RGBA readback.
 use super::*;
+#[path = "cpu_rgba_reference.rs"]
+mod rgba_reference;
 use cosmix_term_core::{config::Cursor, terminal::Cell};
 use iced::advanced::{Renderer as _, image::Renderer as _};
+use iced::widget::image::{self, Handle};
 use iced::{Color, Font, Pixels, Rectangle, Size};
 use iced_tiny_skia::{
     Layer, Renderer,
     graphics::{Viewport, damage},
 };
+use rgba_reference::RgbaBand;
 use std::time::Instant;
 
 #[test]
@@ -43,7 +47,7 @@ fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
                 .collect(),
             updated: Instant::now(),
         };
-        let mut baseline = PixelBand::default();
+        let mut baseline = RgbaBand::default();
         baseline.paint(&mut raster, &screen, &[]);
         baseline.cache_handle(1);
         let mut surface = Surface::default();
@@ -74,9 +78,9 @@ fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
                 &[clip],
                 Color::BLACK,
             );
-            // One full-pane region draws every band exactly once. Count only
-            // the first native-placement shortcut, never the secondary copy
-            // or Pattern fallback; pixel equality alone cannot prove routing.
+            // One full-pane region draws every native grid band exactly once.
+            // Count successful native placement/copy, never draw_fallback;
+            // pixel equality alone cannot prove routing.
             #[cfg(feature = "raster-probe")]
             assert_eq!(
                 iced_tiny_skia::take_native_copy_count(),
@@ -131,7 +135,7 @@ fn tiny_skia_frame_bench() {
                 updated: Instant::now(),
             };
             let mut surface = Surface::default();
-            let mut baseline = PixelBand::default();
+            let mut baseline = RgbaBand::default();
             let mut renderer = Renderer::new(Font::default(), Pixels(13.0));
             let viewport = Viewport::with_physical_size(Size::new(2250, 1250), 2.5);
             let bounds = Rectangle::with_size(viewport.logical_size());
@@ -233,7 +237,11 @@ fn tiny_skia_frame_bench() {
             samples.sort_by(f64::total_cmp);
             eprintln!(
                 "{} {} 2250x1250 scale=2.5 age=3: mean={:.3} p50={:.3} p99={:.3} ms; paint+handle={:.3} prepare+convert={:.3} render={:.3} damaged_px={:.0}",
-                if banded { "bands" } else { "baseline" },
+                if banded {
+                    "native bands"
+                } else {
+                    "RGBA baseline"
+                },
                 if all { "redraw" } else { "echo" },
                 samples.iter().sum::<f64>() / 200.0,
                 samples[100],
@@ -242,6 +250,197 @@ fn tiny_skia_frame_bench() {
                 prepare_ms / 200.0,
                 draw_ms / 200.0,
                 area / 200.0
+            );
+        }
+    }
+}
+
+/// Exercise the real layer diff against three rotating targets, and compare
+/// every repaired frame to a fresh old RGBA+convert draw. No timing/Wayland.
+#[test]
+fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
+    for scale in [1.0, 1.25, 2.5] {
+        let mut raster = Raster::new(scale, 13.0, Cursor::Block).unwrap();
+        let mut screen = Screen {
+            cols: 9,
+            rows: 9,
+            cursor: (2, 3),
+            cursor_visible: true,
+            cells: (0..81)
+                .map(|i| Cell {
+                    c: ['M', 'g', ' ', '@'][i % 4],
+                    fg: [[255, 0, 127], [0, 255, 0], [0, 0, 255]][i % 3],
+                    bg: [i as u8, 255 - i as u8, 31],
+                    bold: i % 2 == 0,
+                })
+                .collect(),
+            updated: Instant::now(),
+        };
+        let mut surface = Surface::default();
+        let mut reference = RgbaBand::default();
+        let viewport = Viewport::with_physical_size(Size::new(480, 480), scale);
+        let full = Rectangle::with_size(viewport.logical_size());
+        let mut renderer = Renderer::new(Font::default(), Pixels(13.0));
+        let mut oracle = Renderer::new(Font::default(), Pixels(13.0));
+        let mut mask = tiny_skia::Mask::new(480, 480).unwrap();
+        let mut targets: Vec<_> = (0..3)
+            .map(|_| tiny_skia::Pixmap::new(480, 480).unwrap())
+            .collect();
+        let mut history: std::collections::VecDeque<Vec<Layer>> = Default::default();
+        let overlay = Handle::from_rgba(8, 8, [31, 47, 239, 127].repeat(64));
+        for n in 0..12 {
+            if n == 7 {
+                screen.rows = 6;
+                screen.cells.truncate(54); // Final band now has two rows.
+            }
+            if n == 9 {
+                surface.invalidate();
+            }
+            let row = n % screen.rows;
+            screen.cells[row * screen.cols].bg = [n as u8 * 19, 3, 201];
+            screen.cursor = (2, row);
+            screen.cursor_visible = n % 4 != 0;
+            let mut dirty = vec![false; screen.rows];
+            dirty[row] = true;
+            surface.paint(&mut raster, &screen, &dirty);
+            surface.cache_handle(n as u64);
+            reference.paint(&mut raster, &screen, &[]);
+            reference.cache_handle(n as u64);
+            let origin = iced::Point::new(if n < 8 { 17.0 } else { 23.0 } / scale, 11.0 / scale);
+            let bounds = Rectangle {
+                x: origin.x,
+                y: origin.y,
+                width: reference.width as f32 / scale,
+                height: reference.height as f32 / scale,
+            };
+            let clip = Rectangle {
+                x: origin.x + 2.49 / scale,
+                y: origin.y + 0.51 / scale,
+                width: bounds.width - 5.0 / scale,
+                height: bounds.height - 2.0 / scale,
+            };
+            for (r, native) in [(&mut renderer, true), (&mut oracle, false)] {
+                r.reset(full);
+                r.with_layer(clip, |r| {
+                    if native {
+                        widget::draw_images(r, &surface.images(scale), origin, scale, clip);
+                    } else {
+                        let mut image = iced::advanced::image::Image::new(
+                            reference.cached.as_ref().unwrap().1.clone(),
+                        );
+                        image.filter_method = image::FilterMethod::Nearest;
+                        r.draw_image(image, bounds, clip);
+                    }
+                    // Same image sublayer: an overlapping translucent image
+                    // after the grid must remain above it, including repair.
+                    if n % 3 != 0 {
+                        r.draw_image(
+                            iced::advanced::image::Image::new(overlay.clone()),
+                            Rectangle {
+                                x: origin.x + 4.0 / scale,
+                                y: origin.y + 4.0 / scale,
+                                width: 8.0 / scale,
+                                height: 8.0 / scale,
+                            },
+                            clip,
+                        );
+                    }
+                });
+            }
+            // Unknown age must discard the damaged target's old contents.
+            if n == 5 {
+                history.clear();
+                targets[n % 3].fill(tiny_skia::Color::from_rgba8(255, 0, 255, 255));
+            }
+            let regions = history
+                .front()
+                .filter(|_| history.len() == 3)
+                .map(|old| damage::diff(old, renderer.layers(), |l| vec![l.bounds], Layer::damage))
+                .unwrap_or_else(|| vec![full]);
+            let regions = damage::group(regions, full);
+            history.push_back(renderer.layers().to_vec());
+            if history.len() > 3 {
+                history.pop_front();
+            }
+            renderer.draw(
+                &mut targets[n % 3].as_mut(),
+                &mut mask,
+                &viewport,
+                &regions,
+                Color::BLACK,
+            );
+            let mut expected = tiny_skia::Pixmap::new(480, 480).unwrap();
+            oracle.draw(
+                &mut expected.as_mut(),
+                &mut mask,
+                &viewport,
+                &[full],
+                Color::BLACK,
+            );
+            assert_eq!(
+                targets[n % 3].data(),
+                expected.data(),
+                "scale={scale} frame={n}"
+            );
+        }
+    }
+}
+
+/// Isolated costs, not additive frame timings. No window/presentation is
+/// created. Keep allocations outside the timer except where explicitly named.
+#[test]
+#[ignore = "release-only rank-6 warm-paint measurement"]
+fn raster_warm_spans_bench() {
+    use cosmix_term_core::raster::PaintState;
+    use std::hint::black_box;
+
+    let mut raster = Raster::new(2.5, 13.0, Cursor::Underline).unwrap();
+    raster.width = 25;
+    raster.height = 50;
+    for spaces in [false, true] {
+        for run_cells in [90, 7, 1] {
+            let mut screen = Screen {
+                cols: 90,
+                rows: 25,
+                cursor: (0, 0),
+                cursor_visible: false,
+                cells: (0..2250)
+                    .map(|i| Cell {
+                        c: if spaces { ' ' } else { char::from(b'!' + (i % 90) as u8) },
+                        fg: [210, 220, 230],
+                        bg: [20, 25, 30],
+                        bold: false,
+                    })
+                    .collect(),
+                updated: Instant::now(),
+            };
+            let mut pixels = vec![0; 2250 * 1250 * 4];
+            let mut state = PaintState::default();
+            let mut samples = Vec::with_capacity(200);
+            for n in 0..220 {
+                // Change real content without changing the warmed glyph keys.
+                // Set up the colours outside the timed region.
+                for (i, cell) in screen.cells.iter_mut().enumerate() {
+                    cell.bg[0] = 20 + (n % 40) as u8
+                        + (((i % 90) / run_cells) % 2) as u8;
+                }
+                let start = Instant::now();
+                black_box(raster.paint(
+                    black_box(&screen), &mut pixels, 2250 * 4, &mut state, &[true; 25],
+                ));
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                black_box(&pixels);
+                if n >= 20 {
+                    samples.push(ms);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "rank6 warm {} bg_run={run_cells} cells 2250x1250 scale=2.5: mean={:.3} p50={:.3} p99={:.3} ms",
+                if spaces { "spaces" } else { "glyphs" },
+                samples.iter().sum::<f64>() / samples.len() as f64,
+                samples[100],
+                samples[198],
             );
         }
     }

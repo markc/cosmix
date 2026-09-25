@@ -2,21 +2,21 @@
 //! process holds no DRM fd at all — foot's configuration, which is the only
 //! one anyone has ever measured at zero GEM.
 //!
-//! Each four-row band paints into the allocation its image handle shares. Before
+//! Each four-row band paints native BGRA into its generation-owned allocation. Before
 //! painting we drop our cached handle and reclaim the `Bytes` with
 //! `try_into_mut`. iced's renderer layers and compositor history retain old
 //! handles, normally forcing one memcpy plus incremental dirty-row painting.
 //! Reclaim remains zero-copy when no other owner remains. At rest each pane
 //! has one app-side buffer per band (the separate Frame Vec is gone), plus iced's
-//! premultiplied cache and up to max_age retained older buffers after a burst,
-//! until later redraws release them. Unchanged bands retain their handle id,
-//! bounding iced's conversion cache misses and damage to changed bands.
+//! retained older buffers after a burst, until later redraws release them.
+//! There is no RGBA image or converted image cache. Unchanged bands retain
+//! their native generation, bounding damage to changed bands.
 
 use crate::frame::Frame;
 use bytes::{Bytes, BytesMut};
-use cosmix_term_core::raster::{DamageBand, PaintState, Raster};
+use cosmix_term_core::raster::{DamageBand, PaintState, PixelFormat, Raster};
 use cosmix_term_core::terminal::Screen;
-use iced::widget::image::{self, Handle};
+use iced_tiny_skia::grid::Grid as Handle;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
@@ -35,7 +35,7 @@ pub use widget::{Grid, view};
 #[derive(Default)]
 pub(super) struct PixelBand {
     state: PaintState,
-    rgba: Bytes,
+    native: Bytes,
     width: u32,
     height: u32,
     cell: (u32, u32),
@@ -56,16 +56,11 @@ impl PixelBand {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rgba.is_empty()
+        self.native.is_empty()
     }
 
     pub fn invalidate(&mut self) {
         self.state.invalidate();
-    }
-
-    #[cfg(test)]
-    pub fn paint(&mut self, raster: &mut Raster, screen: &Screen, dirty: &[bool]) -> &[DamageBand] {
-        self.paint_inner(raster, screen, dirty, false)
     }
 
     fn paint_inner(
@@ -79,7 +74,7 @@ impl PixelBand {
         let (width, height) = raster.target_size(screen);
         if width == 0 || height == 0 {
             self.cached = None;
-            self.rgba = Bytes::new();
+            self.native = Bytes::new();
             self.width = 0;
             self.height = 0;
             self.cursor = false;
@@ -106,7 +101,11 @@ impl PixelBand {
         }
 
         self.cached = None;
-        let mut pixels = match std::mem::take(&mut self.rgba).try_into_mut() {
+        // Lifetime rule: a widget, renderer layer or age-repair history may
+        // retain ANY older generation. Never mutate its bytes, even after two
+        // frames. Bytes grants mutation only to the sole owner; otherwise the
+        // new generation gets separate storage. No fixed-age assumption.
+        let mut pixels = match std::mem::take(&mut self.native).try_into_mut() {
             Ok(pixels) => pixels,
             Err(shared) => {
                 if discard {
@@ -129,14 +128,15 @@ impl PixelBand {
             pixels.resize(len, 0);
             self.state.invalidate();
         }
-        self.bands.extend_from_slice(raster.paint(
+        self.bands.extend_from_slice(raster.paint_format(
             screen,
             &mut pixels,
             width as usize * 4,
             &mut self.state,
             dirty,
+            PixelFormat::Bgra,
         ));
-        self.rgba = pixels.freeze();
+        self.native = pixels.freeze();
         self.width = width;
         self.height = height;
         self.cell = (raster.width, raster.height);
@@ -150,7 +150,8 @@ impl PixelBand {
         } else if self.cached.as_ref().map(|(current, _)| *current) != Some(generation) {
             self.cached = Some((
                 generation,
-                Handle::from_rgba(self.width, self.height, self.rgba.clone()),
+                Handle::new(self.width, self.height, self.native.clone())
+                    .expect("painted native band dimensions"),
             ));
         }
     }
@@ -211,10 +212,13 @@ mod tests {
     }
 
     fn pixels(handle: &Handle) -> &Bytes {
-        let Handle::Rgba { pixels, .. } = handle else {
-            panic!("expected an RGBA handle");
-        };
-        pixels
+        handle.pixels()
+    }
+
+    fn native(rgba: &[u8]) -> Vec<u8> {
+        rgba.chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect()
     }
 
     #[test]
@@ -226,10 +230,10 @@ mod tests {
         refresh(&frame);
         let old = handle(&frame);
         let pointer = pixels(&old).as_ptr();
-        let id = old.id();
+        let id = old.generation();
         let before = pixels(&old).to_vec();
         assert_eq!(
-            frame.lock().unwrap().surface().tiles[0].rgba.as_ptr(),
+            frame.lock().unwrap().surface().tiles[0].native.as_ptr(),
             pointer
         );
         drop(old);
@@ -243,7 +247,11 @@ mod tests {
         refresh(&frame);
         let next = handle(&frame);
         assert_eq!(pixels(&next).as_ptr(), pointer);
-        assert_ne!(next.id(), id, "new pixels need a new iced cache entry");
+        assert_ne!(
+            next.generation(),
+            id,
+            "new pixels need a new damage generation"
+        );
         assert_eq!(frame.lock().unwrap().generation(), 2);
         let row_bytes = painter.cell().0 as usize * grid.cols * 4 * painter.cell().1 as usize;
         assert_eq!(&pixels(&next)[..row_bytes], &before[..row_bytes]);
@@ -283,12 +291,12 @@ mod tests {
             before.as_slice(),
             "old widget pixels changed"
         );
-        assert_ne!(old.id(), next.id());
+        assert_ne!(old.generation(), next.generation());
 
         let mut reference = cosmix_term_core::raster::Surface::default();
         let mut raster = Raster::new(1.0, 13.0, Cursor::Underline).expect("a monospace font");
         raster.render_into(&grid, &[], &mut reference);
-        assert_eq!(pixels(&next).as_ref(), reference.rgba());
+        assert_eq!(pixels(&next).as_ref(), native(reference.rgba()));
     }
 
     #[test]
@@ -325,14 +333,17 @@ mod tests {
             let current = handle(&frame);
             let mut reference = cosmix_term_core::raster::Surface::default();
             raster.render_into(&grid, &[], &mut reference);
-            assert_eq!(pixels(&current).as_ref(), reference.rgba());
+            assert_eq!(pixels(&current).as_ref(), native(reference.rgba()));
             let locked = frame.lock().unwrap();
             assert_eq!(locked.generation(), generation);
             assert_eq!(
-                locked.surface().tiles[0].rgba.as_ptr(),
+                locked.surface().tiles[0].native.as_ptr(),
                 pixels(&current).as_ptr()
             );
-            assert_eq!(locked.surface().tiles[0].rgba.len(), pixels(&current).len());
+            assert_eq!(
+                locked.surface().tiles[0].native.len(),
+                pixels(&current).len()
+            );
             for (retained, expected) in &history {
                 assert_eq!(pixels(retained).as_ref(), expected.as_slice());
                 assert_ne!(pixels(retained).as_ptr(), pixels(&current).as_ptr());
@@ -343,9 +354,7 @@ mod tests {
         // renderer history leaves each older buffer uniquely owned. The app
         // has retained no previous-generation buffers of its own.
         for (retained, _) in history {
-            let Handle::Rgba { pixels, .. } = retained else {
-                panic!("expected an RGBA handle");
-            };
+            let pixels = retained.into_pixels();
             assert!(pixels.try_into_mut().is_ok(), "app retained an old buffer");
         }
     }
@@ -371,10 +380,8 @@ mod tests {
         let surface = &locked.surface().tiles[0];
         assert_eq!(locked.generation(), generation);
         assert_eq!(surface.cached.as_ref().unwrap().0, generation);
-        assert_eq!(surface.rgba.as_ptr(), pixels(&current).as_ptr());
-        let Handle::Rgba { width, height, .. } = current else {
-            panic!("expected an RGBA handle");
-        };
+        assert_eq!(surface.native.as_ptr(), pixels(&current).as_ptr());
+        let (width, height) = (current.width(), current.height());
         assert_eq!((width, height), (surface.width(), surface.height()));
         assert!(width > 1 && height > 1);
     }
@@ -393,7 +400,7 @@ mod tests {
         refresh(&frame);
         refresh(&frame);
         let next = handle(&frame);
-        assert_eq!(next.id(), old.id());
+        assert_eq!(next.generation(), old.generation());
         assert_eq!(pixels(&next).as_ptr(), pixels(&old).as_ptr());
         assert_eq!(pixels(&next).as_ref(), before.as_slice());
         assert_eq!(frame.lock().unwrap().generation(), generation);
@@ -410,7 +417,7 @@ mod tests {
             assert_eq!(painter.repaint(PANE, grid, dirty), changed);
             refresh(&frame);
             let current = handle(&frame);
-            assert_eq!(pixels(&current).as_ref(), reference.rgba());
+            assert_eq!(pixels(&current).as_ref(), native(reference.rgba()));
         };
         let mut grid = screen();
         check(&grid, &[]);

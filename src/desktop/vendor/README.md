@@ -13,9 +13,13 @@
 | licence | MIT, declared in the archive's Cargo manifests; no LICENSE file was shipped |
 
 The complete archive is imported byte-for-byte in its own commit. The local
-patch touches `src/raster.rs` (opaque cache/copy and tests), `src/lib.rs`
-(verification counter export), `src/engine.rs`
-(rectangular clip passed to the raster pipeline), `src/window/compositor.rs`
+patch touches `src/raster.rs` (opaque image cache/copy, shared placement/copy
+helpers, image/grid verification counter and tests), `src/lib.rs`
+(native grid module/draw API and verification counter export), `src/grid.rs`
+(new immutable native grid primitive, copy/fallback and tests), `src/layer.rs`
+(ordered image/grid sublayer and generation-aware damage), `src/engine.rs`
+(grid dispatch, widget clipping/mask restoration and rectangular clip passed
+to the raster pipeline), `src/window/compositor.rs`
 (damage, present history and tests), and `Cargo.toml` (the verification-only
 `reference-raster` and `raster-probe` features and an allowance for upstream's
 argument-heavy drawing APIs under clippy). No other upstream source is reformatted.
@@ -31,25 +35,84 @@ rotation and scaling retain the original draw. Negative local bounds under
 an identity transform AFTER image scaling also retain it: tiny-skia's specialised `fill_rect`
 rounding extends these edges differently from its transformed path. Translated
 negative physical origins still use the copy and are pixel-tested.
-Cache ids, conversion format and immutable image ownership are unchanged.
+Ordinary image cache ids, conversion format and immutable ownership are unchanged.
+
+T16 rank 3 adds `grid::Grid` and `Renderer::draw_grid` under the `image`
+feature. This is a native, tightly packed premultiplied BGRA8 **Source**
+primitive: recording it retains immutable `Bytes`, with no image cache load,
+allocation or conversion. A unique generation token drives constant-time
+layer equality. Native grids and ordinary images share one ordered sublayer
+(`layer::Image`); a later image or overlay still draws above the grid.
+The rank-1 placement/copy helpers are shared, including their rectangular
+clipping and fractional-edge tolerance. Non-native-size placement falls back
+to nearest-neighbour drawing directly from the native bytes. Widget clipping
+is intersected with layer/damage clipping before either route. The copy does
+not prepare another mask; the fallback does and restores the layer mask.
+
+The producer owns storage reuse. Term reclaims `Bytes` only when uniquely
+owned; retained widgets/layers/history force a separate generation allocation
+(copying unchanged rows for partial updates). No double-buffer or maximum-age
+assumption can allow mutation of a retained generation. The constructor checks
+dimensions and byte length, not channel premultiplication: supplying valid
+native premultiplied channels is the public producer contract. Term enforces
+opacity in its raster writes (alpha 255); it cannot supply image alpha here.
+Source semantics are deliberate, not a transparent-image replacement API.
+
+Rank-3 regressions: `grid::tests` checks shape/generation/shared ownership and
+copy/fallback pixel equality with the RGBA image pipeline. A layer regression
+checks no damage for a retained generation and damage for generation, placement
+or clip changes; term's expanded fractional-scale
+fixture compares native bands with exact BGRA placement from RGBA-painted
+reference bytes, including partial final bands and nonzero origins. Its
+ordinary rotating-target regression compares against the RGBA image pipeline and adds
+fractional clips, translucent overlapping images, movement, resize, cursor
+crossing/hiding, invalidation and unknown age. Existing retained-handle tests
+now exercise native generations. The ignored frame benchmark retains the old
+whole-pane RGBA transport as a test-only reference and times native bands.
+These tests pass on the build cluster (vendor `image,wayland` suite plus the
+term tiny-skia and default suites, 2026-09-25). Retire this extension when upstream provides equivalent immutable
+native storage, generation-aware damage, clipping and draw-order semantics;
+retain all pixel and history regressions when updating.
+
+Rank-3 review follow-up: `Grid` has a manual `Debug` implementation reporting
+only generation, width, height and byte length, avoiding native buffer dumps
+through image/layer diagnostics. Keep this until upstream offers equivalent
+bounded diagnostics. The vendored regression
+`grid::tests::layer_draw_intersects_widget_clip_and_restores_image_mask`
+uses `Renderer::draw` with a widget clip strictly inside its layer clip, then
+a translucent ordinary image in the same layer crossing the layer boundary.
+At scales 1.0 (native copy) and 1.25 (masked fallback), an independent BGRA
+pixel oracle requires untouched pixels outside the widget clip and image
+coverage limited only by the layer clip. Dropping the widget intersection
+paints extra grid pixels; removing mask restoration suppresses the subsequent
+image at 1.25. Retain this test on upstream updates; run it with the vendored
+image-feature test command below. It has not been run locally; cluster
+validation, including mutation checks, is required.
 
 T16 integration resolves cumulative band edges in physical coordinates before
-the upstream image-size division and truncation. Edge tolerance is four f32
+any fallback size division and truncation. Edge tolerance is four f32
 epsilons relative to coordinate size, capped at 0.01 physical pixel. Edges
 qualify only when their rounded extent equals the source image size;
 the copy receives an exact integer translation. Seven-scale regression tests
 check this eligibility, and term checks the rendered pixels against exact
-placement. The widget also corrects truncation round-off using cumulative
-origins and each image's pixel size, so fallback placement is seam-free too.
-`reference-raster` disables BOTH copy shortcuts to verify that guarantee.
-Draw extents come directly from the image's integer pixel dimensions divided
-by output scale. Subtracting logical band edges here would amplify rounding
-error in the fallback origin correction and reject lower bands for native copy.
+placement. Main's former image widget also corrected truncation round-off
+and touched every image cache entry. The native grid widget needs neither:
+it submits immutable grid bytes directly with cumulative origins. Draw extents
+come directly from the grid's integer pixel dimensions divided by output
+scale, porting main's fractional-band fix without the image-only correction.
+The ordinary-image pipeline retains main's negative-identity guard and both
+copy shortcuts; `reference-raster` disables those two image shortcuts only.
+It leaves grid native copies enabled. Non-native-size grid fallback is covered
+by `grid::tests`, not by switching `reference-raster` on.
 The integrated pane regression checks exact pixels and, with `raster-probe`,
-counts successful native-placement copies for every band, including the final
+counts successful grid native-placement copies for every band, including the final
 partial band, at 1.25/1.5/1.75/2.0/2.25/2.5 scales and nonzero origins.
-The thread-local counter is absent from normal builds. Run its test separately
-from `reference-raster`, which intentionally takes no native copies:
+The shared thread-local counter records successful image and grid native
+placement/copy, excluding image secondary copies and either fallback, and is
+absent from normal builds. The pane test resets it immediately before drawing
+only grids. Run it with `raster-probe`. The second command checks feature
+compatibility only: this pane test still exercises native grids, while vendor
+raster tests cover ordinary-image fallback:
 
 ```text
 cargo test -p cosmix-term --release --features raster-probe band_widget_matches_exact
@@ -70,8 +133,9 @@ Run pixel and physical-damage tests with
 `cargo test --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --lib`;
 run term's release CPU tests and ignored benchmark for integrated coverage.
 Remove each local change only when upstream supplies equivalent opaque-copy,
-cumulative-edge placement (including negative scale cancellation and the
-fallback arm), physical damage and paced empty-commit lifecycle handling.
+native grid storage/damage/clipping, cumulative-edge placement (including
+negative scale cancellation and the image fallback arm), physical damage and
+paced empty-commit lifecycle handling.
 Retain the regressions when checking an update.
 
 ### iced update procedure and pristine re-verification
@@ -123,6 +187,10 @@ mix docs/build/verify-iced-tiny-skia.mix fixes HEAD
 Success prints `verdict=0 EXPECT=pristine|fixes` and an evidence directory
 containing `pristine.diff`. `fixes` requires diff exit 1, `pristine` requires
 exit 0; diff errors never pass. Inspect the diff against the patch shape above.
+There is no file allowlist or patch manifest: the script compares the entire
+committed vendor tree (including added `src/grid.rs`) and lists its Git history.
+It does not verify uncommitted merge resolutions; run `fixes` on the eventual
+merge commit. No script change is needed for the grid extension.
 
 ## Smithay libinput: opt-in dispatch fairness
 
