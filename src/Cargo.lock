@@ -1103,6 +1103,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-edit-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cosmix-filesd"
 version = "0.8.2"
 dependencies = [
