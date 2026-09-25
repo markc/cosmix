@@ -15,6 +15,7 @@ pub mod config;
 pub mod control;
 pub mod font;
 pub mod metrics;
+pub mod native_lane;
 pub mod native_session;
 pub mod panes;
 pub mod raster;

@@ -21,6 +21,8 @@ mod frame;
 mod input;
 mod keys;
 mod layout;
+#[cfg(test)]
+mod native_tests;
 mod theme;
 
 #[cfg(feature = "wgpu")]
@@ -35,6 +37,7 @@ compile_error!("term needs a renderer: enable the `tiny-skia` (default) or `wgpu
 use cosmix_term_core::{
     bus, config,
     font::FontSize,
+    native_lane::NativeLane,
     panes::{Geometry, SplitDir},
     session_fd,
     tabs::{self, CompletionNote, Removed, TabSet},
@@ -89,7 +92,11 @@ fn main() {
              TERM_NOTIFY=0: no desktop notification when a pane's shell exits\n\
              --version: print version and build hash, and nothing else\n\
              --print-config: print resolved startup settings and exit\n\
-             Bus: serves `{SERVICE}` / `{SERVICE}.*`; the Bevy frontend is `bterm`"
+             Bus: serves `{SERVICE}` / `{SERVICE}.*`; the Bevy frontend is `bterm`\n\
+             Native lane: target-bound list/session/tabs/panes/snapshot/type, execute,\n\
+             exec.result/cancel, task.submit/result/cancel, operation, props.get/set.\n\
+             Requires local noded >= 0.16.8 native ingress (COSMIX_RUN=/run/cosmix,\n\
+             socket directory 0755); unavailable ingress leaves graphics working."
         );
         return;
     }
@@ -144,12 +151,12 @@ fn run(settings: config::Settings) -> Result<(), String> {
         FontSize::new(settings.config.font_px),
         settings.config.cursor,
     )?;
-    let tabs = Arc::new(Mutex::new(TabSet::with_session(settings, None)?));
+    let tabs = Arc::new(Mutex::new(TabSet::starting(settings)));
     let (cleanup, reaper) = tabs::Cleanup::start().map_err(|e| format!("cleanup worker: {e}"))?;
 
     // One eventfd for the whole frontend: every PTY, resize, pane exit and
-    // Bus mutation coalesces onto it, and the UI thread learns of all of them
-    // in one poll.
+    // Bus mutation (including the native lane) coalesces onto it. The UI
+    // subscription learns of all of them in one poll, without doing RPC work.
     let waker = Arc::new(Waker {
         fd: WakeFd::new().map_err(|e| format!("wake descriptor: {e}"))?,
         pending: AtomicBool::new(false),
@@ -160,6 +167,8 @@ fn run(settings: config::Settings) -> Result<(), String> {
     WAKER
         .set(waker.clone())
         .map_err(|_| "wake descriptor installed twice".to_owned())?;
+    let native = NativeLane::start_background(tabs.clone(), settings, cleanup.clone())
+        .map_err(|e| format!("native startup worker: {e}"))?;
 
     // Completion notifications, exactly as bterm: a pane whose shell exits on
     // its own is reaped on the UI thread and handed to the Bus thread, which
@@ -232,14 +241,20 @@ fn run(settings: config::Settings) -> Result<(), String> {
     .run();
 
     // Same teardown ordering as bterm: shut the tabs (which releases the Bus
-    // loop through `emptied`), let the Bus thread finish its bounded replies,
-    // and only then drop the last Cleanup — the reaper's loop ends only when
-    // EVERY sender is gone, and the Bus thread owns one.
+    // loop through `emptied`), finish bounded Bus replies, then reap each
+    // pane while the native actor is still serving its revoke acknowledgements.
     let removed = tabs.lock().expect("tabs").shutdown();
     cleanup.submit(removed);
     let _ = bus.join();
+    let native = native
+        .join()
+        .map_err(|_| "native startup worker panicked")?;
+    native.release_cleanup();
     drop(cleanup);
     let _ = reaper.join();
+    let startup = native.startup_result();
+    drop(native);
+    startup?;
     result.map_err(|error| error.to_string())
 }
 
@@ -537,6 +552,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             iced::window::Event::Resized(size) => state.resize(size),
             iced::window::Event::Rescaled(scale) => state.rescale(scale),
+            iced::window::Event::Focused => state.tabs.lock().expect("tabs").user_activity(),
             // A release that happens while another window has the keyboard
             // is never delivered; a latched Ctrl would turn every later wheel
             // into a zoom.
@@ -972,6 +988,9 @@ impl State {
         let shape = {
             let tabs = self.tabs.lock().expect("tabs");
             if tabs.is_empty() {
+                if tabs.is_starting() {
+                    return Task::none();
+                }
                 return iced::exit();
             }
             Shape::of(&tabs)

@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -12,8 +12,7 @@ path = "src/main.rs"
 
 # The global Bus name `term` and the `term.*` verb namespace belong to this
 # frontend (TODO-term D1, 2026-09-21); the Bevy one is `bterm` / `bterm.*`.
-# Neither is registered yet — T2 is the render loop and the weight budget, and
-# the verb surface is T6.
+# Both frontends also serve the shared target-bound native-session lane.
 [package.metadata.cosmix]
 kind = "app"
 component = "term"
@@ -96,4 +95,8 @@ iced_tiny_skia = { version = "=0.14.1", optional = true, default-features = fals
 tiny-skia = { version = "0.11", optional = true, default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+term-native-test-broker = { path = "../../crates/cosmix-term-core/tests/support" }
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus" }
 cosmix-term-core = { path = "../../crates/cosmix-term-core", features = ["test-support"] }
