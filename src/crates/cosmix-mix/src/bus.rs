@@ -1145,6 +1145,8 @@ impl BusHandler for MixBusHandler {
 /// split its identity and is the legibility regression the substrate
 /// criteria forbid.
 pub struct MixServeHandler {
+    connection_state: tokio::sync::Mutex<tokio::sync::watch::Receiver<cosmix_lib_client::ConnState>>,
+    delivered_connection: Cell<u64>,
     supervised: std::sync::Arc<cosmix_lib_client::SupervisedClient>,
     /// The supervisor's outward incoming receiver, taken **once** at
     /// construction (it survives reconnects underneath). `None` here
@@ -1179,6 +1181,8 @@ impl MixServeHandler {
         let service_name = supervised.service_name().to_string();
         let incoming = supervised.incoming();
         MixServeHandler {
+            connection_state: tokio::sync::Mutex::new(supervised.subscribe_state()),
+            delivered_connection: Cell::new(0),
             supervised,
             incoming: RefCell::new(incoming),
             incoming_closed: RefCell::new(false),
@@ -1186,6 +1190,71 @@ impl MixServeHandler {
             incoming_generation: Cell::new(0),
             service_name,
         }
+    }
+
+    async fn next_connected(&self) -> IncomingEvent {
+        let generation = next_connected_generation(
+            &self.connection_state, &self.delivered_connection,
+            || self.supervised.connection_generation(),
+        ).await;
+        IncomingEvent {
+            command: "bus.connected".into(),
+            headers: BTreeMap::new(),
+            body: serde_json::json!({"generation": generation}).to_string(),
+        }
+    }
+}
+
+async fn next_connected_generation(
+    state: &tokio::sync::Mutex<tokio::sync::watch::Receiver<cosmix_lib_client::ConnState>>,
+    delivered: &Cell<u64>,
+    current: impl Fn() -> u64,
+) -> u64 {
+    let mut state = state.lock().await;
+    loop {
+        let (connected, generation) = {
+            // Hold the watch read guard through the counter sample: a concurrent
+            // disconnect cannot let an old Connected sample label a newer,
+            // not-yet-published connection generation.
+            let sampled = state.borrow_and_update();
+            (*sampled == cosmix_lib_client::ConnState::Connected, current())
+        };
+        if connected && generation > delivered.get() {
+            delivered.set(generation);
+            return generation;
+        }
+        if state.changed().await.is_err() { std::future::pending::<()>().await; }
+    }
+}
+
+#[cfg(test)]
+mod connection_events_tests {
+    use super::*;
+    use std::{future::Future, pin::pin, task::{Context, Poll, Wake, Waker}};
+    struct Noop;
+    impl Wake for Noop { fn wake(self: std::sync::Arc<Self>) {} }
+
+    #[tokio::test]
+    async fn connected_generation_initial_reconnect_gap_and_cancel() {
+        use cosmix_lib_client::ConnState;
+        let (tx, rx) = tokio::sync::watch::channel(ConnState::Connected);
+        let state = tokio::sync::Mutex::new(rx);
+        let delivered = Cell::new(0);
+        let generation = Cell::new(1);
+        assert_eq!(next_connected_generation(&state, &delivered, || generation.get()).await, 1);
+        let waker = Waker::from(std::sync::Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut next = pin!(next_connected_generation(&state, &delivered, || generation.get()));
+            assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));
+            // Dropping this select loser must release the receiver lock.
+        }
+        tx.send(ConnState::Disconnected).unwrap();
+        generation.set(3); // two reconnects coalesced before the consumer runs
+        tx.send(ConnState::Connected).unwrap();
+        assert_eq!(next_connected_generation(&state, &delivered, || generation.get()).await, 3);
+        let mut next = pin!(next_connected_generation(&state, &delivered, || generation.get()));
+        assert!(next.as_mut().poll(&mut cx).is_pending(), "no duplicate or clock wake");
     }
 }
 
@@ -1329,7 +1398,10 @@ impl BusHandler for MixServeHandler {
                 Some(g) => g,
                 None => return None,
             };
-            let result = guard.as_mut().recv().await;
+            let result = tokio::select! {
+                command = guard.as_mut().recv() => command,
+                event = self.next_connected() => return Some(event),
+            };
             drop(guard);
 
             match result {

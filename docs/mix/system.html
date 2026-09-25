@@ -1161,7 +1161,7 @@ that dies on its first line looks exactly like one that worked. A non-string
 raises <code>TYPE_MISMATCH</code> at argument validation, before any stdio file is opened
 (so a NUL in <code>stderr_path</code> can no longer truncate the <code>stdout_path</code> file on the
 way to failing).</p>
-<p><strong>Argv form — <code>spawn(argv[, {detach, die_with_parent, cwd, env, clear_env, stdout, stderr}])</code></strong>
+<p><strong>Argv form — <code>spawn(argv[, {detach, die_with_parent, exit_event, tag, cwd, env, clear_env, stdout, stderr}])</code></strong>
 (v0.89.0), a <strong>list</strong> of strings run <strong>directly, with no shell</strong> — so no
 word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force <code>run("setsid app &amp;")</code> through <code>sh</code>.</p>
@@ -1194,7 +1194,7 @@ Bus verb the child itself answers, rather than trusting a bare pid. Default <cod
 in the caller's session, which stays the caller's to reap).</p>
 </li>
 <li>
-<p><code>die_with_parent: true</code> (Linux) → the opposite slot. The child <strong>ends with
+<p><code>die_with_parent: true</code> (Linux), without <code>exit_event</code>, → the opposite slot. The child <strong>ends with
 this mix process</strong>, for a helper that must not outlive the script or
 <code>--serve</code> citizen that started it:</p>
 <pre><code class="language-mix">$pid = spawn(["goose", "serve", "--port", "7070"], {die_with_parent: true})
@@ -1245,7 +1245,7 @@ changes nothing, if another thread enabled first; only the first thread is
 ever the host. The embedder must also call <code>sweep()</code> on that
 same thread before it exits. Off Linux the option raises
 <code>OPTION_INVALID</code>. Default <code>false</code>: a plain spawn child is untouched by mix's
-exit.</p>
+exit. With <code>exit_event:true</code>, use the generation lifetime below instead.</p>
 </li>
 <li>
 <p><code>cwd</code> / <code>env</code> / <code>clear_env</code> behave exactly as in <a href="/mix/system#run_argv"><code>run_argv</code></a>
@@ -1274,6 +1274,32 @@ elements, are <code>TYPE_MISMATCH</code>; the argv form's option values — <cod
 and a file route's <code>{file: …}</code> path — are <code>OPTION_INVALID</code>. <code>std</code> would reject a
 NUL at spawn anyway, but catching it early keeps a late failure from truncating
 a good log on the way down.</p>
+<h3 id="managed-child-exit-events">Managed child exit events</h3>
+<p><code>spawn(argv, {exit_event:true, tag:"scene:12"}) -&gt; pid</code> starts a managed Linux
+child. <code>tag</code> is an optional string of at most 4096 bytes (default <code>""</code>), copied
+unchanged into <code>on proc.exited</code>'s <code>$event.args</code>:
+<code>{pid,tag,exit_code,signal}</code>. Normal exit supplies an exit code and nil signal;
+signal death supplies nil exit code and the signal number. An unexpected reap
+failure has both nil and additional <code>{error_code:"PROC_REAP",message}</code> fields.
+Use tags to reject exits from stale application generations.</p>
+<p>Mix owns the child and is its sole reaper. A pidfd and a cancellation descriptor
+wake the monitor; it does not poll process state. Up to 128 managed children and
+undelivered exits can be admitted per evaluator. <code>detach:true</code> is incompatible;
+<code>die_with_parent:true</code> additionally applies the existing Linux parent-death
+protection. The <a href="/mix/serve#native-events-and-generation-lifetime">generation lifetime</a>
+governs reload, shutdown and descendant cleanup. Managed retirement does not
+deliver a terminal event to another evaluator generation.</p>
+<p><code>kill($pid, signal)</code> and <code>process_alive($pid)</code> use the registered pidfd while the
+child is retained, without competing for its exit status. After the exit has
+been delivered and the slot reclaimed, the numeric PID is no longer an owned
+identity: discard it. Negative PID/group operations keep their existing raw
+meaning. Do not reap managed children from an embedding application's SIGCHLD
+handler or another thread. <code>PROC_LIMIT</code>, <code>PROC_UNSUPPORTED</code> (including kernels
+without pidfd support), and <code>PROC_MONITOR</code> are catchable setup refusals; invalid
+options use <code>OPTION_INVALID</code>. A failed monitor setup kills and reaps the child.
+Teardown waits for the kernel to complete reaping; an uninterruptible kernel I/O
+wait can delay it despite SIGKILL.</p>
+<h3 id="signalling-and-liveness">Signalling and liveness</h3>
 <p><code>kill(pid[, signal])</code> sends <code>signal</code> (default <code>15</code> = SIGTERM) and returns a bool
 (<code>true</code> if the syscall succeeded). <strong>Both arguments are whole numbers and
 neither is coerced</strong> (strict since v0.52.0) — the same rule as <code>spawn</code>, and for

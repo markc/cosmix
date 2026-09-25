@@ -240,6 +240,9 @@ builtin_table! {
     ("delete", CapabilityClass::Pure,          "map",     "Return map with key removed", contract!((map: map, k: string) -> map)),
 
     ("read_file", CapabilityClass::FsRead,       "io",      "Read entire file contents as string", contract!((path: string) -> string; failure[raises])),
+    ("fs_watch", CapabilityClass::FsRead, "io", "Register Linux inotify watch; returns evaluator-owned opaque handle. Delivers fs.changed via $event.args; bounded, overflow requires rescan; no polling fallback", contract!((path: string, opts?: map("fs_watch_options", {recursive: bool, events: list(string)})) -> string; failure[raises])),
+    ("fs_unwatch", CapabilityClass::FsRead, "io", "Cancel watch and pending changes; wake fs_wait with FS_WATCH_CANCELLED", contract!((handle: string) -> nil; failure[raises])),
+    ("fs_wait", CapabilityClass::FsRead, "io", "Suspend until a filesystem batch; cancellation-safe; refused in serve and expression modes", contract!((handle: string) -> map("fs_watch_batch", {watch: string, changes: list(map), overflow: bool}); effects[blocking]; failure[raises])),
     ("read_file_bytes", CapabilityClass::FsRead, "io",      "Read file contents as raw bytes. Optional 2nd arg caps the read: read_file_bytes(path, 8192) reads at most 8192 bytes (header-sniffing without slurping a huge file) (v0.3.1; cap v0.17.1)", contract!((path: string, max?: number) -> bytes; failure[raises])),
     ("read_lines", CapabilityClass::FsRead,      "io",      "Read file as a list of lines (trailing newline stripped, empty last line dropped) (v0.2.3)", contract!((path: string) -> list(string); failure[raises])),
     ("load_data", CapabilityClass::FsRead,       "io",      "Read + parse a strict-data .mix file (bare-key `k: v`, the zones.mix/conf.mix form) into a Value — the non-executing twin of source/include, for substrate-internal data that must NOT run as code (v0.9.0)", contract!((path: string) -> any; failure[raises])),
@@ -311,7 +314,7 @@ builtin_table! {
     ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
     ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Every stage carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error and broken_pipe (killed by SIGPIPE: its reader closed); the result carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error, failed_stage (the RIGHTMOST non-ok stage, pipefail's rule; nil when none) and a one-line human summary — gates branch on status, never on text. Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool, status: string, broken_pipe: bool})), status: string, failed_stage: any, summary: string}); effects[must_use, blocking]; failure[returns_result])),
     ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
-    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, die_with_parent, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal AND double-forks it so it is reparented to init (the caller never holds a zombie — v0.92.0), so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); die_with_parent:true (Linux) is the opposite slot — the child leads its own process group, is SIGKILLed by the kernel if this process dies (PR_SET_PDEATHSIG), and on a graceful mix exit (script end, --serve QUIT/SIGTERM, restart) its whole group gets SIGTERM, 2 s grace, then SIGKILL, so a helper server never outlives its citizen (refused together with detach); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision (a NON-detached child is still the caller's to reap) — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
+    ("spawn", CapabilityClass::Process, "system", "Start a child and return its PID. String form uses a shell and optional stdout/stderr paths. Argv form runs directly with options: detach, die_with_parent, exit_event, tag, cwd, env, clear_env, stdout, stderr. exit_event:true (Linux pidfd) registers the sole reaper in this evaluator and emits proc.exited {pid,tag,exit_code,signal}; tag is a string up to 4096 bytes, default empty. Cannot detach a managed child. Managed children are killed and reaped when their evaluator retires, after handler drain; failed reload leaves old managed children intact. die_with_parent additionally arms kernel parent-death SIGKILL. Without exit_event, existing detached/owned/plain spawn semantics apply. Stdio defaults null, capture is refused; cwd/env/clear_env match run_argv. See system manual for lifetime rules", contract!((cmd: any_of(string, list(string)), stdout?: any_of(string, map("spawn_options", {detach: bool, die_with_parent: bool, exit_event: bool, tag: string, cwd: any_of(string, nil), env: map, clear_env: bool, stdout: any_of(string, map), stderr: any_of(string, map)})), stderr?: string) -> number; effects[shell]; failure[raises])),
     ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result])),
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
@@ -877,6 +880,9 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
 /// `serve_name`, which reads the evaluator's installed serve runtime, and
 /// `script_version`, which reads the evaluator's installed script record).
 pub const EVAL_SPECIAL_BUILTINS: &[&str] = &[
+    "fs_watch",
+    "fs_unwatch",
+    "fs_wait",
     "printf",
     "eprintf",
     "readline",
@@ -4010,6 +4016,10 @@ fn builtin_spawn(args: Vec<Value>) -> MixResult<Option<Value>> {
 ///   to merge. `"capture"` is refused: capturing means waiting, which is
 ///   run_argv's job.
 fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
+    spawn_argv_native(args, None)
+}
+
+pub(crate) fn spawn_argv_native(args: Vec<Value>, mut native: Option<&mut crate::native_events::NativeEvents>) -> MixResult<Option<Value>> {
     let caller = "spawn";
     if args.len() > 2 {
         return Err(MixError::RuntimeError {
@@ -4055,6 +4065,8 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
     // Options.
     let mut detach = false;
     let mut die_with_parent = false;
+    let mut exit_event = false;
+    let mut tag = String::new();
     let mut cwd: Option<String> = None;
     let mut env: Vec<(String, String)> = Vec::new();
     let mut clear_env = false;
@@ -4069,6 +4081,15 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         };
         for (key, val) in map.iter() {
             match key.as_str() {
+                "exit_event" => {
+                    let Value::Bool(v) = val else { return Err(opt_invalid(caller, "exit_event must be a bool")); };
+                    exit_event = *v;
+                }
+                "tag" => {
+                    let Value::String(v) = val else { return Err(opt_invalid(caller, "tag must be a string")); };
+                    if v.len() > 4096 { return Err(opt_invalid(caller, "tag exceeds 4096 bytes")); }
+                    tag = v.clone();
+                }
                 "detach" => {
                     detach = match val {
                         Value::Bool(b) => *b,
@@ -4193,13 +4214,23 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
                     return Err(opt_invalid(
                         caller,
                         format!(
-                            "unknown option '{}' (supported: detach, die_with_parent, cwd, env, clear_env, stdout, stderr)",
+                            "unknown option '{}' (supported: detach, die_with_parent, exit_event, tag, cwd, env, clear_env, stdout, stderr)",
                             sanitize_for_diag(other)
                         ),
                     ));
                 }
             }
         }
+    }
+
+    if exit_event {
+        if detach { return Err(opt_invalid(caller, "exit_event cannot be combined with detach")); }
+        if !cfg!(target_os = "linux") {
+            return Err(MixError::structured("PROC_UNSUPPORTED", "managed spawn requires Linux pidfd"));
+        }
+        native.as_deref_mut().ok_or_else(|| opt_invalid(caller, "exit_event requires an evaluator-owned native registry"))?.admit_child()?;
+    } else if !tag.is_empty() {
+        return Err(opt_invalid(caller, "tag requires exit_event:true"));
     }
 
     if detach && die_with_parent {
@@ -4240,6 +4271,15 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
     #[cfg(target_os = "linux")]
     if die_with_parent {
         arm_die_with_parent(&mut command);
+    }
+    #[cfg(target_os = "linux")]
+    if exit_event && !die_with_parent {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+            });
+        }
     }
     if let Some(dir) = &cwd {
         command.current_dir(dir);
@@ -4326,6 +4366,10 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         span: None,
         msg: format!("spawn failed: {e}"),
     })?;
+    if exit_event {
+        let pid = native.unwrap().own_child(child, tag)?;
+        return Ok(Some(Value::Number(pid as f64)));
+    }
     #[cfg(target_os = "linux")]
     if die_with_parent {
         owned_spawns::register(child.id() as libc::pid_t);
@@ -4727,7 +4771,7 @@ fn spawn_create_file(f: &RunArgvFile) -> MixResult<std::fs::File> {
 /// `kill($p, "SIGKILL")` into a silent SIGTERM, so the caller believed it had
 /// sent SIGKILL. Truncation is refused too — `kill($p, 9.5)` is a typo, not a
 /// request for signal 9.
-fn pid_int_arg(caller: &str, what: &str, v: &Value) -> MixResult<i32> {
+pub(crate) fn pid_int_arg(caller: &str, what: &str, v: &Value) -> MixResult<i32> {
     let n = match extract_number(v, InputPolicy::NumberOnly) {
         Some(n) => n,
         None => {

@@ -838,7 +838,7 @@ raises `TYPE_MISMATCH` at argument validation, before any stdio file is opened
 (so a NUL in `stderr_path` can no longer truncate the `stdout_path` file on the
 way to failing).
 
-**Argv form — `spawn(argv[, {detach, die_with_parent, cwd, env, clear_env, stdout, stderr}])`**
+**Argv form — `spawn(argv[, {detach, die_with_parent, exit_event, tag, cwd, env, clear_env, stdout, stderr}])`**
 (v0.89.0), a **list** of strings run **directly, with no shell** — so no
 word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force `run("setsid app &")` through `sh`.
@@ -870,7 +870,7 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   (field 22 of `/proc/<pid>/stat`, recorded when the pid was written), or ask a
   Bus verb the child itself answers, rather than trusting a bare pid. Default `false` (a plain child
   in the caller's session, which stays the caller's to reap).
-- `die_with_parent: true` (Linux) → the opposite slot. The child **ends with
+- `die_with_parent: true` (Linux), without `exit_event`, → the opposite slot. The child **ends with
   this mix process**, for a helper that must not outlive the script or
   `--serve` citizen that started it:
 
@@ -923,7 +923,7 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   ever the host. The embedder must also call `sweep()` on that
   same thread before it exits. Off Linux the option raises
   `OPTION_INVALID`. Default `false`: a plain spawn child is untouched by mix's
-  exit.
+  exit. With `exit_event:true`, use the generation lifetime below instead.
 - `cwd` / `env` / `clear_env` behave exactly as in [`run_argv`](#run_argv)
   (clear-then-layer: `{clear_env: true, env: {…}}` starts from empty).
 - `stdout` / `stderr` reuse `run_argv`'s routing, minus capture: `"null"`
@@ -947,6 +947,37 @@ elements, are `TYPE_MISMATCH`; the argv form's option values — `cwd`, `env`,
 and a file route's `{file: …}` path — are `OPTION_INVALID`. `std` would reject a
 NUL at spawn anyway, but catching it early keeps a late failure from truncating
 a good log on the way down.
+
+### Managed child exit events
+
+`spawn(argv, {exit_event:true, tag:"scene:12"}) -> pid` starts a managed Linux
+child. `tag` is an optional string of at most 4096 bytes (default `""`), copied
+unchanged into `on proc.exited`'s `$event.args`:
+`{pid,tag,exit_code,signal}`. Normal exit supplies an exit code and nil signal;
+signal death supplies nil exit code and the signal number. An unexpected reap
+failure has both nil and additional `{error_code:"PROC_REAP",message}` fields.
+Use tags to reject exits from stale application generations.
+
+Mix owns the child and is its sole reaper. A pidfd and a cancellation descriptor
+wake the monitor; it does not poll process state. Up to 128 managed children and
+undelivered exits can be admitted per evaluator. `detach:true` is incompatible;
+`die_with_parent:true` additionally applies the existing Linux parent-death
+protection. The [generation lifetime](serve.md#native-events-and-generation-lifetime)
+governs reload, shutdown and descendant cleanup. Managed retirement does not
+deliver a terminal event to another evaluator generation.
+
+`kill($pid, signal)` and `process_alive($pid)` use the registered pidfd while the
+child is retained, without competing for its exit status. After the exit has
+been delivered and the slot reclaimed, the numeric PID is no longer an owned
+identity: discard it. Negative PID/group operations keep their existing raw
+meaning. Do not reap managed children from an embedding application's SIGCHLD
+handler or another thread. `PROC_LIMIT`, `PROC_UNSUPPORTED` (including kernels
+without pidfd support), and `PROC_MONITOR` are catchable setup refusals; invalid
+options use `OPTION_INVALID`. A failed monitor setup kills and reaps the child.
+Teardown waits for the kernel to complete reaping; an uninterruptible kernel I/O
+wait can delay it despite SIGKILL.
+
+### Signalling and liveness
 
 `kill(pid[, signal])` sends `signal` (default `15` = SIGTERM) and returns a bool
 (`true` if the syscall succeeded). **Both arguments are whole numbers and

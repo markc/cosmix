@@ -464,6 +464,24 @@ print("" .. $result)
 result={extensions: {core: 1.0, topic: 1.0}, pong: true}
 </code></pre>
 <hr />
+<h2 id="connection-events">Connection events</h2>
+<p>In <code>--serve</code>, <code>on bus.connected</code> receives <code>{generation}</code> in <code>$event.args</code> after
+the initial connection and after reconnection. The generation comes from the
+supervised client's successful-connection counter; it is not a wall-clock time
+or the script's reload generation. Use the event to refresh snapshots and
+reconcile after a broker restart, without a recovery timer.</p>
+<p>The adapter waits on <code>subscribe_state()</code>. It emits at most once per observed
+connected generation. State changes can coalesce while a handler is busy:
+generations can skip, so treat the notice as a request to resynchronise rather
+than an audit log of every connection. The state observer is shared with the
+supervised connection across script reloads; a reload alone does not emit a new
+connection event. A dropped receive future preserves state readiness. The lazy
+non-serve Bus connection contract is unchanged.</p>
+<p>Local native events (<code>fs.changed</code>, <code>proc.exited</code>, <code>bus.connected</code>) share the same
+handler dispatch and <code>$event.args</code> conversion as incoming Bus events. Structured
+event bodies are parsed even in a library build without the optional JSON
+<em>builtin</em> feature. This introduces no new transport or local-only command gate;
+the citizen's public verbs retain their existing local/mesh routing.</p>
 <h2 id="the-model-in-one-paragraph">The model in one paragraph</h2>
 <p>A <strong>broker</strong> (<code>cosmix-noded</code>) runs on the node. Services register a <strong>name</strong>
 (<code>noded</code>, <code>statecache</code>, <code>webd</code>, …). You <strong><code>send</code></strong> a service a <strong>command</strong> (a
