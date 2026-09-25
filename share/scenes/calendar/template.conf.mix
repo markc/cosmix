@@ -1,0 +1,4 @@
+schema: 1
+name: "calendar"
+title: "Calendar"
+behaviour: "behaviour.mix"

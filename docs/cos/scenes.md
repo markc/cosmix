@@ -97,10 +97,33 @@ undo state. Plain fields use CTK's single-line editing transactions. Active
 edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.
 
-List rows use CTK VirtualList. Row templates are instantiated with
-`template-node@row-id` identities and substitute `{cells[i]}` only in
-`text.text` and `image.src` inside list templates.
+List rows use CTK VirtualList by default. `flow: "horizontal"` uses natural-width
+rows with `gap` and `align` (`start`, `center`, `end`, `stretch`), without a
+vertical viewport. `row_height` remains required for schema compatibility;
+horizontal flow ignores it and `max_rows`. Rows require unique non-empty IDs.
+Row templates evaluate core bindings against live `$model` and `$item`, then
+substitute legacy `{cells[i]}` only in unbound `text.text` and `image.src`.
+Binding results are literal values and are never substituted again.
+Instance identities include the template, owning list and item ID. Retained
+items keep their template entities across rebinds/reordering. Scene lists opt
+into `VirtualListModel::retain_content`; CTK's default still clears recycled
+content, and changing an item's ID always creates fresh content.
+Each template evaluation pass shares a 250 ms / 16,384-node budget across all
+lists. Ingress preflights templates before committing a revision or mount;
+failure returns `{error_code:"scene_template",message,scene,diagnostics}`.
+Model-only patch paths must call the same `render::validate_templates` on the
+candidate resolved tree. Rendering also enforces the budget: a render-time
+deadline failure logs its diagnostic and retains the previously rendered tree,
+retrying only on a new revision. That late deadline failure is not a loader
+status event; a first render has no prior tree.
+Nested-list rendering remains outside this renderer's supported template path.
+Clicks on repeated rows use the owning list's handler and node ID, with the
+complete row in `item`; descendant row handlers cannot redirect that click.
 Outside templates, cell markers in other ports are literal data.
+All non-window families expose `hidden`. Hidden containers and horizontal
+row wrappers use `Display::None`, so their padding and gap allocation disappear.
+A hidden template inside a vertical VirtualList hides its content; the fixed
+row slot remains. Filter the model's `rows` to remove a vertical slot entirely.
 Text elision uses CTK's middle-elision policy.
 `column.align` sets cross-axis alignment to `start`, `center`,
 `end` or `stretch` (default).
@@ -226,6 +249,18 @@ taskbars, tray variants, launcher lists, calendar months and notifications;
 record the font/scale inputs alongside any numeric geometry goldens. The
 current freeze does not claim to cover those dynamic states or Quoin's edge
 chrome/mount geometry.
+
+Stage A now adds exact, sanitised launcher/calendar/notes builder captures in
+`src/desktop/scripts/tests/fixtures/scenes/`. The Mix extraction gate compares
+the legacy builder bodies and returned document bytes, and records the models
+separately. Renderer tests compare fully instantiated visible trees, including
+the hidden notes alternative, against those documents. Cases cover empty and
+filtered launchers, the 500-row cap, empty/full notifications, leap day, a
+non-leap century and year rollover. Scheduled Taffy tests cover horizontal
+natural widths, gap/alignment, and real VirtualList rebind/reorder identity;
+the Bus bridge test checks the outgoing citizen, command and item body.
+These are cluster gates, not a claim of live GPU screenshot acceptance. Panel,
+tray, settings and live migration remain later stages.
 
 Absolute image `src` paths load PNG and SVG directly, rasterised or resized
 at `UiScale` multiplied by the primary window's scale factor, or `UiScale`

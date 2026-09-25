@@ -1,0 +1,153 @@
+-- Exact legacy builder functions; fixed clock and sanitised services/icons.
+$p = require("../../../lib/panel.mix")
+$ME = "scene-fixture"
+$C = {
+  panel: "#202326f2", fg: "#fcfcfc", dim: "#a1a9b1", faint: "#6e7680",
+  hover: "#ffffff1a", press: "#ffffff29", accent: "#3daee9",
+  accent_bg: "#3daee940", task_bg: "#ffffff0f", card: "#2a2e32",
+  today_fg: "#ffffff", weekend: "#c9cfd6"
+}
+$MAX_LIST_ROWS = 500
+$MAX_NOTES = 50
+fn icon_path($name, $size)
+  return $name == "example-icon" ? "/usr/share/icons/example.svg" : ""
+end
+fn capture($name, $input, $at, $paths)
+  if $name == "launcher" then return launcher_doc($input) end
+  if $name == "calendar" then return calendar_doc($input, $at) end
+  return notes_doc($input)
+end
+fn launcher_doc($state)
+  $rows = []
+  for each $a in $state.apps
+    if length($rows) >= $MAX_LIST_ROWS then break end
+    $sub = $a.generic_name ?? ""
+    if $sub == "" then $sub = $a.comment ?? "" end
+    push($rows, {id: $a.id, cells: [$p.short_title($a.name ?? $a.id, 80), $p.short_title($sub, 120), icon_path($a.icon ?? "", 48)]})
+  end
+  $count = to_string(length($state.apps)) .. (length($state.apps) == 1 ? " application" : " applications")
+  $nodes = [
+    ["root", {widget: "column", gap: 10, padding: 16, fill: true, children: ["head", "search", "cats1", "cats2", "list"]}],
+    ["head", {widget: "row", gap: 8, align: "center", children: ["head_t", "head_fill", "head_n"]}],
+    ["head_t", {widget: "text", text: "Applications", size: 18, bold: true, color: $C.fg}],
+    ["head_fill", {widget: "spacer"}],
+    ["head_n", {widget: "text", text: $count, size: 11, color: $C.faint}],
+    ["search", {widget: "field", value: $state.query, placeholder: "Search…", width: 380, on_change: "filter", on_submit: "launch_first"}],
+    ["list", {widget: "list", row: "app_row", row_height: 46, gap: 2, fill: true, on_click: "launch", rows: $rows}],
+    ["app_row", {widget: "row", height: 46, radius: 8, padding: 8, gap: 12, align: "center", hover: $C.hover, children: ["app_icon", "app_col"]}],
+    ["app_icon", {widget: "image", src: "{cells[2]}", w: 32, h: 32}],
+    ["app_col", {widget: "column", gap: 1, fill: true, children: ["app_name", "app_sub"]}],
+    ["app_name", {widget: "text", text: "{cells[0]}", size: 14, color: $C.fg, elide: true}],
+    ["app_sub", {widget: "text", text: "{cells[1]}", size: 11, color: $C.dim, elide: true}]
+  ]
+  -- Kickoff-style category chips (freedesktop main categories), two rows
+  $rows_of = [["", "Network", "Office", "Development", "Graphics"], ["AudioVideo", "Game", "System", "Utility", "Settings"]]
+  $r = 0
+  for each $cats in $rows_of
+    $r = $r + 1
+    $ids = []
+    for each $cat in $cats
+      push($ids, "cat_" .. ($cat == "" ? "all" : lower($cat)))
+    end
+    push($nodes, ["cats" .. to_string($r), {widget: "row", gap: 6, align: "center", children: $ids}])
+    for each $cat in $cats
+      $id = "cat_" .. ($cat == "" ? "all" : lower($cat))
+      $on = $cat == $state.category
+      push($nodes, [$id, {widget: "row", height: 28, radius: 14, padding: 10, align: "center", justify: "center", hover: $C.hover, background: $on ? $C.accent : $C.task_bg, on_click: "cat", children: [$id .. "_t"]}])
+      push($nodes, [$id .. "_t", {widget: "text", text: $p.category_label($cat), size: 12, bold: $on, color: $on ? "#0b1f2b" : $C.fg}])
+    end
+  end
+  return $p.document({scene: "1", name: "launcher", citizen: $ME, window: {kind: "edge", edge: "left", title: "Applications", w: 440, chrome: false}}, $nodes)
+end
+
+fn calendar_doc($state, $fixed_time)
+  $now = $fixed_time
+  $today = $p.ymd($now)
+  $shown = $p.shift_month($today.year, $today.month, $state.cal_offset)
+  $grid = $p.month_grid($shown.year, $shown.month, $today)
+  $nodes = []
+  $week_ids = ["wk_h"]
+  for $w = 0 to 5
+    push($week_ids, "wk_" .. to_string($w))
+  end
+  $root_children = ["cal_day", "cal_full", "cal_gap", "cal_nav"]
+  $root_children = concat($root_children, $week_ids)
+  $root_children = concat($root_children, ["cal_fill", "cal_open"])
+  push($nodes, ["root", {widget: "column", gap: 6, padding: 18, fill: true, children: $root_children}])
+  push($nodes, ["cal_day", {widget: "text", text: date_format($now, "%A"), size: 24, bold: true, color: $C.fg}])
+  push($nodes, ["cal_full", {widget: "text", text: date_format($now, "%-d ") .. $p.month_title($today.year, $today.month) .. "  ·  " .. $p.clock_text($now), size: 13, color: $C.dim}])
+  push($nodes, ["cal_gap", {widget: "spacer", size: 10}])
+  push($nodes, ["cal_nav", {widget: "row", gap: 6, align: "center", children: ["cal_title", "cal_prev", "cal_today", "cal_next"]}])
+  -- Flat tool-buttons (hover rows), the way Plasma draws calendar nav.
+  push($nodes, ["cal_title", {widget: "text", text: $p.month_title($shown.year, $shown.month), size: 16, bold: true, color: $C.fg, fill: true}])
+  push($nodes, ["cal_prev", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, on_click: "cal_prev", children: ["cal_prev_t"]}])
+  push($nodes, ["cal_prev_t", {widget: "text", text: "‹", size: 16, bold: true, color: $C.fg}])
+  push($nodes, ["cal_today", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, background: $C.task_bg, on_click: "cal_today", children: ["cal_today_t"]}])
+  push($nodes, ["cal_today_t", {widget: "text", text: "Today", size: 12, color: $C.fg}])
+  push($nodes, ["cal_next", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, on_click: "cal_next", children: ["cal_next_t"]}])
+  push($nodes, ["cal_next_t", {widget: "text", text: "›", size: 16, bold: true, color: $C.fg}])
+  -- weekday header
+  $hdr = []
+  for $c = 0 to 6
+    push($hdr, "wh_" .. to_string($c))
+  end
+  push($nodes, ["wk_h", {widget: "row", gap: 4, children: $hdr}])
+  for $c = 0 to 6
+    push($nodes, ["wh_" .. to_string($c), {widget: "text", text: $p.WEEKDAYS_SHORT[$c], size: 11, bold: true, width: 38, align: "center", color: $C.faint}])
+  end
+  -- six weeks
+  for $w = 0 to 5
+    $cells = []
+    for $c = 0 to 6
+      push($cells, "d_" .. to_string($w) .. "_" .. to_string($c))
+    end
+    push($nodes, ["wk_" .. to_string($w), {widget: "row", gap: 4, children: $cells}])
+    for $c = 0 to 6
+      $cell = $grid[$w][$c]
+      $id = "d_" .. to_string($w) .. "_" .. to_string($c)
+      $box = {widget: "row", height: 38, radius: 19, padding: 0, align: "center", hover: $C.hover, children: [$id .. "_t"]}
+      if $cell.today then $box.background = $C.accent end
+      push($nodes, [$id, $box])
+      $fg = $cell.in_month ? ($cell.weekend ? $C.weekend : $C.fg) : $C.faint
+      if $cell.today then $fg = $C.today_fg end
+      push($nodes, [$id .. "_t", {widget: "text", text: to_string($cell.day), size: 13, bold: $cell.today, width: 38, align: "center", color: $fg}])
+    end
+  end
+  push($nodes, ["cal_fill", {widget: "spacer"}])
+  push($nodes, ["cal_open", {widget: "button", label: "Open calendar app", tone: "primary", on_click: "open_calendar"}])
+  return $p.document({scene: "1", name: "calendar", citizen: $ME, window: {kind: "edge", edge: "right", title: "Calendar", w: 360, chrome: false}}, $nodes)
+end
+
+fn notes_doc($state)
+  $rows = []
+  -- newest first, bounded: a flood of notifications cannot outgrow the
+  -- document limit (the popup shows one line of body anyway)
+  $newest = reverse($state.notes)
+  for each $n in $newest
+    if length($rows) >= $MAX_NOTES then break end
+    $app = $n.app ?? ""
+    if $app == "" then $app = "Notification" end
+    push($rows, {id: to_string($n.id), cells: [$p.short_title($app, 60), $p.short_title($n.summary ?? "", 120), $p.short_title($n.body ?? "", 240)]})
+  end
+  $children = ["nh"]
+  if length($rows) == 0 then push($children, "n_empty") else push($children, "n_list") end
+  $nodes = [
+    ["root", {widget: "column", gap: 10, padding: 16, fill: true, children: $children}],
+    ["nh", {widget: "row", gap: 8, align: "center", children: ["nh_t", "nh_fill", "nh_clear"]}],
+    ["nh_t", {widget: "text", text: "Notifications", size: 18, bold: true, color: $C.fg}],
+    ["nh_fill", {widget: "spacer"}],
+    ["nh_clear", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, background: $C.task_bg, on_click: "notes_clear", children: ["nh_clear_t"]}],
+    ["nh_clear_t", {widget: "text", text: "Clear all", size: 12, color: $C.fg}]
+  ]
+  if length($rows) == 0 then
+    push($nodes, ["n_empty", {widget: "text", text: "No new notifications", size: 13, color: $C.faint}])
+  else
+    push($nodes, ["n_list", {widget: "list", row: "n_row", row_height: 76, gap: 6, fill: true, on_click: "note_close", rows: $rows}])
+    push($nodes, ["n_row", {widget: "row", height: 76, radius: 10, padding: 12, gap: 10, align: "center", background: $C.card, hover: "#343a40", children: ["n_col"]}])
+    push($nodes, ["n_col", {widget: "column", gap: 2, fill: true, children: ["n_app", "n_sum", "n_body"]}])
+    push($nodes, ["n_app", {widget: "text", text: "{cells[0]}", size: 11, color: $C.faint, elide: true}])
+    push($nodes, ["n_sum", {widget: "text", text: "{cells[1]}", size: 14, bold: true, color: $C.fg, elide: true}])
+    push($nodes, ["n_body", {widget: "text", text: "{cells[2]}", size: 12, color: $C.dim, elide: true}])
+  end
+  return $p.document({scene: "1", name: "notes", citizen: $ME, window: {kind: "edge", edge: "right", title: "Notifications", w: 380, chrome: false}}, $nodes)
+end

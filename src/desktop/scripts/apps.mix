@@ -138,6 +138,7 @@ end
 
 on "apps.reload" desc "rescan the desktop-entry directories now"
   $apps = $a.scan_apps($a.application_dirs(), $a.locale_id(), "COSMIX")
+  publish(serve_name() .. ".changed", json_encode({reason: "reload", count: len($apps)}), {command: "apps.changed"})
   reply(0, json_encode({count: len($apps)}))
 end
 
@@ -170,6 +171,7 @@ on "apps.props.set" desc "set a citizen property (icon_theme, terminal; count is
     reply(10, json_encode({error: "invalid_request"}))
   elif $path == "apps.icon_theme" then
     $icon_theme = trim($value)
+    publish(serve_name() .. ".changed", json_encode({reason: "icon_theme", value: $icon_theme}), {command: "apps.changed"})
     reply(0, json_encode({path: $path, value: $icon_theme}))
   elif $path == "apps.terminal" then
     $terminal_cmd = trim($value)

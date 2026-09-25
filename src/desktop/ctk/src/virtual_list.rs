@@ -50,7 +50,8 @@ pub struct RowId(pub u64);
 
 /// Application-owned data boundary for a virtual list.
 ///
-/// `bind` receives a fresh `content` child after CTK has inserted the current
+/// `bind` receives a fresh `content` child (unless `retain_content` opts in to
+/// retaining it for the same row ID) after CTK has inserted the current
 /// [`VirtualListRow`] on its parent row shell. Implementations can follow the
 /// child's [`ChildOf`] relationship to read that metadata, but must add
 /// application components only to `content` or its descendants. The model may
@@ -65,6 +66,12 @@ pub trait VirtualListModel: Send + Sync + 'static {
         self.len() == 0
     }
     fn row_id(&self, index: usize) -> RowId;
+    /// Rebind retained content for a surviving row ID. Implementations opting
+    /// in must reconcile their descendants and replace stale item state.
+    /// Recycled shells assigned a different ID always receive fresh content.
+    fn retain_content(&self) -> bool {
+        false
+    }
     fn bind(&self, world: &mut World, content: Entity, index: usize);
 }
 
@@ -1175,22 +1182,32 @@ fn realise_window(
             world.entity_mut(state.content).add_child(row);
         }
         if changed_binding || explicitly_updated {
-            world.entity_mut(row).despawn_children();
-            let content_accessible = accesskit::Node::new(Role::GenericContainer);
-            let content = world
-                .spawn((
-                    Node {
-                        width: percent(100),
-                        height: percent(100),
-                        flex_direction: FlexDirection::Row,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    Pickable::IGNORE,
-                    AccessibilityNode::from(content_accessible),
-                ))
-                .id();
-            world.entity_mut(row).add_child(content);
+            let retained = (model.retain_content() && old.is_some_and(|old| old.row_id == row_id))
+                .then(|| {
+                    world
+                        .get::<Children>(row)
+                        .and_then(|children| children.iter().next())
+                })
+                .flatten();
+            let content = retained.unwrap_or_else(|| {
+                world.entity_mut(row).despawn_children();
+                let content_accessible = accesskit::Node::new(Role::GenericContainer);
+                let content = world
+                    .spawn((
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        Pickable::IGNORE,
+                        AccessibilityNode::from(content_accessible),
+                    ))
+                    .id();
+                world.entity_mut(row).add_child(content);
+                content
+            });
             bind_jobs.push(BindJob {
                 model: Arc::clone(&model),
                 content,

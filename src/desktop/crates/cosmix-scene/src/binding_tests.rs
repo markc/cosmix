@@ -1,6 +1,26 @@
 use super::*;
 use bindings::{compile, reevaluate, template_instantiate};
 
+#[test]
+fn horizontal_flow_and_hidden_are_described_and_type_checked() {
+    for family in ["row", "column", "text", "image", "list", "field", "button", "toggle", "spacer"] {
+        let ports = describe(family).unwrap();
+        assert_eq!(ports.iter().filter(|p| p.path == "hidden").count(), 1);
+        assert_eq!(ports.iter().find(|p| p.path == "hidden").unwrap().ty, "bool");
+    }
+    assert!(!describe("window").unwrap().iter().any(|p| p.path == "hidden"));
+    let ports = describe("list").unwrap();
+    assert_eq!(ports.iter().find(|p| p.path == "flow").unwrap().enum_values,
+        Some(vec!["vertical".into(), "horizontal".into()]));
+    let source = "root: {widget: \"list\", flow: \"horizontal\", align: \"center\", hidden: false, rows: [], row: \"t\", row_height: 20}\nt: {widget: \"row\", children: []}";
+    assert!(resolve(&doc(source)).is_ok());
+    assert!(lint(&doc(&source.replace("horizontal", "diagonal"))).iter().any(|d| d.code == "enum-value"));
+    assert!(lint(&doc(&source.replace("hidden: false", "hidden: 1"))).iter().any(|d| d.code == "port-type"));
+    for rows in ["[{id: \"\", cells: []}]", "[{id: \"x\", cells: []}, {id: \"x\", cells: []}]"] {
+        assert!(lint(&doc(&source.replace("rows: []", &format!("rows: {rows}")))).iter().any(|d| d.code == "row-type"));
+    }
+}
+
 fn doc(body: &str) -> SceneDocument {
     let fence = char::from(96).to_string().repeat(3);
     parse(&format!("---\nscene: 1\nname: test\ncitizen: c\n---\n{fence}mix\n{body}\n{fence}\n")).unwrap()

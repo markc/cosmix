@@ -1,0 +1,42 @@
+---
+scene: 1
+name: launcher
+citizen: scene-fixture
+window: {"chrome":false,"edge":"left","kind":"edge","title":"Applications","w":440}
+---
+```mix
+root: {"children":["head","search","cats1","cats2","list"],"fill":true,"gap":10,"padding":16,"widget":"column"}
+head: {"align":"center","children":["head_t","head_fill","head_n"],"gap":8,"widget":"row"}
+head_t: {"bold":true,"color":"#fcfcfc","size":18,"text":"Applications","widget":"text"}
+head_fill: {"widget":"spacer"}
+head_n: {"color":"#6e7680","size":11,"text":"2 applications","widget":"text"}
+search: {"on_change":"filter","on_submit":"launch_first","placeholder":"Search…","value":"edit","widget":"field","width":380}
+list: {"fill":true,"gap":2,"on_click":"launch","row":"app_row","row_height":46,"rows":[{"cells":["Example Editor","Text editor","/usr/share/icons/example.svg"],"id":"example-editor.desktop"},{"cells":["Fallback","No icon",""],"id":"fallback.desktop"}],"widget":"list"}
+app_row: {"align":"center","children":["app_icon","app_col"],"gap":12,"height":46,"hover":"#ffffff1a","padding":8,"radius":8,"widget":"row"}
+app_icon: {"h":32,"src":"{cells[2]}","w":32,"widget":"image"}
+app_col: {"children":["app_name","app_sub"],"fill":true,"gap":1,"widget":"column"}
+app_name: {"color":"#fcfcfc","elide":true,"size":14,"text":"{cells[0]}","widget":"text"}
+app_sub: {"color":"#a1a9b1","elide":true,"size":11,"text":"{cells[1]}","widget":"text"}
+cats1: {"align":"center","children":["cat_all","cat_network","cat_office","cat_development","cat_graphics"],"gap":6,"widget":"row"}
+cat_all: {"align":"center","background":"#ffffff0f","children":["cat_all_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_all_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"All","widget":"text"}
+cat_network: {"align":"center","background":"#ffffff0f","children":["cat_network_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_network_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"Internet","widget":"text"}
+cat_office: {"align":"center","background":"#ffffff0f","children":["cat_office_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_office_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"Office","widget":"text"}
+cat_development: {"align":"center","background":"#3daee9","children":["cat_development_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_development_t: {"bold":true,"color":"#0b1f2b","size":12,"text":"Development","widget":"text"}
+cat_graphics: {"align":"center","background":"#ffffff0f","children":["cat_graphics_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_graphics_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"Graphics","widget":"text"}
+cats2: {"align":"center","children":["cat_audiovideo","cat_game","cat_system","cat_utility","cat_settings"],"gap":6,"widget":"row"}
+cat_audiovideo: {"align":"center","background":"#ffffff0f","children":["cat_audiovideo_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_audiovideo_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"Media","widget":"text"}
+cat_game: {"align":"center","background":"#ffffff0f","children":["cat_game_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_game_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"Games","widget":"text"}
+cat_system: {"align":"center","background":"#ffffff0f","children":["cat_system_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_system_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"System","widget":"text"}
+cat_utility: {"align":"center","background":"#ffffff0f","children":["cat_utility_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_utility_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"Utilities","widget":"text"}
+cat_settings: {"align":"center","background":"#ffffff0f","children":["cat_settings_t"],"height":28,"hover":"#ffffff1a","justify":"center","on_click":"cat","padding":10,"radius":14,"widget":"row"}
+cat_settings_t: {"bold":false,"color":"#fcfcfc","size":12,"text":"Settings","widget":"text"}
+```

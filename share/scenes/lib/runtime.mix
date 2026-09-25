@@ -1,0 +1,80 @@
+-- Stateless Bus helpers shared by scene behaviours. No loading or popup state.
+fn context($default_name)
+  $name = env("SCENE_NAME", $default_name)
+  $generation = to_number(env("SCENE_GENERATION", ""))
+  $me = serve_name()
+  if $me == nil or $generation == nil or $generation < 1 or floor($generation) != $generation then
+    raise("SCENE_CONTEXT", "behaviour requires --serve and a positive SCENE_GENERATION")
+  end
+  return {name: $name, generation: $generation, citizen: $me,
+    loader: env("SCENES_SERVICE", "scenes"), host: env("SCENE_HOST", "shell")}
+end
+
+fn failure($code, $message)
+  return {ok: false, rc: 10, value: {error_code: $code, message: $message}}
+end
+
+fn call($target, $verb, $args)
+  send $target $verb body=json_encode($args) timeout=5
+  $code = $rc
+  $body = $result
+  if type($body) == "string" and $body != "" then
+    try
+      $body = json_parse($body)
+    catch $e
+      -- Preserve non-JSON upstream diagnostics verbatim.
+    end
+  end
+  if $code != 0 then
+    return {ok: false, rc: $code < 0 ? 20 : 21, value: {
+      error_code: $code < 0 ? "upstream_transport" : "upstream_refused",
+      message: "Scene request failed: " .. $target .. " " .. $verb,
+      context: {target: $target, verb: $verb, rc: $code, reply: $body}
+    }}
+  end
+  return {ok: true, rc: 0, value: $body}
+end
+
+fn respond($outcome)
+  reply($outcome.rc, json_encode($outcome.value))
+end
+
+fn ready($ctx)
+  $check = call($ctx.host, "shell.scene.describe", {family: "list"})
+  if not $check.ok then return $check end
+  if not template_capable($check.value) then
+    return failure("scene_capability", "Host requires list.flow horizontal and list.hidden support")
+  end
+  return call($ctx.loader, "scenes.ready", {name: $ctx.name, generation: $ctx.generation})
+end
+
+fn template_capable($ports)
+  if type($ports) != "list" then return false end
+  $flow = false
+  $hidden = false
+  for each $port in $ports
+    if $port.path == "flow" and type($port.enum) == "list" then
+      $flow = contains($port.enum, "horizontal")
+    end
+    if $port.path == "hidden" and $port.type == "bool" then $hidden = true end
+  end
+  return $flow and $hidden
+end
+
+fn publish_model($ctx, $model)
+  return call($ctx.loader, "scenes.model", {name: $ctx.name, generation: $ctx.generation, value: $model})
+end
+
+fn popup($ctx, $verb)
+  return call($ctx.loader, "scenes." .. $verb, {name: $ctx.name})
+end
+
+fn event_args($event)
+  return type($event.args) == "map" ? $event.args : {}
+end
+
+fn item_id($event)
+  $args = event_args($event)
+  if type($args.item) != "map" or type($args.item.id) != "string" then return nil end
+  return $args.item.id
+end

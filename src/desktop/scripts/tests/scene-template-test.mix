@@ -1,0 +1,108 @@
+-- Deterministic extraction gate. --record refreshes the public captures.
+-- Run with TZ=UTC so captured date strings do not depend on the workstation.
+$root = dirname(dirname(dirname(dirname(dirname(realpath($0))))))
+$fixtures = dirname(realpath($0)) .. "/fixtures/scenes"
+$old = require("fixtures/scenes/old-builders.mix")
+$models = require($root .. "/share/scenes/lib/models.mix")
+$runtime = require($root .. "/share/scenes/lib/runtime.mix")
+$record = contains(args(), "--record")
+fn check($ok, $message)
+  if not $ok then raise("SCENE_TEMPLATE_TEST", $message) end
+end
+check(date_format(0, "%z") == "+0000", "run this gate with TZ=UTC")
+for each $name in ["launcher", "calendar", "notes"]
+  $directory = $root .. "/share/scenes/" .. $name
+  $metadata = data_parse(read_file($directory .. "/template.conf.mix"))
+  check($metadata.name == $name and $metadata.behaviour == "behaviour.mix", "strict metadata: " .. $name)
+  $source = read_file($directory .. "/scene.mix")
+  $nodes = data_parse(before(after($source, "```mix\n"), "\n```"))
+  check($nodes.root.widget == "column", "strict static document: " .. $name)
+  if $name == "calendar" then
+    $cells = 0
+    for each $id in keys($nodes)
+      if re_match($id, "^d_[0-5]_[0-6]$") then $cells = $cells + 1 end
+    end
+    check($cells == 42, "six-by-seven grid is authored directly")
+  end
+end
+
+-- The captured builder bodies must still be the actual unchanged builders.
+$original = read_file($root .. "/src/desktop/scripts/quoin-panel.mix")
+$copied = read_file($fixtures .. "/old-builders.mix")
+for each $name in ["launcher", "calendar", "notes"]
+  $body = before(after($original, "fn " .. $name .. "_doc()\n"), "\n-- ──")
+  $signature = $name == "calendar" ? "($state, $fixed_time)" : "($state)"
+  $copy = after($copied, "fn " .. $name .. "_doc" .. $signature .. "\n")
+  $copy = before($copy, "\nfn ") ?? $copy
+  $body = replace($body, "$now = time()", "$now = $fixed_time")
+  check(trim($body) == trim($copy), "legacy builder body drift: " .. $name)
+end
+
+$base = {apps: [], query: "", category: "", notes: [], cal_offset: 0}
+$fixed = date_parse("2024-02-29T12:05:07Z")
+$icons = {"example-icon": "/usr/share/icons/example.svg"}
+$cases = [
+  {id: "launcher-empty", name: "launcher", input: $base, at: $fixed},
+  {id: "notes-empty", name: "notes", input: $base, at: $fixed},
+  {id: "calendar-leap", name: "calendar", input: $base, at: $fixed}
+]
+$filtered = $base
+$filtered.query = "edit"
+$filtered.category = "Development"
+$filtered.apps = [
+  {id: "example-editor.desktop", name: "Example Editor", generic_name: "Text editor", icon: "example-icon"},
+  {id: "fallback.desktop", name: "Fallback", comment: "No icon", icon: "missing"}
+]
+push($cases, {id: "launcher-filtered", name: "launcher", input: $filtered, at: $fixed})
+$many = $base
+$apps = []
+for $i = 0 to 504
+  push($apps, {id: "app-" .. to_string($i), name: "Application " .. to_string($i), icon: ""})
+end
+$many.apps = $apps
+push($cases, {id: "launcher-cap", name: "launcher", input: $many, at: $fixed})
+$many = $base
+$notes = []
+for $i = 1 to 55
+  push($notes, {id: to_string($i), app: $i == 55 ? "" : "Example", summary: "Notice " .. to_string($i), body: "Public fixture", created_at: to_string($i)})
+end
+$many.notes = $notes
+push($cases, {id: "notes-full", name: "notes", input: $many, at: $fixed})
+$year = $base
+$year.cal_offset = 1
+push($cases, {id: "calendar-year", name: "calendar", input: $year, at: date_parse("2026-12-31T23:59:00Z")})
+$century = $base
+push($cases, {id: "calendar-century", name: "calendar", input: $century, at: date_parse("2100-02-28T00:00:00Z")})
+
+$manifest = []
+for each $case in $cases
+  $input = $case.input
+  $doc = $old.capture($case.name, $input, $case.at, $icons)
+  if $case.name == "launcher" then
+    $model = $models.launcher($input.apps, $input.query, $input.category, $icons)
+  elif $case.name == "calendar" then
+    $model = $models.calendar($case.at, $input.cal_offset)
+  else
+    $model = $models.notes($input.notes)
+  end
+  if $record then
+    write_file($fixtures .. "/" .. $case.id .. ".scene.mix", $doc)
+    write_file($fixtures .. "/" .. $case.id .. ".model.json", json_encode($model) .. "\n")
+  else
+    check(read_file($fixtures .. "/" .. $case.id .. ".scene.mix") == $doc, "exact old document: " .. $case.id)
+    check(deep_eq(json_parse(read_file($fixtures .. "/" .. $case.id .. ".model.json")), $model), "model capture: " .. $case.id)
+  end
+  push($manifest, {id: $case.id, name: $case.name})
+end
+if $record then write_file($fixtures .. "/cases.json", json_encode($manifest) .. "\n") end
+check(length($models.launcher($apps, "", "", {}).rows) == 500, "launcher cap")
+$note_model = $models.notes($notes)
+check(length($note_model.rows) == 50 and $note_model.rows[0].id == "55" and $note_model.rows[49].id == "6", "newest-first 50-row cap")
+check($note_model.rows[0].cells[0] == "Notification", "empty application fallback")
+check($models.notes([]).empty, "notification empty state")
+check($runtime.item_id({args: {item: {id: "app@with:punctuation"}}}) == "app@with:punctuation", "item payload is not parsed from a generated node")
+check($runtime.item_id({item: {id: "wrong"}, args: {node: "fake@id"}}) == nil, "only event.args.item is accepted")
+check(not $runtime.template_capable([]), "older host refused")
+check($runtime.template_capable([{path: "flow", enum: ["vertical", "horizontal"]}, {path: "hidden", type: "bool"}]), "capability check uses schema")
+check($runtime.failure("example", "Example").value.error_code == "example", "unified refusal")
+print("scene-template-test: exact captures, models, caps, payloads and capabilities OK")

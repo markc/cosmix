@@ -1,0 +1,85 @@
+-- version: 0.1.0
+$LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
+$r = require($LIB .. "/runtime.mix")
+$m = require($LIB .. "/models.mix")
+$p = require($LIB .. "/data.mix")
+$ctx = $r.context("calendar")
+$APPS = env("APPS_SERVICE", "apps")
+$state = {offset: 0, clock_armed: false, ready: false, model: $m.calendar(time(), 0)}
+
+fn refresh()
+  if not $state.ready then return $r.failure("scene_not_ready", "Waiting for loader readiness") end
+  $state.model = $m.calendar(time(), $state.offset)
+  return $r.publish_model($ctx, $state.model)
+end
+
+-- One deadline for displayed wall-clock text. No state/recovery polling.
+on clock.deadline async
+  if $state.clock_armed then reply(0, "{}"); return end
+  $state.clock_armed = true
+  reply(0, "{}")
+  $now = time()
+  $deadline = $now + $p.seconds_to_next_minute($now)
+  sleep(max(0, $deadline - time()))
+  refresh()
+  $state.clock_armed = false
+  emit $ctx.citizen clock.deadline
+end
+on cal_prev
+  $state.offset = $state.offset - 1
+  $r.respond(refresh())
+end
+on cal_next
+  $state.offset = $state.offset + 1
+  $r.respond(refresh())
+end
+on cal_today
+  $state.offset = 0
+  $r.respond(refresh())
+end
+on calendar.open
+  $r.respond($r.popup($ctx, "open"))
+end
+on calendar.close
+  $r.respond($r.popup($ctx, "close"))
+end
+on calendar
+  $r.respond($r.popup($ctx, "toggle"))
+end
+on calendar.state
+  reply(0, json_encode({year: $state.model.year, month: $state.model.month}))
+end
+on open_calendar async
+  $out = $r.call($APPS, "apps.list", {category: "Calendar"})
+  if not $out.ok then $r.respond($out); return end
+  if type($out.value) != "list" then $r.respond($r.failure("apps_invalid_reply", "apps.list must return a list")); return end
+  if length($out.value) > 0 then
+    $out = $r.call($APPS, "apps.launch", {id: $out.value[0].id})
+    if not $out.ok then $r.respond($out); return end
+  elif which("thunderbird") != nil then
+    spawn(["thunderbird", "-calendar"], {detach: true})
+  else
+    $r.respond($r.failure("calendar_unavailable", "No calendar application is installed")); return
+  end
+  $r.respond($r.popup($ctx, "close"))
+end
+on bus.connected
+  $state.ready = false
+  $ready = $r.ready($ctx)
+  $state.ready = $ready.ok
+  if $state.ready then refresh() end
+end
+on props.changed
+  $a = $r.event_args($event)
+  if not $state.ready and $a.path == "services.registered" then
+    $ready = $r.ready($ctx)
+    $state.ready = $ready.ok
+    if $state.ready then refresh() end
+  end
+end
+subscribe(env("NODED_SERVICE", "noded") .. ".props.changed")
+$ready = $r.ready($ctx)
+if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
+$state.ready = true
+refresh()
+emit $ctx.citizen clock.deadline
