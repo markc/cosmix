@@ -152,6 +152,8 @@ fn panel($snap, $icons, $now)
     tray_empty: length($tray) == 0, notes: $notes, volume: $volume, network: $network,
     clock: {time: $p.clock_text($now), date: $p.date_text($now), background: ($open.calendar ?? false) ? $C.accent_bg : nil},
     peek: $peek}
+end
+
 -- Settings/Appearance from Quoin's shell.settings.get snapshot (or the
 -- shell.settings.changed notice carrying the same fields). Marks mirror the
 -- configured motion, fade included, exactly as Quoin's built-in fallback.
