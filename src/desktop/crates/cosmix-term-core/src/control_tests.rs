@@ -21,17 +21,34 @@ fn t15_control_input_returns_to_live_screen() {
         let target = target(&parent, &child);
         let pane = fixture.tabs.lock().unwrap().pane_by_id(1).unwrap();
         let listener = pane.lock().unwrap().listener.clone();
-        let lines = (0..100).map(|n| format!("history-{n}\\n")).collect::<String>();
-        listener.type_text(&format!("print(\"{lines}T15-END\")\n")).unwrap();
+        // Native attachment can precede editor readiness. Also keep the typed
+        // command short: the owned editor redraws on every key, so spelling out
+        // 100 lines here makes setup depend on processing quadratic VT output.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if pane.lock().unwrap().snapshot().split_once("\nT15-END ")
-                    .is_some_and(|(_, tail)| !tail.trim().is_empty()) {
+                if pane.lock().unwrap().snapshot().lines()
+                    .any(|line| line.trim() == "S4>") {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("Mix history output");
+        }).await.unwrap_or_else(|_| {
+            panic!("Mix initial prompt:\n{}", pane.lock().unwrap().snapshot())
+        });
+        listener
+            .type_text("print(repeat(\"history\\n\", 100) + \"T15-END\")\n")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pane.lock().unwrap().snapshot().split_once("\nT15-END ")
+                    .is_some_and(|(_, tail)| tail.lines().any(|line| line.trim() == "S4>")) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap_or_else(|_| {
+            panic!("Mix history output and returned prompt:\n{}", pane.lock().unwrap().snapshot())
+        });
         pane.lock().unwrap().scroll_view(crate::terminal::ScrollRequest::Top);
         assert!(pane.lock().unwrap().display_offset() > 0);
         listener.block_control_writes(true);
