@@ -1320,17 +1320,17 @@ mod tests {
     }
 
     fn fill_history(terminal: &Arc<Mutex<cosmix_term_core::terminal::Terminal>>) {
-        let text = (0..120).map(|n| format!("history-{n}\\n")).collect::<String>();
-        terminal.lock().unwrap().listener.type_text(&format!("print(\"{text}T15-END\")\n")).unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if terminal.lock().unwrap().snapshot().split_once("\nT15-END ")
-                .is_some_and(|(_, tail)| !tail.trim().is_empty()) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "Mix did not produce the history fixture");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        let text = (0..120).map(|n| format!("history-{n}\r\n")).collect::<String>();
+        let mut terminal = terminal.lock().unwrap();
+        let screen = terminal.grid_snapshot().screen;
+        // Replace the live pane with an isolated grid, keeping its dimensions.
+        // Dropping the old terminal stops its reader; shell startup output can
+        // never race the fixture or the subsequent pixel comparisons.
+        *terminal = cosmix_term_core::terminal::Terminal::from_test_vt(
+            screen.cols,
+            screen.rows,
+            text.as_bytes(),
+        );
     }
 
     #[test]

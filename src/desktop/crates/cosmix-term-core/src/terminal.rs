@@ -579,6 +579,45 @@ fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<St
 }
 
 impl Terminal {
+    /// A synchronous VT fixture with no PTY, child process or reader thread.
+    /// Frontend tests opt in through their dev-dependency's `test-support` feature.
+    #[cfg(feature = "test-support")]
+    pub fn from_test_vt(cols: usize, rows: usize, bytes: &[u8]) -> Self {
+        let stats = Arc::new(Mutex::new(Metrics::default()));
+        let (damage, rx) = mpsc::sync_channel(1);
+        let listener = Listener {
+            grid: Arc::new(OnceLock::new()),
+            damage,
+            wake: Arc::new(OnceLock::new()),
+            writes: Arc::new(Mutex::new(Writes::default())),
+            stats: stats.clone(),
+            quit: Arc::new(AtomicBool::new(false)),
+        };
+        let mut grid = Crosswords::new(
+            CrosswordsSize::new(cols, rows),
+            CursorShape::Block,
+            listener.clone(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+        rio_vt::performer::handler::Processor::default().advance(&mut grid, bytes);
+        let grid = Arc::new(FairMutex::new(grid));
+        let _ = listener.grid.set(Arc::downgrade(&grid));
+        Self {
+            #[cfg(test)]
+            before_pty_cleanup: None,
+            session: None,
+            listener,
+            stats,
+            grid,
+            captured_offset: Mutex::new(0),
+            damage: Mutex::new(rx),
+            pid: 0,
+            thread: None,
+        }
+    }
+
     pub fn start_session(
         settings: crate::config::Settings,
         native: Option<&crate::native_session::NativeSession>,

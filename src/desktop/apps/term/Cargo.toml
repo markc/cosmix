@@ -87,3 +87,6 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # Retire this when iced moves to wgpu 29 (TODO-term D3's iced 0.15 question, at
 # T3): naga 27 leaves the graph and takes the conflict with it.
 naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
+
+[dev-dependencies]
+cosmix-term-core = { path = "../../crates/cosmix-term-core", features = ["test-support"] }

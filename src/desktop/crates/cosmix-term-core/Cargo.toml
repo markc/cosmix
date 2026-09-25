@@ -9,6 +9,9 @@ description = "Renderer-free core of CosMix Term: PTY, VT grid, tabs/panes, CPU 
 
 # No Bevy and no Wayland. A frontend owns the window, feeds input in, and
 # renders from `Terminal::grid_snapshot` when `wake::WakeFd` fires.
+[features]
+test-support = []
+
 [dependencies]
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
