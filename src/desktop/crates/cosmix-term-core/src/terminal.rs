@@ -1,7 +1,12 @@
+use crate::clusters::ClusterInterner;
+pub use crate::clusters::{CellWidth, Clusters};
 use crate::metrics::Metrics;
 #[path = "mouse.rs"]
 mod mouse;
 pub use mouse::MouseModifiers;
+#[path = "selection.rs"]
+mod selection;
+use rio_vt::selection::SelectionRange;
 use rio_vt::{
     ansi::CursorShape,
     corcovado::{Poll, PollOpt, Ready, Token, channel},
@@ -10,6 +15,7 @@ use rio_vt::{
     performer::Machine,
     teletypewriter::{self, ChildEvent, EventedPty, ProcessReadWrite, WinsizeBuilder},
 };
+pub use rio_vt::{crosswords::pos::Side as SelectionSide, selection::SelectionType};
 use std::{
     borrow::Cow,
     collections::VecDeque,
@@ -68,6 +74,7 @@ struct Pending {
     remaining: usize,
     key: Option<Instant>,
     permit: Option<Arc<crate::control::Permit>>,
+    control: bool,
 }
 #[derive(Default)]
 struct Writes {
@@ -77,7 +84,9 @@ struct Writes {
     group: i32,
     sender: Option<channel::Sender<Msg>>,
     pending: VecDeque<Pending>,
-    bytes: usize,
+    // Only Bus/control input consumes the bounded admission budget. Human
+    // input and VT replies must remain admissible while a paste drains.
+    control_bytes: usize,
     foreground: u64,
     owner: Option<(String, Arc<crate::control::Permit>)>,
 }
@@ -124,11 +133,24 @@ impl Listener {
         }
         self.wake();
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_input_receiver(&self) -> channel::Receiver<Msg> {
         let (sender, receiver) = channel::channel();
         self.writes.lock().unwrap().sender = Some(sender);
         receiver
+    }
+    /// Capture queued PTY input without exposing Rio types to frontend tests.
+    #[cfg(feature = "test-support")]
+    pub fn test_input_reader(&self) -> impl Fn() -> Option<Vec<u8>> + use<> {
+        let receiver = self.test_input_receiver();
+        move || {
+            while let Ok(message) = receiver.try_recv() {
+                if let Msg::Input(bytes) = message {
+                    return Some(bytes.into_owned());
+                }
+            }
+            None
+        }
     }
     #[cfg(test)]
     pub(crate) fn block_control_writes(&self, block: bool) {
@@ -149,7 +171,7 @@ impl Listener {
             return Ok(());
         }
         let mut writes = self.writes.lock().unwrap();
-        self.enqueue(&mut writes, bytes, key, None)
+        self.enqueue(&mut writes, bytes, key, None, false)
     }
     fn enqueue(
         &self,
@@ -157,6 +179,7 @@ impl Listener {
         bytes: Vec<u8>,
         key: Option<Instant>,
         permit: Option<Arc<crate::control::Permit>>,
+        control: bool,
     ) -> Result<(), String> {
         if bytes.is_empty() {
             return Ok(());
@@ -164,7 +187,8 @@ impl Listener {
         if self.quit.load(Ordering::Acquire) {
             return Err("terminal closing".into());
         }
-        if bytes.len() + writes.bytes > 65536 {
+        let control = control || permit.is_some();
+        if control && bytes.len() > 65536_usize.saturating_sub(writes.control_bytes) {
             return Err("PTY input queue full".into());
         }
         let sender = writes.sender.as_ref().ok_or("PTY unavailable")?.clone();
@@ -173,11 +197,14 @@ impl Listener {
         sender
             .send(Msg::Input(Cow::Owned(bytes)))
             .map_err(|e| e.to_string())?;
-        writes.bytes += len;
+        if control {
+            writes.control_bytes += len;
+        }
         writes.pending.push_back(Pending {
             remaining: len,
             key,
             permit,
+            control,
         });
         Ok(())
     }
@@ -187,23 +214,33 @@ impl Listener {
     // key() which revokes unconditionally: a no-op write must not invalidate
     // a live control writer.
     pub fn type_text(&self, text: &str) -> Result<(), String> {
+        self.type_text_in_lane(text, false)
+    }
+    /// Legacy diagnostic Bus input is still bounded, even without a permit.
+    pub(crate) fn bus_text(&self, text: &str) -> Result<(), String> {
+        self.type_text_in_lane(text, true)
+    }
+    fn type_text_in_lane(&self, text: &str, control: bool) -> Result<(), String> {
         let bytes = encode_text(text)?;
         if bytes.is_empty() {
             return Ok(());
         }
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        self.enqueue(&mut writes, bytes, Some(Instant::now()), None)?;
+        self.enqueue(&mut writes, bytes, Some(Instant::now()), None, control)?;
         drop(writes);
         self.follow_input();
         Ok(())
     }
     pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
+        self.keys(&[key], at)
+    }
+    fn keys(&self, keys: &[Key], at: Instant) -> Result<(), String> {
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        let bytes = encode(key);
+        let bytes: Vec<u8> = keys.iter().flat_map(|key| encode(*key)).collect();
         let sends_bytes = !bytes.is_empty();
-        self.enqueue(&mut writes, bytes, Some(at), None)?;
+        self.enqueue(&mut writes, bytes, Some(at), None, false)?;
         drop(writes);
         if sends_bytes {
             self.follow_input();
@@ -274,6 +311,7 @@ impl Listener {
             bytes,
             Some(Instant::now()),
             Some(permit.clone()),
+            true,
         )
         .map_err(|_| "RESOURCE_LIMIT")?;
         writes.owner = Some((actor.into(), permit));
@@ -339,7 +377,7 @@ pub enum Key {
 }
 pub fn encode(key: Key) -> Vec<u8> {
     match key {
-        Key::Char(c) if c.is_ascii() && !c.is_control() => vec![c as u8],
+        Key::Char(c) if !c.is_control() => c.encode_utf8(&mut [0; 4]).as_bytes().to_vec(),
         Key::Char(_) => Vec::new(),
         Key::Enter => vec![b'\r'],
         Key::Backspace => vec![127],
@@ -447,10 +485,13 @@ impl Write for MeteredPty {
             }
             pending.remaining -= consumed;
             left -= consumed;
+            let control = pending.control;
             if pending.remaining == 0 {
                 writes.pending.pop_front();
             }
-            writes.bytes -= consumed;
+            if control {
+                writes.control_bytes -= consumed;
+            }
         }
         Ok(n)
     }
@@ -507,16 +548,22 @@ impl EventedPty for MeteredPty {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
+    /// Full cluster in `Screen::clusters`; zero keeps a scalar inline.
+    pub extra: u32,
+    pub width: CellWidth,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub bold: bool,
 }
 pub struct Screen {
+    pub clusters: Clusters,
     pub cols: usize,
     pub rows: usize,
+    /// Viewport identity for raster invalidation; captured under the grid lock.
+    pub display_offset: usize,
     pub cursor: (usize, usize),
     pub cursor_visible: bool,
     pub cells: Vec<Cell>,
@@ -552,6 +599,8 @@ pub struct Terminal {
     captured_offset: Mutex<usize>,
     damage: Mutex<Receiver<()>>,
     captured_cursor: Mutex<Option<((usize, usize), bool)>>,
+    captured_selection: Mutex<Option<SelectionRange>>,
+    clusters: Mutex<ClusterInterner>,
     pub pid: i32,
     thread: Option<JoinHandle<(Machine<MeteredPty, Listener>, rio_vt::performer::State)>>,
 }
@@ -711,6 +760,8 @@ impl Terminal {
             captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
             captured_cursor: Mutex::new(None),
+            captured_selection: Mutex::new(None),
+            clusters: Mutex::new(ClusterInterner::default()),
             pid: 0,
             thread: None,
         }
@@ -943,6 +994,8 @@ impl Terminal {
             captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
             captured_cursor: Mutex::new(None),
+            captured_selection: Mutex::new(None),
+            clusters: Mutex::new(ClusterInterner::default()),
             pid,
             thread: Some(thread),
         })
@@ -1012,6 +1065,11 @@ impl Terminal {
         self.listener.key(key, at)
     }
 
+    /// One seat event, including a whole IME commit, occupies one FIFO entry.
+    pub fn keys(&self, keys: &[Key], at: Instant) -> Result<(), String> {
+        self.listener.keys(keys, at)
+    }
+
     pub fn alternate_screen(&self) -> bool {
         self.grid
             .lock()
@@ -1052,27 +1110,90 @@ impl Terminal {
         let cols = term.columns();
         let rows = term.screen_lines();
         let mut cells = Vec::with_capacity(cols * rows);
+        let mut clusters = self.clusters.lock().unwrap();
+        clusters.begin_capture();
         let offset = term.display_offset();
-        for y in 0..rows {
-            let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
-            for x in 0..cols {
-                let square = &row[Column(x)];
-                let style = term.grid.style_of(square);
-                let mut fg = colour(style.fg);
-                let mut bg = colour(style.bg);
-                let bold = style.flags.contains(StyleFlags::BOLD);
-                if bold {
-                    fg = fg.map(|v| v.saturating_add(40));
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(&term));
+        for attempt in 0..2 {
+            cells.clear();
+            for y in 0..rows {
+                let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
+                for x in 0..cols {
+                    let square = &row[Column(x)];
+                    let style = term.grid.style_of(square);
+                    let mut fg = colour(style.fg);
+                    let mut bg = colour(style.bg);
+                    let bold = style.flags.contains(StyleFlags::BOLD);
+                    if bold {
+                        fg = fg.map(|v| v.saturating_add(40));
+                    }
+                    if style.flags.contains(StyleFlags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    if selection.is_some_and(|range| {
+                        let point = rio_vt::crosswords::pos::Pos::new(
+                            rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
+                            Column(x),
+                        );
+                        // Rio's contains_square membership, without its block
+                        // cursor exception (our painter owns cursor rendering).
+                        range.contains(point)
+                            || (matches!(square.wide(), rio_vt::crosswords::square::Wide::Wide)
+                                && range.contains(rio_vt::crosswords::pos::Pos::new(
+                                    point.row,
+                                    point.col + 1,
+                                )))
+                            || (matches!(square.wide(), rio_vt::crosswords::square::Wide::Spacer)
+                                && x > 0
+                                && range.contains(rio_vt::crosswords::pos::Pos::new(
+                                    point.row,
+                                    point.col - 1,
+                                )))
+                    }) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    cells.push(Cell {
+                        c: square.c(),
+                        extra: if square
+                            .extras_id_checked()
+                            .and_then(|id| term.grid.extras_table.get(id))
+                            .is_some_and(|extras| !extras.zerowidth.is_empty())
+                        {
+                            let pos = rio_vt::crosswords::pos::Pos::new(
+                                rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
+                                Column(x),
+                            );
+                            // Bound our temporary string even for pathological VT extras.
+                            let text: String = term
+                                .grid
+                                .cell_text(pos)
+                                .take(super::clusters::MAX_CLUSTER_BYTES + 1)
+                                .collect();
+                            clusters.intern(&text)
+                        } else {
+                            0
+                        },
+                        width: match square.wide() {
+                            rio_vt::crosswords::square::Wide::Narrow => CellWidth::Narrow,
+                            rio_vt::crosswords::square::Wide::Wide => CellWidth::Wide,
+                            rio_vt::crosswords::square::Wide::Spacer => CellWidth::Spacer,
+                            rio_vt::crosswords::square::Wide::LeadingSpacer => {
+                                CellWidth::LeadingSpacer
+                            }
+                        },
+                        fg,
+                        bg,
+                        bold,
+                    });
                 }
-                if style.flags.contains(StyleFlags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                cells.push(Cell {
-                    c: square.c(),
-                    fg,
-                    bg,
-                    bold,
-                });
+            }
+            if attempt == 0 && clusters.saturated() {
+                // No partially interned frame escapes. Keep the grid locked and
+                // redo once with room for every visible cell; new identity forces
+                // a full repaint even when Rio reports no row damage.
+                clusters.restart_capture(cols * rows);
+            } else {
+                break;
             }
         }
         let pos = term.grid.cursor.pos;
@@ -1080,11 +1201,28 @@ impl Terminal {
             pos.col.0,
             (pos.row.0.max(0) as usize).saturating_add(offset),
         );
+        // T15: scrolled back, the cursor stays visible while its live row is
+        // still inside the viewport (cursor.1 already includes the offset).
         let cursor_visible =
             cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
         let mut previous = self.captured_cursor.lock().unwrap();
+        let mut previous_selection = self.captured_selection.lock().unwrap();
         if let Some(dirty) = dirty {
             *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
+            // Compare at capture time too: the parser can rotate or clear Rio's
+            // selection without going through the frontend's selection methods.
+            if *previous_selection != selection {
+                for range in previous_selection.iter().chain(selection.iter()) {
+                    for (y, row) in dirty.iter_mut().enumerate() {
+                        let line = y as i64 - offset as i64;
+                        if (i64::from(range.start.row.0)..=i64::from(range.end.row.0))
+                            .contains(&line)
+                        {
+                            *row = true;
+                        }
+                    }
+                }
+            }
             if *previous != Some((cursor, cursor_visible)) {
                 for ((_, row), visible) in previous
                     .iter()
@@ -1098,6 +1236,7 @@ impl Terminal {
             }
         }
         if consume {
+            *previous_selection = selection;
             *previous = Some((cursor, cursor_visible));
             *self.captured_offset.lock().unwrap() = term.display_offset();
             // Both operations must remain under this same grid lock. reset_damage
@@ -1111,8 +1250,10 @@ impl Terminal {
             .vt_updated
             .unwrap_or_else(Instant::now);
         Screen {
+            clusters: clusters.snapshot.clone(),
             cols,
             rows,
+            display_offset: offset,
             cursor,
             cursor_visible,
             cells,
@@ -1446,6 +1587,25 @@ mod tests {
         assert!(thread.is_finished(), "Machine shutdown must finish");
         drop(thread.join().unwrap());
     }
+    #[test]
+    fn machine_delivers_large_paste_before_the_following_key_and_vt_reply() {
+        let mut f = GridFixture::new();
+        f.child
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        f.feed(b"\x1b[?2004h", |t| t.mode().contains(Mode::BRACKETED_PASTE));
+        let text = "p".repeat(1024 * 1024);
+        f.terminal.paste(&text).unwrap();
+        f.terminal.key(Key::Char('k'), Instant::now()).unwrap();
+        // Real parser reply, while the paste is blocked on the socket's
+        // small send buffer. Machine must retain one atomic write buffer.
+        f.feed(b"\x1b[6nZ", |t| cell(t, 0, 0) == 'Z');
+        let expected = format!("\x1b[200~{text}\x1b[201~k\x1b[1;1R");
+        let mut received = vec![0; expected.len()];
+        f.child.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected.as_bytes());
+    }
+
     type FixtureThread = JoinHandle<(Machine<FixturePty, Listener>, rio_vt::performer::State)>;
 
     /// A real Terminal whose PTY is a socketpair: grid, Machine, Listener and
@@ -1507,6 +1667,8 @@ mod tests {
                 captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
                 captured_cursor: Mutex::new(None),
+                captured_selection: Mutex::new(None),
+                clusters: Mutex::new(ClusterInterner::default()),
                 pid: 0,
                 thread: None,
             };
@@ -1638,7 +1800,11 @@ mod tests {
             term.scroll_display(Scroll::Delta(5));
             assert_ne!(term.display_offset(), 0);
         }
-        assert!(all(&f.settled_snapshot().dirty_rows), "scroll-back");
+        let scrolled = f.settled_snapshot();
+        assert!(all(&scrolled.dirty_rows), "scroll-back");
+        assert_eq!(scrolled.screen.display_offset, 5);
+        // The cursor sat on the bottom row; five rows back it is off-screen.
+        assert!(!scrolled.screen.cursor_visible);
         // Still scrolled back: repainted whole, and still no self-wake.
         assert!(all(&f.quiet_snapshot().dirty_rows), "scrolled view");
     }

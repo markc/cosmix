@@ -557,6 +557,18 @@ assignment table. The record (`{type_step, weight, …}`) holds everything
 the mapping may author for a text part — the IR is never narrower than
 the authoring contract.
 
+Desktop role records (`ui`, `ui_display`, `small`, `mono`, `terminal`) also
+accept a finite positive `logical_px` instead of `type_step`; specifying both
+or neither is invalid. `fallbacks` is an ordered list of non-empty family
+names, defaulting to empty for existing records. `generic` is `sans_serif`
+(default) or `monospace`; it is reserved metadata for future adapter selection.
+Current adapters use their role's fixed sans or monospace generic after named
+families; changing `generic` alone has no rendering effect. `family`, `weight`
+(1–1000), and optional positive `line_height` retain their meaning. Resolved
+records preserve this chain and store the exact logical pixel size; output
+scale is a renderer concern. See [desktop font defaults](../cos/ui-typography.md)
+for values, consumer mappings and the compatibility boundary.
+
 5.2 Text-part typography is authored in the family mapping under §4's
 rules (base / variants / null / coverage). No Rust match arm carries a
 size.

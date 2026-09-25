@@ -184,14 +184,17 @@ pub fn present(
 }
 
 #[derive(Default)]
-struct PresentHistory {
+#[doc(hidden)]
+// Exposed so downstream headless tests exercise the same age repair and
+// submission lifecycle as the window compositor, without a second model.
+pub struct PresentHistory {
     layers: VecDeque<Vec<Layer>>,
     background: Option<Color>,
     max_age: u8,
 }
 
 impl PresentHistory {
-    fn damage(&mut self, age: u8, layers: &[Layer], viewport: &Viewport, background: Color) -> Vec<Rectangle> {
+    pub fn damage(&mut self, age: u8, layers: &[Layer], viewport: &Viewport, background: Color) -> Vec<Rectangle> {
         self.max_age = self.max_age.max(age);
         self.layers.truncate(self.max_age as usize);
         let full = Rectangle::with_size(viewport.logical_size());
@@ -207,7 +210,7 @@ impl PresentHistory {
         damage::group(repair, full)
     }
 
-    fn submit<E>(&mut self, layers: &[Layer], background: Color, pre_present: impl FnOnce(), present: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+    pub fn submit<E>(&mut self, layers: &[Layer], background: Color, pre_present: impl FnOnce(), present: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         // Even empty damage commits: winit's pre-present hook requests the
         // Wayland frame callback. Skipping either half removes vsync pacing
         // from unchanged NextFrame animations. Empty commits rotate ages too.
@@ -222,7 +225,8 @@ impl PresentHistory {
     }
 }
 
-fn physical_damage(damage: &[Rectangle], viewport: &Viewport) -> Vec<softbuffer::Rect> {
+#[doc(hidden)]
+pub fn physical_damage(damage: &[Rectangle], viewport: &Viewport) -> Vec<softbuffer::Rect> {
     let size = viewport.physical_size();
     damage
         .iter()
@@ -297,6 +301,34 @@ pub fn screenshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn native_cell_damage_reaches_physical_present_rectangles() {
+        use crate::core::{Bytes, Renderer as _};
+        use crate::grid::{Damage, Grid};
+        let viewport = Viewport::with_physical_size(Size::new(2250, 200), 2.5);
+        let full = Rectangle::with_size(viewport.logical_size());
+        let mut stamps = Damage::new(2250, 200, (25, 50)).unwrap();
+        let pixels = Bytes::from([0, 0, 0, 255].repeat(2250 * 200));
+        let mut renderer = Renderer::new(crate::core::Font::default(), crate::core::Pixels(13.0));
+        let mut history = PresentHistory::default();
+        renderer.reset(full);
+        renderer.draw_grid(Grid::with_damage(pixels.clone(), &stamps).unwrap(), full, full);
+        assert_eq!(history.damage(0, renderer.layers(), &viewport, Color::BLACK), [full]);
+        history.submit(renderer.layers(), Color::BLACK, || {}, || Ok::<_, ()>(())).unwrap();
+        stamps.mark([Rectangle { x: 1125, y: 50, width: 25, height: 50 }]);
+        renderer.reset(full);
+        renderer.draw_grid(Grid::with_damage(pixels, &stamps).unwrap(), full, full);
+        let regions = history.damage(1, renderer.layers(), &viewport, Color::BLACK);
+        let physical = physical_damage(&regions, &viewport);
+        assert_eq!(physical.len(), 1);
+        let rect = &physical[0];
+        assert_eq!((rect.x, rect.y, rect.width.get(), rect.height.get()), (1122, 47, 31, 56));
+        // Identical scene: no surface damage, even with the changed generation.
+        history.submit(renderer.layers(), Color::BLACK, || {}, || Ok::<_, ()>(())).unwrap();
+        assert!(history.damage(1, renderer.layers(), &viewport, Color::BLACK).is_empty());
+    }
 
     fn scene(x: f32) -> Vec<Layer> {
         vec![Layer {

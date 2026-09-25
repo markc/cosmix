@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term-core"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -13,6 +13,9 @@ description = "Renderer-free core of CosMix Term: PTY, VT grid, tabs/panes, CPU 
 test-support = []
 
 [dependencies]
+cosmix-design = { path = "../cosmix-design" }
+# Match iced -> cosmic-text's locked discovery library.
+fontdb = "=0.23.0"
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,4 +34,5 @@ sha2 = "0.10"
 cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 
 [dev-dependencies]
+png = "0.18.1"
 term-native-test-broker = { path = "tests/support" }

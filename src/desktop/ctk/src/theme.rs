@@ -26,7 +26,7 @@ use bevy::log::warn;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::{App, Entity, Plugin, Update};
 use bevy::text::{
-    detect_text_needs_rerender, FontCx, FontSize, FontSource, TextFont, TextPipeline,
+    detect_text_needs_rerender, FontCx, FontSize, FontSource, FontWeight, TextFont, TextPipeline,
 };
 use bevy::ui::UiSystems;
 #[cfg(feature = "theme")]
@@ -34,7 +34,6 @@ use bevy::window::WindowFocused;
 use std::collections::HashSet;
 
 const AUTHORED_BODY_PX: f32 = 13.0;
-const DEFAULT_BODY_PX: f32 = 15.333;
 /// Bounds on the configured base size. Below the floor chrome is unreadable;
 /// above the ceiling a single mistyped digit (`13333` for `13.333`) would ask
 /// Bevy to rasterise glyph atlases thousands of pixels tall during startup.
@@ -43,7 +42,7 @@ const DEFAULT_BODY_PX: f32 = 15.333;
 /// `TypographySpec` — is clamped where the value is consumed.
 const MIN_BODY_PX: f32 = 6.0;
 const MAX_BODY_PX: f32 = 96.0;
-const DEFAULT_FONT_FAMILY: &str = "Noto Sans";
+use cosmix_design::{default_typography, TypographyRole};
 
 /// The CTK design-token vocabulary. Names are stable; values live in
 /// [`ThemeSpec`] and are installed through [`apply_theme`].
@@ -167,13 +166,18 @@ impl Default for CtkThemeMetrics {
 pub struct TypographySpec {
     pub family: String,
     pub body_px: f32,
+    pub fallbacks: Vec<String>,
+    pub weight: u16,
 }
 
 impl Default for TypographySpec {
     fn default() -> Self {
+        let ui = default_typography(TypographyRole::Ui);
         Self {
-            family: DEFAULT_FONT_FAMILY.to_string(),
-            body_px: DEFAULT_BODY_PX,
+            family: ui.family.clone(),
+            body_px: ui.font_size as f32,
+            fallbacks: ui.fallbacks.clone(),
+            weight: ui.weight,
         }
     }
 }
@@ -194,6 +198,7 @@ pub enum TypographyProvenance {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TypographyFallback {
     Requested,
+    Chain,
     LastKnownGood,
     #[default]
     Embedded,
@@ -214,17 +219,26 @@ pub enum TypographyFallback {
 #[derive(Resource, Clone, Debug)]
 pub struct CtkTypography {
     pub effective_family: Option<String>,
+    pub resolved_families: Vec<String>,
+    pub resolved_mono_families: Vec<String>,
     pub requested_family: String,
     pub body_px: f32,
+    pub weight: u16,
     pub revision: u64,
     pub fallback: TypographyFallback,
     pub family_provenance: TypographyProvenance,
     pub body_px_provenance: TypographyProvenance,
     pub last_warning: Option<String>,
-    observed_theme_revision: Option<u64>,
+    small: cosmix_design::ResolvedTypeRecord,
+    mono: cosmix_design::ResolvedTypeRecord,
+    small_family: Option<String>,
+    small_weight: u16,
+    mono_weight: u16,
     warned_families: HashSet<String>,
     environment_family: Option<String>,
     environment_body_px: Option<f32>,
+    system_families: Option<Vec<String>>,
+    system_mono_families: Option<Vec<String>>,
 }
 
 impl Default for CtkTypography {
@@ -237,6 +251,12 @@ impl Default for CtkTypography {
 }
 
 impl CtkTypography {
+    /// Construct an isolated theme consumer, without process deployment
+    /// overrides. Useful for previews and deterministic font acceptance tests.
+    pub fn without_environment() -> Self {
+        Self::with_environment(None, None)
+    }
+
     fn with_environment(family: Option<&str>, body_px: Option<&str>) -> Self {
         let environment_family = family
             .map(str::trim)
@@ -247,19 +267,32 @@ impl CtkTypography {
             .filter(|value| value.is_finite() && (MIN_BODY_PX..=MAX_BODY_PX).contains(value));
         Self {
             effective_family: None,
+            resolved_families: Vec::new(),
+            resolved_mono_families: Vec::new(),
             requested_family: environment_family
                 .clone()
-                .unwrap_or_else(|| DEFAULT_FONT_FAMILY.to_string()),
-            body_px: environment_body_px.unwrap_or(DEFAULT_BODY_PX),
+                .unwrap_or_else(|| TypographySpec::default().family),
+            body_px: environment_body_px.unwrap_or_else(|| TypographySpec::default().body_px),
+            weight: if environment_family.is_some() {
+                400
+            } else {
+                TypographySpec::default().weight
+            },
+            small: default_typography(TypographyRole::Small).clone(),
+            mono: default_typography(TypographyRole::Mono).clone(),
+            small_family: None,
+            small_weight: default_typography(TypographyRole::Small).weight,
+            mono_weight: default_typography(TypographyRole::Mono).weight,
             revision: 0,
             fallback: TypographyFallback::Embedded,
             family_provenance: TypographyProvenance::EmbeddedFallback,
             body_px_provenance: TypographyProvenance::EmbeddedFallback,
             last_warning: None,
-            observed_theme_revision: None,
             warned_families: HashSet::new(),
             environment_family,
             environment_body_px,
+            system_families: None,
+            system_mono_families: None,
         }
     }
 }
@@ -293,8 +326,8 @@ pub struct CtkTypographyOptOut;
 /// The entity stays fully size-managed — its authored size scales with the
 /// configured body size exactly like every other managed entity — but CTK
 /// stamps and restores [`FontSource::Monospace`] instead of
-/// [`FontSource::SansSerif`], so the platform's generic monospace mapping
-/// supplies the face. Clocks, meters and tabular readouts want this: a
+/// [`FontSource::SansSerif`], with the shared mono family chain ahead of the
+/// platform's generic mapping. Clocks, meters and tabular readouts want this: a
 /// proportional face makes their digits jitter.
 ///
 /// Add it in the same spawn operation as the `TextFont`. Stamping shares the
@@ -303,6 +336,35 @@ pub struct CtkTypographyOptOut;
 /// managed at all — the opt-out wins over the role.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct CtkMonospace;
+
+/// Exact logical sizes, never multiplied by the legacy body/13 scale. Small
+/// shares the UI family chain unless its design record overrides the family;
+/// Mono has its own ordered family chain.
+#[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CtkTextRole {
+    #[default]
+    Ui,
+    Small,
+    Mono,
+}
+
+impl CtkTypography {
+    pub fn role_size(&self, role: CtkTextRole) -> f32 {
+        match role {
+            CtkTextRole::Ui => self.body_px,
+            CtkTextRole::Small => self.small.font_size as f32,
+            CtkTextRole::Mono => self.mono.font_size as f32,
+        }
+    }
+
+    pub fn role_weight(&self, role: CtkTextRole) -> FontWeight {
+        FontWeight(match role {
+            CtkTextRole::Ui => self.weight,
+            CtkTextRole::Small => self.small_weight,
+            CtkTextRole::Mono => self.mono_weight,
+        })
+    }
+}
 
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct ManagedTypography {
@@ -340,6 +402,7 @@ type TypographyTextQueryData = (
     Option<&'static mut ManagedTypography>,
     Has<CtkTypographyOptOut>,
     Has<CtkMonospace>,
+    Option<&'static CtkTextRole>,
 );
 // `Changed` rather than `Added`: an entity CTK declined to manage on sight —
 // one spawned with a size it cannot derive from — must get another look when
@@ -901,6 +964,7 @@ pub struct ThemeSpec {
     pub typography: TypographySpec,
     typography_family_provenance: TypographyProvenance,
     typography_body_px_provenance: TypographyProvenance,
+    typography_weight_explicit: bool,
 }
 
 /// The CTK colour-token values (the wire names are in [`tokens`]).
@@ -1015,6 +1079,7 @@ impl ThemeSpec {
             typography: TypographySpec::default(),
             typography_family_provenance: TypographyProvenance::BuiltIn,
             typography_body_px_provenance: TypographyProvenance::BuiltIn,
+            typography_weight_explicit: false,
         }
     }
 }
@@ -1072,6 +1137,7 @@ pub struct ThemeState {
     typography: TypographySpec,
     typography_family_provenance: TypographyProvenance,
     typography_body_px_provenance: TypographyProvenance,
+    typography_weight_explicit: bool,
 }
 
 impl Default for ThemeState {
@@ -1085,6 +1151,7 @@ impl Default for ThemeState {
             typography: spec.typography,
             typography_family_provenance: spec.typography_family_provenance,
             typography_body_px_provenance: spec.typography_body_px_provenance,
+            typography_weight_explicit: spec.typography_weight_explicit,
         }
     }
 }
@@ -1098,6 +1165,7 @@ impl ThemeState {
             && self.typography == spec.typography
             && self.typography_family_provenance == spec.typography_family_provenance
             && self.typography_body_px_provenance == spec.typography_body_px_provenance
+            && self.typography_weight_explicit == spec.typography_weight_explicit
     }
 }
 
@@ -1128,7 +1196,8 @@ pub fn apply_theme(theme: &mut UiTheme, state: &mut ThemeState, spec: &ThemeSpec
         || state.colors != spec.colors
         || state.typography != spec.typography
         || state.typography_family_provenance != spec.typography_family_provenance
-        || state.typography_body_px_provenance != spec.typography_body_px_provenance;
+        || state.typography_body_px_provenance != spec.typography_body_px_provenance
+        || state.typography_weight_explicit != spec.typography_weight_explicit;
     if changed {
         state.scheme = spec.scheme;
         state.mode = spec.mode;
@@ -1136,6 +1205,7 @@ pub fn apply_theme(theme: &mut UiTheme, state: &mut ThemeState, spec: &ThemeSpec
         state.typography = spec.typography.clone();
         state.typography_family_provenance = spec.typography_family_provenance;
         state.typography_body_px_provenance = spec.typography_body_px_provenance;
+        state.typography_weight_explicit = spec.typography_weight_explicit;
         state.revision = state.revision.saturating_add(1);
         spec.check_selection_contrast();
     }
@@ -1149,7 +1219,7 @@ fn clamp_body_px(body_px: f32) -> f32 {
     if body_px.is_finite() {
         body_px.clamp(MIN_BODY_PX, MAX_BODY_PX)
     } else {
-        DEFAULT_BODY_PX
+        TypographySpec::default().body_px
     }
 }
 
@@ -1165,35 +1235,34 @@ fn configure_typography(
     // The shared cache locates the strong handles retained by CTK even after
     // Bevy prunes its local entries and Parley clears the sole text layout.
     font_cx.source_cache.make_shared();
-    // An unresolved family is retried on every pass, not once per theme
-    // revision: the font collection is built from the system at `FontCx`
-    // construction, but families can still be registered into it afterwards,
-    // and caching the miss against the revision would strand the mapping until
-    // an unrelated theme change happened to come along. A retry that changes
-    // nothing returns `false` below, so this costs one collection lookup.
-    if typography.observed_theme_revision == Some(state.revision)
-        && typography.fallback == TypographyFallback::Requested
-    {
-        // Settled — but re-assert ownership of the generic mapping rather than
-        // assuming it survives. The collection can be rebuilt underneath us
-        // (dropping the last strong handle to a font asset does exactly that),
-        // and a mapping lost that way would leave managed text rendering
-        // through some other fallback while this resource still claimed the
-        // requested family was in force. A failure falls through to a full
-        // re-resolution, which downgrades the state honestly.
-        match typography.effective_family.as_deref() {
-            Some(family) if font_cx.set_sans_serif_family(family).is_err() => {}
-            _ => return false,
-        }
+    // Preserve the platform list before taking ownership of its generic.
+    if typography.system_families.is_none() {
+        let ids: Vec<_> = font_cx
+            .collection
+            .generic_families(fontique::GenericFamily::SansSerif)
+            .collect();
+        typography.system_families = Some(
+            ids.into_iter()
+                .filter_map(|id| font_cx.collection.family_name(id).map(str::to_owned))
+                .collect(),
+        );
     }
 
     let previous = (
         typography.effective_family.clone(),
+        typography.resolved_families.clone(),
+        typography.resolved_mono_families.clone(),
         typography.requested_family.clone(),
         typography.body_px,
+        typography.weight,
         typography.fallback,
         typography.family_provenance,
         typography.body_px_provenance,
+        (
+            typography.small_family.clone(),
+            typography.small_weight,
+            typography.mono_weight,
+        ),
     );
     // Deployment overrides win over the theme cascade, including live reloads.
     let requested_family = typography
@@ -1205,17 +1274,35 @@ fn configure_typography(
         .environment_body_px
         .unwrap_or_else(|| clamp_body_px(state.typography.body_px));
 
-    let resolved = font_cx
-        .collection
-        .family_by_name(requested_family)
-        .is_some()
-        && font_cx.set_sans_serif_family(requested_family).is_ok();
+    let resolved_family = std::iter::once(requested_family)
+        .chain(state.typography.fallbacks.iter().map(String::as_str))
+        .chain(
+            typography
+                .system_families
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str),
+        )
+        .find(|family| {
+            font_cx.collection.family_by_name(family).is_some()
+                && font_cx.set_sans_serif_family(family).is_ok()
+        });
+    let resolved = resolved_family.is_some();
 
     // The configured size is honoured whichever way the family resolves. It has
     // its own cascade provenance, so letting a missing family also revert the
     // size would make the same theme file mean different things depending on
     // whether the family happened to resolve earlier in the process's life.
     typography.body_px = requested_body_px;
+    typography.weight = if typography.environment_family.is_some()
+        && !state.typography_weight_explicit
+        && state.typography.weight == TypographySpec::default().weight
+    {
+        400
+    } else {
+        state.typography.weight.clamp(1, 1000)
+    };
     typography.body_px_provenance = if typography.environment_body_px.is_some() {
         TypographyProvenance::Environment
     } else {
@@ -1223,8 +1310,12 @@ fn configure_typography(
     };
 
     if resolved {
-        typography.effective_family = Some(requested_family.to_string());
-        typography.fallback = TypographyFallback::Requested;
+        typography.effective_family = resolved_family.map(str::to_owned);
+        typography.fallback = if resolved_family == Some(requested_family) {
+            TypographyFallback::Requested
+        } else {
+            TypographyFallback::Chain
+        };
         typography.family_provenance = if typography.environment_family.is_some() {
             TypographyProvenance::Environment
         } else {
@@ -1265,21 +1356,142 @@ fn configure_typography(
             typography.family_provenance = TypographyProvenance::EmbeddedFallback;
         }
     }
-    typography.observed_theme_revision = Some(state.revision);
+    // Reassert the complete glyph fallback chain after collection rebuilds.
+    let mut chain = Vec::new();
+    for family in typography
+        .effective_family
+        .iter()
+        .chain(state.typography.fallbacks.iter())
+        .chain(
+            typography
+                .system_families
+                .as_deref()
+                .unwrap_or_default()
+                .iter(),
+        )
+    {
+        if let Some(id) = font_cx.collection.family_id(family) {
+            if !chain.contains(&id) {
+                chain.push(id);
+            }
+        }
+    }
+    if !chain.is_empty() {
+        font_cx
+            .collection
+            .set_generic_families(fontique::GenericFamily::SansSerif, chain.iter().copied());
+    }
+    typography.resolved_families = chain
+        .into_iter()
+        .filter_map(|id| font_cx.collection.family_name(id).map(str::to_owned))
+        .collect();
+
+    if typography.system_mono_families.is_none() {
+        let ids: Vec<_> = font_cx
+            .collection
+            .generic_families(fontique::GenericFamily::Monospace)
+            .collect();
+        typography.system_mono_families = Some(
+            ids.into_iter()
+                .filter_map(|id| font_cx.collection.family_name(id).map(str::to_owned))
+                .collect(),
+        );
+    }
+    let mut mono_chain = Vec::new();
+    for family in typography.mono.families().chain(
+        typography
+            .system_mono_families
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str),
+    ) {
+        if let Some(id) = font_cx.collection.family_id(family) {
+            if !mono_chain.contains(&id) {
+                mono_chain.push(id);
+            }
+        }
+    }
+    font_cx.collection.set_generic_families(
+        fontique::GenericFamily::Monospace,
+        mono_chain.iter().copied(),
+    );
+    typography.resolved_mono_families = mono_chain
+        .into_iter()
+        .filter_map(|id| font_cx.collection.family_name(id).map(str::to_owned))
+        .collect();
+
+    typography.weight = resolved_family_weight(
+        font_cx,
+        typography.effective_family.as_deref(),
+        typography.weight,
+    );
+    typography.mono_weight = resolved_family_weight(
+        font_cx,
+        typography
+            .resolved_mono_families
+            .first()
+            .map(String::as_str),
+        typography.mono.weight,
+    );
+    // The default Small role follows UI overrides. An authored Small family
+    // or chain selects its own first discoverable family.
+    let default_small = default_typography(TypographyRole::Small);
+    typography.small_family = if typography.small.family == default_small.family
+        && typography.small.fallbacks == default_small.fallbacks
+    {
+        None
+    } else {
+        typography
+            .small
+            .families()
+            .find(|family| font_cx.collection.family_id(family).is_some())
+            .map(str::to_owned)
+    };
+    typography.small_weight = resolved_family_weight(
+        font_cx,
+        typography
+            .small_family
+            .as_deref()
+            .or(typography.effective_family.as_deref()),
+        typography.small.weight,
+    );
 
     let current = (
         typography.effective_family.clone(),
+        typography.resolved_families.clone(),
+        typography.resolved_mono_families.clone(),
         typography.requested_family.clone(),
         typography.body_px,
+        typography.weight,
         typography.fallback,
         typography.family_provenance,
         typography.body_px_provenance,
+        (
+            typography.small_family.clone(),
+            typography.small_weight,
+            typography.mono_weight,
+        ),
     );
     let changed = current != previous;
     if changed {
         typography.revision = typography.revision.saturating_add(1);
     }
     changed
+}
+
+fn resolved_family_weight(font_cx: &mut FontCx, family: Option<&str>, requested: u16) -> u16 {
+    let has_light = family
+        .and_then(|name| font_cx.collection.family_by_name(name))
+        .is_some_and(|family| {
+            family.fonts().iter().any(|font| {
+                (300.0..400.0).contains(&font.weight().value())
+                    || font.axes().iter().any(|axis| {
+                        axis.tag.to_be_bytes() == *b"wght" && axis.min <= 300.0 && axis.max >= 300.0
+                    })
+            })
+        });
+    cosmix_design::family_font_weight(requested, has_light)
 }
 
 /// Bevy keeps font atlases for its lifetime. Keep only blobs observed in shaped
@@ -1334,11 +1546,26 @@ fn retain_used_font_sources(
 fn apply_ctk_typography(
     mut commands: Commands,
     state: Res<ThemeState>,
+    design: Option<Res<crate::design::CtkDesign>>,
     mut typography: ResMut<CtkTypography>,
     mut font_cx: Option<ResMut<FontCx>>,
     mut text_fonts: Query<TypographyTextQueryData, TypographyTextQueryFilter>,
 ) {
     let mut typography_changed = false;
+    let active = design
+        .as_deref()
+        .and_then(|design| design.live())
+        .map(|design| design.typography());
+    let small = cosmix_design::active_typography(active, TypographyRole::Small);
+    let mono = cosmix_design::active_typography(active, TypographyRole::Mono);
+    if typography.small != *small || typography.mono != *mono {
+        typography.small = small.clone();
+        typography.mono = mono.clone();
+        typography.small_weight = small.weight;
+        typography.mono_weight = mono.weight;
+        typography.revision = typography.revision.saturating_add(1);
+        typography_changed = true;
+    }
     if let Some(font_cx) = font_cx.as_deref_mut() {
         // Deliberately bypassed: an unresolved family is re-examined on every
         // pass, and touching `ResMut` would dirty the resource's change tick
@@ -1351,7 +1578,6 @@ fn apply_ctk_typography(
     if typography_changed {
         typography.set_changed();
     }
-    let mapping_available = typography.effective_family.is_some();
     // `CtkTypography` is a public resource, so a caller can write `body_px`
     // directly and skip the theme cascade's bounds entirely. Normalise it here,
     // in the resource itself rather than only in the derived sizes: an agent
@@ -1361,13 +1587,17 @@ fn apply_ctk_typography(
         typography.body_px = body_px;
     }
 
-    for (entity, mut font, managed, opted_out, monospace) in &mut text_fonts {
+    for (entity, mut font, managed, opted_out, monospace, role) in &mut text_fonts {
         if opted_out {
             continue;
         }
         if !is_manageable_size(font.font_size) {
             continue;
         }
+        let is_mono = monospace || role == Some(&CtkTextRole::Mono);
+        let mapping_available = typography.effective_family.is_some()
+            || (is_mono && !typography.resolved_mono_families.is_empty())
+            || (role == Some(&CtkTextRole::Small) && typography.small_family.is_some());
 
         // Reconcile rather than stamp once: an entity whose size no longer
         // matches what CTK last saw has been reassigned by somebody else, and
@@ -1390,7 +1620,14 @@ fn apply_ctk_typography(
         // would silently abandon the base size the operator also asked for, and
         // leave already-managed text stranded at whatever size was in force
         // when the mapping was last good.
-        let effective = scale_authored_font_size(record.authored_size, body_px);
+        let effective = role.map_or_else(
+            || scale_authored_font_size(record.authored_size, body_px),
+            |role| FontSize::Px(typography.role_size(*role)),
+        );
+        let weight = role
+            .copied()
+            .or(monospace.then_some(CtkTextRole::Mono))
+            .map_or(font.weight, |role| typography.role_weight(role));
         // Only the *source* is gated on actually owning the generic mapping:
         // stamping a generic without it would hand text to whatever
         // fontconfig picks rather than Bevy's embedded font. A source already
@@ -1398,17 +1635,28 @@ fn apply_ctk_typography(
         // ASCII-only subset, so unwinding to it on a lost mapping would trade
         // a working face for tofu. The [`CtkMonospace`] role selects which
         // generic CTK owns for this entity; size management is role-blind.
-        let desired_source = if monospace {
+        let desired_source = if is_mono {
             FontSource::Monospace
+        } else if let Some(family) = typography
+            .small_family
+            .as_deref()
+            .filter(|_| role == Some(&CtkTextRole::Small))
+        {
+            FontSource::Family(family.into())
         } else {
             FontSource::SansSerif
         };
         let source_drift = mapping_available && font.font != desired_source;
-        if font.font_size != effective || source_drift {
+        if font.font_size != effective
+            || source_drift
+            || font.weight != weight
+            || typography_changed
+        {
             if mapping_available {
                 font.font = desired_source;
             }
             font.font_size = effective;
+            font.weight = weight;
             font.set_changed();
         }
         record.last_seen_size = effective;
@@ -1484,6 +1732,28 @@ pub struct CtkThemePlugin {
 }
 
 impl CtkThemePlugin {
+    /// Font/widget acceptance fixtures must not read the operator's theme,
+    /// including when Cargo unifies the `theme` feature from another crate.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn isolated() -> Self {
+        let plugin = Self::new(None);
+        #[cfg(feature = "theme")]
+        {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let mut plugin = plugin;
+            plugin.shared_path = std::env::temp_dir()
+                .join(format!(
+                    "ctk-isolated-theme-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ))
+                .join(THEME_FILE);
+            plugin
+        }
+        #[cfg(not(feature = "theme"))]
+        plugin
+    }
+
     /// Build the runtime plugin for an optional per-app theme directory.
     pub fn new(app_config_dir: Option<std::path::PathBuf>) -> Self {
         Self {
@@ -1532,6 +1802,7 @@ impl Plugin for CtkThemePlugin {
                 apply_ctk_typography
                     .in_set(UiSystems::Propagate)
                     .after(PropagateSet::<TextFont>::default())
+                    .after(bevy::text::load_font_assets_into_font_collection)
                     .before(detect_text_needs_rerender),
             )
             .add_systems(
@@ -2578,6 +2849,8 @@ mod file {
     pub struct TypographyFile {
         pub family: Option<String>,
         pub body_px: Option<f32>,
+        pub fallbacks: Option<Vec<String>>,
+        pub weight: Option<u16>,
     }
 
     /// Parse a `#rrggbb` (or `#rgb`) hex colour into an sRGB [`Color`].
@@ -2712,12 +2985,27 @@ mod file {
                 c.danger_surface = hex(v)?;
             }
             if let Some(typography) = &file.typography {
+                if let Some(weight) = typography.weight {
+                    if !(1..=1000).contains(&weight) {
+                        return Err("typography.weight must be in 1..=1000".into());
+                    }
+                    self.typography.weight = weight;
+                    self.typography_weight_explicit = true;
+                }
+                if let Some(fallbacks) = &typography.fallbacks {
+                    if fallbacks.iter().any(|family| family.trim().is_empty()) {
+                        return Err("typography.fallbacks must contain non-empty families".into());
+                    }
+                    self.typography.fallbacks = fallbacks.clone();
+                }
                 if let Some(family) = &typography.family {
                     let family = family.trim();
                     if family.is_empty() {
                         return Err("typography.family must not be empty".to_string());
                     }
                     self.typography.family = family.to_string();
+                    self.typography.weight = typography.weight.unwrap_or(400);
+                    self.typography_weight_explicit = typography.weight.is_some();
                     self.typography_family_provenance = provenance;
                 }
                 if let Some(body_px) = typography.body_px {
@@ -3295,8 +3583,8 @@ mod tests {
         let spec = ThemeSpec::builtin();
         assert_eq!(spec.scheme, Scheme::Ocean);
         assert_eq!(spec.mode, Mode::Light);
-        assert_eq!(spec.typography.family, "Noto Sans");
-        assert_eq!(spec.typography.body_px, 15.333);
+        assert_eq!(spec.typography.family, "SF Pro Text");
+        assert_eq!(spec.typography.body_px, 44.0 / 3.0);
         // surface is the web Ocean-light bg-primary: oklch(98% .008 220).
         assert_eq!(spec.colors.surface, ok(98., 0.008, 220.).color());
         // control.active is the web accent: oklch(50% .12 220).
@@ -3309,8 +3597,11 @@ mod tests {
     fn typography_environment_ignores_empty_family_and_invalid_sizes() {
         for value in ["", "bad", "NaN", "inf", "5.9", "96.1"] {
             let typography = CtkTypography::with_environment(Some("  "), Some(value));
-            assert_eq!(typography.requested_family, DEFAULT_FONT_FAMILY);
-            assert_eq!(typography.body_px, DEFAULT_BODY_PX);
+            assert_eq!(
+                typography.requested_family,
+                TypographySpec::default().family
+            );
+            assert_eq!(typography.body_px, TypographySpec::default().body_px);
             assert!(typography.environment_body_px.is_none());
         }
         for value in ["6", "17.5", "96"] {
@@ -3325,6 +3616,10 @@ mod tests {
         let mut typography =
             CtkTypography::with_environment(Some("CTK Missing Deployment Font 36d7"), Some("17.5"));
         let mut font_cx = FontCx::default();
+        font_cx.collection = fontique::Collection::new(fontique::CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
         let mut state = ThemeState::default();
         let mut theme = UiTheme::default();
         for size in [12.0, 24.0] {
@@ -3337,6 +3632,10 @@ mod tests {
                 "CTK Missing Deployment Font 36d7"
             );
             assert_eq!(typography.body_px, 17.5);
+            assert_eq!(
+                typography.weight, 400,
+                "family-only environment override uses Regular"
+            );
             assert_eq!(
                 typography.body_px_provenance,
                 TypographyProvenance::Environment
@@ -4300,6 +4599,113 @@ mod tests {
     }
 
     #[test]
+    fn untagged_bold_survives_reconciliation_and_theme_reload() {
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        let mut app = App::new();
+        app.insert_resource(fonts)
+            .insert_resource(CtkTypography::without_environment())
+            .add_plugins(CtkThemePlugin::isolated());
+        let label = app
+            .world_mut()
+            .spawn(TextFont::from_font_size(13.0).with_font_weight(FontWeight::BOLD))
+            .id();
+        let mono = app
+            .world_mut()
+            .spawn((TextFont::from_font_size(13.0), CtkMonospace))
+            .id();
+        for weight in [300, 600, 400] {
+            let mut spec = ThemeSpec::builtin();
+            spec.typography.weight = weight;
+            app.world_mut().write_message(ApplyTheme(spec));
+            app.update();
+            app.update();
+            assert_eq!(
+                app.world().get::<TextFont>(label).unwrap().weight,
+                FontWeight::BOLD
+            );
+            assert_eq!(
+                app.world().get::<TextFont>(mono).unwrap().weight,
+                app.world()
+                    .resource::<CtkTypography>()
+                    .role_weight(CtkTextRole::Mono)
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_small_and_mono_roles_apply_and_reload_without_widgets_plugin() {
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        fonts.collection.register_fonts(
+            bevy::text::Font::from_bytes(bevy::text::DEFAULT_FONT_DATA.to_vec()).data,
+            None,
+        );
+        let mut app = App::new();
+        app.insert_resource(fonts)
+            .insert_resource(CtkTypography::without_environment())
+            .add_plugins(CtkThemePlugin::isolated());
+        let small = app
+            .world_mut()
+            .spawn((TextFont::default(), CtkTextRole::Small))
+            .id();
+        let mono = app
+            .world_mut()
+            .spawn((TextFont::default(), CtkTextRole::Mono))
+            .id();
+        let legacy_mono = app
+            .world_mut()
+            .spawn((TextFont::from_font_size(13.0), CtkMonospace))
+            .id();
+        for size in [12, 15] {
+            let source = cosmix_design::EMBEDDED_DEFAULT_SOURCE
+                .replace(
+                    "small: { family: \"SF Pro Text\"",
+                    "small: { family: \"Fira Mono\"",
+                )
+                .replace(
+                    "logical_px: 10.666666666666666, weight: 400",
+                    &format!("logical_px: {size}, weight: 600"),
+                )
+                .replace(
+                    "mono: { family: \"SF Mono\"",
+                    "mono: { family: \"Fira Mono\"",
+                )
+                .replace("logical_px: 16, weight: 300", "logical_px: 19, weight: 500");
+            app.world_mut()
+                .resource_mut::<crate::design::CtkDesignStatus>()
+                .replace_source("test:typography-roles", source);
+            app.update();
+            let small_font = app.world().get::<TextFont>(small).unwrap();
+            assert_eq!(small_font.font_size, FontSize::Px(size as f32));
+            assert_eq!(small_font.weight, FontWeight(600));
+            assert_eq!(small_font.font, FontSource::Family("Fira Mono".into()));
+            let mono_font = app.world().get::<TextFont>(mono).unwrap();
+            assert_eq!(mono_font.font_size, FontSize::Px(19.0));
+            assert_eq!(mono_font.weight, FontWeight(500));
+            assert_eq!(mono_font.font, FontSource::Monospace);
+            assert_eq!(
+                app.world().get::<TextFont>(legacy_mono).unwrap().weight,
+                FontWeight(500)
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<CtkTypography>()
+                    .resolved_mono_families
+                    .first()
+                    .map(String::as_str),
+                Some("Fira Mono")
+            );
+        }
+    }
+
+    #[test]
     fn a_last_good_family_that_no_longer_maps_is_not_reported_as_in_effect() {
         // A mapping can be lost without any theme change — dropping the last
         // strong handle to a font asset rebuilds the collection. Reporting the
@@ -4309,7 +4715,12 @@ mod tests {
         const MISSING: &str = "CTK Test Missing Family 9d3e51aa";
 
         let mut app = App::new();
-        app.init_resource::<FontCx>()
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        app.insert_resource(fonts)
             .add_plugins(CtkThemePlugin::default());
         {
             let mut typography = app.world_mut().resource_mut::<CtkTypography>();
@@ -4383,7 +4794,12 @@ mod tests {
         const MISSING: &str = "CTK Test Missing Family 7a1049e7";
 
         let mut app = App::new();
-        app.init_resource::<FontCx>()
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        app.insert_resource(fonts)
             .add_plugins(CtkThemePlugin::default());
         let original = TextFont::from_font_size(13.0);
         let original_source = original.font.clone();
@@ -4418,7 +4834,12 @@ mod tests {
         const MISSING: &str = "CTK Test Missing Family 0f52c9d1";
 
         let mut app = App::new();
-        app.init_resource::<FontCx>()
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        app.insert_resource(fonts)
             .add_plugins(CtkThemePlugin::default());
         let text = app.world_mut().spawn(TextFont::from_font_size(13.0)).id();
         let mut spec = ThemeSpec::builtin();
@@ -4452,6 +4873,10 @@ mod tests {
         // Where the host does have fonts, prove the retry can also succeed.
         let available = {
             let mut font_cx = app.world_mut().resource_mut::<FontCx>();
+            font_cx.collection.register_fonts(
+                bevy::text::Font::from_bytes(bevy::text::DEFAULT_FONT_DATA.to_vec()).data,
+                None,
+            );
             let first = font_cx.collection.family_names().next().map(str::to_string);
             first
         };
@@ -4793,7 +5218,7 @@ mod tests {
 
         assert_eq!(
             app.world().resource::<CtkTypography>().body_px,
-            DEFAULT_BODY_PX
+            TypographySpec::default().body_px
         );
     }
 }
@@ -5544,6 +5969,40 @@ mod theme_file_tests {
             spec.metrics.knob_size, base_knob,
             "absent metric keeps built-in"
         );
+    }
+
+    #[test]
+    fn family_only_overrides_default_to_regular_but_explicit_weights_win() {
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        for weight in [None, Some(300), Some(600)] {
+            let mut spec = ThemeSpec::builtin();
+            assert_eq!(spec.typography.weight, 300);
+            spec.overlay(&ThemeFile {
+                typography: Some(TypographyFile {
+                    family: Some("Example Sans".into()),
+                    weight,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(spec.typography.weight, weight.unwrap_or(400));
+            assert_eq!(spec.typography_weight_explicit, weight.is_some());
+            // Test explicit weight precedence without Light adaptation masking
+            // the result: a non-Light explicit weight must survive the env.
+            let mut typography = CtkTypography::with_environment(Some("Deployment Sans"), None);
+            let mut state = ThemeState::default();
+            apply_theme(&mut UiTheme::default(), &mut state, &spec);
+            configure_typography(&state, &mut typography, &mut fonts);
+            assert_eq!(
+                typography.weight,
+                if weight == Some(600) { 600 } else { 400 }
+            );
+        }
     }
 
     #[test]

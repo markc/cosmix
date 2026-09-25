@@ -29,6 +29,8 @@ pub enum Action {
     FontDecrease,
     FontReset,
     Scroll(ScrollRequest),
+    Copy,
+    Paste,
 }
 
 impl Action {
@@ -79,7 +81,11 @@ pub fn action_for(
     }
     if !modifiers.control() {
         return if modifiers.shift() {
-            scroll_request(key).map(Action::Scroll)
+            if matches!(key, Key::Named(Named::Insert)) {
+                Some(Action::Paste)
+            } else {
+                scroll_request(key).map(Action::Scroll)
+            }
         } else {
             None
         };
@@ -100,6 +106,8 @@ pub fn action_for(
     }
     match key.as_ref() {
         Key::Character(_) if shift => Some(match chord_letter(key, physical)? {
+            'c' => Action::Copy,
+            'v' => Action::Paste,
             't' => Action::NewTab,
             'w' => Action::CloseTab,
             'q' => Action::Quit,
@@ -185,6 +193,8 @@ fn chord_letter(key: &Key, physical: Physical) -> Option<char> {
         return None;
     };
     Some(match code {
+        Code::KeyC => 'c',
+        Code::KeyV => 'v',
         Code::KeyT => 't',
         Code::KeyW => 'w',
         Code::KeyQ => 'q',
@@ -267,13 +277,15 @@ pub fn keys_for(key: &Key, text: Option<&str>, modifiers: Modifiers) -> Vec<Term
     }
     // Everything else is what the seat says the key typed, so a non-US layout
     // works without this file knowing anything about layouts.
-    text.map(|text| {
-        text.chars()
-            .filter(|c| c.is_ascii() && !c.is_control())
-            .map(TerminalKey::Char)
-            .collect()
-    })
-    .unwrap_or_default()
+    text.map(text_keys).unwrap_or_default()
+}
+
+/// Shared by key text and IME commits; format characters (ZWJ/VS) are text.
+pub fn text_keys(text: &str) -> Vec<TerminalKey> {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .map(TerminalKey::Char)
+        .collect()
 }
 
 /// A single ASCII letter, or nothing. `Key::Character` can hold a whole
@@ -320,6 +332,33 @@ mod tests {
 
     fn character(c: &str) -> Key {
         Key::Character(c.into())
+    }
+
+    #[test]
+    fn clipboard_chords_follow_layout_letters_and_physical_fallback() {
+        let mods = Modifiers::CTRL | Modifiers::SHIFT;
+        for (letter, code, non_latin, action) in [
+            ("c", Code::KeyC, "с", Action::Copy),
+            ("v", Code::KeyV, "м", Action::Paste),
+        ] {
+            for text in [letter, non_latin] {
+                assert_eq!(action_for(&character(text), &character(text), Physical::Code(code), mods), Some(action));
+            }
+            assert_eq!(action_for(&character(letter), &character(letter), Physical::Code(Code::KeyX), mods), Some(action));
+            for extra in [Modifiers::ALT, Modifiers::LOGO] {
+                assert_eq!(action_for(&character(letter), &character(letter), Physical::Code(code), mods | extra), None);
+            }
+            assert_eq!(action_for(&character("ö"), &character("Ö"), Physical::Code(code), mods), None);
+            assert!(!action.repeats());
+            assert_eq!(action_on_screen(Some(action), true), Some(action));
+        }
+        let insert = Key::Named(Named::Insert);
+        assert_eq!(action_for(&insert, &insert, Physical::Code(Code::Insert), Modifiers::SHIFT), Some(Action::Paste));
+        for modifiers in [Modifiers::empty(), Modifiers::CTRL, mods, Modifiers::SHIFT | Modifiers::ALT] {
+            assert_eq!(action_for(&insert, &insert, Physical::Code(Code::Insert), modifiers), None);
+        }
+        assert_eq!(action_for(&character("c"), &character("c"), Physical::Code(Code::KeyC), Modifiers::CTRL), None);
+        assert_eq!(bytes(&character("c"), None, Modifiers::CTRL), [3]);
     }
 
     #[test]
@@ -677,14 +716,17 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_text_is_dropped_rather_than_mangled() {
-        // The core's encoder returns an empty Vec for a non-ASCII char, so
-        // passing it through would be a silent no-op with a key press
-        // charged against it. Filtering here keeps that visible in one place.
-        assert!(bytes(&character("é"), Some("é"), Modifiers::empty()).is_empty());
+    fn keyboard_text_preserves_complete_unicode_sequences() {
+        for text in ["aéb", "👩‍💻", "🇦🇺", "👍🏽", "❤️", "e\u{301}"] {
+            assert_eq!(
+                bytes(&character(text), Some(text), Modifiers::empty()),
+                text.as_bytes()
+            );
+            assert!(cosmix_term_core::terminal::encode_text(text).is_err());
+        }
         assert_eq!(
-            keys_for(&character("aéb"), Some("aéb"), Modifiers::empty()).len(),
-            2
+            bytes(&character("x"), Some("\u{1b}👩‍💻\u{3}"), Modifiers::empty()),
+            "👩‍💻".as_bytes()
         );
     }
 }

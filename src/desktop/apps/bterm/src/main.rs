@@ -1168,7 +1168,7 @@ fn refresh(
     let scale = if inv > 0.0 { 1.0 / inv } else { 1.0 };
     if (scale - view.scale).abs() > 0.01 {
         let settings = settings.0;
-        match raster::Raster::new(scale, settings.config.font_px, settings.config.cursor) {
+        match painter.resized(scale, settings.config.font_px) {
             Ok(next) => {
                 *painter = next;
                 rebuilt = true;

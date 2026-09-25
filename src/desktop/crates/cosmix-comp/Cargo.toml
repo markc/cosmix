@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.69.1"
+version = "0.69.2"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -62,6 +62,7 @@ name = "cosmix-input-probe"
 path = "src/bin/cosmix-input-probe.rs"
 
 [dependencies]
+cosmix-design = { path = "../cosmix-design" }
 cosmix-quoin = { path = "../../apps/quoin", optional = true }
 cosmix-shell = { path = "../cosmix-shell", features = ["chrome"], optional = true }
 cosmix-bg-boing = { path = "../cosmix-bg-boing", optional = true }
@@ -125,6 +126,9 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"], optional =
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 
 [dev-dependencies]
+parley = "=0.9.0"
+swash = "=0.2.10"
+ttf-parser = "=0.25.1"
 tokio = { version = "1", features = ["test-util"] }
 wgpu = { version = "=29.0.4", features = ["noop"] }
 # Compiles the vendored `*_offline` X11Surface setters for the deterministic

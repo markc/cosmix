@@ -1163,7 +1163,11 @@ fn dictionary_provenance(
             DesignValueId::TypeRecord(name.clone()),
             authored(
                 format!("design.v1.typography.records.{name}"),
-                vec![format!("dictionary.metrics.{}", record.font_size_metric)],
+                if record.font_size_metric.is_empty() {
+                    Vec::new() // logical_px is authored directly on this record
+                } else {
+                    vec![format!("dictionary.metrics.{}", record.font_size_metric)]
+                },
             ),
         );
     }
@@ -2655,6 +2659,80 @@ mod tests {
             .expect("button typography")
             .type_step = "button.height.md".into();
         assert_fatal_code(&document, "metric-kind-mismatch");
+    }
+
+    #[test]
+    fn desktop_roles_match_the_lightweight_defaults() {
+        let result = compile_design(&document(), DesignContext::default());
+        let DesignCompileResult::Success(success) = result else {
+            panic!("default typography must compile: {result:?}");
+        };
+        for (role, family, weight, px) in [
+            (crate::TypographyRole::Ui, "SF Pro Text", 300, 44.0 / 3.0),
+            (
+                crate::TypographyRole::UiDisplay,
+                "SF Pro Display",
+                300,
+                44.0 / 3.0,
+            ),
+            (crate::TypographyRole::Small, "SF Pro Text", 400, 32.0 / 3.0),
+            (crate::TypographyRole::Mono, "SF Mono", 300, 16.0),
+            (crate::TypographyRole::Terminal, "SF Mono", 300, 64.0 / 3.0),
+        ] {
+            let record = crate::default_typography(role);
+            assert_eq!(record.family, family);
+            assert_eq!(record.weight, weight);
+            assert_eq!(record.font_size, px);
+            assert_eq!(
+                record.generic,
+                if family == "SF Mono" {
+                    crate::TypographyGeneric::Monospace
+                } else {
+                    crate::TypographyGeneric::SansSerif
+                }
+            );
+            assert_eq!(success.candidate.typography().role(role), Some(record));
+            let expected: &[&str] = if family == "SF Mono" {
+                &["DejaVu Sans Mono", "Noto Sans Mono"]
+            } else {
+                &["Inter", "Noto Sans", "DejaVu Sans"]
+            };
+            assert_eq!(record.fallbacks, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_invalid_exact_typography() {
+        for px in [None, Some(0.0), Some(-1.0), Some(f64::NAN)] {
+            let mut document = document();
+            document
+                .v1
+                .typography
+                .records
+                .get_mut("ui")
+                .unwrap()
+                .logical_px = px;
+            assert_fatal_code(&document, "invalid-typography");
+        }
+        let mut document = document();
+        document
+            .v1
+            .typography
+            .records
+            .get_mut("ui")
+            .unwrap()
+            .type_step = "type.body".into();
+        assert_fatal_code(&document, "invalid-typography");
+        let mut document = self::document();
+        document
+            .v1
+            .typography
+            .records
+            .get_mut("ui")
+            .unwrap()
+            .fallbacks
+            .push(" ".into());
+        assert_fatal_code(&document, "invalid-typography");
     }
 
     #[test]

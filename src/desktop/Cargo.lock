@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bterm"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3052,12 +3052,13 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.69.1"
+version = "0.69.2"
 dependencies = [
  "bevy",
  "chrono",
  "cosmix-bg-boing",
  "cosmix-deco",
+ "cosmix-design",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
@@ -3072,14 +3073,17 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "libc",
+ "parley",
  "serde",
  "serde_json",
  "signal-hook 0.3.18",
  "smithay",
  "smithay-client-toolkit 0.19.2",
  "static_assertions",
+ "swash",
  "tokio",
  "tracing",
+ "ttf-parser",
  "unicode-segmentation",
  "wayland-client",
  "wgpu 29.0.4",
@@ -3087,11 +3091,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-deco"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "cosmix-design"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "cosmix-lib-mix",
  "serde",
@@ -3362,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.14.4"
+version = "0.15.0"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3373,8 +3377,13 @@ dependencies = [
  "cosmix-shell",
  "cosmix-shell-host",
  "ctk",
+ "fontique",
+ "image",
+ "parley",
  "serde_json",
+ "swash",
  "tempfile",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -3405,7 +3414,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3469,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytes",
  "cosmix-design",
@@ -3490,14 +3499,17 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
+ "cosmix-design",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
  "ed25519-dalek",
+ "fontdb",
  "libc",
+ "png",
  "rio-vt",
  "serde",
  "serde_json",
@@ -3798,7 +3810,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "accesskit",
  "ammonia",

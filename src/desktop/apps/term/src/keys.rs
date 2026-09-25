@@ -27,7 +27,10 @@ use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, r
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
 type KeyHandler<'a, Message> = Box<dyn Fn(&iced::keyboard::Event) -> Option<Message> + 'a>;
+type ImeHandler<'a, Message> = Box<dyn Fn(&iced::advanced::input_method::Event) -> Message + 'a>;
 type PointerHandler<'a, Message> = Box<dyn Fn(iced::Point) -> Option<Message> + 'a>;
+type MouseHandler<'a, Message> =
+    Box<dyn Fn(&mouse::Event, Option<iced::Point>) -> Option<Message> + 'a>;
 type Redraw<Message> = (
     Option<std::time::Instant>,
     fn(std::time::Instant) -> Message,
@@ -37,7 +40,10 @@ type Redraw<Message> = (
 pub struct Keys<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_press: KeyHandler<'a, Message>,
+    on_ime: Option<ImeHandler<'a, Message>>,
+    ime: iced::advanced::input_method::InputMethod,
     on_pointer: Option<PointerHandler<'a, Message>>,
+    on_mouse: Option<MouseHandler<'a, Message>>,
     redraw: Option<Redraw<Message>>,
 }
 
@@ -49,12 +55,35 @@ pub fn keys<'a, Message, Theme, Renderer>(
     Keys {
         content: content.into(),
         on_press: Box::new(on_press),
+        on_ime: None,
+        ime: iced::advanced::input_method::InputMethod::Disabled,
         on_pointer: None,
+        on_mouse: None,
         redraw: None,
     }
 }
 
 impl<'a, Message, Theme, Renderer> Keys<'a, Message, Theme, Renderer> {
+    pub fn input_method(
+        mut self,
+        ime: iced::advanced::input_method::InputMethod,
+        callback: impl Fn(&iced::advanced::input_method::Event) -> Message + 'a,
+    ) -> Self {
+        self.ime = ime;
+        self.on_ime = Some(Box::new(callback));
+        self
+    }
+
+    /// Buttons and drag endpoints use the same lossless path as keys. The
+    /// callback claims only terminal events, leaving tab-strip widgets alone.
+    pub fn on_mouse(
+        mut self,
+        callback: impl Fn(&mouse::Event, Option<iced::Point>) -> Option<Message> + 'a,
+    ) -> Self {
+        self.on_mouse = Some(Box::new(callback));
+        self
+    }
+
     pub fn on_pointer(mut self, callback: impl Fn(iced::Point) -> Option<Message> + 'a) -> Self {
         self.on_pointer = Some(Box::new(callback));
         self
@@ -141,13 +170,37 @@ where
         {
             shell.publish(message(*at));
         }
+        if let Event::Mouse(event) = event
+            && let Some(callback) = &self.on_mouse
+            && let Some(message) = callback(event, cursor.position())
+        {
+            shell.publish(message);
+            shell.capture_event();
+            return;
+        }
         self.content.as_widget_mut().update(
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,
         );
+        // Merge after children: a focused text field's IME request wins.
+        if matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        ) {
+            shell.request_input_method(&self.ime);
+        }
         // After the child, and only if the child did not claim it: a future
         // text field or menu in the tree (T3) must win the key it is focused
         // on, exactly as it does in the Bevy frontend.
         if shell.is_event_captured() {
+            return;
+        }
+        if let Event::InputMethod(event) = event
+            && (self.ime.is_enabled()
+                || matches!(event, iced::advanced::input_method::Event::Closed))
+            && let Some(callback) = &self.on_ime
+        {
+            shell.publish(callback(event));
+            shell.capture_event();
             return;
         }
         if let Event::Keyboard(event) = event

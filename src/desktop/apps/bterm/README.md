@@ -110,7 +110,7 @@ oversized files also use defaults without parsing a truncated prefix.
 
 | Key | Values | Default |
 | --- | --- | --- |
-| `font_px` | Number, 6–48 logical pixels | 13 |
+| `font_px` | Number, 6–48 logical pixels (fractions allowed) | Terminal design role: 21.3333 (16pt) |
 | `scrollback` | Integer, 0–1000000 history lines per tab | 1000 (existing Crosswords limit) |
 | `cursor` | `"block"` (inverted cell) or `"underline"` | `"underline"` |
 

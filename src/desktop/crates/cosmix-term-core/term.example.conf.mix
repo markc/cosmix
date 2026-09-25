@@ -4,8 +4,9 @@
 -- Missing, malformed or invalid files log once and use all defaults.
 
 -- Logical pixels, number in 6..48. Valid TERM_FONT_PX overrides this value.
--- Invalid TERM_FONT_PX is ignored; the file value (or default 13) remains.
-font_px: 13
+-- Invalid TERM_FONT_PX is ignored; the file value or terminal design role remains.
+-- Omit to follow the role (currently 21.3333 logical px / 16pt).
+-- font_px: 21.3333
 
 -- History lines per tab, integer in 0..1000000; 0 disables history.
 -- Default 1000 preserves the existing Crosswords history limit.

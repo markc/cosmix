@@ -93,6 +93,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_preserves_fractional_config_and_design_default() {
+        for configured in [21.333, crate::config::Config::default().font_px] {
+            let mut size = FontSize::new(configured);
+            assert!(size.step_by(3));
+            assert!(size.reset());
+            assert_eq!(size.current(), configured);
+        }
+    }
+
+    #[test]
     fn a_step_is_half_a_point_at_96_dpi() {
         let mut size = FontSize::new(13.0);
         assert!(size.increase());

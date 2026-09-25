@@ -61,6 +61,10 @@ The original two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
 `cpu_grid::bench::tiny_skia_foot_phases_bench`. `--test-threads=1` matters:
 running performance tests concurrently would contaminate their results.
 Rank 6 adds `cpu_grid::bench::raster_warm_spans_bench` (described below).
+`cpu_grid::bench::raster_warm_spans_default_font_bench` adds the same DejaVu
+workload at `Config::default().font_px` (21.3333), scale 2.5, with actual font
+cell metrics and a matching target size. The original 13px, 25×50-cell
+benchmarks remain for comparison; the new variant has no recorded timings yet.
 These historical measurements used the then-default wgpu build; both this report and
 [term-rendering.md](term-rendering.md) use explicit tiny-skia feature
 selection for CPU measurements. Only the term release test target and its dependencies were
@@ -405,8 +409,9 @@ band over deterministic varied grids, scales 1/1.25/1.5/2.5, bold and wide or
 combining characters (still cell-clipped), both cursor styles, partial final
 rows, partial repaint sequences, odd padding and nonzero unaligned buffer
 origins. Synthetic masks exercise all 256 coverage values and each clipping
-edge, including fully clipped glyphs. Tests require an installed monospace
-font or `TERM_SPIKE_FONT`, as existing raster tests do.
+edge, including fully clipped glyphs. Pixel oracles and raster benchmarks pin
+the installed DejaVu Sans Mono fixture explicitly, independent of desktop
+font discovery and `TERM_SPIKE_FONT`.
 
 The ignored `cpu_grid::bench::raster_warm_spans_bench` sits beside the existing
 phase probes. It measures the same padded 2250×1250, scale-2.5 fixture for
@@ -894,3 +899,316 @@ merged tree. Term stays at 0.2.5 and core at 0.6.2. Tiny-skia is the default,
 clean wgpu uses `--no-default-features --features wgpu`, and enabling both
 selects wgpu. Merge resolution is source-checked only; build, regression and
 clippy validation of this integration remain for the cluster.
+
+## Rank 5: cell comparison and range damage (2026-09-25)
+
+Implemented on the ranks 1/2/3/4/6 base; **not built, tested or measured locally**.
+Cluster validation remains required. Versions are unchanged. The comparison
+baseline remains banded row echo **0.370 ms** (about **0.13 ms paint + 0.24 ms
+render**) and full redraw **3.742 ms**; there are no new timing claims here.
+
+`PaintState` retains the captured `Cell` values. On correctly sized dirty-row
+hints, it compares `char`, final foreground/background RGB and bold using
+`Cell` equality. It paints contiguous changed-cell ranges and coalesces equal
+backgrounds only within those ranges. No palette, selection or semantic VT
+state is reconstructed: capture-time selection colour swaps work automatically
+when capture marks their rows dirty. Old/new cursor cells are independently
+repainted on movement or visibility changes. A stationary cursor is composited
+only over a cell repainted this call; an unchanged dirty row costs comparisons,
+with no pixel writes, generation change or buffer copy.
+
+Full invalidation covers columns, paintable rows, physical cell size, output
+scale, destination format, stride, changed buffer address/length, explicit
+invalidation, and replacement raster identity (including a different font/size
+with identical rounded metrics). A byte-identical complete-copy `rebind` is the
+explicit storage exception. Malformed damage lengths and incomplete cell rows
+retain the conservative full-paint behaviour. `Screen::display_offset` is
+captured under the terminal lock and carried through CPU band snapshots: an
+offset change forces full rows even if all cells compare equal. Capture keeps
+the cursor visible while its live row remains inside the viewport, including
+at nonzero offsets; raster honours that captured visibility. An unchanged
+scrolled viewport may skip identical cells despite conservative row hints.
+
+`DamageBand` now includes physical `x` and `width`. Its legacy `byte_range`
+still returns conservative full scanlines, including padding. Frame damage
+coalescing preserves horizontal extents. Pending frame damage collapses to a
+full rectangle above twice the row count, bounding undrained hidden/stalled
+panes even when each read changes a different horizontal range. Both raster
+and native-grid vertical merging search only the preceding row's open runs;
+above twice the row count they fall back to full-width damaged-row bands.
+Wgpu uploads narrow rectangles from the existing full-stride RGBA allocation
+using x/y texture origins and byte
+offsets; new textures still receive a full upload. No packing allocation or
+texture-format change is introduced. GPU execution remains unvalidated here.
+
+The tiny-skia primitive keeps a bounded cell-revision array beside each
+immutable native BGRA generation. Its separate `Damage` tracker holds metadata,
+never old pixels. Updating stamps uses copy-on-write if a retained generation
+still owns the old array; a full overwrite replaces it with fresh stamps
+without copying the old array. Damage rectangles pass from the borrowed band
+slice through an iterator, without an intermediate rectangle allocation.
+Comparing two generations from the same lineage finds changed ranges at any
+buffer age, including A → B → A and multiple
+paints/publications before a presentation. Unrelated geometry/lineage, changed
+placement/clip and added/removed primitives retain full-bound damage. Equal
+generations stay a constant-time comparison.
+
+The four-row allocation remains the storage unit. A retained generation always
+forces separate pixels before mutation. Partial updates copy the **complete**
+band and rebind; an update proven to overwrite every cell may discard its old
+pixels. This overwrite check runs only when the allocation is shared. Full
+paints skip change-mask allocation/clearing/comparison and record cells row by
+row while painting. Dirty rows compare and record `Copy` cells in one pass,
+counting changes without later row scans or cell copies. The warm full/echo
+probe prepares background changes outside the timer, matching the rank-6
+probe. Row flags alone no longer authorise discarding bytes. No storage safety
+depends on a maximum age, a two-frame rotation or history release timing.
+The widget still draws complete immutable grids; layer diffing supplies narrow
+regions to the existing clipped copy and `present_with_damage` path. Iced's
+damage expansion/grouping, age repair and redraws beneath overlays can enlarge
+those regions: cell damage and buffer repair remain separate concerns.
+
+Added/extended validation for the cluster:
+
+- 2,048 deterministic random frames per cursor style compare **every frame**
+  against a fresh full paint using the retained original per-pixel painter.
+  Cases include typing, colours/style and selection-like swaps, redundant
+  dirtiness, cursor movement/hide/out-of-bounds, resize, partial last rows,
+  scale/font/format/stride changes, replacement buffers, complete-copy rebinds,
+  explicit invalidation and viewport changes. Guard bytes/padding and damage
+  coverage of every changed byte are checked.
+- Focused tests require one-cell damage, two disjoint ranges, unchanged cursor
+  no-ops and full viewport invalidation with identical cells. Pixel assertions
+  cover block and underline cursors at nonzero offsets in RGBA and BGRA.
+  Tests also cover untouched full-paint change scratch, varied undrained
+  ranges, continuing vertical runs and bounded checkerboard damage. Existing row,
+  format, storage and frame tests use the new rectangle semantics.
+- The rotating-target/RGBA comparison now checks 384 frames for each of three
+  initial scales, including output-scale changes, retained historical pixels,
+  skipped intermediate generations, clips/overlays, resize and unknown ages.
+  It uses production `PresentHistory`, physical rectangle conversion and
+  submission sequencing. A headless displayed buffer copies only submitted
+  rectangles and must match the full RGBA oracle, as must each repaired target;
+  only the softbuffer/Wayland commit itself is simulated.
+- Vendor regressions check arbitrary-age cell stamps, reverts, narrow layer
+  diffing and the physical rectangles passed to presentation. At scale 2.5,
+  one 25×50 cell yields a 31×56 outward-rounded rectangle after iced's margin,
+  instead of damaging the full 2250×200 storage band.
+- A wgpu-side host test replays the production upload layouts into a simulated
+  texture after coalesced cell/cursor paints and compares every byte with the
+  current RGBA surface. It does not exercise a device or driver.
+- The ignored frame benchmark retains row echo/full redraw and adds genuine
+  one-cell glyph echo plus cursor-only moves across a band boundary. It prints
+  the existing phase timing and damaged-area columns for both transports.
+  Warm phase probes now change actual cell backgrounds so they measure paint,
+  rather than the newly cheap redundant-damage path (that setup is timed).
+
+Expected savings are structural, pending measurement: one-cell echo paints
+1/90 of a row's cells and submits roughly 1,736 pixels instead of about 450,000
+band pixels in the isolated fixture. Cursor-only movement paints two cells.
+The previous ~0.13 ms paint phase and ~0.24 ms render phase provide headroom,
+but full-band retained-storage copies, snapshot/band cell copies, mask work,
+metadata comparison and grouping remain. A genuinely changed full pane still
+paints/presents all cells; no full-redraw speedup is claimed.
+
+Unenforced contracts and limits:
+
+- Dirty-row hints must cover every captured visual change, including future
+  selection changes, and consumers must not drop consuming snapshots between
+  paints. Pane identity changes or undetectable same-address buffer reuse
+  require explicit invalidation; external writes to retained pixels are not
+  detectable. `rebind` requires an exact complete copy with unchanged layout.
+- External native-grid producers must supply premultiplied BGRA and mark
+  every written region before publishing with `Grid::with_damage`. Shape is
+  validated; channel validity and completeness of reported damage are not.
+  Term derives marks from the actual painter ranges and writes opaque pixels.
+- The existing Swash Outline/Alpha mask layout and representable grid/stride
+  arithmetic are still library/caller contracts. Public raster dimensions
+  must remain valid nonzero font metrics. New pixel-affecting `Cell` fields
+  must be captured and painted; derived equality includes them automatically.
+- The existing iced CPU renderer alias, dependency feature unification and
+  ordered sublayer contracts remain source-audited integration dependencies.
+  Headless tests do not establish live Wayland acquire/present pacing, old
+  surface-version damage expansion, compositor cost or input-to-visible latency.
+  Timing estimates assume comparable hardware/font/fixture conditions.
+
+## Unicode clusters and colour emoji
+
+Implemented on the ranks 1–6 integration; source and formatting review only.
+No local build, check, test, clippy or timing gate was run for this change, and
+versions are unchanged. The existing warm full-paint (~1.24 ms), one-cell echo
+(~0.16 ms) and banded full-redraw (~3.66 ms) baselines remain cluster acceptance
+targets, not measurements of this implementation.
+
+Rio `932c1a7` already provides complete grapheme extras, Unicode 17 widths,
+default-on DEC mode 2027 and the four `Wide` states. Capture now copies those
+states and all cell text under the grid lock. It does not recalculate widths
+from fonts, Unicode-width crates or shaping advances, including when an
+application disables mode 2027. Copy/paste and keyboard details are in
+[term-clipboard](term-clipboard.md).
+
+`Cell` remains `Copy`: an inline base `char`, a `u32` extended-text ID (zero for
+a scalar), a byte-sized width enum and the original visual attributes. Tests
+require its size to remain at most 16 bytes. Equality remains constant-time;
+the scalar row comparison retains the zipped compare-and-record pass and full
+paints retain `copy_from_slice`. Wide rows expand changed cells through the
+union of old and new pair ownership before recording cells or producing damage.
+That covers extras-only changes, spacer background changes, shifted pairs,
+pair breakup and cursor width changes. Both cursor styles normalise a trailing
+half to its lead and cover both cells. Incomplete or malformed pairs are clipped
+to the available cell; `Spacer` and `LeadingSpacer` paint only backgrounds.
+
+Each terminal normally interns up to 4,096 entries and 1 MiB of UTF-8 text,
+with a hard limit of 1,024 bytes per cluster. Immutable `Arc<str>` entries live
+in a copy-on-write table carried by each `Screen`, including CPU band snapshots. Appending keeps
+the generation identity and existing IDs. Capture resets at 75% of either
+table limit. If it still saturates mid-capture, it discards that partial result
+and retries once with a fresh generation and capacity for one cluster per
+visible cell. This temporary table is discarded at the next capture, so screens
+with more than 4,096 distinct clusters do not retain saturation tofu when idle.
+Raster state compares that generation identity even with clean damage hints,
+forcing repaint when IDs are reused. Old screens retain their own text. Oversize
+or unrepresentable clusters render as bounded tofu; Rio selection text remains
+complete. Limits are per table: callers retaining many historical screens also
+retain their historical tables. There is no global cap on caller-owned frames.
+
+The primary font is shared across resize, including its stable Swash cache
+identity. Fallback fonts load lazily on the first non-ASCII cache miss and
+share immutable bytes and identities across rasters through a process-wide
+`OnceLock`; ASCII-only sessions do not read them.
+Existing monospace discovery and `TERM_SPIKE_FONT` continue
+to set cell metrics. Optional fallbacks are Noto Color Emoji followed by Noto
+Sans Symbols 2, searched in common `/usr/share/fonts` Noto locations. Missing
+or unreadable fallbacks are skipped. VS16 and wide emoji presentation prefer
+the emoji face; VS15 retains normal font priority. `CharCluster::map` checks
+whole-cluster coverage, ignoring joiners/selectors as independent visible-glyph
+requirements. `ShapeContext` shapes the full text with advances and offsets,
+then verifies the result before caching it. No font can move terminal columns.
+For a space with combining marks, empty glyph layers are discarded and visible
+ink is shifted horizontally into the cell if necessary: fonts without a space
+mark anchor can otherwise place the accent beyond the cell clip. Its baseline
+is preserved; this correction runs only on Unicode cache misses.
+
+The ASCII glyph loop, background spans and mask blend arithmetic are retained.
+`paint_reference` is unchanged as the frozen ASCII oracle. Unicode has a
+separate size-specific cache keyed by text and cell span; the immutable
+font set fixes face selection, and each entry records its chosen face identity.
+Entries include negative/tofu results, never foreground or background colours.
+The cache clears at 4,096 text keys or 16 MiB of pixel storage. Shaping, decoding
+and resampling occur only on misses. Layers and individual bitmap dimensions
+are bounded; excessive output falls back to tofu.
+Warm Unicode painting uses one borrowed cache lookup. Fully opaque mask
+samples store the foreground directly; bold remains a foreground adjustment
+and does not duplicate an unchanged glyph image.
+
+Colour bitmap selection uses Swash's nearest suitable strike (BestFit), then
+decodes at that strike's exact ppem. CBLC image formats 17–19 establish that the
+source is PNG/straight RGBA: RGB is premultiplied before resizing on the cache
+miss. Reductions use area averages over every covered source pixel; enlargement
+retains bilinear sampling. Other bitmap encodings, including sbix, currently fall
+through to outlines or tofu. Colour outlines are rasterised as ordered layers:
+CPAL colours become premultiplied RGBA and current-foreground layers remain
+alpha masks. This avoids treating Swash's composited colour-outline output as
+straight PNG data, and keeps foreground changes independent of cached colours.
+The supported COLR outline functionality is that provided by pinned Swash.
+
+Colour clusters fit proportionally within the VT's one- or two-cell box and are
+centred; ordinary outline text preserves the primary baseline. Both backgrounds
+are filled before the lead paints. Masks and colour layers blend source-over
+the actual destination, so a pair can have different backgrounds. RGBA and
+BGRA use the same data and write opaque destination alpha. Both frontends
+receive pair-expanded rectangles through their existing damage paths.
+
+Added cluster gates:
+
+- Capture, selection, parser chunk boundaries, paste, keyboard and IME tests.
+- Required installed Noto Color Emoji fixtures: ZWJ, flag, skin tone and VS16
+  ligatures, chromatic pixels in both halves, strict clipping, odd stride
+  padding and RGBA/BGRA at scales 1, 1.25, 1.5 and 2.5. Font absence fails these
+  tests loudly; separate tests exercise missing fallback and invalid IDs.
+  A French-flag golden checks absolute blue/white/red region bounds at scale
+  2 and untouched background outside the two-cell box, independently of the
+  Unicode image lookup and differential compositor.
+- An independent full-frame Unicode compositor uses fresh glyph caches and
+  destination-driven per-pixel loops. It shares the Swash/font backend, but no
+  production damage expansion, clipping loop or blending helper. Synthetic
+  alpha fixtures independently check PNG premultiplication, transparent-edge
+  resampling, palette colour and ordered current-foreground masks.
+- The rank-5 random differential test now runs 4,096 frames per cursor style:
+  2,048 against the frozen ASCII painter and 2,048 with Unicode transitions
+  against the full Unicode oracle, retaining storage, padding, damage, cursor,
+  resize, viewport, scale and format variations.
+- CPU band tests retain old emoji generations and move pair cursors across
+  bands; wgpu host tests replay a two-column upload. The ignored
+  `cached_ascii_and_emoji_paint_benchmark` reports cached ASCII, emoji and full
+  box-drawing/braille screen timings and
+  asserts that warm painting causes no new shaping/resampling. Existing rank-5
+  and rank-6 benchmarks remain the fixed-size performance acceptance probes.
+
+Remaining assumptions and validation limits:
+
+- Dirty-row hints, consecutive consuming snapshots, explicit invalidation on
+  pane/storage reuse, exact-copy `rebind`, valid nonzero raster geometry and
+  representable buffer arithmetic retain the existing rank-5 contracts.
+- Font files are trusted local inputs and their Swash parsing/rasterisation
+  contracts remain dependencies. Optional face discovery validates font headers,
+  not every table. Resource checks bound retained results, not all allocations
+  internal to a font decoder before it returns.
+- Noto test files are discovered by their fixed filenames but their byte versions
+  are not pinned in the repository. Glyph design and coverage depend on the
+  installed font; the tests enforce the required sequence behaviour.
+- Rio and Swash have separate segmentation tables. Shaping is per terminal cell
+  cluster, not paragraph bidi or joining across neighbouring terminal cells.
+  Swash may segment a long Rio cluster internally; bounded unsupported results
+  become tofu rather than changing grid width.
+- IME delivery, keyboard/commit deduplication and composition UI depend on
+  iced/winit and the compositor. The host tests do not establish live IME,
+  clipboard, Wayland presentation or GPU-driver behaviour. Performance and
+  visual font quality still require cluster gates and a live desktop check.
+
+## Terminal default typography
+
+Both terminal frontends read the `cosmix-design` **terminal** role: **SF Mono,
+Light (300), normal style, 21.3333 logical pixels (16pt)**. Fonts are not bundled.
+Primary discovery uses fontdb's ordered family query: SF Mono → DejaVu Sans
+Mono → Noto Sans Mono → system monospace. If a Light query returns Thin or
+ExtraLight, that family is queried again at Regular (400); faces lighter
+than the role are rejected, including through the system monospace alias.
+If discovery yields no usable face, the existing DejaVu/Liberation/
+Noto/JetBrains file paths remain the last resort. Each selected path and face
+index is validated with Swash: positive units per em and `M`/`0` advances,
+plus non-empty rendered outlines for both glyphs. Unusable faces are removed
+and selection continues. The discovered primary bytes are cached process-wide
+and shared by ASCII and Unicode rendering,
+including after zoom or an output-scale change. Cell advance, line height and
+baseline come from that face's metrics; output scale is applied once.
+
+`TERM_SPIKE_FONT=/path/to/font.ttf` (TTF, OTF or collection) takes precedence
+over discovery; an invalid override reports an error. Within a collection,
+the selected face index is retained. Overrides are checked before the system
+primary cache. Both frontends reuse the loaded faces on scale changes.
+Unicode coverage tries the primary, DejaVu Sans Mono, Noto Sans Mono, emoji,
+then symbols. Emoji-presentation clusters (including VS16) still try emoji
+first. Coverage, emoji and symbol faces are loaded lazily and shared across
+rasters in the process.
+
+Set `font_px: 21.333` in `$XDG_CONFIG_HOME/cosmix/term.conf.mix` (or
+`~/.config/cosmix/term.conf.mix`) to override the size. Fractions are accepted
+throughout the inclusive 6–48 logical-pixel range. A valid `TERM_FONT_PX`
+overrides the file. Omit `font_px` to follow the design token; an existing
+configured size continues to win. Zoom reset returns to that configured size.
+
+The core's `raster::primary_font_tests` check the loaded family, weight, style,
+face index and metrics, including a temporary free-font collection whose
+chosen face is index 1. They write one headless row at 2.5× to
+`src/desktop/target/font-probes/term-row-sf-2.5x.png` and
+`src/desktop/target/font-probes/term-row-free-2.5x.png`, printing each path
+with `--nocapture`. SF tests explicitly skip when fontdb cannot find the
+`SF Mono` family. The free test excludes SF from its
+database without changing installed files. Pixel oracles and benchmarks use
+`Raster::for_test` / `Painter::for_test` to pin DejaVu Sans Mono regardless of
+the desktop default or process environment. The fixture and its Bold sibling
+are resolved by family through fontdb, with legacy file paths as a last resort.
+Regressions cover below-Light matching, damaged candidates, shared discovery,
+collection indices in test painters, and DejaVu coverage for ∀, ≡ and ↵ with
+an SF primary while retaining SF ASCII and emoji priority.

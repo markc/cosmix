@@ -787,7 +787,7 @@ fn handle(
                 // VERIFY: term.type extracts validated text, never the JSON envelope.
                 terminal
                     .listener
-                    .type_text(
+                    .bus_text(
                         args["text"]
                             .as_str()
                             .ok_or_else(|| "internal: term verb/args desync (text)".to_string())?,

@@ -65,6 +65,20 @@ Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.
 
+## Selection and clipboard
+
+Drag with the left button to select; double-click selects a word and
+triple-click a logical line. A single click clears the selection. Ctrl+Shift+C
+copies to CLIPBOARD; Ctrl+Shift+V and Shift+Insert paste CLIPBOARD. Completed
+selections also populate PRIMARY, pasted with the middle button. Hold Shift
+before pressing a mouse button to override an application's mouse reporting.
+Copy/paste chords do not repeat; plain Ctrl+C still interrupts.
+
+Selections belong to each pane and follow their text through scrollback.
+Pasting returns to the live bottom and honours the application's bracketed
+paste mode. See [selection and clipboard details](../dev/term-clipboard.md)
+for encoding, limits and Wayland requirements.
+
 ## Scrollback
 
 | Input | Action |
@@ -279,8 +293,6 @@ plain terminal.
 
 ## Not yet in this frontend
 
-- Mouse reporting, wheel scrollback and selection. bterm has them, see
-  [term-mouse](term-mouse.md).
 - The app-control port: `app.describe`, `app.quit` and `app.controls.*` are
   not served yet.
 - The native-session lane, see [term-native-session](term-native-session.md).

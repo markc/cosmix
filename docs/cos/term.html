@@ -493,6 +493,17 @@ the shell.</p>
 <p>Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>
+<h2 id="selection-and-clipboard">Selection and clipboard</h2>
+<p>Drag with the left button to select; double-click selects a word and
+triple-click a logical line. A single click clears the selection. Ctrl+Shift+C
+copies to CLIPBOARD; Ctrl+Shift+V and Shift+Insert paste CLIPBOARD. Completed
+selections also populate PRIMARY, pasted with the middle button. Hold Shift
+before pressing a mouse button to override an application's mouse reporting.
+Copy/paste chords do not repeat; plain Ctrl+C still interrupts.</p>
+<p>Selections belong to each pane and follow their text through scrollback.
+Pasting returns to the live bottom and honours the application's bracketed
+paste mode. See <a href="/dev/term-clipboard">selection and clipboard details</a>
+for encoding, limits and Wayland requirements.</p>
 <h2 id="scrollback">Scrollback</h2>
 <table><thead><tr><th>Input</th><th>Action</th></tr></thead><tbody>
 <tr><td>Wheel up / down</td><td>scroll the pane under the pointer</td></tr>
@@ -680,8 +691,6 @@ It does not move that viewport or consume pending repaint damage.</p>
 plain terminal.</p>
 <h2 id="not-yet-in-this-frontend">Not yet in this frontend</h2>
 <ul>
-<li>Mouse reporting, wheel scrollback and selection. bterm has them, see
-<a href="/cos/term-mouse">term-mouse</a>.</li>
 <li>The app-control port: <code>app.describe</code>, <code>app.quit</code> and <code>app.controls.*</code> are
 not served yet.</li>
 <li>The native-session lane, see <a href="/cos/term-native-session">term-native-session</a>.

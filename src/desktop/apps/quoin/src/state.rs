@@ -457,6 +457,8 @@ pub(crate) fn persist_transitions(
             spec.typography = ctk::theme::TypographySpec {
                 family: font.family,
                 body_px: font.body_px,
+                weight: font.weight,
+                ..Default::default()
             };
         }
         themes.write(ctk::theme::ApplyTheme(spec));

@@ -13,6 +13,7 @@
 //! transfer at all.
 
 use crate::frame::Frame;
+use cosmix_term_core::raster::DamageBand;
 use iced::wgpu;
 use iced::widget::shader;
 use std::collections::{HashMap, HashSet};
@@ -37,6 +38,29 @@ type GridId = usize;
 
 fn grid_id(frame: &Arc<Mutex<Frame>>) -> GridId {
     Arc::as_ptr(frame) as GridId
+}
+
+fn upload_region(
+    stride: usize,
+    band: DamageBand,
+) -> (wgpu::Origin3d, wgpu::TexelCopyBufferLayout, wgpu::Extent3d) {
+    (
+        wgpu::Origin3d {
+            x: band.x,
+            y: band.y,
+            z: 0,
+        },
+        wgpu::TexelCopyBufferLayout {
+            offset: band.y as u64 * stride as u64 + band.x as u64 * 4,
+            bytes_per_row: Some(stride as u32),
+            rows_per_image: Some(band.height),
+        },
+        wgpu::Extent3d {
+            width: band.width,
+            height: band.height,
+            depth_or_array_layers: 1,
+        },
+    )
 }
 
 impl GridProgram {
@@ -99,7 +123,18 @@ impl shader::Primitive for GridPrimitive {
         // A texture that was just created holds nothing, so pending damage is
         // not merely stale, it is wrong: upload the lot and drop it.
         if pipeline.ensure_texture(device, id, width, height) {
-            pipeline.upload(queue, id, frame.surface().rgba(), stride, 0, height);
+            pipeline.upload(
+                queue,
+                id,
+                frame.surface().rgba(),
+                stride,
+                DamageBand {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+            );
             frame.clear_damage();
             return;
         }
@@ -108,8 +143,21 @@ impl shader::Primitive for GridPrimitive {
             // band recorded against a larger one would be a GPU-side panic.
             let y = band.y.min(height);
             let rows = band.height.min(height - y);
-            if rows > 0 {
-                pipeline.upload(queue, id, frame.surface().rgba(), stride, y, rows);
+            let x = band.x.min(width);
+            let columns = band.width.min(width - x);
+            if rows > 0 && columns > 0 {
+                pipeline.upload(
+                    queue,
+                    id,
+                    frame.surface().rgba(),
+                    stride,
+                    DamageBand {
+                        x,
+                        y,
+                        width: columns,
+                        height: rows,
+                    },
+                );
             }
         }
     }
@@ -214,49 +262,36 @@ impl GridPipeline {
         true
     }
 
-    /// Writes `rows` rows starting at `y` from the CPU surface. `rgba` is the
-    /// whole surface; the row offset rides in the copy layout, so no slice and
-    /// no temporary buffer is made for a band.
+    /// Write a cell range directly from the full-stride RGBA surface, without
+    /// repacking. Queue::write_texture does not require 256-byte row alignment.
     fn upload(
         &self,
         queue: &wgpu::Queue,
         id: GridId,
         rgba: &[u8],
         stride: usize,
-        y: u32,
-        rows: u32,
+        band: DamageBand,
     ) {
         let Some(target) = self.textures.get(&id) else {
             return;
         };
+        let (origin, layout, extent) = upload_region(stride, band);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &target.texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                origin,
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: y as u64 * stride as u64,
-                bytes_per_row: Some(stride as u32),
-                rows_per_image: Some(rows),
-            },
-            wgpu::Extent3d {
-                width: target.width,
-                height: rows,
-                depth_or_array_layers: 1,
-            },
+            layout,
+            extent,
         );
     }
 }
 
 impl shader::Pipeline for GridPipeline {
-    fn new(
-        device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-    ) -> Self {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         // The VT hands us sRGB-encoded bytes. Matching the target's encoding
         // makes sample-then-write an identity: against an sRGB target the
         // sampler linearises and the blend-free write re-encodes; against a
@@ -353,5 +388,98 @@ impl shader::Pipeline for GridPipeline {
     fn trim(&mut self) {
         self.textures.retain(|id, _| self.live.contains(id));
         self.live.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::Painter;
+    use cosmix_term_core::{
+        config::Cursor,
+        font::FontSize,
+        terminal::{Cell, Screen},
+    };
+
+    #[test]
+    fn range_upload_layout_repairs_a_texture_after_coalesced_paints() {
+        let mut painter = Painter::for_test(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
+        let mut screen = Screen {
+            clusters: Default::default(),
+            cols: 90,
+            rows: 6,
+            display_offset: 0,
+            cursor: (1, 0),
+            cursor_visible: true,
+            cells: vec![
+                Cell {
+                    extra: 0,
+                    width: Default::default(),
+                    c: 'M',
+                    fg: [201, 31, 127],
+                    bg: [9, 17, 32],
+                    bold: false
+                };
+                540
+            ],
+            updated: std::time::Instant::now(),
+        };
+        painter.repaint(1, &screen, &[]);
+        let shared = painter.frame(1);
+        let mut texture = shared.lock().unwrap().surface().rgba().to_vec();
+        shared.lock().unwrap().clear_damage();
+        for (col, row) in [(80, 3), (5, 3), (45, 5)] {
+            screen.cells[row * 90 + col].c = 'g';
+            screen.cursor = (col, row);
+            let mut dirty = [false; 6];
+            dirty[row] = true;
+            painter.repaint(1, &screen, &dirty);
+        }
+        let mut frame = shared.lock().unwrap();
+        let stride = frame.surface().stride();
+        for band in frame.take_damage() {
+            assert!(band.width < frame.surface().width());
+            let (origin, layout, extent) = upload_region(stride, band);
+            for row in 0..extent.height as usize {
+                let source = layout.offset as usize + row * layout.bytes_per_row.unwrap() as usize;
+                let target = (origin.y as usize + row) * stride + origin.x as usize * 4;
+                let len = extent.width as usize * 4;
+                texture[target..target + len]
+                    .copy_from_slice(&frame.surface().rgba()[source..source + len]);
+            }
+        }
+        assert_eq!(texture, frame.surface().rgba());
+        assert!(frame.take_damage().is_empty());
+    }
+
+    #[test]
+    fn emoji_spacer_damage_uploads_both_columns() {
+        let mut painter = Painter::for_test(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
+        let mut screen = cosmix_term_core::terminal::Terminal::from_test_vt(8, 3, " 👩‍💻".as_bytes())
+            .screen(false);
+        screen.cursor_visible = false;
+        painter.repaint(1, &screen, &[]);
+        let shared = painter.frame(1);
+        let mut texture = shared.lock().unwrap().surface().rgba().to_vec();
+        shared.lock().unwrap().clear_damage();
+        screen.cells[2].bg = [20, 90, 150];
+        painter.repaint(1, &screen, &[true, false, false]);
+        let mut frame = shared.lock().unwrap();
+        let stride = frame.surface().stride();
+        let damage = frame.take_damage();
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].x, painter.cell().0);
+        assert_eq!(damage[0].width, painter.cell().0 * 2);
+        for band in damage {
+            let (origin, layout, extent) = upload_region(stride, band);
+            for row in 0..extent.height as usize {
+                let source = layout.offset as usize + row * layout.bytes_per_row.unwrap() as usize;
+                let target = (origin.y as usize + row) * stride + origin.x as usize * 4;
+                let len = extent.width as usize * 4;
+                texture[target..target + len]
+                    .copy_from_slice(&frame.surface().rgba()[source..source + len]);
+            }
+        }
+        assert_eq!(texture, frame.surface().rgba());
     }
 }

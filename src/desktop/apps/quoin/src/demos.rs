@@ -306,6 +306,7 @@ fn text(commands: &mut Commands, label: &str) -> Entity {
     commands
         .spawn((
             Text::new(label),
+            ctk::theme::CtkTextRole::Ui,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
             TextFont {
                 font_size: FontSize::Px(13.0),

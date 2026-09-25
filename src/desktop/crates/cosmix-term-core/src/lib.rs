@@ -10,6 +10,7 @@
 //! `Terminal::grid_snapshot` for each visible pane, repainting the rows the
 //! snapshot marks dirty.
 pub mod bus;
+mod clusters;
 pub mod config;
 pub mod control;
 pub mod font;

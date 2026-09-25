@@ -89,6 +89,29 @@ image at 1.25. Retain this test on upstream updates; run it with the vendored
 image-feature test command below. It has not been run locally; cluster
 validation, including mutation checks, is required.
 
+T16 rank 5 adds `grid::Damage`, a cell-sized revision map independent of pixel
+storage, and `Grid::with_damage`. Immutable generations retain a snapshot of
+that metadata; producers keep only the current tracker. `Layer::damage` diffs
+cell stamps for grids with identical lineage, placement and clip, at arbitrary
+buffer ages. It does not follow a chain of old grids or retain extra historical
+pixels. Unrelated grids and placement/clip changes keep full-bound damage.
+The existing compositor repair/front-frame union, grouping, rounding and
+`present_with_damage` remain unchanged. Reverts still change stamps; multiple
+marks before publication accumulate. The generic fallback's truncated origin
+is covered by expanding ranges by at least one scaled source pixel.
+
+Producer contract: mark **every** written rectangle before publishing with
+`with_damage`; constructors validate shape, not whether the marks describe the
+bytes. Term obtains rectangles from its cell painter. It still copies whole
+four-row bands when retained generations prevent mutation, and discards old
+bytes only for proven full overwrites. Cell stamps narrow damage, not ownership.
+New vendor tests cover arbitrary ages/reverts/skipped publications, narrow
+layer rectangles, and cell damage reaching outward-rounded physical present
+rectangles. Term extends its rotating-target pixel regression and benchmarks.
+These rank-5 tests are **unrun locally** and await cluster validation. Retain
+them on an upstream bump; remove this patch only when upstream offers equivalent
+immutable range damage across arbitrary retained ages and presentation history.
+
 T16 integration resolves cumulative band edges in physical coordinates before
 any fallback size division and truncation. Edge tolerance is four f32
 epsilons relative to coordinate size, capped at 0.01 physical pixel. Edges
