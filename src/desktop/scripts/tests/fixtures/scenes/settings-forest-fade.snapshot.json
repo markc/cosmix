@@ -1,0 +1,22 @@
+{
+  "scheme": "forest",
+  "schemes": [
+    {"name": "ocean", "accent": "#00000001"},
+    {"name": "crimson", "accent": "#00000002"},
+    {"name": "stone", "accent": "#00000003"},
+    {"name": "forest", "accent": "#00000004"},
+    {"name": "sunset", "accent": "#00000005"},
+    {"name": "mono", "accent": "#00000006"}
+  ],
+  "motion": "fade",
+  "motions": [
+    {"name": "slide", "available": true},
+    {"name": "fade", "available": false, "reason": "Fade needs renderer sibling\nstacking in one rectangle.\nOnly slide is available."}
+  ],
+  "fade_reason": "Fade needs renderer sibling\nstacking in one rectangle.\nOnly slide is available.",
+  "sizes": {"top": 260.0, "bottom": 52.5, "left": 200.0, "right": 239.5},
+  "step_px": 10.0,
+  "range_px": [120.0, 500.0],
+  "edge": "right",
+  "page_owner": "quoin@host"
+}

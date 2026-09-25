@@ -164,13 +164,13 @@ restores exactly the id+generation pairs it minimised. Replies carry the
 upstream outcome or a `{error_code,message}` refusal. `panel.state` returns
 the last accepted model; `panel.refresh` queues one rebuild.
 
-The clock is one `task_start` wall-clock deadline per displayed minute.
-**STAGE-C seam:** network (sysfs operstate) and volume (`wpctl`) are read by
-the single `stage_c_status()` function, called from that minute deadline (as
-the legacy clock did), on (re)connect and after a mute toggle;
-`stage_c_toggle_mute()` is the only `wpctl set-mute`. Stage C replaces that
-labelled block with native rtnetlink / PipeWire events and deletes it. No
-other code polls.
+The clock is one `task_start` wall-clock deadline per displayed minute and
+only redraws the time. Network and volume are event-driven: `net_watch`
+(rtnetlink link changes) and `audio_watch` (a `pactl subscribe` stream) wake
+the behaviour, which re-reads `net_state()` / `audio_state()` through the
+`status_*` helpers in `lib/runtime.mix`. A closed audio stream re-subscribes
+after 5 s, doubling to 300 s (a reconnect backoff, not a poll). A mix without
+these builtins shows the network offline and hides volume. Nothing polls.
 
 `scene-template-test.mix` captures the exact legacy `panel_doc` output for
 empty, busy (focused/minimised/no-workspace/overlay windows, three

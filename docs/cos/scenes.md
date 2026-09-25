@@ -60,6 +60,17 @@ after subscribing and resynchronise after a connection/gap. Enqueue replies
 are not applied-state receipts, so page selection and temporary pin release
 must wait on these events rather than retry sleeps.
 
+Settings/Appearance follows the same pattern. The `share/scenes/settings`
+template (scene `quoin-settings`, page `settings.appearance`) is layout only.
+Its behaviour subscribes to `<host>.settings.changed` (inner command
+`shell.settings.changed`) and re-reads `shell.settings.get` on each notice,
+after reconnecting, and when the host re-registers. It publishes the model
+through `scenes.model` and forwards the page's clicks unchanged to
+`shell.settings.{scheme,motion,size}`. The effects, the stepper size and the
+clamping stay in Quoin. Without the loader, Quoin serves the same node block
+as a built-in fallback and yields the page to a loader-managed load. Snapshot
+fields and the handover rules are in [Quoin](quoin).
+
 ## V1 bindings
 
 A port value beginning `= ` is one Mix expression. `== x` escapes to the

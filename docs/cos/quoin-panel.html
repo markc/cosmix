@@ -583,13 +583,13 @@ receives too. Peek minimises the current workspace's visible windows and
 restores exactly the id+generation pairs it minimised. Replies carry the
 upstream outcome or a <code>{error_code,message}</code> refusal. <code>panel.state</code> returns
 the last accepted model; <code>panel.refresh</code> queues one rebuild.</p>
-<p>The clock is one <code>task_start</code> wall-clock deadline per displayed minute.
-<strong>STAGE-C seam:</strong> network (sysfs operstate) and volume (<code>wpctl</code>) are read by
-the single <code>stage_c_status()</code> function, called from that minute deadline (as
-the legacy clock did), on (re)connect and after a mute toggle;
-<code>stage_c_toggle_mute()</code> is the only <code>wpctl set-mute</code>. Stage C replaces that
-labelled block with native rtnetlink / PipeWire events and deletes it. No
-other code polls.</p>
+<p>The clock is one <code>task_start</code> wall-clock deadline per displayed minute and
+only redraws the time. Network and volume are event-driven: <code>net_watch</code>
+(rtnetlink link changes) and <code>audio_watch</code> (a <code>pactl subscribe</code> stream) wake
+the behaviour, which re-reads <code>net_state()</code> / <code>audio_state()</code> through the
+<code>status_*</code> helpers in <code>lib/runtime.mix</code>. A closed audio stream re-subscribes
+after 5 s, doubling to 300 s (a reconnect backoff, not a poll). A mix without
+these builtins shows the network offline and hides volume. Nothing polls.</p>
 <p><code>scene-template-test.mix</code> captures the exact legacy <code>panel_doc</code> output for
 empty, busy (focused/minimised/no-workspace/overlay windows, three
 workspaces, open launcher, peeked), tray-change (removed and added items,

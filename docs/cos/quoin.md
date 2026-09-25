@@ -28,14 +28,36 @@ Empty startup retains the shared Bus, holder retry deadlines, theme and scene
 runtime in both hosts. A headless regression exercises the production embedded
 assembly through startup and repeated updates without registering any scenes.
 
-Settings/Appearance is already a Mix scene. For now Quoin loads it **only** if
-an edge's panel list declares `settings.appearance`, at that slot on that edge.
-It need not be the primary, and no edge is required to declare it. For example,
-`{panels: {right: ["settings.appearance"]}}` loads it on the right; `{}` loads
-nothing. Standalone config reloads can add, move or withdraw the declaration.
-An explicit scene unload or sub-panel removal still retires the loader for that
-session. This scene will move to the scene editor. The corner menu and
-`shell.settings.{scheme,motion,size}` Bus verbs remain available independently.
+Settings/Appearance is a Mix scene whose layout is the shipped template
+`share/scenes/settings/` (scene `quoin-settings`, page `settings.appearance`).
+It appears **only** if an edge's panel list declares `settings.appearance`, at
+that slot on that edge. It need not be the primary, and no edge is required to
+declare it. For example, `{panels: {right: ["settings.appearance"]}}` puts it
+on the right; `{}` shows nothing. Standalone config reloads can add, move or
+withdraw the declaration.
+
+Two things can fill that page:
+
+- **The scenes loader** (normal case): `scenes.install {template:"settings"}`
+  installs the template as `quoin-settings`, and enabling it loads the
+  template and starts its behaviour citizen `scene-quoin-settings`. The
+  behaviour forwards clicks to the `shell.settings.*` verbs and builds its
+  model from `shell.settings.get`, re-reading it on each
+  `shell.settings.changed` notice. The template mounts on the **right**; a
+  declaration on another edge refuses the load with `SETTINGS_EDGE_MISMATCH`
+  (edit the template's `window.edge` to match).
+- **Quoin's built-in fallback**, for a host with no loader or no enabled
+  template: the same node block, built with Quoin as citizen and a model
+  computed in Rust. When a `shell.scene.load` for the `settings.appearance` page
+  arrives from another owner, the fallback unloads itself in that dispatch and
+  the external load takes the page. The fallback stays out while that owner
+  holds the page. It returns when the owner unloads (disable, remove, loader
+  disconnect), so a fresh install still has an Appearance page. An explicit
+  scene unload or sub-panel removal of the *fallback* still retires it for that
+  session.
+
+The corner menu and the `shell.settings.*` Bus verbs are available whichever
+one is serving.
 
 ## Experimental compositor host
 
@@ -406,7 +428,11 @@ compositor corner-observation notifications. Read back
 `shell.props.get path="panels.left.visible"` to verify the applied state.
 
 The Settings/Appearance panel's own controls come back as
-`shell.settings.{scheme,motion,size}` (also listed by `shell.info`).
+`shell.settings.{scheme,motion,size}` (also listed by `shell.info`) —
+directly from the built-in fallback, or forwarded unchanged by the template's
+behaviour citizen. Either form works: explicit arguments, or the scene event
+body `{scene,node,kind}`, where the node id (`scheme_forest`, `motion_slide`,
+`size_left_plus`) names the choice.
 `shell.settings.scheme` takes `name` (a known scheme such as `forest`) and
 applies the theme live through the same path as the chrome scheme dots,
 persisting it for the next launch. `shell.settings.motion` takes
@@ -423,6 +449,21 @@ the supported thickness range and the output budget. Like the scene and
 sub-panel verbs, settings verbs from a stale Quoin connection are refused.
 Read back `shell.props.get path="panels.<edge>.width_px"` to verify a size
 change.
+
+`shell.settings.get` (a read, no arguments) returns the page's state as data:
+`scheme` (the selected name), `schemes` (`[{name,accent}]` in display order),
+`motion` (the *ingested* `slide|fade`), `motions` (`fade` carries
+`available:false` and its `reason`), `fade_reason`, `sizes` (settled
+thickness in logical pixels per edge; a drag in progress does not change
+them), `step_px`, `range_px`, `edge` (the edge that declares
+`settings.appearance`, or null), `page_owner` (who serves the page:
+`quoin@host` is the built-in fallback, or null), plus `generation` and
+`revision`. Quoin publishes the same body as `shell.settings.changed` on the
+topic `<service>.settings.changed` when any field changes: a scheme chosen
+over the Bus or from the chrome dots, an ingested motion, a settled resize, or
+the page changing hands. A notice is sent again after every reconnect. It is
+not sent on idle updates or on a timer. `revision` is the last published
+notice's revision.
 
 `shell.debug.status` exposes process-lifetime request/rejection counts,
 accepted mutation counts, maximum dispatch time in microseconds, pending reply

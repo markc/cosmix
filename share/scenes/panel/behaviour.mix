@@ -30,57 +30,62 @@ $state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes
   net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
   open: {launcher: false, calendar: false, notes: false}, peeked: [], peek_busy: false,
   icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false,
+  net_watch: nil, audio_watch: nil, audio_retry: 5, audio_retrying: false,
   model: nil}
 
--- ── STAGE-C: legacy network/volume snapshots ─────────────────────────────
--- The ONLY code that reads link or audio state, and the only thing the
--- minute deadline does besides redrawing the clock. Stage C replaces this
--- block with native rtnetlink / PipeWire event sources and deletes it.
--- Network: any non-loopback interface whose operstate is "up" (sysfs, no
--- D-Bus). Volume: PipeWire's default sink via wpctl; no default sink hides
--- the applet rather than showing a false 0 %.
-fn stage_c_status()
-  $up = false
-  $wireless = false
-  try
-    for each $name in ls("/sys/class/net")
-      if $name != "lo" then
-        $dir = "/sys/class/net/" .. $name
-        $oper = ""
-        try
-          $oper = trim(read_file($dir .. "/operstate"))
-        catch $e
-        end
-        if $oper == "up" then
-          $up = true
-          if is_dir($dir .. "/wireless") then $wireless = true end
-        end
-      end
-    end
-  catch $e
+-- ── status: network + volume, pushed by the kernel and PipeWire ─────────
+-- rtnetlink link events and a `pactl subscribe` stream (net_watch /
+-- audio_watch); every batch re-reads state (events are hints, state is
+-- truth). A mix without these builtins shows the network offline and hides
+-- volume, and says so: there is no polling fallback.
+fn start_status()
+  if not has_builtin("net_watch") then
+    eprint("panel: status events unavailable: this mix has no net_watch/audio_watch")
+    return
   end
-  $vol = {ok: false, level: 0, muted: false}
-  $w = run_argv(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
-  if $w.ok then
-    $found = re_find($w.stdout, "Volume:\\s*([0-9.]+)")
-    if length($found) > 0 then
-      $vol = {ok: true, level: round(to_number($found[0].groups[0]) * 100), muted: index_of($w.stdout, "MUTED") >= 0}
+  if $state.net_watch == nil then
+    try
+      $state.net_watch = net_watch({events: ["link"]})
+    catch $message
+      eprint("panel: net_watch failed: " .. to_string($message))
     end
   end
-  return {net: {up: $up, wireless: $wireless}, vol: $vol}
+  start_audio()
 end
 
-fn stage_c_toggle_mute()
+fn start_audio()
+  if $state.audio_watch != nil then return end
+  try
+    $state.audio_watch = audio_watch({runtime_dir: $PW_RUNTIME})
+  catch $message
+    eprint("panel: audio_watch failed: " .. to_string($message))
+    retry_audio()
+  end
+end
+
+-- PipeWire's server went away or is not up yet: subscribe again after a
+-- delay doubling to five minutes. A reconnect backoff, not a state poll.
+fn retry_audio()
+  if $state.audio_retrying then return end
+  $state.audio_retrying = true
+  try
+    task_start("audio.retry", "{}")
+  catch $message
+    $state.audio_retrying = false
+    eprint("panel: audio retry not scheduled: " .. to_string($message))
+  end
+end
+
+fn toggle_mute()
   $w = run_argv(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
   if not $w.ok then return $r.failure("mute_failed", "wpctl set-mute failed: " .. trim($w.stderr ?? "")) end
   return {ok: true, rc: 0, value: {}}
 end
--- ── end STAGE-C ───────────────────────────────────────────────────────────
+
 
 fn apply_status()
-  $s = stage_c_status()
-  $state.net = $s.net
-  $state.vol = $s.vol
+  $state.net = has_builtin("net_state") ? $r.status_net() : {up: false, wireless: false}
+  $state.vol = $state.audio_watch != nil ? $r.status_volume($PW_RUNTIME) : {ok: false, level: 0, muted: false}
 end
 
 -- ── service state (events are hints; these reads are the truth) ─────────
@@ -275,7 +280,6 @@ on clock.deadline async
     while true
       sleep($p.seconds_to_next_minute(time()))
       try
-        apply_status()
         schedule()
       catch $message
         eprint("panel clock: " .. to_string($message))
@@ -338,7 +342,7 @@ on tray async
 end
 
 on vol_mute async
-  $out = stage_c_toggle_mute()
+  $out = toggle_mute()
   apply_status()
   schedule()
   $r.respond($out)
@@ -439,6 +443,56 @@ on bus.connected
   if $state.ready then resync() end
 end
 
+on net.changed async
+  if len(keys($event.headers)) != 0 then return end
+  $batch = type($event.args) == "map" ? $event.args : {}
+  if type($batch.closed) == "map" then
+    eprint("panel: net_watch ended: " .. to_string($batch.closed.message))
+    try
+      net_unwatch($batch.watch)
+    catch $e
+    end
+    $state.net_watch = nil
+  end
+  apply_status()
+  schedule()
+end
+
+on audio.changed async
+  if len(keys($event.headers)) != 0 then return end
+  $batch = type($event.args) == "map" ? $event.args : {}
+  if type($batch.closed) == "map" then
+    eprint("panel: audio events ended: " .. to_string($batch.closed.message))
+    if $batch.watch == $state.audio_watch then
+      try
+        audio_unwatch($batch.watch)
+      catch $e
+      end
+      $state.audio_watch = nil
+    end
+    apply_status()
+    schedule()
+    retry_audio()
+    return
+  end
+  $state.audio_retry = 5
+  apply_status()
+  schedule()
+end
+
+on audio.retry async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    sleep($state.audio_retry)
+    $state.audio_retry = min($state.audio_retry * 2, 300)
+  finally
+    $state.audio_retrying = false
+  end
+  start_audio()
+  apply_status()
+  schedule()
+end
+
 -- ── init: subscribe before the first snapshot ───────────────────────────
 subscribe($COMP .. ".props.changed")
 subscribe($TRAY .. ".item.added")
@@ -449,6 +503,7 @@ subscribe($NOTIFY .. ".props.changed")
 subscribe($APPS .. ".changed")
 subscribe($NODED .. ".props.changed")
 subscribe("scenes.changed")
+start_status()
 $state.services = registered() ?? []
 $ready = $r.ready($ctx)
 if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end

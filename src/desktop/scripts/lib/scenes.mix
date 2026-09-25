@@ -471,11 +471,29 @@ fn load_managed($s, $source, $model, $generation)
   return $r
 end
 
+-- Default installation name: the template's authored scene name (the
+-- settings template authors quoin-settings). Anything unreadable falls back
+-- to the template name so staging reports the real refusal.
+fn authored_name($s, $template)
+  if not valid_name($template) then return $template end
+  $path = $s.templates .. "/" .. $template .. "/scene.mix"
+  if not regular($path) then return $template end
+  try
+    $authored = document(bounded_read($path, 262144)).name
+  catch $message
+    return $template
+  end
+  return $authored
+end
+
 fn rewrite_install($source, $name)
   $d = document($source)
+  -- Installing under the authored name keeps an authored panel address
+  -- (quoin-settings keeps settings.appearance); a rename gets its own page.
+  $renamed = $d.name != $name
   $d.headers.name = $name
   $d.headers.citizen = "scene-" .. $name
-  if $d.window.panel != nil then
+  if $renamed and $d.window.panel != nil then
     $d.window.panel = "scene-" .. $name
     $d.headers.window = json_encode($d.window)
   end
@@ -760,7 +778,7 @@ fn request($s, $verb, $args)
       return $s
     end
     if $verb == "install" then
-      $name = $args.name ?? $args.template
+      $name = $args.name ?? authored_name($s, $args.template)
       if not valid_name($name) then fail("SCENES_NAME", "invalid installation name", {}) end
       if exists($s.root .. "/" .. $name, {follow_symlinks:false}) then fail("SCENES_COLLISION", "installation already exists", {name:$name}) end
       if len(keys($s.scenes)) >= 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end

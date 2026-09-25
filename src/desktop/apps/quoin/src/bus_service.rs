@@ -49,6 +49,11 @@ struct ShellBusState {
     frame: u64,
     applied_panels: Value,
     panel_revision: u64,
+    /// Shadow of the scheme selection for the settings snapshot; seeded
+    /// lazily from the persisted state (see `settings::initial_scheme`).
+    settings_scheme: Option<String>,
+    applied_settings: Value,
+    settings_revision: u64,
 }
 
 impl Default for ShellBusState {
@@ -68,6 +73,9 @@ impl Default for ShellBusState {
             frame: 0,
             applied_panels: Value::Null,
             panel_revision: 0,
+            settings_scheme: None,
+            applied_settings: Value::Null,
+            settings_revision: 0,
         }
     }
 }
@@ -129,6 +137,7 @@ impl Plugin for ShellBusPlugin {
             .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
             .add_systems(Update, reply_panels.in_set(ShellRuntimeSet::Presentation))
             .add_systems(Update, publish_panel_state.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(Update, publish_settings_state.in_set(ShellRuntimeSet::Presentation))
             .add_systems(
                 Update,
                 crate::holders::report_holders
@@ -156,6 +165,52 @@ fn publish_panel_state(
         state.applied_panels = panels;
         state.panel_revision = revision;
     }
+}
+
+/// `shell.settings.changed`: the settings snapshot, published when it differs
+/// from the last one (a scheme selected from chrome or the Bus, an ingested
+/// motion, a settled resize, the page changing hands). Same shape as the
+/// `shell.settings.get` reply. No timer and no idle publication.
+fn publish_settings_state(
+    bridge: Res<BusBridge>,
+    frame: Res<ShellFrameState>,
+    (config, registry): (Res<crate::config::ShellConfig>, Res<SubPanelRegistryState>),
+    store: Option<Res<crate::state::StateStore>>,
+    mut selections: MessageReader<cosmix_shell::chrome::QuoinSchemeSelected>,
+    mut state: ResMut<ShellBusState>,
+) {
+    let scheme = state
+        .settings_scheme
+        .get_or_insert_with(|| crate::settings::initial_scheme(store.as_deref()));
+    for selection in selections.read() {
+        *scheme = selection.0.name().to_owned();
+    }
+    let snapshot = crate::settings::snapshot(
+        scheme,
+        &config,
+        &frame.0,
+        settings_page_owner(&registry.0),
+    );
+    if state.live_generation.is_none() || snapshot == state.applied_settings {
+        return;
+    }
+    let revision = state.settings_revision.saturating_add(1);
+    let mut body = snapshot.clone();
+    body["generation"] = json!(state.live_generation);
+    body["revision"] = json!(revision);
+    let wire = format!("---\ncommand: shell.settings.changed\n---\n{body}");
+    let topic = format!("{}.settings.changed", bridge.service_name());
+    if bridge.try_publish_topic(&topic, true, wire).is_ok() {
+        state.applied_settings = snapshot;
+        state.settings_revision = revision;
+    }
+}
+
+/// Who serves `settings.appearance` right now (`quoin@host` = the built-in).
+fn settings_page_owner(registry: &cosmix_shell::core::SubPanelRegistry) -> Option<&str> {
+    registry
+        .seat(crate::config::SETTINGS_APPEARANCE)
+        .map(|seat| seat.owner.as_str())
 }
 
 /// Selection/mode/mapping are discrete state. During a resize gesture retain
@@ -231,6 +286,7 @@ struct SceneBus<'w> {
     registry: ResMut<'w, SubPanelRegistryState>,
     config: ResMut<'w, crate::config::ShellConfig>,
     schemes: MessageWriter<'w, cosmix_shell::chrome::QuoinSchemeSelected>,
+    settings: Option<ResMut<'w, crate::settings::SettingsScene>>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -335,6 +391,7 @@ fn service_bus(
                 }
                 state.live_generation = Some(generation);
                 state.applied_panels = Value::Null;
+                state.applied_settings = Value::Null;
                 request_citizen_snapshot(&bridge, &mut state);
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
@@ -500,20 +557,38 @@ fn service_bus(
                         .expect("receipt sequence exhausted");
                     let owner = attested_owner(&request, state.citizen_receipt);
                     let SceneBus {
-                        scenes, registry, ..
+                        scenes, registry, settings, ..
                     } = &mut content;
-                    scenes.dispatch(
-                        verb,
-                        &request.body,
-                        &args,
-                        &bridge,
-                        &mut cosmix_scene_bevy::SceneMount {
-                            registry: &mut registry.0,
-                            output: &frame.0.geometry.output,
-                            owner: &owner,
-                            accepted_at: state.citizen_receipt,
-                        },
-                    )
+                    // The loader's settings template replaces the built-in
+                    // fallback page in this same dispatch (settings.rs).
+                    let refusal = if verb == cosmix_shell::runtime::SceneVerb::Load {
+                        crate::settings::yield_to_external(
+                            &request.body,
+                            &args,
+                            settings.as_deref_mut(),
+                            scenes,
+                            &mut registry.0,
+                            &frame.0.geometry.output,
+                            &bridge,
+                        )
+                    } else {
+                        None
+                    };
+                    match refusal {
+                        Some(refusal) => refusal,
+                        None => scenes.dispatch(
+                            verb,
+                            &request.body,
+                            &args,
+                            &bridge,
+                            &mut cosmix_scene_bevy::SceneMount {
+                                registry: &mut registry.0,
+                                output: &frame.0.geometry.output,
+                                owner: &owner,
+                                accepted_at: state.citizen_receipt,
+                            },
+                        ),
+                    }
                 };
                 (rc, body, None)
             } else if request.command == "shell.scenes.list" {
@@ -580,16 +655,34 @@ fn service_bus(
                     )
                 } else {
                     let SceneBus {
-                        config, schemes, ..
+                        config, schemes, registry, ..
                     } = &mut content;
-                    crate::settings::dispatch_verb(
-                        &request,
-                        &frame.0,
-                        config,
-                        &crate::config::conf_mix_path(),
-                        schemes,
-                        time.elapsed(),
-                    )
+                    let scheme = state.settings_scheme.get_or_insert_with(|| {
+                        crate::settings::initial_scheme(state_store.as_deref())
+                    });
+                    if request.command == "shell.settings.get" {
+                        // A read: the snapshot the template behaviour builds
+                        // its model from; `revision` is the last notice's.
+                        let mut body = crate::settings::snapshot(
+                            scheme,
+                            config,
+                            &frame.0,
+                            settings_page_owner(&registry.0),
+                        );
+                        body["generation"] = json!(state.live_generation);
+                        body["revision"] = json!(state.settings_revision);
+                        (0, body.to_string(), None)
+                    } else {
+                        crate::settings::dispatch_verb(
+                            &request,
+                            &frame.0,
+                            config,
+                            &crate::config::conf_mix_path(),
+                            schemes,
+                            scheme,
+                            time.elapsed(),
+                        )
+                    }
                 }
             } else if request.command == "shell.debug.status" {
                 (
@@ -991,7 +1084,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1841,7 +1934,7 @@ mod tests {
         assert_eq!(rc, 0);
         let info: Value = serde_json::from_str(&body).unwrap();
         let verbs = info["verbs"].as_array().expect("verbs is a list");
-        for verb in ["settings.scheme", "settings.motion", "settings.size"] {
+        for verb in ["settings.scheme", "settings.motion", "settings.size", "settings.get"] {
             assert!(
                 verbs.contains(&json!(verb)),
                 "shell.info must advertise {verb}; got {verbs:?}"
@@ -3333,6 +3426,80 @@ mod tests {
             0,
             "a stale settings request must not apply a theme"
         );
+    }
+
+    /// `shell.settings.changed` notices published since the last drain.
+    fn settings_notices(peer: &ctk::bus::TestBusPeer) -> Vec<Value> {
+        peer.drain_publishes()
+            .iter()
+            .filter(|p| p.headers.get("name").is_some_and(|n| n == "quoin.settings.changed"))
+            .map(|p| {
+                let (head, body) = p.body.split_once("\n---\n").unwrap();
+                assert!(head.contains("command: shell.settings.changed"), "{head}");
+                serde_json::from_str(body).unwrap()
+            })
+            .collect()
+    }
+
+    /// The settings template's behaviour builds its model from
+    /// `shell.settings.get` and wakes on `shell.settings.changed`: the read
+    /// carries every choice, a scheme selected over the Bus OR from chrome
+    /// publishes exactly one notice with the new state, an idle update
+    /// publishes nothing, and a reconnect republishes under the new epoch.
+    #[test]
+    fn settings_get_snapshot_and_change_notices() {
+        // The test peer's calls, responses and publishes share one queue, and
+        // each drain discards the other kinds: drain one kind per step. The
+        // fixture's connect update published revision 1 (drained with calls).
+        let (mut app, peer) = sub_panel_app();
+        let (rc, got) = sub_send(&mut app, &peer, "shell.settings.get", json!({}));
+        assert_eq!(rc, 0, "{got}");
+        assert_eq!(got["revision"], 1, "the connected host published its first snapshot");
+        assert_eq!(got["scheme"], "ocean");
+        assert_eq!(got["motion"], "slide");
+        assert_eq!(got["schemes"].as_array().unwrap().len(), 6);
+        assert_eq!(got["fade_reason"], crate::settings::FADE_UNAVAILABLE_REASON);
+        assert_eq!(got["motions"][1]["available"], false);
+        assert_eq!(got["generation"], 1);
+        assert_eq!(got["page_owner"], Value::Null);
+        for edge in Edge::ALL {
+            let settled = app.world().resource::<ShellFrameState>().0.panel(edge).settled_thickness_px;
+            assert_eq!(got["sizes"][edge_name(edge)], json!(settled));
+        }
+        app.update();
+        assert!(settings_notices(&peer).is_empty(), "a read publishes nothing");
+
+        // The write's reply is covered by the settings tests; here its notice.
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let notices = settings_notices(&peer);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["scheme"], "forest");
+        assert_eq!(notices[0]["generation"], 1);
+        let revision = notices[0]["revision"].as_u64().unwrap();
+        assert_eq!(revision, 2);
+        let (_, got) = sub_send(&mut app, &peer, "shell.settings.get", json!({}));
+        assert_eq!((got["scheme"].as_str(), got["revision"].as_u64()), (Some("forest"), Some(revision)));
+        app.update();
+        assert!(settings_notices(&peer).is_empty(), "no idle publication");
+
+        // A chrome scheme dot writes the same message; the notice follows it.
+        app.world_mut()
+            .write_message(cosmix_shell::chrome::QuoinSchemeSelected(ctk::theme::Scheme::Mono));
+        app.update();
+        let notices = settings_notices(&peer);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["scheme"], "mono");
+
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+        let notices = settings_notices(&peer);
+        assert_eq!(notices.len(), 1, "a reconnect republishes the unchanged snapshot");
+        assert_eq!(notices[0]["generation"], 2);
+        assert_eq!(notices[0]["scheme"], "mono");
     }
 
     /// Chunk-8 fixture: the sub-panel verbs address the process-wide
