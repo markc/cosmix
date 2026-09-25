@@ -104,6 +104,12 @@ fn main() {
     } else {
         // Single instance (plan §4.8): a running ced takes the paths.
         if cosmix_ced::bus::probe_running(&args.service) {
+            if paths.is_empty() {
+                // Nothing to hand over (a launcher relaunch): the running
+                // instance is the answer, not an error (Opus m6).
+                eprintln!("ced: already running as {}", args.service);
+                return;
+            }
             match cosmix_ced::bus::forward_open(&args.service, &paths) {
                 Ok(()) => return,
                 Err(e) => {

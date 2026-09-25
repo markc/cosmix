@@ -23,9 +23,9 @@ use std::time::Instant;
 
 use cosmix_edit_client::diag::Diagnostics;
 use cosmix_edit_client::highlight::Highlight;
-use cosmix_edit_client::mirror::{DetachReason, LaneArg, Mirror, Phase, ServerOp, Step};
+use cosmix_edit_client::mirror::{DetachReason, LaneArg, Mirror, Outcome, Phase, ServerOp, Step};
 use cosmix_edit_client::model::{EditCfg, EditCommand, EditorModel};
-use cosmix_edit_client::types::{DeltaKind, Incoming, Intent, Level, Notice, OpIdGen, Outgoing, TabId, UI_ORIGIN};
+use cosmix_edit_client::types::{DeltaKind, Incoming, Intent, Invoker, Level, Notice, OpIdGen, Outgoing, TabId, UI_ORIGIN};
 use cosmix_edit_core::anchor::Selection;
 use cosmix_edit_core::pos::{NamedPos, PosSpec};
 use cosmix_edit_core::text::Text;
@@ -117,6 +117,11 @@ const SESSION_DEBOUNCE_MS: u64 = 1_000;
 /// Deadlines for the controller's own requests (plan §2).
 const DEADLINE_MS: u64 = 5_000;
 const DEADLINE_LONG_MS: u64 = 30_000;
+/// A Bus `ced.action` waits this long for its server op's outcome (a save's
+/// own deadline, its `edit.list` check and one resend fit inside).
+const OP_WAIT_MS: u64 = 90_000;
+/// `edit.open` deadlines before the tab says the service is silent.
+const OPEN_WARN_AFTER: u32 = 3;
 
 /// Controller-private per-tab state.
 #[derive(Default)]
@@ -127,6 +132,8 @@ struct TabX {
     /// Waiting for a reattach open/list.
     reattaching: bool,
     open_error: Option<String>,
+    /// `edit.open` deadlines passed in a row (GLM M5: the human hears once).
+    open_misses: u32,
     /// The caret/selection last published with `edit.select`.
     published: Option<Selection>,
     last_publish: Option<Instant>,
@@ -167,6 +174,8 @@ enum Req {
     Matches { tab: TabId, query: ui::MatchQuery },
     /// `edit.list` at start for the recovered-buffers prompt.
     Recovered,
+    /// `edit.list` for the tab's save state (Opus m2).
+    Saved { tab: TabId },
     Discard,
 }
 
@@ -183,6 +192,10 @@ enum TimerFor {
     ClearMarkers(TabId),
     /// A Bus `ced.action` waiting on the window's `ui_done`.
     UiDeadline(u64),
+    /// An `rc 0` reply whose effect has not arrived (the mirror's echo wait).
+    Echo(TabId, String),
+    /// A Bus `ced.action` waiting on its server op's outcome (by op id).
+    OpWait(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +267,10 @@ pub struct Controller {
     /// `UiAction` tokens: the next one, and the Bus commands awaiting `ui_done`.
     next_ui_token: u64,
     ui_pending: HashMap<u64, (u64, String)>,
+    /// Bus `ced.action`s answered from their server op's outcome, by op id
+    /// (Opus m4), and the one being dispatched right now.
+    op_waits: HashMap<String, (u64, String)>,
+    op_cmd: Option<(u64, String)>,
 }
 
 fn refusal(code: &str, message: impl Into<String>, reason: Option<&str>) -> String {
@@ -421,6 +438,8 @@ impl Controller {
             recovered_epoch: String::new(),
             next_ui_token: 0,
             ui_pending: HashMap::new(),
+            op_waits: HashMap::new(),
+            op_cmd: None,
         }
     }
 
@@ -539,7 +558,10 @@ impl Controller {
         match msg {
             EditorMsg::Command(c) => {
                 self.stats.keys += 1;
-                if let Err(e) = self.command(tab, c, Intent::ui(tab), &mut fx) {
+                let started = Instant::now();
+                let done = self.command(tab, c, Intent::ui(tab), &mut fx);
+                self.record_model(started.elapsed().as_micros() as u64);
+                if let Err(e) = done {
                     fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: e } });
                 }
             }
@@ -548,7 +570,10 @@ impl Controller {
                 if let Some(t) = self.tab_mut(tab) {
                     t.editor.set_preedit(false);
                 }
-                if let Err(e) = self.command(tab, EditCommand::Insert(text), Intent::ui(tab), &mut fx) {
+                let started = Instant::now();
+                let done = self.command(tab, EditCommand::Insert(text), Intent::ui(tab), &mut fx);
+                self.record_model(started.elapsed().as_micros() as u64);
+                if let Err(e) = done {
                     fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text: e } });
                 }
             }
@@ -581,6 +606,9 @@ impl Controller {
                         x.agent_since_focus = false;
                     }
                     self.timer(2_000, TimerFor::ClearMarkers(tab), &mut fx);
+                    if self.tab(tab).is_some_and(|t| t.mirror.is_some()) {
+                        self.send_saved(tab, &mut fx);
+                    }
                 }
             }
             EditorMsg::Layout(r) => {
@@ -774,6 +802,7 @@ impl Controller {
             Some(Req::Find { tab, job }) => self.on_find_reply(tab, *job, rc, body, fx),
             Some(Req::Matches { tab, query }) => self.on_matches_reply(tab, query, rc, body, fx),
             Some(Req::Recovered) => self.on_recovered_list(rc, body, fx),
+            Some(Req::Saved { tab }) => self.on_saved_reply(tab, rc, body),
             Some(Req::Discard) => {
                 if rc >= 10 {
                     let msg = reply_result(rc, body).err().map(|r| r.message).unwrap_or_default();
@@ -796,6 +825,14 @@ impl Controller {
                 // Opening is idempotent for a path; ask again.
                 let path = self.tab(tab).and_then(|t| t.path.clone());
                 self.send_open(tab, path, reattach, fx);
+                let misses = self.x.get_mut(&tab).map(|x| {
+                    x.open_misses += 1;
+                    x.open_misses
+                });
+                if misses == Some(OPEN_WARN_AFTER) {
+                    let text = cosmix_edit_client::mirror::MSG_SERVICE_SILENT.to_string();
+                    fx.push(Effect::Notice { tab: Some(tab), notice: Notice::Message { level: Level::Warn, text } });
+                }
             }
             Some(Req::List { tab }) => self.send_list(tab, fx),
             Some(Req::Find { tab, .. }) => {
@@ -837,6 +874,20 @@ impl Controller {
                 self.request_matches(tab, fx);
             }
             Some(TimerFor::UiDeadline(token)) => self.ui_timeout(token, fx),
+            Some(TimerFor::Echo(tab, op_id)) => {
+                if let Some(step) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()).map(|m| m.on_echo_timeout(&op_id)) {
+                    if !step.out.is_empty() {
+                        self.stats.history_recoveries += 1;
+                    }
+                    self.drive(tab, step, fx);
+                }
+            }
+            Some(TimerFor::OpWait(op_id)) => {
+                if let Some((id, action)) = self.op_waits.remove(&op_id) {
+                    let msg = format!("{action} is still queued or in flight after {} s; it may yet complete", OP_WAIT_MS / 1000);
+                    fx.push(Effect::Respond { id, rc: 10, body: refusal("TIMEOUT", msg, Some("timeout")) });
+                }
+            }
             Some(TimerFor::ClearMarkers(tab)) => {
                 if self.active == Some(tab)
                     && let Some(t) = self.tab_mut(tab)
@@ -911,6 +962,10 @@ impl Controller {
                 x.agent_since_focus = true;
             }
             self.drive(id, step, fx);
+            if matches!(ev, wire::Event::Disk(_)) {
+                // A save (by anyone) or reload changed the disk state.
+                self.send_saved(id, fx);
+            }
         }
     }
 
@@ -1020,6 +1075,7 @@ impl Controller {
         if let Some(x) = self.x.get_mut(&tab) {
             x.recovery_id = Some(open.recovery_id.clone());
             x.opened = true;
+            x.open_misses = 0;
             x.reattaching = false;
             x.open_error = None;
         }
@@ -1029,6 +1085,7 @@ impl Controller {
             self.recent.truncate(RECENT_MAX);
         }
         self.drive(tab, step, fx);
+        self.send_saved(tab, fx);
         self.check_opens(fx);
         self.session_changed(fx);
     }
@@ -1161,10 +1218,24 @@ impl Controller {
                     x.save_intent.take()
                 });
                 let intent = intent.unwrap_or_else(|| Intent::ui(tab));
-                fx.push(Effect::Prompt(Prompt::DiskModified { tab, intent }));
-                continue;
+                // Only the human who pressed Save is asked; a Bus caller gets
+                // the refusal as its `ced.action` reply (Opus m4).
+                if matches!(intent.by, Invoker::Ui) {
+                    fx.push(Effect::Prompt(Prompt::DiskModified { tab, intent }));
+                    continue;
+                }
             }
             fx.push(Effect::Notice { tab: Some(tab), notice: n });
+        }
+        let (outcomes, echo) = match self.tab_mut(tab).and_then(|t| t.mirror.as_mut()) {
+            Some(m) => (m.take_outcomes(), m.take_echo_timer()),
+            None => (Vec::new(), None),
+        };
+        for (op_id, outcome) in outcomes {
+            self.answer_op(&op_id, outcome, fx);
+        }
+        if let Some((op_id, ms)) = echo {
+            self.timer(ms, TimerFor::Echo(tab, op_id), fx);
         }
         for out in step.out {
             let op_id = out.op_id.clone().unwrap_or_default();
@@ -1300,9 +1371,49 @@ impl Controller {
         if matches!(m.phase(), Phase::Detached { .. }) {
             return Err("the buffer is detached".into());
         }
+        // The id `server_op` is about to hand out: a Bus `ced.action` being
+        // dispatched is answered from this op's outcome, not now.
+        let op_id = self.ids.clone().next_id();
         let step = m.server_op(op, intent, &mut self.ids);
+        if let Some(cmd) = self.op_cmd.take() {
+            self.op_waits.insert(op_id.clone(), cmd);
+            self.timer(OP_WAIT_MS, TimerFor::OpWait(op_id), fx);
+        }
         self.drive(tab, step, fx);
         Ok(())
+    }
+
+    /// Answer the Bus `ced.action` waiting on server op `op_id`, if any.
+    fn answer_op(&mut self, op_id: &str, outcome: Outcome, fx: &mut Vec<Effect>) {
+        let Some((id, action)) = self.op_waits.remove(op_id) else { return };
+        self.timers.retain(|_, t| !matches!(t, TimerFor::OpWait(x) if x == op_id));
+        let (rc, body) = match outcome {
+            Outcome::Done => (0, ok_body(&verbs::ActionReply { id: action, ok: true, result: None })),
+            Outcome::Refused(r) => {
+                let code = serde_json::to_value(&r.error_code).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                (10, refusal(&code, r.message, r.reason.as_deref()))
+            }
+        };
+        fx.push(Effect::Respond { id, rc, body });
+    }
+
+    /// Ask the service for the tab's save state (Opus m2): after an attach,
+    /// on a disk-state change and when the tab gains focus — the open reply
+    /// carries none, and another holder may save behind ced's back.
+    fn send_saved(&mut self, tab: TabId, fx: &mut Vec<Effect>) {
+        let out = Outgoing { verb: "edit.list".into(), body: "{}".into(), op_id: None, deadline_ms: DEADLINE_MS };
+        self.send(out, Req::Saved { tab }, fx);
+    }
+
+    fn on_saved_reply(&mut self, tab: TabId, rc: u8, body: &str) {
+        let Some(list) = reply_result(rc, body).ok().and_then(|v| serde_json::from_value::<wire::ListReply>(v).ok()) else { return };
+        let Some(m) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()) else { return };
+        if list.epoch != m.epoch() {
+            return;
+        }
+        if let Some(row) = list.buffers.iter().find(|b| b.buffer == m.buffer()) {
+            m.note_saved(row.saved_rev, row.recovered);
+        }
     }
 
     // ── selection publishing (plan §3.3) ─────────────────────────────────────
@@ -1647,17 +1758,38 @@ impl Controller {
                     // reply waits for the window's `ui_done`.
                     return self.ui_dispatch(tab, action, r.args.clone(), intent, Some((id, r.id.clone())), fx);
                 }
-                if action == ActionId::FileClose {
-                    let force = r.args.as_ref().and_then(|a| a.get("force")).and_then(Value::as_bool).unwrap_or(false);
+                let arg = |k: &str| r.args.as_ref().and_then(|a| a.get(k)).and_then(Value::as_bool).unwrap_or(false);
+                if action == ActionId::FileClose && !arg("save") {
                     match tab {
-                        Some(t) => self.close(t, force, Some((id, r.id.clone())), intent, fx),
+                        Some(t) => self.close(t, arg("force"), Some((id, r.id.clone())), intent, fx),
                         None => refuse(fx, code::NOT_FOUND, "no tab is open".into(), None),
                     }
                     return;
                 }
-                match self.action_args(tab, action, r.args.as_ref(), intent, fx) {
+                // One server op each: answered from its outcome (Opus m4).
+                // `file.close {save:true}` answers when the save completes;
+                // the close follows.
+                let on_outcome = matches!(
+                    action,
+                    ActionId::FileSave
+                        | ActionId::FileSaveAs
+                        | ActionId::FileReload
+                        | ActionId::FileClose
+                        | ActionId::EditUndo
+                        | ActionId::EditRedo
+                        | ActionId::EditUndoAny
+                        | ActionId::EditUndoOther
+                );
+                self.op_cmd = on_outcome.then(|| (id, r.id.clone()));
+                let result = self.action_args(tab, action, r.args.as_ref(), intent, fx);
+                let queued = on_outcome && self.op_cmd.take().is_none();
+                match result {
+                    Ok(_) if queued => {}
                     Ok(result) => reply(fx, ok_body(&verbs::ActionReply { id: r.id, ok: true, result })),
-                    Err((c, m)) => refuse(fx, c, m, None),
+                    Err((c, m)) => {
+                        self.op_waits.retain(|_, (i, _)| *i != id);
+                        refuse(fx, c, m, None)
+                    }
                 }
             }
             "ced.actions" => {
@@ -1721,7 +1853,7 @@ impl Controller {
                     ok_body(&verbs::StatsReply {
                         keys: s.keys,
                         frames: self.frames.count,
-                        model_us: verbs::Percentiles::default(),
+                        model_us: ui::percentiles(&self.frames.model_us),
                         view_us: ui::percentiles(&self.frames.view_us),
                         next_frame_us: ui::percentiles(&self.frames.next_frame_us),
                         events: s.events,
@@ -2082,6 +2214,138 @@ mod tests {
             .expect("a deadline");
         let (rc, v) = response(&gui.on_incoming(Incoming::Timer { id: timer }));
         assert_eq!((rc, v["error_code"].as_str(), v["reason"].as_str()), (10, Some("TIMEOUT"), Some("timeout")));
+    }
+
+    const B: &str = "b1_0000e1e1";
+
+    /// A headless controller with one live tab on "hello world\n" (rev 0);
+    /// returns the `edit.list` request the attach sent for the save state.
+    fn live(c: &mut Controller) -> u64 {
+        c.start();
+        let fx = c.on_bus_command(cmd("ced.open", json!({"paths": ["/nonexistent/ced-r/x.txt"]})));
+        let (req, _) = sent(&fx, "edit.open");
+        let open = json!({"buffer": B, "epoch": "0000e1e1", "path": "/nonexistent/ced-r/x.txt", "opened_as": null,
+                          "name": "x.txt", "language": "text", "rev": 0, "lines": 2, "bytes": 12, "eol": "lf", "bom": false,
+                          "disk": "clean", "reopened": false, "created": false, "recovery_id": "5f0c2a9e1b7d4c33",
+                          "recovered": false, "recovered_from": null});
+        let fx = reply(c, req, open);
+        let (list, _) = sent(&fx, "edit.list");
+        let (req, _) = sent(&fx, "edit.get");
+        let p = |o: usize, col: usize| json!({"offset": o, "line": 1, "col": col});
+        let page = json!({"buffer": B, "epoch": "0000e1e1", "rev": 0, "text": "hello world\n", "lines": null,
+                          "start": p(0, 1), "end": p(12, 13), "bytes_total": 12, "lines_total": 2, "truncated": false,
+                          "next": null, "snapshot": "s1"});
+        reply(c, req, page);
+        list
+    }
+
+    fn refused_reply(c: &mut Controller, req: u64, code: &str, reason: &str) -> Vec<Effect> {
+        let body = json!({"error_code": code, "message": format!("refused: {reason}"), "reason": reason, "buffer": B, "rev": 0});
+        c.on_incoming(Incoming::Reply { req, rc: 10, body: body.to_string() })
+    }
+
+    #[test]
+    fn bus_actions_answer_from_the_server_ops_outcome() {
+        // Opus m4: not `ok:true` at enqueue.
+        let mut c = ctl();
+        live(&mut c);
+        let fx = c.on_bus_command(cmd("ced.action", json!({"id": "edit.undo"})));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Respond { .. })), "no answer before the service's");
+        let (req, _) = sent(&fx, "edit.undo");
+        let (rc, v) = response(&refused_reply(&mut c, req, "NOT_FOUND", "nothing_to_undo"));
+        assert_eq!((rc, v["error_code"].as_str(), v["reason"].as_str()), (10, Some("NOT_FOUND"), Some("nothing_to_undo")));
+
+        let fx = c.on_bus_command(cmd("ced.action", json!({"id": "file.save"})));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Respond { .. })));
+        let (req, _) = sent(&fx, "edit.save");
+        // A Bus caller's disk_modified goes to the caller, never a prompt.
+        let fx = refused_reply(&mut c, req, "CONFLICT", "disk_modified");
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Prompt(_))), "no prompt for a Bus save: {fx:?}");
+        let (rc, v) = response(&fx);
+        assert_eq!((rc, v["reason"].as_str()), (10, Some("disk_modified")));
+
+        let fx = c.on_bus_command(cmd("ced.action", json!({"id": "file.save"})));
+        let (req, _) = sent(&fx, "edit.save");
+        let saved = json!({"buffer": B, "epoch": "0000e1e1", "path": "/nonexistent/ced-r/x.txt", "rev": 0, "saved_rev": 0,
+                           "file_bytes": 12, "disk": "clean", "durable": true, "warning": null});
+        let (rc, v) = response(&reply(&mut c, req, saved));
+        assert_eq!((rc, v["id"].as_str(), v["ok"].as_bool()), (0, Some("file.save"), Some(true)));
+    }
+
+    #[test]
+    fn a_lost_echo_after_the_reply_recovers_from_history() {
+        // Opus M1: the mirror's echo timer reaches the host and, when it
+        // fires with the op still waiting, starts a history recovery.
+        let mut c = ctl();
+        live(&mut c);
+        let fx = c.on_bus_command(cmd("ced.type", json!({"text": "!"})));
+        let (req, ins) = sent(&fx, "edit.insert");
+        let fx = reply(&mut c, req, json!({"buffer": B, "epoch": "0000e1e1", "rev": 1, "op_id": ins["op_id"]}));
+        let timer = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::Timer { id, ms: 5_000 } => Some(*id),
+                _ => None,
+            })
+            .expect("an echo timer with the reply");
+        // No event ever comes; the timer fires.
+        let fx = c.on_incoming(Incoming::Timer { id: timer });
+        let (_, h) = sent(&fx, "edit.history");
+        assert_eq!((h["buffer"].as_str(), h["since_rev"].as_u64()), (Some(B), Some(0)));
+    }
+
+    #[test]
+    fn find_replies_wait_for_pending_local_edits() {
+        // GLM M1: a reply at the mirror's rev is still the service's text,
+        // not the view, while a local edit is pending.
+        let mut c = ctl();
+        live(&mut c);
+        let fx = c.on_bus_command(cmd("ced.action", json!({"id": "search.find_next", "args": {"pattern": "world"}})));
+        // The find job's request (`from`), not highlight-all's.
+        let find_req = |fx: &[Effect]| {
+            fx.iter().find_map(|e| match e {
+                Effect::Send { req, out } if out.verb == "edit.find" && out.body.contains("\"from\"") => Some(*req),
+                _ => None,
+            })
+        };
+        let find = find_req(&fx).expect("the find job's edit.find");
+        let fx = c.on_bus_command(cmd("ced.type", json!({"text": "!"})));
+        let (req, ins) = sent(&fx, "edit.insert");
+        let pt = |o: usize| json!({"offset": o, "line": 1, "col": o + 1});
+        let m = json!({"start": pt(6), "end": pt(11), "text": "world", "text_truncated": false, "groups": null, "groups_truncated": false});
+        let fx = reply(&mut c, find, json!({"buffer": B, "rev": 0, "matches": [m], "truncated": false, "next": null}));
+        assert!(find_req(&fx).is_none(), "waits for idle");
+        let (_, st) = response(&c.on_bus_command(cmd("ced.state", json!({}))));
+        assert_eq!((st["selection"]["anchor"]["offset"].as_u64(), st["selection"]["head"]["offset"].as_u64()), (Some(1), Some(1)), "unmapped offsets not applied");
+        reply(&mut c, req, json!({"buffer": B, "epoch": "0000e1e1", "rev": 1, "op_id": ins["op_id"]}));
+        let ev = json!({"event": "edit", "epoch": "0000e1e1", "buffer": B, "rev": 1, "base_rev": 0, "origin": "agent:ced.local_tester",
+                        "lane": "agent:ced.local_tester", "kind": "edit", "of": null, "op_id": ins["op_id"],
+                        "edits": [{"offset": 0, "delete": 0, "insert": "!"}], "event_seq": 1});
+        let fx = c.on_incoming(Incoming::Topic { topic: "edit.changed".into(), body: ev.to_string() });
+        assert!(find_req(&fx).is_some(), "asked again once idle");
+    }
+
+    #[test]
+    fn the_save_state_comes_from_the_list_row_and_keys_feed_model_us() {
+        // Opus m2: another holder's unsaved edits show as dirty.
+        let mut c = ctl();
+        let list = live(&mut c);
+        let (_, v) = response(&c.on_bus_command(cmd("ced.tabs", json!({}))));
+        assert_eq!(v["tabs"][0]["dirty"].as_bool(), Some(false), "the open-time guess");
+        let row = json!({"buffer": B, "path": "/nonexistent/ced-r/x.txt", "opened_as": null, "name": "x.txt", "language": "text",
+                         "rev": 0, "saved_rev": null, "dirty": true, "disk": "clean", "lines": 2, "bytes": 12,
+                         "holders": ["local:other"], "recovery_id": "5f0c2a9e1b7d4c33", "recovered": false});
+        reply(&mut c, list, json!({"epoch": "0000e1e1", "buffers": [row]}));
+        let (_, v) = response(&c.on_bus_command(cmd("ced.tabs", json!({}))));
+        assert_eq!(v["tabs"][0]["dirty"].as_bool(), Some(true));
+        // A disk-state change asks again.
+        let ev = json!({"event": "disk", "epoch": "0000e1e1", "buffer": B, "rev": 0, "disk": "modified", "event_seq": 1});
+        let fx = c.on_incoming(Incoming::Topic { topic: "edit.changed".into(), body: ev.to_string() });
+        sent(&fx, "edit.list");
+        // ced.stats model_us is measured per key.
+        let tab = v["tabs"][0]["tab"].as_u64().unwrap() as TabId;
+        c.on_editor(tab, EditorMsg::Command(EditCommand::Insert("x".into())));
+        assert_eq!(c.frames.model_us.len(), 1);
     }
 
     #[test]

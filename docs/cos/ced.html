@@ -461,7 +461,8 @@ ced --version                 # cosmix-ced &lt;semver&gt; (&lt;sha12&gt;, built 
 </code></pre>
 <p><strong>One instance.</strong> <code>ced PATH…</code> first asks a running ced (<code>ced.ping</code>, 500 ms);
 if one answers, the paths go to it as <code>ced.open</code> and the command exits.
-Relative paths are resolved against the <em>calling</em> shell's directory. The
+Relative paths are resolved against the <em>calling</em> shell's directory. With no
+paths (a launcher relaunch) it just reports the running instance and exits 0. The
 launcher entry is <code>dev.cosmix.ced.desktop</code> (Name <em>CosMix Editor</em>); it does not
 make ced the default for text files.</p>
 <p><strong>Quitting detaches.</strong> Closing the window (or <code>Ctrl+Q</code>, <code>app.quit</code>) never
@@ -551,7 +552,8 @@ ced compares its copy with the restored text by blake3:
 as a <em>detached copy</em>. The infobar offers <strong>Keep mine</strong> (replace the
 difference in one undoable edit, or in 1 MiB steps for larger
 differences, which other clients see as they land), <strong>Take the
-service's</strong>, and <strong>Save mine as…</strong>.</li>
+service's</strong>, and <strong>Save mine as…</strong>. What you type during a staged
+transfer shows at once and is sent when the transfer finishes.</li>
 </ul>
 </li>
 <li><strong>ced starts</strong> with tabs from <code>session.json</code>, reattached the same way.
@@ -598,14 +600,14 @@ Positions (<code>POINT</code>, <code>POS</code>) are the edit service's forms.</
 <table><thead><tr><th>Verb</th><th>Args</th><th>Reply</th></tr></thead><tbody>
 <tr><td><code>ced.ping</code></td><td>—</td><td><code>{pong, service:"ced", schema:"ced.v1", pid, headless}</code></td></tr>
 <tr><td><code>ced.info</code></td><td>—</td><td><code>{version, git_sha, build_time, headless, tabs, edit:{epoch, version, volatile}, config_path, session_path}</code></td></tr>
-<tr><td><code>ced.open</code></td><td><code>paths:[…]</code>, <code>line?</code>, <code>col?</code></td><td><code>{tabs:[{tab, buffer, path}]}</code> (<code>path:line:col</code> accepted)</td></tr>
+<tr><td><code>ced.open</code></td><td><code>paths:[…]</code>, <code>line?</code>, <code>col?</code></td><td><code>{tabs:[{tab, buffer, path}]}</code> (<code>path:line:col</code> accepted; a relative path resolves against ced's own directory, so Bus callers pass absolute paths)</td></tr>
 <tr><td><code>ced.new</code></td><td>—</td><td><code>{tab, buffer}</code></td></tr>
 <tr><td><code>ced.tabs</code></td><td>—</td><td><code>{active, tabs:[{tab, buffer, epoch, path, name, language, rev, dirty, disk, pending, conflicts, recovered, phase}]}</code></td></tr>
 <tr><td><code>ced.focus</code></td><td><code>tab</code> | <code>buffer</code></td><td><code>{tab}</code></td></tr>
 <tr><td><code>ced.state</code></td><td><code>tab?</code>, <code>text?</code></td><td><code>{tab, buffer, rev, view_gen, phase, pending, inflight, text_hash, bytes, lines, selection:{anchor, head}, first_line, last_remote, conflicts, detached_copy, text?}</code> — <code>text_hash</code> is blake3 of ced's view; <code>text</code> is inlined up to 4 MiB</td></tr>
 <tr><td><code>ced.type</code></td><td><code>text</code>, <code>tab?</code></td><td><code>{tab, pending}</code> — typed at the window's selection</td></tr>
 <tr><td><code>ced.select</code></td><td><code>anchor</code>, <code>head</code>, <code>tab?</code></td><td><code>{selection}</code> — sets the window's selection</td></tr>
-<tr><td><code>ced.action</code></td><td><code>id</code>, <code>args?</code>, <code>tab?</code></td><td><code>{id, ok, result?}</code> — any action id from <code>ced.actions</code></td></tr>
+<tr><td><code>ced.action</code></td><td><code>id</code>, <code>args?</code>, <code>tab?</code></td><td><code>{id, ok, result?}</code> — any action id from <code>ced.actions</code>; see below for when it answers</td></tr>
 <tr><td><code>ced.actions</code></td><td>—</td><td><code>{actions:[{id, label, menu, keys, enabled}]}</code></td></tr>
 <tr><td><code>ced.wait</code></td><td><code>tab?</code>, exactly one of <code>rev</code> / <code>idle:true</code> / <code>epoch</code> / <code>phase</code>, <code>timeout_ms</code> (1–30000)</td><td><code>{tab, rev, phase, epoch, waited_ms}</code></td></tr>
 <tr><td><code>ced.layout</code></td><td><code>tab?</code></td><td>the last frame's geometry in logical px: <code>{window, menubar, tabstrip, editor, gutter_w, line_height, cell_w, first_line, visible_rows, caret, statusbar}</code></td></tr>
@@ -615,9 +617,18 @@ Positions (<code>POINT</code>, <code>POS</code>) are the edit service's forms.</
 </tbody></table>
 <p><strong><code>ced.type</code> and <code>ced.select</code> drive the window's selection</strong>, ARexx-style: a
 Bus-driven insert lands at your caret and moves it. That is by design; use
-<code>edit.*</code> directly to edit elsewhere without touching the view. In Mix, quote
-this verb for now (<code>send ced "ced.select" anchor=0 head=0</code>): <code>select</code> is a Mix
-keyword and a bare <code>ced.select</code> does not parse yet.</p>
+<code>edit.*</code> directly to edit elsewhere without touching the view.</p>
+<p><strong>When <code>ced.action</code> answers.</strong> A save, save-as, reload, undo or redo (and
+<code>file.close</code> with <code>save:true</code>) answers when the edit service has finished it:
+<code>ok</code> means saved, reloaded or undone, and a refusal (<code>disk_modified</code>,
+<code>nothing_to_undo</code>, …) comes back to you rather than as a prompt to the human.
+A lost reply whose outcome cannot be checked refuses <code>CONFLICT</code> <code>uncertain</code>;
+one still queued after 90 s refuses <code>TIMEOUT</code> and may yet complete.
+<code>file.close {save:true}</code> answers when the save completes; the close follows.
+Editing actions (paste, cut, indent, …) answer once applied to ced's view,
+like <code>ced.type</code>. Find and replace answer when the search starts; the result
+shows in the window. A window action that would open a dialog while one is
+already open refuses <code>CONFLICT</code> <code>modal_open</code>.</p>
 <p><strong><code>ced.wait</code></strong> is event-driven. The condition is checked when the request
 arrives (an immediate reply when it already holds) and again after every
 change in ced; it never polls. <code>rev:N</code> holds once the tab has folded rev N and

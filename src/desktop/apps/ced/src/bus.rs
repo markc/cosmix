@@ -216,10 +216,32 @@ async fn run(
                         });
                     }
                     Effect::Subscribe { topic } => {
-                        let c = client.clone();
+                        let (c, d) = (client.clone(), dtx.clone());
                         tokio::spawn(async move {
-                            if let Err(e) = c.subscribe_topic(&topic).await {
-                                tracing::warn!("subscribe {topic}: {e}");
+                            // The client replays only topics that once
+                            // subscribed, so a failed first subscribe would
+                            // leave ced deaf for good (Opus m7): retry with
+                            // backoff, and once it lands treat it as the
+                            // reconnect edge — every mirror recovers what it
+                            // missed.
+                            let mut delay = Duration::from_millis(250);
+                            let mut failed = false;
+                            loop {
+                                match c.subscribe_topic(&topic).await {
+                                    Ok(_) => break,
+                                    Err(e) => {
+                                        if !failed {
+                                            tracing::warn!("subscribe {topic}: {e}; retrying");
+                                        }
+                                        failed = true;
+                                        tokio::time::sleep(delay).await;
+                                        delay = (delay * 2).min(Duration::from_secs(5));
+                                    }
+                                }
+                            }
+                            if failed {
+                                tracing::info!("subscribed {topic} after retrying");
+                                let _ = d.unbounded_send(Delivery::Incoming(Incoming::Connection { up: true }));
                             }
                         });
                     }

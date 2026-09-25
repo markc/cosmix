@@ -104,6 +104,8 @@ impl LintCapture {
 #[derive(Default)]
 pub(super) struct Frames {
     pub(super) count: u64,
+    /// Key dispatch → `LocalEdit` applied → deltas mapped (plan §4.2).
+    pub(super) model_us: VecDeque<u64>,
     pub(super) view_us: VecDeque<u64>,
     pub(super) next_frame_us: VecDeque<u64>,
 }
@@ -314,8 +316,18 @@ impl Controller {
         self.frames.count += 1;
         push_sample(&mut self.frames.view_us, view_us);
         if let Some(n) = next_frame_us {
-            push_sample(&mut self.frames.next_frame_us, n);
+            self.record_next_frame(n);
         }
+    }
+
+    /// A key's `next_frame_us` alone: the frames tick that follows a redraw
+    /// already counted by [`Controller::record_frame`].
+    pub fn record_next_frame(&mut self, next_frame_us: u64) {
+        push_sample(&mut self.frames.next_frame_us, next_frame_us);
+    }
+
+    pub(super) fn record_model(&mut self, model_us: u64) {
+        push_sample(&mut self.frames.model_us, model_us);
     }
 
     /// Capture the tab's text for a lint run (plan §4.10): the tag at the
@@ -542,8 +554,10 @@ impl Controller {
             },
             Err(r) => return info(fx, &r.message),
         };
-        let Some(view_rev) = self.tab(tab).and_then(|t| t.mirror.as_ref()).map(Mirror::rev) else { return };
-        if reply.rev != view_rev {
+        let Some((view_rev, pending)) = self.tab(tab).and_then(|t| t.mirror.as_ref()).map(|m| (m.rev(), m.pending())) else { return };
+        // Offsets are the service's text at `reply.rev`: the view equals it
+        // only at that rev AND with no local edit pending (GLM M1).
+        if reply.rev != view_rev || pending > 0 {
             // The text moved on: ask again once the pipeline is idle.
             job.found.clear();
             job.rev = None;
@@ -874,7 +888,7 @@ impl Controller {
 
     pub(super) fn on_matches_reply(&mut self, tab: TabId, query: MatchQuery, rc: u8, body: &str, fx: &mut Vec<Effect>) {
         let _ = fx;
-        let Some(view_rev) = self.tab(tab).and_then(|t| t.mirror.as_ref()).map(Mirror::rev) else { return };
+        let Some((view_rev, pending)) = self.tab(tab).and_then(|t| t.mirror.as_ref()).map(|m| (m.rev(), m.pending())) else { return };
         let Some(x) = self.x.get_mut(&tab) else { return };
         if x.match_query.as_ref() != Some(&query) {
             return; // superseded
@@ -892,7 +906,7 @@ impl Controller {
             x.matches.clear();
             return;
         };
-        if reply.rev != view_rev {
+        if reply.rev != view_rev || pending > 0 {
             x.rematch_due = true;
             return;
         }

@@ -24,7 +24,8 @@ ced --version                 # cosmix-ced <semver> (<sha12>, built …)
 
 **One instance.** `ced PATH…` first asks a running ced (`ced.ping`, 500 ms);
 if one answers, the paths go to it as `ced.open` and the command exits.
-Relative paths are resolved against the *calling* shell's directory. The
+Relative paths are resolved against the *calling* shell's directory. With no
+paths (a launcher relaunch) it just reports the running instance and exits 0. The
 launcher entry is `dev.cosmix.ced.desktop` (Name *CosMix Editor*); it does not
 make ced the default for text files.
 
@@ -125,7 +126,8 @@ not by ced: ced writes none. What ced adds is its own full copy of each text.
     as a *detached copy*. The infobar offers **Keep mine** (replace the
     difference in one undoable edit, or in 1 MiB steps for larger
     differences, which other clients see as they land), **Take the
-    service's**, and **Save mine as…**.
+    service's**, and **Save mine as…**. What you type during a staged
+    transfer shows at once and is sent when the transfer finishes.
 - **ced starts** with tabs from `session.json`, reattached the same way.
   Buffers the service restored that no one holds are offered once in a
   *Recovered buffers* dialog: Open, or Discard.
@@ -175,14 +177,14 @@ Positions (`POINT`, `POS`) are the edit service's forms.
 |---|---|---|
 | `ced.ping` | — | `{pong, service:"ced", schema:"ced.v1", pid, headless}` |
 | `ced.info` | — | `{version, git_sha, build_time, headless, tabs, edit:{epoch, version, volatile}, config_path, session_path}` |
-| `ced.open` | `paths:[…]`, `line?`, `col?` | `{tabs:[{tab, buffer, path}]}` (`path:line:col` accepted) |
+| `ced.open` | `paths:[…]`, `line?`, `col?` | `{tabs:[{tab, buffer, path}]}` (`path:line:col` accepted; a relative path resolves against ced's own directory, so Bus callers pass absolute paths) |
 | `ced.new` | — | `{tab, buffer}` |
 | `ced.tabs` | — | `{active, tabs:[{tab, buffer, epoch, path, name, language, rev, dirty, disk, pending, conflicts, recovered, phase}]}` |
 | `ced.focus` | `tab` \| `buffer` | `{tab}` |
 | `ced.state` | `tab?`, `text?` | `{tab, buffer, rev, view_gen, phase, pending, inflight, text_hash, bytes, lines, selection:{anchor, head}, first_line, last_remote, conflicts, detached_copy, text?}` — `text_hash` is blake3 of ced's view; `text` is inlined up to 4 MiB |
 | `ced.type` | `text`, `tab?` | `{tab, pending}` — typed at the window's selection |
 | `ced.select` | `anchor`, `head`, `tab?` | `{selection}` — sets the window's selection |
-| `ced.action` | `id`, `args?`, `tab?` | `{id, ok, result?}` — any action id from `ced.actions` |
+| `ced.action` | `id`, `args?`, `tab?` | `{id, ok, result?}` — any action id from `ced.actions`; see below for when it answers |
 | `ced.actions` | — | `{actions:[{id, label, menu, keys, enabled}]}` |
 | `ced.wait` | `tab?`, exactly one of `rev` / `idle:true` / `epoch` / `phase`, `timeout_ms` (1–30000) | `{tab, rev, phase, epoch, waited_ms}` |
 | `ced.layout` | `tab?` | the last frame's geometry in logical px: `{window, menubar, tabstrip, editor, gutter_w, line_height, cell_w, first_line, visible_rows, caret, statusbar}` |
@@ -192,9 +194,19 @@ Positions (`POINT`, `POS`) are the edit service's forms.
 
 **`ced.type` and `ced.select` drive the window's selection**, ARexx-style: a
 Bus-driven insert lands at your caret and moves it. That is by design; use
-`edit.*` directly to edit elsewhere without touching the view. In Mix, quote
-this verb for now (`send ced "ced.select" anchor=0 head=0`): `select` is a Mix
-keyword and a bare `ced.select` does not parse yet.
+`edit.*` directly to edit elsewhere without touching the view.
+
+**When `ced.action` answers.** A save, save-as, reload, undo or redo (and
+`file.close` with `save:true`) answers when the edit service has finished it:
+`ok` means saved, reloaded or undone, and a refusal (`disk_modified`,
+`nothing_to_undo`, …) comes back to you rather than as a prompt to the human.
+A lost reply whose outcome cannot be checked refuses `CONFLICT` `uncertain`;
+one still queued after 90 s refuses `TIMEOUT` and may yet complete.
+`file.close {save:true}` answers when the save completes; the close follows.
+Editing actions (paste, cut, indent, …) answer once applied to ced's view,
+like `ced.type`. Find and replace answer when the search starts; the result
+shows in the window. A window action that would open a dialog while one is
+already open refuses `CONFLICT` `modal_open`.
 
 **`ced.wait`** is event-driven. The condition is checked when the request
 arrives (an immediate reply when it already holds) and again after every

@@ -144,6 +144,12 @@ pub struct App {
     /// For `ced.stats`: when the last key was dispatched, not yet framed.
     key_at: Option<Instant>,
     view_us: Cell<u64>,
+    /// Views built so far, and how many of them `ced.stats` has counted: one
+    /// frame per view, costing the updates before it plus the view itself
+    /// (GLM NIT 1 — not one per update).
+    views: Cell<u64>,
+    framed_views: u64,
+    update_us: u64,
     quitting: bool,
     empty_diag: Diagnostics,
 }
@@ -213,6 +219,9 @@ pub fn run(service: &str, config: Config, paths: Vec<String>) -> anyhow::Result<
         last_active: None,
         key_at: None,
         view_us: Cell::new(0),
+        views: Cell::new(0),
+        framed_views: 0,
+        update_us: 0,
         quitting: false,
         empty_diag: Diagnostics::default(),
     };
@@ -309,10 +318,14 @@ impl App {
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
         let started = Instant::now();
+        if self.views.get() != self.framed_views {
+            self.framed_views = self.views.get();
+            self.controller.record_frame(self.update_us + self.view_us.get(), None);
+            self.update_us = 0;
+        }
         let task = self.dispatch(msg);
         let task = Task::batch([task, self.after_transition()]);
-        let us = started.elapsed().as_micros() as u64 + self.view_us.get();
-        self.controller.record_frame(us, None);
+        self.update_us += started.elapsed().as_micros() as u64;
         task
     }
 
@@ -394,7 +407,7 @@ impl App {
             Msg::Frame(at) => {
                 if let Some(key_at) = self.key_at.take() {
                     let next = at.saturating_duration_since(key_at).as_micros() as u64;
-                    self.controller.record_frame(self.view_us.get(), Some(next));
+                    self.controller.record_next_frame(next);
                 }
                 Task::none()
             }
@@ -651,6 +664,13 @@ impl App {
         args: Option<serde_json::Value>,
         intent: Intent,
     ) -> (Task<Msg>, Result<serde_json::Value, crate::verbs::Refusal>) {
+        // A dialog replaces `self.modal`: never discard one a human is
+        // answering (a close or disk prompt, Save As) — Opus m5.
+        if self.modal.is_some() && opens_modal(action) {
+            let message = format!("{} would replace the dialog open in ced; answer it first", action.id());
+            let r = crate::verbs::Refusal { error_code: crate::verbs::code::CONFLICT.to_owned(), message, reason: Some("modal_open".to_owned()) };
+            return (Task::none(), Err(r));
+        }
         let mut selected = Task::none();
         if let Some(t) = tab
             && Some(t) != self.controller.active()
@@ -1196,6 +1216,7 @@ impl App {
         let started = Instant::now();
         let element = self.view_inner();
         self.view_us.set(started.elapsed().as_micros() as u64);
+        self.views.set(self.views.get() + 1);
         element
     }
 
@@ -1365,6 +1386,11 @@ fn relex(
     }
 }
 
+/// Window actions that open a modal dialog.
+fn opens_modal(action: ActionId) -> bool {
+    matches!(action, ActionId::FileOpen | ActionId::FileSaveAs | ActionId::SearchGotoLine | ActionId::HelpKeys | ActionId::HelpAbout)
+}
+
 fn refusal(code: &str, message: String) -> crate::verbs::Refusal {
     crate::verbs::Refusal { error_code: code.to_owned(), message, reason: None }
 }
@@ -1419,6 +1445,16 @@ mod tests {
         assert_eq!(unclaimed(&Key::Named(Named::Escape), none, false), Some(Msg::Escape));
         assert_eq!(unclaimed(&Key::Named(Named::Tab), none, true), Some(Msg::FileTab));
         assert_eq!(unclaimed(&Key::Named(Named::Tab), none, false), None, "outside a dialog Tab belongs to the editor");
+    }
+
+    #[test]
+    fn dialog_opening_actions_are_the_guarded_ones() {
+        for a in [ActionId::FileOpen, ActionId::FileSaveAs, ActionId::SearchGotoLine, ActionId::HelpKeys, ActionId::HelpAbout] {
+            assert!(opens_modal(a), "{}", a.id());
+        }
+        for a in [ActionId::SearchFind, ActionId::ViewZoomIn, ActionId::FileSave] {
+            assert!(!opens_modal(a), "{}", a.id());
+        }
     }
 
     #[test]

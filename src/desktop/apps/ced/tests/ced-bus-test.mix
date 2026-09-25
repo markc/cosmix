@@ -2,7 +2,8 @@
 -- recovery files in the temp dir, and `ced --headless --service ced`, driven
 -- by one-shot Mix clients. Agents' edits reach ced's mirror; concurrent
 -- ced.type + agent inserts converge; ced.action edit.undo undoes only the
--- caller's lane (agent:ced.anon); an overlap race converges; editd SIGKILL +
+-- caller's lane (agent:ced.anon) and answers from the op's outcome (an empty
+-- lane refuses nothing_to_undo); an overlap race converges; editd SIGKILL +
 -- restart reattaches the tab to the restored buffer with no detached copy,
 -- twice (the second across the restore's new generation); file.save writes
 -- the bytes and removes the recovery files. Headless truthfulness: ced.layout
@@ -45,8 +46,9 @@ $editd_pid = nil
 $ced_pid = nil
 $noded_pid = nil
 $file = $tmp .. "/work/doc.txt"
--- `select` is a Mix keyword, so a bare `send ced ced.select` does not parse
--- (mix 0.96.1); the verb is quoted until the parser takes it as a name.
+-- `select` is a Mix keyword; since mix 0.96.2 a dotted Bus name takes it as a
+-- segment, so `send ced ced.select …` parses. One call keeps the quoted form
+-- (`send ced "ced.select" …`), which must go on working too.
 -- Bus-driven ced edits claim agent:<bus_lane_label(caller)>; a one-shot
 -- client is anonymous, so its lane is agent:ced.anon (plan D5).
 $lane = "agent:ced.anon"
@@ -220,7 +222,7 @@ try
 
   -- 3. three ced.type and three agent inserts at the same offset, unsynchronised
   for each $k in range(1, 3)
-    cok('"ced.select" tab=$a.t anchor=0 head=0', {t: $t})
+    cok('ced.select tab=$a.t anchor=0 head=0', {t: $t})
     cok('ced.type tab=$a.t text=$a.s', {t: $t, s: "<t" .. to_string($k) .. ">"})
     eok('edit.insert buffer=$a.b at=0 text=$a.s origin="agent:e2e"', {b: $b, s: "<a" .. to_string($k) .. ">"})
   end
@@ -236,6 +238,9 @@ try
     $u = cok('ced.action tab=$a.t id="edit.undo"', {t: $t})
     check($u.ok and $u.id == "edit.undo", "ced.action edit.undo: " .. json_encode($u))
   end
+  -- ced.action answers from the op's outcome: the lane is empty now, and the
+  -- caller (not a prompt in the window) gets editd's refusal
+  cd_refused('ced.action tab=$a.t id="edit.undo"', {t: $t}, "NOT_FOUND", "nothing_to_undo")
   sync($t, $b)
   $t4 = converged($t, $b, "lane undo")
   check($t4 == replace(replace(replace($t3, "<t1>", ""), "<t2>", ""), "<t3>", ""), "undo touched another lane: " .. json_encode({before: $t3, after: $t4}))
@@ -247,7 +252,7 @@ try
   end
 
   -- 5. overlap race: ced types inside a span an agent replaces at once
-  cok('"ced.select" tab=$a.t anchor=2 head=2', {t: $t})
+  cok('ced.select tab=$a.t anchor=2 head=2', {t: $t})
   cok('ced.type tab=$a.t text="RACE"', {t: $t})
   eok('edit.replace buffer=$a.b range=[0, 10] text="agent-wins" origin="agent:e2e"', {b: $b})
   sync($t, $b)
