@@ -4,8 +4,9 @@
 //! `HELP` is answered by cosmix-lib-client from the manifest.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use cosmix_client::SupervisedClient;
+use cosmix_client::{ConnState, SupervisedClient};
 use cosmix_edit_core::wire::{SERVICE, VERBS};
 
 /// Declared args per verb (the manifest's `args` column).
@@ -98,9 +99,89 @@ pub async fn connect() -> Result<Arc<SupervisedClient>, String> {
         .map_err(|error| format!("connecting supervised Bus client: {error}"))
 }
 
-/// `cosmix-editd serve`. Stage S skeleton: refuses to run.
+/// `cosmix-editd serve`: register `edit`, signal READY=1 once, serve until
+/// SIGTERM/SIGINT, then log every dirty buffer and exit within
+/// `SHUTDOWN_BUDGET_MS` (E0 buffers are volatile: the log is the record).
 pub async fn serve() -> anyhow::Result<()> {
-    anyhow::bail!("cosmix-editd 0.1.0 is a Stage S skeleton: serve is not implemented yet (ced E0b)")
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+    let config = crate::router::Config::from_env();
+    tracing::info!(
+        "cosmix-editd: epoch {}, mesh access {}",
+        config.epoch,
+        if config.mesh_open { "open" } else { "locked (COSMIX_MESH_OPEN=0: mutations node-local only)" }
+    );
+    let client = connect().await.map_err(anyhow::Error::msg)?;
+    let mut incoming = client.incoming().ok_or_else(|| anyhow::anyhow!("the Bus incoming stream was already taken"))?;
+    let editd = crate::router::Editd::start(config, Arc::new(crate::events::BusSink(client.clone())));
+    // Registered: `edit` is callable now.
+    crate::readiness::notify_ready();
+
+    // Every reconnect edge owes mirrors a `resync all` (events published while
+    // disconnected were dropped and are already owed individually).
+    let mut state = client.subscribe_state();
+    let publisher = editd.publisher().clone();
+    tokio::spawn(async move {
+        let mut connected = *state.borrow() == ConnState::Connected;
+        while state.changed().await.is_ok() {
+            let now = *state.borrow_and_update() == ConnState::Connected;
+            if now && !connected {
+                publisher.reconnected();
+            }
+            connected = now;
+        }
+    });
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    loop {
+        tokio::select! {
+            cmd = incoming.recv() => {
+                let Some(cmd) = cmd else { break };
+                if cmd.command.is_empty() {
+                    continue; // a topic delivery, not a verb
+                }
+                // Routing happens here, in receive order; only the wait is spawned.
+                let reply = editd.submit(&cmd);
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let (rc, body) = reply.await;
+                    match tokio::time::timeout(Duration::from_secs(10), client.respond(&cmd, rc, &body)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!("cosmix-editd: reply to {} failed: {error}", cmd.command),
+                        Err(_) => tracing::warn!("cosmix-editd: reply to {} timed out", cmd.command),
+                    }
+                });
+            }
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+        }
+    }
+
+    let budget = Duration::from_millis(crate::limits::SHUTDOWN_BUDGET_MS);
+    let shutdown = async {
+        for dirty in editd.dirty_buffers().await {
+            tracing::warn!(
+                "cosmix-editd: discarding unsaved buffer {} ({}) at rev {}",
+                dirty.buffer,
+                dirty.path.as_deref().unwrap_or("scratch"),
+                dirty.rev
+            );
+        }
+        if let Err(error) = client.deregister().await {
+            tracing::warn!("cosmix-editd: deregister failed: {error}");
+        }
+        client.shutdown().await;
+    };
+    if tokio::time::timeout(budget - Duration::from_millis(500), shutdown).await.is_err() {
+        tracing::warn!("cosmix-editd: shutdown budget spent; exiting anyway");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

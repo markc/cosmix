@@ -10,7 +10,6 @@
 //! [`history`], anchor mapping → [`anchor`], positions → [`pos`], wire →
 //! [`wire`], refusal vocabulary → [`error`].
 //!
-//! Stage S state: signatures are frozen, most bodies are `todo!()` (E0a).
 //! Vendored msedit sources live in `vendor/msedit/` (MIT, see its README).
 
 pub mod anchor;
@@ -27,3 +26,13 @@ pub mod text;
 pub mod wire;
 
 mod vendor;
+
+// editd moves each buffer into its own actor task: `Text` and `Buffer` must be `Send`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<text::Text>();
+    assert_send::<buffer::Buffer>();
+};
+
+#[cfg(test)]
+mod tests;

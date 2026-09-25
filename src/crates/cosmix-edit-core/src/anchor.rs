@@ -64,8 +64,73 @@ pub struct Selection {
 /// Map one point through one applied edit (table above). Returns the new
 /// offset and whether it collapsed.
 pub fn map_point(a: usize, bias: Bias, edit: &Edit) -> (usize, bool) {
-    let _ = (a, bias, edit);
-    todo!("E0a: §3.6 mapping table")
+    let (p, dd, ii) = (edit.offset, edit.delete, edit.insert.len());
+    if a < p || (dd == 0 && a > p) {
+        // Before the edit, or after a pure insert.
+        return if a < p { (a, false) } else { (a + ii, false) };
+    }
+    if a == p {
+        // The delete (if any) starts here; the insert then applies the bias.
+        return match bias {
+            Bias::Before => (a, false),
+            Bias::After => (a + ii, false),
+        };
+    }
+    if a < p + dd {
+        // Strictly inside the deleted span: collapse to `p` as a `Before` point.
+        return (p, true);
+    }
+    (a - dd + ii, false)
+}
+
+/// Map a point through a whole applied sequence; `collapsed` is set if any
+/// step collapsed it.
+pub(crate) fn map_through(mut a: usize, bias: Bias, edits: &[Edit]) -> (usize, bool) {
+    let mut collapsed = false;
+    for e in edits {
+        let (n, c) = map_point(a, bias, e);
+        a = n;
+        collapsed |= c;
+    }
+    (a, collapsed)
+}
+
+impl NamedAnchor {
+    /// Map through an applied sequence (module rules); `rev` is the new rev,
+    /// recorded as `collapsed_rev` if a delete swallowed an end.
+    pub(crate) fn map(&mut self, edits: &[Edit], rev: u64) {
+        match &mut self.end {
+            None => {
+                let (o, c) = map_through(self.start.offset, self.start.bias, edits);
+                self.start.offset = o;
+                if c {
+                    self.start.collapsed_rev = Some(rev);
+                }
+            }
+            Some(end) => {
+                let empty = self.start.offset == end.offset;
+                let (sb, eb) = if empty { (Bias::Before, Bias::Before) } else { (Bias::After, Bias::Before) };
+                let (s, sc) = map_through(self.start.offset, sb, edits);
+                let (e, ec) = map_through(end.offset, eb, edits);
+                self.start.offset = s.min(e);
+                end.offset = e;
+                if sc {
+                    self.start.collapsed_rev = Some(rev);
+                }
+                if ec {
+                    end.collapsed_rev = Some(rev);
+                }
+            }
+        }
+    }
+}
+
+impl Selection {
+    /// Map through an applied sequence with one bias for both ends.
+    pub(crate) fn map(&mut self, edits: &[Edit], bias: Bias) {
+        self.anchor = map_through(self.anchor, bias, edits).0;
+        self.head = map_through(self.head, bias, edits).0;
+    }
 }
 
 /// Whether `name` is a valid anchor name.

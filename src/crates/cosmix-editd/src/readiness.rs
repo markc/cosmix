@@ -56,3 +56,21 @@ pub(crate) fn notify_ready() {
         libc::close(fd);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sends_ready_to_notify_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        // SAFETY: no other test in this crate reads or writes NOTIFY_SOCKET.
+        unsafe { std::env::set_var("NOTIFY_SOCKET", &path) };
+        super::notify_ready();
+        unsafe { std::env::remove_var("NOTIFY_SOCKET") };
+        let mut buf = [0u8; 64];
+        let n = socket.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1\n");
+    }
+}
