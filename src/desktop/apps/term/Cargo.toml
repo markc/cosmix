@@ -4,7 +4,7 @@ version = "0.2.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "CosMix Wayland terminal on iced + tiny-skia (lightweight frontend; wgpu behind a feature)"
+description = "CosMix Wayland terminal on iced + wgpu (lightweight frontend; banded tiny-skia behind a feature)"
 
 [[bin]]
 name = "term"
@@ -21,20 +21,26 @@ display = "CosMix Term"
 engine = "iced"
 
 [features]
-# Default renderer: tiny-skia (Mark, 2026-09-25, sweep decision 28). The
-# 2026-09-24 T5 retake measured it at ~57-63 MB PSS and 0 GEM against wgpu's
-# ~43 MB PSS + 113-121 MB GEM (iGPU GEM is system RAM), and wgpu's GEM is its
-# own swapchain, so it cannot get under the 80 MB gate at desktop sizes.
-default = ["tiny-skia"]
-# iced's CPU rasteriser into `wl_shm`: no DRM fd at all, like foot.
-tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes"]
-# The shader-widget path, kept buildable: one persistent wgpu texture,
-# damage-band uploads. `--features wgpu` on top of the default selects it —
-# when both are compiled in, main.rs takes the wgpu grid and iced_renderer
-# puts wgpu first. `--no-default-features --features wgpu` is the clean arm
-# for measurement. `naga27-termcolor` rides along: see that dependency for
-# why iced-on-wgpu cannot share a build with Bevy without it.
+# Default renderer: wgpu (Mark, 2026-09-25, TODO-term T16). tiny-skia was the
+# default for a morning (sweep decision 28: ~57-63 MB PSS and 0 GEM against
+# wgpu's ~43 MB PSS + 113-121 MB GEM) and typing under Claude Code was
+# "almost unusable". The headless benchmark (src/cpu_bench.rs,
+# docs/dev/term-rendering.md) at 2250x1250 px: a full-pane redraw costs
+# ~23 ms on tiny-skia, of which ~5 ms is glyph painting both arms share and
+# ~18 ms is CPU image conversion + blit that wgpu does on the GPU. Banding
+# cut a one-row echo from 17.8 to 6.7 ms but cannot make a full-screen TUI
+# redraw fit a 16.7 ms frame. Mark's rule: speed skia up first, default to
+# wgpu if it is still needed — it is.
+default = ["wgpu"]
+# The shader-widget path: one persistent wgpu texture, damage-band uploads.
+# `naga27-termcolor` rides along: see that dependency for why iced-on-wgpu
+# cannot share a build with Bevy without it.
 wgpu = ["iced/wgpu", "naga27-termcolor"]
+# iced's CPU rasteriser into `wl_shm`, banded (src/cpu_bands.rs): no DRM fd
+# at all, like foot, and cheap for sparse updates. Build it ALONE —
+# `--no-default-features --features tiny-skia` — because with both compiled
+# in, main.rs takes the wgpu grid and iced_renderer puts wgpu first.
+tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes"]
 # Not meant to be selected on its own; `wgpu` pulls it in. It exists as a
 # feature so the compatibility dependency stays optional.
 naga27-termcolor = ["dep:naga27"]
