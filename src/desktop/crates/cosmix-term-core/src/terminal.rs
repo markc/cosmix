@@ -914,7 +914,10 @@ impl Terminal {
         for y in -(offset as i32) - history as i32..rows as i32 - offset as i32 {
             let row = &term.grid[Line(y)];
             for x in 0..cols {
-                out.push(row[Column(x)].c());
+                // Rio stores untouched cells as NUL; text snapshots use spaces
+                // so blank cells preserve columns without leaking that sentinel.
+                let c = row[Column(x)].c();
+                out.push(if c == '\0' { ' ' } else { c });
             }
             out.push('\n');
         }
@@ -1347,6 +1350,20 @@ mod tests {
         assert!(all(&f.settled_snapshot().dirty_rows), "scroll-back");
         // Still scrolled back: repainted whole, and still no self-wake.
         assert!(all(&f.quiet_snapshot().dirty_rows), "scrolled view");
+    }
+
+    #[test]
+    fn snapshot_blank_cells_are_spaces_and_preserve_columns() {
+        let mut f = GridFixture::new();
+        f.feed(b"A\x1b[3CB", |t| cell(t, 0, 4) == 'B');
+        let snapshot = f.terminal.snapshot();
+        let text = snapshot.split_once("--- screen ---\n").unwrap().1;
+        let rows = text.lines().collect::<Vec<_>>();
+        assert!(!text.contains('\0'));
+        assert_eq!(rows.len(), 24);
+        assert!(rows.iter().all(|row| row.chars().count() == 80));
+        assert_eq!(rows[0], format!("A   B{}", " ".repeat(75)));
+        assert!(rows[1..].iter().all(|row| *row == " ".repeat(80)));
     }
 
     #[test]

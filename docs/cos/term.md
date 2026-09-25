@@ -135,6 +135,8 @@ belong to the tab or the call returns `invalid-argument`. `contents:false`
 returns the usual metadata and diagnostic timings without the screen marker
 or text. Scrollback is prepended after the screen marker, oldest first;
 `rows` still describes the viewport. Reading never moves the scroll offset.
+Snapshot text represents empty grid cells as spaces, preserving column positions
+and trailing blank cells in both history and viewport rows.
 
 Existing replies keep their key=value format. New title replies are
 `retitled id=N tab=N pane=P revision=R`; move replies are

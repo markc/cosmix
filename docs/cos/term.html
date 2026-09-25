@@ -552,7 +552,9 @@ error, never the active pane. With both snapshot selectors, the pane must
 belong to the tab or the call returns <code>invalid-argument</code>. <code>contents:false</code>
 returns the usual metadata and diagnostic timings without the screen marker
 or text. Scrollback is prepended after the screen marker, oldest first;
-<code>rows</code> still describes the viewport. Reading never moves the scroll offset.</p>
+<code>rows</code> still describes the viewport. Reading never moves the scroll offset.
+Snapshot text represents empty grid cells as spaces, preserving column positions
+and trailing blank cells in both history and viewport rows.</p>
 <p>Existing replies keep their key=value format. New title replies are
 <code>retitled id=N tab=N pane=P revision=R</code>; move replies are
 <code>moved id=N index=I tab=N pane=P revision=R</code>. Tab creation still replies
