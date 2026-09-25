@@ -1299,20 +1299,9 @@ impl Parser {
             | Token::InterpString(_)
             | Token::HeredocString(_)
             | Token::CommandSub(_) => self.parse_expression(),
-            Token::String(_) => {
-                let mut command = self.expect_identifier()?;
-                while self.peek() == &Token::Dot {
-                    if self.pos + 1 < self.tokens.len()
-                        && let Token::String(_) = &self.tokens[self.pos + 1].token
-                    {
-                        self.advance(); // skip '.'
-                        let part = self.expect_identifier()?;
-                        command = format!("{}.{}", command, part);
-                        continue;
-                    }
-                    break;
-                }
-                Ok(Expr::StringLiteral(command))
+            Token::String(_) => Ok(Expr::StringLiteral(self.parse_bus_dotted_name()?)),
+            _ if self.at_keyword_led_dotted_name() => {
+                Ok(Expr::StringLiteral(self.parse_bus_dotted_name()?))
             }
             _ => {
                 let span = self.peek_span();
@@ -1323,6 +1312,68 @@ impl Parser {
                 })
             }
         }
+    }
+
+    /// One segment of a dotted Bus name (verb, topic, handler name, dotted
+    /// address) at token index `i`: a bareword, or ANY keyword's source
+    /// lexeme. Bus names are dotted identifiers owned by the services that
+    /// define them, so a segment coinciding with a Mix keyword
+    /// (`ced.select`, `x.if`, `a.print.end`) is ordinary there — the lexer
+    /// has no context and emits the keyword token, so the parser takes the
+    /// name back. `fn`/`function` share one token; the spelling is read
+    /// from the source, and `None` (not a name) if the two views disagree.
+    fn bus_segment_at(&self, i: usize) -> Option<String> {
+        let st = self.tokens.get(i)?;
+        match &st.token {
+            Token::String(s) => Some(s.clone()),
+            Token::Function => ["function", "fn"]
+                .into_iter()
+                .find(|kw| {
+                    let end = st.offset + kw.len();
+                    end <= self.source.len()
+                        && self.source[st.offset..end].iter().copied().eq(kw.chars())
+                        && !self
+                            .source
+                            .get(end)
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                })
+                .map(str::to_string),
+            tok => keyword_lexeme(tok).map(str::to_string),
+        }
+    }
+
+    /// True when the cursor sits on a KEYWORD that leads a dotted Bus name
+    /// (`select.all`, `print.x.y`). A bare keyword on its own is never
+    /// taken — only keyword `.` segment — so no statement that parsed
+    /// before changes meaning: keyword-then-`.` in these positions was
+    /// always a parse error (or, as a send target, a runtime field access
+    /// on a literal).
+    fn at_keyword_led_dotted_name(&self) -> bool {
+        !matches!(self.peek(), Token::String(_))
+            && self.bus_segment_at(self.pos).is_some()
+            && self.peek_ahead(1) == &Token::Dot
+            && self.bus_segment_at(self.pos + 2).is_some()
+    }
+
+    /// Consume a dotted Bus name: a head segment, then `.segment` for as
+    /// long as a segment follows the dot. Shared by the `send`/`emit`/
+    /// `address` command and dotted target, and the `on` handler header,
+    /// so all four accept exactly the same names.
+    fn parse_bus_dotted_name(&mut self) -> MixResult<String> {
+        let Some(mut name) = self.bus_segment_at(self.pos) else {
+            return self.expect_identifier();
+        };
+        self.advance();
+        while self.peek() == &Token::Dot {
+            let Some(part) = self.bus_segment_at(self.pos + 1) else {
+                break;
+            };
+            self.advance(); // '.'
+            self.advance(); // segment
+            name.push('.');
+            name.push_str(&part);
+        }
+        Ok(name)
     }
 
     /// Parse send args: tokens until end of line.
@@ -1405,11 +1456,8 @@ impl Parser {
         if let Some(name) = self.take_hyphenated_service_word() {
             return Ok(Expr::StringLiteral(name));
         }
-        if let Token::String(_) = self.peek()
-            && matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.token),
-                Some(Token::Dot)
-            )
+        if (matches!(self.peek(), Token::String(_)) && self.peek_ahead(1) == &Token::Dot)
+            || self.at_keyword_led_dotted_name()
         {
             return self.parse_command_expr();
         }
@@ -1573,7 +1621,9 @@ impl Parser {
         let mut body = Vec::new();
         loop {
             self.skip_statement_separators();
-            if self.is_at_end() || self.check(&Token::End) {
+            // `end.x …` is a body line sending verb `end.x`, not the
+            // block's closing `end`.
+            if self.is_at_end() || (self.check(&Token::End) && !self.at_keyword_led_dotted_name()) {
                 break;
             }
             // Each line in address block is an implicit send. The
@@ -1636,19 +1686,15 @@ impl Parser {
     fn parse_on(&mut self) -> MixResult<StmtKind> {
         self.advance(); // skip 'on'
 
-        // Dotted command name, same shape as send/emit command parsing.
-        let mut command = self.expect_identifier()?;
-        while self.peek() == &Token::Dot {
-            if self.pos + 1 < self.tokens.len()
-                && let Token::String(_) = &self.tokens[self.pos + 1].token
-            {
-                self.advance(); // skip '.'
-                let part = self.expect_identifier()?;
-                command = format!("{}.{}", command, part);
-                continue;
-            }
-            break;
-        }
+        // Dotted command name, same shape as send/emit command parsing:
+        // any segment may be a keyword lexeme (`on ced.select`); a keyword
+        // may lead only when dotted (`on select.all`), never bare.
+        let command =
+            if matches!(self.peek(), Token::String(_)) || self.at_keyword_led_dotted_name() {
+                self.parse_bus_dotted_name()?
+            } else {
+                self.expect_identifier()?
+            };
 
         // Optional trailer, in either order: a `desc "…"` doc-string and/or
         // the `async` modifier (SPEC 18 §10.3 Class C). Both are contextual

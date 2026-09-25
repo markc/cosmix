@@ -46,6 +46,8 @@ print($m.to)                                    -- field access -> x
 $m.label = 5                                    -- field assignment
 $v = data_parse("{to: 1, on: true}")            -- strict-data keys, unquoted
 send maild mailbox.move to=$dest                -- send/emit/address kwargs
+send ced ced.select anchor=0                    -- dotted Bus verb segments (0.96.2)
+on edit.select; reply("ok"); end                -- ... and `on` handler names
 parse $s with $a to $b                          -- literal delimiter word
 ```
 
