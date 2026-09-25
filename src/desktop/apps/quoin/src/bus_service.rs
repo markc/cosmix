@@ -34,6 +34,9 @@ struct ShellBusState {
     /// own timeout — worse than answering late.
     pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
     pending_resizes: BTreeMap<u64, (InboundRequest, u64)>,
+    /// Panel operations answered from Presentation, after Model. Concealment
+    /// uses the host's existing animation frames, never a Bus notification.
+    pending_panels: Vec<(InboundRequest, cosmix_shell::core::OutputKey)>,
     /// Local receipt ordering, not a broker incarnation token. Absence sweeps
     /// only affect reservations accepted strictly before their cutoff.
     /// CTK uses separate control/telemetry planes: this orders consumption in
@@ -57,6 +60,7 @@ impl Default for ShellBusState {
             live_generation: None,
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
+            pending_panels: Vec::new(),
             citizen_receipt: 0,
             disconnected_citizens: BTreeMap::new(),
             citizen_snapshot: None,
@@ -123,6 +127,7 @@ impl Plugin for ShellBusPlugin {
                     .after(service_bus),
             )
             .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(Update, reply_panels.in_set(ShellRuntimeSet::Presentation))
             .add_systems(Update, publish_panel_state.in_set(ShellRuntimeSet::Presentation))
             .add_systems(
                 Update,
@@ -141,16 +146,79 @@ fn publish_panel_state(
     mut state: ResMut<ShellBusState>,
 ) {
     if state.live_generation.is_none() { return; }
-    let snapshot = Value::from(&ShellProps(&frame.0).snapshot());
-    let panels = &snapshot["panels"];
-    if *panels == state.applied_panels { return; }
+    let panels = panel_notice_snapshot(&frame.0);
+    if panels == state.applied_panels { return; }
     let revision = state.panel_revision.saturating_add(1);
     let body = json!({"generation":state.live_generation,"revision":revision,"panels":panels});
     let wire = format!("---\ncommand: shell.panel.changed\n---\n{body}");
     let topic = format!("{}.panel.changed", bridge.service_name());
     if bridge.try_publish_topic(&topic, true, wire).is_ok() {
-        state.applied_panels = panels.clone();
+        state.applied_panels = panels;
         state.panel_revision = revision;
+    }
+}
+
+/// Selection/mode/mapping are discrete state. During a resize gesture retain
+/// the settled width; publish the final size once, without serialising the
+/// entire property tree on every animation frame. `visible` is a boolean,
+/// so reveal/conceal emits only its mapping transitions, not motion fractions.
+fn panel_notice_snapshot(frame: &ShellFrame) -> Value {
+    let mut panels = serde_json::Map::new();
+    for edge in Edge::ALL {
+        let panel = frame.panel(edge);
+        panels.insert(edge_name(edge).into(), json!({
+            "visible": panel.mapped,
+            "pinned": panel.mode != PanelMode::Hidden,
+            "mode": panel.mode.as_str(),
+            "width_px": panel.settled_thickness_px,
+            "page": panel.active_page_id,
+            "pages": panel.page_ids.as_ref(),
+            "output": frame.geometry.output.as_str(),
+        }));
+    }
+    Value::Object(panels)
+}
+
+/// These idempotent verbs drive the legacy citizen's select/pin/release
+/// sequence. A superseding command or output change is an explicit refusal,
+/// not a success inferred from enqueueing. Reads remain immediate snapshots.
+fn reply_panels(
+    bridge: Res<BusBridge>,
+    frame: Res<ShellFrameState>,
+    mut state: ResMut<ShellBusState>,
+) {
+    for (request, output) in std::mem::take(&mut state.pending_panels) {
+        if state.live_generation != Some(request.connection_generation) {
+            continue;
+        }
+        let edge = argument(&request, "edge").and_then(parse_edge).expect("validated edge");
+        let panel = frame.0.panel(edge);
+        let applied = output == frame.0.geometry.output && match request.command.as_str() {
+            "shell.panel.page.set" => panel.active_page_id == argument(&request, "id"),
+            "shell.panel.pin" => panel.mode == PanelMode::Docked && panel.mapped,
+            "shell.panel.mode" => Some(panel.mode.as_str().to_owned()) == argument(&request, "mode"),
+            _ => unreachable!("only applied panel verbs are queued"),
+        };
+        // Hidden mode is applied before its outgoing motion completes. The
+        // model already requests frames until unmapping; hold the reply until
+        // that state is observable, so even a dropped final notice is harmless.
+        if applied && request.command == "shell.panel.mode"
+            && panel.mode == PanelMode::Hidden && panel.mapped
+            && !panel.transient_revealed
+        {
+            state.pending_panels.push((request, output));
+            continue;
+        }
+        let applied = applied && !(request.command == "shell.panel.mode"
+            && panel.mode == PanelMode::Hidden && panel.mapped);
+        let snapshot = Value::from(&ShellProps(&frame.0).snapshot());
+        let body = if applied {
+            json!({"accepted":true, "applied":true, "panels":snapshot["panels"]})
+        } else {
+            json!({"error_code":"PANEL_NOT_APPLIED", "message":"panel command was superseded or could not apply", "panels":snapshot["panels"]})
+        };
+        stash_or_respond(&bridge, &mut state, request, if applied { 0 } else { 10 },
+            body.to_string(), None, &mut |_| {});
     }
 }
 
@@ -271,6 +339,7 @@ fn service_bus(
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
                 state.pending_resizes.clear();
+                state.pending_panels.clear();
                 state.live_generation = None;
                 state.citizen_snapshot = None;
                 state.citizen_snapshot_retry = false;
@@ -586,6 +655,19 @@ fn service_bus(
                     None,
                     &mut dispatch,
                 );
+            }
+            continue;
+        }
+        if rc == 0 && matches!(request.command.as_str(),
+            "shell.panel.page.set" | "shell.panel.pin" | "shell.panel.mode")
+            && let Some(command) = &command
+        {
+            if state.pending_panels.len() < MAX_PENDING_REPLIES {
+                state.pending_panels.push((request, command.output.clone()));
+                dispatch(command.clone());
+            } else {
+                stash_or_respond(&bridge, &mut state, request, 11,
+                    json!({"error":"panel queue full"}).to_string(), None, &mut dispatch);
             }
             continue;
         }
@@ -1135,9 +1217,9 @@ fn dispatch_shell_request(
             None,
         );
     }
-    // `accepted` means validated and enqueued for the Model stage of this
-    // update — an acceptance ack, not an application receipt. Callers needing
-    // the applied state read it back via `shell.props.get`.
+    // The dispatcher describes enqueue acceptance. service_bus upgrades
+    // page.set/pin/mode to applied receipts in Presentation; other legacy
+    // verbs retain their acceptance reply and require state readback.
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
@@ -2660,6 +2742,92 @@ mod tests {
         let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["generation"], 2);
         assert!(body["revision"].as_u64().unwrap() > revision);
+    }
+
+    #[test]
+    fn panel_notices_coalesce_resize_and_reveal_frames() {
+        let mut frame = test_frame();
+        let before = panel_notice_snapshot(&frame);
+        for fraction in [0.1, 0.25, 0.5, 0.75, 1.0] {
+            let panel = &mut frame.panels[Edge::Left.index()];
+            panel.resize_active = true;
+            panel.thickness_px += 1.0;
+            panel.visible_fraction = fraction;
+            assert_eq!(panel_notice_snapshot(&frame), before);
+        }
+        let panel = &mut frame.panels[Edge::Left.index()];
+        panel.resize_active = false;
+        panel.settled_thickness_px = panel.thickness_px;
+        let settled = panel_notice_snapshot(&frame);
+        assert_ne!(settled, before);
+        assert_eq!(settled["left"]["width_px"], json!(frame.panel(Edge::Left).thickness_px));
+        frame.panels[Edge::Left.index()].mapped = !frame.panel(Edge::Left).mapped;
+        assert_ne!(panel_notice_snapshot(&frame), settled);
+    }
+
+    #[test]
+    fn panel_replies_confirm_application_without_notices() {
+        let (mut app, peer) = mounted_bus_app();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(16),
+        ));
+        load_scene(&mut app, &peer, "reply-page", "owner", "left");
+        peer.drain_responses();
+        for (verb, args) in [
+            ("shell.panel.page.set", json!({"edge":"left", "id":"scene-reply-page"})),
+            ("shell.panel.pin", json!({"edge":"left"})),
+            ("shell.panel.mode", json!({"edge":"left", "mode":"hidden"})),
+        ] {
+            let mut req = local(verb);
+            req.body = args.to_string();
+            peer.send(req);
+            assert!(peer.drain_responses().is_empty());
+            let mut replies = Vec::new();
+            // Drive the model's native animation frames, discarding every
+            // notice. There is no client-side notification continuation.
+            for _ in 0..120 {
+                app.update();
+                peer.drain_publishes();
+                replies.extend(peer.drain_responses());
+                if !replies.is_empty() { break; }
+            }
+            assert_eq!(replies.len(), 1, "{verb}");
+            assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+            let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+            assert_eq!(body["applied"], true);
+            let snapshot = Value::from(&ShellProps(&app.world().resource::<ShellFrameState>().0).snapshot());
+            assert_eq!(body["panels"], snapshot["panels"]);
+            if verb == "shell.panel.pin" {
+                // Let reveal progress before hiding; otherwise concealment
+                // can finish immediately from a still-zero motion fraction.
+                for _ in 0..30 {
+                    app.update();
+                    peer.drain_publishes();
+                }
+            }
+            if verb == "shell.panel.mode" {
+                assert_eq!(body["panels"]["left"]["pinned"], false);
+                assert_eq!(body["panels"]["left"]["visible"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn superseded_panel_command_is_refused_with_applied_state() {
+        let (mut app, peer) = mounted_bus_app();
+        let mut pin = local("shell.panel.pin");
+        pin.body = json!({"edge":"left"}).to_string();
+        let mut hide = local("shell.panel.mode");
+        hide.body = json!({"edge":"left", "mode":"hidden"}).to_string();
+        peer.send(pin);
+        peer.send(hide);
+        app.update();
+        let replies = peer.drain_responses();
+        let pin = replies.iter().find(|reply| reply.command == "shell.panel.pin").unwrap();
+        assert_eq!(pin.rc, 10);
+        let body: Value = serde_json::from_str(&pin.body).unwrap();
+        assert_eq!(body["error_code"], "PANEL_NOT_APPLIED");
+        assert_eq!(body["panels"]["left"]["pinned"], false);
     }
 
     #[test]

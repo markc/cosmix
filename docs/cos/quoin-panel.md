@@ -2,12 +2,12 @@
 
 Stage A keeps this citizen and its existing page IDs running alongside the
 [scenes loader](scenes-loader.md). New templates use distinct names until
-Stage B. Page selection and popup release now advance through pending
-operations on `<host>.panel.changed` applied-state notifications, with no
-select/hide sleep loops. Open/close replies acknowledge desired state;
+Stage B. Page selection and popup release advance from command replies and
+applied state reads. `<host>.panel.changed` notifications are invalidation
+hints; dropping one cannot strand an operation. Open replies acknowledge desired state;
 `shown` reflects the last applied host snapshot. Saved popup pins are cleared
-only after an applied release. Refresh bursts enqueue one `panel.flush` Bus
-event instead of a 100 ms sleep loop. The legacy network/audio clock polling
+only after an applied release. Refresh bursts use one local 10 ms coalescing
+deadline in the calling handler, with no Bus loopback continuation. The legacy network/audio clock polling
 is reserved for Stage C's native event sources.
 
 The Quoin bottom panel, application launcher, calendar and notifications
@@ -126,7 +126,7 @@ The citizen subscribes to `<comp>.props.changed` (windows and workspaces),
 the tray adapter's `item.added`/`item.removed`/`props.changed`, and the
 notify adapter's `changed`/`props.changed`. A handler matches the
 publisher's **inner** verb (`props.changed`), not the topic name. Bursts are
-coalesced into one rebuild with the legacy 100 ms delay. An `async`
+coalesced into one rebuild with a local 10 ms deadline. An `async`
 handler (`clock.run`, kicked once by init) sleeps to each minute boundary
 and redraws the time, one wake per minute. Init itself returns, so the
 runtime's reserved verbs (`RELOAD`, `QUIT`, `INFO`, lifecycle props) are
@@ -142,10 +142,16 @@ already in flight does not leave a closed popup open. Every popup pin the
 panel makes is recorded in `$XDG_STATE_HOME/cosmix/quoin-panel-pins.json`; at
 start the citizen releases exactly those edges (a popup open when Quoin or
 the citizen went down would otherwise return as a pinned native page). A
-record is only dropped after an applied `shell.panel.changed` subtree snapshot
-confirms both `pinned == false` and `visible == false`. An enqueue acknowledgement
-is insufficient. A pending operation waits for that event; an unconfirmed
-release leaves the record for startup/reconnection recovery.
+record is only dropped after a state read confirms both `pinned == false` and
+`visible == false`. Quoin's `shell.panel.page.set`, `shell.panel.pin` and
+`shell.panel.mode` replies carry `{accepted:true, applied:true, panels}` after
+model application; hidden mode also waits for concealment to finish. A command
+superseded before application is refused with `PANEL_NOT_APPLIED` and the current
+snapshot. The citizen re-reads state after every command, including refusals
+and timeouts; an applied reply remains usable if that read fails. Unconfirmed
+releases retain their record and report rc 22.
+Pending operations retry on state hints, subscription gaps, reconnects and
+explicit opens/closes. Already-satisfied phases complete immediately.
 The file remains a bare JSON array of edge strings. Its explicit compatibility
 rule is that legacy Bus `unpin` releases both persistent modes, including dock
 reservations migrated from legacy `pinned: true`. No version conversion is
@@ -155,8 +161,12 @@ Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.
 
-Broker registration changes and `bus.connected` now re-seed the compositor
-watch and remount a returning shell. The previous five-minute recovery pass
+Broker registration changes, subscription gaps and `bus.connected` re-seed
+the compositor watch and recover recorded pins from state; returning shells
+are remounted. A missing host at init leaves the citizen available until the
+host appears. Panel notices include settled width, so resize motion emits
+only the final width; reveal/conceal reports mapping changes, not each frame.
+The previous five-minute recovery pass
 is removed. The clock still reads network/audio status once per minute until
 Stage C supplies their native event sources. Stage A keeps this legacy host
 citizen running; the extracted behaviours above do not inherit those polls.
