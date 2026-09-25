@@ -230,7 +230,28 @@ try
   end
   check($edits[5].origin == "tool:disk" and $edits[1].op_id == "t1", "reload origin / op_id: " .. json_encode($edits))
   check(length(filter($events, fn($e) = $e.event == "resync")) == 0, "unexpected resync: " .. json_encode($events))
-  print("PASS edit Bus surface: open/reopen, find+replace CAS, op_id dedup, stale_rev, per-origin undo, human: downgrade, apply, anchors, numbered get, history, dirty close, save bytes, external reload, contiguous edit.changed feed")
+
+  -- SIGTERM with a dirty buffer: editd logs it (id, path, rev) and exits
+  -- within the 10 s budget (buffers are volatile; the log is the record).
+  $file2 = $tmp .. "/work/dirty.txt"
+  write_file($file2, "keep\n")
+  $b2 = ok('edit.open path=$a.path', {path: $file2}).buffer
+  check(ok('edit.insert buffer=$a.b at="end" text="unsaved\n"', {b: $b2}).dirty, "second buffer not dirty")
+  $t0 = time()
+  run_argv_must(["kill", "-TERM", "--", to_string($editd_pid)])
+  $exited = false
+  for each $i in range(1, 110)
+    if not process_alive($editd_pid) then $exited = true; break end
+    sleep(0.1)
+  end
+  $took = time() - $t0
+  check($exited, "editd still running 11 s after SIGTERM")
+  $editd_pid = nil
+  check($took <= 10, "editd took " .. to_string($took) .. " s to exit after SIGTERM")
+  $log = re_replace(read_file($tmp .. "/editd.log"), "\x1b\\[[0-9;]*m", "")
+  check(contains($log, "discarding unsaved buffer " .. $b2 .. " (" .. $file2 .. ") at rev 1"), "SIGTERM did not log the dirty buffer: " .. $log)
+  check(not contains($log, "discarding unsaved buffer " .. $b .. " "), "SIGTERM logged a closed buffer")
+  print("PASS edit Bus surface: open/reopen, find+replace CAS, op_id dedup, stale_rev, per-origin undo, human: downgrade, apply, anchors, numbered get, history, dirty close, save bytes, external reload, contiguous edit.changed feed, SIGTERM dirty-buffer log + exit within budget")
 catch $err
   for each $log in ["noded.log", "observer.log", "editd.log"]
     if exists($tmp .. "/" .. $log) then print("--- " .. $log .. "\n" .. read_file($tmp .. "/" .. $log)) end
