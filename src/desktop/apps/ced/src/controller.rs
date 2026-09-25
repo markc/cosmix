@@ -2489,6 +2489,28 @@ mod tests {
             c.on_editor(tab, EditorMsg::Command(EditCommand::Insert("k".into())));
             println!("PERF {name}: goto line 10 {goto10} us; keystroke {} us", us(t));
         }
+        // The session save (the gate's slow `bus.timer` updates): inline vs
+        // handed to the writer thread.
+        let dir = std::env::temp_dir().join(format!("ced-perf-session-{}", std::process::id()));
+        let path = dir.join("session.json");
+        let session = crate::session::Session { recent: vec!["/p/x".into()], ..Default::default() };
+        let mut inline = Vec::new();
+        let mut queued = Vec::new();
+        let mut w = crate::session::SessionWriter::spawn();
+        for _ in 0..20 {
+            let t = Instant::now();
+            crate::session::save(&path, &session).unwrap();
+            inline.push(us(t));
+            let t = Instant::now();
+            w.save(path.clone(), session.clone());
+            queued.push(us(t));
+        }
+        w.flush();
+        inline.sort_unstable();
+        queued.sort_unstable();
+        println!("PERF session save: inline p50 {} us max {} us; on the writer thread (UI cost) p50 {} us max {} us",
+            inline[10], inline[19], queued[10], queued[19]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -70,9 +70,80 @@ pub fn save(path: &std::path::Path, session: &Session) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Session writes off the UI thread: [`save`] fsyncs twice (~5 ms, over the
+/// frame budget — the nested gate's slow `bus.timer` updates were this).
+/// One writer thread, in order; a burst collapses to its newest session.
+/// [`SessionWriter::flush`] waits for the last write (exit).
+pub struct SessionWriter {
+    tx: Option<std::sync::mpsc::Sender<(std::path::PathBuf, Session)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Default for SessionWriter {
+    fn default() -> Self {
+        Self::spawn()
+    }
+}
+
+impl SessionWriter {
+    pub fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(std::path::PathBuf, Session)>();
+        let thread = std::thread::Builder::new()
+            .name("ced-session".into())
+            .spawn(move || {
+                while let Ok(mut job) = rx.recv() {
+                    while let Ok(newer) = rx.try_recv() {
+                        job = newer;
+                    }
+                    if let Err(e) = save(&job.0, &job.1) {
+                        tracing::warn!("ced: saving {}: {e}", job.0.display());
+                    }
+                }
+            })
+            .ok();
+        Self { tx: thread.as_ref().map(|_| tx), thread }
+    }
+
+    /// Queue a write (synchronous if the thread could not start).
+    pub fn save(&self, path: std::path::PathBuf, session: Session) {
+        match &self.tx {
+            Some(tx) => {
+                let _ = tx.send((path, session));
+            }
+            None => {
+                if let Err(e) = save(&path, &session) {
+                    tracing::warn!("ced: saving {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    /// Wait until every queued write is on disk; later saves write inline.
+    pub fn flush(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_writer_keeps_the_newest_session_and_flushes() {
+        let dir = std::env::temp_dir().join(format!("ced-session-writer-{}", std::process::id()));
+        let path = dir.join("session.json");
+        let mut w = SessionWriter::spawn();
+        for k in 0..50 {
+            let s = Session { recent: vec![format!("/f{k}")], ..Session::default() };
+            w.save(path.clone(), s);
+        }
+        w.flush();
+        assert_eq!(load(&path).recent, vec!["/f49".to_string()], "the last save wins, and flush waited for it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_frozen_example_parses() {

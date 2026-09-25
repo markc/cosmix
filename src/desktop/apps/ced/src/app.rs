@@ -115,6 +115,7 @@ pub struct App {
     bus: BusHandle,
     timers: Timers,
     dirs: Option<AppDirs>,
+    session_writer: crate::session::SessionWriter,
     config: Config,
     theme: Theme,
     zoom_px: Option<u16>,
@@ -200,6 +201,7 @@ pub fn run(service: &str, config: Config, paths: Vec<String>) -> anyhow::Result<
         remote_carets: config.remote_carets,
         zoom_px: None,
         dirs,
+        session_writer: crate::session::SessionWriter::spawn(),
         config,
         theme,
         panel: None,
@@ -988,6 +990,7 @@ impl App {
         }
         self.quitting = true;
         self.save_session();
+        self.session_writer.flush();
         iced::exit()
     }
 
@@ -1151,10 +1154,7 @@ impl App {
 
     fn save_session(&mut self) {
         let Some(path) = self.dirs.as_ref().map(|d| d.session_file()) else { return };
-        let session = self.controller.session();
-        if let Err(e) = crate::session::save(&path, &session) {
-            tracing::warn!("ced: saving {}: {e}", path.display());
-        }
+        self.session_writer.save(path, self.controller.session());
     }
 
     fn recent(&self) -> Vec<String> {
