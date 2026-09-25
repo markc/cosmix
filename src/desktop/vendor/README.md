@@ -10,6 +10,33 @@ The complete archive is imported byte-for-byte, before local patches in a
 separate commit. Verify routing from `src/desktop` with
 `cargo tree -p cosmix-term --no-default-features --features tiny-skia -i iced_tiny_skia`.
 
+Local patch: `raster.rs` records all-alpha-255 once during native pixel
+conversion. Fully opaque draws with an exactly unit, integer-translation net
+transform copy native rows with `copy_from_slice`, clipped using the same
+26.6 edge rounding as tiny-skia's non-antialiased rectangular mask.
+No Pattern shader or mask is used by the copy. Non-unit opacity,
+rotation and scaling retain the original draw. Negative local bounds under
+an identity transform also retain it: tiny-skia's specialised `fill_rect`
+rounding extends these edges differently from its transformed path. Translated
+negative physical origins still use the copy and are pixel-tested.
+Cache ids, conversion format and immutable image ownership are unchanged.
+
+`window/compositor.rs` submits outward-rounded, surface-clamped physical
+damage, combining acquired-buffer repair with changes from the displayed
+frame. Empty damage drops the acquired buffer without presenting, advancing
+history or calling `on_pre_present`. Softbuffer's Wayland buffer rotates and
+updates ages only in `present_with_damage`; dropping its borrowing buffer
+leaves the back buffer available for the next acquire. Avoiding pre-present
+also avoids arming a frame callback without a surface commit. Unknown ages,
+resize and background changes retain full redraw. Older Wayland surface
+versions may still expand damage inside softbuffer.
+
+Run pixel and physical-damage tests with
+`cargo test --manifest-path vendor/iced_tiny_skia/Cargo.toml --no-default-features --features image,wayland --lib`;
+run term's release CPU tests and ignored benchmark for integrated coverage.
+Remove each local change when upstream supplies equivalent opaque-copy and
+damage/lifecycle handling; retain the regressions when checking an update.
+
 ## Smithay libinput: opt-in dispatch fairness
 
 `smithay/src/backend/libinput/mod.rs` adds `set_dispatch_budget` for comp's
