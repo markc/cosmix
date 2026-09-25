@@ -167,8 +167,29 @@ send term term.type pane=1 text="pwd\n"
 send term term.props.watch
 ```
 
-The same surface is served by bterm as `bterm.*`. The target-bound native
-session lane is unchanged. Explicit stale tab/pane IDs return a `not-found`
+The same surface is served by bterm as `bterm.*`. Since term 0.2.8 the iced
+frontend also starts the shared native-session supervisor and serves the full
+target-bound lane: `term.list`, `term.session`, `term.tabs`, `term.panes`,
+`term.snapshot`, `term.type`, `term.execute`, `term.exec.result/cancel`,
+`term.task.submit/result/cancel`, `term.operation`, and `term.props.get/set`,
+along with target-bound tab/pane mutations. These requests use the allocated
+native-session route and its `target` identity, not the global targetless
+`term` service. The native route's `HELP` describes its arguments. Mesh callers
+need no additional authorisation; target identity, generation freshness and
+mutation-time rechecks still apply.
+
+The lane requires local noded 0.16.8 or later with native ingress enabled,
+`COSMIX_RUN=/run/cosmix` and a traversable socket directory (0755). If ingress
+is unavailable, graphics still start and the supervisor reports the reason
+once rather than repeating it for each pane or reconnect retry.
+Startup's first-pane readiness wait runs before the iced event loop; subsequent
+native work runs on the actor/PTY workers and wakes the existing iced eventfd
+subscription. Both frontends share control ownership and stop the native actor
+before releasing the cleanup worker on exit. See
+[native-session control](term-native-control.md) for discovery and request
+envelopes.
+
+Explicit stale tab/pane IDs return a `not-found`
 error, never the active pane. With both snapshot selectors, the pane must
 belong to the tab or the call returns `invalid-argument`. `contents:false`
 returns the usual metadata and diagnostic timings without the screen marker

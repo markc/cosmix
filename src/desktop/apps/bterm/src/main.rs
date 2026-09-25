@@ -6,8 +6,10 @@ mod input_tests;
 mod layout_tests;
 mod mouse_input;
 
+#[cfg(test)]
+use cosmix_term_core::native_session;
 use cosmix_term_core::{
-    bus, config, native_session, panes, raster, session_fd, tabs, version::version_request,
+    bus, config, native_lane::NativeLane, panes, raster, session_fd, tabs, version::version_request,
 };
 
 use bevy::{
@@ -294,21 +296,15 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1)
         });
-    let mut native = native_session::Supervisor::start()
-        .map_err(|error| {
-            eprintln!("term native-session disabled: {error}");
-        })
-        .ok();
+    let mut native = NativeLane::start();
     let terminal = Arc::new(Mutex::new(
-        TabSet::with_supervisor(settings, native.as_mut()).unwrap_or_else(|e| {
+        native.open_tabs(settings).unwrap_or_else(|e| {
             eprintln!("PTY startup: {e}");
             std::process::exit(1)
         }),
     ));
     let (cleanup, reaper) = tabs::Cleanup::start().expect("terminal cleanup worker");
-    let _control = native
-        .as_ref()
-        .map(|s| s.handle.install_control(terminal.clone(), cleanup.clone()));
+    native.install_control(terminal.clone(), cleanup.clone());
     // Completion notifications: the reap system (render thread) hands
     // self-exited pane identities to the Bus task, which emits interact.notify.
     // TERM_NOTIFY=0 disables it — the sender is dropped, so notes are never
@@ -404,9 +400,9 @@ fn main() {
     // Cleanup (this one and the bus thread's, via join) must be released
     // before reaper.join(), or it hangs forever.
     let _ = bus.join();
+    drop(native);
     drop(cleanup);
     let _ = reaper.join();
-    drop(native);
 }
 fn setup(
     mut commands: Commands,

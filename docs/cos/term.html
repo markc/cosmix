@@ -579,8 +579,27 @@ send term term.snapshot pane=1 contents=true scrollback_lines=100
 send term term.type pane=1 text="pwd\n"
 send term term.props.watch
 </code></pre>
-<p>The same surface is served by bterm as <code>bterm.*</code>. The target-bound native
-session lane is unchanged. Explicit stale tab/pane IDs return a <code>not-found</code>
+<p>The same surface is served by bterm as <code>bterm.*</code>. Since term 0.2.8 the iced
+frontend also starts the shared native-session supervisor and serves the full
+target-bound lane: <code>term.list</code>, <code>term.session</code>, <code>term.tabs</code>, <code>term.panes</code>,
+<code>term.snapshot</code>, <code>term.type</code>, <code>term.execute</code>, <code>term.exec.result/cancel</code>,
+<code>term.task.submit/result/cancel</code>, <code>term.operation</code>, and <code>term.props.get/set</code>,
+along with target-bound tab/pane mutations. These requests use the allocated
+native-session route and its <code>target</code> identity, not the global targetless
+<code>term</code> service. The native route's <code>HELP</code> describes its arguments. Mesh callers
+need no additional authorisation; target identity, generation freshness and
+mutation-time rechecks still apply.</p>
+<p>The lane requires local noded 0.16.8 or later with native ingress enabled,
+<code>COSMIX_RUN=/run/cosmix</code> and a traversable socket directory (0755). If ingress
+is unavailable, graphics still start and the supervisor reports the reason
+once rather than repeating it for each pane or reconnect retry.
+Startup's first-pane readiness wait runs before the iced event loop; subsequent
+native work runs on the actor/PTY workers and wakes the existing iced eventfd
+subscription. Both frontends share control ownership and stop the native actor
+before releasing the cleanup worker on exit. See
+<a href="/cos/term-native-control">native-session control</a> for discovery and request
+envelopes.</p>
+<p>Explicit stale tab/pane IDs return a <code>not-found</code>
 error, never the active pane. With both snapshot selectors, the pane must
 belong to the tab or the call returns <code>invalid-argument</code>. <code>contents:false</code>
 returns the usual metadata and diagnostic timings without the screen marker

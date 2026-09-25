@@ -99,6 +99,7 @@ struct Shared {
     panes: HashMap<u64, std::sync::Weak<PaneState>>,
     status: HashMap<u64, String>,
     diagnostic: String,
+    last_diagnostic: Option<String>,
 }
 
 impl Default for Shared {
@@ -112,6 +113,7 @@ impl Default for Shared {
             panes: HashMap::new(),
             status: HashMap::new(),
             diagnostic: "native session starting; no ready launch grant".into(),
+            last_diagnostic: None,
         }
     }
 }
@@ -335,7 +337,11 @@ impl NativeSession {
                 "unbound (graphics-only): no usable ready grant; {}",
                 shared.diagnostic
             );
-            eprintln!("term pane {id}: {reason}");
+            // Keep per-pane diagnostics queryable, but do not repeat the
+            // actor's already-reported ingress failure for every opened pane.
+            if shared.last_diagnostic.as_ref() != Some(&shared.diagnostic) {
+                eprintln!("term pane {id}: {reason}");
+            }
             shared.status.insert(id, reason);
             None
         };
@@ -701,8 +707,12 @@ impl Actor {
     }
     fn diagnostic(&self, id: Option<u64>, message: impl Into<String>) {
         let message = message.into();
-        eprintln!("term native session: {message}");
         let mut shared = self.shared.lock().unwrap();
+        // Reconnect retries must not flood stderr on a graphics-only desktop.
+        if shared.last_diagnostic.as_ref() != Some(&message) {
+            eprintln!("term native session: {message}");
+            shared.last_diagnostic = Some(message.clone());
+        }
         if let Some(id) = id {
             if let Some(status) = shared.status.get_mut(&id) {
                 *status = message;
