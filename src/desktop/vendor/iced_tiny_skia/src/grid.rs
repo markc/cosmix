@@ -79,17 +79,15 @@ impl Grid {
             self.height,
         )
         .expect("validated native grid dimensions");
-        if let Some(placed) = crate::raster::native_placement(
+        crate::raster::native_placement(
             bounds,
             transform,
             self.width,
             self.height,
-        ) {
-            if crate::raster::copy_opaque(pixmap, target, placed, clip) {
-                return true;
-            }
-        }
-        false
+        )
+        .is_some_and(|placed| {
+            crate::raster::copy_opaque(pixmap, target, placed, clip)
+        })
     }
 
     pub(crate) fn draw_fallback(
