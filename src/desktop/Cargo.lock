@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bterm"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.69.1"
+version = "0.69.2"
 dependencies = [
  "bevy",
  "chrono",
@@ -3091,11 +3091,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-deco"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "cosmix-design"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "cosmix-lib-mix",
  "serde",
@@ -3366,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.14.4"
+version = "0.15.0"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3414,7 +3414,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytes",
  "cosmix-design",
@@ -3499,7 +3499,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.6.5"
+version = "0.7.0"
 dependencies = [
  "cosmix-design",
  "cosmix-lib-buildinfo",
@@ -3810,7 +3810,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "accesskit",
  "ammonia",

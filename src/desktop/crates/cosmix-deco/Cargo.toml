@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-deco"
-version = "0.4.0"
+version = "0.4.1"
 description = "Server-side decoration theme engine for the CosMix desktop: chrome styles, tokens, layout and hit-testing. Dependency-free by design."
 edition = "2024"
 rust-version = "1.95"
