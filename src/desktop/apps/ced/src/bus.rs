@@ -187,7 +187,8 @@ async fn run(
                         let (c, d) = (client.clone(), dtx.clone());
                         tokio::spawn(async move {
                             let deadline = tokio::time::Instant::now() + Duration::from_millis(out.deadline_ms);
-                            let call = c.call_with_headers_raw(EDIT, &out.verb, &BTreeMap::new(), &out.body);
+                            let headers = BTreeMap::new();
+                            let call = c.call_with_headers_raw(EDIT, &out.verb, &headers, &out.body);
                             let incoming = match tokio::time::timeout_at(deadline, call).await {
                                 Ok(Ok((rc, body, _))) => Incoming::Reply { req, rc, body },
                                 Ok(Err(_)) => {
