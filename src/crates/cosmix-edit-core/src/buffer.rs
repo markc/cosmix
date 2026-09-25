@@ -971,13 +971,8 @@ impl Buffer {
     /// Byte-budget preview for editd's lease: the peak growth (text + log text)
     /// `apply` would need. Pure; same validation as `apply`.
     pub fn apply_cost(&self, req: &TxnRequest) -> Result<usize, CoreError> {
-        let mut items = self.resolve_txn(req)?;
-        canonical(&mut items);
-        let seq: Vec<Edit> =
-            items.into_iter().map(|r| Edit { offset: r.s, delete: r.e - r.s, insert: r.text }).collect();
-        let sim = self.text.simulate(&seq)?;
-        let log_text: usize = seq.iter().map(|e| e.insert.len() + e.delete).sum();
-        Ok(sim.peak_len.saturating_sub(self.len()) + log_text)
+        let items = self.resolve_txn(req)?;
+        self.cost_of(items)
     }
 
     fn pick_lane(&self, sel: &LaneSel, caller: &Origin, redo: bool) -> Result<Origin, CoreError> {
@@ -1078,6 +1073,9 @@ impl Buffer {
             .after(first - 1)
             .take_while(|e| e.rev <= last)
             .map(|e| {
+                // A group is contiguous log entries of ONE lane: coalescing
+                // only extends a group whose last entry is the log's newest.
+                debug_assert_eq!(&e.lane, lane, "group {first}..={last} holds rev {} of another lane", e.rev);
                 let payloads = e
                     .edits
                     .iter()
@@ -1125,15 +1123,9 @@ impl Buffer {
         Ok(items)
     }
 
-    fn undo_redo(
-        &mut self,
-        sel: LaneSel,
-        caller: &Origin,
-        via: Via,
-        now_ms: u64,
-        redo: bool,
-    ) -> Result<Applied, CoreError> {
-        let lane = self.pick_lane(&sel, caller, redo)?;
+    /// The lane, group and inverse items an undo (or redo) would commit. Pure.
+    fn undo_plan(&self, sel: &LaneSel, caller: &Origin, redo: bool) -> Result<(Origin, Group, Vec<Resolved>), CoreError> {
+        let lane = self.pick_lane(sel, caller, redo)?;
         let group = {
             let l = &self.log.lanes[&lane];
             let top = if redo { l.redo.last() } else { l.undo.last() };
@@ -1145,30 +1137,65 @@ impl Buffer {
             .enumerate()
             .map(|(idx, it)| Resolved { s: it.range.start, e: it.range.end, text: it.restore, idx })
             .collect();
+        Ok((lane, group, resolved))
+    }
+
+    /// Peak growth (text + log text) committing `items` would need.
+    fn cost_of(&self, mut items: Vec<Resolved>) -> Result<usize, CoreError> {
+        canonical(&mut items);
+        let seq: Vec<Edit> =
+            items.into_iter().map(|r| Edit { offset: r.s, delete: r.e - r.s, insert: r.text }).collect();
+        let sim = self.text.simulate(&seq)?;
+        let log_text: usize = seq.iter().map(|e| e.insert.len() + e.delete).sum();
+        Ok(sim.peak_len.saturating_sub(self.len()) + log_text)
+    }
+
+    fn undo_redo(
+        &mut self,
+        sel: LaneSel,
+        caller: &Origin,
+        via: Via,
+        now_ms: u64,
+        redo: bool,
+        op_id: Option<String>,
+    ) -> Result<Applied, CoreError> {
+        let (lane, group, resolved) = self.undo_plan(&sel, caller, redo)?;
         let kind = if redo { EntryKind::Redo { of: group } } else { EntryKind::Undo { of: group } };
         self.commit_txn(
             resolved,
-            Commit {
-                origin: caller,
-                lane,
-                kind,
-                via,
-                now_ms,
-                op_id: None,
-                coalesce: false,
-                cursor: None,
-                rebased: false,
-            },
+            Commit { origin: caller, lane, kind, via, now_ms, op_id, coalesce: false, cursor: None, rebased: false },
         )
     }
 
     /// Preflighted undo (see `history` module docs). On `Err` nothing changed.
     pub fn undo(&mut self, lane: LaneSel, caller: &Origin, via: Via, now_ms: u64) -> Result<Applied, CoreError> {
-        self.undo_redo(lane, caller, via, now_ms, false)
+        self.undo_redo(lane, caller, via, now_ms, false, None)
     }
 
     pub fn redo(&mut self, lane: LaneSel, caller: &Origin, via: Via, now_ms: u64) -> Result<Applied, CoreError> {
-        self.undo_redo(lane, caller, via, now_ms, true)
+        self.undo_redo(lane, caller, via, now_ms, true, None)
+    }
+
+    /// [`undo`](Self::undo) / [`redo`](Self::redo) recording the request's
+    /// `op_id` on the new entry (echoed in `Applied`, history and events).
+    pub fn undo_redo_op(
+        &mut self,
+        lane: LaneSel,
+        caller: &Origin,
+        via: Via,
+        now_ms: u64,
+        redo: bool,
+        op_id: Option<String>,
+    ) -> Result<Applied, CoreError> {
+        self.undo_redo(lane, caller, via, now_ms, redo, op_id)
+    }
+
+    /// Byte-budget preview of an undo (or redo), like [`apply_cost`](Self::apply_cost):
+    /// the peak growth of text + log text it would need. Pure; the same
+    /// refusals as the undo itself (nothing to undo, conflict, limits).
+    pub fn undo_cost(&self, lane: &LaneSel, caller: &Origin, redo: bool) -> Result<usize, CoreError> {
+        let (_, _, resolved) = self.undo_plan(lane, caller, redo)?;
+        self.cost_of(resolved)
     }
 
     /// Common prefix/suffix kept; one `Reload` entry in lane `tool:disk`.
@@ -1340,14 +1367,14 @@ impl Buffer {
                 for g in c.iter().skip(1) {
                     let g = g.map(|g| truncate(g.as_str(), MATCH_TEXT_MAX).0);
                     let g_size = 1 + g.as_deref().map_or(4, json_str_len);
-                    if groups_truncated || size + g_size > MATCH_ENCODED_MAX {
+                    if size + g_size > MATCH_ENCODED_MAX {
+                        // Omit this group and every later one: a `null` per
+                        // omitted slot would itself grow past the cap.
                         groups_truncated = true;
-                        out.push(None);
-                        size += 5;
-                    } else {
-                        size += g_size;
-                        out.push(g);
+                        break;
                     }
+                    size += g_size;
+                    out.push(g);
                 }
                 out
             });

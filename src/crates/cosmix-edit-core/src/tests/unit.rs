@@ -220,6 +220,25 @@ fn op_id_is_recorded_and_echoed() {
     assert_eq!((e.op_id.as_deref(), e.time_ms, e.via.from.as_deref()), (Some("k-1"), 7, Some("test")));
 }
 
+#[test]
+fn undo_records_its_op_id_and_previews_its_cost() {
+    let mut b = buf("");
+    let a = o("agent:a");
+    b.apply(req(vec![ins(0, "hello")]), &a, via(), 0).unwrap();
+    b.apply(req(vec![del(0, 5)]), &a, via(), 0).unwrap();
+    // Undoing the delete restores 5 bytes of text and logs 5 inserted bytes.
+    let before = b.fingerprint();
+    assert_eq!(b.undo_cost(&LaneSel::Own, &a, false).unwrap(), 10);
+    assert_eq!(b.fingerprint(), before, "the preview is pure");
+    let u = b.undo_redo_op(LaneSel::Own, &a, via(), 0, false, Some("u-1".into())).unwrap();
+    assert_eq!(u.op_id.as_deref(), Some("u-1"));
+    assert_eq!(b.history(u.rev - 1, 1).next().unwrap().op_id.as_deref(), Some("u-1"));
+    assert_eq!(text(&b), "hello");
+    // Redo deletes again: no text growth, 5 logged deleted bytes.
+    assert_eq!(b.undo_cost(&LaneSel::Own, &a, true).unwrap(), 5);
+    assert_code(b.undo_cost(&LaneSel::Own, &o("agent:z"), false), ErrorCode::NotFound, reason::NOTHING_TO_UNDO);
+}
+
 // ---- lanes, coalescing, undo ------------------------------------------------
 
 #[test]
@@ -518,12 +537,26 @@ fn find_caps_one_match_and_pages_advance() {
     assert!(m.text_truncated && m.text.len() <= crate::limits::MATCH_TEXT_MAX);
     assert!(m.groups_truncated);
     let groups = m.groups.as_ref().unwrap();
-    assert_eq!(groups.len(), 16);
-    assert!(groups[0].is_some() && groups[15].is_none());
+    // Cut at the budget: the groups that fit, none after (not nulls).
+    assert!(!groups.is_empty() && groups.len() < 16, "{} groups", groups.len());
+    assert!(groups.iter().all(Option::is_some));
     assert_eq!((r.matches.len(), r.truncated, r.next), (1, true, Some(70_000)));
     let r = b.find(&FindQuery { from: r.next, ..fq }, 100 * 1024).unwrap();
     assert_eq!(r.matches[0].range, 70_001..140_001);
     assert!(!r.truncated);
+}
+
+#[test]
+fn many_empty_groups_stay_under_the_match_cap() {
+    // 30,000 empty captures: 3 encoded bytes each is past MATCH_ENCODED_MAX,
+    // and a `null` per omitted slot would keep growing the match past it.
+    let mut b = buf("x");
+    let fq = FindQuery { regex: true, groups: true, limit: 1, ..q(&"()".repeat(30_000)) };
+    let r = b.find(&fq, 1 << 20).unwrap();
+    let m = &r.matches[0];
+    assert!(m.groups_truncated);
+    let encoded = serde_json::to_string(m.groups.as_ref().unwrap()).unwrap().len();
+    assert!(encoded <= crate::limits::MATCH_ENCODED_MAX, "groups encode to {encoded} bytes");
 }
 
 // ---- language ---------------------------------------------------------------
