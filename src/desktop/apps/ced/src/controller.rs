@@ -2401,6 +2401,70 @@ mod tests {
         assert_eq!(c.frames.model_us.len(), 1);
     }
 
+    /// Perf probe for the nested gate's view_us (run on cbc:
+    /// `cargo test --release -p cosmix-ced perf_probe -- --ignored --nocapture`).
+    /// Times the controller work one `update` does for each stage of the
+    /// gate's matrix — the UI-thread cost view_us counts besides `view`.
+    #[test]
+    #[ignore]
+    fn perf_probe() {
+        let us = |t: Instant| t.elapsed().as_micros() as u64;
+        let pt = |o: usize| json!({"offset": o, "line": 1, "col": 1});
+        for (name, path, unit, n) in [
+            ("64 MB", "/p/sixty-four.txt", "0123456789abcdef0123456789abcdef0123456\n", 1_600_000usize),
+            ("2 M-line rust", "/p/big.rs", "fn f() { let x = 1; } // c\n", 1_999_999),
+            ("2 M lines", "/p/two-million.txt", "abcdefghij\n", 1_999_999),
+        ] {
+            let text = unit.repeat(n);
+            let mut c = ctl();
+            c.start();
+            let fx = c.on_bus_command(cmd("ced.open", json!({"paths": [path]})));
+            let (req, _) = sent(&fx, "edit.open");
+            let lang = if path.ends_with(".rs") { "rust" } else { "text" };
+            let open = json!({"buffer": B, "epoch": "0000e1e1", "path": path, "opened_as": null, "name": "x", "language": lang,
+                              "rev": 0, "lines": n + 1, "bytes": text.len(), "eol": "lf", "bom": false, "disk": "clean",
+                              "reopened": false, "created": false, "recovery_id": "5f0c2a9e1b7d4c33", "recovered": false,
+                              "recovered_from": null});
+            let mut fx = reply(&mut c, req, open);
+            // editd's page budget: MAX_REPLY_BYTES minus overhead, cut at a char boundary.
+            let page = 4 * 1024 * 1024 - 4096;
+            let mut at = 0;
+            let mut times = Vec::new();
+            while at < text.len() {
+                let (req, _) = sent(&fx, "edit.get");
+                let end = (at + page).min(text.len());
+                let next = (end < text.len()).then_some(end);
+                let body = json!({"buffer": B, "epoch": "0000e1e1", "rev": 0, "text": &text[at..end], "lines": null,
+                                  "start": pt(at), "end": pt(end), "bytes_total": text.len(), "lines_total": n + 1,
+                                  "truncated": next.is_some(), "next": next, "snapshot": "s1"})
+                .to_string();
+                let t = Instant::now();
+                fx = c.on_incoming(Incoming::Reply { req, rc: 0, body });
+                times.push(us(t));
+                at = end;
+            }
+            let last = times.pop().unwrap_or(0);
+            times.sort_unstable();
+            println!(
+                "PERF {name}: {} pages, per page p50 {} us max {} us; final page (Text::from_text + resync) {} us",
+                times.len() + 1,
+                times.get(times.len() / 2).copied().unwrap_or(0),
+                times.last().copied().unwrap_or(0),
+                last
+            );
+            let tab = c.active.unwrap();
+            let t = Instant::now();
+            let _ = c.on_bus_command(cmd("ced.action", json!({"id": "search.goto_line", "args": {"line": n}})));
+            println!("PERF {name}: goto last line {} us", us(t));
+            let t = Instant::now();
+            let _ = c.on_bus_command(cmd("ced.action", json!({"id": "search.goto_line", "args": {"line": 10}})));
+            let goto10 = us(t);
+            let t = Instant::now();
+            c.on_editor(tab, EditorMsg::Command(EditCommand::Insert("k".into())));
+            println!("PERF {name}: goto line 10 {goto10} us; keystroke {} us", us(t));
+        }
+    }
+
     #[test]
     fn recovered_buffers_prompt_once_and_frames_feed_stats() {
         let mut c = ctl();
