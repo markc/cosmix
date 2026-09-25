@@ -45,6 +45,8 @@ $editd_pid = nil
 $ced_pid = nil
 $noded_pid = nil
 $file = $tmp .. "/work/doc.txt"
+-- `select` is a Mix keyword, so a bare `send ced ced.select` does not parse
+-- (mix 0.96.1); the verb is quoted until the parser takes it as a name.
 -- Bus-driven ced edits claim agent:<bus_lane_label(caller)>; a one-shot
 -- client is anonymous, so its lane is agent:ced.anon (plan D5).
 $lane = "agent:ced.anon"
@@ -218,7 +220,7 @@ try
 
   -- 3. three ced.type and three agent inserts at the same offset, unsynchronised
   for each $k in range(1, 3)
-    cok('ced.select tab=$a.t anchor=0 head=0', {t: $t})
+    cok('"ced.select" tab=$a.t anchor=0 head=0', {t: $t})
     cok('ced.type tab=$a.t text=$a.s', {t: $t, s: "<t" .. to_string($k) .. ">"})
     eok('edit.insert buffer=$a.b at=0 text=$a.s origin="agent:e2e"', {b: $b, s: "<a" .. to_string($k) .. ">"})
   end
@@ -245,7 +247,7 @@ try
   end
 
   -- 5. overlap race: ced types inside a span an agent replaces at once
-  cok('ced.select tab=$a.t anchor=2 head=2', {t: $t})
+  cok('"ced.select" tab=$a.t anchor=2 head=2', {t: $t})
   cok('ced.type tab=$a.t text="RACE"', {t: $t})
   eok('edit.replace buffer=$a.b range=[0, 10] text="agent-wins" origin="agent:e2e"', {b: $b})
   sync($t, $b)
@@ -277,7 +279,7 @@ try
 
   -- 7. an edit after the restore, SIGKILL again: pre-crash AND post-restore
   -- edits both survive (the restore started a new generation)
-  cok('ced.select tab=$a.t anchor=0 head=0', {t: $t})
+  cok('"ced.select" tab=$a.t anchor=0 head=0', {t: $t})
   cok('ced.type tab=$a.t text="POST "', {t: $t})
   sync($t, $b6)
   $pre7 = converged($t, $b6, "post-restore edit")

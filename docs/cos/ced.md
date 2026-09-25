@@ -192,7 +192,9 @@ Positions (`POINT`, `POS`) are the edit service's forms.
 
 **`ced.type` and `ced.select` drive the window's selection**, ARexx-style: a
 Bus-driven insert lands at your caret and moves it. That is by design; use
-`edit.*` directly to edit elsewhere without touching the view.
+`edit.*` directly to edit elsewhere without touching the view. In Mix, quote
+this verb for now (`send ced "ced.select" anchor=0 head=0`): `select` is a Mix
+keyword and a bare `ced.select` does not parse yet.
 
 **`ced.wait`** is event-driven. The condition is checked when the request
 arrives (an immediate reply when it already holds) and again after every
