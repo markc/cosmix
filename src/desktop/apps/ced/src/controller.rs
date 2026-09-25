@@ -2450,12 +2450,12 @@ mod tests {
                               "reopened": false, "created": false, "recovery_id": "5f0c2a9e1b7d4c33", "recovered": false,
                               "recovered_from": null});
             let mut fx = reply(&mut c, req, open);
-            // editd's page budget: MAX_REPLY_BYTES minus overhead, cut at a char boundary.
-            let page = 4 * 1024 * 1024 - 4096;
             let mut at = 0;
             let mut times = Vec::new();
             while at < text.len() {
-                let (req, _) = sent(&fx, "edit.get");
+                let (req, get) = sent(&fx, "edit.get");
+                // The page editd would cut: the mirror's max_bytes, else its default.
+                let page = get["max_bytes"].as_u64().map_or(4 * 1024 * 1024 - 4096, |m| m as usize);
                 let end = (at + page).min(text.len());
                 let next = (end < text.len()).then_some(end);
                 let body = json!({"buffer": B, "epoch": "0000e1e1", "rev": 0, "text": &text[at..end], "lines": null,
