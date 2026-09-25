@@ -50,6 +50,17 @@ impl Pipeline {
             return;
         };
 
+        // Resolve cumulative logical edges in physical space before upstream's
+        // per-image scaling and truncation. Float cancellation at fractional
+        // output scales must not turn a native-size band into a resampled one.
+        if image.opaque && opacity == 1.0 {
+            if let Some(placed) = native_placement(bounds, transform, image.width(), image.height()) {
+                if copy_opaque(image.pixmap(), pixels, placed, clip_bounds) {
+                    return;
+                }
+            }
+        }
+
         let width_scale = bounds.width / image.width() as f32;
         let height_scale = bounds.height / image.height() as f32;
 
@@ -175,6 +186,35 @@ impl Entry {
     }
 }
 
+// Only absorb float round-off, not genuine fractional placement or scaling.
+fn native_placement(
+    bounds: Rectangle,
+    transform: tiny_skia::Transform,
+    width: u32,
+    height: u32,
+) -> Option<tiny_skia::Transform> {
+    if transform.kx != 0.0 || transform.ky != 0.0
+        || transform.sx <= 0.0 || transform.sy <= 0.0
+        || (transform.is_identity() && (bounds.x < 0.0 || bounds.y < 0.0))
+    {
+        return None;
+    }
+    let edges = [
+        bounds.x * transform.sx + transform.tx,
+        bounds.y * transform.sy + transform.ty,
+        (bounds.x + bounds.width) * transform.sx + transform.tx,
+        (bounds.y + bounds.height) * transform.sy + transform.ty,
+    ];
+    if !edges.iter().all(|v| v.is_finite() && (v - v.round()).abs() <= 0.001) {
+        return None;
+    }
+    let [left, top, right, bottom] = edges.map(f32::round);
+    if right - left != width as f32 || bottom - top != height as f32 {
+        return None;
+    }
+    Some(tiny_skia::Transform::from_translate(left, top))
+}
+
 /// Native premultiplied pixels; only exact translations qualify. Rectangle
 /// coverage matches the non-antialiased mask's 26.6 scan conversion.
 fn copy_opaque(
@@ -227,6 +267,29 @@ fn copy_opaque(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cumulative_band_edges_use_native_copy_at_seven_scales() {
+        for scale in [1.0, 1.1, 1.25, 1.5, 1.75, 2.25, 2.5] {
+            for offset in [0.0, 1.0, 3.0, 17.0, 30.0] {
+                for first in (0..61).step_by(4) {
+                    let top = first * 41;
+                    let bottom = (first + 4).min(61) * 41;
+                    let bounds = Rectangle {
+                        x: offset / scale,
+                        y: top as f32 / scale + offset / scale,
+                        width: 180.0 / scale,
+                        height: bottom as f32 / scale - top as f32 / scale,
+                    };
+                    assert_eq!(
+                        native_placement(bounds, tiny_skia::Transform::from_scale(scale, scale), 180, bottom - top),
+                        Some(tiny_skia::Transform::from_translate(offset, top as f32 + offset)),
+                        "scale={scale} offset={offset} row={first}",
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn pipeline_matches_forced_fallback_for_placement_and_fractional_clips() {

@@ -13,22 +13,30 @@ use std::time::Instant;
 
 #[test]
 fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
-    for scale in [1.25, 1.5, 2.5] {
+    for (scale, cell_height) in [
+        (1.0, 20),
+        (1.1, 41),
+        (1.25, 20),
+        (1.5, 20),
+        (1.75, 41),
+        (2.25, 20),
+        (2.5, 41),
+    ] {
         let mut raster = Raster::new(scale, 13.0, Cursor::Underline).unwrap();
+        raster.height = cell_height;
         let screen = Screen {
             cols: 9,
-            rows: 13,
+            rows: 61,
             cursor: (2, 4),
             cursor_visible: true,
-            cells: vec![
-                Cell {
+            cells: (0..9 * 61)
+                .map(|i| Cell {
                     c: 'M',
                     fg: [210, 220, 230],
-                    bg: [20, 25, 30],
-                    bold: false
-                };
-                117
-            ],
+                    bg: [20 + (i / 9) as u8, 25, 30],
+                    bold: false,
+                })
+                .collect(),
             updated: Instant::now(),
         };
         let mut baseline = PixelBand::default();
@@ -37,9 +45,16 @@ fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
         let mut surface = Surface::default();
         surface.paint(&mut raster, &screen, &[]);
         surface.cache_handle(1);
-        let viewport = Viewport::with_physical_size(Size::new(800, 800), scale);
+        let height = baseline.height + 64;
+        let viewport = Viewport::with_physical_size(Size::new(800, height), scale);
         let clip = Rectangle::with_size(viewport.logical_size());
-        for offset in [1.0, 3.0, 17.0] {
+        let images = surface.images(scale);
+        for pair in images.windows(2) {
+            assert_eq!(pair[0].1.y + pair[0].1.height, pair[1].1.y);
+        }
+        let last = images.last().unwrap().1;
+        assert_eq!(last.y + last.height, baseline.height as f32 / scale);
+        for offset in [0.0, 1.0, 3.0, 17.0, 30.0] {
             let origin = iced::Point::new(offset / scale, offset / scale);
             let bounds = Rectangle {
                 x: origin.x,
@@ -48,8 +63,8 @@ fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
                 height: baseline.height as f32 / scale,
             };
             let mut renderer = Renderer::new(Font::default(), Pixels(13.0));
-            let mut mask = tiny_skia::Mask::new(800, 800).unwrap();
-            let mut whole = tiny_skia::Pixmap::new(800, 800).unwrap();
+            let mut mask = tiny_skia::Mask::new(800, height).unwrap();
+            let mut whole = tiny_skia::Pixmap::new(800, height).unwrap();
             renderer.reset(clip);
             let mut image =
                 iced::advanced::image::Image::new(baseline.cached.as_ref().unwrap().1.clone());
@@ -64,7 +79,7 @@ fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
             );
             renderer.reset(clip);
             widget::draw_images(&mut renderer, &surface.images(scale), origin, scale, clip);
-            let mut bands = tiny_skia::Pixmap::new(800, 800).unwrap();
+            let mut bands = tiny_skia::Pixmap::new(800, height).unwrap();
             renderer.draw(
                 &mut bands.as_mut(),
                 &mut mask,
@@ -74,7 +89,7 @@ fn band_widget_matches_whole_image_at_fractional_scale_and_offset() {
             );
             // Compare to exact physical placement, not the old image widget:
             // its float-to-i32 truncation can itself shift a pane by a pixel.
-            let mut exact = tiny_skia::Pixmap::new(800, 800).unwrap();
+            let mut exact = tiny_skia::Pixmap::new(800, height).unwrap();
             exact.fill(tiny_skia::Color::BLACK);
             for row in 0..baseline.height as usize {
                 for col in 0..baseline.width as usize {

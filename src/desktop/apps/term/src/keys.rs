@@ -26,14 +26,16 @@ use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
+type Redraw<Message> = (
+    Option<std::time::Instant>,
+    fn(std::time::Instant) -> Message,
+);
+
 /// Wraps `content` and reports every key press it sees, losslessly.
 pub struct Keys<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_press: fn(&iced::keyboard::Event) -> Option<Message>,
-    redraw: Option<(
-        Option<std::time::Instant>,
-        fn(std::time::Instant) -> Message,
-    )>,
+    redraw: Option<Redraw<Message>>,
 }
 
 /// Wrap `content` so `on_press` sees every keyboard event.

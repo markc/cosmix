@@ -45,26 +45,16 @@ pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
         // tiny-skia trims ids not touched in a draw. Touch ALL visible bands,
         // including undamaged ones: otherwise an adjacent damage rectangle
         // can repeatedly re-convert an unchanged band after cache eviction.
-        let _ = renderer.measure_image(handle);
-        let mut bounds = Rectangle {
+        let Some(_) = renderer.measure_image(handle) else {
+            continue;
+        };
+        let bounds = Rectangle {
             x: relative.x + x,
             y: relative.y + y,
             ..*relative
         };
-        // iced_tiny_skia divides these coordinates by the image's logical
-        // pixel size, then casts to i32 (truncating). A mathematically integral
-        // position can land just below the integer at fractional scale. Bias
-        // one ULP away from zero so adjacent bands cannot lose a scanline.
-        bounds.x = if bounds.x >= 0.0 {
-            bounds.x.next_up()
-        } else {
-            bounds.x.next_down()
-        };
-        bounds.y = if bounds.y >= 0.0 {
-            bounds.y.next_up()
-        } else {
-            bounds.y.next_down()
-        };
+        // Preserve cumulative edges for the vendored renderer, which resolves
+        // physical placement before testing for an integer-aligned 1:1 copy.
         if bounds.intersects(&clip) {
             let mut image = iced::advanced::image::Image::new(handle.clone());
             image.filter_method = image::FilterMethod::Nearest;

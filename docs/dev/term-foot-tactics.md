@@ -1,6 +1,8 @@
 # term: foot tactics investigation
 
-2026-09-25. Investigation and proposed design; **no production implementation**.
+2026-09-25. Initial investigation followed by implemented ranks 1, 2 and 4
+and the T16 merge validation below. Opening measurements describe the original
+tree; the implementation section holds the newer numbers.
 
 The largest measured opportunity is the CPU image pipeline, not missing glyph
 caching. The existing banded path costs about 6.4 ms for one changed row and
@@ -53,9 +55,9 @@ print(run_argv(["cargo", "test", "-p", "cosmix-term", "--release",
 The two ignored tests are `cpu_grid::bench::tiny_skia_frame_bench` and
 `cpu_grid::bench::tiny_skia_foot_phases_bench`. `--test-threads=1` matters:
 running the two performance tests concurrently would contaminate their results.
-The default feature is now wgpu; the older command in
-[term-rendering.md](term-rendering.md) needs the explicit tiny-skia feature
-selection above. Only the term release test target and its dependencies were
+The default feature remains wgpu; both this report and
+[term-rendering.md](term-rendering.md) use explicit tiny-skia feature
+selection for CPU measurements. Only the term release test target and its dependencies were
 built. No workspace build, installation, renderer-default change or push.
 
 Hardware: Intel Core Ultra 5 125H; normal desktop workload; DejaVu Sans Mono,
@@ -565,7 +567,8 @@ cargo test -p cosmix-term --release --no-default-features --features tiny-skia -
 ### Validation and remaining limits
 
 - CPU: **44 passed**, including both ignored benchmarks explicitly enabled.
-  Existing band/full-image pixel equality at scales 1.25, 1.5 and 2.5,
+  Band placement now has exact-pixel coverage at scales 1.0, 1.1, 1.25, 1.5,
+  1.75, 2.25 and 2.5, including nonzero origins and final partial bands;
   retained-history, cursor-band crossing, resize and invalidation tests pass.
 - Default wgpu: **34 passed** with `cargo test -p cosmix-term --release`.
   This compiles the default arm and checks shared app behaviour; it is not a
@@ -595,3 +598,61 @@ cargo test -p cosmix-term --release --no-default-features --features tiny-skia -
 
 The existing teletypewriter unused-variable warning remains unrelated. There
 is no deployment, renderer-default change or push in this implementation.
+
+## T16 merge validation (2026-09-25)
+
+Merged `term/skia-perf` at `49cd1e7a` into `term/foot-tactics`, preserving
+term 0.2.5, core 0.5.2 and the wgpu default. Cumulative band edges feed the
+vendored native-copy path directly. It resolves physical edges before image
+scaling/truncation, tolerates at most 0.001 pixel of floating-point round-off,
+and requires rounded extents to equal the image dimensions. The resulting
+copy transform is an exact integer translation with unit scale. The former
+widget origin bias is removed. The seven-scale pixel regression and an
+additional vendor eligibility regression cover nonzero origins and partial
+final bands. Redraw coalescing, clean-pane skipping and presentation damage
+remain intact. A redraw callback type alias resolves the clippy complexity
+warning without changing behaviour.
+
+All gates used release builds, restricted to term and the vendor crate:
+default term **34 passed**; tiny-skia **42 passed, 2 ignored**; both clippy
+feature configurations passed with `--all-targets -- -D warnings`.
+The vendor manifest's default suite passed **1 test** (plus zero doctests);
+`--no-default-features --features image,wayland --lib` passed **5 tests**,
+including the image-copy regressions omitted by the vendor's default features.
+The final serial tiny-skia run with `--include-ignored --nocapture
+--test-threads=1` passed **44 tests**, including both benchmarks. The existing
+teletypewriter dependency warning remains unrelated.
+
+Latest frame measurements: 2250×1250, scale 2.5, age 3, DejaVu Sans Mono,
+20 warm-ups and 200 samples, no affinity and no overlapping builds. Both
+whole-image and banded cases use the patched vendor renderer.
+
+| Path | Case | Mean ms | p50 ms | p99 ms | Paint + handle ms | Prepare + convert ms | Draw ms |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Whole image | echo | 6.547 | 6.364 | 7.697 | 0.901 | 3.084 | 2.558 |
+| Whole image | full | 10.532 | 10.412 | 12.632 | 5.005 | 2.984 | 2.539 |
+| Four-row bands | echo | 1.770 | 1.737 | 2.242 | 0.323 | 0.474 | 0.384 |
+| Four-row bands | full | 11.578 | 11.528 | 12.617 | 5.259 | 3.849 | 2.461 |
+
+Damage remains 461,250 pixels for banded echo and 2,812,500 for the other
+cases. Final whole-image/banded pixels match. Mean echo remains below 2 ms;
+full redraw remains above the 8 ms target. These measurements exclude live
+Wayland presentation and input-to-visible latency.
+
+Isolated phase probes from the same run (not additive frame costs):
+
+| Phase | Mean ms | p50 ms | p99 ms |
+|---|---:|---:|---:|
+| Warm echo paint, 90 cells | 0.172 | 0.171 | 0.197 |
+| Warm full paint, 2250 cells | 4.284 | 4.233 | 4.929 |
+| Cold full paint + new raster | 6.457 | 6.418 | 6.889 |
+| Background-only full paint | 2.340 | 2.326 | 3.065 |
+| RGBA → native BGRA loop | 1.856 | 1.774 | 2.381 |
+| Native copy, 50 pixel rows | 0.008 | 0.008 | 0.010 |
+| Native copy, 200 pixel rows | 0.067 | 0.067 | 0.073 |
+| Native copy, 1250 pixel rows | 0.431 | 0.417 | 0.597 |
+| Native scroll, 24 terminal rows | 0.385 | 0.383 | 0.425 |
+| Generic identity draw_pixmap | 10.540 | 10.456 | 11.461 |
+| New image id: load + allocation + conversion | 2.855 | 2.819 | 3.294 |
+| iced cached full image draw | 1.515 | 1.447 | 2.128 |
+| iced empty-layer full clear | 0.516 | 0.486 | 0.720 |

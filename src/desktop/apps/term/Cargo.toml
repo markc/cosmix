@@ -25,12 +25,13 @@ engine = "iced"
 # default for a morning (sweep decision 28: ~57-63 MB PSS and 0 GEM against
 # wgpu's ~43 MB PSS + 113-121 MB GEM) and typing under Claude Code was
 # "almost unusable". The headless benchmark (src/cpu_bench.rs,
-# docs/dev/term-rendering.md) at 2250x1250 px: a full-pane redraw costs
+# docs/dev/term-rendering.md) at 2250x1250 px: a full-pane redraw formerly cost
 # ~23 ms on tiny-skia, of which ~5 ms is glyph painting both arms share and
 # ~18 ms is CPU image conversion + blit that wgpu does on the GPU. Banding
 # cut a one-row echo from 17.8 to 6.7 ms but cannot make a full-screen TUI
 # redraw fit a 16.7 ms frame. Mark's rule: speed skia up first, default to
-# wgpu if it is still needed — it is.
+# wgpu if it is still needed. The 0.2.5 native-copy results and remaining live
+# acceptance work are in docs/dev/term-foot-tactics.md; keep wgpu meanwhile.
 default = ["wgpu"]
 # The shader-widget path: one persistent wgpu texture, damage-band uploads.
 # `naga27-termcolor` rides along: see that dependency for why iced-on-wgpu
@@ -95,7 +96,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
 
 [dev-dependencies]
-# Tests also compile this dependency in the wgpu arm, where iced does not
-# enable its softbuffer platform backend on our behalf.
+# Tests compile this dependency even with the default wgpu renderer. Its
+# softbuffer dependency needs a platform backend independently of iced's arm.
 iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image", "wayland"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }

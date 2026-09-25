@@ -23,6 +23,13 @@ rounding extends these edges differently from its transformed path. Translated
 negative physical origins still use the copy and are pixel-tested.
 Cache ids, conversion format and immutable image ownership are unchanged.
 
+T16 integration resolves cumulative band edges in physical coordinates before
+the upstream image-size division and truncation. Edges within 0.001 pixel of
+integers qualify only when their rounded extent equals the source image size;
+the copy receives an exact integer translation. Seven-scale regression tests
+check this eligibility, and term checks the rendered pixels against exact
+placement. This avoids both accumulated seams and a half-pixel origin bias.
+
 `window/compositor.rs` submits outward-rounded, surface-clamped physical
 damage, combining acquired-buffer repair with changes from the displayed
 frame. Empty damage drops the acquired buffer without presenting, advancing
