@@ -470,7 +470,7 @@ pub struct UnchangedReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReloadReply {
-    Applied(MutationReply),
+    Applied(Box<MutationReply>),
     Unchanged(UnchangedReply),
 }
 
