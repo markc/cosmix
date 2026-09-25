@@ -175,6 +175,7 @@ pub struct Menu<'a, Message, Theme, Renderer> {
     style: MenuStyle,
     external: Option<OnState<'a, Message>>,
     host_state: Option<MenuState>,
+    id: Option<iced_core::widget::Id>,
 }
 
 impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
@@ -187,6 +188,7 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
             style: MenuStyle::default(),
             external: None,
             host_state: None,
+            id: None,
         }
     }
 
@@ -202,7 +204,14 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
             style: MenuStyle::default(),
             external: None,
             host_state: None,
+            id: None,
         }
+    }
+
+    /// Names the widget so [`open_operation`] can find it.
+    pub fn id(mut self, id: impl Into<iced_core::widget::Id>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     /// Replaces the default style; see `Tokens::menu_style`.
@@ -261,6 +270,8 @@ struct State {
     translation: Vector,
     // External mode: the state last published, compared before publishing.
     reported: MenuState,
+    // Bar entry an `open_operation` asked for, consumed in `operate`.
+    requested: Option<usize>,
 }
 
 impl Default for State {
@@ -273,6 +284,48 @@ impl Default for State {
             overlay_bounds: None,
             translation: Vector::ZERO,
             reported: MenuState::default(),
+            requested: None,
+        }
+    }
+}
+
+/// Opens entry `index` of the menu bar named `id` (see [`Menu::id`]) as if
+/// by keyboard: the first selectable row is highlighted, and arrows, Enter
+/// and Escape drive it from there. This is how a host binds Alt+letter
+/// mnemonics, since an overlay menu ignores host state. It does nothing to
+/// a context menu, to a menu in `external_popups` mode (the host owns the
+/// state there), or when the entry is missing or disabled.
+///
+/// iced does not redraw after an operation by itself: chain a message after
+/// the task (`widget::operate(op).chain(Task::done(msg))`) so the frame that
+/// shows the open menu is drawn.
+pub fn open_operation(id: impl Into<iced_core::widget::Id>, index: usize) -> impl Operation + 'static {
+    OpenBar {
+        id: id.into(),
+        index,
+    }
+}
+
+struct OpenBar {
+    id: iced_core::widget::Id,
+    index: usize,
+}
+
+impl Operation for OpenBar {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn custom(
+        &mut self,
+        id: Option<&iced_core::widget::Id>,
+        _bounds: Rectangle,
+        state: &mut dyn std::any::Any,
+    ) {
+        if id == Some(&self.id)
+            && let Some(state) = state.downcast_mut::<State>()
+        {
+            state.requested = Some(self.index);
         }
     }
 }
@@ -703,6 +756,18 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
                 renderer,
                 operation,
             );
+            return;
+        }
+        let state = tree.state.downcast_mut::<State>();
+        operation.custom(self.id.as_ref(), layout.bounds(), state);
+        if let Some(index) = state.requested.take()
+            && self.external.is_none()
+            && self.items.get(index).is_some_and(Item::selectable)
+        {
+            state.focused = true;
+            state.hovered = None;
+            state.position = layout.bounds().position();
+            let _ = self.navigator().open(&mut state.nav, index, true);
         }
     }
     fn update(
@@ -2044,6 +2109,60 @@ mod tests {
             &mut messages,
         );
         assert_eq!(messages, [Host::Act(9)]);
+    }
+
+    // iced_core implements `Renderer` for `()` only with debug assertions,
+    // like the other UserInterface tests here: run without --release.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn open_operation_opens_the_named_bar_entry_by_keyboard() {
+        let bar = || {
+            Menu::<'_, u8, iced_core::Theme, ()>::bar(vec![
+                Item::submenu("file", items()),
+                Item::submenu("edit", vec![Item::action("seven", 7)]),
+                Item::submenu("off", vec![Item::action("nine", 9)]).enabled(false),
+            ])
+            .id("bar")
+        };
+        let mut ui = iced_runtime::UserInterface::build(
+            bar(),
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut (),
+        );
+        // A different id and a disabled entry are no-ops.
+        ui.operate(&(), &mut open_operation("other", 1));
+        ui.operate(&(), &mut open_operation("bar", 2));
+        let mut messages = vec![];
+        ui.update(
+            &[key_event(Named::Enter, keyboard::Modifiers::empty())],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced_core::clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.is_empty(), "nothing was opened");
+        ui.operate(&(), &mut open_operation("bar", 1));
+        ui.update(
+            &[key_event(Named::Enter, keyboard::Modifiers::empty())],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced_core::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, [7], "Enter activates the first row of entry 1");
+        // Rebuilt from a fresh view, the menu is closed again.
+        let cache = ui.into_cache();
+        let mut ui = iced_runtime::UserInterface::build(bar(), Size::new(400.0, 300.0), cache, &mut ());
+        messages.clear();
+        ui.update(
+            &[key_event(Named::Enter, keyboard::Modifiers::empty())],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced_core::clipboard::Null,
+            &mut messages,
+        );
+        assert!(messages.is_empty());
     }
 
     fn items() -> Vec<Item<u8>> {
