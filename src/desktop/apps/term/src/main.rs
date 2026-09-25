@@ -685,15 +685,14 @@ fn view(state: &State) -> Element<'_, Message> {
     })
     .on_mouse(move |event, position| mouse.message(state, event, position))
     .input_method(
-        if state.keyboard_focus && ime_cursor.is_some() {
-            iced::advanced::input_method::InputMethod::Enabled {
+        match ime_cursor {
+            Some(cursor) if state.keyboard_focus => iced::advanced::input_method::InputMethod::Enabled {
                 // Runtime composition overlay; only Commit goes to the PTY.
-                cursor: ime_cursor.unwrap(),
+                cursor,
                 purpose: iced::advanced::input_method::Purpose::Terminal,
                 preedit: state.ime_preedit.clone(),
-            }
-        } else {
-            iced::advanced::input_method::InputMethod::Disabled
+            },
+            _ => iced::advanced::input_method::InputMethod::Disabled,
         },
         |event| Message::Ime(event.clone()),
     );
