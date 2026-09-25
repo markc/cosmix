@@ -10,7 +10,6 @@ use cosmix_edit_client::types::{Intent, TabId};
 
 use crate::actions::ActionId;
 use crate::controller::{Controller, Effect};
-use crate::session::Session;
 use crate::verbs::{EditInfo, LayoutReply};
 
 /// A decision the controller needs from a human (window only).
@@ -68,9 +67,6 @@ pub trait ControllerExt {
         todo!("ced E1d")
     }
     fn on_lint(&mut self, tab: TabId, tag: ResultTag, result: Result<String, String>) -> Vec<Effect> {
-        todo!("ced E1d")
-    }
-    fn session(&self) -> Session {
         todo!("ced E1d")
     }
     fn edit_info(&self) -> Option<&EditInfo> {

@@ -54,8 +54,6 @@ use crate::verbs::{LayoutReply, Rect};
 
 pub const APP_ID: &str = "dev.cosmix.ced";
 
-/// Session writes are debounced this long after the last change.
-const SESSION_DEBOUNCE_MS: u64 = 1000;
 /// Change markers clear this long after the tab is focused (§4.5).
 const MARKER_CLEAR_MS: u64 = 2000;
 /// A transient status message stays this long.
@@ -141,8 +139,6 @@ pub struct App {
     notices: Vec<(u64, Option<TabId>, Level, String)>,
     notice_seq: u64,
     status: Option<String>,
-    /// Tabs an agent edited since they were last focused.
-    agent_edited: HashSet<TabId>,
     last_active: Option<TabId>,
     /// For `ced.stats`: when the last key was dispatched, not yet framed.
     key_at: Option<Instant>,
@@ -213,7 +209,6 @@ pub fn run(service: &str, config: Config, paths: Vec<String>) -> anyhow::Result<
         notices: Vec::new(),
         notice_seq: 0,
         status: None,
-        agent_edited: HashSet::new(),
         last_active: None,
         key_at: None,
         view_us: Cell::new(0),
@@ -223,6 +218,14 @@ pub fn run(service: &str, config: Config, paths: Vec<String>) -> anyhow::Result<
     app.reload_macros();
     if let Some(note) = app.theme.notes.clone() {
         app.post(None, Level::Warn, format!("Theme: {note}"));
+    }
+    let session_path = app.dirs.as_ref().map(AppDirs::session_file);
+    app.controller.set_paths(
+        app.dirs.as_ref().map(|d| d.config_file().to_string_lossy().into_owned()),
+        session_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    );
+    if let Some(p) = &session_path {
+        app.controller.set_session(crate::session::load(p));
     }
     let mut effects = app.controller.start();
     if !paths.is_empty() {
@@ -412,8 +415,12 @@ impl App {
                     let read = if primary { iced::clipboard::read_primary() } else { iced::clipboard::read() };
                     tasks.push(read.map(move |text| Msg::Paste(intent.clone(), text)));
                 }
-                Effect::SaveSession => self.timers.arm(TimerKey::SessionSave, SESSION_DEBOUNCE_MS),
-                Effect::Quit => tasks.push(self.quit()),
+                // The controller debounces session writes itself.
+                Effect::SaveSession => self.save_session(),
+                Effect::Quit => {
+                    self.bus.perform(&effect);
+                    tasks.push(self.quit());
+                }
             }
         }
         Task::batch(tasks)
@@ -447,7 +454,6 @@ impl App {
             TimerKey::FindHighlight => Task::none(),
             TimerKey::ClearMarkers(tab) => {
                 if self.controller.active() == Some(tab) && self.window_focused {
-                    self.agent_edited.remove(&tab);
                     let effects = self.controller.on_action(Some(tab), ActionId::ViewClearMarkers, Intent::ui(tab));
                     return self.perform(effects);
                 }
@@ -551,11 +557,6 @@ impl App {
                 | ActionId::ViewOutput
         ) {
             return Task::none();
-        }
-        if action == ActionId::ViewClearMarkers
-            && let Some(t) = tab
-        {
-            self.agent_edited.remove(&t);
         }
         let effects = self.controller.on_action(tab, action, intent);
         self.perform(effects)
@@ -878,12 +879,8 @@ impl App {
         let mut lint_now = Vec::new();
         let ids: Vec<TabId> = self.controller.tabs().iter().map(|t| t.id).collect();
         self.lint.retain(|id, _| ids.contains(id));
-        self.agent_edited.retain(|id| ids.contains(id));
         for tab in self.controller.tabs() {
             let Some(m) = tab.mirror.as_ref() else { continue };
-            if Some(tab.id) != active && !tab.editor.markers.changed.is_empty() {
-                self.agent_edited.insert(tab.id);
-            }
             if !matches!(m.meta().disk, cosmix_edit_core::wire::DiskState::Modified) {
                 self.dismissed.remove(&InfoKey::DiskModified(tab.id));
             }
@@ -1125,7 +1122,7 @@ impl App {
             .id(BAR_ID)
             .style(cosmix_iced_widgets::MenuStyle { text_size: look.ui_px, row_height: MENU_H, ..look.tokens.menu_style() });
 
-        let mut body = column![menubar, chrome::tabs::view(look, tabs, active, |id| self.agent_edited.contains(&id))];
+        let mut body = column![menubar, chrome::tabs::view(look, tabs, active, |id| self.controller.agent_since_focus(id))];
         let infos = self.infos(tab);
         if !infos.is_empty() {
             body = body.push(chrome::infobar::view(look, infos));
