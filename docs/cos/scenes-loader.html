@@ -460,6 +460,14 @@ The document name must match its installation directory. Names contain
 lower-case ASCII letters, digits, <code>-</code> and <code>_</code>, at most 64 characters; leading
 <code>-</code> and <code>_</code> are refused. The scene/metadata/behaviour files and installation
 directory cannot be symlinks. Shipped templates live at <code>$COSMIX/share/scenes</code>.</p>
+<p>Without <code>name</code>, <code>scenes.install</code> uses the scene name the template authors:
+the directory name for every template except <code>settings</code>, which authors
+<code>quoin-settings</code>. An authored <code>window.panel</code> is kept when installing under
+the authored name and rewritten to <code>scene-&lt;name&gt;</code> on a rename. So
+<code>{template:"settings"}</code> installs <code>quoin-settings</code> on Quoin's declared page
+<code>settings.appearance</code>. While Quoin's built-in fallback holds that page, the
+loader's load takes it over (see <a href="quoin">Quoin</a>). Disabling or removing the
+scene gives the page back to the fallback.</p>
 <p>State has <code>{schema_version:1,enabled:[],origins:{},recovery:{}}</code>. Writes use
 <code>write_atomic</code> with full durability and mode <code>0600</code>. Enablement is separate
 from template metadata. A directory discovered through the filesystem remains

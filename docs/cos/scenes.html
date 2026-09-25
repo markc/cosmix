@@ -497,6 +497,16 @@ application; unchanged snapshots produce no event. Take a property snapshot
 after subscribing and resynchronise after a connection/gap. Enqueue replies
 are not applied-state receipts, so page selection and temporary pin release
 must wait on these events rather than retry sleeps.</p>
+<p>Settings/Appearance follows the same pattern. The <code>share/scenes/settings</code>
+template (scene <code>quoin-settings</code>, page <code>settings.appearance</code>) is layout only.
+Its behaviour subscribes to <code>&lt;host&gt;.settings.changed</code> (inner command
+<code>shell.settings.changed</code>) and re-reads <code>shell.settings.get</code> on each notice,
+after reconnecting, and when the host re-registers. It publishes the model
+through <code>scenes.model</code> and forwards the page's clicks unchanged to
+<code>shell.settings.{scheme,motion,size}</code>. The effects, the stepper size and the
+clamping stay in Quoin. Without the loader, Quoin serves the same node block
+as a built-in fallback and yields the page to a loader-managed load. Snapshot
+fields and the handover rules are in <a href="quoin">Quoin</a>.</p>
 <h2 id="v1-bindings">V1 bindings</h2>
 <p>A port value beginning <code>= </code> is one Mix expression. <code>== x</code> escapes to the
 literal <code>= x</code>, while <code>=x</code> remains a literal. For example:</p>

@@ -23,6 +23,15 @@ lower-case ASCII letters, digits, `-` and `_`, at most 64 characters; leading
 `-` and `_` are refused. The scene/metadata/behaviour files and installation
 directory cannot be symlinks. Shipped templates live at `$COSMIX/share/scenes`.
 
+Without `name`, `scenes.install` uses the scene name the template authors:
+the directory name for every template except `settings`, which authors
+`quoin-settings`. An authored `window.panel` is kept when installing under
+the authored name and rewritten to `scene-<name>` on a rename. So
+`{template:"settings"}` installs `quoin-settings` on Quoin's declared page
+`settings.appearance`. While Quoin's built-in fallback holds that page, the
+loader's load takes it over (see [Quoin](quoin)). Disabling or removing the
+scene gives the page back to the fallback.
+
 State has `{schema_version:1,enabled:[],origins:{},recovery:{}}`. Writes use
 `write_atomic` with full durability and mode `0600`. Enablement is separate
 from template metadata. A directory discovered through the filesystem remains

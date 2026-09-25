@@ -1,0 +1,13 @@
+{
+  "schemes": {
+    "ocean": {"accent": "#00000001", "background": "#00000000", "mark": "○"},
+    "crimson": {"accent": "#00000002", "background": "#00000000", "mark": "○"},
+    "stone": {"accent": "#00000003", "background": "#00000000", "mark": "○"},
+    "forest": {"accent": "#00000004", "background": "#2a2e32", "mark": "●"},
+    "sunset": {"accent": "#00000005", "background": "#00000000", "mark": "○"},
+    "mono": {"accent": "#00000006", "background": "#00000000", "mark": "○"}
+  },
+  "sizes": {"top": "260 px", "bottom": "53 px", "left": "200 px", "right": "240 px"},
+  "fade_reason": "Fade needs renderer sibling\nstacking in one rectangle.\nOnly slide is available.",
+  "motion": {"slide": "○ Slide", "fade": "● Fade (unavailable)"}
+}

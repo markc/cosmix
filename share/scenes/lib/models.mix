@@ -63,3 +63,34 @@ fn notification_rows($props)
   end
   return sort_by($out, function ($n) = $n.created_at)
 end
+
+-- Settings/Appearance from Quoin's shell.settings.get snapshot (or the
+-- shell.settings.changed notice carrying the same fields). Marks mirror the
+-- configured motion, fade included, exactly as Quoin's built-in fallback.
+fn settings_valid($snap)
+  if type($snap) != "map" or type($snap.scheme) != "string" or type($snap.schemes) != "list" then return false end
+  if type($snap.motion) != "string" or type($snap.fade_reason) != "string" or type($snap.sizes) != "map" then return false end
+  for each $s in $snap.schemes
+    if type($s) != "map" or type($s.name) != "string" or type($s.accent) != "string" then return false end
+  end
+  for each $edge in ["top", "bottom", "left", "right"]
+    if type($snap.sizes[$edge]) != "number" then return false end
+  end
+  return true
+end
+
+fn settings($snap)
+  $schemes = {}
+  for each $s in $snap.schemes
+    $on = $s.name == $snap.scheme
+    $schemes[$s.name] = {accent: $s.accent, background: $on ? "#2a2e32" : "#00000000", mark: $on ? "●" : "○"}
+  end
+  $sizes = {}
+  for each $edge in ["top", "bottom", "left", "right"]
+    $sizes[$edge] = to_string(round($snap.sizes[$edge])) .. " px"
+  end
+  return {schemes: $schemes, sizes: $sizes, fade_reason: $snap.fade_reason, motion: {
+    slide: ($snap.motion == "slide" ? "● " : "○ ") .. "Slide",
+    fade: ($snap.motion == "fade" ? "● " : "○ ") .. "Fade (unavailable)"
+  }}
+end

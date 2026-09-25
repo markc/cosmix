@@ -276,9 +276,11 @@ fn candidate($s, $name, $dir)
     end
   end
   -- Stage A cannot capture any of the legacy host's seats, even if free.
+  -- settings.appearance is released in Stage B: Quoin's built-in content
+  -- yields that page to a loader-managed quoin-settings load.
   $page = $doc.mount.panel
   if type($page) != "string" or trim($page) == "" then $page = "scene-" .. $name end
-  if contains(["scene-panel", "scene-launcher", "scene-calendar", "scene-notes", "settings.appearance"], $page) then
+  if contains(["scene-panel", "scene-launcher", "scene-calendar", "scene-notes"], $page) then
     fail("SCENES_STAGE_A", "legacy page is reserved until Stage B; use a distinct scene/page name", {page:$page})
   end
   $meta_text = bounded_read($dir .. "/template.conf.mix", 65536)
@@ -461,11 +463,29 @@ fn load_managed($s, $source, $model, $generation)
   return $r
 end
 
+-- Default installation name: the template's authored scene name (the
+-- settings template authors quoin-settings). Anything unreadable falls back
+-- to the template name so staging reports the real refusal.
+fn authored_name($s, $template)
+  if not valid_name($template) then return $template end
+  $path = $s.templates .. "/" .. $template .. "/scene.mix"
+  if not regular($path) then return $template end
+  try
+    $authored = document(bounded_read($path, 262144)).name
+  catch $message
+    return $template
+  end
+  return $authored
+end
+
 fn rewrite_install($source, $name)
   $d = document($source)
+  -- Installing under the authored name keeps an authored panel address
+  -- (quoin-settings keeps settings.appearance); a rename gets its own page.
+  $renamed = $d.name != $name
   $d.headers.name = $name
   $d.headers.citizen = "scene-" .. $name
-  if $d.window.panel != nil then
+  if $renamed and $d.window.panel != nil then
     $d.window.panel = "scene-" .. $name
     $d.headers.window = json_encode($d.window)
   end
@@ -746,7 +766,7 @@ fn request($s, $verb, $args)
       return $s
     end
     if $verb == "install" then
-      $name = $args.name ?? $args.template
+      $name = $args.name ?? authored_name($s, $args.template)
       if not valid_name($name) then fail("SCENES_NAME", "invalid installation name", {}) end
       if exists($s.root .. "/" .. $name, {follow_symlinks:false}) then fail("SCENES_COLLISION", "installation already exists", {name:$name}) end
       if len(keys($s.scenes)) >= 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end

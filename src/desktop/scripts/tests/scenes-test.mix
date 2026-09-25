@@ -520,6 +520,21 @@ try
   $s = deadline($s, "pair-a", $old.generation)
   check(not $s.scenes["pair-a"].enabled and $s.scenes["pair-a"].pid == nil and not contains($s.desired.enabled, "pair-a"), "disable during deadline remains disabled in memory and on disk")
 
+  -- Stage B settings.appearance: the shipped template installs under its
+  -- authored name and keeps its declared page; a rename still gets its own.
+  $shipped = dirname(dirname(dirname(dirname(dirname(realpath($0)))))) .. "/share/scenes/settings"
+  copy_tree($shipped, $s.templates .. "/settings")
+  $s = $l.request($s, "install", {template:"settings"})
+  check($s.rc == 0 and $s.response.name == "quoin-settings" and $s.desired.origins["quoin-settings"] == "settings", "settings installs as quoin-settings: " .. json_encode($s.response))
+  $installed = $l.candidate($s, "quoin-settings", $s.root .. "/quoin-settings")
+  $doc = $l.document($installed.source)
+  check($installed.page == "settings.appearance" and $installed.edge == "right" and $doc.citizen == "scene-quoin-settings", "authored page, edge and behaviour routing kept")
+  check(len(filter(calls("check"), fn($c) = ends_with($c.body, "/behaviour.mix") and contains($c.body, ".stage-"))) > 0, "settings behaviour checked while staging")
+  $s = $l.request($s, "install", {template:"settings", name:"preview-settings"})
+  $preview = $l.candidate($s, "preview-settings", $s.root .. "/preview-settings")
+  check($s.rc == 0 and $preview.page == "scene-preview-settings", "renamed install gets a distinct page: " .. json_encode($s.response))
+  $_ = refused($s, "install", {template:"settings"}, "SCENES_COLLISION")
+
   write_file($s.root .. "/state.conf.mix", "BROKEN")
   $s = $l.rescan($s, false)
   check($s.diagnostic != nil and $s.scenes.probe.enabled, "bad state retains last-good desire")

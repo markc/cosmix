@@ -106,4 +106,50 @@ check($runtime.item_id({item: {id: "wrong"}, args: {node: "fake@id"}}) == nil, "
 check(not $runtime.template_capable([]), "older host refused")
 check($runtime.template_capable([{path: "flow", enum: ["vertical", "horizontal"]}, {path: "hidden", type: "bool"}]), "capability check uses schema")
 check($runtime.failure("example", "Example").value.error_code == "example", "unified refusal")
+
+-- Stage B settings.appearance. The snapshot/model fixtures are shared with
+-- Quoin's Rust test (settings.rs), which checks shell.settings.get and the
+-- built-in fallback model against the same two files, so this Mix model
+-- builder and the fallback cannot drift apart.
+$directory = $root .. "/share/scenes/settings"
+$metadata = data_parse(read_file($directory .. "/template.conf.mix"))
+check($metadata.name == "quoin-settings" and $metadata.behaviour == "behaviour.mix", "strict metadata: settings")
+$source = read_file($directory .. "/scene.mix")
+$header = before(after($source, "---\n"), "\n---\n")
+check(contains($header, "\nname: quoin-settings\n") and contains($header, "\ncitizen: scene-quoin-settings\n"), "settings keeps scene name and behaviour routing")
+$window = json_parse(before(after($header, "\nwindow: "), "\n"))
+check($window.panel == "settings.appearance" and $window.edge == "right", "settings keeps its declared page")
+$default_model = json_parse(after($header, "\nmodel: "))
+$nodes = data_parse(before(after($source, "```mix\n"), "\n```"))
+check($nodes.root.widget == "column" and length(keys($nodes)) == 64, "strict static settings document")
+$snapshot = json_parse(read_file($fixtures .. "/settings-forest-fade.snapshot.json"))
+$expected = json_parse(read_file($fixtures .. "/settings-forest-fade.model.json"))
+check($models.settings_valid($snapshot), "fixture snapshot is valid")
+$model = $models.settings($snapshot)
+check(deep_eq($model, $expected), "settings model capture: " .. json_encode($model))
+-- Every model path a node binds exists in both the template default and the live model.
+for each $id, $node in $nodes
+  for each $port, $value in $node
+    if type($value) == "string" and starts_with($value, '= $model.') then
+      $path = split(after($value, '= $model.'), ".")
+      $live = $model
+      $fallback = $default_model
+      for each $key in $path
+        check(type($live) == "map" and has_key($live, $key), "live model binds " .. $id .. "." .. $port)
+        check(type($fallback) == "map" and has_key($fallback, $key), "default model binds " .. $id .. "." .. $port)
+        $live = $live[$key]
+        $fallback = $fallback[$key]
+      end
+    end
+  end
+end
+-- The fallback's click routing is the template's: every control names a settings verb.
+for each $id in ["scheme_ocean", "scheme_mono", "motion_slide", "size_top_minus", "size_right_plus"]
+  check(starts_with($nodes[$id].on_click, "shell.settings."), "control routes to a settings verb: " .. $id)
+end
+check($nodes.motion_fade.on_click == nil, "fade stays unselectable")
+$bad = $snapshot
+$bad.sizes = {top: 1}
+check(not $models.settings_valid($bad), "partial sizes refused")
+check(not $models.settings_valid(nil) and not $models.settings_valid({scheme: "ocean"}), "malformed snapshot refused")
 print("scene-template-test: exact captures, models, caps, payloads and capabilities OK")
