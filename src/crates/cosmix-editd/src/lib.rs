@@ -11,7 +11,9 @@
 //! **E0 buffers are volatile**: unsaved text is lost on any daemon stop,
 //! crash or heap-OOM abort. `edit.info` reports `volatile: true`.
 //!
-//! Stage S state: types and contracts are frozen, behaviour is `todo!()` (E0b).
+//! In-process use (tests): [`router::Editd::start`] with any
+//! [`events::EventSink`], then [`router::Editd::handle`] synthesized
+//! `IncomingCommand`s — no broker needed.
 
 pub mod actor;
 pub mod bus;
@@ -24,5 +26,6 @@ pub mod refusal;
 pub mod router;
 pub mod watch;
 
-#[allow(dead_code)] // Stage S: E0b calls it after the first registration.
 mod readiness;
+
+pub use router::{Config, Editd};
