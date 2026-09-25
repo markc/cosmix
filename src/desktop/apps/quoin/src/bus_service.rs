@@ -209,8 +209,8 @@ fn reply_panels(
             state.pending_panels.push((request, output));
             continue;
         }
-        let applied = applied && !(request.command == "shell.panel.mode"
-            && panel.mode == PanelMode::Hidden && panel.mapped);
+        // A pointer/holder reveal does not undo the applied persistent mode.
+        // Report its actual visible:true state instead of a false refusal.
         let snapshot = Value::from(&ShellProps(&frame.0).snapshot());
         let body = if applied {
             json!({"accepted":true, "applied":true, "panels":snapshot["panels"]})
@@ -2828,6 +2828,38 @@ mod tests {
         let body: Value = serde_json::from_str(&pin.body).unwrap();
         assert_eq!(body["error_code"], "PANEL_NOT_APPLIED");
         assert_eq!(body["panels"]["left"]["pinned"], false);
+    }
+
+    #[test]
+    fn hide_reply_applies_mode_when_pointer_reveals_during_concealment() {
+        let (mut app, peer) = mounted_bus_app();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(16),
+        ));
+        load_scene(&mut app, &peer, "held-reply", "owner", "left");
+        let mut pin = local("shell.panel.pin");
+        pin.body = json!({"edge":"left"}).to_string();
+        peer.send(pin);
+        for _ in 0..30 { app.update(); }
+        peer.drain_responses();
+        let mut hide = local("shell.panel.mode");
+        hide.body = json!({"edge":"left", "mode":"hidden"}).to_string();
+        peer.send(hide);
+        app.update();
+        assert!(peer.drain_responses().is_empty(), "concealment holds the reply");
+        app.world_mut().write_message(ShellCommand {
+            output: test_model().output().clone(),
+            at: std::time::Duration::from_secs(1),
+            kind: ShellCommandKind::Panel { edge: Edge::Left, input: PanelInput::CornerEntered },
+        });
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["panels"]["left"]["mode"], "hidden");
+        assert_eq!(body["panels"]["left"]["visible"], true);
     }
 
     #[test]

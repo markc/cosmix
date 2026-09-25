@@ -28,7 +28,7 @@
 --
 -- Event-driven: the taskbar and pager rebuild on the compositor's
 -- props.changed topic, the tray and notifications on their adapters'
--- events. The one clock is the wall clock itself: an async handler kicked
+-- events. The one clock is the wall clock itself: a local async task started
 -- once by init sleeps to each minute boundary, one wake per minute, never a
 -- poll of anyone's state.
 $p = require("lib/panel.mix")
@@ -77,7 +77,7 @@ $state = {
   -- and pinned the taskbar page yet
   reg_launcher: false, reg_calendar: false, reg_notes: false,
   applied_panels: {}, pending_panels: {}, live_services: [],
-  panel_op_seq: 0, panel_drivers: {}, resyncing: false,
+  panel_op_seq: 0, panel_drivers: {}, panel_failures: {}, resyncing: false, resync_again: false,
   registering: false, panel_shown: false,
   -- consecutive show_page refusals this host generation; past PANEL_SHOW_CAP
   -- we stop resubmitting refused selections on every render (a host that keeps
@@ -166,9 +166,10 @@ fn refresh_panels()
 end
 
 fn queue_panel($edge, $page, $flag, $gen, $phase)
+  $state.panel_failures = delete($state.panel_failures, $edge)
   $state.panel_op_seq = $state.panel_op_seq + 1
   $state.pending_panels[$edge] = {page:$page, phase:$phase, flag:$flag,
-    generation:$gen, token:$state.panel_op_seq, refused:false}
+    generation:$gen, token:$state.panel_op_seq}
 end
 
 -- Queue page selection and consume applied replies/readback immediately.
@@ -193,8 +194,8 @@ end
 -- Legacy Bus unpin releases BOTH Pinned and Docked. This is also the
 -- compatibility rule for bare-array popup records: a legacy saved true
 -- migrates to Docked, and still needs its reservation released here.
--- Quoin replies after application and concealment. Keep the recovery record
--- unless a read confirms BOTH persistence and visibility are clear.
+-- Quoin replies after application and concealment, or with visible:true if
+-- a pointer/holder re-reveals hidden mode. Either settles our pin release.
 fn hide_edge($edge)
   queue_panel($edge, nil, nil, $state.popup_gen, "release")
   drive_panel_operations()
@@ -238,9 +239,13 @@ fn drive_panel_edge($edge)
       $verb = $action == "release" ? "shell.panel.mode" : ($action == "select" ? "shell.panel.page.set" : "shell.panel.pin")
       $ok = panel_verb($verb, $edge, $action == "select" ? $op.page : nil)
       if not $p.panel_operation_current($state.pending_panels, $edge, $op.token) then continue end
-      $state.pending_panels[$edge].refused = not $ok
       -- An applied state can confirm success even if the reply was lost.
-      if not $ok and $p.panel_action($op, $state.applied_panels[$edge]) != "done" then break end
+      if not $ok and $p.panel_action($op, $state.applied_panels[$edge]) != "done" then
+        note("panel " .. $action .. " refused on " .. $edge .. "; attempt settled failed")
+        $state.panel_failures[$edge] = {token:$op.token, action:$action}
+        $state.pending_panels = delete($state.pending_panels, $edge)
+        break
+      end
     end
   finally
     $state.panel_drivers[$edge] = false
@@ -920,7 +925,7 @@ fn hide_popup($edge)
   end
   $confirmed = hide_edge($edge)
   if edge_in_use($edge) then return false end
-  if ($state.pending_panels[$edge] ?? {}).refused == true then return false end
+  if $state.panel_failures[$edge] != nil then return false end
   if not $p.popup_release_confirmed($confirmed) then return false end
   $kept = $p.released_popup_pins(read_pins(), $edge, $confirmed)
   write_pins($kept)
@@ -1041,20 +1046,27 @@ fn recover_pins()
 end
 
 fn resynchronise()
-  if $state.resyncing then return end
+  if $state.resyncing then
+    $state.resync_again = true
+    return
+  end
   $state.resyncing = true
   try
-    rpc($COMP, "comp.props.watch", {})
-    refresh_panels()
-    recover_pins()
-    update_shown()
-    schedule()
-    -- A broker gap can hide a complete host restart while the registered
-    -- names stay identical. Re-establish open intent even when its previous
-    -- operation had already completed and left no pending entry.
-    if $state.launcher_open and not $state.launcher_shown then render_launcher() end
-    if $state.calendar_open and not $state.calendar_shown then render_calendar() end
-    if $state.notes_open and not $state.notes_shown then render_notes() end
+    while true
+      $state.resync_again = false
+      rpc($COMP, "comp.props.watch", {})
+      refresh_panels()
+      recover_pins()
+      update_shown()
+      schedule()
+      -- A broker gap can hide a complete host restart while the registered
+      -- names stay identical. Re-establish open intent even when its previous
+      -- operation had already completed and left no pending entry.
+      if $state.launcher_open and not $state.launcher_shown then render_launcher() end
+      if $state.calendar_open and not $state.calendar_shown then render_calendar() end
+      if $state.notes_open and not $state.notes_shown then render_notes() end
+      if not $state.resync_again then break end
+    end
   finally
     $state.resyncing = false
   end
@@ -1062,6 +1074,7 @@ end
 
 on bus.connected async
   if len(keys($event.headers)) != 0 then return end
+  start_clock()
   $state.panel_shown = false
   $state.reg_launcher = false
   $state.reg_calendar = false
@@ -1580,23 +1593,36 @@ on notification.closed async
 end
 
 -- The clock: wake on each minute boundary and redraw the panel and the
--- calendar page -- one wake per minute. A second kick is
--- ignored so a stray clock.run cannot start a second loop.
-on clock.run async
+-- calendar page -- one wake per minute, scheduled entirely in process.
+fn start_clock()
   if $state.clock_running then return end
   $state.clock_running = true
-  while true
-    sleep($p.seconds_to_next_minute(time()))
-    try
-      fetch_net()
-      fetch_vol()
-      render_panel()
-      -- the calendar's "today" and header clock stay current while it is
-      -- registered, open or not; it is revealed only while open
-      render_calendar()
-    catch $e
-      note("clock tick failed: " .. to_string($e))
+  try
+    task_start("clock.run", "{}")
+  catch $message, $error
+    $state.clock_running = false
+    raise($error.code, $message, $error.details)
+  end
+end
+
+on clock.run async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    while true
+      sleep($p.seconds_to_next_minute(time()))
+      try
+        fetch_net()
+        fetch_vol()
+        render_panel()
+        -- the calendar's "today" and header clock stay current while it is
+        -- registered, open or not; it is revealed only while open
+        render_calendar()
+      catch $e
+        note("clock tick failed: " .. to_string($e))
+      end
     end
+  finally
+    $state.clock_running = false
   end
 end
 
@@ -1627,8 +1653,8 @@ $initial_registry = rpc("noded", "noded.props.get", {})
 reconcile_services((($initial_registry ?? {}).services ?? {}).registered)
 note("quoin-panel up: host=" .. $HOST .. " comp=" .. $COMP)
 
--- The clock runs in its own async handler (below), kicked once from here, so
+-- The clock runs in its own local async task, started here, so
 -- this init body returns and the runtime serves its reserved verbs (RELOAD,
 -- QUIT, INFO, lifecycle props) -- an init that never returns would starve
 -- them. On shutdown the runtime drains the loop like any async handler.
-emit $ME clock.run
+start_clock()

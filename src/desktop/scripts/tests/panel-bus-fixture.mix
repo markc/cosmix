@@ -16,6 +16,7 @@ $launcher_scene = ""
 $notes_loads = 0
 $pins = 0
 $watches = 0
+$watch_pending = false
 
 on fixture.mode
   $mode = $event.args
@@ -116,8 +117,13 @@ end
 on "comp.props.get"
   reply(0, json_encode({count: 1, current: 1}))
 end
-on "comp.props.watch"
+on "comp.props.watch" async
   $watches = $watches + 1
+  if ($mode.watch_delay ?? 0) > 0 then
+    $watch_pending = true
+    sleep($mode.watch_delay)
+    $watch_pending = false
+  end
   reply(0, "{}")
 end
 
@@ -169,5 +175,5 @@ on "apps.launch"
 end
 on fixture.state
   reply(0, json_encode({edges: $edges, lists: $lists, launches: $launches, pending: $pending, loads: $loads,
-    launcher_scene: $launcher_scene, notes_loads: $notes_loads, pins: $pins, watches:$watches}))
+    launcher_scene: $launcher_scene, notes_loads: $notes_loads, pins: $pins, watches:$watches, watch_pending:$watch_pending}))
 end

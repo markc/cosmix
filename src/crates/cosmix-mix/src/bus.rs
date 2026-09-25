@@ -1230,9 +1230,7 @@ async fn next_connected_generation(
 #[cfg(test)]
 mod connection_events_tests {
     use super::*;
-    use std::{future::Future, pin::pin, task::{Context, Poll, Wake, Waker}};
-    struct Noop;
-    impl Wake for Noop { fn wake(self: std::sync::Arc<Self>) {} }
+    use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
 
     #[tokio::test]
     async fn connected_generation_initial_reconnect_gap_and_cancel() {
@@ -1242,8 +1240,7 @@ mod connection_events_tests {
         let delivered = Cell::new(0);
         let generation = Cell::new(1);
         assert_eq!(next_connected_generation(&state, &delivered, || generation.get()).await, 1);
-        let waker = Waker::from(std::sync::Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         {
             let mut next = pin!(next_connected_generation(&state, &delivered, || generation.get()));
             assert!(matches!(next.as_mut().poll(&mut cx), Poll::Pending));

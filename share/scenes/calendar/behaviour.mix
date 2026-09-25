@@ -13,17 +13,32 @@ fn refresh()
   return $r.publish_model($ctx, $state.model)
 end
 
--- One deadline for displayed wall-clock text. No state/recovery polling.
-on clock.deadline async
-  if $state.clock_armed then reply(0, "{}"); return end
+fn start_clock()
+  if $state.clock_armed then return end
   $state.clock_armed = true
-  reply(0, "{}")
-  $now = time()
-  $deadline = $now + $p.seconds_to_next_minute($now)
-  sleep(max(0, $deadline - time()))
-  refresh()
-  $state.clock_armed = false
-  emit $ctx.citizen clock.deadline
+  try
+    task_start("clock.deadline", "{}")
+  catch $message, $error
+    $state.clock_armed = false
+    raise($error.code, $message, $error.details)
+  end
+end
+
+-- One in-process task for displayed wall-clock text. No recovery polling.
+on clock.deadline async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    while true
+      sleep($p.seconds_to_next_minute(time()))
+      try
+        refresh()
+      catch $message
+        eprint("calendar clock: " .. to_string($message))
+      end
+    end
+  finally
+    $state.clock_armed = false
+  end
 end
 on cal_prev
   $state.offset = $state.offset - 1
@@ -64,6 +79,8 @@ on open_calendar async
   $r.respond($r.popup($ctx, "close"))
 end
 on bus.connected
+  if len(keys($event.headers)) != 0 then return end
+  start_clock()
   $state.ready = false
   $ready = $r.ready($ctx)
   $state.ready = $ready.ok
@@ -82,4 +99,4 @@ $ready = $r.ready($ctx)
 if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
 $state.ready = true
 refresh()
-emit $ctx.citizen clock.deadline
+start_clock()

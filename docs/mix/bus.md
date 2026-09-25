@@ -600,6 +600,21 @@ requester forever, so every `reply` failure path is a hard error by design.
 
 ### `async` handlers (Class C)
 
+`task_start(command, body)` starts a registered handler chain in process,
+without sending a Bus message. `command` and `body` are strings; the body is
+decoded into `$event.args` just as for other handler invocations. The event
+has empty headers and no reply correlation. The chain must contain an `async`
+handler (`TASK_HANDLER` otherwise). It uses the existing Class C task registry,
+shutdown drain and runner LocalSet; embedders must provide that LocalSet.
+The builtin requires Process capability and is refused in expression mode.
+
+Mixed chains retain declaration order: an async entry can wait on `sleep`,
+then a plain entry acquires the writer lock and reads current state to commit.
+Never assign a whole pre-wait state copy after a yield. A clock can start one
+local task at init and recheck its running flag on `bus.connected`, with no
+Bus self-emits. A task is a local continuation, not a separate service or
+transport, and does not provide exactly-once remote effects.
+
 A trailing `async` on the handler header marks it **Class C** — the dispatch
 *yields* at every `send`/`reply`/`sleep_ms` so concurrent invocations interleave
 instead of head-of-line-blocking each other behind a slow downstream call. Plain

@@ -913,6 +913,19 @@ inside an <code>on</code> handler; it errors loudly if the current event is <em>
 (a topic delivery has no caller to answer). A dropped reply would block the
 requester forever, so every <code>reply</code> failure path is a hard error by design.</p>
 <h3 id="async-handlers-class-c"><code>async</code> handlers (Class C)</h3>
+<p><code>task_start(command, body)</code> starts a registered handler chain in process,
+without sending a Bus message. <code>command</code> and <code>body</code> are strings; the body is
+decoded into <code>$event.args</code> just as for other handler invocations. The event
+has empty headers and no reply correlation. The chain must contain an <code>async</code>
+handler (<code>TASK_HANDLER</code> otherwise). It uses the existing Class C task registry,
+shutdown drain and runner LocalSet; embedders must provide that LocalSet.
+The builtin requires Process capability and is refused in expression mode.</p>
+<p>Mixed chains retain declaration order: an async entry can wait on <code>sleep</code>,
+then a plain entry acquires the writer lock and reads current state to commit.
+Never assign a whole pre-wait state copy after a yield. A clock can start one
+local task at init and recheck its running flag on <code>bus.connected</code>, with no
+Bus self-emits. A task is a local continuation, not a separate service or
+transport, and does not provide exactly-once remote effects.</p>
 <p>A trailing <code>async</code> on the handler header marks it <strong>Class C</strong> — the dispatch
 <em>yields</em> at every <code>send</code>/<code>reply</code>/<code>sleep_ms</code> so concurrent invocations interleave
 instead of head-of-line-blocking each other behind a slow downstream call. Plain

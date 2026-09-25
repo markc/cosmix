@@ -4,7 +4,7 @@ $l = require("../lib/scenes.mix")
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-scenes-test.XXXXXXXX"]))
 $log = $tmp .. "/calls"
 $checks = {count:0}
-$host_state = {panels:{}, apply:false, nil_verb:nil, unload_error:nil, names:["test-shell"]}
+$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, names:["test-shell"]}
 write_file($log, "")
 
 fn check($ok, $message)
@@ -25,6 +25,7 @@ end
 fn rpc($host, $verb, $body)
   record($verb, $body)
   if $verb == $host_state.nil_verb then return nil end
+  if $verb == $host_state.refuse_verb then return {accepted:false, error_code:"PANEL_NOT_APPLIED"} end
   if $verb == "noded.props.get" then return {services:{registered:$host_state.names}} end
   if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_error then raise("SCENES_UPSTREAM", "unload refused", {}) end
   if contains(["shell.scene.load", "shell.scene.validate"], $verb) then
@@ -66,6 +67,19 @@ fn deadline($s, $name, $generation)
   -- Advance the deterministic clock to the deadline, without a real sleep.
   if ($s.scenes[$name] ?? {}).generation == $generation then $s.scenes[$name].restart_at = 0 end
   return $l.restart($s, $name, $generation)
+end
+fn process_exit($s, $event)
+  -- Simulate the synchronous bookkeeping and separate task's writer phase.
+  $s = $l.exited($s, $event)
+  $e = $s.scenes[($event.tag ?? {}).name]
+  if $e != nil and $e.status == "handover" then
+    try
+      $s = $l.restart($s, $e.name, $e.generation)
+    catch $message, $error
+      $s.scenes[$e.name].diagnostic = {error_code:$error.code, message:$message}
+    end
+  end
+  return $s
 end
 fn check_behaviour($path)
   record("check", $path)
@@ -170,9 +184,9 @@ try
   $s = $l.filesystem($s, {overflow:false, changes:[{path:$s.root .. "/probe/behaviour.mix",kind:"modified"}]})
   $pid = $s.scenes.probe.pid
   $exit = {pid:$pid, tag:{name:"probe", generation:$gen}, exit_code:1, signal:nil}
-  $s = $l.exited($s, $exit)
+  $s = process_exit($s, $exit)
   check($s.scenes.probe.status == "backoff" and $s.scenes.probe.mounted, "crash leaves mounted")
-  $s = $l.exited($s, $exit)
+  $s = process_exit($s, $exit)
   check($s.scenes.probe.crashes == 1, "duplicate exit suppressed")
   $s = $l.request($s, "disable", {name:"probe"})
   $s = $l.restart($s, "probe", $gen)
@@ -180,7 +194,7 @@ try
   $s = $l.request($s, "enable", {name:"probe"})
   for $i = 1 to 5
     $e = $s.scenes.probe
-    $s = $l.exited($s, {pid:$e.pid, tag:{name:"probe", generation:$e.generation}, exit_code:1, signal:nil})
+    $s = process_exit($s, {pid:$e.pid, tag:{name:"probe", generation:$e.generation}, exit_code:1, signal:nil})
     if $i < 5 then $s = deadline($s, "probe", $e.generation) end
   end
   check($s.scenes.probe.status == "crash_loop", "bounded crash-loop failure")
@@ -189,10 +203,10 @@ try
   $e = $s.scenes.probe
   $s = $l.request($s, "reload", {name:"probe"})
   check($s.scenes.probe.pid == nil and $s.scenes.probe.retiring.pid == $e.pid, "replacement waits for owned exit")
-  $s = $l.exited($s, {pid:$e.pid, tag:{name:"probe", generation:$e.generation}, exit_code:0, signal:nil})
+  $s = process_exit($s, {pid:$e.pid, tag:{name:"probe", generation:$e.generation}, exit_code:0, signal:nil})
   $newpid = $s.scenes.probe.pid
   check($newpid != nil and $newpid != $e.pid, "owned exit starts replacement")
-  $s = $l.exited($s, {pid:$e.pid, tag:{name:"probe", generation:$e.generation}, exit_code:0, signal:nil})
+  $s = process_exit($s, {pid:$e.pid, tag:{name:"probe", generation:$e.generation}, exit_code:0, signal:nil})
   check($s.scenes.probe.pid == $newpid, "replacement ignores prior generation exit")
   install_fixture($s.templates, "template", false)
   $s = $l.request($s, "install", {template:"template", name:"example"})
@@ -267,6 +281,9 @@ try
   check(len(calls("shell.scene.load")) == $n, "startup waits for subscribed service snapshot before mounting")
   $fresh = $l.services($fresh, ["test-shell"], false)
   check($fresh.scenes.probe.generation > $s.scenes.probe.generation, "loader restart never reuses behaviour generation")
+  $loads = len(calls("shell.scene.load"))
+  $fresh = $l.services($fresh, ["test-shell"], false)
+  check(len(calls("shell.scene.load")) == $loads, "initial connection notice reuses startup mounts")
 
   -- #2/#3: commands apply but every panel notice is dropped. No-op selects
   -- and pins must complete from reads, including restoring another pinned page.
@@ -293,6 +310,39 @@ try
   $s = $l.request($s, "open", {name:"fast"})
   $s = $l.request($s, "close", {name:"fast"})
   check($host_state.panels.right.page == "other" and $host_state.panels.right.mode == "docked" and $s.desired.recovery.right == nil, "restore both page and different mode without notices")
+  -- Hidden page still revealed by a pointer/holder: close restores the
+  -- persistent mode and settles without fighting the independently held reveal.
+  $host_state.panels.right = {pages:["scene-fast", "other"],page:"scene-fast",mode:"hidden",visible:true}
+  $s = $l.request($s, "open", {name:"fast"})
+  $host_state.panels.right.mode = "hidden"
+  $host_state.panels.right.visible = true
+  $s = $l.request($s, "close", {name:"fast"})
+  check($s.rc == 0 and $s.desired.recovery.right == nil and $host_state.panels.right.visible, "pointer-held hidden restoration settles")
+  $s = $l.request($s, "close", {name:"fast"})
+  check($s.rc == 0 and not $s.scenes.fast.pending, "repeated close cannot wedge on pointer reveal")
+
+  for each $verb in ["shell.panel.page.set", "shell.panel.mode"]
+    $host_state.panels.right = {pages:["scene-fast", "other"],page:"other",mode:"hidden",visible:false}
+    $host_state.refuse_verb = $verb
+    $s = refused($s, "open", {name:"fast"}, "SCENES_UPSTREAM")
+    check(not $s.scenes.fast.pending and $s.open == nil and $s.desired.recovery.right.phase == "failed", "refused open settles immediately")
+    $failed_rows = filter($l.inventory($s).scenes, fn($row) = $row.name == "fast")
+    check(len($failed_rows[0].diagnostics) > 0 and $failed_rows[0].diagnostics[0].error_code == "SCENES_UPSTREAM", "failed open diagnostic is inventory state")
+    $attempts = len(calls($verb))
+    $s = $l.panel_snapshot($s)
+    check(len(calls($verb)) == $attempts, "a hint does not retry a settled refusal")
+    $host_state.refuse_verb = nil
+    $s = $l.request($s, "close", {name:"fast"})
+    check($s.rc == 0 and $s.desired.recovery.right == nil, "explicit close retries failed restore")
+  end
+  $s = $l.request($s, "open", {name:"fast"})
+  $host_state.refuse_verb = "shell.panel.mode"
+  $s = refused($s, "close", {name:"fast"}, "SCENES_UPSTREAM")
+  check(not $s.scenes.fast.pending and $s.desired.recovery.right.phase == "failed" and $s.scenes.fast.diagnostic != nil, "refused release settles failed with diagnostic")
+  $host_state.refuse_verb = nil
+  $s = $l.request($s, "close", {name:"fast"})
+  check($s.rc == 0 and $s.desired.recovery.right == nil, "explicit close recovers refused release")
+
   $host_state.nil_verb = "shell.props.get"
   $_ = refused($s, "open", {name:"fast"}, "SCENES_SNAPSHOT")
   $host_state.nil_verb = "shell.panel.page.set"
@@ -315,7 +365,7 @@ try
   -- #4/M3: a deadline can expire while Quoin is absent. Remount must restart,
   -- including when the continuation was cancelled and only its deadline remains.
   $e = $s.scenes.probe
-  $s = $l.exited($s, {pid:$e.pid,tag:{name:"probe",generation:$e.generation},exit_code:1,signal:nil})
+  $s = process_exit($s, {pid:$e.pid,tag:{name:"probe",generation:$e.generation},exit_code:1,signal:nil})
   $n = len(calls("launch"))
   $s = $l.restart($s, "probe", $e.generation)
   check(len(calls("launch")) == $n and $s.scenes.probe.restart_at > monotonic(), "restart cannot run before its computed deadline")
@@ -325,12 +375,12 @@ try
   $s = $l.services($s, ["test-shell"], false)
   check($s.scenes.probe.pid != nil and $s.scenes.probe.generation > $e.generation, "remount resumes elapsed backoff")
   $e = $s.scenes.probe
-  $s = $l.exited($s, {pid:$e.pid,tag:{name:"probe",generation:$e.generation},exit_code:1,signal:nil})
+  $s = process_exit($s, {pid:$e.pid,tag:{name:"probe",generation:$e.generation},exit_code:1,signal:nil})
   $s.scenes.probe.restart_at = 0
   $s = $l.services($s, ["test-shell"], true)
   check($s.scenes.probe.pid != nil and $s.scenes.probe.generation > $e.generation, "reconnect recovers expired backoff without restart event")
   $entry_script = read_file(dirname($0) .. "/../scenes.mix")
-  check(not contains($entry_script, "emit $ME scenes.restart_due") and contains($entry_script, "on proc.exited async"), "native exit owns in-process deadline; no Bus self-emit")
+  check(not contains($entry_script, "emit $ME scenes.restart_due") and not contains($entry_script, "on proc.exited async") and contains($entry_script, "task_start(\"scenes.restart\""), "synchronous exit bookkeeping starts a local deadline task")
 
   -- #5: pre-existing aliases (including dangling links) never receive writes.
   $recovery_dir = $s.root .. "/.recovery"
@@ -393,8 +443,13 @@ try
   $s = $l.request($s, "install", {template:"worker",name:"handover",enable:true})
   check($s.scenes.handover.pid == nil, "same-name reinstall waits for old child")
   $host_state.names = ["test-shell", "scene-handover"]
-  $s = $l.exited($s, {pid:$old.pid,tag:{name:"handover",generation:$old.generation},exit_code:0,signal:nil})
+  $s = process_exit($s, {pid:$old.pid,tag:{name:"handover",generation:$old.generation},exit_code:0,signal:nil})
   check($s.scenes.handover.pid == nil and $s.scenes.handover.status == "handover", "reaped child still waits for broker name release")
+  check($s.scenes.handover.diagnostic.error_code == "SCENES_NAME_HELD" and $s.scenes.handover.diagnostic.context.holder == "scene-handover", "foreign holder is diagnosed")
+  $s = $l.changed($s)
+  $notices = calls("publish")
+  $rows = $notices[len($notices)-1].body.scenes
+  check(len(filter($rows, fn($row) = $row.name == "handover" and ($row.diagnostic ?? {}).error_code == "SCENES_NAME_HELD")) == 1, "handover diagnostic is published in scenes.changed")
   $host_state.names = ["test-shell"]
   $s = $l.services($s, $host_state.names, false)
   check($s.scenes.handover.pid != nil and $s.scenes.handover.generation > $old.generation, "registry snapshot completes serial handover")
@@ -411,9 +466,9 @@ try
   check(deep_eq($s.scenes.handover.model, $model), "nil patch reply cannot commit cached model")
   $host_state.nil_verb = nil
   $s = $l.request($s, "remove", {name:"handover"})
-  $s = $l.exited($s, {pid:$current.pid,tag:{name:"handover",generation:$current.generation},exit_code:0,signal:nil})
+  $s = process_exit($s, {pid:$current.pid,tag:{name:"handover",generation:$current.generation},exit_code:0,signal:nil})
   check($s.scenes.handover == nil and $s.retiring.handover == nil, "exit after remove consumes tombstone without nil dereference")
-  $s = $l.exited($s, {pid:$current.pid,tag:{name:"handover",generation:$current.generation},exit_code:0,signal:nil})
+  $s = process_exit($s, {pid:$current.pid,tag:{name:"handover",generation:$current.generation},exit_code:0,signal:nil})
   $s = $l.changed($s)
   check($s.scenes.handover == nil, "duplicate removed-scene exit remains harmless and publishable")
   $refused_reload = false
@@ -435,11 +490,35 @@ try
   $host_state.nil_verb = nil
   $s = $l.request($s, "enable", {name:"probe"})
   $host_state.nil_verb = "noded.props.get"
-  $s = $l.exited($s, {pid:$old.pid,tag:{name:"probe",generation:$old.generation},exit_code:0,signal:nil})
+  $s = process_exit($s, {pid:$old.pid,tag:{name:"probe",generation:$old.generation},exit_code:0,signal:nil})
   check($s.retiring.probe == nil and $s.scenes.probe.retiring == nil and $s.scenes.probe.status == "handover", "failed registry read cannot resurrect consumed retirement")
   $host_state.nil_verb = nil
   $s = $l.services($s, ["test-shell"], false)
   check($s.scenes.probe.pid != nil, "next service snapshot retries handover after failed registry read")
+
+  -- Both retirement events are consumed before either restart task runs.
+  for each $name in ["pair-a", "pair-b"]
+    $s = $l.request($s, "install", {template:"worker",name:$name,enable:true})
+  end
+  $old_a = $s.scenes["pair-a"]
+  $old_b = $s.scenes["pair-b"]
+  for each $name in ["pair-a", "pair-b"]
+    $s = $l.request($s, "reload", {name:$name})
+  end
+  $launches = len(calls("launch"))
+  for each $old in [$old_a, $old_b]
+    $s = $l.exited($s, {pid:$old.pid,tag:{name:$old.name,generation:$old.generation},exit_code:0,signal:nil})
+  end
+  check(len(calls("launch")) == $launches and $s.retiring["pair-a"] == nil and $s.retiring["pair-b"] == nil, "exit bookkeeping never starts or yields through RPC")
+  $s = $l.restart($s, "pair-a", $s.scenes["pair-a"].generation)
+  $pid_a = $s.scenes["pair-a"].pid
+  $s = $l.restart($s, "pair-b", $s.scenes["pair-b"].generation)
+  check($pid_a != nil and $s.scenes["pair-a"].pid == $pid_a and $s.scenes["pair-b"].pid != nil, "two retiring behaviours keep both successor pids")
+  $old = $s.scenes["pair-a"]
+  $s = $l.exited($s, {pid:$old.pid,tag:{name:$old.name,generation:$old.generation},exit_code:1,signal:nil})
+  $s = $l.request($s, "disable", {name:"pair-a"})
+  $s = deadline($s, "pair-a", $old.generation)
+  check(not $s.scenes["pair-a"].enabled and $s.scenes["pair-a"].pid == nil and not contains($s.desired.enabled, "pair-a"), "disable during deadline remains disabled in memory and on disk")
 
   write_file($s.root .. "/state.conf.mix", "BROKEN")
   $s = $l.rescan($s, false)

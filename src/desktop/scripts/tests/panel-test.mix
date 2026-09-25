@@ -19,6 +19,8 @@ $confirmed = {pinned: false, visible: false}
 check($p.popup_release_confirmed($confirmed), "applied release")
 check(deep_eq($p.released_popup_pins($pins, "left", $confirmed), ["right"]), "release only our edge")
 check(deep_eq($p.released_popup_pins(["right"], "left", $confirmed), ["right"]), "idempotent recovery")
+check($p.popup_release_confirmed({mode:"hidden", pinned:false, visible:true}), "pointer reveal does not retain our pin")
+check($p.panel_action({phase:"release"}, {mode:"hidden", pinned:false, visible:true}) == "done", "pointer-held hide settles")
 
 -- The production operation selector consumes state, never notification
 -- counts. Cover first open on each edge and deletion at an immediate reply.

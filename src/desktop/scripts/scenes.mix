@@ -36,10 +36,11 @@ end
 on bus.connected
   if len(keys($event.headers)) != 0 then return end
   if $state.connection != $event.args.generation then
+    $reconnect = $state.connection != nil
     $state.connection = $event.args.generation
     $state.published = ""
     try
-      $state = refresh_services($state, true)
+      $state = refresh_services($state, $reconnect)
     catch $message, $error
       $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
     end
@@ -93,13 +94,12 @@ on "shell.scene.changed"
   $state = $loader.changed($state)
 end
 
-on proc.exited async
+on proc.exited
   if len(keys($event.headers)) != 0 then return end
-  -- The only delay is a one-shot response to an observed crash. No polling.
+  -- Bookkeeping only, under the writer lock. Never yield a state copy.
   $exit = $event.args
   try
     $exit.tag = json_parse($exit.tag)
-    $previous_pid = ($state.scenes[($exit.tag ?? {}).name] ?? {}).pid
     $state = $loader.exited($state, $exit)
   catch $message, $error
     $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
@@ -109,23 +109,35 @@ on proc.exited async
   $name = ($exit.tag ?? {}).name
   $e = $state.scenes[$name]
   $state = $loader.changed($state)
-  if $e != nil and $e.status == "backoff" and $e.generation == $exit.tag.generation and $previous_pid == $exit.pid then
-    $generation = $e.generation
-    $delay = $e.restart_at - monotonic()
-    if $delay > 0 then sleep($delay) end
-    -- Disable/reload/model handlers can run while the failure deadline waits.
-    try
-      $state = $loader.restart($state, $name, $generation)
-    catch $message, $error
-      if ($state.scenes[$name] ?? {}).generation == $generation then
-        -- A transport failure is not another behaviour crash. Preserve the
-        -- elapsed restart so a later mount/connection snapshot can retry it.
-        $state.scenes[$name].restart_at = nil
-        $state.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
-      end
-    end
-    $state = $loader.changed($state)
+  if $e != nil and $e.enabled and contains(["backoff", "handover"], $e.status) then
+    task_start("scenes.restart", json_encode({name:$name, generation:$e.generation}))
   end
+end
+
+-- One local task: the async phase only waits, then the synchronous phase
+-- reacquires the writer lock and reads current state. RPCs in that phase do
+-- not release the lock, so concurrent exits and disable cannot be overwritten.
+on scenes.restart async
+  if len(keys($event.headers)) != 0 then return end
+  $e = $state.scenes[$event.args.name]
+  if $e == nil or $e.generation != $event.args.generation then return end
+  $delay = ($e.restart_at ?? 0) - monotonic()
+  if $delay > 0 then sleep($delay) end
+end
+
+on scenes.restart
+  if len(keys($event.headers)) != 0 then return end
+  $name = $event.args.name
+  $generation = $event.args.generation
+  try
+    $state = $loader.restart($state, $name, $generation)
+  catch $message, $error
+    if ($state.scenes[$name] ?? {}).generation == $generation then
+      $state.scenes[$name].restart_at = nil
+      $state.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+  end
+  $state = $loader.changed($state)
 end
 
 -- Registration precedes enumeration/snapshots, closing startup observation gaps.
@@ -202,6 +214,8 @@ on scenes.model desc "Publish complete runtime model {name,generation,value}; re
 end
 
 
+-- Defer removing this parent watch: it observes root replacement and shares
+-- the evaluator's inotify instance, so it costs no extra fd or worker.
 $PARENT_WATCH = fs_watch(dirname($ROOT), {recursive:false, events:["created", "modified", "deleted", "moved"]})
 $WATCH = fs_watch($ROOT, {recursive:true, events:["created", "modified", "deleted", "moved"]})
 subscribe("noded.props.changed")

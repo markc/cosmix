@@ -164,7 +164,7 @@ quick-xml = { version = "0.41.0", optional = true }
 # `serde_derive`. Feature unification gives the test build both edges.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "test-util", "net", "io-util"] }
 cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml", "yaml", "ws"] }
 # Property-based testing for the lexer/parser (P1 of the mix tokenizer
 # fuzz/property corpus — _doc/planned/mix-tokenizer-fuzz-corpus.md in the cosmix

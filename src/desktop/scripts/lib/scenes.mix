@@ -116,9 +116,17 @@ fn inventory($s)
   $rows = []
   for each $name in sort(keys($s.scenes))
     $e = $s.scenes[$name]
+    $diagnostic = $e.diagnostic
+    $diagnostics = $e.diagnostics
+    for each $r in values($s.desired.recovery)
+      if $r.name == $name and $r.phase == "failed" and $r.diagnostic != nil then
+        $diagnostic = $diagnostic ?? $r.diagnostic
+        push($diagnostics, $r.diagnostic)
+      end
+    end
     push($rows, {name:$name, installed:$e.installed, enabled:$e.enabled, mounted:$e.mounted,
       revision:$e.revision, generation:$e.generation, behaviour:$e.status, ready:$e.ready,
-      template:$s.desired.origins[$name], diagnostic:$e.diagnostic, diagnostics:$e.diagnostics, exit:$e.exit,
+      template:$s.desired.origins[$name], diagnostic:$diagnostic, diagnostics:$diagnostics, exit:$e.exit,
       attempted_digest:$e.attempted, accepted_digest:$e.digest,
       journal:"journalctl -u cosmix-desk-scenes.service", open:$s.open == $name, pending:$e.pending})
   end
@@ -227,6 +235,7 @@ fn start($s, $name)
     if type($names) != "list" then fail("SCENES_SNAPSHOT", "missing behaviour registration snapshot", {}) end
     if contains($names, "scene-" .. $name) then
       $s.scenes[$name].status = "handover"
+      $s.scenes[$name].diagnostic = {error_code:"SCENES_NAME_HELD", message:"waiting for behaviour service name release", context:{holder:"scene-" .. $name}}
       return $s
     end
     -- A prior spawn may have failed after persisting its allocation. Never
@@ -246,6 +255,7 @@ fn start($s, $name)
     $e.revision = $r.revision
     $e.pid = $s.io.launch($path, $name, $e.generation, $s.host, $s.me)
     $e.status = "starting"
+    $e.diagnostic = nil
     $e.started = monotonic()
   end
   $e.restart_at = nil
@@ -419,13 +429,8 @@ fn exited($s, $event)
     $s.retiring = delete($s.retiring, $name)
     if $e == nil then return $s end
     $s.scenes[$name].retiring = nil
-    $s.scenes[$name].status = "handover"
-    try
-      return start($s, $name)
-    catch $message, $error
-      $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
-      return $s
-    end
+    if $e.enabled then $s.scenes[$name].status = "handover" end
+    return $s
   end
   if $e == nil or $e.generation != $event.tag.generation or $e.pid != $event.pid then return $s end
   $e.pid = nil
@@ -442,7 +447,7 @@ end
 
 fn restart($s, $name, $generation)
   $e = $s.scenes[$name]
-  if $e == nil or not $e.enabled or $e.generation != $generation or $e.status != "backoff" then return $s end
+  if $e == nil or not $e.enabled or $e.generation != $generation or not contains(["backoff", "handover"], $e.status) then return $s end
   if $e.restart_at != nil and monotonic() < $e.restart_at then return $s end
   -- An elapsed deadline remains eligible while the host is absent. Remount
   -- reconciliation calls start again; no notification has to re-arm it.
@@ -530,10 +535,40 @@ fn known($s, $name)
 end
 
 fn drive_popups($s)
+  try
+    return drive_popups_inner($s)
+  catch $message, $error
+    -- Commands may have applied before a later refusal. Recover the durable
+    -- record, settle this attempt, and retain it for an explicit user retry.
+    $s.state_digest = ""
+    $s = read_state($s)
+    $diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    for each $edge in keys($s.desired.recovery)
+      $name = $s.desired.recovery[$edge].name
+      $s.desired.recovery[$edge].phase = "failed"
+      $s.desired.recovery[$edge].diagnostic = $diagnostic
+      if $s.scenes[$name] != nil then
+        $s.scenes[$name].pending = false
+        $s.scenes[$name].diagnostic = $diagnostic
+      end
+    end
+    if $s.open != nil and $s.scenes[$s.open] != nil then
+      $s.scenes[$s.open].pending = false
+      $s.scenes[$s.open].diagnostic = $diagnostic
+    end
+    $s.open = nil
+    $s.rc = 10
+    $s.response = $diagnostic
+    return persist($s)
+  end
+end
+
+fn drive_popups_inner($s)
   -- Recovery records survive loader/host restarts. Restore saved state only
   -- while the edge still selects our page; never hide another owner's page.
   for each $edge in keys($s.desired.recovery)
     $r = $s.desired.recovery[$edge]
+    if $r.phase == "failed" then continue end
     if $s.open == $r.name then continue end
     $p = $s.panels[$edge]
     if $p == nil then continue end
@@ -559,7 +594,9 @@ fn drive_popups($s)
       $s = panel_command($s, $edge, "shell.panel.mode", {edge:$edge, mode:$r.mode})
       $p = $s.panels[$edge]
     end
-    if $p.page == $previous and $p.mode == $r.mode and ($r.mode != "hidden" or not $p.visible) then
+    -- Restoration owns selection and persistent mode, not pointer/holder
+    -- reveal. Matching hidden mode is complete even while visibly revealed.
+    if $p.page == $previous and $p.mode == $r.mode then
       $s.desired.recovery = delete($s.desired.recovery, $edge)
       $s = persist($s)
     end
@@ -569,7 +606,7 @@ fn drive_popups($s)
   if $e == nil or not $e.enabled or not $e.mounted or not $e.ready then return $s end
   -- Other popup release is an applied-state prerequisite for the next open.
   for each $edge in keys($s.desired.recovery)
-    if $s.desired.recovery[$edge].name != $s.open then return $s end
+    if $s.desired.recovery[$edge].name != $s.open and $s.desired.recovery[$edge].phase != "failed" then return $s end
   end
   $p = $s.panels[$e.edge]
   if $p == nil or not contains($p.pages, $e.page) then return $s end
@@ -596,7 +633,7 @@ end
 fn panel_command($s, $edge, $verb, $args)
   $r = $s.io.rpc($s.host, $verb, $args)
   if type($r) != "map" then fail("SCENES_SNAPSHOT", "missing panel command receipt", {verb:$verb}) end
-  if $r.accepted == false then fail("SCENES_UPSTREAM", "panel command refused", {verb:$verb, upstream:$r}) end
+  if $r.accepted == false or $r.applied == false then fail("SCENES_UPSTREAM", "panel command refused", {verb:$verb, upstream:$r}) end
   $p = $s.io.rpc($s.host, "shell.panel.state", {edge:$edge})
   if type($p) != "map" or type($p.pages) != "list" then fail("SCENES_SNAPSHOT", "missing applied panel state", {edge:$edge}) end
   $s.panels[$edge] = $p
@@ -672,6 +709,7 @@ fn services($s, $names, $reconnect)
     end
     $s = rescan($s, false)
     for each $edge in keys($s.desired.recovery)
+      if $s.desired.recovery[$edge].phase == "failed" then continue end
       $s.desired.recovery[$edge].phase = $s.desired.recovery[$edge].name == $s.open ? "select" : "recover"
     end
     $s = panel_snapshot($s)
@@ -821,6 +859,11 @@ fn request($s, $verb, $args)
       $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
       if type(($snapshot ?? {}).panels) != "map" then fail("SCENES_SNAPSHOT", "missing panel snapshot", {}) end
       $s.panels = $snapshot.panels
+      -- Only an explicit command retries a settled failed popup attempt.
+      for each $edge in keys($s.desired.recovery)
+        if $s.desired.recovery[$edge].phase == "failed" then $s.desired.recovery[$edge].phase = "recover" end
+      end
+      $s.scenes[$name].diagnostic = nil
       if $opening then
         $s.open = $name
         $s.scenes[$name].pending = true
@@ -829,6 +872,7 @@ fn request($s, $verb, $args)
         $s.scenes[$name].pending = false
       end
       $s = drive_popups($s)
+      if $s.rc != 0 then return $s end
       $s.response = {name:$name, open:$s.open == $name, pending:$s.scenes[$name].pending}
     else
       fail("SCENES_VERB", "unknown scenes verb", {verb:$verb})

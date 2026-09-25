@@ -312,6 +312,14 @@ pub fn reconcile(world: &mut World) {
                     continue;
                 }
             }
+            // A new revision/remount clears render_error. If the previous
+            // failure lost ECS entities, rebuild instead of diffing dead IDs.
+            if entry.rebuild_mount {
+                if let Some(broken) = entry.mounted.take() {
+                    destroy(world, broken);
+                }
+                entry.rebuild_mount = false;
+            }
             let mounted = entry.mounted.get_or_insert_with(|| Mounted {
                 revision: 0,
                 tree: ResolvedScene {
@@ -352,6 +360,7 @@ pub fn reconcile(world: &mut World) {
                                 format!("{}.scene.changed", bridge.service_name()), false, wire);
                         }
                         entry.render_error = Some(error);
+                        entry.rebuild_mount = true;
                         continue;
                     }
                 }
@@ -458,6 +467,12 @@ fn destroy(world: &mut World, mounted: Mounted) {
     cosmix_shell::chrome::unmount_page(world, mounted.edge, &id);
     if world.get_entity(mounted.page).is_ok() {
         world.despawn(mounted.page);
+    }
+    // A missing/detached page may have left some content entities alive.
+    for view in mounted.nodes.values() {
+        if world.get_entity(view.root).is_ok() {
+            world.despawn(view.root);
+        }
     }
 }
 /// The sub-panel address a scene mounts under.

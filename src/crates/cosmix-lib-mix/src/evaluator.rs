@@ -2824,6 +2824,7 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "pop",
     "shift",
     "sleep",
+    "task_start",
     "readline",
     "read_stdin",
     "read_stdin_bytes",
@@ -2957,6 +2958,7 @@ pub const MAX_EXPR_DEPTH: usize = 256;
 /// host input whenever the host passes `policy: None` — a legal call
 /// shape — so the static deny is what makes the premise unconditional.
 pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
+    "task_start",
     "fs_wait",
     "sleep",     // Pure-classed, pends on the tokio timer
     "readline",  // Env-classed but blocking on host input
@@ -11016,6 +11018,28 @@ impl Evaluator {
                         }
                     }
 
+                    if name == "task_start" {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        let [Value::String(command), Value::String(body)] = eval_args.as_slice() else {
+                            return Err(crate::native_events::refusal("TASK_ARGUMENT", "task_start expects command and body strings"));
+                        };
+                        // Only Class C chains can be started from inside a
+                        // dispatch: a synchronous chain would reacquire the
+                        // writer lock held by its caller. Plain entries in a
+                        // mixed chain still run with their own writer permit.
+                        let asynchronous = self.globals.borrow().handlers.get(command)
+                            .is_some_and(|entries| entries.iter().any(|entry| entry.is_async));
+                        if !asynchronous {
+                            return Err(crate::native_events::refusal("TASK_HANDLER", "task_start requires a registered async handler"));
+                        }
+                        self.dispatch_event(IncomingEvent {
+                            command: command.clone(),
+                            headers: BTreeMap::new(),
+                            body: body.clone(),
+                        }).await?;
+                        return Ok(Value::Nil);
+                    }
                     if matches!(name.as_str(), "fs_watch" | "fs_unwatch" | "fs_wait") {
                         self.check_capability(name)?;
                         self.check_builtin_arity(name, eval_args.len())?;
@@ -16271,5 +16295,89 @@ mod event_args_tests {
             }
             other => panic!("expected Map, got {other:?}"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "tokio-sleep", feature = "json"))]
+mod local_task_tests {
+    use super::*;
+
+    fn run(test: impl std::future::Future<Output = ()>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time().build().unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, test);
+    }
+
+    async fn settle(eval: &Evaluator) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while eval.class_c_task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("local tasks complete without a broker");
+    }
+
+    #[test]
+    fn local_tasks_serialize_restart_commits_and_read_state_after_wait() {
+        run(async {
+            let mut eval = Evaluator::new();
+            // No BusHandler: all scheduling and deadlines must stay local.
+            eval.execute_script_source(r#"
+                $state = {a:{enabled:true,pid:nil}, b:{enabled:true,pid:nil}}
+                on restart async
+                  sleep(0.01)
+                end
+                on restart
+                  $name = $event.args.name
+                  if not $state[$name].enabled then return end
+                  $copy = $state
+                  -- Stand in for start's host RPC while holding the writer.
+                  sleep(0.01)
+                  $copy[$name].pid = $event.args.pid
+                  $state = $copy
+                end
+                on disable
+                  $state.a.enabled = false
+                end
+                on retire
+                  task_start("restart", "{\"name\":\"a\",\"pid\":101}")
+                  task_start("restart", "{\"name\":\"b\",\"pid\":102}")
+                end
+            "#).await.unwrap();
+            let event = |command: &str| IncomingEvent {
+                command: command.into(), headers: BTreeMap::new(), body: "{}".into(),
+            };
+            eval.dispatch_event(event("retire")).await.unwrap();
+            settle(&eval).await;
+            eval.execute_script_source(r#"
+                if $state.a.pid != 101 or $state.b.pid != 102 then
+                  raise("TEST", "lost a concurrent retirement")
+                end
+                $state.a.pid = nil
+                task_start("restart", "{\"name\":\"a\",\"pid\":103}")
+            "#).await.unwrap();
+            tokio::task::yield_now().await;
+            eval.dispatch_event(event("disable")).await.unwrap();
+            settle(&eval).await;
+            eval.execute_script_source(r#"
+                if $state.a.enabled or $state.a.pid != nil or $state.b.pid != 102 then
+                  raise("TEST", "restart overwrote disable or sibling")
+                end
+            "#).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn local_task_requires_async_handler_and_is_shutdown_visible() {
+        run(async {
+            let mut eval = Evaluator::new();
+            eval.execute_script_source("on plain\nend\non clock async\n sleep(3600)\nend").await.unwrap();
+            for source in ["task_start(\"plain\", \"{}\")", "task_start(\"absent\", \"{}\")", "task_start(1, \"{}\")"] {
+                assert!(eval.execute_script_source(source).await.is_err(), "{source}");
+            }
+            eval.execute_script_source("task_start(\"clock\", \"{}\")").await.unwrap();
+            assert_eq!(eval.class_c_task_count(), 1);
+            eval.drain_class_c_for_shutdown(std::time::Duration::ZERO, false).await;
+            assert_eq!(eval.class_c_task_count(), 0);
+        });
     }
 }

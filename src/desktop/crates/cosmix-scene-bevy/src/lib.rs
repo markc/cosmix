@@ -42,6 +42,7 @@ pub(crate) struct SceneEntry {
     revision: u64,
     prepared: render::PreparedLists,
     render_error: Option<Value>,
+    rebuild_mount: bool,
     pub mounted: Option<render::Mounted>,
     owner: Option<SceneOwner>,
     // Set by a loader's JSON load envelope; zero fences a stopped behaviour.
@@ -453,6 +454,7 @@ impl SceneStore {
             json!({"scene":tree.name,"revision":revision,"ops":ops,"diagnostics":diagnostics});
         let old = self.scenes.remove(&tree.name);
         let model_generation = old.as_ref().and_then(|old| old.model_generation);
+        let rebuild_mount = old.as_ref().is_some_and(|old| old.rebuild_mount);
         let mounted = old.and_then(|old| old.mounted);
         self.scenes.insert(
             tree.name.clone(),
@@ -463,6 +465,7 @@ impl SceneStore {
                 revision,
                 prepared,
                 render_error: None,
+                rebuild_mount,
                 mounted,
                 owner,
                 model_generation,

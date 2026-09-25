@@ -235,6 +235,37 @@ fn renderer_failure_retains_applied_revision_and_readable_diagnostics() {
     );
     assert_eq!(rows[0]["applied_revision"], revision);
     assert_eq!(rows[0]["diagnostics"], watch["diagnostics"]);
+
+    // A later accepted patch clears the error and recreates missing entities.
+    store.request(SceneVerb::Patch, "", &json!({
+        "scene":"repeated", "path":"model.prefix", "value":"retry "
+    })).unwrap();
+    drop(store);
+    reconcile(&mut world);
+    let entry = &world.resource::<SceneStore>().scenes["repeated"];
+    let mounted = entry.mounted.as_ref().unwrap();
+    assert_ne!(mounted.page, page);
+    assert_eq!(mounted.revision, revision + 2);
+    assert!(entry.render_error.is_none());
+    assert!(world.get_entity(mounted.page).is_ok());
+    assert!(mounted.nodes.values().all(|view| world.get_entity(view.root).is_ok()));
+
+    // The same recovery must work for a missing content root and a full load.
+    let root = mounted.nodes["root"].root;
+    world.despawn(root);
+    world.resource_mut::<SceneStore>().request(SceneVerb::Patch, "", &json!({
+        "scene":"repeated", "path":"model.prefix", "value":"lost root "
+    })).unwrap();
+    reconcile(&mut world);
+    assert!(world.resource::<SceneStore>().scenes["repeated"].render_error.is_some());
+    world.resource_mut::<SceneStore>()
+        .request(SceneVerb::Load, &sample_source("horizontal"), &Value::Null).unwrap();
+    reconcile(&mut world);
+    let entry = &world.resource::<SceneStore>().scenes["repeated"];
+    assert!(entry.render_error.is_none());
+    assert_eq!(entry.mounted.as_ref().unwrap().revision, revision + 4);
+    assert!(entry.mounted.as_ref().unwrap().nodes.values()
+        .all(|view| world.get_entity(view.root).is_ok()));
 }
 
 fn mounted(world: &mut World, tree: &ResolvedScene) -> Mounted {

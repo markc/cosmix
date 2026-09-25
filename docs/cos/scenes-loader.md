@@ -110,7 +110,10 @@ invalidation precedes stop; replacement waits for the retiring child's exit.
 The retiring record survives removal and reinstallation of the same name.
 Before spawning, the loader also reads the broker registry and waits for any
 old `scene-<name>` registration to disappear. Service snapshots resume that
-handover. Each name in a filesystem batch or rescan has its own error boundary,
+handover. A held `scene-<name>` registration reports `SCENES_NAME_HELD` with
+the holder name in `scenes.list` and `scenes.changed`; it waits for the
+name-release event without a timeout loop.
+Each name in a filesystem batch or rescan has its own error boundary,
 so one refused unload does not discard the rest of the batch.
 
 Loader `RELOAD` is refused during candidate initialisation, before filesystem
@@ -126,7 +129,11 @@ Four failure-triggered restart deadlines are 1, 2, 4 and 8 seconds; the fifth
 consecutive exit enters `crash_loop`. Running at least 60 seconds resets the
 count at the next exit, without a health timer. Explicit reload retries the
 failed scene. Disable during a deadline invalidates its generation. Deadlines
-use an in-process async wait in the native exit handler, never a Bus self-emit.
+use a separate in-process `task_start` task, never a Bus self-emit. The native
+exit handler performs synchronous bookkeeping only. The task's async phase
+waits without carrying writable state; its synchronous phase re-reads current
+state under the writer lock and performs the fenced restart. Concurrent exits
+retain both successors, and disable during the wait stays disabled.
 An elapsed deadline stays eligible when Quoin is absent and resumes on remount;
 reconnect reconciliation also checks the computed deadline directly.
 
@@ -153,9 +160,30 @@ satisfied phases complete immediately. `shell.panel.changed` is a hint to read
 state, and every subscribed topic's gap causes a full resynchronisation.
 Recovery requires both the saved page and mode to be restored before its
 record is removed, including when both pages were already pinned.
+Hidden mode can remain visible because the pointer or a holder reveals it;
+matching page and mode completes restoration without cancelling that reveal.
+Quoin replies `applied:true` with the actual `visible:true` snapshot in this
+case. Refused popup commands settle with `pending:false` and a diagnostic in
+`scenes.list`; failed recovery records wait for an explicit open/close retry,
+not another hint. The legacy panel logs refusals and clears the pending attempt,
+retaining its pin recovery record for a later explicit retry or resynchronisation.
 Recovery is persisted before pinning. If another page takes the edge, recovery
 does not hide it. The legacy panel remains in use in Stage A but consumes the
 same applied-state stream; its network/audio conversion belongs to Stage C.
+Its minute clock and the calendar template use local async deadline tasks;
+`bus.connected` starts a clock only when it is not running. Gaps received
+during a resynchronisation coalesce into one further pass.
+
+Render failures retain readable diagnostics and the last applied revision.
+A subsequent accepted revision or remount recreates missing renderer entities.
+The initial connection notice reuses the startup snapshot without remounting.
+
+Deferred: `.recovery` retention remains manual until the editor offers a
+reviewable prune policy; automatic deletion could destroy the only saved edit.
+Deferred: the parent filesystem watch is retained for root replacement and
+shares the evaluator's inotify fd and worker.
+Deferred: per-expression `Instant::now()` budget checks remain until measured
+optimisation preserves the deadline guarantee for always-ready expressions.
 
 ## Gates and installer follow-up
 
