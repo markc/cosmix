@@ -6,7 +6,7 @@ use super::{
 use crate::config::{Config, Cursor};
 use fontdb::Database;
 use std::{path::Path, process::Command};
-use swash::{FontDataRef, FontRef, string::StringId};
+use swash::{FontDataRef, FontRef, StringId};
 
 fn loaded_family(font: FontRef<'_>) -> String {
     let strings = font.localized_strings();
