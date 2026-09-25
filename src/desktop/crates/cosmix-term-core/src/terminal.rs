@@ -1105,7 +1105,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let result = validate_cwd(path.to_str().unwrap());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir(&path).unwrap();
