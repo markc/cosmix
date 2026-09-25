@@ -216,6 +216,8 @@ impl TabSet {
             });
             if tab.title != title {
                 tab.title = title;
+                self.revision += 1;
+                tab.revision = self.revision;
                 changed.push((tab.id, tab.active_pane));
             }
         }
@@ -231,6 +233,7 @@ impl TabSet {
             .iter_mut()
             .find(|tab| tab.id == id)
             .ok_or_else(|| format!("not-found: tab id={id}"))?;
+        let title = crate::terminal::sanitise_title(&title);
         tab.user_title = (!title.is_empty()).then_some(title);
         self.refresh_titles();
         Ok(())
@@ -756,6 +759,12 @@ impl TabSet {
                 self.active_tab().active_pane,
                 "selected",
             );
+            self.changed(
+                "pane.changed",
+                self.active_id(),
+                self.active_tab().active_pane,
+                "selected",
+            );
         }
         self.notify();
         (Outcome::Remaining(self.tabs.len()), removed)
@@ -768,6 +777,7 @@ impl TabSet {
         if self.active != index {
             self.invalidate_control_focus();
             self.changed("tabs.changed", id, self.tabs[index].active_pane, "selected");
+            self.changed("pane.changed", id, self.tabs[index].active_pane, "selected");
         }
         self.active = index;
         self.invalidate_control_focus();
@@ -848,6 +858,12 @@ impl TabSet {
         if self.active != previous {
             self.changed(
                 "tabs.changed",
+                self.active_id(),
+                self.active_tab().active_pane,
+                "selected",
+            );
+            self.changed(
+                "pane.changed",
                 self.active_id(),
                 self.active_tab().active_pane,
                 "selected",

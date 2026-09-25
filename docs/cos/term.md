@@ -20,8 +20,8 @@ pane's border takes the design's focus-ring colour. Every other border,
 including a tab's only pane, takes the plain border colour.
 All strip and border colours come from the `cosmix-design` tokens.
 
-Every tab is labelled `mix` for now, since the core does not yet take a title
-from the shell. The strip does not scroll or wrap. At the default window width, past about 17 tabs the `+`
+Each tab shows its focused pane's program-set OSC title, falling back to `mix`.
+A user-pinned title overrides OSC updates until cleared. The strip does not scroll or wrap. At the default window width, past about 17 tabs the `+`
 and the later tabs run off the right edge, although up to 32 terminals can be
 open. Ctrl+PageUp and Ctrl+PageDown still reach every tab.
 
@@ -102,7 +102,7 @@ is a JSON object, and `{}` means no arguments.
 | Verb | Body | Effect |
 |---|---|---|
 | `term.tabs` | `{}` | list tabs: id, active, title, cols, rows, child pid, revision |
-| `term.tab.new` | `{"cwd":"/absolute/directory","title":"build"}` (both optional) | open and select a tab; explicit cwd must exist and never falls back; title pins the tab label |
+| `term.tab.new` | `{"cwd":"/absolute/directory","title":"build"}` (both optional) | open and select a tab; explicit cwd must exist, be searchable by the current user and never falls back; title pins the tab label |
 | `term.tab.title` | `{"id":N,"title":"build"}` | pin a label; empty string clears the pin and restores the focused pane's program-set OSC title (default `mix`) |
 | `term.tab.move` | `{"id":N,"index":0}` | reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane |
 | `term.tab.select` | `{"id":N}` | select tab N |
@@ -113,7 +113,7 @@ is a JSON object, and `{}` means no arguments.
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |
 | `term.snapshot` | `{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}` (all optional) | read a pane anywhere; default is the focused pane in the selected/active tab; `contents` defaults true; history defaults 0, accepts 0–10000, capped at history above the current viewport |
 | `term.type` | `{"pane":N,"text":"..."}` (`pane` optional) | type ASCII as keys into that pane, default focused pane; does not change focus |
-| `term.props.watch` | `{}` | enable caller-free topic publishing; return JSON `{topics,revision}`; callers subscribe to the returned topics through noded |
+| `term.props.watch` | `{}` | subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON `{topics,revision}`), then read state |
 
 ```mix
 send term term.tab.new
@@ -136,7 +136,23 @@ returns the usual metadata and diagnostic timings without the screen marker
 or text. Scrollback is prepended after the screen marker, oldest first;
 `rows` still describes the viewport. Reading never moves the scroll offset.
 Snapshot text represents empty grid cells as spaces, preserving column positions
-and trailing blank cells in both history and viewport rows.
+and trailing blank cells in both history and viewport rows. Text is limited to
+512 KiB of encoded bytes (including allowance for JSON escaping), leaving
+metadata and transport headroom below the MCP 1 MiB and Bus 8 MiB limits.
+Only complete rows are returned, oldest first; the header reports
+`truncated=true` when the byte budget omits rows and `lines_returned=N`
+counts history and viewport rows actually returned. A row larger than the
+budget returns no text rows. With `contents:false`, the count is zero and
+`truncated=false`. Capture copies bounded rows under the grid lock; text
+formatting runs after releasing the grid, terminal and tab-set locks.
+
+Pinned and OSC titles have control characters and Unicode line/paragraph
+separators stripped and are capped at 256 UTF-8 bytes on a character boundary.
+An empty sanitised pin clears it. Titles may contain spaces; tab-list readers
+should delimit the title at the final ` cols=` field, rather than tokenising
+it on whitespace. Effective title changes bump the tab-set revision.
+Completion notifications use the same sanitised, possibly program-set label.
+Explicit cwd paths follow symlinks and resolve `..` normally.
 
 Existing replies keep their key=value format. New title replies are
 `retitled id=N tab=N pane=P revision=R`; move replies are
@@ -162,10 +178,16 @@ older layout revision in verb replies. Publishing uses a bounded 256-record
 queue and a serial, best-effort Bus sender. Subscribe before enabling watch,
 then read current state; on a revision gap or reconnect read state again.
 The watch response gives the current event revision. Events are not retained
-by noded; publication failures are logged and do not block terminal input.
+by noded; publication failures are logged at most once per 30 seconds and
+do not block terminal input. A dropped final event may remain undetectable
+until a later revision arrives; read state whenever freshness is required.
 
 `term.panes` reports each pane's geometry in logical pixels, relative to the
-pane area below the tab strip, as bterm does.
+pane area below the tab strip, as bterm does. Geometry is from the last
+frontend layout: hidden tabs can report stale values after a window resize,
+or zeros after geometry invalidation. Select the tab and allow a frontend
+layout before relying on its geometry. Grid dimensions describe the current
+PTY grid and do not promise an up-to-date window layout.
 
 With no broker, term prints that the Bus is unavailable and works as a
 plain terminal.
