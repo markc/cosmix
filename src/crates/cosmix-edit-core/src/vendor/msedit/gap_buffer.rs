@@ -1,22 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-edit-core from microsoft/edit@826b4c0 crates/edit/src/buffer/gap_buffer.rs; see vendor/msedit/README.md.
+// Patched (ced E0 plan §2.2(3)): memory commit is fallible and all-or-nothing.
+// Upstream deleted text before a silently-failing enlargement; here
+// `allocate_gap` commits first and returns `Err` with the buffer untouched,
+// `ensure_commit` lets a caller commit a whole transaction's peak up front,
+// and `commit_calls` counts `virtual_commit` calls so phase 2 of a
+// transaction can assert it made none.
 
 use std::ops::Range;
 use std::ptr::{self, NonNull};
 use std::{io, slice};
 
-use stdext::sys::{virtual_commit, virtual_release, virtual_reserve};
-use stdext::{ReplaceRange as _, slice_copy_safe};
-
-use crate::document::{ReadableDocument, WriteableDocument};
-use crate::helpers::*;
+use super::document::{ReadableDocument, WriteableDocument};
+use super::helpers::*;
+use super::stdext::helpers::{ReplaceRange as _, slice_copy_safe};
+use super::stdext::sys_unix::{virtual_commit, virtual_release, virtual_reserve};
 
 #[cfg(target_pointer_width = "32")]
 const LARGE_CAPACITY: usize = 128 * MEBI;
 #[cfg(target_pointer_width = "64")]
 const LARGE_CAPACITY: usize = 4 * GIBI;
-const LARGE_ALLOC_CHUNK: usize = 64 * KIBI;
-const LARGE_GAP_CHUNK: usize = 4 * KIBI;
+pub const LARGE_ALLOC_CHUNK: usize = 64 * KIBI;
+pub const LARGE_GAP_CHUNK: usize = 4 * KIBI;
 
 const SMALL_CAPACITY: usize = 128 * KIBI;
 const SMALL_ALLOC_CHUNK: usize = 256;
@@ -39,6 +45,22 @@ impl Drop for BackingBuffer {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only failure injection: while set, every commit attempt fails.
+    static FAIL_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: make every subsequent memory commit on this thread fail.
+#[cfg(test)]
+pub fn inject_commit_failure(fail: bool) {
+    FAIL_COMMIT.with(|f| f.set(fail));
+}
+
+fn out_of_reserve() -> io::Error {
+    io::Error::new(io::ErrorKind::OutOfMemory, "gap buffer reserve exhausted")
+}
+
 /// Most people know how `Vec<T>` works: It has some spare capacity at the end,
 /// so that pushing into it doesn't reallocate every single time. A gap buffer
 /// is the same thing, but the spare capacity can be anywhere in the buffer.
@@ -58,6 +80,8 @@ pub struct GapBuffer {
     gap_len: usize,
     /// Increments every time the buffer is modified.
     generation: u32,
+    /// Number of successful or attempted memory commits (cosmix addition).
+    commit_calls: u64,
     /// If `Vec(..)`, the buffer is optimized for small amounts of text
     /// and uses the standard heap. Otherwise, it uses virtual memory.
     buffer: BackingBuffer,
@@ -87,6 +111,7 @@ impl GapBuffer {
             gap_off: 0,
             gap_len: 0,
             generation: 0,
+            commit_calls: 0,
             buffer,
         })
     }
@@ -104,11 +129,94 @@ impl GapBuffer {
         self.generation = generation;
     }
 
-    /// WARNING: The returned slice must not necessarily be the same length as `len` (due to OOM).
-    pub fn allocate_gap(&mut self, off: usize, len: usize, delete: usize) -> &mut [u8] {
+    /// Bytes of backing memory currently committed (text + gap).
+    pub fn committed(&self) -> usize {
+        self.commit
+    }
+
+    /// Number of memory-commit attempts made so far.
+    pub fn commit_calls(&self) -> u64 {
+        self.commit_calls
+    }
+
+    fn chunks(&self) -> (usize, usize) {
+        if matches!(self.buffer, BackingBuffer::VirtualMemory(..)) {
+            (LARGE_GAP_CHUNK, LARGE_ALLOC_CHUNK)
+        } else {
+            (SMALL_GAP_CHUNK, SMALL_ALLOC_CHUNK)
+        }
+    }
+
+    /// The committed size a gap of at least `len` bytes needs when the text is
+    /// `text_length` bytes long — exactly what `enlarge_gap` would require.
+    pub fn commit_needed(text_length: usize, len: usize) -> Option<usize> {
+        let gap_len_new = len.checked_add(2 * LARGE_GAP_CHUNK - 1)? & !(LARGE_GAP_CHUNK - 1);
+        let bytes = text_length.checked_add(gap_len_new)?;
+        Some(bytes.checked_add(LARGE_ALLOC_CHUNK - 1)? & !(LARGE_ALLOC_CHUNK - 1))
+    }
+
+    /// Commits backing memory up to `required_commit` bytes (never releases).
+    /// Leaves the text untouched; on error nothing has changed.
+    pub fn ensure_commit(&mut self, required_commit: usize) -> io::Result<()> {
+        if required_commit <= self.commit {
+            return Ok(());
+        }
+        let (_, alloc_chunk) = self.chunks();
+        let bytes_new = required_commit
+            .checked_add(alloc_chunk - 1)
+            .ok_or_else(out_of_reserve)?
+            & !(alloc_chunk - 1);
+        if bytes_new > self.reserve {
+            return Err(out_of_reserve());
+        }
+        self.commit_to(bytes_new)
+    }
+
+    fn commit_to(&mut self, bytes_new: usize) -> io::Result<()> {
+        let bytes_old = self.commit;
+        self.commit_calls += 1;
+        #[cfg(test)]
+        if FAIL_COMMIT.with(|f| f.get()) {
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "injected commit failure"));
+        }
+        match &mut self.buffer {
+            BackingBuffer::VirtualMemory(ptr, _) => unsafe {
+                virtual_commit(ptr.add(bytes_old), bytes_new - bytes_old)?;
+            },
+            BackingBuffer::Vec(v) => {
+                v.try_reserve_exact(bytes_new.saturating_sub(v.len()))
+                    .map_err(|_| out_of_reserve())?;
+                v.resize(bytes_new, 0);
+                self.text = unsafe { NonNull::new_unchecked(v.as_mut_ptr()) };
+            }
+        }
+        self.commit = bytes_new;
+        Ok(())
+    }
+
+    /// Opens a gap of at least `len` bytes at `off`, deleting `delete` bytes
+    /// after it. All-or-nothing: any memory the gap needs is committed BEFORE
+    /// the gap moves or text is deleted, so an `Err` leaves the buffer exactly
+    /// as it was (cosmix patch; upstream returned a short slice after deleting).
+    pub fn allocate_gap(&mut self, off: usize, len: usize, delete: usize) -> io::Result<&mut [u8]> {
         // Sanitize parameters
         let off = off.min(self.text_length);
         let delete = delete.min(self.text_length - off);
+
+        // Commit first, while nothing has been touched.
+        let gap_after_delete = self.gap_len + delete;
+        if len > gap_after_delete {
+            let (gap_chunk, alloc_chunk) = self.chunks();
+            let gap_len_new = (len + gap_chunk + gap_chunk - 1) & !(gap_chunk - 1);
+            let bytes_new = self.text_length - delete + gap_len_new;
+            if bytes_new > self.commit {
+                let bytes_new = (bytes_new + alloc_chunk - 1) & !(alloc_chunk - 1);
+                if bytes_new > self.reserve {
+                    return Err(out_of_reserve());
+                }
+                self.commit_to(bytes_new)?;
+            }
+        }
 
         // Move the existing gap if it exists
         if off != self.gap_off {
@@ -120,13 +228,13 @@ impl GapBuffer {
             self.delete_text(delete);
         }
 
-        // Enlarge the gap if needed
+        // Enlarge the gap if needed (memory is already committed).
         if len > self.gap_len {
             self.enlarge_gap(len);
         }
 
         self.generation = self.generation.wrapping_add(1);
-        unsafe { slice::from_raw_parts_mut(self.text.add(self.gap_off).as_ptr(), self.gap_len) }
+        Ok(unsafe { slice::from_raw_parts_mut(self.text.add(self.gap_off).as_ptr(), self.gap_len) })
     }
 
     fn move_gap(&mut self, off: usize) {
@@ -170,40 +278,14 @@ impl GapBuffer {
         self.text_length -= delete;
     }
 
+    /// Grows the gap to at least `len` bytes. The caller (`allocate_gap`) has
+    /// already committed the memory this needs, so this only moves bytes.
     fn enlarge_gap(&mut self, len: usize) {
-        let (gap_chunk, alloc_chunk) = if matches!(self.buffer, BackingBuffer::VirtualMemory(..)) {
-            (LARGE_GAP_CHUNK, LARGE_ALLOC_CHUNK)
-        } else {
-            (SMALL_GAP_CHUNK, SMALL_ALLOC_CHUNK)
-        };
+        let (gap_chunk, _) = self.chunks();
 
         let gap_len_old = self.gap_len;
         let gap_len_new = (len + gap_chunk + gap_chunk - 1) & !(gap_chunk - 1);
-
-        let bytes_old = self.commit;
-        let bytes_new = self.text_length + gap_len_new;
-
-        if bytes_new > bytes_old {
-            let bytes_new = (bytes_new + alloc_chunk - 1) & !(alloc_chunk - 1);
-
-            if bytes_new > self.reserve {
-                return;
-            }
-
-            match &mut self.buffer {
-                BackingBuffer::VirtualMemory(ptr, _) => unsafe {
-                    if virtual_commit(ptr.add(bytes_old), bytes_new - bytes_old).is_err() {
-                        return;
-                    }
-                },
-                BackingBuffer::Vec(v) => {
-                    v.resize(bytes_new, 0);
-                    self.text = unsafe { NonNull::new_unchecked(v.as_mut_ptr()) };
-                }
-            }
-
-            self.commit = bytes_new;
-        }
+        debug_assert!(self.text_length + gap_len_new <= self.commit, "enlarge_gap without commit");
 
         let gap_beg = unsafe { self.text.add(self.gap_off) };
         unsafe {
@@ -229,10 +311,12 @@ impl GapBuffer {
         self.gap_len -= len;
     }
 
-    pub fn replace(&mut self, range: Range<usize>, src: &[u8]) {
-        let gap = self.allocate_gap(range.start, src.len(), range.end.saturating_sub(range.start));
+    /// All-or-nothing replace (cosmix patch: returns `Err` untouched on OOM).
+    pub fn replace(&mut self, range: Range<usize>, src: &[u8]) -> io::Result<()> {
+        let gap = self.allocate_gap(range.start, src.len(), range.end.saturating_sub(range.start))?;
         let len = slice_copy_safe(gap, src);
         self.commit_gap(len);
+        Ok(())
     }
 
     pub fn clear(&mut self) {
@@ -259,50 +343,6 @@ impl GapBuffer {
             out.replace_range(out_off..out_off, chunk);
             beg += chunk.len();
             out_off += chunk.len();
-        }
-    }
-
-    /// Replaces the entire buffer contents with the given `text`.
-    /// The method is optimized for the case where the given `text` already matches
-    /// the existing contents. Returns `true` if the buffer contents were changed.
-    pub fn copy_from(&mut self, src: &dyn ReadableDocument) -> bool {
-        let mut off = 0;
-
-        // Find the position at which the contents change.
-        loop {
-            let dst_chunk = self.read_forward(off);
-            let src_chunk = src.read_forward(off);
-
-            let dst_len = dst_chunk.len();
-            let src_len = src_chunk.len();
-            let len = dst_len.min(src_len);
-            let mismatch = dst_chunk[..len] != src_chunk[..len];
-
-            if mismatch {
-                break; // The contents differ.
-            }
-            if len == 0 {
-                if dst_len == src_len {
-                    return false; // Both done simultaneously. -> Done.
-                }
-                break; // One of the two is shorter.
-            }
-
-            off += len;
-        }
-
-        // Update the buffer starting at `off`.
-        loop {
-            let chunk = src.read_forward(off);
-            self.replace(off..usize::MAX, chunk);
-            off += chunk.len();
-
-            // No more data to copy -> Done. By checking this _after_ the replace()
-            // call, we ensure that the initial `off..usize::MAX` range is deleted.
-            // This fixes going from some buffer contents to being empty.
-            if chunk.is_empty() {
-                return true;
-            }
         }
     }
 
@@ -352,5 +392,38 @@ impl ReadableDocument for GapBuffer {
         };
 
         unsafe { slice::from_raw_parts(self.text.add(beg).as_ptr(), len) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(g: &GapBuffer) -> Vec<u8> {
+        let mut out = Vec::new();
+        g.extract_raw(0..g.len(), &mut out, 0);
+        out
+    }
+
+    #[test]
+    fn failed_commit_leaves_buffer_untouched() {
+        let mut g = GapBuffer::new(false).unwrap();
+        g.replace(0..0, b"hello world").unwrap();
+        inject_commit_failure(true);
+        let big = vec![b'x'; 256 * KIBI];
+        let err = g.replace(0..5, &big);
+        inject_commit_failure(false);
+        assert!(err.is_err());
+        assert_eq!(text(&g), b"hello world");
+    }
+
+    #[test]
+    fn ensure_commit_then_replace_makes_no_further_commits() {
+        let mut g = GapBuffer::new(false).unwrap();
+        let need = GapBuffer::commit_needed(0, 200 * KIBI).unwrap();
+        g.ensure_commit(need).unwrap();
+        let before = g.commit_calls();
+        g.replace(0..0, &vec![b'y'; 200 * KIBI]).unwrap();
+        assert_eq!(g.commit_calls(), before);
     }
 }

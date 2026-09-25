@@ -1,15 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-edit-core from microsoft/edit@826b4c0 crates/edit/src/simd/mod.rs; see vendor/msedit/README.md.
+// Patched: `memchr2` is not vendored in E0 (it serves navigation, which lands in E1).
 
 //! Provides various high-throughput utilities.
 
 pub mod lines_bwd;
 pub mod lines_fwd;
-mod memchr2;
 
 pub use lines_bwd::*;
 pub use lines_fwd::*;
-pub use memchr2::*;
 
 #[cfg(test)]
 mod test {

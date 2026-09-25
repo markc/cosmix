@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-edit-core from microsoft/edit@826b4c0 crates/edit/src/document.rs; see vendor/msedit/README.md.
+// Subset: the two traits and the `&[u8]` / `String` impls (the `PathBuf`
+// impls are not vendored).
 
 //! Abstractions over reading/writing arbitrary text containers.
 
-use std::ffi::OsString;
-use std::mem;
 use std::ops::Range;
-use std::path::PathBuf;
 
-use stdext::ReplaceRange as _;
+use super::stdext::helpers::ReplaceRange as _;
 
 /// An abstraction over reading from text containers.
 pub trait ReadableDocument {
@@ -22,6 +22,10 @@ pub trait ReadableDocument {
     /// * Be strict on outputs:
     ///   * You MUST NOT break grapheme clusters across chunks.
     ///   * You MUST NOT return an empty slice unless the offset is at or beyond the end.
+    ///
+    /// Cosmix note: `GapBuffer` does NOT honour the grapheme promise (its chunk
+    /// boundary is wherever the gap is). Nothing in cosmix-edit-core E0 relies on
+    /// it; the E1 measurement code must add an adapter first (ced E0 plan §9.3).
     fn read_forward(&self, off: usize) -> &[u8];
 
     /// Read some bytes before (but not including) the given absolute offset.
@@ -78,25 +82,5 @@ impl WriteableDocument for String {
         let utf8 = String::from_utf8_lossy(replacement);
         // SAFETY: `range` is guaranteed to be on codepoint boundaries.
         unsafe { self.as_mut_vec() }.replace_range(range, utf8.as_bytes());
-    }
-}
-
-impl ReadableDocument for PathBuf {
-    fn read_forward(&self, off: usize) -> &[u8] {
-        let s = self.as_os_str().as_encoded_bytes();
-        &s[off.min(s.len())..]
-    }
-
-    fn read_backward(&self, off: usize) -> &[u8] {
-        let s = self.as_os_str().as_encoded_bytes();
-        &s[..off.min(s.len())]
-    }
-}
-
-impl WriteableDocument for PathBuf {
-    fn replace(&mut self, range: Range<usize>, replacement: &[u8]) {
-        let mut vec = mem::take(self).into_os_string().into_encoded_bytes();
-        vec.replace_range(range, replacement);
-        *self = unsafe { Self::from(OsString::from_encoded_bytes_unchecked(vec)) };
     }
 }

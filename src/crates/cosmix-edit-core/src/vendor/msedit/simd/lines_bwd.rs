@@ -1,9 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-edit-core from microsoft/edit@826b4c0 crates/edit/src/simd/lines_bwd.rs; see vendor/msedit/README.md.
+// Patched: OnceLock dispatch, loongarch arms removed (they need nightly features).
 
 use std::ptr;
 
-use crate::helpers::CoordType;
+use crate::vendor::msedit::helpers::CoordType;
 
 /// Starting from the `offset` in `haystack` with a current line index of
 /// `line`, this seeks backwards to the `line_stop`-nth line and returns the
@@ -34,8 +36,8 @@ unsafe fn lines_bwd_raw(
     line: CoordType,
     line_stop: CoordType,
 ) -> (*const u8, CoordType) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-    return unsafe { LINES_BWD_DISPATCH(beg, end, line, line_stop) };
+    #[cfg(target_arch = "x86_64")]
+    return unsafe { lines_bwd_select()(beg, end, line, line_stop) };
 
     #[cfg(target_arch = "aarch64")]
     return unsafe { lines_bwd_neon(beg, end, line, line_stop) };
@@ -65,24 +67,23 @@ unsafe fn lines_bwd_fallback(
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-static mut LINES_BWD_DISPATCH: unsafe fn(
-    beg: *const u8,
-    end: *const u8,
-    line: CoordType,
-    line_stop: CoordType,
-) -> (*const u8, CoordType) = lines_bwd_dispatch;
+#[cfg(target_arch = "x86_64")]
+type LinesBwdFn = unsafe fn(*const u8, *const u8, CoordType, CoordType) -> (*const u8, CoordType);
+
+// cosmix patch (ced E0 plan §2.2(1)): upstream used a `static mut` fn pointer
+// overwritten on first call, a data race in a multi-threaded process.
+#[cfg(target_arch = "x86_64")]
+static LINES_BWD_DISPATCH: std::sync::OnceLock<LinesBwdFn> = std::sync::OnceLock::new();
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn lines_bwd_dispatch(
-    beg: *const u8,
-    end: *const u8,
-    line: CoordType,
-    line_stop: CoordType,
-) -> (*const u8, CoordType) {
-    let func = if is_x86_feature_detected!("avx2") { lines_bwd_avx2 } else { lines_bwd_fallback };
-    unsafe { LINES_BWD_DISPATCH = func };
-    unsafe { func(beg, end, line, line_stop) }
+fn lines_bwd_select() -> LinesBwdFn {
+    *LINES_BWD_DISPATCH.get_or_init(|| {
+        if is_x86_feature_detected!("avx2") {
+            lines_bwd_avx2 as LinesBwdFn
+        } else {
+            lines_bwd_fallback as LinesBwdFn
+        }
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -162,174 +163,6 @@ unsafe fn lines_bwd_avx2(
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
-unsafe fn lines_bwd_dispatch(
-    beg: *const u8,
-    end: *const u8,
-    line: CoordType,
-    line_stop: CoordType,
-) -> (*const u8, CoordType) {
-    use std::arch::is_loongarch_feature_detected;
-
-    let func = if is_loongarch_feature_detected!("lasx") {
-        lines_bwd_lasx
-    } else if is_loongarch_feature_detected!("lsx") {
-        lines_bwd_lsx
-    } else {
-        lines_bwd_fallback
-    };
-    unsafe { LINES_BWD_DISPATCH = func };
-    unsafe { func(beg, end, line, line_stop) }
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[target_feature(enable = "lasx")]
-unsafe fn lines_bwd_lasx(
-    beg: *const u8,
-    mut end: *const u8,
-    mut line: CoordType,
-    line_stop: CoordType,
-) -> (*const u8, CoordType) {
-    unsafe {
-        use std::arch::loongarch64::*;
-
-        #[inline(always)]
-        unsafe fn horizontal_sum(sum: m256i) -> u32 {
-            unsafe {
-                let sum = lasx_xvhaddw_h_b(sum, sum);
-                let sum = lasx_xvhaddw_w_h(sum, sum);
-                let sum = lasx_xvhaddw_d_w(sum, sum);
-                let sum = lasx_xvhaddw_q_d(sum, sum);
-                let tmp = lasx_xvpermi_q::<1>(sum, sum);
-                let sum = lasx_xvadd_w(sum, tmp);
-                lasx_xvpickve2gr_wu::<0>(sum)
-            }
-        }
-
-        const LF: i32 = b'\n' as i32;
-        let line_stop = line_stop.min(line);
-        let off = end.addr() & 31;
-        if off != 0 && off < end.offset_from_unsigned(beg) {
-            (end, line) = lines_bwd_fallback(end.sub(off), end, line, line_stop);
-        }
-
-        while end.offset_from_unsigned(beg) >= 128 {
-            let chunk_start = end.sub(128);
-
-            let v1 = lasx_xvld::<0>(chunk_start as *const _);
-            let v2 = lasx_xvld::<32>(chunk_start as *const _);
-            let v3 = lasx_xvld::<64>(chunk_start as *const _);
-            let v4 = lasx_xvld::<96>(chunk_start as *const _);
-
-            let mut sum = lasx_xvneg_b(lasx_xvseqi_b::<LF>(v1));
-            sum = lasx_xvsub_b(sum, lasx_xvseqi_b::<LF>(v2));
-            sum = lasx_xvsub_b(sum, lasx_xvseqi_b::<LF>(v3));
-            sum = lasx_xvsub_b(sum, lasx_xvseqi_b::<LF>(v4));
-            let sum = horizontal_sum(sum);
-
-            let line_next = line - sum as CoordType;
-            if line_next <= line_stop {
-                break;
-            }
-
-            end = chunk_start;
-            line = line_next;
-        }
-
-        while end.offset_from_unsigned(beg) >= 32 {
-            let chunk_start = end.sub(32);
-            let v = lasx_xvld::<0>(chunk_start as *const _);
-            let c = lasx_xvseqi_b::<LF>(v);
-
-            let ones = lasx_xvandi_b::<1>(c);
-            let sum = horizontal_sum(ones);
-
-            let line_next = line - sum as CoordType;
-            if line_next <= line_stop {
-                break;
-            }
-
-            end = chunk_start;
-            line = line_next;
-        }
-
-        lines_bwd_fallback(beg, end, line, line_stop)
-    }
-}
-
-#[cfg(target_arch = "loongarch64")]
-#[target_feature(enable = "lsx")]
-unsafe fn lines_bwd_lsx(
-    beg: *const u8,
-    mut end: *const u8,
-    mut line: CoordType,
-    line_stop: CoordType,
-) -> (*const u8, CoordType) {
-    unsafe {
-        use std::arch::loongarch64::*;
-
-        #[inline(always)]
-        unsafe fn horizontal_sum(sum: m128i) -> u32 {
-            unsafe {
-                let sum = lsx_vhaddw_h_b(sum, sum);
-                let sum = lsx_vhaddw_w_h(sum, sum);
-                let sum = lsx_vhaddw_d_w(sum, sum);
-                let sum = lsx_vhaddw_q_d(sum, sum);
-                lsx_vpickve2gr_wu::<0>(sum)
-            }
-        }
-
-        const LF: i32 = b'\n' as i32;
-        let line_stop = line_stop.min(line);
-        let off = end.addr() & 15;
-        if off != 0 && off < end.offset_from_unsigned(beg) {
-            (end, line) = lines_bwd_fallback(end.sub(off), end, line, line_stop);
-        }
-
-        while end.offset_from_unsigned(beg) >= 64 {
-            let chunk_start = end.sub(64);
-
-            let v1 = lsx_vld::<0>(chunk_start as *const _);
-            let v2 = lsx_vld::<16>(chunk_start as *const _);
-            let v3 = lsx_vld::<32>(chunk_start as *const _);
-            let v4 = lsx_vld::<48>(chunk_start as *const _);
-
-            let mut sum = lsx_vneg_b(lsx_vseqi_b::<LF>(v1));
-            sum = lsx_vsub_b(sum, lsx_vseqi_b::<LF>(v2));
-            sum = lsx_vsub_b(sum, lsx_vseqi_b::<LF>(v3));
-            sum = lsx_vsub_b(sum, lsx_vseqi_b::<LF>(v4));
-            let sum = horizontal_sum(sum);
-
-            let line_next = line - sum as CoordType;
-            if line_next <= line_stop {
-                break;
-            }
-
-            end = chunk_start;
-            line = line_next;
-        }
-
-        while end.offset_from_unsigned(beg) >= 16 {
-            let chunk_start = end.sub(16);
-            let v = lsx_vld::<0>(chunk_start as *const _);
-            let c = lsx_vseqi_b::<LF>(v);
-
-            let ones = lsx_vandi_b::<1>(c);
-            let sum = horizontal_sum(ones);
-
-            let line_next = line - sum as CoordType;
-            if line_next <= line_stop {
-                break;
-            }
-
-            end = chunk_start;
-            line = line_next;
-        }
-
-        lines_bwd_fallback(beg, end, line, line_stop)
-    }
-}
-
 #[cfg(target_arch = "aarch64")]
 unsafe fn lines_bwd_neon(
     beg: *const u8,
@@ -395,8 +228,8 @@ unsafe fn lines_bwd_neon(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::helpers::CoordType;
-    use crate::simd::test::*;
+    use crate::vendor::msedit::helpers::CoordType;
+    use crate::vendor::msedit::simd::test::*;
 
     #[test]
     fn pseudo_fuzz() {
