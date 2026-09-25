@@ -157,7 +157,7 @@ fn advance_makes_progress_below_one_interval_per_call() {
         assert!(calls < 100, "no progress");
     }
     assert!(calls >= 3 * INTERVAL / 100, "each call parsed at most 100 lines");
-    assert!(cache.reach() >= (target - 1) / INTERVAL * INTERVAL + 1);
+    assert!(cache.reach() > (target - 1) / INTERVAL * INTERVAL);
 
     let mut h = Highlighter::new(&src, rust());
     let mut out = Vec::new();
