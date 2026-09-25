@@ -155,11 +155,21 @@ pub struct Outgoing {
     pub deadline_ms: u64,
 }
 
+/// A reply body parsed off the UI thread ([`Incoming::Parsed`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedBody(pub serde_json::Value);
+
+// JSON holds no NaN, so equality on a parsed body is total.
+impl Eq for ParsedBody {}
+
 /// What the transport delivers back to a controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
     /// A Bus reply to a request the controller correlated as `req`.
     Reply { req: u64, rc: u8, body: String },
+    /// A large reply the host's I/O thread already parsed as JSON, so the
+    /// UI thread does not (a 4 MiB snapshot page costs milliseconds).
+    Parsed { req: u64, rc: u8, body: ParsedBody },
     /// A topic delivery (`edit.changed`, `theme.changed`, …): raw inner body.
     Topic { topic: String, body: String },
     /// A one-shot timer the controller armed fired.

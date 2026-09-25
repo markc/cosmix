@@ -742,3 +742,30 @@ fn non_canonical_sequences_are_refused_by_prepare() {
     assert_eq!(e.code, ErrorCode::Internal);
     assert_eq!(t.to_string_lossless(), "abcdef");
 }
+
+#[test]
+fn append_in_pages_equals_from_text() {
+    // Pages cut anywhere, including between CR and LF and inside a line.
+    let whole = "one\r\ntwo\nthree\r\n\nfour, no newline at the end";
+    for cut in [1usize, 3, 4, 5, 9, 17] {
+        let mut t = Text::new().unwrap();
+        let mut at = 0;
+        while at < whole.len() {
+            let end = (at + cut).min(whole.len());
+            t.append(&whole[at..end]).unwrap();
+            at = end;
+        }
+        let w = Text::from_text(whole).unwrap();
+        assert_eq!((t.len(), t.line_count()), (w.len(), w.line_count()), "cut {cut}");
+        for line in 1..=w.line_count() {
+            assert_eq!(t.line_range(line), w.line_range(line), "cut {cut} line {line}");
+        }
+        let mut s = String::new();
+        t.read(0..t.len(), &mut s);
+        assert_eq!(s, whole);
+    }
+    let mut t = Text::from_text("x").unwrap();
+    let big = "y".repeat(MAX_BUFFER_BYTES);
+    assert!(t.append(&big).is_err(), "over the byte limit");
+    assert_eq!(t.len(), 1, "a refused append changes nothing");
+}

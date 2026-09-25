@@ -326,8 +326,14 @@ impl App {
             self.controller.record_frame(self.update_us + self.view_us.get(), None);
             self.update_us = 0;
         }
+        let kind = msg_kind(&msg);
         let task = self.dispatch(msg);
         let task = Task::batch([task, self.after_transition()]);
+        let spent = started.elapsed().as_micros() as u64;
+        if spent > SLOW_US {
+            // Evidence for the view_us budget: which message cost the frame.
+            tracing::info!(kind, us = spent, "ced: slow update");
+        }
         // A dialog closed: the next queued prompt whose tab still exists.
         if self.modal.is_none() && !self.modal_queue.is_empty() {
             let live: HashSet<TabId> = self.controller.tabs().iter().map(|t| t.id).collect();
@@ -1229,6 +1235,9 @@ impl App {
         let started = Instant::now();
         let element = self.view_inner();
         self.view_us.set(started.elapsed().as_micros() as u64);
+        if self.view_us.get() > SLOW_US {
+            tracing::info!(us = self.view_us.get(), "ced: slow view");
+        }
         self.views.set(self.views.get() + 1);
         element
     }
@@ -1396,6 +1405,32 @@ fn relex(
             Err(_) => Vec::new(),
         };
         (tag, spans)
+    }
+}
+
+/// An update or view slower than this is logged (the §4.2 view budget).
+const SLOW_US: u64 = 4_000;
+
+/// A message's kind for the slow-update log (never its payload: a snapshot
+/// page is megabytes).
+fn msg_kind(msg: &Msg) -> &'static str {
+    use cosmix_edit_client::types::Incoming;
+    match msg {
+        Msg::Bus(Delivery::Incoming(Incoming::Reply { .. })) => "bus.reply",
+        Msg::Bus(Delivery::Incoming(Incoming::Parsed { .. })) => "bus.reply.parsed",
+        Msg::Bus(Delivery::Incoming(Incoming::Topic { .. })) => "bus.topic",
+        Msg::Bus(Delivery::Incoming(Incoming::Timer { .. })) => "bus.timer",
+        Msg::Bus(Delivery::Incoming(Incoming::Deadline { .. })) => "bus.deadline",
+        Msg::Bus(Delivery::Incoming(Incoming::Connection { .. })) => "bus.connection",
+        Msg::Bus(Delivery::Command(_)) => "bus.command",
+        Msg::Timer(_) => "timer",
+        Msg::Action(_) => "action",
+        Msg::Editor(..) => "editor",
+        Msg::Lint(..) => "lint",
+        Msg::Relex(..) => "relex",
+        Msg::Window(_) => "window",
+        Msg::Frame(_) => "frame",
+        _ => "other",
     }
 }
 

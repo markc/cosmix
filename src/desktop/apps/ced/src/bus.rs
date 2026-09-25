@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cosmix_client::{ConnState, IncomingCommand, NodedClient, SupervisedClient};
-use cosmix_edit_client::types::Incoming;
+use cosmix_edit_client::types::{Incoming, ParsedBody};
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
 use crate::controller::{BusCommand, Effect};
@@ -58,6 +58,9 @@ impl std::error::Error for StartError {}
 
 /// The service every mirror request goes to.
 const EDIT: &str = "edit";
+/// Success replies bigger than this are parsed on the bus thread, not the
+/// UI thread (snapshot pages are up to 4 MiB).
+const PARSE_OFF_UI_BYTES: usize = 64 * 1024;
 /// Initial connect + register budget.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Single-instance probe deadline (plan §4.8).
@@ -190,6 +193,14 @@ async fn run(
                             let headers = BTreeMap::new();
                             let call = c.call_with_headers_raw(EDIT, &out.verb, &headers, &out.body);
                             let incoming = match tokio::time::timeout_at(deadline, call).await {
+                                // A large success body (a snapshot page) is
+                                // parsed here, off the UI thread.
+                                Ok(Ok((rc, body, _))) if rc < 10 && body.len() > PARSE_OFF_UI_BYTES => {
+                                    match serde_json::from_str::<serde_json::Value>(&body) {
+                                        Ok(v) => Incoming::Parsed { req, rc, body: ParsedBody(v) },
+                                        Err(_) => Incoming::Reply { req, rc, body },
+                                    }
+                                }
                                 Ok(Ok((rc, body, _))) => Incoming::Reply { req, rc, body },
                                 Ok(Err(_)) => {
                                     tokio::time::sleep_until(deadline).await;

@@ -336,6 +336,17 @@ fn reply_result(rc: u8, body: &str) -> Result<Value, wire::Refusal> {
     }))
 }
 
+fn unparsed_refusal(v: &Value) -> wire::Refusal {
+    wire::Refusal {
+        error_code: wire::ErrorCode::Internal,
+        message: v.to_string(),
+        reason: None,
+        buffer: None,
+        rev: None,
+        context: Default::default(),
+    }
+}
+
 /// An `edit.open`-shaped reply for a buffer known from `edit.list` (scratch
 /// reattach, recovered buffers): the list row carries everything the mirror
 /// needs except eol/bom, which a snapshot does not depend on.
@@ -516,6 +527,7 @@ impl Controller {
         let mut fx = Vec::new();
         match incoming {
             Incoming::Reply { req, rc, body } => self.on_reply(req, rc, &body, &mut fx),
+            Incoming::Parsed { req, rc, body } => self.on_parsed(req, rc, body.0, &mut fx),
             Incoming::Deadline { req } => self.on_deadline(req, &mut fx),
             Incoming::Timer { id } => self.on_timer(id, &mut fx),
             Incoming::Topic { topic, body } => self.on_topic(&topic, &body, &mut fx),
@@ -774,19 +786,31 @@ impl Controller {
         self.send(out, Req::List { tab }, fx);
     }
 
+    /// A reply the bus thread parsed already: a mirror's (snapshot pages,
+    /// histories) goes straight in; anything else takes the text path.
+    fn on_parsed(&mut self, req: u64, rc: u8, v: Value, fx: &mut Vec<Effect>) {
+        if !matches!(self.reqs.get(&req), Some(Req::Mirror { .. })) {
+            return self.on_reply(req, rc, &v.to_string(), fx);
+        }
+        let Some(Req::Mirror { tab, op_id }) = self.reqs.remove(&req) else { return };
+        let result = if rc < 10 { Ok(v) } else { Err(reply_result(rc, &v.to_string()).err().unwrap_or_else(|| unparsed_refusal(&v))) };
+        self.mirror_reply(tab, &op_id, result, fx);
+    }
+
+    fn mirror_reply(&mut self, tab: TabId, op_id: &str, result: Result<Value, wire::Refusal>, fx: &mut Vec<Effect>) {
+        if let Ok(v) = &result
+            && let Some(ep) = v.get("epoch").and_then(Value::as_str)
+        {
+            self.note_epoch(ep, fx);
+        }
+        if let Some(step) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()).map(|m| m.on_reply(op_id, result)) {
+            self.drive(tab, step, fx);
+        }
+    }
+
     fn on_reply(&mut self, req: u64, rc: u8, body: &str, fx: &mut Vec<Effect>) {
         match self.reqs.remove(&req) {
-            Some(Req::Mirror { tab, op_id }) => {
-                let result = reply_result(rc, body);
-                if let Ok(v) = &result
-                    && let Some(ep) = v.get("epoch").and_then(Value::as_str)
-                {
-                    self.note_epoch(ep, fx);
-                }
-                if let Some(step) = self.tab_mut(tab).and_then(|t| t.mirror.as_mut()).map(|m| m.on_reply(&op_id, result)) {
-                    self.drive(tab, step, fx);
-                }
-            }
+            Some(Req::Mirror { tab, op_id }) => self.mirror_reply(tab, &op_id, reply_result(rc, body), fx),
             Some(Req::Open { tab, reattach }) => self.on_open_reply(tab, reattach, rc, body, fx),
             Some(Req::List { tab }) => self.on_list_reply(tab, rc, body, fx),
             Some(Req::Info) => {
@@ -2438,15 +2462,17 @@ mod tests {
                                   "start": pt(at), "end": pt(end), "bytes_total": text.len(), "lines_total": n + 1,
                                   "truncated": next.is_some(), "next": next, "snapshot": "s1"})
                 .to_string();
+                // The bus thread parses big replies (Incoming::Parsed).
+                let body = cosmix_edit_client::types::ParsedBody(serde_json::from_str(&body).unwrap());
                 let t = Instant::now();
-                fx = c.on_incoming(Incoming::Reply { req, rc: 0, body });
+                fx = c.on_incoming(Incoming::Parsed { req, rc: 0, body });
                 times.push(us(t));
                 at = end;
             }
             let last = times.pop().unwrap_or(0);
             times.sort_unstable();
             println!(
-                "PERF {name}: {} pages, per page p50 {} us max {} us; final page (Text::from_text + resync) {} us",
+                "PERF {name}: {} pages, per page p50 {} us max {} us; final page (+ resync) {} us",
                 times.len() + 1,
                 times.get(times.len() / 2).copied().unwrap_or(0),
                 times.last().copied().unwrap_or(0),

@@ -379,9 +379,13 @@ enum Read {
 }
 
 /// Snapshot pages being accumulated.
+/// Pages go straight into a [`Text`] (and, on a reattach, a running hash),
+/// so a large snapshot's line scan and copy are spread over its pages
+/// rather than paid in one frame at the end.
 struct Pager {
     token: Option<String>,
-    text: String,
+    text: Text,
+    hash: Option<blake3::Hasher>,
 }
 
 /// §3.5 reconciliation of the in-flight op.
@@ -972,7 +976,13 @@ impl Mirror {
         }
         let Some(pager) = self.pager.as_mut() else { return step };
         if let Some(t) = &page.text {
-            pager.text.push_str(t);
+            if let Err(e) = pager.text.append(t) {
+                self.detach_failed(e.to_string());
+                return step;
+            }
+            if let Some(h) = pager.hash.as_mut() {
+                h.update(t.as_bytes());
+            }
         }
         if page.snapshot.is_some() {
             pager.token = page.snapshot.clone();
@@ -987,8 +997,9 @@ impl Mirror {
             self.send_read(Read::Page, "edit.get", body, DEADLINE_LONG_MS, &mut step);
             return step;
         }
-        let text = self.pager.take().map(|p| p.text).unwrap_or_default();
-        self.finish_snapshot(text, page.rev, &mut step);
+        if let Some(p) = self.pager.take() {
+            self.finish_snapshot(p.text, p.hash.map(|h| h.finalize()), page.rev, &mut step);
+        }
         step
     }
 
@@ -1230,7 +1241,15 @@ impl Mirror {
     }
 
     fn start_pages(&mut self, step: &mut Step) {
-        self.pager = Some(Pager { token: None, text: String::new() });
+        let text = match Text::new() {
+            Ok(t) => t,
+            Err(e) => {
+                self.detach_failed(e.to_string());
+                return;
+            }
+        };
+        let hash = self.compare_with.is_some().then(blake3::Hasher::new);
+        self.pager = Some(Pager { token: None, text, hash });
         let body = json!({"buffer": self.buffer, "snapshot": true});
         self.send_read(Read::Page, "edit.get", body, DEADLINE_LONG_MS, step);
     }
@@ -2239,10 +2258,10 @@ impl Mirror {
 
     /// The final snapshot page arrived: replace the text, resolve the
     /// in-flight op, replay buffered events, go Live.
-    fn finish_snapshot(&mut self, text: String, rev: u64, step: &mut Step) {
+    fn finish_snapshot(&mut self, text: Text, hash: Option<blake3::Hash>, rev: u64, step: &mut Step) {
         let replace = match self.compare_with.take() {
             Some(old) => {
-                if blake3::hash(old.as_bytes()) == blake3::hash(text.as_bytes()) {
+                if hash == Some(blake3::hash(old.as_bytes())) {
                     false
                 } else {
                     step.notices.push(Notice::DetachedCopy { bytes: old.len() });
@@ -2253,13 +2272,7 @@ impl Mirror {
             None => true,
         };
         if replace {
-            match Text::from_text(&text) {
-                Ok(t) => self.text = t,
-                Err(e) => {
-                    self.detach_failed(e.to_string());
-                    return;
-                }
-            }
+            self.text = text;
         }
         self.rev = rev;
         self.cursors.clear();
