@@ -311,6 +311,12 @@ mod tests {
         let screen = term.screen(false);
         assert_eq!(screen.cursor, (0, 5));
         assert!(screen.cursor_visible, "a live row still in the viewport keeps its cursor");
+        term.scroll_wheel(-5, MouseModifiers::default());
+        let bottom = term.grid_snapshot();
+        assert_eq!(bottom.screen.display_offset, 0);
+        assert_eq!(bottom.screen.cursor, (0, 0));
+        assert!(bottom.screen.cursor_visible);
+        assert!(bottom.dirty_rows.iter().all(|dirty| *dirty));
     }
 
     #[test]

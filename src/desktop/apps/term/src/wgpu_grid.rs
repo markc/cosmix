@@ -290,65 +290,6 @@ impl GridPipeline {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::frame::Painter;
-    use cosmix_term_core::{
-        config::Cursor,
-        font::FontSize,
-        terminal::{Cell, Screen},
-    };
-
-    #[test]
-    fn range_upload_layout_repairs_a_texture_after_coalesced_paints() {
-        let mut painter = Painter::new(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
-        let mut screen = Screen {
-            cols: 90,
-            rows: 6,
-            display_offset: 0,
-            cursor: (1, 0),
-            cursor_visible: true,
-            cells: vec![
-                Cell {
-                    c: 'M',
-                    fg: [201, 31, 127],
-                    bg: [9, 17, 32],
-                    bold: false
-                };
-                540
-            ],
-            updated: std::time::Instant::now(),
-        };
-        painter.repaint(1, &screen, &[]);
-        let shared = painter.frame(1);
-        let mut texture = shared.lock().unwrap().surface().rgba().to_vec();
-        shared.lock().unwrap().clear_damage();
-        for (col, row) in [(80, 3), (5, 3), (45, 5)] {
-            screen.cells[row * 90 + col].c = 'g';
-            screen.cursor = (col, row);
-            let mut dirty = [false; 6];
-            dirty[row] = true;
-            painter.repaint(1, &screen, &dirty);
-        }
-        let mut frame = shared.lock().unwrap();
-        let stride = frame.surface().stride();
-        for band in frame.take_damage() {
-            assert!(band.width < frame.surface().width());
-            let (origin, layout, extent) = upload_region(stride, band);
-            for row in 0..extent.height as usize {
-                let source = layout.offset as usize + row * layout.bytes_per_row.unwrap() as usize;
-                let target = (origin.y as usize + row) * stride + origin.x as usize * 4;
-                let len = extent.width as usize * 4;
-                texture[target..target + len]
-                    .copy_from_slice(&frame.surface().rgba()[source..source + len]);
-            }
-        }
-        assert_eq!(texture, frame.surface().rgba());
-        assert!(frame.take_damage().is_empty());
-    }
-}
-
 impl shader::Pipeline for GridPipeline {
     fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         // The VT hands us sRGB-encoded bytes. Matching the target's encoding
@@ -447,5 +388,64 @@ impl shader::Pipeline for GridPipeline {
     fn trim(&mut self) {
         self.textures.retain(|id, _| self.live.contains(id));
         self.live.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::Painter;
+    use cosmix_term_core::{
+        config::Cursor,
+        font::FontSize,
+        terminal::{Cell, Screen},
+    };
+
+    #[test]
+    fn range_upload_layout_repairs_a_texture_after_coalesced_paints() {
+        let mut painter = Painter::new(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
+        let mut screen = Screen {
+            cols: 90,
+            rows: 6,
+            display_offset: 0,
+            cursor: (1, 0),
+            cursor_visible: true,
+            cells: vec![
+                Cell {
+                    c: 'M',
+                    fg: [201, 31, 127],
+                    bg: [9, 17, 32],
+                    bold: false
+                };
+                540
+            ],
+            updated: std::time::Instant::now(),
+        };
+        painter.repaint(1, &screen, &[]);
+        let shared = painter.frame(1);
+        let mut texture = shared.lock().unwrap().surface().rgba().to_vec();
+        shared.lock().unwrap().clear_damage();
+        for (col, row) in [(80, 3), (5, 3), (45, 5)] {
+            screen.cells[row * 90 + col].c = 'g';
+            screen.cursor = (col, row);
+            let mut dirty = [false; 6];
+            dirty[row] = true;
+            painter.repaint(1, &screen, &dirty);
+        }
+        let mut frame = shared.lock().unwrap();
+        let stride = frame.surface().stride();
+        for band in frame.take_damage() {
+            assert!(band.width < frame.surface().width());
+            let (origin, layout, extent) = upload_region(stride, band);
+            for row in 0..extent.height as usize {
+                let source = layout.offset as usize + row * layout.bytes_per_row.unwrap() as usize;
+                let target = (origin.y as usize + row) * stride + origin.x as usize * 4;
+                let len = extent.width as usize * 4;
+                texture[target..target + len]
+                    .copy_from_slice(&frame.surface().rgba()[source..source + len]);
+            }
+        }
+        assert_eq!(texture, frame.surface().rgba());
+        assert!(frame.take_damage().is_empty());
     }
 }

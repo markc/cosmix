@@ -311,7 +311,7 @@ mod tests {
         let mut history = PresentHistory::default();
         renderer.reset(full);
         renderer.draw_grid(Grid::with_damage(pixels.clone(), &stamps).unwrap(), full, full);
-        history.damage(0, renderer.layers(), &viewport, Color::BLACK);
+        assert_eq!(history.damage(0, renderer.layers(), &viewport, Color::BLACK), [full]);
         history.submit(renderer.layers(), Color::BLACK, || {}, || Ok::<_, ()>(())).unwrap();
         stamps.mark(&[Rectangle { x: 1125, y: 50, width: 25, height: 50 }]);
         renderer.reset(full);

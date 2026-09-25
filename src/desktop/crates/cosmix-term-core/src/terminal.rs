@@ -1082,8 +1082,10 @@ impl Terminal {
             pos.col.0,
             (pos.row.0.max(0) as usize).saturating_add(offset),
         );
-        let cursor_visible = offset == 0
-            && cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+        // T15: scrolled back, the cursor stays visible while its live row is
+        // still inside the viewport (cursor.1 already includes the offset).
+        let cursor_visible =
+            cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
         let mut previous = self.captured_cursor.lock().unwrap();
         if let Some(dirty) = dirty {
             *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
@@ -1635,9 +1637,6 @@ mod tests {
         let mut lines = b"\r\n".repeat(40);
         lines.push(b'Z');
         f.feed(&lines, |t| cell(t, 29, 0) == 'Z');
-        // A cursor near the top would still be inside the visible row count
-        // after adding a small history offset; it must nevertheless be hidden.
-        f.feed(b"\x1b[H", |t| t.grid.cursor.pos.row.0 == 0);
         f.settled_snapshot();
         {
             let mut term = f.terminal.grid.lock();
@@ -1647,6 +1646,7 @@ mod tests {
         let scrolled = f.settled_snapshot();
         assert!(all(&scrolled.dirty_rows), "scroll-back");
         assert_eq!(scrolled.screen.display_offset, 5);
+        // The cursor sat on the bottom row; five rows back it is off-screen.
         assert!(!scrolled.screen.cursor_visible);
         // Still scrolled back: repainted whole, and still no self-wake.
         assert!(all(&f.quiet_snapshot().dirty_rows), "scrolled view");

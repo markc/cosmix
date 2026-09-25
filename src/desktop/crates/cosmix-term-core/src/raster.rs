@@ -620,28 +620,44 @@ impl Raster {
                 }
             }
         }
-        cell_bands_into(changed, screen.cols, cell, &mut state.bands);
+        if full {
+            state.bands.push(DamageBand {
+                x: 0,
+                y: 0,
+                width: width as u32,
+                height: height as u32,
+            });
+        } else {
+            cell_bands_into(changed, screen.cols, cell, &mut state.bands);
+        }
         let rgba = dst;
         for (row, cells) in screen.cells[..screen.cols * rows]
             .chunks_exact(screen.cols)
             .enumerate()
         {
             let row_changed = &changed[row * screen.cols..(row + 1) * screen.cols];
-            if !row_changed.iter().any(|&changed| changed) {
+            let full_row = full || row_changed.iter().all(|&changed| changed);
+            if !full_row && !row_changed.iter().any(|&changed| changed) {
                 continue;
+            }
+            // Full invalidation already recorded the grid. Dense rows can
+            // record it in bulk and skip damage checks in the paint loops.
+            if full_row && !full {
+                state.cells[row * screen.cols..(row + 1) * screen.cols].clone_from_slice(cells);
             }
             let y = row * self.height as usize;
             // Glyphs cannot escape their cells, so filling the row's backgrounds
             // before its glyphs preserves the old per-cell overwrite order.
             let mut first = 0;
             while first < cells.len() {
-                if !row_changed[first] {
+                if !full_row && !row_changed[first] {
                     first += 1;
                     continue;
                 }
                 let bg = cells[first].bg;
                 let mut end = first + 1;
-                while end < cells.len() && row_changed[end] && cells[end].bg == bg {
+                while end < cells.len() && (full_row || row_changed[end]) && cells[end].bg == bg
+                {
                     end += 1;
                 }
                 let left = first * self.width as usize * 4;
@@ -658,10 +674,12 @@ impl Raster {
                 first = end;
             }
             for (col, cell) in cells.iter().enumerate() {
-                if !row_changed[col] {
+                if !full_row && !row_changed[col] {
                     continue;
                 }
-                state.cells[row * screen.cols + col] = cell.clone();
+                if !full_row {
+                    state.cells[row * screen.cols + col] = cell.clone();
+                }
                 if cell.c == ' ' || cell.c == '\0' {
                     continue;
                 }
@@ -919,6 +937,80 @@ mod tests {
     use crate::config::Cursor;
     use crate::terminal::Cell;
     use std::time::Instant;
+
+    #[test]
+    fn fully_changed_rows_record_cells_for_the_next_partial_paint() {
+        for format in [PixelFormat::Rgba, PixelFormat::Bgra] {
+            let mut raster = raster_with(Cursor::Block);
+            let mut grid = screen(8, 3, 'M');
+            grid.cursor_visible = true;
+            grid.cursor = (3, 1);
+            let (width, height) = raster.target_size(&grid);
+            let stride = width as usize * 4 + 3;
+            let mut pixels = vec![0x5a; stride * height as usize];
+            let mut state = PaintState::default();
+            raster.paint_format(&grid, &mut pixels, stride, &mut state, &[], format);
+            for row in [None, Some(1)] {
+                for (index, cell) in grid.cells.iter_mut().enumerate() {
+                    if row.is_none_or(|row| index / grid.cols == row) {
+                        cell.bg[0] = cell.bg[0].wrapping_add(1);
+                    }
+                }
+                let dirty = [row.is_none(), true, row.is_none()];
+                assert_eq!(
+                    raster.paint_format(&grid, &mut pixels, stride, &mut state, &dirty, format),
+                    &[DamageBand {
+                        x: 0,
+                        y: row.unwrap_or(0) as u32 * raster.height,
+                        width,
+                        height: if row.is_some() { raster.height } else { height },
+                    }]
+                );
+                let mut expected = vec![0x5a; pixels.len()];
+                raster.paint_reference(
+                    &grid,
+                    &mut expected,
+                    stride,
+                    &mut PaintState::default(),
+                    &[],
+                    format,
+                );
+                assert_eq!(pixels, expected);
+                assert!(
+                    raster
+                        .paint_format(&grid, &mut pixels, stride, &mut state, &dirty, format)
+                        .is_empty()
+                );
+            }
+            grid.cells[11].c = 'g';
+            assert_eq!(
+                raster.paint_format(
+                    &grid,
+                    &mut pixels,
+                    stride,
+                    &mut state,
+                    &[false, true, false],
+                    format,
+                ),
+                &[DamageBand {
+                    x: 3 * raster.width,
+                    y: raster.height,
+                    width: raster.width,
+                    height: raster.height,
+                }]
+            );
+            let mut expected = vec![0x5a; pixels.len()];
+            raster.paint_reference(
+                &grid,
+                &mut expected,
+                stride,
+                &mut PaintState::default(),
+                &[],
+                format,
+            );
+            assert_eq!(pixels, expected);
+        }
+    }
 
     #[test]
     fn cell_ranges_skip_identical_visuals_and_include_selection_colours() {
@@ -1561,13 +1653,17 @@ mod tests {
         surface.invalidate(); // Losing bytes requires explicit invalidation.
         let third = raster.render_into(&grid, &[true, true, true], &mut surface);
         assert_eq!(third.len(), 1);
-        assert!(!surface.rgba.contains(&0x5a));
+        // Antialiased glyph pixels can legitimately contain the poison byte.
+        // Compare the complete frame, rather than forbidding a colour value.
+        assert_eq!(surface.rgba(), raster.render(&grid));
 
         // Nothing dirty, no cursor: no work and no damage at all.
+        let before = surface.rgba().to_vec();
         assert_eq!(
             raster.render_into(&grid, &[false, false, false], &mut surface),
             vec![]
         );
+        assert_eq!(surface.rgba(), before);
 
         // A resize re-owes the whole surface even though `dirty` says nothing.
         grid = screen(4, 4, 'x');
