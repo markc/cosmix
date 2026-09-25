@@ -83,10 +83,13 @@ pub struct EditorView {
 }
 
 impl Default for EditorView {
+    /// The embedded design's `Mono` role (SF Mono, 16 px); the app replaces
+    /// the family with the installed one it resolved (`theme.rs`).
     fn default() -> Self {
+        let mono = cosmix_design::default_typography(cosmix_design::TypographyRole::Mono);
         Self {
-            font: iced::Font::MONOSPACE,
-            px: 16.0,
+            font: iced::Font { family: iced::font::Family::Name(mono.family.as_str()), ..iced::Font::MONOSPACE },
+            px: mono.font_size as f32,
             line_height: 1.3,
             measure: cosmix_edit_core::view::MeasureCfg { tab_size: 4, ambiguous_wide: false },
             whitespace: false,

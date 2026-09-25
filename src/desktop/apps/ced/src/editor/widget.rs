@@ -30,6 +30,13 @@ impl EditorWidget {
         Self::with(text, model, highlight, palette, diagnostics, &EditorView::default())
     }
 
+    /// The widget the app builds every frame. Contract for E1e: draw with
+    /// `view.font` at `view.px` (line height `px × view.line_height`), measure
+    /// with `view.measure`, honour the three View toggles, draw the caret and
+    /// request the input method only while `view.focused`. The app's root key
+    /// router consumes every keymap chord, Alt+letter and Ctrl+wheel before
+    /// this widget sees them, and blocks all keyboard/IME input to it while a
+    /// modal dialog is open.
     pub fn with<'a>(
         text: &'a Text,
         model: &'a EditorModel,
