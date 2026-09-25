@@ -2,15 +2,15 @@
 //! process holds no DRM fd at all — foot's configuration, which is the only
 //! one anyone has ever measured at zero GEM.
 //!
-//! Each pane paints into the same allocation its image handle shares. Before
+//! Each four-row band paints into the allocation its image handle shares. Before
 //! painting we drop our cached handle and reclaim the `Bytes` with
 //! `try_into_mut`. iced's renderer layers and compositor history retain old
 //! handles, normally forcing one memcpy plus incremental dirty-row painting.
 //! Reclaim remains zero-copy when no other owner remains. At rest each pane
-//! has one app-side buffer (the separate Frame Vec is gone), plus iced's
+//! has one app-side buffer per band (the separate Frame Vec is gone), plus iced's
 //! premultiplied cache and up to max_age retained older buffers after a burst,
-//! until later redraws release them. The handle is keyed on
-//! `Frame::generation`, so an idle terminal rebuilds nothing.
+//! until later redraws release them. Unchanged bands retain their handle id,
+//! bounding iced's conversion cache misses and damage to changed bands.
 
 use crate::frame::Frame;
 use bytes::{Bytes, BytesMut};
@@ -19,10 +19,21 @@ use cosmix_term_core::terminal::Screen;
 use iced::widget::image::{self, Handle};
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+#[path = "cpu_bench.rs"]
+mod bench;
+
+#[path = "cpu_bands.rs"]
+mod bands;
+pub use bands::Surface;
+#[path = "cpu_widget.rs"]
+mod widget;
+pub use widget::{Grid, view};
+
 /// CPU-only counterpart of the core's Vec-backed Surface. Keeping the handle
 /// here lets painting release ALL app-owned references before reclaiming.
 #[derive(Default)]
-pub struct Surface {
+pub(super) struct PixelBand {
     state: PaintState,
     rgba: Bytes,
     width: u32,
@@ -33,12 +44,7 @@ pub struct Surface {
     bands: Vec<DamageBand>,
 }
 
-impl Surface {
-    #[cfg(test)]
-    pub fn rgba(&self) -> &[u8] {
-        &self.rgba
-    }
-
+impl PixelBand {
     #[cfg(test)]
     pub fn width(&self) -> u32 {
         self.width
@@ -57,7 +63,18 @@ impl Surface {
         self.state.invalidate();
     }
 
+    #[cfg(test)]
     pub fn paint(&mut self, raster: &mut Raster, screen: &Screen, dirty: &[bool]) -> &[DamageBand] {
+        self.paint_inner(raster, screen, dirty, false)
+    }
+
+    fn paint_inner(
+        &mut self,
+        raster: &mut Raster,
+        screen: &Screen,
+        dirty: &[bool],
+        discard: bool,
+    ) -> &[DamageBand] {
         self.bands.clear();
         let (width, height) = raster.target_size(screen);
         if width == 0 || height == 0 {
@@ -92,12 +109,19 @@ impl Surface {
         let mut pixels = match std::mem::take(&mut self.rgba).try_into_mut() {
             Ok(pixels) => pixels,
             Err(shared) => {
-                // iced may still draw the old handle. Copy every byte and
-                // preserve damage state: unchanged rows already contain the
-                // right pixels, even though their address has changed.
-                let pixels = BytesMut::from(shared.as_ref());
-                self.state.rebind(&pixels);
-                pixels
+                if discard {
+                    // Every row will be overwritten: copying retained pixels
+                    // here only wastes memory bandwidth on full-screen TUIs.
+                    self.state.invalidate();
+                    BytesMut::zeroed(shared.len())
+                } else {
+                    // iced may still draw the old handle. Copy every byte and
+                    // preserve damage state: unchanged rows already contain the
+                    // right pixels, even though their address has changed.
+                    let pixels = BytesMut::from(shared.as_ref());
+                    self.state.rebind(&pixels);
+                    pixels
+                }
             }
         };
         let len = width as usize * height as usize * 4;
@@ -135,35 +159,12 @@ impl Surface {
 /// Rebuild the cached handle if the frame moved on; otherwise keep it.
 pub fn refresh(frame: &Arc<Mutex<Frame>>) {
     let mut frame = frame.lock().expect("frame lock");
-    // Bands are the GPU arm's currency; tiny-skia re-blits the whole handle,
-    // so this arm consumes them purely to stop them accumulating for the life
-    // of the process (cold-review finding, 2026-09-21).
+    // Per-band handles already record CPU damage; drain the frame's separate
+    // upload bookkeeping so repeated PTY reads cannot accumulate it.
     frame.clear_damage();
-    // Emptiness FIRST: a surface cleared by a zero-row screen must drop the
-    // handle even if the generation happened to match, or the widget keeps
-    // presenting pixels whose source no longer exists.
+    // Surface::paint drops the tiles on clear, regardless of generation.
     let generation = frame.generation();
     frame.cpu_surface_mut().cache_handle(generation);
-}
-
-pub fn view(frame: &Arc<Mutex<Frame>>) -> image::Image<Handle> {
-    // An empty 1x1 stands in until the first repaint, so `view` has the same
-    // shape before and after — a `None` arm returning a different widget type
-    // would mean two layouts and two chances to get the sizing wrong.
-    let handle = frame
-        .lock()
-        .expect("frame lock")
-        .surface()
-        .cached
-        .as_ref()
-        .map(|(_, handle)| handle.clone())
-        .unwrap_or_else(|| Handle::from_rgba(1, 1, vec![0, 0, 0, 0]));
-    // `content_fit: Fill` because the widget is sized to the grid's LOGICAL
-    // extent while the handle carries PHYSICAL pixels: the default `Contain`
-    // would letterbox to preserve a ratio that is already exact.
-    image::Image::new(handle)
-        .filter_method(image::FilterMethod::Nearest)
-        .content_fit(iced::ContentFit::Fill)
 }
 
 #[cfg(test)]
@@ -201,10 +202,7 @@ mod tests {
     }
 
     fn handle(frame: &Arc<Mutex<Frame>>) -> Handle {
-        frame
-            .lock()
-            .unwrap()
-            .surface()
+        frame.lock().unwrap().surface().tiles[0]
             .cached
             .as_ref()
             .unwrap()
@@ -230,7 +228,10 @@ mod tests {
         let pointer = pixels(&old).as_ptr();
         let id = old.id();
         let before = pixels(&old).to_vec();
-        assert_eq!(frame.lock().unwrap().surface().rgba.as_ptr(), pointer);
+        assert_eq!(
+            frame.lock().unwrap().surface().tiles[0].rgba.as_ptr(),
+            pointer
+        );
         drop(old);
 
         // Only row 1 is dirty. Changing the snapshot's other rows as well
@@ -327,8 +328,11 @@ mod tests {
             assert_eq!(pixels(&current).as_ref(), reference.rgba());
             let locked = frame.lock().unwrap();
             assert_eq!(locked.generation(), generation);
-            assert_eq!(locked.surface().rgba.as_ptr(), pixels(&current).as_ptr());
-            assert_eq!(locked.surface().rgba.len(), pixels(&current).len());
+            assert_eq!(
+                locked.surface().tiles[0].rgba.as_ptr(),
+                pixels(&current).as_ptr()
+            );
+            assert_eq!(locked.surface().tiles[0].rgba.len(), pixels(&current).len());
             for (retained, expected) in &history {
                 assert_eq!(pixels(retained).as_ref(), expected.as_slice());
                 assert_ne!(pixels(retained).as_ptr(), pixels(&current).as_ptr());
@@ -358,13 +362,13 @@ mod tests {
         // Force the conservative frontend guard to fall through while core
         // state correctly reports no cursor and no dirty rows. This models
         // divergence between the guard and core's damage rules.
-        frame.lock().unwrap().cpu_surface_mut().cursor = true;
+        frame.lock().unwrap().cpu_surface_mut().tiles[0].cursor = true;
         assert!(!painter.repaint(PANE, &grid, &[false; 4]));
         // Deliberately do not refresh: main skips it for a false repaint.
         let current = handle(&frame);
         assert_eq!(pixels(&current).as_ref(), pixels(&old).as_ref());
         let locked = frame.lock().unwrap();
-        let surface = locked.surface();
+        let surface = &locked.surface().tiles[0];
         assert_eq!(locked.generation(), generation);
         assert_eq!(surface.cached.as_ref().unwrap().0, generation);
         assert_eq!(surface.rgba.as_ptr(), pixels(&current).as_ptr());

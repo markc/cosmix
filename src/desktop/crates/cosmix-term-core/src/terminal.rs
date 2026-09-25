@@ -33,8 +33,8 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
     term.damage_event_in_flight = false;
 }
 
-/// Rows changed since the last `rearm_damage`, plus the cursor's row (rio's
-/// damage covers where the cursor was, not where it is). Scrolled-back views
+/// Rows changed since the last `rearm_damage`. Cursor changes are added by
+/// capture, relative to the last consuming read. Scrolled-back views
 /// are repainted whole: rio reports their damage in scrollback coordinates.
 ///
 /// rio's `damage()` is not read-only. In insert mode (IRM) it calls
@@ -43,10 +43,7 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
 /// schedule the next. Insert mode repaints whole anyway, so skip the call.
 fn dirty_rows(term: &mut Crosswords<Listener>) -> Vec<bool> {
     let mut dirty = vec![false; term.screen_lines()];
-    let cursor = term.grid.cursor.pos.row.0.max(0) as usize;
-    if term.display_offset() != 0
-        || term.mode().contains(rio_vt::crosswords::Mode::INSERT)
-    {
+    if term.display_offset() != 0 || term.mode().contains(rio_vt::crosswords::Mode::INSERT) {
         dirty.fill(true);
         return dirty;
     }
@@ -59,9 +56,6 @@ fn dirty_rows(term: &mut Crosswords<Listener>) -> Vec<bool> {
             }
         }
         _ => dirty.fill(true),
-    }
-    if let Some(row) = dirty.get_mut(cursor) {
-        *row = true;
     }
     dirty
 }
@@ -507,6 +501,7 @@ pub struct Terminal {
     pub stats: Stats,
     grid: Grid,
     damage: Mutex<Receiver<()>>,
+    captured_cursor: Mutex<Option<((usize, usize), bool)>>,
     pub pid: i32,
     thread: Option<JoinHandle<(Machine<MeteredPty, Listener>, rio_vt::performer::State)>>,
 }
@@ -852,6 +847,7 @@ impl Terminal {
             stats,
             grid,
             damage: Mutex::new(rx),
+            captured_cursor: Mutex::new(None),
             pid,
             thread: Some(thread),
         })
@@ -860,7 +856,10 @@ impl Terminal {
     /// (debug builds assert), so wrap a changing target inside one callback.
     pub fn set_wake(&self, wake: Wake) {
         let installed = self.listener.wake.set(wake).is_ok();
-        debug_assert!(installed, "Terminal::set_wake called twice; the second waker is ignored");
+        debug_assert!(
+            installed,
+            "Terminal::set_wake called twice; the second waker is ignored"
+        );
         self.listener.wake();
     }
     pub fn take_damage(&self) -> bool {
@@ -923,10 +922,23 @@ impl Terminal {
         let pos = term.grid.cursor.pos;
         let cursor = (pos.col.0, pos.row.0.max(0) as usize);
         let cursor_visible = term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+        let mut previous = self.captured_cursor.lock().unwrap();
         if let Some(dirty) = dirty {
             *dirty = dirty_rows(&mut term);
+            if *previous != Some((cursor, cursor_visible)) {
+                for ((_, row), visible) in previous
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once((cursor, cursor_visible)))
+                {
+                    if visible && let Some(row) = dirty.get_mut(row) {
+                        *row = true;
+                    }
+                }
+            }
         }
         if consume {
+            *previous = Some((cursor, cursor_visible));
             // Both operations must remain under this same grid lock. reset_damage
             // alone does not re-arm Machine's damage notification latch.
             rearm_damage(&mut term);
@@ -1334,6 +1346,7 @@ mod tests {
                 stats,
                 grid,
                 damage: Mutex::new(rx),
+                captured_cursor: Mutex::new(None),
                 pid: 0,
                 thread: None,
             };
@@ -1419,8 +1432,8 @@ mod tests {
         assert_eq!(first.screen.cells[0].c, 'A');
         assert_eq!(
             f.quiet_snapshot().dirty_rows.iter().positions(),
-            vec![0],
-            "an idle grid marks only the cursor row"
+            Vec::<usize>::new(),
+            "an unchanged cursor does not dirty an idle grid"
         );
         f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
         assert_eq!(
@@ -1440,13 +1453,13 @@ mod tests {
         assert_eq!(resized.dirty_rows.len(), 30);
         assert_eq!(resized.screen.cols, 100);
         assert!(all(&resized.dirty_rows), "resize");
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
 
         f.feed(b"\x1b[?1049hB", |t| {
             t.mode().contains(Mode::ALT_SCREEN) && cell(t, 0, 1) == 'B'
         });
         assert!(all(&f.settled_snapshot().dirty_rows), "alt-screen entry");
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
         f.feed(b"\x1b[?1049l", |t| !t.mode().contains(Mode::ALT_SCREEN));
         assert!(all(&f.settled_snapshot().dirty_rows), "alt-screen exit");
 
@@ -1454,7 +1467,7 @@ mod tests {
             t.colors()[1].is_some_and(|c| c[0] == 1.0 && c[1] == 0.0 && c[2] == 0.0)
         });
         assert!(all(&f.settled_snapshot().dirty_rows), "palette change");
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
 
         let mut lines = b"\r\n".repeat(40);
         lines.push(b'Z');
@@ -1626,8 +1639,8 @@ mod tests {
         f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
         assert!(f.terminal.take_damage());
         let _ = f.terminal.screen(true);
-        // screen(true) consumed the row damage; only the cursor row remains.
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![2]);
+        // screen(true) consumed both row damage and cursor movement.
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
     }
 
     trait Positions {
