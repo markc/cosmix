@@ -79,6 +79,11 @@ impl Families {
         audio: true,
     };
 
+    #[cfg(feature = "tokio-sleep")]
+    pub fn any(self) -> bool {
+        self.filesystem || self.children || self.net || self.audio
+    }
+
     fn source(self, command: &str) -> bool {
         match command {
             "net.changed" => self.net,
@@ -115,8 +120,9 @@ impl Queue {
         w.overflow |= overflow;
         if let Some(mut c) = change {
             if let Some(previous) = w.changes.get(&c.path) {
-                // Do not erase a paired rename when a close-write follows it.
-                if c.kind == "modified" && previous.kind == "moved" {
+                // Do not erase a pending creation or paired rename when a
+                // write/close-write follows it: the stronger kind subsumes it.
+                if c.kind == "modified" && matches!(previous.kind, "moved" | "created") {
                     c = previous.clone();
                 } else if previous.old_path.is_some() && previous.old_path != c.old_path {
                     // A single per-path record cannot retain two different
@@ -702,6 +708,24 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&event.body).unwrap();
         assert_eq!(v["changes"][0]["old_path"], "old");
         assert_eq!(v["changes"][0]["kind"], "moved");
+    }
+
+    #[tokio::test]
+    async fn close_write_preserves_pending_creation() {
+        let q = queue();
+        q.change(
+            "test",
+            Some(Change {
+                path: "new".into(),
+                old_path: None,
+                kind: "created",
+            }),
+            false,
+        );
+        q.change("test", Some(change("new".into())), false);
+        let event = q.next(None).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&event.body).unwrap();
+        assert_eq!(v["changes"][0]["kind"], "created");
     }
 
     #[tokio::test]
