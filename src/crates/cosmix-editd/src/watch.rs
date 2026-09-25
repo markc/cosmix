@@ -116,8 +116,11 @@ struct Inner {
     warned: bool,
     /// Test hook: runs between `rearm`'s existence check and its watch call.
     #[cfg(test)]
-    before_watch: Option<Box<dyn FnMut(&Path) + Send>>,
+    before_watch: Option<BeforeWatch>,
 }
+
+#[cfg(test)]
+type BeforeWatch = Box<dyn FnMut(&Path) + Send>;
 
 /// Work for the watch thread, in arrival order.
 enum Msg {
