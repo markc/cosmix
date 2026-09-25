@@ -14,6 +14,9 @@ fn rpc($target, $verb, $body)
     if $code != 0 then
       raise("SCENES_UPSTREAM", "scene host refused request", {target:$target, verb:$verb, rc:$code, upstream:$value})
     end
+    if $value == nil then
+      raise("SCENES_UPSTREAM", "scene host returned no reply value", {target:$target, verb:$verb, rc:$code})
+    end
     return $value
   catch $message, $error
     if $error.code == "SCENES_UPSTREAM" then raise($error.code, $message, $error.details) end

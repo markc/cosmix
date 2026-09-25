@@ -42,6 +42,9 @@ pub(crate) struct SceneEntry {
     revision: u64,
     pub mounted: Option<render::Mounted>,
     owner: Option<SceneOwner>,
+    // Set by a loader's JSON load envelope; zero fences a stopped behaviour.
+    // Authored citizen metadata never grants model-write authority.
+    model_generation: Option<u64>,
 }
 
 impl SceneEntry {
@@ -100,6 +103,7 @@ impl SceneStore {
                         "citizen": entry.document.citizen,
                         "owner": entry.owner.as_ref().map(|owner| &owner.citizen),
                         "revision": entry.revision,
+                        "model_generation": entry.model_generation,
                         "digest": digest(&entry.tree),
                         "registered": seat.is_some(),
                     })
@@ -182,8 +186,25 @@ impl SceneStore {
                 Ok((json!({"scene":tree.name,"valid":true,"diagnostics":diagnostics}), None))
             }
             SceneVerb::Load => {
-                let document = cosmix_scene::parse(body).map_err(|d| json!({"diagnostics":d}))?;
-                self.accept(document, mount, true)
+                let managed_generation = if args.get("model_generation").is_some() {
+                    Some(args["model_generation"].as_u64().filter(|g| *g <= 9_007_199_254_740_990)
+                        .ok_or_else(|| json!({"error_code":"SCENE_MODEL_GENERATION", "message":"model_generation must be an exact nonnegative integer"}))?)
+                } else { None };
+                let source = args["source"].as_str().unwrap_or(body);
+                let document = cosmix_scene::parse(source).map_err(|d| json!({"diagnostics":d}))?;
+                if let Some(entry) = self.scenes.get(&document.name)
+                    && entry.model_generation.is_some()
+                    && (managed_generation.is_none() || !entry.is_model_authority(mount.as_deref()))
+                {
+                    return Err(model_authority_refusal(&document.name));
+                }
+                if managed_generation.is_some() && mount.is_none() {
+                    return Err(model_authority_refusal(&document.name));
+                }
+                let name = document.name.clone();
+                let result = self.accept(document, mount, true)?;
+                self.scenes.get_mut(&name).unwrap().model_generation = managed_generation;
+                Ok(result)
             }
             SceneVerb::Describe => {
                 let families = [
@@ -244,6 +265,12 @@ impl SceneStore {
                 let value = args.get("value")
                     .ok_or_else(|| json!({"error":"value is required"}))?;
                 if path == "model" || path.starts_with("model.") {
+                    if let Some(generation) = entry.model_generation
+                        && (!entry.is_model_authority(mount.as_deref())
+                            || generation == 0 || args["generation"].as_u64() != Some(generation))
+                    {
+                        return Err(model_authority_refusal(name));
+                    }
                     let result = cosmix_scene::bindings::reevaluate(&entry.tree, &entry.bindings, path, value)
                         .map_err(|d| json!({"scene":name,"diagnostics":d}))?;
                     document.model = Some(result.tree.model.clone());
@@ -416,7 +443,9 @@ impl SceneStore {
         let reply = json!({"scene":tree.name,"revision":revision,"digest":digest(&tree)});
         let summary =
             json!({"scene":tree.name,"revision":revision,"ops":ops,"diagnostics":diagnostics});
-        let mounted = self.scenes.remove(&tree.name).and_then(|old| old.mounted);
+        let old = self.scenes.remove(&tree.name);
+        let model_generation = old.as_ref().and_then(|old| old.model_generation);
+        let mounted = old.and_then(|old| old.mounted);
         self.scenes.insert(
             tree.name.clone(),
             SceneEntry {
@@ -426,10 +455,23 @@ impl SceneStore {
                 revision,
                 mounted,
                 owner,
+                model_generation,
             },
         );
         Ok((reply, Some(summary)))
     }
+}
+
+impl SceneEntry {
+    fn is_model_authority(&self, mount: Option<&SceneMount<'_>>) -> bool {
+        self.owner.as_ref().zip(mount)
+            .is_some_and(|(owner, caller)| owner.citizen == caller.owner)
+    }
+}
+
+fn model_authority_refusal(name: &str) -> Value {
+    json!({"scene":name, "error_code":"SCENE_MODEL_AUTHORITY",
+        "message":"managed model writes require the loader and its current generation; use scenes.model"})
 }
 
 fn digest(tree: &ResolvedScene) -> String {
@@ -478,6 +520,58 @@ rows: {widget: "list", rows: "= $model.rows", row: "item", row_height: 24}
 item: {widget: "text", text: "{cells[0]}"}
 ```
 "#;
+
+    #[test]
+    fn managed_model_writes_require_loader_and_current_generation() {
+        let mut store = SceneStore::default();
+        let output = OutputKey::new("test-output").unwrap();
+        let mut registry = SubPanelRegistry::default();
+        let mut mount = SceneMount {
+            registry: &mut registry, output: &output, owner: "scenes", accepted_at: 1,
+        };
+        let load = json!({"source": MODEL_SCENE, "model_generation": 7});
+        store.request_mounted(SceneVerb::Load, "", &load, Some(&mut mount)).unwrap();
+        let patch = json!({"scene":"model-test", "path":"model.caption", "value":"current", "generation":7});
+        store.request_mounted(SceneVerb::Patch, "", &patch, Some(&mut mount)).unwrap();
+        assert_eq!(store.scenes["model-test"].tree.nodes["caption"].ports["text"], "current");
+
+        // Equal tokens confer no authority to a direct behaviour or mesh caller.
+        for caller in ["scene-model-test", "peer/editor"] {
+            mount.owner = caller;
+            let before = store.scenes["model-test"].tree.clone();
+            let revision = store.scenes["model-test"].revision;
+            for path in ["model", "model.caption"] {
+                let mut request = patch.clone();
+                request["path"] = json!(path);
+                request["value"] = if path == "model" { json!({"caption":"bad"}) } else { json!("bad") };
+                let error = store.request_mounted(SceneVerb::Patch, "", &request, Some(&mut mount)).unwrap_err();
+                assert_eq!(error["error_code"], "SCENE_MODEL_AUTHORITY");
+                assert_eq!(store.scenes["model-test"].tree, before);
+                assert_eq!(store.scenes["model-test"].revision, revision);
+            }
+            assert!(store.request_mounted(SceneVerb::Load, MODEL_SCENE, &Value::Null, Some(&mut mount)).is_err());
+            assert!(store.request_mounted(SceneVerb::Load, "", &load, Some(&mut mount)).is_err());
+        }
+        mount.owner = "scenes";
+        // A raw load cannot accidentally strip an existing fence, even by its owner.
+        assert!(store.request_mounted(SceneVerb::Load, MODEL_SCENE, &Value::Null, Some(&mut mount)).is_err());
+        store.request_mounted(SceneVerb::Load, "", &json!({"source":MODEL_SCENE,"model_generation":8}), Some(&mut mount)).unwrap();
+        let revision = store.scenes["model-test"].revision;
+        for generation in [Value::Null, json!(7), json!("8")] {
+            let mut stale = patch.clone();
+            stale["generation"] = generation;
+            assert!(store.request_mounted(SceneVerb::Patch, "", &stale, Some(&mut mount)).is_err());
+            assert_eq!(store.scenes["model-test"].revision, revision);
+        }
+        let mut current = patch;
+        current["generation"] = json!(8);
+        store.request_mounted(SceneVerb::Patch, "", &current, Some(&mut mount)).unwrap();
+        store.request_mounted(SceneVerb::Patch, "", &json!({"scene":"model-test","path":"caption.text","value":"layout"}), Some(&mut mount)).unwrap();
+        assert_eq!(store.scenes["model-test"].model_generation, Some(8));
+        store.request_mounted(SceneVerb::Load, "", &json!({"source":MODEL_SCENE,"model_generation":0}), Some(&mut mount)).unwrap();
+        current["generation"] = json!(0);
+        assert!(store.request_mounted(SceneVerb::Patch, "", &current, Some(&mut mount)).is_err());
+    }
 
     #[test]
     fn model_patch_is_transactional_and_retains_bindings_and_last_good_values() {

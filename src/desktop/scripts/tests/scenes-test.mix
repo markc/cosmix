@@ -4,6 +4,7 @@ $l = require("../lib/scenes.mix")
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-scenes-test.XXXXXXXX"]))
 $log = $tmp .. "/calls"
 $checks = {count:0}
+$host_state = {panels:{}, apply:false, nil_verb:nil, unload_error:nil, names:["test-shell"]}
 write_file($log, "")
 
 fn check($ok, $message)
@@ -23,22 +24,32 @@ fn record($verb, $body)
 end
 fn rpc($host, $verb, $body)
   record($verb, $body)
+  if $verb == $host_state.nil_verb then return nil end
+  if $verb == "noded.props.get" then return {services:{registered:$host_state.names}} end
+  if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_error then raise("SCENES_UPSTREAM", "unload refused", {}) end
   if contains(["shell.scene.load", "shell.scene.validate"], $verb) then
-    $d = $l.document($body)
-    if contains($body, "BROKEN") then raise("SCENES_UPSTREAM", "invalid document", {rc:10, upstream:{diagnostics:[{line:7, code:"mix-parse"}]}}) end
+    $source = type($body) == "map" ? $body.source : $body
+    $d = $l.document($source)
+    if contains($source, "BROKEN") then raise("SCENES_UPSTREAM", "invalid document", {rc:10, upstream:{diagnostics:[{line:7, code:"mix-parse"}]}}) end
     return {revision:len(calls("shell.scene.load")), scene:$d.name}
   end
   if $verb == "shell.scene.patch" then
     if $body.value.refuse == true then raise("SCENES_UPSTREAM", "refused model", {rc:10, upstream:{error_code:"DOCUMENT_TOO_LARGE", message:"large"}}) end
     return {revision:100 + len(calls("shell.scene.patch"))}
   end
-  if $verb == "shell.props.get" then return {panels:{}} end
+  if $verb == "shell.props.get" then return {panels:$host_state.panels} end
+  if $verb == "shell.panel.state" then return $host_state.panels[$body.edge] end
+  if $host_state.apply and $verb == "shell.panel.page.set" then $host_state.panels[$body.edge].page = $body.id end
+  if $host_state.apply and $verb == "shell.panel.mode" then
+    $host_state.panels[$body.edge].mode = $body.mode
+    $host_state.panels[$body.edge].visible = $body.mode != "hidden"
+  end
   if $verb == "shell.scenes.list" then
     $mounted = {}
     for each $line in read_lines($log)
       $call = json_parse($line)
-      if $call.verb == "shell.scene.load" and not contains($call.body, "BROKEN") then
-        $mounted[$l.document($call.body).name] = true
+      if $call.verb == "shell.scene.load" and not contains($call.body.source, "BROKEN") then
+        $mounted[$l.document($call.body.source).name] = true
       elif $call.verb == "shell.scene.unload" then
         $mounted = delete($mounted, $call.body.scene)
       end
@@ -46,6 +57,15 @@ fn rpc($host, $verb, $body)
     return map(keys($mounted), fn($name) = {name:$name, owner:"test-scenes"})
   end
   return {accepted:true}
+end
+fn panel_notice($s, $notice)
+  $host_state.panels = $notice.panels
+  return $l.panel_changed($s, $notice)
+end
+fn deadline($s, $name, $generation)
+  -- Advance the deterministic clock to the deadline, without a real sleep.
+  if ($s.scenes[$name] ?? {}).generation == $generation then $s.scenes[$name].restart_at = 0 end
+  return $l.restart($s, $name, $generation)
 end
 fn check_behaviour($path)
   record("check", $path)
@@ -161,7 +181,7 @@ try
   for $i = 1 to 5
     $e = $s.scenes.probe
     $s = $l.exited($s, {pid:$e.pid, tag:{name:"probe", generation:$e.generation}, exit_code:1, signal:nil})
-    if $i < 5 then $s = $l.restart($s, "probe", $e.generation) end
+    if $i < 5 then $s = deadline($s, "probe", $e.generation) end
   end
   check($s.scenes.probe.status == "crash_loop", "bounded crash-loop failure")
   $s = $l.request($s, "reload", {name:"probe"})
@@ -184,35 +204,38 @@ try
   $s = $l.request($s, "reset", {name:"example"})
   check($s.rc == 0 and $s.scenes.example.model.text == "default" and is_dir($s.response.recovery), "reset restores defaults and backs up")
   $s.panels = {right:{pages:["scene-example", "other"], page:"other", mode:"hidden", visible:false}}
+  $host_state.panels = $s.panels
   $s = $l.request($s, "open", {name:"example"})
   check($s.open == "example" and $s.scenes.example.pending, "open queued")
-  $s = $l.panel_changed($s, {generation:1, revision:1, panels:{right:{pages:["scene-example", "other"], page:"scene-example", mode:"hidden", visible:false}}})
-  $s = $l.panel_changed($s, {generation:1, revision:2, panels:{right:{pages:["scene-example", "other"], page:"scene-example", mode:"pinned", visible:true}}})
+  $s = panel_notice($s, {generation:1, revision:1, panels:{right:{pages:["scene-example", "other"], page:"scene-example", mode:"hidden", visible:false}}})
+  $s = panel_notice($s, {generation:1, revision:2, panels:{right:{pages:["scene-example", "other"], page:"scene-example", mode:"pinned", visible:true}}})
   check(not $s.scenes.example.pending, "applied notification completes open")
   install_fixture($s.root, "second", false)
   write_file($s.root .. "/second/scene.mix", replace(fixture_source("second", "second"), "\"edge\":\"right\"", "\"edge\":\"left\""))
   $s = $l.rescan($s, false)
   $s = $l.request($s, "enable", {name:"second"})
   $s.panels.left = {pages:["scene-second", "native"], page:"native", mode:"hidden", visible:false}
+  $host_state.panels = $s.panels
   $selected = len(calls("shell.panel.page.set"))
   $s = $l.request($s, "open", {name:"second"})
   check($s.open == "second" and $s.scenes.second.pending and $s.desired.recovery.right.phase == "restoring", "second popup waits for first release")
   check(len(calls("shell.panel.page.set")) == $selected + 1, "only previous selection restored while release is pending")
-  $s = $l.panel_changed($s, {generation:1, revision:3, panels:{right:{pages:["scene-example", "other"], page:"other", mode:"hidden", visible:false},left:$s.panels.left}})
+  $s = panel_notice($s, {generation:1, revision:3, panels:{right:{pages:["scene-example", "other"], page:"other", mode:"hidden", visible:false},left:$s.panels.left}})
   check($s.desired.recovery.right == nil and $s.desired.recovery.left.name == "second", "applied release advances mutually exclusive open")
   $s.panels.left = {pages:["scene-second", "native"],page:"scene-second",mode:"pinned",visible:true}
+  $host_state.panels = $s.panels
   remove($s.root .. "/second/scene.mix")
   $s = $l.filesystem($s, {overflow:false, changes:[{path:$s.root .. "/second/scene.mix",kind:"deleted"}]})
   check($s.open == nil and not $s.scenes.second.mounted and $s.desired.recovery.left.phase == "restoring", "document deletion stops/unloads and releases popup")
-  $s = $l.panel_changed($s, {generation:1,revision:4,panels:{right:$s.panels.right,left:{pages:["native"],page:"native",mode:"hidden",visible:false}}})
+  $s = panel_notice($s, {generation:1,revision:4,panels:{right:$s.panels.right,left:{pages:["native"],page:"native",mode:"hidden",visible:false}}})
   $s = $l.request($s, "open", {name:"example"})
-  $s = $l.panel_changed($s, {generation:1,revision:5,panels:{right:{pages:["scene-example","other"],page:"scene-example",mode:"pinned",visible:true},left:$s.panels.left}})
+  $s = panel_notice($s, {generation:1,revision:5,panels:{right:{pages:["scene-example","other"],page:"scene-example",mode:"pinned",visible:true},left:$s.panels.left}})
   $n = len(calls("shell.panel.mode"))
-  $s = $l.panel_changed($s, {generation:1, revision:5, panels:$s.panels})
+  $s = panel_notice($s, {generation:1, revision:5, panels:$s.panels})
   check(len(calls("shell.panel.mode")) == $n, "duplicate applied event suppressed")
   $s = $l.request($s, "toggle", {name:"example"})
   check($s.open == nil, "toggle closes")
-  $s = $l.panel_changed($s, {generation:1, revision:6, panels:{right:{pages:["scene-example", "other"], page:"other", mode:"hidden", visible:false}}})
+  $s = panel_notice($s, {generation:1, revision:6, panels:{right:{pages:["scene-example", "other"], page:"other", mode:"hidden", visible:false}}})
   check(len(keys($s.desired.recovery)) == 0, "applied restore clears recovery")
   $s = $l.request($s, "close", {name:"example"})
   check($s.rc == 0, "idempotent close")
@@ -244,6 +267,180 @@ try
   check(len(calls("shell.scene.load")) == $n, "startup waits for subscribed service snapshot before mounting")
   $fresh = $l.services($fresh, ["test-shell"], false)
   check($fresh.scenes.probe.generation > $s.scenes.probe.generation, "loader restart never reuses behaviour generation")
+
+  -- #2/#3: commands apply but every panel notice is dropped. No-op selects
+  -- and pins must complete from reads, including restoring another pinned page.
+  install_fixture($s.root, "fast", false)
+  $s = $l.rescan($s, false)
+  $s = $l.request($s, "enable", {name:"fast"})
+  $host_state.apply = true
+  $host_state.panels = {right:{pages:["scene-fast", "other"], page:"scene-fast", mode:"hidden", visible:false}}
+  $selects = len(calls("shell.panel.page.set"))
+  $s = $l.request($s, "open", {name:"fast"})
+  check($s.rc == 0 and not $s.scenes.fast.pending and $host_state.panels.right.mode == "pinned", "selected hidden popup pins without a notice")
+  check(len(calls("shell.panel.page.set")) == $selects, "already selected page needs no command")
+  $pins = len(calls("shell.panel.mode"))
+  $s = $l.request($s, "open", {name:"fast"})
+  check(not $s.scenes.fast.pending and len(calls("shell.panel.mode")) == $pins, "already pinned open completes without an event")
+  $s = $l.request($s, "close", {name:"fast"})
+  check($s.rc == 0 and $s.desired.recovery.right == nil and $host_state.panels.right.mode == "hidden", "own hidden page restored from command reads")
+  $host_state.panels.right = {pages:["scene-fast", "other"],page:"other",mode:"pinned",visible:true}
+  $s = $l.request($s, "open", {name:"fast"})
+  check(not $s.scenes.fast.pending and $host_state.panels.right.page == "scene-fast", "open over another pinned page")
+  $s = $l.request($s, "close", {name:"fast"})
+  check($s.desired.recovery.right == nil and $host_state.panels.right.page == "other" and $host_state.panels.right.mode == "pinned", "same-mode close restores previous page before clearing recovery")
+  $host_state.panels.right.mode = "docked"
+  $s = $l.request($s, "open", {name:"fast"})
+  $s = $l.request($s, "close", {name:"fast"})
+  check($host_state.panels.right.page == "other" and $host_state.panels.right.mode == "docked" and $s.desired.recovery.right == nil, "restore both page and different mode without notices")
+  $host_state.nil_verb = "shell.props.get"
+  $_ = refused($s, "open", {name:"fast"}, "SCENES_SNAPSHOT")
+  $host_state.nil_verb = "shell.panel.page.set"
+  $_ = refused($s, "open", {name:"fast"}, "SCENES_SNAPSHOT")
+  $host_state.nil_verb = nil
+  $s = $l.request($s, "close", {name:"fast"})
+  -- A stale event payload must not overwrite a newer command snapshot.
+  $before = $host_state.panels
+  $s = $l.panel_changed($s, {generation:8,revision:1,panels:{}})
+  check(deep_eq($s.panels, $before), "notice is a hint; panel state read is authoritative")
+  $s = $l.services($s, ["test-shell"], true)
+  check(deep_eq($s.panels, $host_state.panels), "gap/reconnect resynchronises panel state")
+  $host_state.nil_verb = "shell.props.get"
+  $s = $l.services($s, ["test-shell"], true)
+  check(($s.diagnostic ?? {}).error_code == "SCENES_SNAPSHOT" and $s.sync_needed, "nil reconnect snapshot leaves resynchronisation due")
+  $host_state.nil_verb = nil
+  $s = $l.services($s, ["test-shell"], false)
+  check(not $s.sync_needed, "same service snapshot retries a previously failed resynchronisation")
+
+  -- #4/M3: a deadline can expire while Quoin is absent. Remount must restart,
+  -- including when the continuation was cancelled and only its deadline remains.
+  $e = $s.scenes.probe
+  $s = $l.exited($s, {pid:$e.pid,tag:{name:"probe",generation:$e.generation},exit_code:1,signal:nil})
+  $n = len(calls("launch"))
+  $s = $l.restart($s, "probe", $e.generation)
+  check(len(calls("launch")) == $n and $s.scenes.probe.restart_at > monotonic(), "restart cannot run before its computed deadline")
+  $s = $l.services($s, [], false)
+  $s = deadline($s, "probe", $e.generation)
+  check($s.scenes.probe.pid == nil and $s.scenes.probe.restart_at == nil, "elapsed deadline recorded while host absent")
+  $s = $l.services($s, ["test-shell"], false)
+  check($s.scenes.probe.pid != nil and $s.scenes.probe.generation > $e.generation, "remount resumes elapsed backoff")
+  $e = $s.scenes.probe
+  $s = $l.exited($s, {pid:$e.pid,tag:{name:"probe",generation:$e.generation},exit_code:1,signal:nil})
+  $s.scenes.probe.restart_at = 0
+  $s = $l.services($s, ["test-shell"], true)
+  check($s.scenes.probe.pid != nil and $s.scenes.probe.generation > $e.generation, "reconnect recovers expired backoff without restart event")
+  $entry_script = read_file(dirname($0) .. "/../scenes.mix")
+  check(not contains($entry_script, "emit $ME scenes.restart_due") and contains($entry_script, "on proc.exited async"), "native exit owns in-process deadline; no Bus self-emit")
+
+  -- #5: pre-existing aliases (including dangling links) never receive writes.
+  $recovery_dir = $s.root .. "/.recovery"
+  rename($recovery_dir, $s.root .. "/.saved-recovery")
+  mkdir($tmp .. "/outside")
+  $original = read_file($s.root .. "/fast/scene.mix")
+  symlink($tmp .. "/outside", $recovery_dir)
+  for each $verb in ["remove", "reset"]
+    $_ = refused($s, $verb, {name:"fast"}, "SCENES_FILES")
+    check(read_file($s.root .. "/fast/scene.mix") == $original and len(ls($tmp .. "/outside")) == 0, "recovery symlink refusal preserves source and outside directory")
+  end
+  remove($recovery_dir)
+  symlink($tmp .. "/missing", $recovery_dir)
+  $_ = refused($s, "remove", {name:"fast"}, "SCENES_FILES")
+  check(not exists($tmp .. "/missing"), "dangling recovery link never creates its target")
+  remove($recovery_dir)
+  write_file($recovery_dir, "not a directory")
+  $_ = refused($s, "remove", {name:"fast"}, "SCENES_FILES")
+  remove($recovery_dir)
+  rename($s.root .. "/.saved-recovery", $recovery_dir)
+  symlink($s.root .. "/fast", $s.root .. "/alias")
+  $s = $l.rescan($s, false)
+  $_ = refused($s, "remove", {name:"alias"}, "SCENES_FILES")
+  check(read_file($s.root .. "/fast/scene.mix") == $original, "installation symlink cannot move the real source")
+  remove($s.root .. "/alias")
+  $escaped = false
+  try
+    $l.recovery_move($s, $s.root .. "/fast", $tmp .. "/outside/fast")
+  catch $message, $error
+    $escaped = $error.code == "SCENES_FILES"
+  end
+  check($escaped and is_dir($s.root .. "/fast"), "recovery destination containment enforced")
+
+  -- m5: one raising unload cannot discard later names in an fs batch/rescan.
+  for each $name in ["aa-fails", "zz-good"]
+    install_fixture($s.root, $name, false)
+  end
+  $s = $l.rescan($s, false)
+  for each $name in ["aa-fails", "zz-good"]
+    $s = $l.request($s, "enable", {name:$name})
+  end
+  $host_state.unload_error = "aa-fails"
+  remove($s.root .. "/aa-fails/scene.mix")
+  write_file($s.root .. "/zz-good/scene.mix", fixture_source("zz-good", "batch edit"))
+  $revision = $s.scenes["zz-good"].revision
+  $s = $l.filesystem($s, {overflow:false,changes:[{path:$s.root .. "/aa-fails/scene.mix"},{path:$s.root .. "/zz-good/scene.mix"}]})
+  check($s.scenes["aa-fails"].diagnostic.error_code == "SCENES_UPSTREAM" and $s.scenes["zz-good"].revision > $revision, "raising reconcile isolated within fs batch")
+  write_file($s.root .. "/zz-good/scene.mix", fixture_source("zz-good", "rescan edit"))
+  $revision = $s.scenes["zz-good"].revision
+  $s = $l.rescan($s, false)
+  check($s.scenes["zz-good"].revision > $revision, "raising reconcile isolated within full rescan")
+  $host_state.unload_error = nil
+
+  -- m6/m7: retiring ownership outlives an installation and its replacement.
+  install_fixture($s.templates, "worker", true)
+  $s = $l.request($s, "install", {template:"worker",name:"handover",enable:true})
+  $old = $s.scenes.handover
+  $s = $l.request($s, "remove", {name:"handover"})
+  check($s.scenes.handover == nil and $s.retiring.handover.pid == $old.pid, "remove retains owned child tombstone")
+  $s = $l.request($s, "install", {template:"worker",name:"handover",enable:true})
+  check($s.scenes.handover.pid == nil, "same-name reinstall waits for old child")
+  $host_state.names = ["test-shell", "scene-handover"]
+  $s = $l.exited($s, {pid:$old.pid,tag:{name:"handover",generation:$old.generation},exit_code:0,signal:nil})
+  check($s.scenes.handover.pid == nil and $s.scenes.handover.status == "handover", "reaped child still waits for broker name release")
+  $host_state.names = ["test-shell"]
+  $s = $l.services($s, $host_state.names, false)
+  check($s.scenes.handover.pid != nil and $s.scenes.handover.generation > $old.generation, "registry snapshot completes serial handover")
+  $_ = refused($s, "model", {name:"handover",generation:$old.generation,value:{}}, "SCENES_STALE_GENERATION")
+  $current = $s.scenes.handover
+  $s = $l.request($s, "model", {name:"handover",generation:$current.generation,value:{text:"mesh edit"}})
+  $patches = calls("shell.scene.patch")
+  check($s.rc == 0 and $patches[len($patches)-1].body.generation == $current.generation, "mesh loader model verb forwards current generation")
+  $loads = calls("shell.scene.load")
+  check($loads[len($loads)-1].body.model_generation == $current.generation, "host load installs generation fence before launch")
+  $host_state.nil_verb = "shell.scene.patch"
+  $model = $s.scenes.handover.model
+  $s = refused($s, "model", {name:"handover",generation:$current.generation,value:{text:"nil reply"}}, "SCENES_SNAPSHOT")
+  check(deep_eq($s.scenes.handover.model, $model), "nil patch reply cannot commit cached model")
+  $host_state.nil_verb = nil
+  $s = $l.request($s, "remove", {name:"handover"})
+  $s = $l.exited($s, {pid:$current.pid,tag:{name:"handover",generation:$current.generation},exit_code:0,signal:nil})
+  check($s.scenes.handover == nil and $s.retiring.handover == nil, "exit after remove consumes tombstone without nil dereference")
+  $s = $l.exited($s, {pid:$current.pid,tag:{name:"handover",generation:$current.generation},exit_code:0,signal:nil})
+  $s = $l.changed($s)
+  check($s.scenes.handover == nil, "duplicate removed-scene exit remains harmless and publishable")
+  $refused_reload = false
+  $n = len(calls("launch"))
+  try
+    $l.check_loader_epoch(to_string(pid()), pid())
+  catch $message, $error
+    $refused_reload = $error.code == "SCENES_RELOAD_RESTART_REQUIRED"
+  end
+  check($refused_reload and len(calls("launch")) == $n, "loader hot reload refuses before starting overlapping children")
+  $l.check_loader_epoch("previous-process", pid())
+
+  -- A failure after issuing stop must still retain its ownership tombstone;
+  -- a failure during restart must still consume the old exit exactly once.
+  $old = $s.scenes.probe
+  $host_state.nil_verb = "shell.scene.load"
+  $s = $l.request($s, "disable", {name:"probe"})
+  check($s.retiring.probe.pid == $old.pid and $s.scenes.probe.pid == nil, "failed host fence cannot forget an issued stop")
+  $host_state.nil_verb = nil
+  $s = $l.request($s, "enable", {name:"probe"})
+  $host_state.nil_verb = "noded.props.get"
+  $s = $l.exited($s, {pid:$old.pid,tag:{name:"probe",generation:$old.generation},exit_code:0,signal:nil})
+  check($s.retiring.probe == nil and $s.scenes.probe.retiring == nil and $s.scenes.probe.status == "handover", "failed registry read cannot resurrect consumed retirement")
+  $host_state.nil_verb = nil
+  $s = $l.services($s, ["test-shell"], false)
+  check($s.scenes.probe.pid != nil, "next service snapshot retries handover after failed registry read")
+
   write_file($s.root .. "/state.conf.mix", "BROKEN")
   $s = $l.rescan($s, false)
   check($s.diagnostic != nil and $s.scenes.probe.enabled, "bad state retains last-good desire")

@@ -76,7 +76,7 @@ diagnostics also report file, attempted digest and last-good revision.
 | `scenes.reload` | `{name}` → acceptance/revision; retry files and failed behaviour, retaining runtime model |
 | `scenes.reset` | `{name}` → `{name,recovery}`; stage recorded shipped origin, validate, retain old copy, restore defaults; refuse unknown origin |
 | `scenes.ready` | `{name,generation}` → `{name,generation,publish_model:true}`; the behaviour then publishes its initial complete model |
-| `scenes.model` | `{name,generation,value}` → acceptance/revision; `value` is a complete map, submitted as `shell.scene.patch {scene,path:"model",value}` |
+| `scenes.model` | `{name,generation,value}` → acceptance/revision; `value` is a complete map, submitted by the loader as `shell.scene.patch {scene,path:"model",generation,value}` |
 | `scenes.open` / `scenes.close` / `scenes.toggle` | `{name}` → `{name,open,pending}`; desired popup state, with applied completion reported through `scenes.changed` |
 
 Stage A refuses the reserved pages `scene-panel`, `scene-launcher`,
@@ -107,6 +107,17 @@ Layout changes use full `shell.scene.load`, carrying the last accepted runtime
 model in the candidate. Model updates use the patch endpoint. Behaviour edits
 pass `mix --check` and `mix lint --deny-warnings` before replacement. Generation
 invalidation precedes stop; replacement waits for the retiring child's exit.
+The retiring record survives removal and reinstallation of the same name.
+Before spawning, the loader also reads the broker registry and waits for any
+old `scene-<name>` registration to disappear. Service snapshots resume that
+handover. Each name in a filesystem batch or rescan has its own error boundary,
+so one refused unload does not discard the rest of the batch.
+
+Loader `RELOAD` is refused during candidate initialisation, before filesystem
+or process side effects; the old evaluator continues serving. Restart the
+loader process to update its script. Native Mix currently has no post-commit
+hook for starting replacement children after the old registry retires.
+`scenes.reload {name}` still replaces an individual behaviour normally.
 
 Managed spawn uses `{die_with_parent:true,exit_event:true,tag:<JSON string>}`.
 The string encodes `{name,generation}`; `on proc.exited` receives
@@ -114,15 +125,17 @@ The string encodes `{name,generation}`; `on proc.exited` receives
 Four failure-triggered restart deadlines are 1, 2, 4 and 8 seconds; the fifth
 consecutive exit enters `crash_loop`. Running at least 60 seconds resets the
 count at the next exit, without a health timer. Explicit reload retries the
-failed scene. Disable during a deadline invalidates its generation.
+failed scene. Disable during a deadline invalidates its generation. Deadlines
+use an in-process async wait in the native exit handler, never a Bus self-emit.
+An elapsed deadline stays eligible when Quoin is absent and resumes on remount;
+reconnect reconciliation also checks the computed deadline directly.
 
 The process adapter uses W1's registry-backed `kill(pid,9)` to stop the owned
 child through its retained pidfd. Generation checks precede stop and exit
-handling is synchronous: the numeric PID is discarded as soon as its exit
-event is delivered. Replacement waits for that event; the native reaper owns
+bookkeeping precedes the async deadline: the numeric PID is discarded as soon
+as its exit event is handled. Replacement waits for that event; the native reaper owns
 descendant cleanup. SIGKILL is deliberate so a stuck behaviour needs no stop
-poll or escalation timer. Only the crash restart deadline runs in an async
-self-directed handler. The installed pre-W1 interpreter cannot run this
+poll or escalation timer. The installed pre-W1 interpreter cannot run this
 watcher/child path; deterministic tests fake only that boundary. The integration
 gate must confirm W1's PID retention and exit-delivery guarantees before
 enabling the unit.
@@ -135,7 +148,11 @@ the current on-disk edit is broken. Behaviour service disappearance alone
 never unloads a scene. The owner is the verified loading citizen.
 
 Popup selection, temporary pinning, mutual exclusion and saved-mode recovery
-advance on applied `shell.panel.changed` receipts, never select/hide polling.
+advance from command replies followed by `shell.panel.state` reads. Already
+satisfied phases complete immediately. `shell.panel.changed` is a hint to read
+state, and every subscribed topic's gap causes a full resynchronisation.
+Recovery requires both the saved page and mode to be restored before its
+record is removed, including when both pages were already pinned.
 Recovery is persisted before pinning. If another page takes the edge, recovery
 does not hide it. The legacy panel remains in use in Stage A but consumes the
 same applied-state stream; its network/audio conversion belongs to Stage C.
@@ -161,9 +178,13 @@ installer is changed by this public workstream.
 
 Limits and remaining operational assumptions: at most 128 installed scene
 records, 256 KiB per scene/behaviour file and runtime model, and 64 KiB state or
-metadata. Recovery copies are retained for the operator to manage. Trusted
-desktop-user edits are assumed: filesystem prechecks are not an `openat`
-security boundary against a simultaneous hostile symlink swap. Reset uses two
+metadata. Recovery copies are retained for the operator to manage. Recovery
+mutations reject symlinks (including dangling links), non-directory recovery
+paths and destinations outside the canonical scene root. Source and parent
+checks use no-follow stat; rename does not follow its final components. Trusted
+desktop-user edits are still assumed: Mix has no directory-handle-relative
+rename, so these prechecks cannot exclude a simultaneous hostile parent swap.
+Reset uses two
 renames with rollback on an ordinary error; power loss between those renames
 leaves the preserved copy under `.recovery`. Multiple processes directly
 editing state do not share the loader's advisory lock. A transport timeout can
@@ -174,6 +195,13 @@ touches it.
 The advisory loader lock assumes the root directory itself remains in place;
 replacing the root can detach that lock inode even though native watches
 recover. Stop the loader before replacing its whole root. Runtime model writes
-for managed scenes must use `scenes.model`; direct `shell.scene.patch` model
-writes are not imported into the loader's retained model. The local/mesh gate
+for managed scenes must use `scenes.model`. The loader mounts with a JSON
+`shell.scene.load {source,model_generation}` envelope and updates the fence
+before each spawn; zero disables model writes. The host requires both the
+verified loading citizen and matching positive `generation` for `model` and
+`model.*` patches. Direct behaviour/editor writes are refused without changing
+the model or revision, and a raw load cannot strip a managed fence. Local and
+mesh editors keep access through the loader's generation-aware verbs, so its
+retained model survives remounts. Unmanaged scenes keep direct model patches.
+The local/mesh gate
 assumes its two configured targets reach the same citizen over distinct routes.
