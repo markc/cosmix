@@ -1,10 +1,10 @@
 //! Frontend-side model for the `edit` service (ced E1 plan
 //! `_plan/2026-09-26-ced-e1-implementation.md` §1.4): the mirror (local echo
-//! + single-authority OT rebase), the editor model, highlighting and
+//! with single-authority OT rebase), the editor model, highlighting and
 //! diagnostics state. Shared by the ced app, `ced --headless` and the E2 scene
 //! widget. No UI toolkit; nothing here needs a running async runtime; the Bus
-//! transport stays in the consumer (the mirror only produces [`types::Outgoing`]
-//! and consumes replies/events).
+//! transport stays in the consumer (the mirror only produces
+//! [`types::Outgoing`] and consumes replies/events).
 //!
 //! Where each contract lives: pipeline, fold, replies, deadlines, recovery,
 //! conflicts → [`mirror`]; editing commands and delta mapping → [`model`];

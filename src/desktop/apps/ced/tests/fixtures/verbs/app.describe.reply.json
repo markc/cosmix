@@ -1,0 +1,1 @@
+{"contract": "ctk-app-control.v0", "app": "ced", "title": "CosMix Editor", "view": "x.mix", "engine": "iced", "version": "0.1.0", "description": "The CosMix Editor: an iced editor over the edit Bus service", "controls": [], "verbs": ["ced.open", "ced.state", "app.quit"]}

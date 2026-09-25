@@ -1,0 +1,1 @@
+{"keys": 1200, "frames": 3400, "model_us": {"p50": 40, "p95": 90, "p99": 150, "max": 900}, "view_us": {"p50": 900, "p95": 1800, "p99": 2600, "max": 7000}, "next_frame_us": {"p50": 4000, "p95": 9000, "p99": 12000, "max": 30000}, "events": 250, "history_recoveries": 1, "snapshot_recoveries": 0, "conflicts": 0, "retries": 0, "uncertain": 0}
