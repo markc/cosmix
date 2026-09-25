@@ -901,7 +901,12 @@ fn update(
         }
         "image" => {
             let src = text(node, "src");
-            let image = if src.starts_with('/') {
+            // An empty source (e.g. a list row whose app has no icon) is "no
+            // image", never an asset-server load of "" — Bevy logs that as an
+            // ERROR. The node keeps its size so rows do not reflow.
+            let image = if src.trim().is_empty() {
+                None
+            } else if src.starts_with('/') {
                 icons::load(world, src, number(node, "w", 16.0), number(node, "h", 16.0))
             } else {
                 world
@@ -910,7 +915,8 @@ fn update(
             };
             if let Some(image) = image {
                 world.entity_mut(view.root).insert(ImageNode::new(image));
-            } else if src.starts_with('/') {
+            } else if src.trim().is_empty() || src.starts_with('/') {
+                // Also clears a stale image when a row's src becomes empty.
                 world.entity_mut(view.root).remove::<ImageNode>();
             }
             layout.width = px(number(node, "w", 16.0));

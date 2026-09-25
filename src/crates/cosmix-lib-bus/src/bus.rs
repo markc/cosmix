@@ -153,10 +153,20 @@ impl BusMessage {
         }
         let body = self.body.trim();
         if !body.is_empty() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
-                && let Some(e) = v.get("error").and_then(|e| e.as_str())
-            {
-                return e.to_string();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                // The unified refusal shape {error_code, message} (house style
+                // for new verbs) renders as "CODE: message". The legacy
+                // {error} shape keeps its exact text, even beside an
+                // error_code, so callers matching on it see no change.
+                if let (Some(code), Some(message)) = (
+                    v.get("error_code").and_then(|c| c.as_str()),
+                    v.get("message").and_then(|m| m.as_str()),
+                ) {
+                    return format!("{code}: {message}");
+                }
+                if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+                    return e.to_string();
+                }
             }
             return body.to_string();
         }
@@ -1249,6 +1259,22 @@ mod tests {
             msg.error_message(),
             "invalid type: floating point `2.0`, expected usize"
         );
+    }
+
+    #[test]
+    fn error_message_renders_the_unified_shape_and_keeps_legacy_text() {
+        let unified = BusMessage::new().with_body(
+            r#"{"error_code":"EMPTY_EDGE","message":"edge has no registered pages","edge":"top"}"#,
+        );
+        assert_eq!(unified.error_message(), "EMPTY_EDGE: edge has no registered pages");
+        // A legacy reply with a code beside `error` keeps its exact text.
+        let legacy = BusMessage::new().with_body(
+            r#"{"error_code":"PANEL_THICKNESS_BUDGET","error":"panel thickness exceeds output budget"}"#,
+        );
+        assert_eq!(legacy.error_message(), "panel thickness exceeds output budget");
+        // `message` without a code is not the unified shape; the raw body stands.
+        let bare = BusMessage::new().with_body(r#"{"message":"hello"}"#);
+        assert_eq!(bare.error_message(), r#"{"message":"hello"}"#);
     }
 
     #[test]

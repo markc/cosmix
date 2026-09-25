@@ -1103,7 +1103,8 @@ fn dispatch_shell_request(
     {
         return (
             10,
-            json!({"error_code":"EMPTY_EDGE", "error":"edge has no registered pages", "edge":edge_name(edge)}).to_string(),
+            // Unified refusal shape (decision 10): {error_code, message}.
+            json!({"error_code":"EMPTY_EDGE", "message":"edge has no registered pages", "edge":edge_name(edge)}).to_string(),
             None,
         );
     }
@@ -2538,10 +2539,9 @@ mod tests {
                 let (rc, body, command) =
                     dispatch_shell_request(&request, &frame, Default::default());
                 assert_eq!(rc, 10, "{verb} on {edge:?}");
-                assert_eq!(
-                    serde_json::from_str::<Value>(&body).unwrap()["error_code"],
-                    "EMPTY_EDGE"
-                );
+                let reply = serde_json::from_str::<Value>(&body).unwrap();
+                assert_eq!(reply["error_code"], "EMPTY_EDGE");
+                assert_eq!(reply["message"], "edge has no registered pages");
                 assert!(command.is_none());
             }
         }
@@ -2552,10 +2552,9 @@ mod tests {
                 let (rc, body, command) =
                     dispatch_shell_request(&request, &frame, Default::default());
                 assert_eq!(rc, 10);
-                assert_eq!(
-                    serde_json::from_str::<Value>(&body).unwrap()["error_code"],
-                    "EMPTY_EDGE"
-                );
+                let reply = serde_json::from_str::<Value>(&body).unwrap();
+                assert_eq!(reply["error_code"], "EMPTY_EDGE");
+                assert_eq!(reply["message"], "edge has no registered pages");
                 assert!(command.is_none());
             }
         }
