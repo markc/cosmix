@@ -125,6 +125,20 @@ impl Ctx<'_, '_> {
         {
             quad(r, Rectangle { x: t.x, y: rows[i].y, width: t.width, height: self.g.metrics.line_h }, p.current_line);
         }
+        // Highlight-all matches, under the selection. Ascending, so the scan
+        // stops at the first match past the last visible row.
+        let visible_end = rows.last().map_or(0, |row| row.cells.content.end + 1);
+        let match_colour = with_alpha(p.caret, 0.22);
+        for m in ed.view.matches.iter().filter(|m| !m.is_empty()) {
+            if m.start > visible_end {
+                break;
+            }
+            for row in rows {
+                if let Some((a, b)) = self.span_on(row, m) {
+                    quad(r, self.row_rect(row, a, b), match_colour);
+                }
+            }
+        }
         for row in rows {
             if let Some((a, b)) = self.span_on(row, &sel) {
                 quad(r, self.row_rect(row, a, b), p.selection);

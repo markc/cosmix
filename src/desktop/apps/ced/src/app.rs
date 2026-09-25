@@ -1274,6 +1274,7 @@ impl App {
             line_numbers: self.line_numbers,
             remote_carets: self.remote_carets,
             focused: self.window_focused && self.modal.is_none() && !(self.find.open && self.field_focused),
+            matches: if self.find.open { self.controller.find_matches(tab.id).to_vec() } else { Vec::new() },
         };
         let id = tab.id;
         let diagnostics = if self.config.lint_on_save { &tab.diagnostics } else { &self.empty_diag };
