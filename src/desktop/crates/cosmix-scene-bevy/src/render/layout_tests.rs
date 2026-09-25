@@ -9,6 +9,7 @@ use bevy::ui::{UiPlugin, widget::TextNodeFlags};
 use cosmix_shell::runtime::SceneVerb;
 
 mod legacy;
+mod templates;
 
 const TOLERANCE: f32 = 0.5;
 const SETTLE_FRAMES: usize = 12;

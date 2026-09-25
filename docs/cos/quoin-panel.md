@@ -16,6 +16,77 @@ The layout follows Plasma's default bottom panel and Breeze Dark palette.
 The clock is the big `09:05 pm` with `Wed 16 Sept` underneath; clicking it
 opens the calendar. One popup is open at a time, like Plasma.
 
+## Stage A file templates
+
+The shipped `share/scenes/{launcher,calendar,notes}/` directories each contain
+`scene.mix` (an AMP document with strict-data nodes), `template.conf.mix`
+(strict metadata), and an executable `behaviour.mix`. Layout is static; all
+changing content comes from `$model`. Calendar authors its six-by-seven grid
+directly. Page IDs remain `scene-launcher`, `scene-calendar`, `scene-notes`.
+The existing `quoin-panel.mix` continues serving the host during Stage A.
+Test these templates in a nested host or under non-colliding scene names.
+
+`mix share/scenes/install.mix [destination]` installs the shipped catalogue and
+its shared `lib/` once. The default is `$XDG_DATA_HOME/cosmix/scenes` (falling
+back to `$HOME/.local/share/cosmix/scenes`). It does not install user scenes or
+enable them. Behaviours resolve helpers through `SCENES_LIB`, or the same XDG
+data path, so installed scenes do not depend on a checkout. `lib/data.mix`
+contains reusable clock/calendar/title/category helpers; `lib/models.mix`
+builds model values and `lib/runtime.mix` handles Bus envelopes. The original
+`scripts/lib/panel.mix` retains compatibility helpers for the running panel
+and screenshot callers until their migration.
+
+The loader executes one behaviour with `SCENE_NAME`, `SCENE_HOST`,
+`SCENES_SERVICE`, `SCENE_GENERATION` and existing service overrides. The
+behaviour uses `serve_name()` as its actual citizen identity. The loader must
+route the installed document's `citizen` to that identity if it renames it;
+the shipped documents name `scene-launcher`, `scene-calendar`, `scene-notes`.
+`SCENE_GENERATION` is a positive integer. Metadata currently carries
+`schema: 1`, `name`, `title` and `behaviour: "behaviour.mix"`.
+
+Behaviours check `shell.scene.describe {family:"list"}` for `flow`'s
+`horizontal` enum and boolean `hidden`, then send:
+
+```text
+scenes.ready {name,generation}
+scenes.model {name,generation,value}  # complete model
+scenes.open/close/toggle {name}      # popup ownership stays with the loader
+```
+
+They never load/unload scenes, change host configuration or manage popup pins.
+W2's loader must reject stale generations, serialise complete models with
+reloads, and restore the last accepted model on host reconnect. Directed UI
+requests arrive as `$event.args = {scene,node,kind,value?,item?}`. Public verbs
+are mesh-open. Refusals are nonzero with `{error_code,message}`; upstream
+failures retain the original RC and reply under `context`.
+
+`launcher.open/close`, `launcher` (toggle), `calendar.open/close`, `calendar`
+and `notes.open/close`, `notes` delegate popup operations to the loader.
+Launcher additionally supports `filter`, `cat`, `launch`, `launch_first`,
+`launcher.launch`, `launcher.search` and `launcher.state`; calendar has
+`cal_prev/next/today`, `open_calendar`, `calendar.state`; notes has `note_close`,
+`notes_clear`, `notes.state`. The Stage A state verbs report behaviour data;
+open/selected/pinned state belongs to the loader. Launcher result publication
+checks a request sequence after the search and after icon resolution, including
+A→B→A races. Enter only launches a result matching the current query/category.
+
+Refreshes are queued by Bus events, with one pending self-event and no debounce
+sleep. The launcher observes `apps.changed` (published by `apps.reload` and
+icon-theme changes), property events and broker service-list changes. Notes
+observes notification/property and service-list events. Both subscribe before
+their first snapshot. `bus.connected` reannounces readiness and refreshes data.
+Calendar's sole recurring deadline advances its displayed clock at the next
+wall-clock minute; it never checks service state. The existing Mix sleep
+primitive implements each single deadline, so a wall-clock adjustment during
+that wait is reflected at the next wake, not immediately. Network/PipeWire
+conversion belongs to the later panel work.
+
+Run the deterministic gate with a process environment of `TZ=UTC`:
+`mix src/desktop/scripts/tests/scene-template-test.mix`. `--record` refreshes
+public captures. Rust binding, renderer, Taffy and click bridge tests run on
+the build cluster. Live screenshots and W1/W2 integrated lifecycle/race tests
+remain required before migrating the host.
+
 ## Data sources
 
 Everything comes from an existing citizen or the kernel; the panel stores
@@ -39,13 +110,13 @@ nothing of its own.
   when there is no default sink. Click toggles mute. `PIPEWIRE_RUNTIME_DIR`
   points at the login session's runtime directory.
 
-## Events, not polling
+## Legacy host update loop
 
 The citizen subscribes to `<comp>.props.changed` (windows and workspaces),
 the tray adapter's `item.added`/`item.removed`/`props.changed`, and the
 notify adapter's `changed`/`props.changed`. A handler matches the
 publisher's **inner** verb (`props.changed`), not the topic name. Bursts are
-coalesced into one rebuild. The only clock is the wall clock: an `async`
+coalesced into one rebuild with the legacy 100 ms delay. An `async`
 handler (`clock.run`, kicked once by init) sleeps to each minute boundary
 and redraws the time, one wake per minute. Init itself returns, so the
 runtime's reserved verbs (`RELOAD`, `QUIT`, `INFO`, lifecycle props) are
@@ -74,10 +145,11 @@ Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.
 
-Once every five minutes the clock tick also re-seeds the compositor watch
-and refetches windows, tray and notifications — a backstop for an event
-missed while comp restarted, not a poll (every change still arrives as an
-event).
+The legacy clock also snapshots network/volume each minute. Every five
+minutes it re-seeds the compositor watch and refetches windows, tray and
+notifications. Those are polls, retained only because Stage A keeps this
+host citizen unchanged. The extracted behaviours above do not inherit them;
+panel migration and native status event sources belong to later stages.
 
 ## Limits
 

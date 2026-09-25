@@ -455,6 +455,66 @@ scene documents and loads them into the running Quoin (<code>shell</code>):</p>
 <p>The layout follows Plasma's default bottom panel and Breeze Dark palette.
 The clock is the big <code>09:05 pm</code> with <code>Wed 16 Sept</code> underneath; clicking it
 opens the calendar. One popup is open at a time, like Plasma.</p>
+<h2 id="stage-a-file-templates">Stage A file templates</h2>
+<p>The shipped <code>share/scenes/{launcher,calendar,notes}/</code> directories each contain
+<code>scene.mix</code> (an AMP document with strict-data nodes), <code>template.conf.mix</code>
+(strict metadata), and an executable <code>behaviour.mix</code>. Layout is static; all
+changing content comes from <code>$model</code>. Calendar authors its six-by-seven grid
+directly. Page IDs remain <code>scene-launcher</code>, <code>scene-calendar</code>, <code>scene-notes</code>.
+The existing <code>quoin-panel.mix</code> continues serving the host during Stage A.
+Test these templates in a nested host or under non-colliding scene names.</p>
+<p><code>mix share/scenes/install.mix [destination]</code> installs the shipped catalogue and
+its shared <code>lib/</code> once. The default is <code>$XDG_DATA_HOME/cosmix/scenes</code> (falling
+back to <code>$HOME/.local/share/cosmix/scenes</code>). It does not install user scenes or
+enable them. Behaviours resolve helpers through <code>SCENES_LIB</code>, or the same XDG
+data path, so installed scenes do not depend on a checkout. <code>lib/data.mix</code>
+contains reusable clock/calendar/title/category helpers; <code>lib/models.mix</code>
+builds model values and <code>lib/runtime.mix</code> handles Bus envelopes. The original
+<code>scripts/lib/panel.mix</code> retains compatibility helpers for the running panel
+and screenshot callers until their migration.</p>
+<p>The loader executes one behaviour with <code>SCENE_NAME</code>, <code>SCENE_HOST</code>,
+<code>SCENES_SERVICE</code>, <code>SCENE_GENERATION</code> and existing service overrides. The
+behaviour uses <code>serve_name()</code> as its actual citizen identity. The loader must
+route the installed document's <code>citizen</code> to that identity if it renames it;
+the shipped documents name <code>scene-launcher</code>, <code>scene-calendar</code>, <code>scene-notes</code>.
+<code>SCENE_GENERATION</code> is a positive integer. Metadata currently carries
+<code>schema: 1</code>, <code>name</code>, <code>title</code> and <code>behaviour: "behaviour.mix"</code>.</p>
+<p>Behaviours check <code>shell.scene.describe {family:"list"}</code> for <code>flow</code>'s
+<code>horizontal</code> enum and boolean <code>hidden</code>, then send:</p>
+<pre><code class="language-text">scenes.ready {name,generation}
+scenes.model {name,generation,value}  # complete model
+scenes.open/close/toggle {name}      # popup ownership stays with the loader
+</code></pre>
+<p>They never load/unload scenes, change host configuration or manage popup pins.
+W2's loader must reject stale generations, serialise complete models with
+reloads, and restore the last accepted model on host reconnect. Directed UI
+requests arrive as <code>$event.args = {scene,node,kind,value?,item?}</code>. Public verbs
+are mesh-open. Refusals are nonzero with <code>{error_code,message}</code>; upstream
+failures retain the original RC and reply under <code>context</code>.</p>
+<p><code>launcher.open/close</code>, <code>launcher</code> (toggle), <code>calendar.open/close</code>, <code>calendar</code>
+and <code>notes.open/close</code>, <code>notes</code> delegate popup operations to the loader.
+Launcher additionally supports <code>filter</code>, <code>cat</code>, <code>launch</code>, <code>launch_first</code>,
+<code>launcher.launch</code>, <code>launcher.search</code> and <code>launcher.state</code>; calendar has
+<code>cal_prev/next/today</code>, <code>open_calendar</code>, <code>calendar.state</code>; notes has <code>note_close</code>,
+<code>notes_clear</code>, <code>notes.state</code>. The Stage A state verbs report behaviour data;
+open/selected/pinned state belongs to the loader. Launcher result publication
+checks a request sequence after the search and after icon resolution, including
+A→B→A races. Enter only launches a result matching the current query/category.</p>
+<p>Refreshes are queued by Bus events, with one pending self-event and no debounce
+sleep. The launcher observes <code>apps.changed</code> (published by <code>apps.reload</code> and
+icon-theme changes), property events and broker service-list changes. Notes
+observes notification/property and service-list events. Both subscribe before
+their first snapshot. <code>bus.connected</code> reannounces readiness and refreshes data.
+Calendar's sole recurring deadline advances its displayed clock at the next
+wall-clock minute; it never checks service state. The existing Mix sleep
+primitive implements each single deadline, so a wall-clock adjustment during
+that wait is reflected at the next wake, not immediately. Network/PipeWire
+conversion belongs to the later panel work.</p>
+<p>Run the deterministic gate with a process environment of <code>TZ=UTC</code>:
+<code>mix src/desktop/scripts/tests/scene-template-test.mix</code>. <code>--record</code> refreshes
+public captures. Rust binding, renderer, Taffy and click bridge tests run on
+the build cluster. Live screenshots and W1/W2 integrated lifecycle/race tests
+remain required before migrating the host.</p>
 <h2 id="data-sources">Data sources</h2>
 <p>Everything comes from an existing citizen or the kernel; the panel stores
 nothing of its own.</p>
@@ -476,12 +536,12 @@ when an application publishes a StatusNotifierItem.</li>
 when there is no default sink. Click toggles mute. <code>PIPEWIRE_RUNTIME_DIR</code>
 points at the login session's runtime directory.</li>
 </ul>
-<h2 id="events-not-polling">Events, not polling</h2>
+<h2 id="legacy-host-update-loop">Legacy host update loop</h2>
 <p>The citizen subscribes to <code>&lt;comp&gt;.props.changed</code> (windows and workspaces),
 the tray adapter's <code>item.added</code>/<code>item.removed</code>/<code>props.changed</code>, and the
 notify adapter's <code>changed</code>/<code>props.changed</code>. A handler matches the
 publisher's <strong>inner</strong> verb (<code>props.changed</code>), not the topic name. Bursts are
-coalesced into one rebuild. The only clock is the wall clock: an <code>async</code>
+coalesced into one rebuild with the legacy 100 ms delay. An <code>async</code>
 handler (<code>clock.run</code>, kicked once by init) sleeps to each minute boundary
 and redraws the time, one wake per minute. Init itself returns, so the
 runtime's reserved verbs (<code>RELOAD</code>, <code>QUIT</code>, <code>INFO</code>, lifecycle props) are
@@ -507,10 +567,11 @@ popup/capture callers to overlay pin intent is a separate API/caller chunk.
 Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.</p>
-<p>Once every five minutes the clock tick also re-seeds the compositor watch
-and refetches windows, tray and notifications — a backstop for an event
-missed while comp restarted, not a poll (every change still arrives as an
-event).</p>
+<p>The legacy clock also snapshots network/volume each minute. Every five
+minutes it re-seeds the compositor watch and refetches windows, tray and
+notifications. Those are polls, retained only because Stage A keeps this
+host citizen unchanged. The extracted behaviours above do not inherit them;
+panel migration and native status event sources belong to later stages.</p>
 <h2 id="limits">Limits</h2>
 <p>The launcher shows at most 500 applications (the host's list cap) and the
 notifications popup the 50 newest; long names, descriptions and bodies are

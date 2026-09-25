@@ -463,11 +463,26 @@ contradictory legacy/explicit sizing and inverted min/max bounds; an old
 host instead rejects the new ports as <code>unknown-port</code>. See the renderer manual
 for the text centring correction and the preserved zero text-wrapper minimum width.</p>
 <p>Lists require rows of <code>{id: string, cells: [string]}</code>, a sibling <code>row</code>
-template and a positive <code>row_height</code>. Template subtrees may contain only row,
+template and a positive <code>row_height</code>. IDs must be non-empty and unique within
+each list; extra item fields remain available through <code>$item</code> and click bodies.
+<code>flow: "horizontal"</code> opts into natural-width repeated rows with <code>gap</code> and
+<code>align</code>; omitted flow remains the vertical VirtualList. Horizontal flow ignores
+vertical viewport sizing (<code>row_height</code> and <code>max_rows</code>). Template subtrees may contain only row,
 column, text, spacer and image. <code>{cells[i]}</code> is allowed only in <code>text.text</code>,
 and must be within the minimum cell count across all rows. Template nodes are
 marked in <code>ResolvedScene</code>; their ids are not rendered. <code>@</code> is reserved for
-future <code>&lt;template&gt;@&lt;row&gt;</code> instance ids and is rejected in source node ids.</p>
+renderer instance identities and is rejected in source node ids. Instance IDs
+include the owning list and item ID; consumers use the event's <code>item</code>, never
+parse these IDs.</p>
+<p>Every non-window family accepts the boolean <code>hidden</code> port, including bindings.
+Its absence preserves previous resolved defaults (<code>text.hidden</code> still defaults
+to false). Hidden containers consume no layout space.</p>
+<p><code>bindings::template_instantiate_with</code> shares a <code>TemplateEvaluation</code> across an
+entire scene revision: one model conversion, at most 16,384 instantiated nodes,
+and the core's 250 ms evaluation budget. The convenience
+<code>template_instantiate</code> creates a context for a single node; hosts rendering
+repeated trees must use the shared context. Both evaluate against the live
+<code>$model</code> and supplied <code>$item</code>, coerce ports and validate layout bounds.</p>
 <p>Lint reports bounded-document, schema, graph, template, row and header
 diagnostics. <code>orphan-node</code> is a warning; other violations are errors. The
 resolver returns diagnostics for unknown families rather than panicking.</p>

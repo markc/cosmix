@@ -1,0 +1,161 @@
+-- version: 0.1.0
+-- Installed shared helpers, independent of any source checkout.
+$LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
+$r = require($LIB .. "/runtime.mix")
+$m = require($LIB .. "/models.mix")
+$p = require($LIB .. "/data.mix")
+$ctx = $r.context("launcher")
+$APPS = env("APPS_SERVICE", "apps")
+$state = {query: "", category: "", apps: [], icons: {}, sequence: 0, model_sequence: -1, queued: false, ready: false, model: $m.launcher([], "", "", {})}
+
+fn schedule()
+  $state.sequence = $state.sequence + 1
+  if $state.ready and not $state.queued then
+    $state.queued = true
+    emit $ctx.citizen refresh
+  end
+end
+
+fn refresh()
+  if not $state.ready then return $r.failure("scene_not_ready", "Waiting for loader readiness") end
+  $sequence = $state.sequence
+  $query = $state.query
+  $category = $state.category
+  $out = $r.call($APPS, "apps.list", {query: $query, category: $category})
+  if not $out.ok then return $out end
+  if type($out.value) != "list" then return $r.failure("apps_invalid_reply", "apps.list must return a list") end
+  $apps = $out.value
+  $icons = $state.icons
+  $n = 0
+  for each $a in $apps
+    if not $state.ready or $sequence != $state.sequence then return $r.failure("superseded", "A newer search replaced this result") end
+    if $n >= 500 then break end
+    $n = $n + 1
+    $icon = $a.icon ?? ""
+    if $icon != "" and not has_key($icons, $icon) then
+      $hit = $r.call($APPS, "apps.icon", {name: $icon, size: 48})
+      if $hit.ok and type($hit.value) == "map" and type($hit.value.path) == "string" and $hit.value.path != "" then
+        $icons[$icon] = $hit.value.path
+      end
+    end
+  end
+  -- Check again after icon requests: even an A → B → A race is superseded.
+  if not $state.ready or $sequence != $state.sequence then return $r.failure("superseded", "A newer search replaced this result") end
+  $model = $m.launcher($apps, $query, $category, $icons)
+  $out = $r.publish_model($ctx, $model)
+  if $out.ok and $sequence == $state.sequence then
+    $state.apps = $apps
+    $state.icons = length(keys($icons)) > 512 ? {} : $icons
+    $state.model = $model
+    $state.model_sequence = $sequence
+  end
+  return $out
+end
+
+fn launch_id($id)
+  if type($id) != "string" or $id == "" then return $r.failure("invalid_args", "id must be a non-empty application ID") end
+  $out = $r.call($APPS, "apps.launch", {id: $id})
+  if not $out.ok then return $out end
+  $closed = $r.popup($ctx, "close")
+  if not $closed.ok then return $closed end
+  return {ok: true, rc: 0, value: {launched: $id}}
+end
+
+on refresh async
+  $state.queued = false
+  $r.respond(refresh())
+end
+on filter
+  $a = $r.event_args($event)
+  if type($a.value) != "string" then $r.respond($r.failure("invalid_args", "value must be a string")); return end
+  $state.query = slice($a.value, 0, 128)
+  schedule()
+  reply(0, "{}")
+end
+on cat
+  $a = $r.event_args($event)
+  $node = $a.node ?? ""
+  $category = $p.category_from_node($node)
+  if $node != "cat_" .. ($category == "" ? "all" : lower($category)) then
+    $r.respond($r.failure("invalid_args", "node must name a category chip")); return
+  end
+  $state.category = $category
+  schedule()
+  reply(0, "{}")
+end
+on launch async
+  $r.respond(launch_id($r.item_id($event)))
+end
+on launch_first async
+  -- Pending search results must never launch an app from the previous query.
+  if $state.model_sequence != $state.sequence or $state.model.query != $state.query or $state.model.category != $state.category or length($state.apps) == 0 then
+    $r.respond($r.failure("no_match", "No current application result")); return
+  end
+  $r.respond(launch_id($state.apps[0].id))
+end
+on launcher.launch async
+  $r.respond(launch_id($r.event_args($event).id))
+end
+on launcher.open async
+  $a = $r.event_args($event)
+  if $a.query != nil then
+    if type($a.query) != "string" then $r.respond($r.failure("invalid_args", "query must be a string")); return end
+    $state.query = slice($a.query, 0, 128)
+  end
+  if $a.category != nil then
+    if type($a.category) != "string" or not has_key($p.CATEGORY_LABELS, $a.category) then
+      $r.respond($r.failure("invalid_args", "Unknown launcher category")); return
+    end
+    $state.category = $a.category
+  end
+  schedule()
+  $r.respond($r.popup($ctx, "open"))
+end
+on launcher.close async
+  $r.respond($r.popup($ctx, "close"))
+end
+on launcher async
+  $r.respond($r.popup($ctx, "toggle"))
+end
+on launcher.state
+  reply(0, json_encode($state.model))
+end
+on launcher.search async
+  $a = $r.event_args($event)
+  if type($a.query) != "string" then $r.respond($r.failure("invalid_args", "query is required")); return end
+  $limit = $a.limit ?? 50
+  if type($limit) != "number" or $limit < 1 or $limit > 50 or floor($limit) != $limit then
+    $r.respond($r.failure("invalid_args", "limit must be an integer from 1 to 50")); return
+  end
+  $out = $r.call($APPS, "apps.list", {query: $a.query, category: $a.category ?? ""})
+  if not $out.ok then $r.respond($out); return end
+  if type($out.value) != "list" then $r.respond($r.failure("apps_invalid_reply", "apps.list must return a list")); return end
+  reply(0, json_encode({query: $a.query, category: $a.category ?? "", count: length($out.value), items: slice($out.value, 0, $limit)}))
+end
+on apps.changed
+  $state.icons = {}
+  schedule()
+end
+on props.changed
+  $a = $r.event_args($event)
+  if $a.path != nil and $a.path != "services.registered" and not starts_with($a.path, "apps.") then return end
+  $state.icons = {}
+  if not $state.ready then
+    $ready = $r.ready($ctx)
+    $state.ready = $ready.ok
+  end
+  schedule()
+end
+on bus.connected
+  $state.ready = false
+  $ready = $r.ready($ctx)
+  $state.ready = $ready.ok
+  schedule()
+end
+subscribe($APPS .. ".changed")
+subscribe($APPS .. ".props.changed")
+subscribe(env("NODED_SERVICE", "noded") .. ".props.changed")
+$ready = $r.ready($ctx)
+if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
+$state.ready = true
+schedule()

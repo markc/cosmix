@@ -525,10 +525,33 @@ once per minute. Hover, focus and pointer motion stay local.</p>
 undo state. Plain fields use CTK's single-line editing transactions. Active
 edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.</p>
-<p>List rows use CTK VirtualList. Row templates are instantiated with
-<code>template-node@row-id</code> identities and substitute <code>{cells[i]}</code> only in
-<code>text.text</code> and <code>image.src</code> inside list templates.
+<p>List rows use CTK VirtualList by default. <code>flow: "horizontal"</code> uses natural-width
+rows with <code>gap</code> and <code>align</code> (<code>start</code>, <code>center</code>, <code>end</code>, <code>stretch</code>), without a
+vertical viewport. <code>row_height</code> remains required for schema compatibility;
+horizontal flow ignores it and <code>max_rows</code>. Rows require unique non-empty IDs.
+Row templates evaluate core bindings against live <code>$model</code> and <code>$item</code>, then
+substitute legacy <code>{cells[i]}</code> only in unbound <code>text.text</code> and <code>image.src</code>.
+Binding results are literal values and are never substituted again.
+Instance identities include the template, owning list and item ID. Retained
+items keep their template entities across rebinds/reordering. Scene lists opt
+into <code>VirtualListModel::retain_content</code>; CTK's default still clears recycled
+content, and changing an item's ID always creates fresh content.
+Each template evaluation pass shares a 250 ms / 16,384-node budget across all
+lists. Ingress preflights templates before committing a revision or mount;
+failure returns <code>{error_code:"scene_template",message,scene,diagnostics}</code>.
+Model-only patch paths must call the same <code>render::validate_templates</code> on the
+candidate resolved tree. Rendering also enforces the budget: a render-time
+deadline failure logs its diagnostic and retains the previously rendered tree,
+retrying only on a new revision. That late deadline failure is not a loader
+status event; a first render has no prior tree.
+Nested-list rendering remains outside this renderer's supported template path.
+Clicks on repeated rows use the owning list's handler and node ID, with the
+complete row in <code>item</code>; descendant row handlers cannot redirect that click.
 Outside templates, cell markers in other ports are literal data.
+All non-window families expose <code>hidden</code>. Hidden containers and horizontal
+row wrappers use <code>Display::None</code>, so their padding and gap allocation disappear.
+A hidden template inside a vertical VirtualList hides its content; the fixed
+row slot remains. Filter the model's <code>rows</code> to remove a vertical slot entirely.
 Text elision uses CTK's middle-elision policy.
 <code>column.align</code> sets cross-axis alignment to <code>start</code>, <code>center</code>,
 <code>end</code> or <code>stretch</code> (default).
@@ -639,6 +662,17 @@ taskbars, tray variants, launcher lists, calendar months and notifications;
 record the font/scale inputs alongside any numeric geometry goldens. The
 current freeze does not claim to cover those dynamic states or Quoin's edge
 chrome/mount geometry.</p>
+<p>Stage A now adds exact, sanitised launcher/calendar/notes builder captures in
+<code>src/desktop/scripts/tests/fixtures/scenes/</code>. The Mix extraction gate compares
+the legacy builder bodies and returned document bytes, and records the models
+separately. Renderer tests compare fully instantiated visible trees, including
+the hidden notes alternative, against those documents. Cases cover empty and
+filtered launchers, the 500-row cap, empty/full notifications, leap day, a
+non-leap century and year rollover. Scheduled Taffy tests cover horizontal
+natural widths, gap/alignment, and real VirtualList rebind/reorder identity;
+the Bus bridge test checks the outgoing citizen, command and item body.
+These are cluster gates, not a claim of live GPU screenshot acceptance. Panel,
+tray, settings and live migration remain later stages.</p>
 <p>Absolute image <code>src</code> paths load PNG and SVG directly, rasterised or resized
 at <code>UiScale</code> multiplied by the primary window's scale factor, or <code>UiScale</code>
 alone in a compositor host without a primary window. Scale changes reapply

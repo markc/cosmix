@@ -25,11 +25,28 @@ host instead rejects the new ports as `unknown-port`. See the renderer manual
 for the text centring correction and the preserved zero text-wrapper minimum width.
 
 Lists require rows of `{id: string, cells: [string]}`, a sibling `row`
-template and a positive `row_height`. Template subtrees may contain only row,
+template and a positive `row_height`. IDs must be non-empty and unique within
+each list; extra item fields remain available through `$item` and click bodies.
+`flow: "horizontal"` opts into natural-width repeated rows with `gap` and
+`align`; omitted flow remains the vertical VirtualList. Horizontal flow ignores
+vertical viewport sizing (`row_height` and `max_rows`). Template subtrees may contain only row,
 column, text, spacer and image. `{cells[i]}` is allowed only in `text.text`,
 and must be within the minimum cell count across all rows. Template nodes are
 marked in `ResolvedScene`; their ids are not rendered. `@` is reserved for
-future `<template>@<row>` instance ids and is rejected in source node ids.
+renderer instance identities and is rejected in source node ids. Instance IDs
+include the owning list and item ID; consumers use the event's `item`, never
+parse these IDs.
+
+Every non-window family accepts the boolean `hidden` port, including bindings.
+Its absence preserves previous resolved defaults (`text.hidden` still defaults
+to false). Hidden containers consume no layout space.
+
+`bindings::template_instantiate_with` shares a `TemplateEvaluation` across an
+entire scene revision: one model conversion, at most 16,384 instantiated nodes,
+and the core's 250 ms evaluation budget. The convenience
+`template_instantiate` creates a context for a single node; hosts rendering
+repeated trees must use the shared context. Both evaluate against the live
+`$model` and supplied `$item`, coerce ports and validate layout bounds.
 
 Lint reports bounded-document, schema, graph, template, row and header
 diagnostics. `orphan-node` is a warning; other violations are errors. The

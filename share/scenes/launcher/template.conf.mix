@@ -1,0 +1,4 @@
+schema: 1
+name: "launcher"
+title: "Applications"
+behaviour: "behaviour.mix"

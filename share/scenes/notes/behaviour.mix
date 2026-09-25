@@ -1,0 +1,94 @@
+-- version: 0.1.0
+$LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
+$r = require($LIB .. "/runtime.mix")
+$m = require($LIB .. "/models.mix")
+$ctx = $r.context("notes")
+$NOTIFY = env("NOTIFY_SERVICE", "notify")
+$state = {notes: [], sequence: 0, queued: false, ready: false, model: $m.notes([])}
+
+fn schedule()
+  $state.sequence = $state.sequence + 1
+  if $state.ready and not $state.queued then
+    $state.queued = true
+    emit $ctx.citizen refresh
+  end
+end
+fn snapshot()
+  $out = $r.call($NOTIFY, "notify.props.get", {})
+  if not $out.ok then return $out end
+  if type($out.value) != "map" then return $r.failure("notify_invalid_reply", "notify.props.get must return a map") end
+  return {ok: true, rc: 0, value: $m.notification_rows($out.value)}
+end
+fn refresh()
+  if not $state.ready then return $r.failure("scene_not_ready", "Waiting for loader readiness") end
+  $sequence = $state.sequence
+  $out = snapshot()
+  if not $out.ok then return $out end
+  if not $state.ready or $sequence != $state.sequence then return $r.failure("superseded", "A newer notification event replaced this snapshot") end
+  $state.notes = $out.value
+  $state.model = $m.notes($state.notes)
+  return $r.publish_model($ctx, $state.model)
+end
+on refresh async
+  $state.queued = false
+  $r.respond(refresh())
+end
+on note_close async
+  $id = $r.item_id($event)
+  if $id == nil or not re_match($id, "^[0-9]+$") then
+    $r.respond($r.failure("invalid_args", "item.id must be a notification ID")); return
+  end
+  $out = $r.call($NOTIFY, "notify.close", {id: to_number($id)})
+  if $out.ok then schedule() end
+  $r.respond($out)
+end
+on notes_clear async
+  $out = snapshot()
+  if not $out.ok then $r.respond($out); return end
+  for each $note in $out.value
+    $closed = $r.call($NOTIFY, "notify.close", {id: to_number($note.id)})
+    if not $closed.ok then schedule(); $r.respond($closed); return end
+  end
+  schedule()
+  reply(0, "{}")
+end
+on notes.open
+  $r.respond($r.popup($ctx, "open"))
+end
+on notes.close
+  $r.respond($r.popup($ctx, "close"))
+end
+on notes
+  $r.respond($r.popup($ctx, "toggle"))
+end
+on notes.state
+  reply(0, json_encode({count: $state.model.count}))
+end
+on props.changed
+  $a = $r.event_args($event)
+  if $event.headers.from == env("NODED_SERVICE", "noded") and $a.path != "services.registered" then return end
+  if not $state.ready then
+    $ready = $r.ready($ctx)
+    $state.ready = $ready.ok
+  end
+  schedule()
+end
+on notification.created
+  schedule()
+end
+on notification.closed
+  schedule()
+end
+on bus.connected
+  $state.ready = false
+  $ready = $r.ready($ctx)
+  $state.ready = $ready.ok
+  schedule()
+end
+subscribe($NOTIFY .. ".changed")
+subscribe($NOTIFY .. ".props.changed")
+subscribe(env("NODED_SERVICE", "noded") .. ".props.changed")
+$ready = $r.ready($ctx)
+if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
+$state.ready = true
+schedule()

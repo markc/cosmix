@@ -1,0 +1,65 @@
+-- Model construction only. Layout lives in the strict-data scene files.
+$p = require("data.mix")
+$C = {
+  fg: "#fcfcfc", dim: "#a1a9b1", faint: "#6e7680", hover: "#ffffff1a",
+  accent: "#3daee9", task_bg: "#ffffff0f", card: "#2a2e32",
+  today_fg: "#ffffff", weekend: "#c9cfd6"
+}
+
+fn launcher($apps, $query, $category, $icons)
+  $rows = []
+  for each $a in $apps
+    if length($rows) >= 500 then break end
+    $sub = $a.generic_name ?? ""
+    if $sub == "" then $sub = $a.comment ?? "" end
+    push($rows, {id: $a.id, cells: [$p.short_title($a.name ?? $a.id, 80), $p.short_title($sub, 120), $icons[$a.icon ?? ""] ?? ""]})
+  end
+  $chips = {}
+  for each $cat, $label in $p.CATEGORY_LABELS
+    $id = "cat_" .. ($cat == "" ? "all" : lower($cat))
+    $on = $cat == $category
+    $chips[$id] = {background: $on ? $C.accent : $C.task_bg, bold: $on, color: $on ? "#0b1f2b" : $C.fg}
+  end
+  return {query: $query, category: $category, count: to_string(length($apps)) .. (length($apps) == 1 ? " application" : " applications"), rows: $rows, chips: $chips}
+end
+
+fn calendar($now, $offset)
+  $today = $p.ymd($now)
+  $shown = $p.shift_month($today.year, $today.month, $offset)
+  $grid = $p.month_grid($shown.year, $shown.month, $today)
+  $cells = {}
+  for $w = 0 to 5
+    for $c = 0 to 6
+      $cell = $grid[$w][$c]
+      $fg = $cell.in_month ? ($cell.weekend ? $C.weekend : $C.fg) : $C.faint
+      if $cell.today then $fg = $C.today_fg end
+      $cells["d_" .. to_string($w) .. "_" .. to_string($c)] = {
+        text: to_string($cell.day), bold: $cell.today, color: $fg,
+        background: $cell.today ? $C.accent : nil
+      }
+    end
+  end
+  return {day: date_format($now, "%A"), full: date_format($now, "%-d ") .. $p.month_title($today.year, $today.month) .. "  ·  " .. $p.clock_text($now), title: $p.month_title($shown.year, $shown.month), year: $shown.year, month: $shown.month, cells: $cells}
+end
+
+-- Input is the service's oldest-first snapshot, as in the legacy builder.
+fn notes($notes)
+  $rows = []
+  for each $n in reverse($notes)
+    if length($rows) >= 50 then break end
+    $app = $n.app ?? ""
+    if $app == "" then $app = "Notification" end
+    push($rows, {id: to_string($n.id), cells: [$p.short_title($app, 60), $p.short_title($n.summary ?? "", 120), $p.short_title($n.body ?? "", 240)]})
+  end
+  return {rows: $rows, count: length($notes), empty: length($rows) == 0}
+end
+
+fn notification_rows($props)
+  $out = []
+  for each $key, $n in $props
+    if re_match($key, "^n[0-9]+$") and type($n) == "map" then
+      push($out, {id: slice($key, 1, length($key)), app: $n.app ?? "", summary: $n.summary ?? "", body: $n.body ?? "", created_at: $n.created_at ?? ""})
+    end
+  end
+  return sort_by($out, function ($n) = $n.created_at)
+end
