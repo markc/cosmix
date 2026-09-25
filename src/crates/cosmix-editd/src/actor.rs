@@ -294,6 +294,8 @@ fn escaped_len(c: char) -> usize {
 
 /// Bytes of fixed JSON around a `get` page (fields other than the text).
 const GET_OVERHEAD: usize = 4096;
+/// The smallest page `edit.get {max_bytes}` asks for (smaller is clamped up).
+const MIN_PAGE_BYTES: usize = 4096;
 /// Encoded overhead of one numbered line object.
 const NUMBERED_LINE_OVERHEAD: usize = 48;
 /// Reply bytes kept back from `find`'s match budget for the envelope.
@@ -452,8 +454,16 @@ fn str_range(s: &str, r: &RangeSpec) -> Result<std::ops::Range<usize>, Refusal> 
 }
 
 /// One `get` page over `src` (plan §4.4): encoded-budgeted, always progressing.
-fn page(src: &Src, range: std::ops::Range<usize>, numbered: bool) -> (Option<String>, Option<Vec<NumberedLine>>, Point, Point, bool) {
-    let budget = MAX_REPLY_BYTES - GET_OVERHEAD;
+/// `max_bytes` (the request's `max_bytes`) lowers the page budget; values
+/// under [`MIN_PAGE_BYTES`] are raised to it.
+fn page(
+    src: &Src,
+    range: std::ops::Range<usize>,
+    numbered: bool,
+    max_bytes: Option<usize>,
+) -> (Option<String>, Option<Vec<NumberedLine>>, Point, Point, bool) {
+    let full = MAX_REPLY_BYTES - GET_OVERHEAD;
+    let budget = max_bytes.map_or(full, |m| m.max(MIN_PAGE_BYTES).min(full));
     let start = range.start;
     let raw_end = src.floor(range.end.min(start.saturating_add(budget)));
     let text = src.read(start..raw_end.max(start));
@@ -876,7 +886,7 @@ impl Actor {
                 Src::Live(b) => b.resolve_range(&spec).map_err(|e| self.core(e))?,
                 Src::Snap(s) => str_range(s, &spec).map_err(|e| self.with_ctx(e))?,
             };
-            let (text, lines, start, end, truncated) = heavy(|| page(&src, range, r.numbered));
+            let (text, lines, start, end, truncated) = heavy(|| page(&src, range, r.numbered, r.max_bytes));
             (rev, text, lines, start, end, truncated, totals.0, totals.1)
         };
         let next = truncated.then_some(end.offset);
@@ -1819,7 +1829,7 @@ mod tests {
             str_pos(s, &PosSpec::LineCol { line: 9, col: None }).unwrap_err().reason.as_deref(),
             Some("line_out_of_range")
         );
-        let (_, lines, start, end, truncated) = page(&Src::Snap(s), 0..s.len(), true);
+        let (_, lines, start, end, truncated) = page(&Src::Snap(s), 0..s.len(), true, None);
         let lines = lines.unwrap();
         assert_eq!(lines.len(), 3, "two lines plus the empty last line");
         assert_eq!(lines[0].text, "ab");
@@ -1830,13 +1840,13 @@ mod tests {
     fn long_line_pages_with_cont() {
         let line = "é".repeat(MAX_REPLY_BYTES); // 2 bytes each: twice the budget
         let s = format!("{line}\nz");
-        let (_, lines, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), true);
+        let (_, lines, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), true, None);
         assert!(truncated);
         let first = lines.unwrap();
         assert_eq!(first.len(), 1);
         assert!(!first[0].cont);
         assert!(s.is_char_boundary(end.offset));
-        let (_, lines, start, _, _) = page(&Src::Snap(&s), end.offset..s.len(), true);
+        let (_, lines, start, _, _) = page(&Src::Snap(&s), end.offset..s.len(), true, None);
         let second = lines.unwrap();
         assert!(second[0].cont, "a mid-line page continues the line");
         assert_eq!(second[0].line, 1);
@@ -1846,9 +1856,23 @@ mod tests {
     #[test]
     fn control_characters_count_their_escapes() {
         let s = "\u{1}".repeat(MAX_REPLY_BYTES / 4);
-        let (text, _, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), false);
+        let (text, _, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), false, None);
         let encoded = serde_json::to_string(&text.unwrap()).unwrap().len();
         assert!(encoded <= MAX_REPLY_BYTES - GET_OVERHEAD + 2);
         assert!(truncated && end.offset < s.len());
+    }
+
+    #[test]
+    fn max_bytes_lowers_the_page_budget_at_a_char_boundary() {
+        let s = "é".repeat(1024 * 1024); // 2 MiB, 2 bytes per char
+        let (text, _, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), false, Some(1024 * 1024 + 1));
+        let text = text.unwrap();
+        assert!(truncated && text.len() <= 1024 * 1024 + 1 && text.len() > 1024 * 1024 - 2);
+        assert!(s.is_char_boundary(end.offset), "cut inside a char");
+        // Silly values are clamped up to MIN_PAGE_BYTES; absent = the default.
+        let (text, ..) = page(&Src::Snap(&s), 0..s.len(), false, Some(1));
+        assert_eq!(text.unwrap().len(), MIN_PAGE_BYTES);
+        let (text, ..) = page(&Src::Snap(&s), 0..s.len(), false, None);
+        assert!(text.unwrap().len() > 2 * 1024 * 1024 - GET_OVERHEAD - 2);
     }
 }

@@ -150,3 +150,12 @@ fn every_event_kind_has_a_fixture() {
         assert!(names.iter().any(|n| split(n) == (kind.to_string(), "event")), "event {kind}: no fixture");
     }
 }
+
+#[test]
+fn get_max_bytes_is_carried() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/contract/edit.get.request.snapshot_page_max_bytes.json");
+    let r: GetReq = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(r.max_bytes, Some(1_048_576));
+    let plain: GetReq = serde_json::from_value(serde_json::json!({"buffer": "b1_00000001"})).unwrap();
+    assert_eq!(plain.max_bytes, None, "absent = the default budget");
+}

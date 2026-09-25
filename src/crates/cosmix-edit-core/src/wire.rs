@@ -161,6 +161,10 @@ pub struct GetReq {
     pub expect_rev: Option<u64>,
     #[serde(default)]
     pub snapshot: Option<SnapshotArg>,
+    /// Page budget in text bytes, lowered from the 4 MiB default (clamped
+    /// up to 4 KiB); absent = the default.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

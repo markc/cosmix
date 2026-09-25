@@ -126,6 +126,9 @@ const COMPLETED_MAX: usize = 4096;
 /// Request deadlines (plan §2): 5 s, 30 s for open / get pages / save.
 const DEADLINE_MS: u64 = 5_000;
 const DEADLINE_LONG_MS: u64 = 30_000;
+/// Snapshot page size asked of `edit.get` (`max_bytes`): about 1 ms of UI
+/// work per page, where editd's 4 MiB default costs 3-6 ms (ced E1 perf).
+const PAGE_BYTES: usize = 1024 * 1024;
 /// `edit.history` page size for recovery and reconciliation.
 const HISTORY_LIMIT: usize = 1000;
 /// `RESOURCE_LIMIT busy` backoff: 250 ms doubling, capped at 5 s.
@@ -993,7 +996,7 @@ impl Mirror {
                 self.start_pages(&mut step);
                 return step;
             };
-            let body = json!({"buffer": self.buffer, "snapshot": token, "range": [next, page.bytes_total]});
+            let body = json!({"buffer": self.buffer, "snapshot": token, "range": [next, page.bytes_total], "max_bytes": PAGE_BYTES});
             self.send_read(Read::Page, "edit.get", body, DEADLINE_LONG_MS, &mut step);
             return step;
         }
@@ -1250,7 +1253,7 @@ impl Mirror {
         };
         let hash = self.compare_with.is_some().then(blake3::Hasher::new);
         self.pager = Some(Pager { token: None, text, hash });
-        let body = json!({"buffer": self.buffer, "snapshot": true});
+        let body = json!({"buffer": self.buffer, "snapshot": true, "max_bytes": PAGE_BYTES});
         self.send_read(Read::Page, "edit.get", body, DEADLINE_LONG_MS, step);
     }
 

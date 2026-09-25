@@ -593,7 +593,7 @@ refused request can be retried with its op_id.</p>
 <tr><td><code>edit.close</code></td><td><code>buffer</code>, <code>force?</code></td><td><code>{buffer, closed, holders}</code></td></tr>
 <tr><td><code>edit.save</code></td><td><code>buffer</code>, <code>path?</code> (save-as), <code>expect_rev?</code>, <code>force?</code></td><td><code>{buffer, epoch, path, rev, saved_rev, file_bytes, disk:"clean", durable, warning}</code></td></tr>
 <tr><td><code>edit.reload</code></td><td><code>buffer</code>, <code>force?</code>, <code>expect_rev?</code></td><td>a mutation reply, or <code>{buffer, rev, unchanged:true}</code></td></tr>
-<tr><td><code>edit.get</code></td><td><code>buffer</code>, <code>range?</code>=<code>"all"</code>, <code>numbered?</code>, <code>expect_rev?</code>, <code>snapshot?</code></td><td><code>{buffer, epoch, rev, text | lines, start, end, bytes_total, lines_total, truncated, next, snapshot}</code></td></tr>
+<tr><td><code>edit.get</code></td><td><code>buffer</code>, <code>range?</code>=<code>"all"</code>, <code>numbered?</code>, <code>expect_rev?</code>, <code>snapshot?</code>, <code>max_bytes?</code> (page budget: lower than the 4 MiB default, at least 4 KiB, still cut at a character)</td><td><code>{buffer, epoch, rev, text | lines, start, end, bytes_total, lines_total, truncated, next, snapshot}</code></td></tr>
 <tr><td><code>edit.insert</code></td><td><code>buffer</code>, <code>at</code>, <code>text</code> + common</td><td>mutation reply</td></tr>
 <tr><td><code>edit.delete</code></td><td><code>buffer</code>, <code>range</code> + common</td><td>mutation reply</td></tr>
 <tr><td><code>edit.replace</code></td><td><code>buffer</code>, <code>range</code>, <code>text</code> + common</td><td>mutation reply</td></tr>

@@ -167,7 +167,7 @@ refused request can be retried with its op_id.
 | `edit.close` | `buffer`, `force?` | `{buffer, closed, holders}` |
 | `edit.save` | `buffer`, `path?` (save-as), `expect_rev?`, `force?` | `{buffer, epoch, path, rev, saved_rev, file_bytes, disk:"clean", durable, warning}` |
 | `edit.reload` | `buffer`, `force?`, `expect_rev?` | a mutation reply, or `{buffer, rev, unchanged:true}` |
-| `edit.get` | `buffer`, `range?`=`"all"`, `numbered?`, `expect_rev?`, `snapshot?` | `{buffer, epoch, rev, text \| lines, start, end, bytes_total, lines_total, truncated, next, snapshot}` |
+| `edit.get` | `buffer`, `range?`=`"all"`, `numbered?`, `expect_rev?`, `snapshot?`, `max_bytes?` (page budget: lower than the 4 MiB default, at least 4 KiB, still cut at a character) | `{buffer, epoch, rev, text \| lines, start, end, bytes_total, lines_total, truncated, next, snapshot}` |
 | `edit.insert` | `buffer`, `at`, `text` + common | mutation reply |
 | `edit.delete` | `buffer`, `range` + common | mutation reply |
 | `edit.replace` | `buffer`, `range`, `text` + common | mutation reply |
