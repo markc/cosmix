@@ -633,12 +633,26 @@ edit text.</li>
 <p><strong>Open, holders and close.</strong> Opening a path that is already open returns the
 same buffer (<code>reopened: true</code>) and adds your caller key to <code>holders</code>. A buffer
 binds to the canonical path resolved at open, so a later retarget of a symlink
-is not followed. <code>edit.open</code> without a path creates a scratch buffer.
+is not followed. A missing file binds through its canonical parent directory.
+A <strong>dangling</strong> symlink binds to the link's own path, so the first save
+replaces the link with a regular file. That is the one case where a save does
+not keep a symlink. <code>edit.open</code> without a path creates a scratch buffer.</p>
+<p>Opens are refused in these cases:</p>
+<ul>
+<li>The path, as given or as resolved, is longer than 1,024 bytes JSON-encoded:
+<code>INVALID_ARGUMENT</code> <code>bad_path</code>. The path is repeated in replies, props and
+events, so its size is capped.</li>
+<li>The <code>language</code> override does not match <code>^[A-Za-z0-9._+#-]{1,32}$</code>:
+<code>INVALID_ARGUMENT</code> <code>bad_args</code>.</li>
+<li>A 33rd distinct caller opens a buffer: <code>RESOURCE_LIMIT</code> <code>limit</code>. A buffer
+holds at most 32 caller keys, and a caller already holding it can always
+reopen.
 <code>create: true</code> opens a missing file as an empty buffer with <code>disk:"none"</code>.
 <code>close</code> removes your key. The buffer is freed when no holders remain and it is
 clean. Closing the last holder of a dirty buffer is refused with <code>CONFLICT</code>
 <code>dirty</code>. <code>force: true</code> frees the buffer <strong>and discards unsaved text</strong>. In E0,
-holders are never reaped when an agent crashes.</p>
+holders are never reaped when an agent crashes.</li>
+</ul>
 <p><strong>Paging.</strong> <code>get</code>, <code>find</code> and <code>history</code> stop at a 4 MiB encoded reply and
 return <code>truncated</code> plus <code>next</code>; resume from there. To read a consistent
 multi-page copy, pass <code>snapshot: true</code> on the first <code>get</code>. editd freezes that
@@ -750,7 +764,8 @@ directory. If that directory fsync fails after the rename, the reply says
 precondition, not a filesystem compare-and-swap. A writer that lands between
 the final check and the rename is overwritten, which is the same window
 every mainstream editor has. Writing the canonical target keeps a symlink
-intact. Hard links to the old inode are detached.</p>
+intact, except a link that was dangling at open, which the first save
+replaces with a regular file. Hard links to the old inode are detached.</p>
 </li>
 <li>
 <p><strong>External changes.</strong> editd watches each open file's parent directory
@@ -773,7 +788,8 @@ the save-time check still protects the file.</p>
 <tr><td>Buffer text / lines</td><td>64 MiB / 2,000,000</td></tr>
 <tr><td>Inserted text per request / ops per <code>apply</code></td><td>1 MiB / 10,000</td></tr>
 <tr><td>Undo log per buffer</td><td>100,000 entries or 32 MiB of edit text</td></tr>
-<tr><td>Open buffers</td><td>256</td></tr>
+<tr><td>Open buffers / holders per buffer</td><td>256 / 32</td></tr>
+<tr><td>Path (given and resolved, JSON-encoded) / <code>language</code></td><td>1,024 bytes / 32 chars</td></tr>
 <tr><td>All buffers + logs + snapshots</td><td>1 GiB</td></tr>
 <tr><td>Reply / event (encoded)</td><td>4 MiB / 256 KiB</td></tr>
 <tr><td><code>find</code> matches</td><td>1,000 default, 10,000 max; 4 KiB text per match</td></tr>

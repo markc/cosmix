@@ -212,7 +212,20 @@ and in `edit.history`:
 **Open, holders and close.** Opening a path that is already open returns the
 same buffer (`reopened: true`) and adds your caller key to `holders`. A buffer
 binds to the canonical path resolved at open, so a later retarget of a symlink
-is not followed. `edit.open` without a path creates a scratch buffer.
+is not followed. A missing file binds through its canonical parent directory.
+A **dangling** symlink binds to the link's own path, so the first save
+replaces the link with a regular file. That is the one case where a save does
+not keep a symlink. `edit.open` without a path creates a scratch buffer.
+
+Opens are refused in these cases:
+- The path, as given or as resolved, is longer than 1,024 bytes JSON-encoded:
+  `INVALID_ARGUMENT` `bad_path`. The path is repeated in replies, props and
+  events, so its size is capped.
+- The `language` override does not match `^[A-Za-z0-9._+#-]{1,32}$`:
+  `INVALID_ARGUMENT` `bad_args`.
+- A 33rd distinct caller opens a buffer: `RESOURCE_LIMIT` `limit`. A buffer
+  holds at most 32 caller keys, and a caller already holding it can always
+  reopen.
 `create: true` opens a missing file as an empty buffer with `disk:"none"`.
 `close` removes your key. The buffer is freed when no holders remain and it is
 clean. Closing the last holder of a dirty buffer is refused with `CONFLICT`
@@ -338,7 +351,8 @@ In Mix: `subscribe("edit.changed")` plus `on edit.changed … end`.
   precondition, not a filesystem compare-and-swap. A writer that lands between
   the final check and the rename is overwritten, which is the same window
   every mainstream editor has. Writing the canonical target keeps a symlink
-  intact. Hard links to the old inode are detached.
+  intact, except a link that was dangling at open, which the first save
+  replaces with a regular file. Hard links to the old inode are detached.
 - **External changes.** editd watches each open file's parent directory
   through inotify; it does not poll. When the file changes on disk:
   - A **clean** buffer reloads with a minimal edit (the common prefix and
@@ -360,7 +374,8 @@ In Mix: `subscribe("edit.changed")` plus `on edit.changed … end`.
 | Buffer text / lines | 64 MiB / 2,000,000 |
 | Inserted text per request / ops per `apply` | 1 MiB / 10,000 |
 | Undo log per buffer | 100,000 entries or 32 MiB of edit text |
-| Open buffers | 256 |
+| Open buffers / holders per buffer | 256 / 32 |
+| Path (given and resolved, JSON-encoded) / `language` | 1,024 bytes / 32 chars |
 | All buffers + logs + snapshots | 1 GiB |
 | Reply / event (encoded) | 4 MiB / 256 KiB |
 | `find` matches | 1,000 default, 10,000 max; 4 KiB text per match |
