@@ -14,6 +14,14 @@ fn fail($code, $message, $context)
   raise($code, $message, $context)
 end
 
+fn check_loader_epoch($previous, $process)
+  -- Native RELOAD initialises beside the still-running old children and has
+  -- no commit hook. Refuse before side effects; the old evaluator continues.
+  if $previous == to_string($process) then
+    fail("SCENES_RELOAD_RESTART_REQUIRED", "restart the loader process to replace its script; use scenes.reload for a behaviour", {})
+  end
+end
+
 fn bounded_read($path, $cap)
   $v = bytes_to_string(read_file_bytes($path, $cap + 1))
   if bytes_len(string_to_bytes($v)) > $cap then fail("SCENES_LIMIT", "file exceeds size limit", {file:$path}) end
@@ -87,6 +95,8 @@ fn with_model($source, $model)
 end
 
 fn initial($root, $templates, $host, $me, $io)
+  if not stat($root, {follow_symlinks:false}).is_dir then fail("SCENES_FILES", "scene root must be a real directory", {}) end
+  $root = realpath($root)
   $sequence = 0
   if exists($root .. "/.generation", {follow_symlinks:false}) then
     if not regular($root .. "/.generation") then fail("SCENES_GENERATION", "generation counter must be a regular file", {}) end
@@ -97,8 +107,8 @@ fn initial($root, $templates, $host, $me, $io)
   end
   return {root:$root, templates:$templates, host:$host, me:$me, io:$io,
     desired:{schema_version:1, enabled:[], origins:{}, recovery:{}}, state_digest:"",
-    scenes:{}, panels:{}, panel_revision:0, panel_generation:nil, open:nil,
-    host_live:false, services:nil, connection:nil, revision:0, published:"",
+    scenes:{}, retiring:{}, panels:{}, panel_revision:0, panel_generation:nil, open:nil,
+    host_live:false, sync_needed:true, services:nil, connection:nil, revision:0, published:"",
     sequence:$sequence, diagnostic:nil, response:{}, rc:0}
 end
 
@@ -129,7 +139,7 @@ end
 fn entry($name)
   return {name:$name, installed:true, enabled:false, mounted:false, revision:0,
     source:nil, model:nil, digest:"", attempted:"", behaviour_digest:"", meta_digest:"",
-    generation:0, pid:nil, retiring:nil, status:"disabled", ready:false, crashes:0, started:0,
+    generation:0, pid:nil, retiring:nil, status:"disabled", ready:false, crashes:0, started:0, restart_at:nil,
     diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, pending:false}
 end
 
@@ -177,26 +187,48 @@ fn invalidate($s, $name)
   -- Invalidate before stop; a queued exit/model can never revive this epoch.
   $old = $e.generation
   $e.generation = 0
+  $e.restart_at = nil
   $e.ready = false
   $e.pending = false
   if $e.pid != nil then
     $s.io.stop($e.pid, {name:$name, generation:$old})
     $e.retiring = {pid:$e.pid, generation:$old}
+    -- Keep the tombstone independently of installation lifetime: remove and
+    -- reinstall must still wait for this exact owned child's exit.
+    $s.retiring[$name] = $e.retiring
   end
   $e.pid = nil
   $e.status = "disabled"
   $s.scenes[$name] = $e
+  if $s.host_live and $e.mounted and $e.source != nil then
+    try
+      $r = load_managed($s, $e.source, $e.model, 0)
+      $s.scenes[$name].revision = $r.revision
+    catch $message, $error
+      -- Never lose the owned retirement after stop has already happened.
+      $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+      $s.sync_needed = true
+    end
+  end
   return $s
 end
 
 fn start($s, $name)
   $e = $s.scenes[$name]
-  if not $e.enabled or not $e.mounted or $e.pid != nil or $e.retiring != nil then return $s end
+  if $e == nil or not $e.enabled or not $e.mounted or $e.pid != nil or $s.retiring[$name] != nil or $e.retiring != nil then return $s end
+  if $e.status == "backoff" and $e.restart_at != nil and monotonic() < $e.restart_at then return $s end
   $path = $s.root .. "/" .. $name .. "/behaviour.mix"
   if not regular($path) then
     $e.status = "static"
     $e.ready = true
   else
+    $registry = $s.io.rpc("noded", "noded.props.get", {})
+    $names = (($registry ?? {}).services ?? {}).registered
+    if type($names) != "list" then fail("SCENES_SNAPSHOT", "missing behaviour registration snapshot", {}) end
+    if contains($names, "scene-" .. $name) then
+      $s.scenes[$name].status = "handover"
+      return $s
+    end
     -- A prior spawn may have failed after persisting its allocation. Never
     -- reuse that token just because its caller did not receive updated state.
     if regular($s.root .. "/.generation") then
@@ -209,10 +241,14 @@ fn start($s, $name)
     write_atomic($s.root .. "/.generation", data_encode({value:$s.sequence}), {durability:"full", mode:0o600, max_bytes:64})
     $e.generation = $s.sequence
     $e.ready = false
+    -- Install the host fence before admitting any messages from the child.
+    $r = load_managed($s, $e.source, $e.model, $e.generation)
+    $e.revision = $r.revision
     $e.pid = $s.io.launch($path, $name, $e.generation, $s.host, $s.me)
     $e.status = "starting"
     $e.started = monotonic()
   end
+  $e.restart_at = nil
   $s.scenes[$name] = $e
   return $s
 end
@@ -271,8 +307,13 @@ fn reconcile_one($s, $name, $force)
     end
     $e = $s.scenes[$name]
     if $e.mounted then
-      $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
-      $e.mounted = false
+      try
+        $unloaded = $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
+        if type($unloaded) != "map" then fail("SCENES_SNAPSHOT", "missing scene unload receipt", {}) end
+        $e.mounted = false
+      catch $message, $error
+        $e.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+      end
     end
     $s.scenes[$name] = $e
     return $s
@@ -288,7 +329,7 @@ fn reconcile_one($s, $name, $force)
     end
     if $force or $c.digest != $e.digest or not $e.mounted then
       $model = $e.model ?? $c.model
-      $r = $s.io.rpc($s.host, "shell.scene.load", with_model($c.source, $model))
+      $r = load_managed($s, $c.source, $model, $e.generation)
       $e.source = $c.source
       $e.model = $model
       $e.revision = $r.revision
@@ -306,13 +347,23 @@ fn reconcile_one($s, $name, $force)
       $s.scenes[$name].behaviour_digest = $c.behaviour_digest
       $s.scenes[$name].crashes = 0
     end
-    if $s.scenes[$name].status != "crash_loop" and $s.scenes[$name].status != "backoff" then $s = start($s, $name) end
+    if $s.scenes[$name].status != "crash_loop" then $s = start($s, $name) end
   catch $message, $error
     $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details,
-      file:$error.details.file ?? ($dir .. "/scene.mix"), attempted_digest:$s.scenes[$name].attempted,
+      file:($error.details ?? {}).file ?? ($dir .. "/scene.mix"), attempted_digest:$s.scenes[$name].attempted,
       last_good_revision:$s.scenes[$name].revision}
   end
   return $s
+end
+
+fn reconcile_safe($s, $name, $force)
+  try
+    return reconcile_one($s, $name, $force)
+  catch $message, $error
+    if $s.scenes[$name] == nil then $s.scenes[$name] = entry($name) end
+    $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    return $s
+  end
 end
 
 fn rescan($s, $force)
@@ -334,7 +385,7 @@ fn rescan($s, $force)
   end
   if len($names) > 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
   for each $n in $names
-    $s = reconcile_one($s, $n, $force)
+    $s = reconcile_safe($s, $n, $force)
   end
   return $s
 end
@@ -354,17 +405,27 @@ fn filesystem($s, $batch)
     end
   end
   for each $name in $names
-    $s = reconcile_one($s, $name, false)
+    $s = reconcile_safe($s, $name, false)
   end
   return $s
 end
 
 fn exited($s, $event)
-  $name = $event.tag.name
+  $name = ($event.tag ?? {}).name
+  if not valid_name($name) then return $s end
   $e = $s.scenes[$name]
-  if $e != nil and $e.retiring != nil and $e.retiring.pid == $event.pid and $e.retiring.generation == $event.tag.generation then
+  $retiring = $s.retiring[$name]
+  if $retiring != nil and $retiring.pid == $event.pid and $retiring.generation == $event.tag.generation then
+    $s.retiring = delete($s.retiring, $name)
+    if $e == nil then return $s end
     $s.scenes[$name].retiring = nil
-    return start($s, $name)
+    $s.scenes[$name].status = "handover"
+    try
+      return start($s, $name)
+    catch $message, $error
+      $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+      return $s
+    end
   end
   if $e == nil or $e.generation != $event.tag.generation or $e.pid != $event.pid then return $s end
   $e.pid = nil
@@ -373,6 +434,7 @@ fn exited($s, $event)
   if monotonic() - $e.started > 60 then $e.crashes = 0 end
   $e.crashes = $e.crashes + 1
   $e.status = $e.crashes >= 5 ? "crash_loop" : "backoff"
+  $e.restart_at = $e.status == "backoff" ? monotonic() + [1, 2, 4, 8][$e.crashes - 1] : nil
   $e.diagnostic = {error_code:"SCENES_BEHAVIOUR_EXIT", message:"behaviour exited; mounted content retained", context:$e.exit}
   $s.scenes[$name] = $e
   return $s
@@ -381,7 +443,17 @@ end
 fn restart($s, $name, $generation)
   $e = $s.scenes[$name]
   if $e == nil or not $e.enabled or $e.generation != $generation or $e.status != "backoff" then return $s end
+  if $e.restart_at != nil and monotonic() < $e.restart_at then return $s end
+  -- An elapsed deadline remains eligible while the host is absent. Remount
+  -- reconciliation calls start again; no notification has to re-arm it.
+  $s.scenes[$name].restart_at = nil
   return start($s, $name)
+end
+
+fn load_managed($s, $source, $model, $generation)
+  $r = $s.io.rpc($s.host, "shell.scene.load", {source:with_model($source, $model), model_generation:$generation})
+  if type($r) != "map" or type($r.revision) != "number" then fail("SCENES_SNAPSHOT", "missing scene load receipt", {}) end
+  return $r
 end
 
 fn rewrite_install($source, $name)
@@ -408,17 +480,48 @@ fn stage($s, $template, $name)
     if stat($path, {follow_symlinks:false}).is_symlink then fail("SCENES_FILES", "template contains symlink", {file:$path}) end
   end
   $dst = $s.root .. "/.stage-" .. uuid()
-  copy_tree($src, $dst)
   try
+    copy_tree($src, $dst)
     write_atomic($dst .. "/scene.mix", rewrite_install(bounded_read($dst .. "/scene.mix", 262144), $name))
     $c = candidate($s, $name, $dst)
-    $s.io.rpc($s.host, "shell.scene.validate", $c.source)
+    $validation = $s.io.rpc($s.host, "shell.scene.validate", $c.source)
+    if type($validation) != "map" then fail("SCENES_SNAPSHOT", "missing scene validation receipt", {}) end
     if $c.behaviour_digest != "" then $s.io.check($dst .. "/behaviour.mix") end
   catch $message, $error
     remove_dir($dst)
     raise($error.code, $message, $error.details)
   end
   return $dst
+end
+
+fn recovery_directory($s)
+  -- lstat the directory itself, including dangling links. mkdir must never
+  -- follow an existing .recovery alias or silently recreate a missing root.
+  if realpath($s.root) != $s.root or not stat($s.root, {follow_symlinks:false}).is_dir then
+    fail("SCENES_FILES", "scene root is no longer a real directory", {})
+  end
+  $path = $s.root .. "/.recovery"
+  if not exists($path, {follow_symlinks:false}) then mkdir($path, {parents:false}) end
+  if not stat($path, {follow_symlinks:false}).is_dir or realpath($path) != $path then
+    fail("SCENES_FILES", "recovery must be a real directory inside the scene root", {file:$path})
+  end
+  return $path
+end
+
+fn recovery_move($s, $from, $to)
+  $recovery = recovery_directory($s)
+  for each $path in [$from, $to]
+    if not contains([$s.root, $recovery], dirname($path)) then
+      fail("SCENES_FILES", "recovery move escaped scene root", {file:$path})
+    end
+  end
+  if not stat($from, {follow_symlinks:false}).is_dir or realpath($from) != $from then
+    fail("SCENES_FILES", "recovery source must be a real directory", {file:$from})
+  end
+  if exists($to, {follow_symlinks:false}) then fail("SCENES_COLLISION", "recovery destination exists", {file:$to}) end
+  -- rename itself does not follow either final component. Parent checks
+  -- above reject existing aliases; Mix has no dirfd-relative rename yet.
+  rename($from, $to)
 end
 
 fn known($s, $name)
@@ -434,15 +537,30 @@ fn drive_popups($s)
     if $s.open == $r.name then continue end
     $p = $s.panels[$edge]
     if $p == nil then continue end
-    if $p.page != $r.page or ($p.mode == $r.mode and ($r.mode != "hidden" or not $p.visible)) then
+    $previous = $r.previous ?? $r.page
+    if not contains($p.pages, $previous) then $previous = $r.page end
+    if $p.page != $r.page and $p.page != $previous then
+      -- A third party took the edge. Do not change its selection or mode.
       $s.desired.recovery = delete($s.desired.recovery, $edge)
       $s = persist($s)
-    elif $r.phase != "restoring" then
-      $s.io.rpc($s.host, "shell.panel.mode", {edge:$edge, mode:$r.mode})
-      if $r.previous != nil and contains($p.pages, $r.previous) then
-        $s.io.rpc($s.host, "shell.panel.page.set", {edge:$edge, id:$r.previous})
-      end
+      continue
+    end
+    -- Persist ownership of the restore before either command. Each reply is
+    -- followed by an applied-state read; notices are only invalidation hints.
+    if $r.phase != "restoring" then
       $s.desired.recovery[$edge].phase = "restoring"
+      $s = persist($s)
+    end
+    if $p.page != $previous and contains($p.pages, $previous) then
+      $s = panel_command($s, $edge, "shell.panel.page.set", {edge:$edge, id:$previous})
+      $p = $s.panels[$edge]
+    end
+    if $p.page == $previous and $p.mode != $r.mode then
+      $s = panel_command($s, $edge, "shell.panel.mode", {edge:$edge, mode:$r.mode})
+      $p = $s.panels[$edge]
+    end
+    if $p.page == $previous and $p.mode == $r.mode and ($r.mode != "hidden" or not $p.visible) then
+      $s.desired.recovery = delete($s.desired.recovery, $edge)
       $s = persist($s)
     end
   end
@@ -458,24 +576,51 @@ fn drive_popups($s)
   if $s.desired.recovery[$e.edge] == nil then
     $s.desired.recovery[$e.edge] = {name:$s.open, page:$e.page, previous:$p.page, mode:$p.mode, phase:"select"}
     $s = persist($s)
-    $s.io.rpc($s.host, "shell.panel.page.set", {edge:$e.edge, id:$e.page})
-  elif $p.page == $e.page and $s.desired.recovery[$e.edge].phase == "select" then
-    $s.io.rpc($s.host, "shell.panel.mode", {edge:$e.edge, mode:"pinned"})
+  end
+  if $p.page != $e.page then
+    $s = panel_command($s, $e.edge, "shell.panel.page.set", {edge:$e.edge, id:$e.page})
+    $p = $s.panels[$e.edge]
+  end
+  if $p.page == $e.page and $p.mode != "pinned" then
     $s.desired.recovery[$e.edge].phase = "pinning"
     $s = persist($s)
-  elif $p.page == $e.page and $p.visible and $p.mode == "pinned" then
+    $s = panel_command($s, $e.edge, "shell.panel.mode", {edge:$e.edge, mode:"pinned"})
+    $p = $s.panels[$e.edge]
+  end
+  if $p.page == $e.page and $p.visible and $p.mode == "pinned" then
     $s.scenes[$s.open].pending = false
   end
   return $s
 end
 
+fn panel_command($s, $edge, $verb, $args)
+  $r = $s.io.rpc($s.host, $verb, $args)
+  if type($r) != "map" then fail("SCENES_SNAPSHOT", "missing panel command receipt", {verb:$verb}) end
+  if $r.accepted == false then fail("SCENES_UPSTREAM", "panel command refused", {verb:$verb, upstream:$r}) end
+  $p = $s.io.rpc($s.host, "shell.panel.state", {edge:$edge})
+  if type($p) != "map" or type($p.pages) != "list" then fail("SCENES_SNAPSHOT", "missing applied panel state", {edge:$edge}) end
+  $s.panels[$edge] = $p
+  return $s
+end
+
+fn panel_snapshot($s)
+  $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
+  if type(($snapshot ?? {}).panels) != "map" then fail("SCENES_SNAPSHOT", "missing panel snapshot", {}) end
+  $s.panels = $snapshot.panels
+  $s.panel_generation = nil
+  $s.panel_revision = 0
+  return drive_popups($s)
+end
+
 fn panel_changed($s, $event)
-  if type($event.panels) != "map" then return $s end
+  if type($event) != "map" or type($event.panels) != "map" then return $s end
   if $s.panel_generation == $event.generation and $event.revision <= $s.panel_revision then return $s end
+  -- A delayed notice may predate our command's read. Read current state
+  -- instead of overwriting a newer applied snapshot with the event payload.
+  $s = panel_snapshot($s)
   $s.panel_generation = $event.generation
   $s.panel_revision = $event.revision
-  $s.panels = $event.panels
-  return drive_popups($s)
+  return $s
 end
 
 fn services($s, $names, $reconnect)
@@ -484,15 +629,18 @@ fn services($s, $names, $reconnect)
     if type($name) != "string" then fail("SCENES_SNAPSHOT", "malformed service snapshot", {}) end
   end
   $live = contains($names, $s.host)
-  $returning = $live and (not $s.host_live or $reconnect)
+  $returning = $live and (not $s.host_live or $reconnect or $s.sync_needed)
   $s.host_live = $live
   $s.services = $names
   if not $live or $reconnect then
+    $s.sync_needed = true
     for each $name in keys($s.scenes)
       $s.scenes[$name].mounted = false
     end
   end
   if $returning then
+    $s.sync_needed = true
+    try
     -- A broker reconnect need not mean Quoin restarted. Recover the actual
     -- loader-owned mounts so an offline disable cannot leave an old seat up.
     $hosted = $s.io.rpc($s.host, "shell.scenes.list", {})
@@ -514,7 +662,7 @@ fn services($s, $names, $reconnect)
       $e = $s.scenes[$name]
       if $e.enabled and $e.installed and $e.source != nil then
         try
-          $r = $s.io.rpc($s.host, "shell.scene.load", with_model($e.source, $e.model))
+          $r = load_managed($s, $e.source, $e.model, $e.generation)
           $s.scenes[$name].mounted = true
           $s.scenes[$name].revision = $r.revision
         catch $message, $error
@@ -523,14 +671,28 @@ fn services($s, $names, $reconnect)
       end
     end
     $s = rescan($s, false)
-    $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
-    $s.panels = $snapshot.panels ?? {}
-    $s.panel_generation = nil
-    $s.panel_revision = 0
     for each $edge in keys($s.desired.recovery)
       $s.desired.recovery[$edge].phase = $s.desired.recovery[$edge].name == $s.open ? "select" : "recover"
     end
-    $s = drive_popups($s)
+    $s = panel_snapshot($s)
+    $s.sync_needed = false
+    catch $message, $error
+      $s.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+      return $s
+    end
+  end
+  -- A native exit proves the process is gone, but the broker may still be
+  -- retiring its name. A fresh registry read in start closes that handover.
+  if $live then
+    for each $name in keys($s.scenes)
+      if $s.scenes[$name].status == "handover" then
+        try
+          $s = start($s, $name)
+        catch $message, $error
+          $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+        end
+      end
+    end
   end
   return $s
 end
@@ -588,14 +750,18 @@ fn request($s, $verb, $args)
     elif $verb == "reload" then
       $s = reconcile_one($s, $name, true)
     elif $verb == "remove" or $verb == "reset" then
+      $recovery = recovery_directory($s)
+      $installation = $s.root .. "/" .. $name
+      if exists($installation, {follow_symlinks:false}) and not stat($installation, {follow_symlinks:false}).is_dir then
+        fail("SCENES_FILES", "installation must be a real directory", {file:$installation})
+      end
       $tmp = nil
       if $verb == "reset" then
         $origin = $s.desired.origins[$name]
         if $origin == nil then fail("SCENES_NO_ORIGIN", "reset requires a recorded shipped template origin", {name:$name}) end
         $tmp = stage($s, $origin, $name)
       end
-      $backup = $s.root .. "/.recovery/" .. $name .. "-" .. uuid()
-      mkdir(dirname($backup))
+      $backup = $recovery .. "/" .. $name .. "-" .. uuid()
       if $s.open == $name then $s.open = nil end
       $s = drive_popups($s)
       $s = invalidate($s, $name)
@@ -603,16 +769,16 @@ fn request($s, $verb, $args)
         $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $name)
         $s = persist($s)
         $s = reconcile_one($s, $name, false)
-        if is_dir($s.root .. "/" .. $name) then rename($s.root .. "/" .. $name, $backup) end
+        if exists($installation, {follow_symlinks:false}) then recovery_move($s, $installation, $backup) end
         $s.scenes = delete($s.scenes, $name)
         $s.desired.origins = delete($s.desired.origins, $name)
         $s = persist($s)
       else
-        if is_dir($s.root .. "/" .. $name) then rename($s.root .. "/" .. $name, $backup) end
+        if exists($installation, {follow_symlinks:false}) then recovery_move($s, $installation, $backup) end
         try
-          rename($tmp, $s.root .. "/" .. $name)
+          recovery_move($s, $tmp, $installation)
         catch $message, $error
-          if is_dir($backup) then rename($backup, $s.root .. "/" .. $name) end
+          if exists($backup, {follow_symlinks:false}) then recovery_move($s, $backup, $installation) end
           raise($error.code, $message, $error.details)
         end
         $s.scenes[$name].model = nil
@@ -640,7 +806,8 @@ fn request($s, $verb, $args)
         if not has_key($args, "value") or type($args.value) != "map" then fail("SCENES_MODEL", "value must be the complete model map", {}) end
         if bytes_len(string_to_bytes(json_encode($args.value))) > 262144 then fail("SCENES_LIMIT", "model exceeds limit", {}) end
         if not deep_eq($args.value, $e.model) then
-          $r = $s.io.rpc($s.host, "shell.scene.patch", {scene:$name, path:"model", value:$args.value})
+          $r = $s.io.rpc($s.host, "shell.scene.patch", {scene:$name, path:"model", value:$args.value, generation:$e.generation})
+          if type($r) != "map" or type($r.revision) != "number" then fail("SCENES_SNAPSHOT", "missing model receipt", {name:$name}) end
           $s.scenes[$name].model = $args.value
           $s.scenes[$name].revision = $r.revision
         end
@@ -650,6 +817,10 @@ fn request($s, $verb, $args)
     elif contains(["open", "close", "toggle"], $verb) then
       if not $e.enabled then fail("SCENES_DISABLED", "scene is disabled", {name:$name}) end
       $opening = $verb == "open" or ($verb == "toggle" and $s.open != $name)
+      -- Snapshot before saving the page/mode we will later restore.
+      $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
+      if type(($snapshot ?? {}).panels) != "map" then fail("SCENES_SNAPSHOT", "missing panel snapshot", {}) end
+      $s.panels = $snapshot.panels
       if $opening then
         $s.open = $name
         $s.scenes[$name].pending = true

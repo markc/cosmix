@@ -9,13 +9,16 @@ export SCENES_LIB = env("SCENES_LIB", $TEMPLATES .. "/lib")
 $HOST = env("SCENE_HOST", "shell")
 $ME = serve_name()
 if $ME == nil then raise("SCENES_SERVE", "start scenes with mix --serve", {}) end
+$loader.check_loader_epoch(env("SCENES_LOADER_PROCESS"), pid())
 mkdir($ROOT)
+if not stat($ROOT, {follow_symlinks:false}).is_dir then raise("SCENES_FILES", "scene root must be a real directory", {}) end
 if not flock($ROOT .. "/.loader.lock") then raise("SCENES_LOCKED", "another loader owns this scenes directory", {}) end
 $state = $loader.initial($ROOT, $TEMPLATES, $HOST, $ME, $io)
+$ROOT = $state.root
 
 fn refresh_services($s, $reconnect)
   $r = $s.io.rpc("noded", "noded.props.get", {})
-  return $loader.services($s, $r.services.registered, $reconnect)
+  return $loader.services($s, (($r ?? {}).services ?? {}).registered, $reconnect)
 end
 
 on fs.changed
@@ -50,7 +53,7 @@ on props.changed
       if $event.headers.gap == "true" then
         $state = refresh_services($state, true)
       elif $event.args.path == "services.registered" then
-        $state = $loader.services($state, $event.args.new, false)
+        $state = refresh_services($state, false)
       end
     catch $message, $error
       $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
@@ -62,7 +65,11 @@ end
 on "shell.panel.changed"
   if $event.headers.topic == $HOST .. ".panel.changed" then
     try
-      $state = $loader.panel_changed($state, $event.args)
+      if $event.headers.gap == "true" then
+        $state = refresh_services($state, true)
+      else
+        $state = $loader.panel_changed($state, $event.args)
+      end
     catch $message, $error
       $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
     end
@@ -72,46 +79,50 @@ end
 
 on "shell.scene.changed"
   if $event.headers.topic != $HOST .. ".scene.changed" then return end
-  $notice = $event.args
+  if $event.headers.gap == "true" then
+    try
+      $state = refresh_services($state, true)
+    catch $message, $error
+      $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+  end
+  $notice = $event.args ?? {}
   if has_key($state.scenes, $notice.scene ?? "") and $state.scenes[$notice.scene].revision == $notice.revision then
     $state.scenes[$notice.scene].diagnostics = $notice.diagnostics ?? []
-    $state = $loader.changed($state)
   end
+  $state = $loader.changed($state)
 end
 
-on proc.exited
+on proc.exited async
   if len(keys($event.headers)) != 0 then return end
   -- The only delay is a one-shot response to an observed crash. No polling.
   $exit = $event.args
-  $exit.tag = json_parse($exit.tag)
-  $previous_pid = $state.scenes[$exit.tag.name].pid
   try
+    $exit.tag = json_parse($exit.tag)
+    $previous_pid = ($state.scenes[($exit.tag ?? {}).name] ?? {}).pid
     $state = $loader.exited($state, $exit)
   catch $message, $error
     $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
     $state = $loader.changed($state)
     return
   end
-  $name = $exit.tag.name
+  $name = ($exit.tag ?? {}).name
   $e = $state.scenes[$name]
   $state = $loader.changed($state)
   if $e != nil and $e.status == "backoff" and $e.generation == $exit.tag.generation and $previous_pid == $exit.pid then
-    emit $ME scenes.restart_due body=json_encode({name:$name, generation:$e.generation, delay:[1, 2, 4, 8][$e.crashes - 1]})
-  end
-end
-
-on scenes.restart_due async
-  if $event.headers.from != $ME or $event.headers.broker_origin != "local" then return end
-  $name = $event.args.name
-  $generation = $event.args.generation
-  if $state.scenes[$name].status == "backoff" and $state.scenes[$name].generation == $generation then
-    sleep($event.args.delay)
+    $generation = $e.generation
+    $delay = $e.restart_at - monotonic()
+    if $delay > 0 then sleep($delay) end
     -- Disable/reload/model handlers can run while the failure deadline waits.
     try
       $state = $loader.restart($state, $name, $generation)
     catch $message, $error
-      $state.scenes[$name].status = "crash_loop"
-      $state.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+      if ($state.scenes[$name] ?? {}).generation == $generation then
+        -- A transport failure is not another behaviour crash. Preserve the
+        -- elapsed restart so a later mount/connection snapshot can retry it.
+        $state.scenes[$name].restart_at = nil
+        $state.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+      end
     end
     $state = $loader.changed($state)
   end
@@ -199,3 +210,4 @@ subscribe($HOST .. ".scene.changed")
 $state = $loader.rescan($state, false)
 $state = refresh_services($state, false)
 $state = $loader.changed($state)
+export SCENES_LOADER_PROCESS = to_string(pid())
