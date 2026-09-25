@@ -1,0 +1,11 @@
+{
+  "buffers": [
+    "b3_9f2c41a7",
+    "b4_9f2c41a7"
+  ],
+  "epoch": "9f2c41a7",
+  "event": "resync",
+  "event_seq": 1216,
+  "reason": "publisher_loss",
+  "rev": null
+}

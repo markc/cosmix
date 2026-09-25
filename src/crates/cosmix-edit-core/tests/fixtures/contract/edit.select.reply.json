@@ -1,0 +1,32 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "origin": "agent:ctl-90",
+  "origin_downgraded": false,
+  "rev": 43,
+  "selections": [
+    {
+      "anchor": {
+        "col": 5,
+        "line": 3,
+        "offset": 24
+      },
+      "head": {
+        "col": 1,
+        "line": 3,
+        "offset": 20
+      }
+    },
+    {
+      "anchor": {
+        "col": 1,
+        "line": 20,
+        "offset": 200
+      },
+      "head": {
+        "col": 11,
+        "line": 20,
+        "offset": 210
+      }
+    }
+  ]
+}

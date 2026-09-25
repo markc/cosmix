@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "message": "buffer b3_9f2c41a7 has unsaved changes; reload with force:true to discard them",
+  "reason": "dirty",
+  "rev": 43
+}

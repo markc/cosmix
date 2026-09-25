@@ -1,0 +1,8 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "message": "/home/user/x.mix changed on disk since it was loaded; pass force:true to overwrite",
+  "path": "/home/user/x.mix",
+  "reason": "disk_modified",
+  "rev": 43
+}

@@ -1,0 +1,23 @@
+{
+  "base_rev": 47,
+  "buffer": "b3_9f2c41a7",
+  "edits": [
+    {
+      "delete": 5,
+      "insert": "abc",
+      "offset": 120
+    }
+  ],
+  "epoch": "9f2c41a7",
+  "event": "edit",
+  "event_seq": 1300,
+  "kind": "undo",
+  "lane": "agent:ctl-90",
+  "of": [
+    43,
+    43
+  ],
+  "op_id": null,
+  "origin": "human:ced",
+  "rev": 48
+}

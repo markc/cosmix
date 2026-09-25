@@ -1,0 +1,8 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "INVALID_ARGUMENT",
+  "message": "offset 121 is inside a UTF-8 sequence",
+  "offset": 121,
+  "reason": "not_char_boundary",
+  "rev": 43
+}

@@ -1,0 +1,22 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "ranges": [
+    {
+      "anchor": {
+        "col": 5,
+        "line": 3
+      },
+      "head": {
+        "col": 1,
+        "line": 3
+      }
+    },
+    [
+      200,
+      210
+    ],
+    {
+      "anchor": "fn_render"
+    }
+  ]
+}

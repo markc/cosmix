@@ -1,0 +1,22 @@
+{
+  "buffers": [
+    {
+      "buffer": "b3_9f2c41a7",
+      "bytes": 2310,
+      "dirty": true,
+      "disk": "clean",
+      "holders": [
+        "local:ced",
+        "anon"
+      ],
+      "language": "mix",
+      "lines": 88,
+      "name": "x.mix",
+      "opened_as": "~/x.mix",
+      "path": "/home/user/x.mix",
+      "rev": 12,
+      "saved_rev": 10
+    }
+  ],
+  "epoch": "9f2c41a7"
+}

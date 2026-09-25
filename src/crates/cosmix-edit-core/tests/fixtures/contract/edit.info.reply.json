@@ -1,0 +1,22 @@
+{
+  "binary": "cosmix-editd",
+  "buffers": 2,
+  "build_time": "2026-09-26T00:00:00Z",
+  "dirty": 1,
+  "epoch": "9f2c41a7",
+  "event_seq": 1207,
+  "git_dirty": false,
+  "git_sha": "0123456789ab",
+  "limits": {
+    "max_buffer_bytes": 67108864,
+    "max_buffers": 256,
+    "max_reply_bytes": 4194304
+  },
+  "mesh_open": true,
+  "name": "edit",
+  "props_level": "L2",
+  "publisher_loss": 0,
+  "schema": "edit.v1",
+  "version": "0.1.0",
+  "volatile": true
+}

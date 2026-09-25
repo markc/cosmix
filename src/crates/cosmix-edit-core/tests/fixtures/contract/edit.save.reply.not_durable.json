@@ -1,0 +1,11 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "disk": "clean",
+  "durable": false,
+  "epoch": "9f2c41a7",
+  "file_bytes": 8123,
+  "path": "/home/user/x.mix",
+  "rev": 43,
+  "saved_rev": 43,
+  "warning": "saved, but fsync of /home/user failed: EIO"
+}

@@ -1,0 +1,10 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "cursor": "end",
+  "expect_rev": 42,
+  "range": [
+    120,
+    123
+  ],
+  "text": "hello"
+}

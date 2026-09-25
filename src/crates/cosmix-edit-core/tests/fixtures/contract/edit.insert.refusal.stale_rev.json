@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "message": "expect_rev 41 is stale: buffer b3_9f2c41a7 is at rev 43",
+  "reason": "stale_rev",
+  "rev": 43
+}

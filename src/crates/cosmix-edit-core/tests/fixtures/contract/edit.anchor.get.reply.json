@@ -1,0 +1,32 @@
+{
+  "anchors": [
+    {
+      "bias": "before",
+      "collapsed_rev": null,
+      "end": {
+        "col": 1,
+        "line": 41,
+        "offset": 240
+      },
+      "name": "fn_render",
+      "start": {
+        "col": 1,
+        "line": 12,
+        "offset": 98
+      }
+    },
+    {
+      "bias": "before",
+      "collapsed_rev": 41,
+      "end": null,
+      "name": "mark1",
+      "start": {
+        "col": 1,
+        "line": 3,
+        "offset": 30
+      }
+    }
+  ],
+  "buffer": "b3_9f2c41a7",
+  "rev": 43
+}

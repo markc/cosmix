@@ -1,0 +1,22 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "bytes_total": 11,
+  "end": {
+    "col": 1,
+    "line": 3,
+    "offset": 11
+  },
+  "epoch": "9f2c41a7",
+  "lines": null,
+  "lines_total": 3,
+  "next": null,
+  "rev": 43,
+  "snapshot": null,
+  "start": {
+    "col": 1,
+    "line": 1,
+    "offset": 0
+  },
+  "text": "alpha\nbeta\n",
+  "truncated": false
+}

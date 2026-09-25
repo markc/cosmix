@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "FORBIDDEN",
+  "message": "edit mutations are node-local only (mesh access locked: COSMIX_MESH_OPEN=0)",
+  "reason": "mesh_locked",
+  "rev": null
+}

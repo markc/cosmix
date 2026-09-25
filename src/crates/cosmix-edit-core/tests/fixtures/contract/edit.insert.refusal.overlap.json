@@ -1,0 +1,9 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "intervening_origin": "human:ced",
+  "intervening_rev": 42,
+  "message": "base_rev 40: range [118,125) overlaps rev 42 by human:ced",
+  "reason": "overlap",
+  "rev": 43
+}

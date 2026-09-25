@@ -1,0 +1,8 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "message": "base_rev 3 is older than the retained history (oldest rev 900)",
+  "oldest_rev": 900,
+  "reason": "history_trimmed",
+  "rev": 1043
+}

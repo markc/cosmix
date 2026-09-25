@@ -1,0 +1,20 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "origin": "agent:ctl-90",
+  "origin_downgraded": false,
+  "rev": 43,
+  "selections": [
+    {
+      "anchor": {
+        "col": 1,
+        "line": 10,
+        "offset": 90
+      },
+      "head": {
+        "col": 1,
+        "line": 10,
+        "offset": 90
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "epoch": "9f2c41a7",
+  "error_code": "NOT_FOUND",
+  "message": "buffer b3_0badf00d belongs to an earlier editd (epoch 0badf00d, now 9f2c41a7)",
+  "reason": "epoch_mismatch",
+  "rev": null
+}

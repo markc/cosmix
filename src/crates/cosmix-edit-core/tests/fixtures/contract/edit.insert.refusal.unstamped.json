@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "INVALID_ARGUMENT",
+  "message": "mutations require a broker-stamped caller (broker_origin local or mesh)",
+  "reason": "unstamped",
+  "rev": null
+}

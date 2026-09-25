@@ -1,0 +1,10 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "intervening_origin": "human:ced",
+  "intervening_rev": 42,
+  "lane": "agent:ctl-90",
+  "message": "undoing rev 40 conflicts with rev 42 by human:ced",
+  "reason": "undo_conflict",
+  "rev": 43
+}

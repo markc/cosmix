@@ -1,0 +1,20 @@
+{
+  "base_rev": 42,
+  "buffer": "b3_9f2c41a7",
+  "edits": [
+    {
+      "delete": 3,
+      "insert": "hello",
+      "offset": 120
+    }
+  ],
+  "epoch": "9f2c41a7",
+  "event": "edit",
+  "event_seq": 1207,
+  "kind": "edit",
+  "lane": "agent:ctl-90",
+  "of": null,
+  "op_id": "k-118",
+  "origin": "agent:ctl-90",
+  "rev": 43
+}
