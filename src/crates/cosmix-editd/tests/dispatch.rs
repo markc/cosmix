@@ -445,19 +445,23 @@ async fn open_racing_close_waits_and_loads_fresh() {
     let h = start();
     let f = h.file("r.txt", "old\n");
     let b = h.open(&f).await;
+    // Changed on disk behind a clean buffer: whatever the watcher does, a
+    // fresh load after the close must read "new".
+    std::fs::write(&f, "new\n").unwrap();
+    // The close reaches the router first (the open resolves its path first),
+    // so the open parks on `Closing` and re-runs as a fresh load.
     let close = h.editd.submit(&cmd(Who::Local("tester"), "edit.close", json!({"buffer": b})));
     let reopen = h.editd.submit(&cmd(Who::Local("other"), "edit.open", json!({"path": f})));
-    std::fs::write(&f, "new\n").unwrap();
     let (rc, body) = close.await;
     assert_eq!(rc, 0, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["closed"], true);
     let (rc, body) = reopen.await;
     assert_eq!(rc, 0, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
     let b2 = v["buffer"].as_str().unwrap();
-    if b2 != b {
-        assert_eq!(v["reopened"], false);
-        assert_eq!(h.text(b2).await, "new\n");
-    }
+    assert_ne!(b2, b, "a parked open loads a new buffer");
+    assert_eq!(v["reopened"], false);
+    assert_eq!(h.text(b2).await, "new\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -708,7 +712,9 @@ async fn publish_failure_and_reconnect_resync() {
     h.sink.fail_next.store(1, Ordering::Release);
     h.ok("edit.insert", json!({"buffer": b, "at": 0, "text": "lost"})).await;
     let r = h.event(|e| e["event"] == "resync" && e["reason"] == "publisher_loss").await;
-    assert_eq!(r["buffers"], json!([b]));
+    // The failed send may have been this edit or a trailing props message of
+    // the open (buffer_count has no buffer, so it owes `all`).
+    assert!(r["buffers"] == json!([b]) || r["buffers"] == "all", "{r}");
     assert!(h.editd.publisher().loss() >= 1);
     h.editd.publisher().reconnected();
     let r = h.event(|e| e["event"] == "resync" && e["reason"] == "reconnect").await;
@@ -766,11 +772,12 @@ async fn snapshot_paging_reassembles_its_rev_while_edits_land() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn long_single_line_pages_with_cont() {
     let h = start();
-    let long = "y".repeat(3 * 1024 * 1024);
+    // Tabs encode as `\t` (2 bytes each): 3 MiB of text is 6 MiB of JSON.
+    let long = "\t".repeat(3 * 1024 * 1024);
     let f = h.file("long.txt", &format!("short\n{long}\n"));
     let b = h.open(&f).await;
     let first = h.ok("edit.get", json!({"buffer": b, "numbered": true})).await;
-    assert_eq!(first["truncated"], true, "a 3 MiB line + numbering does not fit one page? {}", first["end"]);
+    assert_eq!(first["truncated"], true, "{}", first["end"]);
     let mut collected = String::new();
     let mut next = Some(0u64);
     let mut saw_cont = false;
@@ -785,7 +792,7 @@ async fn long_single_line_pages_with_cont() {
         }
         next = page["next"].as_u64();
     }
-    let _ = saw_cont;
+    assert!(saw_cont, "the line's later chunks are marked cont");
     assert_eq!(collected, long);
 }
 
