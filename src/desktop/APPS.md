@@ -42,7 +42,8 @@ Quoin-like shell around their content. The compositor manages window titles,
 borders, caption buttons, movement, resizing and fullscreen presentation.
 
 Apps use shared CTK widgets for conventional menu bars and dropdown menus,
-toolbars, status rows and controls appropriate to their purpose. Application
+toolbars, status rows and controls appropriate to their purpose. iced apps
+(`term`, `ced`) use the equivalent `cosmix-iced-widgets` menus instead. Application
 content can include sidebars, browsers, inspectors and transport controls when
 needed; adding one does not require adopting desktop panel furniture. Reuse
 the widgets and behaviour without imposing the same outer layout on every app.
@@ -67,4 +68,5 @@ updated; their use of `DcsAppShell` is not a template for new app furniture.
 | active | `mail` | CosMix Mail | Frontend mail reader and composer (Bevy + ctk); reads the `maild` domain, which stays the backend server. Not a reused retired slug: the archived Bus/`ui.*` disp-skia client of the same name was never registered here and was carved out to `_attic/bus-display/` on 2026-07-20. Landed 2026-07-31 as the widget vertical slice — fixture corpus, no JMAP transport yet. |
 | active | `quoin` | CosMix Quoin | Furniture-tier desktop shell: four edge panels; Bus service `shell` |
 | active | `media` | CosMix Media | Native CTK audio/video player; local MP3/MP4 playback and Bus service `media` |
-| active | `term` | CosMix Term | Native Wayland Mix terminal (Bevy + ctk): rio-vt PTY/VT core, swash-rendered grid, child Mix shell per pane. P2 frontend landing (menu bar + tabs, one pane per tab); full ABP control is P3a, gated on authenticated per-instance identity (P0-I). Not a reused slug. |
+| active | `term` | CosMix Term | Lightweight Wayland Mix terminal on iced (tiny-skia renderer by default, wgpu optional) over the toolkit-free `cosmix-term-core`: tabs, split panes, a child Mix shell per pane; Bus service `term` with the `term.*` verbs. Its Bevy twin is `bterm` (same core, Bus service `bterm`). Not a reused slug. |
+| active | `ced` | CosMix Editor | Desktop text editor on iced (tiny-skia) over the `edit` Bus service (`cosmix-editd`): local echo with single-authority OT, per-origin undo lanes, live agent edits, lsh/Mix-lexer highlighting, recovery via editd. Bus service `ced` (`ced.v1`); binary `ced` (explicit naming exception, like `term`); `app_id` `dev.cosmix.ced`. |

@@ -476,7 +476,8 @@ an AI agent can observe, change, and rebuild.</p>
 <li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power-source state.</li>
 <li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
 <li><strong><a href="/cos/dbusd">dbusd</a></strong> — the D-Bus boundary daemon; per-domain adapters translate D-Bus to Bus verbs/props in both directions.</li>
-<li><strong><a href="/cos/edit">edit</a></strong> — the <code>edit</code> Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo); the core of ced.</li>
+<li><strong><a href="/cos/edit">edit</a></strong> — the <code>edit</code> Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo, crash-recovery files); the core of ced.</li>
+<li><strong><a href="/cos/ced">ced</a></strong> — the CosMix Editor: an iced desktop editor over <code>edit</code> with live agent edits, per-origin undo, lsh/Mix highlighting and the <code>ced.*</code> Bus verbs.</li>
 </ul>
 <h3 id="bridge--libraries">Bridge &amp; libraries</h3>
 <ul>

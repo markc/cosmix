@@ -213,6 +213,7 @@ if $want_desktop then
   $launchers = []
   push($launchers, {dir: "quoin", bin: $qship.bin, exec: "cosmix-quoin", id: "dev.cosmix.quoin"})
   push($launchers, {dir: "term", bin: "term", exec: "term", id: "dev.cosmix.term"})
+  push($launchers, {dir: "ced", bin: "ced", exec: "ced", id: "dev.cosmix.ced"})
   push($launchers, {dir: "bterm", bin: "bterm", exec: "bterm", id: "dev.cosmix.bterm"})
   for each $launcher in $launchers
     $qexec = replace($bin .. "/" .. $launcher.bin, "\\", "\\\\\\\\")
@@ -221,7 +222,12 @@ if $want_desktop then
     $qexec = replace($qexec, "$", "\\\\$")
     $qexec = replace($qexec, "%", "%%")
     $entry = read_file($desktop .. "/apps/" .. $launcher.dir .. "/" .. $launcher.id .. ".desktop")
+    -- `Exec=<name>` alone or followed by field codes (`Exec=ced %F`).
     $entry = replace($entry, "Exec=" .. $launcher.exec .. "\n", "Exec=\"" .. $qexec .. "\"\n")
+    $entry = replace($entry, "Exec=" .. $launcher.exec .. " ", "Exec=\"" .. $qexec .. "\" ")
+    if not contains($entry, "Exec=\"" .. $qexec .. "\"") then
+      raise("SETUP_LAUNCHER", $launcher.id .. ".desktop has no `Exec=" .. $launcher.exec .. "` line to rewrite", {})
+    end
     $entry_path = $applications .. "/" .. $launcher.id .. ".desktop"
     write_file($entry_path .. ".new", $entry)
     rename($entry_path .. ".new", $entry_path)
