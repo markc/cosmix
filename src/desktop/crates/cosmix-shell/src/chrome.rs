@@ -618,7 +618,7 @@ pub fn mount_page_with(
     world.entity_mut(host).add_child(wrapper);
     let mut queue = bevy::ecs::world::CommandQueue::default();
     let mut commands = Commands::new(&mut queue, world);
-    let label = text(&mut commands, "○", 11.0, true);
+    let label = text(&mut commands, "○", 11.0, true, None);
     let dot = button(
         &mut commands,
         edge,
@@ -696,7 +696,7 @@ fn spawn_panel(
         .iter()
         .map(|page| (page.id.clone(), page.title.clone()))
         .collect::<Vec<_>>();
-    let previous_label = text(commands, "‹", 17.0, false);
+    let previous_label = text(commands, "‹", 17.0, false, None);
     let previous = button(
         commands,
         edge,
@@ -704,7 +704,7 @@ fn spawn_panel(
         previous_label,
         "Previous page",
     );
-    let next_label = text(commands, "›", 17.0, false);
+    let next_label = text(commands, "›", 17.0, false, None);
     let next = button(commands, edge, QuoinAction::Next, next_label, "Next page");
     let title_label = text(
         commands,
@@ -714,6 +714,7 @@ fn spawn_panel(
             .unwrap_or("Panel"),
         12.0,
         false,
+        Some(ctk::theme::CtkTextRole::Ui),
     );
 
     let dots = commands
@@ -727,7 +728,7 @@ fn spawn_panel(
     let mut controls = vec![previous, next];
     let mut dot_labels = Vec::with_capacity(pages.len());
     for page in &pages {
-        let label = text(commands, "○", 11.0, true);
+        let label = text(commands, "○", 11.0, true, None);
         let dot = button(
             commands,
             edge,
@@ -980,7 +981,13 @@ fn slide_translation(edge: Edge, forward: bool, progress: f32, outgoing: bool) -
 
 /// A quit control follows the same semantic command path as Bus quit.
 pub fn quoin_quit_button(commands: &mut Commands, edge: Edge, page: &str) -> Entity {
-    let label = text(commands, "Quit Quoin", 14.0, false);
+    let label = text(
+        commands,
+        "Quit Quoin",
+        14.0,
+        false,
+        Some(ctk::theme::CtkTextRole::Ui),
+    );
     let entity = button(commands, edge, QuoinAction::Quit, label, "Quit Quoin");
     commands
         .entity(entity)
@@ -1063,8 +1070,14 @@ pub fn navlink(
         }
         NavLinkTarget::Intent => QuoinAction::Intent,
     };
-    let glyph = text(commands, icon, 15.0, true);
-    let caption = text(commands, label, 14.0, true);
+    let glyph = text(commands, icon, 15.0, true, None);
+    let caption = text(
+        commands,
+        label,
+        14.0,
+        true,
+        Some(ctk::theme::CtkTextRole::Ui),
+    );
     let entity = button(commands, edge, action, glyph, label);
     commands.entity(entity).add_child(caption).insert((
         Node {
@@ -1164,7 +1177,7 @@ pub fn scheme_dot(
     scheme: Scheme,
 ) -> Result<Entity, CarouselError> {
     Carousel::new([page])?;
-    let label = text(commands, "", 1.0, true);
+    let label = text(commands, "", 1.0, true, None);
     let entity = button(
         commands,
         edge,
@@ -1212,24 +1225,23 @@ fn present_scheme_dots(
     }
 }
 
-fn text(commands: &mut Commands, value: &str, size: f32, dim: bool) -> Entity {
-    commands
-        .spawn((
-            Text::new(value),
-            TextFont::from_font_size(size),
-            if dim {
-                ctk::theme::CtkTextRole::Small
-            } else {
-                ctk::theme::CtkTextRole::Ui
-            },
-            bevy::feathers::theme::ThemeTextColor(if dim {
-                tokens::TEXT_DIM
-            } else {
-                tokens::TEXT
-            }),
-            Pickable::IGNORE,
-        ))
-        .id()
+fn text(
+    commands: &mut Commands,
+    value: &str,
+    size: f32,
+    dim: bool,
+    role: Option<ctk::theme::CtkTextRole>,
+) -> Entity {
+    let mut entity = commands.spawn((
+        Text::new(value),
+        TextFont::from_font_size(size),
+        bevy::feathers::theme::ThemeTextColor(if dim { tokens::TEXT_DIM } else { tokens::TEXT }),
+        Pickable::IGNORE,
+    ));
+    if let Some(role) = role {
+        entity.insert(role);
+    }
+    entity.id()
 }
 
 #[derive(SystemParam)]
@@ -1901,6 +1913,20 @@ mod tests {
         .unwrap();
         queue.apply(app.world_mut());
         let label = app.world().get::<NavLink>(entity).unwrap().label;
+        let icon = app.world().get::<NavLink>(entity).unwrap().icon;
+        assert_eq!(
+            app.world().get::<ctk::theme::CtkTextRole>(label),
+            Some(&ctk::theme::CtkTextRole::Ui),
+            "a dim navigation caption is still a UI label"
+        );
+        assert!(
+            app.world().get::<ctk::theme::CtkTextRole>(icon).is_none(),
+            "icon size must remain authored rather than take the Small role"
+        );
+        assert_eq!(
+            app.world().get::<TextFont>(icon).unwrap().font_size,
+            bevy::text::FontSize::Px(15.0)
+        );
         for (thickness, display) in [(109.0, Display::None), (110.0, Display::Flex)] {
             app.world_mut().resource_mut::<ShellFrameState>().0.panels[Edge::Left.index()]
                 .thickness_px = thickness;

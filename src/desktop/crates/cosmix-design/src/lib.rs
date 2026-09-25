@@ -53,9 +53,10 @@ mod recipe_compiler;
 mod source;
 mod state;
 mod typography;
-#[cfg(feature = "compiler")]
-pub use typography::default_typography;
+pub use typography::family_font_weight;
 pub use typography::{TypographyGeneric, TypographyRole};
+#[cfg(feature = "compiler")]
+pub use typography::{active_typography, default_typography};
 #[cfg(all(test, feature = "compiler"))]
 mod trial;
 

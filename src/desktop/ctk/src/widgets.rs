@@ -1030,12 +1030,6 @@ impl Plugin for CtkWidgetsPlugin {
             )
             .add_systems(
                 Update,
-                crate::design::sync_ctk_design
-                    .after(crate::theme::apply_theme_requests)
-                    .in_set(crate::design::CtkDesignSystems::Sync),
-            )
-            .add_systems(
-                Update,
                 (
                     update_fader_visuals,
                     update_hfader_visuals,

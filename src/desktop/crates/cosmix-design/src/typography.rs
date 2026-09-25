@@ -30,6 +30,27 @@ impl TypographyRole {
     }
 }
 
+/// Prefer the active compiled role, with embedded defaults for omitted roles.
+#[cfg(feature = "compiler")]
+pub fn active_typography(
+    typography: Option<&crate::ResolvedTypography>,
+    role: TypographyRole,
+) -> &crate::ResolvedTypeRecord {
+    typography
+        .and_then(|typography| typography.role(role))
+        .unwrap_or_else(|| default_typography(role))
+}
+
+/// A Light request must not select an ExtraLight face in a fallback family.
+/// Adapters inspect the selected family's faces (including variable ranges).
+pub fn family_font_weight(requested: u16, has_light: bool) -> u16 {
+    if requested == 300 && !has_light {
+        400
+    } else {
+        requested
+    }
+}
+
 /// Read the embedded role without compiling colours or widget tables. The
 /// strict-data source is parsed once; there is no second Rust token authority.
 #[cfg(feature = "compiler")]

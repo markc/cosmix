@@ -54,12 +54,15 @@ struct ChromeFontCxInitMeasurement {
 }
 
 #[derive(Resource)]
-pub(crate) struct DecorationSceneTheme(DecoTheme);
+pub(crate) struct DecorationSceneTheme(DecoTheme, cosmix_design::ResolvedTypeRecord);
 
 impl DecorationSceneTheme {
     #[cfg(test)]
     pub(crate) fn for_test(theme: DecoTheme) -> Self {
-        Self(theme)
+        Self(
+            theme,
+            cosmix_design::default_typography(cosmix_design::TypographyRole::UiDisplay).clone(),
+        )
     }
 
     /// The live scheme's accent, whatever chrome style draws the frames
@@ -98,6 +101,7 @@ struct ChromeFontSelection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChromeFaceRung {
     Theme,
+    FreeChain,
     LastKnownGood,
     SystemUiRescue,
     Embedded,
@@ -230,6 +234,11 @@ impl DecorationEntities {
 impl Plugin for ChromeTypographyPlugin {
     fn build(&self, app: &mut App) {
         let theme = app.world().resource::<DecorationStartup>().theme.clone();
+        let title_typography = app
+            .world()
+            .resource::<DecorationStartup>()
+            .title_typography
+            .clone();
         app.init_resource::<Assets<Font>>();
         // Own FontCx even in minimal/headless plugin graphs. Production callers
         // initialise it before DefaultPlugins so the eager discovery cost below
@@ -254,7 +263,7 @@ impl Plugin for ChromeTypographyPlugin {
             system_dejavu,
             ..Default::default()
         })
-        .insert_resource(DecorationSceneTheme(theme));
+        .insert_resource(DecorationSceneTheme(theme, title_typography));
         {
             let mut fonts = app.world_mut().resource_mut::<Assets<Font>>();
             // Replace Bevy's tiny default subset even when TextPlugin already
@@ -269,7 +278,9 @@ impl Plugin for ChromeTypographyPlugin {
         }
         app.add_systems(
             PostUpdate,
-            configure_chrome_typography.after(bevy::text::load_font_assets_into_font_collection),
+            configure_chrome_typography
+                .after(bevy::text::load_font_assets_into_font_collection)
+                .before(bevy::text::detect_text_needs_rerender),
         );
     }
 }
@@ -412,14 +423,17 @@ fn configure_chrome_typography(
             .discovered_ui_sans_families
             .as_deref()
             .unwrap_or_default(),
-    )
-    .or_else(|| {
-        cosmix_design::default_typography(cosmix_design::TypographyRole::UiDisplay)
+    );
+    let free_chain = if requested.is_none() {
+        theme
+            .1
             .fallbacks
             .iter()
             .filter(|name| name.as_str() != EMBEDDED_CHROME_FONT_FAMILY || selection.system_dejavu)
             .find_map(|name| named_family(&mut font_cx, name))
-    });
+    } else {
+        None
+    };
     // A themed family this host does not have must not fall straight past the
     // platform UI family to our vendored last resort — that is the common case
     // for a default naming a family only some hosts ship. Neither rescue is a
@@ -429,6 +443,8 @@ fn configure_chrome_typography(
         // unavailable prior family's name across transient collection rebuilds.
         selection.last_known_good = Some(resolved.1.clone());
         (resolved, ChromeFaceRung::Theme)
+    } else if let Some(free) = free_chain {
+        (free, ChromeFaceRung::FreeChain)
     } else if let Some(good) = selection
         .last_known_good
         .as_deref()
@@ -455,11 +471,26 @@ fn configure_chrome_typography(
     // it depends on what this host has installed. Report it once per change so
     // an operator (or a smoke gate) can read the outcome instead of eyeballing
     // glyph shapes. Latched — this system runs every frame.
+    let has_light = font_cx
+        .collection
+        .family_by_name(&resolved.1)
+        .is_some_and(|family| {
+            family.fonts().iter().any(|font| {
+                (300.0..400.0).contains(&font.weight().value())
+                    || font.axes().iter().any(|axis| {
+                        axis.tag.to_be_bytes() == *b"wght" && axis.min <= 300.0 && axis.max >= 300.0
+                    })
+            })
+        });
+    let weight = cosmix_design::family_font_weight(
+        theme.0.metrics.title_font_weight.resolved().0,
+        has_light,
+    );
     let report = ChromeFaceReport {
         family: resolved.1.clone(),
         rung,
         size_px_bits: theme.0.metrics.title_size_px.to_bits(),
-        weight: theme.0.metrics.title_font_weight.resolved().0,
+        weight,
     };
     if selection.reported_face.as_ref() != Some(&report) {
         info!(
@@ -485,17 +516,13 @@ fn configure_chrome_typography(
     if resolved.0 != embedded_id || selection.system_dejavu {
         chain.push(resolved.0);
     }
-    for name in cosmix_design::default_typography(cosmix_design::TypographyRole::UiDisplay)
-        .fallbacks
-        .iter()
-        .chain(
-            selection
-                .discovered_ui_sans_families
-                .as_deref()
-                .unwrap_or_default()
-                .iter(),
-        )
-    {
+    for name in theme.1.fallbacks.iter().chain(
+        selection
+            .discovered_ui_sans_families
+            .as_deref()
+            .unwrap_or_default()
+            .iter(),
+    ) {
         if let Some((id, _)) = named_family(&mut font_cx, name)
             && (id != embedded_id || selection.system_dejavu)
             && !chain.contains(&id)
@@ -513,10 +540,12 @@ fn configure_chrome_typography(
     font_cx
         .collection
         .set_generic_families(GenericFamily::UiSansSerif, chain.into_iter());
-    if chain_changed {
-        // Fontique mapping changes do not participate in Bevy component change
-        // detection. Invalidate both shaping and our independent elision cache.
-        for (mut font, mut projection, mut elision_cache) in &mut titles {
+    // Reconcile both the rendered and measured weight, including titles added
+    // after the mapping settled. Fontique changes have no Bevy change tick.
+    for (mut font, mut projection, mut elision_cache) in &mut titles {
+        if chain_changed || font.weight.0 != weight || projection.font_weight != weight {
+            font.weight = FontWeight(weight);
+            projection.font_weight = weight;
             font.set_changed();
             projection.set_changed();
             elision_cache.key = None;
@@ -526,8 +555,8 @@ fn configure_chrome_typography(
 
 /// The chrome title face at a given size. `weight` is the theme token; the
 /// family is resolved per-glyph through the `UiSansSerif` chain, and Parley
-/// matches the nearest available face — a family with no light face renders
-/// heavier than requested rather than failing.
+/// matches the available face. `configure_chrome_typography` adjusts Light to
+/// Regular for a resolved family without Light before shaping and measurement.
 fn chrome_title_font(font_size: f32, weight: DecoFontWeight) -> TextFont {
     TextFont::from(FontSource::UiSansSerif)
         .with_font_size(font_size)
@@ -1758,7 +1787,7 @@ mod tests {
         app.update();
         let metrics = &app.world().resource::<DecorationSceneTheme>().0.metrics;
         assert_eq!(metrics.title_size_px, 44.0 / 3.0);
-        let font = chrome_title_font(metrics.title_size_px, metrics.title_font_weight);
+        let font = reconciled_title_font(&mut app);
         for scale in [1.0, 2.5] {
             font_probe::assert_face_and_render(
                 &mut app.world_mut().resource_mut::<FontCx>(),
@@ -1776,8 +1805,14 @@ mod tests {
     fn title_without_sf_uses_explicit_free_family_before_system_ui() {
         let mut app = typography_app(Some(font_probe::free_fonts_only()));
         app.update();
-        let metrics = &app.world().resource::<DecorationSceneTheme>().0.metrics;
-        let font = chrome_title_font(metrics.title_size_px, metrics.title_font_weight);
+        let font = reconciled_title_font(&mut app);
+        assert_eq!(font.weight, FontWeight(400));
+        let selection = app.world().resource::<ChromeFontSelection>();
+        assert_eq!(
+            selection.reported_face.as_ref().unwrap().rung,
+            ChromeFaceRung::FreeChain
+        );
+        assert_eq!(selection.last_known_good, None);
         for scale in [1.0, 2.5] {
             font_probe::assert_face_and_render(
                 &mut app.world_mut().resource_mut::<FontCx>(),
@@ -1789,6 +1824,62 @@ mod tests {
                 "comp-title-free",
             );
         }
+    }
+
+    #[test]
+    fn free_chain_preserves_the_previous_successful_theme_family() {
+        let mut app = typography_app(Some(font_probe::free_fonts_only()));
+        app.world_mut()
+            .resource_mut::<DecorationSceneTheme>()
+            .0
+            .metrics
+            .title_font_family = DecoFontFamily::Named("Fira Mono".into());
+        app.update();
+        app.world_mut()
+            .resource_mut::<DecorationSceneTheme>()
+            .0
+            .metrics
+            .title_font_family = DecoFontFamily::Named("Missing Display".into());
+        app.update();
+        let selection = app.world().resource::<ChromeFontSelection>();
+        assert_eq!(selection.resolved_family.as_deref(), Some("DejaVu Sans"));
+        assert_eq!(selection.last_known_good.as_deref(), Some("Fira Mono"));
+        assert_eq!(
+            selection.reported_face.as_ref().unwrap().rung,
+            ChromeFaceRung::FreeChain
+        );
+    }
+
+    fn reconciled_title_font(app: &mut App) -> TextFont {
+        let metrics = &app.world().resource::<DecorationSceneTheme>().0.metrics;
+        let font = chrome_title_font(metrics.title_size_px, metrics.title_font_weight);
+        let projection = DecoTitleProjection {
+            source: Arc::from("Cosmix window title"),
+            slot_width: 300.0,
+            font_size: metrics.title_size_px,
+            font_weight: metrics.title_font_weight.resolved().0,
+            scale120: 120,
+        };
+        let entity = app
+            .world_mut()
+            .spawn((
+                DecoTitle,
+                font,
+                projection,
+                DecoTitleElisionCache::default(),
+            ))
+            .id();
+        app.update();
+        let font = app.world().get::<TextFont>(entity).unwrap().clone();
+        assert_eq!(
+            app.world()
+                .get::<DecoTitleProjection>(entity)
+                .unwrap()
+                .font_weight,
+            font.weight.0,
+            "elision measures the same weight that is rendered"
+        );
+        font
     }
 
     use std::any::TypeId;

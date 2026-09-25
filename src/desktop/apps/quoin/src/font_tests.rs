@@ -77,7 +77,7 @@ fn verify(app: &mut App, sf: bool, suffix: &str) {
             font.font_size,
             FontSize::Px(if small { 32.0 / 3.0 } else { 44.0 / 3.0 })
         );
-        assert_eq!(font.weight.0, if small { 400 } else { 300 });
+        assert_eq!(font.weight.0, if sf && !small { 300 } else { 400 });
         for scale in [1.0, 2.5] {
             font_probe::assert_face_and_render(
                 &mut app.world_mut().resource_mut::<FontCx>(),
@@ -125,7 +125,7 @@ fn role_sizes_and_weights_survive_theme_reload_without_proportional_scaling() {
     {
         if *role == CtkTextRole::Mono {
             assert_eq!(font.font_size, FontSize::Px(16.0));
-            assert_eq!(font.weight.0, 300);
+            assert_eq!(font.weight.0, 400);
             continue;
         }
         let small = *role == CtkTextRole::Small;

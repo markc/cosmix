@@ -4,12 +4,36 @@ use bevy::prelude::*;
 use bevy::text::{ComputedTextBlock, FontCx, LayoutCx, TextBounds, TextPipeline};
 
 pub fn sf_installed() -> bool {
-    if std::path::Path::new("/usr/share/fonts/apple-fonts").is_dir() {
-        true
-    } else {
-        eprintln!("SKIP SF font acceptance: /usr/share/fonts/apple-fonts is absent");
-        false
+    let mut fonts = FontCx::default();
+    sf_families_discoverable(&mut fonts)
+}
+
+fn sf_families_discoverable(fonts: &mut FontCx) -> bool {
+    let missing: Vec<_> = ["SF Pro Text", "SF Pro Display", "SF Mono"]
+        .into_iter()
+        .filter(|family| {
+            fonts
+                .collection
+                .family_by_name(family)
+                .is_none_or(|family| family.fonts().is_empty())
+        })
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "SKIP SF FONT ACCEPTANCE (no assertions run): required families are not discoverable: {missing:?}; directory presence is insufficient"
+        );
     }
+    missing.is_empty()
+}
+
+#[test]
+fn absent_sf_families_skip_independently_of_host_directories() {
+    let mut fonts = FontCx::default();
+    fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+        shared: false,
+        system_fonts: false,
+    });
+    assert!(!sf_families_discoverable(&mut fonts));
 }
 
 pub fn free_fonts_only() -> FontCx {
@@ -29,6 +53,29 @@ pub fn free_fonts_only() -> FontCx {
         .data,
         None,
     );
+    // Host-only regression fixture: never vendor this additional font.
+    let extra_light = "/usr/share/fonts/TTF/DejaVuSans-ExtraLight.ttf";
+    match std::fs::read(extra_light) {
+        Ok(bytes) => {
+            fonts
+                .collection
+                .register_fonts(Font::from_bytes(bytes).data, None);
+            let family = fonts.collection.family_by_name("DejaVu Sans").unwrap();
+            assert!(
+                family
+                    .fonts()
+                    .iter()
+                    .any(|font| font.weight().value() == 200.0),
+                "host fixture must add ExtraLight to the fallback family"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "SKIP ExtraLight regression assertion: host fixture {extra_light} is absent; Regular-only fallback coverage still runs"
+            );
+        }
+        Err(error) => panic!("cannot load host ExtraLight fixture: {error}"),
+    }
     let fira = fonts.collection.register_fonts(
         Font::from_bytes(bevy::text::DEFAULT_FONT_DATA.to_vec()).data,
         None,
@@ -115,6 +162,10 @@ pub fn assert_face_and_render(
                 face.weight().to_number(),
                 expected_weight,
                 "{filename}: actual OS/2 weight"
+            );
+            assert!(
+                face.weight().to_number() >= 300,
+                "{filename}: fallback must not select ExtraLight"
             );
             assert!(!face.is_italic(), "desktop default is upright");
             if let bevy::text::FontSize::Px(px) = font.font_size {
