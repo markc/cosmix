@@ -1,0 +1,8 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "message": "/home/user/copy.mix exists; pass force:true to overwrite it",
+  "path": "/home/user/copy.mix",
+  "reason": "exists",
+  "rev": 43
+}

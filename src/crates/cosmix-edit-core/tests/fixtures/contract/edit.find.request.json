@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "groups": true,
+  "limit": 100,
+  "pattern": "fn (\\w+)",
+  "regex": true
+}

@@ -1,0 +1,50 @@
+{
+  "base_rev": 40,
+  "buffer": "b3_9f2c41a7",
+  "bytes": 8123,
+  "changed": [
+    {
+      "end": {
+        "col": 4,
+        "line": 12,
+        "offset": 123
+      },
+      "start": {
+        "col": 3,
+        "line": 12,
+        "offset": 122
+      }
+    }
+  ],
+  "changed_span": {
+    "end": {
+      "col": 4,
+      "line": 12,
+      "offset": 123
+    },
+    "start": {
+      "col": 3,
+      "line": 12,
+      "offset": 122
+    }
+  },
+  "changed_truncated": false,
+  "cursor": {
+    "col": 4,
+    "line": 12,
+    "offset": 123
+  },
+  "deleted_bytes": 0,
+  "dirty": true,
+  "duplicate": false,
+  "edit_count": 1,
+  "epoch": "9f2c41a7",
+  "history_trimmed_to": null,
+  "inserted_bytes": 1,
+  "lines": 204,
+  "op_id": "k-119",
+  "origin": "human:ced",
+  "origin_downgraded": false,
+  "rebased": true,
+  "rev": 43
+}

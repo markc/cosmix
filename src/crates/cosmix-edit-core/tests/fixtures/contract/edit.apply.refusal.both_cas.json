@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "INVALID_ARGUMENT",
+  "message": "pass expect_rev or base_rev, not both",
+  "reason": "both_cas",
+  "rev": null
+}

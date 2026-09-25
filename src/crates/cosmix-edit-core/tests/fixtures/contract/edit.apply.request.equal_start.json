@@ -1,0 +1,18 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "expect_rev": 5,
+  "ops": [
+    {
+      "op": "delete",
+      "range": [
+        10,
+        20
+      ]
+    },
+    {
+      "at": 10,
+      "op": "insert",
+      "text": "bar"
+    }
+  ]
+}

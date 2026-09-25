@@ -1,0 +1,8 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "NOT_FOUND",
+  "message": "/home/user/missing.mix does not exist; pass create:true to start it",
+  "path": "/home/user/missing.mix",
+  "reason": "file_not_found",
+  "rev": null
+}

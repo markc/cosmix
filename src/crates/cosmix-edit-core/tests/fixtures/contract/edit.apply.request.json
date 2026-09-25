@@ -1,0 +1,19 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "ops": [
+    {
+      "at": "end",
+      "op": "insert",
+      "text": "tail\n"
+    },
+    {
+      "op": "delete",
+      "range": {
+        "lines": [
+          1,
+          1
+        ]
+      }
+    }
+  ]
+}

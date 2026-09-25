@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "RESOURCE_LIMIT",
+  "message": "transaction peak 67200000 bytes exceeds 67108864",
+  "reason": "too_large",
+  "rev": 43
+}

@@ -1,0 +1,8 @@
+{
+  "buffers": "all",
+  "epoch": "9f2c41a7",
+  "event": "resync",
+  "event_seq": 1213,
+  "reason": "reconnect",
+  "rev": null
+}

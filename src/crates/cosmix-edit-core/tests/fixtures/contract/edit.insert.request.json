@@ -1,0 +1,11 @@
+{
+  "at": {
+    "col": 1,
+    "line": 2
+  },
+  "buffer": "b3_9f2c41a7",
+  "expect_rev": 42,
+  "op_id": "k-118",
+  "origin": "agent:ctl-90",
+  "text": "-- note\n"
+}

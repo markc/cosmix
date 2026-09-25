@@ -1,0 +1,46 @@
+{
+  "base_rev": 5,
+  "buffer": "b3_9f2c41a7",
+  "bytes": 17,
+  "changed": [
+    {
+      "end": {
+        "col": 14,
+        "line": 1,
+        "offset": 13
+      },
+      "start": {
+        "col": 11,
+        "line": 1,
+        "offset": 10
+      }
+    }
+  ],
+  "changed_span": {
+    "end": {
+      "col": 14,
+      "line": 1,
+      "offset": 13
+    },
+    "start": {
+      "col": 11,
+      "line": 1,
+      "offset": 10
+    }
+  },
+  "changed_truncated": false,
+  "cursor": null,
+  "deleted_bytes": 10,
+  "dirty": true,
+  "duplicate": false,
+  "edit_count": 2,
+  "epoch": "9f2c41a7",
+  "history_trimmed_to": null,
+  "inserted_bytes": 3,
+  "lines": 1,
+  "op_id": null,
+  "origin": "agent:anon",
+  "origin_downgraded": false,
+  "rebased": false,
+  "rev": 6
+}

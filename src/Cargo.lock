@@ -1103,6 +1103,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-edit-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cosmix-editd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "clap",
+ "cosmix-edit-core",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-props-core",
+ "libc",
+ "notify",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cosmix-filesd"
 version = "0.8.2"
 dependencies = [

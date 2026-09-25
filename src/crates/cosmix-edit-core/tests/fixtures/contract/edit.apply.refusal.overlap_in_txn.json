@@ -1,0 +1,11 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "INVALID_ARGUMENT",
+  "message": "ops 0 and 1 overlap: [10,20) and insert at 15",
+  "ops": [
+    0,
+    1
+  ],
+  "reason": "overlap_in_txn",
+  "rev": 5
+}

@@ -1,0 +1,19 @@
+[package]
+name = "cosmix-edit-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless text-buffer core for the Cosmix editor: vendored msedit gap buffer, line index, revisioned op log with per-origin undo, anchors, selections, transactions, single-authority OT, search. No Bus, no async, no clock."
+
+[lib]
+name = "cosmix_edit_core"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = "1"
+libc = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

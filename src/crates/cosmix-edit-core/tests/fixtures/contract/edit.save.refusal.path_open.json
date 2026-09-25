@@ -1,0 +1,9 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "CONFLICT",
+  "message": "/home/user/copy.mix is bound to buffer b5_9f2c41a7",
+  "other_buffer": "b5_9f2c41a7",
+  "path": "/home/user/copy.mix",
+  "reason": "path_open",
+  "rev": 43
+}

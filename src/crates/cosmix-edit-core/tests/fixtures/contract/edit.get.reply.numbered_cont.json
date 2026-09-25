@@ -1,0 +1,33 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "bytes_total": 3145740,
+  "end": {
+    "col": 30,
+    "line": 2,
+    "offset": 35
+  },
+  "epoch": "9f2c41a7",
+  "lines": [
+    {
+      "cont": false,
+      "line": 1,
+      "text": "short"
+    },
+    {
+      "cont": false,
+      "line": 2,
+      "text": "a very long line, first chunk"
+    }
+  ],
+  "lines_total": 2,
+  "next": 35,
+  "rev": 43,
+  "snapshot": "s7",
+  "start": {
+    "col": 1,
+    "line": 1,
+    "offset": 0
+  },
+  "text": null,
+  "truncated": true
+}

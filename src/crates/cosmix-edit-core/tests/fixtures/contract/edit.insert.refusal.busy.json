@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "RESOURCE_LIMIT",
+  "message": "buffer b3_9f2c41a7 has 256 queued commands; retry",
+  "reason": "busy",
+  "rev": null
+}

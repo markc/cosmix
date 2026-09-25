@@ -1,0 +1,8 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "INVALID_ARGUMENT",
+  "message": "/home/user/logo.png is not valid UTF-8 (byte 0)",
+  "path": "/home/user/logo.png",
+  "reason": "not_utf8",
+  "rev": null
+}

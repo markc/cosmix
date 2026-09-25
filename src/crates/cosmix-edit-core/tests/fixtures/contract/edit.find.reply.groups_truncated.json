@@ -1,0 +1,28 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "matches": [
+    {
+      "end": {
+        "col": 70001,
+        "line": 1,
+        "offset": 70000
+      },
+      "groups": [
+        "aaaa…",
+        null,
+        null
+      ],
+      "groups_truncated": true,
+      "start": {
+        "col": 1,
+        "line": 1,
+        "offset": 0
+      },
+      "text": "aaaa…(4 KiB)",
+      "text_truncated": true
+    }
+  ],
+  "next": 70000,
+  "rev": 43,
+  "truncated": true
+}

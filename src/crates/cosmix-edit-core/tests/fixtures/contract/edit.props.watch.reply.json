@@ -1,0 +1,10 @@
+{
+  "bootstrap": "subscribe, then edit.get snapshot:true, then apply buffered edit events with base_rev >= snapshot rev",
+  "domain_topics": [
+    "edit.changed"
+  ],
+  "event_seq": 1207,
+  "event_sequence": "daemon_session_monotonic",
+  "loss_signal": "resync_event",
+  "topic": "edit.props.changed"
+}

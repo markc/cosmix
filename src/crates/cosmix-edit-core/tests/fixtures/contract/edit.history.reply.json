@@ -1,0 +1,54 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "entries": [
+    {
+      "edits": [
+        {
+          "delete": 0,
+          "insert": "x",
+          "offset": 120
+        }
+      ],
+      "edits_elided": false,
+      "kind": "edit",
+      "lane": "human:ced",
+      "of": null,
+      "op_id": "k-117",
+      "origin": "human:ced",
+      "rev": 41,
+      "text_bytes": 1,
+      "time": "2026-09-26T01:02:03.456Z",
+      "via": {
+        "broker_origin": "local",
+        "broker_peer": null,
+        "broker_service": null,
+        "from": "ced"
+      }
+    },
+    {
+      "edits": null,
+      "edits_elided": true,
+      "kind": "undo",
+      "lane": "agent:ctl-90",
+      "of": [
+        38,
+        40
+      ],
+      "op_id": null,
+      "origin": "agent:ctl-90",
+      "rev": 42,
+      "text_bytes": 200000,
+      "time": "2026-09-26T01:02:04.000Z",
+      "via": {
+        "broker_origin": "local",
+        "broker_peer": null,
+        "broker_service": null,
+        "from": "ctl-90"
+      }
+    }
+  ],
+  "next": 42,
+  "oldest_rev": 1,
+  "rev": 43,
+  "truncated": true
+}

@@ -1,0 +1,9 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "errno": 28,
+  "error_code": "IO_ERROR",
+  "kind": "StorageFull",
+  "message": "writing /home/user/x.mix: No space left on device",
+  "reason": null,
+  "rev": 43
+}

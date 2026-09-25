@@ -1,0 +1,7 @@
+{
+  "buffer": "b3_9f2c41a7",
+  "error_code": "RESOURCE_LIMIT",
+  "message": "256 buffers are open",
+  "reason": "too_many_buffers",
+  "rev": null
+}

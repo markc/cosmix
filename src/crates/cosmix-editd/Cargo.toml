@@ -1,0 +1,41 @@
+[package]
+name = "cosmix-editd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The `edit` Bus citizen: shared text buffers for humans and agents (cosmix-edit-core), with revision CAS, per-origin undo, anchors, atomic save, inotify external-change detection and a recoverable change feed."
+
+[lib]
+name = "cosmix_editd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-editd"
+path = "src/main.rs"
+
+[dependencies]
+cosmix-edit-core = { path = "../cosmix-edit-core" }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client" }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus" }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
+cosmix_props_core = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", features = ["bus"] }
+tokio = { workspace = true }
+notify = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+libc = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
