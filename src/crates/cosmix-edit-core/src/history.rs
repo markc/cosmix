@@ -8,9 +8,14 @@
 //!    that member (including the group's own later members), so every item ends
 //!    in current-rev coordinates. Overlap → CONFLICT `undo_conflict` (context
 //!    `intervening_rev`, `intervening_origin`).
-//! 3. Union the items into one RangeSet, newest member first. Two items
+//! 3. Union the items into one RangeSet in READING order. Two items
 //!    overlapping under the §3.4 rule → `undo_conflict`. Equal-offset inserts
-//!    keep list order.
+//!    keep list order. (E0a sharpening: the plan said "newest member first",
+//!    which restores a run of backspaces correctly but REVERSES a run of
+//!    forward deletes — both coalesce by the rule below. The composition in
+//!    `Buffer::compose_inverse` orders a tie by where the newer member's edit
+//!    lay relative to the older item when it applied, which is the original
+//!    order in both cases.)
 //! 4. Verify against the CURRENT text that each item's target range holds
 //!    exactly the text it removes; mismatch → `undo_conflict`.
 //! 5. Apply the union as ONE ordinary two-phase transaction, recorded as one
@@ -86,14 +91,50 @@ pub struct Lane {
 #[derive(Debug, Default)]
 pub struct OpLog {
     pub(crate) entries: std::collections::VecDeque<LogEntry>,
-    #[allow(dead_code)] // Stage S stub; E0a's undo/redo read it.
     pub(crate) lanes: BTreeMap<Origin, Lane>,
     pub(crate) text_bytes: usize,
+    /// The rev just before the first retained entry: the oldest rev a
+    /// `base_rev` may name, and the lower bound of `history`.
+    pub(crate) base: u64,
+}
+
+/// Stored text of one entry (inserted + deleted bytes).
+pub(crate) fn entry_text_bytes(e: &LogEntry) -> usize {
+    e.edits.iter().map(|x| x.insert.len()).sum::<usize>() + e.deleted.iter().map(String::len).sum::<usize>()
 }
 
 impl OpLog {
+    /// The oldest rev whose successors are all retained: a `base_rev` or an
+    /// undo reaching further back is `history_trimmed`.
     pub fn oldest_rev(&self) -> u64 {
-        todo!("E0a")
+        self.base
+    }
+
+    /// Appends `entry` (its space was reserved in phase 1) and trims to the
+    /// retention limits. Returns the new `oldest_rev` if anything was trimmed.
+    pub(crate) fn push(&mut self, entry: LogEntry) -> Option<u64> {
+        self.text_bytes += entry_text_bytes(&entry);
+        self.entries.push_back(entry);
+        let mut trimmed = false;
+        while self.entries.len() > crate::limits::LOG_MAX_ENTRIES
+            || self.text_bytes > crate::limits::LOG_MAX_TEXT_BYTES
+        {
+            let Some(old) = self.entries.pop_front() else { break };
+            self.text_bytes -= entry_text_bytes(&old);
+            self.base = old.rev;
+            trimmed = true;
+        }
+        if !trimmed {
+            return None;
+        }
+        // Undo reach is exactly the retained suffix.
+        let base = self.base;
+        for lane in self.lanes.values_mut() {
+            lane.undo.retain(|g| *g.start() > base);
+            lane.redo.retain(|g| *g.start() > base);
+        }
+        self.lanes.retain(|_, l| !l.undo.is_empty() || !l.redo.is_empty());
+        Some(base)
     }
 
     /// Up to `limit` entries with `rev > since_rev`, oldest first.
@@ -103,6 +144,11 @@ impl OpLog {
 
     /// Entries strictly after `rev`, in order (for transforms).
     pub fn after(&self, rev: u64) -> impl Iterator<Item = &LogEntry> {
-        self.entries.iter().filter(move |e| e.rev > rev)
+        // Revs are contiguous, so the first entry after `rev` is found by index.
+        let skip = match self.entries.front() {
+            Some(first) => usize::try_from(rev.saturating_add(1).saturating_sub(first.rev)).unwrap_or(usize::MAX),
+            None => 0,
+        };
+        self.entries.range(skip.min(self.entries.len())..)
     }
 }
