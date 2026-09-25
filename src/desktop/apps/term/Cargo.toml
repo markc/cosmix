@@ -95,5 +95,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
 
 [dev-dependencies]
-iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image"] }
+# Tests compile this dependency even with the default wgpu renderer. Its
+# softbuffer dependency needs a platform backend independently of iced's arm.
+iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image", "wayland"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }

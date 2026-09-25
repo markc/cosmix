@@ -45,7 +45,9 @@ pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
         // tiny-skia trims ids not touched in a draw. Touch ALL visible bands,
         // including undamaged ones: otherwise an adjacent damage rectangle
         // can repeatedly re-convert an unchanged band after cache eviction.
-        let _ = renderer.measure_image(handle);
+        let Some(size) = renderer.measure_image(handle) else {
+            continue;
+        };
         let mut bounds = Rectangle {
             x: relative.x + x,
             y: relative.y + y,
@@ -53,24 +55,23 @@ pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
         };
         // iced_tiny_skia divides these coordinates by the image's logical
         // pixel size, then casts to i32 (truncating). A mathematically integral
-        // position can land just below the integer at fractional scale. Bias
-        // one ULP away from zero so adjacent bands cannot lose a scanline.
-        bounds.x = if bounds.x >= 0.0 {
-            bounds.x.next_up()
-        } else {
-            bounds.x.next_down()
-        };
-        bounds.y = if bounds.y >= 0.0 {
-            bounds.y.next_up()
-        } else {
-            bounds.y.next_down()
-        };
+        // position can land just below the integer at fractional scale. Put
+        // the quotient halfway inside the intended truncation interval using
+        // the SAME pixel size as iced. This is only a placement correction:
+        // keep the shared-edge extents unchanged, never accumulate the bias.
+        bounds.x = truncating_origin(bounds.x, scale, bounds.width / size.width as f32);
+        bounds.y = truncating_origin(bounds.y, scale, bounds.height / size.height as f32);
         if bounds.intersects(&clip) {
             let mut image = iced::advanced::image::Image::new(handle.clone());
             image.filter_method = image::FilterMethod::Nearest;
             renderer.draw_image(image, bounds, clip);
         }
     }
+}
+
+fn truncating_origin(logical: f32, scale: f32, pixel_size: f32) -> f32 {
+    let physical = (logical * scale).round();
+    (physical + 0.5_f32.copysign(physical)) * pixel_size
 }
 
 impl<Message, Theme, R> Widget<Message, Theme, R> for Grid

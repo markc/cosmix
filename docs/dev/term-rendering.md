@@ -16,7 +16,7 @@ storage without copying pixels it will overwrite. The previous
 handle remains immutable. Rebinding requires identical bytes and layout;
 geometry changes and raster replacement still force full repaints. An idle
 band retains its handle and buffer across other bands' generation changes.
-If painting releases a handle but returns no damage, refresh restores it
+If painting releases a handle but returns no damage, `Painter::repaint` restores it
 before returning. Clearing a pane drops all bands.
 
 At rest, the bands together hold one pane's worth of app-side RGBA pixels;
@@ -27,11 +27,14 @@ after an output burst, until later redraws release them. Unchanged bands
 keep their ids, limiting cache conversion and layer damage. The grid widget
 touches every current image during drawing to prevent tiny-skia's cache trim
 from evicting undamaged bands. It draws at physical-size/output-scale with
-nearest filtering and snapped physical origins. An outward one-ULP origin
-bias avoids upstream's float-to-integer truncation losing a scanline at
-fractional scale. Selecting
-`wgpu`, including alongside the default `tiny-skia` feature, retains the core
-Vec-backed `Surface`, incremental damage uploads and persistent GPU texture.
+nearest filtering and snapped physical origins. Each band's logical top and
+bottom come from cumulative physical row boundaries, so the rectangles tile
+without accumulating rounding error. Drawing places the origin halfway inside
+upstream's integer truncation interval using that image's logical pixel size;
+this placement correction never changes or accumulates into band heights.
+The default is `wgpu`; selecting both renderer features also uses wgpu. It
+retains the core Vec-backed `Surface`, incremental damage uploads and
+persistent GPU texture.
 
 Regression tests in `cpu_grid.rs` cover allocation reuse and incremental
 painting, an outstanding handle forcing a copy with incremental bands and
@@ -40,17 +43,31 @@ without app-side buffer history. They also cover idle handle identity,
 no-damage cache restoration, cursor damage and a grid geometry change. These
 tests simulate retained handles. `cpu_bands.rs` additionally checks cursor
 movement between bands, accumulated damage, partial final bands and resize.
-`cpu_bench.rs` checks exact physical placement at 1.25, 1.5 and 2.5 scale,
-including nonzero pane origins. The shared frame tests cover pane isolation,
-clearing, zoom and raster invalidation in both arms; they do not directly
+`cpu_bench.rs` checks exact physical placement at 1.0, 1.1, 1.25, 1.5, 1.75,
+2.25 and 2.5 scale, including nonzero pane origins, 61-row panes and a final
+partial band. It also checks that adjacent logical rectangles share an edge.
+The shared frame tests cover pane isolation, clearing, zoom and raster
+invalidation in both arms; they do not directly
 exercise terminal resizing.
+
+Run both feature configurations from `src/desktop`; the default test run covers
+wgpu and shared behaviour, while the second compiles the CPU ownership, band,
+placement and shared frame tests. The ignored timing benchmark is separate.
+There is no automated CI workflow enforcing these two runs yet.
+
+```text
+cargo test -p cosmix-term
+cargo test -p cosmix-term --no-default-features --features tiny-skia
+cargo clippy -p cosmix-term --all-targets -- -D warnings
+cargo clippy -p cosmix-term --no-default-features --features tiny-skia --all-targets -- -D warnings
+```
 
 ## Headless performance gate
 
 From `src/desktop`, run the term-only release test:
 
 ```text
-cargo test -p cosmix-term --release -- --ignored --nocapture tiny_skia_frame_bench
+cargo test -p cosmix-term --no-default-features --features tiny-skia --release -- --ignored --nocapture tiny_skia_frame_bench
 ```
 
 The benchmark retains the 0.2.3 whole-pane algorithm as its baseline and runs
@@ -64,11 +81,16 @@ The final banded pixels must match the whole-pane baseline byte for byte.
 
 Each case warms 20 frames and measures 200. The target is exactly
 2250×1250 physical pixels at scale 2.5: 90×25 cells padded to 25×50 pixels,
-using real 13px DejaVu Sans Mono glyphs at 2.5 scale. Echo changes one row;
-redraw changes every row, including pixel content, on every iteration.
+using real 13px glyphs at 2.5 scale from `Raster::new`'s resolved font
+(`TERM_SPIKE_FONT` or system monospace). Record the resolved font when comparing
+machines. Echo changes one row; redraw changes every row, including pixel
+content, on every iteration.
 This is a CPU frame-cost benchmark, not a PTY-to-display latency test.
-It excludes event scheduling, tab labels, softbuffer presentation and the
-display compositor; none of those costs can be inferred from these results.
+It excludes event scheduling, the pane clip-container layer, borders, tab labels,
+softbuffer buffer acquisition/presentation and the display compositor. It only
+models buffer age 3; none of the excluded costs or other ages can be inferred
+from these results. A one-row echo redraws its entire four-row band plus the
+logical damage expansion margin, not just the changed row.
 
 ### 2026-09-25 results and renderer recommendation
 
@@ -105,7 +127,6 @@ This CPU implementation has not achieved foot-like latency. Full redraw is
 about 23 ms for one pane before presentation, above the 16.7 ms budget at
 60 Hz, and slightly slower than the whole-pane baseline in this comparison.
 The banded arm remains useful for lower CPU cost on sparse updates and zero
-GPU allocation. This change leaves feature defaults and the wgpu rendering
-path unchanged; switching defaults is an operator decision after the build
-cluster's wgpu gate and a live typing retest. No live foot/wgpu latency
-comparison or compositor presentation measurement was made in this work.
+GPU allocation. Version 0.2.4 selects wgpu by default and keeps the existing
+wgpu rendering path. A live typing retest remains necessary. No live foot/wgpu
+latency comparison or compositor presentation measurement was made in this work.
