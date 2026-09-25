@@ -4,11 +4,14 @@
 //! ```text
 //! lifecycle.props_level      "L2"
 //! lifecycle.epoch            string
-//! lifecycle.volatile         true
+//! lifecycle.volatile         !(recovery enabled && ok) (ced E1 plan §5.1)
+//! lifecycle.recovery_ok      bool
+//! lifecycle.recovery_unsynced number (transient)
 //! lifecycle.event_seq        number (transient)
 //! lifecycle.publisher_loss   number (transient)
 //! buffer_count               number
 //! buffers.<bid>.path | opened_as | name | language | eol | bom | dirty | saved_rev | disk | holders
+//! buffers.<bid>.recovery_id | recovered
 //! buffers.<bid>.rev | lines | bytes | origin_last        (transient)
 //! ```
 //! `transient` = excluded from `props.changed` (SPEC-07). Each actor pushes a
@@ -44,6 +47,21 @@ pub struct BufferProps {
     pub recovered: bool,
 }
 
+/// The recovery half of `lifecycle.*` (disabled: volatile, not ok).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryLifecycle {
+    pub volatile: bool,
+    pub ok: bool,
+    /// Records written but not yet synced (transient).
+    pub unsynced: u64,
+}
+
+impl Default for RecoveryLifecycle {
+    fn default() -> Self {
+        Self { volatile: true, ok: false, unsynced: 0 }
+    }
+}
+
 /// Owned projection so no daemon lock is held while props-core dispatches.
 pub struct EditProps {
     pub leaves: Vec<(PropPath, PropValue)>,
@@ -56,10 +74,12 @@ const BUFFER_LEAVES: &[(&str, PropType, bool, &str)] = &[
     ("language", PropType::String, false, "Detected or overridden language id."),
     ("eol", PropType::String, false, "Line endings found at load: lf, crlf, mixed or none."),
     ("bom", PropType::Bool, false, "Whether the file had a UTF-8 BOM (restored on save)."),
-    ("dirty", PropType::Bool, false, "Unsaved changes exist (volatile: lost if editd stops)."),
+    ("dirty", PropType::Bool, false, "Unsaved changes exist (kept in recovery files unless lifecycle.volatile)."),
     ("saved_rev", PropType::Number, false, "The rev last saved or loaded (null if never)."),
     ("disk", PropType::String, false, "clean | modified | deleted | none | unwatched."),
     ("holders", PropType::List, false, "Caller keys holding the buffer open."),
+    ("recovery_id", PropType::String, false, "Stable id of the buffer's recovery files (kept across restarts)."),
+    ("recovered", PropType::Bool, false, "Restored from recovery files at this daemon start."),
     ("rev", PropType::Number, true, "Current revision (per-edit; transient)."),
     ("lines", PropType::Number, true, "Line count (transient)."),
     ("bytes", PropType::Number, true, "Text bytes, BOM excluded (transient)."),
@@ -103,6 +123,8 @@ pub fn buffer_leaves(bid: &str, p: &BufferProps, holders: &[String]) -> Vec<(Pro
             "saved_rev" => p.saved_rev.map(PropValue::UInt).unwrap_or(PropValue::Null),
             "disk" => disk_str(p.disk).into(),
             "holders" => PropValue::List(holders.iter().map(|h| PropValue::String(h.clone())).collect()),
+            "recovery_id" => p.recovery_id.clone().into(),
+            "recovered" => p.recovered.into(),
             "rev" => PropValue::UInt(p.rev),
             "lines" => PropValue::UInt(p.lines as u64),
             "bytes" => PropValue::UInt(p.bytes as u64),
@@ -124,6 +146,7 @@ impl EditProps {
         epoch: &str,
         event_seq: u64,
         publisher_loss: u64,
+        recovery: RecoveryLifecycle,
         buffers: &BTreeMap<BufferId, (BufferProps, Vec<String>)>,
     ) -> Self {
         let mut leaves = Vec::new();
@@ -134,7 +157,9 @@ impl EditProps {
         };
         push("lifecycle.props_level", "L2".into());
         push("lifecycle.epoch", epoch.into());
-        push("lifecycle.volatile", true.into());
+        push("lifecycle.volatile", recovery.volatile.into());
+        push("lifecycle.recovery_ok", recovery.ok.into());
+        push("lifecycle.recovery_unsynced", PropValue::UInt(recovery.unsynced));
         push("lifecycle.event_seq", PropValue::UInt(event_seq));
         push("lifecycle.publisher_loss", PropValue::UInt(publisher_loss));
         push("buffer_count", PropValue::UInt(buffers.len() as u64));
@@ -187,8 +212,17 @@ impl PropTree for EditProps {
             ["lifecycle", "volatile"] => Some(PropDescribe::leaf(
                 path.clone(),
                 PropType::Bool,
-                "Unsaved text is lost on any daemon stop (E0 has no recovery files).",
+                "Unsaved text is lost on a daemon stop: recovery is disabled or degraded.",
             )),
+            ["lifecycle", "recovery_ok"] => Some(PropDescribe::leaf(
+                path.clone(),
+                PropType::Bool,
+                "Recovery files are enabled and every dirty buffer is protected.",
+            )),
+            ["lifecycle", "recovery_unsynced"] => Some(
+                PropDescribe::leaf(path.clone(), PropType::Number, "Recovery records written but not yet synced.")
+                    .with_transient(true),
+            ),
             ["lifecycle", "event_seq"] => Some(
                 PropDescribe::leaf(path.clone(), PropType::Number, "Last event_seq published on edit.changed.")
                     .with_transient(true),
@@ -243,7 +277,8 @@ mod tests {
     fn tree_lists_describes_and_marks_transient() {
         let mut buffers = BTreeMap::new();
         buffers.insert("b1_9f2c41a7".to_string(), (props(), vec!["anon".to_string()]));
-        let tree = EditProps::build("9f2c41a7", 5, 0, &buffers);
+        let rec = RecoveryLifecycle { volatile: false, ok: true, unsynced: 2 };
+        let tree = EditProps::build("9f2c41a7", 5, 0, rec, &buffers);
         let list = tree.list();
         assert!(list.iter().any(|p| p.as_str() == "buffers.b1_9f2c41a7.dirty"));
         let rev = PropPath::new("buffers.b1_9f2c41a7.rev").unwrap();
@@ -259,6 +294,10 @@ mod tests {
         assert_eq!(response.rc, 0);
         let v: serde_json::Value = serde_json::from_str(&response.body).unwrap();
         assert_eq!(v["buffers"]["b1_9f2c41a7"]["language"], "mix");
-        assert_eq!(v["lifecycle"]["volatile"], true);
+        assert_eq!(v["lifecycle"]["volatile"], false);
+        assert_eq!(v["lifecycle"]["recovery_ok"], true);
+        assert_eq!(v["buffers"]["b1_9f2c41a7"]["recovery_id"], "5f0c2a9e1b7d4c33");
+        let unsynced = PropPath::new("lifecycle.recovery_unsynced").unwrap();
+        assert!(tree.describe(&unsynced).unwrap().transient);
     }
 }

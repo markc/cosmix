@@ -248,6 +248,19 @@ pub fn identity(path: &Path) -> std::io::Result<Option<DiskIdentity>> {
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Test hook (ced E1 plan §6 E1c): saves into these directories fail their
+/// post-rename directory fsync, i.e. commit with `durable: false`. Empty
+/// outside tests.
+#[doc(hidden)]
+pub static FAIL_DIR_FSYNC: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    if FAIL_DIR_FSYNC.lock().map(|dirs| dirs.iter().any(|d| d == dir)).unwrap_or(false) {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
+    File::open(dir).and_then(|d| d.sync_all())
+}
+
 /// Steps 2-5 of the save contract. Blocking.
 ///
 /// `force` skips the step-3 comparison and is passed only for a PLAIN save
@@ -329,7 +342,7 @@ fn save_with(
         return Err(write_err(e));
     }
     after_rename();
-    let (durable, warning) = match File::open(dir).and_then(|d| d.sync_all()) {
+    let (durable, warning) = match sync_dir(dir) {
         Ok(()) => (true, None),
         Err(e) => (false, Some(format!("saved, but fsync of {} failed: {e}", dir.display()))),
     };

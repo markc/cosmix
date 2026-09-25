@@ -8,8 +8,10 @@
 //! re-registration → [`watch`]; publisher loss/resync → [`events`]; props tree
 //! → [`props`]; daemon limits → [`limits`].
 //!
-//! **E0 buffers are volatile**: unsaved text is lost on any daemon stop,
-//! crash or heap-OOM abort. `edit.info` reports `volatile: true`.
+//! **Recovery files** ([`recovery`], ced E1 plan §5) keep unsaved text across
+//! a crash, restart or SIGTERM (≤ 1 s loss while healthy). With
+//! `COSMIX_EDIT_RECOVERY=0` — or while recovery is degraded — buffers are
+//! volatile, and `edit.info` says so (`volatile: true`).
 //!
 //! In-process use (tests): [`router::Editd::start`] with any
 //! [`events::EventSink`], then [`router::Editd::handle`] synthesized
