@@ -39,7 +39,7 @@ off.
 
 ## Keys
 
-Tab and pane chords match bterm. They need Ctrl and Shift, or Ctrl alone where shown.
+Tab and pane chords need Ctrl and Shift, or Ctrl alone where shown.
 Any chord that also holds Alt or Super is left alone.
 
 | Keys | Action |
@@ -47,6 +47,7 @@ Any chord that also holds Alt or Super is left alone.
 | Ctrl+Shift+T | new tab |
 | Ctrl+Shift+W | close the active tab |
 | Ctrl+PageDown / Ctrl+PageUp | next / previous tab |
+| Ctrl+Tab / Ctrl+Shift+Tab | next / previous pane in the current tab, in layout order, wrapping at either end |
 | Ctrl+Shift+E | split the focused pane side by side |
 | Ctrl+Shift+O | split the focused pane top and bottom |
 | Ctrl+Shift+X | close the focused pane |
@@ -55,6 +56,10 @@ Any chord that also holds Alt or Super is left alone.
 
 Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
 the repeats are dropped rather than sent to the shell.
+
+Pane cycling changes only keyboard focus within the current tab, following
+the split tree's first pane before its second pane. Bare Tab still goes to
+the shell.
 
 Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
@@ -69,13 +74,18 @@ Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.
 | Shift+PageUp / Shift+PageDown | scroll the focused pane by one page (rows minus one) |
 | Shift+Home / Shift+End | jump to the top / bottom of the focused pane's history |
 
-Scrollback keys repeat when held and never reach the shell. Plain PageUp and
+Scrollback keys repeat when held and apply only on the primary screen. On the
+alternate screen, Shift+PageUp/PageDown/Home/End go to the application as
+PageUp/PageDown/Home/End. Plain PageUp and
 PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
-Sending a key to the shell returns the viewport to the live bottom.
+Accepted keyboard input, pasted or Bus `term.type` text (including control-lane
+typing), and mouse reports return the viewport to the live bottom. Empty or
+rejected input and automatic VT replies leave it alone. A live cursor is shown
+in a scrolled viewport only when its translated row remains on screen.
 
-Each wheel notch scrolls one line. Touchpad travel accumulates at 40 logical
-pixels per line. Applications that enable mouse reporting receive the wheel
-first; otherwise the alternate screen can translate it to cursor keys (for
+Each wheel notch scrolls one line. Touchpad travel accumulates at one logical
+cell height per line, matching bterm. Applications that enable mouse reporting
+receive the wheel first; otherwise the alternate screen can translate it to cursor keys (for
 example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
 to change the font size. The `scrollback` setting controls history depth.
 
@@ -128,7 +138,7 @@ is a JSON object, and `{}` means no arguments.
 | `term.pane.split` | `{"dir":"v"}` or `{"dir":"h"}` | split the focused pane side by side (`v`) or top and bottom (`h`) |
 | `term.pane.select` | `{"id":N}` | focus pane N in the active tab |
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |
-| `term.snapshot` | `{}` | read the focused pane's screen, size and cursor |
+| `term.snapshot` | `{}` | read the focused pane's live screen (offset zero), size and live cursor |
 | `term.type` | `{"text":"..."}` | type ASCII into the focused pane, as keys |
 
 ```mix
@@ -139,6 +149,9 @@ send term term.panes
 
 `term.panes` reports each pane's geometry in logical pixels, relative to the
 pane area below the tab strip, as bterm does.
+
+`term.snapshot` always reads the live screen, even while a human views history.
+It does not move that viewport or consume pending repaint damage.
 
 With no broker, term prints that the Bus is unavailable and works as a
 plain terminal.

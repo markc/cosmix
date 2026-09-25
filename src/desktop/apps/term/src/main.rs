@@ -77,9 +77,11 @@ fn main() {
              Keys: Ctrl+Shift+T/W new/close tab, Ctrl+PageUp/PageDown change tab,\n\
              \x20     Ctrl+Shift+E/O split side by side/stacked, Ctrl+Shift+X close pane,\n\
              \x20     Ctrl+Shift+arrows move focus, Ctrl+Shift+Q quit,\n\
+             \x20     Ctrl+Tab / Ctrl+Shift+Tab next / previous pane (wrap),\n\
              \x20     Ctrl+plus/equal/minus/0 (and Ctrl+wheel) font size\n\
              \x20     Wheel scrolls; Shift forces history; Shift+PageUp/PageDown page history\n\
-             \x20     Shift+Home/End history top/bottom; shell input returns to bottom\n\
+             \x20     Shift+Home/End history top/bottom (primary screen only)\n\
+             \x20     Input returns to bottom; bare Tab goes to the shell\n\
              TERM_NOTIFY=0: no desktop notification when a pane's shell exits\n\
              --version: print version and build hash, and nothing else\n\
              --print-config: print resolved startup settings and exit\n\
@@ -502,6 +504,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 /// shell encoder — without that order, Ctrl+Shift+T would reach the PTY as a
 /// Ctrl-T (`input::tests::a_tab_chord_would_otherwise_reach_the_shell_as_a_control_code`).
 fn on_key(event: &iced::keyboard::Event) -> Option<Message> {
+    on_key_screen(event, false)
+}
+
+fn on_key_screen(event: &iced::keyboard::Event, alternate: bool) -> Option<Message> {
     match event {
         iced::keyboard::Event::KeyPressed {
             key,
@@ -512,7 +518,9 @@ fn on_key(event: &iced::keyboard::Event) -> Option<Message> {
             repeat,
             ..
         } => {
-            if let Some(action) = input::action_for(key, modified_key, *physical_key, *modifiers) {
+            if let Some(action) = input::action_on_screen(
+                input::action_for(key, modified_key, *physical_key, *modifiers), alternate,
+            ) {
                 // A repeat of a non-repeating chord is swallowed, not passed
                 // through: it must not turn into a control code either.
                 return (!*repeat || action.repeats()).then_some(Message::Action(action));
@@ -536,7 +544,36 @@ fn view(state: &State) -> Element<'_, Message> {
     // The keyboard rides the widget tree, not a subscription: see `keys.rs`.
     // It wraps the strip as well, so a key pressed while the pointer is over
     // a tab still reaches the terminal.
-    let content = keys::keys(column![tab_strip(state, scale), panes], on_key);
+    let pane_bounds = state.shape.tree.as_ref()
+        .map(|tree| layout::panes(tree, bounds, scale)).unwrap_or_default();
+    let hovered = move |position: iced::Point| {
+        let (id, pane) = pane_bounds.iter().find(|(_, pane)| {
+            position.x >= pane.x && position.x < pane.x + pane.w
+                && position.y >= pane.y && position.y < pane.y + pane.h
+        })?;
+        let grid = *state.grids.get(id)?;
+        let (col, row) = input::pointer_cell(
+            iced::Point::new(position.x - pane.x, position.y - pane.y),
+            layout::border(scale), state.painter.logical_cell(), grid,
+        );
+        Some((*id, col, row))
+    };
+    let last = std::cell::Cell::new(state.pointer.and_then(&hovered));
+    let content = keys::keys(column![tab_strip(state, scale), panes], move |event| {
+        let message = on_key(event);
+        // Ordinary typing must not acquire an extra terminal/grid lock just
+        // to decide who owns a scrollback chord.
+        if matches!(message, Some(Message::Action(Action::Scroll(_)))) {
+            let tabs = state.tabs.lock().expect("tabs");
+            if !tabs.is_empty() && tabs.active_terminal().lock().expect("terminal").alternate_screen() {
+                return on_key_screen(event, true);
+            }
+        }
+        message
+    }).on_pointer(move |position| {
+        let cell = hovered(position);
+        pointer_message(&last, cell, position)
+    });
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -545,6 +582,16 @@ fn view(state: &State) -> Element<'_, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+type HoveredCell = Option<(u64, u16, u16)>;
+
+fn pointer_message(
+    last: &std::cell::Cell<HoveredCell>,
+    hovered: HoveredCell,
+    position: iced::Point,
+) -> Option<Message> {
+    (last.replace(hovered) != hovered).then_some(Message::Pointer(position))
 }
 
 /// One button per tab and a `+`, as bterm. Every colour is a design token.
@@ -645,9 +692,6 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
         });
     mouse_area(outer)
         .on_press(Message::FocusPane(id))
-        .on_move(move |position| {
-            Message::Pointer(iced::Point::new(bounds.x + position.x, bounds.y + position.y))
-        })
         .on_scroll(move |delta| Message::Wheel(id, delta))
         .into()
 }
@@ -719,6 +763,13 @@ fn apply(tabs: &mut TabSet, action: Action) -> Vec<Removed> {
             tabs.cycle(forward);
             Vec::new()
         }
+        Action::CyclePane { forward } => {
+            let ids: Vec<_> = tabs.leaves().iter().map(|pane| pane.id).collect();
+            if let Some(id) = input::cycle_pane(&ids, tabs.active_tab().active_pane, forward) {
+                tabs.focus(id);
+            }
+            Vec::new()
+        }
         Action::Scroll(request) => {
             tabs.active_terminal()
                 .lock()
@@ -753,7 +804,7 @@ impl State {
         let Some(&grid) = self.grids.get(&id) else {
             return;
         };
-        let lines = input::wheel_steps(&mut self.scroll_wheel, delta);
+        let lines = input::scroll_steps(&mut self.scroll_wheel, delta, self.painter.logical_cell().1);
         if lines == 0 {
             return;
         }
@@ -1041,8 +1092,25 @@ mod tests {
                     on_key(&press(Key::Named(named), Key::Named(named), Modifiers::empty(), None, repeat)),
                     Some(Message::Keys(_))
                 ));
+                assert!(matches!(
+                    on_key_screen(&press(Key::Named(named), Key::Named(named), Modifiers::SHIFT, None, repeat), true),
+                    Some(Message::Keys(_))
+                ));
             }
         }
+    }
+
+    #[test]
+    fn pointer_motion_emits_only_for_a_new_pane_or_cell() {
+        let last = std::cell::Cell::new(None);
+        assert!(pointer_message(&last, Some((1, 0, 0)), iced::Point::new(2.0, 2.0)).is_some());
+        for pixel in 3..8 {
+            assert!(pointer_message(&last, Some((1, 0, 0)), iced::Point::new(pixel as f32, 2.0)).is_none());
+        }
+        assert!(pointer_message(&last, Some((1, 1, 0)), iced::Point::new(9.0, 2.0)).is_some());
+        assert!(pointer_message(&last, Some((2, 1, 0)), iced::Point::new(90.0, 2.0)).is_some());
+        assert!(pointer_message(&last, None, iced::Point::ORIGIN).is_some());
+        assert!(pointer_message(&last, None, iced::Point::ORIGIN).is_none());
     }
 
     /// `on_key` is the dispatcher that decides chord versus shell and
@@ -1217,14 +1285,23 @@ mod tests {
         let _ = state.sync();
         let right = state.shape.active_pane;
         assert_ne!(left, right);
+        let terminal = state.tabs.lock().unwrap().pane_by_id(left).unwrap();
+        fill_history(&terminal);
         let _ = update(&mut state, Message::Pointer(iced::Point::new(10.0, 40.0)));
-        let half = ScrollDelta::Pixels { x: 0.0, y: input::PIXELS_PER_STEP / 2.0 };
+        let half = ScrollDelta::Pixels { x: 0.0, y: state.painter.logical_cell().1 / 2.0 };
         let _ = update(&mut state, Message::Wheel(left, half));
         assert_eq!(state.scroll_pane, Some(left));
         assert_eq!(state.scroll_wheel, 0.5);
         assert_eq!(active_pane(&state.tabs.lock().unwrap()), right);
-        let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
         let _ = update(&mut state, Message::Wheel(left, half));
+        assert_eq!(terminal.lock().unwrap().display_offset(), 1, "two half-cell deltas scroll the hovered pane");
+        let other = state.tabs.lock().unwrap().pane_by_id(right).unwrap();
+        assert_eq!(other.lock().unwrap().display_offset(), 0);
+        assert_eq!(active_pane(&state.tabs.lock().unwrap()), right);
+        let _ = update(&mut state, Message::Wheel(left, ScrollDelta::Lines { x: 0.0, y: -1.0 }));
+        assert_eq!(terminal.lock().unwrap().display_offset(), 0);
+        let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
+        let _ = update(&mut state, Message::Wheel(left, ScrollDelta::Pixels { x: 0.0, y: input::PIXELS_PER_STEP / 2.0 }));
         assert_eq!(state.wheel, 0.5);
         assert_eq!(state.scroll_wheel, 0.0);
         let _ = update(&mut state, Message::Modifiers(Modifiers::empty()));
@@ -1236,6 +1313,56 @@ mod tests {
         let _ = update(&mut state, Message::Wheel(right, half));
         assert_eq!(state.scroll_pane, Some(right));
         assert_eq!(state.scroll_wheel, 0.5);
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    fn fill_history(terminal: &Arc<Mutex<cosmix_term_core::terminal::Terminal>>) {
+        let text = (0..120).map(|n| format!("history-{n}\\n")).collect::<String>();
+        terminal.lock().unwrap().listener.type_text(&format!("print(\"{text}T15-END\")\n")).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if terminal.lock().unwrap().snapshot().split_once("\nT15-END ")
+                .is_some_and(|(_, tail)| !tail.trim().is_empty()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Mix did not produce the history fixture");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn viewport_pixels_match_fresh_painter_after_up_and_down() {
+        use cosmix_term_core::terminal::ScrollRequest;
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let id = state.shape.active_pane;
+        let terminal = state.tabs.lock().unwrap().pane_by_id(id).unwrap();
+        fill_history(&terminal);
+        #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+        let frame = state.painter.frame(id);
+        let mut paint = || {
+            let snapshot = terminal.lock().unwrap().grid_snapshot();
+            state.painter.repaint(id, &snapshot.screen, &snapshot.dirty_rows);
+            let mut fresh = Painter::new(state.painter.scale(), state.painter.font(), config::Cursor::Underline).unwrap();
+            fresh.repaint(id, &snapshot.screen, &vec![true; snapshot.screen.rows]);
+            assert_eq!(state.painter.frame(id).lock().unwrap().surface().rgba(), fresh.frame(id).lock().unwrap().surface().rgba());
+            // Keep a handle alive across the next paint to exercise tiny-skia's
+            // copy/rebind path as well as the wgpu arm's persistent Vec.
+            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+            cpu_grid::refresh(&state.painter.frame(id));
+        };
+        paint();
+        #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+        let _retained = cpu_grid::view(&frame);
+        terminal.lock().unwrap().scroll_view(ScrollRequest::PageUp);
+        assert!(terminal.lock().unwrap().display_offset() > 0);
+        paint();
+        terminal.lock().unwrap().scroll_view(ScrollRequest::Bottom);
+        assert_eq!(terminal.lock().unwrap().display_offset(), 0);
+        paint();
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
         drop(state);
@@ -1258,6 +1385,12 @@ mod tests {
         assert_eq!(tabs.leaves().len(), 2);
         let right = active_pane(&tabs);
         assert_ne!(right, left, "a split focuses the new pane");
+
+        apply(&mut tabs, Action::CyclePane { forward: true });
+        assert_eq!(active_pane(&tabs), left);
+        apply(&mut tabs, Action::CyclePane { forward: false });
+        assert_eq!(active_pane(&tabs), right);
+        assert_eq!(tabs.active_id(), first_tab);
 
         apply(&mut tabs, Action::Focus(Direction::Left));
         assert_eq!(active_pane(&tabs), left);

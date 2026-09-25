@@ -27,6 +27,7 @@ use std::{
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 pub type Stats = Arc<Mutex<Metrics>>;
 type Grid = Arc<FairMutex<Crosswords<Listener>>>;
+type WeakGrid = std::sync::Weak<FairMutex<Crosswords<Listener>>>;
 
 fn rearm_damage(term: &mut Crosswords<Listener>) {
     term.reset_damage();
@@ -90,6 +91,7 @@ struct Writes {
 
 #[derive(Clone)]
 pub struct Listener {
+    grid: Arc<OnceLock<WeakGrid>>,
     damage: SyncSender<()>,
     wake: Arc<OnceLock<Wake>>,
     writes: Arc<Mutex<Writes>>,
@@ -97,6 +99,17 @@ pub struct Listener {
     pub quit: Arc<AtomicBool>,
 }
 impl Listener {
+    /// Call only after dropping the writes lock: the parser takes grid then
+    /// writes when answering VT queries. A weak link avoids a grid/listener cycle.
+    fn follow_input(&self) {
+        if let Some(grid) = self.grid.get().and_then(std::sync::Weak::upgrade) {
+            let mut term = grid.lock();
+            if term.display_offset() != 0 {
+                term.scroll_display(rio_vt::crosswords::grid::Scroll::Bottom);
+                self.dirty();
+            }
+        }
+    }
     #[cfg(test)]
     pub(crate) fn block_control_writes(&self, block: bool) {
         self.writes.lock().unwrap().block_control = block;
@@ -160,12 +173,22 @@ impl Listener {
         }
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        self.enqueue(&mut writes, bytes, Some(Instant::now()), None)
+        self.enqueue(&mut writes, bytes, Some(Instant::now()), None)?;
+        drop(writes);
+        self.follow_input();
+        Ok(())
     }
     pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        self.enqueue(&mut writes, encode(key), Some(at), None)
+        let bytes = encode(key);
+        let sends_bytes = !bytes.is_empty();
+        self.enqueue(&mut writes, bytes, Some(at), None)?;
+        drop(writes);
+        if sends_bytes {
+            self.follow_input();
+        }
+        Ok(())
     }
     fn revoke_writer(writes: &mut Writes) {
         writes.foreground = writes.foreground.saturating_add(1);
@@ -207,6 +230,7 @@ impl Listener {
         permit: Arc<crate::control::Permit>,
     ) -> Result<(), &'static str> {
         let bytes = encode_text(text).map_err(|_| "INVALID_ARGUMENT")?;
+        let sends_bytes = !bytes.is_empty();
         let mut writes = self.writes.lock().unwrap();
         if !Self::check_foreground(&mut writes) {
             return Err("FORBIDDEN");
@@ -233,6 +257,10 @@ impl Listener {
         )
         .map_err(|_| "RESOURCE_LIMIT")?;
         writes.owner = Some((actor.into(), permit));
+        drop(writes);
+        if sends_bytes {
+            self.follow_input();
+        }
         Ok(())
     }
 }
@@ -616,6 +644,7 @@ impl Terminal {
         let stats = Arc::new(Mutex::new(Metrics::default()));
         let (tx, rx) = mpsc::sync_channel(1);
         let listener = Listener {
+            grid: Arc::new(OnceLock::new()),
             damage: tx,
             wake: Arc::new(OnceLock::new()),
             writes: Arc::new(Mutex::new(Writes::default())),
@@ -716,6 +745,7 @@ impl Terminal {
             writes.pty = Some(unsafe { OwnedFd::from_raw_fd(fd) });
             Listener::check_foreground(&mut writes);
         }
+        let _ = listener.grid.set(Arc::downgrade(&grid));
         let machine = Machine::new(
             grid.clone(),
             MeteredPty {
@@ -769,7 +799,7 @@ impl Terminal {
         self.damage.lock().unwrap().try_recv().is_ok()
     }
     pub fn screen(&self, consume: bool) -> Screen {
-        self.capture(consume, None)
+        self.capture(consume, None, false)
     }
     pub fn scroll_view(&self, request: ScrollRequest) {
         use rio_vt::crosswords::grid::Scroll;
@@ -793,21 +823,24 @@ impl Terminal {
     /// Human key input follows the live output once bytes reach the queue.
     /// VT replies use Listener directly and must not move the viewport.
     pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
-        let sends_bytes = !encode(key).is_empty();
-        self.listener.key(key, at)?;
-        if sends_bytes {
-            self.scroll_view(ScrollRequest::Bottom);
-        }
-        Ok(())
+        self.listener.key(key, at)
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.grid.lock().mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN)
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.grid.lock().display_offset()
     }
     /// Like `screen(true)`, and also reports which rows changed since the
     /// previous consuming read (by either method).
     pub fn grid_snapshot(&self) -> GridSnapshot {
         let mut dirty_rows = Vec::new();
-        let screen = self.capture(true, Some(&mut dirty_rows));
+        let screen = self.capture(true, Some(&mut dirty_rows), false);
         GridSnapshot { screen, dirty_rows }
     }
-    fn capture(&self, consume: bool, dirty: Option<&mut Vec<bool>>) -> Screen {
+    fn capture(&self, consume: bool, dirty: Option<&mut Vec<bool>>, live: bool) -> Screen {
         use rio_vt::config::{
             Colors,
             colors::{AnsiColor, term::List},
@@ -830,7 +863,9 @@ impl Terminal {
         let cols = term.columns();
         let rows = term.screen_lines();
         let mut cells = Vec::with_capacity(cols * rows);
-        for row in term.visible_rows() {
+        let offset = if live { 0 } else { term.display_offset() };
+        for y in 0..rows {
+            let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
             for x in 0..cols {
                 let square = &row[Column(x)];
                 let style = term.grid.style_of(square);
@@ -852,8 +887,9 @@ impl Terminal {
             }
         }
         let pos = term.grid.cursor.pos;
-        let cursor = (pos.col.0, pos.row.0.max(0) as usize);
-        let cursor_visible = term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+        let cursor = (pos.col.0, (pos.row.0.max(0) as usize).saturating_add(offset));
+        let cursor_visible = cursor.1 < rows
+            && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
         if let Some(dirty) = dirty {
             *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
         }
@@ -879,7 +915,9 @@ impl Terminal {
         }
     }
     pub fn snapshot(&self) -> String {
-        let s = self.screen(false);
+        // Agent reads always describe the live screen, without moving the human
+        // viewport or consuming its damage.
+        let s = self.capture(false, None, true);
         let mut out = format!(
             "cols={} rows={} cursor={},{} child_pid={}\n{}\n--- screen ---\n",
             s.cols,
@@ -1068,6 +1106,7 @@ mod tests {
             .unwrap();
         let (damage, rx) = mpsc::sync_channel(1);
         let listener = Listener {
+            grid: Arc::new(OnceLock::new()),
             damage,
             wake: Arc::new(OnceLock::new()),
             writes: Arc::new(Mutex::new(Writes::default())),
@@ -1082,6 +1121,7 @@ mod tests {
             0,
             0,
         )));
+        let _ = listener.grid.set(Arc::downgrade(&grid));
         let machine = Machine::new(
             grid.clone(),
             FixturePty {
@@ -1151,6 +1191,7 @@ mod tests {
             let stats = Arc::new(Mutex::new(Metrics::default()));
             let (damage, rx) = mpsc::sync_channel(1);
             let listener = Listener {
+                grid: Arc::new(OnceLock::new()),
                 damage,
                 wake: Arc::new(OnceLock::new()),
                 writes: Arc::new(Mutex::new(Writes::default())),
@@ -1165,6 +1206,7 @@ mod tests {
                 0,
                 100,
             )));
+            let _ = listener.grid.set(Arc::downgrade(&grid));
             let machine = Machine::new(
                 grid.clone(),
                 FixturePty {

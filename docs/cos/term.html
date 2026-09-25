@@ -472,12 +472,13 @@ closes the tab, and closing the last tab quits. A shell that exits on its own
 raises a desktop notification, as in bterm. Set <code>TERM_NOTIFY=0</code> to turn that
 off.</p>
 <h2 id="keys">Keys</h2>
-<p>Tab and pane chords match bterm. They need Ctrl and Shift, or Ctrl alone where shown.
+<p>Tab and pane chords need Ctrl and Shift, or Ctrl alone where shown.
 Any chord that also holds Alt or Super is left alone.</p>
 <table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+Shift+T</td><td>new tab</td></tr>
 <tr><td>Ctrl+Shift+W</td><td>close the active tab</td></tr>
 <tr><td>Ctrl+PageDown / Ctrl+PageUp</td><td>next / previous tab</td></tr>
+<tr><td>Ctrl+Tab / Ctrl+Shift+Tab</td><td>next / previous pane in the current tab, in layout order, wrapping at either end</td></tr>
 <tr><td>Ctrl+Shift+E</td><td>split the focused pane side by side</td></tr>
 <tr><td>Ctrl+Shift+O</td><td>split the focused pane top and bottom</td></tr>
 <tr><td>Ctrl+Shift+X</td><td>close the focused pane</td></tr>
@@ -486,6 +487,9 @@ Any chord that also holds Alt or Super is left alone.</p>
 </tbody></table>
 <p>Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
 the repeats are dropped rather than sent to the shell.</p>
+<p>Pane cycling changes only keyboard focus within the current tab, following
+the split tree's first pane before its second pane. Bare Tab still goes to
+the shell.</p>
 <p>Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>
@@ -496,12 +500,17 @@ Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>
 <tr><td>Shift+PageUp / Shift+PageDown</td><td>scroll the focused pane by one page (rows minus one)</td></tr>
 <tr><td>Shift+Home / Shift+End</td><td>jump to the top / bottom of the focused pane's history</td></tr>
 </tbody></table>
-<p>Scrollback keys repeat when held and never reach the shell. Plain PageUp and
+<p>Scrollback keys repeat when held and apply only on the primary screen. On the
+alternate screen, Shift+PageUp/PageDown/Home/End go to the application as
+PageUp/PageDown/Home/End. Plain PageUp and
 PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
-Sending a key to the shell returns the viewport to the live bottom.</p>
-<p>Each wheel notch scrolls one line. Touchpad travel accumulates at 40 logical
-pixels per line. Applications that enable mouse reporting receive the wheel
-first; otherwise the alternate screen can translate it to cursor keys (for
+Accepted keyboard input, pasted or Bus <code>term.type</code> text (including control-lane
+typing), and mouse reports return the viewport to the live bottom. Empty or
+rejected input and automatic VT replies leave it alone. A live cursor is shown
+in a scrolled viewport only when its translated row remains on screen.</p>
+<p>Each wheel notch scrolls one line. Touchpad travel accumulates at one logical
+cell height per line, matching bterm. Applications that enable mouse reporting
+receive the wheel first; otherwise the alternate screen can translate it to cursor keys (for
 example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
 to change the font size. The <code>scrollback</code> setting controls history depth.</p>
 <h2 id="font-size">Font size</h2>
@@ -544,7 +553,7 @@ is a JSON object, and <code>{}</code> means no arguments.</p>
 <tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
 <tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
-<tr><td><code>term.snapshot</code></td><td><code>{}</code></td><td>read the focused pane's screen, size and cursor</td></tr>
+<tr><td><code>term.snapshot</code></td><td><code>{}</code></td><td>read the focused pane's live screen (offset zero), size and live cursor</td></tr>
 <tr><td><code>term.type</code></td><td><code>{"text":"..."}</code></td><td>type ASCII into the focused pane, as keys</td></tr>
 </tbody></table>
 <pre><code class="language-mix">send term term.tab.new
@@ -553,6 +562,8 @@ send term term.panes
 </code></pre>
 <p><code>term.panes</code> reports each pane's geometry in logical pixels, relative to the
 pane area below the tab strip, as bterm does.</p>
+<p><code>term.snapshot</code> always reads the live screen, even while a human views history.
+It does not move that viewport or consume pending repaint damage.</p>
 <p>With no broker, term prints that the Bus is unavailable and works as a
 plain terminal.</p>
 <h2 id="not-yet-in-this-frontend">Not yet in this frontend</h2>

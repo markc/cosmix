@@ -9,6 +9,47 @@ use term_native_test_broker::Broker;
 
 const REQUIRE_MIX: &str = "requires clean current-HEAD COSMIX_E2E_MIX_BIN; explicit S4 gate only";
 
+#[test]
+fn t15_control_input_returns_to_live_screen() {
+    if in_posture("t15_control_input_returns_to_live_screen", Some("0")) {
+        return;
+    }
+    let fixture = Fixture::admission(Policy::DefaultOpen);
+    runtime().block_on(async {
+        let owner = verified(&fixture.broker).await;
+        let (parent, child) = fixture.records(&owner, 1).await;
+        let target = target(&parent, &child);
+        let pane = fixture.tabs.lock().unwrap().pane_by_id(1).unwrap();
+        let listener = pane.lock().unwrap().listener.clone();
+        let lines = (0..100).map(|n| format!("history-{n}\\n")).collect::<String>();
+        listener.type_text(&format!("print(\"{lines}T15-END\")\n")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if pane.lock().unwrap().snapshot().split_once("\nT15-END ")
+                    .is_some_and(|(_, tail)| !tail.trim().is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("Mix history output");
+        pane.lock().unwrap().scroll_view(crate::terminal::ScrollRequest::Top);
+        assert!(pane.lock().unwrap().display_offset() > 0);
+        listener.block_control_writes(true);
+        let body = json!({"target":target,"request_id":"t15-type",
+            "foreground_generation":listener.foreground_generation().to_string(),"text":"x"});
+        assert_eq!(call(owner.client(), &parent.name, "term.type", body).await.0, 0);
+        assert_eq!(pane.lock().unwrap().display_offset(), 0);
+        pane.lock().unwrap().scroll_view(crate::terminal::ScrollRequest::Top);
+        let offset = pane.lock().unwrap().display_offset();
+        assert!(offset > 0);
+        let body = json!({"target":target,"request_id":"t15-stale",
+            "foreground_generation":"0","text":"refused"});
+        assert_ne!(call(owner.client(), &parent.name, "term.type", body).await.0, 0);
+        assert_eq!(pane.lock().unwrap().display_offset(), offset);
+        listener.block_control_writes(false);
+    });
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
