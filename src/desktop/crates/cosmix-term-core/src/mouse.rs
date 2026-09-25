@@ -210,6 +210,7 @@ mod tests {
                 stats,
                 grid: Arc::new(FairMutex::new(grid)),
                 damage: Mutex::new(rx),
+                captured_cursor: Mutex::new(None),
                 pid: 0,
                 thread: None,
             },

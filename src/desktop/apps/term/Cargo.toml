@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -95,5 +95,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
 
 [dev-dependencies]
-iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image"] }
+# Tests also compile this dependency in the wgpu arm, where iced does not
+# enable its softbuffer platform backend on our behalf.
+iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image", "wayland"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }

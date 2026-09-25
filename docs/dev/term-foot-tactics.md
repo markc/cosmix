@@ -473,3 +473,123 @@ equality remains checked. The existing vendored teletypewriter unused-variable
 warning is unrelated. Changes are limited to this report and the cfg(test),
 ignored phase benchmark; no crate version bump is needed for unchanged runtime
 behaviour.
+
+## Implemented ranks 1, 2 and 4 (2026-09-25)
+
+This follow-up implements the approved narrow CPU path and shared redraw
+scheduling. The investigation and original measurements above describe the
+pre-change tree; the wgpu default remains unchanged.
+
+- **Rank 1:** pristine crates.io `iced_tiny_skia` 0.14.1 import in its own
+  commit, followed by a separate local patch. `raster.rs` records opacity
+  during the existing RGBA-to-native conversion. Unit-scale, integer-placed,
+  opaque images copy clipped rows into the acquired target. The rectangular
+  clip uses tiny-skia's non-antialiased 26.6 edge rounding, including fractional
+  damage bounds; the copy invokes neither Pattern nor a mask. Renderer-wide
+  clip-mask preparation is still present for generic drawing. Fractional net
+  scale/translation, rotation and non-opaque draws use the original path.
+  Negative local bounds with an identity transform also keep upstream's
+  specialised rectangle rounding; tests exposed a different edge footprint
+  there. Translated negative physical origins are supported by the copy.
+- **Rank 4:** `window/compositor.rs` passes outward-rounded physical rectangles
+  to `present_with_damage`. Damage includes both age repair and changes from
+  the displayed frame, covering A → B → A with rotating buffers. Background
+  changes invalidate retained histories so older buffers owe a full clear.
+  Empty damage drops the acquired buffer without advancing history or calling
+  pre-present. Softbuffer's Wayland implementation changes ages and swaps
+  buffers on presentation, not acquisition/drop. Avoiding pre-present avoids
+  requesting a callback without a commit. Resize/unknown age still repaint
+  fully. Old Wayland surface versions can expand damage within softbuffer.
+- **Rank 2:** the app's existing root input widget publishes a paint message
+  from `RedrawRequested`. iced-winit drains widget messages, rebuilds the UI,
+  then draws within that same redraw; a timestamp guard prevents its retry
+  from painting twice. Wake messages continue lifecycle/layout work but no
+  longer snapshot or paint. Each visible pane consumes `take_damage` before
+  capture; a clean existing pane skips both operations. New panes and font or
+  scale invalidation still owe a paint. Hidden panes retain their core damage
+  token and receive a new frame when shown. Snapshot/rearm remains under the
+  grid lock, and no terminal lock is held during presentation. No quiet-period
+  debounce or change to Rio's synchronous-update handling is introduced.
+  Core snapshots add cursor rows only when position or visibility changes;
+  old/current cursor rows remain covered, including hide/show transitions.
+
+Changed files: desktop `Cargo.toml` and `Cargo.lock`; vendor README and
+`iced_tiny_skia/{src/raster.rs,src/engine.rs,src/window/compositor.rs}`;
+`apps/term/{Cargo.toml,src/main.rs,src/keys.rs}`; and
+`crates/cosmix-term-core/{Cargo.toml,src/terminal.rs,src/mouse.rs}` (the mouse
+file only initialises the new snapshot state in its test fixture).
+Versions: cosmix-term **0.2.5**, cosmix-term-core **0.5.2**.
+
+The vendor README records the tarball SHA-256, upstream revision, patch
+removal conditions and routing/test commands. `cargo tree -p cosmix-term
+--no-default-features --features tiny-skia -i iced_tiny_skia` confirms the
+vendored path. The term test-only dependency now explicitly enables Wayland:
+without that feature, default-wgpu tests compile softbuffer with no Linux
+backend and fail before reaching app tests.
+
+### Before/after measurements
+
+Release, headless, 2250×1250 pixels, scale 2.5, age 3, the same DejaVu Sans Mono
+fixture and benchmark code, no CPU affinity. No builds overlapped the final
+benchmark execution. These are complete runs, not best samples; host scheduling
+noise is visible particularly in the before whole-image p99.
+
+| Path | Case | Before mean / p50 / p99 ms | After mean / p50 / p99 ms | Before paint / convert / draw ms | After paint / convert / draw ms |
+|---|---|---:|---:|---:|---:|
+| Whole image | echo | 18.666 / 15.974 / 38.023 | 6.499 / 6.195 / 10.835 | 1.793 / 3.698 / 13.168 | 0.891 / 3.198 / 2.406 |
+| Whole image | full | 23.341 / 22.818 / 35.937 | 10.035 / 9.936 / 11.087 | 5.251 / 4.932 / 13.152 | 4.943 / 2.797 / 2.290 |
+| Four-row bands | echo | 6.436 / 6.428 / 6.766 | 1.671 / 1.657 / 1.865 | 0.325 / 0.416 / 5.203 | 0.305 / 0.454 / 0.333 |
+| Four-row bands | full | 21.643 / 21.602 / 22.371 | 11.310 / 11.370 / 12.112 | 4.874 / 3.170 / 13.590 | 5.196 / 3.761 / 2.342 |
+
+The app's banded path improves mean echo by **74%** and full redraw by **48%**.
+Damage area stays 461,250 pixels for banded echo and 2,812,500 for full redraw.
+The sparse **<2 ms** target passes; the full **<8 ms** target does not. Full
+paint and new-image conversion remain material costs. The headless benchmark
+does not exercise Wake coalescing or softbuffer presentation, so these timing
+savings belong to rank 1; no numeric saving is assigned to ranks 2 or 4.
+
+Before command, from `src/desktop`:
+
+```text
+cargo test -p cosmix-term --release --no-default-features --features tiny-skia tiny_skia_frame_bench -- --ignored --nocapture --test-threads=1
+```
+
+Final CPU run (includes the identical frame benchmark plus phase probes):
+
+```text
+cargo test -p cosmix-term --release --no-default-features --features tiny-skia -- --include-ignored --nocapture --test-threads=1
+```
+
+### Validation and remaining limits
+
+- CPU: **44 passed**, including both ignored benchmarks explicitly enabled.
+  Existing band/full-image pixel equality at scales 1.25, 1.5 and 2.5,
+  retained-history, cursor-band crossing, resize and invalidation tests pass.
+- Default wgpu: **34 passed** with `cargo test -p cosmix-term --release`.
+  This compiles the default arm and checks shared app behaviour; it is not a
+  live GPU presentation or performance measurement.
+- Vendor: **4 passed** using the README command. Byte equality compares native
+  copy with original Pattern drawing for varied opaque colours, clipped and
+  negative translated origins; forced fallback comparisons cover fractional
+  clip boundaries, rotation and negative identity placement. Non-unit scales
+  1.25/1.5/2.5, fractional translations, image alpha and draw opacity retain
+  upstream pixels. Physical damage rounding, clamping and empty input are
+  unit-tested.
+- The two-pane app regression runs in both arms: 20 Wake messages leave frame
+  generations unchanged; one redraw paints the dirty pane once; a redraw retry
+  does not repaint; the neighbour keeps its generation and has no snapshot row
+  damage from its unchanged cursor. Zoom is checked after the pre-draw paint.
+- Cargo runs were restricted to term and the vendored crate as requested.
+  Core changes compile through term and the clean-cursor behaviour is exercised
+  by the app regression; the standalone core test suite was not run. Its
+  snapshot expectations and fixture initialisers were updated with the change.
+- Remaining risk: real compositor acquire/commit/frame-callback timing and
+  emitted Wayland damage have not been captured. Empty-present lifecycle and
+  history handling are source-audited, not validated against a live rotating
+  Wayland surface. Hidden/resumed windows, synchronous-update bursts and actual
+  keyboard-to-visible latency still need the live acceptance session described
+  above. Existing steady-cursor policy is unchanged; visibility transitions
+  still dirty cursor rows. No foot-parity or live CPU-percentage claim is made.
+
+The existing teletypewriter unused-variable warning remains unrelated. There
+is no deployment, renderer-default change or push in this implementation.
