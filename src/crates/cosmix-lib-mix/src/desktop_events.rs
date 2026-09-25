@@ -1421,7 +1421,7 @@ mod tests {
         b.extend_from_slice(&((4 + value.len()) as u16).to_ne_bytes());
         b.extend_from_slice(&kind.to_ne_bytes());
         b.extend_from_slice(value);
-        while b.len() % 4 != 0 {
+        while !b.len().is_multiple_of(4) {
             b.push(0);
         }
         b
@@ -1430,7 +1430,7 @@ mod tests {
     fn message(kind: u16, flags: u16, body: &[u8]) -> Vec<u8> {
         let mut b = header(NLMSG_HDRLEN + body.len(), kind, flags);
         b.extend_from_slice(body);
-        while b.len() % 4 != 0 {
+        while !b.len().is_multiple_of(4) {
             b.push(0);
         }
         b

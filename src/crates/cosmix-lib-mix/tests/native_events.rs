@@ -678,7 +678,9 @@ async fn blocked_child(e: &mut Evaluator) -> i32 {
 async fn managed_signal_delivery_and_shutdown_have_one_reaper() {
     let mut e = Evaluator::new();
     e.set_serve_runtime(Rc::new(Runtime));
-    exec(&mut e, "on proc.exited\n$exit = $event.args\nquit()\nend")
+    // Declare $exit first: a handler assignment to an unbound name binds a
+    // per-invocation local, not a global (as in the sibling tests).
+    exec(&mut e, "$exit = nil\non proc.exited\n$exit = $event.args\nquit()\nend")
         .await
         .unwrap();
     blocked_child(&mut e).await;

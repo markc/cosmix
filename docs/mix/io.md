@@ -55,7 +55,8 @@ only `on proc.exited`) leaves filesystem batches available to `fs_wait`.
 
 Each batch is `{watch, changes:[{path,kind,old_path?}], overflow}`. Paths are
 absolute, with parent symlinks resolved during registration. Changes coalesce
-per path at delivery; a close-write does not erase a pending paired rename.
+per path at delivery; a write or close-write does not erase a pending `created`
+or paired rename.
 Coalescing that would discard a different rename origin sets overflow.
 `moved` has `old_path` only when inotify supplied both endpoints. A half move
 invalidates its reported path without guessing the other endpoint. Consumers
