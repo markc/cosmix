@@ -1,0 +1,23 @@
+{
+  "name": "reply delivered, echo dropped, no further events: the echo timer recovers (local op)",
+  "about": "Opus M1 / GLM M2. L1 replies rc 0 at rev 1 but its edit.changed event is lost and nothing follows it, so no event_seq gap ever reveals the loss. L2, typed meanwhile, waits behind the Replied slot. The mirror hands out an echo timer with the reply; when it fires with L1 still waiting, history from rev 0 acks L1 through its entry and L2 goes out.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "!"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"drop_event": {"seq": 1}},
+    {"deliver_reply": "L1"},
+    {"local": {"id": "L2", "edit": {"items": [[6, 6, "?"]], "coalesce": true}}},
+    {"echo_timeout": "L1"},
+    {"send": {"id": "L2", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 6, "text": "?", "base_rev": 1, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000002"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "hello!? world\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false,
+             "op_ids_once": true, "idle": true}
+}

@@ -5,8 +5,10 @@
 # files; agents drive it headless, so it is wanted by default.target rather
 # than tied to a graphical session.
 #
-# VOLATILE: buffers live in memory only. Stopping or restarting this unit
-# discards unsaved text (SIGTERM logs every dirty buffer before exit).
+# Unsaved text survives a stop or restart (0.2.0+): dirty buffers are kept in
+# recovery files under $XDG_STATE_HOME/cosmix/edit/recovery and restored at
+# the next start; SIGTERM syncs them first. COSMIX_EDIT_RECOVERY=0 in the
+# environment makes the daemon volatile again (docs/cos/edit.md, Recovery).
 #
 # Install:  cp this -> ~/.config/systemd/user/cosmix-editd.service
 #           systemctl --user daemon-reload

@@ -1,0 +1,20 @@
+{
+  "name": "overlap on the in-flight op, event first",
+  "about": "The agent's replace lands first; our in-flight replace overlaps it. The mirror reverts L1 (Doomed) on the event; the server's CONFLICT refusal is expected and clears the slot.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[2, 4, "XY"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.replace",
+      "args": {"buffer": "b1_0000e1e1", "range": [3, 5], "text": "Q", "origin": "agent:ctl-90"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.replace", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "range": [2, 4], "text": "XY", "base_rev": 0, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 10, "reason": "overlap", "rev": 1}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_reply": "L1"}
+  ],
+  "expect": {"server_text": "helQ world\n", "server_rev": 1, "converged": true, "conflicts": 1, "detached": false,
+             "conflict_texts": [["XY"]]}
+}

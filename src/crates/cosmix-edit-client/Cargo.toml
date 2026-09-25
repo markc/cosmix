@@ -1,0 +1,32 @@
+[package]
+name = "cosmix-edit-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Frontend-side model for the `edit` service: mirror with local echo and single-authority OT rebase, editor model (selection, motions, commands), highlighting state (lsh + Mix lexer), view deltas. No UI toolkit; never needs a running async runtime."
+
+[lib]
+name = "cosmix_edit_client"
+
+[features]
+default = ["mix"]
+# Mix-lexer highlighting for mix / scene / mix-data. Links cosmix-lib-mix,
+# which compiles tokio unconditionally; without this feature the crate is
+# tokio-free and those languages highlight as plain text.
+mix = ["dep:cosmix_mix"]
+# The fake `edit` daemon (over the real cosmix-edit-core Buffer) for
+# integration tests and downstream harnesses.
+fake = []
+
+[dependencies]
+cosmix-edit-core = { path = "../cosmix-edit-core" }
+cosmix-lsh = { path = "../cosmix-lsh" }
+cosmix_mix = { package = "cosmix-lib-mix", path = "../cosmix-lib-mix", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+cosmix-edit-client = { path = ".", features = ["fake"] }

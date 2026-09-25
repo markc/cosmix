@@ -1,0 +1,21 @@
+{
+  "name": "a Doomed in-flight op is excluded from later folds",
+  "about": "A1 overlaps the in-flight L1 (j = 0): L1 and the queued L2 are reverted and stashed, L1 stays in flight as Doomed (present = false). A2 must then fold against NO ops — folding it through the reverted L1 again would double-invert (codex N1). L1's CONFLICT refusal clears the slot.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[2, 4, "XY"]], "coalesce": false}}},
+    {"local": {"id": "L2", "edit": {"items": [[11, 11, "Z"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.replace", "args": {"buffer": "b1_0000e1e1", "range": [3, 5], "text": "Q", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "!", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 2}}},
+    {"send": {"id": "L1", "verb": "edit.replace", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "range": [2, 4], "text": "XY", "base_rev": 0, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 10, "reason": "overlap", "rev": 2}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_event": {"seq": 2}},
+    {"deliver_reply": "L1"}
+  ],
+  "expect": {"server_text": "!helQ world\n", "server_rev": 2, "converged": true, "conflicts": 1, "detached": false,
+             "conflict_texts": [["XY", "Z"]]}
+}

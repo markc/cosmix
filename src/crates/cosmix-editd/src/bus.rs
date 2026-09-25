@@ -57,6 +57,7 @@ fn verb_description(verb: &str) -> &'static str {
         "edit.undo" => "Undo the newest group of a lane (default: own)",
         "edit.redo" => "Redo the newest undone group of a lane",
         "edit.history" => "Read the op log",
+        "edit.recovery.flush" => "Reply once every queued recovery record and repair is durable",
         "edit.props.get" => "SPEC-07 property read",
         "edit.props.list" => "SPEC-07 property paths",
         "edit.props.describe" => "SPEC-07 property description",
@@ -100,8 +101,8 @@ pub async fn connect() -> Result<Arc<SupervisedClient>, String> {
 }
 
 /// `cosmix-editd serve`: register `edit`, signal READY=1 once, serve until
-/// SIGTERM/SIGINT, then log every dirty buffer and exit within
-/// `SHUTDOWN_BUDGET_MS` (E0 buffers are volatile: the log is the record).
+/// SIGTERM/SIGINT, then flush the recovery files, log every dirty buffer and
+/// exit within `SHUTDOWN_BUDGET_MS`. Restores recovery files first.
 pub async fn serve() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -116,10 +117,40 @@ pub async fn serve() -> anyhow::Result<()> {
         config.epoch,
         if config.mesh_open { "open" } else { "locked (COSMIX_MESH_OPEN=0: mutations node-local only)" }
     );
+    // Recovery files are restored BEFORE registration (ced E1 plan §5.2): the
+    // scan, quarantine, salvage, sweep and new-generation switches all happen
+    // here; the buffers go live below before the first command is served and
+    // before READY=1.
+    let recovery = crate::recovery::RecoveryConfig::from_env();
+    let recovered = match (recovery.enabled, recovery.dir.clone()) {
+        (true, Some(dir)) => {
+            let epoch = config.epoch.clone();
+            let caps = crate::recovery::RestoreCaps {
+                max_buffers: crate::limits::MAX_BUFFERS,
+                max_bytes: config.budget_cap,
+            };
+            let (rec, restored) =
+                tokio::task::spawn_blocking(move || crate::recovery::Recovery::start(&dir, &epoch, caps)).await?;
+            tracing::info!(
+                "cosmix-editd: recovery files in {} ({} buffer(s) restored)",
+                rec.dir().display(),
+                restored.len()
+            );
+            Some((rec, restored))
+        }
+        _ => {
+            tracing::warn!("cosmix-editd: recovery files disabled (COSMIX_EDIT_RECOVERY=0 or no state directory); buffers are volatile");
+            None
+        }
+    };
     let client = connect().await.map_err(anyhow::Error::msg)?;
     let mut incoming = client.incoming().ok_or_else(|| anyhow::anyhow!("the Bus incoming stream was already taken"))?;
-    let editd = crate::router::Editd::start(config, Arc::new(crate::events::BusSink(client.clone())));
-    // Registered: `edit` is callable now.
+    let sink = Arc::new(crate::events::BusSink(client.clone()));
+    let editd = match recovered {
+        Some((rec, restored)) => crate::router::Editd::start_recovering(config, rec, restored, sink).await,
+        None => crate::router::Editd::start(config, sink),
+    };
+    // Registered, and every restored buffer is live: `edit` is callable now.
     crate::readiness::notify_ready();
 
     // Every reconnect edge owes mirrors a `resync all` (events published while
@@ -165,9 +196,19 @@ pub async fn serve() -> anyhow::Result<()> {
 
     let budget = Duration::from_millis(crate::limits::SHUTDOWN_BUDGET_MS);
     let shutdown = async {
+        // Drain the recovery queue, finish repairs and sync (plan §5.1: 0 loss on SIGTERM).
+        let kept = match editd.recovery_flush().await {
+            Some(flushed) if flushed.synced => true,
+            Some(_) => {
+                tracing::error!("cosmix-editd: recovery files could not be fully synced at shutdown");
+                false
+            }
+            None => false,
+        };
         for dirty in editd.dirty_buffers().await {
             tracing::warn!(
-                "cosmix-editd: discarding unsaved buffer {} ({}) at rev {}",
+                "cosmix-editd: {} unsaved buffer {} ({}) at rev {}",
+                if kept { "keeping (in recovery files)" } else { "discarding" },
                 dirty.buffer,
                 dirty.path.as_deref().unwrap_or("scratch"),
                 dirty.rev

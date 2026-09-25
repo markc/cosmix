@@ -1,0 +1,22 @@
+{
+  "name": "overlap on a queued op, retained in-flight prefix, multi-edit remote",
+  "about": "L1 (in flight) survives; L2 (queued) overlaps the agent's two-edit transaction and is reverted and stashed. The fold is transactional: the first remote step is transformed through both ops before the second step finds the overlap, and the retry transforms against L1 only.",
+  "path": "/fixture/doc.txt",
+  "initial": "abcdefghijkl\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[0, 0, "1"]], "coalesce": true}}},
+    {"local": {"id": "L2", "edit": {"items": [[7, 8, "q"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.apply",
+      "args": {"buffer": "b1_0000e1e1", "ops": [{"op": "replace", "range": [5, 7], "text": "FG"}, {"op": "insert", "at": 10, "text": "!"}], "origin": "agent:ctl-90"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "1", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_event": {"seq": 2}},
+    {"deliver_reply": "L1"}
+  ],
+  "expect": {"server_text": "1abcdeFGhij!kl\n", "server_rev": 2, "converged": true, "conflicts": 1, "detached": false,
+             "conflict_texts": [["q"]]}
+}

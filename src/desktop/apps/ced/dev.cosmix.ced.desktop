@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=CosMix Editor
+GenericName=Text Editor
+Comment=ced — the CosMix Editor over the `edit` Bus service: live agent edits, per-origin undo, crash recovery
+Exec=ced %F
+Icon=accessories-text-editor
+Terminal=false
+Categories=Utility;TextEditor;Development;
+Keywords=editor;text;code;mix;ced;
+MimeType=text/plain;
+StartupWMClass=dev.cosmix.ced
+StartupNotify=false

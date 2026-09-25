@@ -1,0 +1,16 @@
+{
+  "name": "pending [delete [10,20), insert P@10] vs a remote insert at 20",
+  "about": "The Stage S counter-example (freeze note 3): transforming the remote through the op's SEQUENCE puts Z before P (false tie after the delete); through the item SET it lands after P, as on the server.",
+  "path": "/fixture/doc.txt",
+  "initial": "0123456789abcdefghijXYZ\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[10, 20, ""], [10, 10, "P"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 20, "text": "Z", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.apply", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "ops": [{"op": "delete", "range": [10, 20]}, {"op": "insert", "at": 10, "text": "P"}], "base_rev": 0, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "0123456789PZXYZ\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false}
+}

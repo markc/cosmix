@@ -4,6 +4,10 @@
 -- a subscriber citizen recording the `edit.changed` feed (plan §6.3).
 -- Nothing here can reach the host Bus: private TCP port, private unix
 -- socket, admission off, HOME and runtime dirs inside the temp dir.
+-- Recovery files (editd 0.2.0, on by default) go to COSMIX_EDIT_RECOVERY_DIR
+-- inside the temp dir too: SIGTERM keeps a dirty buffer, SIGKILL after
+-- `edit.recovery.flush` loses nothing, a restart restores both, a durable
+-- save removes the files, and COSMIX_EDIT_RECOVERY=0 is E0's volatile daemon.
 --
 -- Run: COSMIX=<checkout> mix src/crates/cosmix-editd/tests/edit-bus-test.mix [--bin PATH]
 -- Binaries: --bin (or COSMIX_TEST_EDITD) for editd, default
@@ -26,7 +30,9 @@ $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-edit-bus-test.XXXXXXXX"]
 $tag = uuid()
 $node = $tmp .. "/node.conf.mix"
 $env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
-  HOME: $tmp, XDG_STATE_HOME: $tmp, XDG_RUNTIME_DIR: $tmp, RUST_LOG: "cosmix_editd=debug"}
+  HOME: $tmp, XDG_STATE_HOME: $tmp, XDG_RUNTIME_DIR: $tmp, RUST_LOG: "cosmix_editd=debug",
+  COSMIX_EDIT_RECOVERY_DIR: $tmp .. "/recovery"}
+$recdir = $tmp .. "/recovery"
 $editd_pid = nil
 $obs_pid = nil
 $noded_pid = nil
@@ -77,6 +83,44 @@ end
 fn text_of($b)
   return ok('edit.get buffer=$a.b', {b: $b}).text
 end
+-- Start editd (`$extra` adds env) and wait, bounded, for its ping; the
+-- previous instance must already be gone (stop_editd), so a pong is ours.
+fn start_editd($log, $extra)
+  $pid = spawn([$editd, "serve"],
+    {detach: true, clear_env: true, env: merge($env, $extra), stdout: {file: $tmp .. "/" .. $log}, stderr: "stdout"})
+  for each $i in range(1, 80)
+    $r = ed('edit.ping', {})
+    if $r.rc == 0 then return {pid: $pid, epoch: $r.reply.epoch} end
+    sleep(0.2)
+  end
+  raise("EDIT_BUS_TEST", "editd did not register (" .. $log .. ")")
+end
+-- Signal editd, wait (bounded) for the process to exit and for the broker to
+-- drop the `edit` registration; returns the seconds the exit took.
+fn stop_editd($pid, $signal)
+  $t0 = time()
+  check(kill($pid, $signal), "could not signal editd pid " .. to_string($pid))
+  $exited = false
+  for each $i in range(1, 110)
+    if not process_alive($pid) then $exited = true; break end
+    sleep(0.1)
+  end
+  check($exited, "editd still running 11 s after signal " .. to_string($signal))
+  $took = time() - $t0
+  $gone = false
+  for each $i in range(1, 50)
+    if ed('edit.ping', {}).rc != 0 then $gone = true; break end
+    sleep(0.1)
+  end
+  check($gone, "the broker still routes edit after editd exited")
+  return $took
+end
+fn rid_files($rid)
+  return glob($recdir .. "/" .. $rid .. ".*")
+end
+fn plain_log($log)
+  return re_replace(read_file($tmp .. "/" .. $log), "\x1b\\[[0-9;]*m", "")
+end
 
 try
   mkdir($tmp .. "/work")
@@ -107,25 +151,22 @@ try
   end
   check($obs_ready, "observer did not register")
 
-  $editd_pid = spawn([$editd, "serve"],
-    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/editd.log"}, stderr: "stdout"})
-  -- Harness startup wait (bounded), not a backend poll.
-  $ping = nil
-  for each $i in range(1, 80)
-    $r = ed('edit.ping', {})
-    if $r.rc == 0 then $ping = $r.reply; break end
-    sleep(0.2)
-  end
-  check($ping != nil, "editd did not register")
+  -- Harness startup wait (bounded, inside start_editd), not a backend poll.
+  $editd_pid = start_editd("editd.log", {}).pid
+  $ping = ok('edit.ping', {})
   check($ping.pong and $ping.service == "edit" and $ping.schema == "edit.v1", "ping shape: " .. json_encode($ping))
   $epoch = $ping.epoch
   $info = ok('edit.info', {})
-  check($info.volatile and $info.schema == "edit.v1" and $info.epoch == $epoch and $info.buffers == 0, "info: " .. json_encode($info))
+  check(not $info.volatile and $info.schema == "edit.v1" and $info.epoch == $epoch and $info.buffers == 0, "info: " .. json_encode($info))
+  check($info.recovery.enabled and $info.recovery.ok and not $info.recovery.degraded and $info.recovery.dir == $recdir,
+    "recovery info: " .. json_encode($info.recovery))
 
   -- open, reopen (same buffer, one holder key)
   $o = ok('edit.open path=$a.path', {path: $file})
   $b = $o.buffer
   check(ends_with($b, "_" .. $epoch) and $o.rev == 0 and $o.path == $file and not $o.reopened, "open: " .. json_encode($o))
+  check(re_match($o.recovery_id, "^[0-9a-f]{16}$") and not $o.recovered and $o.recovered_from == nil, "open recovery fields: " .. json_encode($o))
+  $rid = $o.recovery_id
   check($o.disk == "clean" and $o.eol == "lf" and $o.bytes == 33 and $o.lines == 4,"open file state: " .. json_encode($o))
   $o2 = ok('edit.open path=$a.path', {path: $file})
   check($o2.buffer == $b and $o2.reopened, "reopen: " .. json_encode($o2))
@@ -233,30 +274,104 @@ try
   -- disk stayed clean throughout (clean load, save, clean external reload): no transition, no disk event
   check(length(filter($events, fn($e) = $e.event == "disk")) == 0, "disk event without a transition: " .. json_encode($events))
 
-  -- SIGTERM with a dirty buffer: editd logs it (id, path, rev) and exits
-  -- within the 10 s budget (buffers are volatile; the log is the record).
+  -- The first buffer was saved durably and reloaded clean: no recovery files.
+  ok('edit.recovery.flush', {})
+  check(length(rid_files($rid)) == 0, "a clean closed buffer left recovery files: " .. json_encode(rid_files($rid)))
+
+  -- SIGTERM with a dirty buffer: editd syncs its recovery files, logs it
+  -- as kept (id, path, rev) and exits within the 10 s budget.
   $file2 = $tmp .. "/work/dirty.txt"
   write_file($file2, "keep\n")
-  $b2 = ok('edit.open path=$a.path', {path: $file2}).buffer
+  $o2 = ok('edit.open path=$a.path', {path: $file2})
+  $b2 = $o2.buffer
+  $rid2 = $o2.recovery_id
   check(ok('edit.insert buffer=$a.b at="end" text="unsaved\n"', {b: $b2}).dirty, "second buffer not dirty")
-  $t0 = time()
-  run_argv_must(["kill", "-TERM", "--", to_string($editd_pid)])
-  $exited = false
-  for each $i in range(1, 110)
-    if not process_alive($editd_pid) then $exited = true; break end
-    sleep(0.1)
-  end
-  $took = time() - $t0
-  check($exited, "editd still running 11 s after SIGTERM")
+  $took = stop_editd($editd_pid, 15)
   $editd_pid = nil
   check($took <= 10, "editd took " .. to_string($took) .. " s to exit after SIGTERM")
-  $log = re_replace(read_file($tmp .. "/editd.log"), "\x1b\\[[0-9;]*m", "")
-  check(contains($log, "discarding unsaved buffer " .. $b2 .. " (" .. $file2 .. ") at rev 1"), "SIGTERM did not log the dirty buffer: " .. $log)
-  check(not contains($log, "discarding unsaved buffer " .. $b .. " "), "SIGTERM logged a closed buffer")
-  print("PASS edit Bus surface: open/reopen, find+replace CAS, op_id dedup, stale_rev, per-origin undo, human: downgrade, apply, anchors, numbered get, history, dirty close, save bytes, external reload, contiguous edit.changed feed, SIGTERM dirty-buffer log + exit within budget")
+  $log = plain_log("editd.log")
+  check(contains($log, "keeping (in recovery files) unsaved buffer " .. $b2 .. " (" .. $file2 .. ") at rev 1"), "SIGTERM did not log the kept dirty buffer: " .. $log)
+  check(not contains($log, "unsaved buffer " .. $b .. " "), "SIGTERM logged a closed buffer")
+  check(exists($recdir .. "/" .. $rid2 .. ".meta.json"), "SIGTERM left no recovery meta for " .. $rid2 .. ": " .. json_encode(ls($recdir)))
+
+  -- Restart: the SIGTERM'd buffer comes back as rev 0 = its text, dirty,
+  -- recovered, under the same recovery_id, in a new epoch, with no holder.
+  $s2 = start_editd("editd-2.log", {})
+  $editd_pid = $s2.pid
+  check($s2.epoch != $epoch, "restart kept the epoch " .. $epoch)
+  $l3 = ok('edit.list', {})
+  check(length($l3.buffers) == 1, "restore list: " .. json_encode($l3))
+  $row = $l3.buffers[0]
+  check($row.recovery_id == $rid2 and $row.recovered and $row.dirty and $row.rev == 0 and $row.path == $file2 and length($row.holders) == 0,
+    "restored row: " .. json_encode($row))
+  $b3 = $row.buffer
+  check(text_of($b3) == "keep\nunsaved\n", "SIGTERM restore text: " .. json_encode(text_of($b3)))
+  -- (b) reopening the path attaches to the restored buffer and names its origin
+  $o3 = ok('edit.open path=$a.path', {path: $file2})
+  check($o3.buffer == $b3 and $o3.reopened and $o3.recovered and $o3.recovered_from.epoch == $epoch, "reopen restored: " .. json_encode($o3))
+
+  -- (a) an edit after the restore, flushed: synced, meta on disk
+  check(ok('edit.insert buffer=$a.b at="end" text="after restore\n" origin="agent:test-a"', {b: $b3}).rev == 1, "post-restore insert")
+  $fl = ok('edit.recovery.flush', {})
+  check($fl.synced, "flush: " .. json_encode($fl))
+  check(exists($recdir .. "/" .. $rid2 .. ".meta.json"), "no recovery meta after flush: " .. json_encode(ls($recdir)))
+  $pre_kill = text_of($b3)
+
+  -- (b)(c) SIGKILL (no shutdown path at all), restart: epoch differs, same
+  -- recovery_id, recovered + dirty + rev 0, and BOTH the pre-crash and the
+  -- post-restore edits are there (the restore started a new generation).
+  stop_editd($editd_pid, 9)
+  $editd_pid = nil
+  $s3 = start_editd("editd-3.log", {})
+  $editd_pid = $s3.pid
+  check($s3.epoch != $s2.epoch and $s3.epoch != $epoch, "SIGKILL restart epoch " .. $s3.epoch)
+  $l4 = ok('edit.list', {})
+  check(length($l4.buffers) == 1, "SIGKILL restore list: " .. json_encode($l4))
+  $row = $l4.buffers[0]
+  check($row.recovery_id == $rid2 and $row.recovered and $row.dirty and $row.rev == 0, "SIGKILL restored row: " .. json_encode($row))
+  $b4 = $row.buffer
+  check(text_of($b4) == $pre_kill and $pre_kill == "keep\nunsaved\nafter restore\n", "SIGKILL restore text: " .. json_encode(text_of($b4)))
+  $o4 = ok('edit.open path=$a.path', {path: $file2})
+  check($o4.buffer == $b4 and $o4.reopened and $o4.recovered_from.epoch == $s2.epoch, "reopen after SIGKILL: " .. json_encode($o4))
+
+  -- (d) the restored buffer is dirty: an unforced last-holder close refuses
+  refused('edit.close buffer=$a.b', {b: $b4}, "CONFLICT", "dirty")
+
+  -- (f) info reports the restore; recovery healthy, so not volatile
+  $info3 = ok('edit.info', {})
+  check($info3.recovery.restored >= 1 and $info3.recovery.ok and not $info3.volatile and $info3.dirty == 1, "info after restore: " .. json_encode($info3))
+
+  -- (e) a durable save cleans the buffer and, once flushed, its files
+  $sv2 = ok('edit.save buffer=$a.b', {b: $b4})
+  check($sv2.durable and $sv2.disk == "clean", "save restored: " .. json_encode($sv2))
+  check(read_file($file2) == $pre_kill, "saved restored bytes")
+  check(ok('edit.recovery.flush', {}).synced, "flush after save")
+  check(length(rid_files($rid2)) == 0, "durable save left recovery files: " .. json_encode(rid_files($rid2)))
+  check(not ok('edit.list', {}).buffers[0].dirty, "saved restored buffer still dirty")
+  stop_editd($editd_pid, 15)
+  $editd_pid = nil
+
+  -- Recovery off (COSMIX_EDIT_RECOVERY=0): E0's volatile daemon. Nothing is
+  -- restored, flush answers synced:false, and SIGTERM discards (logged).
+  $s4 = start_editd("editd-4.log", {COSMIX_EDIT_RECOVERY: "0"})
+  $editd_pid = $s4.pid
+  $info4 = ok('edit.info', {})
+  check($info4.volatile and not $info4.recovery.enabled and $info4.buffers == 0, "recovery-off info: " .. json_encode($info4))
+  $fl4 = ed('edit.recovery.flush', {})
+  check($fl4.rc == 0 and not $fl4.reply.synced, "recovery-off flush: " .. json_encode($fl4))
+  $file3 = $tmp .. "/work/volatile.txt"
+  write_file($file3, "v\n")
+  $b5 = ok('edit.open path=$a.path', {path: $file3}).buffer
+  check(ok('edit.insert buffer=$a.b at="end" text="lost\n"', {b: $b5}).dirty, "volatile buffer not dirty")
+  $took = stop_editd($editd_pid, 15)
+  $editd_pid = nil
+  check($took <= 10, "recovery-off editd took " .. to_string($took) .. " s to exit after SIGTERM")
+  $log4 = plain_log("editd-4.log")
+  check(contains($log4, "discarding unsaved buffer " .. $b5 .. " (" .. $file3 .. ") at rev 1"), "recovery-off SIGTERM did not log the discard: " .. $log4)
+  print("PASS edit Bus surface: open/reopen, find+replace CAS, op_id dedup, stale_rev, per-origin undo, human: downgrade, apply, anchors, numbered get, history, dirty close, save bytes, external reload, contiguous edit.changed feed; recovery: SIGTERM keep + restore, flush, SIGKILL restore across a generation switch, restored dirty refuses close, durable save cleans files, recovery-off volatile + discard")
 catch $err
-  for each $log in ["noded.log", "observer.log", "editd.log"]
-    if exists($tmp .. "/" .. $log) then print("--- " .. $log .. "\n" .. read_file($tmp .. "/" .. $log)) end
+  for each $log in glob($tmp .. "/*.log")
+    print("--- " .. $log .. "\n" .. read_file($log))
   end
   raise("EDIT_BUS_TEST", to_string($err))
 finally

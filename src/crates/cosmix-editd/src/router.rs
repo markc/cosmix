@@ -51,7 +51,7 @@
 //! monitor task when the actor task has really ended (its lease dropped),
 //! whether it stopped or panicked.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -72,7 +72,8 @@ use crate::events::{EventSink, Publisher};
 use crate::limits::{
     ACTOR_INBOX, LANGUAGE_MAX, MAX_BUFFERS, MAX_EVENT_BYTES, MAX_HOLDERS, MAX_REPLY_BYTES, MAX_TOTAL_BYTES, ROUTER_INBOX,
 };
-use crate::props::{BufferProps, EditProps, buffer_leaves};
+use crate::props::{BufferProps, EditProps, RecoveryLifecycle, buffer_leaves};
+use crate::recovery::{Recovery, RestoredBuffer};
 use crate::refusal::{RefusalExt, bad_args, busy, refusal, render, router_busy, unknown_buffer};
 use crate::watch::{DiskSignal, Watch};
 
@@ -176,6 +177,9 @@ pub enum RouterCmd {
     List { reply: oneshot::Sender<Reply> },
     Props { suffix: String, args: Option<Value>, reply: oneshot::Sender<Reply> },
     Dirty { reply: oneshot::Sender<Vec<DirtyBuffer>> },
+    /// Restored buffers (ced E1 plan §5.2): answered once every one has
+    /// reported `Loaded` or `Failed`, before the daemon serves anything.
+    Seed { buffers: Vec<RestoredBuffer>, reply: oneshot::Sender<()> },
 }
 
 /// A buffer with unsaved text (the SIGTERM log).
@@ -195,6 +199,8 @@ struct Entry {
     closing: bool,
     /// Scratch opens waiting for the actor's `Loaded`.
     pending: Vec<OpenWaiter>,
+    /// Restored at this start: where from (the `edit.open` reply).
+    recovered_from: Option<RecoveredFrom>,
 }
 
 type ActorTable = Arc<RwLock<HashMap<BufferId, mpsc::Sender<ActorMsg>>>>;
@@ -213,6 +219,9 @@ pub struct Router {
     watch: Watch,
     internal_tx: mpsc::UnboundedSender<ToRouter>,
     snapshot_seq: Arc<AtomicU64>,
+    recovery: Option<Arc<Recovery>>,
+    /// Seeded buffers not yet `Loaded`/`Failed`, and who waits for them.
+    seeding: Option<(HashSet<BufferId>, oneshot::Sender<()>)>,
 }
 
 impl Router {
@@ -259,6 +268,7 @@ impl Router {
                 let response = cosmix_props_core::bus::dispatch_props(&tree, &suffix, args.as_ref(), true);
                 let _ = reply.send((response.rc.clamp(0, 255) as u8, response.body));
             }
+            RouterCmd::Seed { buffers, reply } => self.seed(buffers, reply),
             RouterCmd::Dirty { reply } => {
                 let dirty = self
                     .entries
@@ -275,8 +285,17 @@ impl Router {
 
     fn internal(&mut self, msg: ToRouter) {
         match msg {
-            ToRouter::Loaded { bid, props, created } => self.loaded(bid, props, created),
-            ToRouter::Failed { bid, refusal } => self.failed(bid, refusal),
+            ToRouter::Loaded { bid, props, created } => {
+                self.loaded(bid.clone(), props, created);
+                self.seeded(&bid);
+            }
+            ToRouter::Failed { bid, refusal } => {
+                if self.seeding.as_ref().is_some_and(|(left, _)| left.contains(&bid)) {
+                    tracing::error!("cosmix-editd: restored buffer {bid} failed to start: {}", refusal.message);
+                }
+                self.failed(bid.clone(), refusal);
+                self.seeded(&bid);
+            }
             ToRouter::State { bid, props } => {
                 let Some(entry) = self.entries.get(&bid) else { return };
                 let old = entry.props.clone();
@@ -361,6 +380,50 @@ impl Router {
 
     /// Spawn an actor. A scratch open's waiter rides in the entry (it has no
     /// path slot to park in).
+    /// Spawn every restored buffer, path slots first taken as `Loading`.
+    fn seed(&mut self, buffers: Vec<RestoredBuffer>, reply: oneshot::Sender<()>) {
+        let mut left = HashSet::new();
+        for rb in buffers {
+            let size = rb.text.len() as u64;
+            let taken = rb.path.as_ref().is_some_and(|p| self.paths.contains_key(p));
+            if self.buffer_count >= MAX_BUFFERS || taken || !self.budget.try_lease(size) {
+                // Restore already applied these limits; the files stay for a later start.
+                tracing::error!("cosmix-editd: restored buffer {} ({}) not admitted", rb.bid, rb.rid);
+                continue;
+            }
+            let bid = rb.bid.clone();
+            if let Some(n) = bid.strip_prefix('b').and_then(|b| b.split_once('_')).and_then(|(n, _)| n.parse::<u64>().ok()) {
+                self.next_buffer = self.next_buffer.max(n);
+            }
+            self.buffer_count += 1;
+            let path = rb.path.clone();
+            if let Some(path) = &path {
+                self.paths.insert(path.clone(), PathSlot::Loading { bid: bid.clone(), waiters: vec![] });
+            }
+            let from = rb.from.clone();
+            self.spawn(bid.clone(), path, Init::Restored(Box::new(rb)), size, None);
+            if let Some(entry) = self.entries.get_mut(&bid) {
+                entry.recovered_from = Some(from);
+            }
+            left.insert(bid);
+        }
+        if left.is_empty() {
+            let _ = reply.send(());
+        } else {
+            self.seeding = Some((left, reply));
+        }
+    }
+
+    fn seeded(&mut self, bid: &str) {
+        let done = match &mut self.seeding {
+            Some((left, _)) => left.remove(bid) && left.is_empty(),
+            None => false,
+        };
+        if done && let Some((_, reply)) = self.seeding.take() {
+            let _ = reply.send(());
+        }
+    }
+
     fn spawn(&mut self, bid: BufferId, path: Option<PathBuf>, init: Init, leased: u64, first: Option<OpenWaiter>) {
         let (tx, rx) = mpsc::channel(ACTOR_INBOX);
         let signal = DiskSignal::new();
@@ -374,6 +437,7 @@ impl Router {
                 tx,
                 closing: false,
                 pending: first.into_iter().collect(),
+                recovered_from: None,
             },
         );
         let init = ActorInit {
@@ -387,6 +451,7 @@ impl Router {
             signal,
             snapshot_seq: self.snapshot_seq.clone(),
             rx,
+            recovery: self.recovery.clone(),
         };
         let handle = tokio::spawn(crate::actor::run(init));
         let internal = self.internal_tx.clone();
@@ -457,7 +522,8 @@ impl Router {
     }
 
     fn open_reply(&self, bid: &str, reopened: bool, created: bool) -> Result<String, Refusal> {
-        let p = self.entries.get(bid).and_then(|e| e.props.as_ref()).ok_or_else(|| unknown_buffer(bid))?;
+        let entry = self.entries.get(bid);
+        let p = entry.and_then(|e| e.props.as_ref()).ok_or_else(|| unknown_buffer(bid))?;
         Ok(json_of(&OpenReply {
             buffer: bid.to_string(),
             epoch: self.epoch.clone(),
@@ -473,6 +539,9 @@ impl Router {
             disk: p.disk,
             reopened,
             created,
+            recovery_id: p.recovery_id.clone(),
+            recovered: p.recovered,
+            recovered_from: entry.and_then(|e| e.recovered_from.clone()),
         }))
     }
 
@@ -667,7 +736,15 @@ impl Router {
             .iter()
             .filter_map(|(bid, e)| e.props.clone().map(|p| (bid.clone(), (p, e.holders.clone()))))
             .collect();
-        EditProps::build(&self.epoch, self.publisher.event_seq(), self.publisher.loss(), &buffers)
+        EditProps::build(&self.epoch, self.publisher.event_seq(), self.publisher.loss(), self.lifecycle(), &buffers)
+    }
+
+    fn recovery_info(&self) -> RecoveryInfo {
+        recovery_info(self.recovery.as_deref())
+    }
+
+    fn lifecycle(&self) -> RecoveryLifecycle {
+        lifecycle(self.recovery.as_deref())
     }
 
     fn info(&self) -> String {
@@ -697,11 +774,12 @@ impl Router {
             build_time: build.build_time.into(),
             buffers,
             dirty,
-            volatile: true,
+            volatile: self.lifecycle().volatile,
             mesh_open: self.mesh_open,
             event_seq: self.publisher.event_seq(),
             publisher_loss: self.publisher.loss(),
             limits: limits.as_object().cloned().unwrap_or_default(),
+            recovery: self.recovery_info(),
         })
     }
 
@@ -724,11 +802,59 @@ impl Router {
                     lines: p.lines,
                     bytes: p.bytes,
                     holders: e.holders.clone(),
+                    recovery_id: p.recovery_id.clone(),
+                    recovered: p.recovered,
                 })
             })
             .collect();
         json_of(&ListReply { epoch: self.epoch.clone(), buffers })
     }
+}
+
+/// `edit.info.recovery`: disabled reports `enabled:false` (E0 behaviour).
+fn recovery_info(recovery: Option<&Recovery>) -> RecoveryInfo {
+    match recovery {
+        Some(r) => r.info(),
+        None => RecoveryInfo { ok: true, sync_ms: crate::recovery::SYNC_MS, ..RecoveryInfo::default() },
+    }
+}
+
+/// `volatile = !(enabled && ok)` (plan §5.1), plus the lifecycle props.
+fn lifecycle(recovery: Option<&Recovery>) -> RecoveryLifecycle {
+    match recovery {
+        Some(r) => {
+            let ok = r.shared.healthy();
+            RecoveryLifecycle {
+                volatile: !ok,
+                ok,
+                unsynced: r.shared.stats.unsynced.load(Ordering::Acquire),
+            }
+        }
+        None => RecoveryLifecycle { volatile: true, ok: false, unsynced: 0 },
+    }
+}
+
+/// `lifecycle.recovery_ok` / `lifecycle.volatile` follow recovery health: a
+/// `props.changed` on each transition, woken by the writer and actors ringing
+/// `health` (event-driven, no clock).
+fn spawn_health_props(recovery: Arc<Recovery>, publisher: Arc<Publisher>) {
+    tokio::spawn(async move {
+        let mut last = lifecycle(Some(&recovery));
+        loop {
+            recovery.shared.health.notified().await;
+            let now = lifecycle(Some(&recovery));
+            for (leaf, old, new) in
+                [("lifecycle.recovery_ok", last.ok, now.ok), ("lifecycle.volatile", last.volatile, now.volatile)]
+            {
+                if old != new
+                    && let Ok(path) = cosmix_props_core::PropPath::new(leaf)
+                {
+                    publisher.props_changed(None, &path, &old.into(), &new.into());
+                }
+            }
+            last = now;
+        }
+    });
 }
 
 fn too_many_buffers() -> Refusal {
@@ -773,6 +899,7 @@ pub struct Editd {
     actors: ActorTable,
     publisher: Arc<Publisher>,
     budget: Arc<Budget>,
+    recovery: Option<Arc<Recovery>>,
 }
 
 fn ready(reply: Reply) -> ReplyFuture {
@@ -1005,6 +1132,34 @@ impl Editd {
     /// As [`start`](Self::start), with a caller-built publisher (tests shrink
     /// its queue budget).
     pub fn start_with(config: Config, publisher: Option<Arc<Publisher>>, sink: Arc<dyn EventSink>) -> Arc<Editd> {
+        Self::start_inner(config, publisher, sink, None)
+    }
+
+    /// Start with recovery files (ced E1 plan §5): `restored` (from
+    /// [`crate::recovery::Recovery::start`], run before Bus registration) is
+    /// seeded first, and this returns only once every restored buffer is
+    /// live — nothing is served against a half-restored table.
+    pub async fn start_recovering(
+        config: Config,
+        recovery: Arc<Recovery>,
+        restored: Vec<RestoredBuffer>,
+        sink: Arc<dyn EventSink>,
+    ) -> Arc<Editd> {
+        let editd = Self::start_inner(config, None, sink, Some(recovery.clone()));
+        spawn_health_props(recovery, editd.publisher.clone());
+        let (tx, rx) = oneshot::channel();
+        if editd.router_tx.send(RouterCmd::Seed { buffers: restored, reply: tx }).await.is_ok() {
+            let _ = rx.await;
+        }
+        editd
+    }
+
+    fn start_inner(
+        config: Config,
+        publisher: Option<Arc<Publisher>>,
+        sink: Arc<dyn EventSink>,
+        recovery: Option<Arc<Recovery>>,
+    ) -> Arc<Editd> {
         let publisher = publisher.unwrap_or_else(|| Publisher::new(&config.epoch));
         tokio::spawn(publisher.clone().run(sink));
         let budget = Arc::new(Budget::new(config.budget_cap));
@@ -1024,9 +1179,24 @@ impl Editd {
             watch: Watch::start(),
             internal_tx,
             snapshot_seq: Arc::new(AtomicU64::new(0)),
+            recovery: recovery.clone(),
+            seeding: None,
         };
         tokio::spawn(router.run(router_rx, internal_rx));
-        Arc::new(Editd { epoch: config.epoch, mesh_open: config.mesh_open, router_tx, actors, publisher, budget })
+        Arc::new(Editd { epoch: config.epoch, mesh_open: config.mesh_open, router_tx, actors, publisher, budget, recovery })
+    }
+
+    /// The recovery handle (`None`: disabled).
+    pub fn recovery(&self) -> Option<&Arc<Recovery>> {
+        self.recovery.as_ref()
+    }
+
+    /// `edit.recovery.flush` (also the SIGTERM drain): `None` when disabled.
+    pub async fn recovery_flush(&self) -> Option<RecoveryFlushReply> {
+        match &self.recovery {
+            Some(r) => Some(r.flush().await),
+            None => None,
+        }
     }
 
     pub fn epoch(&self) -> &str {
@@ -1092,6 +1262,11 @@ impl Editd {
                 }),
             )),
             "edit.info" => self.to_router(|reply| RouterCmd::Info { reply }),
+            // ced E1 plan §5.1. Disabled: nothing is durable, so `synced:false`.
+            "edit.recovery.flush" => match self.recovery.clone() {
+                Some(recovery) => Box::pin(async move { (0, json_of(&recovery.flush().await)) }),
+                None => ready((0, json_of(&RecoveryFlushReply { synced: false, records: 0, bytes: 0, repairs: 0 }))),
+            },
             "edit.list" => self.to_router(|reply| RouterCmd::List { reply }),
             "edit.props.get" | "edit.props.list" | "edit.props.describe" => {
                 let suffix = verb.trim_start_matches("edit.props.").to_string();
@@ -1284,6 +1459,8 @@ mod tests {
             watch: Watch::start(),
             internal_tx,
             snapshot_seq: Arc::new(AtomicU64::new(0)),
+            recovery: None,
+            seeding: None,
         };
         (router, internal_rx)
     }
@@ -1305,6 +1482,7 @@ mod tests {
                 tx,
                 closing: false,
                 pending: vec![],
+                recovered_from: None,
             },
         );
         router.paths.insert(old.clone(), PathSlot::Bound { bid: bid.clone() });
@@ -1378,6 +1556,8 @@ mod tests {
             lines: usize::MAX,
             bytes: usize::MAX,
             origin_last: Some(format!("agent:{}", "l".repeat(64))),
+            recovery_id: "f".repeat(16),
+            recovered: true,
         };
         let buffers: Vec<BufferSummary> = (0..MAX_BUFFERS)
             .map(|i| BufferSummary {
@@ -1393,13 +1573,15 @@ mod tests {
                 lines: props.lines,
                 bytes: props.bytes,
                 holders: holders.clone(),
+                recovery_id: props.recovery_id.clone(),
+                recovered: props.recovered,
             })
             .collect();
         let list = json_of(&ListReply { epoch: "00000000".into(), buffers: buffers.clone() });
         assert!(list.len() < MAX_REPLY_BYTES, "worst-case edit.list is {} bytes", list.len());
         let tree: BTreeMap<BufferId, (BufferProps, Vec<String>)> =
             buffers.iter().map(|b| (b.buffer.clone(), (props.clone(), holders.clone()))).collect();
-        let tree = EditProps::build("00000000", u64::MAX, u64::MAX, &tree);
+        let tree = EditProps::build("00000000", u64::MAX, u64::MAX, RecoveryLifecycle::default(), &tree);
         let got = cosmix_props_core::bus::dispatch_props(&tree, "get", None, true);
         assert!(got.body.len() < MAX_REPLY_BYTES, "worst-case props.get is {} bytes", got.body.len());
         // The largest single props leaf (holders) is far under the event budget.

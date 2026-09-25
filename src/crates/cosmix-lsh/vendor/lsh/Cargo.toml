@@ -1,0 +1,17 @@
+# Vendored msedit `lsh` (microsoft/edit@826b4c0, MIT) — see ../README.md.
+# Rewritten manifest: upstream inherits from the msedit workspace. The library
+# keeps its upstream name `lsh`; the package name keeps it distinct.
+[package]
+name = "cosmix-msedit-lsh"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Vendored msedit lsh compiler + runtime for cosmix-lsh. Not for direct use."
+
+[lib]
+name = "lsh"
+path = "src/lib.rs"
+
+[dependencies]
+stdext = { package = "cosmix-msedit-stdext", path = "../stdext" }

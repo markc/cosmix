@@ -40,7 +40,8 @@ Pick any component in the sidebar for its own page.
 - **[powerd](powerd.md)** — event-driven UPower battery and power-source state.
 - **[mprisd](mprisd.md)** — event-driven MPRIS2 media-player state and delegated controls.
 - **[dbusd](dbusd.md)** — the D-Bus boundary daemon; per-domain adapters translate D-Bus to Bus verbs/props in both directions.
-- **[edit](edit.md)** — the `edit` Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo); the core of ced.
+- **[edit](edit.md)** — the `edit` Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo, crash-recovery files); the core of ced.
+- **[ced](ced.md)** — the CosMix Editor: an iced desktop editor over `edit` with live agent edits, per-origin undo, lsh/Mix highlighting and the `ced.*` Bus verbs.
 
 ### Bridge & libraries
 

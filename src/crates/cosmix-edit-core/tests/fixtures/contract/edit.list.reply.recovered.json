@@ -1,0 +1,21 @@
+{
+  "buffers": [
+    {
+      "buffer": "b3_9f2c41a7",
+      "bytes": 2310,
+      "dirty": true,
+      "disk": "clean",
+      "holders": [],
+      "language": "mix",
+      "lines": 88,
+      "name": "x.mix",
+      "opened_as": "~/x.mix",
+      "path": "/home/user/x.mix",
+      "recovered": true,
+      "recovery_id": "5f0c2a9e1b7d4c33",
+      "rev": 0,
+      "saved_rev": null
+    }
+  ],
+  "epoch": "9f2c41a7"
+}

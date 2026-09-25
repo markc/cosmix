@@ -52,6 +52,7 @@ use crate::events::Publisher;
 use crate::files::{self, DiskIdentity, Expect, Stat};
 use crate::limits::{DEDUP_ENTRIES, MAX_REPLY_BYTES, MAX_SNAPSHOTS_PER_BUFFER};
 use crate::props::BufferProps;
+use crate::recovery::{self, ActorRec, BaseIdentity, RecLink, RecState, Recovery, RecoveryMeta, RecoveryMsg, RestoredBuffer};
 use crate::refusal::{RefusalExt, bad_args, from_core, refusal, render};
 use crate::router::{Budget, Reply, ToRouter};
 use crate::watch::DiskSignal;
@@ -166,6 +167,8 @@ pub enum ActorMsg {
 pub enum Init {
     Scratch { language: Option<String> },
     Load { path: PathBuf, opened_as: String, create: bool, language: Option<String> },
+    /// Brought back from recovery files at start (ced E1 plan §5.2).
+    Restored(Box<RestoredBuffer>),
 }
 
 /// Everything an actor starts with.
@@ -181,6 +184,8 @@ pub struct ActorInit {
     pub signal: Arc<DiskSignal>,
     pub snapshot_seq: Arc<AtomicU64>,
     pub rx: mpsc::Receiver<ActorMsg>,
+    /// Recovery files (`None`: disabled, E0 behaviour).
+    pub recovery: Option<Arc<Recovery>>,
 }
 
 /// The actor's byte lease; returned on drop (also on a panic unwind).
@@ -250,6 +255,16 @@ struct Actor {
     snapshot_seq: Arc<AtomicU64>,
     origin_last: Option<String>,
     pushed: Option<BufferProps>,
+    /// 16 lowercase hex, fixed at creation; carried across restarts by the
+    /// recovery files (ced E1 plan §5.1).
+    recovery_id: String,
+    /// Restored from recovery files: dirty even at rev 0 with no saved rev
+    /// (ced E1 plan §5.2(3)); cleared by a durable save or an explicit discard.
+    restored_dirty: bool,
+    /// Restored from recovery files at this daemon start (`recovered`).
+    recovered: bool,
+    /// Recovery-file state (ced E1 plan §5.1); `None` when disabled.
+    rec: Option<ActorRec>,
 }
 
 fn now_ms() -> u64 {
@@ -279,6 +294,8 @@ fn escaped_len(c: char) -> usize {
 
 /// Bytes of fixed JSON around a `get` page (fields other than the text).
 const GET_OVERHEAD: usize = 4096;
+/// The smallest page `edit.get {max_bytes}` asks for (smaller is clamped up).
+const MIN_PAGE_BYTES: usize = 4096;
 /// Encoded overhead of one numbered line object.
 const NUMBERED_LINE_OVERHEAD: usize = 48;
 /// Reply bytes kept back from `find`'s match budget for the envelope.
@@ -437,8 +454,16 @@ fn str_range(s: &str, r: &RangeSpec) -> Result<std::ops::Range<usize>, Refusal> 
 }
 
 /// One `get` page over `src` (plan §4.4): encoded-budgeted, always progressing.
-fn page(src: &Src, range: std::ops::Range<usize>, numbered: bool) -> (Option<String>, Option<Vec<NumberedLine>>, Point, Point, bool) {
-    let budget = MAX_REPLY_BYTES - GET_OVERHEAD;
+/// `max_bytes` (the request's `max_bytes`) lowers the page budget; values
+/// under [`MIN_PAGE_BYTES`] are raised to it.
+fn page(
+    src: &Src,
+    range: std::ops::Range<usize>,
+    numbered: bool,
+    max_bytes: Option<usize>,
+) -> (Option<String>, Option<Vec<NumberedLine>>, Point, Point, bool) {
+    let full = MAX_REPLY_BYTES - GET_OVERHEAD;
+    let budget = max_bytes.map_or(full, |m| m.max(MIN_PAGE_BYTES).min(full));
     let start = range.start;
     let raw_end = src.floor(range.end.min(start.saturating_add(budget)));
     let text = src.read(start..raw_end.max(start));
@@ -492,8 +517,10 @@ fn page(src: &Src, range: std::ops::Range<usize>, numbered: bool) -> (Option<Str
 
 impl Actor {
     fn dirty(&self) -> bool {
-        // A never-saved buffer at rev 0 is empty and unchanged: not dirty.
-        self.buffer.is_dirty() && !(self.buffer.saved_rev().is_none() && self.buffer.rev() == 0)
+        // A never-saved buffer at rev 0 is empty and unchanged: not dirty —
+        // unless it was restored from recovery files (ced E1 plan §5.2(3)).
+        self.buffer.is_dirty()
+            && !(self.buffer.saved_rev().is_none() && self.buffer.rev() == 0 && !self.restored_dirty)
     }
 
     fn name(&self) -> Option<String> {
@@ -515,6 +542,8 @@ impl Actor {
             lines: self.buffer.line_count(),
             bytes: self.buffer.len(),
             origin_last: self.origin_last.clone(),
+            recovery_id: self.recovery_id.clone(),
+            recovered: self.recovered,
         }
     }
 
@@ -528,7 +557,8 @@ impl Actor {
     }
 
     fn footprint(&self) -> u64 {
-        let snaps: usize = self.snapshots.iter().map(|s| s.text.len()).sum();
+        let snaps: usize = self.snapshots.iter().map(|s| s.text.len()).sum::<usize>()
+            + self.rec.as_ref().and_then(|r| r.switch_text.as_ref()).map_or(0, |t| t.len());
         (self.buffer.len() + self.buffer.log_text_bytes() + snaps) as u64
     }
 
@@ -623,6 +653,8 @@ impl Actor {
     /// Publish the `edit` event for `applied` (or `resync oversized` when its
     /// inserted text alone would exceed the event budget — never copied).
     fn publish_edit(&mut self, applied: &Applied) {
+        // Every applied text entry passes here: the recovery record first.
+        self.rec_record(applied);
         let (origin, lane) = self.entry_lane_origin(applied.rev);
         self.origin_last = Some(origin.clone());
         let (kind, of) = kind_w(&applied.kind);
@@ -854,7 +886,7 @@ impl Actor {
                 Src::Live(b) => b.resolve_range(&spec).map_err(|e| self.core(e))?,
                 Src::Snap(s) => str_range(s, &spec).map_err(|e| self.with_ctx(e))?,
             };
-            let (text, lines, start, end, truncated) = heavy(|| page(&src, range, r.numbered));
+            let (text, lines, start, end, truncated) = heavy(|| page(&src, range, r.numbered, r.max_bytes));
             (rev, text, lines, start, end, truncated, totals.0, totals.1)
         };
         let next = truncated.then_some(end.offset);
@@ -1113,6 +1145,11 @@ impl Actor {
         self.base = Some(saved.base);
         self.observed = Some(saved.base.stat());
         self.buffer.mark_saved();
+        if saved.durable {
+            // Clean through a durable save: the recovery files go. After a
+            // `durable:false` save they stay (the meta change re-switches).
+            self.rec_discard();
+        }
         self.set_disk(if self.signal.is_unwatched() { DiskState::Unwatched } else { DiskState::Clean });
         self.push_state();
         Ok(json(&SaveReply {
@@ -1126,6 +1163,190 @@ impl Actor {
             durable: saved.durable,
             warning: saved.warning,
         }))
+    }
+
+    // ── recovery hooks (ced E1 plan §5.1; the boundary rules are in `recovery`) ──
+
+    /// The meta a Switch would carry now.
+    fn rec_meta(&self, generation: u64) -> Option<RecoveryMeta> {
+        let rec = self.rec.as_ref()?;
+        Some(RecoveryMeta {
+            format: recovery::META_FORMAT.into(),
+            rid: self.recovery_id.clone(),
+            generation,
+            path: self.path.as_ref().map(|p| p.display().to_string()),
+            opened_as: self.opened_as.clone(),
+            language: self.language.clone(),
+            eol: self.meta.eol,
+            bom: self.meta.bom,
+            base: self.base.map(BaseIdentity::from),
+            epoch: self.epoch.clone(),
+            buffer: self.bid.clone(),
+            created_ms: rec.created_ms,
+        })
+    }
+
+    /// One applied text entry: an `Append` to the current generation — or,
+    /// when a Switch is wanted (overflow, failure, compaction), none: that
+    /// Switch's snapshot will contain it. An entry on a buffer with no files
+    /// is covered by the clean→dirty Switch `rec_settle` issues.
+    fn rec_record(&mut self, applied: &Applied) {
+        let Some(rec) = self.rec.as_mut() else { return };
+        if !rec.active {
+            return;
+        }
+        if rec.st.needs_switch || rec.held {
+            if rec.st.outstanding_switch.is_none() {
+                self.rec_switch();
+            }
+            return;
+        }
+        let cost = recovery::append_cost(&applied.edits);
+        if rec.recovery.shared.budget.try_reserve(cost) {
+            let msg = RecoveryMsg::Append {
+                rid: rec.rid.clone(),
+                generation: rec.st.generation,
+                rev: applied.rev,
+                edits: applied.edits.clone(),
+            };
+            if !rec.recovery.send(msg) {
+                rec.recovery.shared.budget.release(cost);
+            }
+        } else {
+            // Overflow: the record is not sent; a Switch at this rev covers it.
+            rec.set_overflow(true);
+            self.rec_request_switch();
+        }
+    }
+
+    fn rec_request_switch(&mut self) {
+        let Some(rec) = self.rec.as_mut() else { return };
+        rec.st.needs_switch = true;
+        if rec.st.outstanding_switch.is_none() {
+            self.rec_switch();
+        }
+    }
+
+    /// Switch to generation g+1 at the current rev, in this one actor step.
+    fn rec_switch(&mut self) {
+        let Some(meta) = self.rec_meta(self.rec.as_ref().map_or(0, |r| r.st.generation + 1)) else { return };
+        // The snapshot shares the byte budget (like a `get` snapshot).
+        let size = self.buffer.len() as u64;
+        if !self.lease.take(size) {
+            if let Some(rec) = self.rec.as_mut() {
+                tracing::warn!("cosmix-editd: {}: no budget for a recovery snapshot; retrying at the next edit", self.bid);
+                rec.st.needs_switch = true;
+                rec.held = true;
+                rec.set_overflow(true);
+            }
+            return;
+        }
+        let text = heavy(|| self.buffer.snapshot());
+        let rev = self.buffer.rev();
+        let Some(rec) = self.rec.as_mut() else { return };
+        let generation = meta.generation;
+        if rec.is_repair() {
+            rec.recovery.shared.stats.repairs.fetch_add(1, Ordering::AcqRel);
+        }
+        rec.st = RecState { generation, outstanding_switch: Some(generation), needs_switch: false };
+        rec.held = false;
+        if rec.overflow() {
+            rec.repair_gen = Some(generation);
+        }
+        let mut written = meta.clone();
+        written.generation = 0;
+        rec.written = Some(written);
+        rec.switch_text = Some(text.clone());
+        let sent = rec.recovery.send(RecoveryMsg::Switch { rid: rec.rid.clone(), generation, rev, text, meta: Box::new(meta) });
+        if !sent {
+            // The writer is gone: nothing will acknowledge this switch.
+            rec.switch_text = None;
+            rec.st.outstanding_switch = None;
+            rec.st.needs_switch = true;
+            rec.held = true;
+        }
+        self.reconcile();
+    }
+
+    /// After every actor step: a dirty buffer without files gets its first
+    /// generation; files whose meta went stale (path, base, eol, …) re-switch.
+    fn rec_settle(&mut self) {
+        let Some(rec) = self.rec.as_ref() else { return };
+        if !rec.active {
+            if self.dirty()
+                && let Some(rec) = self.rec.as_mut()
+            {
+                rec.active = true;
+                self.rec_request_switch();
+            }
+            return;
+        }
+        if !rec.st.needs_switch && rec.written != self.rec_meta(0) {
+            self.rec_request_switch();
+        }
+    }
+
+    /// The writer rang (SwitchDone, a failed switch, a switch request, a
+    /// flush token to place) — or any step ended: settle the boundary state.
+    fn rec_wake(&mut self) {
+        let Some(rec) = self.rec.as_mut() else { return };
+        let asked = rec.link.signal.take_switch_request();
+        let mut released = false;
+        if let Some(g) = rec.st.outstanding_switch {
+            if rec.link.signal.durable_gen() >= g {
+                rec.st.outstanding_switch = None;
+                rec.switch_text = None;
+                released = true;
+                if rec.repair_gen.is_some_and(|r| r <= g) {
+                    rec.repair_gen = None;
+                    rec.set_overflow(false);
+                }
+            } else if rec.link.failed_gen() >= g {
+                // Retried at the next text entry, not in a loop against a failing disk.
+                rec.st.outstanding_switch = None;
+                rec.switch_text = None;
+                released = true;
+                rec.held = true;
+                rec.st.needs_switch = true;
+            }
+        }
+        if !rec.active {
+            rec.st.needs_switch = false;
+            rec.held = false;
+            rec.set_overflow(false);
+        } else if asked {
+            rec.st.needs_switch = true;
+        }
+        let switch = rec.active && rec.st.needs_switch && !rec.held && rec.st.outstanding_switch.is_none();
+        if released {
+            self.reconcile();
+        }
+        if switch {
+            self.rec_switch();
+        }
+        // Flush tokens go in once nothing is owed ahead of them (a held
+        // failure owes nothing more until the next edit; the flush reports it).
+        let Some(rec) = self.rec.as_ref() else { return };
+        if rec.st.outstanding_switch.is_none() && (!rec.st.needs_switch || rec.held) {
+            for reply in rec.link.take_flushes() {
+                rec.recovery.send(RecoveryMsg::Flush { reply });
+            }
+        }
+    }
+
+    /// Clean through a durable save, a clean reload or an explicit discard:
+    /// the recovery files go (meta first; the writer's order).
+    fn rec_discard(&mut self) {
+        self.restored_dirty = false;
+        let Some(rec) = self.rec.as_mut() else { return };
+        if rec.active {
+            rec.recovery.send(RecoveryMsg::Discard { rid: rec.rid.clone() });
+        }
+        rec.active = false;
+        rec.held = false;
+        rec.st.needs_switch = false;
+        rec.written = None;
+        rec.set_overflow(false);
     }
 
     /// Read the bound file and decode it (BOM, UTF-8, limits) off the runtime.
@@ -1198,6 +1419,7 @@ impl Actor {
         self.observed = Some(id.stat());
         self.meta = meta;
         self.buffer.mark_saved();
+        self.rec_discard(); // a clean reload
         let body = match applied {
             Some(applied) => {
                 self.publish_edit(&applied);
@@ -1256,6 +1478,7 @@ impl Actor {
                                             self.publish_edit(&applied);
                                         }
                                         self.buffer.mark_saved();
+                                        self.rec_discard(); // a clean (external) reload
                                         self.base = Some(id);
                                         self.meta = meta;
                                         disk = DiskState::Clean;
@@ -1355,6 +1578,26 @@ async fn init(a: &ActorInit) -> Result<(Actor, bool), Refusal> {
                 Err(e) => return Err(e),
             }
         }
+        Init::Restored(r) => {
+            // `from_bytes` strips ONE leading BOM: a text that itself starts
+            // with U+FEFF gets one more, so it comes back verbatim.
+            let mut bytes = Vec::with_capacity(r.text.len() + 3);
+            if r.text.starts_with('\u{FEFF}') {
+                bytes.extend_from_slice(b"\xEF\xBB\xBF");
+            }
+            bytes.extend_from_slice(r.text.as_bytes());
+            let (mut buffer, _) = Buffer::from_bytes(&bytes).map_err(|e| from_core(e, None))?;
+            drop(bytes);
+            if r.clean {
+                buffer.mark_saved();
+            }
+            let meta = FileMeta { bom: r.bom, eol: r.eol };
+            (buffer, meta, r.path.clone(), r.opened_as.clone(), r.base, r.disk, false, r.language.clone())
+        }
+    };
+    let restored = match &a.init {
+        Init::Restored(r) => Some(r),
+        _ => None,
     };
     let mut actor = Actor {
         bid: a.bid.clone(),
@@ -1376,7 +1619,29 @@ async fn init(a: &ActorInit) -> Result<(Actor, bool), Refusal> {
         snapshot_seq: a.snapshot_seq.clone(),
         origin_last: None,
         pushed: None,
+        recovery_id: restored.map(|r| r.rid.clone()).unwrap_or_else(|| format!("{:016x}", rand::random::<u64>())),
+        restored_dirty: restored.is_some_and(|r| !r.clean),
+        recovered: restored.is_some(),
+        rec: None,
     };
+    if let Some(recovery) = &a.recovery {
+        let (st, active, created_ms) = match restored {
+            Some(r) => (
+                RecState { generation: r.generation, outstanding_switch: None, needs_switch: r.needs_switch },
+                !r.clean,
+                r.created_ms,
+            ),
+            None => (RecState::default(), false, recovery::created_now()),
+        };
+        actor.rec = Some(ActorRec::new(recovery.clone(), &actor.recovery_id, created_ms, st, active));
+        if active {
+            // Restore just wrote this meta (no redundant re-switch).
+            let written = actor.rec_meta(0);
+            if let Some(rec) = actor.rec.as_mut() {
+                rec.written = written;
+            }
+        }
+    }
     // Admit what was actually loaded, not what `stat` saw at open: a file
     // that grew in between tops the lease up or the open is refused (the
     // actor drops, returning everything it held).
@@ -1402,6 +1667,10 @@ pub async fn run(mut a: ActorInit) {
     actor.pushed = Some(props.clone());
     let _ = a.to_router.send(ToRouter::Loaded { bid: a.bid.clone(), props, created });
     let signal = a.signal.clone();
+    let link = actor.rec.as_ref().map(|r| r.link.clone());
+    // A restored buffer whose restore Switch failed switches now.
+    actor.rec_settle();
+    actor.rec_wake();
     loop {
         tokio::select! {
             biased;
@@ -1425,16 +1694,31 @@ pub async fn run(mut a: ActorInit) {
                         .rev(actor.buffer.rev());
                         let _ = a.to_router.send(ToRouter::CloseDecided { bid: actor.bid.clone(), result: Err(r), reply });
                     } else {
+                        if force {
+                            // An explicit discard (an ordinary close keeps the files).
+                            actor.rec_discard();
+                        }
                         let _ = a.to_router.send(ToRouter::CloseDecided { bid: actor.bid.clone(), result: Ok(()), reply });
                         break;
                     }
                 }
             },
             _ = signal.notify.notified() => {}
+            _ = rec_notified(link.as_deref()) => {}
         }
         if signal.take() {
             actor.recheck().await;
         }
+        actor.rec_settle();
+        actor.rec_wake();
+    }
+}
+
+/// The writer's ring for this actor (never, with recovery disabled).
+async fn rec_notified(link: Option<&RecLink>) {
+    match link {
+        Some(link) => link.signal.notify.notified().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1500,6 +1784,7 @@ mod tests {
             signal: DiskSignal::new(),
             snapshot_seq: Arc::new(AtomicU64::new(0)),
             rx,
+            recovery: None,
         }
     }
 
@@ -1544,7 +1829,7 @@ mod tests {
             str_pos(s, &PosSpec::LineCol { line: 9, col: None }).unwrap_err().reason.as_deref(),
             Some("line_out_of_range")
         );
-        let (_, lines, start, end, truncated) = page(&Src::Snap(s), 0..s.len(), true);
+        let (_, lines, start, end, truncated) = page(&Src::Snap(s), 0..s.len(), true, None);
         let lines = lines.unwrap();
         assert_eq!(lines.len(), 3, "two lines plus the empty last line");
         assert_eq!(lines[0].text, "ab");
@@ -1555,13 +1840,13 @@ mod tests {
     fn long_line_pages_with_cont() {
         let line = "é".repeat(MAX_REPLY_BYTES); // 2 bytes each: twice the budget
         let s = format!("{line}\nz");
-        let (_, lines, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), true);
+        let (_, lines, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), true, None);
         assert!(truncated);
         let first = lines.unwrap();
         assert_eq!(first.len(), 1);
         assert!(!first[0].cont);
         assert!(s.is_char_boundary(end.offset));
-        let (_, lines, start, _, _) = page(&Src::Snap(&s), end.offset..s.len(), true);
+        let (_, lines, start, _, _) = page(&Src::Snap(&s), end.offset..s.len(), true, None);
         let second = lines.unwrap();
         assert!(second[0].cont, "a mid-line page continues the line");
         assert_eq!(second[0].line, 1);
@@ -1571,9 +1856,23 @@ mod tests {
     #[test]
     fn control_characters_count_their_escapes() {
         let s = "\u{1}".repeat(MAX_REPLY_BYTES / 4);
-        let (text, _, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), false);
+        let (text, _, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), false, None);
         let encoded = serde_json::to_string(&text.unwrap()).unwrap().len();
         assert!(encoded <= MAX_REPLY_BYTES - GET_OVERHEAD + 2);
         assert!(truncated && end.offset < s.len());
+    }
+
+    #[test]
+    fn max_bytes_lowers_the_page_budget_at_a_char_boundary() {
+        let s = "é".repeat(1024 * 1024); // 2 MiB, 2 bytes per char
+        let (text, _, _, end, truncated) = page(&Src::Snap(&s), 0..s.len(), false, Some(1024 * 1024 + 1));
+        let text = text.unwrap();
+        assert!(truncated && text.len() <= 1024 * 1024 + 1 && text.len() > 1024 * 1024 - 2);
+        assert!(s.is_char_boundary(end.offset), "cut inside a char");
+        // Silly values are clamped up to MIN_PAGE_BYTES; absent = the default.
+        let (text, ..) = page(&Src::Snap(&s), 0..s.len(), false, Some(1));
+        assert_eq!(text.unwrap().len(), MIN_PAGE_BYTES);
+        let (text, ..) = page(&Src::Snap(&s), 0..s.len(), false, None);
+        assert!(text.unwrap().len() > 2 * 1024 * 1024 - GET_OVERHEAD - 2);
     }
 }

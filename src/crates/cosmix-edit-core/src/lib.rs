@@ -23,6 +23,7 @@ pub mod ot;
 pub mod pos;
 pub mod search;
 pub mod text;
+pub mod view;
 pub mod wire;
 
 mod vendor;

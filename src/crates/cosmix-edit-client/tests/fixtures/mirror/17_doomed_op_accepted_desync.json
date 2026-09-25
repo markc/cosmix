@@ -1,0 +1,19 @@
+{
+  "name": "a Doomed op accepted by the server is a desync",
+  "about": "Should never happen (§7.2 P3 asserts it cannot with a correct server). The fake is forced to apply our replace without its base_rev, after the agent's overlapping edit; the mirror, having reverted L1 on the agent's event, gets rc 0: snapshot, view text kept as a detached copy.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[2, 4, "XY"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.replace", "args": {"buffer": "b1_0000e1e1", "range": [3, 5], "text": "Q", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.replace", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "range": [2, 4], "text": "XY", "base_rev": 0, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "server_args": {"buffer": "b1_0000e1e1", "range": [2, 4], "text": "XY", "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_reply": "L1"},
+    {"deliver_event": {"seq": 2}}
+  ],
+  "expect": {"server_text": "heXY world\n", "server_rev": 2, "converged": true, "conflicts": 1, "detached": true}
+}

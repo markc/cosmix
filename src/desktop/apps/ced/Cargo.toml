@@ -1,0 +1,49 @@
+[package]
+name = "cosmix-ced"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "ced, the CosMix Editor: an iced desktop editor over the `edit` Bus service (local echo, per-origin undo, live agent edits, lsh/Mix highlighting)"
+
+[lib]
+name = "cosmix_ced"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ced"
+path = "src/main.rs"
+
+# The Bus name `ced` and the `ced.*` verb namespace belong to this app
+# (ced E1 plan §4.8).
+[package.metadata.cosmix]
+kind = "app"
+component = "ced"
+display = "CosMix Editor"
+engine = "iced"
+
+[dependencies]
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "crisp", "thread-pool", "wayland", "tiny-skia"] }
+cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets", features = ["tiny-skia"] }
+cosmix-design = { path = "../../crates/cosmix-design" }
+cosmix-edit-client = { path = "../../../crates/cosmix-edit-client" }
+cosmix-edit-core = { path = "../../../crates/cosmix-edit-core" }
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus" }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+rand = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

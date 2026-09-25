@@ -1,0 +1,341 @@
+-- End-to-end (ced E1 plan §7.3): a private noded, the real cosmix-editd with
+-- recovery files in the temp dir, and `ced --headless --service ced`, driven
+-- by one-shot Mix clients. Agents' edits reach ced's mirror; concurrent
+-- ced.type + agent inserts converge; ced.action edit.undo undoes only the
+-- caller's lane (agent:ced.anon) and answers from the op's outcome (an empty
+-- lane refuses nothing_to_undo); an overlap race converges; editd SIGKILL +
+-- restart reattaches the tab to the restored buffer with no detached copy,
+-- twice (the second across the restore's new generation); file.save writes
+-- the bytes and removes the recovery files. Headless truthfulness: ced.layout
+-- and window-only ced.action refuse UNAVAILABLE; ced.wait times out and
+-- refuses bad arguments. Nothing here can reach the host Bus: private TCP
+-- port, private unix socket, admission off, HOME and state dirs in the temp
+-- dir.
+--
+-- Run: COSMIX=<checkout> mix src/desktop/apps/ced/tests/ced-bus-test.mix [--editd PATH] [--ced PATH]
+-- Binaries: --editd (or COSMIX_TEST_EDITD), default $COSMIX/src/target/release/cosmix-editd;
+-- --ced (or COSMIX_TEST_CED), default $COSMIX/src/desktop/target/release/ced;
+-- COSMIX_TEST_MIX / COSMIX_TEST_NODED point at freshly built mix / noded,
+-- defaults are the system install.
+$root = env("COSMIX")
+if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
+$argv = args()
+$editd = env("COSMIX_TEST_EDITD") ?? ""
+$ced = env("COSMIX_TEST_CED") ?? ""
+for each $k in range(0, length($argv) - 2)
+  if $argv[$k] == "--editd" then $editd = $argv[$k + 1] end
+  if $argv[$k] == "--ced" then $ced = $argv[$k + 1] end
+end
+if $editd == "" then $editd = $root .. "/src/target/release/cosmix-editd" end
+if $ced == "" then $ced = $root .. "/src/desktop/target/release/ced" end
+$mix = env("COSMIX_TEST_MIX") ?? ""
+if $mix == "" then $mix = "/opt/cosmix/bin/mix" end
+$noded = env("COSMIX_TEST_NODED") ?? ""
+if $noded == "" then $noded = "/opt/cosmix/bin/cosmix-noded" end
+for each $bin in [$editd, $ced, $mix, $noded]
+  if not exists($bin) then raise("TEST_CONFIG", "missing binary " .. $bin) end
+end
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-ced-bus-test.XXXXXXXX"]))
+$tag = uuid()
+$node = $tmp .. "/node.conf.mix"
+$recdir = $tmp .. "/recovery"
+$env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
+  HOME: $tmp, XDG_STATE_HOME: $tmp, XDG_RUNTIME_DIR: $tmp, XDG_CONFIG_HOME: $tmp .. "/config",
+  RUST_LOG: "cosmix_editd=debug", CED_LOG: "info", COSMIX_EDIT_RECOVERY_DIR: $recdir}
+$editd_pid = nil
+$ced_pid = nil
+$noded_pid = nil
+$file = $tmp .. "/work/doc.txt"
+-- `select` is a Mix keyword; since mix 0.96.2 a dotted Bus name takes it as a
+-- segment, so `send ced ced.select …` parses. One call keeps the quoted form
+-- (`send ced "ced.select" …`), which must go on working too.
+-- Bus-driven ced edits claim agent:<bus_lane_label(caller)>; a one-shot
+-- client is anonymous, so its lane is agent:ced.anon (plan D5).
+$lane = "agent:ced.anon"
+
+fn check($condition, $message)
+  if not $condition then raise("CED_BUS_TEST", $message) end
+end
+-- One-shot client. `$line` is literal Mix source after `send <svc>`;
+-- runtime values come in as `$a`, decoded from argv. The send timeout
+-- covers ced.wait's 30 s ceiling.
+fn call($svc, $line, $a)
+  $src = "$a = json_parse($1)\nsend " .. $svc .. " " .. $line ..
+    " timeout=40\nprint(json_encode({rc: $rc, result: $result, reply: $reply}))\n"
+  write_file($tmp .. "/step.mix", $src)
+  $run = run_argv([$mix, $tmp .. "/step.mix", json_encode($a)], {clear_env: true, env: $env, timeout: 50})
+  check($run.ok, "client step failed (exit " .. to_string($run.exit_code) .. "): " .. $run.stderr .. $run.stdout ..
+    "\n--- step.mix\n" .. $src .. "--- args " .. json_encode($a))
+  return json_parse($run.stdout)
+end
+fn ok_in($svc, $line, $a)
+  $r = call($svc, $line, $a)
+  check($r.rc == 0, $svc .. " " .. $line .. " failed: " .. json_encode($r))
+  return $r.reply
+end
+fn eok($line, $a)
+  return ok_in("edit", $line, $a)
+end
+fn cok($line, $a)
+  return ok_in("ced", $line, $a)
+end
+-- A ced call that must be refused with rc 10 + this error_code/reason.
+fn cd_refused($line, $a, $code, $reason)
+  $r = call("ced", $line, $a)
+  check($r.rc == 10, "ced " .. $line .. " not refused: " .. json_encode($r))
+  check($r.reply.error_code == $code, "ced " .. $line .. " wrong error_code: " .. json_encode($r.reply))
+  if $reason != nil then check($r.reply.reason == $reason, "ced " .. $line .. " wrong reason: " .. json_encode($r.reply)) end
+  return $r.reply
+end
+-- The tab's row in ced.tabs.
+fn tab_row($t)
+  for each $row in cok('ced.tabs', {}).tabs
+    if $row.tab == $t then return $row end
+  end
+  raise("CED_BUS_TEST", "ced.tabs has no tab " .. to_string($t))
+end
+-- Quiesce: ced's own ops all acked (idle), then every rev editd has is
+-- folded into the mirror (a concurrent agent edit may still be in flight
+-- on the topic when ced goes idle).
+fn sync($t, $b)
+  cok('ced.wait tab=$a.t idle=true timeout_ms=20000', {t: $t})
+  $rev = eok('edit.get buffer=$a.b', {b: $b}).rev
+  cok('ced.wait tab=$a.t rev=$a.r timeout_ms=20000', {t: $t, r: $rev})
+  cok('ced.wait tab=$a.t idle=true timeout_ms=20000', {t: $t})
+end
+-- ced's view equals editd's text, byte for byte and by ced's blake3; returns it.
+fn converged($t, $b, $what)
+  $s = cok('ced.state tab=$a.t text=true', {t: $t})
+  $g = eok('edit.get buffer=$a.b', {b: $b})
+  check($s.text == $g.text, $what .. ": ced view != editd text\nced:   " .. json_encode($s.text) .. "\nedit:  " .. json_encode($g.text))
+  check($s.text_hash == hash_blake3($g.text), $what .. ": text_hash " .. $s.text_hash .. " != blake3(edit.get)")
+  check($s.rev == $g.rev and $s.buffer == $b, $what .. ": rev/buffer " .. json_encode({ced: [$s.rev, $s.buffer], edit: [$g.rev, $b]}))
+  return $g.text
+end
+fn start_editd($log)
+  $pid = spawn([$editd, "serve"],
+    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/" .. $log}, stderr: "stdout"})
+  for each $i in range(1, 80)
+    $r = call("edit", 'edit.ping', {})
+    if $r.rc == 0 then return {pid: $pid, epoch: $r.reply.epoch} end
+    sleep(0.2)
+  end
+  raise("CED_BUS_TEST", "editd did not register (" .. $log .. ")")
+end
+-- SIGKILL editd and wait (bounded) until the process is gone and the broker
+-- no longer routes `edit`.
+fn kill_editd($pid)
+  check(kill($pid, 9), "could not SIGKILL editd pid " .. to_string($pid))
+  $exited = false
+  for each $i in range(1, 110)
+    if not process_alive($pid) then $exited = true; break end
+    sleep(0.1)
+  end
+  check($exited, "editd survived SIGKILL")
+  $gone = false
+  for each $i in range(1, 50)
+    if call("edit", 'edit.ping', {}).rc != 0 then $gone = true; break end
+    sleep(0.1)
+  end
+  check($gone, "the broker still routes edit after SIGKILL")
+end
+-- editd restarted: ced must notice on its own (services.registered), reopen
+-- the tab in the new epoch and go live on the restored text.
+fn reattached($t, $epoch)
+  $w = cok('ced.wait tab=$a.t epoch=$a.e timeout_ms=30000', {t: $t, e: $epoch})
+  check($w.epoch == $epoch, "ced.wait epoch reply: " .. json_encode($w))
+  cok('ced.wait tab=$a.t phase="live" timeout_ms=30000', {t: $t})
+  $row = tab_row($t)
+  check($row.epoch == $epoch and $row.phase == "live", "tab after reattach: " .. json_encode($row))
+  return $row
+end
+fn rid_of($b)
+  for each $row in eok('edit.list', {}).buffers
+    if $row.buffer == $b then return $row.recovery_id end
+  end
+  raise("CED_BUS_TEST", "edit.list has no buffer " .. $b)
+end
+
+try
+  mkdir($tmp .. "/work")
+  write_file($file, "line one\nline two\n")
+  $broker_alive = false
+  for each $attempt in range(1, 5)
+    $port = random(48000, 48999)
+    write_file($node, json_encode({node: "ced-bus-test-" .. $tag, wg_ip: "", mesh: "ced-bus-test.invalid",
+      noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
+    $noded_pid = spawn([$noded, "serve", "--listen", "127.0.0.1:" .. to_string($port),
+      "--node", "ced-bus-test-" .. $tag, "--no-monitor", "--no-log"],
+      {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+    sleep(0.5)
+    $broker_alive = run_argv(["kill", "-0", "--", to_string($noded_pid)]).ok
+    if $broker_alive then break end
+  end
+  check($broker_alive, "broker exhausted port retries")
+
+  $s1 = start_editd("editd.log")
+  $editd_pid = $s1.pid
+  $epoch = $s1.epoch
+
+  $ced_pid = spawn([$ced, "--headless", "--service", "ced"],
+    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/ced.log"}, stderr: "stdout"})
+  -- Harness startup wait (bounded), not a backend poll.
+  $pong = nil
+  for each $i in range(1, 80)
+    $r = call("ced", 'ced.ping', {})
+    if $r.rc == 0 then $pong = $r.reply; break end
+    sleep(0.2)
+  end
+  check($pong != nil, "ced --headless did not register")
+  check($pong.pong and $pong.service == "ced" and $pong.schema == "ced.v1" and $pong.headless, "ced.ping: " .. json_encode($pong))
+  $desc = cok('app.describe', {})
+  check($desc.contract == "ctk-app-control.v0" and $desc.app == "ced" and $desc.engine == "iced" and contains(join($desc.verbs, " "), "ced.wait"),
+    "app.describe: " .. json_encode($desc))
+
+  -- 1. open → live
+  $op = cok('ced.open paths=[$a.p]', {p: $file})
+  check(length($op.tabs) == 1 and $op.tabs[0].path == $file, "ced.open: " .. json_encode($op))
+  $t = $op.tabs[0].tab
+  cok('ced.wait tab=$a.t phase="live" timeout_ms=20000', {t: $t})
+  $b = tab_row($t).buffer
+  check(ends_with($b, "_" .. $epoch), "tab buffer " .. $b .. " not in epoch " .. $epoch)
+  $ci = cok('ced.info', {})
+  check($ci.headless and $ci.tabs == 1 and $ci.edit.epoch == $epoch and $ci.edit.volatile == false,
+    "ced.info (edit 0.2.0 with recovery is not volatile): " .. json_encode($ci))
+  converged($t, $b, "after open")
+
+  -- headless truthfulness: no window, so no layout and no window-only actions
+  cd_refused('ced.layout tab=$a.t', {t: $t}, "UNAVAILABLE", "headless")
+  cd_refused('ced.action tab=$a.t id="search.find"', {t: $t}, "UNAVAILABLE", nil)
+  cd_refused('ced.action tab=$a.t id="view.zoom_in"', {t: $t}, "UNAVAILABLE", nil)
+  cd_refused('ced.action tab=$a.t id="no.such_action"', {t: $t}, "NOT_FOUND", "unknown_action")
+  cd_refused('ced.wait tab=$a.t rev=1 idle=true timeout_ms=100', {t: $t}, "INVALID_ARGUMENT", nil)
+  cd_refused('ced.wait tab=$a.t rev=999999 timeout_ms=300', {t: $t}, "CONFLICT", "timeout")
+
+  -- 2. an agent's edit reaches the mirror, marked with its origin
+  $r2 = eok('edit.insert buffer=$a.b at=0 text="A0 " origin="agent:e2e"', {b: $b})
+  $w2 = cok('ced.wait tab=$a.t rev=$a.r timeout_ms=20000', {t: $t, r: $r2.rev})
+  check($w2.rev >= $r2.rev, "ced.wait rev: " .. json_encode($w2))
+  $st2 = cok('ced.state tab=$a.t', {t: $t})
+  check($st2.last_remote.origin == "agent:e2e" and $st2.last_remote.rev == $r2.rev, "last_remote: " .. json_encode($st2.last_remote))
+  check(converged($t, $b, "agent insert") == "A0 line one\nline two\n", "agent insert text")
+
+  -- 3. three ced.type and three agent inserts at the same offset, unsynchronised
+  for each $k in range(1, 3)
+    cok('ced.select tab=$a.t anchor=0 head=0', {t: $t})
+    cok('ced.type tab=$a.t text=$a.s', {t: $t, s: "<t" .. to_string($k) .. ">"})
+    eok('edit.insert buffer=$a.b at=0 text=$a.s origin="agent:e2e"', {b: $b, s: "<a" .. to_string($k) .. ">"})
+  end
+  sync($t, $b)
+  $t3 = converged($t, $b, "interleaved typing")
+  for each $k in range(1, 3)
+    check(count_of($t3, "<t" .. to_string($k) .. ">") == 1 and count_of($t3, "<a" .. to_string($k) .. ">") == 1, "token lost or doubled: " .. json_encode($t3))
+  end
+  check(ends_with($t3, "A0 line one\nline two\n"), "interleaved text tail: " .. json_encode($t3))
+
+  -- 4. ced.action edit.undo acts on the CALLER's lane: only the ced.type text goes
+  for each $k in range(1, 3)
+    $u = cok('ced.action tab=$a.t id="edit.undo"', {t: $t})
+    check($u.ok and $u.id == "edit.undo", "ced.action edit.undo: " .. json_encode($u))
+  end
+  -- ced.action answers from the op's outcome: the lane is empty now, and the
+  -- caller (not a prompt in the window) gets editd's refusal
+  cd_refused('ced.action tab=$a.t id="edit.undo"', {t: $t}, "NOT_FOUND", "nothing_to_undo")
+  sync($t, $b)
+  $t4 = converged($t, $b, "lane undo")
+  check($t4 == replace(replace(replace($t3, "<t1>", ""), "<t2>", ""), "<t3>", ""), "undo touched another lane: " .. json_encode({before: $t3, after: $t4}))
+  $h4 = eok('edit.history buffer=$a.b', {b: $b}).entries
+  $undos = filter($h4, fn($e) = $e.kind == "undo")
+  check(length($undos) == 3, "expected 3 undo entries: " .. json_encode($undos))
+  for each $e in $undos
+    check($e.lane == $lane or $e.origin == $lane, "undo not in " .. $lane .. ": " .. json_encode($e))
+  end
+
+  -- 5. overlap race: ced types inside a span an agent replaces at once
+  cok('ced.select tab=$a.t anchor=2 head=2', {t: $t})
+  cok('ced.type tab=$a.t text="RACE"', {t: $t})
+  eok('edit.replace buffer=$a.b range=[0, 10] text="agent-wins" origin="agent:e2e"', {b: $b})
+  sync($t, $b)
+  $t5 = converged($t, $b, "overlap race")
+  $st5 = cok('ced.state tab=$a.t', {t: $t})
+  if length($st5.conflicts) > 0 then
+    check(not contains($t5, "RACE") and contains(join($st5.conflicts[0].texts, ""), "RACE"), "conflict does not carry the reverted text: " .. json_encode($st5.conflicts))
+  end
+  check(starts_with($t5, "agent-wins"), "race text: " .. json_encode($t5))
+
+  -- 6. recovery: dirty, flush, SIGKILL editd, restart; the tab reattaches to
+  -- the restored buffer and its text is unchanged (no detached copy)
+  eok('edit.insert buffer=$a.b at="end" text="dirty tail\n" origin="agent:e2e"', {b: $b})
+  sync($t, $b)
+  $pre = converged($t, $b, "before kill")
+  $hash = hash_blake3($pre)
+  check(eok('edit.recovery.flush', {}).synced, "flush before kill")
+  kill_editd($editd_pid)
+  $editd_pid = nil
+  $s2 = start_editd("editd-2.log")
+  $editd_pid = $s2.pid
+  check($s2.epoch != $epoch, "restart kept the epoch")
+  $row6 = reattached($t, $s2.epoch)
+  $b6 = $row6.buffer
+  check($b6 != $b and ends_with($b6, "_" .. $s2.epoch) and $row6.recovered and $row6.dirty, "restored tab: " .. json_encode($row6))
+  $st6 = cok('ced.state tab=$a.t', {t: $t})
+  check($st6.text_hash == $hash and not $st6.detached_copy, "state after restore: " .. json_encode($st6))
+  check(converged($t, $b6, "after restore") == $pre, "restored text differs")
+
+  -- 7. an edit after the restore, SIGKILL again: pre-crash AND post-restore
+  -- edits both survive (the restore started a new generation)
+  cok('"ced.select" tab=$a.t anchor=0 head=0', {t: $t})
+  cok('ced.type tab=$a.t text="POST "', {t: $t})
+  sync($t, $b6)
+  $pre7 = converged($t, $b6, "post-restore edit")
+  check($pre7 == "POST " .. $pre, "post-restore text: " .. json_encode($pre7))
+  check(eok('edit.recovery.flush', {}).synced, "flush before second kill")
+  kill_editd($editd_pid)
+  $editd_pid = nil
+  $s3 = start_editd("editd-3.log")
+  $editd_pid = $s3.pid
+  $row7 = reattached($t, $s3.epoch)
+  $b7 = $row7.buffer
+  $st7 = cok('ced.state tab=$a.t', {t: $t})
+  check(not $st7.detached_copy, "detached copy after the second restore: " .. json_encode($st7))
+  check(converged($t, $b7, "after second restore") == $pre7, "second restore lost an edit")
+
+  -- 8. file.save through ced: bytes on disk, clean, recovery files gone
+  $rid = rid_of($b7)
+  check(length(glob($recdir .. "/" .. $rid .. ".*")) > 0, "no recovery files for the dirty buffer " .. $rid)
+  $sv = cok('ced.action tab=$a.t id="file.save"', {t: $t})
+  check($sv.ok, "file.save: " .. json_encode($sv))
+  cok('ced.wait tab=$a.t idle=true timeout_ms=20000', {t: $t})
+  check(not tab_row($t).dirty, "tab still dirty after file.save: " .. json_encode(tab_row($t)))
+  check(read_file($file) == $pre7, "saved bytes differ: " .. json_encode(read_file($file)))
+  check(eok('edit.recovery.flush', {}).synced, "flush after save")
+  check(length(glob($recdir .. "/" .. $rid .. ".*")) == 0, "file.save left recovery files: " .. json_encode(glob($recdir .. "/" .. $rid .. ".*")))
+
+  -- app.quit: ced detaches (the buffer stays in editd) and writes session.json
+  check(cok('app.quit', {}).quitting, "app.quit")
+  $quit = false
+  for each $i in range(1, 100)
+    if not process_alive($ced_pid) then $quit = true; break end
+    sleep(0.1)
+  end
+  check($quit, "ced still running 10 s after app.quit")
+  $ced_pid = nil
+  $session = $tmp .. "/cosmix/apps/ced/state/session.json"
+  check(exists($session), "no session.json at " .. $session)
+  $sj = json_parse(read_file($session))
+  check(length($sj.tabs) == 1 and $sj.tabs[0].path == $file, "session.json tabs: " .. json_encode($sj))
+  check(length(filter(eok('edit.list', {}).buffers, fn($x) = $x.buffer == $b7)) == 1, "quitting ced closed the buffer")
+  print("PASS ced headless e2e: open/live, agent edit + last_remote, interleaved convergence, per-lane undo (" .. $lane .. "), overlap race, headless refusals + ced.wait timeout, SIGKILL restore reattach x2 across a generation switch, file.save cleans recovery files, app.quit + session")
+catch $err
+  for each $log in glob($tmp .. "/*.log")
+    print("--- " .. $log .. "\n" .. read_file($log))
+  end
+  raise("CED_BUS_TEST", to_string($err))
+finally
+  for each $child in [$ced_pid, $editd_pid, $noded_pid]
+    if $child != nil then $_kill = run_argv(["kill", "--", to_string($child)], {timeout: 10}) end
+  end
+  if starts_with($tmp, "/tmp/cosmix-ced-bus-test.") then
+    $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end

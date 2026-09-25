@@ -163,6 +163,37 @@ impl Text {
         Ok(t)
     }
 
+    /// Append `text` at the end — [`Text::from_text`] one piece at a time, so
+    /// a frontend paging a large snapshot spreads the line scan and the copy
+    /// over its pages instead of paying for the whole text in one frame. The
+    /// same limits apply; on `Err` nothing changed.
+    pub fn append(&mut self, text: &str) -> Result<(), CoreError> {
+        let base = self.len();
+        let total = base + text.len();
+        if total > MAX_BUFFER_BYTES {
+            return Err(too_large(total));
+        }
+        let bytes = text.as_bytes();
+        let mut starts: Vec<u32> = Vec::new();
+        let mut off = 0;
+        while off < bytes.len() {
+            let (next, found) = lines_fwd(bytes, off, 0, 1);
+            if found == 0 {
+                break;
+            }
+            if self.lines.starts.len() + starts.len() >= MAX_LINES {
+                return Err(too_many_lines(self.lines.starts.len() + starts.len() + 1));
+            }
+            starts.try_reserve(1).map_err(|_| oom("line index"))?;
+            starts.push((base + next) as u32);
+            off = next;
+        }
+        self.lines.starts.try_reserve(starts.len()).map_err(|_| oom("line index"))?;
+        self.gap.replace(base..base, bytes).map_err(|e| oom(&format!("text: {e}")))?;
+        self.lines.starts.extend_from_slice(&starts);
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.gap.len()
     }
@@ -187,6 +218,23 @@ impl Text {
             Some(&next) => next as usize - 1,
             None => self.len(),
         })
+    }
+
+    /// Byte range of 1-based `line`, excluding its `\n` (a `\r` before it is
+    /// included, as everywhere in this crate). `None` outside `1..=line_count`.
+    pub fn line_range(&self, line: usize) -> Option<Range<usize>> {
+        Some(self.line_start(line)?..self.line_end(line)?)
+    }
+
+    /// The contiguous bytes from `offset` up to the next gap edge or the end;
+    /// empty at or after the end. Never moves the gap. The slice may end
+    /// inside a UTF-8 scalar or grapheme cluster (at the gap) — the grapheme
+    /// adapter in [`crate::view`] exists for exactly that reason.
+    pub fn chunk_at(&self, offset: usize) -> &[u8] {
+        if offset >= self.len() {
+            return &[];
+        }
+        self.gap.read_forward(offset)
     }
 
     fn byte_at(&self, offset: usize) -> Option<u8> {

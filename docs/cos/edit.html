@@ -446,7 +446,7 @@
 humans and agents edit together.</strong> A buffer has a revision number, a log of
 who changed what, a separate undo lane for each origin, named anchors that
 follow the text, atomic saves, and a change feed a mirror can follow exactly.
-It is the core of <strong>ced</strong>, the Cosmix editor. The ced app (E1) is one
+It is the core of <strong>ced</strong>, the Cosmix editor. The <a href="/cos/ced">ced app</a> is one
 frontend of this daemon. An agent that sends <code>edit.*</code> verbs is another, and
 both have the same standing.</p>
 <p>The text engine is <code>cosmix-edit-core</code>. That crate is pure Rust with no Bus
@@ -454,12 +454,13 @@ code and no async runtime. It builds on a vendored subset of Microsoft's
 <a href="https://github.com/microsoft/edit">msedit</a> (MIT): the gap buffer and the SIMD
 line scanner. See <a href="/cos/libraries">libraries</a>.</p>
 <blockquote>
-<p><strong>Volatile.</strong> Buffers live in memory only. If the daemon stops, crashes or
-restarts, every unsaved edit is lost. <code>edit.info</code> says so
-(<code>"volatile": true</code>), as does the <code>lifecycle.volatile</code> prop. On SIGTERM the
-daemon logs each dirty buffer (id, path, rev) and exits within 10 s. Crash
-recovery files are planned for E1. Save often, or <code>edit.save</code> from your
-script.</p>
+<p><strong>Unsaved text survives a restart</strong> (0.2.0). Every dirty buffer is mirrored
+to recovery files, and a daemon that stops, crashes or is killed comes back
+with those buffers restored: at most the last second of edits is lost on a
+crash, none on SIGTERM. Undo history is not recovered. See
+<a href="/cos/edit#recovery">Recovery</a>. <code>edit.info</code> reports <code>"volatile": false</code> while recovery
+is enabled and healthy; with <code>COSMIX_EDIT_RECOVERY=0</code> the daemon is E0's
+volatile one again.</p>
 </blockquote>
 <h2 id="running-it">Running it</h2>
 <pre><code class="language-sh">/opt/cosmix/bin/cosmix-editd serve        # registers `edit`, READY=1 once registered
@@ -586,13 +587,13 @@ refused request can be retried with its op_id.</p>
 <code>HELP</code> lists the manifest.</p>
 <table><thead><tr><th>Verb</th><th>Args</th><th>Reply</th></tr></thead><tbody>
 <tr><td><code>edit.ping</code></td><td>—</td><td><code>{pong, service:"edit", schema:"edit.v1", epoch}</code></td></tr>
-<tr><td><code>edit.info</code></td><td>—</td><td>name, schema, epoch, <code>props_level:"L2"</code>, build provenance, <code>buffers</code>, <code>dirty</code>, <code>volatile:true</code>, <code>mesh_open</code>, <code>event_seq</code>, <code>publisher_loss</code>, <code>limits</code></td></tr>
-<tr><td><code>edit.list</code></td><td>—</td><td><code>{epoch, buffers:[{buffer, path, opened_as, name, language, rev, saved_rev, dirty, disk, lines, bytes, holders}]}</code></td></tr>
-<tr><td><code>edit.open</code></td><td><code>path?</code> (absolute or <code>~/…</code>), <code>create?</code>, <code>language?</code>, <code>origin?</code></td><td><code>{buffer, epoch, path, opened_as, name, language, rev:0, lines, bytes, eol, bom, disk, reopened, created}</code></td></tr>
+<tr><td><code>edit.info</code></td><td>—</td><td>name, schema, epoch, <code>props_level:"L2"</code>, build provenance, <code>buffers</code>, <code>dirty</code>, <code>volatile</code>, <code>mesh_open</code>, <code>event_seq</code>, <code>publisher_loss</code>, <code>limits</code>, <code>recovery</code> (<a href="/cos/edit#recovery">Recovery</a>)</td></tr>
+<tr><td><code>edit.list</code></td><td>—</td><td><code>{epoch, buffers:[{buffer, path, opened_as, name, language, rev, saved_rev, dirty, disk, lines, bytes, holders, recovery_id, recovered}]}</code></td></tr>
+<tr><td><code>edit.open</code></td><td><code>path?</code> (absolute or <code>~/…</code>), <code>create?</code>, <code>language?</code>, <code>origin?</code></td><td><code>{buffer, epoch, path, opened_as, name, language, rev:0, lines, bytes, eol, bom, disk, reopened, created, recovery_id, recovered, recovered_from}</code></td></tr>
 <tr><td><code>edit.close</code></td><td><code>buffer</code>, <code>force?</code></td><td><code>{buffer, closed, holders}</code></td></tr>
 <tr><td><code>edit.save</code></td><td><code>buffer</code>, <code>path?</code> (save-as), <code>expect_rev?</code>, <code>force?</code></td><td><code>{buffer, epoch, path, rev, saved_rev, file_bytes, disk:"clean", durable, warning}</code></td></tr>
 <tr><td><code>edit.reload</code></td><td><code>buffer</code>, <code>force?</code>, <code>expect_rev?</code></td><td>a mutation reply, or <code>{buffer, rev, unchanged:true}</code></td></tr>
-<tr><td><code>edit.get</code></td><td><code>buffer</code>, <code>range?</code>=<code>"all"</code>, <code>numbered?</code>, <code>expect_rev?</code>, <code>snapshot?</code></td><td><code>{buffer, epoch, rev, text | lines, start, end, bytes_total, lines_total, truncated, next, snapshot}</code></td></tr>
+<tr><td><code>edit.get</code></td><td><code>buffer</code>, <code>range?</code>=<code>"all"</code>, <code>numbered?</code>, <code>expect_rev?</code>, <code>snapshot?</code>, <code>max_bytes?</code> (page budget: lower than the 4 MiB default, at least 4 KiB, still cut at a character)</td><td><code>{buffer, epoch, rev, text | lines, start, end, bytes_total, lines_total, truncated, next, snapshot}</code></td></tr>
 <tr><td><code>edit.insert</code></td><td><code>buffer</code>, <code>at</code>, <code>text</code> + common</td><td>mutation reply</td></tr>
 <tr><td><code>edit.delete</code></td><td><code>buffer</code>, <code>range</code> + common</td><td>mutation reply</td></tr>
 <tr><td><code>edit.replace</code></td><td><code>buffer</code>, <code>range</code>, <code>text</code> + common</td><td>mutation reply</td></tr>
@@ -605,6 +606,7 @@ refused request can be retried with its op_id.</p>
 <tr><td><code>edit.anchor.clear</code></td><td><code>buffer</code>, <code>name</code></td><td><code>{buffer, cleared}</code></td></tr>
 <tr><td><code>edit.undo</code> / <code>edit.redo</code></td><td><code>buffer</code>, <code>origin?</code> (lane: own / <code>"*"</code> / <code>kind:label</code>), <code>as?</code>, <code>expect_rev?</code>, <code>op_id?</code></td><td>mutation reply + <code>lane</code>, <code>undid</code> / <code>redid</code> = <code>[first_rev, last_rev]</code></td></tr>
 <tr><td><code>edit.history</code></td><td><code>buffer</code>, <code>since_rev?</code>=0, <code>limit?</code>=100</td><td><code>{buffer, rev, oldest_rev, entries:[{rev, origin, lane, kind, of, op_id, time, via, edits, edits_elided, text_bytes}], truncated, next}</code></td></tr>
+<tr><td><code>edit.recovery.flush</code></td><td>—</td><td><code>{synced, records, bytes, repairs}</code> once every queued recovery record and repair is durable; <code>synced:false</code> when recovery is disabled</td></tr>
 <tr><td><code>edit.props.get|list|describe|watch</code></td><td>SPEC-07 props</td><td>see <a href="/cos/edit#props">Props</a></td></tr>
 </tbody></table>
 <p>"Common" means <code>expect_rev | base_rev</code>, <code>coalesce</code>, <code>cursor</code> (post-edit
@@ -650,8 +652,8 @@ reopen.
 <code>create: true</code> opens a missing file as an empty buffer with <code>disk:"none"</code>.
 <code>close</code> removes your key. The buffer is freed when no holders remain and it is
 clean. Closing the last holder of a dirty buffer is refused with <code>CONFLICT</code>
-<code>dirty</code>. <code>force: true</code> frees the buffer <strong>and discards unsaved text</strong>. In E0,
-holders are never reaped when an agent crashes.</li>
+<code>dirty</code>. <code>force: true</code> frees the buffer <strong>and discards unsaved text</strong>, recovery files
+included. Holders are not yet reaped when an agent crashes.</li>
 </ul>
 <p><strong>Paging.</strong> <code>get</code>, <code>find</code> and <code>history</code> stop at a 4 MiB encoded reply and
 return <code>truncated</code> plus <code>next</code>; resume from there. To read a consistent
@@ -681,13 +683,15 @@ with your typing and not with someone else's.</p>
 <h2 id="props">Props</h2>
 <p>The daemon has an SPEC-07 read surface, <code>edit.props.get|list|describe|watch</code>.
 <code>props_level</code> is <code>L2</code>.</p>
-<pre><code>lifecycle.props_level  lifecycle.epoch  lifecycle.volatile
-lifecycle.event_seq  lifecycle.publisher_loss                (transient)
+<pre><code>lifecycle.props_level  lifecycle.epoch  lifecycle.volatile  lifecycle.recovery_ok
+lifecycle.event_seq  lifecycle.publisher_loss  lifecycle.recovery_unsynced   (transient)
 buffer_count
 buffers.&lt;bid&gt;.path | opened_as | name | language | eol | bom | dirty | saved_rev | disk | holders
+buffers.&lt;bid&gt;.recovery_id | recovered
 buffers.&lt;bid&gt;.rev | lines | bytes | origin_last              (transient)
 </code></pre>
-<p><code>disk</code> is one of <code>clean modified deleted none unwatched</code>. Cursors and anchors
+<p><code>disk</code> is one of <code>clean modified deleted none unwatched</code>. <code>lifecycle.volatile</code>
+is <code>!(recovery enabled &amp;&amp; recovery_ok)</code> and changes while the daemon runs. Cursors and anchors
 are not props; use the verbs. <code>edit.props.watch</code> replies with the
 <code>edit.props.changed</code> topic, the domain topic <code>edit.changed</code>, and the bootstrap
 recipe below.</p>
@@ -783,6 +787,83 @@ fails (inotify limit, network filesystem), <code>disk</code> becomes <code>unwat
 the save-time check still protects the file.</p>
 </li>
 </ul>
+<h2 id="recovery">Recovery</h2>
+<p>Since 0.2.0 editd keeps <strong>recovery files</strong> for every dirty buffer, path or
+scratch, whoever edited it. A daemon that stops, crashes or is killed comes
+back with those buffers, before it registers <code>edit</code> and before <code>READY=1</code>.</p>
+<p><strong>Where.</strong> <code>COSMIX_EDIT_RECOVERY_DIR</code>, else
+<code>$XDG_STATE_HOME/cosmix/edit/recovery</code>, else
+<code>~/.local/state/cosmix/edit/recovery</code>. The directory is <code>0700</code> and the files
+<code>0600</code>. <code>COSMIX_EDIT_RECOVERY=0</code> turns recovery off: the daemon is E0's
+volatile one (<code>volatile: true</code>), and SIGTERM logs each dirty buffer as
+discarded.</p>
+<p><strong>Identity.</strong> Each buffer gets a <code>recovery_id</code> (16 lowercase hex) when it is
+created, reported by <code>edit.open</code>, <code>edit.list</code> and the props. It survives
+restarts, so a frontend can find its scratch buffer again by id.</p>
+<p><strong>Generations.</strong> A buffer's recovery state is one <em>generation</em>: a snapshot of
+the text at some rev plus an append-only log of every edit after it. A
+<code>&lt;rid&gt;.meta.json</code> file names the current generation and is the commit point.
+Files are never truncated or rewritten in place. A new generation (on the
+clean → dirty transition, when the log outgrows the snapshot, after a write
+failure, and at every restore) is written in full, fsynced, and only then
+named by the meta; the old one — and any a failed switch left behind — is
+deleted afterwards. A crash at any moment
+leaves the meta naming a complete generation.</p>
+<p><strong>The loss window.</strong></p>
+<ul>
+<li><strong>Healthy:</strong> at most 1 s of edits on a crash, kill or out-of-memory abort.
+The log is fdatasynced 1 s after its first unsynced record.</li>
+<li><strong>SIGTERM:</strong> none. The daemon drains the queue and syncs before it exits
+(within the 10 s shutdown budget), then logs each dirty buffer as
+<code>keeping (in recovery files)</code>.</li>
+<li><strong>Degraded</strong> (the 8 MiB write queue overflowed, or a write failed): a crash
+loses everything since the last completed sync, and that window keeps
+growing while the failure persists — records are dropped, not queued, until
+a repair generation is durable. The daemon writes that fresh generation at
+once (and again at each later edit while writes fail); meanwhile <code>recovery.ok</code> is <code>false</code>, <code>volatile</code> is
+<code>true</code>, and <code>lifecycle.recovery_unsynced</code> counts what is at risk.</li>
+<li><strong>Not recovered:</strong> undo and redo history, anchors, selections and holders.
+A restored buffer starts at rev 0 with an empty log.</li>
+</ul>
+<p><strong><code>edit.recovery.flush</code></strong> replies once everything queued before it, and every
+pending repair, is on disk: <code>{synced: true, records, bytes, repairs}</code>. Call it
+before a planned restart, or in a test before a SIGKILL. With recovery off it
+answers <code>synced: false</code>.</p>
+<p><strong>Restore.</strong> At start the daemon scans the directory:</p>
+<ul>
+<li>A malformed meta or snapshot moves every file of that buffer into
+<code>recovery/quarantine/</code>. Nothing is deleted.</li>
+<li>A torn or corrupt log <strong>tail</strong> is salvaged: replay stops at the first bad
+record and keeps everything before it, with a warning naming how many
+records were dropped.</li>
+<li>Files of retired generations, files with no meta and <code>*.tmp</code> leftovers are
+removed.</li>
+<li>A restored buffer is rev 0 = the recovered text, <code>recovered: true</code>, and
+<strong>dirty even though it was never saved in this session</strong>. An unforced close
+of its last holder is refused with <code>CONFLICT</code> <code>dirty</code>, a disk change marks
+it <code>disk:"modified"</code> and never reloads it, and an immediate restart
+restores it again. The flag clears at the next durable save or explicit
+discard.</li>
+<li>A path buffer takes its path again and is compared with the disk. Content
+equal to the recovered text: the buffer is clean and its files are removed.
+Same file identity, different content: <code>disk:"clean"</code>, dirty. A different
+file identity: <code>disk:"modified"</code>, so a plain save refuses with
+<code>disk_modified</code>. A missing file: <code>disk:"deleted"</code>.</li>
+<li><code>edit.open</code> of a restored path returns that buffer (<code>reopened: true</code>) with
+<code>recovered_from: {epoch, rev, time_ms}</code>, naming the daemon session it came
+from.</li>
+<li>Buffers over the buffer or byte limits stay on disk (<code>skipped</code>) and are
+restored at a later start.</li>
+</ul>
+<p><strong>Cleanup.</strong> Recovery files are deleted only by a <strong>durable</strong> save (the reply
+says <code>durable: true</code>), a clean reload, or an explicit discard
+(<code>edit.close force=true</code>). An ordinary close never deletes them. After a
+<code>durable: false</code> save they are kept, and the next restore finds the content
+equal to the disk and cleans them up.</p>
+<p><strong>Status.</strong> <code>edit.info.recovery</code> is
+<code>{enabled, ok, degraded, dir, sync_ms, queue_bytes, unsynced, failures, restored, quarantined, skipped}</code>,
+and <code>volatile</code> is <code>!(enabled &amp;&amp; ok)</code>. ced shows a red <code>UNPROTECTED</code> badge
+whenever <code>volatile</code> is true.</p>
 <h2 id="limits">Limits</h2>
 <table><thead><tr><th>Limit</th><th>Value</th></tr></thead><tbody>
 <tr><td>Buffer text / lines</td><td>64 MiB / 2,000,000</td></tr>
@@ -815,9 +896,13 @@ send edit edit.anchor.set buffer=$b name="mark1" at={line: 3}
 send edit edit.get buffer=$b numbered=true
 send edit edit.save buffer=$b
 </code></pre>
-<p>The same session, with the change feed and an external write checked, is the
-end-to-end test <code>src/crates/cosmix-editd/tests/edit-bus-test.mix</code>. It runs a
-private broker, the real daemon and one-shot Mix clients:</p>
+<p>The same session, with the change feed, an external write and the recovery
+cycle checked (SIGTERM keeps a dirty buffer, SIGKILL after a flush loses
+nothing across two restarts, a durable save removes the files, and
+<code>COSMIX_EDIT_RECOVERY=0</code> discards), is the end-to-end test
+<code>src/crates/cosmix-editd/tests/edit-bus-test.mix</code>. It runs a private broker,
+the real daemon and one-shot Mix clients, with the recovery directory inside
+its temp dir:</p>
 <pre><code class="language-sh">COSMIX=$PWD mix src/crates/cosmix-editd/tests/edit-bus-test.mix --bin src/target/release/cosmix-editd
 </code></pre>
 <h2 id="install">Install</h2>
@@ -827,14 +912,17 @@ systemctl --user enable --now cosmix-editd     # returns once READY=1
 mix -c 'send edit edit.info
 print($result.version)'
 </code></pre>
-<h2 id="not-in-e0">Not in E0</h2>
-<p>The following arrive in E1 or later, each with its first consumer:</p>
+<p>Upgrading from 0.1.x: the old daemon is volatile, so run it down with no dirty
+buffers (<code>edit.info</code> <code>dirty: 0</code>) or its unsaved text is lost at the restart.
+From 0.2.0 on, <code>edit.recovery.flush</code> before a restart is enough.</p>
+<h2 id="not-yet">Not yet</h2>
+<p>Syntax highlighting and grapheme-correct navigation live in the frontend
+(<a href="/cos/ced">ced</a> and <code>cosmix-edit-client</code>), not in the daemon. The following
+arrive later, each with its first consumer:</p>
 <ul>
-<li>diagnostics</li>
-<li>syntax highlighting</li>
-<li>Unicode width and word navigation</li>
+<li>a shared diagnostics store</li>
 <li><code>edit.run</code></li>
-<li>crash-recovery files</li>
+<li>undo history across a restart</li>
 <li>reaping the holders of crashed agents</li>
 <li>lossy loading of non-UTF-8 files</li>
 <li>attested remote human frontends</li>

@@ -100,6 +100,30 @@ pong is true
 core ext: 1.0
 ```
 
+### Verb names with keyword segments (mix 0.96.2)
+
+A bare verb is a dotted name, and **any segment may be a Mix keyword** —
+Bus verbs belong to the services that define them, and `select`, `if`,
+`print`, `end` are ordinary verb words there:
+
+```mix
+send ced ced.select anchor=0
+send edit edit.select
+emit x x.if.for
+on ced.select
+  reply("ok")
+end
+```
+
+The same rule holds everywhere a bare Bus name is written: the `send`/`emit`
+command, `address` body lines, a dotted target (`send print.x verb`), and the
+`on` handler header. A keyword may also *lead* the name, but only when dotted
+(`send svc select.all`, `on print.page`); a bare keyword verb (`send svc
+select`) stays a parse error — quote it: `send svc "select"`. `fn` and
+`function` segments are read by their source spelling (`x.fn` is `"x.fn"`).
+Before 0.96.2 a keyword segment failed with `unexpected token Dot` and the
+verb had to be quoted (`send ced "ced.select"`); quoting still works.
+
 ### `send` as an expression
 
 `send` also returns the reply, so you can capture it directly (it still sets
@@ -521,6 +545,10 @@ on order.created desc "Acknowledge a new order"
   reply("ack")
 end
 ```
+
+The `<command>` is a dotted name whose segments may be Mix keywords
+(`on ced.select`, `on print.page`) — see
+[keyword segments](#verb-names-with-keyword-segments-mix-0962).
 
 Legacy `done` still closes `on` (with a deprecation warning); prefer `end`.
 

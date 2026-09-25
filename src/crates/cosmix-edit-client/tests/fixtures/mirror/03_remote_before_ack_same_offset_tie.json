@@ -1,0 +1,20 @@
+{
+  "name": "remote before ack, same-offset tie",
+  "about": "An agent inserts at the caret's offset first on the server. Server: ours rebased ThroughFirst lands after it. Mirror: the remote transformed SelfFirst through our pending insert keeps its place. Both read XA.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "a"]], "coalesce": true}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.insert",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "X", "origin": "agent:ctl-90"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "a", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_event": {"seq": 2}},
+    {"deliver_reply": "L1"}
+  ],
+  "expect": {"server_text": "helloXa world\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false}
+}

@@ -1,0 +1,22 @@
+# Vendored msedit `stdext` (microsoft/edit@826b4c0, MIT) — see ../README.md.
+# Rewritten manifest: upstream inherits from the msedit workspace. The library
+# keeps its upstream name `stdext` so the vendored lsh sources compile with no
+# path rewrites; the package name keeps it distinct in the cosmix workspace.
+[package]
+name = "cosmix-msedit-stdext"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Vendored msedit stdext (arenas, collections, glob) for cosmix-lsh. Not for direct use."
+
+[lib]
+name = "stdext"
+path = "src/lib.rs"
+# Upstream's one doctest (`arena::debug::Arena`, a should_panic borrow check)
+# only panics under debug_assertions, and the cosmix gates run --release.
+# The unit tests still run.
+doctest = false
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

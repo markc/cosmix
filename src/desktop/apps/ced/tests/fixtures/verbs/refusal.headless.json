@@ -1,0 +1,1 @@
+{"error_code": "UNAVAILABLE", "message": "ced.layout needs a window (this instance is --headless)", "reason": "headless"}

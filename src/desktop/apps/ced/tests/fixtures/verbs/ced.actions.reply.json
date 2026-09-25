@@ -1,0 +1,1 @@
+{"actions": [{"id": "file.save", "label": "Save", "menu": "File", "keys": ["Ctrl+S"], "enabled": true}, {"id": "edit.redo", "label": "Redo", "menu": "Edit", "keys": ["Ctrl+Y", "Ctrl+Shift+Z"], "enabled": false}]}

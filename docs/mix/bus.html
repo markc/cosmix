@@ -520,6 +520,24 @@ print("core ext: " .. ("" .. $result.extensions.core))
 <pre><code class="language-text">pong is true
 core ext: 1.0
 </code></pre>
+<h3 id="verb-names-with-keyword-segments-mix-0962">Verb names with keyword segments (mix 0.96.2)</h3>
+<p>A bare verb is a dotted name, and <strong>any segment may be a Mix keyword</strong> —
+Bus verbs belong to the services that define them, and <code>select</code>, <code>if</code>,
+<code>print</code>, <code>end</code> are ordinary verb words there:</p>
+<pre><code class="language-mix">send ced ced.select anchor=0
+send edit edit.select
+emit x x.if.for
+on ced.select
+  reply("ok")
+end
+</code></pre>
+<p>The same rule holds everywhere a bare Bus name is written: the <code>send</code>/<code>emit</code>
+command, <code>address</code> body lines, a dotted target (<code>send print.x verb</code>), and the
+<code>on</code> handler header. A keyword may also <em>lead</em> the name, but only when dotted
+(<code>send svc select.all</code>, <code>on print.page</code>); a bare keyword verb (<code>send svc select</code>) stays a parse error — quote it: <code>send svc "select"</code>. <code>fn</code> and
+<code>function</code> segments are read by their source spelling (<code>x.fn</code> is <code>"x.fn"</code>).
+Before 0.96.2 a keyword segment failed with <code>unexpected token Dot</code> and the
+verb had to be quoted (<code>send ced "ced.select"</code>); quoting still works.</p>
 <h3 id="send-as-an-expression"><code>send</code> as an expression</h3>
 <p><code>send</code> also returns the reply, so you can capture it directly (it still sets
 <code>$result</code>/<code>$rc</code> too):</p>
@@ -852,6 +870,9 @@ metadata: a serve citizen surfaces it as the verb's <code>description</code> in 
   reply("ack")
 end
 </code></pre>
+<p>The <code>&lt;command&gt;</code> is a dotted name whose segments may be Mix keywords
+(<code>on ced.select</code>, <code>on print.page</code>) — see
+<a href="/mix/bus#verb-names-with-keyword-segments-mix-0962">keyword segments</a>.</p>
 <p>Legacy <code>done</code> still closes <code>on</code> (with a deprecation warning); prefer <code>end</code>.</p>
 <h3 id="the-event-map">The <code>$event</code> map</h3>
 <p>Inside a handler, the inbound message is available as <code>$event</code>, a map with four

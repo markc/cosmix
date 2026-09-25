@@ -53,7 +53,8 @@ fn check(name: &str, v: &Value) {
     match (verb.as_str(), kind) {
         (_, "refusal") => round_trips::<Refusal>(name, v),
         (_, "event") => round_trips::<Event>(name, v),
-        ("edit.ping" | "edit.info" | "edit.list", "request") => parses::<EmptyReq>(name, v),
+        ("edit.ping" | "edit.info" | "edit.list" | "edit.recovery.flush", "request") => parses::<EmptyReq>(name, v),
+        ("edit.recovery.flush", "reply") => round_trips::<RecoveryFlushReply>(name, v),
         ("edit.open", "request") => parses::<OpenReq>(name, v),
         ("edit.close", "request") => parses::<CloseReq>(name, v),
         ("edit.save", "request") => parses::<SaveReq>(name, v),
@@ -148,4 +149,13 @@ fn every_event_kind_has_a_fixture() {
     for kind in ["edit", "cursor", "anchor", "disk", "open", "close", "resync"] {
         assert!(names.iter().any(|n| split(n) == (kind.to_string(), "event")), "event {kind}: no fixture");
     }
+}
+
+#[test]
+fn get_max_bytes_is_carried() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/contract/edit.get.request.snapshot_page_max_bytes.json");
+    let r: GetReq = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(r.max_bytes, Some(1_048_576));
+    let plain: GetReq = serde_json::from_value(serde_json::json!({"buffer": "b1_00000001"})).unwrap();
+    assert_eq!(plain.max_bytes, None, "absent = the default budget");
 }

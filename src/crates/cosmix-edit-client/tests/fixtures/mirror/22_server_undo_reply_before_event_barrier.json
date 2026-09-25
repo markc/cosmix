@@ -1,0 +1,27 @@
+{
+  "name": "Server-op completion barrier: undo reply before its event",
+  "about": "L3 is typed while the undo is in flight. The undo's reply (rev 2) arrives first, but self.rev is still 1, so the slot stays occupied and L3 is NOT sent until the undo's event folds; L3 then goes out with base_rev 2.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "a"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "a", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_reply": "L1"},
+    {"server_op": {"id": "U1", "op": {"undo": {"lane": "own"}}}},
+    {"send": {"id": "U1", "verb": "edit.undo", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "as": "human:ced", "op_id": "c00000001-000002"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"local": {"id": "L3", "edit": {"items": [[0, 0, "Z"]], "coalesce": true}}},
+    {"deliver_reply": "U1"},
+    {"deliver_event": {"seq": 2}},
+    {"send": {"id": "L3", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "Z", "base_rev": 2, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000003"},
+      "expect": {"rc": 0, "rev": 3}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "Zhello world\n", "server_rev": 3, "converged": true, "conflicts": 0, "detached": false}
+}

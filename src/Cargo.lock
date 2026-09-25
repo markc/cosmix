@@ -1103,8 +1103,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmix-edit-core"
+name = "cosmix-edit-client"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cosmix-edit-client",
+ "cosmix-edit-core",
+ "cosmix-lib-mix",
+ "cosmix-lsh",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cosmix-edit-core"
+version = "0.1.1"
 dependencies = [
  "libc",
  "proptest",
@@ -1115,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-editd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1473,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.96.0"
+version = "0.96.1"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1588,6 +1602,15 @@ dependencies = [
  "thiserror 1.0.69",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "cosmix-lsh"
+version = "0.1.0"
+dependencies = [
+ "cosmix-msedit-lsh",
+ "cosmix-msedit-stdext",
+ "proptest",
 ]
 
 [[package]]
@@ -1789,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.96.1"
+version = "0.96.2"
 dependencies = [
  "blake3",
  "chrono",
@@ -1846,6 +1869,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "zbus",
+]
+
+[[package]]
+name = "cosmix-msedit-lsh"
+version = "0.0.0"
+dependencies = [
+ "cosmix-msedit-stdext",
+]
+
+[[package]]
+name = "cosmix-msedit-stdext"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

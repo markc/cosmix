@@ -1,0 +1,23 @@
+{
+  "bom": false,
+  "buffer": "b3_9f2c41a7",
+  "bytes": 2310,
+  "created": false,
+  "disk": "modified",
+  "eol": "lf",
+  "epoch": "9f2c41a7",
+  "language": "markdown",
+  "lines": 88,
+  "name": "todo.md",
+  "opened_as": "~/notes/todo.md",
+  "path": "/home/user/notes/todo.md",
+  "recovered": true,
+  "recovered_from": {
+    "epoch": "1c0ffee5",
+    "rev": 57,
+    "time_ms": 1790000000000
+  },
+  "recovery_id": "5f0c2a9e1b7d4c33",
+  "reopened": false,
+  "rev": 0
+}

@@ -1,0 +1,21 @@
+{
+  "name": "keep mine (<= 1 MiB): one minimal replace with expect_rev",
+  "about": "After 29's reattach, Keep mine sends the minimal differing span (common prefix 'hello', common suffix ' world\\n') as ONE edit.replace with expect_rev, origin human:ced — undoable; the detached copy is dropped on success.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "!"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_all": {}},
+    {"epoch_change": {"new_epoch": "0000e1e2", "text": "hello world\n"}},
+    {"action": {"keep_mine": {}}},
+    {"send": {"id": "K1", "verb": "edit.replace", "caller": "local:ced",
+      "args": {"buffer": "b2_0000e1e2", "range": [5, 5], "text": "!", "expect_rev": 0, "origin": "human:ced", "op_id": "c00000001-keep1-000002"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "hello! world\n", "server_rev": 1, "converged": true, "conflicts": 0, "detached": false}
+}

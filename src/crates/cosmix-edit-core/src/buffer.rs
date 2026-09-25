@@ -328,28 +328,20 @@ fn contiguous(prev: &Edit, next: &Edit) -> bool {
 
 /// §3.4 overlap rule over resolved base ranges.
 fn check_overlap(items: &[Resolved]) -> Result<(), CoreError> {
-    let mut order: Vec<&Resolved> = items.iter().collect();
-    // Points before ranges at one start, so an insert at a range's start passes.
-    order.sort_by_key(|r| (r.s, r.e > r.s));
-    let mut max_e = 0;
-    for r in order {
-        if r.s < max_e {
-            return Err(invalid(
-                reason::OVERLAP_IN_TXN,
-                format!("op at [{}, {}) overlaps another op in the same request", r.s, r.e),
-            ));
-        }
-        if r.e > r.s {
-            max_e = max_e.max(r.e);
-        }
+    match crate::ot::first_overlap(items.iter().map(|r| (r.s, r.e))) {
+        Some((s, e)) => Err(invalid(
+            reason::OVERLAP_IN_TXN,
+            format!("op at [{s}, {e}) overlaps another op in the same request"),
+        )),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// §3.4 application order: `s` descending; at equal `s` the non-empty range
-/// first, then pure inserts in reverse list order.
+/// first, then pure inserts in reverse list order. Shared with the client via
+/// [`crate::ot::txn_sequence`] (one implementation).
 fn canonical(items: &mut [Resolved]) {
-    items.sort_by(|a, b| b.s.cmp(&a.s).then((b.e > b.s).cmp(&(a.e > a.s))).then(b.idx.cmp(&a.idx)));
+    items.sort_by(|a, b| crate::ot::canonical_cmp((a.s, a.e, a.idx), (b.s, b.e, b.idx)));
 }
 
 /// The text after a canonical sequence, as segments of the current text and

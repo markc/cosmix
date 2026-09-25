@@ -1,0 +1,28 @@
+{
+  "name": "undo replied, its event dropped, no further events: the echo timer clears the barrier",
+  "about": "Opus M1 (server-op arm). The undo's reply (rev 2) is in, but its event is lost, so the completion barrier (self.rev >= 2) never clears and the save queued behind it is never sent. The echo timer fires, history folds the undo entry, the barrier clears and the save goes out.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "a"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "a", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_all": {}},
+    {"server_op": {"id": "U1", "op": {"undo": {"lane": "own"}}}},
+    {"send": {"id": "U1", "verb": "edit.undo", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "as": "human:ced", "op_id": "c00000001-000002"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"server_op": {"id": "S1", "op": {"save": {}}}},
+    {"drop_event": {"seq": 2}},
+    {"deliver_reply": "U1"},
+    {"echo_timeout": "U1"},
+    {"send": {"id": "S1", "verb": "edit.save", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "origin": "human:ced", "op_id": "c00000001-000003"},
+      "expect": {"rc": 0}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "hello world\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false,
+             "idle": true, "meta_dirty": false}
+}

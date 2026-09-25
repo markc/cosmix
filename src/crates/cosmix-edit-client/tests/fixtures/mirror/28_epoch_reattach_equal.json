@@ -1,0 +1,16 @@
+{
+  "name": "epoch change, restored text equals the view",
+  "about": "The daemon restarts with recovery; the path tab reopens the restored buffer (b2_0000e1e2, rev 0); texts are equal: Live, no detached copy.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "!"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_all": {}},
+    {"epoch_change": {"new_epoch": "0000e1e2"}}
+  ],
+  "expect": {"server_text": "hello! world\n", "server_rev": 0, "converged": true, "conflicts": 0, "detached": false}
+}
