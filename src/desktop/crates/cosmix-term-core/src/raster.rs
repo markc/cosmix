@@ -1,4 +1,4 @@
-use crate::terminal::Screen;
+use crate::terminal::{Cell, Screen};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use swash::{
     FontRef,
@@ -6,21 +6,18 @@ use swash::{
     zeno::Format,
 };
 
-/// A contiguous run of damaged device-pixel rows.
-///
-/// `y` and `height` are in the target buffer's own physical pixels, which is
-/// what `wgpu::Queue::write_texture`, a `wl_shm` damage rectangle and a Bevy
-/// `Image`'s byte range all want. Full-width by construction: the raster's
-/// damage granularity is the cell ROW, so a consumer that could use a
-/// narrower rectangle gains nothing from this type.
+/// A damaged rectangle in the target buffer's own physical pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DamageBand {
+    pub x: u32,
+    pub width: u32,
     pub y: u32,
     pub height: u32,
 }
 
 impl DamageBand {
-    /// Byte range of this band in a buffer whose rows are `stride` bytes.
+    /// Conservative FULL-ROW byte range, including padding, for consumers
+    /// that cannot upload horizontal ranges. This is not a packed rectangle.
     pub fn byte_range(&self, stride: usize) -> std::ops::Range<usize> {
         self.y as usize * stride..(self.y as usize + self.height as usize) * stride
     }
@@ -43,11 +40,18 @@ pub struct PaintState {
     rows: usize,
     cell: (u32, u32),
     cursor: Option<(usize, usize)>,
+    display_offset: usize,
+    stride: usize,
+    scale: u32,
+    raster: Option<Arc<()>>,
+    cells: Vec<Cell>,
+    cells_scratch: Vec<bool>,
     /// Identity of the buffer last painted; see [`Raster::paint`]'s note on
     /// what it can and cannot detect.
     buffer: (usize, usize),
     /// Scratch, reused so a frame costs no allocation.
     bands: Vec<DamageBand>,
+    #[cfg(test)]
     rows_scratch: Vec<bool>,
 }
 
@@ -105,6 +109,7 @@ impl PaintState {
         self.rows = 0;
         self.cell = (0, 0);
         self.cursor = None;
+        self.raster = None;
         self.buffer = (0, 0);
     }
 }
@@ -174,6 +179,49 @@ fn paintable_rows(screen: &Screen) -> usize {
     screen.rows.min(screen.cells.len() / screen.cols.max(1))
 }
 
+fn visible_cursor(screen: &Screen, rows: usize) -> Option<(usize, usize)> {
+    (screen.display_offset == 0
+        && screen.cursor_visible
+        && screen.cursor.0 < screen.cols
+        && screen.cursor.1 < rows)
+        .then_some(screen.cursor)
+}
+
+/// Horizontal cell runs; merge vertically only when the x extents match.
+fn cell_bands_into(changed: &[bool], cols: usize, cell: (u32, u32), out: &mut Vec<DamageBand>) {
+    out.clear();
+    for (row, cells) in changed.chunks_exact(cols).enumerate() {
+        let mut col = 0;
+        while col < cols {
+            if !cells[col] {
+                col += 1;
+                continue;
+            }
+            let first = col;
+            while col < cols && cells[col] {
+                col += 1;
+            }
+            let x = first as u32 * cell.0;
+            let width = (col - first) as u32 * cell.0;
+            let y = row as u32 * cell.1;
+            if let Some(previous) = out
+                .iter_mut()
+                .rev()
+                .find(|b| b.x == x && b.width == width && b.y + b.height == y)
+            {
+                previous.height += cell.1;
+            } else {
+                out.push(DamageBand {
+                    x,
+                    width,
+                    y,
+                    height: cell.1,
+                });
+            }
+        }
+    }
+}
+
 /// Physical pixels a target must be able to hold, and the cell rows behind
 /// them. The one place this arithmetic exists.
 fn target(raster: &Raster, screen: &Screen) -> (usize, usize, usize) {
@@ -186,7 +234,8 @@ fn target(raster: &Raster, screen: &Screen) -> (usize, usize, usize) {
 }
 
 /// Runs of `true` in `rows`, in device-pixel coordinates, into `out`.
-fn bands_into(rows: &[bool], cell_height: u32, out: &mut Vec<DamageBand>) {
+#[cfg(test)]
+fn bands_into(rows: &[bool], width: u32, cell_height: u32, out: &mut Vec<DamageBand>) {
     out.clear();
     let mut start: Option<usize> = None;
     for (index, dirty) in rows.iter().chain(std::iter::once(&false)).enumerate() {
@@ -194,6 +243,8 @@ fn bands_into(rows: &[bool], cell_height: u32, out: &mut Vec<DamageBand>) {
             (true, None) => start = Some(index),
             (false, Some(first)) => {
                 out.push(DamageBand {
+                    x: 0,
+                    width,
                     y: first as u32 * cell_height,
                     height: (index - first) as u32 * cell_height,
                 });
@@ -205,6 +256,7 @@ fn bands_into(rows: &[bool], cell_height: u32, out: &mut Vec<DamageBand>) {
 }
 
 pub struct Raster {
+    identity: Arc<()>,
     cursor: crate::config::Cursor,
     /// The font file, shared with every raster [`Raster::resized`] from this
     /// one: a zoom step reuses the bytes instead of reading the file again.
@@ -290,6 +342,7 @@ impl Raster {
             return Err("font metrics exceed cell limits".into());
         }
         Ok(Self {
+            identity: Arc::new(()),
             cursor,
             data,
             context: ScaleContext::new(),
@@ -339,6 +392,70 @@ impl Raster {
         (width as u32, height as u32)
     }
 
+    /// Geometry/font/viewport invalidation, independent of storage identity.
+    /// A copied buffer may retain state only through `PaintState::rebind`.
+    pub fn requires_full_paint(
+        &self,
+        screen: &Screen,
+        state: &PaintState,
+        format: PixelFormat,
+    ) -> bool {
+        state.cols != screen.cols
+            || state.rows != paintable_rows(screen)
+            || state.cell != (self.width, self.height)
+            || state.format != format
+            || state.scale != self.scale.to_bits()
+            || state.display_offset != screen.display_offset
+            || !state
+                .raster
+                .as_ref()
+                .is_some_and(|id| Arc::ptr_eq(id, &self.identity))
+    }
+
+    /// Read-only preflight for copy-on-write frontends. The caller must still
+    /// own the last-painted bytes; no pixel allocation is acquired for a no-op.
+    pub fn is_current(
+        &self,
+        screen: &Screen,
+        state: &PaintState,
+        dirty: &[bool],
+        format: PixelFormat,
+    ) -> bool {
+        if self.requires_full_paint(screen, state, format)
+            || screen.cols == 0
+            || dirty.len() != screen.rows
+            || paintable_rows(screen) != screen.rows
+            || state.cursor != visible_cursor(screen, state.rows)
+        {
+            return false;
+        }
+        screen.cells[..screen.cols * state.rows]
+            .chunks_exact(screen.cols)
+            .zip(state.cells.chunks_exact(screen.cols))
+            .zip(dirty)
+            .all(|((now, old), dirty)| !*dirty || now == old)
+    }
+
+    /// Whether painting is guaranteed to overwrite every cell. A dirty-row
+    /// hint alone is insufficient: equal cells now retain their old pixels.
+    pub fn overwrites_all(
+        &self,
+        screen: &Screen,
+        state: &PaintState,
+        dirty: &[bool],
+        format: PixelFormat,
+    ) -> bool {
+        self.requires_full_paint(screen, state, format)
+            || dirty.len() != screen.rows
+            || paintable_rows(screen) != screen.rows
+            || (dirty.iter().all(|&row| row)
+                && screen
+                    .cells
+                    .iter()
+                    .zip(&state.cells)
+                    .all(|(now, old)| now != old))
+    }
+
     /// Rasterise `screen` into `surface` **in place**, repainting only the
     /// rows `dirty` marks, and return the damaged device-pixel bands.
     ///
@@ -356,11 +473,10 @@ impl Raster {
     /// and the caller owes the GPU (or the compositor) nothing at all, which
     /// is the idle case a terminal spends almost all of its life in.
     ///
-    /// Two rows are always repainted beyond `dirty`: the one the cursor is on
-    /// now, and the one this surface last drew a cursor on. The cursor overlay
-    /// belongs to this function, not to the VT, so nothing else can be relied
-    /// on to erase it — in particular when the caller turns the cursor off
-    /// (an unfocused pane) without the grid changing at all.
+    /// Dirty rows are hints: only cells whose captured visual attributes
+    /// differ are repainted. Cursor moves/hide/show additionally repaint the
+    /// old/new cursor cells. A stationary cursor is composited only if its
+    /// underlying cell was repainted. Viewport changes force full repaint.
     pub fn render_into<'a>(
         &mut self,
         screen: &Screen,
@@ -452,11 +568,7 @@ impl Raster {
         // which leaves the old pixels — including an old cursor — on screen.
         let cell = (self.width, self.height);
         let (width, height, rows) = target(self, screen);
-        if screen.cols == 0
-            || rows == 0
-            || stride < width * 4
-            || dst.len() < stride * height
-        {
+        if screen.cols == 0 || rows == 0 || stride < width * 4 || dst.len() < stride * height {
             state.invalidate();
             return &state.bands;
         }
@@ -464,44 +576,58 @@ impl Raster {
         // The state's own record decides, never the caller's: a Raster
         // rebuilt at a new scale changes `cell` while cols/rows stay put, and
         // that must still force a full repaint.
-        let full = state.cols != screen.cols
-            || state.rows != rows
-            || state.cell != cell
-            || state.buffer != buffer;
+        let full = self.requires_full_paint(screen, state, format)
+            || state.buffer != buffer
+            || state.stride != stride
+            || dirty.len() != screen.rows
+            || screen.rows != rows;
         if full {
             state.cols = screen.cols;
             state.rows = rows;
             state.cell = cell;
             state.buffer = buffer;
             state.cursor = None;
+            state.display_offset = screen.display_offset;
+            state.stride = stride;
+            state.scale = self.scale.to_bits();
+            state.raster = Some(self.identity.clone());
+            state.cells.clear();
+            state
+                .cells
+                .extend_from_slice(&screen.cells[..screen.cols * rows]);
         }
-        let dirty_rows = &mut state.rows_scratch;
-        dirty_rows.clear();
-        dirty_rows.resize(rows, full);
+        let cursor = visible_cursor(screen, rows);
+        let changed = &mut state.cells_scratch;
+        changed.clear();
+        changed.resize(screen.cols * rows, full);
         if !full {
-            // `dirty` is indexed against the VT's row count; a short cell
-            // array shrinks the painted area but not the snapshot, so the
-            // slice is only trustworthy when both agree.
-            if dirty.len() == screen.rows && screen.rows == rows {
-                dirty_rows.copy_from_slice(dirty);
-            } else {
-                dirty_rows.fill(true);
+            for (row, &dirty) in dirty.iter().enumerate() {
+                if !dirty {
+                    continue;
+                }
+                let start = row * screen.cols;
+                for ((changed, now), old) in changed[start..start + screen.cols]
+                    .iter_mut()
+                    .zip(&screen.cells[start..start + screen.cols])
+                    .zip(&state.cells[start..start + screen.cols])
+                {
+                    *changed = now != old;
+                }
             }
-            if let Some((_, previous)) = state.cursor
-                && previous < rows
-            {
-                dirty_rows[previous] = true;
-            }
-            if screen.cursor_visible && screen.cursor.1 < rows {
-                dirty_rows[screen.cursor.1] = true;
+            if cursor != state.cursor {
+                for (col, row) in state.cursor.into_iter().chain(cursor) {
+                    changed[row * screen.cols + col] = true;
+                }
             }
         }
+        cell_bands_into(changed, screen.cols, cell, &mut state.bands);
         let rgba = dst;
         for (row, cells) in screen.cells[..screen.cols * rows]
             .chunks_exact(screen.cols)
             .enumerate()
         {
-            if !dirty_rows[row] {
+            let row_changed = &changed[row * screen.cols..(row + 1) * screen.cols];
+            if !row_changed.iter().any(|&changed| changed) {
                 continue;
             }
             let y = row * self.height as usize;
@@ -509,9 +635,13 @@ impl Raster {
             // before its glyphs preserves the old per-cell overwrite order.
             let mut first = 0;
             while first < cells.len() {
+                if !row_changed[first] {
+                    first += 1;
+                    continue;
+                }
                 let bg = cells[first].bg;
                 let mut end = first + 1;
-                while end < cells.len() && cells[end].bg == bg {
+                while end < cells.len() && row_changed[end] && cells[end].bg == bg {
                     end += 1;
                 }
                 let left = first * self.width as usize * 4;
@@ -528,6 +658,10 @@ impl Raster {
                 first = end;
             }
             for (col, cell) in cells.iter().enumerate() {
+                if !row_changed[col] {
+                    continue;
+                }
+                state.cells[row * screen.cols + col] = cell.clone();
                 if cell.c == ' ' || cell.c == '\0' {
                     continue;
                 }
@@ -569,8 +703,7 @@ impl Raster {
                         let mask = &glyph.data[mask_start..mask_start + count];
                         let dy = y + (top + gy) as usize;
                         let offset = dy * stride + x * 4;
-                        let (pixels, _) =
-                            rgba[offset..offset + count * 4].as_chunks_mut::<4>();
+                        let (pixels, _) = rgba[offset..offset + count * 4].as_chunks_mut::<4>();
                         for (&alpha, pixel) in mask.iter().zip(pixels) {
                             match alpha {
                                 0 => {}
@@ -582,8 +715,7 @@ impl Raster {
                                     // This pixel still holds its cell's bg:
                                     // each mask sample visits it at most once.
                                     *pixel = destination_pixel(std::array::from_fn(|channel| {
-                                        ((fg[channel] * alpha + bg[channel] * inverse) / 255)
-                                            as u8
+                                        ((fg[channel] * alpha + bg[channel] * inverse) / 255) as u8
                                     }));
                                 }
                             }
@@ -594,8 +726,7 @@ impl Raster {
         }
         // Steady cursor; invert a block so its glyph remains readable.
         let (cx, cy) = screen.cursor;
-        let drawn = screen.cursor_visible && cx < screen.cols && cy < rows;
-        if drawn {
+        if cursor.is_some() && changed[cy * screen.cols + cx] {
             let bottom = (cy + 1) * self.height as usize;
             let top = match self.cursor {
                 crate::config::Cursor::Block => cy * self.height as usize,
@@ -618,8 +749,7 @@ impl Raster {
                 }
             }
         }
-        state.cursor = drawn.then_some(screen.cursor);
-        bands_into(dirty_rows, self.height, &mut state.bands);
+        state.cursor = cursor;
         &state.bands
     }
     // Frozen pre-rank-6 painter (with rank 3's per-cell colour reorder):
@@ -648,11 +778,7 @@ impl Raster {
         // which leaves the old pixels — including an old cursor — on screen.
         let cell = (self.width, self.height);
         let (width, height, rows) = target(self, screen);
-        if screen.cols == 0
-            || rows == 0
-            || stride < width * 4
-            || dst.len() < stride * height
-        {
+        if screen.cols == 0 || rows == 0 || stride < width * 4 || dst.len() < stride * height {
             state.invalidate();
             return &state.bands;
         }
@@ -752,7 +878,7 @@ impl Raster {
         }
         // Steady cursor; invert a block so its glyph remains readable.
         let (cx, cy) = screen.cursor;
-        let drawn = screen.cursor_visible && cx < screen.cols && cy < rows;
+        let drawn = visible_cursor(screen, rows).is_some();
         if drawn {
             let bottom = (cy + 1) * self.height as usize;
             let top = match self.cursor {
@@ -776,7 +902,7 @@ impl Raster {
             }
         }
         state.cursor = drawn.then_some(screen.cursor);
-        bands_into(dirty_rows, self.height, &mut state.bands);
+        bands_into(dirty_rows, width as u32, self.height, &mut state.bands);
         &state.bands
     }
 }
@@ -793,6 +919,222 @@ mod tests {
     use crate::config::Cursor;
     use crate::terminal::Cell;
     use std::time::Instant;
+
+    #[test]
+    fn cell_ranges_skip_identical_visuals_and_include_selection_colours() {
+        let mut raster = raster_with(Cursor::Block);
+        let mut surface = Surface::default();
+        let mut grid = screen(90, 4, 'M');
+        grid.cursor_visible = true;
+        grid.cursor = (7, 1);
+        raster.render_into(&grid, &[], &mut surface);
+        assert!(
+            raster
+                .render_into(&grid, &[true; 4], &mut surface)
+                .is_empty()
+        );
+        let cell = &mut grid.cells[90 + 7];
+        std::mem::swap(&mut cell.fg, &mut cell.bg);
+        assert_eq!(
+            raster.render_into(&grid, &[false, true, false, false], &mut surface),
+            &[DamageBand {
+                x: 7 * raster.width,
+                y: raster.height,
+                width: raster.width,
+                height: raster.height
+            }]
+        );
+        assert_eq!(surface.rgba(), raster.render(&grid));
+        // Two disjoint runs on one row must not become a whole-row rectangle.
+        grid.cells[91].c = 'g';
+        grid.cells[170].bg = [201, 8, 31];
+        assert_eq!(
+            raster
+                .render_into(&grid, &[false, true, false, false], &mut surface)
+                .len(),
+            2
+        );
+        assert_eq!(surface.rgba(), raster.render(&grid));
+        let unchanged = surface.rgba().to_vec();
+        assert!(
+            raster
+                .render_into(&grid, &[false; 4], &mut surface)
+                .is_empty()
+        );
+        assert_eq!(surface.rgba(), unchanged);
+    }
+
+    #[test]
+    fn randomized_incremental_frames_match_fresh_original_painter() {
+        let mut seed = 0x5eed_1695_a37b_c201_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for style in [Cursor::Block, Cursor::Underline] {
+            let mut raster = raster_with(style);
+            let mut grid = screen(13, 7, 'M');
+            let mut state = PaintState::default();
+            let mut pixels = Vec::new();
+            let mut format = PixelFormat::Rgba;
+            for frame in 0..2048 {
+                let value = next();
+                let mut dirty = vec![false; grid.rows];
+                match frame % 16 {
+                    0..=5 => {
+                        let i = value as usize % grid.cells.len();
+                        dirty[i / grid.cols] = true;
+                        let cell = &mut grid.cells[i];
+                        match frame % 16 {
+                            0 => {
+                                cell.c = [' ', '\0', 'g', '界', '\u{301}', '█']
+                                    [(value >> 16) as usize % 6]
+                            }
+                            1 => cell.fg = [value as u8, (value >> 8) as u8, (value >> 24) as u8],
+                            2 => cell.bg = [value as u8, (value >> 8) as u8, (value >> 32) as u8],
+                            3 => cell.bold = !cell.bold,
+                            4 => std::mem::swap(&mut cell.fg, &mut cell.bg),
+                            _ => { /* redundant dirty row */ }
+                        }
+                    }
+                    6 => {
+                        grid.cursor = (
+                            value as usize % (grid.cols + 1),
+                            (value >> 16) as usize % (grid.rows + 1),
+                        )
+                    }
+                    7 => grid.cursor_visible = !grid.cursor_visible,
+                    8 => {
+                        grid = screen(1 + value as usize % 19, 2 + (value >> 16) as usize % 7, 'M');
+                        dirty = vec![false; grid.rows];
+                    }
+                    9 => {
+                        let scale = [1.0, 1.25, 1.5, 2.5][value as usize % 4];
+                        raster = raster.resized(scale, 13.0).unwrap();
+                    }
+                    10 => {
+                        format = if format == PixelFormat::Rgba {
+                            PixelFormat::Bgra
+                        } else {
+                            PixelFormat::Rgba
+                        }
+                    }
+                    11 => grid.display_offset = if grid.display_offset == 0 { 3 } else { 0 },
+                    12 => {
+                        // An incomplete last row is ignored, but forces full
+                        // repaint of the remaining whole rows on every call.
+                        if grid.cells.len() == grid.cols * grid.rows {
+                            grid.cells.pop();
+                        }
+                    }
+                    13 => state.invalidate(),
+                    14 => {
+                        raster = raster
+                            .resized(raster.scale, if value & 1 == 0 { 12.9 } else { 13.0 })
+                            .unwrap()
+                    }
+                    _ => dirty.fill(true),
+                }
+                let (width, height) = raster.target_size(&grid);
+                let stride = width as usize * 4 + 1 + (frame / 113) % 3;
+                let origin = 7;
+                let len = stride * height as usize;
+                pixels.resize(origin + len + 11, 0x5a);
+                if frame % 29 == 0 && state.buffer.1 == len && state.stride == stride {
+                    // Explicit complete-copy rebind, including odd padding.
+                    let copied = pixels.clone();
+                    state.rebind(&copied[origin..origin + len]);
+                    pixels = copied;
+                }
+                if frame % 37 == 0 {
+                    let replacement = vec![0x5a; pixels.len()];
+                    pixels = replacement; // changed allocation must invalidate
+                }
+                let before = pixels.clone();
+                let mut expected = before.clone();
+                let bands = raster
+                    .paint_format(
+                        &grid,
+                        &mut pixels[origin..origin + len],
+                        stride,
+                        &mut state,
+                        &dirty,
+                        format,
+                    )
+                    .to_vec();
+                raster.paint_reference(
+                    &grid,
+                    &mut expected[origin..origin + len],
+                    stride,
+                    &mut PaintState::default(),
+                    &[],
+                    format,
+                );
+                assert_eq!(
+                    pixels, expected,
+                    "frame={frame} style={style:?} format={format:?}"
+                );
+                for (index, (&old, &new)) in before.iter().zip(&pixels).enumerate() {
+                    if old == new {
+                        continue;
+                    }
+                    assert!(index >= origin && index < origin + len);
+                    let offset = index - origin;
+                    let (x, y) = ((offset % stride / 4) as u32, (offset / stride) as u32);
+                    assert!(
+                        bands.iter().any(|b| x >= b.x
+                            && x < b.x + b.width
+                            && y >= b.y
+                            && y < b.y + b.height),
+                        "unreported write frame={frame}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_offset_forces_full_rows_even_when_cells_are_identical() {
+        let mut raster = raster_with(Cursor::Block);
+        let mut surface = Surface::default();
+        let mut grid = screen(7, 5, 'M');
+        grid.cursor_visible = true;
+        grid.cursor = (1, 0);
+        raster.render_into(&grid, &[], &mut surface);
+        for offset in [1, 2, 0] {
+            grid.display_offset = offset;
+            let (width, height) = raster.target_size(&grid);
+            assert_eq!(
+                raster.render_into(&grid, &[false; 5], &mut surface),
+                &[DamageBand {
+                    x: 0,
+                    width,
+                    y: 0,
+                    height
+                }]
+            );
+            let mut expected = vec![0; surface.rgba().len()];
+            // Make the oracle independent of the production offset predicate.
+            grid.cursor_visible = offset == 0;
+            raster.paint_reference(
+                &grid,
+                &mut expected,
+                surface.stride(),
+                &mut PaintState::default(),
+                &[],
+                PixelFormat::Rgba,
+            );
+            grid.cursor_visible = true;
+            assert_eq!(surface.rgba(), expected);
+            assert!(
+                raster
+                    .render_into(&grid, &[true; 5], &mut surface)
+                    .is_empty()
+            );
+        }
+    }
 
     #[test]
     fn destination_format_switch_repaints_clean_rows_and_preserves_padding() {
@@ -820,7 +1162,15 @@ mod tests {
                     &[false; 5],
                     PixelFormat::Bgra,
                 );
-                assert_eq!(damage, &[DamageBand { y: 0, height }]);
+                assert_eq!(
+                    damage,
+                    &[DamageBand {
+                        x: 0,
+                        width,
+                        y: 0,
+                        height
+                    }]
+                );
                 for (native, original) in bytes.chunks_exact(stride).zip(rgba.chunks_exact(stride))
                 {
                     for (p, q) in native[..width as usize * 4]
@@ -846,12 +1196,24 @@ mod tests {
             let resized = base.resized(scale, px).unwrap();
             let fresh = Raster::new(scale, px, Cursor::Block).unwrap();
             assert_eq!(
-                (resized.width, resized.height, resized.baseline, resized.scale),
+                (
+                    resized.width,
+                    resized.height,
+                    resized.baseline,
+                    resized.scale
+                ),
                 (fresh.width, fresh.height, fresh.baseline, fresh.scale),
                 "{px} px @ {scale}"
             );
-            assert_eq!(resized.cursor, Cursor::Block, "the cursor style carries over");
-            assert!(Arc::ptr_eq(&resized.data, &base.data), "the font file was read again");
+            assert_eq!(
+                resized.cursor,
+                Cursor::Block,
+                "the cursor style carries over"
+            );
+            assert!(
+                Arc::ptr_eq(&resized.data, &base.data),
+                "the font file was read again"
+            );
         }
     }
 
@@ -861,6 +1223,7 @@ mod tests {
             rows,
             cursor: (0, 0),
             cursor_visible: false,
+            display_offset: 0,
             cells: (0..cols * rows)
                 .map(|_| Cell {
                     c: fill,
@@ -938,19 +1301,38 @@ mod tests {
                     }
                 }
             }
-            let bands = raster.paint_format(
-                grid, &mut fast[origin..origin + len], stride, &mut fast_state, &dirty, format,
-            ).to_vec();
-            let reference = raster.paint_reference(
-                grid, &mut slow[origin..origin + len], stride, &mut slow_state, &dirty, format,
+            let _bands = raster
+                .paint_format(
+                    grid,
+                    &mut fast[origin..origin + len],
+                    stride,
+                    &mut fast_state,
+                    &dirty,
+                    format,
+                )
+                .to_vec();
+            let _reference = raster.paint_reference(
+                grid,
+                &mut slow[origin..origin + len],
+                stride,
+                &mut slow_state,
+                &dirty,
+                format,
             );
-            assert_eq!(bands, reference, "damage frame={frame} {format:?}");
-            assert_eq!(fast, slow, "pixels frame={frame} scale={} {format:?}", raster.scale);
+            assert_eq!(
+                fast, slow,
+                "pixels frame={frame} scale={} {format:?}",
+                raster.scale
+            );
             assert!(fast[..origin].iter().all(|&b| b == 0x5a));
             assert!(fast[origin + len..].iter().all(|&b| b == 0x5a));
             for row in 0..height as usize {
                 let pad = origin + row * stride + width as usize * 4;
-                assert!(fast[pad..origin + (row + 1) * stride].iter().all(|&b| b == 0x5a));
+                assert!(
+                    fast[pad..origin + (row + 1) * stride]
+                        .iter()
+                        .all(|&b| b == 0x5a)
+                );
             }
         }
     }
@@ -980,14 +1362,15 @@ mod tests {
                     for (i, cell) in grid.cells.iter_mut().enumerate() {
                         let value = next();
                         // Uniform rows, alternating backgrounds, and mixed runs.
-                        if i % cols == 0
-                            || case % 3 == 1
-                            || (case % 3 == 2 && value % 5 == 0)
-                        {
+                        if i % cols == 0 || case % 3 == 1 || (case % 3 == 2 && value % 5 == 0) {
                             bg = [value as u8, (value >> 8) as u8, (value >> 16) as u8];
                         }
                         cell.bg = bg;
-                        cell.fg = [(value >> 24) as u8, (value >> 32) as u8, (value >> 40) as u8];
+                        cell.fg = [
+                            (value >> 24) as u8,
+                            (value >> 32) as u8,
+                            (value >> 40) as u8,
+                        ];
                         cell.bold = value & 1 != 0;
                         cell.c = chars[(value >> 48) as usize % chars.len()];
                     }
@@ -1011,7 +1394,15 @@ mod tests {
         for (width, height) in [(256, 1), (7, 5)] {
             raster.width = width;
             raster.height = height;
-            for (left, top) in [(0, 0), (-3, 2), (3, -2), (-300, 0), (300, 0), (0, 300), (0, -300)] {
+            for (left, top) in [
+                (0, 0),
+                (-3, 2),
+                (3, -2),
+                (-300, 0),
+                (300, 0),
+                (0, 300),
+                (0, -300),
+            ] {
                 for (fg, bg) in [
                     ([0, 255, 127], [255, 0, 128]),
                     ([1, 17, 254], [254, 239, 1]),
@@ -1061,12 +1452,17 @@ mod tests {
     /// `bands_into` through a Vec, for asserting on runs directly.
     fn runs(rows: &[bool], cell_height: u32) -> Vec<DamageBand> {
         let mut out = Vec::new();
-        bands_into(rows, cell_height, &mut out);
+        bands_into(rows, 10, cell_height, &mut out);
         out
     }
 
     /// Bands copied out, so the surface is readable in the same assertion.
-    fn into(raster: &mut Raster, screen: &Screen, dirty: &[bool], surface: &mut Surface) -> Vec<DamageBand> {
+    fn into(
+        raster: &mut Raster,
+        screen: &Screen,
+        dirty: &[bool],
+        surface: &mut Surface,
+    ) -> Vec<DamageBand> {
         raster.render_into(screen, dirty, surface).to_vec()
     }
 
@@ -1076,17 +1472,38 @@ mod tests {
         assert_eq!(
             runs(&[true, true, false, true], 10),
             vec![
-                DamageBand { y: 0, height: 20 },
-                DamageBand { y: 30, height: 10 },
+                DamageBand {
+                    x: 0,
+                    width: 10,
+                    y: 0,
+                    height: 20
+                },
+                DamageBand {
+                    x: 0,
+                    width: 10,
+                    y: 30,
+                    height: 10
+                },
             ]
         );
         // A run that reaches the last row must still be closed.
         assert_eq!(
             runs(&[false, true, true], 4),
-            vec![DamageBand { y: 4, height: 8 }]
+            vec![DamageBand {
+                x: 0,
+                width: 10,
+                y: 4,
+                height: 8
+            }]
         );
         assert_eq!(
-            DamageBand { y: 4, height: 8 }.byte_range(40),
+            DamageBand {
+                x: 0,
+                width: 10,
+                y: 4,
+                height: 8
+            }
+            .byte_range(40),
             160..480
         );
     }
@@ -1100,6 +1517,8 @@ mod tests {
         assert_eq!(
             first,
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: 3 * raster.height
             }],
@@ -1110,16 +1529,23 @@ mod tests {
         // call touches loses its poison; anything it skips keeps it.
         surface.rgba.fill(0x5a);
         let stride = surface.stride();
+        for cell in &mut grid.cells[4..8] {
+            cell.c = 'M';
+        }
         let second = raster.render_into(&grid, &[false, true, false], &mut surface);
         assert_eq!(
             second,
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: raster.height,
                 height: raster.height
             }]
         );
         let row = |r: u32| {
             let band = DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: r * raster.height,
                 height: raster.height,
             };
@@ -1132,6 +1558,7 @@ mod tests {
         // And the instrument moves the other way: an all-dirty pass clears
         // every poisoned row, so the assertions above are not vacuous.
         surface.rgba.fill(0x5a);
+        surface.invalidate(); // Losing bytes requires explicit invalidation.
         let third = raster.render_into(&grid, &[true, true, true], &mut surface);
         assert_eq!(third.len(), 1);
         assert!(!surface.rgba.contains(&0x5a));
@@ -1148,16 +1575,21 @@ mod tests {
         assert_eq!(
             resized,
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: 4 * raster.height
             }]
         );
         assert_eq!(surface.grid(), (4, 4));
-        assert_eq!(surface.rgba().len(), surface.stride() * surface.height() as usize);
+        assert_eq!(
+            surface.rgba().len(),
+            surface.stride() * surface.height() as usize
+        );
     }
 
     #[test]
-    fn the_cursor_damages_the_row_it_left_as_well_as_the_one_it_entered() {
+    fn the_cursor_damages_only_the_cells_it_left_and_entered() {
         let mut raster = raster();
         let mut surface = Surface::default();
         let mut grid = screen(4, 3, ' ');
@@ -1173,10 +1605,14 @@ mod tests {
             moved,
             vec![
                 DamageBand {
+                    x: 0,
+                    width: raster.width,
                     y: 0,
                     height: raster.height
                 },
                 DamageBand {
+                    x: 0,
+                    width: raster.width,
                     y: 2 * raster.height,
                     height: raster.height
                 },
@@ -1189,6 +1625,8 @@ mod tests {
         assert_eq!(
             hidden,
             vec![DamageBand {
+                x: 0,
+                width: raster.width,
                 y: 2 * raster.height,
                 height: raster.height
             }]
@@ -1210,6 +1648,8 @@ mod tests {
         assert_eq!(
             after,
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: 3 * raster.height
             }]
@@ -1254,6 +1694,8 @@ mod tests {
         assert_eq!(
             bands,
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: 2 * raster.height
             }]
@@ -1270,6 +1712,8 @@ mod tests {
         assert_eq!(
             raster.render_into(&grid, &[false; 3], &mut surface),
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: 2 * raster.height
             }]
@@ -1332,7 +1776,10 @@ mod tests {
         ] {
             let mut dst = vec![0x5a_u8; len];
             let bands = raster.paint(&grid, &mut dst, stride, &mut state, &[]);
-            assert!(bands.is_empty(), "{label}: reported damage it did not write");
+            assert!(
+                bands.is_empty(),
+                "{label}: reported damage it did not write"
+            );
             assert!(
                 dst.iter().all(|byte| *byte == 0x5a),
                 "{label}: wrote into a buffer it should have refused"
@@ -1344,10 +1791,14 @@ mod tests {
         let pad = 16;
         let padded = stride + pad;
         let mut dst = vec![0x5a_u8; padded * height];
-        let bands = raster.paint(&grid, &mut dst, padded, &mut state, &[]).to_vec();
+        let bands = raster
+            .paint(&grid, &mut dst, padded, &mut state, &[])
+            .to_vec();
         assert_eq!(
             bands,
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: height as u32
             }]
@@ -1394,7 +1845,12 @@ mod tests {
             // the same bug and both fail here.
             assert_eq!(
                 bands,
-                vec![DamageBand { y: 0, height }],
+                vec![DamageBand {
+                    x: 0,
+                    width,
+                    y: 0,
+                    height
+                }],
                 "{cols}x{rows} less {truncate} cells: target_size and paint disagree"
             );
             // And `Surface` agrees with the number it hands a slice caller.
@@ -1428,6 +1884,8 @@ mod tests {
         assert_eq!(
             bands,
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: height as u32
             }],
@@ -1453,6 +1911,8 @@ mod tests {
         assert_eq!(
             raster.paint(&grid, &mut copied, stride, &mut state, &[false; 3]),
             &[DamageBand {
+                x: raster.width,
+                width: raster.width,
                 y: raster.height,
                 height: raster.height,
             }]
@@ -1468,6 +1928,8 @@ mod tests {
         assert_eq!(
             raster.paint(&grid, &mut rebound, stride, &mut state, &[false; 3]),
             &[DamageBand {
+                x: 0,
+                width: grid.cols as u32 * raster.width,
                 y: 0,
                 height: 3 * raster.height,
             }]
@@ -1512,7 +1974,11 @@ mod tests {
         // exactly what an uninverted row looks like, and the new one inverts.
         grid.cursor = (1, 2);
         let _ = raster.paint(&grid, &mut once, stride, &mut state, &[false; 3]);
-        assert_eq!(row(&once, 1), row(&once, 0), "the old cursor was not erased");
+        assert_eq!(
+            row(&once, 1),
+            row(&once, 0),
+            "the old cursor was not erased"
+        );
         assert_ne!(row(&once, 2), row(&once, 0));
     }
 
@@ -1535,8 +2001,7 @@ mod tests {
         let tall = screen(3, 4, 'T');
 
         let (cell_w, cell_h) = (raster.width, raster.height);
-        let bytes =
-            |cols: usize, rows: usize| cols * cell_w as usize * 4 * rows * cell_h as usize;
+        let bytes = |cols: usize, rows: usize| cols * cell_w as usize * 4 * rows * cell_h as usize;
         assert_eq!(
             bytes(4, 3),
             bytes(3, 4),
@@ -1544,7 +2009,13 @@ mod tests {
         );
 
         let mut buffer = vec![0_u8; bytes(4, 3)];
-        let _ = raster.paint(&wide, &mut buffer, 4 * raster.width as usize * 4, &mut state, &[]);
+        let _ = raster.paint(
+            &wide,
+            &mut buffer,
+            4 * raster.width as usize * 4,
+            &mut state,
+            &[],
+        );
 
         // Same buffer, same length, nothing reported dirty. Only the recorded
         // grid shape can tell this apart from an idle frame.
@@ -1555,6 +2026,8 @@ mod tests {
         assert_eq!(
             bands,
             vec![DamageBand {
+                x: 0,
+                width: tall.cols as u32 * raster.width,
                 y: 0,
                 height: 4 * raster.height
             }],
@@ -1573,7 +2046,10 @@ mod tests {
     fn an_empty_grid_produces_no_surface_and_no_damage() {
         let mut raster = raster();
         let mut surface = Surface::default();
-        assert_eq!(raster.render_into(&screen(0, 0, ' '), &[], &mut surface), vec![]);
+        assert_eq!(
+            raster.render_into(&screen(0, 0, ' '), &[], &mut surface),
+            vec![]
+        );
         assert!(surface.is_empty());
     }
 }

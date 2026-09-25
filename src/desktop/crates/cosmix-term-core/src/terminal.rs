@@ -507,7 +507,7 @@ impl EventedPty for MeteredPty {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
     pub fg: [u8; 3],
@@ -517,6 +517,8 @@ pub struct Cell {
 pub struct Screen {
     pub cols: usize,
     pub rows: usize,
+    /// Viewport identity for raster invalidation; captured under the grid lock.
+    pub display_offset: usize,
     pub cursor: (usize, usize),
     pub cursor_visible: bool,
     pub cells: Vec<Cell>,
@@ -1080,8 +1082,8 @@ impl Terminal {
             pos.col.0,
             (pos.row.0.max(0) as usize).saturating_add(offset),
         );
-        let cursor_visible =
-            cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+        let cursor_visible = offset == 0
+            && cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
         let mut previous = self.captured_cursor.lock().unwrap();
         if let Some(dirty) = dirty {
             *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
@@ -1113,6 +1115,7 @@ impl Terminal {
         Screen {
             cols,
             rows,
+            display_offset: offset,
             cursor,
             cursor_visible,
             cells,
@@ -1632,13 +1635,19 @@ mod tests {
         let mut lines = b"\r\n".repeat(40);
         lines.push(b'Z');
         f.feed(&lines, |t| cell(t, 29, 0) == 'Z');
+        // A cursor near the top would still be inside the visible row count
+        // after adding a small history offset; it must nevertheless be hidden.
+        f.feed(b"\x1b[H", |t| t.grid.cursor.pos.row.0 == 0);
         f.settled_snapshot();
         {
             let mut term = f.terminal.grid.lock();
             term.scroll_display(Scroll::Delta(5));
             assert_ne!(term.display_offset(), 0);
         }
-        assert!(all(&f.settled_snapshot().dirty_rows), "scroll-back");
+        let scrolled = f.settled_snapshot();
+        assert!(all(&scrolled.dirty_rows), "scroll-back");
+        assert_eq!(scrolled.screen.display_offset, 5);
+        assert!(!scrolled.screen.cursor_visible);
         // Still scrolled back: repainted whole, and still no self-wake.
         assert!(all(&f.quiet_snapshot().dirty_rows), "scrolled view");
     }

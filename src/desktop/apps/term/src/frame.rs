@@ -67,17 +67,21 @@ impl Frame {
     }
 }
 
-/// Merges overlapping and touching bands so a burst of row-damage costs one
-/// upload per contiguous region instead of one per render.
+/// Merge matching horizontal spans vertically; never lose x/width when
+/// accumulating paints between uploads. Repeated ranges remain bounded.
 fn coalesce(mut bands: Vec<DamageBand>) -> Vec<DamageBand> {
     if bands.len() < 2 {
         return bands;
     }
-    bands.sort_unstable_by_key(|band| band.y);
+    bands.sort_unstable_by_key(|band| (band.x, band.width, band.y));
     let mut merged: Vec<DamageBand> = Vec::with_capacity(bands.len());
     for band in bands {
         match merged.last_mut() {
-            Some(last) if band.y <= last.y + last.height => {
+            Some(last)
+                if band.x == last.x
+                    && band.width == last.width
+                    && band.y <= last.y + last.height =>
+            {
                 let end = (band.y + band.height).max(last.y + last.height);
                 last.height = end - last.y;
             }
@@ -192,8 +196,8 @@ impl Painter {
     /// different font sizes can round to the same integer cell — 13.0 px and
     /// 12.9 px both give an 8x16 DejaVuSansMono cell, with visibly different
     /// glyphs inside it (cold-review finding, 2026-09-21, reproduced). The
-    /// swap is the only place that knows the raster changed, so it is the
-    /// only place that can say so — for every pane, since they share it.
+    /// swap invalidates every pane immediately. Core also records a raster
+    /// identity token, so direct core callers cannot miss a same-metrics swap.
     pub fn replace_raster(&mut self, raster: Raster) {
         self.raster = raster;
         for frame in self.frames.values() {
@@ -253,7 +257,7 @@ impl Painter {
         }
         // Coalesced on the way IN, not only on the way out: several paints
         // can arrive before refresh drains damage. Merging bounds the list
-        // to at most one entry per two rows however long presentation stalls.
+        // by the grid's distinct cell ranges, however long presentation stalls.
         frame.damage = coalesce(std::mem::take(&mut frame.damage));
         frame.generation += 1;
         true
@@ -269,7 +273,12 @@ mod tests {
     const PANE: u64 = 1;
 
     fn band(y: u32, height: u32) -> DamageBand {
-        DamageBand { y, height }
+        DamageBand {
+            x: 0,
+            width: 1,
+            y,
+            height,
+        }
     }
 
     fn screen(cols: usize, rows: usize, fill: char) -> Screen {
@@ -278,6 +287,7 @@ mod tests {
             rows,
             cursor: (0, 0),
             cursor_visible: false,
+            display_offset: 0,
             cells: (0..cols * rows)
                 .map(|_| Cell {
                     c: fill,
@@ -307,7 +317,7 @@ mod tests {
     fn repainting_reuses_one_buffer_and_a_clean_frame_costs_nothing() {
         let mut painter = painter();
         let shared = painter.frame(PANE);
-        let grid = screen(20, 6, 'x');
+        let mut grid = screen(20, 6, 'x');
 
         assert!(painter.repaint(PANE, &grid, &[]), "the first frame is owed");
         let (pointer, capacity, generation) = {
@@ -331,6 +341,7 @@ mod tests {
 
         let mut dirty = vec![false; 6];
         dirty[3] = true;
+        grid.cells[3 * 20].c = 'M';
         assert!(painter.repaint(PANE, &grid, &dirty));
         {
             let frame = shared.lock().unwrap();
@@ -381,7 +392,10 @@ mod tests {
         assert!(painter.repaint(PANE, &grid, &[false; 4]));
         assert_eq!(
             shared.lock().unwrap().take_damage(),
-            vec![band(0, 4 * cell.1)]
+            vec![DamageBand {
+                width: 8 * cell.0,
+                ..band(0, 4 * cell.1)
+            }]
         );
     }
 
@@ -391,12 +405,13 @@ mod tests {
     fn damage_stays_bounded_when_nobody_drains_it() {
         let mut painter = painter();
         let shared = painter.frame(PANE);
-        let grid = screen(8, 4, 'M');
+        let mut grid = screen(8, 4, 'M');
         let _ = painter.repaint(PANE, &grid, &[]);
         shared.lock().unwrap().clear_damage();
-        for _ in 0..500 {
+        for n in 0..500 {
             let mut dirty = vec![false; 4];
             dirty[1] = true;
+            grid.cells[8].bg[0] = (n % 255 + 1) as u8;
             assert!(painter.repaint(PANE, &grid, &dirty));
         }
         // Assert on the STORED list, not on `take_damage`'s output: that
@@ -442,7 +457,7 @@ mod tests {
     fn damage_accumulates_between_presents_and_clears_on_take() {
         let mut painter = painter();
         let shared = painter.frame(PANE);
-        let grid = screen(20, 6, 'x');
+        let mut grid = screen(20, 6, 'x');
         let cell_height = painter.cell().1;
         let _ = painter.repaint(PANE, &grid, &[]);
         shared.lock().unwrap().clear_damage();
@@ -453,12 +468,23 @@ mod tests {
         first[0] = true;
         let mut second = vec![false; 6];
         second[4] = true;
+        grid.cells[0].c = 'M';
         assert!(painter.repaint(PANE, &grid, &first));
+        grid.cells[4 * 20].c = 'M';
         assert!(painter.repaint(PANE, &grid, &second));
         let mut frame = shared.lock().unwrap();
         assert_eq!(
             frame.take_damage(),
-            vec![band(0, cell_height), band(4 * cell_height, cell_height)]
+            vec![
+                DamageBand {
+                    width: painter.cell().0,
+                    ..band(0, cell_height)
+                },
+                DamageBand {
+                    width: painter.cell().0,
+                    ..band(4 * cell_height, cell_height)
+                }
+            ]
         );
         assert_eq!(frame.take_damage(), vec![], "damage is consumed once");
     }
@@ -483,6 +509,14 @@ mod tests {
             coalesce(vec![band(0, 10), band(40, 10)]),
             vec![band(0, 10), band(40, 10)]
         );
+        let left = DamageBand {
+            x: 4,
+            width: 8,
+            y: 10,
+            height: 20,
+        };
+        let right = DamageBand { x: 80, ..left };
+        assert_eq!(coalesce(vec![right, left, left]), vec![left, right]);
     }
 
     /// T3: two panes on screen must each own their pixels. A single shared
@@ -531,7 +565,10 @@ mod tests {
         let cell_height = painter.cell().1;
         assert_eq!(
             painter.frame(1).lock().unwrap().take_damage(),
-            vec![band(0, 4 * cell_height)]
+            vec![DamageBand {
+                width: 8 * painter.cell().0,
+                ..band(0, 4 * cell_height)
+            }]
         );
     }
 

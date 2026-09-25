@@ -10,13 +10,14 @@
 //! has one app-side buffer per band (the separate Frame Vec is gone), plus iced's
 //! retained older buffers after a burst, until later redraws release them.
 //! There is no RGBA image or converted image cache. Unchanged bands retain
-//! their native generation, bounding damage to changed bands.
+//! their native generation. Cell revision metadata narrows changed-generation
+//! damage without changing the four-row storage/copy granularity.
 
 use crate::frame::Frame;
 use bytes::{Bytes, BytesMut};
 use cosmix_term_core::raster::{DamageBand, PaintState, PixelFormat, Raster};
 use cosmix_term_core::terminal::Screen;
-use iced_tiny_skia::grid::Grid as Handle;
+use iced_tiny_skia::grid::{Damage, Grid as Handle};
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
@@ -39,7 +40,7 @@ pub(super) struct PixelBand {
     width: u32,
     height: u32,
     cell: (u32, u32),
-    cursor: bool,
+    damage: Option<Damage>,
     cached: Option<(u64, Handle)>,
     bands: Vec<DamageBand>,
 }
@@ -68,7 +69,6 @@ impl PixelBand {
         raster: &mut Raster,
         screen: &Screen,
         dirty: &[bool],
-        discard: bool,
     ) -> &[DamageBand] {
         self.bands.clear();
         let (width, height) = raster.target_size(screen);
@@ -77,28 +77,18 @@ impl PixelBand {
             self.native = Bytes::new();
             self.width = 0;
             self.height = 0;
-            self.cursor = false;
+            self.damage = None;
             self.invalidate();
             return &self.bands;
         }
 
-        // Avoid acquiring mutable storage for a provably clean frame. This
-        // mirrors paint's damage rules, including its conservative treatment
-        // of truncated snapshots and its old/current cursor row repaint.
-        // Invalidation resets state.grid(), so a raster swap cannot skip.
-        let rows = height as usize / raster.height as usize;
-        let cursor = screen.cursor_visible && screen.cursor.1 < rows;
-        if self.state.grid() == (screen.cols, rows)
-            && self.cell == (raster.width, raster.height)
-            && (self.width, self.height) == (width, height)
-            && screen.rows == rows
-            && dirty.len() == rows
-            && !dirty.iter().any(|row| *row)
-            && !self.cursor
-            && !cursor
-        {
+        // Compare captured visual cells BEFORE touching retained storage. A
+        // dirty hint with identical final content keeps the exact generation.
+        if raster.is_current(screen, &self.state, dirty, PixelFormat::Bgra) {
             return &self.bands;
         }
+
+        let discard = raster.overwrites_all(screen, &self.state, dirty, PixelFormat::Bgra);
 
         self.cached = None;
         // Lifetime rule: a widget, renderer layer or age-repair history may
@@ -137,10 +127,27 @@ impl PixelBand {
             PixelFormat::Bgra,
         ));
         self.native = pixels.freeze();
+        if self.damage.is_none()
+            || (self.width, self.height, self.cell)
+                != (width, height, (raster.width, raster.height))
+        {
+            self.damage = Damage::new(width, height, (raster.width, raster.height));
+        }
+        self.damage.as_mut().expect("nonempty band").mark(
+            &self
+                .bands
+                .iter()
+                .map(|b| iced::Rectangle {
+                    x: b.x,
+                    y: b.y,
+                    width: b.width,
+                    height: b.height,
+                })
+                .collect::<Vec<_>>(),
+        );
         self.width = width;
         self.height = height;
         self.cell = (raster.width, raster.height);
-        self.cursor = cursor && screen.cursor.0 < screen.cols;
         &self.bands
     }
 
@@ -150,8 +157,11 @@ impl PixelBand {
         } else if self.cached.as_ref().map(|(current, _)| *current) != Some(generation) {
             self.cached = Some((
                 generation,
-                Handle::new(self.width, self.height, self.native.clone())
-                    .expect("painted native band dimensions"),
+                Handle::with_damage(
+                    self.native.clone(),
+                    self.damage.as_ref().expect("painted damage"),
+                )
+                .expect("painted native band dimensions"),
             ));
         }
     }
@@ -190,6 +200,7 @@ mod tests {
             rows: 4,
             cursor: (0, 0),
             cursor_visible: false,
+            display_offset: 0,
             cells: (0..32)
                 .map(|_| Cell {
                     c: 'M',
@@ -279,6 +290,8 @@ mod tests {
         assert_eq!(
             frame.lock().unwrap().take_damage(),
             vec![DamageBand {
+                x: 0,
+                width: grid.cols as u32 * painter.cell().0,
                 y: painter.cell().1,
                 height: painter.cell().1,
             }]
@@ -325,6 +338,8 @@ mod tests {
             assert_eq!(
                 frame.lock().unwrap().take_damage(),
                 vec![DamageBand {
+                    x: 0,
+                    width: grid.cols as u32 * painter.cell().0,
                     y: row as u32 * painter.cell().1,
                     height: painter.cell().1,
                 }]
@@ -360,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn no_damage_after_cache_release_restores_current_generation_without_refresh() {
+    fn redundant_dirty_hint_preserves_generation_without_refresh() {
         let mut painter = painter();
         let frame = painter.frame(PANE);
         let grid = screen();
@@ -368,13 +383,11 @@ mod tests {
         refresh(&frame);
         let old = handle(&frame);
         let generation = frame.lock().unwrap().generation();
-        // Force the conservative frontend guard to fall through while core
-        // state correctly reports no cursor and no dirty rows. This models
-        // divergence between the guard and core's damage rules.
-        frame.lock().unwrap().cpu_surface_mut().tiles[0].cursor = true;
-        assert!(!painter.repaint(PANE, &grid, &[false; 4]));
+        // A redundant dirty hint must not release the cached generation.
+        assert!(!painter.repaint(PANE, &grid, &[true; 4]));
         // Deliberately do not refresh: main skips it for a false repaint.
         let current = handle(&frame);
+        assert_eq!(current.generation(), old.generation());
         assert_eq!(pixels(&current).as_ref(), pixels(&old).as_ref());
         let locked = frame.lock().unwrap();
         let surface = &locked.surface().tiles[0];

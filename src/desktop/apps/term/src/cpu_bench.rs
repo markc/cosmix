@@ -37,6 +37,7 @@ fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
             rows: 61,
             cursor: (2, 4),
             cursor_visible: true,
+            display_offset: 0,
             cells: (0..9 * 61)
                 .map(|i| Cell {
                     c: 'M',
@@ -113,7 +114,10 @@ fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
 fn tiny_skia_frame_bench() {
     let mut expected = Vec::new();
     for banded in [false, true] {
-        for all in [false, true] {
+        for (case, label) in ["row echo", "redraw", "one-cell echo", "cursor only"]
+            .into_iter()
+            .enumerate()
+        {
             let mut raster = Raster::new(2.5, 13.0, Cursor::Underline).unwrap();
             // Padded cells make the requested physical extent exact independently
             // of the installed font; glyph rendering still uses the real 2.5x font.
@@ -124,6 +128,7 @@ fn tiny_skia_frame_bench() {
                 rows: 25,
                 cursor: (0, 12),
                 cursor_visible: true,
+                display_offset: 0,
                 cells: (0..2250)
                     .map(|i| Cell {
                         c: char::from(b'!' + (i % 90) as u8),
@@ -151,14 +156,24 @@ fn tiny_skia_frame_bench() {
             let mut area = 0.0;
             for n in 0..220 {
                 let pixels = &mut targets[n as usize % 3];
-                let mut dirty = vec![all; 25];
-                dirty[12] = true;
-                for (row, cells) in screen.cells.chunks_mut(90).enumerate() {
-                    if dirty[row] {
-                        for cell in cells {
-                            cell.bg[0] = 20 + (n % 40) as u8;
+                let mut dirty = vec![case == 1; 25];
+                if case < 3 {
+                    dirty[12] = true;
+                }
+                match case {
+                    0 | 1 => {
+                        for (row, cells) in screen.cells.chunks_mut(90).enumerate() {
+                            if dirty[row] {
+                                for cell in cells {
+                                    cell.bg[0] = 20 + (n % 40) as u8;
+                                }
+                            }
                         }
                     }
+                    2 => screen.cells[12 * 90 + 45].c = char::from(b'!' + (n % 90) as u8),
+                    // Cursor cells crossing a four-row-band boundary
+                    // every other frame. No text or colour changes.
+                    _ => screen.cursor = (45, if n % 2 == 0 { 11 } else { 12 }),
                 }
                 let start = Instant::now();
                 if banded {
@@ -228,7 +243,7 @@ fn tiny_skia_frame_bench() {
             if banded {
                 assert_eq!(
                     targets[219 % 3].data(),
-                    expected[usize::from(all)],
+                    expected[case],
                     "banded pixels differ from whole-pane baseline"
                 );
             } else {
@@ -242,7 +257,7 @@ fn tiny_skia_frame_bench() {
                 } else {
                     "RGBA baseline"
                 },
-                if all { "redraw" } else { "echo" },
+                label,
                 samples.iter().sum::<f64>() / 200.0,
                 samples[100],
                 samples[198],
@@ -260,12 +275,14 @@ fn tiny_skia_frame_bench() {
 #[test]
 fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
     for scale in [1.0, 1.25, 2.5] {
+        let mut scale = scale;
         let mut raster = Raster::new(scale, 13.0, Cursor::Block).unwrap();
         let mut screen = Screen {
             cols: 9,
             rows: 9,
             cursor: (2, 3),
             cursor_visible: true,
+            display_offset: 0,
             cells: (0..81)
                 .map(|i| Cell {
                     c: ['M', 'g', ' ', '@'][i % 4],
@@ -278,8 +295,8 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
         };
         let mut surface = Surface::default();
         let mut reference = RgbaBand::default();
-        let viewport = Viewport::with_physical_size(Size::new(480, 480), scale);
-        let full = Rectangle::with_size(viewport.logical_size());
+        let mut viewport = Viewport::with_physical_size(Size::new(480, 480), scale);
+        let mut full = Rectangle::with_size(viewport.logical_size());
         let mut renderer = Renderer::new(Font::default(), Pixels(13.0));
         let mut oracle = Renderer::new(Font::default(), Pixels(13.0));
         let mut mask = tiny_skia::Mask::new(480, 480).unwrap();
@@ -288,22 +305,63 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
             .collect();
         let mut history: std::collections::VecDeque<Vec<Layer>> = Default::default();
         let overlay = Handle::from_rgba(8, 8, [31, 47, 239, 127].repeat(64));
-        for n in 0..12 {
+        let mut seed = 0x1234_5678_91ab_cdef_u64;
+        let mut retained = Vec::new();
+        for n in 0..384 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            if n % 97 == 23 {
+                scale = if scale == 2.5 { 1.0 } else { 2.5 };
+                raster = raster.resized(scale, 13.0).unwrap();
+                viewport = Viewport::with_physical_size(Size::new(480, 480), scale);
+                full = Rectangle::with_size(viewport.logical_size());
+                history.clear(); // configure_surface also resets age history
+            }
             if n == 7 {
                 screen.rows = 6;
                 screen.cells.truncate(54); // Final band now has two rows.
             }
-            if n == 9 {
+            if n % 47 == 9 {
                 surface.invalidate();
             }
-            let row = n % screen.rows;
-            screen.cells[row * screen.cols].bg = [n as u8 * 19, 3, 201];
-            screen.cursor = (2, row);
+            if n % 41 == 0 {
+                screen.display_offset = if screen.display_offset == 0 { 2 } else { 0 };
+            }
+            let row = seed as usize % screen.rows;
+            let col = (seed >> 16) as usize % screen.cols;
+            if n % 17 == 6 {
+                // Publish an intermediate generation that never reaches a
+                // target; the eventual generation must retain both ranges.
+                let other = (row + 1) % screen.rows;
+                screen.cells[other * screen.cols].bg[1] ^= 255;
+                let mut pending = vec![false; screen.rows];
+                pending[other] = true;
+                surface.paint(&mut raster, &screen, &pending);
+                surface.cache_handle(n as u64);
+            }
+            if n % 5 != 0 {
+                let cell = &mut screen.cells[row * screen.cols + col];
+                cell.bg = [(seed >> 24) as u8, 3, 201];
+                cell.fg = [31, (seed >> 32) as u8, 129];
+                cell.c = ['M', ' ', 'g', '界'][n % 4];
+                cell.bold = n % 2 == 0;
+            }
+            screen.cursor = (col, row);
             screen.cursor_visible = n % 4 != 0;
             let mut dirty = vec![false; screen.rows];
             dirty[row] = true;
             surface.paint(&mut raster, &screen, &dirty);
             surface.cache_handle(n as u64);
+            if n % 71 == 0 {
+                retained.extend(surface.images(scale).into_iter().map(|(grid, _)| {
+                    let bytes = grid.pixels().to_vec();
+                    (grid, bytes)
+                }));
+            }
+            for (old, bytes) in &retained {
+                assert_eq!(old.pixels().as_ref(), bytes.as_slice());
+            }
             reference.paint(&mut raster, &screen, &[]);
             reference.cache_handle(n as u64);
             let origin = iced::Point::new(if n < 8 { 17.0 } else { 23.0 } / scale, 11.0 / scale);
@@ -348,7 +406,7 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
                 });
             }
             // Unknown age must discard the damaged target's old contents.
-            if n == 5 {
+            if n % 53 == 5 {
                 history.clear();
                 targets[n % 3].fill(tiny_skia::Color::from_rgba8(255, 0, 255, 255));
             }
@@ -404,9 +462,14 @@ fn raster_warm_spans_bench() {
                 rows: 25,
                 cursor: (0, 0),
                 cursor_visible: false,
+                display_offset: 0,
                 cells: (0..2250)
                     .map(|i| Cell {
-                        c: if spaces { ' ' } else { char::from(b'!' + (i % 90) as u8) },
+                        c: if spaces {
+                            ' '
+                        } else {
+                            char::from(b'!' + (i % 90) as u8)
+                        },
                         fg: [210, 220, 230],
                         bg: [20, 25, 30],
                         bold: false,
@@ -421,12 +484,15 @@ fn raster_warm_spans_bench() {
                 // Change real content without changing the warmed glyph keys.
                 // Set up the colours outside the timed region.
                 for (i, cell) in screen.cells.iter_mut().enumerate() {
-                    cell.bg[0] = 20 + (n % 40) as u8
-                        + (((i % 90) / run_cells) % 2) as u8;
+                    cell.bg[0] = 20 + (n % 40) as u8 + (((i % 90) / run_cells) % 2) as u8;
                 }
                 let start = Instant::now();
                 black_box(raster.paint(
-                    black_box(&screen), &mut pixels, 2250 * 4, &mut state, &[true; 25],
+                    black_box(&screen),
+                    &mut pixels,
+                    2250 * 4,
+                    &mut state,
+                    &[true; 25],
                 ));
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 black_box(&pixels);
@@ -481,6 +547,7 @@ fn tiny_skia_foot_phases_bench() {
         rows: 25,
         cursor: (0, 12),
         cursor_visible: false,
+        display_offset: 0,
         cells: (0..2250)
             .map(|i| Cell {
                 c: char::from(b'!' + (i % 90) as u8),
@@ -503,6 +570,13 @@ fn tiny_skia_foot_phases_bench() {
                 "paint warm full (2250 cells)"
             },
             || {
+                for (row, cells) in screen.cells.chunks_mut(90).enumerate() {
+                    if dirty[row] {
+                        for cell in cells {
+                            cell.bg[0] = cell.bg[0].wrapping_add(1);
+                        }
+                    }
+                }
                 raster.paint(&screen, &mut rgba, 2250 * 4, &mut state, &dirty);
                 black_box(&rgba);
             },

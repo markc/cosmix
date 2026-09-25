@@ -894,3 +894,114 @@ merged tree. Term stays at 0.2.5 and core at 0.6.2. Tiny-skia is the default,
 clean wgpu uses `--no-default-features --features wgpu`, and enabling both
 selects wgpu. Merge resolution is source-checked only; build, regression and
 clippy validation of this integration remain for the cluster.
+
+## Rank 5: cell comparison and range damage (2026-09-25)
+
+Implemented on the ranks 1/2/3/4/6 base; **not built, tested or measured locally**.
+Cluster validation remains required. Versions are unchanged. The comparison
+baseline remains banded row echo **0.370 ms** (about **0.13 ms paint + 0.24 ms
+render**) and full redraw **3.742 ms**; there are no new timing claims here.
+
+`PaintState` retains the captured `Cell` values. On correctly sized dirty-row
+hints, it compares `char`, final foreground/background RGB and bold using
+`Cell` equality. It paints contiguous changed-cell ranges and coalesces equal
+backgrounds only within those ranges. No palette, selection or semantic VT
+state is reconstructed: capture-time selection colour swaps work automatically
+when capture marks their rows dirty. Old/new cursor cells are independently
+repainted on movement or visibility changes. A stationary cursor is composited
+only over a cell repainted this call; an unchanged dirty row costs comparisons,
+with no pixel writes, generation change or buffer copy.
+
+Full invalidation covers columns, paintable rows, physical cell size, output
+scale, destination format, stride, changed buffer address/length, explicit
+invalidation, and replacement raster identity (including a different font/size
+with identical rounded metrics). A byte-identical complete-copy `rebind` is the
+explicit storage exception. Malformed damage lengths and incomplete cell rows
+retain the conservative full-paint behaviour. `Screen::display_offset` is
+captured under the terminal lock and carried through CPU band snapshots: an
+offset change forces full rows even if all cells compare equal. Both capture
+and raster hide the cursor whenever that offset is nonzero. An unchanged
+scrolled viewport may now skip identical cells despite conservative row hints.
+
+`DamageBand` now includes physical `x` and `width`. Its legacy `byte_range`
+still returns conservative full scanlines, including padding. Frame damage
+coalescing preserves horizontal extents. Wgpu uploads narrow rectangles from
+the existing full-stride RGBA allocation using x/y texture origins and byte
+offsets; new textures still receive a full upload. No packing allocation or
+texture-format change is introduced. GPU execution remains unvalidated here.
+
+The tiny-skia primitive keeps a bounded cell-revision array beside each
+immutable native BGRA generation. Its separate `Damage` tracker holds metadata,
+never old pixels. Updating stamps uses copy-on-write if a retained generation
+still owns the old array. Comparing two generations from the same lineage
+finds changed ranges at any buffer age, including A → B → A and multiple
+paints/publications before a presentation. Unrelated geometry/lineage, changed
+placement/clip and added/removed primitives retain full-bound damage. Equal
+generations stay a constant-time comparison.
+
+The four-row allocation remains the storage unit. A retained generation always
+forces separate pixels before mutation. Partial updates copy the **complete**
+band and rebind; an update proven to overwrite every cell may discard its old
+pixels. Row flags alone no longer authorise discarding bytes. No storage safety
+depends on a maximum age, a two-frame rotation or history release timing.
+The widget still draws complete immutable grids; layer diffing supplies narrow
+regions to the existing clipped copy and `present_with_damage` path. Iced's
+damage expansion/grouping, age repair and redraws beneath overlays can enlarge
+those regions: cell damage and buffer repair remain separate concerns.
+
+Added/extended validation for the cluster:
+
+- 2,048 deterministic random frames per cursor style compare **every frame**
+  against a fresh full paint using the retained original per-pixel painter.
+  Cases include typing, colours/style and selection-like swaps, redundant
+  dirtiness, cursor movement/hide/out-of-bounds, resize, partial last rows,
+  scale/font/format/stride changes, replacement buffers, complete-copy rebinds,
+  explicit invalidation and viewport changes. Guard bytes/padding and damage
+  coverage of every changed byte are checked.
+- Focused tests require one-cell damage, two disjoint ranges, unchanged cursor
+  no-ops and full viewport invalidation with identical cells. Existing row,
+  format, storage and frame tests use the new rectangle semantics.
+- The rotating-target/RGBA comparison now checks 384 frames for each of three
+  initial scales, including output-scale changes, retained historical pixels,
+  skipped intermediate generations, clips/overlays, resize and unknown ages.
+- Vendor regressions check arbitrary-age cell stamps, reverts, narrow layer
+  diffing and the physical rectangles passed to presentation. At scale 2.5,
+  one 25×50 cell yields a 31×56 outward-rounded rectangle after iced's margin,
+  instead of damaging the full 2250×200 storage band.
+- A wgpu-side host test replays the production upload layouts into a simulated
+  texture after coalesced cell/cursor paints and compares every byte with the
+  current RGBA surface. It does not exercise a device or driver.
+- The ignored frame benchmark retains row echo/full redraw and adds genuine
+  one-cell glyph echo plus cursor-only moves across a band boundary. It prints
+  the existing phase timing and damaged-area columns for both transports.
+  Warm phase probes now change actual cell backgrounds so they measure paint,
+  rather than the newly cheap redundant-damage path (that setup is timed).
+
+Expected savings are structural, pending measurement: one-cell echo paints
+1/90 of a row's cells and submits roughly 1,736 pixels instead of about 450,000
+band pixels in the isolated fixture. Cursor-only movement paints two cells.
+The previous ~0.13 ms paint phase and ~0.24 ms render phase provide headroom,
+but full-band retained-storage copies, snapshot/band cell copies, mask work,
+metadata comparison and grouping remain. A genuinely changed full pane still
+paints/presents all cells; no full-redraw speedup is claimed.
+
+Unenforced contracts and limits:
+
+- Dirty-row hints must cover every captured visual change, including future
+  selection changes, and consumers must not drop consuming snapshots between
+  paints. Pane identity changes or undetectable same-address buffer reuse
+  require explicit invalidation; external writes to retained pixels are not
+  detectable. `rebind` requires an exact complete copy with unchanged layout.
+- External native-grid producers must supply premultiplied BGRA and mark
+  every written region before publishing with `Grid::with_damage`. Shape is
+  validated; channel validity and completeness of reported damage are not.
+  Term derives marks from the actual painter ranges and writes opaque pixels.
+- The existing Swash Outline/Alpha mask layout and representable grid/stride
+  arithmetic are still library/caller contracts. Public raster dimensions
+  must remain valid nonzero font metrics. New pixel-affecting `Cell` fields
+  must be captured and painted; derived equality includes them automatically.
+- The existing iced CPU renderer alias, dependency feature unification and
+  ordered sublayer contracts remain source-audited integration dependencies.
+  Headless tests do not establish live Wayland acquire/present pacing, old
+  surface-version damage expansion, compositor cost or input-to-visible latency.
+  Timing estimates assume comparable hardware/font/fixture conditions.

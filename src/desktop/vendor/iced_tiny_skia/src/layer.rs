@@ -311,11 +311,37 @@ impl Layer {
             },
         );
 
-        let images = damage::list(
+        let images = damage::diff(
             &previous.images,
             &current.images,
             |image| vec![image.bounds().expand(1.0)],
-            Image::eq,
+            |previous, current| {
+                if previous == current {
+                    return Vec::new();
+                }
+                #[cfg(feature = "image")]
+                if let (
+                    Image::Grid {
+                        grid: old,
+                        bounds: old_bounds,
+                        clip_bounds: old_clip,
+                    },
+                    Image::Grid {
+                        grid: new,
+                        bounds,
+                        clip_bounds,
+                    },
+                ) = (previous, current)
+                    && bounds == old_bounds
+                    && clip_bounds == old_clip
+                {
+                    return new.damage_since(old, *bounds);
+                }
+                vec![
+                    previous.bounds().expand(1.0),
+                    current.bounds().expand(1.0),
+                ]
+            },
         );
 
         damage.extend(text);

@@ -1,6 +1,6 @@
 use super::*;
 
-/// Four terminal rows bound retained-buffer copies and damage on echo,
+/// Four terminal rows bound retained-buffer copies on echo (damage is per cell),
 /// without creating a widget for every physical scanline.
 const ROWS_PER_BAND: usize = 4;
 
@@ -77,6 +77,7 @@ impl Surface {
                 rows: end - first,
                 cursor: (screen.cursor.0, screen.cursor.1.saturating_sub(first)),
                 cursor_visible: screen.cursor_visible && (first..end).contains(&screen.cursor.1),
+                display_offset: screen.display_offset,
                 cells: screen.cells[first * screen.cols..end * screen.cols].to_vec(),
                 updated: screen.updated,
             };
@@ -85,9 +86,10 @@ impl Surface {
             } else {
                 &[]
             };
-            let discard = dirty.len() != part.rows || dirty.iter().all(|row| *row);
-            for damage in tile.paint_inner(raster, &part, dirty, discard) {
+            for damage in tile.paint_inner(raster, &part, dirty) {
                 self.bands.push(DamageBand {
+                    x: damage.x,
+                    width: damage.width,
                     y: first as u32 * raster.height + damage.y,
                     height: damage.height,
                 });
@@ -143,6 +145,7 @@ mod tests {
             rows: 11,
             cursor: (2, 3),
             cursor_visible: true,
+            display_offset: 0,
             cells: vec![
                 Cell {
                     c: 'M',

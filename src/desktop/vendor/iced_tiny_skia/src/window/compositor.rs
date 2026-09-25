@@ -298,6 +298,34 @@ pub fn screenshot(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "image")]
+    #[test]
+    fn native_cell_damage_reaches_physical_present_rectangles() {
+        use crate::core::{Bytes, Renderer as _};
+        use crate::grid::{Damage, Grid};
+        let viewport = Viewport::with_physical_size(Size::new(2250, 200), 2.5);
+        let full = Rectangle::with_size(viewport.logical_size());
+        let mut stamps = Damage::new(2250, 200, (25, 50)).unwrap();
+        let pixels = Bytes::from([0, 0, 0, 255].repeat(2250 * 200));
+        let mut renderer = Renderer::new(crate::core::Font::default(), crate::core::Pixels(13.0));
+        let mut history = PresentHistory::default();
+        renderer.reset(full);
+        renderer.draw_grid(Grid::with_damage(pixels.clone(), &stamps).unwrap(), full, full);
+        history.damage(0, renderer.layers(), &viewport, Color::BLACK);
+        history.submit(renderer.layers(), Color::BLACK, || {}, || Ok::<_, ()>(())).unwrap();
+        stamps.mark(&[Rectangle { x: 1125, y: 50, width: 25, height: 50 }]);
+        renderer.reset(full);
+        renderer.draw_grid(Grid::with_damage(pixels, &stamps).unwrap(), full, full);
+        let regions = history.damage(1, renderer.layers(), &viewport, Color::BLACK);
+        let physical = physical_damage(&regions, &viewport);
+        assert_eq!(physical.len(), 1);
+        let rect = &physical[0];
+        assert_eq!((rect.x, rect.y, rect.width.get(), rect.height.get()), (1122, 47, 31, 56));
+        // Identical scene: no surface damage, even with the changed generation.
+        history.submit(renderer.layers(), Color::BLACK, || {}, || Ok::<_, ()>(())).unwrap();
+        assert!(history.damage(1, renderer.layers(), &viewport, Color::BLACK).is_empty());
+    }
+
     fn scene(x: f32) -> Vec<Layer> {
         vec![Layer {
             bounds: Rectangle { x, y: 0.0, width: 8.0, height: 8.0 },
