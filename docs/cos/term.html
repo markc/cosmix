@@ -505,8 +505,9 @@ alternate screen, Shift+PageUp/PageDown/Home/End go to the application as
 PageUp/PageDown/Home/End. Plain PageUp and
 PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
 Accepted keyboard input, pasted or Bus <code>term.type</code> text (including control-lane
-typing), and mouse reports return the viewport to the live bottom. Empty or
-rejected input and automatic VT replies leave it alone. A live cursor is shown
+typing), and mouse button or wheel reports return the viewport to the live bottom.
+Motion-only reports (including button drags), empty or rejected input, and
+automatic VT replies leave it alone. A live cursor is shown
 in a scrolled viewport only when its translated row remains on screen.</p>
 <p>Each wheel notch scrolls one line. Touchpad travel accumulates at one logical
 cell height per line, matching bterm. Applications that enable mouse reporting
@@ -557,6 +558,7 @@ is a JSON object, and <code>{}</code> means no arguments.</p>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
 <tr><td><code>term.snapshot</code></td><td><code>{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}</code> (all optional)</td><td>read a pane anywhere; default is the focused pane in the selected/active tab; <code>contents</code> defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero)</td></tr>
 <tr><td><code>term.type</code></td><td><code>{"pane":N,"text":"..."}</code> (<code>pane</code> optional)</td><td>type ASCII as keys into that pane, default focused pane; does not change focus</td></tr>
+<tr><td><code>term.scroll</code></td><td><code>{"pane":N,"lines":3}</code> or <code>{"page":-1}</code> or <code>{"to":"top"}</code></td><td>move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed <code>lines</code>, signed <code>page</code>, or <code>to</code> (<code>top</code>/<code>bottom</code>)</td></tr>
 <tr><td><code>term.props.watch</code></td><td><code>{}</code></td><td>subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON <code>{topics,revision}</code>), then read state</td></tr>
 </tbody></table>
 <pre><code class="language-mix">send term term.tab.new
@@ -597,6 +599,16 @@ via <code>tabs.changed</code> and <code>title.changed</code> with <code>kind=ret
 tab-set and pane-layout revisions unchanged, so pane geometry stays valid.
 Completion notifications use the same sanitised, possibly program-set label.
 Explicit cwd paths follow symlinks and resolve <code>..</code> normally.</p>
+<p><code>term.scroll</code> (or <code>bterm.scroll</code> on bterm) returns JSON
+<code>{"pane":N,"display_offset":D,"history_lines":H}</code>. Positive lines/pages move
+up into history; negative values move down, clamped to available history.
+Each page is rows minus one, matching the keyboard chords. Integers must fit
+signed 64 bits; zero is a no-op. Stale pane IDs return <code>not-found</code>.
+Scrolling leaves snapshot content on the live screen and never sends PTY input.
+When watching, an offset change publishes <code>term.pane.changed</code> (or
+<code>bterm.pane.changed</code>) with <code>kind=scrolled</code>; a clamped no-op publishes nothing.
+Like other mutations it supports <code>request_id</code> replay and is refused on the
+strict diagnostic-only targetless lane.</p>
 <p>Existing replies keep their key=value format. New title replies are
 <code>retitled id=N tab=N pane=P revision=R</code>; move replies are
 <code>moved id=N index=I tab=N pane=P revision=R</code>. Tab creation still replies

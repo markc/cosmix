@@ -538,6 +538,8 @@ pub struct GridSnapshot {
 /// Frontend-neutral requests to move the history viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollRequest {
+    Lines(i64),
+    Pages(i64),
     PageUp,
     PageDown,
     Top,
@@ -961,25 +963,49 @@ impl Terminal {
         self.damage.lock().unwrap().try_recv().is_ok()
     }
     pub fn screen(&self, consume: bool) -> Screen {
-        self.capture(consume, None, false)
+        self.capture(consume, None)
     }
     pub fn scroll_view(&self, request: ScrollRequest) {
+        self.scroll_view_state(request);
+    }
+
+    /// Move only the viewport and capture offset/history atomically for Bus replies.
+    pub(crate) fn scroll_view_state(&self, request: ScrollRequest) -> (usize, usize, bool) {
         use rio_vt::crosswords::grid::Scroll;
+        use rio_vt::crosswords::grid::Dimensions;
         let mut term = self.grid.lock();
         // Rio's PageUp/PageDown move by rows, but terminal pages overlap by
         // one row. Delta also preserves that contract at either history edge.
         let page = term.screen_lines().saturating_sub(1) as i32;
+        let before = term.display_offset();
+        let history = term.grid.history_size();
+        // Clamp before entering Rio: its Delta adds in i32 and can overflow
+        // for a large positive request while already viewing history.
+        let delta = |lines: i64| {
+            let target = (before as i64).saturating_add(lines);
+            if target <= 0 {
+                Scroll::Bottom
+            } else if target >= history as i64 {
+                Scroll::Top
+            } else {
+                Scroll::Delta(lines as i32)
+            }
+        };
         let scroll = match request {
+            ScrollRequest::Lines(lines) => delta(lines),
+            ScrollRequest::Pages(pages) => delta(pages.saturating_mul(page as i64)),
             ScrollRequest::PageUp => Scroll::Delta(page),
             ScrollRequest::PageDown => Scroll::Delta(-page),
             ScrollRequest::Top => Scroll::Top,
             ScrollRequest::Bottom => Scroll::Bottom,
         };
-        let before = term.display_offset();
         term.scroll_display(scroll);
-        if term.display_offset() != before {
+        let offset = term.display_offset();
+        drop(term);
+        if offset != before {
             self.listener.dirty();
         }
+        (offset, history, offset != before)
     }
 
     /// Human key input follows the live output once bytes reach the queue.
@@ -1002,10 +1028,10 @@ impl Terminal {
     /// previous consuming read (by either method).
     pub fn grid_snapshot(&self) -> GridSnapshot {
         let mut dirty_rows = Vec::new();
-        let screen = self.capture(true, Some(&mut dirty_rows), false);
+        let screen = self.capture(true, Some(&mut dirty_rows));
         GridSnapshot { screen, dirty_rows }
     }
-    fn capture(&self, consume: bool, dirty: Option<&mut Vec<bool>>, live: bool) -> Screen {
+    fn capture(&self, consume: bool, dirty: Option<&mut Vec<bool>>) -> Screen {
         use rio_vt::config::{
             Colors,
             colors::{AnsiColor, term::List},
@@ -1028,7 +1054,7 @@ impl Terminal {
         let cols = term.columns();
         let rows = term.screen_lines();
         let mut cells = Vec::with_capacity(cols * rows);
-        let offset = if live { 0 } else { term.display_offset() };
+        let offset = term.display_offset();
         for y in 0..rows {
             let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
             for x in 0..cols {

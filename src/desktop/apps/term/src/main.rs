@@ -183,7 +183,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
         wheel: 0.0,
         scroll_wheel: 0.0,
         scroll_pane: None,
-        pointer: None,
+        pointer: std::cell::Cell::new(None),
     };
 
     // `BootFn` is `Fn`, not `FnOnce`, and the state is not cloneable — the
@@ -307,7 +307,7 @@ struct State {
     scroll_wheel: f32,
     scroll_pane: Option<u64>,
     /// Window coordinates survive a tab change beneath a stationary pointer.
-    pointer: Option<iced::Point>,
+    pointer: std::cell::Cell<Option<iced::Point>>,
 }
 
 #[derive(Debug, Clone)]
@@ -324,7 +324,7 @@ enum Message {
     SelectTab(u64),
     FocusPane(u64),
     Wheel(u64, iced::mouse::ScrollDelta),
-    Pointer(iced::Point),
+    Pointer,
     Window(iced::window::Event),
     /// The window's device-pixel ratio, answered by the runtime.
     Scale(f32),
@@ -461,7 +461,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             tabs.user_activity();
             tabs.focus(id);
         }
-        Message::Pointer(position) => state.pointer = Some(position),
+        Message::Pointer => {},
         Message::Wheel(id, delta) => {
             if state.modifiers.control() {
                 let steps = input::wheel_steps(&mut state.wheel, delta);
@@ -558,7 +558,7 @@ fn view(state: &State) -> Element<'_, Message> {
         );
         Some((*id, col, row))
     };
-    let last = std::cell::Cell::new(state.pointer.and_then(&hovered));
+    let last = std::cell::Cell::new(state.pointer.get().and_then(&hovered));
     let content = keys::keys(column![tab_strip(state, scale), panes], move |event| {
         let message = on_key(event);
         // Ordinary typing must not acquire an extra terminal/grid lock just
@@ -572,7 +572,7 @@ fn view(state: &State) -> Element<'_, Message> {
         message
     }).on_pointer(move |position| {
         let cell = hovered(position);
-        pointer_message(&last, cell, position)
+        pointer_message(&state.pointer, &last, cell, position)
     });
     container(content)
         .width(Length::Fill)
@@ -587,11 +587,15 @@ fn view(state: &State) -> Element<'_, Message> {
 type HoveredCell = Option<(u64, u16, u16)>;
 
 fn pointer_message(
+    pointer: &std::cell::Cell<Option<iced::Point>>,
     last: &std::cell::Cell<HoveredCell>,
     hovered: HoveredCell,
     position: iced::Point,
 ) -> Option<Message> {
-    (last.replace(hovered) != hovered).then_some(Message::Pointer(position))
+    // Keep pixel coordinates even when no application update is needed. A queued
+    // Pointer message must never overwrite a newer coalesced position.
+    pointer.set(Some(position));
+    (last.replace(hovered) != hovered).then_some(Message::Pointer)
 }
 
 /// One button per tab and a `+`, as bterm. Every colour is a design token.
@@ -787,7 +791,7 @@ impl State {
             self.scroll_wheel = 0.0;
             self.scroll_pane = Some(id);
         }
-        let Some(position) = self.pointer else {
+        let Some(position) = self.pointer.get() else {
             return;
         };
         let Some(tree) = &self.shape.tree else {
@@ -1102,15 +1106,19 @@ mod tests {
 
     #[test]
     fn pointer_motion_emits_only_for_a_new_pane_or_cell() {
+        let pointer = std::cell::Cell::new(None);
         let last = std::cell::Cell::new(None);
-        assert!(pointer_message(&last, Some((1, 0, 0)), iced::Point::new(2.0, 2.0)).is_some());
+        assert!(pointer_message(&pointer, &last, Some((1, 0, 0)), iced::Point::new(2.0, 2.0)).is_some());
         for pixel in 3..8 {
-            assert!(pointer_message(&last, Some((1, 0, 0)), iced::Point::new(pixel as f32, 2.0)).is_none());
+            assert!(pointer_message(&pointer, &last, Some((1, 0, 0)), iced::Point::new(pixel as f32, 2.0)).is_none());
         }
-        assert!(pointer_message(&last, Some((1, 1, 0)), iced::Point::new(9.0, 2.0)).is_some());
-        assert!(pointer_message(&last, Some((2, 1, 0)), iced::Point::new(90.0, 2.0)).is_some());
-        assert!(pointer_message(&last, None, iced::Point::ORIGIN).is_some());
-        assert!(pointer_message(&last, None, iced::Point::ORIGIN).is_none());
+        assert_eq!(pointer.get(), Some(iced::Point::new(7.0, 2.0)));
+        // A narrower cell after zoom/layout uses the newest pixel, not x=2.
+        assert_eq!(input::pointer_cell(pointer.get().unwrap(), 0.0, (4.0, 4.0), (80, 24)), (1, 0));
+        assert!(pointer_message(&pointer, &last, Some((1, 1, 0)), iced::Point::new(9.0, 2.0)).is_some());
+        assert!(pointer_message(&pointer, &last, Some((2, 1, 0)), iced::Point::new(90.0, 2.0)).is_some());
+        assert!(pointer_message(&pointer, &last, None, iced::Point::ORIGIN).is_some());
+        assert!(pointer_message(&pointer, &last, None, iced::Point::ORIGIN).is_none());
     }
 
     /// `on_key` is the dispatcher that decides chord versus shell and
@@ -1200,7 +1208,7 @@ mod tests {
             wheel: 0.0,
             scroll_wheel: 0.0,
             scroll_pane: None,
-            pointer: None,
+            pointer: std::cell::Cell::new(None),
         };
         (state, reaper)
     }
@@ -1287,7 +1295,7 @@ mod tests {
         assert_ne!(left, right);
         let terminal = state.tabs.lock().unwrap().pane_by_id(left).unwrap();
         fill_history(&terminal);
-        let _ = update(&mut state, Message::Pointer(iced::Point::new(10.0, 40.0)));
+        state.pointer.set(Some(iced::Point::new(10.0, 40.0)));
         let half = ScrollDelta::Pixels { x: 0.0, y: state.painter.logical_cell().1 / 2.0 };
         let _ = update(&mut state, Message::Wheel(left, half));
         assert_eq!(state.scroll_pane, Some(left));

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — unless explicit pane/tab selectors are supplied, they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {cwd?:<absolute existing directory>, title?:<string>}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {tab?:<integer>}: list selected tab (default active tab) pane ids, focus, dimensions, child pids and logical geometry (last layout only; hidden tabs may be stale or zero)\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {pane?:<integer>, tab?:<integer>, contents?:<boolean=true>, scrollback_lines?:<integer=0, max 10000>}: read-only selected live screen (offset zero, default active); buffered history above the live screen is capped at available lines; text has a 512 KiB encoded-byte budget, returns complete oldest-first rows with truncated and lines_returned; formatting happens after releasing capture locks; pane+tab must agree; contents=false omits text but keeps dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {pane?:<integer>, \"text\":\"<string>\"}: ASCII synthetic keys to the selected pane without changing focus (default active pane) through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nterm.tab.title {id:<integer>, title:<string>}: pin a user title (controls stripped, max 256 UTF-8 bytes); empty after sanitising clears the pin and restores the active pane OSC title\nterm.tab.move {id:<integer>, index:<integer>}: reorder tab, clamping index to 0..len-1; focus is preserved\nterm.props.watch {}: first subscribe through noded topic.subscribe to term.tabs.changed, term.pane.changed and term.title.changed; then call this verb to enable caller-free publishing and return JSON {topics,revision}; then read current state. Bodies are {tab,pane,kind,revision}; revision is a separate monotonic event sequence, not the legacy layout revision. Bounded best-effort delivery; on a gap or reconnect read current state.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
+pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — unless explicit pane/tab selectors are supplied, they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {cwd?:<absolute existing directory>, title?:<string>}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {tab?:<integer>}: list selected tab (default active tab) pane ids, focus, dimensions, child pids and logical geometry (last layout only; hidden tabs may be stale or zero)\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {pane?:<integer>, tab?:<integer>, contents?:<boolean=true>, scrollback_lines?:<integer=0, max 10000>}: read-only selected live screen (offset zero, default active); buffered history above the live screen is capped at available lines; text has a 512 KiB encoded-byte budget, returns complete oldest-first rows with truncated and lines_returned; formatting happens after releasing capture locks; pane+tab must agree; contents=false omits text but keeps dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.scroll {pane?:<integer>, lines?:<signed integer>, page?:<signed integer>, to?:top|bottom}: exactly one of lines/page/to; positive lines or pages move up into history; pages overlap by one row; viewport only, snapshots stay live; returns JSON {pane,display_offset,history_lines}; stale pane is not-found; changed offsets publish pane.changed kind=scrolled when watching\nterm.type {pane?:<integer>, \"text\":\"<string>\"}: ASCII synthetic keys to the selected pane without changing focus (default active pane) through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nterm.tab.title {id:<integer>, title:<string>}: pin a user title (controls stripped, max 256 UTF-8 bytes); empty after sanitising clears the pin and restores the active pane OSC title\nterm.tab.move {id:<integer>, index:<integer>}: reorder tab, clamping index to 0..len-1; focus is preserved\nterm.props.watch {}: first subscribe through noded topic.subscribe to term.tabs.changed, term.pane.changed and term.title.changed; then call this verb to enable caller-free publishing and return JSON {topics,revision}; then read current state. Bodies are {tab,pane,kind,revision}; revision is a separate monotonic event sequence, not the legacy layout revision. Bounded best-effort delivery; on a gap or reconnect read current state.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type, scroll) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
 /// The one spelling the handlers in this crate are written in.
 ///
 /// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global Bus
@@ -461,6 +461,7 @@ fn mutates(verb: &str) -> bool {
             | "term.pane.select"
             | "term.pane.close"
             | "term.type"
+            | "term.scroll"
     )
 }
 
@@ -734,6 +735,27 @@ fn handle(
                 ))
             }
         }
+        "term.scroll" => {
+            use crate::terminal::ScrollRequest;
+            let (tab, pane) = tabs.resolve(args["pane"].as_u64(), None)?;
+            let selected = tabs.pane_by_id(pane).expect("resolved pane exists under set lock");
+            let terminal = selected.lock().unwrap();
+            let scroll = match args["to"].as_str() {
+                Some("top") => ScrollRequest::Top,
+                Some("bottom") => ScrollRequest::Bottom,
+                _ => match args["lines"].as_i64() {
+                    Some(lines) => ScrollRequest::Lines(lines),
+                    None => ScrollRequest::Pages(args["page"].as_i64().unwrap()),
+                },
+            };
+            let (display_offset, history_lines, changed) = terminal.scroll_view_state(scroll);
+            drop(terminal);
+            if changed {
+                tabs.changed("pane.changed", tab, pane, "scrolled");
+            }
+            Ok(serde_json::json!({"pane": pane, "display_offset": display_offset,
+                "history_lines": history_lines}).to_string())
+        }
         // VERIFY: active-pane snapshot/type — selection stays under the set lock.
         "term.snapshot" | "term.type" => {
             let (tab, pane) = tabs.resolve(args["pane"].as_u64(), args["tab"].as_u64())?;
@@ -800,7 +822,7 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     }
     let field = match verb {
         "term.snapshot" | "term.tabs" | "term.tab.new" | "term.panes" | "term.pane.close"
-        | "term.session" | "term.props.watch" => None,
+        | "term.session" | "term.props.watch" | "term.scroll" => None,
         #[cfg(test)]
         "term.test.panic" | "term.test.panic_locked" => None,
         "term.type" => Some("text"),
@@ -819,6 +841,7 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     let extra: &[&str] = match verb {
         "term.snapshot" => &["pane", "tab", "contents", "scrollback_lines"],
         "term.type" => &["pane"],
+        "term.scroll" => &["pane", "lines", "page", "to"],
         "term.panes" => &["tab"],
         "term.tab.new" => &["cwd", "title"],
         "term.tab.title" => &["title"],
@@ -836,6 +859,19 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
         args["request_id"]
             .as_str()
             .ok_or("request_id must be a string")?;
+    }
+    if verb == "term.scroll" {
+        if ["lines", "page", "to"].iter().filter(|key| object.contains_key(**key)).count() != 1 {
+            return Err("invalid-argument: exactly one of lines, page or to is required".into());
+        }
+        for key in ["lines", "page"] {
+            if object.contains_key(key) && args[key].as_i64().is_none() {
+                return Err(format!("invalid-argument: {key} must be a signed integer (i64)"));
+            }
+        }
+        if object.contains_key("to") && !matches!(args["to"].as_str(), Some("top" | "bottom")) {
+            return Err("invalid-argument: to must be top or bottom".into());
+        }
     }
     match field {
         Some("text") => {
@@ -898,6 +934,90 @@ mod tests {
         }
         let (cleanup, worker) = Cleanup::start().unwrap();
         Some((Mutex::new(TabSet::new().unwrap()), cleanup, worker))
+    }
+
+    #[test]
+    fn scroll_viewport_selectors_events_replay_and_refusals() {
+        let settings = crate::config::Settings {
+            config: crate::config::Config::default(),
+            term: "xterm-256color",
+        };
+        let fixture = || Ok(crate::terminal::Terminal::from_test_vt(
+            8, 3, b"old0\r\nold1\r\nlive0\r\nlive1\r\nlive2",
+        ));
+        let mut tabs = TabSet::with_initial(settings, None, fixture).unwrap();
+        let input = tabs.active_terminal().lock().unwrap().listener.test_input_receiver();
+        tabs.open_with(fixture).unwrap();
+        let focus = identity(&tabs);
+        let mut events = tabs.observe();
+        let set = Mutex::new(tabs);
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let mut replies = ReplyCache::default();
+        let call = |service, body: &str, replies: &mut ReplyCache| {
+            super::dispatch(true, service, &set, &cleanup, replies,
+                &format!("{service}.scroll"), body)
+        };
+        // Both service names use the same targetless implementation.
+        for service in ["term", "bterm"] {
+            call(service, r#"{"to":"top"}"#, &mut replies).unwrap();
+            let reply = call(service, r#"{"to":"bottom"}"#, &mut replies).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&reply).unwrap(),
+                serde_json::json!({"pane":2,"display_offset":0,"history_lines":2}));
+        }
+        assert!(events.try_recv().is_err());
+        handle(&set, &cleanup, "term.props.watch", "{}").unwrap();
+        let live = handle(&set, &cleanup, "term.snapshot", r#"{"pane":1}"#).unwrap();
+        let body = r#"{"pane":1,"lines":1,"request_id":"scroll-once"}"#;
+        let first = call("term", body, &mut replies).unwrap();
+        assert_eq!(call("term", body, &mut replies).unwrap(), first);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&first).unwrap(),
+            serde_json::json!({"pane":1,"display_offset":1,"history_lines":2}));
+        let event = events.try_recv().unwrap();
+        assert_eq!((event.topic, event.tab, event.pane, event.kind), ("pane.changed", 1, 1, "scrolled"));
+        assert!(events.try_recv().is_err(), "replay does not scroll or publish again");
+        assert_eq!(handle(&set, &cleanup, "term.snapshot", r#"{"pane":1}"#).unwrap().split_once("--- screen ---\n").unwrap().1,
+            live.split_once("--- screen ---\n").unwrap().1);
+        for (body, offset) in [
+            (r#"{"pane":1,"page":1}"#, 2),
+            (r#"{"pane":1,"page":-1}"#, 0),
+            (r#"{"pane":1,"lines":9223372036854775807}"#, 2),
+            (r#"{"pane":1,"lines":9223372036854775807}"#, 2),
+            (r#"{"pane":1,"lines":-9223372036854775808}"#, 0),
+            (r#"{"pane":1,"page":9223372036854775807}"#, 2),
+            (r#"{"pane":1,"page":-9223372036854775808}"#, 0),
+            (r#"{"pane":1,"to":"top"}"#, 2),
+            (r#"{"pane":1,"to":"bottom"}"#, 0),
+            (r#"{"pane":1,"lines":0}"#, 0),
+        ] {
+            let reply = call("bterm", body, &mut replies).unwrap();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&reply).unwrap()["display_offset"], offset);
+        }
+        assert_eq!(identity(&set.lock().unwrap()), focus);
+        assert_eq!(set.lock().unwrap().active_terminal().lock().unwrap().display_offset(), 0);
+        assert!(input.try_recv().is_err(), "viewport scrolling never writes PTY input");
+        let mut changes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            changes.push(event);
+        }
+        assert_eq!(changes.len(), 8, "clamped and zero requests do not publish");
+        assert!(changes.iter().all(|event| event.kind == "scrolled" && event.pane == 1));
+        for body in ["{}", r#"{"lines":1,"page":1}"#, r#"{"lines":1,"to":"top"}"#,
+            r#"{"page":1,"to":"bottom"}"#, r#"{"lines":null}"#, r#"{"lines":1.5}"#,
+            r#"{"page":"1"}"#, r#"{"lines":true}"#, r#"{"to":"middle"}"#,
+            r#"{"to":null}"#, r#"{"lines":9223372036854775808}"#,
+            r#"{"pane":-1,"lines":1}"#, r#"{"pane":null,"lines":1}"#,
+            r#"{"tab":1,"lines":1}"#, r#"{"to":"top","extra":1}"#] {
+            assert!(call("term", body, &mut replies).is_err(), "accepted {body}");
+        }
+        assert!(call("term", r#"{"pane":999,"lines":1}"#, &mut replies).unwrap_err().starts_with("not-found:"));
+        assert!(super::dispatch(false, "bterm", &set, &cleanup, &mut replies,
+            "bterm.scroll", r#"{"lines":1}"#).is_err());
+        assert!(call("term", r#"{"lines":2,"request_id":"scroll-once"}"#, &mut replies).is_err());
+        handle(&set, &cleanup, "term.tab.close", r#"{"id":1}"#).unwrap();
+        assert!(call("term", r#"{"pane":1,"lines":1}"#, &mut replies).unwrap_err().starts_with("not-found:"));
+        cleanup.submit(set.lock().unwrap().shutdown());
+        drop(cleanup);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -2228,6 +2348,7 @@ mod tests {
             let rendered = help(service);
             for suffix in [
                 "snapshot",
+                "scroll",
                 "type",
                 "panes",
                 "tab.new",
@@ -2241,6 +2362,9 @@ mod tests {
             }
             for arg in [
                 "pane?",
+                "lines?",
+                "page?",
+                "to?",
                 "tab?",
                 "contents?",
                 "scrollback_lines?",

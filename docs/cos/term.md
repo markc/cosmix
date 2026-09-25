@@ -79,8 +79,9 @@ alternate screen, Shift+PageUp/PageDown/Home/End go to the application as
 PageUp/PageDown/Home/End. Plain PageUp and
 PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
 Accepted keyboard input, pasted or Bus `term.type` text (including control-lane
-typing), and mouse reports return the viewport to the live bottom. Empty or
-rejected input and automatic VT replies leave it alone. A live cursor is shown
+typing), and mouse button or wheel reports return the viewport to the live bottom.
+Motion-only reports (including button drags), empty or rejected input, and
+automatic VT replies leave it alone. A live cursor is shown
 in a scrolled viewport only when its translated row remains on screen.
 
 Each wheel notch scrolls one line. Touchpad travel accumulates at one logical
@@ -142,6 +143,7 @@ is a JSON object, and `{}` means no arguments.
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |
 | `term.snapshot` | `{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}` (all optional) | read a pane anywhere; default is the focused pane in the selected/active tab; `contents` defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero) |
 | `term.type` | `{"pane":N,"text":"..."}` (`pane` optional) | type ASCII as keys into that pane, default focused pane; does not change focus |
+| `term.scroll` | `{"pane":N,"lines":3}` or `{"page":-1}` or `{"to":"top"}` | move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed `lines`, signed `page`, or `to` (`top`/`bottom`) |
 | `term.props.watch` | `{}` | subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON `{topics,revision}`), then read state |
 
 ```mix
@@ -185,6 +187,17 @@ via `tabs.changed` and `title.changed` with `kind=retitled`; they leave the
 tab-set and pane-layout revisions unchanged, so pane geometry stays valid.
 Completion notifications use the same sanitised, possibly program-set label.
 Explicit cwd paths follow symlinks and resolve `..` normally.
+
+`term.scroll` (or `bterm.scroll` on bterm) returns JSON
+`{"pane":N,"display_offset":D,"history_lines":H}`. Positive lines/pages move
+up into history; negative values move down, clamped to available history.
+Each page is rows minus one, matching the keyboard chords. Integers must fit
+signed 64 bits; zero is a no-op. Stale pane IDs return `not-found`.
+Scrolling leaves snapshot content on the live screen and never sends PTY input.
+When watching, an offset change publishes `term.pane.changed` (or
+`bterm.pane.changed`) with `kind=scrolled`; a clamped no-op publishes nothing.
+Like other mutations it supports `request_id` replay and is refused on the
+strict diagnostic-only targetless lane.
 
 Existing replies keep their key=value format. New title replies are
 `retitled id=N tab=N pane=P revision=R`; move replies are

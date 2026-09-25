@@ -58,7 +58,7 @@ fn mouse_report(button: u8, col: u16, row: u16, pressed: bool, sgr: bool, utf8: 
 }
 
 impl Terminal {
-    fn write_mouse(&self, bytes: Vec<u8>) -> bool {
+    fn write_mouse(&self, bytes: Vec<u8>, follow_input: bool) -> bool {
         let mut writes = self.listener.writes.lock().unwrap();
         // Mouse input has the same human-input authority as keyboard input.
         Listener::revoke_writer(&mut writes);
@@ -68,7 +68,9 @@ impl Terminal {
         {
             Ok(()) => {
                 drop(writes);
-                self.listener.follow_input();
+                if follow_input {
+                    self.listener.follow_input();
+                }
                 true
             },
             Err(e) => {
@@ -103,7 +105,7 @@ impl Terminal {
             pressed,
             mode.contains(Mode::SGR_MOUSE),
             mode.contains(Mode::UTF8_MOUSE),
-        ))
+        ), true)
     }
 
     /// Button 3 means no button held; modes 1002/1003 select drag/all motion.
@@ -124,7 +126,7 @@ impl Terminal {
             true,
             mode.contains(Mode::SGR_MOUSE),
             mode.contains(Mode::UTF8_MOUSE),
-        ))
+        ), false)
     }
 
     /// Positive lines scroll up. Returns false when the host should scroll locally.
@@ -144,7 +146,7 @@ impl Terminal {
         );
         let mut sent = false;
         for _ in 0..lines.unsigned_abs() {
-            if !self.write_mouse(report.clone()) {
+            if !self.write_mouse(report.clone(), true) {
                 break;
             }
             sent = true;
@@ -166,7 +168,7 @@ impl Terminal {
                 (false, false) => b"\x1b[B",
             };
             for _ in 0..lines.unsigned_abs() {
-                if !self.write_mouse(seq.to_vec()) {
+                if !self.write_mouse(seq.to_vec(), true) {
                     break;
                 }
             }
@@ -339,12 +341,27 @@ mod tests {
                 1 => &b"\x1b[<35;3;4M"[..],
                 _ => &b"\x1b[<64;3;4M"[..],
             });
-            assert_eq!(term.display_offset(), 0);
+            assert_eq!(term.display_offset(), if kind == 1 { 57 } else { 0 });
         }
         term.listener.quit.store(true, Ordering::Release);
         term.scroll_view(ScrollRequest::Top);
         assert!(term.listener.type_text("rejected").is_err());
         assert_eq!(term.display_offset(), 57);
+    }
+
+    #[test]
+    fn motion_reports_preserve_history_but_button_changes_follow_input() {
+        for mode in [b"\x1b[?1002;1006h".as_slice(), b"\x1b[?1003;1006h"] {
+            let (term, rx) = history();
+            Processor::default().advance(&mut *term.grid.lock(), mode);
+            term.scroll_view(ScrollRequest::Top);
+            assert!(term.mouse_motion(2, 3, 0, MouseModifiers::default()));
+            assert_eq!(input(&rx), b"\x1b[<32;3;4M");
+            assert_eq!(term.display_offset(), 57);
+            assert!(term.mouse_button(2, 3, 0, false, MouseModifiers::default()));
+            assert_eq!(input(&rx), b"\x1b[<0;3;4m");
+            assert_eq!(term.display_offset(), 0);
+        }
     }
 
     #[test]
