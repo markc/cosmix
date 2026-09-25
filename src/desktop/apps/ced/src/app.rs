@@ -123,6 +123,8 @@ pub struct App {
     remote_carets: bool,
     panel: Option<Panel>,
     modal: Option<Modal>,
+    /// Prompts that arrived while a dialog was open (round-2 m5 residual).
+    modal_queue: chrome::dialogs::ModalQueue<Modal>,
     find: FindBar,
     /// A chrome text field (the find bar) holds the keyboard.
     field_focused: bool,
@@ -202,6 +204,7 @@ pub fn run(service: &str, config: Config, paths: Vec<String>) -> anyhow::Result<
         theme,
         panel: None,
         modal: None,
+        modal_queue: Default::default(),
         find: FindBar { case: false, ..FindBar::default() },
         field_focused: false,
         window_focused: true,
@@ -325,6 +328,15 @@ impl App {
         }
         let task = self.dispatch(msg);
         let task = Task::batch([task, self.after_transition()]);
+        // A dialog closed: the next queued prompt whose tab still exists.
+        if self.modal.is_none() && !self.modal_queue.is_empty() {
+            let live: HashSet<TabId> = self.controller.tabs().iter().map(|t| t.id).collect();
+            self.modal_queue.next(&mut self.modal, |m| match m {
+                Modal::Confirm(Confirm::CloseDirty { tab, .. } | Confirm::DiskModified { tab, .. } | Confirm::Overwrite { tab, .. }) => live.contains(tab),
+                Modal::Conflict(v) => live.contains(&v.tab),
+                _ => true,
+            });
+        }
         self.update_us += started.elapsed().as_micros() as u64;
         task
     }
@@ -869,7 +881,8 @@ impl App {
             InfoAction::CloseTab(tab) => self.controller.on_action(Some(tab), ActionId::FileClose, intent(tab)),
             InfoAction::ShowConflict(tab, rev) => {
                 if let Some(c) = self.conflict(tab, rev) {
-                    self.modal = Some(Modal::Conflict(crate::chrome::dialogs::conflict::ConflictView { tab, conflict: c }));
+                    let view = Modal::Conflict(crate::chrome::dialogs::conflict::ConflictView { tab, conflict: c });
+                    self.modal_queue.offer(&mut self.modal, view);
                 }
                 return Task::none();
             }
@@ -903,15 +916,15 @@ impl App {
         match prompt {
             Prompt::CloseDirty { tab, intent } => {
                 let name = self.tab(tab).map(chrome::tabs::display_name).unwrap_or_default();
-                self.modal = Some(Modal::Confirm(Confirm::CloseDirty { tab, name, intent }));
+                self.modal_queue.offer(&mut self.modal, Modal::Confirm(Confirm::CloseDirty { tab, name, intent }));
             }
             Prompt::DiskModified { tab, intent } => {
                 let name = self.tab(tab).map(chrome::tabs::display_name).unwrap_or_default();
-                self.modal = Some(Modal::Confirm(Confirm::DiskModified { tab, name, intent }));
+                self.modal_queue.offer(&mut self.modal, Modal::Confirm(Confirm::DiskModified { tab, name, intent }));
             }
             Prompt::Recovered { buffers } => {
-                if !buffers.is_empty() && self.modal.is_none() {
-                    self.modal = Some(Modal::Recovered(Recovered { buffers }));
+                if !buffers.is_empty() {
+                    self.modal_queue.offer(&mut self.modal, Modal::Recovered(Recovered { buffers }));
                 }
             }
         }

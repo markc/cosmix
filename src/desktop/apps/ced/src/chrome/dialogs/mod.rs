@@ -17,6 +17,77 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shado
 use super::Look;
 use crate::app::Msg;
 
+/// Dialogs that arrived while another was open. A prompt never replaces a
+/// dialog a human is answering (a pending decision would be lost): it
+/// waits, first in first out, and shows once nothing is open.
+pub struct ModalQueue<T> {
+    waiting: std::collections::VecDeque<T>,
+}
+
+impl<T> Default for ModalQueue<T> {
+    fn default() -> Self {
+        Self { waiting: std::collections::VecDeque::new() }
+    }
+}
+
+impl<T> ModalQueue<T> {
+    /// Show `m` now if nothing is open, else queue it.
+    pub fn offer(&mut self, current: &mut Option<T>, m: T) {
+        match current {
+            Some(_) => self.waiting.push_back(m),
+            None => *current = Some(m),
+        }
+    }
+
+    /// Once nothing is open, show the oldest queued dialog that is still
+    /// `relevant` (its tab may have closed meanwhile); drop the rest of the
+    /// stale ones on the way.
+    pub fn next(&mut self, current: &mut Option<T>, relevant: impl Fn(&T) -> bool) {
+        while current.is_none() {
+            let Some(m) = self.waiting.pop_front() else { break };
+            if relevant(&m) {
+                *current = Some(m);
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.waiting.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::ModalQueue;
+
+    #[test]
+    fn a_prompt_never_replaces_an_open_dialog() {
+        let mut q = ModalQueue::default();
+        let mut open = None;
+        q.offer(&mut open, 1);
+        assert_eq!(open, Some(1), "nothing open: shown at once");
+        q.offer(&mut open, 2);
+        q.offer(&mut open, 3);
+        q.offer(&mut open, 4);
+        assert_eq!((open, q.len()), (Some(1), 3), "the open decision is kept; the rest wait");
+        q.next(&mut open, |_| true);
+        assert_eq!(open, Some(1), "nothing shows over an open dialog");
+        open = None;
+        q.next(&mut open, |m| *m != 2);
+        assert_eq!((open, q.len()), (Some(3), 1), "FIFO; a stale one (its tab closed) is skipped");
+        open = None;
+        q.next(&mut open, |_| true);
+        assert_eq!(open, Some(4));
+        open = None;
+        q.next(&mut open, |_| true);
+        assert!(open.is_none() && q.is_empty());
+    }
+}
+
 /// The open dialog.
 #[derive(Debug, Clone)]
 pub enum Modal {

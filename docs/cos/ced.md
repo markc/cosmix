@@ -208,6 +208,14 @@ like `ced.type`. Find and replace answer when the search starts; the result
 shows in the window. A window action that would open a dialog while one is
 already open refuses `CONFLICT` `modal_open`.
 
+**Dialogs never replace each other.** A question for the human that arrives
+while another dialog is open (unsaved changes on close, a changed file on
+save, recovered buffers) waits and appears when the open one is closed, in
+arrival order; one whose tab has closed meanwhile is dropped. These prompts
+only ever come from the human's own actions: a Bus caller is never left
+waiting on one, because a Bus close of a dirty tab or a Bus save of a changed
+file is refused to the caller directly.
+
 **`ced.wait`** is event-driven. The condition is checked when the request
 arrives (an immediate reply when it already holds) and again after every
 change in ced; it never polls. `rev:N` holds once the tab has folded rev N and
