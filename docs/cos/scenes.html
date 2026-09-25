@@ -445,7 +445,9 @@
 <p>Quoin accepts renderer-neutral scene documents through <code>shell.scene.load</code>.
 The request body is the complete AMP document with one <code>mix</code> fence. The
 <code>cosmix-scene</code> parser and registry validate it before any live state changes.
-Invalid loads and patches return diagnostics and retain the last good tree.</p>
+Invalid loads and patches return diagnostics and retain the last good tree.
+For file discovery, enablement, supervised behaviours and popup coordination,
+see the <a href="scenes-loader">Stage A scenes loader</a>.</p>
 <p>Scenes mount as pages in an edge panel. Floating windows are outside v0.
 The envelope's <code>window</code> header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
@@ -469,6 +471,42 @@ The complete serialised patch candidate must fit the same 256 KiB bound as
 loads. Rejected patches retain both the tree and its revision.
 <code>shell.scene.describe {family?}</code> reports the shared P1 registry.
 <code>shell.scene.unload {scene}</code> removes the page.</p>
+<p><code>shell.scene.validate</code> accepts the same AMP body as load, returning
+<code>{scene,valid:true,diagnostics}</code> without mounting, reserving a page or changing
+revisions. <code>shell.scene.get {scene,format:"source"}</code> returns
+<code>{scene,revision,source}</code> with canonical authored AMP source: expressions,
+template definitions and omitted defaults are preserved. The core serializer
+escapes interpolation, leading tildes, backticks, controls and Unicode for the
+strict Mix parser. Scene refusals use nonzero RC and <code>{error_code,message}</code>
+with diagnostics/context when available.</p>
+<p>Patch paths also accept <code>model</code> (replace the complete model map; null clears it)
+and <code>model.&lt;key&gt;...</code> (map-key updates, null removes a key). The store retains
+compiled bindings and reevaluates against the last accepted resolved tree.
+The authored model, resolved tree and revision commit together only after
+aggregate document/model bounds pass. Evaluation warnings retain last-good
+ports; structural/bounds refusals retain the whole previous revision. Accepted
+model revisions refresh list instances, including templates whose row data
+did not change but whose model dependencies did.
+Model patches that change a scene's mount page or edge are refused with
+<code>SUBPANEL_COLLISION</code>; unload and load explicitly to move that mount.</p>
+<p>Subscribe to <code>&lt;host&gt;.panel.changed</code> for inner command <code>shell.panel.changed</code>:
+<code>{generation,revision,panels:{left,...}}</code>. Each panel has the same applied
+<code>visible</code>, <code>pinned</code>, <code>mode</code>, <code>page</code>, <code>pages</code>, <code>width_px</code> and <code>output</code> values as
+<code>shell.props.get</code>. Publication follows scene reconciliation and model
+application; unchanged snapshots produce no event. Take a property snapshot
+after subscribing and resynchronise after a connection/gap. Enqueue replies
+are not applied-state receipts, so page selection and temporary pin release
+must wait on these events rather than retry sleeps.</p>
+<p>Settings/Appearance follows the same pattern. The <code>share/scenes/settings</code>
+template (scene <code>quoin-settings</code>, page <code>settings.appearance</code>) is layout only.
+Its behaviour subscribes to <code>&lt;host&gt;.settings.changed</code> (inner command
+<code>shell.settings.changed</code>) and re-reads <code>shell.settings.get</code> on each notice,
+after reconnecting, and when the host re-registers. It publishes the model
+through <code>scenes.model</code> and forwards the page's clicks unchanged to
+<code>shell.settings.{scheme,motion,size}</code>. The effects, the stepper size and the
+clamping stay in Quoin. Without the loader, Quoin serves the same node block
+as a built-in fallback and yields the page to a loader-managed load. Snapshot
+fields and the handover rules are in <a href="quoin">Quoin</a>.</p>
 <h2 id="v1-bindings">V1 bindings</h2>
 <p>A port value beginning <code>= </code> is one Mix expression. <code>== x</code> escapes to the
 literal <code>= x</code>, while <code>=x</code> remains a literal. For example:</p>
@@ -499,9 +537,12 @@ Load evaluation and each re-evaluation pass have a 250 ms total wall budget,
 with at most 50 ms per expression. Remaining bindings report <code>binding-eval</code>
 with <code>evaluation budget exhausted</code>; they take defaults at load or retain
 last-good values on a patch. As with lib-mix limits, a non-yielding builtin
-can overshoot until it returns. Template instantiation uses the same budget.
+can overshoot until it returns, but the late result is refused even for the
+final binding in a pass. Template instantiation uses the same budget.
 Null model patches remove keys without creating missing parent maps. Patch
-values are limited to 256 KiB of serialised JSON (<code>model-path</code> on excess).
+values and the aggregate runtime model are limited to 256 KiB of serialised
+JSON (<code>model-path</code> on excess). The host additionally enforces the aggregate
+authored-document bound, including metadata and ports.
 Empty model and binding fields are omitted from resolved-tree serialisation.</p>
 <table><thead><tr><th>diagnostic</th><th>meaning</th></tr></thead><tbody>
 <tr><td><code>invalid-binding</code></td><td>expression syntax, statement count or depth is invalid</td></tr>
@@ -513,10 +554,14 @@ Empty model and binding fields are omitted from resolved-tree serialisation.</p>
 </tbody></table>
 <p>Calling <code>time()</code> is allowed but emits a <code>binding-nondeterministic</code> warning;
 it is not a policy violation.</p>
-<p><code>shell.scene.watch {scene}</code> returns <code>{scene,revision,digest}</code>. Subscribe to
+<p><code>shell.scene.watch {scene}</code> returns
+<code>{scene,revision,digest,applied_revision,diagnostics}</code>. Subscribe to
 <code>shell.scene.changed</code> for summaries <code>{scene,revision,ops,diagnostics}</code>;
 fetch the complete tree with <code>get</code>. Revisions increase on accepted loads and
-patches. Digests are SHA-256 of the serialised resolved tree.</p>
+patches. Digests are SHA-256 of the serialised resolved tree. <code>applied_revision</code>
+is the last revision applied by the renderer (zero before first application).
+Watch replies and scene inventory retain render diagnostics for state-based
+resynchronisation; notifications are hints, not proof of application.</p>
 <p>UI handlers are directed Bus requests to the document's citizen with
 <code>{scene,node,kind,value?,item?}</code>. Kinds are <code>click</code>, <code>change</code> and <code>submit</code>.
 Requests time out after two seconds; unavailable citizens are logged at most
@@ -525,10 +570,35 @@ once per minute. Hover, focus and pointer motion stay local.</p>
 undo state. Plain fields use CTK's single-line editing transactions. Active
 edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.</p>
-<p>List rows use CTK VirtualList. Row templates are instantiated with
-<code>template-node@row-id</code> identities and substitute <code>{cells[i]}</code> only in
-<code>text.text</code> and <code>image.src</code> inside list templates.
+<p>List rows use CTK VirtualList by default. <code>flow: "horizontal"</code> uses natural-width
+rows with <code>gap</code> and <code>align</code> (<code>start</code>, <code>center</code>, <code>end</code>, <code>stretch</code>), without a
+vertical viewport. <code>row_height</code> remains required for schema compatibility;
+horizontal flow ignores it and <code>max_rows</code>. Rows require unique non-empty IDs.
+Row templates evaluate core bindings against live <code>$model</code> and <code>$item</code>, then
+substitute legacy <code>{cells[i]}</code> only in unbound <code>text.text</code> and <code>image.src</code>.
+Binding results are literal values and are never substituted again.
+Instance identities include the template, owning list and item ID. Retained
+items keep their template entities across rebinds/reordering. Scene lists opt
+into <code>VirtualListModel::retain_content</code>; CTK's default still clears recycled
+content, and changing an item's ID always creates fresh content.
+Each template evaluation pass shares a 250 ms / 16,384-node budget across all
+lists. Ingress preflights templates before committing a revision or mount;
+failure returns <code>{error_code:"scene_template",message,scene,diagnostics}</code>.
+Loads, port patches and model-only patches retain those prepared instances with
+the accepted revision. Rendering applies them directly, including when display
+scale changes; there is no second expression evaluation or deadline. Expression
+evaluations reuse a thread-local Tokio runtime while keeping globals, policy and
+limits isolated. A renderer state failure retains the last applied revision and
+a readable <code>scene-render</code> diagnostic in watch/inventory replies. A new accepted
+revision clears that diagnostic and permits another application attempt.
+Nested-list rendering remains outside this renderer's supported template path.
+Clicks on repeated rows use the owning list's handler and node ID, with the
+complete row in <code>item</code>; descendant row handlers cannot redirect that click.
 Outside templates, cell markers in other ports are literal data.
+All non-window families expose <code>hidden</code>. Hidden containers and horizontal
+row wrappers use <code>Display::None</code>, so their padding and gap allocation disappear.
+A hidden template inside a vertical VirtualList hides its content; the fixed
+row slot remains. Filter the model's <code>rows</code> to remove a vertical slot entirely.
 Text elision uses CTK's middle-elision policy.
 <code>column.align</code> sets cross-axis alignment to <code>start</code>, <code>center</code>,
 <code>end</code> or <code>stretch</code> (default).
@@ -639,6 +709,26 @@ taskbars, tray variants, launcher lists, calendar months and notifications;
 record the font/scale inputs alongside any numeric geometry goldens. The
 current freeze does not claim to cover those dynamic states or Quoin's edge
 chrome/mount geometry.</p>
+<p>Stage A now adds exact, sanitised launcher/calendar/notes builder captures in
+<code>src/desktop/scripts/tests/fixtures/scenes/</code>. The Mix extraction gate compares
+the legacy builder bodies and returned document bytes, and records the models
+separately. Renderer tests compare fully instantiated visible trees, including
+the hidden notes alternative, against those documents. Cases cover empty and
+filtered launchers, the 500-row cap, empty/full notifications, leap day, a
+non-leap century and year rollover. Scheduled Taffy tests cover horizontal
+natural widths, gap/alignment, and real VirtualList rebind/reorder identity;
+the Bus bridge test checks the outgoing citizen, command and item body.
+These are cluster gates, not a claim of live GPU screenshot acceptance.</p>
+<p>Stage B adds the bottom panel (<code>share/scenes/panel</code>, page <code>scene-panel</code>) with
+empty, busy, tray-change and task-cap captures in their own
+<code>panel-cases.json</code>. Its pager, tasks and tray are horizontal-flow lists, so
+the old builder's generated button nodes become list instances and node IDs
+no longer match one to one; the Mix gate instead evaluates the template's
+bindings against each captured model and compares visible trees by shape,
+with each list's click handler applied to its instances. A Rust renderer
+comparison of those cases (normalising horizontal instances) is still to be
+added. Settings and live migration are the remaining Stage B work; see
+<a href="/cos/quoin-panel#stage-b-the-panel-template">quoin-panel</a>.</p>
 <p>Absolute image <code>src</code> paths load PNG and SVG directly, rasterised or resized
 at <code>UiScale</code> multiplied by the primary window's scale factor, or <code>UiScale</code>
 alone in a compositor host without a primary window. Scale changes reapply

@@ -1,0 +1,66 @@
+-- version: 0.1.0
+-- Settings/Appearance. Quoin owns the effects (live theme, conf.mix motion,
+-- per-edge thickness); this citizen only forwards clicks and mirrors
+-- shell.settings.get into the model. Woken by shell.settings.changed.
+$LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
+$r = require($LIB .. "/runtime.mix")
+$m = require($LIB .. "/models.mix")
+$ctx = $r.context("quoin-settings")
+$state = {ready: false, model: nil}
+
+-- State is truth: every notice or accepted write re-reads the snapshot.
+fn refresh()
+  if not $state.ready then return $r.failure("scene_not_ready", "Waiting for loader readiness") end
+  $out = $r.call($ctx.host, "shell.settings.get", {})
+  if not $out.ok then return $out end
+  if not $m.settings_valid($out.value) then
+    return $r.failure("settings_invalid_reply", "shell.settings.get must return the settings snapshot")
+  end
+  $state.model = $m.settings($out.value)
+  return $r.publish_model($ctx, $state.model)
+end
+
+-- The scene's node body ({scene,node,kind}) is forwarded unchanged: Quoin
+-- derives the scheme, motion or edge/step from the node id, so the step size
+-- and clamping stay single-sourced in the host.
+fn forward($verb, $event)
+  $out = $r.call($ctx.host, $verb, $r.event_args($event))
+  if $out.ok then refresh() end
+  return $out
+end
+
+on shell.settings.scheme
+  $r.respond(forward("shell.settings.scheme", $event))
+end
+on shell.settings.motion
+  $r.respond(forward("shell.settings.motion", $event))
+end
+on shell.settings.size
+  $r.respond(forward("shell.settings.size", $event))
+end
+on shell.settings.changed
+  refresh()
+end
+on bus.connected
+  if len(keys($event.headers)) != 0 then return end
+  $state.ready = false
+  $ready = $r.ready($ctx)
+  $state.ready = $ready.ok
+  if $state.ready then refresh() end
+end
+on props.changed
+  $a = $r.event_args($event)
+  if $a.path != "services.registered" then return end
+  if not $state.ready then
+    $ready = $r.ready($ctx)
+    $state.ready = $ready.ok
+  end
+  -- A restarted host keeps no memory of this model; re-read it.
+  if $state.ready then refresh() end
+end
+subscribe($ctx.host .. ".settings.changed")
+subscribe(env("NODED_SERVICE", "noded") .. ".props.changed")
+$ready = $r.ready($ctx)
+if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
+$state.ready = true
+refresh()

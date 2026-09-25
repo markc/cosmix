@@ -1,6 +1,26 @@
 use super::*;
 use bindings::{compile, reevaluate, template_instantiate};
 
+#[test]
+fn horizontal_flow_and_hidden_are_described_and_type_checked() {
+    for family in ["row", "column", "text", "image", "list", "field", "button", "toggle", "spacer"] {
+        let ports = describe(family).unwrap();
+        assert_eq!(ports.iter().filter(|p| p.path == "hidden").count(), 1);
+        assert_eq!(ports.iter().find(|p| p.path == "hidden").unwrap().ty, "bool");
+    }
+    assert!(!describe("window").unwrap().iter().any(|p| p.path == "hidden"));
+    let ports = describe("list").unwrap();
+    assert_eq!(ports.iter().find(|p| p.path == "flow").unwrap().enum_values,
+        Some(vec!["vertical".into(), "horizontal".into()]));
+    let source = "root: {widget: \"list\", flow: \"horizontal\", align: \"center\", hidden: false, rows: [], row: \"t\", row_height: 20}\nt: {widget: \"row\", children: []}";
+    assert!(resolve(&doc(source)).is_ok());
+    assert!(lint(&doc(&source.replace("horizontal", "diagonal"))).iter().any(|d| d.code == "enum-value"));
+    assert!(lint(&doc(&source.replace("hidden: false", "hidden: 1"))).iter().any(|d| d.code == "port-type"));
+    for rows in ["[{id: \"\", cells: []}]", "[{id: \"x\", cells: []}, {id: \"x\", cells: []}]"] {
+        assert!(lint(&doc(&source.replace("rows: []", &format!("rows: {rows}")))).iter().any(|d| d.code == "row-type"));
+    }
+}
+
 fn doc(body: &str) -> SceneDocument {
     let fence = char::from(96).to_string().repeat(3);
     parse(&format!("---\nscene: 1\nname: test\ncitizen: c\n---\n{fence}mix\n{body}\n{fence}\n")).unwrap()
@@ -212,17 +232,21 @@ fn nested_list_templates_share_reachability() {
 
 #[test]
 fn load_budget_bounds_total_time() {
-    let mut d = bound("replace(repeat('a', 200000), 'a', 'b')");
-    for i in 1..MAX_NODES {
-        d.nodes.insert(format!("n{i}"), d.nodes["root"].clone());
-    }
-    let start = std::time::Instant::now();
-    let prepared = prepare(&d);
-    assert!(start.elapsed() < std::time::Duration::from_secs(3), "{:?}", start.elapsed());
-    assert!(prepared.diagnostics.iter().any(|d| d.code == "binding-eval" && d.message.contains("evaluation budget exhausted")));
-    assert!(!prepared.values.contains_key(&format!("n{}.text", MAX_NODES - 1)));
-    let tree = resolve(&d).unwrap();
-    assert!(!tree.nodes[&format!("n{}", MAX_NODES - 1)].ports.contains_key("text"));
+    // An already-expired budget is independent of CPU speed and Mix optimisations.
+    // Keep the document (and its preparation cache) inside the override's scope.
+    bindings::with_evaluation_budget(std::time::Duration::ZERO, || {
+        let mut d = bound("'new'");
+        for i in 1..MAX_NODES {
+            d.nodes.insert(format!("n{i}"), d.nodes["root"].clone());
+        }
+        let start = std::time::Instant::now();
+        let prepared = prepare(&d);
+        assert!(start.elapsed() < std::time::Duration::from_secs(3), "{:?}", start.elapsed());
+        assert!(prepared.diagnostics.iter().any(|d| d.code == "binding-eval" && d.message.contains("evaluation budget exhausted")));
+        assert!(!prepared.values.contains_key(&format!("n{}.text", MAX_NODES - 1)));
+        let tree = resolve(&d).unwrap();
+        assert!(!tree.nodes[&format!("n{}", MAX_NODES - 1)].ports.contains_key("text"));
+    });
 }
 
 #[test]
@@ -245,7 +269,7 @@ fn lint_and_resolve_compile_and_evaluate_once() {
 
 #[test]
 fn reevaluation_budget_keeps_last_good() {
-    let mut d = bound("$model.expensive ? replace(repeat('a', 200000), 'a', 'b') : 'old'");
+    let mut d = bound("$model.expensive ? 'new' : 'old'");
     for i in 1..MAX_NODES {
         d.nodes.insert(format!("n{i}"), d.nodes["root"].clone());
     }
@@ -254,7 +278,9 @@ fn reevaluation_budget_keeps_last_good() {
     // Seed every last-good port, including any initial-load budget excess.
     for node in tree.nodes.values_mut() { node.ports.insert("text".into(), json!("old")); }
     let start = std::time::Instant::now();
-    let result = reevaluate(&tree, &set, "model.expensive", &json!(true)).unwrap();
+    let result = bindings::with_evaluation_budget(std::time::Duration::ZERO, || {
+        reevaluate(&tree, &set, "model.expensive", &json!(true)).unwrap()
+    });
     assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     assert!(result.diagnostics.iter().any(|d| d.code == "binding-eval" && d.message.contains("evaluation budget exhausted")));
     assert!(result.evaluated.len() < MAX_NODES);

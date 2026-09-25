@@ -34,6 +34,9 @@ struct ShellBusState {
     /// own timeout — worse than answering late.
     pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
     pending_resizes: BTreeMap<u64, (InboundRequest, u64)>,
+    /// Panel operations answered from Presentation, after Model. Concealment
+    /// uses the host's existing animation frames, never a Bus notification.
+    pending_panels: Vec<(InboundRequest, cosmix_shell::core::OutputKey)>,
     /// Local receipt ordering, not a broker incarnation token. Absence sweeps
     /// only affect reservations accepted strictly before their cutoff.
     /// CTK uses separate control/telemetry planes: this orders consumption in
@@ -44,6 +47,13 @@ struct ShellBusState {
     citizen_snapshot: Option<(u64, u64, u64)>,
     citizen_snapshot_retry: bool,
     frame: u64,
+    applied_panels: Value,
+    panel_revision: u64,
+    /// Shadow of the scheme selection for the settings snapshot; seeded
+    /// lazily from the persisted state (see `settings::initial_scheme`).
+    settings_scheme: Option<String>,
+    applied_settings: Value,
+    settings_revision: u64,
 }
 
 impl Default for ShellBusState {
@@ -55,11 +65,17 @@ impl Default for ShellBusState {
             live_generation: None,
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
+            pending_panels: Vec::new(),
             citizen_receipt: 0,
             disconnected_citizens: BTreeMap::new(),
             citizen_snapshot: None,
             citizen_snapshot_retry: false,
             frame: 0,
+            applied_panels: Value::Null,
+            panel_revision: 0,
+            settings_scheme: None,
+            applied_settings: Value::Null,
+            settings_revision: 0,
         }
     }
 }
@@ -119,12 +135,145 @@ impl Plugin for ShellBusPlugin {
                     .after(service_bus),
             )
             .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(Update, reply_panels.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(Update, publish_panel_state.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(Update, publish_settings_state.in_set(ShellRuntimeSet::Presentation))
             .add_systems(
                 Update,
                 crate::holders::report_holders
                     .in_set(ShellRuntimeSet::Presentation)
                     .after(service_bus),
             );
+    }
+}
+
+/// Publish the applied frame, after Model and scene reconciliation, rather
+/// than command enqueue acceptance. No timer and no idle publication.
+fn publish_panel_state(
+    bridge: Res<BusBridge>,
+    frame: Res<ShellFrameState>,
+    mut state: ResMut<ShellBusState>,
+) {
+    if state.live_generation.is_none() { return; }
+    let panels = panel_notice_snapshot(&frame.0);
+    if panels == state.applied_panels { return; }
+    let revision = state.panel_revision.saturating_add(1);
+    let body = json!({"generation":state.live_generation,"revision":revision,"panels":panels});
+    let wire = format!("---\ncommand: shell.panel.changed\n---\n{body}");
+    let topic = format!("{}.panel.changed", bridge.service_name());
+    if bridge.try_publish_topic(&topic, true, wire).is_ok() {
+        state.applied_panels = panels;
+        state.panel_revision = revision;
+    }
+}
+
+/// `shell.settings.changed`: the settings snapshot, published when it differs
+/// from the last one (a scheme selected from chrome or the Bus, an ingested
+/// motion, a settled resize, the page changing hands). Same shape as the
+/// `shell.settings.get` reply. No timer and no idle publication.
+fn publish_settings_state(
+    bridge: Res<BusBridge>,
+    frame: Res<ShellFrameState>,
+    (config, registry): (Res<crate::config::ShellConfig>, Res<SubPanelRegistryState>),
+    store: Option<Res<crate::state::StateStore>>,
+    mut selections: MessageReader<cosmix_shell::chrome::QuoinSchemeSelected>,
+    mut state: ResMut<ShellBusState>,
+) {
+    let scheme = state
+        .settings_scheme
+        .get_or_insert_with(|| crate::settings::initial_scheme(store.as_deref()));
+    for selection in selections.read() {
+        *scheme = selection.0.name().to_owned();
+    }
+    let snapshot = crate::settings::snapshot(
+        scheme,
+        &config,
+        &frame.0,
+        settings_page_owner(&registry.0),
+    );
+    if state.live_generation.is_none() || snapshot == state.applied_settings {
+        return;
+    }
+    let revision = state.settings_revision.saturating_add(1);
+    let mut body = snapshot.clone();
+    body["generation"] = json!(state.live_generation);
+    body["revision"] = json!(revision);
+    let wire = format!("---\ncommand: shell.settings.changed\n---\n{body}");
+    let topic = format!("{}.settings.changed", bridge.service_name());
+    if bridge.try_publish_topic(&topic, true, wire).is_ok() {
+        state.applied_settings = snapshot;
+        state.settings_revision = revision;
+    }
+}
+
+/// Who serves `settings.appearance` right now (`quoin@host` = the built-in).
+fn settings_page_owner(registry: &cosmix_shell::core::SubPanelRegistry) -> Option<&str> {
+    registry
+        .seat(crate::config::SETTINGS_APPEARANCE)
+        .map(|seat| seat.owner.as_str())
+}
+
+/// Selection/mode/mapping are discrete state. During a resize gesture retain
+/// the settled width; publish the final size once, without serialising the
+/// entire property tree on every animation frame. `visible` is a boolean,
+/// so reveal/conceal emits only its mapping transitions, not motion fractions.
+fn panel_notice_snapshot(frame: &ShellFrame) -> Value {
+    let mut panels = serde_json::Map::new();
+    for edge in Edge::ALL {
+        let panel = frame.panel(edge);
+        panels.insert(edge_name(edge).into(), json!({
+            "visible": panel.mapped,
+            "pinned": panel.mode != PanelMode::Hidden,
+            "mode": panel.mode.as_str(),
+            "width_px": panel.settled_thickness_px,
+            "page": panel.active_page_id,
+            "pages": panel.page_ids.as_ref(),
+            "output": frame.geometry.output.as_str(),
+        }));
+    }
+    Value::Object(panels)
+}
+
+/// These idempotent verbs drive the legacy citizen's select/pin/release
+/// sequence. A superseding command or output change is an explicit refusal,
+/// not a success inferred from enqueueing. Reads remain immediate snapshots.
+fn reply_panels(
+    bridge: Res<BusBridge>,
+    frame: Res<ShellFrameState>,
+    mut state: ResMut<ShellBusState>,
+) {
+    for (request, output) in std::mem::take(&mut state.pending_panels) {
+        if state.live_generation != Some(request.connection_generation) {
+            continue;
+        }
+        let edge = argument(&request, "edge").and_then(parse_edge).expect("validated edge");
+        let panel = frame.0.panel(edge);
+        let applied = output == frame.0.geometry.output && match request.command.as_str() {
+            "shell.panel.page.set" => panel.active_page_id == argument(&request, "id"),
+            "shell.panel.pin" => panel.mode == PanelMode::Docked && panel.mapped,
+            "shell.panel.mode" => Some(panel.mode.as_str().to_owned()) == argument(&request, "mode"),
+            _ => unreachable!("only applied panel verbs are queued"),
+        };
+        // Hidden mode is applied before its outgoing motion completes. The
+        // model already requests frames until unmapping; hold the reply until
+        // that state is observable, so even a dropped final notice is harmless.
+        if applied && request.command == "shell.panel.mode"
+            && panel.mode == PanelMode::Hidden && panel.mapped
+            && !panel.transient_revealed
+        {
+            state.pending_panels.push((request, output));
+            continue;
+        }
+        // A pointer/holder reveal does not undo the applied persistent mode.
+        // Report its actual visible:true state instead of a false refusal.
+        let snapshot = Value::from(&ShellProps(&frame.0).snapshot());
+        let body = if applied {
+            json!({"accepted":true, "applied":true, "panels":snapshot["panels"]})
+        } else {
+            json!({"error_code":"PANEL_NOT_APPLIED", "message":"panel command was superseded or could not apply", "panels":snapshot["panels"]})
+        };
+        stash_or_respond(&bridge, &mut state, request, if applied { 0 } else { 10 },
+            body.to_string(), None, &mut |_| {});
     }
 }
 
@@ -137,6 +286,7 @@ struct SceneBus<'w> {
     registry: ResMut<'w, SubPanelRegistryState>,
     config: ResMut<'w, crate::config::ShellConfig>,
     schemes: MessageWriter<'w, cosmix_shell::chrome::QuoinSchemeSelected>,
+    settings: Option<ResMut<'w, crate::settings::SettingsScene>>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -240,10 +390,13 @@ fn service_bus(
                     state.ready_logged = true;
                 }
                 state.live_generation = Some(generation);
+                state.applied_panels = Value::Null;
+                state.applied_settings = Value::Null;
                 request_citizen_snapshot(&bridge, &mut state);
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
                 state.pending_resizes.clear();
+                state.pending_panels.clear();
                 state.live_generation = None;
                 state.citizen_snapshot = None;
                 state.citizen_snapshot_retry = false;
@@ -386,7 +539,7 @@ fn service_bus(
                 let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
                     (
                         10,
-                        json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
+                        json!({"error_code":"SCENE_PROVENANCE", "message":format!("scene caller provenance: {error:?}")}).to_string(),
                     )
                 } else if state
                     .live_generation
@@ -394,7 +547,7 @@ fn service_bus(
                 {
                     (
                         10,
-                        json!({"error":"scene request belongs to a stale Quoin connection"})
+                        json!({"error_code":"SCENE_STALE_CONNECTION", "message":"scene request belongs to a stale Quoin connection"})
                             .to_string(),
                     )
                 } else {
@@ -404,20 +557,38 @@ fn service_bus(
                         .expect("receipt sequence exhausted");
                     let owner = attested_owner(&request, state.citizen_receipt);
                     let SceneBus {
-                        scenes, registry, ..
+                        scenes, registry, settings, ..
                     } = &mut content;
-                    scenes.dispatch(
-                        verb,
-                        &request.body,
-                        &args,
-                        &bridge,
-                        &mut cosmix_scene_bevy::SceneMount {
-                            registry: &mut registry.0,
-                            output: &frame.0.geometry.output,
-                            owner: &owner,
-                            accepted_at: state.citizen_receipt,
-                        },
-                    )
+                    // The loader's settings template replaces the built-in
+                    // fallback page in this same dispatch (settings.rs).
+                    let refusal = if verb == cosmix_shell::runtime::SceneVerb::Load {
+                        crate::settings::yield_to_external(
+                            &request.body,
+                            &args,
+                            settings.as_deref_mut(),
+                            scenes,
+                            &mut registry.0,
+                            &frame.0.geometry.output,
+                            &bridge,
+                        )
+                    } else {
+                        None
+                    };
+                    match refusal {
+                        Some(refusal) => refusal,
+                        None => scenes.dispatch(
+                            verb,
+                            &request.body,
+                            &args,
+                            &bridge,
+                            &mut cosmix_scene_bevy::SceneMount {
+                                registry: &mut registry.0,
+                                output: &frame.0.geometry.output,
+                                owner: &owner,
+                                accepted_at: state.citizen_receipt,
+                            },
+                        ),
+                    }
                 };
                 (rc, body, None)
             } else if request.command == "shell.scenes.list" {
@@ -484,16 +655,36 @@ fn service_bus(
                     )
                 } else {
                     let SceneBus {
-                        config, schemes, ..
+                        config, schemes, registry, ..
                     } = &mut content;
-                    crate::settings::dispatch_verb(
-                        &request,
-                        &frame.0,
-                        config,
-                        &crate::config::conf_mix_path(),
-                        schemes,
-                        time.elapsed(),
-                    )
+                    let scheme = state.settings_scheme.get_or_insert_with(|| {
+                        crate::settings::initial_scheme(state_store.as_deref())
+                    });
+                    if request.command == "shell.settings.get" {
+                        // A read: the snapshot the template behaviour builds
+                        // its model from; `revision` is the last notice's
+                        // while the body is live, so it may be newer than
+                        // that notice (documented in docs/cos/quoin.md).
+                        let mut body = crate::settings::snapshot(
+                            scheme,
+                            config,
+                            &frame.0,
+                            settings_page_owner(&registry.0),
+                        );
+                        body["generation"] = json!(state.live_generation);
+                        body["revision"] = json!(state.settings_revision);
+                        (0, body.to_string(), None)
+                    } else {
+                        crate::settings::dispatch_verb(
+                            &request,
+                            &frame.0,
+                            config,
+                            &crate::config::conf_mix_path(),
+                            schemes,
+                            scheme,
+                            time.elapsed(),
+                        )
+                    }
                 }
             } else if request.command == "shell.debug.status" {
                 (
@@ -559,6 +750,19 @@ fn service_bus(
                     None,
                     &mut dispatch,
                 );
+            }
+            continue;
+        }
+        if rc == 0 && matches!(request.command.as_str(),
+            "shell.panel.page.set" | "shell.panel.pin" | "shell.panel.mode")
+            && let Some(command) = &command
+        {
+            if state.pending_panels.len() < MAX_PENDING_REPLIES {
+                state.pending_panels.push((request, command.output.clone()));
+                dispatch(command.clone());
+            } else {
+                stash_or_respond(&bridge, &mut state, request, 11,
+                    json!({"error":"panel queue full"}).to_string(), None, &mut dispatch);
             }
             continue;
         }
@@ -882,7 +1086,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1108,9 +1312,9 @@ fn dispatch_shell_request(
             None,
         );
     }
-    // `accepted` means validated and enqueued for the Model stage of this
-    // update — an acceptance ack, not an application receipt. Callers needing
-    // the applied state read it back via `shell.props.get`.
+    // The dispatcher describes enqueue acceptance. service_bus upgrades
+    // page.set/pin/mode to applied receipts in Presentation; other legacy
+    // verbs retain their acceptance reply and require state readback.
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
@@ -1679,6 +1883,9 @@ mod tests {
                 "name":name, "page":page, "edge":edge,
                 "citizen":"authored-metadata", "owner":"loader", "revision":watched["revision"],
                 "digest":watched["digest"], "registered":registered,
+                // Unrendered in this headless fixture: nothing applied yet,
+                // no diagnostics, no published model.
+                "applied_revision":0, "diagnostics":[], "model_generation":null,
             }));
         }
         assert_eq!(app.world().resource::<ShellFrameState>().0, before);
@@ -1729,7 +1936,7 @@ mod tests {
         assert_eq!(rc, 0);
         let info: Value = serde_json::from_str(&body).unwrap();
         let verbs = info["verbs"].as_array().expect("verbs is a list");
-        for verb in ["settings.scheme", "settings.motion", "settings.size"] {
+        for verb in ["settings.scheme", "settings.motion", "settings.size", "settings.get"] {
             assert!(
                 verbs.contains(&json!(verb)),
                 "shell.info must advertise {verb}; got {verbs:?}"
@@ -2611,6 +2818,161 @@ mod tests {
         req
     }
 
+    #[test]
+    fn panel_notifications_report_applied_pages_and_suppress_idle_duplicates() {
+        let (mut app, peer) = mounted_bus_app();
+        peer.drain_publishes(); // Discard the initial empty applied snapshot.
+        peer.send(scene_load("event-page", "scenes", "right"));
+        app.update();
+        let notices = peer.drain_publishes();
+        let notice = notices.iter().find(|p| p.headers.get("name").is_some_and(|n| n == "quoin.panel.changed")).unwrap();
+        let (_, body) = notice.body.split_once("\n---\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert!(body["panels"]["right"]["pages"].as_array().unwrap().contains(&json!("scene-event-page")));
+        let revision = body["revision"].as_u64().unwrap();
+        app.update();
+        assert!(peer.drain_publishes().iter().all(|p| p.headers.get("name").is_none_or(|n| n != "quoin.panel.changed")));
+        peer.deliver_event(BusBridgeEvent::Connection {state:BusConnectionState::Connected, generation:2});
+        app.update();
+        let notices = peer.drain_publishes();
+        let notice = notices.iter().find(|p| p.headers.get("name").is_some_and(|n| n == "quoin.panel.changed")).unwrap();
+        let (_, body) = notice.body.split_once("\n---\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["generation"], 2);
+        assert!(body["revision"].as_u64().unwrap() > revision);
+    }
+
+    #[test]
+    fn panel_notices_coalesce_resize_and_reveal_frames() {
+        let mut frame = test_frame();
+        let before = panel_notice_snapshot(&frame);
+        for fraction in [0.1, 0.25, 0.5, 0.75, 1.0] {
+            let panel = &mut frame.panels[Edge::Left.index()];
+            panel.resize_active = true;
+            panel.thickness_px += 1.0;
+            panel.visible_fraction = fraction;
+            assert_eq!(panel_notice_snapshot(&frame), before);
+        }
+        let panel = &mut frame.panels[Edge::Left.index()];
+        panel.resize_active = false;
+        panel.settled_thickness_px = panel.thickness_px;
+        let settled = panel_notice_snapshot(&frame);
+        assert_ne!(settled, before);
+        assert_eq!(settled["left"]["width_px"], json!(frame.panel(Edge::Left).thickness_px));
+        frame.panels[Edge::Left.index()].mapped = !frame.panel(Edge::Left).mapped;
+        assert_ne!(panel_notice_snapshot(&frame), settled);
+    }
+
+    #[test]
+    fn panel_replies_confirm_application_without_notices() {
+        let (mut app, peer) = mounted_bus_app();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(16),
+        ));
+        load_scene(&mut app, &peer, "reply-page", "owner", "left");
+        peer.drain_responses();
+        for (verb, args) in [
+            ("shell.panel.page.set", json!({"edge":"left", "id":"scene-reply-page"})),
+            ("shell.panel.pin", json!({"edge":"left"})),
+            ("shell.panel.mode", json!({"edge":"left", "mode":"hidden"})),
+        ] {
+            let mut req = local(verb);
+            req.body = args.to_string();
+            peer.send(req);
+            assert!(peer.drain_responses().is_empty());
+            let mut replies = Vec::new();
+            // Drive the model's native animation frames, discarding every
+            // notice. There is no client-side notification continuation.
+            // Both drains read one channel and discard the other kind, so
+            // take responses first; the remaining notices are then dropped.
+            for _ in 0..120 {
+                app.update();
+                replies.extend(peer.drain_responses());
+                peer.drain_publishes();
+                if !replies.is_empty() { break; }
+            }
+            assert_eq!(replies.len(), 1, "{verb}");
+            assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+            let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+            assert_eq!(body["applied"], true);
+            let snapshot = Value::from(&ShellProps(&app.world().resource::<ShellFrameState>().0).snapshot());
+            assert_eq!(body["panels"], snapshot["panels"]);
+            if verb == "shell.panel.pin" {
+                // Let reveal progress before hiding; otherwise concealment
+                // can finish immediately from a still-zero motion fraction.
+                for _ in 0..30 {
+                    app.update();
+                    peer.drain_publishes();
+                }
+            }
+            if verb == "shell.panel.mode" {
+                assert_eq!(body["panels"]["left"]["pinned"], false);
+                assert_eq!(body["panels"]["left"]["visible"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn superseded_panel_command_is_refused_with_applied_state() {
+        let (mut app, peer) = mounted_bus_app();
+        let mut pin = local("shell.panel.pin");
+        pin.body = json!({"edge":"left"}).to_string();
+        let mut hide = local("shell.panel.mode");
+        hide.body = json!({"edge":"left", "mode":"hidden"}).to_string();
+        peer.send(pin);
+        peer.send(hide);
+        app.update();
+        let replies = peer.drain_responses();
+        let pin = replies.iter().find(|reply| reply.command == "shell.panel.pin").unwrap();
+        assert_eq!(pin.rc, 10);
+        let body: Value = serde_json::from_str(&pin.body).unwrap();
+        assert_eq!(body["error_code"], "PANEL_NOT_APPLIED");
+        assert_eq!(body["panels"]["left"]["pinned"], false);
+    }
+
+    #[test]
+    fn hide_reply_applies_mode_when_pointer_reveals_during_concealment() {
+        let (mut app, peer) = mounted_bus_app();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(16),
+        ));
+        load_scene(&mut app, &peer, "held-reply", "owner", "left");
+        let mut pin = local("shell.panel.pin");
+        pin.body = json!({"edge":"left"}).to_string();
+        peer.send(pin);
+        for _ in 0..30 { app.update(); }
+        peer.drain_responses();
+        let mut hide = local("shell.panel.mode");
+        hide.body = json!({"edge":"left", "mode":"hidden"}).to_string();
+        peer.send(hide);
+        app.update();
+        assert!(peer.drain_responses().is_empty(), "concealment holds the reply");
+        app.world_mut().write_message(ShellCommand {
+            output: test_model().output().clone(),
+            at: std::time::Duration::from_secs(1),
+            kind: ShellCommandKind::Panel { edge: Edge::Left, input: PanelInput::CornerEntered },
+        });
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["panels"]["left"]["mode"], "hidden");
+        assert_eq!(body["panels"]["left"]["visible"], true);
+    }
+
+    #[test]
+    fn behaviour_disconnect_does_not_remove_loader_owned_scene() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "frozen", "scenes", "right");
+        peer.deliver_message(services_registered_change(1,
+            &["scenes", "authored-metadata"], &["scenes"]));
+        app.update();
+        assert_eq!(app.world().resource::<cosmix_scene_bevy::SceneStore>().scenes_owned_by("scenes"), ["frozen"]);
+        assert!(app.world().resource::<ShellFrameState>().0.panel(Edge::Right).page_ids.iter().any(|id| id == "scene-frozen"));
+    }
+
     fn load_scene(
         app: &mut App,
         peer: &ctk::bus::TestBusPeer,
@@ -3066,6 +3428,80 @@ mod tests {
             0,
             "a stale settings request must not apply a theme"
         );
+    }
+
+    /// `shell.settings.changed` notices published since the last drain.
+    fn settings_notices(peer: &ctk::bus::TestBusPeer) -> Vec<Value> {
+        peer.drain_publishes()
+            .iter()
+            .filter(|p| p.headers.get("name").is_some_and(|n| n == "quoin.settings.changed"))
+            .map(|p| {
+                let (head, body) = p.body.split_once("\n---\n").unwrap();
+                assert!(head.contains("command: shell.settings.changed"), "{head}");
+                serde_json::from_str(body).unwrap()
+            })
+            .collect()
+    }
+
+    /// The settings template's behaviour builds its model from
+    /// `shell.settings.get` and wakes on `shell.settings.changed`: the read
+    /// carries every choice, a scheme selected over the Bus OR from chrome
+    /// publishes exactly one notice with the new state, an idle update
+    /// publishes nothing, and a reconnect republishes under the new epoch.
+    #[test]
+    fn settings_get_snapshot_and_change_notices() {
+        // The test peer's calls, responses and publishes share one queue, and
+        // each drain discards the other kinds: drain one kind per step. The
+        // fixture's connect update published revision 1 (drained with calls).
+        let (mut app, peer) = sub_panel_app();
+        let (rc, got) = sub_send(&mut app, &peer, "shell.settings.get", json!({}));
+        assert_eq!(rc, 0, "{got}");
+        assert_eq!(got["revision"], 1, "the connected host published its first snapshot");
+        assert_eq!(got["scheme"], "ocean");
+        assert_eq!(got["motion"], "slide");
+        assert_eq!(got["schemes"].as_array().unwrap().len(), 6);
+        assert_eq!(got["fade_reason"], crate::settings::FADE_UNAVAILABLE_REASON);
+        assert_eq!(got["motions"][1]["available"], false);
+        assert_eq!(got["generation"], 1);
+        assert_eq!(got["page_owner"], Value::Null);
+        for edge in Edge::ALL {
+            let settled = app.world().resource::<ShellFrameState>().0.panel(edge).settled_thickness_px;
+            assert_eq!(got["sizes"][edge_name(edge)], json!(settled));
+        }
+        app.update();
+        assert!(settings_notices(&peer).is_empty(), "a read publishes nothing");
+
+        // The write's reply is covered by the settings tests; here its notice.
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let notices = settings_notices(&peer);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["scheme"], "forest");
+        assert_eq!(notices[0]["generation"], 1);
+        let revision = notices[0]["revision"].as_u64().unwrap();
+        assert_eq!(revision, 2);
+        let (_, got) = sub_send(&mut app, &peer, "shell.settings.get", json!({}));
+        assert_eq!((got["scheme"].as_str(), got["revision"].as_u64()), (Some("forest"), Some(revision)));
+        app.update();
+        assert!(settings_notices(&peer).is_empty(), "no idle publication");
+
+        // A chrome scheme dot writes the same message; the notice follows it.
+        app.world_mut()
+            .write_message(cosmix_shell::chrome::QuoinSchemeSelected(ctk::theme::Scheme::Mono));
+        app.update();
+        let notices = settings_notices(&peer);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["scheme"], "mono");
+
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+        let notices = settings_notices(&peer);
+        assert_eq!(notices.len(), 1, "a reconnect republishes the unchanged snapshot");
+        assert_eq!(notices[0]["generation"], 2);
+        assert_eq!(notices[0]["scheme"], "mono");
     }
 
     /// Chunk-8 fixture: the sub-panel verbs address the process-wide

@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.95.0"
+version = "0.96.0"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1453,6 +1453,7 @@ dependencies = [
  "libc",
  "mail-auth",
  "md-5",
+ "notify",
  "proptest",
  "pulldown-cmark",
  "quick-xml 0.41.0",
@@ -1752,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.95.0"
+version = "0.96.0"
 dependencies = [
  "blake3",
  "chrono",

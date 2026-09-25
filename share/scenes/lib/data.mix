@@ -1,0 +1,127 @@
+-- Pure scene data helpers; no Bus or document emission.
+$MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug", "Sept", "Oct", "Nov", "Dec"]
+$MONTHS_LONG = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+-- Weeks start on Monday.
+$WEEKDAYS_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+-- "09:05 pm" -- zero-padded 12-hour clock, lower-case meridiem.
+fn clock_text($t)
+  return date_format($t, "%I:%M %P")
+end
+
+-- "Wed 12 Sept"
+fn date_text($t)
+  $month = to_number(date_format($t, "%m"))
+  return date_format($t, "%a %-d ") .. $MONTHS_SHORT[$month - 1]
+end
+
+-- Seconds until the next wall-clock minute boundary, never less than 50 ms:
+-- a wake 10 ms before the boundary sleeps just past it (not a whole extra
+-- minute), and a wake exactly ON a boundary waits the full minute to the
+-- next -- no busy loop either way.
+fn seconds_to_next_minute($t)
+  $s = to_number(date_format($t, "%S"))
+  $frac = $t - floor($t)
+  $wait = 60 - $s - $frac
+  if $wait < 0.05 then $wait = 0.05 end
+  return $wait
+end
+
+fn is_leap($y)
+  return ($y % 4 == 0 and $y % 100 != 0) or $y % 400 == 0
+end
+
+fn days_in_month($y, $m)
+  if $m == 2 then return is_leap($y) ? 29 : 28 end
+  if $m == 4 or $m == 6 or $m == 9 or $m == 11 then return 30 end
+  return 31
+end
+
+-- ISO weekday (1 = Monday .. 7 = Sunday) of a Gregorian date, by Zeller's
+-- congruence -- pure arithmetic, no timezone involved.
+fn iso_weekday($y, $m, $d)
+  $mm = $m
+  $yy = $y
+  if $mm < 3 then
+    $mm = $mm + 12
+    $yy = $yy - 1
+  end
+  $k = $yy % 100
+  $j = floor($yy / 100)
+  $h = ($d + floor(13 * ($mm + 1) / 5) + $k + floor($k / 4) + floor($j / 4) + 5 * $j) % 7
+  -- Zeller: 0 = Saturday .. 6 = Friday -> ISO 1 = Monday .. 7 = Sunday.
+  return (($h + 5) % 7) + 1
+end
+
+-- Add $delta months to (year, month), carrying across years.
+fn shift_month($y, $m, $delta)
+  $index = $y * 12 + ($m - 1) + $delta
+  return {year: floor($index / 12), month: ($index % 12) + 1}
+end
+
+-- The month as 6 weeks x 7 days, Monday first. Each cell:
+-- {day, in_month, today, weekend}. Leading/trailing days come from the
+-- neighbouring months so the grid is always rectangular (Plasma does the
+-- same: greyed days either side).
+fn month_grid($y, $m, $today)
+  $first = iso_weekday($y, $m, 1)
+  $prev = shift_month($y, $m, -1)
+  $prev_days = days_in_month($prev.year, $prev.month)
+  $days = days_in_month($y, $m)
+  $weeks = []
+  $n = 0
+  for $w = 0 to 5
+    $week = []
+    for $c = 0 to 6
+      $offset = $n - ($first - 1)
+      if $offset < 0 then
+        $cell = {day: $prev_days + $offset + 1, in_month: false, today: false}
+      elif $offset >= $days then
+        $cell = {day: $offset - $days + 1, in_month: false, today: false}
+      else
+        $day = $offset + 1
+        $is_today = $today != nil and $today.year == $y and $today.month == $m and $today.day == $day
+        $cell = {day: $day, in_month: true, today: $is_today}
+      end
+      $cell.weekend = $c >= 5
+      push($week, $cell)
+      $n = $n + 1
+    end
+    push($weeks, $week)
+  end
+  return $weeks
+end
+
+fn ymd($t)
+  return {year: to_number(date_format($t, "%Y")), month: to_number(date_format($t, "%m")), day: to_number(date_format($t, "%d"))}
+end
+
+fn month_title($y, $m)
+  return $MONTHS_LONG[$m - 1] .. " " .. to_string($y)
+end
+
+fn short_title($title, $limit)
+  if $title == nil then return "" end
+  $s = to_string($title)
+  if length($s) <= $limit then return $s end
+  return slice($s, 0, $limit - 1) .. "…"
+end
+
+$CATEGORY_LABELS = {"": "All", Network: "Internet", Office: "Office", Development: "Development",
+  Graphics: "Graphics", AudioVideo: "Media", Game: "Games", System: "System",
+  Utility: "Utilities", Settings: "Settings"}
+
+fn category_label($cat)
+  return $CATEGORY_LABELS[$cat] ?? $cat
+end
+
+-- Chip node ids are "cat_<lowercase category>" ("cat_all" = everything);
+-- map one back to its freedesktop category name.
+fn category_from_node($node)
+  $key = replace($node, "cat_", "")
+  if $key == "all" then return "" end
+  for each $cat, $label in $CATEGORY_LABELS
+    if lower($cat) == $key then return $cat end
+  end
+  return ""
+end

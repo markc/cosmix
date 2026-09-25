@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.95.0"
+version = "0.96.0"
 edition = "2024"
 license = "MIT"
 
@@ -9,7 +9,7 @@ name = "cosmix_mix"
 
 [features]
 default = []
-json = ["dep:serde_json", "dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
+json = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
 regex = ["dep:regex"]
 # `markdown()` builtin — CommonMark + GFM (tables, strikethrough, task lists,
 # footnotes) → HTML via pulldown-cmark, with raw HTML escaped + dangerous URL
@@ -114,7 +114,8 @@ datastar = { version = "0.3", default-features = false, optional = true }
 # test types get derive from the dev-dependency below, so the public
 # feature doesn't force `serde_derive` onto every consumer.
 serde = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
+serde_json = "1"
+notify = { workspace = true }
 sha2 = { version = "0.10", optional = true }
 # `crypto` feature — MD5 and SHA-1 for LEGACY INTEROP only (both are
 # cryptographically broken; see the warning on docs/mix/system.md). Same
@@ -163,7 +164,7 @@ quick-xml = { version = "0.41.0", optional = true }
 # `serde_derive`. Feature unification gives the test build both edges.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "test-util", "net", "io-util"] }
 cosmix-lib-mix = { path = ".", features = ["json", "regex", "toml", "datetime", "url", "crypto", "http", "sqlite", "tokio-sleep", "datastar", "xml", "yaml", "ws"] }
 # Property-based testing for the lexer/parser (P1 of the mix tokenizer
 # fuzz/property corpus — _doc/planned/mix-tokenizer-fuzz-corpus.md in the cosmix

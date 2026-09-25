@@ -25,15 +25,54 @@ host instead rejects the new ports as `unknown-port`. See the renderer manual
 for the text centring correction and the preserved zero text-wrapper minimum width.
 
 Lists require rows of `{id: string, cells: [string]}`, a sibling `row`
-template and a positive `row_height`. Template subtrees may contain only row,
+template and a positive `row_height`. IDs must be non-empty and unique within
+each list; extra item fields remain available through `$item` and click bodies.
+`flow: "horizontal"` opts into natural-width repeated rows with `gap` and
+`align`; omitted flow remains the vertical VirtualList. Horizontal flow ignores
+vertical viewport sizing (`row_height` and `max_rows`). Template subtrees may contain only row,
 column, text, spacer and image. `{cells[i]}` is allowed only in `text.text`,
 and must be within the minimum cell count across all rows. Template nodes are
 marked in `ResolvedScene`; their ids are not rendered. `@` is reserved for
-future `<template>@<row>` instance ids and is rejected in source node ids.
+renderer instance identities and is rejected in source node ids. Instance IDs
+include the owning list and item ID; consumers use the event's `item`, never
+parse these IDs.
+
+Every non-window family accepts the boolean `hidden` port, including bindings.
+Its absence preserves previous resolved defaults (`text.hidden` still defaults
+to false). Hidden containers consume no layout space.
+
+`bindings::template_instantiate_with` shares a `TemplateEvaluation` across an
+entire scene revision: one model conversion, at most 16,384 instantiated nodes,
+and the core's 250 ms evaluation budget. The convenience
+`template_instantiate` creates a context for a single node; hosts rendering
+repeated trees must use the shared context. Both evaluate against the live
+`$model` and supplied `$item`, coerce ports and validate layout bounds.
+Quoin runs that preflight for loads, port patches and model-only patches
+before committing a revision. A template failure preserves the authored
+document, resolved tree, compiled bindings and revision. Results that cross
+the shared deadline are rejected even when the final expression never yields.
+The renderer retains the prepared instances with that accepted revision and
+applies them without evaluating again. Mix expression evaluation reuses one
+Tokio runtime per calling thread; each call still has fresh globals and limits.
 
 Lint reports bounded-document, schema, graph, template, row and header
 diagnostics. `orphan-node` is a warning; other violations are errors. The
 resolver returns diagnostics for unknown families rather than panicking.
+
+`to_source(&SceneDocument)` serialises the authored AMP document, including
+model, optional headers, expressions and template nodes. It does not serialise
+the flattened resolved tree. Strict Mix escaping preserves literal `${...}`,
+leading `~`, backticks (including fence-looking text), Unicode and control
+characters. Quoin exposes this as `shell.scene.get {scene,format:"source"}`.
+
+`bindings::reevaluate` accepts `model` to replace a complete model map (null
+clears it), as well as `model.*` map paths. Both individual patch values and the
+aggregate model are bounded before evaluation. The host retains the compiled
+binding set, commits authored model/resolved tree/revision together, and checks
+the complete canonical document bound before accepting a patch. A refused
+patch leaves the prior revision intact.
+The host also refuses model patches that move the scene's mount page or edge,
+preserving the loading citizen's existing reservation.
 
 `diff(old, new)` emits `Remove`, `Insert { parent, index }`, `SetPort`,
 `Reparent`, and scene-level `SetScene` operations for name, citizen, window

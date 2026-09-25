@@ -1,0 +1,4 @@
+schema: 1
+name: "quoin-settings"
+title: "Appearance"
+behaviour: "behaviour.mix"

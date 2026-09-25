@@ -464,6 +464,86 @@ re-parse.</p>
 <li><strong><code>stat</code>'s <code>ino</code>/<code>dev</code> are STRINGS.</strong> They are <code>u64</code> and Mix numbers are f64, which loses precision above 2^53 — so they come back as text, ready to use verbatim as a dedupe key. Don't <code>to_number()</code> them.</li>
 <li><strong>Bytes vs strings.</strong> <code>read_file</code>/<code>read_lines</code> require valid UTF-8 (they error on a bad byte); <code>read_file_bytes</code> carries the raw buffer through <code>Value::Bytes</code>. <code>write_file</code>/<code>append_file</code>/<code>write_new</code> write a <code>Value::Bytes</code> argument verbatim and stringify anything else.</li>
 </ul>
+<h2 id="native-filesystem-events">Native filesystem events</h2>
+<pre><code class="language-mix">$watch = fs_watch("/srv/scenes", {
+  recursive: true,
+  events: ["created", "modified", "deleted", "moved"]
+})
+on fs.changed
+  $batch = $event.args
+  -- Reconcile affected paths; overflow means rescan the watched root.
+  print($batch)
+end
+-- fs_unwatch($watch) cancels this registration and its pending changes.
+</code></pre>
+<p><code>fs_watch(path[, opts]) -&gt; handle</code> requires an existing root. The handle is an
+opaque string owned by this evaluator generation; do not interpret or persist it.
+Defaults: <code>recursive:false</code>, all four event kinds. Unknown options and event
+names are refused. All three watch builtins require <code>FsRead</code> capability.</p>
+<p><code>fs_unwatch(handle) -&gt; nil</code> removes the watch and pending changes. An already
+dispatched handler may still finish; a waiting <code>fs_wait</code> wakes with cancellation.
+<code>fs_wait(handle) -&gt; batch</code> suspends outside serve mode, without polling. Dropping
+the waiting evaluation does not consume an event. In <code>--serve</code>, use <code>on fs.changed</code>:
+<code>fs_wait</code> is refused so there cannot be competing consumers. Expression mode
+also denies <code>fs_wait</code>. In a plain script, a top-level <code>sleep()</code> dispatches native
+events only for families with a registered handler. An unrelated handler (or
+only <code>on proc.exited</code>) leaves filesystem batches available to <code>fs_wait</code>.</p>
+<p>Each batch is <code>{watch, changes:[{path,kind,old_path?}], overflow}</code>. Paths are
+absolute, with parent symlinks resolved during registration. Changes coalesce
+per path at delivery; a write or close-write does not erase a pending <code>created</code>
+or paired rename.
+Coalescing that would discard a different rename origin sets overflow.
+<code>moved</code> has <code>old_path</code> only when inotify supplied both endpoints. A half move
+invalidates its reported path without guessing the other endpoint. Consumers
+must reconcile current filesystem state, including absence. Separate writes can
+produce separate batches; there is no promise of one notification per save.</p>
+<p>The backend is Linux <code>notify::INotifyWatcher</code>, never <code>PollWatcher</code>. File roots
+watch their parent directory, so atomic-save replacement remains visible.
+Directory roots watch their parent too, permitting deletion and recreation of
+the root while that parent survives. Recursive watches enumerate existing and
+new directories on registration or structural events, never on a clock. Root
+symlinks are refused; discovered directory symlinks are skipped. This is not a
+security boundary against concurrent path/symlink substitution. Moving or deleting
+the stable parent itself requires a new registration. Pseudo-filesystems which
+do not emit inotify events cannot be observed by this API.</p>
+<p>Per evaluator: at most 128 handles, 8192 distinct directory registrations and
+4096 pending coalesced changes. All handles share one inotify instance and its
+event-loop thread, one reconciliation worker and a bounded 256-record backend
+queue. Overlapping handles share directory registrations; removing one handle
+does not remove coverage needed by another. The instance and workers retire
+after the last handle is removed or the evaluator closes its native sources.
+Kernel/queue loss, directory limits or later observation failures set sticky
+<code>overflow:true</code>; the bit clears only when that batch is delivered. A newly
+watched directory also sets overflow because files may have appeared before its
+registration. Rescan once for each overflow batch. Non-UTF-8 event paths request
+a rescan rather than emitting a lossy path. Event filtering never suppresses
+overflow. A failed initial registration releases everything it acquired.
+If a later permission/resource failure prevents reinstalling coverage, resolve
+that failure and recreate the watch; a rescan alone cannot grant missing watches.
+Registration, enumeration and teardown can wait on the underlying filesystem;
+there is no hard latency guarantee for a stalled filesystem.</p>
+<p>Refusals raise; an uncaught refusal exits nonzero. The structured catch value
+contains <code>{error_code,message}</code> (<code>code</code> remains an alias). Codes:</p>
+<table><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>FS_WATCH_MISSING</code></td><td>Initial root/parent is absent.</td></tr>
+<tr><td><code>FS_WATCH_PERMISSION</code></td><td>Kernel denied registration or enumeration.</td></tr>
+<tr><td><code>FS_WATCH_LIMIT</code></td><td>Handle/directory/kernel resource limit.</td></tr>
+<tr><td><code>FS_WATCH_UNSUPPORTED</code></td><td>Platform is not Linux.</td></tr>
+<tr><td><code>FS_WATCH_SYMLINK</code></td><td>Root is a symlink.</td></tr>
+<tr><td><code>FS_WATCH_OPTIONS</code>, <code>FS_WATCH_ARGUMENT</code></td><td>Invalid options or path/handle type.</td></tr>
+<tr><td><code>FS_WATCH_HANDLE</code></td><td>Unknown handle passed to unwatch.</td></tr>
+<tr><td><code>FS_WATCH_CANCELLED</code></td><td>Wait names a removed or unknown watch.</td></tr>
+<tr><td><code>FS_WAIT_SERVE</code></td><td>Blocking-consumer API used in serve mode.</td></tr>
+<tr><td><code>FS_WATCH_IO</code></td><td>Other initial filesystem/backend failure.</td></tr>
+<tr><td><code>NATIVE_CLOSED</code></td><td>This evaluator's native registrations have retired.</td></tr>
+<tr><td><code>NATIVE_CONSUMER</code></td><td>Attempted to enter a second event pump in this evaluator.</td></tr>
+</tbody></table>
+<p>See <a href="/mix/serve#native-events-and-generation-lifetime">serve lifecycle</a> for reload
+and shutdown ownership. Network and audio changes have their own subscriptions
+(<code>net_watch</code>, <code>audio_watch</code>) — see
+<a href="/mix/system#desktop-status-events--net_watch-audio_watch">desktop status events</a>;
+do not watch <code>/sys/class/net</code>, which does not emit inotify events. These examples specify the new API; the older version
+claims at the top of this page do not apply to this section.</p>
 <h2 id="reading-files">Reading files</h2>
 <pre><code>read_file(path)          -&gt; string   (whole file; errors if not UTF-8)
 read_lines(path)         -&gt; list      (lines, trailing \n stripped, trailing empty dropped)

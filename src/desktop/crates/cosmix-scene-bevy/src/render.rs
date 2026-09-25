@@ -9,6 +9,9 @@ use bevy::prelude::*;
 use bevy::text::{EditableText, EditableTextFilter, FontWeight};
 use bevy::ui::Checked;
 use bevy::ui_widgets::Activate;
+use cosmix_scene::bindings::{
+    BindingSet, CompiledBinding, TemplateEvaluation, template_instantiate_with,
+};
 use cosmix_scene::{Node as SceneNode, Op, ResolvedScene};
 use cosmix_shell::core::Edge;
 use ctk::bus::{BusBridge, BusBridgeEvent};
@@ -29,6 +32,10 @@ use super::SceneStore;
 mod icons;
 #[cfg(test)]
 mod layout_tests;
+#[cfg(test)]
+mod model_patch_tests;
+#[cfg(test)]
+mod template_tests;
 use icons::IconCache;
 
 #[derive(Resource)]
@@ -56,6 +63,17 @@ impl Binding {
             submit: string(node, "on_submit"),
             item: None,
         }
+    }
+
+    fn payload(&self, kind: &str, value: Option<Value>) -> Value {
+        let mut body = json!({"scene":self.scene,"node":self.node,"kind":kind});
+        if let Some(value) = value {
+            body["value"] = value;
+        }
+        if let Some(item) = &self.item {
+            body["item"] = item.clone();
+        }
+        body
     }
 }
 
@@ -101,13 +119,7 @@ impl Events {
         }
         self.next = self.next.wrapping_add(1);
         let id = 0x53_0000_0000 | self.next;
-        let mut body = json!({"scene":binding.scene,"node":binding.node,"kind":kind});
-        if let Some(value) = value {
-            body["value"] = value;
-        }
-        if let Some(item) = &binding.item {
-            body["item"] = item.clone();
-        }
+        let body = binding.payload(kind, value);
         match bridge.try_call(
             id,
             &binding.citizen,
@@ -201,14 +213,25 @@ struct ClickRow;
 fn row_click(
     mut event: On<Pointer<Click>>,
     bindings: Query<&Binding, With<ClickRow>>,
+    parents: Query<&ChildOf>,
     bridge: Res<BusBridge>,
     mut events: ResMut<Events>,
 ) {
-    if let Ok(binding) = bindings.get(event.entity)
-        && event.button == bevy::picking::pointer::PointerButton::Primary
-    {
-        events.send(&bridge, binding, "click", None);
-        event.propagate(false);
+    if event.button != bevy::picking::pointer::PointerButton::Primary {
+        return;
+    }
+    // Picking targets the Text/Image descendant, which need not carry a
+    // ClickRow. Resolve its nearest clickable ancestor on the first delivery
+    // instead of relying on another invocation of this global observer.
+    let mut target = event.entity;
+    loop {
+        if let Ok(binding) = bindings.get(target) {
+            events.send(&bridge, binding, "click", None);
+            event.propagate(false);
+            return;
+        }
+        let Ok(parent) = parents.get(target) else { return };
+        target = parent.parent();
     }
 }
 fn hover(mut query: Query<(&Hovered, &SceneHover, &mut BackgroundColor), Changed<Hovered>>) {
@@ -218,7 +241,7 @@ fn hover(mut query: Query<(&Hovered, &SceneHover, &mut BackgroundColor), Changed
 }
 
 pub(crate) struct Mounted {
-    revision: u64,
+    pub(crate) revision: u64,
     tree: ResolvedScene,
     page: Entity,
     edge: Edge,
@@ -261,6 +284,11 @@ pub fn reconcile(world: &mut World) {
             destroy(world, mounted);
         }
         for entry in store.scenes.values_mut() {
+            // Retain failures as readable state. A new accepted revision clears
+            // the diagnostic and retries; repeated frames are not a retry loop.
+            if entry.render_error.is_some() {
+                continue;
+            }
             let edge = scene_edge(&entry.tree);
             // Production ingress reserved this exact name before replying.
             // Rendering never creates or steals a registry seat.
@@ -284,13 +312,13 @@ pub fn reconcile(world: &mut World) {
                     continue;
                 }
             }
-            if entry.mounted.as_ref().is_some_and(|m| m.edge != edge) {
-                // Reparent the existing page when its edge changes: fields survive.
-                let m = entry.mounted.as_mut().unwrap();
-                world.entity_mut(m.page).remove::<ChildOf>();
-                cosmix_shell::chrome::unmount_page(world, m.edge, &page_id(&m.tree));
-                m.edge = edge;
-                m.registered = false;
+            // A new revision/remount clears render_error. If the previous
+            // failure lost ECS entities, rebuild instead of diffing dead IDs.
+            if entry.rebuild_mount {
+                if let Some(broken) = entry.mounted.take() {
+                    destroy(world, broken);
+                }
+                entry.rebuild_mount = false;
             }
             let mounted = entry.mounted.get_or_insert_with(|| Mounted {
                 revision: 0,
@@ -311,13 +339,39 @@ pub fn reconcile(world: &mut World) {
                 nodes: BTreeMap::new(),
             });
             if mounted.revision != entry.revision || scale_changed {
-                if mount_config(&mounted.tree) != mount_config(&entry.tree) {
-                    mounted.registered = false;
+                let mount_changed = mount_config(&mounted.tree) != mount_config(&entry.tree);
+                match apply_prepared(world, mounted, &entry.tree, &entry.prepared) {
+                    Ok(()) => {
+                        mounted.revision = entry.revision;
+                        if mount_changed {
+                            mounted.registered = false;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(scene = entry.tree.name, "render failed: {error}");
+                        // Watch/list expose the retained error and last applied
+                        // revision even if every change notification is lost.
+                        if let Some(bridge) = world.get_resource::<BusBridge>() {
+                            let summary = json!({"scene":entry.tree.name,
+                                "revision":entry.revision,"applied_revision":mounted.revision,
+                                "ops":0,"diagnostics":error["diagnostics"]});
+                            let wire = format!("---\ncommand: shell.scene.changed\n---\n{summary}");
+                            let _ = bridge.try_publish_topic(
+                                format!("{}.scene.changed", bridge.service_name()), false, wire);
+                        }
+                        entry.render_error = Some(error);
+                        entry.rebuild_mount = true;
+                        continue;
+                    }
                 }
-                apply(world, mounted, &entry.tree);
-                mounted.revision = entry.revision;
-            } else {
-                debug_assert_eq!(mounted.tree, entry.tree);
+            }
+            if mounted.edge != edge {
+                // Reparent only after application succeeds. The page ID is
+                // stable across accepted revisions; its contents retain focus.
+                world.entity_mut(mounted.page).remove::<ChildOf>();
+                cosmix_shell::chrome::unmount_page(world, mounted.edge, &page_id(&mounted.tree));
+                mounted.edge = edge;
+                mounted.registered = false;
             }
             if !mounted.registered {
                 let config = mount_config(&entry.tree);
@@ -414,6 +468,12 @@ fn destroy(world: &mut World, mounted: Mounted) {
     if world.get_entity(mounted.page).is_ok() {
         world.despawn(mounted.page);
     }
+    // A missing/detached page may have left some content entities alive.
+    for view in mounted.nodes.values() {
+        if world.get_entity(view.root).is_ok() {
+            world.despawn(view.root);
+        }
+    }
 }
 /// The sub-panel address a scene mounts under.
 ///
@@ -471,7 +531,29 @@ fn template_ids(tree: &ResolvedScene) -> BTreeSet<String> {
     ids
 }
 
+// Direct-tree test fixtures use the same prepare/apply split as ingress.
+#[cfg(test)]
 fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
+    if let Ok(lists) = validate_templates(tree) {
+        apply_prepared(world, mounted, tree, &lists).unwrap();
+    }
+}
+
+fn apply_prepared(
+    world: &mut World,
+    mounted: &mut Mounted,
+    tree: &ResolvedScene,
+    lists: &PreparedLists,
+) -> Result<(), Value> {
+    // All fallible expression work belongs to ingress. Check renderer-owned
+    // entity state before mutation, and report a real application failure.
+    if world.get_entity(mounted.page).is_err()
+        || mounted.nodes.values().any(|view| world.get_entity(view.root).is_err()) {
+        return Err(json!({"scene":tree.name,"error_code":"scene_render",
+            "message":"scene render entities are missing",
+            "diagnostics":[{"severity":"Error","code":"scene-render","line":1,
+                "message":"scene render entities are missing"}]}));
+    }
     icons::begin_revision(world);
     let ops = cosmix_scene::diff(&mounted.tree, tree);
     let templates = template_ids(tree);
@@ -485,8 +567,11 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
                         old.family != new.family
                             || old.ports.get("password") != new.ports.get("password")
                             || (new.family == "list"
-                                && (old.ports.get("row_height") != new.ports.get("row_height")
-                                    || old.ports.get("gap") != new.ports.get("gap")))
+                                && (horizontal(old) != horizontal(new)
+                                    || (!horizontal(new)
+                                        && (old.ports.get("row_height")
+                                            != new.ports.get("row_height")
+                                            || old.ports.get("gap") != new.ports.get("gap")))))
                     })
                 })
         })
@@ -553,14 +638,15 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
         }
         // A template edit must invalidate the list even if its own ports did not change.
         if let Some(data) = &view.list {
-            *data.write().unwrap() = ListData {
-                tree: tree.clone(),
-                node: id.clone(),
-            };
-            world.trigger(ctk::virtual_list::VirtualListModelChanged {
-                list: view.root,
-                hint: ChangeHint::Reset,
-            });
+            *data.write().unwrap() = lists[id].clone();
+            if horizontal(node) {
+                sync_horizontal(world, view.root, &lists[id]);
+            } else {
+                world.trigger(ctk::virtual_list::VirtualListModelChanged {
+                    list: view.root,
+                    hint: ChangeHint::Reset,
+                });
+            }
         }
     }
     // Reparent last, in authored order. Internal CTK children are untouched.
@@ -578,6 +664,7 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
         }
     }
     mounted.tree = tree.clone();
+    Ok(())
 }
 
 fn spawn(world: &mut World, tree: &ResolvedScene, id: &str, node: &SceneNode) -> View {
@@ -652,15 +739,20 @@ fn spawn(world: &mut World, tree: &ResolvedScene, id: &str, node: &SceneNode) ->
             let model = Arc::new(RwLock::new(ListData {
                 tree: tree.clone(),
                 node: id.into(),
+                instances: BTreeMap::new(),
             }));
             let row_height = number(node, "row_height", 24.0) + number(node, "gap", 0.0);
             let viewport = list_height(node);
-            let root = spawn_virtual_list(
-                &mut commands,
-                VirtualListProps::new(row_height, viewport, id),
-                ListModel(model.clone()),
-            )
-            .root;
+            let root = if horizontal(node) {
+                commands.spawn((Node::default(), FlowRows::default())).id()
+            } else {
+                spawn_virtual_list(
+                    &mut commands,
+                    VirtualListProps::new(row_height, viewport, id),
+                    ListModel(model.clone()),
+                )
+                .root
+            };
             list = Some(model);
             root
         }
@@ -892,12 +984,25 @@ fn update(
             }
         }
         "list" => {
-            layout.height = px(list_height(node));
-            layout.max_height = if node.ports.contains_key("max_rows") {
-                layout.height
+            if horizontal(node) {
+                layout.flex_direction = FlexDirection::Row;
+                layout.height = Val::Auto;
+                layout.max_height = Val::Auto;
+                layout.column_gap = px(number(node, "gap", 0.0));
+                layout.align_items = match text(node, "align") {
+                    "center" => AlignItems::Center,
+                    "end" => AlignItems::End,
+                    "stretch" => AlignItems::Stretch,
+                    _ => AlignItems::Start,
+                };
             } else {
-                Val::Auto
-            };
+                layout.height = px(list_height(node));
+                layout.max_height = if node.ports.contains_key("max_rows") {
+                    layout.height
+                } else {
+                    Val::Auto
+                };
+            }
         }
         "image" => {
             let src = text(node, "src");
@@ -971,12 +1076,298 @@ fn update(
     world.entity_mut(view.root).insert(layout);
 }
 
-struct ListData {
+#[derive(Clone)]
+pub(crate) struct ListData {
     tree: ResolvedScene,
     node: String,
+    instances: BTreeMap<String, BTreeMap<String, SceneNode>>,
+}
+
+pub(crate) type PreparedLists = BTreeMap<String, ListData>;
+
+fn horizontal(node: &SceneNode) -> bool {
+    text(node, "flow") == "horizontal"
+}
+
+fn prepare_lists(
+    tree: &ResolvedScene,
+) -> Result<BTreeMap<String, ListData>, cosmix_scene::Diagnostic> {
+    #[cfg(test)]
+    PREPARE_COUNT.with(|n| n.set(n.get() + 1));
+    let set = BindingSet {
+        // Resolved expressions were already policy-checked by scene core.
+        bindings: tree
+            .bindings
+            .iter()
+            .map(|(path, source)| {
+                (
+                    path.clone(),
+                    CompiledBinding {
+                        source: source.clone(),
+                        deps: BTreeSet::new(),
+                        reads_item: false,
+                    },
+                )
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut evaluation = TemplateEvaluation::new(&tree.model);
+    let mut lists = BTreeMap::new();
+    let templates = template_ids(tree);
+    for (id, node) in &tree.nodes {
+        if node.family != "list" {
+            continue;
+        }
+        if templates.contains(id) {
+            return Err(cosmix_scene::Diagnostic {
+                severity: cosmix_scene::Severity::Error,
+                code: "invalid-template".into(),
+                line: node.line,
+                message: "Nested lists are not supported by this renderer".into(),
+            });
+        }
+        let mut data = ListData {
+            tree: tree.clone(),
+            node: id.clone(),
+            instances: BTreeMap::new(),
+        };
+        for item in rows(node) {
+            let mut nodes = BTreeMap::new();
+            template_node(
+                tree,
+                text(node, "row"),
+                item,
+                &set,
+                &mut evaluation,
+                &mut nodes,
+            )?;
+            data.instances
+                .insert(item["id"].as_str().unwrap_or_default().into(), nodes);
+        }
+        lists.insert(id.clone(), data);
+    }
+    Ok(lists)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ingress preflight, before committing a revision or reserving its mount.
+/// Model-only patch paths must call this on the candidate resolved tree too.
+pub(crate) fn validate_templates(tree: &ResolvedScene) -> Result<PreparedLists, Value> {
+    prepare_lists(tree).map_err(|diagnostic| {
+        json!({
+            "error_code": "scene_template",
+            "message": diagnostic.message,
+            "scene": tree.name,
+            "diagnostics": [diagnostic],
+        })
+    })
+}
+
+// Evaluate the core bindings before legacy cells substitution, once per revision.
+fn template_node(
+    tree: &ResolvedScene,
+    id: &str,
+    item: &Value,
+    set: &BindingSet,
+    evaluation: &mut TemplateEvaluation,
+    nodes: &mut BTreeMap<String, SceneNode>,
+) -> Result<(), cosmix_scene::Diagnostic> {
+    if tree.nodes[id].family == "list" {
+        return Err(cosmix_scene::Diagnostic {
+            severity: cosmix_scene::Severity::Error,
+            code: "invalid-template".into(),
+            line: tree.nodes[id].line,
+            message: "Nested lists are not supported by this renderer".into(),
+        });
+    }
+    let mut node = template_instantiate_with(id, &tree.nodes[id], set, item, evaluation)?;
+    let port = match node.family.as_str() {
+        "text" => Some("text"),
+        "image" => Some("src"),
+        _ => None,
+    };
+    if let Some(port) = port {
+        // A binding result is literal data; never interpret its {cells[..]}.
+        if !tree.bindings.contains_key(&format!("{id}.{port}")) {
+            let value = substitute_cells(text(&node, port), &item["cells"]);
+            node.ports.insert(port.into(), json!(value));
+        }
+    }
+    for child in children(&node) {
+        template_node(tree, child, item, set, evaluation, nodes)?;
+    }
+    nodes.insert(id.into(), node);
+    Ok(())
+}
+
+#[derive(Component, Default)]
+struct RowInstances {
+    key: String,
+    views: BTreeMap<String, (View, SceneNode)>,
+}
+
+#[derive(Component, Default)]
+struct FlowRows(BTreeMap<String, Entity>);
+
+fn bind_row(world: &mut World, content: Entity, data: &ListData, item: &Value) {
+    let node = &data.tree.nodes[&data.node];
+    let key = item["id"].as_str().unwrap_or_default();
+    let Some(nodes) = data.instances.get(key) else {
+        return;
+    };
+    let mut old = world
+        .entity_mut(content)
+        .take::<RowInstances>()
+        .unwrap_or_default();
+    // VirtualList may recycle a content entity for another item. Never reuse
+    // that item's identity; retained IDs otherwise retain every template entity.
+    let same_item = old.key == key;
+    let structural = !same_item
+        || old.views.len() != nodes.len()
+        || nodes.iter().any(|(id, node)| {
+            old.views.get(id).is_none_or(|(_, previous)| {
+                previous.family != node.family || children(previous).ne(children(node))
+            })
+        });
+    if structural {
+        for (view, _) in old.views.values() {
+            world.entity_mut(view.root).remove::<ChildOf>();
+        }
+    }
+    old.views.retain(|id, (view, previous)| {
+        let keep = same_item
+            && nodes
+                .get(id)
+                .is_some_and(|node| node.family == previous.family);
+        if !keep {
+            world.despawn(view.root);
+        }
+        keep
+    });
+    old.key = key.into();
+    let mut binding = Binding::new(&data.tree, &data.node, node);
+    binding.item = Some(item.clone());
+    world
+        .entity_mut(content)
+        .insert((binding.clone(), ClickRow));
+    let changed_parents: BTreeSet<_> = nodes
+        .iter()
+        .filter(|(id, node)| {
+            old.views
+                .get(*id)
+                .is_none_or(|(_, previous)| previous != *node)
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    // update's parent-sensitive layout must see instantiated $item ports too.
+    let instance_tree = ResolvedScene {
+        name: data.tree.name.clone(),
+        citizen: data.tree.citizen.clone(),
+        window: None,
+        subscribe: None,
+        model: Value::Null,
+        bindings: BTreeMap::new(),
+        templates: Vec::new(),
+        nodes: nodes
+            .iter()
+            .map(|(id, node)| (id.clone(), node.clone()))
+            .collect(),
+    };
+    for (id, node) in nodes {
+        let instance = format!("{id}@{}:{}:{}:{key}", data.node.len(), data.node, key.len());
+        let fresh = !old.views.contains_key(id);
+        let parent_changed = node.family == "text"
+            && flag(node, "fill")
+            && nodes.iter().any(|(parent_id, parent)| {
+                children(parent).any(|child| child == id)
+                    && changed_parents.contains(parent_id.as_str())
+            });
+        let (view, previous) = old
+            .views
+            .entry(id.clone())
+            .or_insert_with(|| (spawn(world, &data.tree, &instance, node), node.clone()));
+        if fresh || previous != node || parent_changed || node.family == "image" {
+            update(world, &instance_tree, id, node, Some(previous), view);
+        }
+        // Descendant clickable rows use the list's command and payload too.
+        world
+            .entity_mut(view.root)
+            .insert((Name::new(instance), binding.clone()));
+        *previous = node.clone();
+    }
+    if structural {
+        for (id, node) in nodes {
+            let children: Vec<_> = children(node).map(|id| old.views[id].0.root).collect();
+            world
+                .entity_mut(old.views[id].0.root)
+                .add_children(&children);
+        }
+    }
+    let root = old.views[text(node, "row")].0.root;
+    if !horizontal(node) {
+        world.get_mut::<Node>(root).unwrap().width = percent(100);
+    } else {
+        // The internal wrapper must disappear with the authored row, including
+        // its share of horizontal list gaps.
+        let display = world.get::<Node>(root).unwrap().display;
+        if let Some(mut layout) = world.get_mut::<Node>(content) {
+            layout.display = display;
+        }
+    }
+    if structural {
+        world.entity_mut(content).add_child(root);
+    }
+    world.entity_mut(content).insert(old);
+}
+
+fn sync_horizontal(world: &mut World, root: Entity, data: &ListData) {
+    let mut flow = world
+        .entity_mut(root)
+        .take::<FlowRows>()
+        .unwrap_or_default();
+    flow.0.retain(|id, entity| {
+        let keep = data.instances.contains_key(id);
+        if !keep {
+            world.despawn(*entity);
+        }
+        keep
+    });
+    let mut order = Vec::new();
+    for item in rows(&data.tree.nodes[&data.node]) {
+        let key = item["id"].as_str().unwrap_or_default();
+        let content = *flow.0.entry(key.into()).or_insert_with(|| {
+            world
+                .spawn(Node {
+                    flex_shrink: 0.0,
+                    ..default()
+                })
+                .id()
+        });
+        bind_row(world, content, data, item);
+        order.push(content);
+    }
+    let previous = world
+        .get::<Children>(root)
+        .map(|children| children.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if previous != order {
+        for content in &order {
+            world.entity_mut(*content).remove::<ChildOf>();
+        }
+        world.entity_mut(root).add_children(&order);
+    }
+    world.entity_mut(root).insert(flow);
 }
 struct ListModel(Arc<RwLock<ListData>>);
 impl VirtualListModel for ListModel {
+    fn retain_content(&self) -> bool {
+        true
+    }
     fn len(&self) -> usize {
         let data = self.0.read().unwrap();
         rows(&data.tree.nodes[&data.node]).len()
@@ -997,40 +1388,8 @@ impl VirtualListModel for ListModel {
         let Some(item) = rows(node).get(index) else {
             return;
         };
-        let previous = world
-            .get::<Children>(content)
-            .map(|c| c.iter().collect::<Vec<_>>())
-            .unwrap_or_default();
-        for entity in previous {
-            world.despawn(entity);
-        }
-        let mut binding = Binding::new(&data.tree, &data.node, node);
-        binding.item = Some(item.clone());
-        world.entity_mut(content).insert((binding, ClickRow));
-        let template = text(node, "row");
-        let root = template_node(world, &data.tree, template, item);
-        world.get_mut::<Node>(root).unwrap().width = percent(100);
-        world.entity_mut(content).add_child(root);
+        bind_row(world, content, &data, item);
     }
-}
-fn template_node(world: &mut World, tree: &ResolvedScene, id: &str, item: &Value) -> Entity {
-    let mut node = tree.nodes[id].clone();
-    if node.family == "text" {
-        let value = substitute_cells(text(&node, "text"), &item["cells"]);
-        node.ports.insert("text".into(), json!(value));
-    } else if node.family == "image" {
-        let value = substitute_cells(text(&node, "src"), &item["cells"]);
-        node.ports.insert("src".into(), json!(value));
-    }
-    let instance = format!("{id}@{}", item["id"].as_str().unwrap_or_default());
-    let view = spawn(world, tree, &instance, &node);
-    update(world, tree, &instance, &node, None, &view);
-    world.entity_mut(view.root).insert(Name::new(instance));
-    let children: Vec<_> = children(&node)
-        .map(|id| template_node(world, tree, id, item))
-        .collect();
-    world.entity_mut(view.root).add_children(&children);
-    view.root
 }
 fn substitute_cells(mut source: &str, cells: &Value) -> String {
     let mut out = String::new();
@@ -2197,7 +2556,11 @@ mod tests {
         .unwrap();
         world.insert_resource(store);
         reconcile(world);
-        let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
+        let right = &world
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Right)
+            .page_ids;
         // Reconciliation visits scenes in name order (BTreeMap), not load
         // order. The envelope overrides the page id, not that traversal.
         assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
@@ -2211,7 +2574,11 @@ mod tests {
             )
             .unwrap();
         reconcile(world);
-        let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
+        let right = &world
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Right)
+            .page_ids;
         assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
         // A live panel address cannot be aliased or renamed.
         for (name, panel) in [("impostor", "settings.appearance"), ("settings", "renamed")] {
@@ -2220,10 +2587,16 @@ mod tests {
                 &format!("---\nscene: 1\nname: {name}\ncitizen: test\nwindow: {{\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"{panel}\"}}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"),
                 &Value::Null,
             );
-            assert!(result.is_err(), "a live address cannot be aliased or renamed");
+            assert!(
+                result.is_err(),
+                "a live address cannot be aliased or renamed"
+            );
         }
         // An empty or non-string panel field falls back to the anonymous id.
-        for window in ["{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":\"\"}", "{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":7}"] {
+        for window in [
+            "{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":\"\"}",
+            "{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":7}",
+        ] {
             let mut fallback = SceneStore::default();
             fallback
                 .request(

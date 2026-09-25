@@ -27,6 +27,18 @@
 //! Registration retries state-drivenly until the host has chrome and a real
 //! output; a deliberate removal (`sub.remove` / `scene.unload` of the panel)
 //! sticks — the loader retires instead of fighting the caller.
+//!
+//! This built-in content is the FALLBACK for a host with no scenes loader.
+//! The layout is the shipped template `share/scenes/settings/scene.mix`;
+//! when the loader loads that template (`quoin-settings`, page
+//! `settings.appearance`), [`yield_to_external`] unloads the built-in so the
+//! external load takes the page, and [`maintain`] stands aside for as long as
+//! another owner holds it — its seat, or a scene entry that still names the
+//! page after a `sub.remove` took the seat alone. When that owner goes (disable, remove, loader
+//! disconnect) the built-in returns, so the page never silently disappears.
+//! Either way the effects stay here: `shell.settings.{scheme,motion,size}`
+//! plus the `shell.settings.get` snapshot and `shell.settings.changed`
+//! notice ([`snapshot`]) the template's behaviour builds its model from.
 
 use std::time::{Duration, Instant};
 
@@ -76,7 +88,7 @@ struct Rendered {
 }
 
 #[derive(Resource)]
-struct SettingsScene {
+pub(crate) struct SettingsScene {
     rendered: Option<Rendered>,
     edge: Option<Edge>,
     /// Last applied scheme name (shadow of the `QuoinSchemeSelected` stream;
@@ -84,6 +96,10 @@ struct SettingsScene {
     scheme: String,
     receipt: u64,
     retired: bool,
+    /// Stood aside for another owner of the page; the first update after it
+    /// goes only schedules the reload (the edge-move pattern), so the owner's
+    /// teardown reconciles before the fallback mounts again.
+    yielded: bool,
     last_refused: Option<Instant>,
 }
 
@@ -95,6 +111,7 @@ impl Default for SettingsScene {
             scheme: Scheme::Ocean.name().to_owned(),
             receipt: 0,
             retired: false,
+            yielded: false,
             last_refused: None,
         }
     }
@@ -108,14 +125,8 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
     // setting's default (the embedded host opts into the schema separately).
     app.init_resource::<ShellConfig>();
     app.add_systems(Startup, declare_initial_pages.after(crate::setup));
-    let scheme = app
-        .world()
-        .get_resource::<crate::state::StateStore>()
-        .and_then(|store| store.scheme())
-        .and_then(|name| Scheme::from_name(&name))
-        .unwrap_or(Scheme::Ocean);
     let settings = SettingsScene {
-        scheme: scheme.name().to_owned(),
+        scheme: initial_scheme(app.world().get_resource::<crate::state::StateStore>()),
         ..default()
     };
     app.insert_resource(settings).add_systems(
@@ -168,6 +179,28 @@ fn maintain(
     {
         return;
     }
+    // Another owner holds the page (the loader-managed template, admitted by
+    // `yield_to_external`): stand aside without retiring, and come back when
+    // it goes. Its scene entry counts as holding the page even without the
+    // seat — a `sub.remove` drops the seat alone, and loading over the entry
+    // would take that owner's scene and undo the removal. The registry and
+    // the store are state, so no timer is involved either way.
+    if registry
+        .0
+        .seat(SETTINGS_APPEARANCE)
+        .is_some_and(|seat| seat.owner != OWNER)
+        || scenes.claimed_by_other(SCENE_NAME, SETTINGS_APPEARANCE, OWNER)
+    {
+        settings.rendered = None;
+        settings.edge = None;
+        settings.yielded = true;
+        return;
+    }
+    if settings.yielded {
+        settings.yielded = false;
+        redraw.write(bevy::window::RequestRedraw);
+        return;
+    }
     let loaded = scenes
         .scenes_owned_by(OWNER)
         .iter()
@@ -178,11 +211,7 @@ fn maintain(
         settings.retired = true;
         return;
     }
-    let edge = Edge::ALL.into_iter().find(|edge| {
-        config.panels[edge.index()]
-            .iter()
-            .any(|name| name == SETTINGS_APPEARANCE)
-    });
+    let edge = declared_edge(&config);
     if loaded && settings.edge != edge {
         // Release the old mount before moving or withdrawing the declaration.
         // Reconcile tears down its carousel entry before a later update reloads.
@@ -289,6 +318,174 @@ fn report_refusal(settings: &mut SettingsScene, body: &str) {
     }
 }
 
+/// The persisted scheme, or Ocean when none was ever chosen (the `builtin`
+/// sentinel) — what the page marks as selected before any selection.
+pub(crate) fn initial_scheme(store: Option<&crate::state::StateStore>) -> String {
+    store
+        .and_then(|store| store.scheme())
+        .and_then(|name| Scheme::from_name(&name))
+        .unwrap_or(Scheme::Ocean)
+        .name()
+        .to_owned()
+}
+
+/// The edge whose configuration declares `settings.appearance`, if any.
+fn declared_edge(config: &ShellConfig) -> Option<Edge> {
+    Edge::ALL.into_iter().find(|edge| {
+        config.panels[edge.index()]
+            .iter()
+            .any(|name| name == SETTINGS_APPEARANCE)
+    })
+}
+
+fn motion_name(motion: CarouselMotion) -> &'static str {
+    match motion {
+        CarouselMotion::Slide => "slide",
+        CarouselMotion::Fade => "fade",
+    }
+}
+
+/// What `shell.settings.get` answers and `shell.settings.changed` carries:
+/// every choice the Appearance page shows, as data rather than presentation,
+/// so an external behaviour builds the same model the fallback builds here.
+/// `sizes` are settled thicknesses (a drag in progress does not change them);
+/// `motion` is the INGESTED value, fade included; `page_owner` names who
+/// currently serves the page (`quoin@host` = this built-in fallback).
+pub(crate) fn snapshot(
+    scheme: &str,
+    config: &ShellConfig,
+    frame: &ShellFrame,
+    page_owner: Option<&str>,
+) -> serde_json::Value {
+    let mut sizes = serde_json::Map::new();
+    for edge in Edge::ALL {
+        sizes.insert(
+            edge_name(edge).to_owned(),
+            json!(frame.panel(edge).settled_thickness_px),
+        );
+    }
+    // Constant per build; computed once because the notice compares a fresh
+    // snapshot every update.
+    static SCHEMES: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let schemes = SCHEMES.get_or_init(|| {
+        Scheme::ALL
+            .into_iter()
+            .map(|scheme| json!({"name": scheme.name(), "accent": scheme_hex(scheme)}))
+            .collect()
+    });
+    let range = [
+        *RESIZE_THICKNESS_RANGE.start(),
+        *RESIZE_THICKNESS_RANGE.end(),
+    ];
+    json!({
+        "scheme": scheme,
+        "schemes": schemes,
+        "motion": motion_name(config.carousel_motion),
+        "motions": [
+            {"name": "slide", "available": true},
+            {"name": "fade", "available": false, "reason": FADE_UNAVAILABLE_REASON},
+        ],
+        "fade_reason": FADE_UNAVAILABLE_REASON,
+        "sizes": sizes,
+        "step_px": STEP_PX,
+        "range_px": range,
+        "edge": declared_edge(config).map(edge_name),
+        "page_owner": page_owner,
+    })
+}
+
+/// A Bus `shell.scene.load` whose envelope names the `settings.appearance`
+/// page, while this built-in fallback holds it: unload the built-in first so
+/// the external load (the loader's `quoin-settings` template) takes the page
+/// in the same dispatch. Nothing to do for any other load, or when the
+/// built-in is not loaded — ordinary ownership rules then apply. A template
+/// authored for another edge than the declaration is refused (the page stays
+/// with the fallback) rather than mounted where the configuration does not
+/// put it, and a document that would fail validation never unloads the
+/// built-in (the load then refuses it on its own). Returns the refusal, or
+/// `None` to proceed with the load.
+///
+/// The built-in is reset, not retired, so a load that is refused after this
+/// point simply lets `maintain` load the fallback again.
+pub(crate) fn yield_to_external(
+    body: &str,
+    args: &serde_json::Value,
+    settings: Option<&mut SettingsScene>,
+    scenes: &mut SceneStore,
+    registry: &mut cosmix_shell::core::SubPanelRegistry,
+    output: &cosmix_shell::core::OutputKey,
+    bridge: &BusBridge,
+) -> Option<(u8, String)> {
+    let source = args["source"].as_str().unwrap_or(body);
+    // Unparseable documents are the load's own refusal to report.
+    let document = cosmix_scene::parse(source).ok()?;
+    let window = document.window.as_ref()?;
+    if window["panel"].as_str() != Some(SETTINGS_APPEARANCE) {
+        return None;
+    }
+    if !scenes
+        .scenes_owned_by(OWNER)
+        .iter()
+        .any(|name| name == SCENE_NAME)
+    {
+        return None;
+    }
+    let held = registry.seat(SETTINGS_APPEARANCE).map(|seat| seat.edge);
+    // The scene renderer mounts an unknown or absent edge on the right.
+    let requested = window["edge"]
+        .as_str()
+        .and_then(|edge| crate::bus_service::parse_edge(edge.to_owned()))
+        .unwrap_or(Edge::Right);
+    if let Some(held) = held
+        && held != requested
+    {
+        return Some((
+            10,
+            json!({
+                "error_code": "SETTINGS_EDGE_MISMATCH",
+                "message": format!(
+                    "settings.appearance is declared on the {} edge; the document mounts on {}",
+                    edge_name(held),
+                    edge_name(requested)
+                ),
+                "declared": edge_name(held),
+                "requested": edge_name(requested),
+            })
+            .to_string(),
+        ));
+    }
+    // Validate before unloading: a document the load would refuse anyway must
+    // not take the page down first (built-in unloaded, load refused, fallback
+    // back two updates later). Leave the refusal to the load itself.
+    if !SceneStore::document_acceptable(source) {
+        return None;
+    }
+    let accepted_at = settings.as_deref().map_or(0, |settings| settings.receipt);
+    let mut mount = SceneMount {
+        registry,
+        output,
+        owner: OWNER,
+        accepted_at,
+    };
+    let (rc, reply) = scenes.dispatch(
+        SceneVerb::Unload,
+        "",
+        &json!({"scene": SCENE_NAME}),
+        bridge,
+        &mut mount,
+    );
+    if rc != 0 {
+        return Some((rc, reply));
+    }
+    if let Some(settings) = settings {
+        settings.rendered = None;
+        settings.edge = None;
+        settings.yielded = true;
+    }
+    info!("Settings/Appearance built-in yields settings.appearance to an external load");
+    None
+}
+
 /// Author the content in Mix Scene data; only live values and the host's
 /// Bus address come from Rust. The list gives the content its own scrolling.
 fn document(desired: &Rendered, citizen: &str, edge: Edge) -> String {
@@ -338,9 +535,23 @@ fn document(desired: &Rendered, citizen: &str, edge: Edge) -> String {
         "kind": "edge", "edge": edge.as_str(), "title": "Settings", "panel": SETTINGS_APPEARANCE,
     });
     format!(
-        "---\nscene: 1\nname: {SCENE_NAME}\ncitizen: {citizen}\nwindow: {window}\nmodel: {model}\n---\n```mix\n{}\n```\n",
-        include_str!("settings.mix"),
+        "---\nscene: 1\nname: {SCENE_NAME}\ncitizen: {citizen}\nwindow: {window}\nmodel: {model}\n---\n{}",
+        template_body(),
     )
+}
+
+/// The shipped template (`share/scenes/settings/scene.mix`) is the one
+/// authored layout. The fallback reuses its node block verbatim under its own
+/// envelope: this host as citizen, the declared edge and a live model.
+const TEMPLATE: &str = include_str!("../../../../../share/scenes/settings/scene.mix");
+
+/// Everything after the template's AMP header (the fenced node block).
+fn template_body() -> &'static str {
+    TEMPLATE
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map(|(_, body)| body)
+        .expect("the shipped settings template has an AMP header")
 }
 
 /// The scheme's accent as `#rrggbbaa` — the same colour the chrome scheme
@@ -376,19 +587,23 @@ enum SettingsWrite {
 /// the same surface for any script): the scheme selection rides the existing
 /// live-apply message; a motion write updates the setting chunk 6 ingests;
 /// thickness writes return the drag-completion command for the caller to
-/// enqueue through the normal receipt path.
+/// enqueue through the normal receipt path. `applied_scheme` is the host's
+/// shadow of the selection (the snapshot's `scheme`), updated with the write
+/// so a `shell.settings.get` later in the same drain already reports it.
 pub(crate) fn dispatch_verb(
     request: &InboundRequest,
     frame: &ShellFrame,
     config: &mut ShellConfig,
     config_path: &std::path::Path,
     schemes: &mut MessageWriter<'_, QuoinSchemeSelected>,
+    applied_scheme: &mut String,
     at: Duration,
 ) -> (u8, String, Option<ShellCommand>) {
     let (rc, body, command, write) = plan_verb(request, frame, at);
     match write {
         Some(SettingsWrite::Scheme(scheme)) => {
             schemes.write(QuoinSchemeSelected(scheme));
+            *applied_scheme = scheme.name().to_owned();
         }
         Some(SettingsWrite::Motion(motion)) => {
             if let Err(error) = crate::config::write_carousel_motion(config_path, motion) {
@@ -967,12 +1182,14 @@ mod tests {
         let mut writer = bevy::ecs::system::SystemState::<MessageWriter<QuoinSchemeSelected>>::new(
             app.world_mut(),
         );
+        let mut applied = "ocean".to_owned();
         let (rc, body, _) = dispatch_verb(
             &event_request("shell.settings.motion", "motion_fade@appearance"),
             &frame_for("DP-1"),
             &mut config,
             &path,
             &mut writer.get_mut(app.world_mut()).unwrap(),
+            &mut applied,
             Duration::ZERO,
         );
         assert_eq!(rc, 10, "{body}");
@@ -983,6 +1200,7 @@ mod tests {
             &mut config,
             &path,
             &mut writer.get_mut(app.world_mut()).unwrap(),
+            &mut applied,
             Duration::ZERO,
         );
         assert_eq!(rc, 0, "{body}");
@@ -1099,5 +1317,283 @@ mod tests {
             Some("forest".to_owned()),
             "and it persists for the next launch"
         );
+    }
+
+    /// The same fixtures `scene-template-test.mix` feeds the template's Mix
+    /// model builder: one snapshot, one expected model, shared by both sides.
+    const SNAPSHOT_FIXTURE: &str =
+        include_str!("../../../scripts/tests/fixtures/scenes/settings-forest-fade.snapshot.json");
+    const MODEL_FIXTURE: &str =
+        include_str!("../../../scripts/tests/fixtures/scenes/settings-forest-fade.model.json");
+
+    /// The fixtures carry placeholder accents (`#00000001`…): the palette is
+    /// ctk's to change; the shape, selection and marks are the contract.
+    fn fixtures_with_build_accents() -> (serde_json::Value, serde_json::Value) {
+        let mut snapshot: serde_json::Value = serde_json::from_str(SNAPSHOT_FIXTURE).unwrap();
+        let mut model: serde_json::Value = serde_json::from_str(MODEL_FIXTURE).unwrap();
+        for (index, scheme) in Scheme::ALL.into_iter().enumerate() {
+            snapshot["schemes"][index]["accent"] = json!(scheme_hex(scheme));
+            model["schemes"][scheme.name()]["accent"] = json!(scheme_hex(scheme));
+        }
+        (snapshot, model)
+    }
+
+    /// Leaves replaced by null: two models bind the same paths.
+    fn shape(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .map(|(key, value)| (key.clone(), shape(value)))
+                .collect::<serde_json::Map<_, _>>()
+                .into(),
+            _ => serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn snapshot_and_fallback_model_match_the_shared_fixtures() {
+        let config = ShellConfig::parse(
+            r#"{panels: {right: ["settings.appearance"]}, carousel_motion: "fade"}"#,
+        )
+        .unwrap();
+        let mut frame = frame_for("DP-1");
+        // Exact binary fractions, so the f32 thickness equals the fixture's
+        // number, and the halves pin both roundings half away from zero.
+        for (edge, px) in [
+            (Edge::Top, 260.0),
+            (Edge::Bottom, 52.5),
+            (Edge::Left, 200.0),
+            (Edge::Right, 239.5),
+        ] {
+            frame.panels[edge.index()].settled_thickness_px = px;
+        }
+        let (snapshot_fixture, model_fixture) = fixtures_with_build_accents();
+        assert_eq!(
+            snapshot("forest", &config, &frame, Some(OWNER)),
+            snapshot_fixture
+        );
+        let desired = Rendered {
+            scheme: "forest".into(),
+            motion: CarouselMotion::Fade,
+            thickness: std::array::from_fn(|index| {
+                frame.panel(Edge::ALL[index]).settled_thickness_px
+            }),
+        };
+        let parsed = cosmix_scene::parse(&document(&desired, "settings-test", Edge::Right))
+            .expect("the fallback document parses");
+        assert_eq!(parsed.model, Some(model_fixture));
+        // No declaration: the snapshot says so rather than guessing an edge.
+        let bare = snapshot("ocean", &ShellConfig::parse("{}").unwrap(), &frame, None);
+        assert_eq!(bare["edge"], serde_json::Value::Null);
+        assert_eq!(bare["page_owner"], serde_json::Value::Null);
+        assert_eq!(bare["motion"], json!("slide"));
+    }
+
+    #[test]
+    fn shipped_template_is_the_fallback_layout() {
+        let template = cosmix_scene::parse(TEMPLATE).expect("the shipped template parses");
+        assert_eq!(template.name, SCENE_NAME);
+        assert_eq!(template.citizen, "scene-quoin-settings");
+        let window = template.window.as_ref().expect("the template declares its mount");
+        assert_eq!(window["panel"], json!(SETTINGS_APPEARANCE));
+        assert_eq!(window["edge"], json!("right"));
+        assert!(
+            cosmix_scene::lint(&template).is_empty(),
+            "{:?}",
+            cosmix_scene::lint(&template)
+        );
+        cosmix_scene::resolve(&template).expect("the template resolves on its default model");
+        let desired = Rendered {
+            scheme: "ocean".into(),
+            motion: CarouselMotion::Slide,
+            thickness: [260.0, 52.0, 200.0, 240.0],
+        };
+        let fallback = document(&desired, "settings-test", Edge::Left);
+        assert!(
+            fallback.ends_with(template_body()),
+            "the fallback reuses the template's node block verbatim"
+        );
+        let fallback = cosmix_scene::parse(&fallback).unwrap();
+        assert_eq!(
+            fallback.nodes.keys().collect::<Vec<_>>(),
+            template.nodes.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(fallback.window.as_ref().unwrap()["edge"], json!("left"));
+        assert_eq!(
+            shape(template.model.as_ref().unwrap()),
+            shape(fallback.model.as_ref().unwrap()),
+            "the template's default model binds every path the live one does"
+        );
+    }
+
+    /// The loader-managed template takes `settings.appearance` from the
+    /// built-in through the real Bus dispatch; a template for the wrong edge
+    /// is refused; and the fallback returns the moment the owner unloads —
+    /// the handover never retires it.
+    #[test]
+    fn external_template_takes_the_page_and_the_fallback_returns() {
+        let mut app = settings_test_app(r#"{panels: {right: ["settings.appearance"]}}"#);
+        let (bridge, peer) = ctk::bus::test_bridge("settings-test");
+        app.insert_resource(bridge)
+            .add_plugins(crate::bus_service::ShellBusPlugin);
+        app.update();
+        let seat = |app: &App| {
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat(SETTINGS_APPEARANCE)
+                .map(|seat| (seat.edge, seat.owner.clone()))
+        };
+        let owned_by = |app: &App, owner: &str| {
+            app.world().resource::<SceneStore>().scenes_owned_by(owner)
+        };
+        let load = |source: String| {
+            let mut request = verb_request(
+                "shell.scene.load",
+                json!({"source": source, "model_generation": 1}),
+            );
+            request.from = "scenes".to_owned();
+            request
+        };
+        assert_eq!(seat(&app), Some((Edge::Right, OWNER.to_owned())));
+        assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
+
+        peer.send(load(TEMPLATE.replace("\"edge\":\"right\"", "\"edge\":\"left\"")));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10, "{}", replies[0].body);
+        assert!(
+            replies[0].body.contains("SETTINGS_EDGE_MISMATCH"),
+            "{}",
+            replies[0].body
+        );
+        assert_eq!(seat(&app), Some((Edge::Right, OWNER.to_owned())));
+        assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
+
+        // Review n4: a document the load refuses (an unknown port is a lint
+        // error) never unloads the built-in first — the page stays up through
+        // the very update that refuses it.
+        let broken = TEMPLATE.replacen(
+            "\"text\":\"Appearance\"",
+            "\"bogus_port\":1,\"text\":\"Appearance\"",
+            1,
+        );
+        assert_ne!(broken, TEMPLATE, "the fixture edit must apply");
+        assert!(!SceneStore::document_acceptable(&broken));
+        assert!(SceneStore::document_acceptable(TEMPLATE));
+        peer.send(load(broken));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10, "{}", replies[0].body);
+        assert_eq!(seat(&app), Some((Edge::Right, OWNER.to_owned())));
+        assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
+        let settings = app.world().resource::<SettingsScene>();
+        assert!(settings.rendered.is_some() && !settings.yielded);
+
+        peer.send(load(TEMPLATE.to_owned()));
+        app.update();
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(seat(&app), Some((Edge::Right, "scenes".to_owned())));
+        assert!(owned_by(&app, OWNER).is_empty());
+        assert_eq!(owned_by(&app, "scenes"), vec![SCENE_NAME.to_owned()]);
+        let settings = app.world().resource::<SettingsScene>();
+        assert!(!settings.retired && settings.rendered.is_none());
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.panel(Edge::Right).page_ids.as_ref(), [SETTINGS_APPEARANCE]);
+
+        let mut unload = verb_request("shell.scene.unload", json!({"scene": SCENE_NAME}));
+        unload.from = "scenes".to_owned();
+        peer.send(unload);
+        // The unload update only schedules the fallback (the edge-move
+        // pattern); the next one reloads it and reconciles its mount.
+        app.update();
+        app.update();
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(seat(&app), Some((Edge::Right, OWNER.to_owned())));
+        assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
+        assert!(!app.world().resource::<SettingsScene>().retired);
+    }
+
+    /// Review M1: `shell.sub.remove` of the loader's page drops its seat at
+    /// the Model stage, while the loader's `quoin-settings` entry lingers
+    /// until the next reconcile sweeps unseated scenes. For as long as that
+    /// entry exists the fallback must not register a seat of its own or load
+    /// over it — that load would take the loader's scene (a Load takes its
+    /// owner from the mount) and fence its model writes. Once the entry is
+    /// gone the page has no owner and the fallback returns, as it does after
+    /// an unload (the page never silently disappears).
+    #[test]
+    fn fallback_never_takes_the_loader_scene_after_a_sub_remove() {
+        let mut app = settings_test_app(r#"{panels: {right: ["settings.appearance"]}}"#);
+        let (bridge, peer) = ctk::bus::test_bridge("settings-test");
+        app.insert_resource(bridge)
+            .add_plugins(crate::bus_service::ShellBusPlugin);
+        app.update();
+        let seat = |app: &App| {
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat(SETTINGS_APPEARANCE)
+                .map(|seat| seat.owner.clone())
+        };
+        let owned_by = |app: &App, owner: &str| {
+            app.world().resource::<SceneStore>().scenes_owned_by(owner)
+        };
+        let mut load = verb_request(
+            "shell.scene.load",
+            json!({"source": TEMPLATE, "model_generation": 1}),
+        );
+        load.from = "scenes".to_owned();
+        peer.send(load);
+        app.update();
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(seat(&app).as_deref(), Some("scenes"));
+        assert_eq!(owned_by(&app, "scenes"), vec![SCENE_NAME.to_owned()]);
+
+        peer.send(verb_request(
+            "shell.sub.remove",
+            json!({"name": SETTINGS_APPEARANCE}),
+        ));
+        let mut entry_outlived_seat = false;
+        for _ in 0..6 {
+            app.update();
+            let loader_entry = !owned_by(&app, "scenes").is_empty();
+            entry_outlived_seat |= loader_entry && seat(&app).is_none();
+            if loader_entry {
+                assert_ne!(
+                    seat(&app).as_deref(),
+                    Some(OWNER),
+                    "the fallback reserved the page while the loader's entry names it"
+                );
+                assert!(
+                    owned_by(&app, OWNER).is_empty(),
+                    "the fallback took the loader's scene"
+                );
+            }
+        }
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert!(
+            entry_outlived_seat,
+            "the window this test guards (entry without seat) never opened"
+        );
+        // The unseated sweep dropped the loader's entry; the page is free and
+        // the fallback serves it again.
+        assert!(owned_by(&app, "scenes").is_empty());
+        assert_eq!(seat(&app).as_deref(), Some(OWNER));
+        assert_eq!(owned_by(&app, OWNER), vec![SCENE_NAME.to_owned()]);
+        assert!(!app.world().resource::<SettingsScene>().retired);
     }
 }

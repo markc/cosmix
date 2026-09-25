@@ -1,0 +1,74 @@
+-- Real native/ABP boundary. Tests replace this map, never the state machine.
+fn rpc($target, $verb, $body)
+  try
+    $wire = type($body) == "string" ? $body : json_encode($body)
+    send $target $verb body=$wire timeout=5
+    $code = $rc
+    $value = $result
+    if type($value) == "string" then
+      try
+        $value = json_parse($value)
+      catch $ignored
+      end
+    end
+    if $code != 0 then
+      raise("SCENES_UPSTREAM", "scene host refused request", {target:$target, verb:$verb, rc:$code, upstream:$value})
+    end
+    if $value == nil then
+      raise("SCENES_UPSTREAM", "scene host returned no reply value", {target:$target, verb:$verb, rc:$code})
+    end
+    return $value
+  catch $message, $error
+    if $error.code == "SCENES_UPSTREAM" then raise($error.code, $message, $error.details) end
+    raise("SCENES_TRANSPORT", "scene host request failed", {target:$target, verb:$verb, rc:20, upstream:{error_code:$error.code, message:$message, context:$error.details}})
+  end
+end
+
+fn interpreter()
+  -- /proc/self/exe is this running Mix, not an unrelated executable on PATH.
+  return realpath("/proc/self/exe")
+end
+
+fn templates($script)
+  if env("SCENES_TEMPLATES") != "" then return env("SCENES_TEMPLATES") end
+  if env("COSMIX") != "" then return env("COSMIX") .. "/share/scenes" end
+  $path = dirname(realpath($script))
+  while dirname($path) != $path
+    if is_file($path .. "/bootstrap") and is_file($path .. "/src/Cargo.toml") then return $path .. "/share/scenes" end
+    $path = dirname($path)
+  end
+  raise("SCENES_TEMPLATES", "set SCENES_TEMPLATES or COSMIX for this installation", {})
+end
+
+fn check($path)
+  for each $argv in [[interpreter(), "--check", $path], [interpreter(), "lint", "--deny-warnings", $path]]
+    $r = run_argv($argv, {timeout:10, max_output:65536})
+    if not $r.ok then raise("SCENES_BEHAVIOUR_INVALID", "behaviour check failed", {file:$path, rc:$r.exit_code, upstream:$r}) end
+  end
+end
+
+fn launch($path, $name, $generation, $host, $me)
+  return spawn([interpreter(), "--serve", $path, "--name", "scene-" .. $name], {
+    die_with_parent:true, exit_event:true, tag:json_encode({name:$name, generation:$generation}),
+    cwd:dirname($path), stdout:"inherit", stderr:"inherit",
+    env:{SCENE_NAME:$name, SCENE_HOST:$host, SCENES_SERVICE:$me,
+      SCENE_GENERATION:to_string($generation), SCENE_DIR:dirname($path)}})
+end
+
+fn stop($pid, $tag)
+  -- The caller fences the tag before entering this adapter. W1 routes kill
+  -- through the registry's retained pidfd (including queued exit records).
+  -- proc.exited bookkeeping is synchronous and discards the PID on delivery.
+  -- SIGKILL guarantees an exit without another timeout or a stuck QUIT handler.
+  return kill($pid, 9)
+end
+
+fn notify($body)
+  try
+    return publish("scenes.changed", json_encode($body), {command:"scenes.changed"}) == 0
+  catch $ignored
+    return false
+  end
+end
+
+-- No explicit return: require exports the declared functions as callable values.

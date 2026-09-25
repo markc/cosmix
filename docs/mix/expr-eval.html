@@ -556,13 +556,12 @@ by the size caps, never by iteration count or by <em>unbounded</em> waiting
 (<code>flock</code>'s argument-bounded wait remains reachable only when the host
 installs a permissive policy — its class is <code>FsWrite</code>, denied under
 <code>deny_all()</code>).</p>
-<p>The <strong>time limit</strong> is armed at this entry point itself — there is no
-statement loop here to carry the evaluator's usual per-statement poll,
-so the budget is enforced by wrapping the evaluation future: on expiry
-the future is dropped at its next yield and the caller gets a clean
-<code>time limit exceeded</code> error. A single non-yielding CPU-bound builtin can
-still overshoot until its next yield point; with the blocking four
-denied statically, that residual is a slow computation, not a hang. See
+<p>The <strong>time limit</strong> is armed at this entry point itself and checked while
+entering expressions and after evaluation completes. A timer also cancels
+pending evaluation. An expression that finishes without yielding after its
+deadline is refused with a <code>time limit exceeded</code> error; a ready future does
+not bypass the budget. A single CPU-bound builtin cannot be interrupted
+mid-call, but its late result is rejected and further expressions stop. See
 <a href="/mix/capabilities">capabilities &amp; embedding</a> for the same caveat in full
 programs.</p>
 <p><code>eval_expr_string</code> is <strong>synchronous</strong>: it drives the evaluator's async

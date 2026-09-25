@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.2.1
 -- quoin-panel -- the Quoin bottom panel and its popups, written as Mix
 -- Scenes after Plasma's default panel. One citizen owns four scenes:
 --
@@ -26,11 +26,20 @@
 --      TRAY_SERVICE (tray), NOTIFY_SERVICE (notify) -- a nested dev desktop
 --      points these elsewhere. Manual: docs/cos/quoin-panel.md.
 --
+-- RETIRED BY SCENE PHASE 1 STAGE B. Every duty here now has a file-backed
+-- replacement: the scenes loader (scenes.mix) plus share/scenes/{panel,
+-- launcher,calendar,notes}, on the same page IDs. This citizen stays in the
+-- tree only as rollback material until live parity passes; never run it next
+-- to a loader that has those scenes enabled (the loader keeps them unmounted
+-- while this service is registered). Callers and the migration are listed in
+-- docs/cos/quoin-panel.md.
+--
 -- Event-driven: the taskbar and pager rebuild on the compositor's
 -- props.changed topic, the tray and notifications on their adapters'
--- events. The one clock is the wall clock itself: an async handler kicked
--- once by init sleeps to each minute boundary, one wake per minute, never a
--- poll of anyone's state.
+-- events, the network applet on rtnetlink link changes (net_watch) and the
+-- volume applet on PipeWire change notices (audio_watch). The one clock is
+-- the wall clock itself: a local async task started once by init sleeps to
+-- each minute boundary for the displayed time, never a poll of anyone's state.
 $p = require("lib/panel.mix")
 
 -- Our own Bus name goes into every scene document's `citizen:` field, which
@@ -65,6 +74,11 @@ $C = {
 $state = {
   windows: [], ws_count: 1, ws_current: 1, tray: [],
   net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
+  -- status event sources: watch handles (nil = not subscribed) and the
+  -- re-subscribe delays after the link socket or PipeWire's server goes away
+  net_watch: nil, net_started: 0, net_retry: 5, net_retrying: false,
+  audio_watch: nil, audio_started: 0, audio_retry: 5, audio_retrying: false, audio_unavailable: false,
+  status_refreshing: false,
   notes: [], notes_open: false, peeked: [],
   launcher_open: false, calendar_open: false,
   query: "", category: "", apps: [], apps_loaded: false,
@@ -76,9 +90,11 @@ $state = {
   -- register pass in flight, and whether this host generation has selected
   -- and pinned the taskbar page yet
   reg_launcher: false, reg_calendar: false, reg_notes: false,
+  applied_panels: {}, pending_panels: {}, live_services: [],
+  panel_op_seq: 0, panel_drivers: {}, panel_failures: {}, resyncing: false, resync_again: false,
   registering: false, panel_shown: false,
   -- consecutive show_page refusals this host generation; past PANEL_SHOW_CAP
-  -- we stop paying the bounded select wait on every render (a host that keeps
+  -- we stop resubmitting refused selections on every render (a host that keeps
   -- refusing its own bottom edge is a host bug, logged once per attempt)
   panel_show_fails: 0
 }
@@ -131,27 +147,54 @@ fn load_scene($doc)
 end
 
 fn panel_verb($verb, $edge, $id)
-  if $id == nil then
+  if $verb == "shell.panel.mode" then
+    send $HOST $verb edge=$edge mode="hidden" timeout=3
+  elif $id == nil then
     send $HOST $verb edge=$edge timeout=3
   else
     send $HOST $verb edge=$edge id=$id timeout=3
   end
-  return rc_ok($rc)
+  $ok = rc_ok($rc)
+  $receipt = $result
+  if type($receipt) == "string" then
+    try
+      $receipt = json_parse($receipt)
+    catch $err
+      $receipt = nil
+    end
+  end
+  if type($receipt) != "map" then $receipt = {} end
+  -- Even a timeout may have applied. Replies and reads drive progress;
+  -- notifications are only invalidation hints, including our own echoes.
+  if not refresh_panels() and $receipt.applied == true and type($receipt.panels) == "map" then
+    -- A failed read cannot discard an authoritative application receipt.
+    $state.applied_panels = $receipt.panels
+  end
+  return $ok
 end
 
--- Select a scene page on its edge; true once the host accepted it. scene.load
--- replies before the host's next frame mounts a NEW page, so the first select
--- can race the mount ("unknown page id"); retry it briefly -- a bounded wait
--- on the effect of our own command, not a poll of anyone's state.
+fn refresh_panels()
+  $snapshot = rpc($HOST, "shell.props.get", {})
+  $state.applied_panels = ($snapshot ?? {}).panels ?? {}
+  return type(($snapshot ?? {}).panels) == "map"
+end
+
+fn queue_panel($edge, $page, $flag, $gen, $phase)
+  $state.panel_failures = delete($state.panel_failures, $edge)
+  $state.panel_op_seq = $state.panel_op_seq + 1
+  $state.pending_panels[$edge] = {page:$page, phase:$phase, flag:$flag,
+    generation:$gen, token:$state.panel_op_seq}
+end
+
+-- Queue page selection and consume applied replies/readback immediately.
 fn select_page($edge, $page)
-  $tries = 0
-  while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) then return true end
-    $tries = $tries + 1
-    sleep(0.05)
+  if ($state.pending_panels[$edge] ?? {}).page == $page then
+    drive_panel_operations()
+    return true
   end
-  note("page.set " .. $edge .. " " .. $page .. " never accepted")
-  return false
+  queue_panel($edge, $page, nil, $state.popup_gen, "select")
+  drive_panel_operations()
+  return true
 end
 
 -- Select a scene page and pin its edge open; false when the page could not
@@ -159,32 +202,69 @@ end
 -- caller that records success (panel_shown) keeps retrying until the edge is
 -- actually pinned.
 fn show_page($edge, $page)
-  if not select_page($edge, $page) then return false end
-  if not panel_verb("shell.panel.pin", $edge, nil) then
-    note("pin " .. $edge .. " refused after selecting " .. $page)
-    return false
-  end
-  return true
+  return select_page($edge, $page)
 end
 
 -- Legacy Bus unpin releases BOTH Pinned and Docked. This is also the
 -- compatibility rule for bare-array popup records: a legacy saved true
 -- migrates to Docked, and still needs its reservation released here.
--- Reuse the existing bounded hide loop. A reply is only enqueue acceptance;
--- return a single applied snapshot only after BOTH persistence and visibility
--- are clear. Failure leaves the record for the existing recovery pass.
+-- Quoin replies after application and concealment, or with visible:true if
+-- a pointer/holder re-reveals hidden mode. Either settles our pin release.
 fn hide_edge($edge)
-  if not panel_verb("shell.panel.unpin", $edge, nil) then return nil end
-  $tries = 0
-  while $tries < 20
-    if edge_in_use($edge) then return nil end
-    panel_verb("shell.panel.hide", $edge, nil)
-    $state_r = rpc($HOST, "shell.props.get", {path: "panels." .. $edge})
-    if $p.popup_release_confirmed($state_r) then return $state_r end
-    $tries = $tries + 1
-    sleep(0.05)
+  queue_panel($edge, nil, nil, $state.popup_gen, "release")
+  drive_panel_operations()
+  return $state.applied_panels[$edge]
+end
+
+fn drive_panel_operations()
+  for each $edge in keys($state.pending_panels)
+    drive_panel_edge($edge)
   end
-  return nil
+end
+
+fn drive_panel_edge($edge)
+  if $state.panel_drivers[$edge] ?? false then return end
+  $state.panel_drivers[$edge] = true
+  try
+    refresh_panels()
+    -- Drain phase transitions and operations queued during a yield. This is
+    -- not a retry poll: each action is sent at most once per operation here.
+    $attempted = {}
+    while true
+      $op = $state.pending_panels[$edge]
+      if $op == nil then break end
+      if ($op.phase == "release" and edge_in_use($edge)) or ($op.flag != nil and not popup_live($op.flag, $op.generation)) then
+        $state.pending_panels = delete($state.pending_panels, $edge)
+        continue
+      end
+      $applied = $state.applied_panels[$edge]
+      $action = $p.panel_action($op, $applied)
+      if $action == nil then break end
+      if $action == "done" then
+        if $op.phase == "release" then
+          write_pins($p.released_popup_pins(read_pins(), $edge, $applied))
+        end
+        $state.pending_panels = delete($state.pending_panels, $edge)
+        break
+      end
+      $key = to_string($op.token) .. ":" .. $action
+      if $attempted[$key] ?? false then break end
+      $attempted[$key] = true
+      $verb = $action == "release" ? "shell.panel.mode" : ($action == "select" ? "shell.panel.page.set" : "shell.panel.pin")
+      $ok = panel_verb($verb, $edge, $action == "select" ? $op.page : nil)
+      if not $p.panel_operation_current($state.pending_panels, $edge, $op.token) then continue end
+      -- An applied state can confirm success even if the reply was lost.
+      if not $ok and $p.panel_action($op, $state.applied_panels[$edge]) != "done" then
+        note("panel " .. $action .. " refused on " .. $edge .. "; attempt settled failed")
+        $state.panel_failures[$edge] = {token:$op.token, action:$action}
+        $state.pending_panels = delete($state.pending_panels, $edge)
+        break
+      end
+    end
+  finally
+    $state.panel_drivers[$edge] = false
+  end
+  update_shown()
 end
 
 -- ── icons (the apps citizen resolves themes; cached here) ───────────────
@@ -264,45 +344,116 @@ fn fetch_tray()
   $state.tray = $r.items
 end
 
--- Network: any non-loopback interface whose operstate is "up" (the kernel's
--- own answer, read from sysfs -- no D-Bus, per the dbusd-boundary ADR).
+-- Network: any non-loopback link whose operstate is "up" (the kernel's own
+-- answer, from an rtnetlink dump -- no D-Bus, per the dbusd-boundary ADR).
+-- Re-read on every net.changed batch: events are hints, state is truth.
 fn fetch_net()
   $up = false
   $wireless = false
   try
-    for each $name in ls("/sys/class/net")
-      if $name != "lo" then
-        $dir = "/sys/class/net/" .. $name
-        $oper = ""
-        try
-          $oper = trim(read_file($dir .. "/operstate"))
-        catch $e
-        end
-        if $oper == "up" then
-          $up = true
-          if is_dir($dir .. "/wireless") then $wireless = true end
-        end
+    for each $link in net_state().links
+      if $link.loopback != true and $link.operstate == "up" then
+        $up = true
+        if $link.wireless == true then $wireless = true end
       end
     end
   catch $e
+    note("net_state failed: " .. to_string($e))
   end
   $state.net = {up: $up, wireless: $wireless}
 end
 
--- Volume: PipeWire's default sink via wpctl ("Volume: 0.40 [MUTED]"). No
+-- Volume: PipeWire's default sink (one wpctl call inside audio_state). No
 -- default sink -> the applet is hidden rather than showing a false 0 %.
 fn fetch_vol()
-  $r = run_argv(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
-  if not $r.ok then
+  $v = {ok: false}
+  try
+    $v = audio_state({runtime_dir: $PW_RUNTIME})
+  catch $e
+    note("audio_state failed: " .. to_string($e))
+  end
+  if $v.ok != true then
     $state.vol = {ok: false, level: 0, muted: false}
     return
   end
-  $m = re_find($r.stdout, "Volume:\\s*([0-9.]+)")
-  if length($m) == 0 then
-    $state.vol = {ok: false, level: 0, muted: false}
+  $state.vol = {ok: true, level: $v.level, muted: $v.muted == true}
+end
+
+-- Subscribe to link changes and PipeWire change notices. An interpreter
+-- without these builtins (older than the Stage C release) shows the network
+-- applet offline and hides volume, and says so in the log: there is no
+-- polling fallback.
+fn start_status()
+  if not has_builtin("net_watch") then
+    note("status events unavailable: this mix has no net_watch/audio_watch")
     return
   end
-  $state.vol = {ok: true, level: round(to_number($m[0].groups[0]) * 100), muted: index_of($r.stdout, "MUTED") >= 0}
+  start_net()
+  start_audio()
+end
+
+-- Only an I/O failure is retried (a local backoff); any other refusal (the
+-- handle limit, a retired evaluator) is terminal and logged once.
+fn start_net()
+  if $state.net_watch != nil then return end
+  try
+    $state.net_watch = net_watch({events: ["link"]})
+    $state.net_started = monotonic()
+  catch $message, $error
+    note("net_watch failed: " .. to_string($message))
+    if $error.code == "NET_WATCH_IO" then retry_net() end
+  end
+end
+
+-- A host without pactl (AUDIO_UNAVAILABLE) will never answer: the volume
+-- applet stays hidden for this process's life, with no retry timer.
+fn start_audio()
+  if $state.audio_watch != nil or $state.audio_unavailable then return end
+  try
+    $state.audio_watch = audio_watch({runtime_dir: $PW_RUNTIME})
+    $state.audio_started = monotonic()
+  catch $message, $error
+    note("audio_watch failed: " .. to_string($message))
+    if $error.code == "AUDIO_UNAVAILABLE" then
+      $state.audio_unavailable = true
+    elif $error.code == "AUDIO_WATCH_IO" then
+      retry_audio()
+    end
+  end
+end
+
+-- A subscription that outlived the current delay was a working one, so the
+-- server (or the link socket) only restarted: come back after the shortest
+-- delay instead of a stale doubled one.
+fn reset_if_lived($started, $delay)
+  return monotonic() - $started >= $delay ? 5 : $delay
+end
+
+-- The link socket failed: subscribe again after a delay doubling to five
+-- minutes. A reconnect backoff, not a state poll.
+fn retry_net()
+  if $state.net_retrying then return end
+  $state.net_retrying = true
+  try
+    task_start("net.retry", "{}")
+  catch $message
+    $state.net_retrying = false
+    note("net retry not scheduled: " .. to_string($message))
+  end
+end
+
+-- PipeWire's server went away (session restart) or is not up yet: subscribe
+-- again after a delay that doubles to five minutes. This is a reconnect
+-- backoff, not a state poll; a delivered change resets it.
+fn retry_audio()
+  if $state.audio_retrying then return end
+  $state.audio_retrying = true
+  try
+    task_start("audio.retry", "{}")
+  catch $message
+    $state.audio_retrying = false
+    note("audio retry not scheduled: " .. to_string($message))
+  end
 end
 
 -- Notifications come from the adapter's props tree (notify.props.get):
@@ -323,10 +474,18 @@ fn fetch_notes()
   $state.notes = sort_by($out, function ($n) = $n.created_at)
 end
 
-fn fetch_status()
-  fetch_net()
-  fetch_vol()
-  fetch_notes()
+-- net_state() and audio_state() block for up to 2 s each, so a sync path
+-- (init, panel.refresh) never calls them: it queues this one local task
+-- instead. Single in flight; never a Bus self-emit.
+fn refresh_status()
+  if $state.status_refreshing then return end
+  $state.status_refreshing = true
+  try
+    task_start("status.refresh", "{}")
+  catch $message
+    $state.status_refreshing = false
+    note("status refresh not scheduled: " .. to_string($message))
+  end
 end
 
 fn fetch_apps()
@@ -724,11 +883,11 @@ fn render_panel()
   -- First render of this citizen life or host generation: select and pin the
   -- taskbar page. Keyed on our own flag, not revision 1 -- the revision
   -- counter is per scene name and survives a citizen-only restart. Capped so
-  -- a host that keeps refusing does not cost every render a ~1 s wait; a new
+  -- a host that keeps refusing does not receive a request every render; a new
   -- host generation (revision 1) re-arms it.
   if not $state.panel_shown and $state.panel_show_fails < $PANEL_SHOW_CAP then
     if show_page("bottom", "scene-panel") then
-      $state.panel_shown = true
+      $state.panel_shown = page_applied("bottom", "scene-panel")
       $state.panel_show_fails = 0
     else
       $state.panel_show_fails = $state.panel_show_fails + 1
@@ -761,7 +920,7 @@ fn render_launcher()
   $rev = load_launcher()
   $shown = false
   if $rev > 0 and popup_live("launcher_open", $gen) then $shown = show_popup("left", "scene-launcher", "launcher_open", $gen) end
-  if $state.popup_gen == $gen then $state.launcher_shown = $shown end
+  if $state.popup_gen == $gen then $state.launcher_shown = page_applied("left", "scene-launcher") end
   return $shown
 end
 
@@ -770,7 +929,7 @@ fn render_calendar()
   $rev = load_calendar()
   $shown = false
   if $rev > 0 and popup_live("calendar_open", $gen) then $shown = show_popup("right", "scene-calendar", "calendar_open", $gen) end
-  if $state.popup_gen == $gen then $state.calendar_shown = $shown end
+  if $state.popup_gen == $gen then $state.calendar_shown = page_applied("right", "scene-calendar") end
   return $shown
 end
 
@@ -780,7 +939,7 @@ fn render_notes()
   $rev = load_notes()
   $shown = false
   if $rev > 0 and popup_live("notes_open", $gen) then $shown = show_popup("right", "scene-notes", "notes_open", $gen) end
-  if $state.popup_gen == $gen then $state.notes_shown = $shown end
+  if $state.popup_gen == $gen then $state.notes_shown = page_applied("right", "scene-notes") end
   return $shown
 end
 
@@ -821,22 +980,11 @@ end
 -- leaving a closed popup pinned open. A page the host never accepted is not
 -- revealed or pinned at all: that would show whatever page the edge holds.
 fn show_popup($edge, $page, $flag, $gen)
-  $selected = false
-  $tries = 0
-  while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) then
-      $selected = true
-      break
-    end
-    $tries = $tries + 1
-    sleep(0.05)
-    if not popup_live($flag, $gen) then return false end
-  end
-  if not $selected then
-    note("page.set " .. $edge .. " " .. $page .. " never accepted; popup not revealed")
-    return false
-  end
   if not popup_live($flag, $gen) then return false end
+  if ($state.pending_panels[$edge] ?? {}).page == $page and ($state.pending_panels[$edge] ?? {}).generation == $gen then
+    drive_panel_operations()
+    return true
+  end
   -- Record the pin before making it, so a crash between the two still
   -- leaves the recovery pass something to release.
   $pins = read_pins()
@@ -844,11 +992,9 @@ fn show_popup($edge, $page, $flag, $gen)
     push($pins, $edge)
     write_pins($pins)
   end
-  if not panel_verb("shell.panel.show", $edge, nil) then return false end
-  if not popup_live($flag, $gen) then return false end
-  $pinned = panel_verb("shell.panel.pin", $edge, nil)
-  if not popup_live($flag, $gen) and not edge_in_use($edge) then hide_popup($edge) end
-  return $pinned and popup_live($flag, $gen)
+  queue_panel($edge, $page, $flag, $gen, "select")
+  drive_panel_operations()
+  return true
 end
 
 -- Whether an open popup (other than a stale render) currently owns an edge:
@@ -871,9 +1017,19 @@ fn hide_popup($edge)
     write_pins($pins)
   end
   $confirmed = hide_edge($edge)
-  if edge_in_use($edge) or not $p.popup_release_confirmed($confirmed) then return false end
+  if edge_in_use($edge) then return false end
+  if $state.panel_failures[$edge] != nil then return false end
+  if not $p.popup_release_confirmed($confirmed) then return false end
   $kept = $p.released_popup_pins(read_pins(), $edge, $confirmed)
   write_pins($kept)
+  -- Released (unpinned, mode hidden) but still showing: an explicit
+  -- shell.panel.show reveal outlives the release, unlike a pointer reveal.
+  -- Dismiss it only while one of our own pages is on the edge.
+  $now = $state.applied_panels[$edge] ?? {}
+  if $now.visible == true and contains(["scene-launcher", "scene-calendar", "scene-notes"], $now.page ?? "") then
+    if not panel_verb("shell.panel.hide", $edge, nil) then return false end
+    if (($state.applied_panels[$edge] ?? {}).visible ?? false) == true then return false end
+  end
   return true
 end
 
@@ -916,6 +1072,43 @@ fn close_launcher($scene_action = false)
   return hide_popup("left")
 end
 
+-- Scene clicks reply AFTER their effect is applied, like Quoin's applied
+-- replies: a caller that reads state after the reply sees the popup already
+-- closed or opened. rc 0 carries the applied popup flags; a release the host
+-- did not confirm is release_failed (22), as for the agent verbs.
+fn popup_flags()
+  return {launcher: $state.launcher_open, calendar: $state.calendar_open, notes: $state.notes_open}
+end
+
+fn reply_popups($released, $edge)
+  if not $released then
+    reply(22, json_encode({error: "release_failed", open: false, edge: $edge}))
+    return
+  end
+  reply(0, json_encode(popup_flags()))
+end
+
+-- Launch, then dismiss the popup on $edge, then reply. A failed launch still
+-- closes the popup (the click was a dismissal too) and replies with the
+-- upstream rc under context, the same shape launcher.launch uses; the send
+-- globals are captured before the close overwrites them.
+fn launch_and_close($id, $edge)
+  send $APPS apps.launch body=json_encode({id: $id}) timeout=3
+  $launch_rc = $rc
+  $launch_reply = $reply
+  $released = $edge == "left" ? close_launcher(true) : close_calendar(true)
+  render_panel()
+  if not rc_ok($launch_rc) then
+    reply($launch_rc < 0 ? 20 : 21, json_encode({error: $launch_rc < 0 ? "apps_transport" : "apps_refused", rc: $launch_rc, reply: $launch_reply, launched: $id, released: $released}))
+    return
+  end
+  if not $released then
+    reply(22, json_encode({error: "release_failed", open: false, edge: $edge, launched: $id}))
+    return
+  end
+  reply(0, json_encode({launched: $id}))
+end
+
 fn close_calendar($scene_action = false)
   $was_open = $state.calendar_open
   $state.calendar_open = false
@@ -926,28 +1119,132 @@ fn close_calendar($scene_action = false)
   return hide_popup("right")
 end
 
--- Coalesce bursts (a window opening changes many props at once) into one
--- rebuild, the clippanel pattern.
+-- Coalesce inside the calling async handler. A local deadline resumes the
+-- rebuild even if the Bus disconnects; no loopback message owns the flag.
 fn schedule()
   $state.dirty = true
   if $state.scheduled then return end
   $state.scheduled = true
   try
+    sleep(0.01)
     while $state.dirty
-      sleep(0.1)
       $state.dirty = false
-      fetch_windows()
-      fetch_tray()
-      fetch_notes()
-      render_panel()
-      -- registered, so kept current even while closed (the shell can
-      -- reveal it through the corner); already fetched above
-      if $state.notes_open then render_notes() else load_notes() end
+      try
+        fetch_windows()
+        fetch_tray()
+        fetch_notes()
+        render_panel()
+        if $state.notes_open then render_notes() else load_notes() end
+      catch $err
+        note("rebuild failed: " .. to_string($err))
+      end
     end
-  catch $err
-    note("rebuild failed: " .. to_string($err))
+  finally
+    $state.scheduled = false
   end
-  $state.scheduled = false
+end
+
+fn page_applied($edge, $page)
+  $pstate = $state.applied_panels[$edge]
+  return $pstate != nil and $pstate.page == $page and $pstate.visible and $pstate.pinned
+end
+
+fn update_shown()
+  $state.panel_shown = page_applied("bottom", "scene-panel")
+  $state.launcher_shown = $state.launcher_open and page_applied("left", "scene-launcher")
+  $state.calendar_shown = $state.calendar_open and page_applied("right", "scene-calendar")
+  $state.notes_shown = $state.notes_open and page_applied("right", "scene-notes")
+end
+
+fn subscription_gap()
+  -- Broker delivery gaps use a header; comp's retained publisher-loss
+  -- records use a JSON body. Both invalidate the subscription snapshot.
+  return $event.headers.gap == "true" or (($event.args ?? {}).gap == true)
+end
+
+on "shell.panel.changed"
+  if $event.headers.topic != $HOST .. ".panel.changed" then return end
+  if subscription_gap() then
+    resynchronise()
+  else
+    -- Ignore the payload: it can predate our command's applied reply.
+    refresh_panels()
+    drive_panel_operations()
+    update_shown()
+  end
+end
+
+fn recover_pins()
+  for each $edge in read_pins()
+    if not edge_in_use($edge) and $state.pending_panels[$edge] == nil then
+      queue_panel($edge, nil, nil, $state.popup_gen, "release")
+    end
+  end
+  drive_panel_operations()
+end
+
+fn resynchronise()
+  if $state.resyncing then
+    $state.resync_again = true
+    return
+  end
+  $state.resyncing = true
+  try
+    while true
+      $state.resync_again = false
+      rpc($COMP, "comp.props.watch", {})
+      refresh_panels()
+      recover_pins()
+      update_shown()
+      schedule()
+      -- A broker gap can hide a complete host restart while the registered
+      -- names stay identical. Re-establish open intent even when its previous
+      -- operation had already completed and left no pending entry.
+      if $state.launcher_open and not $state.launcher_shown then render_launcher() end
+      if $state.calendar_open and not $state.calendar_shown then render_calendar() end
+      if $state.notes_open and not $state.notes_shown then render_notes() end
+      if not $state.resync_again then break end
+    end
+  finally
+    $state.resyncing = false
+  end
+end
+
+on bus.connected async
+  if len(keys($event.headers)) != 0 then return end
+  start_clock()
+  $state.panel_shown = false
+  $state.reg_launcher = false
+  $state.reg_calendar = false
+  $state.reg_notes = false
+  resynchronise()
+  $registry = rpc("noded", "noded.props.get", {})
+  reconcile_services((($registry ?? {}).services ?? {}).registered)
+end
+
+fn reconcile_services($live)
+  if type($live) != "list" then return end
+  $previous = $state.live_services
+  if not contains($live, $HOST) then
+    $state.applied_panels = {}
+    update_shown()
+  end
+  if contains($live, $HOST) and not contains($previous, $HOST) then
+    -- Do not consume the appearance if the host snapshot is unavailable.
+    if not refresh_panels() then return end
+    $state.panel_shown = false
+    $state.reg_launcher = false
+    $state.reg_calendar = false
+    $state.reg_notes = false
+    recover_pins()
+    render_panel()
+    if $state.launcher_open then render_launcher() end
+    if $state.calendar_open then render_calendar() end
+    if $state.notes_open then render_notes() end
+  end
+  if contains($live, $COMP) and not contains($previous, $COMP) then rpc($COMP, "comp.props.watch", {}) end
+  $state.live_services = $live
+  schedule()
 end
 
 -- ── handlers ────────────────────────────────────────────────────────────
@@ -1160,18 +1457,25 @@ on popups.state desc "popup flags {}; return {launcher,calendar,notes}"
 end
 
 on launcher desc "toggle the application launcher"
-  reply(0, "")
   if $state.launcher_open then
-    close_launcher()
-  else
-    if close_popups() != nil then return end
-    $state.launcher_open = true
-    bump_popups()
-    $state.query = ""
-    $state.category = ""
-    render_launcher()
+    $released = close_launcher()
+    render_panel()
+    reply_popups($released, "left")
+    return
   end
+  $blocked = close_popups()
+  if $blocked != nil then
+    render_panel()
+    reply_popups(false, $blocked)
+    return
+  end
+  $state.launcher_open = true
+  bump_popups()
+  $state.query = ""
+  $state.category = ""
+  render_launcher()
   render_panel()
+  reply(0, json_encode(popup_flags()))
 end
 
 on filter desc "launcher search text changed"
@@ -1190,24 +1494,23 @@ on cat desc "launcher: filter by the clicked category chip"
 end
 
 on launch desc "launch the clicked application"
-  reply(0, "")
   $a = $event.args
-  if $a == nil or type($a) != "map" or $a.item == nil then return end
-  $id = $a.item.id
-  if $id != nil then
-    rpc($APPS, "apps.launch", {id: $id})
-    close_launcher(true)
-    render_panel()
+  $id = nil
+  if $a != nil and type($a) == "map" and type($a.item) == "map" then $id = $a.item.id end
+  if $id == nil then
+    reply(0, json_encode({launched: nil}))
+    return
   end
+  launch_and_close($id, "left")
 end
 
 on launch_first desc "launch the first search match (Enter in the search field)"
-  reply(0, "")
-  if length($state.apps) > 0 then
-    rpc($APPS, "apps.launch", {id: $state.apps[0].id})
-    close_launcher(true)
-    render_panel()
+  -- No match: nothing to launch and nothing to dismiss.
+  if length($state.apps) == 0 then
+    reply(0, json_encode({launched: nil}))
+    return
   end
+  launch_and_close($state.apps[0].id, "left")
 end
 
 on ws desc "switch to the clicked workspace" async
@@ -1253,17 +1556,24 @@ on tray desc "activate the clicked tray item" async
 end
 
 on calendar desc "toggle the calendar"
-  reply(0, "")
   if $state.calendar_open then
-    close_calendar()
-  else
-    if close_popups() != nil then return end
-    $state.calendar_open = true
-    bump_popups()
-    $state.cal_offset = 0
-    render_calendar()
+    $released = close_calendar()
+    render_panel()
+    reply_popups($released, "right")
+    return
   end
+  $blocked = close_popups()
+  if $blocked != nil then
+    render_panel()
+    reply_popups(false, $blocked)
+    return
+  end
+  $state.calendar_open = true
+  bump_popups()
+  $state.cal_offset = 0
+  render_calendar()
   render_panel()
+  reply(0, json_encode(popup_flags()))
 end
 
 on cal_prev desc "calendar: previous month"
@@ -1285,30 +1595,45 @@ on cal_today desc "calendar: back to the current month"
 end
 
 on open_calendar desc "open the desktop's calendar application"
-  reply(0, "")
   -- A .desktop entry in the Calendar category wins; Thunderbird's calendar
   -- tab is the fallback on a desktop that has no dedicated calendar app.
   $apps = rpc($APPS, "apps.list", {category: "Calendar"})
   if $apps != nil and type($apps) == "list" and length($apps) > 0 then
-    rpc($APPS, "apps.launch", {id: $apps[0].id})
-  elif which("thunderbird") != nil then
-    spawn(["thunderbird", "-calendar"], {detach: true})
+    launch_and_close($apps[0].id, "right")
+    return
   end
-  close_calendar(true)
+  $launched = nil
+  if which("thunderbird") != nil then
+    spawn(["thunderbird", "-calendar"], {detach: true})
+    $launched = "thunderbird"
+  end
+  $released = close_calendar(true)
   render_panel()
+  if not $released then
+    reply(22, json_encode({error: "release_failed", open: false, edge: "right", launched: $launched}))
+    return
+  end
+  reply(0, json_encode({launched: $launched}))
 end
 
 on notes desc "toggle the notifications popup"
-  reply(0, "")
   if $state.notes_open then
-    close_notes()
-  else
-    if close_popups() != nil then return end
-    $state.notes_open = true
-    bump_popups()
-    render_notes()
+    $released = close_notes()
+    render_panel()
+    reply_popups($released, "right")
+    return
   end
+  $blocked = close_popups()
+  if $blocked != nil then
+    render_panel()
+    reply_popups(false, $blocked)
+    return
+  end
+  $state.notes_open = true
+  bump_popups()
+  render_notes()
   render_panel()
+  reply(0, json_encode(popup_flags()))
 end
 
 on note_close desc "dismiss the clicked notification"
@@ -1386,7 +1711,8 @@ on panel.refresh desc "rebuild every scene now (reveals only the open popup)"
   reply(0, "")
   fetch_windows()
   fetch_tray()
-  fetch_status()
+  fetch_notes()
+  refresh_status()
   render_panel()
   render_launcher()
   render_calendar()
@@ -1400,56 +1726,152 @@ end
 -- The adapters' named events are wired too, in case a diff is coalesced
 -- away; schedule() refetches everything either way.
 on props.changed async
-  schedule()
+  if subscription_gap() then resynchronise() end
+  if $event.headers.topic == "noded.props.changed" then
+    if subscription_gap() then
+      $registry = rpc("noded", "noded.props.get", {})
+      reconcile_services((($registry ?? {}).services ?? {}).registered)
+    elif ($event.args ?? {}).path == "services.registered" then
+      reconcile_services($event.args.new)
+    end
+  else
+    schedule()
+  end
 end
 
 on tray.item.added async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
 on tray.item.removed async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
 on notification.created async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
 on notification.closed async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
 -- The clock: wake on each minute boundary and redraw the panel and the
--- calendar page (the notifications page every fifth) -- one wake per minute. A second kick is
--- ignored so a stray clock.run cannot start a second loop.
-on clock.run async
+-- calendar page -- one wake per minute, scheduled entirely in process.
+fn start_clock()
   if $state.clock_running then return end
   $state.clock_running = true
-  $tick = 0
-  while true
-    sleep($p.seconds_to_next_minute(time()))
-    $tick = $tick + 1
-    try
-      fetch_net()
-      fetch_vol()
-      if $tick % 5 == 0 then
-        rpc($COMP, "comp.props.watch", {})
-        fetch_windows()
-        fetch_tray()
-        render_notes()
-        -- a release that failed while Quoin was down is retried here
-        for each $edge in read_pins()
-          if not edge_in_use($edge) then hide_popup($edge) end
-        end
-      end
-      render_panel()
-      -- the calendar's "today" and header clock stay current while it is
-      -- registered, open or not; it is revealed only while open
-      render_calendar()
-    catch $e
-      note("clock tick failed: " .. to_string($e))
-    end
+  try
+    task_start("clock.run", "{}")
+  catch $message, $error
+    $state.clock_running = false
+    raise($error.code, $message, $error.details)
   end
+end
+
+on clock.run async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    while true
+      sleep($p.seconds_to_next_minute(time()))
+      try
+        render_panel()
+        -- the calendar's "today" and header clock stay current while it is
+        -- registered, open or not; it is revealed only while open
+        render_calendar()
+      catch $e
+        note("clock tick failed: " .. to_string($e))
+      end
+    end
+  finally
+    $state.clock_running = false
+  end
+end
+
+-- Native status sources (local events: no headers). A batch only says that
+-- something changed; the applets re-read state, and schedule() coalesces the
+-- rebuild with any other pending change. A closed batch from the live handle
+-- re-subscribes after the backoff; one from an older handle changes nothing.
+on net.changed async
+  if len(keys($event.headers)) != 0 then return end
+  $batch = type($event.args) == "map" ? $event.args : {}
+  if type($batch.closed) == "map" then
+    note("net_watch ended: " .. to_string($batch.closed.message))
+    if $batch.watch != $state.net_watch then return end
+    try
+      net_unwatch($batch.watch)
+    catch $e
+    end
+    $state.net_watch = nil
+    $state.net_retry = reset_if_lived($state.net_started, $state.net_retry)
+    retry_net()
+  end
+  fetch_net()
+  schedule()
+end
+
+on audio.changed async
+  if len(keys($event.headers)) != 0 then return end
+  $batch = type($event.args) == "map" ? $event.args : {}
+  if type($batch.closed) == "map" then
+    note("audio events ended: " .. to_string($batch.closed.message))
+    if $batch.watch != $state.audio_watch then return end
+    try
+      audio_unwatch($batch.watch)
+    catch $e
+    end
+    $state.audio_watch = nil
+    $state.audio_retry = reset_if_lived($state.audio_started, $state.audio_retry)
+    $state.vol = {ok: false, level: 0, muted: false}
+    schedule()
+    retry_audio()
+    return
+  end
+  $state.audio_retry = 5
+  fetch_vol()
+  schedule()
+end
+
+on net.retry async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    sleep($state.net_retry)
+    $state.net_retry = min($state.net_retry * 2, 300)
+  finally
+    $state.net_retrying = false
+  end
+  start_net()
+  fetch_net()
+  schedule()
+end
+
+on audio.retry async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    sleep($state.audio_retry)
+    $state.audio_retry = min($state.audio_retry * 2, 300)
+  finally
+    $state.audio_retrying = false
+  end
+  start_audio()
+  if $state.audio_watch != nil then
+    fetch_vol()
+    schedule()
+  end
+end
+
+on status.refresh async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    fetch_net()
+    fetch_vol()
+  finally
+    $state.status_refreshing = false
+  end
+  schedule()
 end
 
 -- ── init ────────────────────────────────────────────────────────────────
@@ -1459,10 +1881,17 @@ subscribe($TRAY .. ".item.removed")
 subscribe($TRAY .. ".props.changed")
 subscribe($NOTIFY .. ".changed")
 subscribe($NOTIFY .. ".props.changed")
+subscribe($HOST .. ".panel.changed")
+subscribe("noded.props.changed")
+$initial_panels = rpc($HOST, "shell.props.get", {})
+$state.applied_panels = ($initial_panels ?? {}).panels ?? {}
 rpc($COMP, "comp.props.watch", {})
 fetch_windows()
 fetch_tray()
-fetch_status()
+-- Subscribe before the first read, so a change in between is not lost.
+start_status()
+fetch_notes()
+refresh_status()
 -- A popup that was open when Quoin or this citizen went down comes back as
 -- a pinned edge with no content (the modes persist; the scenes do not).
 -- Release exactly the popup pins this panel recorded (show_popup/hide_popup
@@ -1471,10 +1900,12 @@ for each $edge in read_pins()
   hide_popup($edge)
 end
 render_panel()
+$initial_registry = rpc("noded", "noded.props.get", {})
+reconcile_services((($initial_registry ?? {}).services ?? {}).registered)
 note("quoin-panel up: host=" .. $HOST .. " comp=" .. $COMP)
 
--- The clock runs in its own async handler (below), kicked once from here, so
+-- The clock runs in its own local async task, started here, so
 -- this init body returns and the runtime serves its reserved verbs (RELOAD,
 -- QUIT, INFO, lifecycle props) -- an init that never returns would starve
 -- them. On shutdown the runtime drains the loop like any async handler.
-emit $ME clock.run
+start_clock()

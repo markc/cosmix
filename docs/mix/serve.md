@@ -11,6 +11,61 @@ long-lived, addressable Mix process that *is* a service. The full normative
 contract is **SPEC 18** (the Mix Citizen Runtime); this page is the operational
 view — what the flag does, what the runtime injects, and how a citizen behaves.
 
+## Native events and generation lifetime
+
+`on fs.changed`, `on proc.exited`, `on net.changed`, `on audio.changed` and
+`on bus.connected` use the ordinary event
+envelope: payloads are in **`$event.args`**, with `command`, `headers` and `body`
+available as usual. Plain handlers remain serial; async handlers use the
+existing concurrent scheduling and drain rules. Native notifications also enter
+the existing top-level yield points. No native source uses a polling loop or a
+timer to discover change; an idle pump parks on readiness notifications.
+
+Filesystem watches, net/audio watches and managed children belong to an
+evaluator generation.
+Workers exchange owned Rust records with a bounded registry; Mix values are
+created only on the evaluation thread. Reload builds a separate candidate
+registry. A failed candidate is drained and closed, leaving the old watches and
+managed children intact. On successful reload, old handlers drain before their
+registrations retire. The candidate's buffered events remain for its pump.
+Candidate handlers can also run at top-level yield points during initialisation;
+discarding a failed candidate does not undo its file writes or outgoing messages.
+Shutdown likewise stops admission, drains handlers, then closes native sources.
+Unwatch cancels buffered work, not a handler already dispatched.
+
+The legacy `spawn(...,{die_with_parent:true})` lifetime rule still applies when
+`exit_event` is absent. With `exit_event:true`, children use generation ownership:
+there can be old and candidate processes alive during candidate initialisation.
+Do not have them contend for an exclusive resource without an application-level
+handover. Registry retirement SIGKILLs the managed process group and also signals
+the leader through its retained pidfd before reaping it, even if the leader has
+left that group. Scripts needing a graceful stop should send their own stop request before
+retirement. When a leader exits naturally, remaining members of that group are
+also ended before the leader is reaped. Descendants that deliberately leave the
+group are outside this guarantee.
+
+Completed child monitors are pruned when checking native-source liveness.
+A plain script's event pump exits once its last managed child exit is delivered
+and no filesystem watches or Bus handler remain; no explicit `quit()` is needed.
+
+```mix
+$pid = spawn(["worker", "scene.mix"], {exit_event: true, tag: "scene:12"})
+on proc.exited
+  $exit = $event.args  -- {pid,tag,exit_code,signal}
+  -- Compare the tag with the active generation before deciding to restart.
+  print($exit)
+end
+on bus.connected
+  print($event.args.generation)
+  -- Refresh snapshots after subscriptions have been restored.
+end
+```
+
+See [filesystem events](io.md#native-filesystem-events),
+[managed spawn](system.md#managed-child-exit-events),
+[network and audio events](system.md#desktop-status-events--net_watch-audio_watch), and
+[connection events](bus.md#connection-events).
+
 ## First, "substrate"
 
 **The substrate is Cosmix itself** — the agent-operable computing environment,

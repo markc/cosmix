@@ -3252,13 +3252,15 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.95.0"
+version = "0.96.0"
 dependencies = [
  "futures-util",
  "indexmap",
  "libc",
+ "notify 7.0.0",
  "rand 0.9.5",
  "serde",
+ "serde_json",
  "signal-hook 0.3.18",
  "tokio",
  "tracing",
@@ -3366,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3388,7 +3390,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-mix",
@@ -3399,7 +3401,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene-bevy"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "bevy",
  "cosmix-scene",
@@ -3415,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3810,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.58.0"
+version = "0.58.1"
 dependencies = [
  "accesskit",
  "ammonia",

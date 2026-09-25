@@ -1,0 +1,16 @@
+-- version: 0.1.0
+-- Install the shipped catalogue + shared libraries only. Does not enable,
+-- replace user scenes, contact a host, or migrate the running panel.
+-- Usage: mix share/scenes/install.mix [destination]
+$source = dirname(realpath($0))
+$argv = args()
+if length($argv) > 1 then raise("INVALID_ARGS", "Expected at most one catalogue destination") end
+$dest = length($argv) == 1 ? $argv[0] : env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes"
+for each $dir in ["lib", "panel", "launcher", "calendar", "notes", "settings"]
+  mkdir($dest .. "/" .. $dir)
+  $files = $dir == "lib" ? ["data.mix", "models.mix", "runtime.mix", "taskbar.mix"] : ["scene.mix", "behaviour.mix", "template.conf.mix"]
+  for each $file in $files
+    copy($source .. "/" .. $dir .. "/" .. $file, $dest .. "/" .. $dir .. "/" .. $file)
+  end
+end
+print("Installed scene catalogue: " .. $dest)

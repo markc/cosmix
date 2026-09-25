@@ -1,0 +1,268 @@
+-- version: 0.1.0
+-- Stage B: owns the panel/launcher/calendar/notes pages once seeded and
+-- enabled; while the legacy quoin-panel citizen (SCENES_LEGACY_SERVICE) is
+-- registered those scenes stay unmounted, and its departure mounts them.
+-- Never auto-enables. Requires W1 native fs events, managed exits/stops and
+-- bus.connected.
+$loader = require("lib/scenes.mix")
+$io = require("lib/scenes-io.mix")
+$ROOT = env("SCENES_DIR", env("XDG_CONFIG_HOME", env("HOME") .. "/.config") .. "/cosmix/scenes")
+$TEMPLATES = $io.templates($0)
+export SCENES_LIB = env("SCENES_LIB", $TEMPLATES .. "/lib")
+$HOST = env("SCENE_HOST", "shell")
+$ME = serve_name()
+if $ME == nil then raise("SCENES_SERVE", "start scenes with mix --serve", {}) end
+$loader.check_loader_epoch(env("SCENES_LOADER_PROCESS"), pid())
+mkdir($ROOT)
+if not stat($ROOT, {follow_symlinks:false}).is_dir then raise("SCENES_FILES", "scene root must be a real directory", {}) end
+if not flock($ROOT .. "/.loader.lock") then raise("SCENES_LOCKED", "another loader owns this scenes directory", {}) end
+$state = $loader.initial($ROOT, $TEMPLATES, $HOST, $ME, $io)
+$state.legacy = env("SCENES_LEGACY_SERVICE", "quoin-panel")
+$ROOT = $state.root
+
+$state.handover_delay = 1
+$state.handover_armed = false
+
+-- An owed legacy handover is retried on every services snapshot and panel
+-- notice. For a failure no later event would retry (an rpc timeout on an
+-- idle desktop), one local task backs off 1, 2 .. 32 s and then stops until
+-- nothing is owed: a page that keeps failing is a diagnostic, not a poll.
+-- Never a Bus self-emit, and at most one task in flight.
+fn schedule_handover($s)
+  if len($loader.legacy_handover_pending($s)) == 0 then
+    $s.handover_delay = 1
+    return $s
+  end
+  if $s.handover_armed or $s.handover_delay > 32 then return $s end
+  $s.handover_armed = true
+  task_start("scenes.handover", json_encode({delay:$s.handover_delay}))
+  $s.handover_delay = $s.handover_delay * 2
+  return $s
+end
+
+fn refresh_services($s, $reconnect)
+  $r = $s.io.rpc("noded", "noded.props.get", {})
+  return schedule_handover($loader.services($s, (($r ?? {}).services ?? {}).registered, $reconnect))
+end
+
+on fs.changed
+  if len(keys($event.headers)) != 0 then return end
+  if $event.args.watch == $WATCH or $event.args.watch == $PARENT_WATCH then
+    try
+      $state = $loader.filesystem($state, $event.args)
+    catch $message, $error
+      $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+    $state = $loader.changed($state)
+  end
+end
+
+on bus.connected
+  if len(keys($event.headers)) != 0 then return end
+  if $state.connection != $event.args.generation then
+    $reconnect = $state.connection != nil
+    $state.connection = $event.args.generation
+    $state.published = ""
+    try
+      $state = refresh_services($state, $reconnect)
+    catch $message, $error
+      $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+    $state = $loader.changed($state)
+  end
+end
+
+on props.changed
+  if $event.headers.topic == "noded.props.changed" then
+    try
+      if $event.headers.gap == "true" then
+        $state = refresh_services($state, true)
+      elif $event.args.path == "services.registered" then
+        $state = refresh_services($state, false)
+      end
+    catch $message, $error
+      $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+    $state = $loader.changed($state)
+  end
+end
+
+on "shell.panel.changed"
+  if $event.headers.topic == $HOST .. ".panel.changed" then
+    try
+      if $event.headers.gap == "true" then
+        $state = refresh_services($state, true)
+      else
+        $state = schedule_handover($loader.panel_changed($state, $event.args))
+      end
+    catch $message, $error
+      $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+    $state = $loader.changed($state)
+  end
+end
+
+on "shell.scene.changed"
+  if $event.headers.topic != $HOST .. ".scene.changed" then return end
+  if $event.headers.gap == "true" then
+    try
+      $state = refresh_services($state, true)
+    catch $message, $error
+      $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+  end
+  $notice = $event.args ?? {}
+  if has_key($state.scenes, $notice.scene ?? "") and $state.scenes[$notice.scene].revision == $notice.revision then
+    $state.scenes[$notice.scene].diagnostics = $notice.diagnostics ?? []
+  end
+  $state = $loader.changed($state)
+end
+
+on proc.exited
+  if len(keys($event.headers)) != 0 then return end
+  -- Bookkeeping only, under the writer lock. Never yield a state copy.
+  $exit = $event.args
+  try
+    $exit.tag = json_parse($exit.tag)
+    $state = $loader.exited($state, $exit)
+  catch $message, $error
+    $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    $state = $loader.changed($state)
+    return
+  end
+  $name = ($exit.tag ?? {}).name
+  $e = $state.scenes[$name]
+  $state = $loader.changed($state)
+  if $e != nil and $e.enabled and contains(["backoff", "handover"], $e.status) then
+    task_start("scenes.restart", json_encode({name:$name, generation:$e.generation}))
+  end
+end
+
+-- One local task: the async phase only waits, then the synchronous phase
+-- reacquires the writer lock and reads current state. RPCs in that phase do
+-- not release the lock, so concurrent exits and disable cannot be overwritten.
+on scenes.restart async
+  if len(keys($event.headers)) != 0 then return end
+  $e = $state.scenes[$event.args.name]
+  if $e == nil or $e.generation != $event.args.generation then return end
+  $delay = ($e.restart_at ?? 0) - monotonic()
+  if $delay > 0 then sleep($delay) end
+end
+
+on scenes.restart
+  if len(keys($event.headers)) != 0 then return end
+  $name = $event.args.name
+  $generation = $event.args.generation
+  try
+    $state = $loader.restart($state, $name, $generation)
+  catch $message, $error
+    if ($state.scenes[$name] ?? {}).generation == $generation then
+      $state.scenes[$name].restart_at = nil
+      $state.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
+  end
+  $state = $loader.changed($state)
+end
+
+on scenes.handover async
+  if len(keys($event.headers)) != 0 then return end
+  sleep($event.args.delay ?? 1)
+end
+
+on scenes.handover
+  if len(keys($event.headers)) != 0 then return end
+  $state.handover_armed = false
+  try
+    $state = $loader.legacy_handover($state)
+  catch $message, $error
+    $state.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+  end
+  $state = schedule_handover($state)
+  $state = $loader.changed($state)
+end
+
+-- Registration precedes enumeration/snapshots, closing startup observation gaps.
+on scenes.list desc "Installed/enabled/mounted state, revisions, diagnostics and needs_setup"
+  $state = $loader.request($state, "list", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.install desc "Stage and validate shipped template {template,name?,enable?}; disabled by default"
+  $state = $loader.request($state, "install", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.remove desc "Stop/unload managed installation {name}; retain recovery copy"
+  $state = $loader.request($state, "remove", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.enable desc "Persist enablement and reconcile {name}"
+  $state = $loader.request($state, "enable", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.disable desc "Persist disablement, invalidate behaviour and unload {name}"
+  $state = $loader.request($state, "disable", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.reload desc "Retry files and behaviour {name}; preserve accepted runtime model"
+  $state = $loader.request($state, "reload", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.reset desc "Restore recorded template defaults {name}; retain recovery copy"
+  $state = $loader.request($state, "reset", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.open desc "Request mutually exclusive popup {name}; completion via scenes.changed"
+  $state = $loader.request($state, "open", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.close desc "Release popup and restore saved panel mode {name}"
+  $state = $loader.request($state, "close", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.toggle desc "Toggle popup {name}"
+  $state = $loader.request($state, "toggle", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.ready desc "Behaviour ready {name,generation}; reply requests complete model publication"
+  $state = $loader.request($state, "ready", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.model desc "Publish complete runtime model {name,generation,value}; reject stale generations"
+  $state = $loader.request($state, "model", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+
+-- Defer removing this parent watch: it observes root replacement and shares
+-- the evaluator's inotify instance, so it costs no extra fd or worker.
+$PARENT_WATCH = fs_watch(dirname($ROOT), {recursive:false, events:["created", "modified", "deleted", "moved"]})
+$WATCH = fs_watch($ROOT, {recursive:true, events:["created", "modified", "deleted", "moved"]})
+subscribe("noded.props.changed")
+subscribe($HOST .. ".panel.changed")
+subscribe($HOST .. ".scene.changed")
+$state = $loader.rescan($state, false)
+$state = refresh_services($state, false)
+$state = $loader.changed($state)
+export SCENES_LOADER_PROCESS = to_string(pid())

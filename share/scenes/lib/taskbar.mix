@@ -1,0 +1,91 @@
+-- Pure taskbar decisions for the panel behaviour: window filtering, click
+-- payload validation and peek plans. No Bus access, no document emission.
+
+-- Normal-band windows in stable id order, so buttons do not jump when focus
+-- moves (Plasma's default launch order). Other bands never get a button.
+fn normal_windows($windows)
+  $out = []
+  for each $w in $windows ?? []
+    if type($w) == "map" and $w.band == "normal" then push($out, $w) end
+  end
+  return sort_by($out, function ($w) = $w.id)
+end
+
+-- The current workspace's windows (Plasma's default filter), bounded. A
+-- window without a workspace belongs to the current one.
+fn current_tasks($windows, $ws_current, $limit)
+  $tasks = []
+  for each $w in $windows
+    if length($tasks) >= $limit then break end
+    if ($w.workspace ?? $ws_current) == $ws_current then push($tasks, $w) end
+  end
+  return $tasks
+end
+
+fn refusal($code, $message)
+  return {ok: false, error_code: $code, message: $message}
+end
+
+-- A task click carries the complete row the panel published, including the
+-- window id and the generation it was rendered with. The action is decided
+-- against a FRESH window list: a window that has since changed identity (same
+-- id, new generation) or closed is refused rather than acted on, and the
+-- compositor re-checks the generation it receives as well.
+fn task_action($windows, $item)
+  if type($item) != "map" or type($item.window) != "number" or type($item.generation) != "number" then
+    return refusal("invalid_args", "item must carry the window id and generation")
+  end
+  for each $w in $windows
+    if $w.id == $item.window then
+      if $w.generation != $item.generation then
+        return refusal("stale_window", "window changed since the panel was drawn")
+      end
+      $args = {id: $w.id, generation: $w.generation}
+      if $w.minimized then return {ok: true, verb: "comp.window.restore", args: $args} end
+      if $w.focused then return {ok: true, verb: "comp.window.minimize", args: $args} end
+      -- comp.window.focus raises by default
+      return {ok: true, verb: "comp.window.focus", args: $args}
+    end
+  end
+  return refusal("stale_window", "window no longer exists")
+end
+
+fn workspace_index($item)
+  if type($item) != "map" or type($item.index) != "number" or $item.index < 1 or floor($item.index) != $item.index then
+    return nil
+  end
+  return $item.index
+end
+
+-- The tray adapter's store KEY ("i<n>", what tray.activate takes; the SNI Id
+-- is the application's own name and is not accepted).
+fn tray_key($item)
+  if type($item) != "map" or type($item.key) != "string" or $item.key == "" then return nil end
+  return $item.key
+end
+
+-- Peek at the desktop minimises every visible window of this workspace.
+fn peek_candidates($windows, $ws_current)
+  $out = []
+  for each $w in $windows
+    if ($w.workspace ?? $ws_current) == $ws_current and not $w.minimized then
+      push($out, {id: $w.id, generation: $w.generation})
+    end
+  end
+  return $out
+end
+
+-- Restore exactly what the peek minimised: same id AND the generation
+-- recorded then. A window that changed identity, or that the user restored
+-- or closed meanwhile, is left alone.
+fn peek_restores($windows, $marks)
+  $out = []
+  for each $w in $windows
+    for each $mark in $marks
+      if $mark.id == $w.id and $mark.generation == $w.generation and $w.minimized then
+        push($out, {id: $w.id, generation: $w.generation})
+      end
+    end
+  end
+  return $out
+end

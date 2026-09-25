@@ -121,24 +121,18 @@ fn incoming_event_to_mix_value(event: &IncomingEvent) -> Value {
 /// `$event.headers` map. `$event.body` stays the raw string regardless.
 ///
 /// Nil when the body is empty, is not valid JSON (a raw `body="hi"` text
-/// payload — a bare word is not JSON, so text bodies read back as nil), or the
-/// `json` feature is compiled out. A handler distinguishes "no structured
-/// args" from a real value with `??` / `if`, and reaches for `$event.body`
+/// payload — a bare word is not JSON, so text bodies read back as nil).
+/// Event decoding is core, independent of optional JSON builtins. A handler
+/// distinguishes "no structured args" from a real value with `??` / `if`, and reaches for `$event.body`
 /// when it wants the raw bytes.
-#[cfg(feature = "json")]
 fn parse_event_args(body: &str) -> Value {
     if body.is_empty() {
         return Value::Nil;
     }
     match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(j) => crate::json::json_to_mix(j),
+        Ok(j) => crate::native_events::json_value(j),
         Err(_) => Value::Nil,
     }
-}
-
-#[cfg(not(feature = "json"))]
-fn parse_event_args(_body: &str) -> Value {
-    Value::Nil
 }
 
 /// A JSON string literal for `s`, without the optional `json` feature —
@@ -2830,6 +2824,7 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "pop",
     "shift",
     "sleep",
+    "task_start",
     "readline",
     "read_stdin",
     "read_stdin_bytes",
@@ -2854,6 +2849,15 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "publish",
     "serve_name",
     "script_version",
+    "fs_watch",
+    "fs_unwatch",
+    "fs_wait",
+    "net_watch",
+    "net_unwatch",
+    "net_state",
+    "audio_watch",
+    "audio_unwatch",
+    "audio_state",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -2922,8 +2926,8 @@ pub struct EvalLimits {
     /// `recursion depth exceeded` error. See [`DEFAULT_RECURSION_LIMIT`].
     pub recursion_limit: usize,
     /// Optional wall-clock budget for one run. Checked at the
-    /// per-statement poll, so loop-based runaways are bounded; a single
-    /// blocking builtin (`run`/`ssh_run`/`http_*`) cannot be
+    /// statement and expression polls, so loop-based runaways are bounded.
+    /// A single blocking builtin (`run`/`ssh_run`/`http_*`) cannot be
     /// interrupted mid-syscall. `None` = no time limit.
     pub time_limit: Option<std::time::Duration>,
     /// Optional cap on any single list's length. `None` = no cap.
@@ -2963,6 +2967,16 @@ pub const MAX_EXPR_DEPTH: usize = 256;
 /// host input whenever the host passes `policy: None` — a legal call
 /// shape — so the static deny is what makes the premise unconditional.
 pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
+    "task_start",
+    "fs_wait",
+    // Native desktop sources: threads, sockets and child processes owned by
+    // the evaluator generation, and bounded waits on host daemons.
+    "net_watch",
+    "net_unwatch",
+    "net_state",
+    "audio_watch",
+    "audio_unwatch",
+    "audio_state",
     "sleep",     // Pure-classed, pends on the tokio timer
     "readline",  // Env-classed but blocking on host input
     "read_stdin",
@@ -3008,7 +3022,7 @@ pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
 /// allowed and are gated by `policy` at dispatch, as usual.
 ///
 /// Synchronous: the evaluator's async expression path is driven on a
-/// fresh current-thread tokio runtime inside this call (a pure-policy
+/// reused thread-local current-thread tokio runtime (a pure-policy
 /// program never pends on a handler — the Db/Jmap/Bus seam builtins
 /// raise "not available" when no handler is registered), so it must
 /// not be called from within an async execution context. This is a
@@ -3063,6 +3077,13 @@ fn checked_mode_expr(source: &str) -> MixResult<Expr> {
     Ok(expr.clone())
 }
 
+thread_local! {
+    // Expression evaluators/globals remain fresh, but thousands of bindings
+    // share one driver instead of rebuilding Tokio's I/O and timer machinery.
+    static EXPR_RUNTIME: std::cell::OnceCell<tokio::runtime::Runtime> =
+        const { std::cell::OnceCell::new() };
+}
+
 fn eval_checked_expr(
     expr: &Expr,
     globals: &[(&str, Value)],
@@ -3075,40 +3096,52 @@ fn eval_checked_expr(
     }
     let dur = limits.time_limit; // Copy out before set_limits takes ownership
     eval.set_limits(limits);
+    // Expression-only calls never enter the statement poll that normally
+    // arms this deadline. Share it with nested expressions and branch bodies.
+    let deadline = dur.map(|dur| std::time::Instant::now() + dur);
+    eval.ctx.deadline = deadline;
     for (name, value) in globals {
         eval.set_global(name, value.clone());
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| MixError::RuntimeError {
-            span: None,
-            msg: format!("eval_expr_string: {}", e),
-        })?;
-    // A statement-free expression never reaches the evaluator's
-    // per-statement deadline poll (if-expression branch bodies DO poll,
-    // via execute_inner) — so arm the wall-clock budget at the future as
-    // well: on expiry the evaluation future is dropped at its next yield
-    // point and the caller gets a clean error. (A single non-yielding
-    // CPU-bound builtin can still overshoot until its next yield; the
-    // blocking-by-nature builtins are statically denied above, which is
-    // the load-bearing bound.)
+    // The timer cancels pending work, but Tokio polls the inner future first:
+    // a CPU-bound builtin can return Ready after expiry without a timeout.
+    // Reject that result too, including when it is the final expression.
     let fut = eval.eval_expr(expr);
-    rt.block_on(async move {
-        match dur {
-            Some(dur) => match tokio::time::timeout(dur, fut).await {
-                Ok(v) => v,
-                Err(_) => Err(MixError::RuntimeError {
+    EXPR_RUNTIME.with(|runtime| {
+        if runtime.get().is_none() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| MixError::RuntimeError {
                     span: None,
-                    msg: format!(
-                        "eval_expr_string: time limit ({:?}) exceeded",
-                        dur
-                    ),
-                }),
-            },
-            None => fut.await,
+                    msg: format!("eval_expr_string: {e}"),
+                })?;
+            // Leave the cell empty on construction failure so a subsequent
+            // revision can recover after temporary resource pressure clears.
+            let _ = runtime.set(rt);
         }
+        let rt = runtime.get().unwrap();
+        rt.block_on(async move {
+            match deadline {
+                Some(deadline) => {
+                    let result = tokio::time::timeout_at(deadline.into(), fut).await;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(MixError::RuntimeError {
+                            span: None,
+                            msg: "eval_expr_string: time limit exceeded".into(),
+                        });
+                    }
+                    result.unwrap_or_else(|_| {
+                        Err(MixError::RuntimeError {
+                            span: None,
+                            msg: "eval_expr_string: time limit exceeded".into(),
+                        })
+                    })
+                }
+                None => fut.await,
+            }
+        })
     })
 }
 
@@ -3564,6 +3597,7 @@ pub(crate) struct EvaluatorGlobals {
     /// slice lets C.5 wrap `globals` without a follow-up reshape on
     /// `serve_runtime` if a future runtime verb gains an async leg.
     serve_runtime: Option<Rc<dyn ServeRuntime>>,
+    native_events: crate::native_events::NativeEvents,
     /// The entry script's provenance — what `script_version()` returns.
     /// Lives in `globals`, so a `require`d module (same evaluator) and every
     /// per-invocation handler activation read the ENTRY script's record,
@@ -3702,6 +3736,7 @@ impl EvaluatorGlobals {
             bus_call_handler: None,
             shell_handler: None,
             serve_runtime: None,
+            native_events: crate::native_events::NativeEvents::default(),
             script_provenance: None,
             capability_policy: None,
             arity_strict: false,
@@ -4399,6 +4434,12 @@ impl Evaluator {
         self.globals.borrow_mut().serve_runtime = Some(runtime);
     }
 
+    /// Retire this generation only AFTER its handler drain. Also called on a
+    /// rejected reload candidate; queued records can never enter its successor.
+    pub fn close_native_events(&mut self) {
+        self.globals.borrow_mut().native_events.close();
+    }
+
     /// Install the entry script's provenance for `script_version()`. The
     /// CLI calls this once per evaluator it runs a script in; an embedder
     /// that never calls it gets nil from `script_version()`.
@@ -5036,6 +5077,7 @@ impl Evaluator {
     ///     dispatch (future: reachable once `off` lands; today the
     ///     registry is append-only, so this branch is future-proofing)
     pub async fn run_event_pump(&mut self) -> MixResult<()> {
+        let _native_consumer = self.globals.borrow().native_events.enter_pump()?;
         tracing::info!(
             handler_count = self.handler_count(),
             command_count = self.handler_command_count(),
@@ -5093,10 +5135,11 @@ impl Evaluator {
             // suspended; nothing on the shared globals is held across
             // the yield point.
             let bus_handler = self.globals.borrow().bus_handler.clone();
-            let handler = match bus_handler {
-                Some(h) => h,
-                None => break "no_handler",
-            };
+            let native = self.globals.borrow().native_events.queue.clone();
+            let has_native_sources = self.globals.borrow_mut().native_events.has_sources();
+            if bus_handler.is_none() && !has_native_sources {
+                break "no_handler";
+            }
             // Race the inbound-message wait against a `quit()` wake. A
             // Class C (spawned-task) handler that calls `quit()` runs
             // concurrently while the pump is parked here; without this
@@ -5109,9 +5152,14 @@ impl Evaluator {
             // drop (same property `run_source`'s Ctrl-C select! relies on).
             let quit_notify = self.globals.borrow().quit_notify.clone();
             let event = tokio::select! {
-                biased;
                 _ = quit_notify.notified() => continue,
-                ev = handler.next_incoming() => ev,
+                ev = native.next(None) => Some(ev?),
+                ev = async {
+                    match &bus_handler {
+                        Some(handler) => handler.next_incoming().await,
+                        None => std::future::pending().await,
+                    }
+                } => ev,
             };
 
             match event {
@@ -10801,6 +10849,15 @@ impl Evaluator {
         expr: &'a Expr,
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            if let Some(limit) = self.ctx.time_limit {
+                let deadline = *self
+                    .ctx
+                    .deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + limit);
+                if std::time::Instant::now() >= deadline {
+                    return Err(self.runtime_err("deadline exceeded"));
+                }
+            }
             match expr {
                 Expr::NumberLiteral(n) => Ok(Value::Number(*n)),
                 Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) => {
@@ -10978,6 +11035,103 @@ impl Evaluator {
                         }
                     }
 
+                    if name == "task_start" {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        let [Value::String(command), Value::String(body)] = eval_args.as_slice() else {
+                            return Err(crate::native_events::refusal("TASK_ARGUMENT", "task_start expects command and body strings"));
+                        };
+                        // Only Class C chains can be started from inside a
+                        // dispatch: a synchronous chain would reacquire the
+                        // writer lock held by its caller. Plain entries in a
+                        // mixed chain still run with their own writer permit.
+                        let asynchronous = self.globals.borrow().handlers.get(command)
+                            .is_some_and(|entries| entries.iter().any(|entry| entry.is_async));
+                        if !asynchronous {
+                            return Err(crate::native_events::refusal("TASK_HANDLER", "task_start requires a registered async handler"));
+                        }
+                        self.dispatch_event(IncomingEvent {
+                            command: command.clone(),
+                            headers: BTreeMap::new(),
+                            body: body.clone(),
+                        }).await?;
+                        return Ok(Value::Nil);
+                    }
+                    if matches!(name.as_str(), "fs_watch" | "fs_unwatch" | "fs_wait") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        let Some(Value::String(arg)) = eval_args.first() else {
+                            return Err(crate::native_events::refusal("FS_WATCH_ARGUMENT", "path/handle must be a string"));
+                        };
+                        if name == "fs_watch" {
+                            let opts = crate::fs_watch::Options::parse(eval_args.get(1))?;
+                            let h = self.globals.borrow_mut().native_events.watch(arg, opts)?;
+                            return Ok(Value::String(h));
+                        }
+                        if name == "fs_unwatch" {
+                            self.globals.borrow_mut().native_events.unwatch(arg)?;
+                            return Ok(Value::Nil);
+                        }
+                        if self.globals.borrow().serve_runtime.is_some()
+                            || self.globals.borrow().native_events.pumping() {
+                            return Err(crate::native_events::refusal("FS_WAIT_SERVE", "fs_wait is unavailable in serve mode; use on fs.changed"));
+                        }
+                        let queue = self.globals.borrow().native_events.queue.clone();
+                        let ev = self.await_with_class_c_yield(queue.next(Some(arg))).await??;
+                        return Ok(parse_event_args(&ev.body));
+                    }
+                    if matches!(name.as_str(), "net_watch" | "net_unwatch" | "net_state"
+                        | "audio_watch" | "audio_unwatch" | "audio_state") {
+                        self.check_capability(name)?;
+                        self.check_builtin_arity(name, eval_args.len())?;
+                        return match name.as_str() {
+                            "net_watch" => {
+                                let groups = crate::desktop_events::net_groups(eval_args.first())?;
+                                let h = self.globals.borrow_mut().native_events.net_watch(groups)?;
+                                Ok(Value::String(h))
+                            }
+                            "audio_watch" => {
+                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), true)?;
+                                let h = self.globals.borrow_mut().native_events.audio_watch(opts)?;
+                                Ok(Value::String(h))
+                            }
+                            "net_unwatch" | "audio_unwatch" => {
+                                let family = if name == "net_unwatch" { "net" } else { "audio" };
+                                let Some(Value::String(h)) = eval_args.first() else {
+                                    return Err(crate::native_events::refusal(
+                                        &format!("{}_WATCH_ARGUMENT", family.to_uppercase()),
+                                        "handle must be a string",
+                                    ));
+                                };
+                                self.globals.borrow_mut().native_events.source_unwatch(family, h)?;
+                                Ok(Value::Nil)
+                            }
+                            "net_state" => Ok(crate::native_events::json_value(crate::desktop_events::net_state()?)),
+                            _ => {
+                                let opts = crate::desktop_events::AudioOptions::parse(eval_args.first(), false)?;
+                                Ok(crate::native_events::json_value(crate::desktop_events::audio_state(&opts)?))
+                            }
+                        };
+                    }
+                    if name == "spawn" && matches!(eval_args.first(), Some(Value::List(_))) {
+                        self.check_capability(name)?;
+                        return crate::builtins::spawn_argv_native(eval_args, Some(&mut self.globals.borrow_mut().native_events))
+                            .map(|v| v.unwrap_or(Value::Nil));
+                    }
+                    if matches!(name.as_str(), "kill" | "process_alive") && !eval_args.is_empty() {
+                        self.check_capability(name)?;
+                        let pid = crate::builtins::pid_int_arg(name, "pid", &eval_args[0])?;
+                        let signal = if name == "process_alive" { 0 } else {
+                            match eval_args.get(1) {
+                                Some(v) => crate::builtins::pid_int_arg(name, "signal", v)?,
+                                None => 15,
+                            }
+                        };
+                        if pid > 0 && let Some(ok) = self.globals.borrow().native_events.signal_child(pid as u32, signal) {
+                            return Ok(Value::Bool(ok));
+                        }
+                    }
+
                     // Async builtins (must be handled before sync builtins)
                     if name == "sleep" {
                         self.check_capability(name)?; // Knob A
@@ -11006,7 +11160,7 @@ impl Evaluator {
                             // so cancellation arrives by dropping this future.
                             let no_handlers = {
                                 let g = self.globals.borrow();
-                                g.handlers.is_empty() || g.bus_handler.is_none()
+                                g.handlers.is_empty()
                             };
                             if no_handlers {
                                 tokio::time::sleep(duration).await;
@@ -11095,17 +11249,6 @@ impl Evaluator {
                                     return Ok(Value::Nil);
                                 }
 
-                                if transport_closed {
-                                    // Transport is dead — finish the remaining
-                                    // sleep as a plain timer with no yield
-                                    // point. No more polling. The script may
-                                    // not use events at all, and the main body
-                                    // depends on the sleep duration being
-                                    // honored; do NOT return early here.
-                                    tokio::time::sleep_until(deadline).await;
-                                    return Ok(Value::Nil);
-                                }
-
                                 // WS3-C.3 clone-out: hold an
                                 // `Rc<dyn BusHandler>` clone in a local
                                 // for the select!. Nothing on
@@ -11134,17 +11277,25 @@ impl Evaluator {
                                 // properties silently breaks the select! — read
                                 // the comments, don't just rearrange the code.
                                 let handler = { self.globals.borrow().bus_handler.clone() };
-                                let Some(handler) = handler else {
-                                    // Handler vanished between the Some-check
-                                    // above and this clone (an embedder tore
-                                    // down Bus mid-sleep). Degrade to the
-                                    // plain timer rather than panicking.
-                                    tokio::time::sleep_until(deadline).await;
-                                    return Ok(Value::Nil);
+                                let native = self.globals.borrow().native_events.queue.clone();
+                                let families = {
+                                    let g = self.globals.borrow();
+                                    crate::native_events::Families {
+                                        filesystem: g.handlers.contains_key("fs.changed"),
+                                        children: g.handlers.contains_key("proc.exited"),
+                                        net: g.handlers.contains_key("net.changed"),
+                                        audio: g.handlers.contains_key("audio.changed"),
+                                    }
                                 };
                                 let outcome: SleepOutcome = tokio::select! {
                                     _ = tokio::time::sleep_until(deadline) => SleepOutcome::Deadline,
-                                    event = handler.next_incoming() => SleepOutcome::Event(event),
+                                    event = native.next_selected(None, families), if families.any() => SleepOutcome::Event(Some(event?)),
+                                    event = async {
+                                        match &handler {
+                                            Some(h) if !transport_closed => h.next_incoming().await,
+                                            _ => std::future::pending().await,
+                                        }
+                                    } => SleepOutcome::Event(event),
                                 };
 
                                 match outcome {
@@ -11168,13 +11319,10 @@ impl Evaluator {
                                         // Loop re-enters select with same deadline.
                                     }
                                     SleepOutcome::Event(None) => {
-                                        // Transport closed mid-sleep. Transition
-                                        // to plain-sleep mode for the remainder.
-                                        // The next iteration will observe the
-                                        // flag and switch paths. Do not return
-                                        // here — the main body may depend on
-                                        // the sleep duration being honored
-                                        // regardless of event-stream liveness.
+                                        // Disable only the closed transport arm.
+                                        // Native sources remain live until the
+                                        // original deadline, without a closed-
+                                        // receiver busy loop or an extended sleep.
                                         transport_closed = true;
                                     }
                                 }
@@ -16201,5 +16349,89 @@ mod event_args_tests {
             }
             other => panic!("expected Map, got {other:?}"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "tokio-sleep", feature = "json"))]
+mod local_task_tests {
+    use super::*;
+
+    fn run(test: impl std::future::Future<Output = ()>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time().build().unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, test);
+    }
+
+    async fn settle(eval: &Evaluator) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while eval.class_c_task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("local tasks complete without a broker");
+    }
+
+    #[test]
+    fn local_tasks_serialize_restart_commits_and_read_state_after_wait() {
+        run(async {
+            let mut eval = Evaluator::new();
+            // No BusHandler: all scheduling and deadlines must stay local.
+            eval.execute_script_source(r#"
+                $state = {a:{enabled:true,pid:nil}, b:{enabled:true,pid:nil}}
+                on restart async
+                  sleep(0.01)
+                end
+                on restart
+                  $name = $event.args.name
+                  if not $state[$name].enabled then return end
+                  $copy = $state
+                  -- Stand in for start's host RPC while holding the writer.
+                  sleep(0.01)
+                  $copy[$name].pid = $event.args.pid
+                  $state = $copy
+                end
+                on disable
+                  $state.a.enabled = false
+                end
+                on retire
+                  task_start("restart", "{\"name\":\"a\",\"pid\":101}")
+                  task_start("restart", "{\"name\":\"b\",\"pid\":102}")
+                end
+            "#).await.unwrap();
+            let event = |command: &str| IncomingEvent {
+                command: command.into(), headers: BTreeMap::new(), body: "{}".into(),
+            };
+            eval.dispatch_event(event("retire")).await.unwrap();
+            settle(&eval).await;
+            eval.execute_script_source(r#"
+                if $state.a.pid != 101 or $state.b.pid != 102 then
+                  raise("TEST", "lost a concurrent retirement")
+                end
+                $state.a.pid = nil
+                task_start("restart", "{\"name\":\"a\",\"pid\":103}")
+            "#).await.unwrap();
+            tokio::task::yield_now().await;
+            eval.dispatch_event(event("disable")).await.unwrap();
+            settle(&eval).await;
+            eval.execute_script_source(r#"
+                if $state.a.enabled or $state.a.pid != nil or $state.b.pid != 102 then
+                  raise("TEST", "restart overwrote disable or sibling")
+                end
+            "#).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn local_task_requires_async_handler_and_is_shutdown_visible() {
+        run(async {
+            let mut eval = Evaluator::new();
+            eval.execute_script_source("on plain\nend\non clock async\n sleep(3600)\nend").await.unwrap();
+            for source in ["task_start(\"plain\", \"{}\")", "task_start(\"absent\", \"{}\")", "task_start(1, \"{}\")"] {
+                assert!(eval.execute_script_source(source).await.is_err(), "{source}");
+            }
+            eval.execute_script_source("task_start(\"clock\", \"{}\")").await.unwrap();
+            assert_eq!(eval.class_c_task_count(), 1);
+            eval.drain_class_c_for_shutdown(std::time::Duration::ZERO, false).await;
+            assert_eq!(eval.class_c_task_count(), 0);
+        });
     }
 }

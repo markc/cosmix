@@ -1,0 +1,431 @@
+-- Deterministic extraction gate. --record refreshes the public captures.
+-- Set the process timezone before any date conversion or module loading.
+export TZ = "UTC"
+$root = dirname(dirname(dirname(dirname(dirname(realpath($0))))))
+$fixtures = dirname(realpath($0)) .. "/fixtures/scenes"
+$old = require("fixtures/scenes/old-builders.mix")
+$models = require($root .. "/share/scenes/lib/models.mix")
+$runtime = require($root .. "/share/scenes/lib/runtime.mix")
+$record = contains(args(), "--record")
+fn check($ok, $message)
+  if not $ok then raise("SCENE_TEMPLATE_TEST", $message) end
+end
+check(date_format(0, "%z") == "+0000", "UTC timezone was not applied")
+for each $name in ["launcher", "calendar", "notes"]
+  $directory = $root .. "/share/scenes/" .. $name
+  $metadata = data_parse(read_file($directory .. "/template.conf.mix"))
+  check($metadata.name == $name and $metadata.behaviour == "behaviour.mix", "strict metadata: " .. $name)
+  $source = read_file($directory .. "/scene.mix")
+  $nodes = data_parse(before(after($source, "```mix\n"), "\n```"))
+  check($nodes.root.widget == "column", "strict static document: " .. $name)
+  if $name == "calendar" then
+    $cells = 0
+    for each $id in keys($nodes)
+      if re_match($id, "^d_[0-5]_[0-6]$") then $cells = $cells + 1 end
+    end
+    check($cells == 42, "six-by-seven grid is authored directly")
+  end
+end
+
+-- The captured builder bodies must still be the actual unchanged builders.
+$original = read_file($root .. "/src/desktop/scripts/quoin-panel.mix")
+$copied = read_file($fixtures .. "/old-builders.mix")
+for each $name in ["launcher", "calendar", "notes"]
+  $body = before(after($original, "fn " .. $name .. "_doc()\n"), "\n-- ──")
+  $signature = $name == "calendar" ? "($state, $fixed_time)" : "($state)"
+  $copy = after($copied, "fn " .. $name .. "_doc" .. $signature .. "\n")
+  $copy = before($copy, "\nfn ") ?? $copy
+  $body = replace($body, "$now = time()", "$now = $fixed_time")
+  check(trim($body) == trim($copy), "legacy builder body drift: " .. $name)
+end
+-- The panel builder and its status-icon helper, likewise.
+$body = replace(before(after($original, "fn panel_doc()\n"), "\n-- ──"), "$now = time()", "$now = $fixed_time")
+$copy = before(after($copied, "fn panel_doc($state, $fixed_time)\n"), "\nfn ") ?? after($copied, "fn panel_doc($state, $fixed_time)\n")
+check(trim($body) == trim($copy), "legacy builder body drift: panel")
+$body = before(after($original, "fn status_icon($name, $fallback)\n"), "\nend\n")
+$copy = before(after($copied, "fn status_icon($name, $fallback)\n"), "\nend\n")
+check(trim($body) == trim($copy), "legacy builder body drift: status_icon")
+
+$base = {apps: [], query: "", category: "", notes: [], cal_offset: 0}
+$fixed = date_parse("2024-02-29T12:05:07Z")
+$icons = {"example-icon": "/usr/share/icons/example.svg"}
+$cases = [
+  {id: "launcher-empty", name: "launcher", input: $base, at: $fixed},
+  {id: "notes-empty", name: "notes", input: $base, at: $fixed},
+  {id: "calendar-leap", name: "calendar", input: $base, at: $fixed}
+]
+$filtered = $base
+$filtered.query = "edit"
+$filtered.category = "Development"
+$filtered.apps = [
+  {id: "example-editor.desktop", name: "Example Editor", generic_name: "Text editor", icon: "example-icon"},
+  {id: "fallback.desktop", name: "Fallback", comment: "No icon", icon: "missing"}
+]
+push($cases, {id: "launcher-filtered", name: "launcher", input: $filtered, at: $fixed})
+$many = $base
+$apps = []
+for $i = 0 to 504
+  push($apps, {id: "app-" .. to_string($i), name: "Application " .. to_string($i), icon: ""})
+end
+$many.apps = $apps
+push($cases, {id: "launcher-cap", name: "launcher", input: $many, at: $fixed})
+$many = $base
+$notes = []
+for $i = 1 to 55
+  push($notes, {id: to_string($i), app: $i == 55 ? "" : "Example", summary: "Notice " .. to_string($i), body: "Public fixture", created_at: to_string($i)})
+end
+$many.notes = $notes
+push($cases, {id: "notes-full", name: "notes", input: $many, at: $fixed})
+$year = $base
+$year.cal_offset = 1
+push($cases, {id: "calendar-year", name: "calendar", input: $year, at: date_parse("2026-12-31T23:59:00Z")})
+$century = $base
+push($cases, {id: "calendar-century", name: "calendar", input: $century, at: date_parse("2100-02-28T00:00:00Z")})
+
+$manifest = []
+for each $case in $cases
+  $input = $case.input
+  $doc = $old.capture($case.name, $input, $case.at, $icons)
+  if $case.name == "launcher" then
+    $model = $models.launcher($input.apps, $input.query, $input.category, $icons)
+  elif $case.name == "calendar" then
+    $model = $models.calendar($case.at, $input.cal_offset)
+  else
+    $model = $models.notes($input.notes)
+  end
+  if $record then
+    write_file($fixtures .. "/" .. $case.id .. ".scene.mix", $doc)
+    write_file($fixtures .. "/" .. $case.id .. ".model.json", json_encode($model) .. "\n")
+  else
+    check(read_file($fixtures .. "/" .. $case.id .. ".scene.mix") == $doc, "exact old document: " .. $case.id)
+    check(deep_eq(json_parse(read_file($fixtures .. "/" .. $case.id .. ".model.json")), $model), "model capture: " .. $case.id)
+  end
+  push($manifest, {id: $case.id, name: $case.name})
+end
+if $record then write_file($fixtures .. "/cases.json", json_encode($manifest) .. "\n") end
+check(length($models.launcher($apps, "", "", {}).rows) == 500, "launcher cap")
+$note_model = $models.notes($notes)
+check(length($note_model.rows) == 50 and $note_model.rows[0].id == "55" and $note_model.rows[49].id == "6", "newest-first 50-row cap")
+check($note_model.rows[0].cells[0] == "Notification", "empty application fallback")
+check($models.notes([]).empty, "notification empty state")
+check($runtime.item_id({args: {item: {id: "app@with:punctuation"}}}) == "app@with:punctuation", "item payload is not parsed from a generated node")
+check($runtime.item_id({item: {id: "wrong"}, args: {node: "fake@id"}}) == nil, "only event.args.item is accepted")
+check(not $runtime.template_capable([]), "older host refused")
+check($runtime.template_capable([{path: "flow", enum: ["vertical", "horizontal"]}, {path: "hidden", type: "bool"}]), "capability check uses schema")
+check($runtime.failure("example", "Example").value.error_code == "example", "unified refusal")
+
+-- ── panel: the static template + model against the exact legacy builder ──
+-- Panel cases live in their own manifest: the Rust renderer gate reads
+-- cases.json and compares node IDs, while the panel's repeated buttons move
+-- from generated static nodes into horizontal-flow list instances. This gate
+-- instantiates the template itself (bindings evaluated by the real Mix
+-- interpreter against $model/$item) and compares the visible trees by shape.
+$taskbar = require($root .. "/share/scenes/lib/taskbar.mix")
+$panel_source = read_file($root .. "/share/scenes/panel/scene.mix")
+$panel_meta = data_parse(read_file($root .. "/share/scenes/panel/template.conf.mix"))
+check($panel_meta.name == "panel" and $panel_meta.behaviour == "behaviour.mix", "strict metadata: panel")
+$MIX = realpath("/proc/self/exe")
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-panel-template.XXXXXXXX"]))
+
+fn fence($source)
+  return data_parse(before(after($source, "```mix\n"), "\n```"))
+end
+fn header($source, $key)
+  for each $line in split(before(after($source, "---\n"), "\n---"), "\n")
+    if starts_with($line, $key .. ": ") then return after($line, $key .. ": ") end
+  end
+  return nil
+end
+fn bound($value)
+  return type($value) == "string" and starts_with($value, "= ")
+end
+-- Every node reachable from a list's row template (instantiated per item).
+fn template_ids($nodes)
+  $queue = []
+  for each $id, $node in $nodes
+    if $node.widget == "list" then push($queue, $node.row) end
+  end
+  return subtree($nodes, $queue)
+end
+fn subtree($nodes, $queue)
+  $out = []
+  while length($queue) > 0
+    $id = $queue[0]
+    $queue = slice($queue, 1)
+    if not contains($out, $id) then
+      push($out, $id)
+      for each $child in $nodes[$id].children ?? []
+        push($queue, $child)
+      end
+    end
+  end
+  return $out
+end
+-- One interpreter run per pass: [key, item index or -1, expression] rows.
+fn evaluate($dir, $model, $items, $jobs)
+  write_file($dir .. "/data.json", json_encode({model: $model, items: $items}))
+  $src = "$d = json_parse(read_file(" .. json_encode($dir .. "/data.json") .. "))\n$model = $d.model\n$item = nil\n$out = {}\n"
+  for each $job in $jobs
+    $src = $src .. "$item = " .. ($job[1] < 0 ? "nil" : "$d.items[" .. to_string($job[1]) .. "]") .. "\n"
+    $src = $src .. "$out[" .. json_encode($job[0]) .. "] = (" .. after($job[2], "= ") .. ")\n"
+  end
+  write_file($dir .. "/eval.mix", $src .. "print(json_encode($out))\n")
+  $run = run_argv([$MIX, $dir .. "/eval.mix"], {timeout: 60})
+  check($run.ok, "binding evaluation failed: " .. $run.stderr)
+  return json_parse(trim($run.stdout))
+end
+fn resolve_template($source, $model, $dir)
+  $nodes = fence($source)
+  $templated = template_ids($nodes)
+  $jobs = []
+  for each $id, $node in $nodes
+    if not contains($templated, $id) then
+      for each $port, $value in $node
+        if bound($value) then push($jobs, [$id .. "." .. $port, -1, $value]) end
+      end
+    end
+  end
+  $values = evaluate($dir, $model, [], $jobs)
+  $items = []
+  $jobs = []
+  for each $id, $node in $nodes
+    if $node.widget == "list" then
+      $rows = bound($node.rows) ? $values[$id .. ".rows"] : $node.rows
+      $k = 0
+      for each $row in $rows ?? []
+        push($items, $row)
+        for each $tid in subtree($nodes, [$node.row])
+          for each $port, $value in $nodes[$tid]
+            if bound($value) then push($jobs, [$id .. "#" .. to_string($k) .. "." .. $tid .. "." .. $port, length($items) - 1, $value]) end
+          end
+        end
+        $k = $k + 1
+      end
+    end
+  end
+  for each $key, $value in evaluate($dir, $model, $items, $jobs)
+    $values[$key] = $value
+  end
+  return {nodes: $nodes, values: $values}
+end
+-- The visible tree by shape: family, literal/evaluated ports and visible
+-- children. Hidden nodes vanish (Display::None). A horizontal-flow list is a
+-- row of its instances; the owning list's click handler applies to each
+-- instance root, exactly as the renderer routes repeated-row clicks.
+fn visible($id, $nodes, $values, $prefix, $click)
+  $node = $nodes[$id]
+  $ports = {}
+  for each $port, $value in $node
+    if $port == "widget" or $port == "children" then continue end
+    if bound($value) then $value = $values[$prefix .. $id .. "." .. $port] end
+    if $value != nil then $ports[$port] = $value end
+  end
+  if $ports.hidden == true then return nil end
+  $ports = delete($ports, "hidden")
+  if $click != nil then $ports.on_click = $click end
+  $family = $node.widget
+  $children = []
+  if $family == "list" and $ports.flow == "horizontal" then
+    $family = "row"
+    $k = 0
+    for each $row in $ports.rows
+      push($children, visible($ports.row, $nodes, $values, $id .. "#" .. to_string($k) .. ".", $ports.on_click))
+      $k = $k + 1
+    end
+    $ports = {gap: $ports.gap, align: $ports.align}
+  else
+    for each $child in $node.children ?? []
+      $shape = visible($child, $nodes, $values, $prefix, nil)
+      if $shape != nil then push($children, $shape) end
+    end
+  end
+  return {family: $family, ports: $ports, children: $children}
+end
+fn first_difference($a, $b, $path)
+  if deep_eq($a, $b) then return nil end
+  if type($a) != "map" or type($b) != "map" then return $path .. ": " .. json_encode($a) .. " != " .. json_encode($b) end
+  if not deep_eq($a.ports, $b.ports) or $a.family != $b.family or length($a.children) != length($b.children) then
+    return $path .. ": " .. json_encode({family: $a.family, ports: $a.ports, children: length($a.children)}) .. " != " .. json_encode({family: $b.family, ports: $b.ports, children: length($b.children)})
+  end
+  for $i = 0 to length($a.children) - 1
+    $d = first_difference($a.children[$i], $b.children[$i], $path .. "/" .. to_string($i))
+    if $d != nil then return $d end
+  end
+  return nil
+end
+
+-- Sanitised public fixtures: example icon paths, invented windows/tray.
+fn themed_all()
+  $out = {}
+  for each $name in $models.PANEL_THEMED_ICONS
+    $out[$name] = "/usr/share/icons/example-dark/" .. $name .. ".svg"
+  end
+  return $out
+end
+fn window_row($id, $generation, $ws, $title, $app, $focused, $minimized)
+  $w = {id: $id, generation: $generation, band: "normal", title: $title, app_id: $app, focused: $focused, minimized: $minimized}
+  if $ws != nil then $w.workspace = $ws end
+  return $w
+end
+fn notes_of($n)
+  $out = []
+  for $i = 1 to $n
+    push($out, {id: to_string($i), app: "Example", summary: "Notice", body: "", created_at: to_string($i)})
+  end
+  return $out
+end
+$raw_busy = [
+  window_row(12, 3, 2, "Example Editor — notes.txt", "example.editor", true, false),
+  window_row(4, 1, 2, "Terminal", "example-term", false, false),
+  window_row(9, 7, 2, "A minimised window with a deliberately long title that the panel shortens", "Example.Viewer", false, true),
+  window_row(20, 1, 1, "Other workspace", "example.editor", false, false),
+  window_row(30, 2, nil, "No workspace field", nil, false, false),
+  {id: 40, generation: 1, band: "overlay", title: "Overlay", app_id: "example.overlay", focused: false, minimized: false}
+]
+$icons_busy = {themed: themed_all(), plain: {"example-tray": "/usr/share/icons/example/tray.svg"},
+  windows: {"example.editor": "/usr/share/icons/example/editor.svg", "Example.Viewer": "/usr/share/icons/example/viewer.svg"}}
+$tray_busy = [{key: "i1", icon_name: "example-tray", title: "Example tray"}, {key: "i2", icon_name: "missing-tray", title: "Updates"}]
+$partial = {themed: {"notifications": "/usr/share/icons/example-dark/notifications.svg", "audio-card": "/usr/share/icons/example-dark/audio-card.svg", "start-here": "/usr/share/icons/example-dark/start-here.svg"}, plain: {}, windows: {}}
+$many = []
+for $i = 1 to 55
+  push($many, window_row($i, 1, 1, "Window " .. to_string($i), "example.app", $i == 3, $i % 7 == 0))
+end
+$panel_cases = [
+  {id: "panel-empty", at: "2024-02-29T00:00:00Z", raw: [], ws_count: 1, ws_current: 1, tray: [], notes: 0,
+    vol: {ok: false, level: 0, muted: false}, net: {up: false, wireless: false}, open: {}, peeked: false,
+    icons: {themed: {}, plain: {}, windows: {}}},
+  {id: "panel-busy", at: "2024-02-29T21:05:07Z", raw: $raw_busy, ws_count: 3, ws_current: 2, tray: $tray_busy, notes: 3,
+    vol: {ok: true, level: 50, muted: false}, net: {up: true, wireless: false}, open: {launcher: true}, peeked: true,
+    icons: $icons_busy},
+  {id: "panel-tray-change", at: "2024-02-29T21:06:00Z", raw: $raw_busy, ws_count: 3, ws_current: 2,
+    tray: [$tray_busy[1], {key: "i3", icon_name: "example-tray", title: "Example sync"}], notes: 12,
+    vol: {ok: true, level: 0, muted: true}, net: {up: true, wireless: true}, open: {calendar: true}, peeked: false,
+    icons: $partial},
+  {id: "panel-cap", at: "2026-12-31T23:59:00Z", raw: $many, ws_count: 1, ws_current: 1, tray: [], notes: 0,
+    vol: {ok: true, level: 80, muted: false}, net: {up: false, wireless: false}, open: {notes: true}, peeked: false,
+    icons: $icons_busy}
+]
+$panel_manifest = []
+$panel_models = {}
+for each $case in $panel_cases
+  $at = date_parse($case.at)
+  $windows = $taskbar.normal_windows($case.raw)
+  $legacy = {windows: $windows, ws_count: $case.ws_count, ws_current: $case.ws_current, tray: $case.tray,
+    notes: notes_of($case.notes), vol: $case.vol, net: $case.net,
+    launcher_open: $case.open.launcher ?? false, calendar_open: $case.open.calendar ?? false,
+    notes_open: $case.open.notes ?? false, peeked: $case.peeked ? [{id: 1, generation: 1}] : []}
+  $snap = {windows: $windows, ws_count: $case.ws_count, ws_current: $case.ws_current, tray: $case.tray,
+    notes_count: $case.notes, vol: $case.vol, net: $case.net, open: $case.open, peeked: $case.peeked}
+  $doc = $old.capture("panel", $legacy, $at, $case.icons)
+  $model = $models.panel($snap, $case.icons, $at)
+  $panel_models[$case.id] = $model
+  if $record then
+    write_file($fixtures .. "/" .. $case.id .. ".scene.mix", $doc)
+    write_file($fixtures .. "/" .. $case.id .. ".model.json", json_encode($model) .. "\n")
+  else
+    check(read_file($fixtures .. "/" .. $case.id .. ".scene.mix") == $doc, "exact old document: " .. $case.id)
+    check(deep_eq(json_parse(read_file($fixtures .. "/" .. $case.id .. ".model.json")), $model), "model capture: " .. $case.id)
+  end
+  -- Same mount, same page, and the same visible tree by shape.
+  check(header($panel_source, "window") != nil and deep_eq(json_parse(header($panel_source, "window")), json_parse(header($doc, "window"))), "panel mount unchanged: " .. $case.id)
+  check(header($panel_source, "name") == "panel" and header($panel_source, "citizen") == "scene-panel", "panel page id scene-panel and behaviour routing")
+  $old_nodes = fence($doc)
+  $old_tree = visible("root", $old_nodes, {}, "", nil)
+  $new = resolve_template($panel_source, $model, $tmp)
+  $new_tree = visible("root", $new.nodes, $new.values, "", nil)
+  $diff = first_difference($old_tree, $new_tree, "root")
+  check($diff == nil, "visible panel tree differs (" .. $case.id .. "): " .. to_string($diff))
+  push($panel_manifest, {id: $case.id, name: "panel"})
+end
+if $record then write_file($fixtures .. "/panel-cases.json", json_encode($panel_manifest) .. "\n") end
+
+-- The template's default model evaluates every binding (no nil access) and
+-- renders an empty, clockless panel until the behaviour's first model.
+$default = resolve_template($panel_source, json_parse(header($panel_source, "model")), $tmp)
+$empty = visible("root", $default.nodes, $default.values, "", nil)
+check(length($empty.children) == 9 and length($empty.children[2].children) == 0 and length($empty.children[4].children) == 0, "default model: no pager/task instances and no tray")
+check(deep_eq(sort(keys(json_parse(header($panel_source, "model")))), sort(keys($panel_models["panel-busy"]))), "default model declares every published key")
+
+-- Caps, fallbacks and stable IDs.
+$busy = $panel_models["panel-busy"]
+check(length($panel_models["panel-cap"].tasks) == 50, "task cap")
+check(deep_eq(map($busy.tasks, fn($x) = $x.id), ["t_4", "t_9", "t_12", "t_30"]), "current-workspace tasks in id order; overlay and other workspaces excluded")
+check(not $busy.tasks[3].has_icon and $busy.tasks[0].has_icon == false and $busy.tasks[2].has_icon, "window icon fallback to the spacer")
+check($busy.tray[1].initial == "U" and not $busy.tray[1].has_icon, "tray initial fallback")
+$changed = $panel_models["panel-tray-change"]
+check($changed.tray[0].id == $busy.tray[1].id and $changed.tray[1].id == "tr_i3", "tray change keeps surviving item ids")
+check($changed.notes.icon == $partial.themed.notifications and $changed.volume.icon == $partial.themed["audio-card"] and not $changed.network.has_icon, "status icon fallback name, then text stand-in")
+check($changed.launcher.icon == $partial.themed["start-here"], "launcher icon fallback name")
+check($panel_models["panel-empty"].clock.time == "12:00 am" and $busy.clock.time == "09:05 pm" and $busy.clock.date == "Thu 29 Feb", "displayed time from the fixed clock")
+
+-- Real click payloads: the renderer sends the owning list's node and the
+-- complete published row as item (template_tests.rs pins that shape).
+fn click($list, $item)
+  return {args: {scene: "panel", node: $list, kind: "click", item: $item}}
+end
+$fresh = $taskbar.normal_windows($raw_busy)
+$focus = $taskbar.task_action($fresh, $runtime.event_args(click("tasks", $busy.tasks[0])).item)
+check($focus.ok and $focus.verb == "comp.window.focus" and deep_eq($focus.args, {id: 4, generation: 1}), "unfocused task focuses with its generation")
+$restore = $taskbar.task_action($fresh, $runtime.event_args(click("tasks", $busy.tasks[1])).item)
+check($restore.verb == "comp.window.restore" and $restore.args.generation == 7, "minimised task restores")
+$minimize = $taskbar.task_action($fresh, $runtime.event_args(click("tasks", $busy.tasks[2])).item)
+check($minimize.verb == "comp.window.minimize" and $minimize.args.id == 12, "focused task minimises")
+$reused = $taskbar.normal_windows([window_row(12, 4, 2, "Recycled id", "example.editor", true, false)])
+check($taskbar.task_action($reused, $busy.tasks[2]).error_code == "stale_window", "a recycled window id with a new generation is refused")
+check($taskbar.task_action([], $busy.tasks[2]).error_code == "stale_window", "a closed window is refused")
+check($taskbar.task_action($fresh, {id: "t_4"}).error_code == "invalid_args", "a row without window/generation is refused")
+check($taskbar.workspace_index($runtime.event_args(click("pager", $busy.workspaces[2])).item) == 3, "workspace click index")
+check($taskbar.workspace_index({index: 0}) == nil and $taskbar.workspace_index({index: 1.5}) == nil, "bad workspace index refused")
+check($taskbar.tray_key($runtime.event_args(click("tray", $changed.tray[1])).item) == "i3", "tray click resolves the adapter key")
+check($taskbar.tray_key({key: ""}) == nil, "empty tray key refused")
+$marks = $taskbar.peek_candidates($fresh, 2)
+check(deep_eq($marks, [{id: 4, generation: 1}, {id: 12, generation: 3}, {id: 30, generation: 2}]), "peek minimises the visible windows of this workspace")
+$after = [window_row(4, 1, 2, "Terminal", "example-term", false, true), window_row(12, 5, 2, "Replaced", "example.editor", false, true)]
+check(deep_eq($taskbar.peek_restores($after, $marks), [{id: 4, generation: 1}]), "peek restores only same-generation windows")
+remove_dir($tmp)
+-- Stage B settings.appearance. The snapshot/model fixtures are shared with
+-- Quoin's Rust test (settings.rs), which checks shell.settings.get and the
+-- built-in fallback model against the same two files, so this Mix model
+-- builder and the fallback cannot drift apart.
+$directory = $root .. "/share/scenes/settings"
+$metadata = data_parse(read_file($directory .. "/template.conf.mix"))
+check($metadata.name == "quoin-settings" and $metadata.behaviour == "behaviour.mix", "strict metadata: settings")
+$source = read_file($directory .. "/scene.mix")
+$header = before(after($source, "---\n"), "\n---\n")
+check(contains($header, "\nname: quoin-settings\n") and contains($header, "\ncitizen: scene-quoin-settings\n"), "settings keeps scene name and behaviour routing")
+$window = json_parse(before(after($header, "\nwindow: "), "\n"))
+check($window.panel == "settings.appearance" and $window.edge == "right", "settings keeps its declared page")
+$default_model = json_parse(after($header, "\nmodel: "))
+$nodes = data_parse(before(after($source, "```mix\n"), "\n```"))
+check($nodes.root.widget == "column" and length(keys($nodes)) == 64, "strict static settings document")
+$snapshot = json_parse(read_file($fixtures .. "/settings-forest-fade.snapshot.json"))
+$expected = json_parse(read_file($fixtures .. "/settings-forest-fade.model.json"))
+check($models.settings_valid($snapshot), "fixture snapshot is valid")
+$model = $models.settings($snapshot)
+check(deep_eq($model, $expected), "settings model capture: " .. json_encode($model))
+-- Every model path a node binds exists in both the template default and the live model.
+for each $id, $node in $nodes
+  for each $port, $value in $node
+    if type($value) == "string" and starts_with($value, '= $model.') then
+      $path = split(after($value, '= $model.'), ".")
+      $live = $model
+      $fallback = $default_model
+      for each $key in $path
+        check(type($live) == "map" and has_key($live, $key), "live model binds " .. $id .. "." .. $port)
+        check(type($fallback) == "map" and has_key($fallback, $key), "default model binds " .. $id .. "." .. $port)
+        $live = $live[$key]
+        $fallback = $fallback[$key]
+      end
+    end
+  end
+end
+-- The fallback's click routing is the template's: every control names a settings verb.
+for each $id in ["scheme_ocean", "scheme_mono", "motion_slide", "size_top_minus", "size_right_plus"]
+  check(starts_with($nodes[$id].on_click, "shell.settings."), "control routes to a settings verb: " .. $id)
+end
+check($nodes.motion_fade.on_click == nil, "fade stays unselectable")
+$bad = $snapshot
+$bad.sizes = {top: 1}
+check(not $models.settings_valid($bad), "partial sizes refused")
+check(not $models.settings_valid(nil) and not $models.settings_valid({scheme: "ocean"}), "malformed snapshot refused")
+print("scene-template-test: exact captures, models, caps, payloads and capabilities OK")

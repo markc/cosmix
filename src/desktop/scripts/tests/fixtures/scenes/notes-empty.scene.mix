@@ -1,0 +1,15 @@
+---
+scene: 1
+name: notes
+citizen: scene-fixture
+window: {"chrome":false,"edge":"right","kind":"edge","title":"Notifications","w":380}
+---
+```mix
+root: {"children":["nh","n_empty"],"fill":true,"gap":10,"padding":16,"widget":"column"}
+nh: {"align":"center","children":["nh_t","nh_fill","nh_clear"],"gap":8,"widget":"row"}
+nh_t: {"bold":true,"color":"#fcfcfc","size":18,"text":"Notifications","widget":"text"}
+nh_fill: {"widget":"spacer"}
+nh_clear: {"align":"center","background":"#ffffff0f","children":["nh_clear_t"],"height":30,"hover":"#ffffff1a","justify":"center","on_click":"notes_clear","padding":10,"radius":6,"widget":"row"}
+nh_clear_t: {"color":"#fcfcfc","size":12,"text":"Clear all","widget":"text"}
+n_empty: {"color":"#6e7680","size":13,"text":"No new notifications","widget":"text"}
+```

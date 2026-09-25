@@ -14,9 +14,22 @@ pub(crate) const EVALUATION_BUDGET: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 thread_local! {
+    static TEST_EVALUATION_BUDGET: std::cell::Cell<Duration> = const { std::cell::Cell::new(EVALUATION_BUDGET) };
     pub(crate) static COMPILE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EVALUATE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static MODEL_CONVERSION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_evaluation_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> T {
+    struct Restore(Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_EVALUATION_BUDGET.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_EVALUATION_BUDGET.replace(budget));
+    f()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -183,6 +196,12 @@ pub fn reevaluate(
             "model patch path must contain map keys",
         )]);
     }
+    // A sequence of individually small patches must not grow an unbounded
+    // model before conversion/evaluation. The host also bounds authored ports
+    // and metadata together with this model before committing a revision.
+    if serde_json::to_vec(&next.model).map_or(true, |v| v.len() > crate::MAX_DOCUMENT_BYTES) {
+        return Err(vec![Diagnostic::error("model-path", 1, "aggregate model too large")]);
+    }
     let old = tree.clone();
     let mut diagnostics = Vec::new();
     let mut evaluated = Vec::new();
@@ -244,15 +263,46 @@ pub fn template_instantiate(
     model: &JsonValue,
     item: &JsonValue,
 ) -> Result<Node, Diagnostic> {
+    template_instantiate_with(id, node, set, item, &mut TemplateEvaluation::new(model))
+}
+
+/// One aggregate budget for a scene revision, shared by every list and row.
+/// Kept outside renderer resources: Mix values are deliberately thread-local.
+pub struct TemplateEvaluation {
+    model: Value,
+    started: Instant,
+    remaining_nodes: usize,
+}
+
+pub const MAX_TEMPLATE_NODES: usize = 16_384;
+
+impl TemplateEvaluation {
+    pub fn new(model: &JsonValue) -> Self {
+        let started = Instant::now();
+        Self { model: prepare_model(model), started, remaining_nodes: MAX_TEMPLATE_NODES }
+    }
+}
+
+/// Instantiate with a shared model conversion, elapsed-time and work budget.
+pub fn template_instantiate_with(
+    id: &str,
+    node: &Node,
+    set: &BindingSet,
+    item: &JsonValue,
+    evaluation: &mut TemplateEvaluation,
+) -> Result<Node, Diagnostic> {
+    if evaluation.remaining_nodes == 0 || evaluation.started.elapsed() >= EVALUATION_BUDGET {
+        return Err(Diagnostic::warning("binding-eval", node.line, "template instantiation budget exhausted"));
+    }
+    evaluation.remaining_nodes -= 1;
     let mut out = node.clone();
-    let model = prepare_model(model);
-    let started = Instant::now();
-    for (path, binding) in &set.bindings {
-        let Some((binding_id, port)) = path.rsplit_once('.') else {
-            continue;
-        };
+    // Range by node instead of scanning every document binding for every cell.
+    let prefix = format!("{id}.");
+    for (path, binding) in set.bindings.range(prefix.clone()..) {
+        if !path.starts_with(&prefix) { break; }
+        let Some((binding_id, port)) = path.rsplit_once('.') else { continue };
         if binding_id != id { continue; }
-        let value = evaluate_budgeted(binding, &model, Some(item), started, || {})
+        let value = evaluate_budgeted(binding, &evaluation.model, Some(item), evaluation.started, || {})
             .and_then(|v| coerce_port(&v, crate::port_for(&node.family, port)))
             .map_err(|code| {
                 Diagnostic::warning(
@@ -267,6 +317,9 @@ pub fn template_instantiate(
     crate::check_layout_bounds(id, &out, &mut conflicts);
     if let Some(conflict) = conflicts.into_iter().next() {
         return Err(conflict);
+    }
+    if evaluation.started.elapsed() >= EVALUATION_BUDGET {
+        return Err(Diagnostic::warning("binding-eval", node.line, "template instantiation budget exhausted"));
     }
     Ok(out)
 }
@@ -298,7 +351,11 @@ pub(crate) fn evaluate_budgeted(
     started: Instant,
     on_evaluate: impl FnOnce(),
 ) -> Result<Value, String> {
-    let remaining = EVALUATION_BUDGET.checked_sub(started.elapsed())
+    #[cfg(test)]
+    let budget = TEST_EVALUATION_BUDGET.get();
+    #[cfg(not(test))]
+    let budget = EVALUATION_BUDGET;
+    let remaining = budget.checked_sub(started.elapsed())
         .filter(|d| !d.is_zero())
         .ok_or_else(|| "evaluation budget exhausted".to_string())?;
     on_evaluate();
@@ -308,7 +365,9 @@ pub(crate) fn evaluate_budgeted(
     if let Some(item) = item {
         globals.push(("item", to_mix(item)));
     }
-    eval_expr_string(
+    // Mix reuses its thread-local Tokio driver; globals, policy and fuel remain
+    // isolated per expression. The revision budget still covers every row.
+    let result = eval_expr_string(
         &binding.source,
         &globals,
         Some(Rc::new(CategoryAllowList::deny_all())),
@@ -320,7 +379,14 @@ pub(crate) fn evaluate_budgeted(
             ..Default::default()
         },
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    // A final, non-yielding builtin may cross the shared deadline. Checking
+    // only before the next binding would accept that value (or miss exhaustion
+    // entirely on the last binding). Keep the old port instead.
+    if started.elapsed() >= budget {
+        return Err("evaluation budget exhausted".into());
+    }
+    result
 }
 
 pub(crate) fn coerce_port(value: &Value, port: Option<Port>) -> Result<Option<JsonValue>, String> {
@@ -408,7 +474,16 @@ pub(crate) fn set_port(ports: &mut indexmap::IndexMap<String, JsonValue>, port: 
 }
 
 fn apply_model_patch(model: &mut JsonValue, parts: &[&str], value: &JsonValue) -> bool {
-    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+    if parts.is_empty() {
+        if value.is_null() {
+            *model = json!({});
+            return true;
+        }
+        if !value.is_object() { return false; }
+        *model = value.clone();
+        return true;
+    }
+    if parts.iter().any(|p| p.is_empty()) {
         return false;
     }
     if !model.is_object() {
@@ -723,5 +798,32 @@ fn contains_index(expr: &Expr) -> bool {
         Expr::Index { .. } => true,
         Expr::FieldAccess { object, .. } => contains_index(object),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod template_budget_tests {
+    use super::*;
+
+    #[test]
+    fn all_rows_share_work_and_time_limits_and_one_model_conversion() {
+        let doc = crate::parse("---\nscene: 1\nname: budget\ncitizen: test\nmodel: {\"prefix\":\"live \"}\n---\n```mix\nroot: {widget: \"list\", rows: [], row: \"t\", row_height: 20}\nt: {widget: \"text\", text: \"= $model.prefix .. $item.cells[0]\"}\n```\n").unwrap();
+        let tree = crate::resolve(&doc).unwrap();
+        let set = compile(&doc).unwrap();
+        MODEL_CONVERSION_COUNT.with(|n| n.set(0));
+        let mut evaluation = TemplateEvaluation::new(&tree.model);
+        evaluation.remaining_nodes = 2;
+        for value in ["one", "two"] {
+            let node = template_instantiate_with("t", &tree.nodes["t"], &set,
+                &json!({"id":value,"cells":[value]}), &mut evaluation).unwrap();
+            assert_eq!(node.ports["text"], json!(format!("live {value}")));
+        }
+        assert_eq!(MODEL_CONVERSION_COUNT.with(|n| n.get()), 1);
+        assert!(template_instantiate_with("t", &tree.nodes["t"], &set,
+            &json!({"cells":["third"]}), &mut evaluation).is_err());
+        let mut expired = TemplateEvaluation::new(&tree.model);
+        expired.started = Instant::now() - EVALUATION_BUDGET;
+        assert!(template_instantiate_with("t", &tree.nodes["t"], &set,
+            &json!({"cells":["late"]}), &mut expired).is_err());
     }
 }

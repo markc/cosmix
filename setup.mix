@@ -188,6 +188,18 @@ if $want_desktop then
     end
   end
   print(">> installed " .. $dn .. " desktop binaries into " .. $bin)
+  -- Loader/helpers are installed together. Canonical shipped templates stay
+  -- at $COSMIX/share/scenes; they are never copied into user enablement here.
+  install_bin($desktop .. "/scripts/scenes.mix", $bin .. "/scenes.mix")
+  mkdir($bin .. "/lib")
+  for each $helper in ["scenes.mix", "scenes-io.mix"]
+    copy($desktop .. "/scripts/lib/" .. $helper, $bin .. "/lib/" .. $helper .. ".new")
+    rename($bin .. "/lib/" .. $helper .. ".new", $bin .. "/lib/" .. $helper)
+  end
+  if not is_dir($root .. "/share/scenes") then
+    raise("SETUP_SCENES", "checkout is missing share/scenes templates", {})
+  end
+  print(">> scenes loader installed; templates: " .. $root .. "/share/scenes (user scenes remain disabled)")
   -- Desktop launchers use the same installed binary, with no restart sleep.
   $data_home = env("XDG_DATA_HOME")
   if $data_home == "" then
@@ -231,6 +243,15 @@ if $want_system then
       print("setup: sudo install " .. $name .. " failed: " .. $r.stderr)
       exit(1)
     end
+  end
+  if $want_desktop then
+    $_loader_dirs = run_argv_must(["sudo", "install", "-d", "-m", "755", "/opt/cosmix/bin/lib", "/opt/cosmix/share/scenes"])
+    $_loader = run_argv_must(["sudo", "install", "-m", "755", $bin .. "/scenes.mix", "/opt/cosmix/bin/scenes.mix"])
+    for each $helper in ["scenes.mix", "scenes-io.mix"]
+      $_helper = run_argv_must(["sudo", "install", "-m", "644", $bin .. "/lib/" .. $helper, "/opt/cosmix/bin/lib/" .. $helper])
+    end
+    $_templates = run_argv_must(["sudo", "cp", "-a", $root .. "/share/scenes/.", "/opt/cosmix/share/scenes/"])
+    print(">> system scenes templates: /opt/cosmix/share/scenes; set SCENES_TEMPLATES in the unit environment")
   end
   print(">> /opt/cosmix/bin updated. systemd units, polkit rules and sysusers live in")
   print("   " .. $src .. "/_etc — install them with your deploy tooling; this script does not.")

@@ -76,13 +76,14 @@ impl ErrorInfo {
     }
 
     /// The script-visible error map bound to the optional second
-    /// `catch` variable: `{code, message, details, cause, frames}`,
+    /// `catch` variable: `{code, error_code, message, details, cause, frames}`,
     /// frames as `[{kind, function, file, line, column}]`
     /// outermost-to-innermost.
     pub fn to_value(&self) -> crate::value::Value {
         use crate::value::Value;
         let mut m = indexmap::IndexMap::new();
         m.insert("code".to_string(), Value::String(self.code.clone()));
+        m.insert("error_code".to_string(), Value::String(self.code.clone()));
         m.insert("message".to_string(), Value::String(self.message.clone()));
         m.insert("details".to_string(), self.details.clone());
         m.insert(

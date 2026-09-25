@@ -15,6 +15,8 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub mod bindings;
+mod serialize;
+pub use serialize::to_source;
 #[cfg(test)]
 mod binding_tests;
 #[cfg(test)]
@@ -342,7 +344,7 @@ fn schema(f: &str) -> Option<Vec<Port>> {
         p("label", "string", true, None),
         p("on_change", "string", false, None),
     ];
-    static LIST: [Port; 8] = [
+    static LIST: [Port; 10] = [
         p("rows", "list", true, None),
         p("row", "string", true, None),
         pn("row_height", true, Some(0.0)),
@@ -351,6 +353,9 @@ fn schema(f: &str) -> Option<Vec<Port>> {
         p("fill", "bool", false, Some("false")),
         p("hidden_if_empty", "bool", false, Some("false")),
         p("on_click", "string", false, None),
+        // Absence keeps the historical resolved document and VirtualList.
+        p("flow", "string", false, None),
+        p("align", "string", false, None),
     ];
     static IMAGE: [Port; 3] = [
         p("src", "string", true, None),
@@ -372,9 +377,16 @@ fn schema(f: &str) -> Option<Vec<Port>> {
         _ => return None,
     };
     let mut ports = family.to_vec();
+    if f == "list" {
+        ports.iter_mut().find(|p| p.name == "flow").unwrap().enum_values = &["vertical", "horizontal"];
+        ports.iter_mut().find(|p| p.name == "align").unwrap().enum_values = ALIGN;
+    }
     // No defaults here: absence preserves the legacy mapping and canonical
     // resolved documents. Window is edge metadata, not a flex child.
     if f != "window" {
+        if f != "text" {
+            ports.push(p("hidden", "bool", false, None));
+        }
         ports.extend([
             p("align_self", "string", false, None),
             pn("grow", false, None), pn("shrink", false, None), pn("basis", false, None),
@@ -1075,7 +1087,12 @@ fn validate_rows(value: &JsonValue, line: usize, o: &mut Vec<Diagnostic>) {
                 "list has more than 500 rows",
             ));
         }
+        let mut ids = HashSet::new();
         for r in rs {
+            if let Some(id) = r.get("id").and_then(JsonValue::as_str)
+                && (id.is_empty() || !ids.insert(id)) {
+                o.push(Diagnostic::error("row-type", line, "row ids must be non-empty and unique within a list"));
+            }
             if r.get("id").and_then(JsonValue::as_str).is_none()
                 || r.get("cells")
                     .and_then(JsonValue::as_array)

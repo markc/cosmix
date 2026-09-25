@@ -465,14 +465,35 @@ page again suppresses visibility and reservation.</p>
 <p>Empty startup retains the shared Bus, holder retry deadlines, theme and scene
 runtime in both hosts. A headless regression exercises the production embedded
 assembly through startup and repeated updates without registering any scenes.</p>
-<p>Settings/Appearance is already a Mix scene. For now Quoin loads it <strong>only</strong> if
-an edge's panel list declares <code>settings.appearance</code>, at that slot on that edge.
-It need not be the primary, and no edge is required to declare it. For example,
-<code>{panels: {right: ["settings.appearance"]}}</code> loads it on the right; <code>{}</code> loads
-nothing. Standalone config reloads can add, move or withdraw the declaration.
-An explicit scene unload or sub-panel removal still retires the loader for that
-session. This scene will move to the scene editor. The corner menu and
-<code>shell.settings.{scheme,motion,size}</code> Bus verbs remain available independently.</p>
+<p>Settings/Appearance is a Mix scene whose layout is the shipped template
+<code>share/scenes/settings/</code> (scene <code>quoin-settings</code>, page <code>settings.appearance</code>).
+It appears <strong>only</strong> if an edge's panel list declares <code>settings.appearance</code>, at
+that slot on that edge. It need not be the primary, and no edge is required to
+declare it. For example, <code>{panels: {right: ["settings.appearance"]}}</code> puts it
+on the right; <code>{}</code> shows nothing. Standalone config reloads can add, move or
+withdraw the declaration.</p>
+<p>Two things can fill that page:</p>
+<ul>
+<li><strong>The scenes loader</strong> (normal case): <code>scenes.install {template:"settings"}</code>
+installs the template as <code>quoin-settings</code>, and enabling it loads the
+template and starts its behaviour citizen <code>scene-quoin-settings</code>. The
+behaviour forwards clicks to the <code>shell.settings.*</code> verbs and builds its
+model from <code>shell.settings.get</code>, re-reading it on each
+<code>shell.settings.changed</code> notice. The template mounts on the <strong>right</strong>; a
+declaration on another edge refuses the load with <code>SETTINGS_EDGE_MISMATCH</code>
+(edit the template's <code>window.edge</code> to match).</li>
+<li><strong>Quoin's built-in fallback</strong>, for a host with no loader or no enabled
+template: the same node block, built with Quoin as citizen and a model
+computed in Rust. When a <code>shell.scene.load</code> for the <code>settings.appearance</code> page
+arrives from another owner, the fallback unloads itself in that dispatch and
+the external load takes the page. The fallback stays out while that owner
+holds the page. It returns when the owner unloads (disable, remove, loader
+disconnect), so a fresh install still has an Appearance page. An explicit
+scene unload or sub-panel removal of the <em>fallback</em> still retires it for that
+session.</li>
+</ul>
+<p>The corner menu and the <code>shell.settings.*</code> Bus verbs are available whichever
+one is serving.</p>
 <h2 id="experimental-compositor-host">Experimental compositor host</h2>
 <p>Quoin 0.11.0 also exposes its application as a Rust library. Comp builds with
 <code>native-quoin</code> can opt in with <code>COSMIX_COMP_HUD_PROBE=1</code> and
@@ -799,7 +820,11 @@ These are semantic commands; they do not move the pointer or fabricate
 compositor corner-observation notifications. Read back
 <code>shell.props.get path="panels.left.visible"</code> to verify the applied state.</p>
 <p>The Settings/Appearance panel's own controls come back as
-<code>shell.settings.{scheme,motion,size}</code> (also listed by <code>shell.info</code>).
+<code>shell.settings.{scheme,motion,size}</code> (also listed by <code>shell.info</code>) —
+directly from the built-in fallback, or forwarded unchanged by the template's
+behaviour citizen. Either form works: explicit arguments, or the scene event
+body <code>{scene,node,kind}</code>, where the node id (<code>scheme_forest</code>, <code>motion_slide</code>,
+<code>size_left_plus</code>) names the choice.
 <code>shell.settings.scheme</code> takes <code>name</code> (a known scheme such as <code>forest</code>) and
 applies the theme live through the same path as the chrome scheme dots,
 persisting it for the next launch. <code>shell.settings.motion</code> takes
@@ -816,6 +841,23 @@ the supported thickness range and the output budget. Like the scene and
 sub-panel verbs, settings verbs from a stale Quoin connection are refused.
 Read back <code>shell.props.get path="panels.&lt;edge&gt;.width_px"</code> to verify a size
 change.</p>
+<p><code>shell.settings.get</code> (a read, no arguments) returns the page's state as data:
+<code>scheme</code> (the selected name), <code>schemes</code> (<code>[{name,accent}]</code> in display order),
+<code>motion</code> (the <em>ingested</em> <code>slide|fade</code>), <code>motions</code> (<code>fade</code> carries
+<code>available:false</code> and its <code>reason</code>), <code>fade_reason</code>, <code>sizes</code> (settled
+thickness in logical pixels per edge; a drag in progress does not change
+them), <code>step_px</code>, <code>range_px</code>, <code>edge</code> (the edge that declares
+<code>settings.appearance</code>, or null), <code>page_owner</code> (who serves the page:
+<code>quoin@host</code> is the built-in fallback, or null), plus <code>generation</code> and
+<code>revision</code>. Quoin publishes the same body as <code>shell.settings.changed</code> on the
+topic <code>&lt;service&gt;.settings.changed</code> when any field changes: a scheme chosen
+over the Bus or from the chrome dots, an ingested motion, a settled resize, or
+the page changing hands. A notice is sent again after every reconnect. It is
+not sent on idle updates or on a timer. In a <code>get</code> reply <code>revision</code> is the
+last published notice's revision while the body is the live state, so a reply
+that follows a write in the same update carries revision N with content the
+next notice (N+1) will repeat. Do not fence on it: a reply is never older than
+its revision, and the notice that follows it is always sent.</p>
 <p><code>shell.debug.status</code> exposes process-lifetime request/rejection counts,
 accepted mutation counts, maximum dispatch time in microseconds, pending reply
 count and connection state. It excludes model application, transport delay and

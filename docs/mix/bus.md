@@ -26,6 +26,28 @@ result={extensions: {core: 1.0, topic: 1.0}, pong: true}
 
 ---
 
+## Connection events
+
+In `--serve`, `on bus.connected` receives `{generation}` in `$event.args` after
+the initial connection and after reconnection. The generation comes from the
+supervised client's successful-connection counter; it is not a wall-clock time
+or the script's reload generation. Use the event to refresh snapshots and
+reconcile after a broker restart, without a recovery timer.
+
+The adapter waits on `subscribe_state()`. It emits at most once per observed
+connected generation. State changes can coalesce while a handler is busy:
+generations can skip, so treat the notice as a request to resynchronise rather
+than an audit log of every connection. The state observer is shared with the
+supervised connection across script reloads; a reload alone does not emit a new
+connection event. A dropped receive future preserves state readiness. The lazy
+non-serve Bus connection contract is unchanged.
+
+Local native events (`fs.changed`, `proc.exited`, `bus.connected`) share the same
+handler dispatch and `$event.args` conversion as incoming Bus events. Structured
+event bodies are parsed even in a library build without the optional JSON
+*builtin* feature. This introduces no new transport or local-only command gate;
+the citizen's public verbs retain their existing local/mesh routing.
+
 ## The model in one paragraph
 
 A **broker** (`cosmix-noded`) runs on the node. Services register a **name**
@@ -577,6 +599,21 @@ inside an `on` handler; it errors loudly if the current event is *not* a request
 requester forever, so every `reply` failure path is a hard error by design.
 
 ### `async` handlers (Class C)
+
+`task_start(command, body)` starts a registered handler chain in process,
+without sending a Bus message. `command` and `body` are strings; the body is
+decoded into `$event.args` just as for other handler invocations. The event
+has empty headers and no reply correlation. The chain must contain an `async`
+handler (`TASK_HANDLER` otherwise). It uses the existing Class C task registry,
+shutdown drain and runner LocalSet; embedders must provide that LocalSet.
+The builtin requires Process capability and is refused in expression mode.
+
+Mixed chains retain declaration order: an async entry can wait on `sleep`,
+then a plain entry acquires the writer lock and reads current state to commit.
+Never assign a whole pre-wait state copy after a yield. A clock can start one
+local task at init and recheck its running flag on `bus.connected`, with no
+Bus self-emits. A task is a local continuation, not a separate service or
+transport, and does not provide exactly-once remote effects.
 
 A trailing `async` on the handler header marks it **Class C** — the dispatch
 *yields* at every `send`/`reply`/`sleep_ms` so concurrent invocations interleave

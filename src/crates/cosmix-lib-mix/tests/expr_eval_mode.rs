@@ -31,6 +31,86 @@ use cosmix_mix::{
     CategoryAllowList, EvalLimits, IndexMap, MAX_EXPR_DEPTH, MixResult, eval_expr_string,
 };
 
+#[test]
+fn reused_expression_runtime_keeps_globals_and_deadlines_per_call() {
+    for value in 0..16 {
+        let result = eval_expr_string("$item", &[("item", Value::Number(value as f64))],
+            None, EvalLimits::default()).unwrap();
+        assert_eq!(result.to_number(), Some(value as f64));
+        let missing = eval_expr_string("$item", &[], None, EvalLimits::default()).unwrap_err();
+        assert!(missing.to_string().contains("undefined variable"), "globals leaked between expressions");
+        assert!(eval_expr_string("42", &[], None, EvalLimits {
+            time_limit: Some(std::time::Duration::ZERO), ..Default::default()
+        }).is_err());
+        assert_eq!(eval_expr_string("42", &[], None, EvalLimits::default()).unwrap().to_number(), Some(42.0));
+    }
+}
+
+#[test]
+fn expired_expression_budget_rejects_ready_futures() {
+    // These complete without yielding. A Tokio timeout alone polls them to
+    // Ready and accepts them even with an already-exhausted budget.
+    for source in [
+        "42",
+        "repeat('a', 200000)",
+        "(if true then 42 else 0 end)",
+    ] {
+        let error = eval_expr_string(
+            source,
+            &[],
+            Some(Rc::new(CategoryAllowList::deny_all())),
+            EvalLimits {
+                time_limit: Some(std::time::Duration::ZERO),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("time limit"), "{source}: {error}");
+    }
+    assert_eq!(
+        eval_expr_string("42", &[], None, EvalLimits::default()).unwrap(),
+        Value::Number(42.0)
+    );
+}
+
+#[test]
+fn slow_non_yielding_expression_rejects_result_after_time_limit() {
+    use cosmix_mix::evaluator::CapabilityPolicy;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    struct SlowDispatch(Cell<usize>);
+    impl CapabilityPolicy for SlowDispatch {
+        fn check_builtin(&self, name: &str) -> Result<(), String> {
+            assert_eq!(name, "time");
+            self.0.set(self.0.get() + 1);
+            // Deliberately block inside a single expression poll. This makes
+            // the dispatch slow on every CPU, without a huge allocation or
+            // relying on the performance of a particular string builtin.
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(())
+        }
+    }
+
+    let policy = Rc::new(SlowDispatch(Cell::new(0)));
+    assert!(eval_expr_string("time()", &[], Some(policy.clone()), EvalLimits::default()).is_ok());
+    policy.0.set(0);
+    let error = eval_expr_string(
+        "time()",
+        &[],
+        Some(policy.clone()),
+        EvalLimits {
+            time_limit: Some(Duration::from_millis(50)),
+            ..Default::default()
+        },
+    ).unwrap_err();
+    // Prove that the expression actually ran; an expired-at-entry test alone
+    // would not exercise the check after a non-yielding future returns Ready.
+    assert_eq!(policy.0.get(), 1);
+    assert!(error.to_string().contains("time limit exceeded"), "{error}");
+    assert!(eval_expr_string("time()", &[], None, EvalLimits::default()).is_ok());
+}
+
 /// Parse + run `source`, applying `configure` to the evaluator first.
 /// Returns Ok(value) or Err(error message).
 async fn run_with(source: &str, configure: impl FnOnce(&mut Evaluator)) -> Result<Value, String> {

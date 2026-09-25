@@ -1161,7 +1161,7 @@ that dies on its first line looks exactly like one that worked. A non-string
 raises <code>TYPE_MISMATCH</code> at argument validation, before any stdio file is opened
 (so a NUL in <code>stderr_path</code> can no longer truncate the <code>stdout_path</code> file on the
 way to failing).</p>
-<p><strong>Argv form — <code>spawn(argv[, {detach, die_with_parent, cwd, env, clear_env, stdout, stderr}])</code></strong>
+<p><strong>Argv form — <code>spawn(argv[, {detach, die_with_parent, exit_event, tag, cwd, env, clear_env, stdout, stderr}])</code></strong>
 (v0.89.0), a <strong>list</strong> of strings run <strong>directly, with no shell</strong> — so no
 word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force <code>run("setsid app &amp;")</code> through <code>sh</code>.</p>
@@ -1194,7 +1194,7 @@ Bus verb the child itself answers, rather than trusting a bare pid. Default <cod
 in the caller's session, which stays the caller's to reap).</p>
 </li>
 <li>
-<p><code>die_with_parent: true</code> (Linux) → the opposite slot. The child <strong>ends with
+<p><code>die_with_parent: true</code> (Linux), without <code>exit_event</code>, → the opposite slot. The child <strong>ends with
 this mix process</strong>, for a helper that must not outlive the script or
 <code>--serve</code> citizen that started it:</p>
 <pre><code class="language-mix">$pid = spawn(["goose", "serve", "--port", "7070"], {die_with_parent: true})
@@ -1245,7 +1245,7 @@ changes nothing, if another thread enabled first; only the first thread is
 ever the host. The embedder must also call <code>sweep()</code> on that
 same thread before it exits. Off Linux the option raises
 <code>OPTION_INVALID</code>. Default <code>false</code>: a plain spawn child is untouched by mix's
-exit.</p>
+exit. With <code>exit_event:true</code>, use the generation lifetime below instead.</p>
 </li>
 <li>
 <p><code>cwd</code> / <code>env</code> / <code>clear_env</code> behave exactly as in <a href="/mix/system#run_argv"><code>run_argv</code></a>
@@ -1274,6 +1274,32 @@ elements, are <code>TYPE_MISMATCH</code>; the argv form's option values — <cod
 and a file route's <code>{file: …}</code> path — are <code>OPTION_INVALID</code>. <code>std</code> would reject a
 NUL at spawn anyway, but catching it early keeps a late failure from truncating
 a good log on the way down.</p>
+<h3 id="managed-child-exit-events">Managed child exit events</h3>
+<p><code>spawn(argv, {exit_event:true, tag:"scene:12"}) -&gt; pid</code> starts a managed Linux
+child. <code>tag</code> is an optional string of at most 4096 bytes (default <code>""</code>), copied
+unchanged into <code>on proc.exited</code>'s <code>$event.args</code>:
+<code>{pid,tag,exit_code,signal}</code>. Normal exit supplies an exit code and nil signal;
+signal death supplies nil exit code and the signal number. An unexpected reap
+failure has both nil and additional <code>{error_code:"PROC_REAP",message}</code> fields.
+Use tags to reject exits from stale application generations.</p>
+<p>Mix owns the child and is its sole reaper. A pidfd and a cancellation descriptor
+wake the monitor; it does not poll process state. Up to 128 managed children and
+undelivered exits can be admitted per evaluator. <code>detach:true</code> is incompatible;
+<code>die_with_parent:true</code> additionally applies the existing Linux parent-death
+protection. The <a href="/mix/serve#native-events-and-generation-lifetime">generation lifetime</a>
+governs reload, shutdown and descendant cleanup. Managed retirement does not
+deliver a terminal event to another evaluator generation.</p>
+<p><code>kill($pid, signal)</code> and <code>process_alive($pid)</code> use the registered pidfd while the
+child is retained, without competing for its exit status. After the exit has
+been delivered and the slot reclaimed, the numeric PID is no longer an owned
+identity: discard it. Negative PID/group operations keep their existing raw
+meaning. Do not reap managed children from an embedding application's SIGCHLD
+handler or another thread. <code>PROC_LIMIT</code>, <code>PROC_UNSUPPORTED</code> (including kernels
+without pidfd support), and <code>PROC_MONITOR</code> are catchable setup refusals; invalid
+options use <code>OPTION_INVALID</code>. A failed monitor setup kills and reaps the child.
+Teardown waits for the kernel to complete reaping; an uninterruptible kernel I/O
+wait can delay it despite SIGKILL.</p>
+<h3 id="signalling-and-liveness">Signalling and liveness</h3>
 <p><code>kill(pid[, signal])</code> sends <code>signal</code> (default <code>15</code> = SIGTERM) and returns a bool
 (<code>true</code> if the syscall succeeded). <strong>Both arguments are whole numbers and
 neither is coerced</strong> (strict since v0.52.0) — the same rule as <code>spawn</code>, and for
@@ -1310,6 +1336,130 @@ print("" .. process_alive(999999))
 false
 </code></pre>
 <p><code>kill(pid, 9)</code> sends SIGKILL; pass any signal number you need.</p>
+<h2 id="desktop-status-events--net_watch-audio_watch">Desktop status events — net_watch, audio_watch</h2>
+<p>A status applet needs to know when the network or the volume changes. Reading
+<code>/sys/class/net/*/operstate</code> on a timer, or running <code>wpctl get-volume</code> every
+minute, is polling: late when something changes and wasted work when nothing
+does. These builtins subscribe instead. They share the
+<a href="/mix/serve#native-events-and-generation-lifetime">native-event</a> machinery of
+<code>fs_watch</code> and managed <code>spawn</code>: opaque evaluator-owned handles, coalesced
+batches in <code>$event.args</code>, sticky overflow, cancellation on unwatch, retirement
+with the evaluator generation, and no clock anywhere.</p>
+<pre><code class="language-mix">$net = net_watch()
+$audio = audio_watch({runtime_dir: env("XDG_RUNTIME_DIR")})
+
+fn network_summary()
+  $up = false
+  for each $link in net_state().links
+    if $link.up and not $link.loopback then $up = true end
+  end
+  return $up
+end
+
+on net.changed
+  -- The batch says what moved; net_state() says what is true now.
+  print("network up: " .. to_string(network_summary()))
+end
+on audio.changed
+  if type($event.args.closed) == "map" then
+    print("audio source ended: " .. $event.args.closed.message)
+  else
+    $vol = audio_state({runtime_dir: env("XDG_RUNTIME_DIR")})
+    print($vol.ok ? to_string($vol.level) .. "%" .. ($vol.muted ? " muted" : "") : "no sink")
+  end
+end
+</code></pre>
+<p><strong>Events are hints, state is truth.</strong> A batch tells a behaviour <em>that</em> something
+changed and roughly what; the model is rebuilt from <code>net_state()</code> /
+<code>audio_state()</code>. Always re-read on <code>overflow:true</code>.</p>
+<h3 id="network-net_watchopts---handle">Network: <code>net_watch([opts]) -&gt; handle</code></h3>
+<p>One rtnetlink socket per handle, subscribed to <code>RTMGRP_LINK</code>,
+<code>RTMGRP_IPV4_IFADDR</code> and <code>RTMGRP_IPV6_IFADDR</code>, read by a thread blocked in
+poll(2) with no timeout. <code>opts.events</code> narrows it to <code>["link"]</code> or <code>["addr"]</code>.
+Each wake drains every queued datagram into <strong>one</strong> <code>net.changed</code> batch:</p>
+<pre><code>{watch, overflow, closed?, changes: [
+  {kind: "link", ifname, index, up, operstate, loopback, wireless, removed},
+  {kind: "addr", ifname, index, up, family: "inet"|"inet6", address, prefix, removed}
+]}
+</code></pre>
+<ul>
+<li><code>up</code> on a link is <em>operationally</em> up: operstate <code>up</code>, or — for drivers that
+report <code>unknown</code>, such as <code>lo</code> and WireGuard — <code>IFF_UP</code> and <code>IFF_RUNNING</code>
+together. On an address it means present (<code>false</code> with <code>removed:true</code>).</li>
+<li>Records coalesce per link index and per address within a batch: a link that
+flaps down and up in one burst arrives once, with its last state.</li>
+<li>Announcements that change nothing are dropped — wireless drivers re-announce
+the link on every scan, IPv6 re-announces addresses on every lifetime refresh.</li>
+<li>A kernel overrun (<code>ENOBUFS</code>), a truncated or malformed message sets
+<code>overflow:true</code>; the next repeat is then delivered rather than suppressed.</li>
+</ul>
+<p><code>net_state() -&gt; {links, addresses}</code> is the same information from a netlink dump
+(<code>links[]</code>: <code>ifname, index, up, operstate, loopback, wireless</code>; <code>addresses[]</code>:
+<code>ifname, index, family, address, prefix</code>). A dump the kernel marks interrupted is
+retried; three in a row raise <code>NET_STATE_INCONSISTENT</code>. The whole call, retries
+included, answers within 2 s or raises <code>NET_STATE_IO</code>. Like <code>audio_state()</code> it
+blocks the evaluator while it waits, so a serve citizen calls both from an
+<code>async</code> handler (a <code>task_start</code> task), not from a sync request path. Only a
+dump reply carrying the request's sequence number is read.</p>
+<p>If the subscription socket itself fails (a poll error, or a receive error other
+than an overrun), the handle delivers one batch with
+<code>closed: {error_code: "NET_WATCH_IO", message}</code> and <code>overflow:true</code>, then stays
+silent: unwatch it and subscribe again when you choose to.</p>
+<p>The socket is raw libc: three fixed headers and a few attributes do not justify
+linking a netlink crate into every Mix build. <code>net_*</code> are <strong>Env</strong> class
+(read-only observation of the host).</p>
+<h3 id="audio-audio_watchopts---handle">Audio: <code>audio_watch([opts]) -&gt; handle</code></h3>
+<p>PipeWire publishes changes through its pulse-compatible server, and
+<code>pactl subscribe</code> prints one line per change and otherwise blocks. Each handle
+owns one such child: its stdout is read by a thread blocked in read(2), and each
+read becomes one <code>audio.changed</code> batch:</p>
+<pre><code>{watch, overflow, closed?, changes: [{facility, kind, index}]}
+</code></pre>
+<p><code>facility</code> is <code>sink</code>, <code>source</code>, <code>server</code>, <code>card</code> by default (<code>opts.facilities</code>
+may name any of <code>sink source sink-input source-output module client sample-cache server card</code>); <code>client</code> is left out by default because every pulse client
+connecting would otherwise be an event. <code>kind</code> is <code>new</code>, <code>change</code> or <code>remove</code>;
+<code>index</code> is nil for <code>server</code>. Changes coalesce per facility and index.</p>
+<p>The volume itself is <code>audio_state([opts]) -&gt; {ok, volume, level, muted, reason?}</code>:
+one <code>wpctl get-volume @DEFAULT_AUDIO_SINK@</code> with a 2 s deadline. <code>level</code> is
+<code>round(volume * 100)</code>. No default sink, a <code>wpctl</code> that is missing or cannot
+start, unreadable output or a timeout is <code>ok:false</code> with a <code>reason</code>, not an
+error. The deadline holds on every path,
+including a kernel without <code>pidfd_open</code>. Call it once per batch: a burst of
+notices costs one read.</p>
+<p><strong>Why a child and not a library.</strong> No PipeWire client crate is in the
+workspace, and libpipewire would bring a C library and its main loop into every
+Mix build. A long-lived subscription child is an event stream — the process is
+idle until the server has news — so this is not polling. Its lifecycle is owned:
+the child runs in its own process group with <code>LC_ALL=C</code> (the parser reads
+English) and <code>XDG_RUNTIME_DIR</code> from <code>opts.runtime_dir</code> when given; unwatch or
+evaluator retirement SIGKILLs the group and reaps it. If <code>pactl</code> exits by itself
+(PipeWire restarted, no server yet), the handle delivers one batch with
+<code>closed: {error_code: "AUDIO_SOURCE_EXITED", message, exit_code}</code> and
+<code>overflow:true</code>, then stays silent: unwatch it and subscribe again when you
+choose to (a behaviour typically retries after a delay from an async handler).
+If the Mix process itself is SIGKILLed, the <code>mix</code> binary's children carry
+<code>PR_SET_PDEATHSIG(SIGKILL)</code> and die with it; in an embedder that has not made
+its evaluator thread the owned-children host, <code>pactl</code> ends at its next write.
+<code>AUDIO_UNAVAILABLE</code> (no <code>pactl</code>) will not change by retrying; treat it as final.
+<code>audio_*</code> are <strong>Process</strong> class (they run programs).</p>
+<h3 id="limits-and-refusals">Limits and refusals</h3>
+<p>At most 16 net and audio handles together per evaluator, and 1024 distinct
+pending records per handle (beyond that the batch sets overflow). A top-level
+<code>sleep()</code> in a plain script dispatches these only when <code>on net.changed</code> /
+<code>on audio.changed</code> is registered. All six builtins are denied in expression
+mode. Refusals raise with <code>{error_code, message}</code>:</p>
+<table><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>NET_WATCH_OPTIONS</code>, <code>AUDIO_OPTIONS</code></td><td>Invalid options.</td></tr>
+<tr><td><code>NET_WATCH_ARGUMENT</code>, <code>AUDIO_WATCH_ARGUMENT</code></td><td>Handle is not a string.</td></tr>
+<tr><td><code>NET_WATCH_HANDLE</code>, <code>AUDIO_WATCH_HANDLE</code></td><td>Unknown, retired, or other-family handle.</td></tr>
+<tr><td><code>NET_WATCH_LIMIT</code>, <code>AUDIO_WATCH_LIMIT</code></td><td>16-handle limit reached.</td></tr>
+<tr><td><code>NET_WATCH_IO</code>, <code>NET_STATE_IO</code></td><td>Netlink socket or dump failure.</td></tr>
+<tr><td><code>NET_STATE_INCONSISTENT</code></td><td>Dump interrupted three times running.</td></tr>
+<tr><td><code>AUDIO_UNAVAILABLE</code></td><td><code>pactl</code> not on PATH.</td></tr>
+<tr><td><code>AUDIO_WATCH_IO</code></td><td>Could not start or reap the <code>pactl</code> child. (<code>audio_state</code> never raises: a <code>wpctl</code> that cannot start or be read is <code>ok:false</code> with a reason.)</td></tr>
+<tr><td><code>*_UNSUPPORTED</code></td><td>Platform is not Linux.</td></tr>
+<tr><td><code>NATIVE_CLOSED</code></td><td>This evaluator's native registrations have retired.</td></tr>
+</tbody></table>
 <h2 id="environment-identity--the-working-directory">Environment, identity &amp; the working directory</h2>
 <pre><code>env("NAME")     environment variable value ("" if unset — never raises)
 env("NAME", d)  value, or default d when NAME is unset OR empty
@@ -1803,9 +1953,10 @@ unbounded and nothing can interrupt it.</p>
 <h2 id="capability-classes">Capability classes</h2>
 <p>Each system builtin carries a <a href="/mix/capabilities">capability class</a> used by the
 <a href="/mix/bus"><code>--serve</code></a> sandbox's <code>check_capability</code> gate: <code>env</code> / <code>pid</code> /
-<code>hostname</code> / <code>cwd</code> / <code>platform</code> / <code>which</code> are <strong>Env</strong> (read-only inspection);
+<code>hostname</code> / <code>cwd</code> / <code>platform</code> / <code>which</code> / <code>net_watch</code> / <code>net_unwatch</code> /
+<code>net_state</code> are <strong>Env</strong> (read-only inspection);
 <code>run</code> / <code>run_rc</code> / <code>run_stream</code> / <code>spawn</code> / <code>kill</code> / <code>process_alive</code> / <code>chdir</code> /
-<code>exit</code> (and <code>panic</code> — see <a href="/mix/errors">errors</a>) are <strong>Process</strong> (they touch the
+<code>audio_watch</code> / <code>audio_unwatch</code> / <code>audio_state</code> / <code>exit</code> (and <code>panic</code> — see <a href="/mix/errors">errors</a>) are <strong>Process</strong> (they touch the
 OS process table or filesystem CWD); <code>shell_quote</code> / <code>sql_quote</code> / <code>sanitize</code> /
 <code>random_password</code> / <code>uuid</code> / hashes / <code>base64_*</code> are <strong>Pure</strong>. An embedding
 daemon can deny the Process class to run untrusted Mix without it spawning

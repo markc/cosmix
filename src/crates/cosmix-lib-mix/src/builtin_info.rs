@@ -366,8 +366,8 @@ macro_rules! shape {
     (map( $name:literal )) => {
         $crate::builtin_info::TypeShape::Map { shape: Some($name), fields: &[] }
     };
-    (any_of( $($t:tt),+ $(,)? )) => {
-        $crate::builtin_info::TypeShape::AnyOf(&[ $( $crate::shape!($t) ),+ ])
+    (any_of( $( $t:ident $( ( $($args:tt)* ) )? ),+ $(,)? )) => {
+        $crate::builtin_info::TypeShape::AnyOf(&[ $( $crate::shape!($t $( ( $($args)* ) )?) ),+ ])
     };
 }
 

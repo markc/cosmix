@@ -1,5 +1,23 @@
 # quoin-panel
 
+**Stage B retires this citizen.** The [scenes loader](scenes-loader.md) and
+the shipped `share/scenes/{panel,launcher,calendar,notes}` templates cover
+every duty below on the same page IDs (`scene-panel`, `scene-launcher`,
+`scene-calendar`, `scene-notes`); see
+[Stage B: the panel template](#stage-b-the-panel-template) and
+[Retirement](#retirement). The rest of this page describes the legacy citizen,
+which stays in the tree as rollback material until live parity passes.
+
+Stage A kept this citizen and its existing page IDs running alongside the
+loader. Page selection and popup release advance from command replies and
+applied state reads. `<host>.panel.changed` notifications are invalidation
+hints; dropping one cannot strand an operation. Open replies acknowledge desired state;
+`shown` reflects the last applied host snapshot. Saved popup pins are cleared
+only after an applied release. Refresh bursts use one local 10 ms coalescing
+deadline in the calling handler, with no Bus loopback continuation. Network
+and volume arrive as Stage C's native events (`net_watch`, `audio_watch`); the
+minute clock only redraws displayed time.
+
 The Quoin bottom panel, application launcher, calendar and notifications
 popup, written as [Mix Scenes](scenes.md). One Mix citizen
 (`src/desktop/scripts/quoin-panel.mix`, Bus name `quoin-panel`) owns four
@@ -15,6 +33,190 @@ scene documents and loads them into the running Quoin (`shell`):
 The layout follows Plasma's default bottom panel and Breeze Dark palette.
 The clock is the big `09:05 pm` with `Wed 16 Sept` underneath; clicking it
 opens the calendar. One popup is open at a time, like Plasma.
+
+## Stage A file templates
+
+The shipped `share/scenes/{launcher,calendar,notes}/` directories each contain
+`scene.mix` (an AMP document with strict-data nodes), `template.conf.mix`
+(strict metadata), and an executable `behaviour.mix`. Layout is static; all
+changing content comes from `$model`. Calendar authors its six-by-seven grid
+directly. Page IDs remain `scene-launcher`, `scene-calendar`, `scene-notes`.
+During Stage A the legacy `quoin-panel.mix` kept serving the host, so these
+templates were tested nested or under non-colliding scene names; Stage B
+installs them under their own names once the legacy citizen stops.
+
+`mix share/scenes/install.mix [destination]` installs the shipped catalogue
+(panel, launcher, calendar, notes) and its shared `lib/` once. The default is `$XDG_DATA_HOME/cosmix/scenes` (falling
+back to `$HOME/.local/share/cosmix/scenes`). It does not install user scenes or
+enable them. Behaviours resolve helpers through `SCENES_LIB`, or the same XDG
+data path, so installed scenes do not depend on a checkout. `lib/data.mix`
+contains reusable clock/calendar/title/category helpers; `lib/models.mix`
+builds model values and `lib/runtime.mix` handles Bus envelopes. The original
+`scripts/lib/panel.mix` retains compatibility helpers for the running panel
+and screenshot callers until their migration.
+
+The loader executes one behaviour with `SCENE_NAME`, `SCENE_HOST`,
+`SCENES_SERVICE`, `SCENE_GENERATION` and existing service overrides. The
+behaviour uses `serve_name()` as its actual citizen identity. The loader must
+route the installed document's `citizen` to that identity if it renames it;
+the shipped documents name `scene-launcher`, `scene-calendar`, `scene-notes`.
+`SCENE_GENERATION` is a positive integer. Metadata currently carries
+`schema: 1`, `name`, `title` and `behaviour: "behaviour.mix"`.
+
+Behaviours check `shell.scene.describe {family:"list"}` for `flow`'s
+`horizontal` enum and boolean `hidden`, then send:
+
+```text
+scenes.ready {name,generation}
+scenes.model {name,generation,value}  # complete model
+scenes.open/close/toggle {name}      # popup ownership stays with the loader
+```
+
+They never load/unload scenes, change host configuration or manage popup pins.
+W2's loader must reject stale generations, serialise complete models with
+reloads, and restore the last accepted model on host reconnect. Directed UI
+requests arrive as `$event.args = {scene,node,kind,value?,item?}`. Public verbs
+are mesh-open. Refusals are nonzero with `{error_code,message}`; upstream
+failures retain the original RC and reply under `context`.
+
+`launcher.open/close`, `launcher` (toggle), `calendar.open/close`, `calendar`
+and `notes.open/close`, `notes` delegate popup operations to the loader.
+Launcher additionally supports `filter`, `cat`, `launch`, `launch_first`,
+`launcher.launch`, `launcher.search` and `launcher.state`; calendar has
+`cal_prev/next/today`, `open_calendar`, `calendar.state`; notes has `note_close`,
+`notes_clear`, `notes.state`. The Stage A state verbs report behaviour data;
+open/selected/pinned state belongs to the loader. Launcher result publication
+checks a request sequence after the search and after icon resolution, including
+A→B→A races. Enter only launches a result matching the current query/category.
+
+Refreshes are queued by Bus events, with one pending self-event and no debounce
+sleep. The launcher observes `apps.changed` (published by `apps.reload` and
+icon-theme changes), property events and broker service-list changes. Notes
+observes notification/property and service-list events. Both subscribe before
+their first snapshot. `bus.connected` reannounces readiness and refreshes data.
+Calendar's sole recurring deadline advances its displayed clock at the next
+wall-clock minute; it never checks service state. The existing Mix sleep
+primitive implements each single deadline, so a wall-clock adjustment during
+that wait is reflected at the next wake, not immediately. Network/PipeWire
+conversion belongs to the later panel work.
+
+Run the deterministic gate with a process environment of `TZ=UTC`:
+`mix src/desktop/scripts/tests/scene-template-test.mix`. `--record` refreshes
+public captures. Rust binding, renderer, Taffy and click bridge tests run on
+the build cluster. Live screenshots and W1/W2 integrated lifecycle/race tests
+remain required before migrating the host.
+
+## Stage B: the panel template
+
+`share/scenes/panel/` is the bottom panel as a file-backed scene. The page ID
+stays `scene-panel`; the mount is today's slim chromeless bottom edge
+(`window: {kind:"edge", edge:"bottom", h:52, chrome:false}`). The authored
+`h` seeds an untouched edge only: Quoin's saved thickness wins, and the
+loader never pins, docks or selects the page, so a bottom edge kept hidden
+stays hidden. Quoin's carousel activates the registered page on its own
+(the page is the edge's only declared slot).
+
+`scene.mix` is static: launcher button, workspace pager, task buttons, tray,
+status applets (notifications, volume, network), clock and peek. The pager,
+tasks and tray are `list` nodes with `flow: "horizontal"`; their rows carry
+stable IDs (`ws_<n>`, `t_<window id>`, `tr_<tray key>`), so a surviving item
+keeps its entities when others come and go. Icon/text alternatives (launcher
+"Apps", task spacer, tray initial, the `•` status stand-in) are sibling nodes
+switched with `hidden`, which removes their gap allocation exactly as the old
+builder omitted them. Every colour, label and path that changes lives in the
+model:
+
+| model key | contents |
+|---|---|
+| `launcher` | `{icon, has_icon, background}`; background tints while the launcher popup is open |
+| `workspaces` | rows `{id, cells, index, label, current, background, color}` |
+| `tasks` | current-workspace normal-band windows in id order, at most 50: rows `{id, cells, window, generation, title, icon, has_icon, background, color}` |
+| `tray`, `tray_empty` | rows `{id, cells, key, icon, has_icon, initial}`; the list is hidden when empty |
+| `notes` | bell `{icon, has_icon, count, has_count, background}` |
+| `volume`, `network` | `{icon, has_icon}`; volume also `shown` (no default sink hides it) |
+| `clock` | `{time, date, background}` |
+| `peek` | `{icon, has_icon, background}` |
+
+The model builder is `lib/models.mix` `panel(snap, icons, now)`; pure
+taskbar decisions (window filter, click validation, peek plans) are in
+`lib/taskbar.mix`. Both are shipped with the catalogue.
+
+`behaviour.mix` (`scene-panel`) subscribes before its first snapshot to the
+compositor's, tray's, notification adapter's and apps citizen's topics,
+`noded.props.changed` and the loader's `scenes.changed`. Every event only
+marks the model dirty; one local `task_start` rebuild drains all changes
+queued while it waited on the Bus (no debounce sleep, no Bus self-emit), then
+publishes the complete model through `scenes.model`. A broker gap, reconnect
+or a returning compositor re-seeds `comp.props.watch`, the popup snapshot
+(`scenes.list`) and the status snapshot. Icon lookups (apps citizen, dark
+theme for status icons) are cached per session including misses;
+`apps.changed`, an apps restart or a reconnect clears the cache.
+
+Clicks: `launcher`, `calendar` and `notes` call `scenes.toggle` on the loader
+(which owns selection, mutual exclusion and pin recovery); the reply's
+`open` and later `scenes.changed` inventories tint the buttons. `ws`, `task`
+and `tray` read the complete published row from `$event.args.item`
+(`index`, `window`+`generation`, `key`), never a generated node ID. A task
+click re-reads `comp.windows.list` and refuses `stale_window` when that window
+closed or its generation changed; the compositor re-checks the generation it
+receives too. Peek minimises the current workspace's visible windows and
+restores exactly the id+generation pairs it minimised. Replies carry the
+upstream outcome or a `{error_code,message}` refusal. `panel.state` returns
+the last accepted model; `panel.refresh` queues one rebuild.
+
+The clock is one `task_start` wall-clock deadline per displayed minute and
+only redraws the time. Network and volume are event-driven: `net_watch`
+(rtnetlink link changes) and `audio_watch` (a `pactl subscribe` stream) wake
+the behaviour, which re-reads `net_state()` / `audio_state()` through the
+`status_*` helpers in `lib/runtime.mix`; a link event re-reads only the
+network and an audio event only the volume. A closed link socket or audio
+stream from the live handle re-subscribes after 5 s, doubling to 300 s (a
+reconnect backoff, not a poll); a subscription that outlived the current delay
+starts again from 5 s. A host without `pactl` (`AUDIO_UNAVAILABLE`) hides
+volume for the behaviour's life with no retry, and only `NET_WATCH_IO` /
+`AUDIO_WATCH_IO` refusals are retried. A mix without these builtins shows the
+network offline and hides volume. Nothing polls.
+
+`scene-template-test.mix` captures the exact legacy `panel_doc` output for
+empty, busy (focused/minimised/no-workspace/overlay windows, three
+workspaces, open launcher, peeked), tray-change (removed and added items,
+partial icon themes, muted wireless, open calendar) and 50-task-cap cases with
+sanitised icons and a fixed clock (`panel-*.scene.mix`, `panel-*.model.json`,
+`panel-cases.json`). It evaluates the template's bindings with the real Mix
+interpreter against each model and requires the visible tree (family, ports,
+children, horizontal instances with their list's click handler) to equal the
+legacy document's. It also pins row IDs across a tray change, icon fallback
+order and real click payloads (`{scene,node,kind,item}` with the published
+row). Panel cases are kept out of `cases.json`, whose Rust gate compares node
+IDs one to one.
+
+## Retirement
+
+With the four templates enabled under the loader, nothing in the legacy
+citizen remains unowned:
+
+| legacy duty | replacement |
+|---|---|
+| `panel` scene, taskbar/pager/tray/status/clock/peek | `panel` template (`scene-panel`) |
+| `launcher`, `calendar`, `notes` scenes and their click handlers | the Stage A templates |
+| popup exclusivity, selection, pin records (`quoin-panel-pins.json`) | loader `scenes.open/close/toggle` and `state.conf.mix` `recovery` |
+| `launcher.*`, `calendar.*`, `notes.*` agent verbs on `quoin-panel` | the same verbs on `scene-launcher`, `scene-calendar`, `scene-notes` |
+| `popups.state` | loader `scenes.list` (`open`, `pending` per scene) |
+| `panel.refresh` | `panel.refresh` on `scene-panel`; `scenes.reload {name}` on the loader |
+
+Agents that sent those verbs to `quoin-panel` must address the behaviour
+names instead. In this repository only `tests/panel-bus-test.mix` (the legacy
+citizen's own gate) and `tests/scene-template-test.mix` (which reads the
+legacy builders for its drift check) still name `quoin-panel.mix`.
+`quoin-shot.mix` and `tests/panel-test.mix` use `lib/panel.mix`, not this
+citizen, and are unaffected. The loader will not mount the four pages
+while a service named `quoin-panel` (`SCENES_LEGACY_SERVICE`) is registered;
+stopping the legacy unit is the handover event. That guard is one-way: a
+legacy citizen started again later finds the pages held by the loader and
+its loads are refused, so it runs without pages. Do not run both. The exact
+rules are in [the loader's legacy handover](scenes-loader.md#stage-b-legacy-handover). The private session installer seeds the chosen set, carries
+any outstanding legacy popup pins into the loader's recovery records, stops
+the legacy unit and keeps it for rollback.
 
 ## Data sources
 
@@ -34,18 +236,30 @@ nothing of its own.
   when an application publishes a StatusNotifierItem.
 - **Notifications** — the `notify` adapter (`notify.list`,
   `notify.close`).
-- **Network** — `/sys/class/net/*/operstate` (no D-Bus).
-- **Volume** — PipeWire's default sink through `wpctl`; the applet is hidden
-  when there is no default sink. Click toggles mute. `PIPEWIRE_RUNTIME_DIR`
-  points at the login session's runtime directory.
+- **Network** — any non-loopback link with operstate `up`, read with
+  `net_state()` (an rtnetlink dump, no D-Bus) at start and on every
+  `net.changed` batch from a `net_watch({events:["link"]})` subscription.
+- **Volume** — PipeWire's default sink through `audio_state()` (one `wpctl`
+  call), re-read on every `audio.changed` batch from `audio_watch`; the applet
+  is hidden when there is no default sink. Click toggles mute.
+  `PIPEWIRE_RUNTIME_DIR` points at the login session's runtime directory. If
+  PipeWire's server goes away the subscription reports `closed` and the panel
+  subscribes again after 5 s, doubling to at most 5 minutes until it succeeds
+  (back to 5 s when the lost subscription had been up longer than the delay).
+  The network subscription recovers the same way. A host without `pactl`
+  hides the applet for good (`AUDIO_UNAVAILABLE`, no retry).
+  See [desktop status events](../mix/system.md#desktop-status-events--net_watch-audio_watch).
+  Behaviours subscribe with `net_watch`/`audio_watch` themselves and re-read
+  through `lib/runtime.mix`'s `status_net` and `status_volume`, from an async
+  handler: each read can block for up to 2 s.
 
-## Events, not polling
+## Legacy host update loop
 
 The citizen subscribes to `<comp>.props.changed` (windows and workspaces),
 the tray adapter's `item.added`/`item.removed`/`props.changed`, and the
 notify adapter's `changed`/`props.changed`. A handler matches the
 publisher's **inner** verb (`props.changed`), not the topic name. Bursts are
-coalesced into one rebuild. The only clock is the wall clock: an `async`
+coalesced into one rebuild with a local 10 ms deadline. An `async`
 handler (`clock.run`, kicked once by init) sleeps to each minute boundary
 and redraws the time, one wake per minute. Init itself returns, so the
 runtime's reserved verbs (`RELOAD`, `QUIT`, `INFO`, lifecycle props) are
@@ -61,10 +275,16 @@ already in flight does not leave a closed popup open. Every popup pin the
 panel makes is recorded in `$XDG_STATE_HOME/cosmix/quoin-panel-pins.json`; at
 start the citizen releases exactly those edges (a popup open when Quoin or
 the citizen went down would otherwise return as a pinned native page). A
-record is only dropped after a single applied `shell.props.get` subtree snapshot
-confirms both `pinned == false` and `visible == false`. An enqueue acknowledgement
-is insufficient. The existing bounded hide loop is retained; failure or an
-unconfirmed release leaves the record for the existing startup/recovery pass.
+record is only dropped after a state read confirms both `pinned == false` and
+`visible == false`. Quoin's `shell.panel.page.set`, `shell.panel.pin` and
+`shell.panel.mode` replies carry `{accepted:true, applied:true, panels}` after
+model application; hidden mode also waits for concealment to finish. A command
+superseded before application is refused with `PANEL_NOT_APPLIED` and the current
+snapshot. The citizen re-reads state after every command, including refusals
+and timeouts; an applied reply remains usable if that read fails. Unconfirmed
+releases retain their record and report rc 22.
+Pending operations retry on state hints, subscription gaps, reconnects and
+explicit opens/closes. Already-satisfied phases complete immediately.
 The file remains a bare JSON array of edge strings. Its explicit compatibility
 rule is that legacy Bus `unpin` releases both persistent modes, including dock
 reservations migrated from legacy `pinned: true`. No version conversion is
@@ -74,10 +294,16 @@ Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.
 
-Once every five minutes the clock tick also re-seeds the compositor watch
-and refetches windows, tray and notifications — a backstop for an event
-missed while comp restarted, not a poll (every change still arrives as an
-event).
+Broker registration changes, subscription gaps and `bus.connected` re-seed
+the compositor watch and recover recorded pins from state; returning shells
+are remounted. A missing host at init leaves the citizen available until the
+host appears. Panel notices include settled width, so resize motion emits
+only the final width; reveal/conceal reports mapping changes, not each frame.
+The previous five-minute recovery pass
+is removed, and so is the clock's once-a-minute network/audio read: those
+applets follow `net.changed` / `audio.changed`. Stage A keeps this legacy host
+citizen running.
+Panel migration belongs to Stage B.
 
 ## Limits
 
@@ -95,6 +321,23 @@ no escape for it) gets an invisible word joiner between `$` and `{`.
 host sends them `{scene, node, kind, value?, item?}`). `panel.refresh`
 rebuilds every open scene on demand.
 
+The popup clicks reply after their effect is applied, so a caller that reads
+state after the reply sees the popup already opened or closed:
+
+- `launcher`, `calendar`, `notes` reply rc 0 with the popup flags
+  `{launcher, calendar, notes}`. If releasing an edge is refused, they reply
+  rc 22 `{error: "release_failed", open: false, edge}`.
+- `launch`, `launch_first` and `open_calendar` launch, then dismiss the popup
+  (a shell-revealed one too), then reply rc 0 `{launched}`. A failed launch
+  still dismisses and replies rc 20 `apps_transport` or rc 21 `apps_refused`
+  with `{rc, reply, launched, released}`. A refused release is rc 22 with
+  `launched`. `launch_first` with no match, and `open_calendar` with no calendar
+  application and no Thunderbird, launch nothing.
+
+The other scene handlers (`filter`, `cat`, `cal_*`, `note_close`,
+`notes_clear`, and the async `ws`, `task`, `tray`, `vol_mute`, `peek`)
+acknowledge the click first and change only what they re-render.
+
 "Open calendar app" launches the first application in the `Calendar`
 category, falling back to `thunderbird -calendar`.
 
@@ -103,7 +346,8 @@ category, falling back to `thunderbird -calendar`.
 Send these to `quoin-panel` with a JSON object body (an absent body means
 `{}`). Success replies are JSON objects with rc 0. Bad arguments return rc 10
 with `{error: "invalid_request", detail: "..."}`; unknown fields are rejected.
-The scene click handlers above keep their toggle behaviour.
+The scene click handlers above keep their toggle behaviour and reply as
+described there.
 
 | Verb | Arguments | Reply |
 |---|---|---|
@@ -126,9 +370,9 @@ other query values and categories must be strings. Open truncates the query
 to 128 characters and validates category against the launcher chips (case
 sensitive; `""` means all). Search accepts any apps category string.
 An already-open calendar retains its navigated month. Every open retries the
-render. `open` records intent; `shown` records whether the latest render had
-its load, page selection, reveal and pin accepted, not a compositor frame
-confirmation. A failed close returns rc 22 with
+render. `open` records intent; `shown` records the last applied host snapshot,
+so an accepted open may initially reply with `shown:false`. A refused close
+returns rc 22 with
 `{error: "release_failed", open: false, edge}`. Repeated closes retry pending
 pin records, without releasing an edge another popup is using.
 Popup switches also return rc 22 if releasing the previous popup fails;
