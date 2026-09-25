@@ -187,7 +187,7 @@ impl Entry {
 }
 
 // Only absorb float round-off, not genuine fractional placement or scaling.
-fn native_placement(
+pub(crate) fn native_placement(
     bounds: Rectangle,
     transform: tiny_skia::Transform,
     width: u32,
@@ -217,7 +217,8 @@ fn native_placement(
 
 /// Native premultiplied pixels; only exact translations qualify. Rectangle
 /// coverage matches the non-antialiased mask's 26.6 scan conversion.
-fn copy_opaque(
+/// Also used by native Source grids, where replacing alpha is intentional.
+pub(crate) fn copy_opaque(
     image: tiny_skia::PixmapRef<'_>,
     target: &mut tiny_skia::PixmapMut<'_>,
     transform: tiny_skia::Transform,

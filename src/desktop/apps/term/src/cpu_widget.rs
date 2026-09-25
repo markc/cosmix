@@ -32,8 +32,8 @@ impl Grid {
 /// Shared by the widget and benchmark. Bounds are physical extents divided
 /// by output scale, never by available layout space. Snap only the origin;
 /// deriving every band's origin from integer pixels prevents fractional seams.
-pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
-    renderer: &mut R,
+pub(super) fn draw_images(
+    renderer: &mut iced_tiny_skia::Renderer,
     images: &[(Handle, Rectangle)],
     origin: iced::Point,
     scale: f32,
@@ -42,12 +42,6 @@ pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
     let x = (origin.x * scale).round() / scale;
     let y = (origin.y * scale).round() / scale;
     for (handle, relative) in images {
-        // tiny-skia trims ids not touched in a draw. Touch ALL visible bands,
-        // including undamaged ones: otherwise an adjacent damage rectangle
-        // can repeatedly re-convert an unchanged band after cache eviction.
-        let Some(_) = renderer.measure_image(handle) else {
-            continue;
-        };
         let bounds = Rectangle {
             x: relative.x + x,
             y: relative.y + y,
@@ -56,27 +50,27 @@ pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
         // Preserve cumulative edges for the vendored renderer, which resolves
         // physical placement before testing for an integer-aligned 1:1 copy.
         if bounds.intersects(&clip) {
-            let mut image = iced::advanced::image::Image::new(handle.clone());
-            image.filter_method = image::FilterMethod::Nearest;
-            renderer.draw_image(image, bounds, clip);
+            renderer.draw_grid(handle.clone(), bounds, clip);
         }
     }
 }
 
-impl<Message, Theme, R> Widget<Message, Theme, R> for Grid
-where
-    R: iced::advanced::image::Renderer<Handle = Handle>,
-{
+impl<Message, Theme> Widget<Message, Theme, iced_tiny_skia::Renderer> for Grid {
     fn size(&self) -> Size<Length> {
         Size::new(self.width, self.height)
     }
-    fn layout(&mut self, _: &mut Tree, _: &R, limits: &layout::Limits) -> layout::Node {
+    fn layout(
+        &mut self,
+        _: &mut Tree,
+        _: &iced_tiny_skia::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
         layout::Node::new(limits.resolve(self.width, self.height, Size::ZERO))
     }
     fn draw(
         &self,
         _: &Tree,
-        renderer: &mut R,
+        renderer: &mut iced_tiny_skia::Renderer,
         _: &Theme,
         _: &renderer::Style,
         layout: Layout<'_>,
@@ -89,9 +83,8 @@ where
     }
 }
 
-impl<'a, Message: 'a, Theme: 'a, R> From<Grid> for iced::Element<'a, Message, Theme, R>
-where
-    R: iced::advanced::image::Renderer<Handle = Handle> + 'a,
+impl<'a, Message: 'a, Theme: 'a> From<Grid>
+    for iced::Element<'a, Message, Theme, iced_tiny_skia::Renderer>
 {
     fn from(grid: Grid) -> Self {
         Self::new(grid)

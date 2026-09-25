@@ -38,6 +38,7 @@ impl DamageBand {
 /// cache and must not share damage, geometry or cursor bookkeeping.
 #[derive(Default)]
 pub struct PaintState {
+    format: PixelFormat,
     cols: usize,
     rows: usize,
     cell: (u32, u32),
@@ -48,6 +49,24 @@ pub struct PaintState {
     /// Scratch, reused so a frame costs no allocation.
     bands: Vec<DamageBand>,
     rows_scratch: Vec<bool>,
+}
+
+/// Channel order at the destination boundary. Both paths paint opaque sRGB
+/// pixels, so BGRA is also premultiplied BGRA without a conversion pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PixelFormat {
+    #[default]
+    Rgba,
+    Bgra,
+}
+
+impl PixelFormat {
+    fn colour(self, rgb: [u8; 3]) -> [u8; 3] {
+        match self {
+            Self::Rgba => rgb,
+            Self::Bgra => [rgb[2], rgb[1], rgb[0]],
+        }
+    }
 }
 
 impl PaintState {
@@ -406,6 +425,24 @@ impl Raster {
         state: &'a mut PaintState,
         dirty: &[bool],
     ) -> &'a [DamageBand] {
+        self.paint_format(screen, dst, stride, state, dirty, PixelFormat::Rgba)
+    }
+
+    /// Like [`Self::paint`], with an explicit destination channel order.
+    /// Changing format invalidates all rows, even at the same buffer address.
+    pub fn paint_format<'a>(
+        &mut self,
+        screen: &Screen,
+        dst: &mut [u8],
+        stride: usize,
+        state: &'a mut PaintState,
+        dirty: &[bool],
+        format: PixelFormat,
+    ) -> &'a [DamageBand] {
+        if state.format != format {
+            state.invalidate();
+            state.format = format;
+        }
         state.bands.clear();
         // `Screen`'s fields are public, so a cell array shorter than
         // `cols * rows` is constructible even though `Terminal::capture` never
@@ -466,11 +503,14 @@ impl Raster {
             }
             let x = (i % screen.cols) as i32 * self.width as i32;
             let y = (i / screen.cols) as i32 * self.height as i32;
+            // Reorder colours once per cell, not the fill/blend inner loops.
+            // Keep the original foreground in the glyph cache key.
+            let bg = format.colour(cell.bg);
+            let fg = format.colour(cell.fg);
             for cy in 0..self.height as usize {
                 for cx in 0..self.width as usize {
                     let offset = (y as usize + cy) * stride + (x as usize + cx) * 4;
-                    rgba[offset..offset + 4]
-                        .copy_from_slice(&[cell.bg[0], cell.bg[1], cell.bg[2], 255]);
+                    rgba[offset..offset + 4].copy_from_slice(&[bg[0], bg[1], bg[2], 255]);
                 }
             }
             if cell.c == ' ' || cell.c == '\0' {
@@ -506,7 +546,7 @@ impl Raster {
                         let alpha = glyph.data[(gy as u32 * p.width + gx as u32) as usize] as u32;
                         let offset = dy as usize * stride + dx as usize * 4;
                         for channel in 0..3 {
-                            rgba[offset + channel] = ((cell.fg[channel] as u32 * alpha
+                            rgba[offset + channel] = ((fg[channel] as u32 * alpha
                                 + rgba[offset + channel] as u32 * (255 - alpha))
                                 / 255) as u8;
                         }
@@ -551,6 +591,49 @@ mod tests {
     use crate::config::Cursor;
     use crate::terminal::Cell;
     use std::time::Instant;
+
+    #[test]
+    fn destination_format_switch_repaints_clean_rows_and_preserves_padding() {
+        for scale in [1.0, 1.25, 2.5] {
+            for cursor in [Cursor::Block, Cursor::Underline] {
+                let mut raster = Raster::new(scale, 13.0, cursor).unwrap();
+                let mut grid = screen(3, 5, 'M');
+                grid.cursor_visible = true;
+                grid.cursor = (1, 4);
+                for (i, cell) in grid.cells.iter_mut().enumerate() {
+                    cell.fg = [255, i as u8 * 11, 0];
+                    cell.bg = [3, 127, 253];
+                }
+                let (width, height) = raster.target_size(&grid);
+                let stride = width as usize * 4 + 12;
+                let mut bytes = vec![0x5a; stride * height as usize];
+                let mut state = PaintState::default();
+                raster.paint(&grid, &mut bytes, stride, &mut state, &[]);
+                let rgba = bytes.clone();
+                let damage = raster.paint_format(
+                    &grid,
+                    &mut bytes,
+                    stride,
+                    &mut state,
+                    &[false; 5],
+                    PixelFormat::Bgra,
+                );
+                assert_eq!(damage, &[DamageBand { y: 0, height }]);
+                for (native, original) in bytes.chunks_exact(stride).zip(rgba.chunks_exact(stride))
+                {
+                    for (p, q) in native[..width as usize * 4]
+                        .chunks_exact(4)
+                        .zip(original[..width as usize * 4].chunks_exact(4))
+                    {
+                        assert_eq!(p, &[q[2], q[1], q[0], 255]);
+                    }
+                    assert_eq!(&native[width as usize * 4..], &[0x5a; 12]);
+                }
+                raster.paint(&grid, &mut bytes, stride, &mut state, &[false; 5]);
+                assert_eq!(bytes, rgba, "default/wgpu destination must stay RGBA");
+            }
+        }
+    }
 
     /// A zoom step must be the same raster `new` would build, without
     /// reading the font again: the bytes are shared, not re-read or copied.

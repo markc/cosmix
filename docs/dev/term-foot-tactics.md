@@ -656,3 +656,66 @@ Isolated phase probes from the same run (not additive frame costs):
 | New image id: load + allocation + conversion | 2.855 | 2.819 | 3.294 |
 | iced cached full image draw | 1.515 | 1.447 | 2.128 |
 | iced empty-layer full clear | 0.516 | 0.486 | 0.720 |
+
+## Rank 3 implementation (cluster validation pending)
+
+The tiny-skia arm now paints each persistent four-row band directly in BGRA
+channel order and records a native grid primitive. `Raster::paint` and the
+core `Surface` still default to RGBA for wgpu; `paint_format` selects BGRA
+explicitly and invalidates all rows if the destination format changes. Only
+the per-cell colour/write boundary changes; fill and glyph-blend loop structure,
+rounding, glyph cache keys and cursor operations are retained for the parallel
+rank-6 work. All raster output is opaque, making the native bytes already
+premultiplied without a post-paint traversal.
+
+`grid::Grid` in the vendored renderer holds immutable `Bytes` and a fresh
+generation token. It shares the existing image sublayer's ordering and damage
+expansion, but never enters the RGBA image cache. Unchanged bands keep their
+generation. The rank-1 placement and clipped native copy are reused; generic
+placement draws the native pixmap without conversion. Grid bounds, widget clip,
+layer clip and damage remain distinct. Renderer-wide clear/mask work remains.
+Paint-once scheduling, clean-pane skipping and `present_with_damage` are unchanged.
+
+Storage is generation-owned, not an unsafe two-frame ping-pong. The app drops
+its cached generation before requesting mutable bytes. Sole ownership permits
+in-place reuse. Any retained widget or history forces fresh storage; partial
+updates copy unchanged rows and rebind paint state, fully dirty bands discard
+the old pixels and repaint. Old generations can outlive any number of frames.
+The app retains no additional history or converted native cache. This removes
+conversion/cache allocation, not every allocation in a changed frame.
+
+Cluster gates remain the term default-wgpu and tiny-skia suites, both ignored
+CPU benchmarks serialised, the core format regression, and the vendor suite
+with `image,wayland`. The new ordinary rotating-target test compares every
+repaired frame to a fresh old RGBA+convert draw at scales 1.0, 1.25 and 2.5;
+it covers clipping, translucent overlays, moving panes, resize/partial final
+bands, cursor changes, invalidation and age loss. The existing seven-scale
+fixture now asserts old/new rendered equality as well as exact physical
+placement. Existing storage/generation tests retain earlier native bytes across
+updates. The core test checks both cursor styles, padded strides and switching
+formats with otherwise clean damage. Vendor tests cover constructor validation,
+generation equality and native-copy/fallback equivalence. The vendor layer
+regression also checks clean generations produce no damage, while new
+generations, movement and changed clips do. A test-only copy of
+the old whole-band transport preserves the frame benchmark's RGBA reference.
+
+Expected, **not measured**, against the T16 merge table: remove nearly all of
+the 3.849 ms full / 0.474 ms echo prepare+convert stages, leaving constant-sized
+primitive recording. Paint+handle should remain near 5.259 / 0.323 ms and draw
+near 2.461 / 0.384 ms. The simple total estimate is about 7.7 ms full and
+1.3 ms echo; allocation, mask/clear and host scheduling variability can move
+it. The <8 ms and ~1.8 ms targets are not claimed as passed. No Cargo build,
+test, check or clippy run was performed for this change; no versions are bumped.
+
+Unenforced assumptions/contracts: arbitrary external producers of `grid::Grid`
+must supply premultiplied BGRA (the constructor validates shape, not channels);
+term's opaque writes satisfy that contract. `PaintState::rebind` still relies
+on a complete byte-for-byte copy, as before. Upstream iced's current single-CPU
+renderer alias and layer ordering are source-audited and must be revisited on
+an upgrade. The CPU-only build requires dependency feature unification not to
+enable iced's wgpu arm independently of term's feature; both-feature term builds
+continue selecting wgpu. Performance estimates assume the same font, hardware
+and benchmark conditions as the merge
+table. Headless regressions do not establish live Wayland lifecycle, timing,
+memory pressure, compositor damage or input-to-visible latency. No age bound
+or renderer-history release timing is assumed for storage safety.

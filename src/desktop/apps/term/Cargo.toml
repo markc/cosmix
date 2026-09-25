@@ -41,7 +41,7 @@ wgpu = ["iced/wgpu", "naga27-termcolor"]
 # at all, like foot, and cheap for sparse updates. Build it ALONE —
 # `--no-default-features --features tiny-skia` — because with both compiled
 # in, main.rs takes the wgpu grid and iced_renderer puts wgpu first.
-tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes"]
+tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes", "dep:iced_tiny_skia"]
 # Not meant to be selected on its own; `wgpu` pulls it in. It exists as a
 # feature so the compatibility dependency stays optional.
 naga27-termcolor = ["dep:naga27"]
@@ -51,6 +51,7 @@ cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/c
 
 [dependencies]
 bytes = { version = "1.12", optional = true }
+iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image", "wayland"], optional = true }
 # iced 0.14 (D3), its own winit/Wayland backend (D2). default-features off is
 # not tidiness: `x11`, `tiny-skia`, `fira-sans` and the theme-detection D-Bus
 # client are all dead weight in a Wayland-only terminal that renders a texture

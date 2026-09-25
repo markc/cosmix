@@ -21,7 +21,43 @@ rotation and scaling retain the original draw. Negative local bounds under
 an identity transform also retain it: tiny-skia's specialised `fill_rect`
 rounding extends these edges differently from its transformed path. Translated
 negative physical origins still use the copy and are pixel-tested.
-Cache ids, conversion format and immutable image ownership are unchanged.
+Ordinary image cache ids, conversion format and immutable ownership are unchanged.
+
+T16 rank 3 adds `grid::Grid` and `Renderer::draw_grid` under the `image`
+feature. This is a native, tightly packed premultiplied BGRA8 **Source**
+primitive: recording it retains immutable `Bytes`, with no image cache load,
+allocation or conversion. A unique generation token drives constant-time
+layer equality. Native grids and ordinary images share one ordered sublayer
+(`layer::Image`); a later image or overlay still draws above the grid.
+The rank-1 placement/copy helpers are shared, including their rectangular
+clipping and fractional-edge tolerance. Non-native-size placement falls back
+to nearest-neighbour drawing directly from the native bytes. Widget clipping
+is intersected with layer/damage clipping before either route. The copy does
+not prepare another mask; the fallback does and restores the layer mask.
+
+The producer owns storage reuse. Term reclaims `Bytes` only when uniquely
+owned; retained widgets/layers/history force a separate generation allocation
+(copying unchanged rows for partial updates). No double-buffer or maximum-age
+assumption can allow mutation of a retained generation. The constructor checks
+dimensions and byte length, not channel premultiplication: supplying valid
+native premultiplied channels is the public producer contract. Term enforces
+opacity in its raster writes (alpha 255); it cannot supply image alpha here.
+Source semantics are deliberate, not a transparent-image replacement API.
+
+Rank-3 regressions: `grid::tests` checks shape/generation/shared ownership and
+copy/fallback pixel equality with the RGBA image pipeline. A layer regression
+checks no damage for a retained generation and damage for generation, placement
+or clip changes; term's seven-scale
+fixture compares old RGBA+convert pixels with native bands, including partial
+final bands and nonzero origins. Its ordinary rotating-target regression adds
+fractional clips, translucent overlapping images, movement, resize, cursor
+crossing/hiding, invalidation and unknown age. Existing retained-handle tests
+now exercise native generations. The ignored frame benchmark retains the old
+whole-pane RGBA transport as a test-only reference and times native bands.
+These added tests are **not run in the rank-3 worktree**; cluster validation
+is required. Retire this extension when upstream provides equivalent immutable
+native storage, generation-aware damage, clipping and draw-order semantics;
+retain all pixel and history regressions when updating.
 
 T16 integration resolves cumulative band edges in physical coordinates before
 the upstream image-size division and truncation. Edges within 0.001 pixel of

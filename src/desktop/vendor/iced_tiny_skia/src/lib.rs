@@ -9,6 +9,9 @@ mod settings;
 mod text;
 
 #[cfg(feature = "image")]
+pub mod grid;
+
+#[cfg(feature = "image")]
 mod raster;
 
 #[cfg(feature = "svg")]
@@ -50,6 +53,22 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Record a native grid in image draw order, without the image cache.
+    #[cfg(feature = "image")]
+    pub fn draw_grid(
+        &mut self,
+        grid: grid::Grid,
+        bounds: Rectangle,
+        clip_bounds: Rectangle,
+    ) {
+        let (layer, transformation) = self.layers.current_mut();
+        layer.images.push(layer::Image::Grid {
+            grid,
+            bounds: bounds * transformation,
+            clip_bounds: clip_bounds * transformation,
+        });
+    }
+
     pub fn new(default_font: Font, default_text_size: Pixels) -> Self {
         Self {
             default_font,
@@ -162,7 +181,7 @@ impl Renderer {
                     let render_span = debug::render(debug::Primitive::Image);
 
                     for image in &layer.images {
-                        self.engine.draw_image(
+                        self.engine.draw_layer_image(
                             image,
                             Transformation::scale(scale_factor),
                             pixels,

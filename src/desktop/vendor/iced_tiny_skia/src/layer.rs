@@ -6,11 +6,33 @@ use crate::core::{
 use crate::graphics::damage;
 use crate::graphics::layer;
 use crate::graphics::text::{Editor, Paragraph, Text};
-use crate::graphics::{self, Image};
+use crate::graphics::{self, Image as GraphicsImage};
 
 use std::sync::Arc;
 
 pub type Stack = layer::Stack<Layer>;
+
+/// Native grids share the image sublayer, preserving chrome/overlay ordering.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Image {
+    Standard(GraphicsImage),
+    #[cfg(feature = "image")]
+    Grid {
+        grid: crate::grid::Grid,
+        bounds: Rectangle,
+        clip_bounds: Rectangle,
+    },
+}
+
+impl Image {
+    fn bounds(&self) -> Rectangle {
+        match self {
+            Self::Standard(image) => image.bounds(),
+            #[cfg(feature = "image")]
+            Self::Grid { bounds, .. } => *bounds,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Layer {
@@ -128,16 +150,20 @@ impl Layer {
             .push(Item::Cached(text, clip_bounds, transformation));
     }
 
-    pub fn draw_image(&mut self, image: Image, transformation: Transformation) {
+    pub fn draw_image(
+        &mut self,
+        image: GraphicsImage,
+        transformation: Transformation,
+    ) {
         match image {
-            Image::Raster {
+            GraphicsImage::Raster {
                 image,
                 bounds,
                 clip_bounds,
             } => {
                 self.draw_raster(image, bounds, clip_bounds, transformation);
             }
-            Image::Vector {
+            GraphicsImage::Vector {
                 svg,
                 bounds,
                 clip_bounds,
@@ -154,7 +180,7 @@ impl Layer {
         clip_bounds: Rectangle,
         transformation: Transformation,
     ) {
-        let image = Image::Raster {
+        let image = GraphicsImage::Raster {
             image: core::Image {
                 border_radius: image.border_radius
                     * transformation.scale_factor(),
@@ -164,7 +190,7 @@ impl Layer {
             clip_bounds: clip_bounds * transformation,
         };
 
-        self.images.push(image);
+        self.images.push(Image::Standard(image));
     }
 
     pub fn draw_svg(
@@ -174,13 +200,13 @@ impl Layer {
         clip_bounds: Rectangle,
         transformation: Transformation,
     ) {
-        let svg = Image::Vector {
+        let svg = GraphicsImage::Vector {
             svg,
             bounds: bounds * transformation,
             clip_bounds: clip_bounds * transformation,
         };
 
-        self.images.push(svg);
+        self.images.push(Image::Standard(svg));
     }
 
     pub fn draw_primitive_group(

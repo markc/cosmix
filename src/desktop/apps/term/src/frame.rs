@@ -3,7 +3,7 @@
 //! A [`Frame`] is created per visible pane and lives while that pane is on
 //! screen. The VT loop rasterises into it in place and appends the damaged
 //! bands; the renderer consumes them. The wgpu arm keeps one Vec-backed
-//! surface; tiny-skia shares each Bytes-backed row band with its image handle,
+//! surface; tiny-skia shares each native Bytes-backed band with its generation,
 //! reclaiming it for painting or copying if iced still holds it. Reusing
 //! storage matters: the Bevy terminal's `Image::new`-per-damaged-frame
 //! is where 320 MB of its 344 MB of mapped GEM went
@@ -30,7 +30,7 @@ pub struct Frame {
     /// distant rows is most of the screen.
     damage: Vec<DamageBand>,
     /// Bumped on every render that wrote anything. The CPU arm keys its
-    /// image-handle cache on it; tests use it to tell a real repaint from a
+    /// native-grid generation on it; tests use it to tell a real repaint from a
     /// no-op.
     generation: u64,
 }
@@ -45,7 +45,7 @@ impl Frame {
         &self.surface
     }
 
-    // Read by the CPU arm's handle cache and by the tests; the wgpu arm keys
+    // Read by the CPU arm's native generation cache and tests; the wgpu arm keys
     // its uploads on damage bands instead, so it never asks.
     #[cfg_attr(feature = "wgpu", allow(dead_code))]
     pub fn generation(&self) -> u64 {

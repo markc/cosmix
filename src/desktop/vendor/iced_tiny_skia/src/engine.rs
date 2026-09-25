@@ -552,6 +552,64 @@ impl Engine {
         }
     }
 
+    pub fn draw_layer_image(
+        &mut self,
+        image: &crate::layer::Image,
+        transformation: Transformation,
+        pixels: &mut tiny_skia::PixmapMut<'_>,
+        clip_mask: &mut tiny_skia::Mask,
+        clip_bounds: Rectangle,
+    ) {
+        match image {
+            crate::layer::Image::Standard(image) => self.draw_image(
+                image,
+                transformation,
+                pixels,
+                clip_mask,
+                clip_bounds,
+            ),
+            #[cfg(feature = "image")]
+            crate::layer::Image::Grid {
+                grid,
+                bounds,
+                clip_bounds: grid_clip,
+            } => {
+                let Some(clip) =
+                    clip_bounds.intersection(&(*grid_clip * transformation))
+                else {
+                    return;
+                };
+                let physical = *bounds * transformation;
+                if !clip.intersects(&physical) {
+                    return;
+                }
+                if grid.copy(
+                    *bounds,
+                    pixels,
+                    into_transform(transformation),
+                    clip,
+                ) {
+                    return;
+                }
+                // Native copy reads only the rectangle, never this mask. The
+                // fallback needs the intersection including the widget clip.
+                let masked = !physical.is_within(&clip);
+                if masked {
+                    adjust_clip_mask(clip_mask, clip);
+                }
+                grid.draw_fallback(
+                    *bounds,
+                    pixels,
+                    into_transform(transformation),
+                    masked.then_some(clip_mask as &_),
+                );
+                if masked {
+                    adjust_clip_mask(clip_mask, clip_bounds);
+                }
+            }
+        }
+    }
+
     pub fn draw_image(
         &mut self,
         image: &Image,
