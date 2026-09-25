@@ -270,10 +270,13 @@ fn tiny_skia_frame_bench() {
     }
 }
 
-/// Exercise the real layer diff against three rotating targets, and compare
-/// every repaired frame to a fresh old RGBA+convert draw. No timing/Wayland.
+/// Exercise production PresentHistory and physical submission rectangles
+/// against three rotating targets and a displayed front buffer. Only the
+/// softbuffer/Wayland commit is replaced by copying the submitted rectangles.
+/// Compare both repaired and displayed pixels to a fresh RGBA+convert draw.
 #[test]
 fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
+    use iced_tiny_skia::window::compositor::{PresentHistory, physical_damage};
     for scale in [1.0, 1.25, 2.5] {
         let mut scale = scale;
         let mut raster = Raster::new(scale, 13.0, Cursor::Block).unwrap();
@@ -303,7 +306,8 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
         let mut targets: Vec<_> = (0..3)
             .map(|_| tiny_skia::Pixmap::new(480, 480).unwrap())
             .collect();
-        let mut history: std::collections::VecDeque<Vec<Layer>> = Default::default();
+        let mut history = PresentHistory::default();
+        let mut displayed = tiny_skia::Pixmap::new(480, 480).unwrap();
         let overlay = Handle::from_rgba(8, 8, [31, 47, 239, 127].repeat(64));
         let mut seed = 0x1234_5678_91ab_cdef_u64;
         let mut retained = Vec::new();
@@ -316,7 +320,7 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
                 raster = raster.resized(scale, 13.0).unwrap();
                 viewport = Viewport::with_physical_size(Size::new(480, 480), scale);
                 full = Rectangle::with_size(viewport.logical_size());
-                history.clear(); // configure_surface also resets age history
+                history = PresentHistory::default(); // configure_surface does this too
             }
             if n == 7 {
                 screen.rows = 6;
@@ -406,39 +410,61 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
                 });
             }
             // Unknown age must discard the damaged target's old contents.
-            if n % 53 == 5 {
-                history.clear();
+            let age = if n < 3 || n % 53 == 5 { 0 } else { 3 };
+            if age == 0 {
                 targets[n % 3].fill(tiny_skia::Color::from_rgba8(255, 0, 255, 255));
             }
-            let regions = history
-                .front()
-                .filter(|_| history.len() == 3)
-                .map(|old| damage::diff(old, renderer.layers(), |l| vec![l.bounds], Layer::damage))
-                .unwrap_or_else(|| vec![full]);
-            let regions = damage::group(regions, full);
-            history.push_back(renderer.layers().to_vec());
-            if history.len() > 3 {
-                history.pop_front();
-            }
+            let background = if n % 83 < 40 {
+                Color::BLACK
+            } else {
+                Color::WHITE
+            };
+            let regions = history.damage(age, renderer.layers(), &viewport, background);
+            let physical = physical_damage(&regions, &viewport);
             renderer.draw(
                 &mut targets[n % 3].as_mut(),
                 &mut mask,
                 &viewport,
                 &regions,
-                Color::BLACK,
+                background,
             );
+            let pre_present = std::cell::Cell::new(false);
+            history
+                .submit(
+                    renderer.layers(),
+                    background,
+                    || pre_present.set(true),
+                    || {
+                        assert!(pre_present.get());
+                        for rect in &physical {
+                            for y in rect.y..rect.y + rect.height.get() {
+                                let start = (y as usize * 480 + rect.x as usize) * 4;
+                                let end = start + rect.width.get() as usize * 4;
+                                displayed.data_mut()[start..end]
+                                    .copy_from_slice(&targets[n % 3].data()[start..end]);
+                            }
+                        }
+                        Ok::<_, ()>(())
+                    },
+                )
+                .unwrap();
             let mut expected = tiny_skia::Pixmap::new(480, 480).unwrap();
             oracle.draw(
                 &mut expected.as_mut(),
                 &mut mask,
                 &viewport,
                 &[full],
-                Color::BLACK,
+                background,
             );
             assert_eq!(
                 targets[n % 3].data(),
                 expected.data(),
                 "scale={scale} frame={n}"
+            );
+            assert_eq!(
+                displayed.data(),
+                expected.data(),
+                "submitted scale={scale} frame={n}"
             );
         }
     }
@@ -521,10 +547,20 @@ fn tiny_skia_foot_phases_bench() {
     use std::hint::black_box;
 
     fn measure(label: &str, mut work: impl FnMut()) {
+        measure_prepared(label, &mut (), |_| {}, |_| work());
+    }
+
+    fn measure_prepared<T>(
+        label: &str,
+        state: &mut T,
+        mut prepare: impl FnMut(&mut T),
+        mut work: impl FnMut(&mut T),
+    ) {
         let mut samples = Vec::new();
         for n in 0..220 {
+            prepare(state);
             let start = Instant::now();
-            work();
+            work(state);
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             if n >= 20 {
                 samples.push(ms);
@@ -563,13 +599,14 @@ fn tiny_skia_foot_phases_bench() {
     for echo in [true, false] {
         let mut dirty = vec![!echo; 25];
         dirty[12] = true;
-        measure(
+        measure_prepared(
             if echo {
                 "paint warm echo (90 cells)"
             } else {
                 "paint warm full (2250 cells)"
             },
-            || {
+            &mut screen,
+            |screen| {
                 for (row, cells) in screen.cells.chunks_mut(90).enumerate() {
                     if dirty[row] {
                         for cell in cells {
@@ -577,7 +614,9 @@ fn tiny_skia_foot_phases_bench() {
                         }
                     }
                 }
-                raster.paint(&screen, &mut rgba, 2250 * 4, &mut state, &dirty);
+            },
+            |screen| {
+                raster.paint(screen, &mut rgba, 2250 * 4, &mut state, &dirty);
                 black_box(&rgba);
             },
         );

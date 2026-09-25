@@ -507,7 +507,7 @@ impl EventedPty for MeteredPty {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
     pub fg: [u8; 3],

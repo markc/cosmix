@@ -88,8 +88,6 @@ impl PixelBand {
             return &self.bands;
         }
 
-        let discard = raster.overwrites_all(screen, &self.state, dirty, PixelFormat::Bgra);
-
         self.cached = None;
         // Lifetime rule: a widget, renderer layer or age-repair history may
         // retain ANY older generation. Never mutate its bytes, even after two
@@ -98,7 +96,7 @@ impl PixelBand {
         let mut pixels = match std::mem::take(&mut self.native).try_into_mut() {
             Ok(pixels) => pixels,
             Err(shared) => {
-                if discard {
+                if raster.overwrites_all(screen, &self.state, dirty, PixelFormat::Bgra) {
                     // Every row will be overwritten: copying retained pixels
                     // here only wastes memory bandwidth on full-screen TUIs.
                     self.state.invalidate();
@@ -133,18 +131,15 @@ impl PixelBand {
         {
             self.damage = Damage::new(width, height, (raster.width, raster.height));
         }
-        self.damage.as_mut().expect("nonempty band").mark(
-            &self
-                .bands
-                .iter()
-                .map(|b| iced::Rectangle {
-                    x: b.x,
-                    y: b.y,
-                    width: b.width,
-                    height: b.height,
-                })
-                .collect::<Vec<_>>(),
-        );
+        self.damage
+            .as_mut()
+            .expect("nonempty band")
+            .mark(self.bands.iter().map(|b| iced::Rectangle {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            }));
         self.width = width;
         self.height = height;
         self.cell = (raster.width, raster.height);

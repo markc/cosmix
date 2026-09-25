@@ -68,7 +68,7 @@ impl Frame {
 }
 
 /// Merge matching horizontal spans vertically; never lose x/width when
-/// accumulating paints between uploads. Repeated ranges remain bounded.
+/// accumulating paints between uploads. The caller caps fragmented input.
 fn coalesce(mut bands: Vec<DamageBand>) -> Vec<DamageBand> {
     if bands.len() < 2 {
         return bands;
@@ -256,9 +256,20 @@ impl Painter {
             return false;
         }
         // Coalesced on the way IN, not only on the way out: several paints
-        // can arrive before refresh drains damage. Merging bounds the list
-        // by the grid's distinct cell ranges, however long presentation stalls.
-        frame.damage = coalesce(std::mem::take(&mut frame.damage));
+        // can arrive before refresh drains damage. Cap BEFORE sorting: varied
+        // horizontal ranges can otherwise accumulate quadratically in cols.
+        if frame.damage.len() > 2 * screen.rows {
+            frame.damage.clear();
+            let (width, height) = self.raster.target_size(screen);
+            frame.damage.push(DamageBand {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            });
+        } else {
+            frame.damage = coalesce(std::mem::take(&mut frame.damage));
+        }
         frame.generation += 1;
         true
     }
@@ -422,6 +433,42 @@ mod tests {
             1,
             "500 repaints of one row must be merged as they arrive, not held"
         );
+    }
+
+    #[test]
+    fn undrained_pane_damage_stays_bounded_for_varied_cell_ranges() {
+        let mut painter = painter();
+        let shared = painter.frame(PANE);
+        let mut grid = screen(24, 6, ' ');
+        painter.repaint(PANE, &grid, &[]);
+        shared.lock().unwrap().clear_damage();
+        let (cw, ch) = painter.cell();
+        // Model a retained hidden/stalled pane: PTY reads keep arriving, but
+        // no upload or refresh drains any of the pending damage.
+        for row in 0..grid.rows {
+            for first in 0..grid.cols {
+                for end in first + 1..=grid.cols {
+                    for cell in &mut grid.cells[row * grid.cols + first..row * grid.cols + end] {
+                        cell.bg[0] ^= 255;
+                    }
+                    let mut dirty = vec![false; grid.rows];
+                    dirty[row] = true;
+                    assert!(painter.repaint(PANE, &grid, &dirty));
+                    let frame = shared.lock().unwrap();
+                    assert!(frame.damage.len() <= 2 * grid.rows);
+                    // Every cell touched by earlier reads remains covered.
+                    for y in 0..=row {
+                        let last = if y == row { end } else { grid.cols };
+                        for x in 0..last {
+                            assert!(frame.damage.iter().any(|b| b.x <= x as u32 * cw
+                                && b.x + b.width >= (x + 1) as u32 * cw
+                                && b.y <= y as u32 * ch
+                                && b.y + b.height >= (y + 1) as u32 * ch));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A surface cleared to nothing is a change, and a renderer told "no

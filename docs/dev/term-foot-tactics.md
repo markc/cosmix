@@ -919,22 +919,31 @@ with identical rounded metrics). A byte-identical complete-copy `rebind` is the
 explicit storage exception. Malformed damage lengths and incomplete cell rows
 retain the conservative full-paint behaviour. `Screen::display_offset` is
 captured under the terminal lock and carried through CPU band snapshots: an
-offset change forces full rows even if all cells compare equal. Both capture
-and raster hide the cursor whenever that offset is nonzero. An unchanged
-scrolled viewport may now skip identical cells despite conservative row hints.
+offset change forces full rows even if all cells compare equal. Capture keeps
+the cursor visible while its live row remains inside the viewport, including
+at nonzero offsets; raster honours that captured visibility. An unchanged
+scrolled viewport may skip identical cells despite conservative row hints.
 
 `DamageBand` now includes physical `x` and `width`. Its legacy `byte_range`
 still returns conservative full scanlines, including padding. Frame damage
-coalescing preserves horizontal extents. Wgpu uploads narrow rectangles from
-the existing full-stride RGBA allocation using x/y texture origins and byte
+coalescing preserves horizontal extents. Pending frame damage collapses to a
+full rectangle above twice the row count, bounding undrained hidden/stalled
+panes even when each read changes a different horizontal range. Both raster
+and native-grid vertical merging search only the preceding row's open runs;
+above twice the row count they fall back to full-width damaged-row bands.
+Wgpu uploads narrow rectangles from the existing full-stride RGBA allocation
+using x/y texture origins and byte
 offsets; new textures still receive a full upload. No packing allocation or
 texture-format change is introduced. GPU execution remains unvalidated here.
 
 The tiny-skia primitive keeps a bounded cell-revision array beside each
 immutable native BGRA generation. Its separate `Damage` tracker holds metadata,
 never old pixels. Updating stamps uses copy-on-write if a retained generation
-still owns the old array. Comparing two generations from the same lineage
-finds changed ranges at any buffer age, including A → B → A and multiple
+still owns the old array; a full overwrite replaces it with fresh stamps
+without copying the old array. Damage rectangles pass from the borrowed band
+slice through an iterator, without an intermediate rectangle allocation.
+Comparing two generations from the same lineage finds changed ranges at any
+buffer age, including A → B → A and multiple
 paints/publications before a presentation. Unrelated geometry/lineage, changed
 placement/clip and added/removed primitives retain full-bound damage. Equal
 generations stay a constant-time comparison.
@@ -942,7 +951,12 @@ generations stay a constant-time comparison.
 The four-row allocation remains the storage unit. A retained generation always
 forces separate pixels before mutation. Partial updates copy the **complete**
 band and rebind; an update proven to overwrite every cell may discard its old
-pixels. Row flags alone no longer authorise discarding bytes. No storage safety
+pixels. This overwrite check runs only when the allocation is shared. Full
+paints skip change-mask allocation/clearing/comparison and record cells row by
+row while painting. Dirty rows compare and record `Copy` cells in one pass,
+counting changes without later row scans or cell copies. The warm full/echo
+probe prepares background changes outside the timer, matching the rank-6
+probe. Row flags alone no longer authorise discarding bytes. No storage safety
 depends on a maximum age, a two-frame rotation or history release timing.
 The widget still draws complete immutable grids; layer diffing supplies narrow
 regions to the existing clipped copy and `present_with_damage` path. Iced's
@@ -959,11 +973,18 @@ Added/extended validation for the cluster:
   explicit invalidation and viewport changes. Guard bytes/padding and damage
   coverage of every changed byte are checked.
 - Focused tests require one-cell damage, two disjoint ranges, unchanged cursor
-  no-ops and full viewport invalidation with identical cells. Existing row,
+  no-ops and full viewport invalidation with identical cells. Pixel assertions
+  cover block and underline cursors at nonzero offsets in RGBA and BGRA.
+  Tests also cover untouched full-paint change scratch, varied undrained
+  ranges, continuing vertical runs and bounded checkerboard damage. Existing row,
   format, storage and frame tests use the new rectangle semantics.
 - The rotating-target/RGBA comparison now checks 384 frames for each of three
   initial scales, including output-scale changes, retained historical pixels,
   skipped intermediate generations, clips/overlays, resize and unknown ages.
+  It uses production `PresentHistory`, physical rectangle conversion and
+  submission sequencing. A headless displayed buffer copies only submitted
+  rectangles and must match the full RGBA oracle, as must each repaired target;
+  only the softbuffer/Wayland commit itself is simulated.
 - Vendor regressions check arbitrary-age cell stamps, reverts, narrow layer
   diffing and the physical rectangles passed to presentation. At scale 2.5,
   one 25×50 cell yields a 31×56 outward-rounded rectangle after iced's margin,

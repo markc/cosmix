@@ -184,14 +184,17 @@ pub fn present(
 }
 
 #[derive(Default)]
-struct PresentHistory {
+#[doc(hidden)]
+// Exposed so downstream headless tests exercise the same age repair and
+// submission lifecycle as the window compositor, without a second model.
+pub struct PresentHistory {
     layers: VecDeque<Vec<Layer>>,
     background: Option<Color>,
     max_age: u8,
 }
 
 impl PresentHistory {
-    fn damage(&mut self, age: u8, layers: &[Layer], viewport: &Viewport, background: Color) -> Vec<Rectangle> {
+    pub fn damage(&mut self, age: u8, layers: &[Layer], viewport: &Viewport, background: Color) -> Vec<Rectangle> {
         self.max_age = self.max_age.max(age);
         self.layers.truncate(self.max_age as usize);
         let full = Rectangle::with_size(viewport.logical_size());
@@ -207,7 +210,7 @@ impl PresentHistory {
         damage::group(repair, full)
     }
 
-    fn submit<E>(&mut self, layers: &[Layer], background: Color, pre_present: impl FnOnce(), present: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+    pub fn submit<E>(&mut self, layers: &[Layer], background: Color, pre_present: impl FnOnce(), present: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         // Even empty damage commits: winit's pre-present hook requests the
         // Wayland frame callback. Skipping either half removes vsync pacing
         // from unchanged NextFrame animations. Empty commits rotate ages too.
@@ -222,7 +225,8 @@ impl PresentHistory {
     }
 }
 
-fn physical_damage(damage: &[Rectangle], viewport: &Viewport) -> Vec<softbuffer::Rect> {
+#[doc(hidden)]
+pub fn physical_damage(damage: &[Rectangle], viewport: &Viewport) -> Vec<softbuffer::Rect> {
     let size = viewport.physical_size();
     damage
         .iter()
@@ -313,7 +317,7 @@ mod tests {
         renderer.draw_grid(Grid::with_damage(pixels.clone(), &stamps).unwrap(), full, full);
         assert_eq!(history.damage(0, renderer.layers(), &viewport, Color::BLACK), [full]);
         history.submit(renderer.layers(), Color::BLACK, || {}, || Ok::<_, ()>(())).unwrap();
-        stamps.mark(&[Rectangle { x: 1125, y: 50, width: 25, height: 50 }]);
+        stamps.mark([Rectangle { x: 1125, y: 50, width: 25, height: 50 }]);
         renderer.reset(full);
         renderer.draw_grid(Grid::with_damage(pixels, &stamps).unwrap(), full, full);
         let regions = history.damage(1, renderer.layers(), &viewport, Color::BLACK);

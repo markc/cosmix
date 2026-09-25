@@ -40,11 +40,31 @@ impl Damage {
         })
     }
 
-    pub fn mark(&mut self, rectangles: &[Rectangle<u32>]) {
+    pub fn mark<R: std::borrow::Borrow<Rectangle<u32>>, I>(
+        &mut self,
+        rectangles: I,
+    ) where
+        I: IntoIterator<Item = R>,
+        I::IntoIter: Clone,
+    {
         let revision = next_generation();
         let cols = self.width.div_ceil(self.cell.0) as usize;
+        let rectangles = rectangles.into_iter();
+        if rectangles.clone().any(|rect| {
+            let rect = rect.borrow();
+            rect.x == 0
+                && rect.y == 0
+                && rect.width >= self.width
+                && rect.height >= self.height
+        }) {
+            // Retained generations need their old stamps, but a full
+            // overwrite has no reason to copy those stamps first.
+            self.revisions = vec![revision; self.revisions.len()].into();
+            return;
+        }
         let revisions = Arc::make_mut(&mut self.revisions);
         for rect in rectangles {
+            let rect = rect.borrow();
             if rect.width == 0 || rect.height == 0 {
                 continue;
             }
@@ -140,12 +160,17 @@ impl Grid {
         }
         let cols = new.width.div_ceil(new.cell.0) as usize;
         let mut regions: Vec<Rectangle<u32>> = Vec::new();
-        for (row, (now, before)) in new
+        let limit = 2 * new.height.div_ceil(new.cell.1) as usize;
+        let mut previous: Vec<usize> = Vec::new();
+        let mut current = Vec::new();
+        'rows: for (row, (now, before)) in new
             .revisions
             .chunks(cols)
             .zip(old.revisions.chunks(cols))
             .enumerate()
         {
+            current.clear();
+            let mut candidate = 0;
             let mut col = 0;
             while col < cols {
                 if now[col] == before[col] {
@@ -160,19 +185,56 @@ impl Grid {
                 let y = row as u32 * new.cell.1;
                 let width = (col as u32 * new.cell.0).min(new.width) - x;
                 let height = new.cell.1.min(new.height - y);
-                if let Some(last) = regions.iter_mut().rev().find(|r| {
-                    r.x == x && r.width == width && r.y + r.height == y
-                }) {
-                    last.height += height;
+                while candidate < previous.len()
+                    && regions[previous[candidate]].x < x
+                {
+                    candidate += 1;
+                }
+                if let Some(&index) = previous.get(candidate)
+                    && regions[index].x == x
+                    && regions[index].width == width
+                {
+                    regions[index].height += height;
+                    current.push(index);
                 } else {
+                    current.push(regions.len());
                     regions.push(Rectangle {
                         x,
                         y,
                         width,
                         height,
                     });
+                    if regions.len() > limit {
+                        regions.clear();
+                        for (row, (now, before)) in new
+                            .revisions
+                            .chunks(cols)
+                            .zip(old.revisions.chunks(cols))
+                            .enumerate()
+                        {
+                            if now == before {
+                                continue;
+                            }
+                            let y = row as u32 * new.cell.1;
+                            let height = new.cell.1.min(new.height - y);
+                            if let Some(last) = regions.last_mut()
+                                && last.y + last.height == y
+                            {
+                                last.height += height;
+                            } else {
+                                regions.push(Rectangle {
+                                    x: 0,
+                                    y,
+                                    width: new.width,
+                                    height,
+                                });
+                            }
+                        }
+                        break 'rows;
+                    }
                 }
             }
+            std::mem::swap(&mut previous, &mut current);
         }
         let sx = bounds.width / new.width as f32;
         let sy = bounds.height / new.height as f32;
@@ -292,6 +354,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_damage_replaces_shared_stamps_without_changing_retained_history() {
+        let mut damage = Damage::new(8, 6, (2, 2)).unwrap();
+        let old = damage.clone();
+        damage.mark([Rectangle {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 6,
+        }]);
+        assert!(!Arc::ptr_eq(&old.revisions, &damage.revisions));
+        assert!(old.revisions.iter().all(|&r| r == old.lineage));
+        assert!(
+            damage
+                .revisions
+                .iter()
+                .all(|&r| r == damage.revisions[0] && r != old.lineage)
+        );
+    }
+
+    #[test]
+    fn revision_damage_bounds_checkerboards_and_preserves_open_runs() {
+        let (cols, rows) = (96, 32);
+        let mut damage = Damage::new(cols, rows, (1, 1)).unwrap();
+        let pixels = Bytes::from([0, 0, 0, 255].repeat((cols * rows) as usize));
+        let old = Grid::with_damage(pixels.clone(), &damage).unwrap();
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: cols as f32,
+            height: rows as f32,
+        };
+        damage.mark([
+            Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 3,
+            },
+            Rectangle {
+                x: 2,
+                y: 1,
+                width: 1,
+                height: 2,
+            },
+        ]);
+        let next = Grid::with_damage(pixels.clone(), &damage).unwrap();
+        assert_eq!(
+            next.damage_since(&old, bounds),
+            vec![
+                Rectangle {
+                    x: -1.0,
+                    y: -1.0,
+                    width: 3.0,
+                    height: 5.0
+                },
+                Rectangle {
+                    x: 1.0,
+                    y: 0.0,
+                    width: 3.0,
+                    height: 4.0
+                },
+            ]
+        );
+        let mut rectangles = Vec::new();
+        for y in 0..rows {
+            for x in 0..cols {
+                if y != 15 && (x + y) % 2 == 0 {
+                    rectangles.push(Rectangle {
+                        x,
+                        y,
+                        width: 1,
+                        height: 1,
+                    });
+                }
+            }
+        }
+        damage.mark(rectangles.iter());
+        let next = Grid::with_damage(pixels, &damage).unwrap();
+        let regions = next.damage_since(&old, bounds);
+        assert!(regions.len() <= 2 * rows as usize);
+        assert_eq!(
+            regions,
+            vec![
+                Rectangle {
+                    x: -1.0,
+                    y: -1.0,
+                    width: 98.0,
+                    height: 17.0
+                },
+                Rectangle {
+                    x: -1.0,
+                    y: 15.0,
+                    width: 98.0,
+                    height: 18.0
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn cell_revisions_cover_arbitrary_ages_reverts_and_skipped_publications() {
         let bounds = Rectangle {
             x: 7.0,
@@ -316,7 +478,7 @@ mod tests {
             height: 5,
         };
         bytes[(5 * 90 + 6) * 4] = 255;
-        damage.mark(&[a]);
+        damage.mark([a]);
         let second =
             Grid::with_damage(Bytes::from(bytes.clone()), &damage).unwrap();
         assert_eq!(
@@ -329,8 +491,8 @@ mod tests {
             }]
         );
         bytes[(5 * 90 + 6) * 4] = 0; // A -> B -> A still owes display damage.
-        damage.mark(&[a]);
-        damage.mark(&[b]); // two updates before publishing, no lost range
+        damage.mark([a]);
+        damage.mark([b]); // two updates before publishing, no lost range
         let third = Grid::with_damage(Bytes::from(bytes), &damage).unwrap();
         assert_eq!(third.damage_since(&first, bounds).len(), 2);
         assert_eq!(third.damage_since(&second, bounds).len(), 2);
@@ -372,7 +534,7 @@ mod tests {
             clip,
         );
         let previous = renderer.layers()[0].clone();
-        damage.mark(&[Rectangle {
+        damage.mark([Rectangle {
             x: 50,
             y: 10,
             width: 2,
