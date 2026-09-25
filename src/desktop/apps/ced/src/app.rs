@@ -421,7 +421,14 @@ impl App {
                     tasks.push(read.map(move |text| Msg::Paste(intent.clone(), text)));
                 }
                 Effect::Prompt(prompt) => self.on_prompt(prompt),
-                Effect::WindowAction { tab, action, args, intent } => tasks.push(self.on_window_action(tab, action, args, intent)),
+                Effect::UiAction { tab, action, args, intent, token } => {
+                    let (task, result) = self.on_window_action(tab, action, args, intent);
+                    tasks.push(task);
+                    // Applied (a dialog counts once it is open): now the Bus
+                    // caller, if any, gets its answer.
+                    let effects = self.controller.ui_done(token, result);
+                    tasks.push(self.perform(effects));
+                }
                 Effect::Relex { tab, tag, source } => tasks.push(Task::perform(relex(tag, source), move |(tag, spans)| Msg::Relex(tab, tag, spans))),
                 // The controller debounces session writes itself.
                 Effect::SaveSession => self.save_session(),
@@ -637,15 +644,37 @@ impl App {
     /// over the Bus, or missing the args only a human can give): perform it
     /// as the window would, keeping the caller's intent for anything it
     /// starts (Save As).
-    fn on_window_action(&mut self, tab: Option<TabId>, action: ActionId, args: Option<serde_json::Value>, intent: Intent) -> Task<Msg> {
+    fn on_window_action(
+        &mut self,
+        tab: Option<TabId>,
+        action: ActionId,
+        args: Option<serde_json::Value>,
+        intent: Intent,
+    ) -> (Task<Msg>, Result<serde_json::Value, crate::verbs::Refusal>) {
         let mut selected = Task::none();
         if let Some(t) = tab
             && Some(t) != self.controller.active()
         {
+            if self.tab(t).is_none() {
+                return (Task::none(), Err(refusal(crate::verbs::code::NOT_FOUND, format!("no tab {t}"))));
+            }
             let effects = self.controller.select_tab(t);
             selected = self.perform(effects);
         }
         let arg = |k: &str| args.as_ref().and_then(|a| a.get(k)).and_then(|v| v.as_str()).map(str::to_owned);
+        let needs_tab = matches!(
+            action,
+            ActionId::FileSaveAs
+                | ActionId::SearchFind
+                | ActionId::SearchFindNext
+                | ActionId::SearchFindPrev
+                | ActionId::SearchReplace
+                | ActionId::SearchReplaceAll
+                | ActionId::SearchGotoLine
+        );
+        if needs_tab && self.controller.active().is_none() {
+            return (selected, Err(refusal(crate::verbs::code::NOT_FOUND, format!("{} needs an open tab", action.id()))));
+        }
         let task = match action {
             ActionId::FileSaveAs => match self.controller.active() {
                 Some(t) => {
@@ -668,7 +697,7 @@ impl App {
             }
             other => self.on_ui_action(other),
         };
-        Task::batch([selected, task])
+        (Task::batch([selected, task]), Ok(serde_json::Value::Null))
     }
 
     fn on_escape(&mut self) -> Task<Msg> {
@@ -1333,6 +1362,10 @@ fn relex(
         };
         (tag, spans)
     }
+}
+
+fn refusal(code: &str, message: String) -> crate::verbs::Refusal {
+    crate::verbs::Refusal { error_code: code.to_owned(), message, reason: None }
 }
 
 fn route_msg(routed: Routed) -> Msg {
