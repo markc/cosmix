@@ -92,10 +92,13 @@ pub enum Effect {
     /// Ask the human (a dialog); the answer comes back as an action or a
     /// [`Controller`] method (see [`Prompt`]). Added in E1d for E1f.
     Prompt(Prompt),
-    /// A window-only action (dialogs, find bar, zoom, panels, help) asked for
-    /// over the Bus or without the args the controller needs: the window
-    /// performs it. Never emitted headless (those refuse UNAVAILABLE).
-    WindowAction { tab: Option<TabId>, action: ActionId, args: Option<Value>, intent: Intent },
+    /// A window-only action (dialogs, find bar, zoom, panels, help, and the
+    /// args-taking actions called without their args): the window performs it
+    /// and then calls [`Controller::ui_done`] with `token` and the outcome.
+    /// A Bus `ced.action` that caused it is answered only from `ui_done` (or
+    /// with a `TIMEOUT` refusal after 10 s) — never before the window acted.
+    /// Never emitted headless (those refuse UNAVAILABLE).
+    UiAction { tab: Option<TabId>, action: ActionId, args: Option<Value>, intent: Intent, token: u64 },
     /// Run a Mix relex off the UI thread:
     /// `cosmix_edit_client::highlight::run_mix(&tag.language, &source)`, then
     /// hand the spans to [`Controller::on_relex`] with the same tag.
@@ -178,6 +181,8 @@ enum TimerFor {
     Rematch(TabId),
     /// Change markers clear 2 s after the tab gains focus (plan §4.5).
     ClearMarkers(TabId),
+    /// A Bus `ced.action` waiting on the window's `ui_done`.
+    UiDeadline(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +251,9 @@ pub struct Controller {
     /// Recovered buffers offered at start, and their epoch.
     recovered: Vec<wire::BufferSummary>,
     recovered_epoch: String,
+    /// `UiAction` tokens: the next one, and the Bus commands awaiting `ui_done`.
+    next_ui_token: u64,
+    ui_pending: HashMap<u64, (u64, String)>,
 }
 
 fn refusal(code: &str, message: impl Into<String>, reason: Option<&str>) -> String {
@@ -411,6 +419,8 @@ impl Controller {
             frames: ui::Frames::default(),
             recovered: Vec::new(),
             recovered_epoch: String::new(),
+            next_ui_token: 0,
+            ui_pending: HashMap::new(),
         }
     }
 
@@ -826,6 +836,7 @@ impl Controller {
                 }
                 self.request_matches(tab, fx);
             }
+            Some(TimerFor::UiDeadline(token)) => self.ui_timeout(token, fx),
             Some(TimerFor::ClearMarkers(tab)) => {
                 if self.active == Some(tab)
                     && let Some(t) = self.tab_mut(tab)
@@ -1631,6 +1642,11 @@ impl Controller {
                     },
                 };
                 let intent = Intent::bus(tab.unwrap_or(0), &cmd.caller_key);
+                if !self.headless && ui::window_only(action, r.args.as_ref()) {
+                    // Full mesh access: the window performs it, and the
+                    // reply waits for the window's `ui_done`.
+                    return self.ui_dispatch(tab, action, r.args.clone(), intent, Some((id, r.id.clone())), fx);
+                }
                 if action == ActionId::FileClose {
                     let force = r.args.as_ref().and_then(|a| a.get("force")).and_then(Value::as_bool).unwrap_or(false);
                     match tab {
@@ -2038,13 +2054,34 @@ mod tests {
         assert_eq!(v["text_hash"].as_str().unwrap(), blake3::hash(b"!hello world\n").to_hex().as_str());
         assert_eq!((v["pending"].as_u64(), v["inflight"].as_bool()), (Some(0), Some(false)));
 
-        // A window-only action over the Bus goes to the window (headless: refused).
+        // A window-only action over the Bus: headless refuses; with a window
+        // the reply waits for ui_done, or times out.
         let (rc, v) = response(&c.on_bus_command(cmd("ced.action", json!({"id": "view.zoom_in"}))));
         assert_eq!((rc, v["error_code"].as_str()), (10, Some("UNAVAILABLE")));
         let mut gui = Controller::new(Config::default(), 2, false);
         let fx = gui.on_bus_command(cmd("ced.action", json!({"id": "search.find"})));
-        assert!(fx.iter().any(|e| matches!(e, Effect::WindowAction { action: ActionId::SearchFind, .. })));
-        assert_eq!(response(&fx).0, 0);
+        let token = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::UiAction { action: ActionId::SearchFind, token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("a UiAction");
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Respond { .. })), "no reply before the window acts");
+        let fx = gui.ui_done(token, Ok(json!({"opened": "find"})));
+        let (rc, v) = response(&fx);
+        assert_eq!((rc, v["ok"].as_bool(), v["result"]["opened"].as_str()), (0, Some(true), Some("find")));
+        assert!(gui.ui_done(token, Ok(Value::Null)).is_empty(), "a token answers once");
+        let fx = gui.on_bus_command(cmd("ced.action", json!({"id": "help.about"})));
+        let timer = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::Timer { id, ms } if *ms == 10_000 => Some(*id),
+                _ => None,
+            })
+            .expect("a deadline");
+        let (rc, v) = response(&gui.on_incoming(Incoming::Timer { id: timer }));
+        assert_eq!((rc, v["error_code"].as_str(), v["reason"].as_str()), (10, Some("TIMEOUT"), Some("timeout")));
     }
 
     #[test]

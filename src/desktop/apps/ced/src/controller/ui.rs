@@ -391,7 +391,7 @@ impl Controller {
             if self.headless {
                 return Err((code::UNAVAILABLE, format!("{} needs a window (this instance is --headless)", action.id())));
             }
-            fx.push(Effect::WindowAction { tab, action, args: args.cloned(), intent });
+            self.ui_dispatch(tab, action, args.cloned(), intent, None, fx);
             return Ok(None);
         }
         let arg_str = |k: &str| args.and_then(|a| a.get(k)).and_then(Value::as_str).map(str::to_string);
@@ -711,6 +711,9 @@ impl Controller {
     }
 }
 
+/// How long a Bus `ced.action` waits for the window's `ui_done`.
+const UI_DEADLINE_MS: u64 = 10_000;
+
 /// A highlight-all query (the find bar's pattern and options).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchQuery {
@@ -730,7 +733,7 @@ const RELEX_DEBOUNCE_MS: u64 = 150;
 /// Actions only the window can perform: dialogs, the find bar, zoom, panels,
 /// help — and the args-taking ones when their args are missing (the window
 /// then asks the human for them).
-fn window_only(action: ActionId, args: Option<&Value>) -> bool {
+pub(super) fn window_only(action: ActionId, args: Option<&Value>) -> bool {
     let has = |k: &str| args.and_then(|a| a.get(k)).is_some_and(|v| !v.is_null());
     match action {
         ActionId::SearchFind
@@ -782,6 +785,59 @@ impl Controller {
     /// The tab's highlight-all ranges (view byte ranges, ascending).
     pub fn find_matches(&self, tab: TabId) -> &[Range<usize>] {
         self.x.get(&tab).map_or(&[], |x| x.matches.as_slice())
+    }
+
+    /// The window finished a [`Effect::UiAction`]: `Ok(result)` (`null` for
+    /// none) or a refusal. Answers the Bus `ced.action` that caused it, once;
+    /// a token nobody is waiting on (window-invoked, or already timed out) is
+    /// a no-op.
+    pub fn ui_done(&mut self, token: u64, result: Result<Value, verbs::Refusal>) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        if let Some((id, action)) = self.ui_pending.remove(&token) {
+            self.timers.retain(|_, t| !matches!(t, super::TimerFor::UiDeadline(x) if *x == token));
+            let (rc, body) = match result {
+                Ok(v) => {
+                    let result = (!v.is_null()).then_some(v);
+                    (0, super::ok_body(&verbs::ActionReply { id: action, ok: true, result }))
+                }
+                Err(r) => (10, serde_json::to_string(&r).unwrap_or_default()),
+            };
+            fx.push(Effect::Respond { id, rc, body });
+        }
+        self.eval_waiters(&mut fx);
+        fx
+    }
+
+    /// Hand a window-only action to the window under a fresh token; with a
+    /// Bus command, its reply waits for `ui_done` (10 s deadline).
+    pub(super) fn ui_dispatch(
+        &mut self,
+        tab: Option<TabId>,
+        action: ActionId,
+        args: Option<Value>,
+        intent: Intent,
+        cmd: Option<(u64, String)>,
+        fx: &mut Vec<Effect>,
+    ) {
+        self.next_ui_token += 1;
+        let token = self.next_ui_token;
+        if let Some(c) = cmd {
+            self.ui_pending.insert(token, c);
+            self.timer(UI_DEADLINE_MS, super::TimerFor::UiDeadline(token), fx);
+        }
+        fx.push(Effect::UiAction { tab, action, args, intent, token });
+    }
+
+    pub(super) fn ui_timeout(&mut self, token: u64, fx: &mut Vec<Effect>) {
+        if let Some((id, action)) = self.ui_pending.remove(&token) {
+            let body = serde_json::to_string(&verbs::Refusal {
+                error_code: "TIMEOUT".into(),
+                message: format!("the window did not finish {action} within {} s", UI_DEADLINE_MS / 1000),
+                reason: Some("timeout".into()),
+            })
+            .unwrap_or_default();
+            fx.push(Effect::Respond { id, rc: 10, body });
+        }
     }
 
     /// A Mix relex finished (see [`Effect::Relex`]); stale tags are dropped
