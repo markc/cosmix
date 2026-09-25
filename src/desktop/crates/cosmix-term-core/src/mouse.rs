@@ -58,7 +58,7 @@ fn mouse_report(button: u8, col: u16, row: u16, pressed: bool, sgr: bool, utf8: 
 }
 
 impl Terminal {
-    fn write_mouse(&self, bytes: Vec<u8>) -> bool {
+    fn write_mouse(&self, bytes: Vec<u8>, follow_input: bool) -> bool {
         let mut writes = self.listener.writes.lock().unwrap();
         // Mouse input has the same human-input authority as keyboard input.
         Listener::revoke_writer(&mut writes);
@@ -66,7 +66,13 @@ impl Terminal {
             .listener
             .enqueue(&mut writes, bytes, Some(Instant::now()), None)
         {
-            Ok(()) => true,
+            Ok(()) => {
+                drop(writes);
+                if follow_input {
+                    self.listener.follow_input();
+                }
+                true
+            },
             Err(e) => {
                 eprintln!("PTY mouse input failed: {e}");
                 false
@@ -99,7 +105,7 @@ impl Terminal {
             pressed,
             mode.contains(Mode::SGR_MOUSE),
             mode.contains(Mode::UTF8_MOUSE),
-        ))
+        ), true)
     }
 
     /// Button 3 means no button held; modes 1002/1003 select drag/all motion.
@@ -120,7 +126,7 @@ impl Terminal {
             true,
             mode.contains(Mode::SGR_MOUSE),
             mode.contains(Mode::UTF8_MOUSE),
-        ))
+        ), false)
     }
 
     /// Positive lines scroll up. Returns false when the host should scroll locally.
@@ -140,7 +146,7 @@ impl Terminal {
         );
         let mut sent = false;
         for _ in 0..lines.unsigned_abs() {
-            if !self.write_mouse(report.clone()) {
+            if !self.write_mouse(report.clone(), true) {
                 break;
             }
             sent = true;
@@ -162,7 +168,7 @@ impl Terminal {
                 (false, false) => b"\x1b[B",
             };
             for _ in 0..lines.unsigned_abs() {
-                if !self.write_mouse(seq.to_vec()) {
+                if !self.write_mouse(seq.to_vec(), true) {
                     break;
                 }
             }
@@ -184,6 +190,7 @@ mod tests {
         let (sender, receiver) = channel::channel();
         let stats = Arc::new(Mutex::new(Metrics::default()));
         let listener = Listener {
+            grid: Arc::new(OnceLock::new()),
             damage,
             wake: Arc::new(OnceLock::new()),
             writes: Arc::new(Mutex::new(Writes {
@@ -204,13 +211,16 @@ mod tests {
             100,
         );
         Processor::default().advance(&mut grid, sequence);
+        let grid = Arc::new(FairMutex::new(grid));
+        let _ = listener.grid.set(Arc::downgrade(&grid));
         (
             Terminal {
                 before_pty_cleanup: None,
                 session: None,
                 listener,
                 stats,
-                grid: Arc::new(FairMutex::new(grid)),
+                grid,
+                captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
                 captured_cursor: Mutex::new(None),
                 pid: 0,
@@ -225,6 +235,191 @@ mod tests {
             Msg::Input(bytes) => bytes.into_owned(),
             _ => panic!("expected PTY input"),
         }
+    }
+
+    fn history() -> (Terminal, channel::Receiver<Msg>) {
+        let mut bytes = Vec::new();
+        for line in 0..80 {
+            bytes.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        fixture(&bytes)
+    }
+
+    #[test]
+    fn viewport_changes_repaint_all_rows_including_return_to_bottom() {
+        let (term, _rx) = history();
+        let live = term.grid_snapshot().screen;
+        term.scroll_wheel(5, MouseModifiers::default());
+        assert_eq!(term.grid.lock().display_offset(), 5);
+        assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| *dirty));
+        term.scroll_wheel(-5, MouseModifiers::default());
+        // A read-only snapshot must not consume the viewport transition.
+        let _ = term.screen(false);
+        let bottom = term.grid_snapshot();
+        assert_eq!(term.grid.lock().display_offset(), 0);
+        assert!(bottom.dirty_rows.iter().all(|dirty| *dirty));
+        assert_eq!(
+            bottom.screen.cells.iter().map(|cell| cell.c).collect::<String>(),
+            live.cells.iter().map(|cell| cell.c).collect::<String>(),
+        );
+        assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| !dirty));
+    }
+
+    #[test]
+    fn scroll_and_history_clear_pixels_match_a_fresh_render() {
+        use crate::{config::Cursor, raster::{Raster, Surface}};
+        let (term, _rx) = history();
+        let mut raster = Raster::new(1.0, 13.0, Cursor::Block).unwrap();
+        let mut incremental = Surface::default();
+        let mut check = || {
+            let snapshot = term.grid_snapshot();
+            raster.render_into(&snapshot.screen, &snapshot.dirty_rows, &mut incremental);
+            let mut fresh = Surface::default();
+            raster.render_into(&snapshot.screen, &vec![true; snapshot.screen.rows], &mut fresh);
+            assert_eq!(incremental.rgba(), fresh.rgba());
+        };
+        check();
+        term.scroll_wheel(5, MouseModifiers::default());
+        check();
+        term.scroll_wheel(-5, MouseModifiers::default());
+        check();
+        term.scroll_view(ScrollRequest::Top);
+        check();
+        // Bypass Crosswords::scroll_display and its full-damage side effect:
+        // only captured_offset detects this return to the live viewport.
+        term.grid.lock().grid.clear_history();
+        assert_eq!(term.display_offset(), 0);
+        check();
+    }
+
+    #[test]
+    fn snapshot_stays_live_and_cursor_tracks_the_viewport() {
+        let (term, _rx) = history();
+        let live = term.snapshot();
+        let live_text = live.split("--- screen ---\n").nth(1).unwrap();
+        let cursor = term.screen(false).cursor;
+        term.scroll_wheel(5, MouseModifiers::default());
+        let screen = term.screen(false);
+        assert_eq!(screen.cursor.1, cursor.1 + 5);
+        assert!(!screen.cursor_visible);
+        let snapshot = term.snapshot();
+        assert_eq!(snapshot.split("--- screen ---\n").nth(1).unwrap(), live_text);
+        assert_eq!(snapshot.lines().next(), live.lines().next());
+        assert_eq!(term.display_offset(), 5, "snapshot leaves the human viewport alone");
+        assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| *dirty));
+        Processor::default().advance(&mut *term.grid.lock(), b"\x1b[1;1H");
+        let screen = term.screen(false);
+        assert_eq!(screen.cursor, (0, 5));
+        assert!(screen.cursor_visible, "a live row still in the viewport keeps its cursor");
+    }
+
+    #[test]
+    fn listener_text_and_mouse_reports_follow_live_output() {
+        let (term, rx) = history();
+        term.scroll_view(ScrollRequest::Top);
+        term.listener.type_text("pasted\ntext").unwrap();
+        assert_eq!(input(&rx), b"pasted\rtext");
+        assert_eq!(term.display_offset(), 0);
+        term.scroll_view(ScrollRequest::Top);
+        term.listener.key(Key::Char('x'), Instant::now()).unwrap();
+        assert_eq!(input(&rx), b"x");
+        assert_eq!(term.display_offset(), 0, "direct listener keys follow too");
+        term.scroll_view(ScrollRequest::Top);
+        term.listener.type_text("").unwrap();
+        assert!(term.listener.type_text("é").is_err());
+        assert_eq!(term.display_offset(), 57);
+        Processor::default().advance(&mut *term.grid.lock(), b"\x1b[?1003;1006h");
+        for kind in 0..3 {
+            term.scroll_view(ScrollRequest::Top);
+            let sent = match kind {
+                0 => term.mouse_button(2, 3, 0, true, MouseModifiers::default()),
+                1 => term.mouse_motion(2, 3, 3, MouseModifiers::default()),
+                _ => term.mouse_scroll(2, 3, 1, MouseModifiers::default()),
+            };
+            assert!(sent);
+            assert_eq!(input(&rx), match kind {
+                0 => &b"\x1b[<0;3;4M"[..],
+                1 => &b"\x1b[<35;3;4M"[..],
+                _ => &b"\x1b[<64;3;4M"[..],
+            });
+            assert_eq!(term.display_offset(), if kind == 1 { 57 } else { 0 });
+        }
+        term.listener.quit.store(true, Ordering::Release);
+        term.scroll_view(ScrollRequest::Top);
+        assert!(term.listener.type_text("rejected").is_err());
+        assert_eq!(term.display_offset(), 57);
+    }
+
+    #[test]
+    fn motion_reports_preserve_history_but_button_changes_follow_input() {
+        for mode in [b"\x1b[?1002;1006h".as_slice(), b"\x1b[?1003;1006h"] {
+            let (term, rx) = history();
+            Processor::default().advance(&mut *term.grid.lock(), mode);
+            term.scroll_view(ScrollRequest::Top);
+            assert!(term.mouse_motion(2, 3, 0, MouseModifiers::default()));
+            assert_eq!(input(&rx), b"\x1b[<32;3;4M");
+            assert_eq!(term.display_offset(), 57);
+            assert!(term.mouse_button(2, 3, 0, false, MouseModifiers::default()));
+            assert_eq!(input(&rx), b"\x1b[<0;3;4m");
+            assert_eq!(term.display_offset(), 0);
+        }
+    }
+
+    #[test]
+    fn scroll_view_pages_overlap_and_top_bottom_reach_history_edges() {
+        let (term, _rx) = history();
+        term.scroll_view(ScrollRequest::PageUp);
+        assert_eq!(term.grid.lock().display_offset(), 23);
+        term.scroll_view(ScrollRequest::PageUp);
+        assert_eq!(term.grid.lock().display_offset(), 46);
+        term.scroll_view(ScrollRequest::PageDown);
+        assert_eq!(term.grid.lock().display_offset(), 23);
+        term.scroll_view(ScrollRequest::Top);
+        assert_eq!(term.grid.lock().display_offset(), 57);
+        term.scroll_view(ScrollRequest::PageUp);
+        assert_eq!(term.grid.lock().display_offset(), 57);
+        term.scroll_view(ScrollRequest::Bottom);
+        assert_eq!(term.grid.lock().display_offset(), 0);
+        term.scroll_view(ScrollRequest::PageDown);
+        assert_eq!(term.grid.lock().display_offset(), 0);
+    }
+
+    #[test]
+    fn shell_keys_snap_to_bottom_but_empty_keys_and_vt_replies_do_not() {
+        let (term, rx) = history();
+        for key in [Key::Char('x'), Key::Enter, Key::PageUp, Key::Control('c')] {
+            term.scroll_view(ScrollRequest::Top);
+            term.grid_snapshot();
+            term.key(key, Instant::now()).unwrap();
+            assert_eq!(input(&rx), encode(key));
+            assert_eq!(term.grid.lock().display_offset(), 0);
+            assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| *dirty));
+            assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| !dirty));
+        }
+        term.scroll_view(ScrollRequest::Top);
+        term.key(Key::Char('é'), Instant::now()).unwrap();
+        assert_eq!(term.grid.lock().display_offset(), 57);
+        assert!(rx.try_recv().is_err());
+        term.listener.write(b"reply".to_vec(), None).unwrap();
+        assert_eq!(input(&rx), b"reply");
+        assert_eq!(term.grid.lock().display_offset(), 57);
+    }
+
+    #[test]
+    fn shift_wheel_bypasses_reporting_and_alternate_scroll_uses_cursor_keys() {
+        let (term, rx) = history();
+        Processor::default().advance(&mut *term.grid.lock(), b"\x1b[?1000;1006h");
+        let shift = MouseModifiers { shift: true, ..Default::default() };
+        assert!(!term.mouse_scroll(2, 3, 4, shift));
+        term.scroll_wheel(4, shift);
+        assert_eq!(term.grid.lock().display_offset(), 4);
+        assert!(rx.try_recv().is_err());
+        Processor::default().advance(&mut *term.grid.lock(), b"\x1b[?1000l\x1b[?1049;1007h");
+        assert!(!term.mouse_scroll(2, 3, 1, MouseModifiers::default()));
+        term.scroll_wheel(1, MouseModifiers::default());
+        assert_eq!(input(&rx), b"\x1b[A");
+        term.scroll_wheel(1, shift);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

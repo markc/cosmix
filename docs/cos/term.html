@@ -472,12 +472,13 @@ closes the tab, and closing the last tab quits. A shell that exits on its own
 raises a desktop notification, as in bterm. Set <code>TERM_NOTIFY=0</code> to turn that
 off.</p>
 <h2 id="keys">Keys</h2>
-<p>The chords are bterm's. They need Ctrl and Shift, or Ctrl alone where shown.
+<p>Tab and pane chords need Ctrl and Shift, or Ctrl alone where shown.
 Any chord that also holds Alt or Super is left alone.</p>
 <table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+Shift+T</td><td>new tab</td></tr>
 <tr><td>Ctrl+Shift+W</td><td>close the active tab</td></tr>
 <tr><td>Ctrl+PageDown / Ctrl+PageUp</td><td>next / previous tab</td></tr>
+<tr><td>Ctrl+Tab / Ctrl+Shift+Tab</td><td>next / previous pane in the current tab, in layout order, wrapping at either end</td></tr>
 <tr><td>Ctrl+Shift+E</td><td>split the focused pane side by side</td></tr>
 <tr><td>Ctrl+Shift+O</td><td>split the focused pane top and bottom</td></tr>
 <tr><td>Ctrl+Shift+X</td><td>close the focused pane</td></tr>
@@ -486,9 +487,40 @@ Any chord that also holds Alt or Super is left alone.</p>
 </tbody></table>
 <p>Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
 the repeats are dropped rather than sent to the shell.</p>
+<p>Pane cycling changes only keyboard focus within the current tab, following
+the split tree's first pane before its second pane. Bare Tab still goes to
+the shell.</p>
 <p>Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>
+<h2 id="scrollback">Scrollback</h2>
+<table><thead><tr><th>Input</th><th>Action</th></tr></thead><tbody>
+<tr><td>Wheel up / down</td><td>scroll the pane under the pointer</td></tr>
+<tr><td>Shift+wheel</td><td>force local history instead of application mouse reporting</td></tr>
+<tr><td>Shift+PageUp / Shift+PageDown</td><td>scroll the focused pane by one page (rows minus one)</td></tr>
+<tr><td>Shift+Home / Shift+End</td><td>jump to the top / bottom of the focused pane's history</td></tr>
+</tbody></table>
+<p>Scrollback keys repeat when held and apply only on the primary screen. On the
+alternate screen, Shift+PageUp/PageDown/Home/End go to the application as
+PageUp/PageDown/Home/End. Plain PageUp and
+PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
+Accepted keyboard input, pasted or Bus <code>term.type</code> text (including control-lane
+typing), and mouse button or wheel reports return the viewport to the live bottom.
+Motion-only reports (including button drags), empty or rejected input, and
+automatic VT replies leave it alone. A live cursor is shown
+in a scrolled viewport only when its translated row remains on screen.</p>
+<p>Each wheel notch scrolls one line. Touchpad travel accumulates at one logical
+cell height per line, matching bterm. Applications that enable mouse reporting
+receive the wheel first; otherwise the alternate screen can translate it to cursor keys (for
+example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
+to change the font size. The <code>scrollback</code> setting controls history depth.</p>
+<p>Viewport changes mark only the affected pane dirty and arm the next redraw.
+Wheel scrolling, history keys and Bus <code>term.scroll</code> share this path: wakes
+coalesce without painting intermediate views, then the redraw repaints every
+row of the changed viewport, including when returning to the live bottom.
+Clean neighbouring panes keep their frames. The four-row tiny-skia bands use
+the viewport's translated cursor visibility, so an off-screen live cursor
+does not appear in history.</p>
 <h2 id="font-size">Font size</h2>
 <p>Font sizing follows foot. The window keeps its size and the grid gains or
 loses cells. Every pane is re-rasterised, and every shell is told its new
@@ -531,8 +563,9 @@ is a JSON object, and <code>{}</code> means no arguments.</p>
 <tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
 <tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
-<tr><td><code>term.snapshot</code></td><td><code>{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}</code> (all optional)</td><td>read a pane anywhere; default is the focused pane in the selected/active tab; <code>contents</code> defaults true; history defaults 0, accepts 0–10000, capped at history above the current viewport</td></tr>
+<tr><td><code>term.snapshot</code></td><td><code>{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}</code> (all optional)</td><td>read a pane anywhere; default is the focused pane in the selected/active tab; <code>contents</code> defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero)</td></tr>
 <tr><td><code>term.type</code></td><td><code>{"pane":N,"text":"..."}</code> (<code>pane</code> optional)</td><td>type ASCII as keys into that pane, default focused pane; does not change focus</td></tr>
+<tr><td><code>term.scroll</code></td><td><code>{"pane":N,"lines":3}</code> or <code>{"page":-1}</code> or <code>{"to":"top"}</code></td><td>move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed <code>lines</code>, signed <code>page</code>, or <code>to</code> (<code>top</code>/<code>bottom</code>)</td></tr>
 <tr><td><code>term.props.watch</code></td><td><code>{}</code></td><td>subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON <code>{topics,revision}</code>), then read state</td></tr>
 </tbody></table>
 <pre><code class="language-mix">send term term.tab.new
@@ -552,15 +585,15 @@ error, never the active pane. With both snapshot selectors, the pane must
 belong to the tab or the call returns <code>invalid-argument</code>. <code>contents:false</code>
 returns the usual metadata and diagnostic timings without the screen marker
 or text. Scrollback is prepended after the screen marker, oldest first;
-<code>rows</code> still describes the viewport. Reading never moves the scroll offset.
+<code>rows</code> still describes the live screen. Reading never moves the scroll offset.
 Snapshot text represents empty grid cells as spaces, preserving column positions
-and trailing blank cells in both history and viewport rows. Text is limited to
+and trailing blank cells in both history and live-screen rows. Text is limited to
 512 KiB of encoded bytes (including allowance for JSON escaping), leaving
 metadata and transport headroom below the MCP 1 MiB and Bus 8 MiB limits.
-The budget keeps the newest complete rows: the viewport first, then as much
+The budget keeps the newest complete rows: the live screen first, then as much
 recent history as fits. Retained rows are returned oldest first; the header reports
 <code>truncated=true</code> when the byte budget omits rows and <code>lines_returned=N</code>
-counts history and viewport rows actually returned. A row larger than the
+counts history and live-screen rows actually returned. A row larger than the
 budget returns no text rows. With <code>contents:false</code>, the count is zero and
 <code>truncated=false</code>. Capture copies bounded rows under the grid lock; text
 formatting runs after releasing the grid, terminal and tab-set locks.</p>
@@ -573,6 +606,16 @@ via <code>tabs.changed</code> and <code>title.changed</code> with <code>kind=ret
 tab-set and pane-layout revisions unchanged, so pane geometry stays valid.
 Completion notifications use the same sanitised, possibly program-set label.
 Explicit cwd paths follow symlinks and resolve <code>..</code> normally.</p>
+<p><code>term.scroll</code> (or <code>bterm.scroll</code> on bterm) returns JSON
+<code>{"pane":N,"display_offset":D,"history_lines":H}</code>. Positive lines/pages move
+up into history; negative values move down, clamped to available history.
+Each page is rows minus one, matching the keyboard chords. Integers must fit
+signed 64 bits; zero is a no-op. Stale pane IDs return <code>not-found</code>.
+Scrolling leaves snapshot content on the live screen and never sends PTY input.
+When watching, an offset change publishes <code>term.pane.changed</code> (or
+<code>bterm.pane.changed</code>) with <code>kind=scrolled</code>; a clamped no-op publishes nothing.
+Like other mutations it supports <code>request_id</code> replay and is refused on the
+strict diagnostic-only targetless lane.</p>
 <p>Existing replies keep their key=value format. New title replies are
 <code>retitled id=N tab=N pane=P revision=R</code>; move replies are
 <code>moved id=N index=I tab=N pane=P revision=R</code>. Tab creation still replies
@@ -604,6 +647,8 @@ frontend layout: hidden tabs can report stale values after a window resize,
 or zeros after geometry invalidation. Select the tab and allow a frontend
 layout before relying on its geometry. Grid dimensions describe the current
 PTY grid and do not promise an up-to-date window layout.</p>
+<p><code>term.snapshot</code> always reads the live screen, even while a human views history.
+It does not move that viewport or consume pending repaint damage.</p>
 <p>With no broker, term prints that the Bus is unavailable and works as a
 plain terminal.</p>
 <h2 id="not-yet-in-this-frontend">Not yet in this frontend</h2>

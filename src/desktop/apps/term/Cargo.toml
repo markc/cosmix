@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -94,3 +94,6 @@ iced_tiny_skia = { version = "=0.14.1", optional = true, default-features = fals
 # Cargo does not support optional dev-dependencies. This CPU test helper is
 # an optional normal dependency; clean wgpu tests omit it.
 tiny-skia = { version = "0.11", optional = true, default-features = false, features = ["std", "simd"] }
+
+[dev-dependencies]
+cosmix-term-core = { path = "../../crates/cosmix-term-core", features = ["test-support"] }

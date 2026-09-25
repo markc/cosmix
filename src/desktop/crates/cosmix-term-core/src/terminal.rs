@@ -27,6 +27,7 @@ use std::{
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 pub type Stats = Arc<Mutex<Metrics>>;
 type Grid = Arc<FairMutex<Crosswords<Listener>>>;
+type WeakGrid = std::sync::Weak<FairMutex<Crosswords<Listener>>>;
 
 fn rearm_damage(term: &mut Crosswords<Listener>) {
     term.reset_damage();
@@ -41,9 +42,12 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
 /// `mark_fully_damaged`, which after a rearm emits `RenderRoute`, which
 /// `Listener` turns into a fresh damage token and wake: every snapshot would
 /// schedule the next. Insert mode repaints whole anyway, so skip the call.
-fn dirty_rows(term: &mut Crosswords<Listener>) -> Vec<bool> {
+fn dirty_rows(term: &mut Crosswords<Listener>, previous_offset: usize) -> Vec<bool> {
     let mut dirty = vec![false; term.screen_lines()];
-    if term.display_offset() != 0 || term.mode().contains(rio_vt::crosswords::Mode::INSERT) {
+    if term.display_offset() != previous_offset
+        || term.display_offset() != 0
+        || term.mode().contains(rio_vt::crosswords::Mode::INSERT)
+    {
         dirty.fill(true);
         return dirty;
     }
@@ -80,6 +84,7 @@ struct Writes {
 
 #[derive(Clone)]
 pub struct Listener {
+    grid: Arc<OnceLock<WeakGrid>>,
     damage: SyncSender<()>,
     wake: Arc<OnceLock<Wake>>,
     writes: Arc<Mutex<Writes>>,
@@ -89,6 +94,17 @@ pub struct Listener {
     title_changed: Arc<OnceLock<Arc<tokio::sync::Notify>>>,
 }
 impl Listener {
+    /// Call only after dropping the writes lock: the parser takes grid then
+    /// writes when answering VT queries. A weak link avoids a grid/listener cycle.
+    fn follow_input(&self) {
+        if let Some(grid) = self.grid.get().and_then(std::sync::Weak::upgrade) {
+            let mut term = grid.lock();
+            if term.display_offset() != 0 {
+                term.scroll_display(rio_vt::crosswords::grid::Scroll::Bottom);
+                self.dirty();
+            }
+        }
+    }
     pub(crate) fn title(&self) -> String {
         self.title.lock().unwrap().clone()
     }
@@ -107,6 +123,12 @@ impl Listener {
             notify.notify_one();
         }
         self.wake();
+    }
+    #[cfg(test)]
+    pub(crate) fn test_input_receiver(&self) -> channel::Receiver<Msg> {
+        let (sender, receiver) = channel::channel();
+        self.writes.lock().unwrap().sender = Some(sender);
+        receiver
     }
     #[cfg(test)]
     pub(crate) fn block_control_writes(&self, block: bool) {
@@ -171,12 +193,22 @@ impl Listener {
         }
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        self.enqueue(&mut writes, bytes, Some(Instant::now()), None)
+        self.enqueue(&mut writes, bytes, Some(Instant::now()), None)?;
+        drop(writes);
+        self.follow_input();
+        Ok(())
     }
     pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        self.enqueue(&mut writes, encode(key), Some(at), None)
+        let bytes = encode(key);
+        let sends_bytes = !bytes.is_empty();
+        self.enqueue(&mut writes, bytes, Some(at), None)?;
+        drop(writes);
+        if sends_bytes {
+            self.follow_input();
+        }
+        Ok(())
     }
     fn revoke_writer(writes: &mut Writes) {
         writes.foreground = writes.foreground.saturating_add(1);
@@ -218,6 +250,7 @@ impl Listener {
         permit: Arc<crate::control::Permit>,
     ) -> Result<(), &'static str> {
         let bytes = encode_text(text).map_err(|_| "INVALID_ARGUMENT")?;
+        let sends_bytes = !bytes.is_empty();
         let mut writes = self.writes.lock().unwrap();
         if !Self::check_foreground(&mut writes) {
             return Err("FORBIDDEN");
@@ -244,6 +277,10 @@ impl Listener {
         )
         .map_err(|_| "RESOURCE_LIMIT")?;
         writes.owner = Some((actor.into(), permit));
+        drop(writes);
+        if sends_bytes {
+            self.follow_input();
+        }
         Ok(())
     }
 }
@@ -489,10 +526,21 @@ pub struct Screen {
 pub struct GridSnapshot {
     pub screen: Screen,
     /// One flag per visible row: true when that row may differ from the
-    /// previous consuming read. All true after a resize, a scroll-back, a
+    /// previous consuming read. All true after a resize, a viewport change, a
     /// full-screen mode change or on the first read.
     pub dirty_rows: Vec<bool>,
 }
+/// Frontend-neutral requests to move the history viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollRequest {
+    Lines(i64),
+    Pages(i64),
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
 pub struct Terminal {
     #[cfg(test)]
     pub before_pty_cleanup: Option<Box<dyn FnMut() + Send>>,
@@ -500,6 +548,8 @@ pub struct Terminal {
     pub listener: Listener,
     pub stats: Stats,
     grid: Grid,
+    /// Updated only by consuming captures, under the grid lock.
+    captured_offset: Mutex<usize>,
     damage: Mutex<Receiver<()>>,
     captured_cursor: Mutex<Option<((usize, usize), bool)>>,
     pub pid: i32,
@@ -624,6 +674,48 @@ impl TextSnapshot {
 }
 
 impl Terminal {
+    /// A synchronous VT fixture with no PTY, child process or reader thread.
+    /// Frontend tests opt in through their dev-dependency's `test-support` feature.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_test_vt(cols: usize, rows: usize, bytes: &[u8]) -> Self {
+        let stats = Arc::new(Mutex::new(Metrics::default()));
+        let (damage, rx) = mpsc::sync_channel(1);
+        let listener = Listener {
+            grid: Arc::new(OnceLock::new()),
+            damage,
+            wake: Arc::new(OnceLock::new()),
+            writes: Arc::new(Mutex::new(Writes::default())),
+            stats: stats.clone(),
+            quit: Arc::new(AtomicBool::new(false)),
+            title: Arc::new(Mutex::new(String::new())),
+            title_changed: Arc::new(OnceLock::new()),
+        };
+        let mut grid = Crosswords::new(
+            CrosswordsSize::new(cols, rows),
+            CursorShape::Block,
+            listener.clone(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+        rio_vt::performer::handler::Processor::default().advance(&mut grid, bytes);
+        let grid = Arc::new(FairMutex::new(grid));
+        let _ = listener.grid.set(Arc::downgrade(&grid));
+        Self {
+            #[cfg(test)]
+            before_pty_cleanup: None,
+            session: None,
+            listener,
+            stats,
+            grid,
+            captured_offset: Mutex::new(0),
+            damage: Mutex::new(rx),
+            captured_cursor: Mutex::new(None),
+            pid: 0,
+            thread: None,
+        }
+    }
+
     pub fn start_session(
         settings: crate::config::Settings,
         native: Option<&crate::native_session::NativeSession>,
@@ -708,6 +800,7 @@ impl Terminal {
         let stats = Arc::new(Mutex::new(Metrics::default()));
         let (tx, rx) = mpsc::sync_channel(1);
         let listener = Listener {
+            grid: Arc::new(OnceLock::new()),
             damage: tx,
             wake: Arc::new(OnceLock::new()),
             writes: Arc::new(Mutex::new(Writes::default())),
@@ -810,6 +903,7 @@ impl Terminal {
             writes.pty = Some(unsafe { OwnedFd::from_raw_fd(fd) });
             Listener::check_foreground(&mut writes);
         }
+        let _ = listener.grid.set(Arc::downgrade(&grid));
         let machine = Machine::new(
             grid.clone(),
             MeteredPty {
@@ -846,6 +940,7 @@ impl Terminal {
             listener,
             stats,
             grid,
+            captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
             captured_cursor: Mutex::new(None),
             pid,
@@ -867,6 +962,65 @@ impl Terminal {
     }
     pub fn screen(&self, consume: bool) -> Screen {
         self.capture(consume, None)
+    }
+    pub fn scroll_view(&self, request: ScrollRequest) {
+        self.scroll_view_state(request);
+    }
+
+    /// Move only the viewport and capture offset/history atomically for Bus replies.
+    pub(crate) fn scroll_view_state(&self, request: ScrollRequest) -> (usize, usize, bool) {
+        use rio_vt::crosswords::grid::Dimensions;
+        use rio_vt::crosswords::grid::Scroll;
+        let mut term = self.grid.lock();
+        // Rio's PageUp/PageDown move by rows, but terminal pages overlap by
+        // one row. Delta also preserves that contract at either history edge.
+        let page = term.screen_lines().saturating_sub(1) as i32;
+        let before = term.display_offset();
+        let history = term.grid.history_size();
+        // Clamp before entering Rio: its Delta adds in i32 and can overflow
+        // for a large positive request while already viewing history.
+        let delta = |lines: i64| {
+            let target = (before as i64).saturating_add(lines);
+            if target <= 0 {
+                Scroll::Bottom
+            } else if target >= history as i64 {
+                Scroll::Top
+            } else {
+                Scroll::Delta(lines as i32)
+            }
+        };
+        let scroll = match request {
+            ScrollRequest::Lines(lines) => delta(lines),
+            ScrollRequest::Pages(pages) => delta(pages.saturating_mul(page as i64)),
+            ScrollRequest::PageUp => Scroll::Delta(page),
+            ScrollRequest::PageDown => Scroll::Delta(-page),
+            ScrollRequest::Top => Scroll::Top,
+            ScrollRequest::Bottom => Scroll::Bottom,
+        };
+        term.scroll_display(scroll);
+        let offset = term.display_offset();
+        drop(term);
+        if offset != before {
+            self.listener.dirty();
+        }
+        (offset, history, offset != before)
+    }
+
+    /// Human key input follows the live output once bytes reach the queue.
+    /// VT replies use Listener directly and must not move the viewport.
+    pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
+        self.listener.key(key, at)
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.grid
+            .lock()
+            .mode()
+            .contains(rio_vt::crosswords::Mode::ALT_SCREEN)
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.grid.lock().display_offset()
     }
     /// Like `screen(true)`, and also reports which rows changed since the
     /// previous consuming read (by either method).
@@ -898,7 +1052,9 @@ impl Terminal {
         let cols = term.columns();
         let rows = term.screen_lines();
         let mut cells = Vec::with_capacity(cols * rows);
-        for row in term.visible_rows() {
+        let offset = term.display_offset();
+        for y in 0..rows {
+            let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
             for x in 0..cols {
                 let square = &row[Column(x)];
                 let style = term.grid.style_of(square);
@@ -920,11 +1076,15 @@ impl Terminal {
             }
         }
         let pos = term.grid.cursor.pos;
-        let cursor = (pos.col.0, pos.row.0.max(0) as usize);
-        let cursor_visible = term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+        let cursor = (
+            pos.col.0,
+            (pos.row.0.max(0) as usize).saturating_add(offset),
+        );
+        let cursor_visible =
+            cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
         let mut previous = self.captured_cursor.lock().unwrap();
         if let Some(dirty) = dirty {
-            *dirty = dirty_rows(&mut term);
+            *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
             if *previous != Some((cursor, cursor_visible)) {
                 for ((_, row), visible) in previous
                     .iter()
@@ -939,6 +1099,7 @@ impl Terminal {
         }
         if consume {
             *previous = Some((cursor, cursor_visible));
+            *self.captured_offset.lock().unwrap() = term.display_offset();
             // Both operations must remain under this same grid lock. reset_damage
             // alone does not re-arm Machine's damage notification latch.
             rearm_damage(&mut term);
@@ -966,26 +1127,20 @@ impl Terminal {
     }
     pub(crate) fn capture_snapshot(&self, contents: bool, scrollback_lines: usize) -> TextSnapshot {
         use rio_vt::crosswords::{grid::Dimensions, pos::Line};
-        // One grid lock makes history and viewport a coherent capture, without
+        // One grid lock makes history and live screen a coherent capture, without
         // moving the scroll offset or consuming the renderer's damage.
         let term = self.grid.lock();
         let cols = term.columns();
         let rows = term.screen_lines();
         let cursor = term.grid.cursor.pos;
-        let offset = term.display_offset();
-        let history = scrollback_lines
-            .min(10000)
-            .min(term.grid.history_size().saturating_sub(offset));
+        let history = scrollback_lines.min(10000).min(term.grid.history_size());
         let mut lines = Vec::new();
         let mut bytes = 0;
         let mut truncated = false;
         let count = if contents { rows + history } else { 0 };
-        // Spend the budget on the newest rows first, preserving the viewport
+        // Spend the budget on the newest rows first, preserving the live screen
         // before recent history. Restore oldest-first output after capture.
-        for y in (-(offset as i32) - history as i32..rows as i32 - offset as i32)
-            .rev()
-            .take(count)
-        {
+        for y in (-(history as i32)..rows as i32).rev().take(count) {
             let row = &term.grid[Line(y)];
             let mut line = Vec::new();
             let mut line_bytes = 2; // JSON-escaped newline.
@@ -1224,6 +1379,7 @@ mod tests {
             .unwrap();
         let (damage, rx) = mpsc::sync_channel(1);
         let listener = Listener {
+            grid: Arc::new(OnceLock::new()),
             damage,
             wake: Arc::new(OnceLock::new()),
             writes: Arc::new(Mutex::new(Writes::default())),
@@ -1240,6 +1396,7 @@ mod tests {
             0,
             0,
         )));
+        let _ = listener.grid.set(Arc::downgrade(&grid));
         let machine = Machine::new(
             grid.clone(),
             FixturePty {
@@ -1309,6 +1466,7 @@ mod tests {
             let stats = Arc::new(Mutex::new(Metrics::default()));
             let (damage, rx) = mpsc::sync_channel(1);
             let listener = Listener {
+                grid: Arc::new(OnceLock::new()),
                 damage,
                 wake: Arc::new(OnceLock::new()),
                 writes: Arc::new(Mutex::new(Writes::default())),
@@ -1325,6 +1483,7 @@ mod tests {
                 0,
                 100,
             )));
+            let _ = listener.grid.set(Arc::downgrade(&grid));
             let machine = Machine::new(
                 grid.clone(),
                 FixturePty {
@@ -1345,6 +1504,7 @@ mod tests {
                 listener,
                 stats,
                 grid,
+                captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
                 captured_cursor: Mutex::new(None),
                 pid: 0,
@@ -1508,6 +1668,8 @@ mod tests {
         input.push(b'Z');
         expected.push(format!("Z{}", " ".repeat(2999)));
         f.feed(&input, |t| cell(t, 23, 0) == 'Z');
+        f.terminal.scroll_view(ScrollRequest::Top);
+        assert!(f.terminal.display_offset() > 0);
         let snapshot = f.terminal.capture_snapshot(true, 10000);
         assert!(snapshot.truncated);
         let returned = snapshot.lines.len();
@@ -1590,9 +1752,11 @@ mod tests {
         f.quiet_snapshot();
         f.terminal.grid.lock().scroll_display(Scroll::Delta(5));
         f.settled_snapshot();
-        assert_eq!(lines(10000).len(), 36);
+        assert_eq!(lines(10000).len(), 41);
         assert_eq!(lines(10000)[0], "line00");
-        assert_eq!(lines(0)[0], "line12");
+        assert_eq!(lines(0)[0], "line17");
+        assert_eq!(lines(3)[0], "line14");
+        assert_eq!(lines(10000)[40], "Z");
         assert_eq!(f.terminal.grid.lock().display_offset(), 5);
         f.quiet_snapshot();
     }
