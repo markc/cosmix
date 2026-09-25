@@ -1,3 +1,4 @@
+// Vendored into cosmix-lsh from microsoft/edit@826b4c0 crates/stdext/src/maybe_owned.rs (upstream file carries no header; the crate is MIT, see LICENSE); see cosmix-lsh/vendor/README.md.
 use std::borrow::Borrow;
 use std::ops::Deref;
 

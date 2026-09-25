@@ -52,7 +52,31 @@ path. `crate::…` paths are rewritten to `crate::vendor::msedit::…` / `super:
    Deliberately not `Sync`. `lib.rs` asserts at compile time that
    `Text` and `Buffer` are `Send`.
 
-Not vendored in E0 (land in E1 with their first consumer): `unicode/*`,
-`buffer/navigation.rs`, `simd/memchr2.rs`, `stdext::unicode`, `crates/lsh`.
-Note for E1: `GapBuffer` does not honour `ReadableDocument`'s "never split a
-grapheme cluster across chunks" promise; the measurement code needs an adapter.
+## E1 additions (ced E1 plan `_plan/2026-09-26-ced-e1-implementation.md` §1.3)
+
+| pristine import | commit `403eba59` (byte-for-byte, not wired) |
+|---|---|
+
+| Here | Upstream path | Changes |
+|---|---|---|
+| `unicode/mod.rs` | `crates/edit/src/unicode/mod.rs` | header only |
+| `unicode/measurement.rs` | `crates/edit/src/unicode/measurement.rs` | patched (6) |
+| `unicode/tables.rs` | `crates/edit/src/unicode/tables.rs` | header only (generated UCD tables, Unicode 16.0.0) |
+| `navigation.rs` | `crates/edit/src/buffer/navigation.rs` | header + path |
+| `stdext/unicode/utf8.rs` | `crates/stdext/src/unicode/utf8.rs` | header only (`Utf8Chars`) |
+| `helpers.rs` | `crates/edit/src/helpers.rs` | subset grows by `Point` (+ its `Ord`) |
+| `stdext/helpers.rs` | `crates/stdext/src/helpers.rs` | subset grows by `cold_path` |
+
+6. **Per-measurement ambiguous width** (`measurement.rs`): upstream's
+   process-global `static mut AMBIGUOUS_WIDTH` + `setup_ambiguous_width`
+   became a `MeasurementConfig` field set by `with_ambiguous_width(1|2)`.
+
+`simd/memchr2.rs` is **not** vendored after all: nothing in measurement or
+navigation calls it (upstream only uses it from the TUI buffer and the VT
+parser). `crates/lsh` and the `stdext` crate it needs are vendored as their
+own path crates under `cosmix-lsh/vendor/` (see that crate's README).
+
+`GapBuffer` does not honour `ReadableDocument`'s "never split a grapheme
+cluster across chunks" promise (`document.rs:23`). The measurement code is
+therefore only ever handed the grapheme-safe adapter in `crate::view`
+(ced E1 plan §1.3(3)), never a `GapBuffer` directly.

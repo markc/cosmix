@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-lsh from microsoft/edit@826b4c0 crates/lsh/src/lib.rs; see cosmix-lsh/vendor/README.md.
 
 //! Welcome to the Lightweight Syntax Highlighter (LSH), otherwise known as
 //! Leonard's Shitty Highlighter, which is really what it is.

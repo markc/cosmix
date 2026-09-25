@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-lsh from microsoft/edit@826b4c0 crates/stdext/src/arena/scratch.rs; see cosmix-lsh/vendor/README.md.
 
 use std::io;
 #[cfg(debug_assertions)]
@@ -67,57 +68,9 @@ impl Deref for ScratchArena<'_> {
     }
 }
 
-mod single_threaded {
-    use super::*;
-
-    static mut S_SCRATCH: [release::Arena; 2] =
-        const { [release::Arena::empty(), release::Arena::empty()] };
-
-    /// Initialize the scratch arenas with a given capacity.
-    /// Call this before using [`scratch_arena`].
-    #[allow(dead_code)]
-    pub fn init(capacity: usize) -> io::Result<()> {
-        unsafe {
-            for s in &mut S_SCRATCH[..] {
-                *s = release::Arena::new(capacity)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Need an arena for temporary allocations? [`scratch_arena`] got you covered.
-    /// Call [`scratch_arena`] and it'll return an [`Arena`] that resets when it goes out of scope.
-    ///
-    /// ---
-    ///
-    /// Most methods make just two kinds of allocations:
-    /// * Interior: Temporary data that can be deallocated when the function returns.
-    /// * Exterior: Data that is returned to the caller and must remain alive until the caller stops using it.
-    ///
-    /// Such methods only have two lifetimes, for which you consequently also only need two arenas.
-    /// ...even if your method calls other methods recursively! This is because the exterior allocations
-    /// of a callee are simply interior allocations to the caller, and so on, recursively.
-    ///
-    /// This works as long as the two arenas flip/flop between being used as interior/exterior allocator
-    /// along the callstack. To ensure that is the case, we use a recursion counter in debug builds.
-    ///
-    /// This approach was described among others at: <https://nullprogram.com/blog/2023/09/27/>
-    ///
-    /// # Safety
-    ///
-    /// If your function takes an [`Arena`] argument, you **MUST** pass it to `scratch_arena` as `Some(&arena)`.
-    #[allow(dead_code)]
-    pub fn scratch_arena(conflict: Option<&Arena>) -> ScratchArena<'static> {
-        unsafe {
-            #[cfg(debug_assertions)]
-            let conflict = conflict.map(|a| a.delegate_target_unchecked());
-
-            let index = opt_ptr_eq(conflict, Some(&S_SCRATCH[0])) as usize;
-            let arena = &S_SCRATCH[index];
-            ScratchArena::new(arena)
-        }
-    }
-}
+// cosmix patch (ced E1 plan §1.2(1)): upstream's `mod single_threaded` kept the
+// scratch arenas in a mutable static (behind the `single-threaded` feature). It
+// is deleted; only the thread-local variant below exists.
 
 mod multi_threaded {
     use std::cell::Cell;
@@ -142,7 +95,12 @@ mod multi_threaded {
         Ok(())
     }
 
-    /// See `single_threaded::scratch_arena`.
+    /// Need an arena for temporary allocations? [`scratch_arena`] got you covered.
+    /// It returns an [`Arena`] that resets when it goes out of scope.
+    ///
+    /// # Safety
+    ///
+    /// If your function takes an [`Arena`] argument, you **MUST** pass it to `scratch_arena` as `Some(&arena)`.
     #[allow(dead_code)]
     pub fn scratch_arena(conflict: Option<&Arena>) -> ScratchArena<'static> {
         #[cfg(debug_assertions)]
@@ -167,7 +125,4 @@ mod multi_threaded {
     }
 }
 
-#[cfg(not(feature = "single-threaded"))]
 pub use multi_threaded::*;
-#[cfg(feature = "single-threaded")]
-pub use single_threaded::*;

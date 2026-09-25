@@ -1,31 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-edit-core from microsoft/edit@826b4c0 crates/edit/src/unicode/measurement.rs; see vendor/msedit/README.md.
+// Patched (ced E1 plan §1.3(1)): the process-global `static mut AMBIGUOUS_WIDTH`
+// + `setup_ambiguous_width` became a per-measurement `MeasurementConfig` field.
 
-use stdext::cold_path;
-use stdext::unicode::Utf8Chars;
+use crate::vendor::msedit::stdext::helpers::cold_path;
+use crate::vendor::msedit::stdext::unicode::Utf8Chars;
 
 use super::tables::*;
-use crate::document::ReadableDocument;
-use crate::helpers::{CoordType, Point};
-
-// On one hand it's disgusting that I wrote this as a global variable, but on the
-// other hand, this isn't a public library API, and it makes the code a lot cleaner,
-// because we don't need to inject this once-per-process value everywhere.
-static mut AMBIGUOUS_WIDTH: usize = 1;
-
-/// Sets the width of "ambiguous" width characters as per "UAX #11: East Asian Width".
-///
-/// Defaults to 1.
-pub fn setup_ambiguous_width(ambiguous_width: CoordType) {
-    unsafe { AMBIGUOUS_WIDTH = ambiguous_width as usize };
-}
-
-#[inline]
-fn ambiguous_width() -> usize {
-    // SAFETY: This is a global variable that is set once per process.
-    // It is never changed after that, so this is safe to call.
-    unsafe { AMBIGUOUS_WIDTH }
-}
+use crate::vendor::msedit::document::ReadableDocument;
+use crate::vendor::msedit::helpers::{CoordType, Point};
 
 /// Stores a position inside a [`ReadableDocument`].
 ///
@@ -61,13 +45,22 @@ pub struct MeasurementConfig<'doc> {
     cursor: Cursor,
     tab_size: CoordType,
     word_wrap_column: CoordType,
+    ambiguous_width: usize,
     buffer: &'doc dyn ReadableDocument,
 }
 
 impl<'doc> MeasurementConfig<'doc> {
     /// Creates a new [`MeasurementConfig`] for the given document.
     pub fn new(buffer: &'doc dyn ReadableDocument) -> Self {
-        Self { cursor: Default::default(), tab_size: 8, word_wrap_column: 0, buffer }
+        Self { cursor: Default::default(), tab_size: 8, word_wrap_column: 0, ambiguous_width: 1, buffer }
+    }
+
+    /// Sets the width of "ambiguous" width characters as per "UAX #11: East Asian Width".
+    ///
+    /// Defaults to 1. (cosmix patch: per measurement, not a process global.)
+    pub fn with_ambiguous_width(mut self, ambiguous_width: CoordType) -> Self {
+        self.ambiguous_width = ambiguous_width.clamp(1, 2) as usize;
+        self
     }
 
     /// Sets the initial cursor to the given position.
@@ -152,6 +145,7 @@ impl<'doc> MeasurementConfig<'doc> {
             return self.cursor;
         }
 
+        let ambiguous_width = self.ambiguous_width;
         let mut offset = self.cursor.offset;
         let mut logical_pos_x = self.cursor.logical_pos.x;
         let mut logical_pos_y = self.cursor.logical_pos.y;
@@ -207,7 +201,7 @@ impl<'doc> MeasurementConfig<'doc> {
                 // Similar applies to the width.
                 props_last_char = props_next_cluster;
                 offset_next_cluster = chunk_range.start + chunk_iter.offset();
-                width += ucd_grapheme_cluster_character_width(props_next_cluster, ambiguous_width())
+                width += ucd_grapheme_cluster_character_width(props_next_cluster, ambiguous_width)
                     as CoordType;
 
                 // The `Document::read_forward` interface promises us that it will not split
@@ -388,7 +382,7 @@ impl<'doc> MeasurementConfig<'doc> {
                         offset_next_cluster = chunk_range.start + chunk_iter.offset();
                         width += ucd_grapheme_cluster_character_width(
                             props_next_cluster,
-                            ambiguous_width(),
+                            ambiguous_width,
                         ) as CoordType;
 
                         // The `Document::read_forward` interface promises us that it will not split

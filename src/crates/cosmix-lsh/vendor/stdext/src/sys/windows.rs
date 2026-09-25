@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-lsh from microsoft/edit@826b4c0 crates/stdext/src/sys/windows.rs; see cosmix-lsh/vendor/README.md.
 
 use std::io;
 use std::ptr::{NonNull, null_mut};

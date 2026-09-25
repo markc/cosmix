@@ -1,0 +1,19 @@
+[package]
+name = "cosmix-lsh"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vendored msedit lsh (MIT, Microsoft): compiler + line-oriented bytecode runtime for syntax highlighting, with pre-generated definitions and a chunk-source adapter."
+
+[lib]
+name = "cosmix_lsh"
+
+[dependencies]
+# Vendored upstream crates, kept as their own path crates so their sources
+# compile with no path rewrites (vendor/README.md). Library names stay
+# `lsh` / `stdext`.
+lsh = { package = "cosmix-msedit-lsh", path = "vendor/lsh" }
+
+[dev-dependencies]
+proptest = "1"

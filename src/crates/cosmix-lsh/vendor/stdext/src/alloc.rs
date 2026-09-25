@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-lsh from microsoft/edit@826b4c0 crates/stdext/src/alloc.rs; see cosmix-lsh/vendor/README.md.
 
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc};
 use std::ptr::NonNull;

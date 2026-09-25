@@ -1591,6 +1591,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-lsh"
+version = "0.1.0"
+dependencies = [
+ "cosmix-msedit-lsh",
+ "proptest",
+]
+
+[[package]]
 name = "cosmix-maild"
 version = "0.9.1"
 dependencies = [
@@ -1846,6 +1854,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "zbus",
+]
+
+[[package]]
+name = "cosmix-msedit-lsh"
+version = "0.0.0"
+dependencies = [
+ "cosmix-msedit-stdext",
+]
+
+[[package]]
+name = "cosmix-msedit-stdext"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -2,7 +2,8 @@
 // Licensed under the MIT License.
 // Vendored into cosmix-edit-core from microsoft/edit@826b4c0 crates/stdext/src/helpers.rs; see vendor/msedit/README.md.
 // Subset: `slice_copy_safe`, `ReplaceRange` + its `Vec` impl and the private
-// `vec_replace_impl` it calls. Bodies unchanged.
+// `vec_replace_impl` it calls, and (ced E1, for unicode measurement)
+// `cold_path`. Bodies unchanged.
 
 use std::ops::{Bound, Range, RangeBounds};
 use std::ptr;
@@ -70,3 +71,7 @@ fn vec_replace_impl<T: Copy>(dst: &mut Vec<T>, range: Range<usize>, src: &[T]) {
         dst.set_len(new_len);
     }
 }
+
+#[inline(always)]
+#[cold]
+pub const fn cold_path() {}

@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-lsh from microsoft/edit@826b4c0 crates/lsh/src/compiler/optimizer.rs; see cosmix-lsh/vendor/README.md.
 
 //! IR optimization passes, run before register allocation.
 //!

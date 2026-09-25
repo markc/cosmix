@@ -1,9 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-edit-core from microsoft/edit@826b4c0 crates/edit/src/buffer/navigation.rs; see vendor/msedit/README.md.
 
 use std::ops::Range;
 
-use crate::document::ReadableDocument;
+use crate::vendor::msedit::document::ReadableDocument;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CharClass {

@@ -1,14 +1,18 @@
+# Vendored msedit `stdext` (microsoft/edit@826b4c0, MIT) — see ../README.md.
+# Rewritten manifest: upstream inherits from the msedit workspace. The library
+# keeps its upstream name `stdext` so the vendored lsh sources compile with no
+# path rewrites; the package name keeps it distinct in the cosmix workspace.
 [package]
-name = "stdext"
+name = "cosmix-msedit-stdext"
 version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Vendored msedit stdext (arenas, collections, glob) for cosmix-lsh. Not for direct use."
 
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
-
-[features]
-single-threaded = []
+[lib]
+name = "stdext"
+path = "src/lib.rs"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }

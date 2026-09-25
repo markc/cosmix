@@ -1,5 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// Vendored into cosmix-lsh from microsoft/edit@826b4c0 crates/stdext/src/helpers.rs; see cosmix-lsh/vendor/README.md.
 
 //! Random assortment of helpers I didn't know where to put.
 
