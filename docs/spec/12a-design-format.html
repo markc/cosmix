@@ -947,7 +947,9 @@ the authoring contract.</p>
 accept a finite positive <code>logical_px</code> instead of <code>type_step</code>; specifying both
 or neither is invalid. <code>fallbacks</code> is an ordered list of non-empty family
 names, defaulting to empty for existing records. <code>generic</code> is <code>sans_serif</code>
-(default) or <code>monospace</code>, tried after named families. <code>family</code>, <code>weight</code>
+(default) or <code>monospace</code>; it is reserved metadata for future adapter selection.
+Current adapters use their role's fixed sans or monospace generic after named
+families; changing <code>generic</code> alone has no rendering effect. <code>family</code>, <code>weight</code>
 (1–1000), and optional positive <code>line_height</code> retain their meaning. Resolved
 records preserve this chain and store the exact logical pixel size; output
 scale is a renderer concern. See <a href="/cos/ui-typography">desktop font defaults</a>

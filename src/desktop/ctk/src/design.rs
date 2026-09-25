@@ -4,9 +4,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use bevy::app::App;
+use bevy::app::{App, Update};
 use bevy::color::{Color, LinearRgba as BevyLinearRgba};
-use bevy::ecs::prelude::{Res, ResMut, Resource, SystemSet};
+use bevy::ecs::prelude::{IntoScheduleConfigs, Res, ResMut, Resource, SystemSet};
 use bevy::log::{error, info, warn};
 use cosmix_design::{
     apply_compiled_design, compile_design, parse_design_source, ButtonCellKey, Contrast,
@@ -142,7 +142,20 @@ pub(crate) enum CtkDesignSystems {
     Sync,
 }
 
+#[derive(Resource)]
+struct DesignSyncInstalled;
+
 pub(crate) fn init_design_resources(app: &mut App) {
+    // Both theme-only consumers and widgets need the active design. Register
+    // once regardless of plugin order.
+    if !app.world().contains_resource::<DesignSyncInstalled>() {
+        app.insert_resource(DesignSyncInstalled).add_systems(
+            Update,
+            sync_ctk_design
+                .after(crate::theme::apply_theme_requests)
+                .in_set(CtkDesignSystems::Sync),
+        );
+    }
     if !app.world().contains_resource::<CtkDesign>() {
         let (design, status) = design_resources_for_source(
             EMBEDDED_SOURCE_IDENTITY,
