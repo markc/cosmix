@@ -3,7 +3,7 @@
 //! All fields are optional; omitted fields reset to the defaults below on each
 //! ingestion. Unknown keys, wrong types and duplicate names/chords are errors.
 //! `panels.{left,bottom,right,top}` are ordered string lists; position zero is
-//! primary. Right must start with `settings.appearance` (content comes separately).
+//! primary. Content is supplied only by registered scenes.
 //! `menu_items.{edge}` contains `{label, target, verb, args}` Bus actions, with
 //! `args` an optional list of strings. These are additions to the mode menu.
 //! `bindings.{edge}.{pin,dock,hide}` and `bindings.cycle_focus` are optional
@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use bevy::prelude::*;
 use cosmix_config::{CosmixDir, Value, cosmix_path, parse_mix_data};
 use cosmix_shell::core::Edge;
-use cosmix_shell::runtime::{CLOCK_PAGE_ID, ShellRuntimeSet, redeclare_shell_pages};
+use cosmix_shell::runtime::{ShellRuntimeSet, redeclare_shell_pages};
 use cosmix_shell_host::file_watch::{LayerHostFileWatch, LayerHostFileWatches};
 
 pub const SETTINGS_APPEARANCE: &str = "settings.appearance";
@@ -38,6 +38,28 @@ pub const SETTINGS_APPEARANCE: &str = "settings.appearance";
 /// writes (`settings::dispatch_verb`). Never restate the path inline.
 pub(crate) fn conf_mix_path() -> PathBuf {
     cosmix_path(CosmixDir::Etc).join("quoin/conf.mix")
+}
+
+/// Seed both hosts before constructing the model. Standalone also watches edits.
+pub(crate) fn startup_config(smoke: bool) -> ShellConfig {
+    if smoke {
+        return ShellConfig::default();
+    }
+    let path = conf_mix_path();
+    let candidate = match std::fs::read_to_string(&path) {
+        Ok(source) => ShellConfig::parse(&source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ShellConfig::default();
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    candidate.unwrap_or_else(|error| {
+        eprintln!(
+            "QUOIN_CONFIG refused path={} reason={error}",
+            path.display()
+        );
+        ShellConfig::default()
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -77,17 +99,7 @@ pub struct ShellConfig {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            panels: [
-                vec!["nav".into(), "places".into(), "info".into()],
-                vec![CLOCK_PAGE_ID.into(), "power".into(), "tasks".into()],
-                vec![
-                    SETTINGS_APPEARANCE.into(),
-                    "monitor".into(),
-                    "demos".into(),
-                    "agents".into(),
-                ],
-                vec!["status".into(), "spaces".into()],
-            ],
+            panels: std::array::from_fn(|_| Vec::new()),
             menu_items: std::array::from_fn(|_| Vec::new()),
             bindings: std::array::from_fn(|_| EdgeBindings::default()),
             cycle_focus: None,
@@ -188,9 +200,7 @@ fn chord(value: &Value, path: &str) -> Result<Option<String>, String> {
     // A bare or Shift-only key would steal typing from the panel's own
     // controls (a Tab, letter or capital from the launcher's search field).
     if !["Ctrl", "Alt", "Super"].iter().any(|m| seen.contains(m)) {
-        return Err(format!(
-            "{path}: key chord {text} needs Ctrl, Alt or Super"
-        ));
+        return Err(format!("{path}: key chord {text} needs Ctrl, Alt or Super"));
     }
     let mut canonical: Vec<String> = modifiers
         .into_iter()
@@ -231,15 +241,6 @@ impl ShellConfig {
                     "panels: invalid or duplicate sub-panel name {name:?}"
                 ));
             }
-        }
-        if config.panels[Edge::Right.index()]
-            .first()
-            .map(String::as_str)
-            != Some(SETTINGS_APPEARANCE)
-        {
-            return Err(format!(
-                "panels.right: primary must be {SETTINGS_APPEARANCE}"
-            ));
         }
         if let Some(value) = root.get("menu_items") {
             let menus = fields(value, &edges, "menu_items")?;
@@ -590,6 +591,28 @@ mod tests {
     }
 
     #[test]
+    fn defaults_are_empty_and_right_primary_is_unrestricted() {
+        let config = ShellConfig::parse("{}").unwrap();
+        assert!(config.panels.iter().all(Vec::is_empty));
+        for source in [
+            r#"{panels: {right: ["scene-tools"]}}"#,
+            r#"{panels: {right: []}}"#,
+        ] {
+            assert!(ShellConfig::parse(source).is_ok());
+        }
+        let config = ShellConfig::parse(r#"{panels: {bottom: ["scene-panel"]}}"#).unwrap();
+        assert_eq!(
+            config
+                .panels
+                .iter()
+                .filter(|pages| !pages.is_empty())
+                .count(),
+            1
+        );
+        assert_eq!(config.panels[Edge::Bottom.index()], ["scene-panel"]);
+    }
+
+    #[test]
     fn declared_order_ingests_per_edge() {
         let config = ShellConfig::parse(
             r#"{panels: {
@@ -655,28 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_appearance_is_declared_right_primary() {
-        let config = ShellConfig::parse("{}").unwrap();
-        assert_eq!(config.panels[Edge::Right.index()][0], SETTINGS_APPEARANCE);
-        assert!(ShellConfig::parse(r#"{panels: {right: ["monitor"]}}"#).is_err());
-        assert!(ShellConfig::parse(r#"{panels: {right: []}}"#).is_err());
-        let mut model = model();
-        model
-            .declare_carousel(Edge::Right, config.panels[Edge::Right.index()].clone())
-            .unwrap();
-        model.carousel_mut(Edge::Right).register("monitor").unwrap();
-        assert_eq!(model.carousel(Edge::Right).page_ids(), ["monitor"]);
-        model
-            .carousel_mut(Edge::Right)
-            .register(SETTINGS_APPEARANCE)
-            .unwrap();
-        assert_eq!(
-            model.carousel(Edge::Right).page_ids(),
-            [SETTINGS_APPEARANCE, "monitor"]
-        );
-    }
-
-    #[test]
     fn invalid_schema_is_refused_and_previous_config_retained() {
         let mut app = app(model());
         edit(
@@ -692,7 +693,7 @@ mod tests {
             "{panels: {lef: []}}",
             "{panels: {left: 1}}",
             r#"{panels: {left: ["dup", "dup"]}}"#,
-            r#"{panels: {left: ["status"]}}"#,
+            r#"{panels: {left: ["status"], top: ["status"]}}"#,
             r#"{panels: {left: [""]}}"#,
             r#"{carousel_motion: "sldie"}"#,
             r#"{menu_items: {left: [{label: "Missing action"}]}}"#,

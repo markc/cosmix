@@ -1,5 +1,5 @@
-//! The Settings/Appearance sub-panel: the right edge's declared primary
-//! (panel doc §2), implemented as a Mix Scene the Quoin process itself loads.
+//! Settings/Appearance is a Mix Scene loaded only where configuration declares
+//! `settings.appearance`. It will move to the scene editor.
 //!
 //! Three control groups, per the design: the theme colour palette (applied
 //! live through the existing [`QuoinSchemeSelected`] → `ApplyTheme` path —
@@ -44,12 +44,10 @@ use ctk::theme::{Mode, Scheme, ThemeSpec};
 use serde_json::json;
 
 use crate::bus_service::ShellBusDispatch;
-#[cfg(test)]
 use crate::config::SETTINGS_APPEARANCE;
 use crate::config::{CarouselMotion, ShellConfig};
 
-/// The scene document's own name; the sub-panel address is the declared
-/// configured right primary via the mount envelope.
+/// The scene document's own name; its dotted panel address is in the envelope.
 const SCENE_NAME: &str = "quoin-settings";
 
 /// Seat owner for host-loaded content. Qualified with `@` on purpose: the
@@ -80,6 +78,7 @@ struct Rendered {
 #[derive(Resource)]
 struct SettingsScene {
     rendered: Option<Rendered>,
+    edge: Option<Edge>,
     /// Last applied scheme name (shadow of the `QuoinSchemeSelected` stream;
     /// seeded from the persisted state at install).
     scheme: String,
@@ -92,6 +91,7 @@ impl Default for SettingsScene {
     fn default() -> Self {
         Self {
             rendered: None,
+            edge: None,
             scheme: Scheme::Ocean.name().to_owned(),
             receipt: 0,
             retired: false,
@@ -107,6 +107,7 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
     // Hosts that have not installed the config reader still get the motion
     // setting's default (the embedded host opts into the schema separately).
     app.init_resource::<ShellConfig>();
+    app.add_systems(Startup, declare_initial_pages.after(crate::setup));
     let scheme = app
         .world()
         .get_resource::<crate::state::StateStore>()
@@ -117,20 +118,18 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
         scheme: scheme.name().to_owned(),
         ..default()
     };
-    app.insert_resource(settings)
-        .add_systems(Startup, declare_initial_pages.after(crate::setup))
-        .add_systems(
-            Update,
-            maintain
-                .in_set(ShellRuntimeSet::Input)
-                .after(crate::config::ConfigIngest)
-                .after(ShellBusDispatch),
-        );
+    app.insert_resource(settings).add_systems(
+        Update,
+        maintain
+            .in_set(ShellRuntimeSet::Input)
+            .after(crate::config::ConfigIngest)
+            .after(ShellBusDispatch),
+    );
 }
 
 /// Embedded hosts do not install the standalone conf.mix watcher. Initialise
-/// their declarations from the same ShellConfig defaults, after legacy chrome
-/// binds its initial frame. Standalone ingestion replaces these before loading
+/// their declarations from ShellConfig, after chrome binds its initial frame.
+/// Standalone ingestion replaces these before loading
 /// Settings; output replacement already carries declarations forward.
 fn declare_initial_pages(world: &mut World) {
     let declarations = world.resource::<ShellConfig>().panels.clone();
@@ -149,10 +148,9 @@ fn maintain(
     config: Res<ShellConfig>,
     (mut registry, mut scenes): (ResMut<SubPanelRegistryState>, ResMut<SceneStore>),
     bridge: Res<BusBridge>,
-    time: Res<Time>,
+    (time, mut redraw): (Res<Time>, MessageWriter<bevy::window::RequestRedraw>),
 ) {
-    // The chrome scheme dots (still on the monitor page) drive the same
-    // message; keep the rendered selection honest for both sources.
+    // Settings verbs publish scheme changes through the shared message path.
     for selection in selections.read() {
         settings.scheme = selection.0.name().to_owned();
     }
@@ -180,6 +178,43 @@ fn maintain(
         settings.retired = true;
         return;
     }
+    let edge = Edge::ALL.into_iter().find(|edge| {
+        config.panels[edge.index()]
+            .iter()
+            .any(|name| name == SETTINGS_APPEARANCE)
+    });
+    if loaded && settings.edge != edge {
+        // Release the old mount before moving or withdrawing the declaration.
+        // Reconcile tears down its carousel entry before a later update reloads.
+        let mut mount = SceneMount {
+            registry: &mut registry.0,
+            output: &frame.0.geometry.output,
+            owner: OWNER,
+            accepted_at: settings.receipt,
+        };
+        let (rc, body) = scenes.dispatch(
+            SceneVerb::Unload,
+            "",
+            &json!({"scene": SCENE_NAME}),
+            &bridge,
+            &mut mount,
+        );
+        if rc == 0 {
+            settings.rendered = None;
+            settings.edge = None;
+            if edge.is_some() {
+                // The standalone host can become idle after teardown. Arrange
+                // the next update that mounts the newly declared edge.
+                redraw.write(bevy::window::RequestRedraw);
+            }
+        } else {
+            report_refusal(&mut settings, &body);
+        }
+        return;
+    }
+    let Some(edge) = edge else {
+        return;
+    };
     let desired = Rendered {
         scheme: settings.scheme.clone(),
         motion: config.carousel_motion,
@@ -195,15 +230,12 @@ fn maintain(
     if !loaded {
         settings.receipt = settings.receipt.saturating_add(1);
     }
-    let Some(primary) = config.panels[Edge::Right.index()].first() else {
-        return;
-    };
     let registration = if !loaded {
         let (rc, body, command) = crate::bus_service::register_sub_panel(
             &frame.0,
             &mut registry.0,
-            primary.clone(),
-            Edge::Right,
+            SETTINGS_APPEARANCE.to_owned(),
+            edge,
             OWNER.to_owned(),
             settings.receipt,
             time.elapsed(),
@@ -216,7 +248,7 @@ fn maintain(
     } else {
         None
     };
-    let source = document(&desired, bridge.service_name(), primary);
+    let source = document(&desired, bridge.service_name(), edge);
     let mut mount = SceneMount {
         registry: &mut registry.0,
         output: &frame.0.geometry.output,
@@ -235,11 +267,12 @@ fn maintain(
         // sub.register reservation. Enqueuing its command as well would
         // register the same page twice (reconcile runs before Model).
         settings.rendered = Some(desired);
+        settings.edge = Some(edge);
         settings.last_refused = None;
     } else {
         // A rejected first load must not strand its registration reservation.
         if registration.is_some() {
-            registry.0.forget(primary);
+            registry.0.forget(SETTINGS_APPEARANCE);
         }
         report_refusal(&mut settings, &body);
     }
@@ -258,7 +291,7 @@ fn report_refusal(settings: &mut SettingsScene, body: &str) {
 
 /// Author the content in Mix Scene data; only live values and the host's
 /// Bus address come from Rust. The list gives the content its own scrolling.
-fn document(desired: &Rendered, citizen: &str, primary: &str) -> String {
+fn document(desired: &Rendered, citizen: &str, edge: Edge) -> String {
     let mut schemes = serde_json::Map::new();
     for scheme in Scheme::ALL {
         let selected = scheme.name() == desired.scheme;
@@ -302,7 +335,7 @@ fn document(desired: &Rendered, citizen: &str, primary: &str) -> String {
         },
     });
     let window = json!({
-        "kind": "edge", "edge": "right", "title": "Settings", "panel": primary,
+        "kind": "edge", "edge": edge.as_str(), "title": "Settings", "panel": SETTINGS_APPEARANCE,
     });
     format!(
         "---\nscene: 1\nname: {SCENE_NAME}\ncitizen: {citizen}\nwindow: {window}\nmodel: {model}\n---\n```mix\n{}\n```\n",
@@ -544,7 +577,7 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap();
-        let registry = crate::page_registry();
+        let registry = crate::tests::fixture_registry();
         for edge in Edge::ALL {
             model.set_carousel(edge, registry.carousel(edge));
         }
@@ -583,8 +616,7 @@ mod tests {
         model.panel(edge).thickness_px
     }
 
-    #[test]
-    fn settings_registers_under_declared_right_primary() {
+    fn settings_test_app(source: &str) -> App {
         use cosmix_shell::chrome::{
             QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
             spawn_quoin_chrome,
@@ -597,6 +629,7 @@ mod tests {
                 cosmix_shell::core::Carousel::new(std::iter::empty::<&str>()).unwrap(),
             );
         }
+        model.suppress_empty_edges(true);
         app.add_plugins((
             MinimalPlugins,
             ShellRuntimePlugin::new(model),
@@ -630,14 +663,96 @@ mod tests {
         let (bridge, _peer) = ctk::bus::test_bridge("settings-test");
         world.insert_resource(bridge);
         world.insert_resource(crate::state::StateStore::load(None));
-        // The conf-declared order (chunk 6's default): settings.appearance is
-        // the right edge's position-zero primary.
-        crate::config::ingest_test_config(
-            world,
-            r#"{panels: {right: ["settings.appearance", "test-tools"]}}"#,
-        );
+        crate::config::ingest_test_config(world, source);
         install(&mut app, false);
         app.update();
+        app
+    }
+
+    #[test]
+    fn settings_requires_its_named_declaration_on_any_edge() {
+        for source in ["{}", r#"{panels: {right: ["scene-tools"]}}"#] {
+            let app = settings_test_app(source);
+            assert!(
+                app.world()
+                    .resource::<SceneStore>()
+                    .scenes_owned_by(OWNER)
+                    .is_empty()
+            );
+            assert!(
+                app.world()
+                    .resource::<SubPanelRegistryState>()
+                    .0
+                    .seat(SETTINGS_APPEARANCE)
+                    .is_none()
+            );
+            for panel in &app.world().resource::<ShellFrameState>().0.panels {
+                assert!(panel.page_ids.is_empty());
+                assert!(!panel.mapped);
+                assert_eq!(panel.exclusive_zone_px, 0.0);
+            }
+        }
+        for edge in Edge::ALL {
+            // It need not be the primary, and must not occupy the preceding slot.
+            let app = settings_test_app(&format!(
+                "{{panels: {{{}: [\"scene-tools\", \"settings.appearance\"]}}}}",
+                edge.as_str()
+            ));
+            let registry = &app.world().resource::<SubPanelRegistryState>().0;
+            assert_eq!(registry.seat(SETTINGS_APPEARANCE).unwrap().edge, edge);
+            assert!(registry.seat("scene-tools").is_none());
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            for other in Edge::ALL {
+                let panel = frame.panel(other);
+                if other == edge {
+                    assert_eq!(panel.page_ids.as_ref(), [SETTINGS_APPEARANCE]);
+                    assert_eq!(panel.active_page_id.as_deref(), Some(SETTINGS_APPEARANCE));
+                } else {
+                    assert!(panel.page_ids.is_empty());
+                }
+                assert!(!panel.mapped);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_follows_config_add_move_and_withdrawal() {
+        let mut app = settings_test_app("{}");
+        for source in [
+            r#"{panels: {left: ["settings.appearance"]}}"#,
+            r#"{panels: {bottom: ["settings.appearance"]}}"#,
+            "{}",
+        ] {
+            crate::config::ingest_test_config(app.world_mut(), source);
+            app.update();
+            app.update();
+            let registry = &app.world().resource::<SubPanelRegistryState>().0;
+            let expected = if source.contains("left") {
+                Some(Edge::Left)
+            } else if source.contains("bottom") {
+                Some(Edge::Bottom)
+            } else {
+                None
+            };
+            assert_eq!(
+                registry.seat(SETTINGS_APPEARANCE).map(|seat| seat.edge),
+                expected
+            );
+            for edge in Edge::ALL {
+                let panel = app.world().resource::<ShellFrameState>().0.panel(edge);
+                assert_eq!(
+                    panel.page_ids.contains(&SETTINGS_APPEARANCE.to_owned()),
+                    expected == Some(edge)
+                );
+            }
+            assert!(!app.world().resource::<SettingsScene>().retired);
+        }
+    }
+
+    #[test]
+    fn settings_registers_under_declared_right_primary() {
+        let mut app =
+            settings_test_app(r#"{panels: {right: ["settings.appearance", "test-tools"]}}"#);
         let frame = app.world().resource::<ShellFrameState>().0.clone();
         assert_eq!(
             frame.panel(Edge::Right).page_ids.as_ref(),
@@ -892,9 +1007,8 @@ mod tests {
                 ..base.clone()
             }))
         {
-            let parsed =
-                cosmix_scene::parse(&document(&desired, "settings-test", SETTINGS_APPEARANCE))
-                    .expect("the document parses");
+            let parsed = cosmix_scene::parse(&document(&desired, "settings-test", Edge::Right))
+                .expect("the document parses");
             assert!(
                 cosmix_scene::lint(&parsed).is_empty(),
                 "{:?}",
@@ -928,12 +1042,14 @@ mod tests {
                 motion,
                 ..base.clone()
             };
-            let parsed =
-                cosmix_scene::parse(&document(&desired, "settings-test", SETTINGS_APPEARANCE))
-                    .expect("the document parses");
+            let parsed = cosmix_scene::parse(&document(&desired, "settings-test", Edge::Right))
+                .expect("the document parses");
             assert!(cosmix_scene::lint(&parsed).is_empty());
             let tree = cosmix_scene::resolve(&parsed).unwrap();
-            assert_eq!(tree.nodes["motion_slide_t"].ports["text"], json!(slide_mark));
+            assert_eq!(
+                tree.nodes["motion_slide_t"].ports["text"],
+                json!(slide_mark)
+            );
             assert_eq!(tree.nodes["motion_fade_t"].ports["text"], json!(fade_mark));
             assert!(
                 !tree.nodes["motion_fade"].ports.contains_key("on_click"),

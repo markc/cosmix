@@ -153,6 +153,13 @@ impl Carousel {
         self.last_selected.as_deref()
     }
 
+    /// Saved selection still waiting for registration; explicit selection or
+    /// successful restoration clears it. Persistence must not lose it merely
+    /// because another edge saves first.
+    pub fn pending_restore(&self) -> Option<&str> {
+        self.pending_restore.as_deref()
+    }
+
     /// Restore a saved name now, or when its content first registers.
     /// Until then the carousel rests on live content. Explicit selection wins
     /// over this deferred restore, including selection of the current page.

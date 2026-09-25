@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-quoin"
-version = "0.15.0"
+version = "0.16.0"
 description = "Cosmix Quoin four-edge layer-shell furniture"
 edition = "2024"
 rust-version = "1.95"
@@ -11,16 +11,10 @@ default-run = "cosmix-quoin"
 [features]
 default = []
 scene-gates = ["cosmix-scene-bevy/gate"]
-demo = ["cosmix-shell/dev-host"]
 
 [[bin]]
 name = "cosmix-quoin"
 path = "src/main.rs"
-
-[[bin]]
-name = "cosmix-quoin-demo"
-path = "src/demo.rs"
-required-features = ["demo"]
 
 [dependencies]
 cosmix-scene-bevy = { path = "../../crates/cosmix-scene-bevy" }

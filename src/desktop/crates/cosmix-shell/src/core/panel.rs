@@ -113,6 +113,28 @@ pub enum PanelInput {
     HolderConceal,
 }
 
+impl PanelInput {
+    /// Inputs that can expose or persist visible content. An empty Quoin edge
+    /// ignores these; dismissal and preference cleanup remain available.
+    pub fn requires_content(self) -> bool {
+        matches!(
+            self,
+            Self::Reveal
+                | Self::Toggle
+                | Self::CornerEntered
+                | Self::PointerEntered
+                | Self::HolderReveal
+                | Self::MenuHold(true)
+                | Self::ResizeStarted
+                | Self::Pin
+                | Self::PinToggle
+                | Self::Dock
+                | Self::DockToggle
+                | Self::SetMode(PanelMode::Pinned | PanelMode::Docked)
+        )
+    }
+}
+
 /// Why an actual reveal transition occurred.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RevealTrigger {

@@ -9,20 +9,19 @@ use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy::prelude::{Mut, Res, ResMut, Resource, Time, World};
 use bevy::time::Real;
-use std::time::{Duration, SystemTime};
+#[cfg(test)]
+use std::time::Duration;
 
 use crate::chrome::QuoinCommittedMotionModes;
 use crate::core::{Edge, PanelInput, PanelMode, ShellModel, SubPanelRegistry, SubPanelSeat};
 use crate::runtime::{
     CarouselInput, KeyboardCommand, PageChange, ShellCommand, ShellCommandKind, ShellEffect,
-    ShellFrame, WakePolicy,
+    ShellFrame,
 };
 
 #[derive(Resource)]
 struct ShellRuntime {
     model: ShellModel,
-    clock_text: String,
-    clock_deadline: Option<Duration>,
     /// Carousel change markers for the update in flight; merged into the
     /// frame after the model rebuild and cleared on the next update.
     page_changes: [PageChange; 4],
@@ -90,8 +89,6 @@ impl Plugin for ShellRuntimePlugin {
         app.add_message::<ShellCommand>()
             .insert_resource(ShellRuntime {
                 model: self.model.clone(),
-                clock_text: String::new(),
-                clock_deadline: None,
                 page_changes: [PageChange::None; 4],
             })
             .insert_resource(ShellFrameState(ShellFrame::from_model(&self.model)))
@@ -153,8 +150,6 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     let frame = ShellFrame::from_model(&model);
     *world.resource_mut::<ShellRuntime>() = ShellRuntime {
         model,
-        clock_text: String::new(),
-        clock_deadline: None,
         page_changes: [PageChange::None; 4],
     };
     world.resource_mut::<ShellFrameState>().0 = frame;
@@ -395,9 +390,10 @@ fn update_model(
                 // load after this seat was dropped is a replacement and
                 // survives, the stale removal dropping silently because
                 // its target is already gone.
-                let exact = registry.0.seat(name).is_some_and(|seat| {
-                    seat.owner == *owner && seat.accepted_at == *accepted_at
-                });
+                let exact = registry
+                    .0
+                    .seat(name)
+                    .is_some_and(|seat| seat.owner == *owner && seat.accepted_at == *accepted_at);
                 if exact {
                     let before = runtime.model.carousel(*edge).active_index();
                     let _ = registry.0.remove(name, &mut runtime.model);
@@ -639,75 +635,10 @@ fn update_model(
         }
     }
     let mut next_frame = ShellFrame::from_model(&runtime.model);
-    // Tick only while the built-in clock is on screen: another bottom page
-    // (e.g. a citizen's scene page) hides it, and a hidden clock must not
-    // wake the host every second.
-    let bottom = next_frame.panel(Edge::Bottom);
-    if bottom.mapped && bottom.active_page_id.as_deref() == Some(CLOCK_PAGE_ID) {
-        if runtime
-            .clock_deadline
-            .is_none_or(|deadline| now >= deadline)
-        {
-            // Sample wall and monotonic together: `now` is the update's start,
-            // and the wall clock read later in the frame would otherwise put
-            // the deadline early by that skew.
-            let (instant, wall) = (std::time::Instant::now(), SystemTime::now());
-            let skew = time
-                .last_update()
-                .map_or(Duration::ZERO, |start| instant.saturating_duration_since(start));
-            runtime.clock_text = local_clock_text_at(wall);
-            runtime.clock_deadline = Some(next_second_boundary(now + skew, wall));
-        }
-        next_frame.content.bottom_clock_text = Some(runtime.clock_text.clone());
-        if let Some(deadline) = runtime.clock_deadline {
-            next_frame.wake = merge_wake(next_frame.wake, deadline);
-            next_frame.wake_deadline = Some(
-                next_frame
-                    .wake_deadline
-                    .map_or(deadline, |current| current.min(deadline)),
-            );
-        }
-    } else {
-        runtime.clock_deadline = None;
-    }
     for (index, change) in runtime.page_changes.into_iter().enumerate() {
         next_frame.panels[index].page_change = change;
     }
     frame.0 = next_frame;
-}
-
-/// The bottom page whose content carries the built-in `QuoinClock`; the
-/// runtime publishes clock text and arms its wake only while it is active.
-pub const CLOCK_PAGE_ID: &str = "launcher";
-
-/// Lands the clock wake just past the second boundary. A wake even slightly
-/// early (runner early-fire, NTP slew) would read the old second, leave the
-/// text unchanged and re-arm a sub-millisecond deadline: 2-3 updates a second.
-const CLOCK_BOUNDARY_MARGIN: Duration = Duration::from_millis(2);
-
-/// Monotonic time just past the next wall-clock second, so the displayed
-/// seconds change on the boundary instead of drifting by one update's
-/// latency. `now` is the monotonic time at which `wall` was sampled.
-fn next_second_boundary(now: Duration, wall: SystemTime) -> Duration {
-    let into = wall
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.subsec_nanos());
-    now + Duration::from_nanos(u64::from(1_000_000_000 - into)) + CLOCK_BOUNDARY_MARGIN
-}
-
-fn local_clock_text_at(wall: SystemTime) -> String {
-    // Honour the machine timezone (or its process TZ override). Numeric
-    // offsets remain unambiguous across daylight saving and half-hour zones.
-    let local = chrono::DateTime::<chrono::Local>::from(wall);
-    local.format("%H:%M:%S %:z").to_string()
-}
-
-fn merge_wake(current: WakePolicy, deadline: Duration) -> WakePolicy {
-    match current {
-        WakePolicy::Animate => WakePolicy::Animate,
-        WakePolicy::WakeAt(current) => WakePolicy::WakeAt(current.min(deadline)),
-        WakePolicy::Idle => WakePolicy::WakeAt(deadline),
-    }
 }
 
 #[cfg(test)]
@@ -880,44 +811,6 @@ mod tests {
             assert!(left.thickness_px > 0.0 && right.thickness_px > 0.0);
         }
     }
-    #[test]
-    fn local_clock_timezone_probe() {
-        let Ok(expected) = std::env::var("QUOIN_CLOCK_TEST_EXPECTED") else {
-            return;
-        };
-        let wall = std::time::UNIX_EPOCH + Duration::from_secs(86_399);
-        assert_eq!(local_clock_text_at(wall), expected);
-    }
-
-    #[test]
-    fn local_clock_uses_process_timezone() {
-        // Separate processes avoid mutating TZ in a multithreaded test runner
-        // and exercise the same local-time conversion as the visible clock.
-        for (zone, expected) in [
-            ("UTC", "23:59:59 +00:00"),
-            ("Australia/Brisbane", "09:59:59 +10:00"),
-            ("Asia/Kolkata", "05:29:59 +05:30"),
-            ("America/New_York", "18:59:59 -05:00"),
-        ] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "runtime::bevy_runtime::tests::local_clock_timezone_probe",
-                    "--nocapture",
-                ])
-                .env("TZ", zone)
-                .env("QUOIN_CLOCK_TEST_EXPECTED", expected)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "zone={zone}: {}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        }
-    }
-
     use crate::core::{
         Corner, CornerEvent, CornerTrigger, LogicalSize, OutputKey, PanelEffect, PanelMode,
         RevealTrigger,
@@ -939,55 +832,6 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
         app
-    }
-
-    #[test]
-    fn clock_ticks_only_while_its_page_is_shown() {
-        let mut app = app();
-        app.world_mut()
-            .resource_mut::<ShellRuntime>()
-            .model
-            .panel_input(Edge::Bottom, Duration::ZERO, PanelInput::Dock)
-            .unwrap();
-        let pages = vec![CLOCK_PAGE_ID.to_owned(), "scene-panel".to_owned()];
-        set_shell_pages(app.world_mut(), Edge::Bottom, pages.clone(), Some("scene-panel"));
-        app.update();
-        let frame = &app.world().resource::<ShellFrameState>().0;
-        assert!(frame.panel(Edge::Bottom).mapped);
-        assert_eq!(frame.content.bottom_clock_text, None);
-        assert_eq!(
-            app.world().resource::<ShellRuntime>().clock_deadline,
-            None,
-            "a hidden clock arms no wake"
-        );
-        set_shell_pages(app.world_mut(), Edge::Bottom, pages, Some(CLOCK_PAGE_ID));
-        app.update();
-        let frame = &app.world().resource::<ShellFrameState>().0;
-        assert!(frame.content.bottom_clock_text.is_some());
-        let deadline = app.world().resource::<ShellRuntime>().clock_deadline.unwrap();
-        assert!(frame.wake_deadline.is_some_and(|wake| wake <= deadline));
-    }
-
-    #[test]
-    fn clock_wakes_on_the_next_wall_second() {
-        let now = Duration::from_secs(40);
-        let wall = std::time::UNIX_EPOCH + Duration::from_millis(5_250);
-        let margin = Duration::from_millis(2);
-        assert_eq!(
-            next_second_boundary(now, wall),
-            now + Duration::from_millis(750) + margin
-        );
-        let exact = std::time::UNIX_EPOCH + Duration::from_secs(6);
-        assert_eq!(
-            next_second_boundary(now, exact),
-            now + Duration::from_secs(1) + margin
-        );
-        // A wake exactly on the deadline reads the NEW second.
-        let woke = wall + (next_second_boundary(now, wall) - now);
-        assert_eq!(
-            woke.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-            6
-        );
     }
 
     #[test]

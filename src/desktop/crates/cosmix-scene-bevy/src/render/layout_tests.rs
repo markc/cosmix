@@ -106,7 +106,29 @@ impl Harness {
         }
         if theme {
             // Elision belongs to this production plugin, not ScenePlugin.
-            app.add_plugins(ctk::theme::CtkThemePlugin::default());
+            // Pin the free fixture face and its authored size: host SF/default
+            // role metrics change the fractional physical-pixel rounding slack
+            // between the shaped run and its ceil-rounded UI measurement.
+            let mut fonts = bevy::text::FontCx::default();
+            fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+                shared: false,
+                system_fonts: false,
+            });
+            fonts.collection.register_fonts(
+                Font::from_bytes(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../cosmix-comp/assets/fonts/DejaVuSans.ttf"
+                )).to_vec()).data,
+                None,
+            );
+            app.insert_resource(fonts)
+                .insert_resource(ctk::theme::CtkTypography::without_environment())
+                .add_plugins(ctk::theme::CtkThemePlugin::isolated());
+            let mut spec = ctk::theme::ThemeSpec::builtin();
+            spec.typography.family = "DejaVu Sans".into();
+            spec.typography.body_px = 13.0;
+            spec.typography.weight = 400;
+            app.world_mut().write_message(ctk::theme::ApplyTheme(spec));
         }
         app.finish();
         app.cleanup();
@@ -862,6 +884,16 @@ fn elision_uses_the_wrapper_budget_and_recovers_after_resize() {
             r#"root: {{widget: "text", text: "{source}", width: 120, elide: true, align: "{align}"}}"#
         );
         let mut harness = Harness::load_options(&body, false, true);
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .resource::<ctk::theme::CtkTypography>()
+                .effective_family
+                .as_deref(),
+            Some("DejaVu Sans"),
+            "geometry fixture must never inherit the host desktop font"
+        );
         let label = harness.app.world().resource::<SceneStore>().scenes["layout"]
             .mounted
             .as_ref()
@@ -870,21 +902,31 @@ fn elision_uses_the_wrapper_budget_and_recovers_after_resize() {
             .label
             .unwrap();
         let displayed = &harness.app.world().get::<Text>(label).unwrap().0;
+        let font = harness.app.world().get::<TextFont>(label).unwrap();
+        assert_eq!(font.font_size, bevy::text::FontSize::Px(13.0));
+        assert_eq!(font.weight.0, 400);
         assert!(
             displayed.contains('…') && displayed.ends_with(".txt"),
             "{displayed}"
         );
         let g = harness.geometry();
         let shaped = g["root"].label_box.unwrap();
+        let allocated = g["root"].label_node.unwrap();
         assert!(shaped.width() <= 120.0 + TOLERANCE);
+        // Bevy ceil-rounds the intrinsic UI measurement in physical pixels;
+        // Parley's run advance stays fractional. Taffy aligns that allocated
+        // box, so the run can end short by the font-dependent rounding slack.
+        // Test allocation alignment and the run's origin separately rather
+        // than mistaking that slack for a layout error (or widening tolerance).
+        close("elided run origin", shaped.min.x, allocated.min.x);
         match align {
             "center" => close(
                 "elided centre",
-                shaped.center().x,
+                allocated.center().x,
                 g["root"].content.center().x,
             ),
-            "right" => close("elided right", shaped.max.x, g["root"].content.max.x),
-            _ => close("elided left", shaped.min.x, g["root"].content.min.x),
+            "right" => close("elided right", allocated.max.x, g["root"].content.max.x),
+            _ => close("elided left", allocated.min.x, g["root"].content.min.x),
         }
         let height = shaped.height();
         harness.patch("root.width", json!(700));

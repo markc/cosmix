@@ -1,5 +1,42 @@
 # cosmix-quoin
 
+## Scene-only edges
+
+Quoin is the frame: all edge content comes from Mix scenes. There are no native
+built-in pages or compatibility switch. A future scene-editor app with templates
+will manage edge content.
+
+The default `ShellConfig.panels` lists are empty on all four edges. Names in
+`conf.mix` declare **empty slots**, not content. A scene fills its declared slot
+when it registers; undeclared registrations append in arrival order. For example,
+`{panels: {bottom: ["scene-panel"]}}` leaves every edge empty until a scene
+registers. Loading a bottom-edge scene named `panel` then populates only that
+edge and supplies its reveal page. A scene can use `window.panel` to address a
+declared name instead of the default `scene-<name>` page ID. Registration does
+not reveal the edge or replace an existing selection. Both hosts read the initial
+configuration; standalone also watches later edits.
+
+An edge without registered pages ignores hotspot reveals and skips the startup
+intro. It maps no strip and reserves no work area, even with a saved dock mode.
+`shell.panel.show`, `pin`, `dock`, `toggle`, visible `mode` requests and the
+corresponding corner verbs refuse with `error_code: EMPTY_EDGE`. Registration
+restores ordinary reveal and mode behaviour. Saved modes, sizes and deferred
+page selections remain available for late registration. Removing the final
+page again suppresses visibility and reservation.
+
+Empty startup retains the shared Bus, holder retry deadlines, theme and scene
+runtime in both hosts. A headless regression exercises the production embedded
+assembly through startup and repeated updates without registering any scenes.
+
+Settings/Appearance is already a Mix scene. For now Quoin loads it **only** if
+an edge's panel list declares `settings.appearance`, at that slot on that edge.
+It need not be the primary, and no edge is required to declare it. For example,
+`{panels: {right: ["settings.appearance"]}}` loads it on the right; `{}` loads
+nothing. Standalone config reloads can add, move or withdraw the declaration.
+An explicit scene unload or sub-panel removal still retires the loader for that
+session. This scene will move to the scene editor. The corner menu and
+`shell.settings.{scheme,motion,size}` Bus verbs remain available independently.
+
 ## Experimental compositor host
 
 Quoin 0.11.0 also exposes its application as a Rust library. Comp builds with
@@ -38,9 +75,7 @@ This remains an opt-in integration experiment. It uses a continuously rendered
 native Boing background and does not yet provide native equivalents of the
 external showcase's scene-selection controls. Keyboard navigation, touch,
 multiple outputs and idle wake scheduling need separate native-host acceptance
-before this replaces the standalone shell. A compositor host must supply the
-normal `COSMIX_QUOIN_LAUNCHER` Mix hook and its session environment when app
-launches need to run under a separate desktop user.
+before this replaces the standalone shell.
 
 ## Standalone layer-shell host
 
@@ -54,9 +89,7 @@ corner menu `dev.cosmix.quoin-corner-menu.<unique>` (see
 
 Quoin presents real layer-shell buffers through `cosmix-shell-host`,
 `cosmix-shell` and SCTK. See [component versions](../VERSIONS.md) for the
-current source versions. `cosmix-quoin-demo` remains a
-feature-gated, non-installable normal-window tuning arm; it is not a
-layer-shell client.
+current source versions. The native-page Q-0 tuning binary has been removed.
 
 `QUOIN_BUS_READY service=NAME` reports the configured Bus identity (including
 `--bus-service` overrides). It records the first connected event consumed by
@@ -201,31 +234,9 @@ coalesces work into one `app.update()` demand. `Idle` removes the model timer
 and blocks on the Wayland file descriptor when no configure or frame request
 is outstanding. `WakeAt` owns one replaceable absolute calloop timer.
 `Animate` advances only from `wl_surface.frame` callbacks, with at most one
-outstanding callback per mapped animating panel. The bottom clock's deadline
-is content work, armed for the next wall-clock second only while the bottom
-panel is mapped with its clock-bearing `launcher` page active; any other
-bottom page (a citizen's scene page, for instance) or an unmapped panel arms
-none. Unchanged clock text is not rewritten. Callbacks are generation-tagged, so late or expired callbacks are
-ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
-requests, which no process lifetime reaches).
-
-The clock follows the system timezone, or the process `TZ` override, and shows
-local time with an explicit numeric UTC offset. Persist timezone preferences
-through the operating system's timezone configuration; Quoin reuses that
-configuration on subsequent launches.
-
-Background preference reconciliation shares this deadline mechanism and
-never polls while its page is hidden. Quoin reads the wallpaper snapshot once
-per connection, again after each write, and again whenever the System page is
-opened; while that page is visible it re-reads on a `wallpaper.props.changed`
-(or `bg-showcase.props.changed`) invalidation, on a delivery gap in Quoin's own
-Bus queue, and as a backstop 30 s after its last good read. While the page is
-hidden an invalidation only marks the snapshot stale. The backstop exists
-because noded drops a notification silently when a subscriber's queue is full,
-and the last notice of a burst has no successor to reveal the loss: a visible
-page can therefore show stale values until the next change, the 30 s backstop,
-or a reopen. A failed read retries only while the page is visible, backing off
-from 2 s to at most 30 s. Unchanged values do not rewrite widget text.
+outstanding callback per mapped animating panel. Callbacks are generation-tagged,
+so late or expired callbacks are ignored. Quoin has no native clock tick or
+page-telemetry polling; scenes own their content updates.
 
 Keyboard repeat shares this wake layer. The active key owns one replaceable
 absolute deadline; a due wake emits one coalesced repeat and arms the next
@@ -267,7 +278,7 @@ the patterns below.
 | non-zero | `bevy-app-error` | Bevy requested an error exit. |
 | non-zero | `calloop-create-failed-*`, `wayland-source-failed-*`, `signal-source-failed-*`, `signal-source-insert-failed-*`, `calloop-dispatch-failed-*`, `wayland-flush-failed-*` | Event-loop, signal integration, dispatch or Wayland flushing failed. |
 
-## Bus identity and live power
+## Bus identity and control
 
 Quoin registers the stable Bus service identity `shell`; its subscription
 plane is `shell-sub`. `shell.ping` and `shell.info` provide presence and
@@ -311,8 +322,7 @@ The semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin,dock,mode}`,
 `shell.panel.page.{next,prev,set}` and `shell.quit`. They require a broker-stamped local,
 registered caller and are translated to the same `ShellCommand` ingress used
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
-persistence. `shell.quit` and the right Monitoring page's Quit Quoin button
-request a successful Bevy exit through the normal render and surface drain
+persistence. `shell.quit` requests a successful Bevy exit through the normal render and surface drain
 (`QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit`). `shell.panel.resize` accepts
 `edge` and `thickness_px` in the supported 120–500 range.
 
@@ -429,38 +439,7 @@ index values during animation updates. This preserves Bevy's change detection
 instead of repeatedly invalidating the same UI state. It does not change panel
 animation or the layer host's surface creation/retirement rules.
 
-### Background controls
-
-The right-hand System page has nine controls for
-[cosmix-wallpaper](cosmix-wallpaper.md): enabled, paused, palette, bird count,
-speed, pointer radius, window margin, frame limit and seed. Boolean buttons
-toggle, palette and numeric buttons cycle through common choices, and Seed
-advances the deterministic scene seed. The wallpaper property API accepts the
-full supported ranges.
-
-Quoin reads and writes the `wallpaper` service through its existing Bus
-connection. A successful write is followed by a fresh read before another
-activation is allowed. Controls retain keyboard focus during this exchange;
-hidden pages and unavailable services cannot activate them. Disconnects clear
-cached values, and reconnection fetches the current preferences. Wallpaper
-owns persistence, so Quoin and Mix control the same saved settings.
-
-### Launch state and lifecycle
-
-The bottom `launcher` page includes working Foot, Firefox and Thunderbird buttons.
-They start `foot`, `firefox` and `thunderbird` through argv, report startup and failures,
-and disable duplicate requests for each app while its launched process is running.
-An open application does not block the other launchers. Hidden panels and
-other carousel pages cannot activate these buttons. The other application names remain
-static labels.
-
-Operators can set `COSMIX_QUOIN_LAUNCHER` to an absolute Mix script path.
-Quoin invokes `/opt/cosmix/bin/mix <script> <app>` without shell parsing,
-where `<app>` is exactly `foot`, `firefox` or `thunderbird`.
-The helper is responsible for its application's account, display and service
-lifetime; a successful helper exit does not prove a window was mapped.
-Process feedback wakes the UI without periodic polling. The default child
-inherits Quoin's environment and service lifetime.
+### Persistent shell state
 
 Quoin loads strict-data `$COSMIX_VAR/quoin.state.mix` before constructing its
 initial model, using the shared path resolver (including its XDG fallback).
@@ -475,16 +454,16 @@ exactly `thickness_px`, `mode` and `page`:
   scheme: "builtin",
   outputs: {
     "connector:DP-1": {
-      left:   {thickness_px: 240, mode: "hidden", page: "nav"},
-      bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
-      right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
-      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+      left:   {thickness_px: 240, mode: "hidden", page: "scene-apps"},
+      bottom: {thickness_px: 60,  mode: "docked", page: "scene-panel"},
+      right:  {thickness_px: 240, mode: "pinned", page: "settings.appearance"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "scene-status"}
     },
     "connector:HDMI-1": {
-      left:   {thickness_px: 200, mode: "docked", page: "places"},
-      bottom: {thickness_px: 60,  mode: "hidden", page: "tasks"},
-      right:  {thickness_px: 240, mode: "hidden", page: "monitor"},
-      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+      left:   {thickness_px: 200, mode: "docked", page: "scene-files"},
+      bottom: {thickness_px: 60,  mode: "hidden", page: "scene-panel"},
+      right:  {thickness_px: 240, mode: "hidden", page: "settings.appearance"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "scene-status"}
     }
   }
 }
@@ -504,7 +483,8 @@ placeholder) restores nothing, claims nothing and is never persisted —
 protocol ids are reassigned across sessions and must not anchor state.
 
 Modes are the strings `hidden`, `pinned` or `docked`. Thickness must be finite
-and positive; unknown page IDs use the edge's default page. On restore, an
+and positive; saved page IDs wait for their scene to register, while any live
+page remains available as the reveal default. On restore, an
 output with an entry under its own identity reuses it as-is. The strict
 legacy five-field root (no version) with three-field edges containing
 `pinned` booleans is migrated in memory — true becomes `docked`, false
@@ -532,7 +512,7 @@ mode, page and thickness state; an output change keeps the replacement's
 restored or default state, so live state never crosses outputs. Both smoke
 modes skip restore, saving and the intro pulse.
 
-A normal cold start transiently reveals hidden panels for two seconds, then releases
+A normal cold start transiently reveals populated hidden panels for two seconds, then releases
 a temporary startup hold into normal 800 ms grace. This discovery pulse is
 an explicit exception to compositor-only corner reveal. Real corner and
 pointer membership remain independent and can keep panels revealed after
@@ -542,19 +522,7 @@ once unless comp reports a holder.
 
 `setup.mix --desktop` installs `dev.cosmix.quoin.desktop` into the user's XDG
 applications directory, pointing at the installed checkout binary. Quit
-completes the existing render/surface drain; the launcher adds no settle sleep.
-
-The bottom carousel places `power` immediately after the clock-bearing
-launcher page. It subscribes to `power.props.changed` before reading
-`power.props.get`, snapshots again on reconnect, on a delivery gap, on a
-change arriving while it holds no snapshot (a powerd that was down at connect
-recovers on its first publication — no broker reconnect needed), and on a
-stale event sequence while live (a restarted powerd republishes from 1), and
-never polls. Before an authoritative snapshot it says `Power unavailable`; a
-host without a battery says `No system battery`; a partial battery reading
-names missing charge or state explicitly; a full reading renders only the
-supplied percentage, state, time, rate and health fields. Missing values are
-never rendered as zero.
+completes the existing render/surface drain.
 
 ## Interaction boundary
 
@@ -655,7 +623,7 @@ reported; another live client's layer under a copied token is refused
 (`panel_owner_mismatch`, which Quoin retries on the next layer mapping or
 registry receipt). Quoin sends nothing extra to stay alive: comp checks it
 only when it has reason to — a panel still showing 1 s after comp's conceal,
-or a click or key elsewhere while only Quoin's menu or launcher holds a
+or a click or key elsewhere while only Quoin's menu or a scene popup holds a
 panel — by re-sending an unchanged layer configure that a live Quoin
 acknowledges within a second, as SCTK does on its own. A Quoin that does not
 answer is taken to be stopped: its menu and focus holds drop, its Exclusive
@@ -953,32 +921,6 @@ The source and nested gates cannot prove these real-session paths:
   `wp_fractional_scale` and viewporter;
 - keyboard repeat pausing rather than bursting under KMS load; and
 - VT switch and seat re-add on a real session.
-
-## Background demos and capture
-
-The right panel's **Demos** tab selects Bloom, Shapes, Boing or Boids through
-the native `bg-showcase` Bus service. Camera toggles fixed/moving views for the
-three 3D scenes; Boing also has a Kick button. An optional compositor F9 binding
-can invoke the same `boing.kick` verb.
-
-**Save screenshot** captures the complete selected output, including Quoin,
-the cursor and open windows. **Record full screen MP4** starts a silent 30 fps
-recording; click **Stop recording MP4** to finalise it. The native
-`cosmix-capture` citizen must be running on that Wayland session. Recordings
-have a five-minute ceiling. Pending and finalising states are distinct from
-`complete`, which displays the saved file path. Files default to
-`~/Videos/Cosmix` in the capture citizen's account, or its configured directory.
-
-These controls share Quoin's existing asynchronous Bus bridge, reconcile after
-reconnect and report unavailable services. Neither service publishes a change
-notification for this state, so Quoin reads both statuses once per connection,
-after each action and when the Demos tab opens, then at most every 5 s while
-the tab stays visible; a hidden tab polls nothing. Failed reads back off from
-2 s to at most 30 s, visible-only. They do not launch competing
-background processes. Session supervision starts one showcase and one capture
-citizen alongside the compositor. The existing System-page boids preferences
-can target the showcase with `COSMIX_QUOIN_BACKGROUND_SERVICE=bg-showcase`;
-the default `wallpaper` target supports the compatibility wallpaper binary.
 
 ## Host limits
 

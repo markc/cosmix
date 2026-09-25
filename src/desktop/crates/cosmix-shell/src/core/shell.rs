@@ -21,6 +21,8 @@ pub struct ShellModel {
     geometry: LogicalSize,
     panels: [PanelStateMachine; 4],
     carousels: [Carousel; 4],
+    /// Quoin's scene-only frame. Generic shell hosts can choose their policy.
+    suppress_empty_edges: bool,
     thickness_set: [bool; 4],
     /// The panel whose surface holds the keyboard, as the host last reported.
     keyboard_focus: Option<Edge>,
@@ -69,6 +71,7 @@ impl ShellModel {
             geometry,
             panels,
             carousels: std::array::from_fn(|_| Carousel::empty()),
+            suppress_empty_edges: false,
             thickness_set: [false; 4],
             keyboard_focus: None,
             focus_reported: false,
@@ -98,7 +101,31 @@ impl ShellModel {
     }
 
     pub fn panel(&self, edge: Edge) -> PanelSnapshot {
-        self.panels[edge.index()].snapshot()
+        let mut panel = self.panels[edge.index()].snapshot();
+        if self.edge_is_empty(edge) {
+            // Keep the saved mode and dimensions, but never present or reserve
+            // an empty edge. A later registration resumes those preferences.
+            panel.transient_revealed = false;
+            panel.mapped = false;
+            panel.visible_fraction = 0.0;
+            panel.target_fraction = 0.0;
+            panel.velocity_per_second = 0.0;
+            panel.exclusive_zone_px = 0.0;
+            panel.hide_at = None;
+        }
+        panel
+    }
+
+    pub fn suppress_empty_edges(&mut self, enabled: bool) {
+        self.suppress_empty_edges = enabled;
+    }
+
+    pub fn empty_edges_suppressed(&self) -> bool {
+        self.suppress_empty_edges
+    }
+
+    fn edge_is_empty(&self, edge: Edge) -> bool {
+        self.suppress_empty_edges && self.carousel(edge).page_ids().is_empty()
     }
 
     pub fn carousel(&self, edge: Edge) -> &Carousel {
@@ -205,6 +232,9 @@ impl ShellModel {
     /// Cold-start discovery is independent of compositor corner membership.
     pub fn start_intro(&mut self, duration: Duration) {
         for (panel, carousel) in self.panels.iter_mut().zip(&mut self.carousels) {
+            if self.suppress_empty_edges && carousel.page_ids().is_empty() {
+                continue;
+            }
             let before = panel.snapshot();
             panel.start_intro(duration);
             if before.mode == PanelMode::Hidden && !before.transient_revealed {
@@ -261,6 +291,36 @@ impl ShellModel {
         input: PanelInput,
     ) -> Result<PanelUpdate, PanelTimeError> {
         self.ensure_monotonic(at)?;
+        if self.edge_is_empty(edge) && input.requires_content() {
+            self.last_update = at;
+            return Ok(PanelUpdate {
+                changed: false,
+                snapshot: self.panel(edge),
+                effect: None,
+            });
+        }
+        self.apply_panel_input(edge, at, input)
+    }
+
+    /// Restore a persistent preference even before its scene registers. Empty
+    /// edges remain unmapped and reserve no space; interactive input cannot
+    /// use this restoration path.
+    pub fn restore_mode(
+        &mut self,
+        edge: Edge,
+        at: Duration,
+        mode: PanelMode,
+    ) -> Result<PanelUpdate, PanelTimeError> {
+        self.ensure_monotonic(at)?;
+        self.apply_panel_input(edge, at, PanelInput::SetMode(mode))
+    }
+
+    fn apply_panel_input(
+        &mut self,
+        edge: Edge,
+        at: Duration,
+        input: PanelInput,
+    ) -> Result<PanelUpdate, PanelTimeError> {
         // Only Dock clamps into the opposing-edge thickness budget here: Docked
         // is the only mode that claims an exclusive zone, so it is the only one
         // that competes for it. Pin/PinToggle deliberately do NOT clamp -- a
@@ -292,6 +352,9 @@ impl ShellModel {
             self.carousels[edge.index()].restore_selection();
         }
         self.last_update = at;
+        if self.edge_is_empty(edge) {
+            update.snapshot = self.panel(edge);
+        }
         Ok(update)
     }
 
@@ -478,12 +541,25 @@ impl ShellModel {
             }
         }
         self.last_update = at;
+        for edge in Edge::ALL {
+            if self.edge_is_empty(edge) {
+                updates[edge.index()] = PanelUpdate {
+                    changed: false,
+                    snapshot: self.panel(edge),
+                    effect: None,
+                };
+            }
+        }
         Ok(updates)
     }
 
     pub fn wake(&self) -> PanelWake {
         let mut earliest = self.focus_grant_deadline;
-        for panel in &self.panels {
+        for edge in Edge::ALL {
+            if self.edge_is_empty(edge) {
+                continue;
+            }
+            let panel = &self.panels[edge.index()];
             match panel.wake() {
                 PanelWake::Animate => return PanelWake::Animate,
                 PanelWake::WakeAt(deadline) => {
@@ -497,9 +573,10 @@ impl ShellModel {
     }
 
     pub fn next_deadline(&self) -> Option<Duration> {
-        self.panels
-            .iter()
-            .filter_map(PanelStateMachine::next_deadline)
+        Edge::ALL
+            .into_iter()
+            .filter(|&edge| !self.edge_is_empty(edge))
+            .filter_map(|edge| self.panels[edge.index()].next_deadline())
             .chain(self.focus_grant_deadline)
             .min()
     }
@@ -536,3 +613,89 @@ impl Display for ShellError {
 }
 
 impl Error for ShellError {}
+
+#[cfg(test)]
+mod empty_edge_tests {
+    use super::*;
+    use crate::core::{Corner, CornerTrigger};
+
+    fn model() -> ShellModel {
+        let mut model = ShellModel::new(
+            OutputKey::new("test-output").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model.suppress_empty_edges(true);
+        model
+    }
+
+    #[test]
+    fn empty_hotspots_and_intro_do_nothing_until_registration() {
+        let mut model = model();
+        model.set_carousel(Edge::Left, Carousel::declared(["scene-tools"]).unwrap());
+        model.start_intro(Duration::from_secs(2));
+        let event = CornerEvent::Entered {
+            corner: Corner::TopLeft,
+            dwell: Duration::ZERO,
+            trigger: CornerTrigger::Compositor,
+        };
+        let update = model.corner_event(Duration::ZERO, event).unwrap().unwrap();
+        assert!(!update.changed);
+        assert!(update.effect.is_none());
+        for edge in Edge::ALL {
+            for input in [
+                PanelInput::Pin,
+                PanelInput::Dock,
+                PanelInput::Reveal,
+                PanelInput::HolderReveal,
+                PanelInput::SetMode(PanelMode::Docked),
+            ] {
+                assert!(
+                    !model
+                        .panel_input(edge, Duration::ZERO, input)
+                        .unwrap()
+                        .changed
+                );
+            }
+            assert!(!model.panel(edge).mapped);
+            assert_eq!(model.panel(edge).exclusive_zone_px, 0.0);
+        }
+        assert_eq!(model.wake(), PanelWake::Idle);
+        assert_eq!(model.next_deadline(), None);
+        model
+            .carousel_mut(Edge::Left)
+            .register("scene-tools")
+            .unwrap();
+        model.corner_event(Duration::ZERO, event).unwrap();
+        assert!(model.panel(Edge::Left).transient_revealed);
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("scene-tools"));
+    }
+
+    #[test]
+    fn saved_dock_reserves_nothing_until_content_registers_or_after_removal() {
+        let mut model = model();
+        model
+            .restore_mode(Edge::Bottom, Duration::ZERO, PanelMode::Docked)
+            .unwrap();
+        model.tick(Duration::from_secs(1)).unwrap();
+        assert_eq!(model.panel(Edge::Bottom).mode, PanelMode::Docked);
+        assert!(!model.panel(Edge::Bottom).mapped);
+        assert_eq!(model.panel(Edge::Bottom).exclusive_zone_px, 0.0);
+        assert_eq!(model.wake(), PanelWake::Idle);
+        model
+            .carousel_mut(Edge::Bottom)
+            .register("scene-panel")
+            .unwrap();
+        assert!(model.panel(Edge::Bottom).mapped);
+        assert!(model.panel(Edge::Bottom).exclusive_zone_px > 0.0);
+        model
+            .carousel_mut(Edge::Bottom)
+            .remove("scene-panel")
+            .unwrap();
+        assert!(!model.panel(Edge::Bottom).mapped);
+        assert_eq!(model.panel(Edge::Bottom).exclusive_zone_px, 0.0);
+    }
+}

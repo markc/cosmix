@@ -388,7 +388,8 @@ pub(crate) fn remove_unseated_scenes(world: &mut World) {
                 if still_registered {
                     eprintln!("QUOIN_INVARIANT unseated_scene_still_in_carousel page={id}");
                     #[cfg(test)]
-                    debug_assert!(!still_registered, "unseated scene still in carousel: {id}");
+                    // The test tripwire must also fire in release-profile gates.
+                    assert!(!still_registered, "unseated scene still in carousel: {id}");
                 }
                 cosmix_shell::chrome::unmount_page_content(
                     world,
@@ -900,7 +901,12 @@ fn update(
         }
         "image" => {
             let src = text(node, "src");
-            let image = if src.starts_with('/') {
+            // An empty source (e.g. a list row whose app has no icon) is "no
+            // image", never an asset-server load of "" — Bevy logs that as an
+            // ERROR. The node keeps its size so rows do not reflow.
+            let image = if src.trim().is_empty() {
+                None
+            } else if src.starts_with('/') {
                 icons::load(world, src, number(node, "w", 16.0), number(node, "h", 16.0))
             } else {
                 world
@@ -909,7 +915,8 @@ fn update(
             };
             if let Some(image) = image {
                 world.entity_mut(view.root).insert(ImageNode::new(image));
-            } else if src.starts_with('/') {
+            } else if src.trim().is_empty() || src.starts_with('/') {
+                // Also clears a stale image when a row's src becomes empty.
                 world.entity_mut(view.root).remove::<ImageNode>();
             }
             layout.width = px(number(node, "w", 16.0));
@@ -1398,9 +1405,35 @@ mod tests {
         let world = app.world_mut();
         load_mount_test_scene(world, "orphan", Edge::Left, 200);
         reconcile(world);
+        assert!(
+            world.resource::<SceneStore>().scenes["orphan"]
+                .mounted
+                .as_ref()
+                .unwrap()
+                .registered
+        );
+        assert!(
+            world
+                .resource::<cosmix_shell::runtime::ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .any(|id| id == "scene-orphan")
+        );
         // Deliberately violate the registry-removal contract: drop only the
         // seat, leaving the frame's page live when content teardown runs.
-        world.resource_mut::<SubPanelRegistryState>().0.forget("scene-orphan");
+        assert!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-orphan")
+                .is_some()
+        );
+        world
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .forget("scene-orphan");
         remove_unseated_scenes(world);
     }
 
@@ -1979,10 +2012,14 @@ mod tests {
             .as_ref()
             .unwrap()
             .page;
-        let wrapper = world.get::<ChildOf>(page).unwrap().parent();
-        let host = world.get::<ChildOf>(wrapper).unwrap().parent();
-        let panel = world.get::<ChildOf>(host).unwrap().parent();
-        let header = world.get::<Children>(panel).unwrap()[0];
+        assert!(world.get::<ChildOf>(page).is_some());
+        // On horizontal edges child zero is a chevron, which remains hidden
+        // after unloading down to one page. Inspect the actual header instead.
+        let header = world
+            .query::<(Entity, &cosmix_shell::chrome::QuoinPanelHeader)>()
+            .iter(world)
+            .find_map(|(entity, header)| (header.edge == Edge::Bottom).then_some(entity))
+            .unwrap();
         app.update();
         assert_eq!(
             app.world().get::<Node>(header).unwrap().display,

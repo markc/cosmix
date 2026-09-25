@@ -190,9 +190,11 @@ impl SavedState {
                     .restore_thickness(edge, thickness)
                     .expect("saved thickness was validated");
             }
-            model.carousel_mut(edge).restore_saved_selection(&saved.page);
             model
-                .set_mode(edge, model.last_update(), saved.mode)
+                .carousel_mut(edge)
+                .restore_saved_selection(&saved.page);
+            model
+                .restore_mode(edge, model.last_update(), saved.mode)
                 .expect("restore uses model time");
         }
         self.outputs.insert(identity, state);
@@ -490,19 +492,25 @@ pub(crate) fn persist_transitions(
     // Only the current output's entry is rewritten; other outputs' remembered
     // state stays for reconnection (shell design §7's output-removal row).
     if let Some(output) = identity {
-        saved.outputs.insert(
-            output,
-            OutputState {
-                edges: std::array::from_fn(|index| {
-                    let panel = frame.0.panel(Edge::ALL[index]);
-                    EdgeState {
-                        thickness_px: Some(panel.settled_thickness_px),
-                        mode: panel.mode,
-                        page: panel.active_page_id.clone().unwrap_or_default(),
-                    }
-                }),
-            },
-        );
+        let edges = std::array::from_fn(|index| {
+            let panel = frame.0.panel(Edge::ALL[index]);
+            // A different edge may save while this edge is waiting for its
+            // scene. Explicit selection/removal must still cancel restoration.
+            let pending = frame
+                .0
+                .empty_edges_suppressed
+                .then(|| frame.0.pending_page_restores[index].clone())
+                .flatten();
+            let page = pending
+                .or_else(|| panel.active_page_id.clone())
+                .unwrap_or_default();
+            EdgeState {
+                thickness_px: Some(panel.settled_thickness_px),
+                mode: panel.mode,
+                page,
+            }
+        });
+        saved.outputs.insert(output, OutputState { edges });
     }
     let saved_result = match store.path.as_deref() {
         Some(path) => atomic_save(path, &saved),
@@ -689,7 +697,7 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap();
-        let registry = crate::page_registry();
+        let registry = crate::tests::fixture_registry();
         for edge in Edge::ALL {
             model.set_carousel(edge, registry.carousel(edge));
         }
@@ -1141,6 +1149,71 @@ mod tests {
             state,
         );
         saved
+    }
+
+    #[test]
+    fn empty_edges_preserve_pending_selection_when_another_edge_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        atomic_save(&path, &scene_selection_state("DP-1")).unwrap();
+        let store = StateStore::load(Some(path.clone()));
+        let mut model = model_for("DP-1");
+        for edge in Edge::ALL {
+            model.set_carousel(
+                edge,
+                cosmix_shell::core::Carousel::declared(Vec::<String>::new()).unwrap(),
+            );
+        }
+        model.suppress_empty_edges(true);
+        store.restore(&mut model);
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
+            .add_message::<ctk::theme::ApplyTheme>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .insert_resource(store)
+            .add_systems(Update, persist_transitions.in_set(ShellRuntimeSet::Host));
+        // The saving edge must have content: empty edges deliberately ignore
+        // ResizeStarted, so resizing one cannot produce a persistence event.
+        cosmix_shell::runtime::register_shell_page(app.world_mut(), Edge::Bottom, "saving-panel");
+        resize_command(
+            &mut app,
+            ShellCommandKind::ResizeCommit {
+                edge: Edge::Bottom,
+                thickness_px: 160.0,
+            },
+        );
+        assert_eq!(app.world().resource::<StateStore>().writes(), 1);
+        let saved = StateStore::load(Some(path.clone()));
+        assert_eq!(
+            saved.lock_saved().outputs["connector:DP-1"].edges[Edge::Left.index()].page,
+            "scene-panel"
+        );
+        cosmix_shell::runtime::register_shell_page(app.world_mut(), Edge::Left, "scene-panel");
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-panel")
+        );
+        cosmix_shell::runtime::remove_shell_page(app.world_mut(), Edge::Left, "scene-panel");
+        resize_command(
+            &mut app,
+            ShellCommandKind::ResizeCommit {
+                edge: Edge::Bottom,
+                thickness_px: 170.0,
+            },
+        );
+        assert_eq!(app.world().resource::<StateStore>().writes(), 2);
+        let saved = StateStore::load(Some(path));
+        assert!(
+            saved.lock_saved().outputs["connector:DP-1"].edges[Edge::Left.index()]
+                .page
+                .is_empty()
+        );
     }
 
     #[test]

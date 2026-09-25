@@ -15,8 +15,6 @@ use ctk::app_control::verify_caller_provenance;
 use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, BusMessage, InboundRequest};
 use serde_json::{Value, json};
 
-use crate::power::{PowerAction, PowerSync};
-
 /// Bound on replies stashed while the outbound channel is full. Beyond this
 /// the oldest is dropped with a warning — a bounded stash that eventually
 /// answers beats an unbounded one, and both beat silently losing every reply
@@ -24,27 +22,12 @@ use crate::power::{PowerAction, PowerSync};
 const MAX_PENDING_REPLIES: usize = 32;
 const RESIZE_RECEIPT_FRAMES: u64 = 120;
 
-#[derive(Component)]
-pub(crate) struct QuoinPowerText;
-
 #[derive(Resource)]
 struct ShellBusState {
     diagnostics: BusDiagnostics,
-    power: PowerSync,
     ready_logged: bool,
     next_request_id: u64,
-    /// A snapshot request that could not be queued (outbound channel full).
-    /// Re-issued state-drivenly on a later update — no timer — so a
-    /// transiently full channel cannot dead-end the display in
-    /// "Power unavailable" until an unrelated reconnect.
-    snapshot_retry: Option<u64>,
-    /// The generation of the last `Connected` event, `None` while down. A
-    /// message-triggered resync (`PowerAction::Resync`) is honored only for
-    /// this generation: a stale-epoch message drained from the queue after a
-    /// reconnect must not start a sync that could land `Ready` on a dead
-    /// generation and ignore live telemetry from then on. Refusing costs
-    /// nothing — the `Connected` event for the live generation runs its own
-    /// sync, and a live-generation change retriggers recovery.
+    /// Current Bus connection epoch; rejects stale requests and observations.
     live_generation: Option<u64>,
     /// Replies that hit a full outbound channel, retried before new inbound
     /// work. Losing a reply outright would leave the peer hanging until its
@@ -67,10 +50,8 @@ impl Default for ShellBusState {
     fn default() -> Self {
         Self {
             diagnostics: BusDiagnostics::default(),
-            power: PowerSync::default(),
             ready_logged: false,
             next_request_id: 0x51_0000_0000,
-            snapshot_retry: None,
             live_generation: None,
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
@@ -118,10 +99,11 @@ impl Plugin for ShellBusPlugin {
             .init_resource::<SubPanelRegistryState>()
             .init_resource::<cosmix_scene_bevy::SceneStore>()
             .init_resource::<cosmix_scene_bevy::SceneEvents>()
-            .init_resource::<crate::wallpaper::WallpaperState>()
-            .init_resource::<crate::demos::DemoState>()
             .init_resource::<crate::config::ShellConfig>()
             .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
+            // Holder reporting still arms retry deadlines after the native
+            // pages are gone. Embedded hosts also run report_holders, even
+            // without a HolderClient, so its required resource lives here.
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_message::<cosmix_shell::runtime::ShellResizeResult>()
             .add_systems(
@@ -147,10 +129,9 @@ impl Plugin for ShellBusPlugin {
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
-struct SceneBus<'w, 's> {
+struct SceneBus<'w> {
     holders: Option<ResMut<'w, crate::holders::HolderClient>>,
     targets: Option<ResMut<'w, crate::activation::ActivationTargets>>,
-    power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
     registry: ResMut<'w, SubPanelRegistryState>,
@@ -212,11 +193,6 @@ fn service_bus(
         ResMut<cosmix_shell::chrome::QuoinHotspotSize>,
         Option<Res<crate::state::StateStore>>,
     ),
-    mut wallpaper: (
-        ResMut<crate::wallpaper::WallpaperState>,
-        ResMut<cosmix_shell_host::LayerHostDeadline>,
-        ResMut<crate::demos::DemoState>,
-    ),
 ) {
     // This system is the app's single inbound drain + reply owner (see
     // `BusBridge::claim_inbound`); Quoin installs no `AppPortPlugin`.
@@ -243,14 +219,10 @@ fn service_bus(
         }
     }
 
-    if let Some(generation) = state.snapshot_retry.take() {
-        request_power_snapshot(&bridge, &mut state, generation);
-    }
     if state.citizen_snapshot_retry {
         request_citizen_snapshot(&bridge, &mut state);
     }
 
-    let mut power_changed = false;
     for event in bridge.drain_events() {
         if let Some(client) = content.holders.as_deref_mut() { client.event(&event); }
         if let Some(targets) = content.targets.as_deref_mut() { targets.event(&event); }
@@ -258,8 +230,6 @@ fn service_bus(
             observer.event(&event, &mut hotspot_size);
         }
         content.events.reply(&event);
-        wallpaper.0.event(&event, time.elapsed());
-        wallpaper.2.event(&event, time.elapsed());
         match event {
             BusBridgeEvent::Connection {
                 state: BusConnectionState::Connected,
@@ -270,14 +240,10 @@ fn service_bus(
                     state.ready_logged = true;
                 }
                 state.live_generation = Some(generation);
-                request_power_snapshot(&bridge, &mut state, generation);
                 request_citizen_snapshot(&bridge, &mut state);
-                power_changed = true;
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
                 state.pending_resizes.clear();
-                state.power.invalidate();
-                state.snapshot_retry = None;
                 state.live_generation = None;
                 state.citizen_snapshot = None;
                 state.citizen_snapshot_retry = false;
@@ -292,7 +258,6 @@ fn service_bus(
                         shell_commands.write(command);
                     }
                 }
-                power_changed = true;
             }
             BusBridgeEvent::Reply { request_id, result } => {
                 if state
@@ -318,20 +283,10 @@ fn service_bus(
                             warn!("citizen registry snapshot failed; awaiting next Bus trigger");
                         }
                     }
-                } else {
-                    power_changed |= state.power.accept_reply(request_id, result);
                 }
             }
             BusBridgeEvent::DroppedMessages(_) => {
                 request_citizen_snapshot(&bridge, &mut state);
-                if let Some(generation) = state.power.generation() {
-                    request_power_snapshot(&bridge, &mut state, generation);
-                } else {
-                    // No generation to key a sync on; MAJOR-1 recovery kicks
-                    // in on the next delivered change instead.
-                    state.power.invalidate();
-                }
-                power_changed = true;
             }
             BusBridgeEvent::ObservationDroppedMessages(_) => {
                 request_citizen_snapshot(&bridge, &mut state);
@@ -365,8 +320,9 @@ fn service_bus(
         if let Some(observer) = hotspot.as_deref_mut() {
             observer.message(&message);
         }
-        if let Some(targets) = content.targets.as_deref_mut() { targets.message(&message); }
-        wallpaper.0.message(&message, time.elapsed());
+        if let Some(targets) = content.targets.as_deref_mut() {
+            targets.message(&message);
+        }
         if state.live_generation == Some(message.connection_generation) {
             if let Some(live) = registered_services(&message) {
                 state.citizen_receipt = state
@@ -390,19 +346,6 @@ fn service_bus(
                 request_citizen_snapshot(&bridge, &mut state);
             }
         }
-        match state.power.observe_message(message) {
-            PowerAction::None => {}
-            PowerAction::Changed => power_changed = true,
-            PowerAction::Resync { generation } => {
-                // Only the live generation may start a sync (see
-                // `live_generation`); a refused stale trigger recovers via
-                // the Connected event or the next live-generation change.
-                if state.live_generation == Some(generation) {
-                    request_power_snapshot(&bridge, &mut state, generation);
-                    power_changed = true;
-                }
-            }
-        }
     }
     if let Some(client) = content.holders.as_deref_mut() {
         holder_plane(client, &mut shell_commands);
@@ -417,15 +360,6 @@ fn service_bus(
             store.consume_first_run();
         }
     }
-    wallpaper.0.tick(&bridge, time.elapsed(), &mut wallpaper.1);
-    wallpaper.2.tick(&bridge, time.elapsed(), &mut wallpaper.1);
-    if power_changed {
-        let rendered = state.power.render();
-        for mut text in &mut content.power_text {
-            **text = rendered.clone();
-        }
-    }
-
     // Retry stashed replies before answering new work so a recovered channel
     // drains in arrival order.
     let pending = std::mem::take(&mut state.pending_replies);
@@ -446,134 +380,139 @@ fn service_bus(
 
     for request in bridge.drain_inbound() {
         let started = std::time::Instant::now();
-        let (rc, body, command) = if let Some(verb) =
-            cosmix_shell::runtime::SceneVerb::parse(&request.command)
-        {
-            let args = parse_args(&request).unwrap_or(Value::Null);
-            let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
+        let (rc, body, command) =
+            if let Some(verb) = cosmix_shell::runtime::SceneVerb::parse(&request.command) {
+                let args = parse_args(&request).unwrap_or(Value::Null);
+                let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
+                    (
+                        10,
+                        json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
+                    )
+                } else if state
+                    .live_generation
+                    .is_some_and(|generation| generation != request.connection_generation)
+                {
+                    (
+                        10,
+                        json!({"error":"scene request belongs to a stale Quoin connection"})
+                            .to_string(),
+                    )
+                } else {
+                    state.citizen_receipt = state
+                        .citizen_receipt
+                        .checked_add(1)
+                        .expect("receipt sequence exhausted");
+                    let owner = attested_owner(&request, state.citizen_receipt);
+                    let SceneBus {
+                        scenes, registry, ..
+                    } = &mut content;
+                    scenes.dispatch(
+                        verb,
+                        &request.body,
+                        &args,
+                        &bridge,
+                        &mut cosmix_scene_bevy::SceneMount {
+                            registry: &mut registry.0,
+                            output: &frame.0.geometry.output,
+                            owner: &owner,
+                            accepted_at: state.citizen_receipt,
+                        },
+                    )
+                };
+                (rc, body, None)
+            } else if request.command == "shell.scenes.list" {
                 (
-                    10,
-                    json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
-                )
-            } else if state
-                .live_generation
-                .is_some_and(|generation| generation != request.connection_generation)
-            {
-                (
-                    10,
-                    json!({"error":"scene request belongs to a stale Quoin connection"})
-                        .to_string(),
-                )
-            } else {
-                state.citizen_receipt = state
-                    .citizen_receipt
-                    .checked_add(1)
-                    .expect("receipt sequence exhausted");
-                let owner = attested_owner(&request, state.citizen_receipt);
-                let SceneBus {
-                    scenes, registry, ..
-                } = &mut content;
-                scenes.dispatch(
-                    verb,
-                    &request.body,
-                    &args,
-                    &bridge,
-                    &mut cosmix_scene_bevy::SceneMount {
-                        registry: &mut registry.0,
-                        output: &frame.0.geometry.output,
-                        owner: &owner,
-                        accepted_at: state.citizen_receipt,
-                    },
-                )
-            };
-            (rc, body, None)
-        } else if request.command == "shell.scenes.list" {
-            (
-                0,
-                content
-                    .scenes
-                    .list(&content.registry.0, &frame.0.geometry.output)
-                    .to_string(),
-                None,
-            )
-        } else if matches!(
-            request.command.as_str(),
-            "shell.sub.register" | "shell.sub.remove"
-        ) {
-            let (rc, body, command) = dispatch_sub_panel_verb(
-                &request,
-                &frame.0,
-                &mut content.registry.0,
-                &mut state,
-                time.elapsed(),
-            );
-            (rc, body, command)
-        } else if request.command == "shell.sub.activate" {
-            // Gated on the gate the model follows: the plane change above
-            // already reached it, so an admitted activation's reveal is
-            // command-driven and held by comp, never left to local grace.
-            // Wontfix (review NIT-5): the gate can close in the one frame
-            // between this check and the Model stage; the reveal then falls
-            // to local rules and stays up through its explicit-show flag
-            // until a hide, as `shell.panel.show` does. Closing that would
-            // mean deferring the reply to the Model stage for a window that
-            // only a comp gap or restart opens, and a panel left open is the
-            // safe side of it (never one that vanishes while typed into).
-            crate::activation::dispatch_activate(
-                &request,
-                &frame.0,
-                &content.registry.0,
-                content.holders.as_deref().is_some_and(|client| client.capable),
-                content.targets.as_deref().and_then(|targets| targets.target()),
-                state.live_generation,
-                time.elapsed(),
-            )
-        } else if request.command.starts_with("shell.settings.") {
-            // The bridge drops stale epochs before dispatch; the same fence
-            // the scene and sub-panel verbs keep — a stale request must not
-            // spend a settings write (a live theme application, a conf.mix
-            // rewrite or a resize command).
-            if state
-                .live_generation
-                .is_some_and(|generation| generation != request.connection_generation)
-            {
-                (
-                    10,
-                    json!({"error":"settings request belongs to a stale Quoin connection"})
+                    0,
+                    content
+                        .scenes
+                        .list(&content.registry.0, &frame.0.geometry.output)
                         .to_string(),
                     None,
                 )
-            } else {
-                let SceneBus {
-                    config, schemes, ..
-                } = &mut content;
-                crate::settings::dispatch_verb(
+            } else if matches!(
+                request.command.as_str(),
+                "shell.sub.register" | "shell.sub.remove"
+            ) {
+                let (rc, body, command) = dispatch_sub_panel_verb(
                     &request,
                     &frame.0,
-                    config,
-                    &crate::config::conf_mix_path(),
-                    schemes,
+                    &mut content.registry.0,
+                    &mut state,
+                    time.elapsed(),
+                );
+                (rc, body, command)
+            } else if request.command == "shell.sub.activate" {
+                // Gated on the gate the model follows: the plane change above
+                // already reached it, so an admitted activation's reveal is
+                // command-driven and held by comp, never left to local grace.
+                // Wontfix (review NIT-5): the gate can close in the one frame
+                // between this check and the Model stage; the reveal then falls
+                // to local rules and stays up through its explicit-show flag
+                // until a hide, as `shell.panel.show` does. Closing that would
+                // mean deferring the reply to the Model stage for a window that
+                // only a comp gap or restart opens, and a panel left open is the
+                // safe side of it (never one that vanishes while typed into).
+                crate::activation::dispatch_activate(
+                    &request,
+                    &frame.0,
+                    &content.registry.0,
+                    content
+                        .holders
+                        .as_deref()
+                        .is_some_and(|client| client.capable),
+                    content
+                        .targets
+                        .as_deref()
+                        .and_then(|targets| targets.target()),
+                    state.live_generation,
                     time.elapsed(),
                 )
-            }
-        } else if request.command == "shell.debug.status" {
-            (
-                0,
-                json!({
-                    "requests":state.diagnostics.requests,
-                    "rejected":state.diagnostics.rejected,
-                    "accepted_mutations":state.diagnostics.accepted_mutations,
-                    "max_dispatch_us":state.diagnostics.max_dispatch_us,
-                    "pending_replies":state.pending_replies.len(),
-                    "connected":state.live_generation.is_some(),
-                    "scope":"this process; dispatch excludes model application and transport"
-                })
-                .to_string(),
-                None,
-            )
-        } else {
-            dispatch_shell_request(&request, &frame.0, time.elapsed())
-        };
+            } else if request.command.starts_with("shell.settings.") {
+                // The bridge drops stale epochs before dispatch; the same fence
+                // the scene and sub-panel verbs keep — a stale request must not
+                // spend a settings write (a live theme application, a conf.mix
+                // rewrite or a resize command).
+                if state
+                    .live_generation
+                    .is_some_and(|generation| generation != request.connection_generation)
+                {
+                    (
+                        10,
+                        json!({"error":"settings request belongs to a stale Quoin connection"})
+                            .to_string(),
+                        None,
+                    )
+                } else {
+                    let SceneBus {
+                        config, schemes, ..
+                    } = &mut content;
+                    crate::settings::dispatch_verb(
+                        &request,
+                        &frame.0,
+                        config,
+                        &crate::config::conf_mix_path(),
+                        schemes,
+                        time.elapsed(),
+                    )
+                }
+            } else if request.command == "shell.debug.status" {
+                (
+                    0,
+                    json!({
+                        "requests":state.diagnostics.requests,
+                        "rejected":state.diagnostics.rejected,
+                        "accepted_mutations":state.diagnostics.accepted_mutations,
+                        "max_dispatch_us":state.diagnostics.max_dispatch_us,
+                        "pending_replies":state.pending_replies.len(),
+                        "connected":state.live_generation.is_some(),
+                        "scope":"this process; dispatch excludes model application and transport"
+                    })
+                    .to_string(),
+                    None,
+                )
+            } else {
+                dispatch_shell_request(&request, &frame.0, time.elapsed())
+            };
         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         state.diagnostics.record(rc, command.is_some(), elapsed_us);
         if command.is_some() || rc != 0 {
@@ -781,37 +720,6 @@ fn stash_or_respond(
         state.pending_replies.push((request, rc, body, command));
     } else if let Some(command) = command {
         dispatch(command);
-    }
-}
-
-fn request_power_snapshot(bridge: &BusBridge, state: &mut ShellBusState, generation: u64) {
-    state.snapshot_retry = None;
-    state.next_request_id = state.next_request_id.saturating_add(1);
-    let request_id = state.next_request_id;
-    state.power.begin(generation, request_id);
-    if bridge
-        .try_call(
-            request_id,
-            "power",
-            "power.props.get",
-            BTreeMap::new(),
-            "{}",
-        )
-        .is_err()
-    {
-        if bridge.worker_is_gone() {
-            // No retry can ever succeed, and no Fatal event will arrive to
-            // clear one — the events channel died with the worker. Settle on
-            // Unavailable (rendered honestly as "Power unavailable") and stop
-            // asking, rather than re-firing a dead send every frame forever.
-            state.power.invalidate();
-            state.live_generation = None;
-            return;
-        }
-        // Outbound channel merely full. Stay Syncing — also rendered as
-        // "Power unavailable" — and re-issue on a later update instead of
-        // dead-ending until an unrelated reconnect.
-        state.snapshot_retry = Some(generation);
     }
 }
 
@@ -1189,6 +1097,17 @@ fn dispatch_shell_request(
         );
     }
     let command = semantic_shell_command(frame.geometry.output.clone(), at, edge, verb);
+    if frame.empty_edges_suppressed
+        && frame.panel(edge).page_ids.is_empty()
+        && matches!(&command.kind, ShellCommandKind::Panel { input, .. } if input.requires_content())
+    {
+        return (
+            10,
+            // Unified refusal shape (decision 10): {error_code, message}.
+            json!({"error_code":"EMPTY_EDGE", "message":"edge has no registered pages", "edge":edge_name(edge)}).to_string(),
+            None,
+        );
+    }
     // `accepted` means validated and enqueued for the Model stage of this
     // update — an acceptance ack, not an application receipt. Callers needing
     // the applied state read it back via `shell.props.get`.
@@ -2491,125 +2410,42 @@ mod tests {
         assert_eq!(app.world().resource::<cosmix_shell::chrome::QuoinHotspotSize>().0, 32.0);
     }
 
-    /// A `power.props.changed` delivery-gap notice on `generation`.
-    fn gap_change(generation: u64) -> BusMessage {
-        let mut headers = BTreeMap::new();
-        headers.insert("topic".to_owned(), "power.props.changed".to_owned());
-        headers.insert("gap".to_owned(), "true".to_owned());
-        BusMessage {
+    #[test]
+    fn registry_gap_resync_uses_live_generation_and_events_drain_first() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        let gap = |generation| BusMessage {
             connection_generation: generation,
-            from: "power".to_owned(),
-            command: "noded.topic.event".to_owned(),
-            body: "{}".to_owned(),
-            headers,
-        }
-    }
-
-    /// The `live_generation` gate itself — NOT `PowerSync`'s own sync
-    /// generation (that one is `power.rs`'s
-    /// `gap_recovery_is_keyed_on_the_sync_generation`).
-    ///
-    /// Honoring a stale-epoch `PowerAction::Resync` would land `Ready` on a
-    /// dead generation and ignore live telemetry from then on — MAJOR 1's
-    /// permanent "Power unavailable", restored. The gate's correctness
-    /// otherwise rests entirely on an unwritten cross-crate invariant (the
-    /// worker enqueues `Connected{g}` before any g-stamped message can be
-    /// forwarded), so both directions are pinned here.
-    #[test]
-    fn the_live_generation_gate_refuses_a_stale_epoch_resync_and_honors_a_live_one() {
-        let (bridge, peer) = test_bridge("quoin");
-        let mut app = bus_app(bridge);
-
-        // Connect on generation 2: the event records the live generation and
-        // issues that epoch's own snapshot.
+            from: "noded".into(),
+            command: "noded.topic.event".into(),
+            body: "{}".into(),
+            headers: BTreeMap::from([
+                ("topic".into(), "noded.props.changed".into()),
+                ("gap".into(), "true".into()),
+            ]),
+        };
         peer.deliver_event(BusBridgeEvent::Connection {
             state: BusConnectionState::Connected,
             generation: 2,
         });
-        app.update();
-        let calls = peer.drain_calls();
-        assert_eq!(
-            calls
-                .iter()
-                .map(|call| call.command.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "power.props.get",
-                "noded.props.get",
-                "wallpaper.props.get",
-                "background.status",
-                "capture.status"
-            ],
-            "each projection bootstraps once"
-        );
-        let request_id = calls[0].request_id;
-
-        // powerd is down: the snapshot fails, so the projection falls back to
-        // Unavailable while the CONNECTION stays live on generation 2.
-        peer.deliver_event(BusBridgeEvent::Reply {
-            request_id,
-            result: Err("powerd is down".to_owned()),
-        });
-        app.update();
-        assert!(peer.drain_calls().is_empty());
-
-        // A message forwarded under the OLD epoch, drained after the
-        // reconnect. `PowerSync` holds no generation, so it asks for a resync
-        // keyed on the message's own stale epoch; the gate must refuse it.
-        peer.deliver_message(gap_change(1));
-        app.update();
-        assert!(
-            peer.drain_calls().is_empty(),
-            "a stale-epoch resync must not issue a request"
-        );
-
-        // The same notice on the live epoch must start a sync — refusing
-        // everything would be the other half of MAJOR 1.
-        peer.deliver_message(gap_change(2));
-        app.update();
-        let calls = peer.drain_calls();
-        assert_eq!(
-            calls.len(),
-            2,
-            "a live-generation gap resyncs both projections"
-        );
-        assert_eq!(calls[0].command, "noded.props.get");
-        assert_eq!(calls[1].command, "power.props.get");
-    }
-
-    /// The drain order the gate depends on: `drain_events` BEFORE
-    /// `drain_messages`, so a connect and a message forwarded under the same
-    /// generation both take effect in one frame.
-    ///
-    /// Reversed, `live_generation` would still be unset when the message is
-    /// read, the gate would refuse it, and only the Connected event's own
-    /// snapshot would appear — one call, not two.
-    #[test]
-    fn events_drain_before_messages_within_one_frame() {
-        let (bridge, peer) = test_bridge("quoin");
-        let mut app = bus_app(bridge);
-        peer.deliver_event(BusBridgeEvent::Connection {
-            state: BusConnectionState::Connected,
-            generation: 2,
-        });
-        peer.deliver_message(gap_change(2));
+        peer.deliver_message(gap(2));
         app.update();
         assert_eq!(
             peer.drain_calls()
                 .iter()
                 .map(|call| call.command.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "power.props.get",
-                "noded.props.get",
-                "noded.props.get",
-                "power.props.get",
-                "wallpaper.props.get",
-                "background.status",
-                "capture.status"
-            ],
-            "drain_events must run before drain_messages"
+            ["noded.props.get", "noded.props.get"],
+            "connect then live gap; no native page telemetry requests"
         );
+        peer.deliver_message(gap(1));
+        app.update();
+        assert!(peer.drain_calls().is_empty(), "stale gaps cannot resync");
+        peer.deliver_message(gap(2));
+        app.update();
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].command, "noded.props.get");
     }
 
     /// A broker registry observation. Consumers must reconcile against `new`,
@@ -2633,13 +2469,32 @@ mod tests {
     }
 
     fn mounted_bus_app() -> (App, ctk::bus::TestBusPeer) {
+        mounted_bus_app_with_config(None)
+    }
+
+    fn mounted_bus_app_with_config(
+        config: Option<crate::config::ShellConfig>,
+    ) -> (App, ctk::bus::TestBusPeer) {
         use cosmix_shell::chrome::{
             QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
             spawn_quoin_chrome,
         };
         let (bridge, peer) = test_bridge("quoin");
         let mut app = bus_app(bridge);
-        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()))
+        let mut model = test_model();
+        let registry = if let Some(config) = config {
+            let registry = QuoinPageRegistry::declared(&config.panels).unwrap();
+            for edge in Edge::ALL {
+                model.set_carousel(edge, registry.carousel(edge));
+            }
+            model.suppress_empty_edges(true);
+            model.start_intro(std::time::Duration::from_secs(2));
+            app.insert_resource(config);
+            registry
+        } else {
+            QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap()
+        };
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(model))
             .add_plugins(QuoinChromePlugin)
             .init_resource::<ButtonInput<KeyCode>>()
             .add_systems(
@@ -2649,8 +2504,7 @@ mod tests {
                     .before(ShellRuntimeSet::Model),
             );
         let world = app.world_mut();
-        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
-            .unwrap()
+        let props = registry
             .bind(
                 &world.resource::<ShellFrameState>().0,
                 QuoinContentBindings::default(),
@@ -2671,6 +2525,80 @@ mod tests {
         app.update();
         peer.drain_calls();
         (app, peer)
+    }
+
+    #[test]
+    fn empty_edges_refuse_visibility_verbs_without_enqueuing_commands() {
+        let mut model = test_model();
+        model.suppress_empty_edges(true);
+        let frame = ShellFrame::from_model(&model);
+        for edge in Edge::ALL {
+            for verb in ["show", "pin", "dock", "toggle", "mode"] {
+                let mut request = local(&format!("shell.panel.{verb}"));
+                request.body = json!({"edge":edge_name(edge), "mode":"pinned"}).to_string();
+                let (rc, body, command) =
+                    dispatch_shell_request(&request, &frame, Default::default());
+                assert_eq!(rc, 10, "{verb} on {edge:?}");
+                let reply = serde_json::from_str::<Value>(&body).unwrap();
+                assert_eq!(reply["error_code"], "EMPTY_EDGE");
+                assert_eq!(reply["message"], "edge has no registered pages");
+                assert!(command.is_none());
+            }
+        }
+        for corner in ["top-left", "bottom-left", "bottom-right", "top-right"] {
+            for verb in ["show", "pin", "toggle"] {
+                let mut request = local(&format!("shell.corner.{verb}"));
+                request.body = json!({"corner":corner}).to_string();
+                let (rc, body, command) =
+                    dispatch_shell_request(&request, &frame, Default::default());
+                assert_eq!(rc, 10);
+                let reply = serde_json::from_str::<Value>(&body).unwrap();
+                assert_eq!(reply["error_code"], "EMPTY_EDGE");
+                assert_eq!(reply["message"], "edge has no registered pages");
+                assert!(command.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn starts_empty_and_bottom_scene_fills_declared_slot_then_reveals() {
+        for source in ["{}", r#"{panels: {bottom: ["scene-panel"]}}"#] {
+            let config =
+                crate::config::ShellConfig::parse(source).unwrap();
+            let (mut app, peer) = mounted_bus_app_with_config(Some(config));
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            for edge in Edge::ALL {
+                assert!(frame.panel(edge).page_ids.is_empty());
+                assert!(!frame.panel(edge).mapped, "intro must skip empty edges");
+                assert_eq!(frame.panel(edge).exclusive_zone_px, 0.0);
+            }
+            load_scene(&mut app, &peer, "panel", "owner", "bottom");
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            assert_eq!(
+                frame
+                    .panels
+                    .iter()
+                    .filter(|panel| !panel.page_ids.is_empty())
+                    .count(),
+                1
+            );
+            assert_eq!(frame.panel(Edge::Bottom).page_ids.as_ref(), ["scene-panel"]);
+            assert_eq!(
+                frame.panel(Edge::Bottom).active_page_id.as_deref(),
+                Some("scene-panel")
+            );
+            let mut show = local("shell.panel.show");
+            show.body = json!({"edge":"bottom"}).to_string();
+            peer.send(show);
+            app.update();
+            assert_eq!(peer.drain_responses()[0].rc, 0);
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            assert!(frame.panel(Edge::Bottom).transient_revealed);
+            assert_eq!(
+                frame.panel(Edge::Bottom).active_page_id.as_deref(),
+                Some("scene-panel")
+            );
+        }
     }
 
     fn scene_load(name: &str, owner: &str, edge: &str) -> InboundRequest {

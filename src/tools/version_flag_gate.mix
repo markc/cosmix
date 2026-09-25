@@ -44,8 +44,7 @@
 #   cargo build --release --workspace
 #   cargo build --release -p cosmix-mds --features _stress-helper
 #   (cd desktop && cargo build --release --workspace \
-#       && cargo build --release -p cosmix-comp --features kms-live \
-#       && cargo build --release -p cosmix-quoin --features demo)
+#       && cargo build --release -p cosmix-comp --features kms-live)
 #   mix tools/version_flag_gate.mix [--src DIR] [--profile release|dev|NAME]
 #                                   [--expect-sha SHA]
 #

@@ -88,8 +88,24 @@ impl EmbeddedQuoinPlugin {
 
 impl Plugin for EmbeddedQuoinPlugin {
     fn build(&self, app: &mut App) {
-        let registry = crate::page_registry();
+        let config = crate::config::startup_config(false);
         let store = crate::state::StateStore::startup(false);
+        let bus = BusBridgeConfig::new("shell", resolve_noded_url());
+        self.configure(app, config, store, bus);
+    }
+}
+
+impl EmbeddedQuoinPlugin {
+    /// Shared production assembly; callers supply startup I/O so the full
+    /// application can also be exercised without a display or a live broker.
+    fn configure(
+        &self,
+        app: &mut App,
+        config: crate::config::ShellConfig,
+        store: crate::state::StateStore,
+        mut bus: BusBridgeConfig,
+    ) {
+        let registry = crate::startup_page_registry(&config);
         // The placeholder model restores nothing: comp has not named the
         // output yet, and claiming under a placeholder identity would take
         // the migrated legacy entry away from the real connector. `prepare`
@@ -124,21 +140,12 @@ impl Plugin for EmbeddedQuoinPlugin {
             name: PLACEHOLDER_OUTPUT.into(),
             size: Vec2::new(1920.0, 1080.0),
         });
-        let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
         crate::hotspot::install(app, &mut bus, self.comp_service.clone());
         crate::hotspot::arm_first_run(app, store.first_run());
         bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
         bus.inbound_prefixes.push("shell.".into());
-        bus.subscriptions.extend(
-            [
-                "power.props.changed",
-                "wallpaper.props.changed",
-                "bg-showcase.props.changed",
-                "noded.props.changed",
-            ]
-            .map(str::to_owned),
-        );
-        crate::configure_content(app, bus, registry, store, false, false);
+        bus.subscriptions.push("noded.props.changed".into());
+        crate::configure_content(app, bus, registry, store, false, false, config);
         // Output preparation runs BEFORE the Bus dispatch drains: a
         // dispatch reserves its registry seat and queues its command
         // against the current frame's output, so the model replacement
@@ -280,6 +287,7 @@ fn model(name: &str, size: Vec2, registry: &cosmix_shell::chrome::QuoinPageRegis
         Duration::from_millis(200),
     )
     .expect("valid shell timing");
+    model.suppress_empty_edges(registry.declarations_only());
     for edge in Edge::ALL {
         model.set_carousel(edge, registry.carousel(edge));
     }
@@ -408,6 +416,90 @@ fn present(
 mod tests {
     use super::*;
 
+    #[test]
+    fn production_plugins_update_headlessly_without_scenes() {
+        use bevy::asset::AssetApp;
+
+        let mut app = App::new();
+        // Headless Bevy platform services: keep real input, picking, text and
+        // UI schedules, without a window, renderer or display event loop.
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin::default(),
+            bevy::transform::TransformPlugin,
+            bevy::camera::CameraPlugin,
+            ImagePlugin::default(),
+            bevy::image::TextureAtlasPlugin,
+            bevy::mesh::MeshPlugin,
+            bevy::input::InputPlugin,
+            bevy::input_focus::InputFocusPlugin,
+            bevy::input_focus::InputDispatchPlugin,
+            bevy::window::WindowPlugin {
+                primary_window: None,
+                exit_condition: bevy::window::ExitCondition::DontExit,
+                ..default()
+            },
+        ))
+        // Bevy's plugin tuples stop at 15 elements; the rest go in a second call.
+        .add_plugins((
+            bevy::picking::DefaultPickingPlugins,
+            bevy::clipboard::ClipboardPlugin,
+            bevy::text::TextPlugin,
+            bevy::ui::UiPlugin,
+            bevy::ui_widgets::UiWidgetsPlugins,
+        ))
+        // Feathers loads shader assets even without a RenderApp.
+        .init_asset::<bevy::shader::Shader>()
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(250),
+        ));
+
+        // Call the production assembly used by Plugin::build, including
+        // configure_content shared with standalone startup. Only startup I/O
+        // differs: no saved state, empty config, and an unsupported URL scheme
+        // so the real BusBridgePlugin cannot contact an operator's broker.
+        EmbeddedQuoinPlugin::default().configure(
+            &mut app,
+            crate::config::ShellConfig::default(),
+            crate::state::StateStore::load(None),
+            BusBridgeConfig::new("quoin-headless-test", "unsupported://headless"),
+        );
+        app.finish();
+        app.cleanup();
+
+        for step in 0..12 {
+            if step == 1 {
+                // Exercise both the startup placeholder and the host's first
+                // real output observation, including its intro and settings.
+                *app.world_mut().resource_mut::<EmbeddedOutput>() = EmbeddedOutput {
+                    size: Vec2::new(1000.0, 800.0),
+                    name: "test-output".into(),
+                    active: true,
+                    ..default()
+                };
+            }
+            // Bevy's default error handler panics on a missing system resource.
+            // Do not seed Quoin resources here or skip any application systems.
+            app.update();
+            let world = app.world();
+            let frame = &world.resource::<ShellFrameState>().0;
+            let seats = &world.resource::<cosmix_shell::runtime::SubPanelRegistryState>().0;
+            assert!(
+                world
+                    .resource::<cosmix_scene_bevy::SceneStore>()
+                    .list(seats, &frame.geometry.output)
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+            );
+            for edge in Edge::ALL {
+                assert!(frame.panel(edge).page_ids.is_empty());
+                assert!(!frame.panel(edge).mapped);
+                assert_eq!(frame.panel(edge).exclusive_zone_px, 0.0);
+            }
+            assert!(world.resource::<EmbeddedPanelRegions>().0.is_empty());
+        }
+    }
+
     /// A legacy v2 state file as today's Quoin writes it, for the migration
     /// path (mirrors `state`'s `v2_source` fixture).
     fn v2_state_file() -> String {
@@ -433,7 +525,7 @@ mod tests {
     #[test]
     fn output_change_repopulates_carousel_from_migrated_seats() {
         use cosmix_shell::runtime::{SubPanelRegistryState, register_shell_page};
-        let registry = crate::page_registry();
+        let registry = crate::tests::fixture_registry();
         let size = Vec2::new(1920.0, 1080.0);
         let mut app = App::new();
         app.add_plugins((
@@ -496,7 +588,7 @@ mod tests {
 
         // Mirrors EmbeddedQuoinPlugin::build: a placeholder model with no
         // restore, waiting for the host's first real observation.
-        let registry = crate::page_registry();
+        let registry = crate::tests::fixture_registry();
         let fresh = model(PLACEHOLDER_OUTPUT, Vec2::new(1920.0, 1080.0), &registry);
         let mut app = App::new();
         app.add_plugins((
@@ -508,7 +600,7 @@ mod tests {
             )),
         ))
         .insert_resource(crate::state::StateStore::load(Some(path)))
-        .insert_resource(crate::page_registry())
+        .insert_resource(crate::tests::fixture_registry())
         .insert_resource(EmbeddedHost {
             detector: CornerDetector::new(
                 CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
@@ -575,7 +667,7 @@ mod tests {
                 .spawn((Node::default(), GlobalZIndex(0)))
                 .id()
         });
-        let mut model = model("test", Vec2::new(1000., 800.), &crate::page_registry());
+        let mut model = model("test", Vec2::new(1000., 800.), &crate::tests::fixture_registry());
         model
             .panel_input(Edge::Left, Duration::ZERO, PanelInput::Dock)
             .unwrap();
@@ -653,7 +745,7 @@ mod tests {
                 .spawn((Node::default(), GlobalZIndex(0)))
                 .id()
         });
-        let mut model = model("test", Vec2::new(1000., 800.), &crate::page_registry());
+        let mut model = model("test", Vec2::new(1000., 800.), &crate::tests::fixture_registry());
         model
             .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)
             .unwrap();

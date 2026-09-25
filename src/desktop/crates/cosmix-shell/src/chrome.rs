@@ -155,6 +155,7 @@ impl QuoinPageSpec {
 #[derive(Resource, Clone, Debug)]
 pub struct QuoinPageRegistry {
     panels: [Vec<QuoinPageSpec>; 4],
+    declarations_only: bool,
 }
 
 impl QuoinPageRegistry {
@@ -169,11 +170,49 @@ impl QuoinPageRegistry {
             Carousel::new(panels[edge.index()].iter().map(|page| page.id.as_str()))
                 .map_err(|source| QuoinPageRegistryError::InvalidRegistry { edge, source })?;
         }
-        Ok(Self { panels })
+        Ok(Self {
+            panels,
+            declarations_only: false,
+        })
+    }
+
+    /// A frame with declared slots but no native content. Scenes fill slots
+    /// later through the normal mount/registration path.
+    pub fn declared(panels: &[Vec<String>; 4]) -> Result<Self, QuoinPageRegistryError> {
+        let panels = std::array::from_fn(|i| {
+            panels[i]
+                .iter()
+                .map(|id| QuoinPageSpec::new(id, id))
+                .collect()
+        });
+        let [left, bottom, right, top] = panels;
+        let mut registry = Self::new(left, bottom, right, top)?;
+        registry.declarations_only = true;
+        Ok(registry)
+    }
+
+    pub fn declarations_only(&self) -> bool {
+        self.declarations_only
+    }
+
+    fn content_pages(&self, edge: Edge) -> &[QuoinPageSpec] {
+        if self.declarations_only {
+            &[]
+        } else {
+            &self.panels[edge.index()]
+        }
     }
 
     /// Model carousel derived from the same validated IDs chrome will bind.
     pub fn carousel(&self, edge: Edge) -> Carousel {
+        if self.declarations_only {
+            return Carousel::declared(
+                self.panels[edge.index()]
+                    .iter()
+                    .map(|page| page.id.as_str()),
+            )
+            .expect("QuoinPageRegistry validates IDs at construction");
+        }
         Carousel::new(
             self.panels[edge.index()]
                 .iter()
@@ -185,7 +224,8 @@ impl QuoinPageRegistry {
     /// Validate the actual runtime model snapshot before chrome is spawned.
     pub fn validate_frame(&self, frame: &ShellFrame) -> Result<(), QuoinPageRegistryError> {
         for edge in Edge::ALL {
-            let expected = self.panels[edge.index()]
+            let expected = self
+                .content_pages(edge)
                 .iter()
                 .map(|page| page.id.clone())
                 .collect::<Vec<_>>();
@@ -217,7 +257,8 @@ impl QuoinPageRegistry {
                 .collect::<Vec<_>>();
             Carousel::new(actual.iter().map(String::as_str))
                 .map_err(|source| QuoinPageRegistryError::InvalidContent { edge, source })?;
-            let expected = self.panels[edge.index()]
+            let expected = self
+                .content_pages(edge)
                 .iter()
                 .map(|page| page.id.clone())
                 .collect::<Vec<_>>();
@@ -228,7 +269,7 @@ impl QuoinPageRegistry {
                     actual,
                 });
             }
-            for spec in &self.panels[edge.index()] {
+            for spec in self.content_pages(edge) {
                 let binding = edge_bindings
                     .iter()
                     .find(|binding| binding.id == spec.id)
@@ -338,9 +379,11 @@ pub struct QuoinChromeProps {
     panels: [Vec<QuoinPage>; 4],
 }
 
-/// Marker for clock text reproduced from [`crate::runtime::ShellFrame`].
+/// The title-and-carousel header, independent of the edge's child ordering.
 #[derive(Component)]
-pub struct QuoinClock;
+pub struct QuoinPanelHeader {
+    pub edge: Edge,
+}
 
 /// Native host hit-tests this rendered strip before dispatching ordinary buttons.
 /// Its computed transform includes the committed-motion chrome translation.
@@ -518,7 +561,6 @@ impl Plugin for QuoinChromePlugin {
                 (
                     present_panels,
                     present_page_controls,
-                    present_content,
                     present_navlinks,
                     present_resize_grips,
                 )
@@ -788,6 +830,7 @@ fn spawn_panel(
             .id()
     };
 
+    commands.entity(header).insert(QuoinPanelHeader { edge });
     let page_host = commands
         .spawn(Node {
             min_width: px(0),
@@ -1624,19 +1667,6 @@ fn present_page_controls(
     }
 }
 
-fn present_content(frame: Res<ShellFrameState>, mut clocks: Query<&mut Text, With<QuoinClock>>) {
-    let Some(value) = &frame.0.content.bottom_clock_text else {
-        return;
-    };
-    for mut clock in &mut clocks {
-        // Compare through `Deref` first: an unconditional write marks the
-        // Text changed every update and re-lays-out an unchanged clock.
-        if clock.0 != *value {
-            clock.0.clone_from(value);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1679,44 +1709,6 @@ mod tests {
             model.set_carousel(edge, registry.carousel(edge));
         }
         ShellFrame::from_model(&model)
-    }
-
-    #[test]
-    fn present_content_leaves_an_unchanged_clock_unmarked() {
-        let model = ShellModel::new(
-            OutputKey::new("test").unwrap(),
-            LogicalSize::new(1_000.0, 800.0).unwrap(),
-            Duration::ZERO,
-            Duration::from_millis(300),
-            Duration::from_millis(180),
-        )
-        .unwrap();
-        let mut frame = ShellFrame::from_model(&model);
-        frame.content.bottom_clock_text = Some("12:00:00 +10:00".into());
-        let mut world = World::new();
-        world.insert_resource(ShellFrameState(frame));
-        let clock = world
-            .spawn((Text::new("12:00:00 +10:00"), QuoinClock))
-            .id();
-        world.clear_trackers();
-        let changed = |world: &World| {
-            world
-                .entity(clock)
-                .get_ref::<Text>()
-                .unwrap()
-                .last_changed()
-        };
-        let before = changed(&world);
-        world.run_system_once(present_content).unwrap();
-        assert_eq!(changed(&world), before, "equal text must not be rewritten");
-        world
-            .resource_mut::<ShellFrameState>()
-            .0
-            .content
-            .bottom_clock_text = Some("12:00:01 +10:00".into());
-        world.run_system_once(present_content).unwrap();
-        assert_ne!(changed(&world), before);
-        assert_eq!(world.get::<Text>(clock).unwrap().0, "12:00:01 +10:00");
     }
 
     fn pointer_click_command(action: QuoinAction) -> ShellCommandKind {
