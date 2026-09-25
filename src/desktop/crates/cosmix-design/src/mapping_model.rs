@@ -74,10 +74,20 @@ impl ButtonTypographyKey {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedTypeRecord {
     pub family: String,
+    pub fallbacks: Vec<String>,
+    pub generic: crate::TypographyGeneric,
+    /// Empty for a directly authored `logical_px` size.
     pub font_size_metric: String,
     pub font_size: f64,
     pub weight: u16,
     pub line_height: Option<f64>,
+}
+
+impl ResolvedTypeRecord {
+    /// Named families in priority order, before the generic system rescue.
+    pub fn families(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.family.as_str()).chain(self.fallbacks.iter().map(String::as_str))
+    }
 }
 
 /// Which named type record a `(variant, size, part)` coordinate resolves to.

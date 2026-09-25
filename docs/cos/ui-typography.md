@@ -1,8 +1,58 @@
 # Application chrome typography
 
-CTK applications use Noto Sans at a 15.333px body size by default. Authored
-widget text scales from its existing 13px baseline. Terminal grid text keeps
-its separate terminal font settings.
+Desktop defaults come from `cosmix-design`'s embedded
+`design.v1.typography.records`:
+
+| Role | Preferred family | Weight | Logical px |
+| --- | --- | --- | --- |
+| `ui` (panel, menu, toolbar) | SF Pro Text | Light 300 | 44/3 (11pt) |
+| `ui_display` (window title) | SF Pro Display | Light 300 | 44/3 (11pt) |
+| `small` (secondary copy) | SF Pro Text | Regular 400 | 32/3 (8pt) |
+| `mono` (fixed width) | SF Mono | Light 300 | 16 (12pt) |
+| `terminal` | SF Mono | Light 300 | 64/3 (16pt) |
+
+Each record contains `family`, ordered `fallbacks`, `generic` (`sans_serif`
+or `monospace`), `weight` (1–1000), and exactly one of `logical_px` (finite,
+positive) or the existing `type_step` metric reference. Optional `line_height`
+remains supported. For example:
+
+```mix
+ui: {
+  family: "SF Pro Text",
+  fallbacks: ["Inter", "Noto Sans", "DejaVu Sans"],
+  generic: "sans_serif",
+  logical_px: 14.666666666666666,
+  weight: 300
+}
+```
+
+UI roles try Inter, Noto Sans and DejaVu Sans in that order before the system
+sans family. Mono roles specify DejaVu Sans Mono, Noto Sans Mono, then system
+monospace. Family discovery selects the nearest installed weight. A free
+family without Light can therefore render at Regular. Apple fonts are
+proprietary and are referenced only by family name; install them separately.
+
+`default_typography(TypographyRole)` reads these exact records once without
+compiling widget tables. A compiled design exposes `typography().role(role)`.
+The legacy v0 crosswalk and `button.md`/`button.sm` metric records are retained
+for compatibility; they are not the desktop's default UI font authority.
+
+The compositor maps `ui_display` into its title metrics for every chrome
+style. Explicit free families precede last-known-good and system UI rescue;
+embedded DejaVu remains the final rescue when discovery is unavailable.
+Its glyph chain preserves the explicit family order before platform families.
+
+CTK's `CtkTextRole::Ui` and `CtkTextRole::Small` apply exact logical sizes and
+weights. Panel, menu and toolbar labels use UI; secondary labels use Small.
+Button reconciliation applies UI even for compact button geometry. Untagged
+legacy widget text still scales from its authored 13px baseline; semantic
+roles bypass that multiplier entirely. Output scale is applied once by Bevy.
+`CtkTextRole::Mono` applies the fixed-width token at 16px; Quoin's clock uses
+it. Existing `CtkMonospace` labels gain the mono family chain while retaining
+legacy authored sizing unless an exact role is supplied.
+Small uses the UI family chain, retaining its independent size and Regular
+weight when the UI family or size is overridden. Terminal consumers apply
+the terminal record separately; terminal rendering is outside this change.
 
 Set `COSMIX_UI_FONT` to a system font family name, for example `SF Pro Text`,
 and `COSMIX_UI_FONT_PX` to a body size in logical pixels. These deployment
@@ -12,8 +62,24 @@ changing their environment.
 
 Whitespace-only family names are ignored. Sizes must parse as finite numbers
 between 6 and 96 inclusive; invalid values leave the default/theme value in
-effect. Missing families retain CTK's existing safe font fallback. Fonts are
-resolved through the system font database; no font files are bundled.
+effect. Missing families try the explicit free chain, then system sans;
+last-known-good and Bevy's embedded face remain available if none resolve.
+CTK retains the complete resolved chain for glyph fallback and reasserts it
+after collection changes.
+
+Theme files can override `typography.family`, `body_px`, `weight` and
+`fallbacks`. Family and size environment overrides retain precedence on
+reload. Quoin optionally imports Plasma's `[General] font` from `kdeglobals`
+when `COSMIX_IMPORT_PLASMA_FONT=1`. Import includes Qt 5/6 weight conversion
+and point-to-logical-pixel conversion; without opt-in, KDE configuration does
+not affect the defaults.
+
+Font acceptance tests shape actual compositor and Quoin panel/menu/small
+text, inspect each selected face's family, OS/2 weight and collection index,
+and rasterise the same glyphs to `target/font-probes/*.png` at 1× and 2.5×.
+SF tests print an explicit skip when `/usr/share/fonts/apple-fonts` is absent.
+Isolated fallback tests disable system discovery and load only free fixtures,
+proving DejaVu Sans wins over an unrelated system generic. They need no GPU.
 
 CosMix Term uses the dark variant of its selected chrome palette. Its menu
 bar uses `ctk.panel` with white titles; dropdowns use `ctk.master.panel` and

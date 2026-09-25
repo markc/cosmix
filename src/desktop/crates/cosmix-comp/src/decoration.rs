@@ -9,10 +9,12 @@ pub(crate) struct DecorationStartup {
 
 impl DecorationStartup {
     pub(crate) fn resolve(enabled: bool, style: ChromeStyle) -> Self {
-        Self {
-            enabled,
-            theme: presets::resolve(style, Scheme::Ocean, Mode::Light),
-        }
+        let title = cosmix_design::default_typography(cosmix_design::TypographyRole::UiDisplay);
+        let mut theme = presets::resolve(style, Scheme::Ocean, Mode::Light);
+        theme.metrics.title_font_family = cosmix_deco::DecoFontFamily::Named(title.family.clone());
+        theme.metrics.title_size_px = title.font_size as f32;
+        theme.metrics.title_font_weight = cosmix_deco::DecoFontWeight(title.weight);
+        Self { enabled, theme }
     }
 }
 

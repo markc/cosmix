@@ -838,6 +838,7 @@ fn spawn_menu_bar_inner(
             .spawn((
                 Text::new(menu.label.clone()),
                 TextFont::from_font_size(FONT_SIZE),
+                crate::theme::CtkTextRole::Ui,
                 ThemeTextColor(tokens::TEXT),
             ))
             .id();
@@ -893,6 +894,7 @@ fn spawn_menu_entries(
                 },
                 Text::new(""),
                 TextFont::from_font_size(FONT_SIZE),
+                crate::theme::CtkTextRole::Ui,
                 ThemeTextColor(tokens::TEXT),
             ))
             .id();
@@ -921,6 +923,7 @@ fn spawn_menu_entries(
             .spawn((
                 Text::new(item.label.as_str().to_owned()),
                 TextFont::from_font_size(FONT_SIZE),
+                crate::theme::CtkTextRole::Ui,
                 ThemeTextColor(tokens::TEXT),
             ))
             .id();
@@ -936,6 +939,7 @@ fn spawn_menu_entries(
             .spawn((
                 Text::new(""),
                 TextFont::from_font_size(FONT_SIZE),
+                crate::theme::CtkTextRole::Small,
                 ThemeTextColor(tokens::TEXT_DIM),
                 MenuAccelerator {
                     action: match item.action_id() {

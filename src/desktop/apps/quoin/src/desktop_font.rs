@@ -1,5 +1,5 @@
-//! Read the host desktop environment's configured UI font, so Quoin's chrome
-//! matches the surrounding desktop rather than shipping a fixed face.
+//! Optionally import the host desktop's UI font. Shared Cosmix typography is
+//! the default; `COSMIX_IMPORT_PLASMA_FONT=1` enables this override.
 //!
 //! This is a best-effort *import*, never a dependency: any failure — no config
 //! file, an unreadable one, a line that does not parse — yields `None` and the
@@ -8,8 +8,8 @@
 //!
 //! Only KDE Plasma's `kdeglobals` is read today (the host this port targets).
 //! The format is INI; the `[General]` section's `font` key is a Qt font
-//! descriptor whose first two comma-separated fields are the family and the
-//! point size:
+//! descriptor whose first two fields are family and point size, and whose
+//! fifth field is the Qt weight:
 //!
 //! ```text
 //! [General]
@@ -27,6 +27,7 @@ use std::path::PathBuf;
 pub(crate) struct DesktopFont {
     pub family: String,
     pub body_px: f32,
+    pub weight: u16,
 }
 
 /// Points to logical pixels at 96 dpi. Downstream output scale is separate.
@@ -36,6 +37,11 @@ fn points_to_px(points: f32) -> f32 {
 
 /// Resolve the desktop UI font, or `None` to keep CTK's built-in.
 pub(crate) fn detect() -> Option<DesktopFont> {
+    // Shared Cosmix tokens are authoritative unless the operator opts into
+    // importing Plasma. No KDE installation is needed for the default face.
+    if std::env::var("COSMIX_IMPORT_PLASMA_FONT").as_deref() != Ok("1") {
+        return None;
+    }
     let path = kdeglobals_path()?;
     let source = std::fs::read_to_string(path).ok()?;
     parse_kdeglobals_font(&source)
@@ -49,7 +55,7 @@ fn kdeglobals_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config").join("kdeglobals"))
 }
 
-/// Extract family + body pixel size from a `kdeglobals` INI body.
+/// Extract family, weight and logical pixel size from a `kdeglobals` INI body.
 ///
 /// Scans for the `[General]` section and its `font=` key. The value's first
 /// field is the family; the second is the point size. A missing section, key,
@@ -81,9 +87,32 @@ fn parse_kdeglobals_font(source: &str) -> Option<DesktopFont> {
         return Some(DesktopFont {
             family: family.to_owned(),
             body_px: points_to_px(points),
+            weight: fields
+                .nth(2)
+                .and_then(|value| value.trim().parse::<u16>().ok())
+                .map(qt_weight)
+                .unwrap_or(400),
         });
     }
     None
+}
+
+// Qt 6 uses OpenType weights; older kdeglobals files use Qt 5's 0..99 scale.
+fn qt_weight(weight: u16) -> u16 {
+    if weight > 99 {
+        return weight.clamp(1, 1000);
+    }
+    match weight {
+        0..=6 => 100,
+        7..=18 => 200,
+        19..=37 => 300,
+        38..=53 => 400,
+        54..=59 => 500,
+        60..=69 => 600,
+        70..=78 => 700,
+        79..=84 => 800,
+        _ => 900,
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +131,7 @@ font=SF Pro Text,11,-1,5,300,0,0,0,0,0,0,0,0,0,0,1,Light,0,0
 ";
         let font = parse_kdeglobals_font(source).expect("font in [General]");
         assert_eq!(font.family, "SF Pro Text");
+        assert_eq!(font.weight, 300);
         // 11 pt at 96 dpi = 14.666…
         assert!((font.body_px - 14.6667).abs() < 0.01, "{}", font.body_px);
     }
@@ -110,6 +140,23 @@ font=SF Pro Text,11,-1,5,300,0,0,0,0,0,0,0,0,0,0,1,Light,0,0
     fn font_outside_general_is_ignored() {
         let source = "[ColorScheme]\nfont=Wrong,99\n";
         assert_eq!(parse_kdeglobals_font(source), None);
+    }
+
+    #[test]
+    fn qt5_light_and_regular_and_missing_weight_are_imported() {
+        for (descriptor, weight) in [
+            ("Example,11,-1,5,25", 300),
+            ("Example,11,-1,5,50", 400),
+            ("Example,11,-1,5,400", 400),
+            ("Example,11", 400),
+        ] {
+            assert_eq!(
+                parse_kdeglobals_font(&format!("[General]\nfont={descriptor}\n"))
+                    .unwrap()
+                    .weight,
+                weight
+            );
+        }
     }
 
     #[test]

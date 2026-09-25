@@ -262,6 +262,7 @@ pub(crate) fn button(commands: &mut Commands, app: LauncherApp) -> Entity {
         .spawn((
             Text::new(app.label()),
             TextFont::from_font_size(13.0),
+            ctk::theme::CtkTextRole::Ui,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
             LauncherLabel(app),
         ))

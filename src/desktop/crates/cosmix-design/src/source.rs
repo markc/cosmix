@@ -374,7 +374,14 @@ pub struct TypographySource {
 #[serde(deny_unknown_fields)]
 pub struct TypeRecordSource {
     pub family: String,
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    #[serde(default)]
+    pub generic: crate::TypographyGeneric,
+    #[serde(default)]
     pub type_step: String,
+    #[serde(default)]
+    pub logical_px: Option<f64>,
     pub weight: u16,
     #[serde(default)]
     pub line_height: Option<f64>,

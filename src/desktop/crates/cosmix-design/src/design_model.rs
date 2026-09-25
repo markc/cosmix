@@ -158,6 +158,10 @@ impl ResolvedTypography {
         self.scale.get(name)
     }
 
+    pub fn role(&self, role: crate::TypographyRole) -> Option<&ResolvedTypeRecord> {
+        self.record(role.name())
+    }
+
     /// Resolves a button coordinate to its named record. Total by construction.
     pub fn button(&self, key: ButtonTypographyKey) -> ResolvedTypographyRef<'_> {
         let name = &self.button.assignment(key).record_name;

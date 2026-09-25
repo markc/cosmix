@@ -76,6 +76,8 @@ impl DecorationSceneTheme {
 
 #[derive(Resource, Default)]
 struct ChromeFontSelection {
+    /// Distinguish a discovered DejaVu family from our embedded final rescue.
+    system_dejavu: bool,
     /// The last whole family which successfully resolved through the theme
     /// ladder. This is deliberately separate from the per-glyph chain below.
     last_known_good: Option<String>,
@@ -242,8 +244,17 @@ impl Plugin for ChromeTypographyPlugin {
                 "initialised chrome FontCx with eager system font discovery"
             );
         }
-        app.init_resource::<ChromeFontSelection>()
-            .insert_resource(DecorationSceneTheme(theme));
+        let system_dejavu = app
+            .world_mut()
+            .resource_mut::<FontCx>()
+            .collection
+            .family_id(EMBEDDED_CHROME_FONT_FAMILY)
+            .is_some();
+        app.insert_resource(ChromeFontSelection {
+            system_dejavu,
+            ..Default::default()
+        })
+        .insert_resource(DecorationSceneTheme(theme));
         {
             let mut fonts = app.world_mut().resource_mut::<Assets<Font>>();
             // Replace Bevy's tiny default subset even when TextPlugin already
@@ -392,7 +403,7 @@ fn configure_chrome_typography(
         ));
     }
 
-    // Whole-family resolution is requested -> last-known-good -> embedded.
+    // Explicit free families precede last-known-good and platform rescue.
     // It chooses the primary family; it is not the per-glyph fallback chain.
     let requested = requested_chrome_family(
         &mut font_cx,
@@ -401,7 +412,14 @@ fn configure_chrome_typography(
             .discovered_ui_sans_families
             .as_deref()
             .unwrap_or_default(),
-    );
+    )
+    .or_else(|| {
+        cosmix_design::default_typography(cosmix_design::TypographyRole::UiDisplay)
+            .fallbacks
+            .iter()
+            .filter(|name| name.as_str() != EMBEDDED_CHROME_FONT_FAMILY || selection.system_dejavu)
+            .find_map(|name| named_family(&mut font_cx, name))
+    });
     // A themed family this host does not have must not fall straight past the
     // platform UI family to our vendored last resort — that is the common case
     // for a default naming a family only some hosts ship. Neither rescue is a
@@ -461,24 +479,33 @@ fn configure_chrome_typography(
     // Per-glyph coverage is a separate ordered UiSansSerif chain. Reassert it
     // only after `load_font_assets_into_font_collection`: that system clears
     // registered generic mappings when it rebuilds the collection. The
-    // embedded DejaVu family is explicitly kept terminal.
+    // embedded-only DejaVu family is explicitly kept terminal. A discovered
+    // DejaVu family also serves the earlier, explicit free-family rung.
     let mut chain = Vec::new();
-    if resolved.0 != embedded_id {
+    if resolved.0 != embedded_id || selection.system_dejavu {
         chain.push(resolved.0);
     }
-    for name in selection
-        .discovered_ui_sans_families
-        .as_deref()
-        .unwrap_or_default()
+    for name in cosmix_design::default_typography(cosmix_design::TypographyRole::UiDisplay)
+        .fallbacks
+        .iter()
+        .chain(
+            selection
+                .discovered_ui_sans_families
+                .as_deref()
+                .unwrap_or_default()
+                .iter(),
+        )
     {
         if let Some((id, _)) = named_family(&mut font_cx, name)
-            && id != embedded_id
+            && (id != embedded_id || selection.system_dejavu)
             && !chain.contains(&id)
         {
             chain.push(id);
         }
     }
-    chain.push(embedded_id);
+    if !chain.contains(&embedded_id) {
+        chain.push(embedded_id);
+    }
     let chain_changed = !font_cx
         .collection
         .generic_families(GenericFamily::UiSansSerif)
@@ -1714,6 +1741,55 @@ fn elide_title_end_with_measure<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod font_probe {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/font_probe.rs"
+        ));
+    }
+
+    #[test]
+    fn title_shapes_installed_sf_display_light_and_renders() {
+        if !font_probe::sf_installed() {
+            return;
+        }
+        let mut app = typography_app(None);
+        app.update();
+        let metrics = &app.world().resource::<DecorationSceneTheme>().0.metrics;
+        assert_eq!(metrics.title_size_px, 44.0 / 3.0);
+        let font = chrome_title_font(metrics.title_size_px, metrics.title_font_weight);
+        for scale in [1.0, 2.5] {
+            font_probe::assert_face_and_render(
+                &mut app.world_mut().resource_mut::<FontCx>(),
+                &font,
+                "Cosmix window title",
+                "SF Pro Display",
+                300,
+                scale,
+                "comp-title-sf",
+            );
+        }
+    }
+
+    #[test]
+    fn title_without_sf_uses_explicit_free_family_before_system_ui() {
+        let mut app = typography_app(Some(font_probe::free_fonts_only()));
+        app.update();
+        let metrics = &app.world().resource::<DecorationSceneTheme>().0.metrics;
+        let font = chrome_title_font(metrics.title_size_px, metrics.title_font_weight);
+        for scale in [1.0, 2.5] {
+            font_probe::assert_face_and_render(
+                &mut app.world_mut().resource_mut::<FontCx>(),
+                &font,
+                "Cosmix window title",
+                "DejaVu Sans",
+                400,
+                scale,
+                "comp-title-free",
+            );
+        }
+    }
 
     use std::any::TypeId;
     use std::sync::{Arc, mpsc::SyncSender};

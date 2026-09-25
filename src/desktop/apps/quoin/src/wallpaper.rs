@@ -396,6 +396,7 @@ pub(crate) fn controls(commands: &mut Commands) -> Entity {
     let title = commands
         .spawn((
             Text::new("Background · click a value to change it"),
+            ctk::theme::CtkTextRole::Ui,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
             TextFont {
                 font_size: FontSize::Px(12.0),
@@ -425,6 +426,7 @@ pub(crate) fn controls(commands: &mut Commands) -> Entity {
             .spawn((
                 SettingLabel(index),
                 Text::new(format!("{label}: —")),
+                ctk::theme::CtkTextRole::Ui,
                 bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
                 TextFont {
                     font_size: FontSize::Px(13.0),
@@ -439,6 +441,7 @@ pub(crate) fn controls(commands: &mut Commands) -> Entity {
         .spawn((
             Feedback,
             Text::new("Connecting to background…"),
+            ctk::theme::CtkTextRole::Small,
             bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
             TextFont {
                 font_size: FontSize::Px(12.0),
