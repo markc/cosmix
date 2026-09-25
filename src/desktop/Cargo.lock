@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bterm"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3469,25 +3469,28 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "bytes",
  "cosmix-design",
  "cosmix-iced-widgets",
  "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
  "cosmix-term-core",
  "iced",
  "iced_tiny_skia",
  "libc",
  "naga 27.0.3",
  "serde_json",
+ "term-native-test-broker",
  "tiny-skia 0.11.4",
  "tokio",
 ]
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",

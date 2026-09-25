@@ -417,7 +417,7 @@ struct InputNotice {
 
 pub struct Control {
     terminal: Arc<Mutex<TabSet>>,
-    cleanup: Cleanup,
+    cleanup: std::sync::Mutex<Option<Cleanup>>,
     state: Mutex<State>,
     native: crate::native_session::NativeSession,
     notice_tx: tokio::sync::mpsc::Sender<InputNotice>,
@@ -442,6 +442,9 @@ impl Drop for SingleFlight<'_> {
     }
 }
 impl Control {
+    pub(crate) fn release_cleanup(&self) {
+        self.cleanup.lock().unwrap().take();
+    }
     #[cfg(test)]
     pub(crate) fn expire_retries(&self) {
         for history in self.state.lock().unwrap().history.values_mut() {
@@ -458,7 +461,7 @@ impl Control {
         let (notice_tx, notice_rx) = tokio::sync::mpsc::channel(256);
         Self {
             terminal,
-            cleanup,
+            cleanup: std::sync::Mutex::new(Some(cleanup)),
             native,
             state: Mutex::new(State::default()),
             notice_tx,
@@ -1447,7 +1450,9 @@ impl Control {
             }
             "term.tab.close" => {
                 let (_, removed) = tabs.close(tab);
-                self.cleanup.submit(removed.into_iter().collect());
+                if let Some(cleanup) = self.cleanup.lock().unwrap().as_ref() {
+                    cleanup.submit(removed.into_iter().collect());
+                }
                 Reply::ok(json!({"closed":request.target}))
             }
             "term.pane.close" => {
@@ -1459,7 +1464,9 @@ impl Control {
                     return Reply::error("FORBIDDEN");
                 }
                 let (_, removed) = tabs.close_active();
-                self.cleanup.submit(removed.into_iter().collect());
+                if let Some(cleanup) = self.cleanup.lock().unwrap().as_ref() {
+                    cleanup.submit(removed.into_iter().collect());
+                }
                 Reply::ok(json!({"closed":request.target}))
             }
             "term.pane.split" => {

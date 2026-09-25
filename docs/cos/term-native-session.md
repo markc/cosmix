@@ -6,9 +6,16 @@ defaults to `cosmix-noded`; trusted launch configuration can select a different
 account with `COSMIX_BROKER_ACCOUNT`. The endpoint follows the client library's
 explicit/config/discovery/system order and always undergoes ownership and peer
 credential verification. Identity establishment runs on the actor. Before the
-first TabSet open, main waits once for at most 900ms for a ready bundle; healthy
+first TabSet open, the startup worker waits once for at most 900ms for a ready bundle; healthy
 startup can therefore bind pane 1. An unavailable profile or failed grant leaves
 ordinary panes usable, including Ctrl+Shift+T.
+While the first tab is starting, all targetless mutating Bus verbs return a
+non-zero rc with error `starting`. Retry after attach; this refusal is not
+cached, so the same `request_id` can be reused. Read and watch requests remain
+available, and watchers receive the first tab and pane's add/select events.
+A first-pane spawn failure is reported as an error and exits non-zero after
+cleanup. Native outage diagnostics suppress repeated causes, but report a
+changed cause, including the eventual failure after a startup deadline.
 The allocated native route's `term.session` reports authorised pane binding
 status with an explicit target. The global diagnostic `term` route serves no
 protected controls. See [native control](term-native-control.md) for the S4
