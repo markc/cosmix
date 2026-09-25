@@ -48,7 +48,8 @@ pub(super) fn paint_emoji_reference(
             let fg = order(cell.fg);
             if cell.c.is_ascii() && cell.extra == 0 && cell.width == CellWidth::Narrow {
                 let glyph = ascii.entry(cell.c).or_insert_with(|| {
-                    let font = FontRef::from_index(&raster.data, 0).unwrap();
+                    // The raster's own primary face (keeps a collection's face index).
+                    let font = raster.unicode.fonts.primary.font();
                     Render::new(&[Source::Outline])
                         .format(Format::Alpha)
                         .render(
