@@ -16,7 +16,7 @@ use cosmix_edit_client::highlight::{HlClass, SliceBudget};
 use cosmix_edit_client::model::line_of;
 use cosmix_edit_core::origin::{Origin, OriginKind};
 use iced::advanced::text::{self as atext};
-use iced::advanced::{Renderer as _, mouse, renderer};
+use iced::advanced::{mouse, renderer};
 use iced::{Border, Color, Font, Pixels, Point, Rectangle, Size};
 
 use super::layout::{self as geo, Geometry, STRIP_W};
