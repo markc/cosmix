@@ -223,6 +223,7 @@ mod tests {
                 captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
                 captured_cursor: Mutex::new(None),
+                captured_selection: Mutex::new(None),
                 pid: 0,
                 thread: None,
             },

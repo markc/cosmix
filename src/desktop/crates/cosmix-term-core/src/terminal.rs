@@ -2,6 +2,10 @@ use crate::metrics::Metrics;
 #[path = "mouse.rs"]
 mod mouse;
 pub use mouse::MouseModifiers;
+#[path = "selection.rs"]
+mod selection;
+pub use rio_vt::{crosswords::pos::Side as SelectionSide, selection::SelectionType};
+use rio_vt::selection::SelectionRange;
 use rio_vt::{
     ansi::CursorShape,
     corcovado::{Poll, PollOpt, Ready, Token, channel},
@@ -552,6 +556,7 @@ pub struct Terminal {
     captured_offset: Mutex<usize>,
     damage: Mutex<Receiver<()>>,
     captured_cursor: Mutex<Option<((usize, usize), bool)>>,
+    captured_selection: Mutex<Option<SelectionRange>>,
     pub pid: i32,
     thread: Option<JoinHandle<(Machine<MeteredPty, Listener>, rio_vt::performer::State)>>,
 }
@@ -711,6 +716,7 @@ impl Terminal {
             captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
             captured_cursor: Mutex::new(None),
+            captured_selection: Mutex::new(None),
             pid: 0,
             thread: None,
         }
@@ -943,6 +949,7 @@ impl Terminal {
             captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
             captured_cursor: Mutex::new(None),
+            captured_selection: Mutex::new(None),
             pid,
             thread: Some(thread),
         })
@@ -1053,6 +1060,7 @@ impl Terminal {
         let rows = term.screen_lines();
         let mut cells = Vec::with_capacity(cols * rows);
         let offset = term.display_offset();
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(&term));
         for y in 0..rows {
             let row = &term.grid[rio_vt::crosswords::pos::Line(y as i32 - offset as i32)];
             for x in 0..cols {
@@ -1065,6 +1073,14 @@ impl Terminal {
                     fg = fg.map(|v| v.saturating_add(40));
                 }
                 if style.flags.contains(StyleFlags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                if selection.is_some_and(|range| {
+                    range.contains(rio_vt::crosswords::pos::Pos::new(
+                        rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
+                        Column(x),
+                    ))
+                }) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
                 cells.push(Cell {
@@ -1083,8 +1099,23 @@ impl Terminal {
         let cursor_visible =
             cursor.1 < rows && term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
         let mut previous = self.captured_cursor.lock().unwrap();
+        let mut previous_selection = self.captured_selection.lock().unwrap();
         if let Some(dirty) = dirty {
             *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
+            // Compare at capture time too: the parser can rotate or clear Rio's
+            // selection without going through the frontend's selection methods.
+            if *previous_selection != selection {
+                for range in previous_selection.iter().chain(selection.iter()) {
+                    for (y, row) in dirty.iter_mut().enumerate() {
+                        let line = y as i64 - offset as i64;
+                        if (i64::from(range.start.row.0)..=i64::from(range.end.row.0))
+                            .contains(&line)
+                        {
+                            *row = true;
+                        }
+                    }
+                }
+            }
             if *previous != Some((cursor, cursor_visible)) {
                 for ((_, row), visible) in previous
                     .iter()
@@ -1098,6 +1129,7 @@ impl Terminal {
             }
         }
         if consume {
+            *previous_selection = selection;
             *previous = Some((cursor, cursor_visible));
             *self.captured_offset.lock().unwrap() = term.display_offset();
             // Both operations must remain under this same grid lock. reset_damage
@@ -1507,6 +1539,7 @@ mod tests {
                 captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
                 captured_cursor: Mutex::new(None),
+                captured_selection: Mutex::new(None),
                 pid: 0,
                 thread: None,
             };

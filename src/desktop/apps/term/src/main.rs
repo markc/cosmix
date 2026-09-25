@@ -16,6 +16,7 @@
 //! (four-row CPU bands or a whole-pane wgpu buffer). See `frame.rs` and
 //! `cosmix_term_core::raster::render_into`.
 
+mod clipboard;
 mod frame;
 mod input;
 mod keys;
@@ -78,6 +79,9 @@ fn main() {
              \x20     Ctrl+Shift+E/O split side by side/stacked, Ctrl+Shift+X close pane,\n\
              \x20     Ctrl+Shift+arrows move focus, Ctrl+Shift+Q quit,\n\
              \x20     Ctrl+Tab / Ctrl+Shift+Tab next / previous pane (wrap),\n\
+             \x20     Ctrl+Shift+C copy; Ctrl+Shift+V or Shift+Insert paste clipboard\n\
+             \x20     Drag selects; double/triple click word/line; middle click pastes primary\n\
+             \x20     Shift+mouse overrides application mouse reporting\n\
              \x20     Ctrl+plus/equal/minus/0 (and Ctrl+wheel) font size\n\
              \x20     Wheel scrolls; Shift forces history; Shift+PageUp/PageDown page history\n\
              \x20     Shift+Home/End history top/bottom (primary screen only)\n\
@@ -184,6 +188,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
         scroll_wheel: 0.0,
         scroll_pane: None,
         pointer: std::cell::Cell::new(None),
+        mouse: clipboard::MouseState::default(),
         last_redraw: None,
         force_paint: false,
         paint_requested: true,
@@ -311,6 +316,7 @@ struct State {
     scroll_pane: Option<u64>,
     /// Window coordinates survive a tab change beneath a stationary pointer.
     pointer: std::cell::Cell<Option<iced::Point>>,
+    mouse: clipboard::MouseState,
     last_redraw: Option<std::time::Instant>,
     force_paint: bool,
     paint_requested: bool,
@@ -329,7 +335,8 @@ enum Message {
     Action(Action),
     Modifiers(iced::keyboard::Modifiers),
     SelectTab(u64),
-    FocusPane(u64),
+    Mouse(iced::mouse::Event, iced::Point, Instant),
+    Paste(u64, Option<String>),
     Wheel(u64, iced::mouse::ScrollDelta),
     Pointer,
     Window(iced::window::Event),
@@ -475,11 +482,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             tabs.user_activity();
             tabs.select(id);
         }
-        Message::FocusPane(id) => {
-            let mut tabs = state.tabs.lock().expect("tabs");
-            tabs.user_activity();
-            tabs.focus(id);
-        }
+        Message::Mouse(event, position, at) => return state.mouse_event(event, position, at),
+        Message::Paste(id, text) => state.paste(id, text),
         Message::Pointer => {}
         Message::Wheel(id, delta) => {
             if state.modifiers.control() {
@@ -508,6 +512,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // is never delivered; a latched Ctrl would turn every later wheel
             // into a zoom.
             iced::window::Event::Unfocused => {
+                state.mouse = clipboard::MouseState::default();
                 state.modifiers = iced::keyboard::Modifiers::empty();
                 state.wheel = 0.0;
                 state.scroll_wheel = 0.0;
@@ -587,6 +592,7 @@ fn view(state: &State) -> Element<'_, Message> {
         Some((*id, col, row))
     };
     let last = std::cell::Cell::new(state.pointer.get().and_then(&hovered));
+    let mouse = clipboard::MouseEvents::new(state);
     let mut content = keys::keys(column![tab_strip(state, scale), panes], move |event| {
         let message = on_key(event);
         // Ordinary typing must not acquire an extra terminal/grid lock just
@@ -608,7 +614,8 @@ fn view(state: &State) -> Element<'_, Message> {
     .on_pointer(move |position| {
         let cell = hovered(position);
         pointer_message(&state.pointer, &last, cell, position)
-    });
+    })
+    .on_mouse(move |event, position| mouse.message(state, event, position));
     // Clean chrome redraws must not publish Paint: iced would rebuild the UI
     // and dispatch RedrawRequested a second time for no terminal change.
     if state.needs_paint() {
@@ -741,7 +748,6 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
             ..container::Style::default()
         });
     mouse_area(outer)
-        .on_press(Message::FocusPane(id))
         .on_scroll(move |delta| Message::Wheel(id, delta))
         .into()
 }
@@ -823,7 +829,11 @@ fn apply(tabs: &mut TabSet, action: Action) -> Vec<Removed> {
                 .scroll_view(request);
             Vec::new()
         }
-        Action::FontIncrease | Action::FontDecrease | Action::FontReset => Vec::new(),
+        Action::FontIncrease
+        | Action::FontDecrease
+        | Action::FontReset
+        | Action::Copy
+        | Action::Paste => Vec::new(),
     }
 }
 
@@ -953,6 +963,7 @@ impl State {
 
     fn act(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::Copy | Action::Paste => return self.clipboard_action(action),
             Action::FontIncrease => self.zoom(FontSize::increase),
             Action::FontDecrease => self.zoom(FontSize::decrease),
             Action::FontReset => self.zoom(FontSize::reset),
@@ -1145,6 +1156,36 @@ mod tests {
 
     fn character(c: &str) -> iced::keyboard::Key {
         iced::keyboard::Key::Character(c.into())
+    }
+
+    #[test]
+    fn clipboard_chords_win_before_pty_encoding_and_swallow_repeats() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        for (key, mods, expected) in [
+            (character("c"), Modifiers::CTRL | Modifiers::SHIFT, Action::Copy),
+            (character("v"), Modifiers::CTRL | Modifiers::SHIFT, Action::Paste),
+            (Key::Named(Named::Insert), Modifiers::SHIFT, Action::Paste),
+        ] {
+            for alternate in [false, true] {
+                let event = press(key.clone(), key.clone(), mods, None, false);
+                assert!(matches!(
+                    on_key_screen(&event, alternate),
+                    Some(Message::Action(action)) if action == expected
+                ));
+                let event = press(key.clone(), key.clone(), mods, None, true);
+                assert!(on_key_screen(&event, alternate).is_none());
+            }
+        }
+        let event = press(character("c"), character("c"), Modifiers::CTRL, None, false);
+        let Some(Message::Keys(keys)) = on_key(&event) else {
+            panic!("plain Ctrl+C must reach the shell");
+        };
+        assert_eq!(
+            keys.into_iter()
+                .flat_map(cosmix_term_core::terminal::encode)
+                .collect::<Vec<_>>(),
+            [3]
+        );
     }
 
     #[test]
@@ -1351,11 +1392,116 @@ mod tests {
             scroll_wheel: 0.0,
             scroll_pane: None,
             pointer: std::cell::Cell::new(None),
+            mouse: clipboard::MouseState::default(),
             last_redraw: None,
             force_paint: false,
             paint_requested: true,
         };
         (state, reaper)
+    }
+
+    #[test]
+    fn mouse_drag_uses_event_positions_and_release_outside_the_pane() {
+        use cosmix_term_core::terminal::Terminal;
+        use iced::{Point, mouse::{Button, Event}};
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let id = state.shape.active_pane;
+        let terminal = state.tabs.lock().unwrap().pane_by_id(id).unwrap();
+        *terminal.lock().unwrap() = Terminal::from_test_vt(8, 3, b"abcdefgh\r\nijklmnop");
+        state.grids.insert(id, (8, 3));
+        let (cw, ch) = state.painter.logical_cell();
+        let border = layout::border(state.painter.scale());
+        let top = layout::strip_height(state.painter.scale()) + border;
+        let start = Point::new(border + cw * 0.1, top + ch * 0.5);
+        let end = Point::new(border + cw * 3.9, start.y);
+        let events = clipboard::MouseEvents::new(&state);
+        // Coalesced hover is deliberately ahead of the queued button press.
+        state.pointer.set(Some(end));
+        let press = events
+            .message(&state, &Event::ButtonPressed(Button::Left), Some(start))
+            .unwrap();
+        let motion = events
+            .message(&state, &Event::CursorMoved { position: end }, Some(end))
+            .unwrap();
+        let _ = update(&mut state, press);
+        let _ = update(&mut state, motion);
+        assert_eq!(
+            terminal.lock().unwrap().selection_text().as_deref(),
+            Some("abcd")
+        );
+        // Moving back to the original anchor clears the range again.
+        let _ = state.mouse_event(Event::CursorMoved { position: start }, start, Instant::now());
+        assert_eq!(terminal.lock().unwrap().selection_text(), None);
+        // An unmatched release must not lose the original grab.
+        assert!(events
+            .message(&state, &Event::ButtonReleased(Button::Right), Some(end))
+            .is_none());
+        let outside = Point::new(state.window.width + 20.0, start.y);
+        let release = events
+            .message(&state, &Event::ButtonReleased(Button::Left), Some(outside))
+            .unwrap();
+        let primary = update(&mut state, release);
+        assert!(primary.units() > 0, "a completed selection writes PRIMARY");
+        assert_eq!(
+            terminal.lock().unwrap().selection_text().as_deref(),
+            Some("abcdefgh")
+        );
+        assert!(state.clipboard_action(Action::Copy).units() > 0);
+
+        let later = Instant::now() + std::time::Duration::from_secs(1);
+        let _ = state.mouse_event(Event::ButtonPressed(Button::Left), start, later);
+        assert_eq!(
+            state.mouse_event(Event::ButtonReleased(Button::Left), start, later).units(),
+            0
+        );
+        assert_eq!(terminal.lock().unwrap().selection_text(), None);
+        assert_eq!(state.clipboard_action(Action::Copy).units(), 0);
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(terminal);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn mouse_reporting_owns_buttons_unless_shift_started_the_gesture() {
+        use cosmix_term_core::terminal::Terminal;
+        use iced::{Point, keyboard::Modifiers, mouse::{Button, Event}};
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let id = state.shape.active_pane;
+        let terminal = state.tabs.lock().unwrap().pane_by_id(id).unwrap();
+        // No PTY sender: a failed report must still NEVER fall back to paste.
+        *terminal.lock().unwrap() = Terminal::from_test_vt(8, 3, b"\x1b[?9hword");
+        state.grids.insert(id, (8, 3));
+        let position = Point::new(4.0, layout::strip_height(state.painter.scale()) + 4.0);
+        let now = Instant::now();
+        assert_eq!(
+            state.mouse_event(Event::ButtonPressed(Button::Middle), position, now).units(),
+            0
+        );
+        assert_eq!(
+            state.mouse_event(Event::ButtonReleased(Button::Middle), position, now).units(),
+            0
+        );
+        let _ = state.mouse_event(Event::ButtonPressed(Button::Left), position, now);
+        let _ = state.mouse_event(Event::ButtonReleased(Button::Left), position, now);
+        assert_eq!(terminal.lock().unwrap().selection_text(), None);
+        state.modifiers = Modifiers::SHIFT;
+        assert!(state.mouse_event(Event::ButtonPressed(Button::Middle), position, now).units() > 0);
+        let _ = state.mouse_event(Event::ButtonReleased(Button::Middle), position, now);
+        let _ = state.mouse_event(Event::ButtonPressed(Button::Left), position, now);
+        // Releasing Shift during this local gesture must not hand it to the app.
+        state.modifiers = Modifiers::empty();
+        let end = Point::new(position.x + state.painter.logical_cell().0 * 3.8, position.y);
+        assert!(state.mouse_event(Event::ButtonReleased(Button::Left), end, now).units() > 0);
+        assert!(terminal.lock().unwrap().selection_text().is_some());
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(terminal);
+        drop(state);
+        reaper.join().unwrap();
     }
 
     /// Review finding: a zoom used to relayout and then only WAKE, so the
