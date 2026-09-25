@@ -255,7 +255,6 @@ impl Text {
                 {
                     return;
                 }
-                carry_len = 0;
             }
             let (valid, tail) = match std::str::from_utf8(rest) {
                 Ok(s) => (s, &[][..]),

@@ -174,7 +174,7 @@ proptest! {
         let applied = r.unwrap();
         let (model, spans) = model_apply(&base, &ops);
         prop_assert_eq!(text(&b), model.clone());
-        prop_assert_eq!(b.text().line_index(), recount(&model).as_slice());
+        prop_assert_eq!(b.text().line_index().to_vec(), recount(&model));
         prop_assert_eq!(applied.changed, spans);
     }
 
@@ -210,7 +210,7 @@ proptest! {
         }
         while b.redo(LaneSel::Own, &a, via(), 0).is_ok() {}
         prop_assert_eq!(text(&b), top);
-        prop_assert_eq!(b.text().line_index(), recount(&text(&b)).as_slice());
+        prop_assert_eq!(b.text().line_index().to_vec(), recount(&text(&b)));
     }
 
     /// 4. Lane independence: A edits even cells, B odd cells, interleaved;
