@@ -212,23 +212,38 @@ impl Parent {
         state: BindingState,
         generation: u64,
     ) -> SessionRecord {
-        let deadline = Instant::now() + Duration::from_secs(25);
-        loop {
-            self.renew().await;
-            let list = self.connection.session_list().await.unwrap();
-            if let Some(record) = list.records.into_iter().find(|record| {
-                record.record_id == id
-                    && record.state == state
-                    && record.binding_generation.0 >= generation
-            }) {
-                return record;
+        self.wait_with_limit(id, state, generation, Duration::from_secs(25))
+            .await
+    }
+    async fn wait_with_limit(
+        &mut self,
+        id: HexBytes<16>,
+        state: BindingState,
+        generation: u64,
+        limit: Duration,
+    ) -> SessionRecord {
+        assert!(
+            !limit.is_zero(),
+            "child did not reach {state:?}, generation {generation}: deadline expired"
+        );
+        // One timeout covers renewal, list RPCs and every polling sleep;
+        // none of them may restart the caller's remaining budget.
+        tokio::time::timeout(limit, async {
+            loop {
+                self.renew().await;
+                let list = self.connection.session_list().await.unwrap();
+                if let Some(record) = list.records.into_iter().find(|record| {
+                    record.record_id == id
+                        && record.state == state
+                        && record.binding_generation.0 >= generation
+                }) {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            assert!(
-                Instant::now() < deadline,
-                "child did not reach {state:?}, generation {generation}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("child did not reach {state:?}, generation {generation}"))
     }
 }
 
@@ -1925,7 +1940,12 @@ async fn stage_d_fixture_with_limit(
         deadline.saturating_duration_since(Instant::now()),
     );
     let bound = parent
-        .wait(grant.record.record_id, BindingState::Attached, 1)
+        .wait_with_limit(
+            grant.record.record_id,
+            BindingState::Attached,
+            1,
+            deadline.saturating_duration_since(Instant::now()),
+        )
         .await;
     phase_with_limit(
         &mut parent,
