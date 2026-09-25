@@ -760,6 +760,34 @@ mod tests {
                 "{text}: non-empty ink"
             );
         }
+        // Han, Hangul and Kana are wide cells that neither SF Mono nor the Latin
+        // mono fallbacks cover; the CJK mono face must supply real ink (Mark saw
+        // tofu for all three on 2026-09-25). Skip when the CJK font is absent.
+        if let Some(cjk) = fonts.fallbacks().coverage.iter().find(|face| {
+            let strings = face.font().localized_strings();
+            strings
+                .find_by_id(swash::StringId::Family, None)
+                .is_some_and(|name| name.chars().collect::<String>().contains("CJK"))
+        }) {
+            for text in ["界", "한", "あ"] {
+                let image = raster.unicode.image(
+                    text,
+                    2,
+                    raster.px,
+                    (raster.width, raster.height),
+                    raster.baseline,
+                );
+                assert_eq!(image.font, Some(cjk.key), "{text}: CJK coverage face (not tofu)");
+                assert!(
+                    image.layers.iter().any(|layer| match &layer.pixels {
+                        Pixels::Mask(data) | Pixels::Color(data) => data.iter().any(|v| *v != 0),
+                    }),
+                    "{text}: non-empty ink"
+                );
+            }
+        } else {
+            eprintln!("SKIP CJK coverage: no Noto Sans Mono CJK face discovered");
+        }
         if let Some(emoji) = &fonts.fallbacks().emoji {
             for text in ["❤\u{fe0f}", "😀"] {
                 let image = raster.unicode.image(

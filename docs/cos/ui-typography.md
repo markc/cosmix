@@ -27,7 +27,7 @@ ui: {
 ```
 
 UI roles try Inter, Noto Sans and DejaVu Sans in that order before the system
-sans family. Mono roles specify DejaVu Sans Mono, Noto Sans Mono, then system
+sans family. Mono roles specify DejaVu Sans Mono, Noto Sans Mono, Noto Sans Mono CJK SC (Han, Hangul and Kana; Regular only), then system
 monospace. Consumers request Light (300) only when the resolved family has a
 face in 300–399 (or a variable weight range containing 300); otherwise they
 request Regular (400). This keeps DejaVu Sans on Regular even when ExtraLight
