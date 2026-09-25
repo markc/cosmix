@@ -2492,7 +2492,10 @@ mod tests {
         // The session save (the gate's slow `bus.timer` updates): inline vs
         // handed to the writer thread.
         let dir = std::env::temp_dir().join(format!("ced-perf-session-{}", std::process::id()));
-        let path = dir.join("session.json");
+        // Separate dirs: save() names its temp file by pid, so the inline and
+        // the writer thread's saves must not share one.
+        let path = dir.join("inline/session.json");
+        let queued_path = dir.join("queued/session.json");
         let session = crate::session::Session { recent: vec!["/p/x".into()], ..Default::default() };
         let mut inline = Vec::new();
         let mut queued = Vec::new();
@@ -2502,7 +2505,7 @@ mod tests {
             crate::session::save(&path, &session).unwrap();
             inline.push(us(t));
             let t = Instant::now();
-            w.save(path.clone(), session.clone());
+            w.save(queued_path.clone(), session.clone());
             queued.push(us(t));
         }
         w.flush();
