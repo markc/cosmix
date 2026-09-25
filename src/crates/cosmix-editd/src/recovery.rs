@@ -155,7 +155,7 @@ pub fn record_hash(generation: u64, rev: u64, edits: &[Edit]) -> String {
 /// Actor → writer, one FIFO for the whole daemon (per-rid order = send order).
 pub enum RecoveryMsg {
     /// Start generation `gen` whose snap covers every rev `<= rev`.
-    Switch { rid: String, generation: u64, rev: u64, text: Arc<str>, meta: RecoveryMeta },
+    Switch { rid: String, generation: u64, rev: u64, text: Arc<str>, meta: Box<RecoveryMeta> },
     /// One applied text entry (rev > the current gen's snap rev).
     Append { rid: String, generation: u64, rev: u64, edits: Vec<Edit> },
     /// Delete every file of `rid` (clean through a durable save / clean reload
