@@ -849,11 +849,29 @@ fn check_language(language: Option<&str>) -> Result<(), Refusal> {
 
 /// The last line of defence for every reply: an encoded body over
 /// `MAX_REPLY_BYTES` is never sent (inputs are bounded so none should be).
+///
+/// A too-large SUCCESS may be a mutation that already applied, so it must not
+/// look like a refusal a client would retry under a new op_id: it becomes a
+/// compact success (`rc 0`) keeping `buffer`, `epoch`, `rev`, `op_id` and
+/// flagged `reply_truncated: true` (refetch with `edit.get` / `edit.history`).
 fn bounded(reply: Reply) -> Reply {
     if reply.1.len() <= MAX_REPLY_BYTES {
         return reply;
     }
     tracing::error!("cosmix-editd: a {}-byte reply exceeded MAX_REPLY_BYTES", reply.1.len());
+    if reply.0 == 0 {
+        let full: Value = serde_json::from_str(&reply.1).unwrap_or(Value::Null);
+        let mut compact = serde_json::Map::new();
+        for key in ["buffer", "epoch", "rev", "op_id", "duplicate"] {
+            // Only short scalars survive (ids, numbers, flags).
+            if let Some(v) = full.get(key).filter(|v| !v.is_object() && !v.is_array() && crate::events::encoded_len(v) <= 256) {
+                compact.insert(key.to_string(), v.clone());
+            }
+        }
+        compact.insert("reply_truncated".into(), Value::Bool(true));
+        compact.insert("reply_bytes".into(), json!(reply.1.len()));
+        return (0, Value::Object(compact).to_string());
+    }
     render(
         &refusal(
             ErrorCode::ResourceLimit,
@@ -1401,7 +1419,17 @@ mod tests {
         assert_eq!(check_language(Some(&"x".repeat(3 << 20))).unwrap_err().reason.as_deref(), Some("bad_args"));
         assert!(check_language(Some("has space")).is_err());
         assert!(check_language(Some("")).is_err());
-        let (rc, body) = bounded((0, "x".repeat(MAX_REPLY_BYTES + 1)));
+        // An oversized success (a mutation that applied) stays a success with
+        // its rev and op_id, never a refusal a client would retry.
+        let big = json!({"buffer": "b1_00000000", "epoch": "00000000", "rev": 7, "op_id": "k-1", "text": "x".repeat(MAX_REPLY_BYTES)});
+        let (rc, body) = bounded((0, big.to_string()));
+        assert_eq!(rc, 0);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((v["rev"].as_u64(), v["op_id"].as_str()), (Some(7), Some("k-1")));
+        assert_eq!(v["reply_truncated"], true);
+        assert!(v.get("text").is_none());
+        // An oversized refusal stays a refusal.
+        let (rc, body) = bounded((10, "x".repeat(MAX_REPLY_BYTES + 1)));
         assert_eq!(rc, 10);
         assert!(body.contains("RESOURCE_LIMIT"), "{body}");
         assert_eq!(bounded((0, "{}".into())), (0, "{}".to_string()));

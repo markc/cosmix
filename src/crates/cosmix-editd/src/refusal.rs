@@ -59,6 +59,16 @@ pub fn render(r: &Refusal) -> (u8, String) {
     cut.context.retain(|_, v| crate::events::encoded_len(v) <= CONTEXT_VALUE_KEEP);
     // A buffer id echoed from bad arguments can be any size; real ids are short.
     cut.buffer = cut.buffer.filter(|b| b.len() <= CONTEXT_VALUE_KEEP);
+    cut.reason = cut.reason.filter(|r| r.len() <= 64);
+    let body = serde_json::to_string(&cut).unwrap_or_default();
+    if body.len() <= MAX_REFUSAL_BYTES {
+        return (REFUSAL_RC, body);
+    }
+    // Many kept context entries (or large keys) can still add up: drop the
+    // context. What is left is bounded by construction — message <= 4 KiB
+    // and buffer <= 1 KiB raw (6x when every byte escapes), a short reason,
+    // a code and a number — about 31 KiB at worst.
+    cut.context.clear();
     (REFUSAL_RC, serde_json::to_string(&cut).unwrap_or_default())
 }
 
@@ -183,6 +193,20 @@ mod tests {
         assert_eq!((v["buffer"].as_str(), v["rev"].as_u64()), (Some("b1_00000000"), Some(3)));
         assert!(v.get("big").is_none());
         assert_eq!(v["small"], 7);
+
+        // The worst case: every part at its kept maximum, all escaping 6x,
+        // plus hundreds of just-kept context values and a huge key.
+        let mut worst = refusal(ErrorCode::Internal, Some(reason::BAD_ARGS), "\u{1}".repeat(1 << 20))
+            .buffer(&"\u{1}".repeat(CONTEXT_VALUE_KEEP))
+            .rev(u64::MAX);
+        for i in 0..500 {
+            worst = worst.with(&format!("k{i}"), "\u{1}".repeat(CONTEXT_VALUE_KEEP / 6 - 1));
+        }
+        worst = worst.with(&"\u{1}".repeat(1 << 20), 1);
+        let (_, body) = render(&worst);
+        assert!(body.len() <= MAX_REFUSAL_BYTES, "worst case is {} bytes", body.len());
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((v["error_code"].as_str(), v["rev"].as_u64()), (Some("INTERNAL"), Some(u64::MAX)));
     }
 
     #[test]

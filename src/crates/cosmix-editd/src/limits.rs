@@ -26,7 +26,10 @@ pub const DEDUP_ENTRIES: usize = 1_024;
 /// `MAX_BUFFERS` worst-case list entries stay far under `MAX_REPLY_BYTES`
 /// (asserted by a router test), and no props leaf nears `MAX_EVENT_BYTES`.
 /// JSON-encoded bytes of a path given to `edit.open` / `edit.save`, and of the
-/// canonical path it resolves to (over → INVALID_ARGUMENT `bad_path`).
+/// canonical path it resolves to (over → INVALID_ARGUMENT `bad_path`). A
+/// design limit, below Linux's 4096-byte PATH_MAX: a file deep enough (a long
+/// `node_modules` or build tree) that its canonical path encodes past this
+/// cannot be opened or saved in E0.
 pub const PATH_MAX_ENCODED_BYTES: usize = 1024;
 /// A `language` override: `^[A-Za-z0-9._+#-]{1,LANGUAGE_MAX}$` (else `bad_args`).
 pub const LANGUAGE_MAX: usize = 32;

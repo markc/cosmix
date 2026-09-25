@@ -16,11 +16,23 @@
 //! - `event_seq` is daemon-session monotonic and counts `edit.changed`
 //!   frames ONLY (contiguous: 1, 2, 3, …); `edit.props.changed` frames carry
 //!   none. Every event carries `epoch`.
-//! - Published means ACCEPTED BY EVERY SUBSCRIBER: the sink awaits noded's
-//!   `topic.publish` result, and a refusal or any `dropped` recipient counts
-//!   as a lost event (resync owed), not as a delivery.
+//! - The sink awaits noded's `topic.publish` result. For an ordinary
+//!   `edit.changed` event, a refusal, a transport failure OR any `dropped`
+//!   recipient (a subscriber whose outbound queue was full) is a loss: a
+//!   resync is owed for its buffer.
+//! - A RESYNC is retried only when noded did not accept it (refusal, transport
+//!   failure, timeout). Accepted with `dropped > 0` counts as delivered: the
+//!   stalled subscriber that missed it sees its own `event_seq` gap when it
+//!   drains, and live events must never queue behind one stalled subscriber.
 //! - An owed resync is detached from the pending set while it is in flight, so
 //!   a loss recorded meanwhile stays owed; a failed attempt merges it back.
+//! - Loss is accounted PER TOPIC. A lost `edit.props.changed` frame (queue
+//!   budget, oversize, send failure, drop) counts in `publisher_loss` but owes
+//!   no `edit.changed` resync: props consumers heal from `edit.props.get` /
+//!   `props.watch`, and props-only subscribers would never see that resync.
+//! - Known limit (E0, Wontfix): one awaited noded round trip per frame,
+//!   serially. Fine at typing rates; a burst of thousands of frames or a noded
+//!   stall (5 s timeout per frame) overflows the queue into resyncs.
 //!
 //! Mirror rule (documented for clients): apply `edit` events whose `base_rev`
 //! equals the mirror's rev, in list order; on a `base_rev` mismatch, an
@@ -62,7 +74,25 @@ pub struct Outgoing {
     pub message: BusMessage,
 }
 
-pub type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+/// Why a publication did not reach every subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SinkError {
+    /// Not accepted: refused, transport failure or timeout.
+    Failed(String),
+    /// Accepted by noded, but dropped for this many full subscribers.
+    Dropped(u64),
+}
+
+impl std::fmt::Display for SinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SinkError::Failed(e) => f.write_str(e),
+            SinkError::Dropped(n) => write!(f, "dropped for {n} subscriber(s)"),
+        }
+    }
+}
+
+pub type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
 /// Where publications go: the Bus in production, a recorder in tests.
 pub trait EventSink: Send + Sync + 'static {
@@ -87,42 +117,36 @@ impl EventSink for BusSink {
             .await
             {
                 Ok(Ok((rc, body, error))) => publish_outcome(rc, &body, error.as_deref()),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(_) => Err("topic.publish timed out".to_string()),
+                Ok(Err(error)) => Err(SinkError::Failed(error.to_string())),
+                Err(_) => Err(SinkError::Failed("topic.publish timed out".to_string())),
             }
         })
     }
 }
 
-/// noded's `topic.publish` answer → delivered to every subscriber, or not.
-/// `rc 0` with `dropped > 0` means some subscriber's outbound queue was full:
-/// that subscriber lost the frame, so it is a loss like any send failure.
-/// (`refused` recipients were never eligible to see it; not a loss.)
-pub fn publish_outcome(rc: u8, body: &str, error: Option<&str>) -> Result<(), String> {
+/// noded's `topic.publish` answer. `rc 0` with `dropped > 0` means some
+/// subscriber's outbound queue was full: noded ACCEPTED the frame but that
+/// subscriber lost it ([`SinkError::Dropped`]; see the module docs for how
+/// events and resyncs treat it). `refused` recipients were never eligible to
+/// see it: not a loss.
+pub fn publish_outcome(rc: u8, body: &str, error: Option<&str>) -> Result<(), SinkError> {
     if rc != 0 {
-        return Err(format!("topic.publish refused (rc {rc}): {}", error.filter(|e| !e.is_empty()).unwrap_or(body)));
+        return Err(SinkError::Failed(format!("topic.publish refused (rc {rc}): {}", error.filter(|e| !e.is_empty()).unwrap_or(body))));
     }
     let dropped = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("dropped").and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
     if dropped > 0 {
-        return Err(format!("topic.publish dropped the frame for {dropped} subscriber(s)"));
+        return Err(SinkError::Dropped(dropped));
     }
     Ok(())
 }
 
 enum Item {
     Event { buffer: Option<BufferId>, event: Event },
-    Props { buffer: Option<BufferId>, message: BusMessage },
-}
-
-impl Item {
-    fn buffer(&self) -> Option<&BufferId> {
-        match self {
-            Item::Event { buffer, .. } | Item::Props { buffer, .. } => buffer.as_ref(),
-        }
-    }
+    /// Props frames owe no `edit.changed` resync when lost (module docs).
+    Props { message: BusMessage },
 }
 
 struct Queued {
@@ -222,7 +246,8 @@ impl Publisher {
         self.event_seq.load(Ordering::Acquire)
     }
 
-    /// Events dropped so far (each one announced by a resync).
+    /// Frames lost so far (`edit.changed` losses are announced by a resync;
+    /// `edit.props.changed` losses are only counted).
     pub fn loss(&self) -> u64 {
         self.loss.load(Ordering::Acquire)
     }
@@ -259,22 +284,18 @@ impl Publisher {
         self.enqueue(Queued { item: Item::Event { buffer: Some(buffer.to_string()), event }, bytes });
     }
 
-    /// Queue one SPEC-07 `props.changed` leaf change.
-    pub fn props_changed(&self, buffer: Option<&str>, path: &PropPath, old: &PropValue, new: &PropValue) {
+    /// Queue one SPEC-07 `props.changed` leaf change (`_buffer`: the buffer it
+    /// concerns, if any — a lost props frame owes no resync, see module docs).
+    pub fn props_changed(&self, _buffer: Option<&str>, path: &PropPath, old: &PropValue, new: &PropValue) {
         let message = cosmix_props_core::publish::build_props_changed_message(path, old, new, "edit");
         if message.body.len() > MAX_EVENT_BYTES {
             // Inputs are bounded so this cannot happen; if it ever does, the
-            // loss is announced like any other, never published oversized.
-            {
-                let mut state = self.state.lock().expect("publisher state");
-                Self::mark_lost(&mut state, buffer.map(str::to_string).as_ref());
-            }
+            // frame is counted lost, never published oversized.
             self.loss.fetch_add(1, Ordering::AcqRel);
-            self.wake.notify_one();
             return;
         }
         let bytes = message.body.len() + 256;
-        self.enqueue(Queued { item: Item::Props { buffer: buffer.map(str::to_string), message }, bytes });
+        self.enqueue(Queued { item: Item::Props { message }, bytes });
     }
 
     /// A supervised-client reconnect edge: `resync all` goes out first.
@@ -287,7 +308,9 @@ impl Publisher {
         {
             let mut state = self.state.lock().expect("publisher state");
             if state.queue_bytes.saturating_add(queued.bytes) > self.queue_cap {
-                Self::mark_lost(&mut state, queued.item.buffer());
+                if let Item::Event { buffer, .. } = &queued.item {
+                    Self::mark_lost(&mut state, buffer.as_ref());
+                }
                 self.loss.fetch_add(1, Ordering::AcqRel);
             } else {
                 state.queue_bytes += queued.bytes;
@@ -363,7 +386,9 @@ impl Publisher {
                 message.set("event_seq", &seq.to_string());
                 let out = Outgoing { topic: TOPIC_CHANGED, message };
                 match sink.publish(&out).await {
-                    Ok(()) => backoff = base,
+                    // Accepted by noded (even if dropped for a stalled
+                    // subscriber, which sees its own event_seq gap): done.
+                    Ok(()) | Err(SinkError::Dropped(_)) => backoff = base,
                     Err(error) => {
                         self.restore_owed(reconnect, all, buffers);
                         tracing::warn!("cosmix-editd: resync publish failed ({error}); retrying in {backoff:?}");
@@ -394,15 +419,21 @@ impl Publisher {
                     set_seq(&mut event, seq);
                     let mut message = Self::event_message(&event);
                     message.set("event_seq", &seq.to_string());
-                    (buffer, Outgoing { topic: TOPIC_CHANGED, message })
+                    (Some(buffer), Outgoing { topic: TOPIC_CHANGED, message })
                 }
-                Item::Props { buffer, message } => (buffer, Outgoing { topic: TOPIC_PROPS_CHANGED, message }),
+                Item::Props { message } => (None, Outgoing { topic: TOPIC_PROPS_CHANGED, message }),
             };
             if let Err(error) = sink.publish(&out).await {
-                tracing::warn!("cosmix-editd: publish failed ({error}); resync owed");
-                let mut state = self.state.lock().expect("publisher state");
-                Self::mark_lost(&mut state, buffer.as_ref());
                 self.loss.fetch_add(1, Ordering::AcqRel);
+                match buffer {
+                    // A lost edit.changed event (failed OR dropped): resync owed.
+                    Some(buffer) => {
+                        tracing::warn!("cosmix-editd: edit.changed publish lost ({error}); resync owed");
+                        let mut state = self.state.lock().expect("publisher state");
+                        Self::mark_lost(&mut state, buffer.as_ref());
+                    }
+                    None => tracing::warn!("cosmix-editd: edit.props.changed publish lost ({error})"),
+                }
             }
         }
     }
@@ -413,11 +444,16 @@ impl Publisher {
 pub mod testing {
     use super::*;
 
-    /// A recording sink with an injectable failure count.
+    /// A recording sink with injectable failures (`fail_next`: not accepted,
+    /// not recorded) and drops (`drop_every`: recorded as accepted, answered
+    /// `Dropped(1)`, as noded does for a stalled subscriber).
     #[derive(Default)]
     pub struct RecordingSink {
         pub sent: Mutex<Vec<(String, serde_json::Value)>>,
         pub fail_next: AtomicU64,
+        /// Like `fail_next`, counting `edit.changed` frames only.
+        pub fail_next_changed: AtomicU64,
+        pub drop_every: std::sync::atomic::AtomicBool,
         pub wake: Notify,
     }
 
@@ -427,13 +463,21 @@ pub mod testing {
                 let failing = self
                     .fail_next
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-                    .is_ok();
+                    .is_ok()
+                    || (out.topic == TOPIC_CHANGED
+                        && self
+                            .fail_next_changed
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                            .is_ok());
                 if failing {
-                    return Err("injected failure".into());
+                    return Err(SinkError::Failed("injected failure".into()));
                 }
                 let body = serde_json::from_str(&out.message.body).unwrap_or(serde_json::Value::Null);
                 self.sent.lock().unwrap().push((out.topic.to_string(), body));
                 self.wake.notify_waiters();
+                if self.drop_every.load(Ordering::Acquire) {
+                    return Err(SinkError::Dropped(1));
+                }
                 Ok(())
             })
         }
@@ -625,10 +669,51 @@ mod tests {
     fn publish_outcome_counts_drops_as_loss() {
         assert!(publish_outcome(0, r#"{"seq":4,"delivered":2,"refused":0,"dropped":0,"eligible":2}"#, None).is_ok());
         assert!(publish_outcome(0, r#"{"seq":4,"delivered":1,"refused":1,"dropped":0,"eligible":2}"#, None).is_ok());
-        let e = publish_outcome(0, r#"{"seq":5,"delivered":1,"refused":0,"dropped":1,"eligible":2}"#, None).unwrap_err();
-        assert!(e.contains("dropped"), "{e}");
-        assert!(publish_outcome(10, r#"{"error": "payload_too_large", "limit": 1048576}"#, None).is_err());
-        assert!(publish_outcome(10, "", Some("topic.publish requires 'name' header")).is_err());
+        let e = publish_outcome(0, r#"{"seq":5,"delivered":1,"refused":0,"dropped":1,"eligible":2}"#, None);
+        assert_eq!(e, Err(SinkError::Dropped(1)));
+        let refused = publish_outcome(10, r#"{"error": "payload_too_large", "limit": 1048576}"#, None);
+        assert!(matches!(refused, Err(SinkError::Failed(_))), "{refused:?}");
+        let refused = publish_outcome(10, "", Some("topic.publish requires 'name' header"));
+        assert!(matches!(refused, Err(SinkError::Failed(_))), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_subscriber_does_not_block_live_events() {
+        // Every publish is accepted but dropped for one full subscriber.
+        let p = Publisher::new("9f2c41a7");
+        let sink = Arc::new(RecordingSink::default());
+        sink.drop_every.store(true, Ordering::Release);
+        tokio::spawn(p.clone().run(sink.clone()));
+        for rev in 1..=5 {
+            p.event(Some("b1_9f2c41a7"), edit_event("b1_9f2c41a7", rev, "x".into()));
+        }
+        let edits = |s: &[(String, serde_json::Value)]| s.iter().filter(|(_, b)| b["event"] == "edit").count();
+        assert!(sink.wait_for(|s| edits(s) == 5).await, "live events stalled behind a resync");
+        // Each loss owes at most one resync, which is not retried once noded
+        // accepted it: the stream goes quiet instead of looping.
+        assert!(sink.wait_for(|s| s.last().is_some_and(|(_, b)| b["event"] == "resync")).await);
+        tokio::time::sleep(Duration::from_millis(3 * RESYNC_BACKOFF_BASE_MS)).await;
+        let sent = sink.sent.lock().unwrap();
+        let resyncs = sent.iter().filter(|(_, b)| b["event"] == "resync").count();
+        assert!((1..=5).contains(&resyncs), "{resyncs} resyncs for 5 lost events");
+        assert!(sent.last().is_some_and(|(_, b)| b["event"] == "resync"), "no retry loop after the last resync");
+        assert_eq!(p.loss(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_lost_props_frame_owes_no_edit_resync() {
+        let p = Publisher::new("9f2c41a7");
+        let sink = Arc::new(RecordingSink::default());
+        sink.fail_next.store(1, Ordering::Release);
+        tokio::spawn(p.clone().run(sink.clone()));
+        let path = PropPath::new("buffers.b1_9f2c41a7.dirty").unwrap();
+        p.props_changed(Some("b1_9f2c41a7"), &path, &false.into(), &true.into());
+        p.event(Some("b1_9f2c41a7"), edit_event("b1_9f2c41a7", 1, "x".into()));
+        assert!(sink.wait_for(|s| !s.is_empty()).await);
+        let sent = sink.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1["event"], "edit", "no resync for a props loss");
+        assert_eq!(p.loss(), 1);
     }
 
     #[tokio::test]

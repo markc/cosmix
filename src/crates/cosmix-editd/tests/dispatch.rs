@@ -741,12 +741,12 @@ async fn publish_failure_and_reconnect_resync() {
     let h = start();
     let b = h.scratch().await;
     h.event(|e| e["event"] == "open").await;
-    h.sink.fail_next.store(1, Ordering::Release);
+    // The next edit.changed frame (this edit's event) fails; props frames of
+    // the open still in flight are unaffected and would owe no resync anyway.
+    h.sink.fail_next_changed.store(1, Ordering::Release);
     h.ok("edit.insert", json!({"buffer": b, "at": 0, "text": "lost"})).await;
     let r = h.event(|e| e["event"] == "resync" && e["reason"] == "publisher_loss").await;
-    // The failed send may have been this edit or a trailing props message of
-    // the open (buffer_count has no buffer, so it owes `all`).
-    assert!(r["buffers"] == json!([b]) || r["buffers"] == "all", "{r}");
+    assert_eq!(r["buffers"], json!([b]), "{r}");
     assert!(h.editd.publisher().loss() >= 1);
     h.editd.publisher().reconnected();
     let r = h.event(|e| e["event"] == "resync" && e["reason"] == "reconnect").await;
@@ -769,9 +769,13 @@ async fn publisher_queue_budget_is_announced() {
     for f in futures {
         assert_eq!(f.await.0, 0);
     }
-    if editd.publisher().loss() > 0 {
-        assert!(sink.wait_for(|s| s.iter().any(|(_, e)| e["event"] == "resync" && e["reason"] == "publisher_loss")).await);
-    }
+    // Every edit event either arrives or its loss is announced by a resync
+    // naming the buffer (lost props frames are only counted).
+    let edits = |s: &[(String, Value)]| s.iter().filter(|(_, e)| e["event"] == "edit").count();
+    let resync = |s: &[(String, Value)]| {
+        s.iter().any(|(_, e)| e["event"] == "resync" && e["reason"] == "publisher_loss" && e["buffers"] == json!([b]))
+    };
+    assert!(sink.wait_for(|s| edits(s) == 50 || resync(s)).await, "a lost edit was never announced");
 }
 
 // ── paging ──────────────────────────────────────────────────────────────────
