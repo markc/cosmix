@@ -442,6 +442,41 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/quoin.md"><div class="prose"><h1 id="cosmix-quoin">cosmix-quoin</h1>
+<h2 id="trial-empty-edges">Trial: empty edges</h2>
+<p>Quoin now starts as a frame with no built-in pages. This is a reversible trial
+in both the embedded and standalone hosts. <code>COSMIX_QUOIN_BUILTIN_PAGES=1</code>
+restores the built-in path; the flag is read once at startup, so restart the
+Quoin host (the compositor for embedded Quoin) after changing it. Unset or any
+other value selects empty edges. The separate demo harness is unchanged.</p>
+<p>With built-ins off, the default <code>ShellConfig.panels</code> lists are empty on all four
+edges. Names in <code>conf.mix</code> declare <strong>empty slots</strong>, not content. A scene fills
+its declared slot when it registers; undeclared registrations append as usual.
+For example, <code>{panels: {bottom: ["scene-panel"]}}</code> leaves every edge empty
+until a scene registers. Loading a bottom-edge scene named <code>panel</code> then populates
+only the bottom edge. A scene using <code>window.panel</code> addresses that named slot
+instead of the legacy <code>scene-&lt;name&gt;</code> page ID. The right edge may be empty or
+have any valid declared primary; it need not start with <code>settings.appearance</code>.
+Both hosts read the initial configuration; standalone also watches later edits.</p>
+<p>An edge without registered pages ignores hotspot reveals and skips the startup
+intro. It maps no strip and reserves no work area, even with a saved dock mode.
+<code>shell.panel.show</code>, <code>pin</code>, <code>dock</code>, <code>toggle</code>, visible <code>mode</code> requests and the
+corresponding corner verbs refuse with <code>error_code: EMPTY_EDGE</code>. Registration
+restores ordinary reveal and mode behaviour. Saved modes, sizes and deferred
+page selections remain available for late registration. Removing the final
+page again suppresses visibility and reservation.</p>
+<p>The corner menu and <code>shell.settings.{scheme,motion,size}</code> verbs remain available.
+The built-in Settings/Appearance scene is not automatically loaded in the
+empty-edge trial. The absent native launcher clock schedules no clock ticks.</p>
+<p>With <code>COSMIX_QUOIN_BUILTIN_PAGES=1</code>, the existing content and default declarations
+remain:</p>
+<table><thead><tr><th>Edge</th><th>Built-in pages in default order</th></tr></thead><tbody>
+<tr><td>Left</td><td><code>nav</code>, <code>places</code>, <code>info</code></td></tr>
+<tr><td>Bottom</td><td><code>launcher</code>, <code>power</code>, <code>tasks</code></td></tr>
+<tr><td>Right</td><td><code>settings.appearance</code> (host-loaded scene), <code>monitor</code>, <code>demos</code>, <code>agents</code></td></tr>
+<tr><td>Top</td><td><code>status</code>, <code>spaces</code></td></tr>
+</tbody></table>
+<p>In that mode, configuration still requires <code>settings.appearance</code> as the right
+primary. Smoke runs that need native built-in content must also set the flag.</p>
 <h2 id="experimental-compositor-host">Experimental compositor host</h2>
 <p>Quoin 0.11.0 also exposes its application as a Rust library. Comp builds with
 <code>native-quoin</code> can opt in with <code>COSMIX_COMP_HUD_PROBE=1</code> and

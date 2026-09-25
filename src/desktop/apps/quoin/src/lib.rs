@@ -89,7 +89,8 @@ pub fn run_layer_host() -> AppExit {
             return AppExit::error();
         }
     };
-    let registry = page_registry();
+    let config = config::startup_config(cli.smoke_all_panels || cli.smoke_hidden);
+    let registry = startup_page_registry(&config);
     let state_store = state::StateStore::startup(cli.smoke_all_panels || cli.smoke_hidden);
     let restore_saved = state_store.shared_saved();
     let model_registry = registry.clone();
@@ -104,6 +105,7 @@ pub fn run_layer_host() -> AppExit {
             Duration::from_millis(200),
         )
         .expect("SCTK supplied valid positive output geometry");
+        model.suppress_empty_edges(model_registry.declarations_only());
         for edge in Edge::ALL {
             model.set_carousel(edge, model_registry.carousel(edge));
             if smoke_all_panels {
@@ -148,6 +150,7 @@ pub fn run_layer_host() -> AppExit {
         state_store,
         smoke_all_panels,
         smoke_hidden,
+        config,
     );
     config::install(&mut app, smoke_all_panels || smoke_hidden);
     keyboard::install(&mut app);
@@ -162,8 +165,10 @@ fn configure_content(
     state_store: state::StateStore,
     all_panels: bool,
     hidden: bool,
+    config: config::ShellConfig,
 ) {
     app.insert_resource(registry)
+        .insert_resource(config)
         .insert_resource(state_store)
         .insert_resource(SmokeState {
             all_panels,
@@ -295,7 +300,9 @@ fn log_transitions(
     }
     if smoke.all_panels {
         for edge in Edge::ALL {
-            println!("QUOIN_PIN edge={} state=pinned", edge_name(edge));
+            if frame.0.panel(edge).mode == cosmix_shell::core::PanelMode::Docked {
+                println!("QUOIN_PIN edge={} state=pinned", edge_name(edge));
+            }
         }
         smoke.emitted = true;
     } else if smoke.hidden
@@ -339,6 +346,27 @@ fn setup(
     *theme = UiTheme(create_dark_theme());
     apply_theme(&mut theme, &mut theme_state, &spec);
 
+    let bindings = page_content(&registry, &mut commands);
+    let props = registry
+        .bind(&frame.0, bindings)
+        .expect("Quoin content IDs match its validated registry");
+    let mounts = mounts
+        .1
+        .map(|m| m.0)
+        .or_else(|| mounts.0.map(|m| m.0))
+        .expect("Quoin requires a panel host");
+    spawn_quoin_chrome(&mut commands, mounts, props);
+}
+
+fn page_content(registry: &QuoinPageRegistry, commands: &mut Commands) -> QuoinContentBindings {
+    if registry.declarations_only() {
+        QuoinContentBindings::default()
+    } else {
+        builtin_content(commands)
+    }
+}
+
+fn builtin_content(commands: &mut Commands) -> QuoinContentBindings {
     let mut bindings = QuoinContentBindings::default();
     bindings.set(
         Edge::Bottom,
@@ -346,13 +374,13 @@ fn setup(
             // The runtime ticks the clock only while this page is active.
             QuoinPageContent::new(
                 cosmix_shell::runtime::CLOCK_PAGE_ID,
-                bottom_launcher(&mut commands),
+                bottom_launcher(commands),
             ),
-            QuoinPageContent::new("power", bottom_power(&mut commands)),
+            QuoinPageContent::new("power", bottom_power(commands)),
             QuoinPageContent::new(
                 "tasks",
                 placeholder(
-                    &mut commands,
+                    commands,
                     "Task strip",
                     "Studio  •  Mail  •  Files  •  Terminal",
                     true,
@@ -363,19 +391,19 @@ fn setup(
     bindings.set(
         Edge::Left,
         vec![
-            QuoinPageContent::new("nav", left_page(&mut commands, "nav")),
-            QuoinPageContent::new("places", left_page(&mut commands, "places")),
-            QuoinPageContent::new("info", left_page(&mut commands, "info")),
+            QuoinPageContent::new("nav", left_page(commands, "nav")),
+            QuoinPageContent::new("places", left_page(commands, "places")),
+            QuoinPageContent::new("info", left_page(commands, "info")),
         ],
     );
     bindings.set(
         Edge::Right,
         vec![
-            QuoinPageContent::new("monitor", system_page(&mut commands)),
-            QuoinPageContent::new("demos", demos::controls(&mut commands)),
+            QuoinPageContent::new("monitor", system_page(commands)),
+            QuoinPageContent::new("demos", demos::controls(commands)),
             QuoinPageContent::new(
                 "agents",
-                placeholder(&mut commands, "Agents", "No active jobs", false),
+                placeholder(commands, "Agents", "No active jobs", false),
             ),
         ],
     );
@@ -385,7 +413,7 @@ fn setup(
             QuoinPageContent::new(
                 "status",
                 placeholder(
-                    &mut commands,
+                    commands,
                     "Cosmix",
                     "Network online  •  Audio ready  •  Power balanced",
                     true,
@@ -393,19 +421,19 @@ fn setup(
             ),
             QuoinPageContent::new(
                 "spaces",
-                placeholder(&mut commands, "Spaces", "1  ●   2  ○   3  ○", true),
+                placeholder(commands, "Spaces", "1  ●   2  ○   3  ○", true),
             ),
         ],
     );
-    let props = registry
-        .bind(&frame.0, bindings)
-        .expect("Quoin content IDs match its validated registry");
-    let mounts = mounts
-        .1
-        .map(|m| m.0)
-        .or_else(|| mounts.0.map(|m| m.0))
-        .expect("Quoin requires a panel host");
-    spawn_quoin_chrome(&mut commands, mounts, props);
+    bindings
+}
+
+fn startup_page_registry(config: &config::ShellConfig) -> QuoinPageRegistry {
+    if config::builtin_pages_enabled() {
+        page_registry()
+    } else {
+        QuoinPageRegistry::declared(&config.panels).expect("accepted declarations are valid")
+    }
 }
 
 fn page_registry() -> QuoinPageRegistry {
@@ -639,6 +667,38 @@ fn bottom_power(commands: &mut Commands) -> Entity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_startup_creates_no_native_page_entities() {
+        let config = config::ShellConfig::parse_with_builtin_pages(
+            r#"{panels: {bottom: ["scene-panel"]}}"#,
+            false,
+        )
+        .unwrap();
+        let registry = QuoinPageRegistry::declared(&config.panels).unwrap();
+        let mut model = ShellModel::new(
+            cosmix_shell::core::OutputKey::new("test-output").unwrap(),
+            cosmix_shell::core::LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        for edge in Edge::ALL {
+            model.set_carousel(edge, registry.carousel(edge));
+            assert!(model.carousel(edge).page_ids().is_empty());
+        }
+        let mut world = World::new();
+        let bindings = page_content(&registry, &mut world.commands());
+        world.flush();
+        assert_eq!(world.entities().len(), 0);
+        registry
+            .bind(
+                &cosmix_shell::runtime::ShellFrame::from_model(&model),
+                bindings,
+            )
+            .unwrap();
+    }
 
     #[test]
     fn cli_accepts_output_and_smoke_flag_in_either_order() {

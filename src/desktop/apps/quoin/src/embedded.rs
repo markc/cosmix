@@ -88,7 +88,8 @@ impl EmbeddedQuoinPlugin {
 
 impl Plugin for EmbeddedQuoinPlugin {
     fn build(&self, app: &mut App) {
-        let registry = crate::page_registry();
+        let config = crate::config::startup_config(false);
+        let registry = crate::startup_page_registry(&config);
         let store = crate::state::StateStore::startup(false);
         // The placeholder model restores nothing: comp has not named the
         // output yet, and claiming under a placeholder identity would take
@@ -138,7 +139,7 @@ impl Plugin for EmbeddedQuoinPlugin {
             ]
             .map(str::to_owned),
         );
-        crate::configure_content(app, bus, registry, store, false, false);
+        crate::configure_content(app, bus, registry, store, false, false, config);
         // Output preparation runs BEFORE the Bus dispatch drains: a
         // dispatch reserves its registry seat and queues its command
         // against the current frame's output, so the model replacement
@@ -280,6 +281,7 @@ fn model(name: &str, size: Vec2, registry: &cosmix_shell::chrome::QuoinPageRegis
         Duration::from_millis(200),
     )
     .expect("valid shell timing");
+    model.suppress_empty_edges(registry.declarations_only());
     for edge in Edge::ALL {
         model.set_carousel(edge, registry.carousel(edge));
     }

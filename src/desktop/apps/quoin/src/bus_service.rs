@@ -1189,6 +1189,16 @@ fn dispatch_shell_request(
         );
     }
     let command = semantic_shell_command(frame.geometry.output.clone(), at, edge, verb);
+    if frame.empty_edges_suppressed
+        && frame.panel(edge).page_ids.is_empty()
+        && matches!(&command.kind, ShellCommandKind::Panel { input, .. } if input.requires_content())
+    {
+        return (
+            10,
+            json!({"error_code":"EMPTY_EDGE", "error":"edge has no registered pages", "edge":edge_name(edge)}).to_string(),
+            None,
+        );
+    }
     // `accepted` means validated and enqueued for the Model stage of this
     // update — an acceptance ack, not an application receipt. Callers needing
     // the applied state read it back via `shell.props.get`.
@@ -2633,13 +2643,32 @@ mod tests {
     }
 
     fn mounted_bus_app() -> (App, ctk::bus::TestBusPeer) {
+        mounted_bus_app_with_config(None)
+    }
+
+    fn mounted_bus_app_with_config(
+        config: Option<crate::config::ShellConfig>,
+    ) -> (App, ctk::bus::TestBusPeer) {
         use cosmix_shell::chrome::{
             QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
             spawn_quoin_chrome,
         };
         let (bridge, peer) = test_bridge("quoin");
         let mut app = bus_app(bridge);
-        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()))
+        let mut model = test_model();
+        let registry = if let Some(config) = config {
+            let registry = QuoinPageRegistry::declared(&config.panels).unwrap();
+            for edge in Edge::ALL {
+                model.set_carousel(edge, registry.carousel(edge));
+            }
+            model.suppress_empty_edges(true);
+            model.start_intro(std::time::Duration::from_secs(2));
+            app.insert_resource(config);
+            registry
+        } else {
+            QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap()
+        };
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(model))
             .add_plugins(QuoinChromePlugin)
             .init_resource::<ButtonInput<KeyCode>>()
             .add_systems(
@@ -2649,8 +2678,7 @@ mod tests {
                     .before(ShellRuntimeSet::Model),
             );
         let world = app.world_mut();
-        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
-            .unwrap()
+        let props = registry
             .bind(
                 &world.resource::<ShellFrameState>().0,
                 QuoinContentBindings::default(),
@@ -2671,6 +2699,84 @@ mod tests {
         app.update();
         peer.drain_calls();
         (app, peer)
+    }
+
+    #[test]
+    fn empty_edges_refuse_visibility_verbs_without_enqueuing_commands() {
+        let mut model = test_model();
+        model.suppress_empty_edges(true);
+        let frame = ShellFrame::from_model(&model);
+        for edge in Edge::ALL {
+            for verb in ["show", "pin", "dock", "toggle", "mode"] {
+                let mut request = local(&format!("shell.panel.{verb}"));
+                request.body = json!({"edge":edge_name(edge), "mode":"pinned"}).to_string();
+                let (rc, body, command) =
+                    dispatch_shell_request(&request, &frame, Default::default());
+                assert_eq!(rc, 10, "{verb} on {edge:?}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["error_code"],
+                    "EMPTY_EDGE"
+                );
+                assert!(command.is_none());
+            }
+        }
+        for corner in ["top-left", "bottom-left", "bottom-right", "top-right"] {
+            for verb in ["show", "pin", "toggle"] {
+                let mut request = local(&format!("shell.corner.{verb}"));
+                request.body = json!({"corner":corner}).to_string();
+                let (rc, body, command) =
+                    dispatch_shell_request(&request, &frame, Default::default());
+                assert_eq!(rc, 10);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["error_code"],
+                    "EMPTY_EDGE"
+                );
+                assert!(command.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn trial_starts_empty_and_bottom_scene_fills_declared_slot_then_reveals() {
+        for source in ["{}", r#"{panels: {bottom: ["scene-panel"]}}"#] {
+            let config =
+                crate::config::ShellConfig::parse_with_builtin_pages(source, false).unwrap();
+            let (mut app, peer) = mounted_bus_app_with_config(Some(config));
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            for edge in Edge::ALL {
+                assert!(frame.panel(edge).page_ids.is_empty());
+                assert!(!frame.panel(edge).mapped, "intro must skip empty edges");
+                assert_eq!(frame.panel(edge).exclusive_zone_px, 0.0);
+            }
+            assert!(frame.content.bottom_clock_text.is_none());
+            load_scene(&mut app, &peer, "panel", "owner", "bottom");
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            assert_eq!(
+                frame
+                    .panels
+                    .iter()
+                    .filter(|panel| !panel.page_ids.is_empty())
+                    .count(),
+                1
+            );
+            assert_eq!(frame.panel(Edge::Bottom).page_ids.as_ref(), ["scene-panel"]);
+            assert_eq!(
+                frame.panel(Edge::Bottom).active_page_id.as_deref(),
+                Some("scene-panel")
+            );
+            let mut show = local("shell.panel.show");
+            show.body = json!({"edge":"bottom"}).to_string();
+            peer.send(show);
+            app.update();
+            assert_eq!(peer.drain_responses()[0].rc, 0);
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            assert!(frame.panel(Edge::Bottom).transient_revealed);
+            assert_eq!(
+                frame.panel(Edge::Bottom).active_page_id.as_deref(),
+                Some("scene-panel")
+            );
+            assert!(frame.content.bottom_clock_text.is_none());
+        }
     }
 
     fn scene_load(name: &str, owner: &str, edge: &str) -> InboundRequest {

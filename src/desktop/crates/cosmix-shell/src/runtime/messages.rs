@@ -215,6 +215,10 @@ pub struct ShellContentPresentation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellFrame {
     pub geometry: HostGeometry,
+    /// Frame-only Quoin refuses commands that would expose an empty edge.
+    pub empty_edges_suppressed: bool,
+    /// Deferred saved selections, kept separate from the pages currently shown.
+    pub pending_page_restores: [Option<String>; 4],
     pub panels: [PanelPresentation; 4],
     pub content: ShellContentPresentation,
     pub wake: WakePolicy,
@@ -262,6 +266,13 @@ impl ShellFrame {
             }
         });
         Self {
+            empty_edges_suppressed: model.empty_edges_suppressed(),
+            pending_page_restores: std::array::from_fn(|index| {
+                model
+                    .carousel(Edge::ALL[index])
+                    .pending_restore()
+                    .map(str::to_owned)
+            }),
             geometry: HostGeometry {
                 output: model.output().clone(),
                 logical_size: model.geometry(),

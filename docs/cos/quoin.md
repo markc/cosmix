@@ -1,5 +1,48 @@
 # cosmix-quoin
 
+## Trial: empty edges
+
+Quoin now starts as a frame with no built-in pages. This is a reversible trial
+in both the embedded and standalone hosts. `COSMIX_QUOIN_BUILTIN_PAGES=1`
+restores the built-in path; the flag is read once at startup, so restart the
+Quoin host (the compositor for embedded Quoin) after changing it. Unset or any
+other value selects empty edges. The separate demo harness is unchanged.
+
+With built-ins off, the default `ShellConfig.panels` lists are empty on all four
+edges. Names in `conf.mix` declare **empty slots**, not content. A scene fills
+its declared slot when it registers; undeclared registrations append as usual.
+For example, `{panels: {bottom: ["scene-panel"]}}` leaves every edge empty
+until a scene registers. Loading a bottom-edge scene named `panel` then populates
+only the bottom edge. A scene using `window.panel` addresses that named slot
+instead of the legacy `scene-<name>` page ID. The right edge may be empty or
+have any valid declared primary; it need not start with `settings.appearance`.
+Both hosts read the initial configuration; standalone also watches later edits.
+
+An edge without registered pages ignores hotspot reveals and skips the startup
+intro. It maps no strip and reserves no work area, even with a saved dock mode.
+`shell.panel.show`, `pin`, `dock`, `toggle`, visible `mode` requests and the
+corresponding corner verbs refuse with `error_code: EMPTY_EDGE`. Registration
+restores ordinary reveal and mode behaviour. Saved modes, sizes and deferred
+page selections remain available for late registration. Removing the final
+page again suppresses visibility and reservation.
+
+The corner menu and `shell.settings.{scheme,motion,size}` verbs remain available.
+The built-in Settings/Appearance scene is not automatically loaded in the
+empty-edge trial. The absent native launcher clock schedules no clock ticks.
+
+With `COSMIX_QUOIN_BUILTIN_PAGES=1`, the existing content and default declarations
+remain:
+
+| Edge | Built-in pages in default order |
+|---|---|
+| Left | `nav`, `places`, `info` |
+| Bottom | `launcher`, `power`, `tasks` |
+| Right | `settings.appearance` (host-loaded scene), `monitor`, `demos`, `agents` |
+| Top | `status`, `spaces` |
+
+In that mode, configuration still requires `settings.appearance` as the right
+primary. Smoke runs that need native built-in content must also set the flag.
+
 ## Experimental compositor host
 
 Quoin 0.11.0 also exposes its application as a Rust library. Comp builds with

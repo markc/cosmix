@@ -155,6 +155,7 @@ impl QuoinPageSpec {
 #[derive(Resource, Clone, Debug)]
 pub struct QuoinPageRegistry {
     panels: [Vec<QuoinPageSpec>; 4],
+    declarations_only: bool,
 }
 
 impl QuoinPageRegistry {
@@ -169,11 +170,49 @@ impl QuoinPageRegistry {
             Carousel::new(panels[edge.index()].iter().map(|page| page.id.as_str()))
                 .map_err(|source| QuoinPageRegistryError::InvalidRegistry { edge, source })?;
         }
-        Ok(Self { panels })
+        Ok(Self {
+            panels,
+            declarations_only: false,
+        })
+    }
+
+    /// A frame with declared slots but no native content. Scenes fill slots
+    /// later through the normal mount/registration path.
+    pub fn declared(panels: &[Vec<String>; 4]) -> Result<Self, QuoinPageRegistryError> {
+        let panels = std::array::from_fn(|i| {
+            panels[i]
+                .iter()
+                .map(|id| QuoinPageSpec::new(id, id))
+                .collect()
+        });
+        let [left, bottom, right, top] = panels;
+        let mut registry = Self::new(left, bottom, right, top)?;
+        registry.declarations_only = true;
+        Ok(registry)
+    }
+
+    pub fn declarations_only(&self) -> bool {
+        self.declarations_only
+    }
+
+    fn content_pages(&self, edge: Edge) -> &[QuoinPageSpec] {
+        if self.declarations_only {
+            &[]
+        } else {
+            &self.panels[edge.index()]
+        }
     }
 
     /// Model carousel derived from the same validated IDs chrome will bind.
     pub fn carousel(&self, edge: Edge) -> Carousel {
+        if self.declarations_only {
+            return Carousel::declared(
+                self.panels[edge.index()]
+                    .iter()
+                    .map(|page| page.id.as_str()),
+            )
+            .expect("QuoinPageRegistry validates IDs at construction");
+        }
         Carousel::new(
             self.panels[edge.index()]
                 .iter()
@@ -185,7 +224,8 @@ impl QuoinPageRegistry {
     /// Validate the actual runtime model snapshot before chrome is spawned.
     pub fn validate_frame(&self, frame: &ShellFrame) -> Result<(), QuoinPageRegistryError> {
         for edge in Edge::ALL {
-            let expected = self.panels[edge.index()]
+            let expected = self
+                .content_pages(edge)
                 .iter()
                 .map(|page| page.id.clone())
                 .collect::<Vec<_>>();
@@ -217,7 +257,8 @@ impl QuoinPageRegistry {
                 .collect::<Vec<_>>();
             Carousel::new(actual.iter().map(String::as_str))
                 .map_err(|source| QuoinPageRegistryError::InvalidContent { edge, source })?;
-            let expected = self.panels[edge.index()]
+            let expected = self
+                .content_pages(edge)
                 .iter()
                 .map(|page| page.id.clone())
                 .collect::<Vec<_>>();
@@ -228,7 +269,7 @@ impl QuoinPageRegistry {
                     actual,
                 });
             }
-            for spec in &self.panels[edge.index()] {
+            for spec in self.content_pages(edge) {
                 let binding = edge_bindings
                     .iter()
                     .find(|binding| binding.id == spec.id)

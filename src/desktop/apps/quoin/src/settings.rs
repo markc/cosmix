@@ -101,12 +101,20 @@ impl Default for SettingsScene {
 }
 
 pub(crate) fn install(app: &mut App, smoke: bool) {
+    install_with_builtin_pages(app, smoke, crate::config::builtin_pages_enabled());
+}
+
+fn install_with_builtin_pages(app: &mut App, smoke: bool, builtin_pages: bool) {
     if smoke {
         return;
     }
     // Hosts that have not installed the config reader still get the motion
     // setting's default (the embedded host opts into the schema separately).
     app.init_resource::<ShellConfig>();
+    app.add_systems(Startup, declare_initial_pages.after(crate::setup));
+    if !builtin_pages {
+        return;
+    }
     let scheme = app
         .world()
         .get_resource::<crate::state::StateStore>()
@@ -117,15 +125,13 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
         scheme: scheme.name().to_owned(),
         ..default()
     };
-    app.insert_resource(settings)
-        .add_systems(Startup, declare_initial_pages.after(crate::setup))
-        .add_systems(
-            Update,
-            maintain
-                .in_set(ShellRuntimeSet::Input)
-                .after(crate::config::ConfigIngest)
-                .after(ShellBusDispatch),
-        );
+    app.insert_resource(settings).add_systems(
+        Update,
+        maintain
+            .in_set(ShellRuntimeSet::Input)
+            .after(crate::config::ConfigIngest)
+            .after(ShellBusDispatch),
+    );
 }
 
 /// Embedded hosts do not install the standalone conf.mix watcher. Initialise
@@ -584,6 +590,24 @@ mod tests {
     }
 
     #[test]
+    fn trial_keeps_declarations_without_loading_settings_content() {
+        let mut app = App::new();
+        let mut model = model_for("DP-1");
+        for edge in Edge::ALL {
+            model.set_carousel(edge, cosmix_shell::core::Carousel::empty());
+        }
+        model.suppress_empty_edges(true);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .insert_resource(ShellConfig::with_builtin_pages(false));
+        install_with_builtin_pages(&mut app, false, false);
+        app.update();
+        assert!(!app.world().contains_resource::<SettingsScene>());
+        for panel in &app.world().resource::<ShellFrameState>().0.panels {
+            assert!(panel.page_ids.is_empty());
+        }
+    }
+
+    #[test]
     fn settings_registers_under_declared_right_primary() {
         use cosmix_shell::chrome::{
             QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
@@ -636,7 +660,7 @@ mod tests {
             world,
             r#"{panels: {right: ["settings.appearance", "test-tools"]}}"#,
         );
-        install(&mut app, false);
+        install_with_builtin_pages(&mut app, false, true);
         app.update();
         let frame = app.world().resource::<ShellFrameState>().0.clone();
         assert_eq!(
