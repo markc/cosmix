@@ -7,7 +7,7 @@
 
 use cosmix_edit_core::error::{CoreError, ErrorCode};
 use cosmix_edit_core::wire::Refusal;
-use serde_json::{Map, Value};
+use serde_json::Map;
 
 /// Every refusal uses this rc.
 pub const REFUSAL_RC: u8 = 10;
@@ -40,6 +40,6 @@ pub fn from_core(err: CoreError, buffer: Option<&str>) -> Refusal {
 
 /// `(rc, body)` for the Bus response.
 pub fn render(r: &Refusal) -> (u8, String) {
-    let body = serde_json::to_value(r).unwrap_or_else(|_| Value::Null).to_string();
-    (REFUSAL_RC, body)
+    // Serializing this plain struct cannot fail; "" would still be a refusal (rc 10).
+    (REFUSAL_RC, serde_json::to_string(r).unwrap_or_default())
 }
