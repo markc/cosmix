@@ -12,14 +12,18 @@ use iced_tiny_skia::{
 use std::time::Instant;
 
 #[test]
-fn band_widget_matches_exact_pixels_at_seven_scales_and_offsets() {
+fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
     for (scale, cell_height) in [
         (1.0, 20),
         (1.1, 41),
         (1.25, 20),
+        (1.25, 41),
         (1.5, 20),
+        (1.5, 41),
         (1.75, 41),
+        (2.0, 41),
         (2.25, 20),
+        (2.25, 41),
         (2.5, 41),
     ] {
         let mut raster = Raster::new(scale, 13.0, Cursor::Underline).unwrap();
@@ -61,12 +65,23 @@ fn band_widget_matches_exact_pixels_at_seven_scales_and_offsets() {
             renderer.reset(clip);
             widget::draw_images(&mut renderer, &surface.images(scale), origin, scale, clip);
             let mut bands = tiny_skia::Pixmap::new(800, height).unwrap();
+            #[cfg(feature = "raster-probe")]
+            let _ = iced_tiny_skia::take_native_copy_count();
             renderer.draw(
                 &mut bands.as_mut(),
                 &mut mask,
                 &viewport,
                 &[clip],
                 Color::BLACK,
+            );
+            // One full-pane region draws every band exactly once. Count only
+            // the first native-placement shortcut, never the secondary copy
+            // or Pattern fallback; pixel equality alone cannot prove routing.
+            #[cfg(feature = "raster-probe")]
+            assert_eq!(
+                iced_tiny_skia::take_native_copy_count(),
+                images.len(),
+                "native copies at scale={scale} cell_height={cell_height} offset={offset}"
             );
             // Compare to exact physical placement, not the old image widget:
             // its float-to-i32 truncation can itself shift a pane by a pixel.

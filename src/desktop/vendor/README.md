@@ -13,11 +13,12 @@
 | licence | MIT, declared in the archive's Cargo manifests; no LICENSE file was shipped |
 
 The complete archive is imported byte-for-byte in its own commit. The local
-patch touches `src/raster.rs` (opaque cache/copy and tests), `src/engine.rs`
+patch touches `src/raster.rs` (opaque cache/copy and tests), `src/lib.rs`
+(verification counter export), `src/engine.rs`
 (rectangular clip passed to the raster pipeline), `src/window/compositor.rs`
 (damage, present history and tests), and `Cargo.toml` (the verification-only
-`reference-raster` feature and an allowance for upstream's argument-heavy
-drawing APIs under clippy). No other upstream source is reformatted.
+`reference-raster` and `raster-probe` features and an allowance for upstream's
+argument-heavy drawing APIs under clippy). No other upstream source is reformatted.
 
 Local patch: `raster.rs` records all-alpha-255 once during native pixel
 conversion. The generic Pattern draw dominated terminal CPU frame time even
@@ -41,6 +42,19 @@ check this eligibility, and term checks the rendered pixels against exact
 placement. The widget also corrects truncation round-off using cumulative
 origins and each image's pixel size, so fallback placement is seam-free too.
 `reference-raster` disables BOTH copy shortcuts to verify that guarantee.
+Draw extents come directly from the image's integer pixel dimensions divided
+by output scale. Subtracting logical band edges here would amplify rounding
+error in the fallback origin correction and reject lower bands for native copy.
+The integrated pane regression checks exact pixels and, with `raster-probe`,
+counts successful native-placement copies for every band, including the final
+partial band, at 1.25/1.5/1.75/2.0/2.25/2.5 scales and nonzero origins.
+The thread-local counter is absent from normal builds. Run its test separately
+from `reference-raster`, which intentionally takes no native copies:
+
+```text
+cargo test -p cosmix-term --release --features raster-probe band_widget_matches_exact
+cargo test -p cosmix-term --release --features iced_tiny_skia/reference-raster band_widget_matches_exact
+```
 
 `window/compositor.rs` submits outward-rounded, surface-clamped physical
 damage, combining acquired-buffer repair with changes from the displayed

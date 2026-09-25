@@ -693,3 +693,44 @@ checkout; running it during merge resolution fails its provenance guard before
 the fixtures run. Run that proof after committing. Live Wayland presentation
 timing remains unmeasured; the pacing regression here exercises the production
 history and submission path with a fake present callback.
+
+## Final fractional-band fix (2026-09-25)
+
+Band draw extents now use the source image's integer physical dimensions
+divided by output scale. The cumulative origins and fallback truncation
+correction remain. This avoids amplifying the subtraction error in lower
+bands' logical heights without widening the vendor's native-copy tolerance.
+
+The integrated 61-row pane regression checks exact reference pixels and,
+with `--features raster-probe`, counts every successful native-placement copy.
+All 16 bands, including the final partial band, qualify at scales 1.25, 1.5,
+1.75, 2.0, 2.25 and 2.5 with 41-pixel cells and five pane offsets. Existing
+1.0/1.1 and 20-pixel fixtures remain covered. The same pixel test passes with
+`--features iced_tiny_skia/reference-raster`, disabling both copy shortcuts.
+Temporarily removing the extent fix makes the counter assertion fail (12 of
+16 native copies at scale 1.1), confirming it detects the regression.
+
+Release gates: instrumented CPU **42 passed, 2 ignored**, clean wgpu
+**34 passed**, vendor **9 passed**, and the forced-fallback pane test passed.
+Clippy with `--all-targets -- -D warnings` passed for both term renderer
+configurations and the instrumented vendor. The existing teletypewriter
+dependency warning is unchanged. The two edited term Rust files pass rustfmt;
+the crate-wide format check reports pre-existing formatting in other files.
+Versions are unchanged. No further review round, deployment or push is part
+of this fix.
+
+The final serial CPU run with `--include-ignored --nocapture --test-threads=1`
+passed **44 tests**, including both benchmarks, without overlapping builds
+or probe instrumentation. Frame fixture: 2250×1250, scale 2.5, buffer age 3,
+20 warm-ups and 200 samples; these are headless costs, excluding presentation.
+
+| Path | Case | Mean ms | p50 ms | p99 ms |
+|---|---|---:|---:|---:|
+| Whole image | echo | 6.679 | 6.529 | 7.685 |
+| Whole image | full | 9.807 | 9.664 | 11.879 |
+| Four-row bands | echo | 1.746 | 1.677 | 2.449 |
+| Four-row bands | full | 11.136 | 11.129 | 12.189 |
+
+Whole-image and banded final pixels match. Banded echo still meets the 2 ms
+mean target; full redraw remains above 8 ms. The benchmark fixture is unchanged;
+the taller 41-pixel-cell regression establishes routing for the lower bands.

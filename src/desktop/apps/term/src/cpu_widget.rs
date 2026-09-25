@@ -53,6 +53,13 @@ pub(super) fn draw_images<R: iced::advanced::image::Renderer<Handle = Handle>>(
             y: relative.y + y,
             ..*relative
         };
+        if let Handle::Rgba { width, height, .. } = handle {
+            // Subtracting logical edges loses precision for lower bands.
+            // Derive the extent from integer physical pixels instead, so the
+            // fallback correction below stays within native-copy tolerance.
+            bounds.width = *width as f32 / scale;
+            bounds.height = *height as f32 / scale;
+        }
         // Cumulative edges avoid accumulated rounding, but upstream's fallback
         // divides by each image's pixel size then truncates to i32. Correct
         // round-off at that division too; do not rely on the vendor shortcut.

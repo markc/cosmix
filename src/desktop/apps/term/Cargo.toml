@@ -26,6 +26,8 @@ engine = "iced"
 # full redraw ~11.5 ms; see docs/dev/term-foot-tactics.md.
 # Clean GPU build: --no-default-features --features wgpu.
 default = ["tiny-skia"]
+# Integrated native-copy regression instrumentation; absent from normal builds.
+raster-probe = ["tiny-skia", "iced_tiny_skia/raster-probe"]
 # The shader-widget path: one persistent wgpu texture, damage-band uploads.
 # `naga27-termcolor` rides along: see that dependency for why iced-on-wgpu
 # cannot share a build with Bevy without it.

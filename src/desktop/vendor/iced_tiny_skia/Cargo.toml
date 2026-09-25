@@ -37,6 +37,8 @@ repository = "https://github.com/iced-rs/iced"
 [features]
 # Verification arm: exercise upstream draw_pixmap, including widget placement.
 reference-raster = []
+# Verification only: thread-local native placement/copy counter.
+raster-probe = []
 default = [
     "x11",
     "wayland",

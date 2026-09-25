@@ -6,6 +6,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::collections::hash_map;
 
+#[cfg(feature = "raster-probe")]
+std::thread_local! {
+    static NATIVE_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Return and reset this thread's successful native-placement copy count.
+#[cfg(feature = "raster-probe")]
+pub fn take_native_copy_count() -> usize {
+    NATIVE_COPIES.with(|count| count.replace(0))
+}
+
 #[derive(Debug)]
 pub struct Pipeline {
     cache: RefCell<Cache>,
@@ -68,6 +79,8 @@ impl Pipeline {
             && let Some(placed) = native_placement(bounds, transform, image.width(), image.height())
             && copy_opaque(image.pixmap(), pixels, placed, clip_bounds)
         {
+            #[cfg(feature = "raster-probe")]
+            NATIVE_COPIES.with(|count| count.set(count.get() + 1));
             return;
         }
 
