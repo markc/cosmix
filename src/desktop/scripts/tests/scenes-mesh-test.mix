@@ -1,0 +1,24 @@
+-- Read-only/refusal acceptance gate for the integrated native stack.
+-- Set SCENES_LOCAL_TARGET and SCENES_REMOTE_TARGET to the same loader,
+-- reached locally and via an attested ABP mesh route respectively.
+$local = env("SCENES_LOCAL_TARGET")
+$remote = env("SCENES_REMOTE_TARGET")
+if $local == "" or $remote == "" then raise("TEST_CONFIG", "set both scenes target routes") end
+fn call($target, $verb, $body)
+  send $target $verb body=json_encode($body) timeout=5
+  $value = type($result) == "string" ? json_parse($result) : $result
+  return {rc:$rc, body:$value}
+end
+for each $target in [$local, $remote]
+  $r = call($target, "scenes.list", {})
+  if $r.rc != 0 or type($r.body.scenes) != "list" then raise("SCENES_MESH_TEST", "list failed", $r) end
+end
+for each $verb in ["install", "remove", "enable", "disable", "reload", "reset", "open", "close", "toggle", "ready", "model"]
+  $body = {name:"../invalid", template:"../invalid", generation:"stale", value:{}}
+  $a = call($local, "scenes." .. $verb, $body)
+  $b = call($remote, "scenes." .. $verb, $body)
+  if $a.rc == 0 or $b.rc != $a.rc or not deep_eq($a.body, $b.body) or type($a.body.error_code) != "string" or type($a.body.message) != "string" then
+    raise("SCENES_MESH_TEST", "local and mesh refusal differ", {verb:$verb, local:$a, remote:$b})
+  end
+end
+print("PASS scenes local/attested-mesh list and all mutation refusals")

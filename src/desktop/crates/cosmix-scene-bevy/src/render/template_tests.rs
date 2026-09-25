@@ -227,7 +227,9 @@ fn vertical_rebind_retains_identity_and_binding_results_are_literal() {
 
 #[test]
 fn emitted_click_request_contains_list_item_and_actual_citizen() {
-    let tree = sample("horizontal");
+    let mut tree = sample("horizontal");
+    tree.nodes.get_mut("root").unwrap().ports["rows"][0]["extra"] =
+        json!({"action":"open", "generation":7});
     let data = prepare_lists(&tree).unwrap();
     let mut world = World::new();
     let content = world.spawn_empty().id();
@@ -238,10 +240,10 @@ fn emitted_click_request_contains_list_item_and_actual_citizen() {
         &rows(&tree.nodes["root"])[0],
     );
     let (bridge, peer) = ctk::bus::test_bridge("shell-test");
-    let expected = world
-        .get::<Binding>(content)
-        .unwrap()
-        .payload("click", None);
+    let expected = json!({
+        "scene": "repeated", "node": "root", "kind": "click",
+        "item": {"id": "a@b:c", "cells": ["Alpha"], "extra": {"action":"open", "generation":7}},
+    });
     let label = world.get::<RowInstances>(content).unwrap().views["label"]
         .0
         .label
@@ -256,8 +258,11 @@ fn emitted_click_request_contains_list_item_and_actual_citizen() {
         pointer::{Location, PointerButton, PointerId},
     };
     use bevy::window::WindowRef;
+    // An unhandled secondary click propagates all the way to the window.
+    // Using `label` as the window creates a traversal cycle back into the row.
+    let window = world.spawn(Window::default()).id();
     let location = Location {
-        target: NormalizedRenderTarget::Window(WindowRef::Entity(label).normalize(None).unwrap()),
+        target: NormalizedRenderTarget::Window(WindowRef::Entity(window).normalize(None).unwrap()),
         position: Vec2::ZERO,
     };
     // Start on the actual Text descendant: propagation must reach the row,

@@ -76,9 +76,10 @@ $state = {
   -- register pass in flight, and whether this host generation has selected
   -- and pinned the taskbar page yet
   reg_launcher: false, reg_calendar: false, reg_notes: false,
+  applied_panels: {}, pending_panels: {}, live_services: [],
   registering: false, panel_shown: false,
   -- consecutive show_page refusals this host generation; past PANEL_SHOW_CAP
-  -- we stop paying the bounded select wait on every render (a host that keeps
+  -- we stop resubmitting refused selections on every render (a host that keeps
   -- refusing its own bottom edge is a host bug, logged once per attempt)
   panel_show_fails: 0
 }
@@ -131,7 +132,9 @@ fn load_scene($doc)
 end
 
 fn panel_verb($verb, $edge, $id)
-  if $id == nil then
+  if $verb == "shell.panel.mode" then
+    send $HOST $verb edge=$edge mode="hidden" timeout=3
+  elif $id == nil then
     send $HOST $verb edge=$edge timeout=3
   else
     send $HOST $verb edge=$edge id=$id timeout=3
@@ -139,19 +142,16 @@ fn panel_verb($verb, $edge, $id)
   return rc_ok($rc)
 end
 
--- Select a scene page on its edge; true once the host accepted it. scene.load
--- replies before the host's next frame mounts a NEW page, so the first select
--- can race the mount ("unknown page id"); retry it briefly -- a bounded wait
--- on the effect of our own command, not a poll of anyone's state.
+-- Queue page selection. Mount/selection/pin completion comes from the host's
+-- applied shell.panel.changed stream, never a sleep/retry loop.
 fn select_page($edge, $page)
-  $tries = 0
-  while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) then return true end
-    $tries = $tries + 1
-    sleep(0.05)
+  if $state.pending_panels[$edge].page == $page then
+    drive_panel_operations()
+    return true
   end
-  note("page.set " .. $edge .. " " .. $page .. " never accepted")
-  return false
+  $state.pending_panels[$edge] = {page:$page, phase:"select", flag:nil, generation:$state.popup_gen}
+  drive_panel_operations()
+  return true
 end
 
 -- Select a scene page and pin its edge open; false when the page could not
@@ -159,12 +159,7 @@ end
 -- caller that records success (panel_shown) keeps retrying until the edge is
 -- actually pinned.
 fn show_page($edge, $page)
-  if not select_page($edge, $page) then return false end
-  if not panel_verb("shell.panel.pin", $edge, nil) then
-    note("pin " .. $edge .. " refused after selecting " .. $page)
-    return false
-  end
-  return true
+  return select_page($edge, $page)
 end
 
 -- Legacy Bus unpin releases BOTH Pinned and Docked. This is also the
@@ -174,17 +169,63 @@ end
 -- return a single applied snapshot only after BOTH persistence and visibility
 -- are clear. Failure leaves the record for the existing recovery pass.
 fn hide_edge($edge)
-  if not panel_verb("shell.panel.unpin", $edge, nil) then return nil end
-  $tries = 0
-  while $tries < 20
-    if edge_in_use($edge) then return nil end
-    panel_verb("shell.panel.hide", $edge, nil)
-    $state_r = rpc($HOST, "shell.props.get", {path: "panels." .. $edge})
-    if $p.popup_release_confirmed($state_r) then return $state_r end
-    $tries = $tries + 1
-    sleep(0.05)
+  $state.pending_panels[$edge] = {page:nil, phase:"release", flag:nil, generation:$state.popup_gen}
+  drive_panel_operations()
+  return $state.applied_panels[$edge]
+end
+
+fn drive_panel_operations()
+  for each $edge in keys($state.pending_panels)
+    $op = $state.pending_panels[$edge]
+    $applied = $state.applied_panels[$edge]
+    if $applied == nil then continue end
+    if $op.phase == "release" or $op.phase == "releasing" then
+      if edge_in_use($edge) then
+        $state.pending_panels = delete($state.pending_panels, $edge)
+      elif $p.popup_release_confirmed($applied) then
+        write_pins($p.released_popup_pins(read_pins(), $edge, $applied))
+        $state.pending_panels = delete($state.pending_panels, $edge)
+      elif $op.phase == "release" then
+        if panel_verb("shell.panel.mode", $edge, nil) then
+          if not edge_in_use($edge) and $state.pending_panels[$edge].phase == "release" then
+            $state.pending_panels[$edge].phase = "releasing"
+            $state.pending_panels[$edge].refused = false
+          end
+        else
+          $state.pending_panels[$edge].refused = true
+        end
+      end
+      continue
+    end
+    if $op.flag != nil and not popup_live($op.flag, $op.generation) then
+      $state.pending_panels = delete($state.pending_panels, $edge)
+      continue
+    end
+    if not contains($applied.pages ?? [], $op.page) then continue end
+    if $op.phase == "select" then
+      if panel_verb("shell.panel.page.set", $edge, $op.page) then
+        if $op.flag != nil and not popup_live($op.flag, $op.generation) then continue end
+        $state.pending_panels[$edge].phase = "selecting"
+      end
+    end
+    if $applied.page == $op.page then
+      if $applied.pinned and $applied.visible then
+        if $edge == "bottom" then $state.panel_shown = true end
+        if $op.flag == "launcher_open" then $state.launcher_shown = true end
+        if $op.flag == "calendar_open" then $state.calendar_shown = true end
+        if $op.flag == "notes_open" then $state.notes_shown = true end
+        $state.pending_panels = delete($state.pending_panels, $edge)
+      elif $op.phase != "pinning" then
+        if panel_verb("shell.panel.pin", $edge, nil) then
+          if $op.flag != nil and not popup_live($op.flag, $op.generation) then
+            if not edge_in_use($edge) then hide_popup($edge) end
+          else
+            $state.pending_panels[$edge].phase = "pinning"
+          end
+        end
+      end
+    end
   end
-  return nil
 end
 
 -- ── icons (the apps citizen resolves themes; cached here) ───────────────
@@ -724,11 +765,11 @@ fn render_panel()
   -- First render of this citizen life or host generation: select and pin the
   -- taskbar page. Keyed on our own flag, not revision 1 -- the revision
   -- counter is per scene name and survives a citizen-only restart. Capped so
-  -- a host that keeps refusing does not cost every render a ~1 s wait; a new
+  -- a host that keeps refusing does not receive a request every render; a new
   -- host generation (revision 1) re-arms it.
   if not $state.panel_shown and $state.panel_show_fails < $PANEL_SHOW_CAP then
     if show_page("bottom", "scene-panel") then
-      $state.panel_shown = true
+      $state.panel_shown = page_applied("bottom", "scene-panel")
       $state.panel_show_fails = 0
     else
       $state.panel_show_fails = $state.panel_show_fails + 1
@@ -761,7 +802,7 @@ fn render_launcher()
   $rev = load_launcher()
   $shown = false
   if $rev > 0 and popup_live("launcher_open", $gen) then $shown = show_popup("left", "scene-launcher", "launcher_open", $gen) end
-  if $state.popup_gen == $gen then $state.launcher_shown = $shown end
+  if $state.popup_gen == $gen then $state.launcher_shown = page_applied("left", "scene-launcher") end
   return $shown
 end
 
@@ -770,7 +811,7 @@ fn render_calendar()
   $rev = load_calendar()
   $shown = false
   if $rev > 0 and popup_live("calendar_open", $gen) then $shown = show_popup("right", "scene-calendar", "calendar_open", $gen) end
-  if $state.popup_gen == $gen then $state.calendar_shown = $shown end
+  if $state.popup_gen == $gen then $state.calendar_shown = page_applied("right", "scene-calendar") end
   return $shown
 end
 
@@ -780,7 +821,7 @@ fn render_notes()
   $rev = load_notes()
   $shown = false
   if $rev > 0 and popup_live("notes_open", $gen) then $shown = show_popup("right", "scene-notes", "notes_open", $gen) end
-  if $state.popup_gen == $gen then $state.notes_shown = $shown end
+  if $state.popup_gen == $gen then $state.notes_shown = page_applied("right", "scene-notes") end
   return $shown
 end
 
@@ -821,22 +862,11 @@ end
 -- leaving a closed popup pinned open. A page the host never accepted is not
 -- revealed or pinned at all: that would show whatever page the edge holds.
 fn show_popup($edge, $page, $flag, $gen)
-  $selected = false
-  $tries = 0
-  while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) then
-      $selected = true
-      break
-    end
-    $tries = $tries + 1
-    sleep(0.05)
-    if not popup_live($flag, $gen) then return false end
-  end
-  if not $selected then
-    note("page.set " .. $edge .. " " .. $page .. " never accepted; popup not revealed")
-    return false
-  end
   if not popup_live($flag, $gen) then return false end
+  if $state.pending_panels[$edge].page == $page and $state.pending_panels[$edge].generation == $gen then
+    drive_panel_operations()
+    return true
+  end
   -- Record the pin before making it, so a crash between the two still
   -- leaves the recovery pass something to release.
   $pins = read_pins()
@@ -844,11 +874,9 @@ fn show_popup($edge, $page, $flag, $gen)
     push($pins, $edge)
     write_pins($pins)
   end
-  if not panel_verb("shell.panel.show", $edge, nil) then return false end
-  if not popup_live($flag, $gen) then return false end
-  $pinned = panel_verb("shell.panel.pin", $edge, nil)
-  if not popup_live($flag, $gen) and not edge_in_use($edge) then hide_popup($edge) end
-  return $pinned and popup_live($flag, $gen)
+  $state.pending_panels[$edge] = {page:$page, phase:"select", flag:$flag, generation:$gen}
+  drive_panel_operations()
+  return true
 end
 
 -- Whether an open popup (other than a stale render) currently owns an edge:
@@ -871,7 +899,9 @@ fn hide_popup($edge)
     write_pins($pins)
   end
   $confirmed = hide_edge($edge)
-  if edge_in_use($edge) or not $p.popup_release_confirmed($confirmed) then return false end
+  if edge_in_use($edge) then return false end
+  if $state.pending_panels[$edge].refused == true then return false end
+  if not $p.popup_release_confirmed($confirmed) then return true end
   $kept = $p.released_popup_pins(read_pins(), $edge, $confirmed)
   write_pins($kept)
   return true
@@ -932,22 +962,80 @@ fn schedule()
   $state.dirty = true
   if $state.scheduled then return end
   $state.scheduled = true
+  emit $ME panel.flush
+end
+
+on panel.flush async
+  if $event.headers.from != $ME or $event.headers.broker_origin != "local" then return end
+  if not $state.dirty then
+    $state.scheduled = false
+    return
+  end
+  $state.dirty = false
   try
-    while $state.dirty
-      sleep(0.1)
-      $state.dirty = false
-      fetch_windows()
-      fetch_tray()
-      fetch_notes()
-      render_panel()
-      -- registered, so kept current even while closed (the shell can
-      -- reveal it through the corner); already fetched above
-      if $state.notes_open then render_notes() else load_notes() end
-    end
+    fetch_windows()
+    fetch_tray()
+    fetch_notes()
+    render_panel()
+    if $state.notes_open then render_notes() else load_notes() end
   catch $err
     note("rebuild failed: " .. to_string($err))
   end
   $state.scheduled = false
+  if $state.dirty then schedule() end
+end
+
+fn page_applied($edge, $page)
+  $pstate = $state.applied_panels[$edge]
+  return $pstate != nil and $pstate.page == $page and $pstate.visible and $pstate.pinned
+end
+
+on "shell.panel.changed"
+  if $event.headers.topic != $HOST .. ".panel.changed" then return end
+  $state.applied_panels = $event.args.panels
+  drive_panel_operations()
+  $state.panel_shown = page_applied("bottom", "scene-panel")
+  $state.launcher_shown = $state.launcher_open and page_applied("left", "scene-launcher")
+  $state.calendar_shown = $state.calendar_open and page_applied("right", "scene-calendar")
+  $state.notes_shown = $state.notes_open and page_applied("right", "scene-notes")
+end
+
+on bus.connected
+  if len(keys($event.headers)) != 0 then return end
+  $snapshot = rpc($HOST, "shell.props.get", {})
+  $state.applied_panels = $snapshot.panels ?? {}
+  $state.panel_shown = false
+  $state.reg_launcher = false
+  $state.reg_calendar = false
+  $state.reg_notes = false
+  $state.pending_panels = {}
+  for each $edge in read_pins()
+    if not edge_in_use($edge) then hide_popup($edge) end
+  end
+  render_panel()
+  $registry = rpc("noded", "noded.props.get", {})
+  reconcile_services($registry.services.registered)
+end
+
+fn reconcile_services($live)
+  if type($live) != "list" then return end
+  $previous = $state.live_services
+  $state.live_services = $live
+  if contains($live, $HOST) and not contains($previous, $HOST) then
+    $state.pending_panels = {}
+    $snapshot = rpc($HOST, "shell.props.get", {})
+    $state.applied_panels = $snapshot.panels ?? {}
+    $state.panel_shown = false
+    $state.reg_launcher = false
+    $state.reg_calendar = false
+    $state.reg_notes = false
+    for each $edge in read_pins()
+      if not edge_in_use($edge) then hide_popup($edge) end
+    end
+    render_panel()
+  end
+  if contains($live, $COMP) and not contains($previous, $COMP) then rpc($COMP, "comp.props.watch", {}) end
+  schedule()
 end
 
 -- ── handlers ────────────────────────────────────────────────────────────
@@ -1400,7 +1488,16 @@ end
 -- The adapters' named events are wired too, in case a diff is coalesced
 -- away; schedule() refetches everything either way.
 on props.changed async
-  schedule()
+  if $event.headers.topic == "noded.props.changed" then
+    if $event.headers.gap == "true" then
+      $registry = rpc("noded", "noded.props.get", {})
+      reconcile_services($registry.services.registered)
+    elif $event.args.path == "services.registered" then
+      reconcile_services($event.args.new)
+    end
+  else
+    schedule()
+  end
 end
 
 on tray.item.added async
@@ -1420,28 +1517,16 @@ on notification.closed async
 end
 
 -- The clock: wake on each minute boundary and redraw the panel and the
--- calendar page (the notifications page every fifth) -- one wake per minute. A second kick is
+-- calendar page -- one wake per minute. A second kick is
 -- ignored so a stray clock.run cannot start a second loop.
 on clock.run async
   if $state.clock_running then return end
   $state.clock_running = true
-  $tick = 0
   while true
     sleep($p.seconds_to_next_minute(time()))
-    $tick = $tick + 1
     try
       fetch_net()
       fetch_vol()
-      if $tick % 5 == 0 then
-        rpc($COMP, "comp.props.watch", {})
-        fetch_windows()
-        fetch_tray()
-        render_notes()
-        -- a release that failed while Quoin was down is retried here
-        for each $edge in read_pins()
-          if not edge_in_use($edge) then hide_popup($edge) end
-        end
-      end
       render_panel()
       -- the calendar's "today" and header clock stay current while it is
       -- registered, open or not; it is revealed only while open
@@ -1459,6 +1544,10 @@ subscribe($TRAY .. ".item.removed")
 subscribe($TRAY .. ".props.changed")
 subscribe($NOTIFY .. ".changed")
 subscribe($NOTIFY .. ".props.changed")
+subscribe($HOST .. ".panel.changed")
+subscribe("noded.props.changed")
+$initial_panels = rpc($HOST, "shell.props.get", {})
+$state.applied_panels = $initial_panels.panels ?? {}
 rpc($COMP, "comp.props.watch", {})
 fetch_windows()
 fetch_tray()
@@ -1471,6 +1560,8 @@ for each $edge in read_pins()
   hide_popup($edge)
 end
 render_panel()
+$initial_registry = rpc("noded", "noded.props.get", {})
+reconcile_services($initial_registry.services.registered)
 note("quoin-panel up: host=" .. $HOST .. " comp=" .. $COMP)
 
 -- The clock runs in its own async handler (below), kicked once from here, so

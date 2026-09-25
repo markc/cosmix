@@ -1,5 +1,6 @@
 -- Deterministic extraction gate. --record refreshes the public captures.
--- Run with TZ=UTC so captured date strings do not depend on the workstation.
+-- Set the process timezone before any date conversion or module loading.
+export TZ = "UTC"
 $root = dirname(dirname(dirname(dirname(dirname(realpath($0))))))
 $fixtures = dirname(realpath($0)) .. "/fixtures/scenes"
 $old = require("fixtures/scenes/old-builders.mix")
@@ -9,7 +10,7 @@ $record = contains(args(), "--record")
 fn check($ok, $message)
   if not $ok then raise("SCENE_TEMPLATE_TEST", $message) end
 end
-check(date_format(0, "%z") == "+0000", "run this gate with TZ=UTC")
+check(date_format(0, "%z") == "+0000", "UTC timezone was not applied")
 for each $name in ["launcher", "calendar", "notes"]
   $directory = $root .. "/share/scenes/" .. $name
   $metadata = data_parse(read_file($directory .. "/template.conf.mix"))

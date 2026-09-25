@@ -183,6 +183,12 @@ pub fn reevaluate(
             "model patch path must contain map keys",
         )]);
     }
+    // A sequence of individually small patches must not grow an unbounded
+    // model before conversion/evaluation. The host also bounds authored ports
+    // and metadata together with this model before committing a revision.
+    if serde_json::to_vec(&next.model).map_or(true, |v| v.len() > crate::MAX_DOCUMENT_BYTES) {
+        return Err(vec![Diagnostic::error("model-path", 1, "aggregate model too large")]);
+    }
     let old = tree.clone();
     let mut diagnostics = Vec::new();
     let mut evaluated = Vec::new();
@@ -299,6 +305,9 @@ pub fn template_instantiate_with(
     if let Some(conflict) = conflicts.into_iter().next() {
         return Err(conflict);
     }
+    if evaluation.started.elapsed() >= EVALUATION_BUDGET {
+        return Err(Diagnostic::warning("binding-eval", node.line, "template instantiation budget exhausted"));
+    }
     Ok(out)
 }
 
@@ -339,7 +348,7 @@ pub(crate) fn evaluate_budgeted(
     if let Some(item) = item {
         globals.push(("item", to_mix(item)));
     }
-    eval_expr_string(
+    let result = eval_expr_string(
         &binding.source,
         &globals,
         Some(Rc::new(CategoryAllowList::deny_all())),
@@ -351,7 +360,14 @@ pub(crate) fn evaluate_budgeted(
             ..Default::default()
         },
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    // A final, non-yielding builtin may cross the shared deadline. Checking
+    // only before the next binding would accept that value (or miss exhaustion
+    // entirely on the last binding). Keep the old port instead.
+    if started.elapsed() >= EVALUATION_BUDGET {
+        return Err("evaluation budget exhausted".into());
+    }
+    result
 }
 
 pub(crate) fn coerce_port(value: &Value, port: Option<Port>) -> Result<Option<JsonValue>, String> {
@@ -439,7 +455,16 @@ pub(crate) fn set_port(ports: &mut indexmap::IndexMap<String, JsonValue>, port: 
 }
 
 fn apply_model_patch(model: &mut JsonValue, parts: &[&str], value: &JsonValue) -> bool {
-    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+    if parts.is_empty() {
+        if value.is_null() {
+            *model = json!({});
+            return true;
+        }
+        if !value.is_object() { return false; }
+        *model = value.clone();
+        return true;
+    }
+    if parts.iter().any(|p| p.is_empty()) {
         return false;
     }
     if !model.is_object() {

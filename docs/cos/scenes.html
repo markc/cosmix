@@ -445,7 +445,9 @@
 <p>Quoin accepts renderer-neutral scene documents through <code>shell.scene.load</code>.
 The request body is the complete AMP document with one <code>mix</code> fence. The
 <code>cosmix-scene</code> parser and registry validate it before any live state changes.
-Invalid loads and patches return diagnostics and retain the last good tree.</p>
+Invalid loads and patches return diagnostics and retain the last good tree.
+For file discovery, enablement, supervised behaviours and popup coordination,
+see the <a href="scenes-loader">Stage A scenes loader</a>.</p>
 <p>Scenes mount as pages in an edge panel. Floating windows are outside v0.
 The envelope's <code>window</code> header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
@@ -469,6 +471,32 @@ The complete serialised patch candidate must fit the same 256 KiB bound as
 loads. Rejected patches retain both the tree and its revision.
 <code>shell.scene.describe {family?}</code> reports the shared P1 registry.
 <code>shell.scene.unload {scene}</code> removes the page.</p>
+<p><code>shell.scene.validate</code> accepts the same AMP body as load, returning
+<code>{scene,valid:true,diagnostics}</code> without mounting, reserving a page or changing
+revisions. <code>shell.scene.get {scene,format:"source"}</code> returns
+<code>{scene,revision,source}</code> with canonical authored AMP source: expressions,
+template definitions and omitted defaults are preserved. The core serializer
+escapes interpolation, leading tildes, backticks, controls and Unicode for the
+strict Mix parser. Scene refusals use nonzero RC and <code>{error_code,message}</code>
+with diagnostics/context when available.</p>
+<p>Patch paths also accept <code>model</code> (replace the complete model map; null clears it)
+and <code>model.&lt;key&gt;...</code> (map-key updates, null removes a key). The store retains
+compiled bindings and reevaluates against the last accepted resolved tree.
+The authored model, resolved tree and revision commit together only after
+aggregate document/model bounds pass. Evaluation warnings retain last-good
+ports; structural/bounds refusals retain the whole previous revision. Accepted
+model revisions refresh list instances, including templates whose row data
+did not change but whose model dependencies did.
+Model patches that change a scene's mount page or edge are refused with
+<code>SUBPANEL_COLLISION</code>; unload and load explicitly to move that mount.</p>
+<p>Subscribe to <code>&lt;host&gt;.panel.changed</code> for inner command <code>shell.panel.changed</code>:
+<code>{generation,revision,panels:{left,...}}</code>. Each panel has the same applied
+<code>visible</code>, <code>pinned</code>, <code>mode</code>, <code>page</code>, <code>pages</code>, <code>width_px</code> and <code>output</code> values as
+<code>shell.props.get</code>. Publication follows scene reconciliation and model
+application; unchanged snapshots produce no event. Take a property snapshot
+after subscribing and resynchronise after a connection/gap. Enqueue replies
+are not applied-state receipts, so page selection and temporary pin release
+must wait on these events rather than retry sleeps.</p>
 <h2 id="v1-bindings">V1 bindings</h2>
 <p>A port value beginning <code>= </code> is one Mix expression. <code>== x</code> escapes to the
 literal <code>= x</code>, while <code>=x</code> remains a literal. For example:</p>
@@ -499,9 +527,12 @@ Load evaluation and each re-evaluation pass have a 250 ms total wall budget,
 with at most 50 ms per expression. Remaining bindings report <code>binding-eval</code>
 with <code>evaluation budget exhausted</code>; they take defaults at load or retain
 last-good values on a patch. As with lib-mix limits, a non-yielding builtin
-can overshoot until it returns. Template instantiation uses the same budget.
+can overshoot until it returns, but the late result is refused even for the
+final binding in a pass. Template instantiation uses the same budget.
 Null model patches remove keys without creating missing parent maps. Patch
-values are limited to 256 KiB of serialised JSON (<code>model-path</code> on excess).
+values and the aggregate runtime model are limited to 256 KiB of serialised
+JSON (<code>model-path</code> on excess). The host additionally enforces the aggregate
+authored-document bound, including metadata and ports.
 Empty model and binding fields are omitted from resolved-tree serialisation.</p>
 <table><thead><tr><th>diagnostic</th><th>meaning</th></tr></thead><tbody>
 <tr><td><code>invalid-binding</code></td><td>expression syntax, statement count or depth is invalid</td></tr>

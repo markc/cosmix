@@ -10,6 +10,7 @@ use super::{CarouselInput, ShellCommand, ShellCommandKind};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SceneVerb {
     Load,
+    Validate,
     Patch,
     Get,
     Describe,
@@ -21,6 +22,7 @@ impl SceneVerb {
     pub fn parse(command: &str) -> Option<Self> {
         Some(match command {
             "shell.scene.load" => Self::Load,
+            "shell.scene.validate" => Self::Validate,
             "shell.scene.patch" => Self::Patch,
             "shell.scene.get" => Self::Get,
             "shell.scene.describe" => Self::Describe,

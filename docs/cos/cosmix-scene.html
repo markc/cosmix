@@ -482,10 +482,27 @@ entire scene revision: one model conversion, at most 16,384 instantiated nodes,
 and the core's 250 ms evaluation budget. The convenience
 <code>template_instantiate</code> creates a context for a single node; hosts rendering
 repeated trees must use the shared context. Both evaluate against the live
-<code>$model</code> and supplied <code>$item</code>, coerce ports and validate layout bounds.</p>
+<code>$model</code> and supplied <code>$item</code>, coerce ports and validate layout bounds.
+Quoin runs that preflight for loads, port patches and model-only patches
+before committing a revision. A template failure preserves the authored
+document, resolved tree, compiled bindings and revision. Results that cross
+the shared deadline are rejected even when the final expression never yields.</p>
 <p>Lint reports bounded-document, schema, graph, template, row and header
 diagnostics. <code>orphan-node</code> is a warning; other violations are errors. The
 resolver returns diagnostics for unknown families rather than panicking.</p>
+<p><code>to_source(&amp;SceneDocument)</code> serialises the authored AMP document, including
+model, optional headers, expressions and template nodes. It does not serialise
+the flattened resolved tree. Strict Mix escaping preserves literal <code>${...}</code>,
+leading <code>~</code>, backticks (including fence-looking text), Unicode and control
+characters. Quoin exposes this as <code>shell.scene.get {scene,format:"source"}</code>.</p>
+<p><code>bindings::reevaluate</code> accepts <code>model</code> to replace a complete model map (null
+clears it), as well as <code>model.*</code> map paths. Both individual patch values and the
+aggregate model are bounded before evaluation. The host retains the compiled
+binding set, commits authored model/resolved tree/revision together, and checks
+the complete canonical document bound before accepting a patch. A refused
+patch leaves the prior revision intact.
+The host also refuses model patches that move the scene's mount page or edge,
+preserving the loading citizen's existing reservation.</p>
 <p><code>diff(old, new)</code> emits <code>Remove</code>, <code>Insert { parent, index }</code>, <code>SetPort</code>,
 <code>Reparent</code>, and scene-level <code>SetScene</code> operations for name, citizen, window
 and subscribe changes. A dropped port emits <code>SetPort</code> with JSON <code>null</code> to

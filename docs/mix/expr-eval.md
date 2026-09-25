@@ -135,13 +135,12 @@ by the size caps, never by iteration count or by *unbounded* waiting
 installs a permissive policy — its class is `FsWrite`, denied under
 `deny_all()`).
 
-The **time limit** is armed at this entry point itself — there is no
-statement loop here to carry the evaluator's usual per-statement poll,
-so the budget is enforced by wrapping the evaluation future: on expiry
-the future is dropped at its next yield and the caller gets a clean
-`time limit exceeded` error. A single non-yielding CPU-bound builtin can
-still overshoot until its next yield point; with the blocking four
-denied statically, that residual is a slow computation, not a hang. See
+The **time limit** is armed at this entry point itself and checked while
+entering expressions and after evaluation completes. A timer also cancels
+pending evaluation. An expression that finishes without yielding after its
+deadline is refused with a `time limit exceeded` error; a ready future does
+not bypass the budget. A single CPU-bound builtin cannot be interrupted
+mid-call, but its late result is rejected and further expressions stop. See
 [capabilities & embedding](capabilities.md) for the same caveat in full
 programs.
 

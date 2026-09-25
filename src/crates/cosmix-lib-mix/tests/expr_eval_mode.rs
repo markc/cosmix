@@ -31,6 +31,33 @@ use cosmix_mix::{
     CategoryAllowList, EvalLimits, IndexMap, MAX_EXPR_DEPTH, MixResult, eval_expr_string,
 };
 
+#[test]
+fn expired_expression_budget_rejects_ready_futures() {
+    // These complete without yielding. A Tokio timeout alone polls them to
+    // Ready and accepts them even with an already-exhausted budget.
+    for source in [
+        "42",
+        "repeat('a', 200000)",
+        "(if true then 42 else 0 end)",
+    ] {
+        let error = eval_expr_string(
+            source,
+            &[],
+            Some(Rc::new(CategoryAllowList::deny_all())),
+            EvalLimits {
+                time_limit: Some(std::time::Duration::ZERO),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("time limit"), "{source}: {error}");
+    }
+    assert_eq!(
+        eval_expr_string("42", &[], None, EvalLimits::default()).unwrap(),
+        Value::Number(42.0)
+    );
+}
+
 /// Parse + run `source`, applying `configure` to the evaluator first.
 /// Returns Ok(value) or Err(error message).
 async fn run_with(source: &str, configure: impl FnOnce(&mut Evaluator)) -> Result<Value, String> {

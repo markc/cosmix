@@ -2916,8 +2916,8 @@ pub struct EvalLimits {
     /// `recursion depth exceeded` error. See [`DEFAULT_RECURSION_LIMIT`].
     pub recursion_limit: usize,
     /// Optional wall-clock budget for one run. Checked at the
-    /// per-statement poll, so loop-based runaways are bounded; a single
-    /// blocking builtin (`run`/`ssh_run`/`http_*`) cannot be
+    /// statement and expression polls, so loop-based runaways are bounded.
+    /// A single blocking builtin (`run`/`ssh_run`/`http_*`) cannot be
     /// interrupted mid-syscall. `None` = no time limit.
     pub time_limit: Option<std::time::Duration>,
     /// Optional cap on any single list's length. `None` = no cap.
@@ -3070,6 +3070,10 @@ fn eval_checked_expr(
     }
     let dur = limits.time_limit; // Copy out before set_limits takes ownership
     eval.set_limits(limits);
+    // Expression-only calls never enter the statement poll that normally
+    // arms this deadline. Share it with nested expressions and branch bodies.
+    let deadline = dur.map(|dur| std::time::Instant::now() + dur);
+    eval.ctx.deadline = deadline;
     for (name, value) in globals {
         eval.set_global(name, value.clone());
     }
@@ -3081,27 +3085,27 @@ fn eval_checked_expr(
             span: None,
             msg: format!("eval_expr_string: {}", e),
         })?;
-    // A statement-free expression never reaches the evaluator's
-    // per-statement deadline poll (if-expression branch bodies DO poll,
-    // via execute_inner) — so arm the wall-clock budget at the future as
-    // well: on expiry the evaluation future is dropped at its next yield
-    // point and the caller gets a clean error. (A single non-yielding
-    // CPU-bound builtin can still overshoot until its next yield; the
-    // blocking-by-nature builtins are statically denied above, which is
-    // the load-bearing bound.)
+    // The timer cancels pending work, but Tokio polls the inner future first:
+    // a CPU-bound builtin can return Ready after expiry without a timeout.
+    // Reject that result too, including when it is the final expression.
     let fut = eval.eval_expr(expr);
     rt.block_on(async move {
-        match dur {
-            Some(dur) => match tokio::time::timeout(dur, fut).await {
-                Ok(v) => v,
-                Err(_) => Err(MixError::RuntimeError {
-                    span: None,
-                    msg: format!(
-                        "eval_expr_string: time limit ({:?}) exceeded",
-                        dur
-                    ),
-                }),
-            },
+        match deadline {
+            Some(deadline) => {
+                let result = tokio::time::timeout_at(deadline.into(), fut).await;
+                if std::time::Instant::now() >= deadline {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: "eval_expr_string: time limit exceeded".into(),
+                    });
+                }
+                result.unwrap_or_else(|_| {
+                    Err(MixError::RuntimeError {
+                        span: None,
+                        msg: "eval_expr_string: time limit exceeded".into(),
+                    })
+                })
+            }
             None => fut.await,
         }
     })
@@ -10810,6 +10814,15 @@ impl Evaluator {
         expr: &'a Expr,
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            if let Some(limit) = self.ctx.time_limit {
+                let deadline = *self
+                    .ctx
+                    .deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + limit);
+                if std::time::Instant::now() >= deadline {
+                    return Err(self.runtime_err("deadline exceeded"));
+                }
+            }
             match expr {
                 Expr::NumberLiteral(n) => Ok(Value::Number(*n)),
                 Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) => {

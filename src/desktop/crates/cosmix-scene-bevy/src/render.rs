@@ -33,6 +33,8 @@ mod icons;
 #[cfg(test)]
 mod layout_tests;
 #[cfg(test)]
+mod model_patch_tests;
+#[cfg(test)]
 mod template_tests;
 use icons::IconCache;
 
@@ -211,14 +213,25 @@ struct ClickRow;
 fn row_click(
     mut event: On<Pointer<Click>>,
     bindings: Query<&Binding, With<ClickRow>>,
+    parents: Query<&ChildOf>,
     bridge: Res<BusBridge>,
     mut events: ResMut<Events>,
 ) {
-    if let Ok(binding) = bindings.get(event.entity)
-        && event.button == bevy::picking::pointer::PointerButton::Primary
-    {
-        events.send(&bridge, binding, "click", None);
-        event.propagate(false);
+    if event.button != bevy::picking::pointer::PointerButton::Primary {
+        return;
+    }
+    // Picking targets the Text/Image descendant, which need not carry a
+    // ClickRow. Resolve its nearest clickable ancestor on the first delivery
+    // instead of relying on another invocation of this global observer.
+    let mut target = event.entity;
+    loop {
+        if let Ok(binding) = bindings.get(target) {
+            events.send(&bridge, binding, "click", None);
+            event.propagate(false);
+            return;
+        }
+        let Ok(parent) = parents.get(target) else { return };
+        target = parent.parent();
     }
 }
 fn hover(mut query: Query<(&Hovered, &SceneHover, &mut BackgroundColor), Changed<Hovered>>) {

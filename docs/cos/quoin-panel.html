@@ -442,6 +442,15 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/quoin-panel.md"><div class="prose"><h1 id="quoin-panel">quoin-panel</h1>
+<p>Stage A keeps this citizen and its existing page IDs running alongside the
+<a href="/cos/scenes-loader">scenes loader</a>. New templates use distinct names until
+Stage B. Page selection and popup release now advance through pending
+operations on <code>&lt;host&gt;.panel.changed</code> applied-state notifications, with no
+select/hide sleep loops. Open/close replies acknowledge desired state;
+<code>shown</code> reflects the last applied host snapshot. Saved popup pins are cleared
+only after an applied release. Refresh bursts enqueue one <code>panel.flush</code> Bus
+event instead of a 100 ms sleep loop. The legacy network/audio clock polling
+is reserved for Stage C's native event sources.</p>
 <p>The Quoin bottom panel, application launcher, calendar and notifications
 popup, written as <a href="/cos/scenes">Mix Scenes</a>. One Mix citizen
 (<code>src/desktop/scripts/quoin-panel.mix</code>, Bus name <code>quoin-panel</code>) owns four
@@ -555,10 +564,10 @@ already in flight does not leave a closed popup open. Every popup pin the
 panel makes is recorded in <code>$XDG_STATE_HOME/cosmix/quoin-panel-pins.json</code>; at
 start the citizen releases exactly those edges (a popup open when Quoin or
 the citizen went down would otherwise return as a pinned native page). A
-record is only dropped after a single applied <code>shell.props.get</code> subtree snapshot
+record is only dropped after an applied <code>shell.panel.changed</code> subtree snapshot
 confirms both <code>pinned == false</code> and <code>visible == false</code>. An enqueue acknowledgement
-is insufficient. The existing bounded hide loop is retained; failure or an
-unconfirmed release leaves the record for the existing startup/recovery pass.
+is insufficient. A pending operation waits for that event; an unconfirmed
+release leaves the record for startup/reconnection recovery.
 The file remains a bare JSON array of edge strings. Its explicit compatibility
 rule is that legacy Bus <code>unpin</code> releases both persistent modes, including dock
 reservations migrated from legacy <code>pinned: true</code>. No version conversion is
@@ -567,11 +576,12 @@ popup/capture callers to overlay pin intent is a separate API/caller chunk.
 Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.</p>
-<p>The legacy clock also snapshots network/volume each minute. Every five
-minutes it re-seeds the compositor watch and refetches windows, tray and
-notifications. Those are polls, retained only because Stage A keeps this
-host citizen unchanged. The extracted behaviours above do not inherit them;
-panel migration and native status event sources belong to later stages.</p>
+<p>Broker registration changes and <code>bus.connected</code> now re-seed the compositor
+watch and remount a returning shell. The previous five-minute recovery pass
+is removed. The clock still reads network/audio status once per minute until
+Stage C supplies their native event sources. Stage A keeps this legacy host
+citizen running; the extracted behaviours above do not inherit those polls.
+Panel migration belongs to Stage B.</p>
 <h2 id="limits">Limits</h2>
 <p>The launcher shows at most 500 applications (the host's list cap) and the
 notifications popup the 50 newest; long names, descriptions and bodies are
@@ -611,9 +621,9 @@ other query values and categories must be strings. Open truncates the query
 to 128 characters and validates category against the launcher chips (case
 sensitive; <code>""</code> means all). Search accepts any apps category string.
 An already-open calendar retains its navigated month. Every open retries the
-render. <code>open</code> records intent; <code>shown</code> records whether the latest render had
-its load, page selection, reveal and pin accepted, not a compositor frame
-confirmation. A failed close returns rc 22 with
+render. <code>open</code> records intent; <code>shown</code> records the last applied host snapshot,
+so an accepted open may initially reply with <code>shown:false</code>. A refused close
+returns rc 22 with
 <code>{error: "release_failed", open: false, edge}</code>. Repeated closes retry pending
 pin records, without releasing an edge another popup is using.
 Popup switches also return rc 22 if releasing the previous popup fails;

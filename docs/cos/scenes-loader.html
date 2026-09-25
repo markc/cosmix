@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — mix/expr-eval</title>
+    <title>CosMix — cos/scenes-loader</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,159 +441,159 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="mix/expr-eval.md"><div class="prose"><h1 id="expression-evaluation-mode">Expression evaluation mode</h1>
-<p>Sometimes a host doesn't want to <em>run a Mix program</em> — it wants to
-<em>evaluate one Mix expression</em>: a scene host resolving a binding like
-<code>$model.a * 2</code>, a config layer computing a default, a template filling a
-field from preset values. For that, <code>cosmix-lib-mix</code> exposes
-<code>eval_expr_string</code> — a synchronous entry point that evaluates <strong>exactly
-one expression</strong> under an optional capability policy and the standard
-eval limits, rejecting everything that isn't a pure expression shape
-<strong>before execution</strong>. It landed in lib-mix 0.89.0 together with the
-<code>send</code>/<code>emit</code> capability-gate fix.</p>
-<p><code>expr_mode_check(source) -&gt; MixResult&lt;()&gt;</code> (lib-mix 0.89.1) performs the same
-single-expression, static deny and depth checks without evaluation. Hosts
-can reject invalid bindings at compile time without constructing an evaluator
-or running builtins. Runtime errors such as division by zero remain evaluation
-errors; this check does not predict values or enforce a host capability policy.</p>
-<pre><code class="language-rust">use cosmix_lib_mix::{
-    eval_expr_string, CategoryAllowList, EvalLimits, IndexMap, Value,
-};
-
-let mut model = IndexMap::new();
-model.insert("a".to_string(), Value::Number(21.0));
-
-let v = eval_expr_string(
-    "$model.a * 2",
-    &amp;[("model", Value::map(model))],
-    Some(Rc::new(CategoryAllowList::deny_all())),
-    EvalLimits::default(),
-)?;   // Value::Number(42.0)
+        <div id="content-doc" data-prerendered="cos/scenes-loader.md"><div class="prose"><h1 id="scenes-loader">Scenes loader</h1>
+<p><code>mix --serve scenes.mix --name scenes</code> owns file-backed scene lifecycles.
+This is Stage A: it runs beside <code>quoin-panel.mix</code>, starts with no enabled
+scenes, and reports <code>needs_setup:true</code> until scenes are explicitly enabled.
+The Scene Editor gallery and recovery chord are later work; this loader does
+not claim to implement them.</p>
+<h2 id="files-and-installation">Files and installation</h2>
+<pre><code>~/.config/cosmix/scenes/
+  state.conf.mix
+  &lt;name&gt;/scene.mix
+  &lt;name&gt;/template.conf.mix
+  &lt;name&gt;/behaviour.mix       # optional
 </code></pre>
-<p>The evaluator is built fresh per call: <code>policy</code> installs via
-<code>set_capability_policy</code>, <code>limits</code> via <code>set_limits</code>, and each
-<code>(name, value)</code> in <code>globals</code> via <code>set_global</code> — the same seam handler
-dispatch uses for <code>$event</code>. Nothing about the caller's own evaluator (if
-any) is touched.</p>
-<h2 id="the-single-expression-rule">The single-expression rule</h2>
-<p><code>source</code> must parse to <strong>exactly one expression statement</strong>. Anything
-else is rejected with an error naming the offending construct:</p>
-<pre><code class="language-text">eval_expr_string: not an expression: assignment
-eval_expr_string: not an expression: for loop
-eval_expr_string: not an expression: emit statement
-eval_expr_string: expected exactly one expression statement, found 2 statements
-</code></pre>
-<p>That rule alone rules out assignment, control flow, <code>print</code>, <code>send</code>,
-<code>emit</code>, <code>sh</code>, <code>on</code>, <code>source</code>, and multiple statements. A <code>try</code>/<code>catch</code>
-around the call is the caller's job — the errors are ordinary
-<code>MixError</code>s.</p>
-<h2 id="the-static-deny-walk">The static deny walk</h2>
-<p>Past the single-expression rule, a static walk over the expression tree
-rejects the constructs that carry authority or first-class functions —
-<strong>before execution, untaken branches included</strong> (deterministic compile
-semantics: a denied construct inside a ternary's false arm still
-rejects, because the walk never evaluates anything):</p>
-<table><thead><tr><th>Construct</th><th>Rejected as</th></tr></thead><tbody>
-<tr><td><code>send …</code> expression / statement</td><td><code>send expression</code> / <code>send statement</code></td></tr>
-<tr><td><code>sh "…"</code> (expression or nested statement)</td><td><code>sh expression</code> / <code>sh statement</code></td></tr>
-<tr><td><code>$(…)</code> command substitution</td><td><code>command substitution $()</code></td></tr>
-<tr><td><code>function (…) …</code> lambda literal</td><td><code>function literal</code></td></tr>
-<tr><td><code>$f(x)</code> — call on a function-valued expression</td><td><code>function-value call</code></td></tr>
-<tr><td><code>$x.name(…)</code> where <code>name</code> is not a builtin</td><td><code>method call</code></td></tr>
-<tr><td><code>on</code> / <code>source</code> / <code>include</code> / `…</td><td>cmd` nested in an if-expression</td></tr>
-<tr><td><code>for</code> / <code>for … in</code> / <code>while</code> / <code>loop</code> nested in an if-expression branch</td><td><code>for loop</code> / <code>for-each loop</code> / <code>while loop</code> / <code>loop statement</code></td></tr>
-<tr><td><code>select … end</code> / <code>address "…" … end</code> nested in an if-expression branch</td><td><code>select statement</code> / <code>address block</code></td></tr>
-<tr><td><code>export</code> (mutates the HOST process environment; its runtime gate is permissive with no policy installed)</td><td><code>export statement</code></td></tr>
-<tr><td><code>print</code> statement nested in an if-expression (writes to the evaluator's output sink — the host daemon's real stdout/stderr)</td><td><code>print statement</code></td></tr>
-<tr><td>a coalesce default in an interpolation (<code>"${x ?? …}"</code> and heredoc bodies): the payload is parsed and executed as a full program AT RUNTIME, so the walk statically analyses it here — it must be a single expression and passes the same deny rules recursively (nested coalesces included)</td><td><code>coalesce default must be a single expression…</code>, or the inner construct's name</td></tr>
-<tr><td><code>sleep</code>, <code>readline</code>, <code>read_stdin</code>, <code>read_stdin_bytes</code>, <code>printf</code>, <code>eprintf</code>, <code>write_stdout</code>, <code>write_stderr</code>, <code>print_raw</code>, <code>eprint_raw</code> — by NAME: each is Pure- or Env-classed so no installed policy stops the Pure ones, and a binding has no business blocking on time/input or writing to the host's output stream; the static deny makes those premises unconditional, whatever policy the host chose</td><td><code>&lt;name&gt; builtin</code></td></tr>
-<tr><td>string interpolation beyond literals and Mix variables</td><td><code>environment-variable interpolation in string</code>, <code>command substitution in string</code></td></tr>
+<p><code>scene.mix</code> is an AMP scene document, never executable Mix. Metadata and
+state are strict data, parsed with <code>data_parse</code>. Only <code>behaviour.mix</code> runs.
+The document name must match its installation directory. Names contain
+lower-case ASCII letters, digits, <code>-</code> and <code>_</code>, at most 64 characters; leading
+<code>-</code> and <code>_</code> are refused. The scene/metadata/behaviour files and installation
+directory cannot be symlinks. Shipped templates live at <code>$COSMIX/share/scenes</code>.</p>
+<p>State has <code>{schema_version:1,enabled:[],origins:{},recovery:{}}</code>. Writes use
+<code>write_atomic</code> with full durability and mode <code>0600</code>. Enablement is separate
+from template metadata. A directory discovered through the filesystem remains
+disabled. A loader lock prevents two loaders sharing one directory.</p>
+<p><code>setup.mix --desktop</code> installs <code>bin/scenes.mix</code> and its helpers; the checkout's
+<code>share/scenes</code> is the canonical template installation. Adding <code>--system</code>
+copies the loader/helpers and templates under <code>/opt/cosmix</code> too. No unit is
+enabled, no user scenes are seeded and Quoin configuration is not rewritten.
+The example <code>src/_etc/systemd/cosmix-desk-scenes.service.in</code> must be rendered by
+the session installer, with a desktop user, session environment and paths.</p>
+<p>Environment overrides:</p>
+<table><thead><tr><th>Variable</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>SCENES_DIR</code></td><td>User scene root; default <code>$XDG_CONFIG_HOME/cosmix/scenes</code></td></tr>
+<tr><td><code>SCENES_TEMPLATES</code></td><td>Shipped template root; otherwise <code>$COSMIX/share/scenes</code>, or discover the checkout from the script</td></tr>
+<tr><td><code>SCENE_HOST</code></td><td>Quoin service; default <code>shell</code></td></tr>
 </tbody></table>
-<p>What stays <strong>allowed</strong>: literals, variables, arithmetic and comparison,
-<code>..</code> concat, ternary <code>?:</code>, <code>if … then … else … end</code> as an expression,
-field access, indexing, list/map literals, and bareword builtin calls
-(<code>upper(…)</code>, <code>length(…)</code>). Method syntax on a builtin (<code>$s.upper()</code>)
-desugars to a bareword <code>FunctionCall</code> at parse time, so it is allowed —
-in a <strong>nested</strong> position (<code>'X-' .. $s.upper()</code>). One parser quirk to
-know: as the <em>whole</em> statement, <code>$s.upper()</code> is the variable-led
-first-accessor form, which folds to a field access and parses the <code>(</code>
-as a first-class call on the map member — a <code>ValueCall</code>, denied like
-every first-class call.</p>
-<p>Interpolation details: <code>"${NAME}"</code> is a Mix <strong>variable</strong> part (scope
-first, process env fallback) and stays allowed; a <strong>leading <code>~</code></strong> in a
-double-quoted string (<code>"~/x"</code>) is an env-var part and is denied;
-<code>$(…)</code> inside a <em>heredoc</em> body is a command-sub part and is denied.</p>
-<p>The walk is depth-capped at <code>MAX_EXPR_DEPTH</code> (<strong>256</strong>): a deeper tree is
-a clean error, never a stack overflow in the walk. (The parser's own
-nesting cap bounds <em>parse recursion</em>; a left-associative operator chain
-parses iteratively but still builds a deep tree, so the walk carries
-its own cap.)</p>
-<pre><code class="language-text">eval_expr_string: expression nesting exceeds MAX_EXPR_DEPTH (256)
-</code></pre>
-<p>Ordinary builtins are <strong>not</strong> statically denied — they run, gated by
-the installed <code>policy</code> at dispatch exactly as in a full program. With
-<code>CategoryAllowList::deny_all()</code> (the documented name for
-<code>CategoryAllowList::new(&amp;[])</code> — Pure only, nothing else) every non-pure
-builtin fails with <code>capability denied</code>, and — since the 0.89.0 gate —
-so do the bare <code>send</code>/<code>emit</code> broker forms and all shell syntax, by
-class.</p>
-<h2 id="limits-the-fuel-story">Limits: the fuel story</h2>
-<p><code>EvalLimits</code> applies in full: <code>max_list_len</code> / <code>max_map_len</code> /
-<code>max_string_len</code> are enforced as values are built (an over-cap <code>..</code>
-concat is a clean <code>string length N exceeds limit M</code> error), and
-<code>recursion_limit</code> bounds what recursion can even be expressed (none, in
-one expression without lambdas). <strong>Loops cannot be expressed at all</strong>:
-the loop statements are denied everywhere the walk reaches, including
-inside if-expression branch bodies — the one place a <code>for</code>/<code>while</code> could
-otherwise hide — and neither can the constructs that <em>wait</em>: <code>sleep</code>,
-<code>readline</code> and the stdin readers are denied by name (sleep is <code>Pure</code>, so
-no installed policy stops it; the readers are <code>Env</code>, stoppable by a
-policy but not by <code>policy: None</code> — the static deny covers both),
-<code>select</code>/<code>address</code>/<code>send</code>/<code>emit</code>/<code>sh</code>/<code>export</code> are denied by construct,
-and a fresh expression evaluator has no Bus/Db/Jmap handler to pend on
-(those seam builtins raise "not available"). Evaluation cost is bounded
-by the size caps, never by iteration count or by <em>unbounded</em> waiting
-(<code>flock</code>'s argument-bounded wait remains reachable only when the host
-installs a permissive policy — its class is <code>FsWrite</code>, denied under
-<code>deny_all()</code>).</p>
-<p>The <strong>time limit</strong> is armed at this entry point itself and checked while
-entering expressions and after evaluation completes. A timer also cancels
-pending evaluation. An expression that finishes without yielding after its
-deadline is refused with a <code>time limit exceeded</code> error; a ready future does
-not bypass the budget. A single CPU-bound builtin cannot be interrupted
-mid-call, but its late result is rejected and further expressions stop. See
-<a href="/mix/capabilities">capabilities &amp; embedding</a> for the same caveat in full
-programs.</p>
-<p><code>eval_expr_string</code> is <strong>synchronous</strong>: it drives the evaluator's async
-path on a fresh current-thread runtime inside the call. Calling it from
-within an async execution context <strong>panics</strong> (tokio refuses to block a
-runtime thread) — hop to a blocking task first. A fresh runtime per
-call is fine at config/scene-load rates; a host re-evaluating bindings
-per frame should measure it.</p>
-<h2 id="the-honest-boundary">The honest boundary</h2>
-<p>The same wording as the <code>CapabilityPolicy</code> trait, because it is the
-same gate: an in-process gate is a <strong>robustness</strong> boundary for trusted
-embedded expressions, <strong>not a containment</strong> boundary for untrusted
-code — a compromise owns the address space the gate runs in. The
-single-expression rule and the deny walk are deterministic <em>fuel and
-footgun</em> bounds (no runaway construction, no blocking on time or input,
-no output to the host's streams, no env or shell reach — the deny table
-above is the whole story), not a sandbox. What remains within a
-conforming expression is pure computation over its inputs and the size
-caps. Untrusted or multi-tenant code runs out-of-process under OS
-isolation; see <a href="/mix/capabilities">capabilities &amp; embedding</a> for the
-trust-split model.</p>
-<h2 id="see-also">See also</h2>
-<ul>
-<li><a href="/mix/capabilities">capabilities &amp; embedding</a> — the classes, <code>CategoryAllowList</code>,
-the limits knobs, the trusted/untrusted split</li>
-<li><a href="/mix/bus">Bus messaging</a> — <code>send</code>/<code>emit</code> semantics and the <code>$rc</code> bands</li>
-<li><a href="/mix/shell-mode">shell dispatch</a> — <code>sh</code>, <code>$(…)</code>, pipes (all <code>Process</code>-gated)</li>
-<li>Source of truth: <code>eval_expr_string</code> / <code>MAX_EXPR_DEPTH</code> in
-<a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/evaluator.rs"><code>evaluator.rs</code></a>,
-<code>CategoryAllowList::deny_all</code> in
-<a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-lib-mix/src/builtins.rs"><code>builtins.rs</code></a></li>
-</ul></div></div>
+<p>The native Mix binary is resolved from the running interpreter. Behaviour
+children inherit the session and existing <code>COMP_SERVICE</code>, <code>APPS_SERVICE</code>,
+<code>TRAY_SERVICE</code>, <code>NOTIFY_SERVICE</code> and other overrides. They additionally receive
+<code>SCENE_NAME</code>, <code>SCENE_HOST</code>, <code>SCENES_SERVICE</code>, <code>SCENE_GENERATION</code>, and <code>SCENE_DIR</code>;
+their working directory is their scene directory. Each runs as <code>scene-&lt;name&gt;</code>.
+<code>SCENES_LIB</code> defaults to the shipped catalogue's <code>lib</code> directory, matching the
+shared behaviour helpers, and can be overridden explicitly. Generations are
+positive exact integers, allocated from an atomically persisted <code>.generation</code>
+counter before spawning. Disabling invalidates the active generation to zero.
+The document's citizen must match that routing name when it has a behaviour.
+Behaviours should use <code>serve_name()</code> for their actual identity.
+Without a <code>window</code> header, the loader follows Quoin's first <code>window</code> node
+for popup routing; an absent edge defaults to <code>right</code>.
+Managed popup page and edge values must be static; the loader refuses bindings
+on those routing fields. Host model patches also refuse a changed mount address
+without advancing the revision; unload and load to move a mount explicitly.</p>
+<h2 id="public-bus-contract">Public Bus contract</h2>
+<p>Verbs are mesh-open, with the same implementation for local and attested mesh
+requests. A refusal has nonzero RC and <code>{error_code,message,context?}</code>. Upstream
+RC, diagnostics and original payload remain under <code>context</code>; filesystem
+diagnostics also report file, attempted digest and last-good revision.</p>
+<table><thead><tr><th>Verb</th><th>Arguments and result</th></tr></thead><tbody>
+<tr><td><code>scenes.list</code></td><td><code>{}</code> → <code>{needs_setup,scenes,diagnostic}</code>; each scene reports installation, enablement, mounted state, revision, generation, behaviour status, ready/open/pending, origin, digests, diagnostics, last exit and journal location</td></tr>
+<tr><td><code>scenes.install</code></td><td><code>{template,name?,enable?}</code> → installation receipt; stage, validate through <code>shell.scene.validate</code>, atomically rename, record origin; default disabled; refuse collisions</td></tr>
+<tr><td><code>scenes.remove</code></td><td><code>{name}</code> → <code>{name,recovery}</code>; disable, stop, unload and move the installation to <code>.recovery/</code></td></tr>
+<tr><td><code>scenes.enable</code> / <code>scenes.disable</code></td><td><code>{name}</code> → acceptance/revision; persist desire and reconcile idempotently</td></tr>
+<tr><td><code>scenes.reload</code></td><td><code>{name}</code> → acceptance/revision; retry files and failed behaviour, retaining runtime model</td></tr>
+<tr><td><code>scenes.reset</code></td><td><code>{name}</code> → <code>{name,recovery}</code>; stage recorded shipped origin, validate, retain old copy, restore defaults; refuse unknown origin</td></tr>
+<tr><td><code>scenes.ready</code></td><td><code>{name,generation}</code> → <code>{name,generation,publish_model:true}</code>; the behaviour then publishes its initial complete model</td></tr>
+<tr><td><code>scenes.model</code></td><td><code>{name,generation,value}</code> → acceptance/revision; <code>value</code> is a complete map, submitted as <code>shell.scene.patch {scene,path:"model",value}</code></td></tr>
+<tr><td><code>scenes.open</code> / <code>scenes.close</code> / <code>scenes.toggle</code></td><td><code>{name}</code> → <code>{name,open,pending}</code>; desired popup state, with applied completion reported through <code>scenes.changed</code></td></tr>
+</tbody></table>
+<p>Stage A refuses the reserved pages <code>scene-panel</code>, <code>scene-launcher</code>,
+<code>scene-calendar</code>, <code>scene-notes</code> and <code>settings.appearance</code>. For example,
+install <code>{template:"launcher",name:"preview-launcher"}</code>. Installation
+rewrites the scene name, behaviour routing citizen and an explicitly authored
+panel name to the distinct installation name. This does not migrate existing
+legacy registrations.</p>
+<p><code>scenes.changed</code> publishes a change-only inventory with a loader revision.
+Subscribers should take <code>scenes.list</code> after subscribing and repeat that
+snapshot after reconnection/gaps. Invalid edits leave accepted content visible.
+Unchanged accepted files and repeated model/exit/applied-state events are
+suppressed. Temporary and backup files are ignored.</p>
+<h2 id="lifecycle-and-events">Lifecycle and events</h2>
+<p>The loader registers filesystem watches and Bus subscriptions before reading
+state and directories. It takes the broker registration snapshot after
+subscribing, then mounts enabled documents as the loading citizen and starts
+behaviours. Quoin directs authored click commands to the document's citizen,
+with <code>{scene,node,kind,value?,item?}</code> in <code>$event.args</code>. Behaviours never load
+or unload their scenes.</p>
+<p><code>fs_watch</code> / <code>on fs.changed</code> batches trigger one reconciliation per affected
+scene; <code>overflow:true</code> triggers one rescan. The stable parent is watched too.
+Layout changes use full <code>shell.scene.load</code>, carrying the last accepted runtime
+model in the candidate. Model updates use the patch endpoint. Behaviour edits
+pass <code>mix --check</code> and <code>mix lint --deny-warnings</code> before replacement. Generation
+invalidation precedes stop; replacement waits for the retiring child's exit.</p>
+<p>Managed spawn uses <code>{die_with_parent:true,exit_event:true,tag:&lt;JSON string&gt;}</code>.
+The string encodes <code>{name,generation}</code>; <code>on proc.exited</code> receives
+<code>{pid,tag,exit_code,signal}</code> in <code>$event.args</code>. A crash leaves the scene mounted.
+Four failure-triggered restart deadlines are 1, 2, 4 and 8 seconds; the fifth
+consecutive exit enters <code>crash_loop</code>. Running at least 60 seconds resets the
+count at the next exit, without a health timer. Explicit reload retries the
+failed scene. Disable during a deadline invalidates its generation.</p>
+<p>The process adapter uses W1's registry-backed <code>kill(pid,9)</code> to stop the owned
+child through its retained pidfd. Generation checks precede stop and exit
+handling is synchronous: the numeric PID is discarded as soon as its exit
+event is delivered. Replacement waits for that event; the native reaper owns
+descendant cleanup. SIGKILL is deliberate so a stuck behaviour needs no stop
+poll or escalation timer. Only the crash restart deadline runs in an async
+self-directed handler. The installed pre-W1 interpreter cannot run this
+watcher/child path; deterministic tests fake only that boundary. The integration
+gate must confirm W1's PID retention and exit-delivery guarantees before
+enabling the unit.</p>
+<p><code>on bus.connected</code> and <code>noded.props.changed</code> repair state with full service
+snapshots and <code>shell.scenes.list</code> mount inventory. This also removes mounts
+disabled or removed while the broker was unavailable but still present in Quoin.
+A returning shell is remounted from accepted source/model even when
+the current on-disk edit is broken. Behaviour service disappearance alone
+never unloads a scene. The owner is the verified loading citizen.</p>
+<p>Popup selection, temporary pinning, mutual exclusion and saved-mode recovery
+advance on applied <code>shell.panel.changed</code> receipts, never select/hide polling.
+Recovery is persisted before pinning. If another page takes the edge, recovery
+does not hide it. The legacy panel remains in use in Stage A but consumes the
+same applied-state stream; its network/audio conversion belongs to Stage C.</p>
+<h2 id="gates-and-installer-follow-up">Gates and installer follow-up</h2>
+<p>Run <code>mix src/desktop/scripts/tests/scenes-test.mix</code> for deterministic loader
+transitions with real temporary files. <code>scenes-mesh-test.mix</code> checks list and
+all mutation refusals over local and attested mesh routes, using the two target
+environment variables documented in that test. Rust regression tests cover
+aggregate model bounds, transactional refusals, retained bindings/ports,
+existing list models and bound row refresh, authored-source round trips,
+behaviour disconnect and applied panel notices.
+The build cluster runs the Rust gates and native W1/Quoin integration tests.</p>
+<p>The private session installer must install the loader, helpers and templates;
+render the example unit in the desktop session; supply the matching native Mix
+binary and Quoin; and leave the existing panel unit running during Stage A.
+Stage B must explicitly seed the chosen set, retain popup recovery and rollback
+material, stop the old citizen, and only then hand over the existing page IDs.
+Readiness checks must consume service/readiness/applied-state events. No private
+installer is changed by this public workstream.</p>
+<p>Limits and remaining operational assumptions: at most 128 installed scene
+records, 256 KiB per scene/behaviour file and runtime model, and 64 KiB state or
+metadata. Recovery copies are retained for the operator to manage. Trusted
+desktop-user edits are assumed: filesystem prechecks are not an <code>openat</code>
+security boundary against a simultaneous hostile symlink swap. Reset uses two
+renames with rollback on an ordinary error; power loss between those renames
+leaves the preserved copy under <code>.recovery</code>. Multiple processes directly
+editing state do not share the loader's advisory lock. A transport timeout can
+leave the upstream mutation applied before a later event repairs local state.
+The private <code>.generation</code> counter must not be removed or rolled back while
+old behaviour messages can still be delivered; ordinary install/reset never
+touches it.
+The advisory loader lock assumes the root directory itself remains in place;
+replacing the root can detach that lock inode even though native watches
+recover. Stop the loader before replacing its whole root. Runtime model writes
+for managed scenes must use <code>scenes.model</code>; direct <code>shell.scene.patch</code> model
+writes are not imported into the loader's retained model. The local/mesh gate
+assumes its two configured targets reach the same citizen over distinct routes.</p></div></div>
     </div>
 
 </main>

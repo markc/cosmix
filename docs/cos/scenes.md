@@ -4,6 +4,8 @@ Quoin accepts renderer-neutral scene documents through `shell.scene.load`.
 The request body is the complete AMP document with one `mix` fence. The
 `cosmix-scene` parser and registry validate it before any live state changes.
 Invalid loads and patches return diagnostics and retain the last good tree.
+For file discovery, enablement, supervised behaviours and popup coordination,
+see the [Stage A scenes loader](scenes-loader).
 
 Scenes mount as pages in an edge panel. Floating windows are outside v0.
 The envelope's `window` header is the mount request; when absent, the window
@@ -28,6 +30,35 @@ The complete serialised patch candidate must fit the same 256 KiB bound as
 loads. Rejected patches retain both the tree and its revision.
 `shell.scene.describe {family?}` reports the shared P1 registry.
 `shell.scene.unload {scene}` removes the page.
+
+`shell.scene.validate` accepts the same AMP body as load, returning
+`{scene,valid:true,diagnostics}` without mounting, reserving a page or changing
+revisions. `shell.scene.get {scene,format:"source"}` returns
+`{scene,revision,source}` with canonical authored AMP source: expressions,
+template definitions and omitted defaults are preserved. The core serializer
+escapes interpolation, leading tildes, backticks, controls and Unicode for the
+strict Mix parser. Scene refusals use nonzero RC and `{error_code,message}`
+with diagnostics/context when available.
+
+Patch paths also accept `model` (replace the complete model map; null clears it)
+and `model.<key>...` (map-key updates, null removes a key). The store retains
+compiled bindings and reevaluates against the last accepted resolved tree.
+The authored model, resolved tree and revision commit together only after
+aggregate document/model bounds pass. Evaluation warnings retain last-good
+ports; structural/bounds refusals retain the whole previous revision. Accepted
+model revisions refresh list instances, including templates whose row data
+did not change but whose model dependencies did.
+Model patches that change a scene's mount page or edge are refused with
+`SUBPANEL_COLLISION`; unload and load explicitly to move that mount.
+
+Subscribe to `<host>.panel.changed` for inner command `shell.panel.changed`:
+`{generation,revision,panels:{left,...}}`. Each panel has the same applied
+`visible`, `pinned`, `mode`, `page`, `pages`, `width_px` and `output` values as
+`shell.props.get`. Publication follows scene reconciliation and model
+application; unchanged snapshots produce no event. Take a property snapshot
+after subscribing and resynchronise after a connection/gap. Enqueue replies
+are not applied-state receipts, so page selection and temporary pin release
+must wait on these events rather than retry sleeps.
 
 ## V1 bindings
 
@@ -65,9 +96,12 @@ Load evaluation and each re-evaluation pass have a 250 ms total wall budget,
 with at most 50 ms per expression. Remaining bindings report `binding-eval`
 with `evaluation budget exhausted`; they take defaults at load or retain
 last-good values on a patch. As with lib-mix limits, a non-yielding builtin
-can overshoot until it returns. Template instantiation uses the same budget.
+can overshoot until it returns, but the late result is refused even for the
+final binding in a pass. Template instantiation uses the same budget.
 Null model patches remove keys without creating missing parent maps. Patch
-values are limited to 256 KiB of serialised JSON (`model-path` on excess).
+values and the aggregate runtime model are limited to 256 KiB of serialised
+JSON (`model-path` on excess). The host additionally enforces the aggregate
+authored-document bound, including metadata and ports.
 Empty model and binding fields are omitted from resolved-tree serialisation.
 
 | diagnostic | meaning |
