@@ -71,7 +71,8 @@ crate; Smithay's baseline and its ten tests do not apply to iced.
    The `fixes` check below requires both a nonempty list and a nonempty diff.
 2. Import the next tarball as a separate pristine commit. Update the table,
    desktop patch routing, consumer version pins and lockfiles, and the
-   verification script's version, checksum and baseline. Audit this section's
+   verification script's version and checksum. Keep the old baseline until
+   step 4. Audit this section's
    version-specific claims and patch shape. Compare the table's upstream SHA
    to the tarball's own `.cargo_vcs_info.json`, not an assumed tag.
 3. Check dependency routing with the command below. Its output MUST contain

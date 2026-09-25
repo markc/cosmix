@@ -47,9 +47,12 @@ cover first frame, older/unknown buffer ages, A → B → A, background changes,
 configuration resets and empty commits. These are headless lifecycle checks;
 they do not measure live compositor timing. Clean chrome redraws publish no
 `Paint` message; wakes, missing frames and explicit invalidation arm painting.
-The default is `wgpu`; selecting both renderer features also uses wgpu. It
-retains the core Vec-backed `Surface`, incremental damage uploads and
-persistent GPU texture.
+The default is `tiny-skia`. Mark's 2026-09-25 test-binary verdict was
+"typing in the test term feels much better"; the native-copy benchmark at
+2250×1250 measured echo around 1.7 ms and full redraw around 11.5 ms.
+For a clean GPU build use `--no-default-features --features wgpu`.
+Selecting both features also uses wgpu, which retains the core Vec-backed
+`Surface`, incremental damage uploads and persistent GPU texture.
 
 Regression tests in `cpu_grid.rs` cover allocation reuse and incremental
 painting, an outstanding handle forcing a copy with incremental bands and
@@ -66,15 +69,15 @@ invalidation in both arms; they do not directly
 exercise terminal resizing.
 
 Run both feature configurations from `src/desktop`; the default test run covers
-wgpu and shared behaviour, while the second compiles the CPU ownership, band,
-placement and shared frame tests. The ignored timing benchmark is separate.
+CPU ownership, bands, placement and shared frame tests, while the second covers
+wgpu and shared behaviour. The ignored timing benchmark is separate.
 There is no automated CI workflow enforcing these two runs yet.
 
 ```text
 cargo test -p cosmix-term
-cargo test -p cosmix-term --no-default-features --features tiny-skia
+cargo test -p cosmix-term --no-default-features --features wgpu
 cargo clippy -p cosmix-term --all-targets -- -D warnings
-cargo clippy -p cosmix-term --no-default-features --features tiny-skia --all-targets -- -D warnings
+cargo clippy -p cosmix-term --no-default-features --features wgpu --all-targets -- -D warnings
 ```
 
 ## Headless performance gate
@@ -141,12 +144,12 @@ costs and the redraw area for echo. It does not make a genuinely changed
 full-screen TUI cheap. The existing scale factors already largely cancelled;
 the concrete geometry defect found was fractional-origin truncation.
 
-**Recommendation: default to wgpu for the reported full-screen TUI workload.**
+**Historical 0.2.4 recommendation: default to wgpu for that full-screen TUI workload.**
 That 0.2.4 CPU implementation had not achieved foot-like latency. Full redraw was
 about 23 ms for one pane before presentation, above the 16.7 ms budget at
 60 Hz, and slightly slower than the whole-pane baseline in this comparison.
 The banded arm remains useful for lower CPU cost on sparse updates and zero
-GPU allocation. Version 0.2.5 keeps wgpu as the default while native copy,
-paint-once-per-redraw and clean-pane skipping reduce CPU work. A live typing
-retest remains necessary. No live foot/wgpu
+GPU allocation. Version 0.2.5 restores tiny-skia as the default after native copy,
+paint-once-per-redraw and clean-pane skipping, and Mark's improved live typing
+verdict. No matched live foot/wgpu
 latency comparison or compositor presentation measurement was made in this work.
