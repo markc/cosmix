@@ -1,0 +1,457 @@
+-- version: 0.1.0
+-- The bottom panel's behaviour: compositor, tray, notification and popup
+-- state in; one complete model out through the loader (scenes.model). The
+-- layout is static in scene.mix. Clicks arrive as {scene,node,kind,item?};
+-- repeated rows (workspaces, tasks, tray) carry their complete model row.
+$LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
+$r = require($LIB .. "/runtime.mix")
+$m = require($LIB .. "/models.mix")
+$p = require($LIB .. "/data.mix")
+$t = require($LIB .. "/taskbar.mix")
+$ctx = $r.context("panel")
+$COMP = env("COMP_SERVICE", "comp")
+$APPS = env("APPS_SERVICE", "apps")
+$TRAY = env("TRAY_SERVICE", "tray")
+$NOTIFY = env("NOTIFY_SERVICE", "notify")
+$NODED = env("NODED_SERVICE", "noded")
+-- Status icons come from the dark variant so they read on the dark panel.
+$ICON_THEME = env("PANEL_ICON_THEME", "breeze-dark")
+-- PipeWire lives in the login session's runtime dir, not the desktop's.
+$PW_RUNTIME = env("PIPEWIRE_RUNTIME_DIR", "/run/user/" .. to_string(uid()))
+-- The loader-owned popup scenes the panel's buttons toggle.
+$POPUPS = {launcher: env("PANEL_LAUNCHER_SCENE", "launcher"),
+  calendar: env("PANEL_CALENDAR_SCENE", "calendar"), notes: env("PANEL_NOTES_SCENE", "notes")}
+
+fn empty_icons()
+  return {themed: {}, plain: {}, windows: {}}
+end
+
+$state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes_count: 0,
+  net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
+  open: {launcher: false, calendar: false, notes: false}, peeked: [], peek_busy: false,
+  icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false,
+  model: nil}
+
+-- ── STAGE-C: legacy network/volume snapshots ─────────────────────────────
+-- The ONLY code that reads link or audio state, and the only thing the
+-- minute deadline does besides redrawing the clock. Stage C replaces this
+-- block with native rtnetlink / PipeWire event sources and deletes it.
+-- Network: any non-loopback interface whose operstate is "up" (sysfs, no
+-- D-Bus). Volume: PipeWire's default sink via wpctl; no default sink hides
+-- the applet rather than showing a false 0 %.
+fn stage_c_status()
+  $up = false
+  $wireless = false
+  try
+    for each $name in ls("/sys/class/net")
+      if $name != "lo" then
+        $dir = "/sys/class/net/" .. $name
+        $oper = ""
+        try
+          $oper = trim(read_file($dir .. "/operstate"))
+        catch $e
+        end
+        if $oper == "up" then
+          $up = true
+          if is_dir($dir .. "/wireless") then $wireless = true end
+        end
+      end
+    end
+  catch $e
+  end
+  $vol = {ok: false, level: 0, muted: false}
+  $w = run_argv(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
+  if $w.ok then
+    $found = re_find($w.stdout, "Volume:\\s*([0-9.]+)")
+    if length($found) > 0 then
+      $vol = {ok: true, level: round(to_number($found[0].groups[0]) * 100), muted: index_of($w.stdout, "MUTED") >= 0}
+    end
+  end
+  return {net: {up: $up, wireless: $wireless}, vol: $vol}
+end
+
+fn stage_c_toggle_mute()
+  $w = run_argv(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
+  if not $w.ok then return $r.failure("mute_failed", "wpctl set-mute failed: " .. trim($w.stderr ?? "")) end
+  return {ok: true, rc: 0, value: {}}
+end
+-- ── end STAGE-C ───────────────────────────────────────────────────────────
+
+fn apply_status()
+  $s = stage_c_status()
+  $state.net = $s.net
+  $state.vol = $s.vol
+end
+
+-- ── service state (events are hints; these reads are the truth) ─────────
+fn fetch_windows()
+  $out = $r.call($COMP, "comp.windows.list", {})
+  if not $out.ok or type($out.value) != "map" or type($out.value.windows) != "list" then return false end
+  $state.windows = $t.normal_windows($out.value.windows)
+  $ws = $r.call($COMP, "comp.props.get", {path: "workspaces"})
+  if $ws.ok and type($ws.value) == "map" then
+    $state.ws_count = $ws.value.count ?? 1
+    $state.ws_current = $ws.value.current ?? 1
+  end
+  return true
+end
+
+fn fetch_tray()
+  $out = $r.call($TRAY, "tray.list", {})
+  $ok = $out.ok and type($out.value) == "map" and type($out.value.items) == "list"
+  $state.tray = $ok ? $out.value.items : []
+end
+
+-- notify.list rows carry no body; the props tree holds every notification.
+fn fetch_notes()
+  $out = $r.call($NOTIFY, "notify.props.get", {})
+  $ok = $out.ok and type($out.value) == "map"
+  $state.notes_count = $ok ? length($m.notification_rows($out.value)) : 0
+end
+
+-- Desired popup state is the loader's; applied completion arrives through
+-- scenes.changed. The panel only tints the matching button.
+fn apply_scenes($inventory)
+  if type($inventory) != "map" or type($inventory.scenes) != "list" then return false end
+  $open = {launcher: false, calendar: false, notes: false}
+  for each $row in $inventory.scenes
+    for each $key, $scene in $POPUPS
+      if type($row) == "map" and $row.name == $scene and $row.open == true then $open[$key] = true end
+    end
+  end
+  $state.open = $open
+  return true
+end
+
+fn sync_popups()
+  $out = $r.call($ctx.loader, "scenes.list", {})
+  if $out.ok then apply_scenes($out.value) end
+end
+
+-- ── icons (the apps citizen resolves themes; cached per session) ─────────
+-- Misses are cached too, so a missing theme costs one request per name, not
+-- one per rebuild. apps.changed, an apps restart and a reconnect clear it.
+fn apps_icon($name, $size, $theme)
+  if $name == nil or $name == "" then return "" end
+  $req = {name: $name, size: $size}
+  if $theme != "" then $req.theme = $theme end
+  $hit = $r.call($APPS, "apps.icon", $req)
+  if $hit.ok and type($hit.value) == "map" and type($hit.value.path) == "string" then return $hit.value.path end
+  return ""
+end
+
+-- A compositor app_id to an icon: the desktop entry's Icon= when one matches
+-- (tried as-is, then lower-case), else the app_id as an icon name, else a
+-- generic window icon.
+fn window_icon($app_id)
+  $icon_name = ""
+  if $app_id != nil and $app_id != "" then
+    for each $candidate in [$app_id, lower($app_id)]
+      if $icon_name == "" then
+        $entry = $r.call($APPS, "apps.get", {id: $candidate})
+        if $entry.ok and type($entry.value) == "map" and type($entry.value.icon) == "string" then $icon_name = $entry.value.icon end
+      end
+    end
+    if $icon_name == "" then $icon_name = $app_id end
+  end
+  $path = apps_icon($icon_name, 48, "")
+  if $path == "" then $path = apps_icon("application-x-executable", 48, "") end
+  return $path
+end
+
+fn resolve_icons()
+  if length(keys($state.icons.windows)) + length(keys($state.icons.plain)) >= 512 then $state.icons = empty_icons() end
+  for each $name in $m.PANEL_THEMED_ICONS
+    if not has_key($state.icons.themed, $name) then
+      $size = starts_with($name, "start-here") ? 48 : 22
+      $state.icons.themed[$name] = apps_icon($name, $size, $ICON_THEME)
+    end
+  end
+  for each $w in $t.current_tasks($state.windows, $state.ws_current, $m.MAX_TASKS)
+    $key = to_string($w.app_id)
+    if not has_key($state.icons.windows, $key) then $state.icons.windows[$key] = window_icon($w.app_id) end
+  end
+  for each $item in $state.tray
+    $name = $item.icon_name ?? ""
+    if not has_key($state.icons.plain, $name) then $state.icons.plain[$name] = apps_icon($name, 24, "") end
+  end
+end
+
+fn snapshot()
+  return {windows: $state.windows, ws_count: $state.ws_count, ws_current: $state.ws_current,
+    tray: $state.tray, notes_count: $state.notes_count, net: $state.net, vol: $state.vol,
+    open: $state.open, peeked: length($state.peeked) > 0}
+end
+
+-- ── one queued rebuild (dirty-state batching, no debounce sleep) ────────
+fn rebuild()
+  if not $state.ready then return end
+  fetch_windows()
+  fetch_tray()
+  fetch_notes()
+  resolve_icons()
+  $model = $m.panel(snapshot(), $state.icons, time())
+  $out = $r.publish_model($ctx, $model)
+  if $out.ok then
+    $state.model = $model
+  else
+    eprint("panel model refused: " .. json_encode($out.value))
+  end
+end
+
+fn schedule()
+  $state.dirty = true
+  if $state.rebuilding or not $state.ready then return end
+  $state.rebuilding = true
+  try
+    task_start("panel.rebuild", "{}")
+  catch $message, $error
+    $state.rebuilding = false
+    raise($error.code, $message, $error.details)
+  end
+end
+
+-- Local task only (empty headers): drains every change queued while the
+-- previous pass was waiting on the Bus, then stops.
+on panel.rebuild async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    while $state.dirty and $state.ready
+      $state.dirty = false
+      try
+        rebuild()
+      catch $message
+        eprint("panel rebuild: " .. to_string($message))
+      end
+    end
+  finally
+    $state.rebuilding = false
+  end
+end
+
+fn resync()
+  $r.call($COMP, "comp.props.watch", {})
+  sync_popups()
+  apply_status()
+  schedule()
+end
+
+-- The broker's full registration list, or nil when the snapshot failed.
+fn registered()
+  $out = $r.call($NODED, "noded.props.get", {})
+  if not $out.ok or type($out.value) != "map" or type($out.value.services) != "map" then return nil end
+  return $out.value.services.registered
+end
+
+fn services_changed($live)
+  if type($live) != "list" then return end
+  $previous = $state.services
+  $state.services = $live
+  if contains($live, $APPS) and not contains($previous, $APPS) then $state.icons = empty_icons() end
+  if contains($live, $COMP) and not contains($previous, $COMP) then $r.call($COMP, "comp.props.watch", {}) end
+  if not $state.ready then
+    $ready = $r.ready($ctx)
+    $state.ready = $ready.ok
+    if $state.ready then resync() end
+  end
+  schedule()
+end
+
+-- ── the clock: one wall-clock deadline per displayed minute ──────────────
+fn start_clock()
+  if $state.clock_armed then return end
+  $state.clock_armed = true
+  try
+    task_start("clock.deadline", "{}")
+  catch $message, $error
+    $state.clock_armed = false
+    raise($error.code, $message, $error.details)
+  end
+end
+
+on clock.deadline async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    while true
+      sleep($p.seconds_to_next_minute(time()))
+      try
+        apply_status()
+        schedule()
+      catch $message
+        eprint("panel clock: " .. to_string($message))
+      end
+    end
+  finally
+    $state.clock_armed = false
+  end
+end
+
+-- ── scene handlers ──────────────────────────────────────────────────────
+fn toggle_popup($key)
+  $out = $r.call($ctx.loader, "scenes.toggle", {name: $POPUPS[$key]})
+  if $out.ok and type($out.value) == "map" then
+    -- The loader keeps one popup open at a time.
+    $open = {launcher: false, calendar: false, notes: false}
+    $open[$key] = $out.value.open == true
+    $state.open = $open
+    schedule()
+  end
+  return $out
+end
+
+on launcher async
+  $r.respond(toggle_popup("launcher"))
+end
+on calendar async
+  $r.respond(toggle_popup("calendar"))
+end
+on notes async
+  $r.respond(toggle_popup("notes"))
+end
+
+on ws async
+  $index = $t.workspace_index($r.event_args($event).item)
+  if $index == nil then $r.respond($r.failure("invalid_args", "item.index must be a workspace number")); return end
+  $out = $r.call($COMP, "comp.workspace.switch", {index: $index})
+  schedule()
+  $r.respond($out)
+end
+
+on task async
+  $item = $r.event_args($event).item
+  if not fetch_windows() then $r.respond($r.failure("comp_unavailable", "window list unavailable")); return end
+  $action = $t.task_action($state.windows, $item)
+  if not $action.ok then
+    schedule()
+    $r.respond($r.failure($action.error_code, $action.message))
+    return
+  end
+  $out = $r.call($COMP, $action.verb, $action.args)
+  schedule()
+  $r.respond($out)
+end
+
+on tray async
+  $key = $t.tray_key($r.event_args($event).item)
+  if $key == nil then $r.respond($r.failure("invalid_args", "item.key must name a tray item")); return end
+  $r.respond($r.call($TRAY, "tray.activate", {id: $key}))
+end
+
+on vol_mute async
+  $out = stage_c_toggle_mute()
+  apply_status()
+  schedule()
+  $r.respond($out)
+end
+
+fn peek_toggle()
+  if not fetch_windows() then return $r.failure("comp_unavailable", "window list unavailable") end
+  if length($state.peeked) > 0 then
+    for each $w in $t.peek_restores($state.windows, $state.peeked)
+      $r.call($COMP, "comp.window.restore", $w)
+    end
+    $state.peeked = []
+    return {ok: true, rc: 0, value: {peeked: false}}
+  end
+  $marks = []
+  for each $w in $t.peek_candidates($state.windows, $state.ws_current)
+    $out = $r.call($COMP, "comp.window.minimize", $w)
+    if $out.ok then push($marks, $w) end
+  end
+  $state.peeked = $marks
+  return {ok: true, rc: 0, value: {peeked: true, minimized: length($marks)}}
+end
+
+-- Two quick clicks must not interleave and clobber each other's restore
+-- marks, so a click while one is running is refused.
+on peek async
+  if $state.peek_busy then $r.respond($r.failure("busy", "peek already in progress")); return end
+  $state.peek_busy = true
+  $out = nil
+  try
+    $out = peek_toggle()
+  catch $message
+    $out = $r.failure("peek_failed", to_string($message))
+  end
+  $state.peek_busy = false
+  schedule()
+  $r.respond($out)
+end
+
+on panel.state desc "panel model {model}; the last model the loader accepted"
+  reply(0, json_encode({model: $state.model}))
+end
+
+on panel.refresh desc "queue one rebuild from fresh service state {}"
+  schedule()
+  reply(0, json_encode({queued: $state.ready}))
+end
+
+-- ── events ──────────────────────────────────────────────────────────────
+fn gap($event)
+  return $event.headers.gap == "true" or ($r.event_args($event).gap == true)
+end
+
+-- Compositor (windows, workspaces), tray and notification diffs all arrive
+-- with the inner verb props.changed; broker registrations too.
+on props.changed
+  $a = $r.event_args($event)
+  if $event.headers.topic == $NODED .. ".props.changed" then
+    if gap($event) then
+      services_changed(registered())
+    elif $a.path == "services.registered" then
+      services_changed($a.new)
+    end
+    return
+  end
+  if gap($event) then resync() else schedule() end
+end
+
+on tray.item.added
+  schedule()
+end
+on tray.item.removed
+  schedule()
+end
+on notification.created
+  schedule()
+end
+on notification.closed
+  schedule()
+end
+on apps.changed
+  $state.icons = empty_icons()
+  schedule()
+end
+
+on scenes.changed
+  if gap($event) or not apply_scenes($r.event_args($event)) then sync_popups() end
+  schedule()
+end
+
+on bus.connected
+  if len(keys($event.headers)) != 0 then return end
+  start_clock()
+  $state.ready = false
+  $state.icons = empty_icons()
+  $ready = $r.ready($ctx)
+  $state.ready = $ready.ok
+  if $state.ready then resync() end
+end
+
+-- ── init: subscribe before the first snapshot ───────────────────────────
+subscribe($COMP .. ".props.changed")
+subscribe($TRAY .. ".item.added")
+subscribe($TRAY .. ".item.removed")
+subscribe($TRAY .. ".props.changed")
+subscribe($NOTIFY .. ".changed")
+subscribe($NOTIFY .. ".props.changed")
+subscribe($APPS .. ".changed")
+subscribe($NODED .. ".props.changed")
+subscribe("scenes.changed")
+$state.services = registered() ?? []
+$ready = $r.ready($ctx)
+if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
+$state.ready = true
+resync()
+start_clock()

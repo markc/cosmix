@@ -1,0 +1,4 @@
+schema: 1
+name: "panel"
+title: "Panel"
+behaviour: "behaviour.mix"

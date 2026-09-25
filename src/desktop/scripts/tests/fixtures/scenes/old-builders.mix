@@ -9,10 +9,32 @@ $C = {
 }
 $MAX_LIST_ROWS = 500
 $MAX_NOTES = 50
+$MAX_TASKS = 50
+$ICON_THEME = "breeze-dark"
+-- Panel icon lookups resolve from the case's sanitised fixture maps, keyed
+-- exactly like the template model's icon maps: themed (dark status theme,
+-- by icon name), plain (default theme, by icon name), windows (by app_id).
+-- A required module's functions cannot update its globals, so capture hands
+-- the maps to these stubs through the process environment.
+fn fixture_icons()
+  return json_parse(env("SCENE_FIXTURE_ICONS", "{\"themed\":{},\"plain\":{},\"windows\":{}}"))
+end
 fn icon_path($name, $size)
-  return $name == "example-icon" ? "/usr/share/icons/example.svg" : ""
+  if $name == "example-icon" then return "/usr/share/icons/example.svg" end
+  return fixture_icons().plain[$name] ?? ""
+end
+fn icon_path_t($name, $size, $theme)
+  if $theme == "" then return icon_path($name, $size) end
+  return fixture_icons().themed[$name] ?? ""
+end
+fn window_icon($app_id)
+  return fixture_icons().windows[to_string($app_id)] ?? ""
 end
 fn capture($name, $input, $at, $paths)
+  if $name == "panel" then
+    export SCENE_FIXTURE_ICONS = json_encode($paths)
+    return panel_doc($input, $at)
+  end
   if $name == "launcher" then return launcher_doc($input) end
   if $name == "calendar" then return calendar_doc($input, $at) end
   return notes_doc($input)
@@ -150,4 +172,150 @@ fn notes_doc($state)
     push($nodes, ["n_body", {widget: "text", text: "{cells[2]}", size: 12, color: $C.dim, elide: true}])
   end
   return $p.document({scene: "1", name: "notes", citizen: $ME, window: {kind: "edge", edge: "right", title: "Notifications", w: 380, chrome: false}}, $nodes)
+end
+
+fn status_icon($name, $fallback)
+  $path = icon_path_t($name, 22, $ICON_THEME)
+  if $path == "" then $path = icon_path_t($fallback, 22, $ICON_THEME) end
+  if $path == "" then return {widget: "text", text: "•", size: 14, color: $C.dim} end
+  return {widget: "image", src: $path, w: 20, h: 20}
+end
+
+fn panel_doc($state, $fixed_time)
+  $now = $fixed_time
+  $nodes = []
+  $children = ["launcher_btn", "gap1", "pager", "gap2", "tasks", "fill"]
+  if length($state.tray) > 0 then push($children, "tray") end
+  push($children, "status")
+  push($children, "clock")
+  push($children, "peek")
+  push($nodes, ["root", {widget: "row", fill: true, align: "center", gap: 4, padding: 4, background: $C.panel, children: $children}])
+
+  -- launcher button: the start-here icon, tinted while the launcher is open
+  -- the dark-theme variant: the light one draws dark-on-dark here
+  $start = icon_path_t("start-here-kde", 48, $ICON_THEME)
+  if $start == "" then $start = icon_path_t("start-here", 48, $ICON_THEME) end
+  $lb = {widget: "row", height: 40, radius: 8, padding: 6, align: "center", hover: $C.hover, on_click: "launcher", children: ["launcher_icon"]}
+  if $state.launcher_open then $lb.background = $C.accent_bg end
+  push($nodes, ["launcher_btn", $lb])
+  if $start != "" then
+    push($nodes, ["launcher_icon", {widget: "image", src: $start, w: 28, h: 28}])
+  else
+    push($nodes, ["launcher_icon", {widget: "text", text: "Apps", size: 14, bold: true, color: $C.fg}])
+  end
+  push($nodes, ["gap1", {widget: "spacer", size: 6}])
+
+  -- pager: one button per workspace, current one filled
+  $ws_ids = []
+  for $i = 1 to $state.ws_count
+    push($ws_ids, "ws_" .. to_string($i))
+  end
+  push($nodes, ["pager", {widget: "row", gap: 3, align: "center", children: $ws_ids}])
+  for $i = 1 to $state.ws_count
+    $id = "ws_" .. to_string($i)
+    $current = $i == $state.ws_current
+    $b = {widget: "row", height: 30, radius: 6, padding: 8, align: "center", justify: "center", hover: $C.hover, on_click: "ws", children: [$id .. "_t"]}
+    $b.background = $current ? $C.accent : $C.task_bg
+    push($nodes, [$id, $b])
+    push($nodes, [$id .. "_t", {widget: "text", text: to_string($i), size: 12, bold: $current, color: $current ? "#0b1f2b" : $C.dim}])
+  end
+  push($nodes, ["gap2", {widget: "spacer", size: 8}])
+
+  -- task buttons for the current workspace (Plasma's default filter),
+  -- bounded like every other list the panel emits
+  $tasks = []
+  for each $w in $state.windows
+    if length($tasks) >= $MAX_TASKS then break end
+    if ($w.workspace ?? $state.ws_current) == $state.ws_current then push($tasks, $w) end
+  end
+  $task_ids = []
+  for each $w in $tasks
+    push($task_ids, "t_" .. to_string($w.id))
+  end
+  push($nodes, ["tasks", {widget: "row", gap: 4, align: "center", children: $task_ids}])
+  for each $w in $tasks
+    if true then
+      $id = "t_" .. to_string($w.id)
+      $b = {widget: "row", height: 40, radius: 6, padding: 8, gap: 8, align: "center", hover: $C.hover, on_click: "task", children: [$id .. "_i", $id .. "_l"]}
+      if $w.focused and not $w.minimized then
+        $b.background = $C.accent_bg
+      elif not $w.minimized then
+        $b.background = $C.task_bg
+      end
+      push($nodes, [$id, $b])
+      $icon = window_icon($w.app_id)
+      if $icon != "" then
+        push($nodes, [$id .. "_i", {widget: "image", src: $icon, w: 24, h: 24}])
+      else
+        push($nodes, [$id .. "_i", {widget: "spacer", size: 0}])
+      end
+      push($nodes, [$id .. "_l", {widget: "text", text: $p.short_title($w.title, 40), size: 13, elide: true, width: 170, color: $w.minimized ? $C.faint : $C.fg}])
+    end
+  end
+  push($nodes, ["fill", {widget: "spacer"}])
+
+  -- tray: one icon per StatusNotifierItem, click = activate. The node id
+  -- carries the adapter's store KEY ("i<n>", what tray.activate takes -- the
+  -- SNI Id is the app's own name and is NOT accepted), so a click resolves to
+  -- the exact item even if the tray changed after this render.
+  if length($state.tray) > 0 then
+    $tray_ids = []
+    for each $item in $state.tray
+      push($tray_ids, "tr_" .. lower(to_string($item.key)))
+    end
+    push($nodes, ["tray", {widget: "row", gap: 2, align: "center", children: $tray_ids}])
+    for each $item in $state.tray
+      $id = "tr_" .. lower(to_string($item.key))
+      push($nodes, [$id, {widget: "row", height: 36, radius: 6, padding: 6, align: "center", hover: $C.hover, on_click: "tray", children: [$id .. "_i"]}])
+      $path = icon_path($item.icon_name ?? "", 24)
+      if $path != "" then
+        push($nodes, [$id .. "_i", {widget: "image", src: $path, w: 20, h: 20}])
+      else
+        push($nodes, [$id .. "_i", {widget: "text", text: slice(to_string($item.title ?? "?"), 0, 1), size: 12, bold: true, color: $C.dim}])
+      end
+    end
+  end
+
+  -- status applets (Plasma's system-tray built-ins): notifications bell
+  -- with a count, volume (hidden without a default sink), network
+  $status_ids = ["st_notes"]
+  if $state.vol.ok then push($status_ids, "st_vol") end
+  push($status_ids, "st_net")
+  push($nodes, ["status", {widget: "row", gap: 2, align: "center", children: $status_ids}])
+  $n_count = length($state.notes)
+  $bell_children = ["st_notes_i"]
+  if $n_count > 0 then push($bell_children, "st_notes_n") end
+  $bell = {widget: "row", height: 36, radius: 6, padding: 7, gap: 4, align: "center", hover: $C.hover, on_click: "notes", children: $bell_children}
+  if $state.notes_open then $bell.background = $C.accent_bg end
+  push($nodes, ["st_notes", $bell])
+  $bell_icon = $n_count > 0 ? "notification-active" : "notification-inactive"
+  push($nodes, ["st_notes_i", status_icon($bell_icon, "notifications")])
+  if $n_count > 0 then push($nodes, ["st_notes_n", {widget: "text", text: to_string($n_count), size: 11, bold: true, color: $C.accent}]) end
+  if $state.vol.ok then
+    $vol_icon = "audio-volume-muted"
+    if not $state.vol.muted then
+      $vol_icon = $state.vol.level >= 67 ? "audio-volume-high" : ($state.vol.level >= 34 ? "audio-volume-medium" : ($state.vol.level > 0 ? "audio-volume-low" : "audio-volume-muted"))
+    end
+    push($nodes, ["st_vol", {widget: "row", height: 36, radius: 6, padding: 7, align: "center", hover: $C.hover, on_click: "vol_mute", children: ["st_vol_i"]}])
+    push($nodes, ["st_vol_i", status_icon($vol_icon, "audio-card")])
+  end
+  $net_icon = $state.net.up ? ($state.net.wireless ? "network-wireless-signal-excellent" : "network-wired-activated") : "network-offline"
+  push($nodes, ["st_net", {widget: "row", height: 36, radius: 6, padding: 7, align: "center", hover: $C.hover, children: ["st_net_i"]}])
+  push($nodes, ["st_net_i", status_icon($net_icon, "network-wired")])
+
+  -- clock: big time, the date beneath it; click opens the calendar
+  $clock = {widget: "row", height: 44, radius: 8, padding: 10, align: "center", hover: $C.hover, on_click: "calendar", children: ["clock_col"]}
+  if $state.calendar_open then $clock.background = $C.accent_bg end
+  push($nodes, ["clock", $clock])
+  push($nodes, ["clock_col", {widget: "column", gap: 0, align: "center", children: ["clock_time", "clock_date"]}])
+  push($nodes, ["clock_time", {widget: "text", text: $p.clock_text($now), size: 19, bold: true, color: $C.fg}])
+  push($nodes, ["clock_date", {widget: "text", text: $p.date_text($now), size: 11, color: $C.dim}])
+
+  -- peek at desktop: minimise everything on this workspace; again restores
+  $peek = {widget: "row", height: 44, radius: 6, padding: 6, align: "center", hover: $C.hover, on_click: "peek", children: ["peek_i"]}
+  if length($state.peeked) > 0 then $peek.background = $C.accent_bg end
+  push($nodes, ["peek", $peek])
+  push($nodes, ["peek_i", status_icon("user-desktop", "desktop")])
+
+  return $p.document({scene: "1", name: "panel", citizen: $ME, window: {kind: "edge", edge: "bottom", title: "Panel", h: 52, chrome: false}}, $nodes)
 end

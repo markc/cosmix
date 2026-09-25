@@ -1,7 +1,7 @@
 # Example only. The private session installer substitutes these placeholders.
 # Run as the desktop user, in the same Bus and display session as Quoin.
 [Unit]
-Description=CosMix scenes loader (Stage A)
+Description=CosMix scenes loader
 After=cosmix-noded.service
 
 [Service]
@@ -11,6 +11,9 @@ Group=@DESKTOP_GROUP@
 EnvironmentFile=@DESKTOP_ENV_FILE@
 Environment=COSMIX=@COSMIX_ROOT@
 Environment=SCENES_TEMPLATES=@COSMIX_ROOT@/share/scenes
+# While this Bus name is registered the loader leaves the legacy panel pages
+# unmounted; stopping that unit is the handover. Default shown.
+Environment=SCENES_LEGACY_SERVICE=quoin-panel
 ExecStart=@COSMIX_BIN@/mix --serve @COSMIX_BIN@/scenes.mix --name scenes
 Restart=on-failure
 RestartSec=2

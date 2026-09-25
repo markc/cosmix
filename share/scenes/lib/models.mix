@@ -1,10 +1,20 @@
 -- Model construction only. Layout lives in the strict-data scene files.
 $p = require("data.mix")
+$t = require("taskbar.mix")
 $C = {
   fg: "#fcfcfc", dim: "#a1a9b1", faint: "#6e7680", hover: "#ffffff1a",
-  accent: "#3daee9", task_bg: "#ffffff0f", card: "#2a2e32",
+  accent: "#3daee9", accent_bg: "#3daee940", task_bg: "#ffffff0f", card: "#2a2e32",
   today_fg: "#ffffff", weekend: "#c9cfd6"
 }
+$MAX_TASKS = 50
+
+-- Every themed (dark variant) icon name the panel can show. The behaviour
+-- resolves these once through the apps citizen and caches hits.
+$PANEL_THEMED_ICONS = ["start-here-kde", "start-here", "notification-active",
+  "notification-inactive", "notifications", "audio-volume-muted", "audio-volume-high",
+  "audio-volume-medium", "audio-volume-low", "audio-card",
+  "network-wireless-signal-excellent", "network-wired-activated", "network-offline",
+  "network-wired", "user-desktop", "desktop"]
 
 fn launcher($apps, $query, $category, $icons)
   $rows = []
@@ -62,4 +72,84 @@ fn notification_rows($props)
     end
   end
   return sort_by($out, function ($n) = $n.created_at)
+end
+
+-- A path from a name -> path map, trying one fallback name; "" when neither
+-- resolved (the template then shows its text stand-in).
+fn icon_choice($paths, $name, $fallback)
+  $path = $paths[$name] ?? ""
+  if $path == "" and $fallback != nil then $path = $paths[$fallback] ?? "" end
+  return {icon: $path, has_icon: $path != ""}
+end
+
+-- The bottom panel's complete runtime model, as the legacy builder drew it.
+-- $snap: {windows (normal band, id order), ws_count, ws_current, tray,
+--         notes_count, net:{up,wireless}, vol:{ok,level,muted},
+--         open:{launcher,calendar,notes}, peeked (bool)}
+-- $icons: {themed:{name:path} (dark status theme), plain:{name:path}
+--          (tray icons), windows:{app_id:path}} -- cache hits only.
+fn panel($snap, $icons, $now)
+  $themed = $icons.themed ?? {}
+  $plain = $icons.plain ?? {}
+  $window_icons = $icons.windows ?? {}
+  $open = $snap.open ?? {}
+  $ws_current = $snap.ws_current ?? 1
+
+  $launcher = icon_choice($themed, "start-here-kde", "start-here")
+  $launcher.background = ($open.launcher ?? false) ? $C.accent_bg : nil
+
+  $workspaces = []
+  for $i = 1 to $snap.ws_count ?? 1
+    $current = $i == $ws_current
+    push($workspaces, {id: "ws_" .. to_string($i), cells: [], index: $i, label: to_string($i),
+      current: $current, background: $current ? $C.accent : $C.task_bg, color: $current ? "#0b1f2b" : $C.dim})
+  end
+
+  $tasks = []
+  for each $w in $t.current_tasks($snap.windows ?? [], $ws_current, $MAX_TASKS)
+    $background = nil
+    if $w.focused and not $w.minimized then
+      $background = $C.accent_bg
+    elif not $w.minimized then
+      $background = $C.task_bg
+    end
+    $icon = $window_icons[to_string($w.app_id)] ?? ""
+    push($tasks, {id: "t_" .. to_string($w.id), cells: [], window: $w.id, generation: $w.generation,
+      title: $p.short_title($w.title, 40), icon: $icon, has_icon: $icon != "",
+      background: $background, color: $w.minimized ? $C.faint : $C.fg})
+  end
+
+  -- Row ids carry the adapter's store key, so a click resolves to the exact
+  -- item even if the tray changed after this model was published.
+  $tray = []
+  for each $item in $snap.tray ?? []
+    $icon = $plain[$item.icon_name ?? ""] ?? ""
+    push($tray, {id: "tr_" .. lower(to_string($item.key)), cells: [], key: to_string($item.key),
+      icon: $icon, has_icon: $icon != "", initial: slice(to_string($item.title ?? "?"), 0, 1)})
+  end
+
+  $count = $snap.notes_count ?? 0
+  $notes = icon_choice($themed, $count > 0 ? "notification-active" : "notification-inactive", "notifications")
+  $notes.count = $count > 0 ? to_string($count) : ""
+  $notes.has_count = $count > 0
+  $notes.background = ($open.notes ?? false) ? $C.accent_bg : nil
+
+  $vol = $snap.vol ?? {ok: false, level: 0, muted: false}
+  $vol_icon = "audio-volume-muted"
+  if not $vol.muted then
+    $vol_icon = $vol.level >= 67 ? "audio-volume-high" : ($vol.level >= 34 ? "audio-volume-medium" : ($vol.level > 0 ? "audio-volume-low" : "audio-volume-muted"))
+  end
+  $volume = icon_choice($themed, $vol_icon, "audio-card")
+  $volume.shown = $vol.ok
+
+  $net = $snap.net ?? {up: false, wireless: false}
+  $network = icon_choice($themed, $net.up ? ($net.wireless ? "network-wireless-signal-excellent" : "network-wired-activated") : "network-offline", "network-wired")
+
+  $peek = icon_choice($themed, "user-desktop", "desktop")
+  $peek.background = ($snap.peeked ?? false) ? $C.accent_bg : nil
+
+  return {launcher: $launcher, workspaces: $workspaces, tasks: $tasks, tray: $tray,
+    tray_empty: length($tray) == 0, notes: $notes, volume: $volume, network: $network,
+    clock: {time: $p.clock_text($now), date: $p.date_text($now), background: ($open.calendar ?? false) ? $C.accent_bg : nil},
+    peek: $peek}
 end

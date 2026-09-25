@@ -1,8 +1,15 @@
 # quoin-panel
 
-Stage A keeps this citizen and its existing page IDs running alongside the
-[scenes loader](scenes-loader.md). New templates use distinct names until
-Stage B. Page selection and popup release advance from command replies and
+**Stage B retires this citizen.** The [scenes loader](scenes-loader.md) and
+the shipped `share/scenes/{panel,launcher,calendar,notes}` templates cover
+every duty below on the same page IDs (`scene-panel`, `scene-launcher`,
+`scene-calendar`, `scene-notes`); see
+[Stage B: the panel template](#stage-b-the-panel-template) and
+[Retirement](#retirement). The rest of this page describes the legacy citizen,
+which stays in the tree as rollback material until live parity passes.
+
+Stage A kept this citizen and its existing page IDs running alongside the
+loader. Page selection and popup release advance from command replies and
 applied state reads. `<host>.panel.changed` notifications are invalidation
 hints; dropping one cannot strand an operation. Open replies acknowledge desired state;
 `shown` reflects the last applied host snapshot. Saved popup pins are cleared
@@ -34,11 +41,12 @@ The shipped `share/scenes/{launcher,calendar,notes}/` directories each contain
 (strict metadata), and an executable `behaviour.mix`. Layout is static; all
 changing content comes from `$model`. Calendar authors its six-by-seven grid
 directly. Page IDs remain `scene-launcher`, `scene-calendar`, `scene-notes`.
-The existing `quoin-panel.mix` continues serving the host during Stage A.
-Test these templates in a nested host or under non-colliding scene names.
+During Stage A the legacy `quoin-panel.mix` kept serving the host, so these
+templates were tested nested or under non-colliding scene names; Stage B
+installs them under their own names once the legacy citizen stops.
 
-`mix share/scenes/install.mix [destination]` installs the shipped catalogue and
-its shared `lib/` once. The default is `$XDG_DATA_HOME/cosmix/scenes` (falling
+`mix share/scenes/install.mix [destination]` installs the shipped catalogue
+(panel, launcher, calendar, notes) and its shared `lib/` once. The default is `$XDG_DATA_HOME/cosmix/scenes` (falling
 back to `$HOME/.local/share/cosmix/scenes`). It does not install user scenes or
 enable them. Behaviours resolve helpers through `SCENES_LIB`, or the same XDG
 data path, so installed scenes do not depend on a checkout. `lib/data.mix`
@@ -97,6 +105,111 @@ Run the deterministic gate with a process environment of `TZ=UTC`:
 public captures. Rust binding, renderer, Taffy and click bridge tests run on
 the build cluster. Live screenshots and W1/W2 integrated lifecycle/race tests
 remain required before migrating the host.
+
+## Stage B: the panel template
+
+`share/scenes/panel/` is the bottom panel as a file-backed scene. The page ID
+stays `scene-panel`; the mount is today's slim chromeless bottom edge
+(`window: {kind:"edge", edge:"bottom", h:52, chrome:false}`). The authored
+`h` seeds an untouched edge only: Quoin's saved thickness wins, and the
+loader never pins, docks or selects the page, so a bottom edge kept hidden
+stays hidden. Quoin's carousel activates the registered page on its own
+(the page is the edge's only declared slot).
+
+`scene.mix` is static: launcher button, workspace pager, task buttons, tray,
+status applets (notifications, volume, network), clock and peek. The pager,
+tasks and tray are `list` nodes with `flow: "horizontal"`; their rows carry
+stable IDs (`ws_<n>`, `t_<window id>`, `tr_<tray key>`), so a surviving item
+keeps its entities when others come and go. Icon/text alternatives (launcher
+"Apps", task spacer, tray initial, the `•` status stand-in) are sibling nodes
+switched with `hidden`, which removes their gap allocation exactly as the old
+builder omitted them. Every colour, label and path that changes lives in the
+model:
+
+| model key | contents |
+|---|---|
+| `launcher` | `{icon, has_icon, background}`; background tints while the launcher popup is open |
+| `workspaces` | rows `{id, cells, index, label, current, background, color}` |
+| `tasks` | current-workspace normal-band windows in id order, at most 50: rows `{id, cells, window, generation, title, icon, has_icon, background, color}` |
+| `tray`, `tray_empty` | rows `{id, cells, key, icon, has_icon, initial}`; the list is hidden when empty |
+| `notes` | bell `{icon, has_icon, count, has_count, background}` |
+| `volume`, `network` | `{icon, has_icon}`; volume also `shown` (no default sink hides it) |
+| `clock` | `{time, date, background}` |
+| `peek` | `{icon, has_icon, background}` |
+
+The model builder is `lib/models.mix` `panel(snap, icons, now)`; pure
+taskbar decisions (window filter, click validation, peek plans) are in
+`lib/taskbar.mix`. Both are shipped with the catalogue.
+
+`behaviour.mix` (`scene-panel`) subscribes before its first snapshot to the
+compositor's, tray's, notification adapter's and apps citizen's topics,
+`noded.props.changed` and the loader's `scenes.changed`. Every event only
+marks the model dirty; one local `task_start` rebuild drains all changes
+queued while it waited on the Bus (no debounce sleep, no Bus self-emit), then
+publishes the complete model through `scenes.model`. A broker gap, reconnect
+or a returning compositor re-seeds `comp.props.watch`, the popup snapshot
+(`scenes.list`) and the status snapshot. Icon lookups (apps citizen, dark
+theme for status icons) are cached per session including misses;
+`apps.changed`, an apps restart or a reconnect clears the cache.
+
+Clicks: `launcher`, `calendar` and `notes` call `scenes.toggle` on the loader
+(which owns selection, mutual exclusion and pin recovery); the reply's
+`open` and later `scenes.changed` inventories tint the buttons. `ws`, `task`
+and `tray` read the complete published row from `$event.args.item`
+(`index`, `window`+`generation`, `key`), never a generated node ID. A task
+click re-reads `comp.windows.list` and refuses `stale_window` when that window
+closed or its generation changed; the compositor re-checks the generation it
+receives too. Peek minimises the current workspace's visible windows and
+restores exactly the id+generation pairs it minimised. Replies carry the
+upstream outcome or a `{error_code,message}` refusal. `panel.state` returns
+the last accepted model; `panel.refresh` queues one rebuild.
+
+The clock is one `task_start` wall-clock deadline per displayed minute.
+**STAGE-C seam:** network (sysfs operstate) and volume (`wpctl`) are read by
+the single `stage_c_status()` function, called from that minute deadline (as
+the legacy clock did), on (re)connect and after a mute toggle;
+`stage_c_toggle_mute()` is the only `wpctl set-mute`. Stage C replaces that
+labelled block with native rtnetlink / PipeWire events and deletes it. No
+other code polls.
+
+`scene-template-test.mix` captures the exact legacy `panel_doc` output for
+empty, busy (focused/minimised/no-workspace/overlay windows, three
+workspaces, open launcher, peeked), tray-change (removed and added items,
+partial icon themes, muted wireless, open calendar) and 50-task-cap cases with
+sanitised icons and a fixed clock (`panel-*.scene.mix`, `panel-*.model.json`,
+`panel-cases.json`). It evaluates the template's bindings with the real Mix
+interpreter against each model and requires the visible tree (family, ports,
+children, horizontal instances with their list's click handler) to equal the
+legacy document's. It also pins row IDs across a tray change, icon fallback
+order and real click payloads (`{scene,node,kind,item}` with the published
+row). Panel cases are kept out of `cases.json`, whose Rust gate compares node
+IDs one to one.
+
+## Retirement
+
+With the four templates enabled under the loader, nothing in the legacy
+citizen remains unowned:
+
+| legacy duty | replacement |
+|---|---|
+| `panel` scene, taskbar/pager/tray/status/clock/peek | `panel` template (`scene-panel`) |
+| `launcher`, `calendar`, `notes` scenes and their click handlers | the Stage A templates |
+| popup exclusivity, selection, pin records (`quoin-panel-pins.json`) | loader `scenes.open/close/toggle` and `state.conf.mix` `recovery` |
+| `launcher.*`, `calendar.*`, `notes.*` agent verbs on `quoin-panel` | the same verbs on `scene-launcher`, `scene-calendar`, `scene-notes` |
+| `popups.state` | loader `scenes.list` (`open`, `pending` per scene) |
+| `panel.refresh` | `panel.refresh` on `scene-panel`; `scenes.reload {name}` on the loader |
+
+Agents that sent those verbs to `quoin-panel` must address the behaviour
+names instead. In this repository only `tests/panel-bus-test.mix` (the legacy
+citizen's own gate) and `tests/scene-template-test.mix` (which reads the
+legacy builders for its drift check) still name `quoin-panel.mix`.
+`quoin-shot.mix` and `tests/panel-test.mix` use `lib/panel.mix`, not this
+citizen, and are unaffected. The loader refuses to mount the four pages
+while a service named `quoin-panel` (`SCENES_LEGACY_SERVICE`) is registered,
+so the two can never fight over a page; stopping the legacy unit is the
+handover event. The private session installer seeds the chosen set, carries
+any outstanding legacy popup pins into the loader's recovery records, stops
+the legacy unit and keeps it for rollback.
 
 ## Data sources
 
