@@ -106,7 +106,7 @@ type LineSpans = Vec<(Range<usize>, HlClass)>;
 
 const EMPTY: &[(Range<usize>, HlClass)] = &[];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Engine {
     Plain,
     Lsh(&'static Language),
