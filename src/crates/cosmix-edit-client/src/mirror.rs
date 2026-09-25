@@ -1280,6 +1280,7 @@ impl Mirror {
 
     /// §3.4 steps 3–6 for an edit already past the duplicate and gap checks.
     fn fold_edit(&mut self, ev: &Ev<'_>, step: &mut Step) {
+        debug_assert_eq!(ev.base_rev, self.rev, "folded past the gap check");
         if let Some(id) = ev.op_id {
             if let Some(Inflight::Local { p, present, state, .. }) = &self.inflight
                 && p.op_id == id
