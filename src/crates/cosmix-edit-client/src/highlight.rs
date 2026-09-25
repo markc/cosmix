@@ -53,7 +53,7 @@ pub enum HlClass {
 pub struct ResultTag {
     pub epoch: String,
     pub buffer: String,
-    pub gen: u64,
+    pub view_gen: u64,
     pub language: String,
     /// Hash of the settings the result depends on.
     pub cfg: u64,

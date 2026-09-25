@@ -141,7 +141,7 @@ pub struct ViewDelta {
     /// The mirror's server rev after this delta.
     pub rev: u64,
     /// The mirror's view generation after this delta (+1 per delta).
-    pub gen: u64,
+    pub view_gen: u64,
 }
 
 /// A request for the transport to send (JSON body; the transport adds the

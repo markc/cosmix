@@ -108,7 +108,8 @@ pub struct BaseIdentity {
 pub struct RecoveryMeta {
     pub format: String,
     pub rid: String,
-    pub gen: u64,
+    #[serde(rename = "gen")]
+    pub generation: u64,
     pub path: Option<String>,
     pub opened_as: Option<String>,
     pub language: String,
@@ -124,7 +125,8 @@ pub struct RecoveryMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapHeader {
     pub format: String,
-    pub gen: u64,
+    #[serde(rename = "gen")]
+    pub generation: u64,
     /// The snap covers every rev `<= rev`.
     pub rev: u64,
     pub bytes: u64,
@@ -142,10 +144,10 @@ pub struct LogRecord {
 }
 
 /// First 16 lowercase hex of `blake3(gen ‖ "\n" ‖ rev ‖ "\n" ‖ compact JSON of edits)`.
-pub fn record_hash(gen: u64, rev: u64, edits: &[Edit]) -> String {
+pub fn record_hash(generation: u64, rev: u64, edits: &[Edit]) -> String {
     let body = serde_json::to_string(edits).unwrap_or_default();
     let mut h = blake3::Hasher::new();
-    h.update(format!("{gen}\n{rev}\n").as_bytes());
+    h.update(format!("{generation}\n{rev}\n").as_bytes());
     h.update(body.as_bytes());
     h.finalize().to_hex()[..16].to_string()
 }
@@ -153,9 +155,9 @@ pub fn record_hash(gen: u64, rev: u64, edits: &[Edit]) -> String {
 /// Actor → writer, one FIFO for the whole daemon (per-rid order = send order).
 pub enum RecoveryMsg {
     /// Start generation `gen` whose snap covers every rev `<= rev`.
-    Switch { rid: String, gen: u64, rev: u64, text: Arc<str>, meta: RecoveryMeta },
+    Switch { rid: String, generation: u64, rev: u64, text: Arc<str>, meta: RecoveryMeta },
     /// One applied text entry (rev > the current gen's snap rev).
-    Append { rid: String, gen: u64, rev: u64, edits: Vec<Edit> },
+    Append { rid: String, generation: u64, rev: u64, edits: Vec<Edit> },
     /// Delete every file of `rid` (clean through a durable save / clean reload
     /// / explicit discard).
     Discard { rid: String },
@@ -174,7 +176,7 @@ pub struct FlushOutcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecState {
     /// Generation that new Appends go to.
-    pub gen: u64,
+    pub generation: u64,
     /// A Switch sent but not yet acknowledged durable.
     pub outstanding_switch: Option<u64>,
     /// A record was dropped / a write failed / the log needs compaction.
@@ -197,8 +199,8 @@ impl RecSignal {
     }
 
     /// Acknowledge that generation `gen`'s switch is durable (step 5).
-    pub fn switch_done(&self, gen: u64) {
-        self.switch_done.fetch_max(gen, Ordering::AcqRel);
+    pub fn switch_done(&self, generation: u64) {
+        self.switch_done.fetch_max(generation, Ordering::AcqRel);
         self.notify.notify_one();
     }
 

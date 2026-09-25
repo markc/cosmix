@@ -23,8 +23,11 @@
 //!    codex N1); on clones, for each remote step `x` in order and each op `P`:
 //!    `P.items` through `x` with `ThroughFirst` (exactly the server's
 //!    `BaseRev` rebase; items keep request order and their own `deleted`), and
-//!    `x` through `P.seq()` (derived via `ot::txn_sequence`, as it stood before
-//!    this step) with `SelfFirst`. `Ok` → apply, commit the clones, `rev =
+//!    `x` through the op's items AS A SET (`ot::transform_through_set`, the
+//!    items as they stood before this step) with `SelfFirst` — NOT through
+//!    `P.seq()`: the sequential form mis-orders a remote insert at the end of a
+//!    deleted range against an insert at its start (Stage S freeze note 3,
+//!    fixture 20). `Ok` → apply, commit the clones, `rev =
 //!    ev.rev`. `Err(j)` → `revert_suffix(j)` on the UNTOUCHED real state and
 //!    loop (the list shrinks; with no ops the fold cannot fail). One
 //!    [`Conflict`] per event, accumulated across passes.
@@ -239,7 +242,7 @@ pub struct Mirror {
     epoch: String,
     text: Text,
     rev: u64,
-    gen: u64,
+    view_gen: u64,
     inflight: Option<Inflight>,
     queue: VecDeque<Pending>,
     server_ops: VecDeque<(ServerOp, Intent)>,
@@ -271,8 +274,8 @@ impl Mirror {
         self.rev
     }
     /// View generation: +1 on every [`ViewDelta`] (async result identity, §4.3).
-    pub fn gen(&self) -> u64 {
-        self.gen
+    pub fn view_gen(&self) -> u64 {
+        self.view_gen
     }
     pub fn phase(&self) -> &Phase {
         &self.phase
