@@ -1249,7 +1249,8 @@ impl Mirror {
         let dropped: Vec<String> = self
             .inflight
             .iter()
-            .filter_map(|i| matches!(i, Inflight::Server { .. }).then(|| i.wire().op_id.clone()))
+            .filter(|i| matches!(i, Inflight::Server { .. }))
+            .map(|i| i.wire().op_id.clone())
             .chain(self.server_ops.iter().map(|(_, q)| q.op_id.clone()))
             .collect();
         for id in dropped {
