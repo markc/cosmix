@@ -745,12 +745,10 @@ impl Controller {
                 let Ok(ev) = serde_json::from_str::<wire::Event>(body) else { return };
                 self.on_edit_event(ev, fx);
             }
-            "noded.props.changed" => {
-                // `edit` (re)appearing in services.registered may be a
-                // restart: ask it its epoch (plan §3.6).
-                if body.contains("services.registered") && body.contains("\"edit\"") {
-                    self.send_info(fx);
-                }
+            // `edit` (re)appearing in services.registered may be a restart:
+            // ask it its epoch (plan §3.6).
+            "noded.props.changed" if body.contains("services.registered") && body.contains("\"edit\"") => {
+                self.send_info(fx);
             }
             _ => {}
         }
