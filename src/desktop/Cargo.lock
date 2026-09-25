@@ -3405,6 +3405,7 @@ dependencies = [
  "cosmix-scene",
  "cosmix-shell",
  "ctk",
+ "fontique",
  "image",
  "resvg",
  "serde_json",
@@ -3418,7 +3419,6 @@ version = "0.15.2"
 dependencies = [
  "accesskit",
  "bevy",
- "chrono",
  "ctk",
 ]
 

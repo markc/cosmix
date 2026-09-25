@@ -21,3 +21,5 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tempfile = "3"
+fontique = "0.9"
+ctk = { path = "../../ctk", default-features = false, features = ["test-support"] }

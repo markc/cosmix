@@ -697,7 +697,7 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap();
-        let registry = crate::page_registry();
+        let registry = crate::tests::fixture_registry();
         for edge in Edge::ALL {
             model.set_carousel(edge, registry.carousel(edge));
         }
@@ -1152,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn trial_preserves_pending_selection_when_another_edge_saves() {
+    fn empty_edges_preserve_pending_selection_when_another_edge_saves() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quoin.state.mix");
         atomic_save(&path, &scene_selection_state("DP-1")).unwrap();

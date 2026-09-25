@@ -130,15 +130,7 @@ impl Plugin for EmbeddedQuoinPlugin {
         crate::hotspot::arm_first_run(app, store.first_run());
         bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
         bus.inbound_prefixes.push("shell.".into());
-        bus.subscriptions.extend(
-            [
-                "power.props.changed",
-                "wallpaper.props.changed",
-                "bg-showcase.props.changed",
-                "noded.props.changed",
-            ]
-            .map(str::to_owned),
-        );
+        bus.subscriptions.push("noded.props.changed".into());
         crate::configure_content(app, bus, registry, store, false, false, config);
         // Output preparation runs BEFORE the Bus dispatch drains: a
         // dispatch reserves its registry seat and queues its command
@@ -435,7 +427,7 @@ mod tests {
     #[test]
     fn output_change_repopulates_carousel_from_migrated_seats() {
         use cosmix_shell::runtime::{SubPanelRegistryState, register_shell_page};
-        let registry = crate::page_registry();
+        let registry = crate::tests::fixture_registry();
         let size = Vec2::new(1920.0, 1080.0);
         let mut app = App::new();
         app.add_plugins((
@@ -498,7 +490,7 @@ mod tests {
 
         // Mirrors EmbeddedQuoinPlugin::build: a placeholder model with no
         // restore, waiting for the host's first real observation.
-        let registry = crate::page_registry();
+        let registry = crate::tests::fixture_registry();
         let fresh = model(PLACEHOLDER_OUTPUT, Vec2::new(1920.0, 1080.0), &registry);
         let mut app = App::new();
         app.add_plugins((
@@ -510,7 +502,7 @@ mod tests {
             )),
         ))
         .insert_resource(crate::state::StateStore::load(Some(path)))
-        .insert_resource(crate::page_registry())
+        .insert_resource(crate::tests::fixture_registry())
         .insert_resource(EmbeddedHost {
             detector: CornerDetector::new(
                 CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
@@ -577,7 +569,7 @@ mod tests {
                 .spawn((Node::default(), GlobalZIndex(0)))
                 .id()
         });
-        let mut model = model("test", Vec2::new(1000., 800.), &crate::page_registry());
+        let mut model = model("test", Vec2::new(1000., 800.), &crate::tests::fixture_registry());
         model
             .panel_input(Edge::Left, Duration::ZERO, PanelInput::Dock)
             .unwrap();
@@ -655,7 +647,7 @@ mod tests {
                 .spawn((Node::default(), GlobalZIndex(0)))
                 .id()
         });
-        let mut model = model("test", Vec2::new(1000., 800.), &crate::page_registry());
+        let mut model = model("test", Vec2::new(1000., 800.), &crate::tests::fixture_registry());
         model
             .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)
             .unwrap();

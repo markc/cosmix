@@ -379,9 +379,11 @@ pub struct QuoinChromeProps {
     panels: [Vec<QuoinPage>; 4],
 }
 
-/// Marker for clock text reproduced from [`crate::runtime::ShellFrame`].
+/// The title-and-carousel header, independent of the edge's child ordering.
 #[derive(Component)]
-pub struct QuoinClock;
+pub struct QuoinPanelHeader {
+    pub edge: Edge,
+}
 
 /// Native host hit-tests this rendered strip before dispatching ordinary buttons.
 /// Its computed transform includes the committed-motion chrome translation.
@@ -559,7 +561,6 @@ impl Plugin for QuoinChromePlugin {
                 (
                     present_panels,
                     present_page_controls,
-                    present_content,
                     present_navlinks,
                     present_resize_grips,
                 )
@@ -829,6 +830,7 @@ fn spawn_panel(
             .id()
     };
 
+    commands.entity(header).insert(QuoinPanelHeader { edge });
     let page_host = commands
         .spawn(Node {
             min_width: px(0),
@@ -1665,19 +1667,6 @@ fn present_page_controls(
     }
 }
 
-fn present_content(frame: Res<ShellFrameState>, mut clocks: Query<&mut Text, With<QuoinClock>>) {
-    let Some(value) = &frame.0.content.bottom_clock_text else {
-        return;
-    };
-    for mut clock in &mut clocks {
-        // Compare through `Deref` first: an unconditional write marks the
-        // Text changed every update and re-lays-out an unchanged clock.
-        if clock.0 != *value {
-            clock.0.clone_from(value);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1720,44 +1709,6 @@ mod tests {
             model.set_carousel(edge, registry.carousel(edge));
         }
         ShellFrame::from_model(&model)
-    }
-
-    #[test]
-    fn present_content_leaves_an_unchanged_clock_unmarked() {
-        let model = ShellModel::new(
-            OutputKey::new("test").unwrap(),
-            LogicalSize::new(1_000.0, 800.0).unwrap(),
-            Duration::ZERO,
-            Duration::from_millis(300),
-            Duration::from_millis(180),
-        )
-        .unwrap();
-        let mut frame = ShellFrame::from_model(&model);
-        frame.content.bottom_clock_text = Some("12:00:00 +10:00".into());
-        let mut world = World::new();
-        world.insert_resource(ShellFrameState(frame));
-        let clock = world
-            .spawn((Text::new("12:00:00 +10:00"), QuoinClock))
-            .id();
-        world.clear_trackers();
-        let changed = |world: &World| {
-            world
-                .entity(clock)
-                .get_ref::<Text>()
-                .unwrap()
-                .last_changed()
-        };
-        let before = changed(&world);
-        world.run_system_once(present_content).unwrap();
-        assert_eq!(changed(&world), before, "equal text must not be rewritten");
-        world
-            .resource_mut::<ShellFrameState>()
-            .0
-            .content
-            .bottom_clock_text = Some("12:00:01 +10:00".into());
-        world.run_system_once(present_content).unwrap();
-        assert_ne!(changed(&world), before);
-        assert_eq!(world.get::<Text>(clock).unwrap().0, "12:00:01 +10:00");
     }
 
     fn pointer_click_command(action: QuoinAction) -> ShellCommandKind {

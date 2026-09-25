@@ -21,7 +21,7 @@ pub struct ShellModel {
     geometry: LogicalSize,
     panels: [PanelStateMachine; 4],
     carousels: [Carousel; 4],
-    /// Quoin's frame-only trial. Generic shell hosts retain their legacy policy.
+    /// Quoin's scene-only frame. Generic shell hosts can choose their policy.
     suppress_empty_edges: bool,
     thickness_set: [bool; 4],
     /// The panel whose surface holds the keyboard, as the host last reported.

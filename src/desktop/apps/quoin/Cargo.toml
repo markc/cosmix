@@ -11,16 +11,10 @@ default-run = "cosmix-quoin"
 [features]
 default = []
 scene-gates = ["cosmix-scene-bevy/gate"]
-demo = ["cosmix-shell/dev-host"]
 
 [[bin]]
 name = "cosmix-quoin"
 path = "src/main.rs"
-
-[[bin]]
-name = "cosmix-quoin-demo"
-path = "src/demo.rs"
-required-features = ["demo"]
 
 [dependencies]
 cosmix-scene-bevy = { path = "../../crates/cosmix-scene-bevy" }

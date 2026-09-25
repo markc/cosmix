@@ -205,12 +205,6 @@ pub struct PanelPresentation {
     pub page_change: PageChange,
 }
 
-/// Renderer-neutral dynamic content carried by the replayable frame.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ShellContentPresentation {
-    pub bottom_clock_text: Option<String>,
-}
-
 /// Complete presentation snapshot reconciled by a [`crate::host::ShellHost`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellFrame {
@@ -220,7 +214,6 @@ pub struct ShellFrame {
     /// Deferred saved selections, kept separate from the pages currently shown.
     pub pending_page_restores: [Option<String>; 4],
     pub panels: [PanelPresentation; 4],
-    pub content: ShellContentPresentation,
     pub wake: WakePolicy,
     /// Earliest timer-driven model transition, retained even while animation
     /// also requests frame callbacks.
@@ -278,7 +271,6 @@ impl ShellFrame {
                 logical_size: model.geometry(),
             },
             panels,
-            content: ShellContentPresentation::default(),
             wake: model.wake().into(),
             wake_deadline: model.next_deadline(),
         }

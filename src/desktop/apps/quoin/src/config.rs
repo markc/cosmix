@@ -3,7 +3,7 @@
 //! All fields are optional; omitted fields reset to the defaults below on each
 //! ingestion. Unknown keys, wrong types and duplicate names/chords are errors.
 //! `panels.{left,bottom,right,top}` are ordered string lists; position zero is
-//! primary. With built-ins enabled, Right must start with `settings.appearance`.
+//! primary. Content is supplied only by registered scenes.
 //! `menu_items.{edge}` contains `{label, target, verb, args}` Bus actions, with
 //! `args` an optional list of strings. These are additions to the mode menu.
 //! `bindings.{edge}.{pin,dock,hide}` and `bindings.cycle_focus` are optional
@@ -23,21 +23,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 use cosmix_config::{CosmixDir, Value, cosmix_path, parse_mix_data};
 use cosmix_shell::core::Edge;
-use cosmix_shell::runtime::{CLOCK_PAGE_ID, ShellRuntimeSet, redeclare_shell_pages};
+use cosmix_shell::runtime::{ShellRuntimeSet, redeclare_shell_pages};
 use cosmix_shell_host::file_watch::{LayerHostFileWatch, LayerHostFileWatches};
 
 pub const SETTINGS_APPEARANCE: &str = "settings.appearance";
-
-/// Trial switch, sampled once by either host at startup and reused on reloads.
-pub(crate) fn builtin_pages_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("COSMIX_QUOIN_BUILTIN_PAGES").as_deref() == Ok("1"))
-}
 
 /// The one resolver for the config file every in-process reader and writer
 /// uses: the standalone watcher (`install`) and the settings verbs' motion
@@ -46,11 +40,9 @@ pub(crate) fn conf_mix_path() -> PathBuf {
     cosmix_path(CosmixDir::Etc).join("quoin/conf.mix")
 }
 
-/// Seed frame-only hosts before constructing the model. Standalone also watches
-/// subsequent edits. The built-in path keeps its existing lifecycle: defaults
-/// first, then the standalone reader (no reader in the embedded built-in host).
+/// Seed both hosts before constructing the model. Standalone also watches edits.
 pub(crate) fn startup_config(smoke: bool) -> ShellConfig {
-    if smoke || builtin_pages_enabled() {
+    if smoke {
         return ShellConfig::default();
     }
     let path = conf_mix_path();
@@ -106,28 +98,8 @@ pub struct ShellConfig {
 
 impl Default for ShellConfig {
     fn default() -> Self {
-        Self::with_builtin_pages(builtin_pages_enabled())
-    }
-}
-
-impl ShellConfig {
-    pub(crate) fn with_builtin_pages(enabled: bool) -> Self {
         Self {
-            panels: if enabled {
-                [
-                    vec!["nav".into(), "places".into(), "info".into()],
-                    vec![CLOCK_PAGE_ID.into(), "power".into(), "tasks".into()],
-                    vec![
-                        SETTINGS_APPEARANCE.into(),
-                        "monitor".into(),
-                        "demos".into(),
-                        "agents".into(),
-                    ],
-                    vec!["status".into(), "spaces".into()],
-                ]
-            } else {
-                std::array::from_fn(|_| Vec::new())
-            },
+            panels: std::array::from_fn(|_| Vec::new()),
             menu_items: std::array::from_fn(|_| Vec::new()),
             bindings: std::array::from_fn(|_| EdgeBindings::default()),
             cycle_focus: None,
@@ -228,9 +200,7 @@ fn chord(value: &Value, path: &str) -> Result<Option<String>, String> {
     // A bare or Shift-only key would steal typing from the panel's own
     // controls (a Tab, letter or capital from the launcher's search field).
     if !["Ctrl", "Alt", "Super"].iter().any(|m| seen.contains(m)) {
-        return Err(format!(
-            "{path}: key chord {text} needs Ctrl, Alt or Super"
-        ));
+        return Err(format!("{path}: key chord {text} needs Ctrl, Alt or Super"));
     }
     let mut canonical: Vec<String> = modifiers
         .into_iter()
@@ -247,17 +217,13 @@ fn chord(value: &Value, path: &str) -> Result<Option<String>, String> {
 
 impl ShellConfig {
     pub fn parse(source: &str) -> Result<Self, String> {
-        Self::parse_with_builtin_pages(source, builtin_pages_enabled())
-    }
-
-    pub(crate) fn parse_with_builtin_pages(source: &str, enabled: bool) -> Result<Self, String> {
         let value = parse_mix_data(source).map_err(|e| e.to_string())?;
         let root = fields(
             &value,
             &["panels", "menu_items", "bindings", "carousel_motion"],
             "config",
         )?;
-        let mut config = Self::with_builtin_pages(enabled);
+        let mut config = Self::default();
         let edges = ["left", "bottom", "right", "top"];
         if let Some(value) = root.get("panels") {
             let panels = fields(value, &edges, "panels")?;
@@ -275,16 +241,6 @@ impl ShellConfig {
                     "panels: invalid or duplicate sub-panel name {name:?}"
                 ));
             }
-        }
-        if enabled
-            && config.panels[Edge::Right.index()]
-                .first()
-                .map(String::as_str)
-                != Some(SETTINGS_APPEARANCE)
-        {
-            return Err(format!(
-                "panels.right: primary must be {SETTINGS_APPEARANCE}"
-            ));
         }
         if let Some(value) = root.get("menu_items") {
             let menus = fields(value, &edges, "menu_items")?;
@@ -635,19 +591,16 @@ mod tests {
     }
 
     #[test]
-    fn trial_defaults_are_empty_and_right_primary_is_unrestricted() {
-        let config = ShellConfig::parse_with_builtin_pages("{}", false).unwrap();
+    fn defaults_are_empty_and_right_primary_is_unrestricted() {
+        let config = ShellConfig::parse("{}").unwrap();
         assert!(config.panels.iter().all(Vec::is_empty));
         for source in [
             r#"{panels: {right: ["scene-tools"]}}"#,
             r#"{panels: {right: []}}"#,
         ] {
-            assert!(ShellConfig::parse_with_builtin_pages(source, false).is_ok());
-            assert!(ShellConfig::parse_with_builtin_pages(source, true).is_err());
+            assert!(ShellConfig::parse(source).is_ok());
         }
-        let config =
-            ShellConfig::parse_with_builtin_pages(r#"{panels: {bottom: ["scene-panel"]}}"#, false)
-                .unwrap();
+        let config = ShellConfig::parse(r#"{panels: {bottom: ["scene-panel"]}}"#).unwrap();
         assert_eq!(
             config
                 .panels
@@ -722,31 +675,6 @@ mod tests {
         model.carousel_mut(Edge::Left).register("later").unwrap();
         assert_eq!(model.carousel(Edge::Left).page_ids(), ["later", "tail"]);
         assert!(model.carousel_mut(Edge::Left).activate("future").is_err());
-    }
-
-    #[test]
-    fn settings_appearance_is_declared_right_primary() {
-        let config = ShellConfig::parse_with_builtin_pages("{}", true).unwrap();
-        assert_eq!(config.panels[Edge::Right.index()][0], SETTINGS_APPEARANCE);
-        assert!(
-            ShellConfig::parse_with_builtin_pages(r#"{panels: {right: ["monitor"]}}"#, true)
-                .is_err()
-        );
-        assert!(ShellConfig::parse_with_builtin_pages(r#"{panels: {right: []}}"#, true).is_err());
-        let mut model = model();
-        model
-            .declare_carousel(Edge::Right, config.panels[Edge::Right.index()].clone())
-            .unwrap();
-        model.carousel_mut(Edge::Right).register("monitor").unwrap();
-        assert_eq!(model.carousel(Edge::Right).page_ids(), ["monitor"]);
-        model
-            .carousel_mut(Edge::Right)
-            .register(SETTINGS_APPEARANCE)
-            .unwrap();
-        assert_eq!(
-            model.carousel(Edge::Right).page_ids(),
-            [SETTINGS_APPEARANCE, "monitor"]
-        );
     }
 
     #[test]

@@ -4,29 +4,23 @@ mod activation;
 mod bus_service;
 pub mod config;
 mod corner_menu;
-mod demos;
 mod desktop_font;
+pub mod embedded;
 #[cfg(test)]
 mod font_tests;
 mod holders;
 mod hotspot;
 mod keyboard;
-mod launcher;
-pub mod embedded;
-mod power;
 mod settings;
 mod state;
-mod wallpaper;
 
 use std::time::Duration;
 
 use bevy::feathers::{FeathersPlugins, dark_theme::create_dark_theme, theme::UiTheme};
 use bevy::prelude::*;
-use bevy::ui::{UiRect, percent, px};
-use bus_service::{QuoinPowerText, ShellBusPlugin};
+use bus_service::ShellBusPlugin;
 use cosmix_shell::chrome::{
-    QuoinChromePlugin, QuoinClock, QuoinContentBindings, QuoinPageContent, QuoinPageRegistry,
-    QuoinPageSpec, spawn_quoin_chrome,
+    QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, spawn_quoin_chrome,
 };
 use cosmix_shell::core::{ConcealReason, Edge, PanelEffect, PanelInput, RevealTrigger, ShellModel};
 use cosmix_shell::runtime::{ShellEffects, ShellFrameState, ShellRuntimeSet};
@@ -35,8 +29,7 @@ use ctk::bus::{
     BusBridgeConfig, BusBridgePlugin, BusWorkerWake, provenance_from_build, resolve_noded_url,
 };
 use ctk::theme::{
-    CtkMonospace, CtkThemePlugin, Mode, Scheme, ThemeSpec, ThemeState, TypographySpec, apply_theme,
-    tokens,
+    CtkThemePlugin, Mode, Scheme, ThemeSpec, ThemeState, TypographySpec, apply_theme,
 };
 
 const USAGE: &str = "usage: cosmix-quoin [--output NAME] [--comp-service NAME] [--bus-service NAME] [--smoke-all-panels|--smoke-hidden]";
@@ -133,10 +126,6 @@ pub fn run_layer_host() -> AppExit {
     activation::install(&mut app, &mut bus, cli.comp_service.clone());
     holders::install(&mut app, &mut bus, cli.comp_service);
     bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
-    bus.subscriptions.push("power.props.changed".to_owned());
-    bus.subscriptions.push("wallpaper.props.changed".to_owned());
-    bus.subscriptions
-        .push("bg-showcase.props.changed".to_owned());
     // Broker service-registry diffs: the citizen-disconnect notification
     // sub-panel ownership keys on (the `services.registered` leaf).
     bus.subscriptions.push("noded.props.changed".to_owned());
@@ -182,9 +171,6 @@ fn configure_content(
             QuoinChromePlugin,
             ShellBusPlugin,
             cosmix_scene_bevy::ScenePlugin,
-            launcher::LauncherPlugin,
-            wallpaper::WallpaperPlugin,
-            demos::DemoPlugin,
         ))
         .add_systems(Startup, setup)
         .add_systems(Update, log_transitions.in_set(ShellRuntimeSet::Host))
@@ -346,7 +332,7 @@ fn setup(
     *theme = UiTheme(create_dark_theme());
     apply_theme(&mut theme, &mut theme_state, &spec);
 
-    let bindings = page_content(&registry, &mut commands);
+    let bindings = QuoinContentBindings::default();
     let props = registry
         .bind(&frame.0, bindings)
         .expect("Quoin content IDs match its validated registry");
@@ -358,324 +344,32 @@ fn setup(
     spawn_quoin_chrome(&mut commands, mounts, props);
 }
 
-fn page_content(registry: &QuoinPageRegistry, commands: &mut Commands) -> QuoinContentBindings {
-    if registry.declarations_only() {
-        QuoinContentBindings::default()
-    } else {
-        builtin_content(commands)
-    }
-}
-
-fn builtin_content(commands: &mut Commands) -> QuoinContentBindings {
-    let mut bindings = QuoinContentBindings::default();
-    bindings.set(
-        Edge::Bottom,
-        vec![
-            // The runtime ticks the clock only while this page is active.
-            QuoinPageContent::new(
-                cosmix_shell::runtime::CLOCK_PAGE_ID,
-                bottom_launcher(commands),
-            ),
-            QuoinPageContent::new("power", bottom_power(commands)),
-            QuoinPageContent::new(
-                "tasks",
-                placeholder(
-                    commands,
-                    "Task strip",
-                    "Studio  •  Mail  •  Files  •  Terminal",
-                    true,
-                ),
-            ),
-        ],
-    );
-    bindings.set(
-        Edge::Left,
-        vec![
-            QuoinPageContent::new("nav", left_page(commands, "nav")),
-            QuoinPageContent::new("places", left_page(commands, "places")),
-            QuoinPageContent::new("info", left_page(commands, "info")),
-        ],
-    );
-    bindings.set(
-        Edge::Right,
-        vec![
-            QuoinPageContent::new("monitor", system_page(commands)),
-            QuoinPageContent::new("demos", demos::controls(commands)),
-            QuoinPageContent::new(
-                "agents",
-                placeholder(commands, "Agents", "No active jobs", false),
-            ),
-        ],
-    );
-    bindings.set(
-        Edge::Top,
-        vec![
-            QuoinPageContent::new(
-                "status",
-                placeholder(
-                    commands,
-                    "Cosmix",
-                    "Network online  •  Audio ready  •  Power balanced",
-                    true,
-                ),
-            ),
-            QuoinPageContent::new(
-                "spaces",
-                placeholder(commands, "Spaces", "1  ●   2  ○   3  ○", true),
-            ),
-        ],
-    );
-    bindings
-}
-
 fn startup_page_registry(config: &config::ShellConfig) -> QuoinPageRegistry {
-    if config::builtin_pages_enabled() {
-        page_registry()
-    } else {
-        QuoinPageRegistry::declared(&config.panels).expect("accepted declarations are valid")
-    }
-}
-
-fn page_registry() -> QuoinPageRegistry {
-    let pages = |values: &[(&str, &str)]| {
-        values
-            .iter()
-            .map(|(id, title)| QuoinPageSpec::new(*id, *title))
-            .collect()
-    };
-    QuoinPageRegistry::new(
-        pages(&[("nav", "Apps"), ("places", "Places"), ("info", "Info")]),
-        pages(&[
-            ("launcher", "Launcher"),
-            ("power", "Power"),
-            ("tasks", "Tasks"),
-        ]),
-        pages(&[
-            ("monitor", "System"),
-            ("demos", "Demos"),
-            ("agents", "Agents"),
-        ]),
-        pages(&[("status", "Status"), ("spaces", "Spaces")]),
-    )
-    .expect("static page registry is valid")
-}
-
-fn system_page(commands: &mut Commands) -> Entity {
-    let root = placeholder(commands, "System", "Colour scheme", false);
-    let quit = cosmix_shell::chrome::quoin_quit_button(commands, Edge::Right, "monitor");
-    let dots = commands
-        .spawn(Node {
-            flex_wrap: FlexWrap::Wrap,
-            column_gap: px(8),
-            row_gap: px(8),
-            ..default()
-        })
-        .id();
-    for scheme in Scheme::ALL {
-        let dot = cosmix_shell::chrome::scheme_dot(commands, Edge::Right, "monitor", scheme)
-            .expect("static system page ID is valid");
-        commands.entity(dots).add_child(dot);
-    }
-    let background = wallpaper::controls(commands);
-    commands
-        .entity(root)
-        .add_children(&[dots, background, quit]);
-    root
-}
-
-fn left_page(commands: &mut Commands, page: &str) -> Entity {
-    use cosmix_shell::chrome::{NavLinkTarget, navlink};
-    let root = commands
-        .spawn(Node {
-            width: percent(100),
-            min_width: px(0),
-            flex_direction: FlexDirection::Column,
-            padding: UiRect::all(px(6)),
-            row_gap: px(4),
-            ..default()
-        })
-        .id();
-    for (icon, label, target) in [
-        ("⊞", "Apps", "nav"),
-        ("⌂", "Places", "places"),
-        ("ℹ", "Info", "info"),
-    ] {
-        let link = navlink(
-            commands,
-            Edge::Left,
-            page,
-            icon,
-            label,
-            NavLinkTarget::Page(target.into()),
-        )
-        .expect("static navigation IDs are valid");
-        commands.entity(root).add_child(link);
-    }
-    if page == "places" {
-        for (icon, label) in [
-            ("⌂", "Home"),
-            ("🗀", "Projects"),
-            ("↓", "Downloads"),
-            ("⚙", "Quoin cfg"),
-        ] {
-            let link = navlink(
-                commands,
-                Edge::Left,
-                page,
-                icon,
-                label,
-                NavLinkTarget::Intent,
-            )
-            .expect("static places ID is valid");
-            commands.entity(root).add_child(link);
-        }
-    } else {
-        let body = if page == "info" {
-            concat!(
-                "Quoin ",
-                env!("CARGO_PKG_VERSION"),
-                "\nFour-edge desktop shell"
-            )
-        } else {
-            "Konsole\nFirefox\nDolphin\nKate"
-        };
-        let copy = commands
-            .spawn((
-                Text::new(body),
-                TextFont::default(),
-                ctk::theme::CtkTextRole::Small,
-                bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
-            ))
-            .id();
-        commands.entity(root).add_child(copy);
-    }
-    root
-}
-
-fn placeholder(commands: &mut Commands, title: &str, body: &str, horizontal: bool) -> Entity {
-    let heading = commands
-        .spawn((
-            Text::new(title),
-            TextFont::default(),
-            ctk::theme::CtkTextRole::Ui,
-            bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
-        ))
-        .id();
-    let copy = commands
-        .spawn((
-            Text::new(body),
-            TextFont::default(),
-            ctk::theme::CtkTextRole::Small,
-            bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
-        ))
-        .id();
-    commands
-        .spawn(Node {
-            width: percent(100),
-            height: percent(100),
-            min_width: px(0),
-            min_height: px(0),
-            flex_direction: if horizontal {
-                FlexDirection::Row
-            } else {
-                FlexDirection::Column
-            },
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::SpaceBetween,
-            padding: UiRect::all(px(10)),
-            row_gap: px(8),
-            column_gap: px(18),
-            ..default()
-        })
-        .add_children(&[heading, copy])
-        .id()
-}
-
-fn bottom_launcher(commands: &mut Commands) -> Entity {
-    let thunderbird = launcher::button(commands, launcher::LauncherApp::Thunderbird);
-    let foot = launcher::button(commands, launcher::LauncherApp::Foot);
-    let firefox = launcher::button(commands, launcher::LauncherApp::Firefox);
-    let apps = commands
-        .spawn((
-            Text::new("Konsole  ·  Dolphin  ·  Kate"),
-            TextFont::default(),
-            ctk::theme::CtkTextRole::Ui,
-            bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
-        ))
-        .id();
-    let clock = commands
-        .spawn((
-            Text::new("--:--:-- UTC"),
-            TextFont::default(),
-            ctk::theme::CtkTextRole::Mono,
-            bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
-            // A proportional face makes clock digits jitter each second; the
-            // monospace role keeps them on a fixed advance while staying
-            // size-managed by CTK.
-            CtkMonospace,
-            QuoinClock,
-        ))
-        .id();
-    commands
-        .spawn(Node {
-            width: percent(100),
-            height: percent(100),
-            min_width: px(0),
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::SpaceBetween,
-            padding: UiRect::axes(px(14), px(8)),
-            ..default()
-        })
-        .add_children(&[apps, foot, firefox, thunderbird, clock])
-        .id()
-}
-
-fn bottom_power(commands: &mut Commands) -> Entity {
-    let heading = commands
-        .spawn((
-            Text::new("Power"),
-            TextFont::default(),
-            ctk::theme::CtkTextRole::Ui,
-            bevy::feathers::theme::ThemeTextColor(tokens::TEXT),
-        ))
-        .id();
-    let reading = commands
-        .spawn((
-            Text::new("Power unavailable"),
-            TextFont::default(),
-            ctk::theme::CtkTextRole::Small,
-            bevy::feathers::theme::ThemeTextColor(tokens::TEXT_DIM),
-            QuoinPowerText,
-        ))
-        .id();
-    commands
-        .spawn(Node {
-            width: percent(100),
-            height: percent(100),
-            min_width: px(0),
-            flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::SpaceBetween,
-            padding: UiRect::axes(px(14), px(8)),
-            ..default()
-        })
-        .add_children(&[heading, reading])
-        .id()
+    QuoinPageRegistry::declared(&config.panels).expect("accepted declarations are valid")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn declared_startup_creates_no_native_page_entities() {
-        let config = config::ShellConfig::parse_with_builtin_pages(
-            r#"{panels: {bottom: ["scene-panel"]}}"#,
-            false,
+    /// Registered IDs for state-migration and model-only tests. These stand in
+    /// for scene registrations; no fixture constructs native page content.
+    pub(crate) fn fixture_registry() -> QuoinPageRegistry {
+        use cosmix_shell::chrome::QuoinPageSpec;
+        let pages = |ids: &[&str]| ids.iter().map(|id| QuoinPageSpec::new(*id, *id)).collect();
+        QuoinPageRegistry::new(
+            pages(&["nav", "places", "info"]),
+            pages(&["launcher", "power", "tasks"]),
+            pages(&["monitor", "demos", "agents"]),
+            pages(&["status", "spaces"]),
         )
-        .unwrap();
-        let registry = QuoinPageRegistry::declared(&config.panels).unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn declared_startup_binds_an_empty_frame() {
+        let config = config::ShellConfig::parse(r#"{panels: {bottom: ["scene-panel"]}}"#).unwrap();
+        let registry = startup_page_registry(&config);
         let mut model = ShellModel::new(
             cosmix_shell::core::OutputKey::new("test-output").unwrap(),
             cosmix_shell::core::LogicalSize::new(1000.0, 800.0).unwrap(),
@@ -688,10 +382,7 @@ mod tests {
             model.set_carousel(edge, registry.carousel(edge));
             assert!(model.carousel(edge).page_ids().is_empty());
         }
-        let mut world = World::new();
-        let bindings = page_content(&registry, &mut world.commands());
-        world.flush();
-        assert_eq!(world.entities().len(), 0);
+        let bindings = QuoinContentBindings::default();
         registry
             .bind(
                 &cosmix_shell::runtime::ShellFrame::from_model(&model),
