@@ -4,6 +4,7 @@ $applied_state = {revision:0}
 $scene_data = require("../lib/scenes.mix")
 fn applied()
   $applied_state.revision = $applied_state.revision + 1
+  if $mode.drop_notices ?? false then return end
   publish(serve_name() .. ".panel.changed", json_encode({generation:1, revision:$applied_state.revision, panels:$edges}), {command:"shell.panel.changed"})
 end
 $lists = 0
@@ -14,9 +15,16 @@ $pending = false
 $launcher_scene = ""
 $notes_loads = 0
 $pins = 0
+$watches = 0
 
 on fixture.mode
   $mode = $event.args
+  if $mode.page_refused ?? false then
+    -- Make selection necessary: refusing an already-satisfied selection
+    -- must not prevent a state-driven client from pinning that page.
+    $edges.left.page = nil
+    $edges.right.page = nil
+  end
   applied()
   reply(0, "{}")
 end
@@ -31,7 +39,11 @@ on "shell.scene.load"
   $doc = $scene_data.document($event.body)
   $edge = $doc.window.edge ?? "right"
   $page = $doc.window.panel ?? ("scene-" .. $doc.name)
-  if not contains($edges[$edge].pages, $page) then $edges[$edge].pages = push($edges[$edge].pages, $page) end
+  if not contains($edges[$edge].pages, $page) then
+    $pages = $edges[$edge].pages
+    push($pages, $page)
+    $edges[$edge].pages = $pages
+  end
   applied()
   if contains($event.body, "name: launcher\n") then $launcher_scene = $event.body end
   if contains($event.body, "name: notes\n") then $notes_loads = $notes_loads + 1 end
@@ -46,7 +58,7 @@ on "shell.panel.page.set"
   if $mode.page_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].page = $event.args.id
   applied()
-  reply($mode.host_rc ?? 0, "{}")
+  reply($mode.host_rc ?? 0, json_encode({accepted:true, applied:true, panels:$edges}))
 end
 on "shell.panel.show"
   if $mode.show_refused ?? false then reply(14, "{}"); return end
@@ -55,13 +67,14 @@ on "shell.panel.show"
   reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.pin"
-  if $mode.show_refused ?? false then reply(14, "{}"); return end
+  if ($mode.show_refused ?? false) or ($mode.pin_refused ?? false) then reply(14, "{}"); return end
   $pins = $pins + 1
   $edges[$event.args.edge].pinned = true
   $edges[$event.args.edge].mode = "docked"
   $edges[$event.args.edge].visible = true
   applied()
-  reply($mode.host_rc ?? 0, "{}")
+  if $mode.lose_pin_read ?? false then $mode.props_refused_once = true end
+  reply($mode.host_rc ?? 0, json_encode({accepted:true, applied:true, panels:$edges}))
 end
 on "shell.panel.unpin"
   if $mode.release_refused ?? false then reply(14, "{}"); return end
@@ -77,6 +90,11 @@ on "shell.panel.hide"
   reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.props.get"
+  if $mode.props_refused_once ?? false then
+    $mode.props_refused_once = false
+    reply(14, "{}"); return
+  end
+  if $mode.props_refused ?? false then reply(14, "{}"); return end
   if $event.args.path == nil then
     reply($mode.host_rc ?? 0, json_encode({panels:$edges}))
   else
@@ -90,7 +108,7 @@ on "shell.panel.mode"
   $edges[$edge].pinned = $event.args.mode != "hidden"
   $edges[$edge].visible = $event.args.mode != "hidden"
   applied()
-  reply($mode.host_rc ?? 0, "{}")
+  reply($mode.host_rc ?? 0, json_encode({accepted:true, applied:true, panels:$edges}))
 end
 on "comp.windows.list"
   reply(0, json_encode({windows: []}))
@@ -99,6 +117,21 @@ on "comp.props.get"
   reply(0, json_encode({count: 1, current: 1}))
 end
 on "comp.props.watch"
+  $watches = $watches + 1
+  reply(0, "{}")
+end
+
+-- A synthetic subscription gap with a deliberately stale snapshot: the
+-- citizen must read state and re-arm the compositor watch, not trust it.
+on fixture.gap
+  publish(serve_name() .. ".panel.changed", json_encode({panels:{}}),
+    {command:"shell.panel.changed", headers:{gap:"true"}})
+  reply(0, "{}")
+end
+
+on fixture.comp_gap
+  publish(serve_name() .. ".props.changed", json_encode({gap:true, cause:"publisher.loss"}),
+    {command:"props.changed"})
   reply(0, "{}")
 end
 on "tray.list"
@@ -136,5 +169,5 @@ on "apps.launch"
 end
 on fixture.state
   reply(0, json_encode({edges: $edges, lists: $lists, launches: $launches, pending: $pending, loads: $loads,
-    launcher_scene: $launcher_scene, notes_loads: $notes_loads, pins: $pins}))
+    launcher_scene: $launcher_scene, notes_loads: $notes_loads, pins: $pins, watches:$watches}))
 end

@@ -77,6 +77,7 @@ $state = {
   -- and pinned the taskbar page yet
   reg_launcher: false, reg_calendar: false, reg_notes: false,
   applied_panels: {}, pending_panels: {}, live_services: [],
+  panel_op_seq: 0, panel_drivers: {}, resyncing: false,
   registering: false, panel_shown: false,
   -- consecutive show_page refusals this host generation; past PANEL_SHOW_CAP
   -- we stop resubmitting refused selections on every render (a host that keeps
@@ -139,17 +140,44 @@ fn panel_verb($verb, $edge, $id)
   else
     send $HOST $verb edge=$edge id=$id timeout=3
   end
-  return rc_ok($rc)
+  $ok = rc_ok($rc)
+  $receipt = $result
+  if type($receipt) == "string" then
+    try
+      $receipt = json_parse($receipt)
+    catch $err
+      $receipt = nil
+    end
+  end
+  if type($receipt) != "map" then $receipt = {} end
+  -- Even a timeout may have applied. Replies and reads drive progress;
+  -- notifications are only invalidation hints, including our own echoes.
+  if not refresh_panels() and $receipt.applied == true and type($receipt.panels) == "map" then
+    -- A failed read cannot discard an authoritative application receipt.
+    $state.applied_panels = $receipt.panels
+  end
+  return $ok
 end
 
--- Queue page selection. Mount/selection/pin completion comes from the host's
--- applied shell.panel.changed stream, never a sleep/retry loop.
+fn refresh_panels()
+  $snapshot = rpc($HOST, "shell.props.get", {})
+  $state.applied_panels = ($snapshot ?? {}).panels ?? {}
+  return type(($snapshot ?? {}).panels) == "map"
+end
+
+fn queue_panel($edge, $page, $flag, $gen, $phase)
+  $state.panel_op_seq = $state.panel_op_seq + 1
+  $state.pending_panels[$edge] = {page:$page, phase:$phase, flag:$flag,
+    generation:$gen, token:$state.panel_op_seq, refused:false}
+end
+
+-- Queue page selection and consume applied replies/readback immediately.
 fn select_page($edge, $page)
-  if $state.pending_panels[$edge].page == $page then
+  if ($state.pending_panels[$edge] ?? {}).page == $page then
     drive_panel_operations()
     return true
   end
-  $state.pending_panels[$edge] = {page:$page, phase:"select", flag:nil, generation:$state.popup_gen}
+  queue_panel($edge, $page, nil, $state.popup_gen, "select")
   drive_panel_operations()
   return true
 end
@@ -165,67 +193,59 @@ end
 -- Legacy Bus unpin releases BOTH Pinned and Docked. This is also the
 -- compatibility rule for bare-array popup records: a legacy saved true
 -- migrates to Docked, and still needs its reservation released here.
--- Reuse the existing bounded hide loop. A reply is only enqueue acceptance;
--- return a single applied snapshot only after BOTH persistence and visibility
--- are clear. Failure leaves the record for the existing recovery pass.
+-- Quoin replies after application and concealment. Keep the recovery record
+-- unless a read confirms BOTH persistence and visibility are clear.
 fn hide_edge($edge)
-  $state.pending_panels[$edge] = {page:nil, phase:"release", flag:nil, generation:$state.popup_gen}
+  queue_panel($edge, nil, nil, $state.popup_gen, "release")
   drive_panel_operations()
   return $state.applied_panels[$edge]
 end
 
 fn drive_panel_operations()
   for each $edge in keys($state.pending_panels)
-    $op = $state.pending_panels[$edge]
-    $applied = $state.applied_panels[$edge]
-    if $applied == nil then continue end
-    if $op.phase == "release" or $op.phase == "releasing" then
-      if edge_in_use($edge) then
-        $state.pending_panels = delete($state.pending_panels, $edge)
-      elif $p.popup_release_confirmed($applied) then
-        write_pins($p.released_popup_pins(read_pins(), $edge, $applied))
-        $state.pending_panels = delete($state.pending_panels, $edge)
-      elif $op.phase == "release" then
-        if panel_verb("shell.panel.mode", $edge, nil) then
-          if not edge_in_use($edge) and $state.pending_panels[$edge].phase == "release" then
-            $state.pending_panels[$edge].phase = "releasing"
-            $state.pending_panels[$edge].refused = false
-          end
-        else
-          $state.pending_panels[$edge].refused = true
-        end
-      end
-      continue
-    end
-    if $op.flag != nil and not popup_live($op.flag, $op.generation) then
-      $state.pending_panels = delete($state.pending_panels, $edge)
-      continue
-    end
-    if not contains($applied.pages ?? [], $op.page) then continue end
-    if $op.phase == "select" then
-      if panel_verb("shell.panel.page.set", $edge, $op.page) then
-        if $op.flag != nil and not popup_live($op.flag, $op.generation) then continue end
-        $state.pending_panels[$edge].phase = "selecting"
-      end
-    end
-    if $applied.page == $op.page then
-      if $applied.pinned and $applied.visible then
-        if $edge == "bottom" then $state.panel_shown = true end
-        if $op.flag == "launcher_open" then $state.launcher_shown = true end
-        if $op.flag == "calendar_open" then $state.calendar_shown = true end
-        if $op.flag == "notes_open" then $state.notes_shown = true end
-        $state.pending_panels = delete($state.pending_panels, $edge)
-      elif $op.phase != "pinning" then
-        if panel_verb("shell.panel.pin", $edge, nil) then
-          if $op.flag != nil and not popup_live($op.flag, $op.generation) then
-            if not edge_in_use($edge) then hide_popup($edge) end
-          else
-            $state.pending_panels[$edge].phase = "pinning"
-          end
-        end
-      end
-    end
+    drive_panel_edge($edge)
   end
+end
+
+fn drive_panel_edge($edge)
+  if $state.panel_drivers[$edge] ?? false then return end
+  $state.panel_drivers[$edge] = true
+  try
+    refresh_panels()
+    -- Drain phase transitions and operations queued during a yield. This is
+    -- not a retry poll: each action is sent at most once per operation here.
+    $attempted = {}
+    while true
+      $op = $state.pending_panels[$edge]
+      if $op == nil then break end
+      if ($op.phase == "release" and edge_in_use($edge)) or ($op.flag != nil and not popup_live($op.flag, $op.generation)) then
+        $state.pending_panels = delete($state.pending_panels, $edge)
+        continue
+      end
+      $applied = $state.applied_panels[$edge]
+      $action = $p.panel_action($op, $applied)
+      if $action == nil then break end
+      if $action == "done" then
+        if $op.phase == "release" then
+          write_pins($p.released_popup_pins(read_pins(), $edge, $applied))
+        end
+        $state.pending_panels = delete($state.pending_panels, $edge)
+        break
+      end
+      $key = to_string($op.token) .. ":" .. $action
+      if $attempted[$key] ?? false then break end
+      $attempted[$key] = true
+      $verb = $action == "release" ? "shell.panel.mode" : ($action == "select" ? "shell.panel.page.set" : "shell.panel.pin")
+      $ok = panel_verb($verb, $edge, $action == "select" ? $op.page : nil)
+      if not $p.panel_operation_current($state.pending_panels, $edge, $op.token) then continue end
+      $state.pending_panels[$edge].refused = not $ok
+      -- An applied state can confirm success even if the reply was lost.
+      if not $ok and $p.panel_action($op, $state.applied_panels[$edge]) != "done" then break end
+    end
+  finally
+    $state.panel_drivers[$edge] = false
+  end
+  update_shown()
 end
 
 -- ── icons (the apps citizen resolves themes; cached here) ───────────────
@@ -863,7 +883,7 @@ end
 -- revealed or pinned at all: that would show whatever page the edge holds.
 fn show_popup($edge, $page, $flag, $gen)
   if not popup_live($flag, $gen) then return false end
-  if $state.pending_panels[$edge].page == $page and $state.pending_panels[$edge].generation == $gen then
+  if ($state.pending_panels[$edge] ?? {}).page == $page and ($state.pending_panels[$edge] ?? {}).generation == $gen then
     drive_panel_operations()
     return true
   end
@@ -874,7 +894,7 @@ fn show_popup($edge, $page, $flag, $gen)
     push($pins, $edge)
     write_pins($pins)
   end
-  $state.pending_panels[$edge] = {page:$page, phase:"select", flag:$flag, generation:$gen}
+  queue_panel($edge, $page, $flag, $gen, "select")
   drive_panel_operations()
   return true
 end
@@ -900,8 +920,8 @@ fn hide_popup($edge)
   end
   $confirmed = hide_edge($edge)
   if edge_in_use($edge) then return false end
-  if $state.pending_panels[$edge].refused == true then return false end
-  if not $p.popup_release_confirmed($confirmed) then return true end
+  if ($state.pending_panels[$edge] ?? {}).refused == true then return false end
+  if not $p.popup_release_confirmed($confirmed) then return false end
   $kept = $p.released_popup_pins(read_pins(), $edge, $confirmed)
   write_pins($kept)
   return true
@@ -956,33 +976,29 @@ fn close_calendar($scene_action = false)
   return hide_popup("right")
 end
 
--- Coalesce bursts (a window opening changes many props at once) into one
--- rebuild, the clippanel pattern.
+-- Coalesce inside the calling async handler. A local deadline resumes the
+-- rebuild even if the Bus disconnects; no loopback message owns the flag.
 fn schedule()
   $state.dirty = true
   if $state.scheduled then return end
   $state.scheduled = true
-  emit $ME panel.flush
-end
-
-on panel.flush async
-  if $event.headers.from != $ME or $event.headers.broker_origin != "local" then return end
-  if not $state.dirty then
-    $state.scheduled = false
-    return
-  end
-  $state.dirty = false
   try
-    fetch_windows()
-    fetch_tray()
-    fetch_notes()
-    render_panel()
-    if $state.notes_open then render_notes() else load_notes() end
-  catch $err
-    note("rebuild failed: " .. to_string($err))
+    sleep(0.01)
+    while $state.dirty
+      $state.dirty = false
+      try
+        fetch_windows()
+        fetch_tray()
+        fetch_notes()
+        render_panel()
+        if $state.notes_open then render_notes() else load_notes() end
+      catch $err
+        note("rebuild failed: " .. to_string($err))
+      end
+    end
+  finally
+    $state.scheduled = false
   end
-  $state.scheduled = false
-  if $state.dirty then schedule() end
 end
 
 fn page_applied($edge, $page)
@@ -990,51 +1006,93 @@ fn page_applied($edge, $page)
   return $pstate != nil and $pstate.page == $page and $pstate.visible and $pstate.pinned
 end
 
-on "shell.panel.changed"
-  if $event.headers.topic != $HOST .. ".panel.changed" then return end
-  $state.applied_panels = $event.args.panels
-  drive_panel_operations()
+fn update_shown()
   $state.panel_shown = page_applied("bottom", "scene-panel")
   $state.launcher_shown = $state.launcher_open and page_applied("left", "scene-launcher")
   $state.calendar_shown = $state.calendar_open and page_applied("right", "scene-calendar")
   $state.notes_shown = $state.notes_open and page_applied("right", "scene-notes")
 end
 
-on bus.connected
+fn subscription_gap()
+  -- Broker delivery gaps use a header; comp's retained publisher-loss
+  -- records use a JSON body. Both invalidate the subscription snapshot.
+  return $event.headers.gap == "true" or (($event.args ?? {}).gap == true)
+end
+
+on "shell.panel.changed"
+  if $event.headers.topic != $HOST .. ".panel.changed" then return end
+  if subscription_gap() then
+    resynchronise()
+  else
+    -- Ignore the payload: it can predate our command's applied reply.
+    refresh_panels()
+    drive_panel_operations()
+    update_shown()
+  end
+end
+
+fn recover_pins()
+  for each $edge in read_pins()
+    if not edge_in_use($edge) and $state.pending_panels[$edge] == nil then
+      queue_panel($edge, nil, nil, $state.popup_gen, "release")
+    end
+  end
+  drive_panel_operations()
+end
+
+fn resynchronise()
+  if $state.resyncing then return end
+  $state.resyncing = true
+  try
+    rpc($COMP, "comp.props.watch", {})
+    refresh_panels()
+    recover_pins()
+    update_shown()
+    schedule()
+    -- A broker gap can hide a complete host restart while the registered
+    -- names stay identical. Re-establish open intent even when its previous
+    -- operation had already completed and left no pending entry.
+    if $state.launcher_open and not $state.launcher_shown then render_launcher() end
+    if $state.calendar_open and not $state.calendar_shown then render_calendar() end
+    if $state.notes_open and not $state.notes_shown then render_notes() end
+  finally
+    $state.resyncing = false
+  end
+end
+
+on bus.connected async
   if len(keys($event.headers)) != 0 then return end
-  $snapshot = rpc($HOST, "shell.props.get", {})
-  $state.applied_panels = $snapshot.panels ?? {}
   $state.panel_shown = false
   $state.reg_launcher = false
   $state.reg_calendar = false
   $state.reg_notes = false
-  $state.pending_panels = {}
-  for each $edge in read_pins()
-    if not edge_in_use($edge) then hide_popup($edge) end
-  end
-  render_panel()
+  resynchronise()
   $registry = rpc("noded", "noded.props.get", {})
-  reconcile_services($registry.services.registered)
+  reconcile_services((($registry ?? {}).services ?? {}).registered)
 end
 
 fn reconcile_services($live)
   if type($live) != "list" then return end
   $previous = $state.live_services
-  $state.live_services = $live
+  if not contains($live, $HOST) then
+    $state.applied_panels = {}
+    update_shown()
+  end
   if contains($live, $HOST) and not contains($previous, $HOST) then
-    $state.pending_panels = {}
-    $snapshot = rpc($HOST, "shell.props.get", {})
-    $state.applied_panels = $snapshot.panels ?? {}
+    -- Do not consume the appearance if the host snapshot is unavailable.
+    if not refresh_panels() then return end
     $state.panel_shown = false
     $state.reg_launcher = false
     $state.reg_calendar = false
     $state.reg_notes = false
-    for each $edge in read_pins()
-      if not edge_in_use($edge) then hide_popup($edge) end
-    end
+    recover_pins()
     render_panel()
+    if $state.launcher_open then render_launcher() end
+    if $state.calendar_open then render_calendar() end
+    if $state.notes_open then render_notes() end
   end
   if contains($live, $COMP) and not contains($previous, $COMP) then rpc($COMP, "comp.props.watch", {}) end
+  $state.live_services = $live
   schedule()
 end
 
@@ -1488,11 +1546,12 @@ end
 -- The adapters' named events are wired too, in case a diff is coalesced
 -- away; schedule() refetches everything either way.
 on props.changed async
+  if subscription_gap() then resynchronise() end
   if $event.headers.topic == "noded.props.changed" then
-    if $event.headers.gap == "true" then
+    if subscription_gap() then
       $registry = rpc("noded", "noded.props.get", {})
-      reconcile_services($registry.services.registered)
-    elif $event.args.path == "services.registered" then
+      reconcile_services((($registry ?? {}).services ?? {}).registered)
+    elif ($event.args ?? {}).path == "services.registered" then
       reconcile_services($event.args.new)
     end
   else
@@ -1501,18 +1560,22 @@ on props.changed async
 end
 
 on tray.item.added async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
 on tray.item.removed async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
 on notification.created async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
 on notification.closed async
+  if subscription_gap() then resynchronise() end
   schedule()
 end
 
@@ -1547,7 +1610,7 @@ subscribe($NOTIFY .. ".props.changed")
 subscribe($HOST .. ".panel.changed")
 subscribe("noded.props.changed")
 $initial_panels = rpc($HOST, "shell.props.get", {})
-$state.applied_panels = $initial_panels.panels ?? {}
+$state.applied_panels = ($initial_panels ?? {}).panels ?? {}
 rpc($COMP, "comp.props.watch", {})
 fetch_windows()
 fetch_tray()
@@ -1561,7 +1624,7 @@ for each $edge in read_pins()
 end
 render_panel()
 $initial_registry = rpc("noded", "noded.props.get", {})
-reconcile_services($initial_registry.services.registered)
+reconcile_services((($initial_registry ?? {}).services ?? {}).registered)
 note("quoin-panel up: host=" .. $HOST .. " comp=" .. $COMP)
 
 -- The clock runs in its own async handler (below), kicked once from here, so

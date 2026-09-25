@@ -20,6 +20,31 @@ check($p.popup_release_confirmed($confirmed), "applied release")
 check(deep_eq($p.released_popup_pins($pins, "left", $confirmed), ["right"]), "release only our edge")
 check(deep_eq($p.released_popup_pins(["right"], "left", $confirmed), ["right"]), "idempotent recovery")
 
+-- The production operation selector consumes state, never notification
+-- counts. Cover first open on each edge and deletion at an immediate reply.
+for each $edge in ["left", "right", "bottom", "top"]
+  $op = {page:"scene-first", phase:"select", token:1}
+  check($p.panel_action($op, nil) == nil, "absent Quoin is unknown")
+  check($p.panel_action(nil, {}) == nil, "deleted pending entry is harmless")
+  check(not $p.panel_operation_current({}, $edge, 1), "late reply cannot resurrect deleted op")
+  $pending = {}; $pending[$edge] = $op
+  check($p.panel_operation_current($pending, $edge, 1), "current operation token")
+  check(not $p.panel_operation_current($pending, $edge, 2), "replacement fences old reply")
+  $s = {page:nil, pages:["scene-first"], pinned:false, visible:false}
+  check($p.panel_action($op, $s) == "select", "first page selection")
+  $s.page = "scene-first"
+  check($p.panel_action($op, $s) == "pin", "selection readback advances without notice")
+  check($p.panel_action($op, $s) == "pin", "refused pin remains retryable")
+  $s.pinned = true; $s.visible = true
+  check($p.panel_action($op, $s) == "done", "already selected/pinned completes")
+  $op.phase = "release"
+  check($p.panel_action($op, $s) == "release", "persistent pin needs release")
+  $s.pinned = false
+  check($p.panel_action($op, $s) == "release", "concealment must finish")
+  $s.visible = false
+  check($p.panel_action($op, $s) == "done", "immediate release removes operation")
+end
+
 -- ── calendar arithmetic ────────────────────────────────────────────────
 -- Known weekdays (ISO 1 = Monday): 2026-09-01 Tue, 2026-09-20 Sun,
 -- 2000-01-01 Sat, 2024-02-29 Thu, 1970-01-01 Thu.
