@@ -324,6 +324,7 @@ pub(crate) fn update_button_style(
     }
 }
 
+#[cfg(feature = "icons")]
 fn label_font_size(typography: &CtkTypography, size: ButtonSize) -> f32 {
     if size == ButtonSize::Sm {
         typography.body_px - 2.0
