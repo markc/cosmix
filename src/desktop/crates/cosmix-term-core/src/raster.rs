@@ -687,6 +687,58 @@ impl Raster {
         self.paint_format(screen, dst, stride, state, dirty, PixelFormat::Rgba)
     }
 
+    /// One non-ASCII / wide / extended-cluster cell, kept out of the ASCII
+    /// glyph loop so that loop stays tight.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn paint_unicode_cell(
+        &mut self,
+        screen: &Screen,
+        cells: &[Cell],
+        col: usize,
+        rgba: &mut [u8],
+        stride: usize,
+        y: usize,
+        format: PixelFormat,
+    ) {
+        let cell = cells[col];
+        let mut scalar = [0; 4];
+        let text = if cell.extra == 0 {
+            cell.c.encode_utf8(&mut scalar)
+        } else {
+            screen.clusters.get(cell.extra).unwrap_or("")
+        };
+        let span = cell_span(cells, col);
+        let image = match self.unicode.get(
+            text,
+            span,
+            self.px,
+            (self.width, self.height),
+            self.baseline,
+        ) {
+            Some(image) => image,
+            None => self.unicode.image(
+                text,
+                span,
+                self.px,
+                (self.width, self.height),
+                self.baseline,
+            ),
+        };
+        paint_cluster(
+            image,
+            rgba,
+            stride,
+            col * self.width as usize,
+            y,
+            self.width as usize * span,
+            self.height as usize,
+            cell.fg,
+            format,
+        );
+    }
+
     /// Like [`Self::paint`], with an explicit destination channel order.
     /// Changing format invalidates all rows, even at the same buffer address.
     pub fn paint_format<'a>(
@@ -835,40 +887,9 @@ impl Raster {
                     continue;
                 }
                 if cell.extra != 0 || !cell.c.is_ascii() || cell.width == CellWidth::Wide {
-                    let mut scalar = [0; 4];
-                    let text = if cell.extra == 0 {
-                        cell.c.encode_utf8(&mut scalar)
-                    } else {
-                        screen.clusters.get(cell.extra).unwrap_or("")
-                    };
-                    let span = cell_span(cells, col);
-                    let image = match self.unicode.get(
-                        text,
-                        span,
-                        self.px,
-                        (self.width, self.height),
-                        self.baseline,
-                    ) {
-                        Some(image) => image,
-                        None => self.unicode.image(
-                            text,
-                            span,
-                            self.px,
-                            (self.width, self.height),
-                            self.baseline,
-                        ),
-                    };
-                    paint_cluster(
-                        image,
-                        rgba,
-                        stride,
-                        col * self.width as usize,
-                        y,
-                        self.width as usize * span,
-                        self.height as usize,
-                        cell.fg,
-                        format,
-                    );
+                    // Out of line and cold: inlining this branch into the
+                    // ASCII loop cost ~0.55 ms per warm full paint (cbc3).
+                    self.paint_unicode_cell(screen, cells, col, rgba, stride, y, format);
                     continue;
                 }
                 if cell.c == ' ' || cell.c == '\0' {
