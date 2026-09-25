@@ -1,0 +1,26 @@
+{
+  "name": "keep mine > 1 MiB: typing during the transfer waits behind the stages",
+  "about": "Opus m3 / GLM M3. The user types while stage 1 is in flight. Stage 2 is queued only when stage 1 completes, so by FIFO the typing would go out first, stale stage 2's expect_rev and abort the transfer. A running transfer holds everything else: stage 2 goes first, then the typing, transformed past both stages. Events carry the full inserts here (fake budgets raised) so both stages fold as remote edits through the held op.",
+  "path": "/fixture/doc.txt",
+  "fake": {"max_event_insert": 4194304, "history_elide_over": 4194304},
+  "initial": {"repeat": ["abcdefgh\n", 160000]},
+  "run_id": 1,
+  "steps": [
+    {"epoch_change": {"new_epoch": "0000e1e2", "text": ""}},
+    {"action": {"keep_mine": {}}},
+    {"send": {"id": "K1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b2_0000e1e2", "at": 0, "text": {"repeat": ["abcdefgh\n", 116508]}, "expect_rev": 0, "origin": "human:ced", "op_id": "c00000001-keep1-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"local": {"id": "L1", "edit": {"items": [[0, 0, "abcdefgh\n"]], "coalesce": false}}},
+    {"deliver_all": {}},
+    {"send": {"id": "K2", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b2_0000e1e2", "at": 1048572, "text": {"repeat": ["abcdefgh\n", 43492]}, "expect_rev": 1, "origin": "human:ced", "op_id": "c00000001-keep1-000002"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_all": {}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b2_0000e1e2", "at": 1440000, "text": "abcdefgh\n", "base_rev": 2, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000003"},
+      "expect": {"rc": 0, "rev": 3}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": {"repeat": ["abcdefgh\n", 160001]}, "server_rev": 3, "converged": true, "conflicts": 0, "detached": false, "idle": true}
+}

@@ -54,6 +54,11 @@ fn insert_replaces_selection_and_coalesces_single_chars() {
     assert!(e.coalesce);
     let (_, e) = run("abcd", &mut model(2, 2), EditCommand::Insert("xy".into()));
     assert!(!e.coalesce, "a paste is not typing");
+    let (s, e) = run("abcd", &mut model(2, 2), EditCommand::Insert("e\u{301}".into()));
+    assert_eq!(s, "abe\u{301}cd");
+    assert!(e.coalesce, "one grapheme of two scalars is one keystroke");
+    let (_, e) = run("abcd", &mut model(2, 2), EditCommand::Insert("\r\n".into()));
+    assert!(!e.coalesce, "a CRLF Enter starts a new undo group");
 }
 
 #[test]

@@ -49,6 +49,7 @@ Each step is exactly one key.
 | `deliver_event` `{seq}` / `drop_event` `{seq}` | client | Deliver or lose the event with that `event_seq`. |
 | `deliver_reply` `id` / `drop_reply` `id` | client | Deliver or lose the reply to `id`. |
 | `deadline` `id` | client | The request `id` timed out with no reply. |
+| `echo_timeout` `id` | client | The echo timer the mirror handed out for `id` (an `rc 0` reply whose effect has not arrived) fires. The harness never fires it unasked. |
 | `action` `{keep_mine:{}}` / … | client | A controller-level action. |
 | `deliver_all` `{}` | client | Deliver everything still pending, in server order. |
 

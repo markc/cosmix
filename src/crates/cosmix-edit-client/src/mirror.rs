@@ -17,7 +17,9 @@
 //! 1. `ev.rev <= self.rev` → drop (duplicate).
 //! 2. `ev.base_rev != self.rev` → `suspect()` and buffer the event.
 //! 3. In-flight Local op with `op_id == ev.op_id` → ack (`rev = ev.rev`,
-//!    clear, add to `completed`); `ev.op_id` in `completed` → only `rev = ev.rev`.
+//!    clear, add to `completed`). An `ev.op_id` already acked is a second
+//!    commit of that op (every ack leaves `rev` at or past its commit, so a
+//!    true duplicate fell to step 1): it folds as remote, with a notice.
 //! 4. Everything else folds as REMOTE, transactionally: `ops` = the PRESENT
 //!    pending ops (a Doomed / `present == false` in-flight op is EXCLUDED —
 //!    codex N1); on clones, for each remote step `x` in order and each op `P`:
@@ -75,6 +77,16 @@
 //!   backoff to arm; when it fires, [`Mirror::on_retry`]). [`Step::out`]
 //!   carries reads (`edit.get`, `edit.history`, `edit.list`) and identical
 //!   resends only.
+//! - Also after every call: [`Mirror::take_echo_timer`] (an `rc 0` reply is
+//!   in but its effect is not — arm a one-shot, then
+//!   [`Mirror::on_echo_timeout`], which recovers from history when the echo
+//!   was lost with no successor event to reveal the gap) and
+//!   [`Mirror::take_outcomes`] (how each queued [`ServerOp`] ended, for the
+//!   caller that asked for it).
+//! - While a keep-mine transfer runs, only its own stage (or compensating
+//!   undo) is sent: local edits and other server ops wait behind it, so they
+//!   can neither stale the next stage's `expect_rev` nor be undone by the
+//!   compensation.
 //! - Every reply, reads included, goes to [`Mirror::on_reply`] with the
 //!   [`Outgoing::op_id`] it was sent with; reads carry a mirror-local
 //!   `read-<n>` id that is not in the body. A read's deadline re-sends it.
@@ -119,6 +131,10 @@ const HISTORY_LIMIT: usize = 1000;
 /// `RESOURCE_LIMIT busy` backoff: 250 ms doubling, capped at 5 s.
 const RETRY_FIRST_MS: u64 = 250;
 const RETRY_CAP_MS: u64 = 5_000;
+/// `busy` refusals of one request before it is given up (~24 s of backoff).
+const RETRY_MAX: u32 = 8;
+/// Deadlines of one read before the human is told the service is silent.
+const READ_WARN_AFTER: u32 = 3;
 
 /// Notice texts a caller may match on (plan §3.5).
 pub const MSG_UNDO_INCOMPLETE: &str = "Undo did not complete — press again";
@@ -130,6 +146,33 @@ pub const MSG_SAVE_UNCERTAIN: &str = "The save may not have completed — save a
 pub const MSG_SAVE_DISK_MODIFIED: &str = "The file changed on disk since it was opened — save anyway?";
 pub const MSG_KEEP_INTERRUPTED: &str =
     "Transfer interrupted; the shared buffer holds a partial copy of yours — Retry, Undo remaining or Save mine as…";
+/// One of ced's edits was committed twice by the service (a resend raced
+/// the original past an evicted dedup entry); the view shows the service's
+/// text.
+pub const MSG_DOUBLE_COMMIT: &str = "The edit service applied one of your edits twice — check the text around it";
+pub const MSG_RELOAD_UNCERTAIN: &str = "The reload may not have completed — reload again";
+pub const MSG_SERVICE_SILENT: &str = "The edit service is not answering — still trying";
+
+/// How a queued [`ServerOp`] ended (Opus m4): the controller answers the Bus
+/// caller that asked for it from this, never at enqueue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Completed (for undo/redo/replace/reload: its effect is in the view).
+    Done,
+    /// Refused, given up, or of unknown fate (`reason: "uncertain"`).
+    Refused(wire::Refusal),
+}
+
+fn refusal(error_code: ErrorCode, reason: Option<&str>, message: &str) -> wire::Refusal {
+    wire::Refusal {
+        error_code,
+        message: message.to_string(),
+        reason: reason.map(str::to_string),
+        buffer: None,
+        rev: None,
+        context: Default::default(),
+    }
+}
 
 /// One item of a local transaction, in REQUEST order for life.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +461,15 @@ struct Retry {
     /// A timer the host has not armed yet.
     unarmed: Option<u64>,
     waiting: bool,
+    /// `busy` refusals so far; past [`RETRY_MAX`] the request is given up.
+    attempts: u32,
+}
+
+/// The in-flight op replied `rc 0` and waits for its effect (Opus M1).
+struct EchoWait {
+    op_id: String,
+    /// The timer has not been handed to the host yet.
+    unarmed: bool,
 }
 
 /// A server edit to fold: an event, or a history entry as one.
@@ -519,8 +571,8 @@ fn meta_of(open: &wire::OpenReply) -> BufferMeta {
         disk: open.disk,
         dirty: open.recovered,
         // E0's open reply carries no saved_rev: a freshly opened, unrecovered
-        // buffer is taken as saved at its rev (the controller refreshes from
-        // `edit.list`).
+        // buffer is taken as saved at its rev until the controller refreshes
+        // it from `edit.list` ([`Mirror::note_saved`]).
         saved_rev: (!open.recovered).then_some(open.rev),
         recovered: open.recovered,
         recovery_id: open.recovery_id.clone(),
@@ -542,16 +594,22 @@ pub struct Mirror {
     conflicts: Vec<Conflict>,
     detached_copy: Option<DetachedCopy>,
     meta: BufferMeta,
+    /// `meta.saved_rev` came from the service (a save reply, a reload, an
+    /// `edit.list` row), not the open-time guess.
+    saved_known: bool,
     last_remote: Option<RemoteMark>,
     phase: Phase,
     completed: Completed,
-    reads: HashMap<String, (Read, Outgoing)>,
+    /// Outstanding reads: kind, the request, deadlines passed so far.
+    reads: HashMap<String, (Read, Outgoing, u32)>,
     read_seq: u64,
     pager: Option<Pager>,
     /// A snapshot fallback is due; `true` = keep the view as a detached copy.
     snap_due: Option<bool>,
     recon: Option<Recon>,
     retry: Option<Retry>,
+    echo: Option<EchoWait>,
+    outcomes: Vec<(String, Outcome)>,
     /// Loss noticed while not Live: recover again once Live.
     resuspect: bool,
     /// Reattach: the view text to compare with the service's.
@@ -579,6 +637,7 @@ impl Mirror {
             conflicts: Vec::new(),
             detached_copy: None,
             meta: meta_of(open),
+            saved_known: false,
             last_remote: None,
             phase: Phase::Bootstrapping { buffered: Vec::new() },
             completed: Completed::default(),
@@ -588,6 +647,8 @@ impl Mirror {
             snap_due: None,
             recon: None,
             retry: None,
+            echo: None,
+            outcomes: Vec::new(),
             resuspect: false,
             compare_with: None,
             keep: None,
@@ -710,9 +771,16 @@ impl Mirror {
             pendings.push(Pending { op_id: ids.next_id(), intent: intent.clone(), items, coalesce: e.coalesce });
         }
         let mut edits = Vec::new();
-        for p in &pendings {
+        for (k, p) in pendings.iter().enumerate() {
             let seq: Vec<Edit> = p.seq().into_iter().map(|(_, e)| e).collect();
-            apply_text(&mut self.text, &seq).map_err(MirrorError::Invalid)?;
+            if let Err(e) = apply_text(&mut self.text, &seq) {
+                // Unreachable (every range was validated above), but never
+                // leave a half-applied edit with no delta and no op (GLM M7).
+                for done in pendings[..k].iter().rev() {
+                    let _ = apply_text(&mut self.text, &done.inverse());
+                }
+                return Err(MirrorError::Invalid(e));
+            }
             edits.extend(seq);
         }
         for p in pendings {
@@ -742,9 +810,11 @@ impl Mirror {
                 }
                 self.on_edit_event(e, &mut step);
             }
-            wire::Event::Cursor(c) if c.buffer == self.buffer => self.on_cursor(c),
-            wire::Event::Disk(d) if d.buffer == self.buffer => self.meta.disk = d.disk,
-            wire::Event::Close(c) if c.buffer == self.buffer => {
+            // A cursor / disk / close event from another daemon session is
+            // stale news about a buffer that no longer exists (GLM NIT 4).
+            wire::Event::Cursor(c) if c.buffer == self.buffer && c.epoch == self.epoch => self.on_cursor(c),
+            wire::Event::Disk(d) if d.buffer == self.buffer && d.epoch == self.epoch => self.meta.disk = d.disk,
+            wire::Event::Close(c) if c.buffer == self.buffer && c.epoch == self.epoch => {
                 self.phase = Phase::Detached { reason: DetachReason::ClosedRemotely { by: None } };
                 self.abandon_pipeline();
             }
@@ -762,7 +832,7 @@ impl Mirror {
     /// The reply to one of this mirror's requests, matched by the op_id the
     /// [`Outgoing`] carried (a `read-<n>` id for reads).
     pub fn on_reply(&mut self, op_id: &str, reply: Result<Value, wire::Refusal>) -> Step {
-        if let Some((kind, _)) = self.reads.remove(op_id) {
+        if let Some((kind, _, _)) = self.reads.remove(op_id) {
             return self.on_read_reply(kind, reply);
         }
         let mut step = Step::default();
@@ -784,15 +854,47 @@ impl Mirror {
             Err(r) => self.reply_refused(&r, &mut step),
         }
         self.try_snapshot(&mut step);
+        self.watch_echo();
         step
+    }
+
+    /// An `rc 0` reply is in but its effect is not: the timer to arm now
+    /// (`(op_id, ms)`, then [`Mirror::on_echo_timeout`]). Handed out once per
+    /// wait.
+    pub fn take_echo_timer(&mut self) -> Option<(String, u64)> {
+        let e = self.echo.as_mut().filter(|e| e.unarmed)?;
+        e.unarmed = false;
+        Some((e.op_id.clone(), DEADLINE_MS))
+    }
+
+    /// The echo timer for `op_id` fired (Opus M1). If that op still waits for
+    /// its effect, the event was lost with nothing after it to reveal the
+    /// gap: recover from history (§3.6), which acks it through its entry.
+    pub fn on_echo_timeout(&mut self, op_id: &str) -> Step {
+        let waiting = self.echo.as_ref().is_some_and(|e| e.op_id == op_id) && self.replied_waiting() == Some(op_id);
+        if !waiting {
+            return Step::default();
+        }
+        self.echo = None;
+        self.suspect()
+    }
+
+    /// How each queued [`ServerOp`] ended since the last call, by op id.
+    pub fn take_outcomes(&mut self) -> Vec<(String, Outcome)> {
+        std::mem::take(&mut self.outcomes)
     }
 
     /// The request carrying `op_id` passed its deadline with no reply (§3.5).
     pub fn on_deadline(&mut self, op_id: &str) -> Step {
         let mut step = Step::default();
-        if let Some((_, out)) = self.reads.get(op_id) {
-            // Reads are idempotent: ask again.
+        if let Some((_, out, missed)) = self.reads.get_mut(op_id) {
+            // Reads are idempotent: ask again, and say so once the service
+            // has been silent for a while (GLM M5).
+            *missed += 1;
             step.out.push(out.clone());
+            if *missed == READ_WARN_AFTER {
+                step.notices.push(Notice::Message { level: Level::Warn, text: MSG_SERVICE_SILENT.into() });
+            }
             return step;
         }
         let Some(inflight) = self.inflight.as_mut() else { return step };
@@ -824,12 +926,14 @@ impl Mirror {
                         // Reload entries carry no op_id: history folds whatever
                         // happened; never resent.
                         self.clear_slot();
+                        self.uncertain(op_id, MSG_RELOAD_UNCERTAIN);
                         step.extend(self.suspect());
                     }
                     ServerOp::Save { .. } => {
                         if self.recon.as_ref().is_some_and(|r| r.save_resent) {
                             self.recon = None;
                             self.clear_slot();
+                            self.uncertain(op_id, MSG_SAVE_UNCERTAIN);
                             step.notices.push(Notice::Message { level: Level::Warn, text: MSG_SAVE_UNCERTAIN.into() });
                         } else {
                             *state = AckState::Uncertain;
@@ -896,6 +1000,7 @@ impl Mirror {
         };
         let mut step = Step::default();
         self.history_page(kind, page, &mut step);
+        self.watch_echo();
         step
     }
 
@@ -919,13 +1024,27 @@ impl Mirror {
         if !matches!(self.phase, Phase::Live) || self.inflight.is_some() {
             return None;
         }
+        if let Some(k) = &self.keep {
+            // A keep-mine transfer holds everything else back (Opus m3): a
+            // local edit or undo between two stages would stale the next
+            // stage's `expect_rev`, and an own-lane compensating undo could
+            // then undo it instead of the stage.
+            let current = k.current.clone()?;
+            let i = self.server_ops.iter().position(|(_, q)| q.op_id == current)?;
+            let (_, q) = self.server_ops.remove(i)?;
+            return Some(self.send_server(q));
+        }
         let local_first = match (self.queue.front(), self.server_ops.front()) {
             (Some((a, _)), Some((b, _))) => a < b,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (None, None) => return None,
         };
-        let (wire, deadline) = if local_first {
+        if !local_first {
+            let (_, q) = self.server_ops.pop_front()?;
+            return Some(self.send_server(q));
+        }
+        let (wire, deadline) = {
             let (_, p) = self.queue.pop_front()?;
             let (verb, body) = self.local_body(&p);
             let wire = SentRequest {
@@ -937,15 +1056,16 @@ impl Mirror {
             };
             self.inflight = Some(Inflight::Local { p, present: true, wire: wire.clone(), state: AckState::Sent });
             (wire, DEADLINE_MS)
-        } else {
-            let (_, q) = self.server_ops.pop_front()?;
-            let (verb, body) = self.server_body(&q);
-            let deadline = if verb == "edit.save" { DEADLINE_LONG_MS } else { DEADLINE_MS };
-            let wire = SentRequest { verb, body: body.to_string(), op_id: q.op_id.clone(), base_rev: None, sent_at_rev: self.rev };
-            self.inflight = Some(Inflight::Server { op: q.op, intent: q.intent, wire: wire.clone(), state: AckState::Sent });
-            (wire, deadline)
         };
         Some(Outgoing { verb: wire.verb.to_string(), body: wire.body, op_id: Some(wire.op_id), deadline_ms: deadline })
+    }
+
+    fn send_server(&mut self, q: QServer) -> Outgoing {
+        let (verb, body) = self.server_body(&q);
+        let deadline = if verb == "edit.save" { DEADLINE_LONG_MS } else { DEADLINE_MS };
+        let wire = SentRequest { verb, body: body.to_string(), op_id: q.op_id.clone(), base_rev: None, sent_at_rev: self.rev };
+        self.inflight = Some(Inflight::Server { op: q.op, intent: q.intent, wire: wire.clone(), state: AckState::Sent });
+        Outgoing { verb: wire.verb.to_string(), body: wire.body, op_id: Some(wire.op_id), deadline_ms: deadline }
     }
 
     /// A busy backoff the host must arm as a one-shot timer (then call
@@ -990,6 +1110,7 @@ impl Mirror {
         self.epoch = open.epoch.clone();
         self.rev = open.rev;
         self.meta = meta_of(open);
+        self.saved_known = false;
         self.abandon_pipeline();
         self.completed = Completed::default();
         self.cursors.clear();
@@ -1072,6 +1193,22 @@ impl Mirror {
         self.conflicts.len() != before
     }
 
+    /// The service's save state for this buffer, from an `edit.list` row
+    /// (Opus m2): the open reply carries none, and another holder may have
+    /// saved (or dirtied) the buffer.
+    ///
+    /// A row older than what ced already knows (a list answered before a
+    /// save whose reply came first) is ignored: `saved_rev` only grows.
+    pub fn note_saved(&mut self, saved_rev: Option<u64>, recovered: bool) {
+        if self.saved_known && saved_rev < self.meta.saved_rev {
+            return;
+        }
+        self.saved_known = true;
+        self.meta.saved_rev = saved_rev;
+        self.meta.recovered = recovered;
+        self.meta.dirty = self.pending() > 0 || self.meta.saved_rev != Some(self.rev) || self.meta.recovered;
+    }
+
     // ── internals ────────────────────────────────────────────────────────────
 
     fn push_delta(&mut self, step: &mut Step, edits: Vec<Edit>, origin: Option<cosmix_edit_core::origin::Origin>, kind: DeltaKind) {
@@ -1082,12 +1219,12 @@ impl Mirror {
     fn send_read(&mut self, kind: Read, verb: &str, body: Value, deadline_ms: u64, step: &mut Step) {
         if matches!(kind, Read::Page | Read::Recover) {
             // A new read of this kind supersedes any outstanding one.
-            self.reads.retain(|_, (k, _)| *k != kind);
+            self.reads.retain(|_, (k, _, _)| *k != kind);
         }
         self.read_seq += 1;
         let id = format!("read-{}", self.read_seq);
         let out = Outgoing { verb: verb.to_string(), body: body.to_string(), op_id: Some(id.clone()), deadline_ms };
-        self.reads.insert(id, (kind, out.clone()));
+        self.reads.insert(id, (kind, out.clone(), 0));
         step.out.push(out);
     }
 
@@ -1109,7 +1246,18 @@ impl Mirror {
 
     /// Drop everything in the pipeline (epoch change, remote close, reattach).
     fn abandon_pipeline(&mut self) {
+        let dropped: Vec<String> = self
+            .inflight
+            .iter()
+            .filter_map(|i| matches!(i, Inflight::Server { .. }).then(|| i.wire().op_id.clone()))
+            .chain(self.server_ops.iter().map(|(_, q)| q.op_id.clone()))
+            .collect();
+        for id in dropped {
+            let msg = "The buffer detached from the edit service before this completed";
+            self.outcomes.push((id, Outcome::Refused(refusal(ErrorCode::Conflict, Some("detached"), msg))));
+        }
         self.inflight = None;
+        self.echo = None;
         self.queue.clear();
         self.server_ops.clear();
         self.reads.clear();
@@ -1119,6 +1267,32 @@ impl Mirror {
         self.retry = None;
         self.resuspect = false;
         self.keep = None;
+    }
+
+    /// A server op whose fate is unknown (a lost reply the checks could not
+    /// resolve).
+    fn uncertain(&mut self, op_id: &str, msg: &str) {
+        self.outcomes.push((op_id.to_string(), Outcome::Refused(refusal(ErrorCode::Conflict, Some("uncertain"), msg))));
+    }
+
+    /// The op id of the in-flight op when it replied `rc 0` and still waits
+    /// for its effect: a Local op not yet acked, or a Server op behind its
+    /// completion barrier.
+    fn replied_waiting(&self) -> Option<&str> {
+        match &self.inflight {
+            Some(Inflight::Local { state: AckState::Replied(_), wire, .. }) => Some(&wire.op_id),
+            Some(Inflight::Server { state: AckState::Replied(info), wire, .. }) if self.rev < info.rev => Some(&wire.op_id),
+            _ => None,
+        }
+    }
+
+    /// Keep [`Self::echo`] on the op that waits for its effect, if any.
+    fn watch_echo(&mut self) {
+        match self.replied_waiting().map(str::to_string) {
+            Some(id) if self.echo.as_ref().is_some_and(|e| e.op_id == id) => {}
+            Some(op_id) => self.echo = Some(EchoWait { op_id, unarmed: true }),
+            None => self.echo = None,
+        }
     }
 
     fn present_inflight(&self) -> bool {
@@ -1315,9 +1489,11 @@ impl Mirror {
                 return;
             }
             if self.completed.local.contains(id) {
-                self.rev = ev.rev;
-                self.after_rev(step);
-                return;
+                // Every ack leaves `rev` at or past the op's commit, so a
+                // later edit with its op id is a SECOND commit (a resend
+                // raced the original past an evicted dedup entry — Opus m1).
+                // Server truth wins: fold it like any remote edit.
+                step.notices.push(Notice::Message { level: Level::Warn, text: MSG_DOUBLE_COMMIT.into() });
             }
         }
         self.fold_remote(ev, step);
@@ -1383,6 +1559,7 @@ impl Mirror {
                     }
                     if ev.kind == wire::KindW::Reload {
                         self.meta.saved_rev = Some(ev.rev);
+                        self.saved_known = true;
                     }
                     if !is_own_origin(ev.origin) {
                         let mut span: Option<Range<usize>> = None;
@@ -1506,6 +1683,7 @@ impl Mirror {
         if let Some(i) = self.inflight.take() {
             self.completed.add(i.wire().op_id.clone(), false);
         }
+        self.retry = None;
     }
 
     /// After `rev` moved: the Server completion barrier and the dirty flag.
@@ -1526,6 +1704,7 @@ impl Mirror {
     fn complete_server(&mut self, rev: u64, step: &mut Step) {
         let Some(Inflight::Server { wire, .. }) = self.inflight.take() else { return };
         self.completed.add(wire.op_id.clone(), false);
+        self.outcomes.push((wire.op_id.clone(), Outcome::Done));
         self.retry = None;
         let Some(k) = self.keep.as_mut() else { return };
         if k.current.as_deref() != Some(wire.op_id.as_str()) {
@@ -1604,9 +1783,27 @@ impl Mirror {
     }
 
     fn reply_ok(&mut self, v: &Value, step: &mut Step) {
-        let rev = v.get("rev").and_then(Value::as_u64).unwrap_or(self.rev);
+        let reply_rev = v.get("rev").and_then(Value::as_u64);
+        let rev = reply_rev.unwrap_or(self.rev);
         let truncated = v.get("reply_truncated").and_then(Value::as_bool).unwrap_or(false);
         self.retry = None;
+        let needs_rev = match &self.inflight {
+            Some(Inflight::Local { state, .. }) => !matches!(state, AckState::Doomed),
+            Some(Inflight::Server { op: ServerOp::Save { .. }, .. }) => false,
+            Some(Inflight::Server { op: ServerOp::Reload { .. }, .. }) => v.get("unchanged").and_then(Value::as_bool) != Some(true),
+            Some(Inflight::Server { .. }) => true,
+            None => false,
+        };
+        if needs_rev && reply_rev.is_none() {
+            // Every rc 0 mutation reply carries `rev` (Opus n1). Without it
+            // the commit point is unknown: reconcile through history, as on
+            // a lost reply (§3.5), rather than guess it.
+            if let Some(Inflight::Local { state, .. } | Inflight::Server { state, .. }) = self.inflight.as_mut() {
+                *state = AckState::Uncertain;
+            }
+            self.start_recon(step);
+            return;
+        }
         match self.inflight.as_mut() {
             Some(Inflight::Local { state, .. }) => {
                 if matches!(state, AckState::Doomed) {
@@ -1625,6 +1822,7 @@ impl Mirror {
                 ServerOp::Save { .. } => {
                     if let Ok(s) = serde_json::from_value::<wire::SaveReply>(v.clone()) {
                         self.meta.saved_rev = Some(s.saved_rev);
+                        self.saved_known = true;
                         self.meta.path = Some(s.path);
                         self.meta.disk = s.disk;
                         self.meta.recovered = false;
@@ -1658,8 +1856,7 @@ impl Mirror {
                     self.clear_slot();
                     return;
                 }
-                if busy {
-                    self.arm_retry();
+                if busy && self.arm_retry() {
                     return;
                 }
                 let mut acc = None;
@@ -1675,11 +1872,11 @@ impl Mirror {
                 }
                 self.after_rev(step);
             }
-            Some(Inflight::Server { op, wire, .. }) => {
-                if busy {
-                    self.arm_retry();
+            Some(Inflight::Server { .. }) => {
+                if busy && self.arm_retry() {
                     return;
                 }
+                let Some(Inflight::Server { op, wire, .. }) = self.inflight.as_ref() else { return };
                 let is_keep = self.keep.as_ref().is_some_and(|k| k.current.as_deref() == Some(wire.op_id.as_str()));
                 let text = match op {
                     ServerOp::ApplyAt { .. } if why == Some(reason::STALE_REV) => {
@@ -1688,6 +1885,7 @@ impl Mirror {
                     ServerOp::Save { .. } if why == Some(reason::DISK_MODIFIED) => MSG_SAVE_DISK_MODIFIED.to_string(),
                     _ => r.message.clone(),
                 };
+                self.outcomes.push((wire.op_id.clone(), Outcome::Refused(r.clone())));
                 self.clear_slot();
                 if is_keep {
                     self.keep_refused(&text, step);
@@ -1699,11 +1897,20 @@ impl Mirror {
         }
     }
 
-    fn arm_retry(&mut self) {
-        let r = self.retry.get_or_insert(Retry { next_delay: RETRY_FIRST_MS, unarmed: None, waiting: false });
+    /// Back off and resend after a `busy` refusal; `false` once the request
+    /// has been refused [`RETRY_MAX`] times — it is then given up like any
+    /// other refusal (never applied, so nothing to reconcile — GLM M6).
+    fn arm_retry(&mut self) -> bool {
+        let r = self.retry.get_or_insert(Retry { next_delay: RETRY_FIRST_MS, unarmed: None, waiting: false, attempts: 0 });
+        r.attempts += 1;
+        if r.attempts > RETRY_MAX {
+            self.retry = None;
+            return false;
+        }
         r.unarmed = Some(r.next_delay);
         r.waiting = true;
         r.next_delay = (r.next_delay * 2).min(RETRY_CAP_MS);
+        true
     }
 
     fn start_recon(&mut self, step: &mut Step) {
@@ -1746,6 +1953,7 @@ impl Mirror {
             }
         }
         self.try_snapshot(&mut step);
+        self.watch_echo();
         step
     }
 
@@ -1923,6 +2131,7 @@ impl Mirror {
                     }
                     (None, trimmed) => {
                         let is_keep = self.keep.as_ref().is_some_and(|k| k.current.as_deref() == Some(rc.op_id.as_str()));
+                        self.uncertain(&rc.op_id, msg);
                         self.clear_slot();
                         if is_keep {
                             self.keep_refused(msg, step);
@@ -1950,6 +2159,7 @@ impl Mirror {
             && row.saved_rev.is_some_and(|s| s >= wire.sent_at_rev)
         {
             self.meta.saved_rev = row.saved_rev;
+            self.saved_known = true;
             self.meta.path = row.path.clone();
             self.meta.disk = row.disk;
             self.meta.recovered = row.recovered;
@@ -1965,6 +2175,7 @@ impl Mirror {
             self.recon = Some(rc);
             return;
         }
+        self.uncertain(&rc.op_id, MSG_SAVE_UNCERTAIN);
         self.clear_slot();
         step.notices.push(Notice::Message { level: Level::Warn, text: MSG_SAVE_UNCERTAIN.into() });
     }
@@ -1987,7 +2198,7 @@ impl Mirror {
             }
         };
         self.phase = Phase::Recovering { since: self.rev, buffered, how: RecoverHow::Snapshot };
-        self.reads.retain(|_, (k, _)| *k != Read::Recover);
+        self.reads.retain(|_, (k, _, _)| *k != Read::Recover);
         self.snap_due = Some(self.snap_due.unwrap_or(false) || detach);
         self.try_snapshot(step);
     }

@@ -1,0 +1,22 @@
+{
+  "name": "a second commit of an acked op folds as remote (dedup evicted between resend and original)",
+  "about": "Opus m1. L1's first send is lost in transit; at the deadline history has no entry, so the identical request is resent and commits (rev 1). The dedup entry is then evicted and the ORIGINAL arrives late: it commits again (rev 2). Every ack leaves rev at or past the op's commit, so the rev-2 echo carrying L1's op id is a second commit, not a duplicate: it must fold as a remote edit (view == server) with a notice — never be skipped into silent divergence.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "!"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced", "lost": true,
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {}}},
+    {"deadline": "L1"},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced", "resend": true,
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"evict_dedup": {}},
+    {"arrive": {"id": "L1"}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "hello!! world\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false,
+             "notices": ["double_commit"], "idle": true}
+}

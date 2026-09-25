@@ -392,7 +392,7 @@ impl EditorModel {
         if s.is_empty() && r.is_empty() {
             return None;
         }
-        let one = is_one_char(&s) && s != "\n" && s != "\r";
+        let one = is_one_grapheme(&s) && !matches!(s.as_str(), "\n" | "\r" | "\r\n");
         if self.overwrite && r.is_empty() && one && r.start < content_end(text, line_of(text, r.start)) {
             r = r.start..cosmix_edit_core::view::next_grapheme(text, r.start);
         }
@@ -673,9 +673,13 @@ fn eol_suffix(s: &str) -> &'static str {
     }
 }
 
-fn is_one_char(s: &str) -> bool {
-    let mut c = s.chars();
-    c.next().is_some() && c.next().is_none()
+/// One grapheme cluster: typing coalesces per grapheme, so an IME commit of
+/// a base letter plus a combining mark is one keystroke (GLM NIT 6).
+fn is_one_grapheme(s: &str) -> bool {
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    Text::from_text(s).is_ok_and(|t| cosmix_edit_core::view::next_grapheme(&t, 0) == s.len())
 }
 
 #[cfg(test)]

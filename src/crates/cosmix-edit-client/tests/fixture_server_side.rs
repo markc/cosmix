@@ -11,7 +11,7 @@ use serde_json::Value;
 
 const EPOCH: &str = "0000e1e1";
 const CLIENT_ONLY: &[&str] =
-    &["local", "server_op", "deliver_event", "drop_event", "deliver_reply", "drop_reply", "deadline", "action", "deliver_all"];
+    &["local", "server_op", "deliver_event", "drop_event", "deliver_reply", "drop_reply", "deadline", "echo_timeout", "action", "deliver_all"];
 
 fn fixtures() -> Vec<(String, Value)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mirror");

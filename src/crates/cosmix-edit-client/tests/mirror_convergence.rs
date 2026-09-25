@@ -99,6 +99,8 @@ struct Net {
     snapshots: usize,
     /// The editor-side replay of every delta (`None` right after a resync).
     shadow: Option<String>,
+    /// Echo timers the mirror handed out (op ids), not fired yet.
+    echo_timers: Vec<String>,
     what: String,
 }
 
@@ -164,6 +166,7 @@ impl Net {
             notices: Vec::new(),
             snapshots: 0,
             shadow: Some(String::new()),
+            echo_timers: Vec::new(),
             what: "bootstrap".into(),
         };
         net.process(step);
@@ -234,6 +237,11 @@ impl Net {
             assert!(ms <= 5_000);
             let s = self.mirror.on_retry();
             self.process(s);
+        }
+        // Echo timers fire only when a fixture says so (`echo_timeout`).
+        if let Some((id, ms)) = self.mirror.take_echo_timer() {
+            assert!(ms <= 5_000);
+            self.echo_timers.push(id);
         }
         while let Some(o) = self.mirror.next_outgoing() {
             assert!(!is_read(&o.verb), "the scheduler only sends writes");
@@ -326,6 +334,15 @@ impl Net {
         self.process(s);
     }
 
+    /// The echo timer the mirror handed out for `op_id` fires.
+    fn echo_timeout(&mut self, op_id: &str) {
+        let i = self.echo_timers.iter().position(|t| t == op_id);
+        let i = i.unwrap_or_else(|| panic!("{}: no echo timer for {op_id} (have {:?})", self.what, self.echo_timers));
+        self.echo_timers.remove(i);
+        let s = self.mirror.on_echo_timeout(op_id);
+        self.process(s);
+    }
+
     /// Deliver everything pending, in server order.
     fn deliver_all(&mut self) {
         while !self.pending.is_empty() {
@@ -415,6 +432,7 @@ fn notice_text(code: &str) -> &'static str {
         "redo_incomplete" => mirror::MSG_REDO_INCOMPLETE,
         "replace_incomplete" => mirror::MSG_REPLACE_INCOMPLETE,
         "save_uncertain" => mirror::MSG_SAVE_UNCERTAIN,
+        "double_commit" => mirror::MSG_DOUBLE_COMMIT,
         other => panic!("unknown notice code {other}"),
     }
 }
@@ -519,6 +537,10 @@ fn run_fixture(name: &str, fx: &Value) {
                 let op = ids[body.as_str().unwrap()].clone();
                 net.deadline(&op);
             }
+            "echo_timeout" => {
+                let op = ids[body.as_str().unwrap()].clone();
+                net.echo_timeout(&op);
+            }
             "action" => {
                 let (a, _) = body.as_object().unwrap().iter().next().unwrap();
                 let step = match a.as_str() {
@@ -593,7 +615,7 @@ fn run_fixture(name: &str, fx: &Value) {
 #[test]
 fn every_mirror_fixture_converges() {
     let all = fixtures();
-    assert!(all.len() >= 31, "expected the full fixture set, found {}", all.len());
+    assert!(all.len() >= 35, "expected the full fixture set, found {}", all.len());
     for (name, fx) in &all {
         run_fixture(name, fx);
     }
@@ -624,6 +646,144 @@ fn pending_seq_and_inverse_round_trip() {
         s.replace_range(e.offset..e.offset + e.delete, &e.insert);
     }
     assert_eq!(s, base);
+}
+
+// ── Stage R fixes, driven directly ──────────────────────────────────────────
+
+const DOC: &str = "/fixture/doc.txt";
+
+/// Type "!" at 5 and take the request the scheduler sent (not yet delivered).
+fn typed(net: &mut Net) -> Outgoing {
+    let e = LocalEdit { items: vec![(5..5, "!".into())], coalesce: true, caret_after: Selection { anchor: 0, head: 0 } };
+    let s = net.mirror.local_edit(e, Intent::ui(1), &mut net.ids).unwrap();
+    net.process(s);
+    net.outbox.remove(0)
+}
+
+fn refused(code: wire::ErrorCode, reason: &str) -> wire::Refusal {
+    wire::Refusal { error_code: code, message: format!("refused: {reason}"), reason: Some(reason.into()), buffer: None, rev: None, context: Default::default() }
+}
+
+/// Queue a server op and hand its request to the fake; the reply is pending.
+fn server(net: &mut Net, op: ServerOp) -> String {
+    let s = net.mirror.server_op(op, Intent::ui(1), &mut net.ids);
+    net.process(s);
+    net.send_next(false, None).op_id.unwrap()
+}
+
+#[test]
+fn busy_is_given_up_after_eight_refusals() {
+    // GLM M6: the identical request goes again after each backoff, but not
+    // forever — then it is reverted and stashed like any other refusal.
+    let mut net = Net::new("hello world\n", Some(DOC), 1, None);
+    let op = typed(&mut net).op_id.unwrap();
+    for k in 0..8 {
+        let s = net.mirror.on_reply(&op, Err(refused(wire::ErrorCode::ResourceLimit, "busy")));
+        net.process(s);
+        let o = net.outbox.remove(0);
+        assert_eq!(o.op_id.as_deref(), Some(op.as_str()), "busy #{k}: the identical request again");
+    }
+    let s = net.mirror.on_reply(&op, Err(refused(wire::ErrorCode::ResourceLimit, "busy")));
+    net.process(s);
+    assert!(net.outbox.is_empty(), "the ninth busy is not retried");
+    assert_eq!(text_of(net.mirror.text()), "hello world\n", "the edit is reverted");
+    assert_eq!(net.mirror.conflicts().len(), 1, "and stashed as a conflict");
+    assert!(net.mirror.is_idle());
+}
+
+#[test]
+fn a_reply_without_rev_reconciles_through_history() {
+    // Opus n1: a rev-less rc 0 reply must not ack the op at the current rev.
+    let mut net = Net::new("hello world\n", Some(DOC), 1, None);
+    let o = typed(&mut net);
+    let args: Value = serde_json::from_str(&o.body).unwrap();
+    assert_eq!(net.fake.handle("local:ced", &o.verb, &args).rc, 0);
+    net.collect();
+    let s = net.mirror.on_reply(o.op_id.as_deref().unwrap(), Ok(json!({"buffer": net.bid})));
+    net.process(s);
+    assert_eq!((net.mirror.rev(), net.mirror.pending()), (1, 0), "acked through its history entry at rev 1");
+    net.deliver_all();
+    assert_eq!(text_of(net.mirror.text()), net.server_text());
+    assert!(net.mirror.is_idle());
+}
+
+#[test]
+fn a_silent_service_is_reported_once_while_reads_keep_retrying() {
+    // GLM M5.
+    let mut fake = FakeEditd::new(EPOCH);
+    fake.create(Some(DOC), "hello\n");
+    let open: wire::OpenReply = serde_json::from_value(fake.handle("local:ced", "edit.open", &json!({"path": DOC})).body).unwrap();
+    let (mut m, step) = Mirror::bootstrap(&open).unwrap();
+    let id = step.out[0].op_id.clone().unwrap();
+    let mut silent = 0;
+    for _ in 0..6 {
+        let s = m.on_deadline(&id);
+        assert_eq!(s.out.len(), 1, "the read goes again");
+        assert_eq!(s.out[0].op_id.as_deref(), Some(id.as_str()));
+        silent += s.notices.iter().filter(|n| matches!(n, Notice::Message { text, .. } if text == mirror::MSG_SERVICE_SILENT)).count();
+    }
+    assert_eq!(silent, 1, "one notice, not one per deadline");
+}
+
+#[test]
+fn server_ops_report_their_outcome_by_op_id() {
+    // Opus m4: the controller answers a Bus caller from these.
+    let mut net = Net::new("hello world\n", Some(DOC), 1, None);
+    let undo = server(&mut net, ServerOp::Undo { lane: LaneArg::Own });
+    net.deliver_all();
+    match net.mirror.take_outcomes().as_slice() {
+        [(id, mirror::Outcome::Refused(r))] => {
+            assert_eq!((id, r.reason.as_deref()), (&undo, Some("nothing_to_undo")));
+        }
+        other => panic!("undo outcome: {other:?}"),
+    }
+    let save = server(&mut net, ServerOp::Save { path: None, force: false });
+    net.deliver_all();
+    assert_eq!(net.mirror.take_outcomes(), vec![(save, mirror::Outcome::Done)]);
+    // Queued behind nothing but detached before it went out: refused.
+    let s = net.mirror.server_op(ServerOp::Undo { lane: LaneArg::Own }, Intent::ui(1), &mut net.ids);
+    net.process(s);
+    let queued = net.outbox.remove(0).op_id.unwrap();
+    let _ = net.mirror.epoch_changed();
+    match net.mirror.take_outcomes().as_slice() {
+        [(id, mirror::Outcome::Refused(r))] => assert_eq!((id, r.reason.as_deref()), (&queued, Some("detached"))),
+        other => panic!("detached outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn saved_state_follows_the_list_row_and_never_goes_back() {
+    // Opus m2: the open reply's clean guess is replaced by the service's row;
+    // a row older than what ced knows is ignored.
+    let mut net = Net::new("hello world\n", Some(DOC), 1, None);
+    assert!(!net.mirror.meta().dirty, "the open-time guess");
+    net.mirror.note_saved(None, false);
+    assert!(net.mirror.meta().dirty, "another holder's unsaved edits");
+    net.mirror.note_saved(Some(0), false);
+    assert!(!net.mirror.meta().dirty);
+    net.mirror.note_saved(None, false);
+    assert!(!net.mirror.meta().dirty, "a stale row does not undo a later save");
+}
+
+#[test]
+fn cursor_events_from_another_session_are_ignored() {
+    // GLM NIT 4.
+    let mut net = Net::new("hello world\n", Some(DOC), 1, None);
+    let cursor = |epoch: &str| {
+        wire::Event::Cursor(wire::CursorEvent {
+            epoch: epoch.into(),
+            buffer: net.bid.clone(),
+            rev: 0,
+            origin: "agent:x".into(),
+            selections: vec![wire::OffsetSelection { anchor: 1, head: 1 }],
+            event_seq: 1,
+        })
+    };
+    let (stale, live) = (cursor("0000dead"), cursor(EPOCH));
+    let _ = net.mirror.on_event(&stale);
+    assert!(net.mirror.remote_cursors().is_empty());
+    let _ = net.mirror.on_event(&live);
+    assert_eq!(net.mirror.remote_cursors().len(), 1);
 }
 
 // ── properties (plan §7.2) ──────────────────────────────────────────────────
