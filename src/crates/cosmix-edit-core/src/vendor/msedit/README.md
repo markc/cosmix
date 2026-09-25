@@ -45,6 +45,12 @@ path. `crate::…` paths are rewritten to `crate::vendor::msedit::…` / `super:
    commits), and a `#[cfg(test)]` commit-failure injection switch.
    `copy_from` (unused, and not all-or-nothing) was removed.
 4. Lint allowances for upstream style are scoped to `mod msedit` in `../mod.rs`.
+5. **`unsafe impl Send for GapBuffer`** (`gap_buffer.rs`, ced E0b need: a
+   buffer lives in a per-buffer actor task and moves between threads).
+   Sound because the buffer exclusively owns its reservation via `NonNull`
+   (released only in its own `Drop`), with no aliasing or interior sharing.
+   Deliberately not `Sync`. `lib.rs` asserts at compile time that
+   `Text` and `Buffer` are `Send`.
 
 Not vendored in E0 (land in E1 with their first consumer): `unicode/*`,
 `buffer/navigation.rs`, `simd/memchr2.rs`, `stdext::unicode`, `crates/lsh`.
