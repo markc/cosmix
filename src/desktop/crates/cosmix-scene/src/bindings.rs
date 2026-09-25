@@ -14,9 +14,22 @@ pub(crate) const EVALUATION_BUDGET: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 thread_local! {
+    static TEST_EVALUATION_BUDGET: std::cell::Cell<Duration> = const { std::cell::Cell::new(EVALUATION_BUDGET) };
     pub(crate) static COMPILE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EVALUATE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static MODEL_CONVERSION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_evaluation_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> T {
+    struct Restore(Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_EVALUATION_BUDGET.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_EVALUATION_BUDGET.replace(budget));
+    f()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -338,7 +351,11 @@ pub(crate) fn evaluate_budgeted(
     started: Instant,
     on_evaluate: impl FnOnce(),
 ) -> Result<Value, String> {
-    let remaining = EVALUATION_BUDGET.checked_sub(started.elapsed())
+    #[cfg(test)]
+    let budget = TEST_EVALUATION_BUDGET.get();
+    #[cfg(not(test))]
+    let budget = EVALUATION_BUDGET;
+    let remaining = budget.checked_sub(started.elapsed())
         .filter(|d| !d.is_zero())
         .ok_or_else(|| "evaluation budget exhausted".to_string())?;
     on_evaluate();
@@ -366,7 +383,7 @@ pub(crate) fn evaluate_budgeted(
     // A final, non-yielding builtin may cross the shared deadline. Checking
     // only before the next binding would accept that value (or miss exhaustion
     // entirely on the last binding). Keep the old port instead.
-    if started.elapsed() >= EVALUATION_BUDGET {
+    if started.elapsed() >= budget {
         return Err("evaluation budget exhausted".into());
     }
     result
