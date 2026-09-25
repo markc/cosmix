@@ -49,6 +49,7 @@ pub const VERBS: &[(&str, bool)] = &[
     ("edit.undo", false),
     ("edit.redo", false),
     ("edit.history", true),
+    ("edit.recovery.flush", false),
     ("edit.props.get", true),
     ("edit.props.list", true),
     ("edit.props.describe", true),
@@ -317,6 +318,41 @@ pub struct InfoReply {
     pub event_seq: u64,
     pub publisher_loss: u64,
     pub limits: Map<String, Value>,
+    /// Recovery-file state (ced E1 plan §5.1). `volatile == !(enabled && ok)`.
+    pub recovery: RecoveryInfo,
+}
+
+/// `edit.info` `recovery` (ced E1 plan §5.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryInfo {
+    /// Recovery is on (`COSMIX_EDIT_RECOVERY` not `0`).
+    pub enabled: bool,
+    /// No write failure and no rid needing a repair switch.
+    pub ok: bool,
+    /// A record was dropped or a write failed and a repair is pending.
+    pub degraded: bool,
+    /// The recovery directory (null when disabled).
+    pub dir: Option<String>,
+    /// Debounce before fdatasync of appended records.
+    pub sync_ms: u64,
+    pub queue_bytes: u64,
+    /// Records written but not yet synced.
+    pub unsynced: u64,
+    pub failures: u64,
+    /// Buffers restored at start / rids quarantined / rids left for a later start.
+    pub restored: u64,
+    pub quarantined: u64,
+    pub skipped: u64,
+}
+
+/// `edit.recovery.flush` reply: every record and repair queued before the
+/// request is durable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryFlushReply {
+    pub synced: bool,
+    pub records: u64,
+    pub bytes: u64,
+    pub repairs: u64,
 }
 
 /// `disk` ∈ `clean | modified | deleted | none | unwatched`.
@@ -345,6 +381,10 @@ pub struct BufferSummary {
     /// Text bytes, BOM excluded (everywhere).
     pub bytes: usize,
     pub holders: Vec<String>,
+    /// Stable across daemon restarts (ced E1 plan §5.1).
+    pub recovery_id: String,
+    /// Restored from recovery files at this daemon start.
+    pub recovered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +409,17 @@ pub struct OpenReply {
     pub disk: DiskState,
     pub reopened: bool,
     pub created: bool,
+    pub recovery_id: String,
+    pub recovered: bool,
+    pub recovered_from: Option<RecoveredFrom>,
+}
+
+/// Where a restored buffer came from (the previous daemon session).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveredFrom {
+    pub epoch: String,
+    pub rev: u64,
+    pub time_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

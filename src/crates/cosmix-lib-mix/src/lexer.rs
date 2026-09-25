@@ -1308,3 +1308,45 @@ impl Lexer {
         Ok(self.spanned(token, line, col))
     }
 }
+
+// ── editor highlighting (ced E1 plan `_plan/2026-09-26-ced-e1-implementation.md` §4.3) ──
+//
+// Frozen in ced E1 Stage S; Stage E1b implements `highlight`.
+
+/// Which Mix grammar a buffer holds: executable Mix (`*.mix`) or Mix data
+/// (`*.conf.mix`, `scene.mix` — the [`Lexer::for_data`] rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MixFlavor {
+    Script,
+    Data,
+}
+
+/// Coarse token classes for syntax colouring. Deliberately not `Token`: an
+/// editor needs classes that survive lexer refactors, and `Token` is flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenClass {
+    Keyword,
+    Identifier,
+    /// `$name`, `${name}`.
+    Variable,
+    /// String literal bodies and delimiters (interpolated parts included).
+    String,
+    Number,
+    /// `true`, `false`, `nil`.
+    Constant,
+    Comment,
+    Operator,
+    Punctuation,
+    /// Text the lexer could not tokenise (to the end of its line).
+    Error,
+}
+
+/// Classify `source` for highlighting. **Never fails and never panics**: an
+/// unterminated string, a bad escape or any other lexer error becomes an
+/// [`TokenClass::Error`] span to the end of that line, and lexing resumes on
+/// the next line. Spans are byte ranges, non-overlapping, in order; bytes not
+/// covered (whitespace) are plain.
+pub fn highlight(source: &str, flavor: MixFlavor) -> Vec<(std::ops::Range<usize>, TokenClass)> {
+    let _ = (source, flavor);
+    todo!("ced E1b")
+}

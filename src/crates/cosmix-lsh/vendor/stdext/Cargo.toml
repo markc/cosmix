@@ -13,6 +13,10 @@ description = "Vendored msedit stdext (arenas, collections, glob) for cosmix-lsh
 [lib]
 name = "stdext"
 path = "src/lib.rs"
+# Upstream's one doctest (`arena::debug::Arena`, a should_panic borrow check)
+# only panics under debug_assertions, and the cosmix gates run --release.
+# The unit tests still run.
+doctest = false
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

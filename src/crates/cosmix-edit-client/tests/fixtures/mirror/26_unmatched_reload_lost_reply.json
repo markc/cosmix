@@ -1,0 +1,18 @@
+{
+  "name": "reload with lost reply and lost event (reload entries carry no op_id)",
+  "about": "The reload applied (rev 1, op_id null, buffer.rs:1229); reply and event are lost. On the deadline the mirror cannot match by op_id: it suspects, history folds rev 1, the slot clears. Never resent.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"set_disk": {"text": "HELLO world\n"}},
+    {"server_op": {"id": "R1", "op": {"reload": {"force": false}}}},
+    {"send": {"id": "R1", "verb": "edit.reload", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "force": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"drop_event": {"seq": 1}},
+    {"drop_reply": "R1"},
+    {"deadline": "R1"}
+  ],
+  "expect": {"server_text": "HELLO world\n", "server_rev": 1, "converged": true, "conflicts": 0, "detached": false, "idle": true}
+}

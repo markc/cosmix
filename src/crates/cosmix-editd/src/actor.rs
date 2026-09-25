@@ -250,6 +250,12 @@ struct Actor {
     snapshot_seq: Arc<AtomicU64>,
     origin_last: Option<String>,
     pushed: Option<BufferProps>,
+    /// 16 lowercase hex, fixed at creation; carried across restarts by the
+    /// recovery files (ced E1 plan §5.1).
+    recovery_id: String,
+    /// Restored from recovery files: dirty even at rev 0 with no saved rev
+    /// (ced E1 plan §5.2(3)); cleared by a durable save or an explicit discard.
+    restored_dirty: bool,
 }
 
 fn now_ms() -> u64 {
@@ -492,8 +498,10 @@ fn page(src: &Src, range: std::ops::Range<usize>, numbered: bool) -> (Option<Str
 
 impl Actor {
     fn dirty(&self) -> bool {
-        // A never-saved buffer at rev 0 is empty and unchanged: not dirty.
-        self.buffer.is_dirty() && !(self.buffer.saved_rev().is_none() && self.buffer.rev() == 0)
+        // A never-saved buffer at rev 0 is empty and unchanged: not dirty —
+        // unless it was restored from recovery files (ced E1 plan §5.2(3)).
+        self.buffer.is_dirty()
+            && !(self.buffer.saved_rev().is_none() && self.buffer.rev() == 0 && !self.restored_dirty)
     }
 
     fn name(&self) -> Option<String> {
@@ -515,6 +523,8 @@ impl Actor {
             lines: self.buffer.line_count(),
             bytes: self.buffer.len(),
             origin_last: self.origin_last.clone(),
+            recovery_id: self.recovery_id.clone(),
+            recovered: self.restored_dirty,
         }
     }
 
@@ -1376,6 +1386,8 @@ async fn init(a: &ActorInit) -> Result<(Actor, bool), Refusal> {
         snapshot_seq: a.snapshot_seq.clone(),
         origin_last: None,
         pushed: None,
+        recovery_id: format!("{:016x}", rand::random::<u64>()),
+        restored_dirty: false,
     };
     // Admit what was actually loaded, not what `stat` saw at open: a file
     // that grew in between tops the lease up or the open is refused (the

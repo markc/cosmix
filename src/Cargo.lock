@@ -1103,8 +1103,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmix-edit-core"
+name = "cosmix-edit-client"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cosmix-edit-client",
+ "cosmix-edit-core",
+ "cosmix-lib-mix",
+ "cosmix-lsh",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cosmix-edit-core"
+version = "0.1.1"
 dependencies = [
  "libc",
  "proptest",
@@ -1115,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-editd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",

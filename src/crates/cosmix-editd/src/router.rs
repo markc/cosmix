@@ -473,6 +473,10 @@ impl Router {
             disk: p.disk,
             reopened,
             created,
+            recovery_id: p.recovery_id.clone(),
+            recovered: p.recovered,
+            // Filled from the recovery meta by the E1c restore path.
+            recovered_from: None,
         }))
     }
 
@@ -702,6 +706,9 @@ impl Router {
             event_seq: self.publisher.event_seq(),
             publisher_loss: self.publisher.loss(),
             limits: limits.as_object().cloned().unwrap_or_default(),
+            // Stage S: recovery files land in E1c; until then the daemon is
+            // volatile and reports recovery disabled.
+            recovery: RecoveryInfo { ok: true, sync_ms: crate::recovery::SYNC_MS, ..RecoveryInfo::default() },
         })
     }
 
@@ -724,6 +731,8 @@ impl Router {
                     lines: p.lines,
                     bytes: p.bytes,
                     holders: e.holders.clone(),
+                    recovery_id: p.recovery_id.clone(),
+                    recovered: p.recovered,
                 })
             })
             .collect();
@@ -1092,6 +1101,12 @@ impl Editd {
                 }),
             )),
             "edit.info" => self.to_router(|reply| RouterCmd::Info { reply }),
+            // ced E1 plan §5.1; implemented by Stage E1c.
+            "edit.recovery.flush" => refused(refusal(
+                ErrorCode::Internal,
+                None,
+                "edit.recovery.flush is not implemented yet (ced E1 Stage E1c)",
+            )),
             "edit.list" => self.to_router(|reply| RouterCmd::List { reply }),
             "edit.props.get" | "edit.props.list" | "edit.props.describe" => {
                 let suffix = verb.trim_start_matches("edit.props.").to_string();
@@ -1378,6 +1393,8 @@ mod tests {
             lines: usize::MAX,
             bytes: usize::MAX,
             origin_last: Some(format!("agent:{}", "l".repeat(64))),
+            recovery_id: "f".repeat(16),
+            recovered: true,
         };
         let buffers: Vec<BufferSummary> = (0..MAX_BUFFERS)
             .map(|i| BufferSummary {
@@ -1393,6 +1410,8 @@ mod tests {
                 lines: props.lines,
                 bytes: props.bytes,
                 holders: holders.clone(),
+                recovery_id: props.recovery_id.clone(),
+                recovered: props.recovered,
             })
             .collect();
         let list = json_of(&ListReply { epoch: "00000000".into(), buffers: buffers.clone() });

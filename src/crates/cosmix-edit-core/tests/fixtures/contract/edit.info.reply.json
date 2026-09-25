@@ -16,7 +16,20 @@
   "name": "edit",
   "props_level": "L2",
   "publisher_loss": 0,
+  "recovery": {
+    "degraded": false,
+    "dir": "/home/user/.local/state/cosmix/edit/recovery",
+    "enabled": true,
+    "failures": 0,
+    "ok": true,
+    "quarantined": 0,
+    "queue_bytes": 0,
+    "restored": 1,
+    "skipped": 0,
+    "sync_ms": 1000,
+    "unsynced": 3
+  },
   "schema": "edit.v1",
   "version": "0.1.0",
-  "volatile": true
+  "volatile": false
 }

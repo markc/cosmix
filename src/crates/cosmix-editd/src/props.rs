@@ -38,6 +38,10 @@ pub struct BufferProps {
     pub lines: usize,
     pub bytes: usize,
     pub origin_last: Option<String>,
+    /// Stable id of this buffer's recovery files (ced E1 plan §5.1).
+    pub recovery_id: String,
+    /// Restored from recovery files at this daemon start.
+    pub recovered: bool,
 }
 
 /// Owned projection so no daemon lock is held while props-core dispatches.
@@ -230,6 +234,8 @@ mod tests {
             lines: 4,
             bytes: 20,
             origin_last: Some("agent:a".into()),
+            recovery_id: "5f0c2a9e1b7d4c33".into(),
+            recovered: false,
         }
     }
 

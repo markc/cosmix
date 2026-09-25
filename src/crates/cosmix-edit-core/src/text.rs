@@ -189,6 +189,23 @@ impl Text {
         })
     }
 
+    /// Byte range of 1-based `line`, excluding its `\n` (a `\r` before it is
+    /// included, as everywhere in this crate). `None` outside `1..=line_count`.
+    pub fn line_range(&self, line: usize) -> Option<Range<usize>> {
+        Some(self.line_start(line)?..self.line_end(line)?)
+    }
+
+    /// The contiguous bytes from `offset` up to the next gap edge or the end;
+    /// empty at or after the end. Never moves the gap. The slice may end
+    /// inside a UTF-8 scalar or grapheme cluster (at the gap) — the grapheme
+    /// adapter in [`crate::view`] exists for exactly that reason.
+    pub fn chunk_at(&self, offset: usize) -> &[u8] {
+        if offset >= self.len() {
+            return &[];
+        }
+        self.gap.read_forward(offset)
+    }
+
     fn byte_at(&self, offset: usize) -> Option<u8> {
         if offset >= self.len() {
             return None;

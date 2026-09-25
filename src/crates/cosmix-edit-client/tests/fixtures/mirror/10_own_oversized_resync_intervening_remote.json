@@ -1,0 +1,20 @@
+{
+  "name": "own oversized op acked by its resync, with an intervening remote edit",
+  "about": "Our 20-byte insert exceeds the fake's event budget (16), so its event is `resync oversized` rev 2. The agent's rev-1 event folds first; the reply (rc 0, rev 2) is in; resync.rev == replied rev and self.rev == resync.rev - 1, so it is our own op: ack without a snapshot.",
+  "fake": {"max_event_insert": 16},
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[11, 11, "0123456789ABCDEFGHIJ"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "X", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 11, "text": "0123456789ABCDEFGHIJ", "base_rev": 0, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_reply": "L1"},
+    {"deliver_event": {"seq": 2}}
+  ],
+  "expect": {"server_text": "Xhello world0123456789ABCDEFGHIJ\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false,
+             "snapshots": 0}
+}

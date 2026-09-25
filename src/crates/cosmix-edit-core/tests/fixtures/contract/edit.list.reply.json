@@ -14,6 +14,8 @@
       "name": "x.mix",
       "opened_as": "~/x.mix",
       "path": "/home/user/x.mix",
+      "recovered": false,
+      "recovery_id": "5f0c2a9e1b7d4c33",
       "rev": 12,
       "saved_rev": 10
     }

@@ -57,6 +57,7 @@ fn verb_description(verb: &str) -> &'static str {
         "edit.undo" => "Undo the newest group of a lane (default: own)",
         "edit.redo" => "Redo the newest undone group of a lane",
         "edit.history" => "Read the op log",
+        "edit.recovery.flush" => "Reply once every queued recovery record and repair is durable",
         "edit.props.get" => "SPEC-07 property read",
         "edit.props.list" => "SPEC-07 property paths",
         "edit.props.describe" => "SPEC-07 property description",

@@ -1,0 +1,16 @@
+{
+  "name": "pending [replace [10,20)->R, insert A@10] vs a remote delete before it",
+  "about": "The agent deletes [0,5) first; the items shift left by 5 on both sides; reads AR.",
+  "path": "/fixture/doc.txt",
+  "initial": "0123456789abcdefghijXYZ\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[10, 20, "R"], [10, 10, "A"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.delete", "args": {"buffer": "b1_0000e1e1", "range": [0, 5], "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.apply", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "ops": [{"op": "replace", "range": [10, 20], "text": "R"}, {"op": "insert", "at": 10, "text": "A"}], "base_rev": 0, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "56789ARXYZ\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false}
+}

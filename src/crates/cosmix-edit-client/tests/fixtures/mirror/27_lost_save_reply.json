@@ -1,0 +1,22 @@
+{
+  "name": "lost save reply",
+  "about": "Save creates no history entry. On the deadline the mirror reads edit.list: saved_rev (1) >= sent_at_rev (1), so the save happened; the slot clears and meta shows clean. No resend.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "!"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_reply": "L1"},
+    {"server_op": {"id": "S1", "op": {"save": {}}}},
+    {"send": {"id": "S1", "verb": "edit.save", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "origin": "human:ced", "op_id": "c00000001-000002"},
+      "expect": {"rc": 0, "saved_rev": 1}}},
+    {"drop_reply": "S1"},
+    {"deadline": "S1"}
+  ],
+  "expect": {"server_text": "hello! world\n", "server_rev": 1, "converged": true, "conflicts": 0, "detached": false, "idle": true, "meta_dirty": false}
+}

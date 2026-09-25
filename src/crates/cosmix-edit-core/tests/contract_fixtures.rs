@@ -53,7 +53,8 @@ fn check(name: &str, v: &Value) {
     match (verb.as_str(), kind) {
         (_, "refusal") => round_trips::<Refusal>(name, v),
         (_, "event") => round_trips::<Event>(name, v),
-        ("edit.ping" | "edit.info" | "edit.list", "request") => parses::<EmptyReq>(name, v),
+        ("edit.ping" | "edit.info" | "edit.list" | "edit.recovery.flush", "request") => parses::<EmptyReq>(name, v),
+        ("edit.recovery.flush", "reply") => round_trips::<RecoveryFlushReply>(name, v),
         ("edit.open", "request") => parses::<OpenReq>(name, v),
         ("edit.close", "request") => parses::<CloseReq>(name, v),
         ("edit.save", "request") => parses::<SaveReq>(name, v),

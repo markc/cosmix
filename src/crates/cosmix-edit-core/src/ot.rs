@@ -144,6 +144,93 @@ pub(crate) fn post_ranges_raw(edits: &[RawEdit]) -> Vec<Range<usize>> {
         .collect()
 }
 
+/// §3.4 overlap rule over base ranges `(start, end)`: two ranges overlap when
+/// they share a byte (`max(s) < min(e)`) or a pure insert lies strictly inside
+/// a non-empty range; two non-empty ranges with one start always overlap. An
+/// insert at a range's start or end does not. Returns the first offender.
+pub(crate) fn first_overlap(items: impl Iterator<Item = (usize, usize)>) -> Option<(usize, usize)> {
+    let mut order: Vec<(usize, usize)> = items.collect();
+    // Points before ranges at one start, so an insert at a range's start passes.
+    order.sort_by_key(|&(s, e)| (s, e > s));
+    let mut max_e = 0;
+    for (s, e) in order {
+        if s < max_e {
+            return Some((s, e));
+        }
+        if e > s {
+            max_e = max_e.max(e);
+        }
+    }
+    None
+}
+
+/// §3.4 application order over `(start, end, request index)`: start
+/// descending; at an equal start the (at most one) non-empty range first, then
+/// pure inserts in REVERSE request order — which is what makes inserts at one
+/// offset read in request order once applied.
+pub(crate) fn canonical_cmp(a: (usize, usize, usize), b: (usize, usize, usize)) -> std::cmp::Ordering {
+    b.0.cmp(&a.0).then((b.1 > b.0).cmp(&(a.1 > a.0))).then(b.2.cmp(&a.2))
+}
+
+/// The server's application order for a base-coordinate transaction (ced E1
+/// plan §1.3; the same code `Buffer::apply` uses, so client and server share
+/// ONE implementation).
+///
+/// `items` are `(base range, replacement)` in REQUEST order (that order breaks
+/// equal-offset ties). Returns, in application order, each step's ORIGINAL item
+/// index and its sequential [`Edit`]. Because the order is canonical, every
+/// step's sequential offsets equal its base offsets (E0 §3.4 invariant), so a
+/// caller pairs each step with its item's deleted text by index.
+///
+/// `Err(Overlap)` when two items overlap under [`first_overlap`]'s rule or an
+/// item's range is reversed.
+pub fn txn_sequence(items: &[(Range<usize>, String)]) -> Result<Vec<(usize, Edit)>, Overlap> {
+    if items.iter().any(|(r, _)| r.start > r.end) || first_overlap(items.iter().map(|(r, _)| (r.start, r.end))).is_some()
+    {
+        return Err(Overlap);
+    }
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by(|&a, &b| {
+        canonical_cmp((items[a].0.start, items[a].0.end, a), (items[b].0.start, items[b].0.end, b))
+    });
+    Ok(order
+        .into_iter()
+        .map(|i| {
+            let (r, text) = &items[i];
+            (i, Edit { offset: r.start, delete: r.end - r.start, insert: text.clone() })
+        })
+        .collect())
+}
+
+/// Transform a range through a whole base-coordinate TRANSACTION applied
+/// after it (ced E1 plan §3.4, Stage S freeze note 3): `items` are
+/// `(base range, inserted length)`, non-overlapping, all in the SAME
+/// coordinates as `r`. Each item is judged against `r`'s original position
+/// independently and the shifts are summed; any overlap is an `Overlap`.
+///
+/// This — not transforming through the transaction's sequential steps — is
+/// what agrees with the server, which rebases the transaction's items as a
+/// set. Counter-example for the sequential form: `r` = insert at 20 through
+/// `[delete [10,20), insert "P"@10]`. Sequentially the delete moves `r` to 10
+/// and it then ties with the insert at 10 (landing before "P"); as a set, `r`
+/// sits after both items and lands after "P" — which is where the server puts
+/// it.
+pub fn transform_through_set(r: Range<usize>, items: &[(Range<usize>, usize)], prio: Priority) -> Result<Range<usize>, Overlap> {
+    let (mut ds, mut de) = (0isize, 0isize);
+    for (ir, ii) in items {
+        let raw = RawEdit { p: ir.start, dd: ir.end - ir.start, ii: *ii };
+        let (t, _) = transform_raw(r.clone(), raw, prio)?;
+        ds += t.start as isize - r.start as isize;
+        de += t.end as isize - r.end as isize;
+    }
+    let start = r.start as isize + ds;
+    let end = r.end as isize + de;
+    if start < 0 || end < start {
+        return Err(Overlap);
+    }
+    Ok(start as usize..end as usize)
+}
+
 /// The entry's inverse as a RangeSet on its post-rev text (module docs).
 /// Items are in reading order: ascending, and at a tie in reverse
 /// application order — the order the removed texts originally had.

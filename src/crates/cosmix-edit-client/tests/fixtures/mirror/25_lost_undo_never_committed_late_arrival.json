@@ -1,0 +1,25 @@
+{
+  "name": "lost undo that never committed; it arrives late",
+  "about": "History from sent_at_rev has no entry: the slot clears with an undo_incomplete notice and the undo is NOT resent. When the lost request arrives late and commits, its event folds as an ordinary remote edit.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "a"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "a", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_reply": "L1"},
+    {"server_op": {"id": "U1", "op": {"undo": {"lane": "own"}}}},
+    {"send": {"id": "U1", "verb": "edit.undo", "caller": "local:ced", "lost": true,
+      "args": {"buffer": "b1_0000e1e1", "as": "human:ced", "op_id": "c00000001-000002"},
+      "expect": {}}},
+    {"deadline": "U1"},
+    {"arrive": {"id": "U1"}},
+    {"deliver_event": {"seq": 2}},
+    {"drop_reply": "U1"}
+  ],
+  "expect": {"server_text": "hello world\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false,
+             "notices": ["undo_incomplete"], "op_ids_once": true}
+}

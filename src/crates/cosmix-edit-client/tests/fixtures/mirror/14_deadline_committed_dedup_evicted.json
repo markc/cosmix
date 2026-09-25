@@ -1,0 +1,18 @@
+{
+  "name": "deadline: committed, reply lost, dedup evicted — history reconciliation, no double apply",
+  "about": "A blind resend here would apply twice (the dedup entry is gone). History from sent_at_rev finds the op_id: ack, no resend.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "!"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"drop_reply": "L1"},
+    {"drop_event": {"seq": 1}},
+    {"evict_dedup": {}},
+    {"deadline": "L1"}
+  ],
+  "expect": {"server_text": "hello! world\n", "server_rev": 1, "converged": true, "conflicts": 0, "detached": false, "op_ids_once": true}
+}

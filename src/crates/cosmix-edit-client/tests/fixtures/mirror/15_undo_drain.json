@@ -1,0 +1,28 @@
+{
+  "name": "Ctrl+Z drains the pipeline first",
+  "about": "Two coalesced keystrokes then undo: the undo waits until both are acked, so it undoes the coalesced group (revs 1..2), not an older one.",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "a"]], "coalesce": true}}},
+    {"local": {"id": "L2", "edit": {"items": [[6, 6, "b"]], "coalesce": true}}},
+    {"server_op": {"id": "U1", "op": {"undo": {"lane": "own"}}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "a", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 1}}},
+    {"deliver_event": {"seq": 1}},
+    {"deliver_reply": "L1"},
+    {"send": {"id": "L2", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 6, "text": "b", "base_rev": 1, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000002"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_event": {"seq": 2}},
+    {"deliver_reply": "L2"},
+    {"send": {"id": "U1", "verb": "edit.undo", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "as": "human:ced", "op_id": "c00000001-000003"},
+      "expect": {"rc": 0, "rev": 3}}},
+    {"deliver_event": {"seq": 3}},
+    {"deliver_reply": "U1"}
+  ],
+  "expect": {"server_text": "hello world\n", "server_rev": 3, "converged": true, "conflicts": 0, "detached": false}
+}

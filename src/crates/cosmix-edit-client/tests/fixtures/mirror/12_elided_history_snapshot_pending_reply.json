@@ -1,0 +1,21 @@
+{
+  "name": "elided history -> snapshot, resolving the in-flight op first",
+  "about": "The lost rev-1 entry is elided (10 bytes > the fake's 8), so recovery falls back to a snapshot. The in-flight L1 is resolved first (its reply, rev 2, arrives) and is contained in the snapshot; the queued L2 certainly did not commit and is stashed.",
+  "fake": {"history_elide_over": 8},
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "0123456789", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"local": {"id": "L1", "edit": {"items": [[5, 5, "!"]], "coalesce": true}}},
+    {"send": {"id": "L1", "verb": "edit.insert", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "at": 5, "text": "!", "base_rev": 0, "coalesce": true, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"local": {"id": "L2", "edit": {"items": [[6, 6, "?"]], "coalesce": true}}},
+    {"drop_event": {"seq": 1}},
+    {"deliver_event": {"seq": 2}},
+    {"deliver_reply": "L1"}
+  ],
+  "expect": {"server_text": "0123456789hello! world\n", "server_rev": 2, "converged": true, "conflicts": 1, "detached": false,
+             "conflict_texts": [["?"]]}
+}

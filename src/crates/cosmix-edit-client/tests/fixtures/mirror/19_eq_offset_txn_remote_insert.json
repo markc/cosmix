@@ -1,0 +1,16 @@
+{
+  "name": "equal-offset transaction vs a remote insert at the same offset",
+  "about": "Pending [A@10, B@10] (reads AB); the agent's X@10 lands first. Server: items rebased ThroughFirst -> XAB. Mirror: X transformed through the item SET, SelfFirst -> stays at 10 -> XAB.",
+  "path": "/fixture/doc.txt",
+  "initial": "0123456789abcdefghijXYZ\n",
+  "run_id": 1,
+  "steps": [
+    {"local": {"id": "L1", "edit": {"items": [[10, 10, "A"], [10, 10, "B"]], "coalesce": false}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 10, "text": "X", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"send": {"id": "L1", "verb": "edit.apply", "caller": "local:ced",
+      "args": {"buffer": "b1_0000e1e1", "ops": [{"op": "insert", "at": 10, "text": "A"}, {"op": "insert", "at": 10, "text": "B"}], "base_rev": 0, "coalesce": false, "origin": "human:ced", "op_id": "c00000001-000001"},
+      "expect": {"rc": 0, "rev": 2}}},
+    {"deliver_all": {}}
+  ],
+  "expect": {"server_text": "0123456789XABabcdefghijXYZ\n", "server_rev": 2, "converged": true, "conflicts": 0, "detached": false}
+}

@@ -1,0 +1,16 @@
+{
+  "name": "event_seq gap recovered from history; the buffered echo is a duplicate",
+  "about": "seq 2 is lost; seq 3 arrives with base_rev 2 != mirror rev 1 and an event_seq gap. History from rev 1 supplies revs 2 and 3; the buffered seq-3 event is then dropped as a duplicate (ev.rev <= self.rev is checked first).",
+  "path": "/fixture/doc.txt",
+  "initial": "hello world\n",
+  "run_id": 1,
+  "steps": [
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "A", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 1}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "B", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 2}}},
+    {"agent": {"caller": "local:agent", "verb": "edit.insert", "args": {"buffer": "b1_0000e1e1", "at": 0, "text": "C", "origin": "agent:ctl-90"}, "expect": {"rc": 0, "rev": 3}}},
+    {"deliver_event": {"seq": 1}},
+    {"drop_event": {"seq": 2}},
+    {"deliver_event": {"seq": 3}}
+  ],
+  "expect": {"server_text": "CBAhello world\n", "server_rev": 3, "converged": true, "conflicts": 0, "detached": false}
+}

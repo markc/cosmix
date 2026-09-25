@@ -22,6 +22,7 @@ pub mod events;
 pub mod files;
 pub mod limits;
 pub mod props;
+pub mod recovery;
 pub mod refusal;
 pub mod router;
 pub mod watch;
