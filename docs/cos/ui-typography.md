@@ -62,7 +62,10 @@ it. Existing `CtkMonospace` labels gain the mono family chain and weight while r
 legacy authored sizing unless an exact role is supplied.
 Small uses the UI family chain by default, retaining its independent size and
 weight when the UI family or size is overridden. A design's Small family or
-fallback override selects its own first available family. Terminal consumers apply
+fallback override selects its own first available family. Only that one family
+reaches shaping (Bevy's `FontSource` carries a single family), so glyphs it lacks
+come from the platform fallback rather than the design's later Small fallbacks;
+the default Small, which shares the UI chain, is unaffected. Terminal consumers apply
 the terminal record separately; terminal rendering is outside this change.
 
 Set `COSMIX_UI_FONT` to a system font family name, for example `SF Pro Text`,
