@@ -1,5 +1,15 @@
 # Vendored upstream sources
 
+## iced_tiny_skia 0.14.1
+
+Pristine import from `https://static.crates.io/crates/iced_tiny_skia/iced_tiny_skia-0.14.1.crate`,
+SHA-256 `c267596d742714b1853cc10c3983a367762816fc4836bd3b79f76ce76787d6f8`.
+The archive's `.cargo_vcs_info.json` records upstream commit
+`0ecf60664df7b8ac7d7aef5f7279d5323027f693`, path `tiny_skia`.
+The complete archive is imported byte-for-byte, before local patches in a
+separate commit. Verify routing from `src/desktop` with
+`cargo tree -p cosmix-term --no-default-features --features tiny-skia -i iced_tiny_skia`.
+
 ## Smithay libinput: opt-in dispatch fairness
 
 `smithay/src/backend/libinput/mod.rs` adds `set_dispatch_budget` for comp's
