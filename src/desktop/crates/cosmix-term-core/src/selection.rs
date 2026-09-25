@@ -60,11 +60,11 @@ impl Terminal {
         if term.selection.as_ref().is_some_and(Selection::is_empty) {
             term.selection = None;
         }
-        term.selection_to_string()
+        selection_text(&term)
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        self.grid.lock().selection_to_string()
+        selection_text(&self.grid.lock())
     }
 
     /// Mode ownership, independent of whether a report was successfully queued
@@ -95,6 +95,77 @@ impl Terminal {
         self.listener.follow_input();
         Ok(())
     }
+}
+
+/// Rio 932c1a7's final LeadingSpacer branch reads the preceding row and
+/// drops extras. Extend just that extraction boundary to the next row's lead:
+/// Rio then takes its ordinary full-cluster path, exactly once. Keep Rio's tab,
+/// blank trimming, semantic ranges and wrap rules for all other selections.
+fn selection_text(term: &Crosswords<Listener>) -> Option<String> {
+    use rio_vt::crosswords::square::Wide;
+    let selection = term.selection.as_ref()?;
+    let range = selection.to_range(term)?;
+    let continuation = |end: Pos| {
+        end.col.0 + 1 == term.columns()
+            && end.row.0 + 1 < term.screen_lines() as i32
+            && matches!(term.grid[end].wide(), Wide::LeadingSpacer)
+            && matches!(
+                term.grid[Pos::new(end.row + 1i32, Column(0))].wide(),
+                Wide::Wide
+            )
+    };
+    let extract = |start: Pos, end: Pos| {
+        if !continuation(end) {
+            return term.bounds_to_string(start, end);
+        }
+        let next = Pos::new(end.row + 1i32, Column(0));
+        // A selected LeadingSpacer-only row belongs to this cluster, not a
+        // blank line. Avoid Rio's blank-soft-wrap newline in that case too.
+        if start.row == end.row
+            && (start.col.0..end.col.0).all(|x| {
+                let cell = term.grid[Pos::new(start.row, Column(x))];
+                !cell.has_extras() && matches!(cell.c(), '\0' | ' ')
+            })
+        {
+            let mut text = " ".repeat(end.col.0 - start.col.0);
+            text.extend(term.grid.cell_text(next));
+            return text;
+        }
+        term.bounds_to_string(start, next)
+    };
+    if selection.ty == SelectionType::Block {
+        if !(range.start.row.0..=range.end.row.0)
+            .any(|y| continuation(Pos::new(Line(y), range.end.col)))
+        {
+            return term.selection_to_string();
+        }
+        let mut lines = Vec::new();
+        for y in range.start.row.0..=range.end.row.0 {
+            let start = Pos::new(Line(y), range.start.col);
+            let end = Pos::new(Line(y), range.end.col);
+            let end = if continuation(end) {
+                if y == range.end.row.0 || range.start.col.0 != 0 {
+                    end
+                } else {
+                    // A full-width block already includes that lead on its
+                    // next selected row. Do not extract it twice.
+                    Pos::new(end.row, end.col - 1)
+                }
+            } else {
+                end
+            };
+            lines.push(extract(start, end));
+        }
+        return Some(lines.join("\n"));
+    }
+    if !continuation(range.end) {
+        return term.selection_to_string();
+    }
+    let mut text = extract(range.start, range.end);
+    if selection.ty == SelectionType::Lines {
+        text.push('\n');
+    }
+    Some(text)
 }
 
 fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -132,6 +203,129 @@ mod tests {
     fn select(term: &Terminal, start: (u16, u16), end: (u16, u16)) {
         term.selection_start(start.0, start.1, SelectionSide::Left, SelectionType::Simple);
         term.selection_update(end.0, end.1, SelectionSide::Right);
+    }
+
+    #[test]
+    fn unicode_capture_selection_and_byte_split_parser_round_trip() {
+        use super::super::CellWidth;
+        fn require_copy<T: Copy>() {}
+        require_copy::<super::super::Cell>();
+        assert!(std::mem::size_of::<super::super::Cell>() <= 16);
+        for text in ["👩‍💻", "🇦🇺", "👍🏽", "❤️", "e\u{301}", " \u{301}"] {
+            let term = Terminal::from_test_vt(8, 3, b"");
+            let mut parser = Processor::default();
+            for byte in text.as_bytes() {
+                parser.advance(&mut *term.grid.lock(), &[*byte]);
+            }
+            let screen = term.screen(false);
+            let lead = screen.cells[0];
+            assert_eq!(lead.c, text.chars().next().unwrap());
+            assert_eq!(screen.clusters.get(lead.extra), Some(text));
+            let wide = !(text.starts_with('e') || text.starts_with(' '));
+            assert_eq!(
+                lead.width,
+                if wide {
+                    CellWidth::Wide
+                } else {
+                    CellWidth::Narrow
+                }
+            );
+            if wide {
+                assert_eq!(screen.cells[1].width, CellWidth::Spacer);
+                select(&term, (1, 0), (1, 0));
+                assert_eq!(
+                    term.selection_text().as_deref(),
+                    Some(text),
+                    "trailing half"
+                );
+            }
+            select(&term, (0, 0), (7, 0));
+            assert_eq!(term.selection_finish().as_deref(), Some(text));
+            // Old frames retain their text after the VT extras storage changes.
+            parser.advance(&mut *term.grid.lock(), b"\r\x1b[2K");
+            let _ = term.screen(true);
+            assert_eq!(screen.clusters.get(lead.extra), Some(text));
+        }
+    }
+
+    #[test]
+    fn leading_spacer_copies_next_rows_whole_cluster_once_even_in_history() {
+        for text in ["👩‍💻", "🇦🇺", "👍🏽", "❤️"] {
+            let term = Terminal::from_test_vt(4, 3, format!("abc{text}!").as_bytes());
+            assert_eq!(
+                term.screen(false).cells[3].width,
+                super::super::CellWidth::LeadingSpacer
+            );
+            select(&term, (0, 0), (3, 0));
+            assert_eq!(term.selection_text(), Some(format!("abc{text}")));
+            select(&term, (3, 0), (3, 0));
+            assert_eq!(term.selection_text().as_deref(), Some(text));
+            select(&term, (0, 0), (1, 1));
+            assert_eq!(
+                term.selection_text(),
+                Some(format!("abc{text}")),
+                "no duplicate"
+            );
+            term.selection_start(3, 0, SelectionSide::Left, SelectionType::Block);
+            term.selection_update(3, 0, SelectionSide::Right);
+            assert_eq!(term.selection_text().as_deref(), Some(text));
+            // Move both boundary rows into history, then select by viewport.
+            Processor::default().advance(&mut *term.grid.lock(), b"\r\n1\r\n2\r\n3");
+            term.scroll_view(super::super::ScrollRequest::Top);
+            select(&term, (0, 0), (3, 0));
+            assert_eq!(term.selection_text(), Some(format!("abc{text}")));
+        }
+    }
+
+    #[test]
+    fn emoji_paste_preserves_utf8_and_keyboard_sequences_are_atomic() {
+        let text = "👩‍💻🇦🇺👍🏽❤️e\u{301}";
+        let expected = format!("\x1b[200~{text}\x1b[201~").into_bytes();
+        assert_eq!(
+            encode_paste(&format!("\x1b{text}\u{3}\x1b[201~\x1b[200~"), true),
+            expected
+        );
+        let term = Terminal::from_test_vt(8, 3, b"\x1b[?2004h");
+        let rx = term.listener.test_input_receiver();
+        term.paste(&format!("\x1b{text}\u{3}")).unwrap();
+        let Msg::Input(bytes) = rx.try_recv().unwrap() else {
+            panic!("paste input");
+        };
+        assert_eq!(bytes.as_ref(), expected.as_slice());
+        term.keys(
+            &text
+                .chars()
+                .map(super::super::Key::Char)
+                .collect::<Vec<_>>(),
+            Instant::now(),
+        )
+        .unwrap();
+        let Msg::Input(bytes) = rx.try_recv().unwrap() else {
+            panic!("keyboard input");
+        };
+        assert_eq!(bytes.as_ref(), text.as_bytes());
+        assert!(
+            rx.try_recv().is_err(),
+            "one complete sequence per FIFO entry"
+        );
+        assert!(super::super::encode_text(text).is_err());
+    }
+
+    #[test]
+    fn capture_obeys_rio_width_with_grapheme_mode_disabled() {
+        use rio_vt::crosswords::square::Wide;
+        let term = Terminal::from_test_vt(16, 3, "\x1b[?2027l👩‍💻🇦🇺❤️".as_bytes());
+        let screen = term.screen(false);
+        let grid = term.grid.lock();
+        for (x, cell) in screen.cells[..16].iter().enumerate() {
+            let expected = match grid.grid[Pos::new(Line(0), Column(x))].wide() {
+                Wide::Narrow => super::super::CellWidth::Narrow,
+                Wide::Wide => super::super::CellWidth::Wide,
+                Wide::Spacer => super::super::CellWidth::Spacer,
+                Wide::LeadingSpacer => super::super::CellWidth::LeadingSpacer,
+            };
+            assert_eq!(cell.width, expected);
+        }
     }
 
     #[test]

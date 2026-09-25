@@ -1026,3 +1026,119 @@ Unenforced contracts and limits:
   Headless tests do not establish live Wayland acquire/present pacing, old
   surface-version damage expansion, compositor cost or input-to-visible latency.
   Timing estimates assume comparable hardware/font/fixture conditions.
+
+## Unicode clusters and colour emoji
+
+Implemented on the ranks 1–6 integration; source and formatting review only.
+No local build, check, test, clippy or timing gate was run for this change, and
+versions are unchanged. The existing warm full-paint (~1.24 ms), one-cell echo
+(~0.16 ms) and banded full-redraw (~3.66 ms) baselines remain cluster acceptance
+targets, not measurements of this implementation.
+
+Rio `932c1a7` already provides complete grapheme extras, Unicode 17 widths,
+default-on DEC mode 2027 and the four `Wide` states. Capture now copies those
+states and all cell text under the grid lock. It does not recalculate widths
+from fonts, Unicode-width crates or shaping advances, including when an
+application disables mode 2027. Copy/paste and keyboard details are in
+[term-clipboard](term-clipboard.md).
+
+`Cell` remains `Copy`: an inline base `char`, a `u32` extended-text ID (zero for
+a scalar), a byte-sized width enum and the original visual attributes. Tests
+require its size to remain at most 16 bytes. Equality remains constant-time;
+the scalar row comparison retains the zipped compare-and-record pass and full
+paints retain `copy_from_slice`. Wide rows expand changed cells through the
+union of old and new pair ownership before recording cells or producing damage.
+That covers extras-only changes, spacer background changes, shifted pairs,
+pair breakup and cursor width changes. Both cursor styles normalise a trailing
+half to its lead and cover both cells. Incomplete or malformed pairs are clipped
+to the available cell; `Spacer` and `LeadingSpacer` paint only backgrounds.
+
+Each terminal owns a bounded interner: 4,096 entries, 1 MiB of UTF-8 text and
+1,024 bytes per cluster. Immutable `Arc<str>` entries live in a copy-on-write
+table carried by each `Screen`, including CPU band snapshots. Appending keeps
+the generation identity and existing IDs. Saturation uses a missing-cluster
+sentinel for further new entries; the next capture starts a fresh generation.
+Raster state compares that generation identity even with clean damage hints,
+forcing repaint when IDs are reused. Old screens retain their own text. Oversize
+or unrepresentable clusters render as bounded tofu; Rio selection text remains
+complete. Limits are per table: callers retaining many historical screens also
+retain their historical tables. There is no global cap on caller-owned frames.
+
+The font set is loaded once and shared across resize, including stable Swash
+cache identities. Existing monospace discovery and `TERM_SPIKE_FONT` continue
+to set cell metrics. Optional fallbacks are Noto Color Emoji followed by Noto
+Sans Symbols 2, searched in common `/usr/share/fonts` Noto locations. Missing
+or unreadable fallbacks are skipped. VS16 and wide emoji presentation prefer
+the emoji face; VS15 retains normal font priority. `CharCluster::map` checks
+whole-cluster coverage, ignoring joiners/selectors as independent visible-glyph
+requirements. `ShapeContext` shapes the full text with advances and offsets,
+then verifies the result before caching it. No font can move terminal columns.
+
+The ASCII glyph loop, background spans and mask blend arithmetic are retained.
+`paint_reference` is unchanged as the frozen ASCII oracle. Unicode has a
+separate size-specific cache keyed by text, bold and cell span; the immutable
+font set fixes face selection, and each entry records its chosen face identity.
+Entries include negative/tofu results, never foreground or background colours.
+The cache clears at 4,096 text keys or 16 MiB of pixel storage. Shaping, decoding
+and resampling occur only on misses. Layers and individual bitmap dimensions
+are bounded; excessive output falls back to tofu.
+
+Colour bitmap selection uses Swash's nearest suitable strike (BestFit), then
+decodes at that strike's exact ppem. CBLC image formats 17–19 establish that the
+source is PNG/straight RGBA: RGB is premultiplied before a single bilinear resize
+on the cache miss. Other bitmap encodings, including sbix, currently fall
+through to outlines or tofu. Colour outlines are rasterised as ordered layers:
+CPAL colours become premultiplied RGBA and current-foreground layers remain
+alpha masks. This avoids treating Swash's composited colour-outline output as
+straight PNG data, and keeps foreground changes independent of cached colours.
+The supported COLR outline functionality is that provided by pinned Swash.
+
+Colour clusters fit proportionally within the VT's one- or two-cell box and are
+centred; ordinary outline text preserves the primary baseline. Both backgrounds
+are filled before the lead paints. Masks and colour layers blend source-over
+the actual destination, so a pair can have different backgrounds. RGBA and
+BGRA use the same data and write opaque destination alpha. Both frontends
+receive pair-expanded rectangles through their existing damage paths.
+
+Added cluster gates:
+
+- Capture, selection, parser chunk boundaries, paste, keyboard and IME tests.
+- Required installed Noto Color Emoji fixtures: ZWJ, flag, skin tone and VS16
+  ligatures, chromatic pixels in both halves, strict clipping, odd stride
+  padding and RGBA/BGRA at scales 1, 1.25, 1.5 and 2.5. Font absence fails these
+  tests loudly; separate tests exercise missing fallback and invalid IDs.
+- An independent full-frame Unicode compositor uses fresh glyph caches and
+  destination-driven per-pixel loops. It shares the Swash/font backend, but no
+  production damage expansion, clipping loop or blending helper. Synthetic
+  alpha fixtures independently check PNG premultiplication, transparent-edge
+  resampling, palette colour and ordered current-foreground masks.
+- The rank-5 random differential test now runs 4,096 frames per cursor style:
+  2,048 against the frozen ASCII painter and 2,048 with Unicode transitions
+  against the full Unicode oracle, retaining storage, padding, damage, cursor,
+  resize, viewport, scale and format variations.
+- CPU band tests retain old emoji generations and move pair cursors across
+  bands; wgpu host tests replay a two-column upload. The ignored
+  `cached_ascii_and_emoji_paint_benchmark` reports cached ASCII/emoji timings and
+  asserts that warm painting causes no new shaping/resampling. Existing rank-5
+  and rank-6 benchmarks remain the fixed-size performance acceptance probes.
+
+Remaining assumptions and validation limits:
+
+- Dirty-row hints, consecutive consuming snapshots, explicit invalidation on
+  pane/storage reuse, exact-copy `rebind`, valid nonzero raster geometry and
+  representable buffer arithmetic retain the existing rank-5 contracts.
+- Font files are trusted local inputs and their Swash parsing/rasterisation
+  contracts remain dependencies. Optional face discovery validates font headers,
+  not every table. Resource checks bound retained results, not all allocations
+  internal to a font decoder before it returns.
+- Noto test files are discovered by their fixed filenames but their byte versions
+  are not pinned in the repository. Glyph design and coverage depend on the
+  installed font; the tests enforce the required sequence behaviour.
+- Rio and Swash have separate segmentation tables. Shaping is per terminal cell
+  cluster, not paragraph bidi or joining across neighbouring terminal cells.
+  Swash may segment a long Rio cluster internally; bounded unsupported results
+  become tofu rather than changing grid width.
+- IME delivery, keyboard/commit deduplication and composition UI depend on
+  iced/winit and the compositor. The host tests do not establish live IME,
+  clipboard, Wayland presentation or GPU-driver behaviour. Performance and
+  visual font quality still require cluster gates and a live desktop check.

@@ -277,13 +277,15 @@ pub fn keys_for(key: &Key, text: Option<&str>, modifiers: Modifiers) -> Vec<Term
     }
     // Everything else is what the seat says the key typed, so a non-US layout
     // works without this file knowing anything about layouts.
-    text.map(|text| {
-        text.chars()
-            .filter(|c| c.is_ascii() && !c.is_control())
-            .map(TerminalKey::Char)
-            .collect()
-    })
-    .unwrap_or_default()
+    text.map(text_keys).unwrap_or_default()
+}
+
+/// Shared by key text and IME commits; format characters (ZWJ/VS) are text.
+pub fn text_keys(text: &str) -> Vec<TerminalKey> {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .map(TerminalKey::Char)
+        .collect()
 }
 
 /// A single ASCII letter, or nothing. `Key::Character` can hold a whole
@@ -714,14 +716,17 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_text_is_dropped_rather_than_mangled() {
-        // The core's encoder returns an empty Vec for a non-ASCII char, so
-        // passing it through would be a silent no-op with a key press
-        // charged against it. Filtering here keeps that visible in one place.
-        assert!(bytes(&character("é"), Some("é"), Modifiers::empty()).is_empty());
+    fn keyboard_text_preserves_complete_unicode_sequences() {
+        for text in ["aéb", "👩‍💻", "🇦🇺", "👍🏽", "❤️", "e\u{301}"] {
+            assert_eq!(
+                bytes(&character(text), Some(text), Modifiers::empty()),
+                text.as_bytes()
+            );
+            assert!(cosmix_term_core::terminal::encode_text(text).is_err());
+        }
         assert_eq!(
-            keys_for(&character("aéb"), Some("aéb"), Modifiers::empty()).len(),
-            2
+            bytes(&character("x"), Some("\u{1b}👩‍💻\u{3}"), Modifiers::empty()),
+            "👩‍💻".as_bytes()
         );
     }
 }

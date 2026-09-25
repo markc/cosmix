@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 /// The grid image plus the regions of it nobody has presented yet.
 #[derive(Default)]
 pub struct Frame {
+    /// Last captured VT caret, for IME placement without locking the terminal.
+    cursor: Option<(usize, usize)>,
     surface: Surface,
     /// Damage accumulated since the last [`Frame::take_damage`]. It is a list
     /// rather than a single rect because a burst of PTY output can rasterise
@@ -36,6 +38,9 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn cursor(&self) -> Option<(usize, usize)> {
+        self.cursor
+    }
     #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
     pub fn cpu_surface_mut(&mut self) -> &mut Surface {
         &mut self.surface
@@ -213,6 +218,10 @@ impl Painter {
     pub fn repaint(&mut self, id: u64, screen: &Screen, dirty: &[bool]) -> bool {
         let frame = self.frame(id);
         let mut frame = frame.lock().expect("frame lock");
+        frame.cursor = (screen.cursor_visible
+            && screen.cursor.0 < screen.cols
+            && screen.cursor.1 < screen.rows)
+            .then_some(screen.cursor);
         // Whether the surface HAS pixels, not what shape they are in. The
         // first cut compared `grid()`, which `invalidate` also resets to
         // (0, 0) — so `repaint(nonempty) -> invalidate -> repaint(empty)`
@@ -294,6 +303,7 @@ mod tests {
 
     fn screen(cols: usize, rows: usize, fill: char) -> Screen {
         Screen {
+            clusters: Default::default(),
             cols,
             rows,
             cursor: (0, 0),
@@ -301,6 +311,8 @@ mod tests {
             display_offset: 0,
             cells: (0..cols * rows)
                 .map(|_| Cell {
+                    extra: 0,
+                    width: Default::default(),
                     c: fill,
                     fg: [200, 200, 200],
                     bg: [0, 0, 0],

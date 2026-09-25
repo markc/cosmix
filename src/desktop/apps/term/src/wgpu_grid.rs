@@ -405,6 +405,7 @@ mod tests {
     fn range_upload_layout_repairs_a_texture_after_coalesced_paints() {
         let mut painter = Painter::new(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
         let mut screen = Screen {
+            clusters: Default::default(),
             cols: 90,
             rows: 6,
             display_offset: 0,
@@ -412,6 +413,8 @@ mod tests {
             cursor_visible: true,
             cells: vec![
                 Cell {
+                    extra: 0,
+                    width: Default::default(),
                     c: 'M',
                     fg: [201, 31, 127],
                     bg: [9, 17, 32],
@@ -447,5 +450,36 @@ mod tests {
         }
         assert_eq!(texture, frame.surface().rgba());
         assert!(frame.take_damage().is_empty());
+    }
+
+    #[test]
+    fn emoji_spacer_damage_uploads_both_columns() {
+        let mut painter = Painter::new(1.25, FontSize::new(13.0), Cursor::Block).unwrap();
+        let mut screen = cosmix_term_core::terminal::Terminal::from_test_vt(8, 3, " 👩‍💻".as_bytes())
+            .screen(false);
+        screen.cursor_visible = false;
+        painter.repaint(1, &screen, &[]);
+        let shared = painter.frame(1);
+        let mut texture = shared.lock().unwrap().surface().rgba().to_vec();
+        shared.lock().unwrap().clear_damage();
+        screen.cells[2].bg = [20, 90, 150];
+        painter.repaint(1, &screen, &[true, false, false]);
+        let mut frame = shared.lock().unwrap();
+        let stride = frame.surface().stride();
+        let damage = frame.take_damage();
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].x, painter.cell().0);
+        assert_eq!(damage[0].width, painter.cell().0 * 2);
+        for band in damage {
+            let (origin, layout, extent) = upload_region(stride, band);
+            for row in 0..extent.height as usize {
+                let source = layout.offset as usize + row * layout.bytes_per_row.unwrap() as usize;
+                let target = (origin.y as usize + row) * stride + origin.x as usize * 4;
+                let len = extent.width as usize * 4;
+                texture[target..target + len]
+                    .copy_from_slice(&frame.surface().rgba()[source..source + len]);
+            }
+        }
+        assert_eq!(texture, frame.surface().rgba());
     }
 }

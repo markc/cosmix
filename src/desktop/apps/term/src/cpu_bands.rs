@@ -73,6 +73,7 @@ impl Surface {
             // cursor origin. Core PaintState then erases the old cursor even
             // when it moves to another band or disappears on a resize.
             let part = Screen {
+                clusters: screen.clusters.clone(),
                 cols: screen.cols,
                 rows: end - first,
                 cursor: (screen.cursor.0, screen.cursor.1.saturating_sub(first)),
@@ -137,10 +138,54 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn unicode_band_snapshots_retain_text_and_expand_spacer_damage() {
+        let mut raster = Raster::new(1.25, 13.0, Cursor::Block).unwrap();
+        let mut surface = Surface::default();
+        let mut screen = cosmix_term_core::terminal::Terminal::from_test_vt(
+            8,
+            8,
+            "\x1b[4;2H👍🏽👍🏻\x1b[5;2H👩‍💻".as_bytes(),
+        )
+        .screen(false);
+        screen.cursor_visible = false;
+        surface.paint(&mut raster, &screen, &[]);
+        surface.cache_handle(1);
+        let retained = surface.images(1.25);
+        let old = surface.rgba();
+        let old_handles: Vec<_> = retained.iter().map(|(h, _)| h.pixels().to_vec()).collect();
+        screen.cells[3 * 8 + 1].extra = screen.cells[3 * 8 + 3].extra;
+        screen.cells[3 * 8 + 2].bg = [1, 51, 91];
+        let mut dirty = [false; 8];
+        dirty[3] = true;
+        assert_eq!(
+            surface.paint(&mut raster, &screen, &dirty),
+            &[DamageBand {
+                x: raster.width,
+                y: 3 * raster.height,
+                width: 2 * raster.width,
+                height: raster.height,
+            }]
+        );
+        surface.cache_handle(2);
+        assert_ne!(surface.rgba(), old);
+        assert_eq!(surface.rgba(), raster.render(&screen));
+        for ((handle, _), bytes) in retained.iter().zip(old_handles) {
+            assert_eq!(handle.pixels(), bytes);
+        }
+        screen.cursor = (2, 3);
+        screen.cursor_visible = true;
+        surface.paint(&mut raster, &screen, &[false; 8]);
+        screen.cursor = (2, 4);
+        surface.paint(&mut raster, &screen, &[false; 8]);
+        assert_eq!(surface.rgba(), raster.render(&screen));
+    }
+
+    #[test]
     fn bands_preserve_pixels_ids_and_cursor_damage_across_boundaries() {
         let mut raster = Raster::new(2.5, 13.0, Cursor::Block).unwrap();
         let mut surface = Surface::default();
         let mut screen = Screen {
+            clusters: Default::default(),
             cols: 13,
             rows: 11,
             cursor: (2, 3),
@@ -148,6 +193,8 @@ mod tests {
             display_offset: 0,
             cells: vec![
                 Cell {
+                    extra: 0,
+                    width: Default::default(),
                     c: 'M',
                     fg: [200, 210, 220],
                     bg: [10, 20, 30],

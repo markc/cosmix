@@ -191,6 +191,8 @@ fn run(settings: config::Settings) -> Result<(), String> {
         mouse: clipboard::MouseState::default(),
         paste_notice: None,
         last_redraw: None,
+        ime_preedit: None,
+        keyboard_focus: true,
         force_paint: false,
         paint_requested: true,
     };
@@ -320,6 +322,8 @@ struct State {
     mouse: clipboard::MouseState,
     paste_notice: Option<String>,
     last_redraw: Option<std::time::Instant>,
+    ime_preedit: Option<iced::advanced::input_method::Preedit>,
+    keyboard_focus: bool,
     force_paint: bool,
     paint_requested: bool,
 }
@@ -333,6 +337,7 @@ enum Message {
     /// Keys to put on the PTY, from the widget tree — NOT from an event
     /// subscription, which drops them under load (see `keys.rs`).
     Keys(Vec<cosmix_term_core::terminal::Key>),
+    Ime(iced::advanced::input_method::Event),
     /// A chord the terminal answers itself (tabs, panes, font size).
     Action(Action),
     Modifiers(iced::keyboard::Modifiers),
@@ -467,6 +472,27 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Scale(scale) => state.rescale(scale),
         Message::Keys(keys) => state.send_keys(keys),
+        Message::Ime(event) => {
+            if !state.keyboard_focus {
+                return Task::none();
+            }
+            use iced::advanced::input_method::{Event, Preedit};
+            match event {
+                Event::Preedit(content, selection) => {
+                    state.ime_preedit = Some(Preedit {
+                        content,
+                        selection,
+                        text_size: None,
+                    });
+                }
+                Event::Commit(text) => {
+                    state.ime_preedit = None;
+                    state.send_keys(input::text_keys(&text));
+                }
+                Event::Closed => state.ime_preedit = None,
+                Event::Opened => {}
+            }
+        }
         Message::Action(action) => return state.act(action),
         Message::Modifiers(modifiers) => {
             if modifiers != state.modifiers {
@@ -515,12 +541,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // is never delivered; a latched Ctrl would turn every later wheel
             // into a zoom.
             iced::window::Event::Unfocused => {
+                state.keyboard_focus = false;
+                state.ime_preedit = None;
                 state.cancel_mouse_gesture();
                 state.modifiers = iced::keyboard::Modifiers::empty();
                 state.wheel = 0.0;
                 state.scroll_wheel = 0.0;
             }
             iced::window::Event::CloseRequested => return iced::exit(),
+            iced::window::Event::Focused => state.keyboard_focus = true,
             _ => {}
         },
     }
@@ -578,6 +607,24 @@ fn view(state: &State) -> Element<'_, Message> {
         .as_ref()
         .map(|tree| layout::panes(tree, bounds, scale))
         .unwrap_or_default();
+    let ime_cursor = pane_bounds
+        .iter()
+        .find(|(id, _)| *id == state.shape.active_pane)
+        .map(|(id, pane)| {
+            let (col, row) = state
+                .painter
+                .existing(*id)
+                .and_then(|frame| frame.lock().expect("frame").cursor())
+                .unwrap_or((0, 0));
+            let (cw, ch) = state.painter.logical_cell();
+            iced::Rectangle::new(
+                iced::Point::new(
+                    pane.x + layout::border(scale) + col as f32 * cw,
+                    pane.y + layout::border(scale) + row as f32 * ch,
+                ),
+                iced::Size::new(cw, ch),
+            )
+        });
     let hovered = move |position: iced::Point| {
         let (id, pane) = pane_bounds.iter().find(|(_, pane)| {
             position.x >= pane.x
@@ -618,7 +665,20 @@ fn view(state: &State) -> Element<'_, Message> {
         let cell = hovered(position);
         pointer_message(&state.pointer, &last, cell, position)
     })
-    .on_mouse(move |event, position| mouse.message(state, event, position));
+    .on_mouse(move |event, position| mouse.message(state, event, position))
+    .input_method(
+        if state.keyboard_focus && ime_cursor.is_some() {
+            iced::advanced::input_method::InputMethod::Enabled {
+                // Runtime composition overlay; only Commit goes to the PTY.
+                cursor: ime_cursor.unwrap(),
+                purpose: iced::advanced::input_method::Purpose::Terminal,
+                preedit: state.ime_preedit.clone(),
+            }
+        } else {
+            iced::advanced::input_method::InputMethod::Disabled
+        },
+        |event| Message::Ime(event.clone()),
+    );
     // Clean chrome redraws must not publish Paint: iced would rebuild the UI
     // and dispatch RedrawRequested a second time for no terminal change.
     if state.needs_paint() {
@@ -1112,10 +1172,8 @@ impl State {
         drop(tabs);
         let terminal = terminal.lock().expect("terminal");
         let at = Instant::now();
-        for key in keys {
-            if let Err(error) = terminal.key(key, at) {
-                eprintln!("term input: {error}");
-            }
+        if let Err(error) = terminal.keys(&keys, at) {
+            eprintln!("term input: {error}");
         }
     }
 }
@@ -1406,10 +1464,44 @@ mod tests {
             mouse: clipboard::MouseState::default(),
             paste_notice: None,
             last_redraw: None,
+            ime_preedit: None,
+            keyboard_focus: true,
             force_paint: false,
             paint_requested: true,
         };
         (state, reaper)
+    }
+
+    #[test]
+    fn ime_preedit_is_local_and_commit_sends_one_complete_sequence() {
+        use iced::advanced::input_method::Event;
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let terminal = state.tabs.lock().unwrap().active_terminal();
+        *terminal.lock().unwrap() = cosmix_term_core::terminal::Terminal::from_test_vt(8, 3, b"");
+        let read = terminal.lock().unwrap().listener.test_input_reader();
+        let text = "👩‍💻🇦🇺👍🏽❤️e\u{301}";
+        let _ = update(&mut state, Message::Ime(Event::Opened));
+        let _ = update(
+            &mut state,
+            Message::Ime(Event::Preedit(text.into(), Some(0..text.len()))),
+        );
+        assert!(state.ime_preedit.is_some());
+        assert_eq!(read(), None);
+        let _ = update(
+            &mut state,
+            Message::Ime(Event::Commit(format!("\u{1b}{text}\u{3}"))),
+        );
+        assert_eq!(read().as_deref(), Some(text.as_bytes()));
+        assert_eq!(read(), None);
+        assert!(state.ime_preedit.is_none());
+        let _ = update(&mut state, Message::Window(iced::window::Event::Unfocused));
+        let _ = update(&mut state, Message::Ime(Event::Commit(text.into())));
+        assert_eq!(read(), None);
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
     }
 
     #[test]

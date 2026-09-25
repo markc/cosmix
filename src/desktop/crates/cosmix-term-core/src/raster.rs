@@ -1,4 +1,10 @@
-use crate::terminal::{Cell, Screen};
+use crate::terminal::{Cell, CellWidth, Screen};
+#[path = "unicode_raster.rs"]
+mod unicode;
+use unicode::{Fonts, Pixels, UnicodeRaster};
+#[cfg(test)]
+#[path = "raster_unicode_tests.rs"]
+mod unicode_tests;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use swash::{
     FontRef,
@@ -40,6 +46,8 @@ pub struct PaintState {
     rows: usize,
     cell: (u32, u32),
     cursor: Option<(usize, usize)>,
+    cursor_span: usize,
+    clusters: Option<Arc<()>>,
     display_offset: usize,
     stride: usize,
     scale: u32,
@@ -180,8 +188,86 @@ fn paintable_rows(screen: &Screen) -> usize {
 }
 
 fn visible_cursor(screen: &Screen, rows: usize) -> Option<(usize, usize)> {
-    (screen.cursor_visible && screen.cursor.0 < screen.cols && screen.cursor.1 < rows)
-        .then_some(screen.cursor)
+    (screen.cursor_visible && screen.cursor.0 < screen.cols && screen.cursor.1 < rows).then(|| {
+        let (col, row) = screen.cursor;
+        let cells = &screen.cells[row * screen.cols..(row + 1) * screen.cols];
+        let col = if col > 0
+            && cells[col].width == CellWidth::Spacer
+            && cells[col - 1].width == CellWidth::Wide
+        {
+            col - 1
+        } else {
+            col
+        };
+        (col, row)
+    })
+}
+
+fn cell_span(cells: &[Cell], col: usize) -> usize {
+    if cells[col].width == CellWidth::Wide
+        && cells
+            .get(col + 1)
+            .is_some_and(|c| c.width == CellWidth::Spacer)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn cursor_span(screen: &Screen, cursor: Option<(usize, usize)>) -> usize {
+    cursor.map_or(0, |(col, row)| {
+        cell_span(
+            &screen.cells[row * screen.cols..(row + 1) * screen.cols],
+            col,
+        )
+    })
+}
+
+/// Scalar rows retain the single cheap compare-and-record pass. At the first
+/// width marker, defer recording the suffix until old AND new pair edges have
+/// expanded damage. Oppositely shifted pairs can form a whole connected run.
+#[inline]
+fn compare_row(now: &[Cell], old: &mut [Cell], changed: &mut [bool], dirty: bool) -> usize {
+    let mut count = 0;
+    let mut paired = None;
+    for (i, ((changed, now), old)) in changed.iter_mut().zip(now).zip(old.iter_mut()).enumerate() {
+        if now.width != CellWidth::Narrow || old.width != CellWidth::Narrow {
+            paired = Some(i);
+            break;
+        }
+        if dirty && now != old {
+            *old = *now;
+            *changed = true;
+        } else if *changed {
+            *old = *now;
+        }
+        count += usize::from(*changed);
+    }
+    let Some(i) = paired else {
+        return count;
+    };
+    for j in i..now.len() {
+        changed[j] |= dirty && now[j] != old[j];
+    }
+    let edge = |j| cell_span(now, j) == 2 || cell_span(old, j) == 2;
+    for j in i..now.len().saturating_sub(1) {
+        if edge(j) && changed[j] {
+            changed[j + 1] = true;
+        }
+    }
+    for j in (i..now.len().saturating_sub(1)).rev() {
+        if edge(j) && changed[j + 1] {
+            changed[j] = true;
+        }
+    }
+    for j in i..now.len() {
+        if changed[j] {
+            old[j] = now[j];
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Horizontal cell runs; merge vertically only when the x extents match.
@@ -295,6 +381,7 @@ pub struct Raster {
     data: Arc<[u8]>,
     context: ScaleContext,
     cache: HashMap<(char, bool, [u8; 3]), Option<Image>>,
+    unicode: UnicodeRaster,
     /// Cell dimensions in PHYSICAL device pixels: the texture is rasterised at
     /// the display's true resolution so the compositor never has to upscale
     /// (which, on a fractional-scale HiDPI output, is what makes text blurry).
@@ -345,11 +432,28 @@ impl Raster {
     /// file and print a line on every step. The glyph cache starts empty,
     /// because every cached glyph was rasterised at the old size.
     pub fn resized(&self, scale: f32, logical_px: f32) -> Result<Self, String> {
-        Self::from_font(self.data.clone(), scale, logical_px, self.cursor)
+        Self::from_fonts(
+            self.data.clone(),
+            self.unicode.fonts.clone(),
+            scale,
+            logical_px,
+            self.cursor,
+        )
     }
 
     fn from_font(
         data: Arc<[u8]>,
+        scale: f32,
+        logical_px: f32,
+        cursor: crate::config::Cursor,
+    ) -> Result<Self, String> {
+        let fonts = Fonts::discover(data.clone()).ok_or("Invalid primary font")?;
+        Self::from_fonts(data, fonts, scale, logical_px, cursor)
+    }
+
+    fn from_fonts(
+        data: Arc<[u8]>,
+        fonts: Arc<Fonts>,
         scale: f32,
         logical_px: f32,
         cursor: crate::config::Cursor,
@@ -379,6 +483,7 @@ impl Raster {
             data,
             context: ScaleContext::new(),
             cache: HashMap::new(),
+            unicode: UnicodeRaster::new(fonts),
             width,
             height,
             scale,
@@ -439,6 +544,10 @@ impl Raster {
             || state.scale != self.scale.to_bits()
             || state.display_offset != screen.display_offset
             || !state
+                .clusters
+                .as_ref()
+                .is_some_and(|id| Arc::ptr_eq(id, &screen.clusters.identity))
+            || !state
                 .raster
                 .as_ref()
                 .is_some_and(|id| Arc::ptr_eq(id, &self.identity))
@@ -458,6 +567,7 @@ impl Raster {
             || dirty.len() != screen.rows
             || paintable_rows(screen) != screen.rows
             || state.cursor != visible_cursor(screen, state.rows)
+            || state.cursor_span != cursor_span(screen, visible_cursor(screen, state.rows))
         {
             return false;
         }
@@ -624,19 +734,24 @@ impl Raster {
             state.stride = stride;
             state.scale = self.scale.to_bits();
             state.raster = Some(self.identity.clone());
+            state.clusters = Some(screen.clusters.identity.clone());
             if state.cells.len() != screen.cols * rows {
                 state.cells.clear();
                 state.cells.reserve(screen.cols * rows);
             }
         }
         let cursor = visible_cursor(screen, rows);
+        let span = cursor_span(screen, cursor);
+        let cursor_changed = cursor != state.cursor || span != state.cursor_span;
         let changed = &mut state.cells_scratch;
         if !full {
             changed.clear();
             changed.resize(screen.cols * rows, false);
-            if cursor != state.cursor {
-                for (col, row) in state.cursor.into_iter().chain(cursor) {
-                    changed[row * screen.cols + col] = true;
+            if cursor_changed {
+                for (position, span) in [(state.cursor, state.cursor_span), (cursor, span)] {
+                    if let Some((col, row)) = position {
+                        changed[row * screen.cols + col..row * screen.cols + col + span].fill(true);
+                    }
                 }
             }
         }
@@ -664,7 +779,7 @@ impl Raster {
                 }
                 (&[][..], true)
             } else {
-                let cursor_row = cursor != state.cursor
+                let cursor_row = cursor_changed
                     && state
                         .cursor
                         .into_iter()
@@ -674,29 +789,20 @@ impl Raster {
                     continue;
                 }
                 let row_changed = &mut changed[start..start + screen.cols];
-                let mut count = 0;
-                for ((changed, now), old) in row_changed
-                    .iter_mut()
-                    .zip(cells)
-                    .zip(&mut state.cells[start..start + screen.cols])
-                {
-                    if dirty[row] && now != old {
-                        *old = *now;
-                        *changed = true;
-                    } else if *changed {
-                        // Cursor damage also records the cell it repaints.
-                        *old = *now;
-                    }
-                    count += usize::from(*changed);
-                }
+                let count = compare_row(
+                    cells,
+                    &mut state.cells[start..start + screen.cols],
+                    row_changed,
+                    dirty[row],
+                );
                 if count == 0 {
                     continue;
                 }
                 (&row_changed[..], count == screen.cols)
             };
             let y = row * self.height as usize;
-            // Glyphs cannot escape their cells, so filling the row's backgrounds
-            // before its glyphs preserves the old per-cell overwrite order.
+            // Fill both halves before a wide lead paints across them. Scalar
+            // glyphs keep the original cell-local mask loop below.
             let mut first = 0;
             while first < cells.len() {
                 if !full_row && !row_changed[first] {
@@ -725,6 +831,38 @@ impl Raster {
                 if !full_row && !row_changed[col] {
                     continue;
                 }
+                if matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer) {
+                    continue;
+                }
+                if cell.extra != 0 || !cell.c.is_ascii() || cell.width == CellWidth::Wide {
+                    let mut scalar = [0; 4];
+                    let text = if cell.extra == 0 {
+                        cell.c.encode_utf8(&mut scalar)
+                    } else {
+                        screen.clusters.get(cell.extra).unwrap_or("")
+                    };
+                    let span = cell_span(cells, col);
+                    let image = self.unicode.image(
+                        text,
+                        cell.bold,
+                        span,
+                        self.px,
+                        (self.width, self.height),
+                        self.baseline,
+                    );
+                    paint_cluster(
+                        image,
+                        rgba,
+                        stride,
+                        col * self.width as usize,
+                        y,
+                        self.width as usize * span,
+                        self.height as usize,
+                        cell.fg,
+                        format,
+                    );
+                    continue;
+                }
                 if cell.c == ' ' || cell.c == '\0' {
                     continue;
                 }
@@ -733,7 +871,7 @@ impl Raster {
                     if self.cache.len() >= 4096 {
                         self.cache.clear();
                     }
-                    let font = FontRef::from_index(&self.data, 0).unwrap();
+                    let font = self.unicode.fonts.primary.font();
                     let mut scaler = self.context.builder(font).size(self.px).hint(true).build();
                     let glyph = Render::new(&[Source::Outline])
                         .format(Format::Alpha)
@@ -791,15 +929,16 @@ impl Raster {
             cell_bands_into(changed, screen.cols, cell, &mut state.bands);
         }
         // Steady cursor; invert a block so its glyph remains readable.
-        let (cx, cy) = screen.cursor;
-        if cursor.is_some() && (full || changed[cy * screen.cols + cx]) {
+        if let Some((cx, cy)) = cursor
+            && (full || changed[cy * screen.cols + cx])
+        {
             let bottom = (cy + 1) * self.height as usize;
             let top = match self.cursor {
                 crate::config::Cursor::Block => cy * self.height as usize,
                 crate::config::Cursor::Underline => bottom - 1,
             };
             for y in top..bottom {
-                for x in cx * self.width as usize..(cx + 1) * self.width as usize {
+                for x in cx * self.width as usize..(cx + span) * self.width as usize {
                     let offset = y * stride + x * 4;
                     match self.cursor {
                         crate::config::Cursor::Block => {
@@ -816,6 +955,7 @@ impl Raster {
             }
         }
         state.cursor = cursor;
+        state.cursor_span = span;
         &state.bands
     }
     // Frozen pre-rank-6 painter (with rank 3's per-cell colour reorder):
@@ -973,8 +1113,72 @@ impl Raster {
     }
 }
 
-/// The sole RGB-to-destination channel-order boundary for the optimised loops.
+/// Unicode layers blend over the destination, including both backgrounds.
+#[allow(clippy::too_many_arguments)]
+fn paint_cluster(
+    image: &unicode::ClusterImage,
+    dst: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    fg: [u8; 3],
+    format: PixelFormat,
+) {
+    let fg = format.colour(fg).map(u32::from);
+    for layer in &image.layers {
+        let left = i64::from(layer.x);
+        let top = i64::from(layer.y);
+        let x0 = (-left).max(0);
+        let y0 = (-top).max(0);
+        let x1 = (width as i64 - left).min(i64::from(layer.width));
+        let y1 = (height as i64 - top).min(i64::from(layer.height));
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        for sy in y0..y1 {
+            let start = (y + (top + sy) as usize) * stride + (x + (left + x0) as usize) * 4;
+            let count = (x1 - x0) as usize;
+            let (pixels, _) = dst[start..start + count * 4].as_chunks_mut::<4>();
+            let source = sy as usize * layer.width as usize + x0 as usize;
+            match &layer.pixels {
+                Pixels::Mask(mask) => {
+                    for (&a, pixel) in mask[source..source + count].iter().zip(pixels) {
+                        if a == 0 {
+                            continue;
+                        }
+                        let a = u32::from(a);
+                        for c in 0..3 {
+                            pixel[c] = ((fg[c] * a + u32::from(pixel[c]) * (255 - a)) / 255) as u8;
+                        }
+                        pixel[3] = 255;
+                    }
+                }
+                Pixels::Color(data) => {
+                    for (src, pixel) in data[source * 4..(source + count) * 4]
+                        .chunks_exact(4)
+                        .zip(pixels)
+                    {
+                        if src[3] == 0 {
+                            continue;
+                        }
+                        let rgb = format.colour([src[0], src[1], src[2]]);
+                        let inverse = 255 - u32::from(src[3]);
+                        for c in 0..3 {
+                            pixel[c] = (u32::from(rgb[c]) + u32::from(pixel[c]) * inverse / 255)
+                                .min(255) as u8;
+                        }
+                        pixel[3] = 255;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[inline]
+/// The RGB-to-destination pixel boundary for the optimised loops.
 fn destination_pixel(rgb: [u8; 3]) -> [u8; 4] {
     [rgb[0], rgb[1], rgb[2], 255]
 }
@@ -1119,7 +1323,10 @@ mod tests {
             let mut state = PaintState::default();
             let mut pixels = Vec::new();
             let mut format = PixelFormat::Rgba;
-            for frame in 0..2048 {
+            // First half retains the frozen ASCII oracle; second half runs
+            // emoji/extras/pair transitions against the independent full painter.
+            for frame in 0..4096 {
+                let unicode_frames = frame >= 2048;
                 let value = next();
                 let mut dirty = vec![false; grid.rows];
                 match frame % 16 {
@@ -1129,8 +1336,7 @@ mod tests {
                         let cell = &mut grid.cells[i];
                         match frame % 16 {
                             0 => {
-                                cell.c = [' ', '\0', 'g', '界', '\u{301}', '█']
-                                    [(value >> 16) as usize % 6]
+                                cell.c = [' ', '\0', 'g', '@', '~', '#'][(value >> 16) as usize % 6]
                             }
                             1 => cell.fg = [value as u8, (value >> 8) as u8, (value >> 24) as u8],
                             2 => cell.bg = [value as u8, (value >> 8) as u8, (value >> 32) as u8],
@@ -1177,6 +1383,9 @@ mod tests {
                     }
                     _ => dirty.fill(true),
                 }
+                if unicode_frames && frame % 16 <= 5 {
+                    unicode_tests::transition(&mut grid, &mut dirty, value, frame);
+                }
                 let (width, height) = raster.target_size(&grid);
                 let stride = width as usize * 4 + 1 + (frame / 113) % 3;
                 let origin = 7;
@@ -1204,14 +1413,24 @@ mod tests {
                         format,
                     )
                     .to_vec();
-                raster.paint_reference(
-                    &grid,
-                    &mut expected[origin..origin + len],
-                    stride,
-                    &mut PaintState::default(),
-                    &[],
-                    format,
-                );
+                if unicode_frames {
+                    unicode_tests::paint_emoji_reference(
+                        &raster,
+                        &grid,
+                        &mut expected[origin..origin + len],
+                        stride,
+                        format,
+                    );
+                } else {
+                    raster.paint_reference(
+                        &grid,
+                        &mut expected[origin..origin + len],
+                        stride,
+                        &mut PaintState::default(),
+                        &[],
+                        format,
+                    );
+                }
                 assert_eq!(
                     pixels, expected,
                     "frame={frame} style={style:?} format={format:?}"
@@ -1479,8 +1698,9 @@ mod tests {
         }
     }
 
-    fn screen(cols: usize, rows: usize, fill: char) -> Screen {
+    pub(super) fn screen(cols: usize, rows: usize, fill: char) -> Screen {
         Screen {
+            clusters: Default::default(),
             cols,
             rows,
             cursor: (0, 0),
@@ -1488,6 +1708,8 @@ mod tests {
             display_offset: 0,
             cells: (0..cols * rows)
                 .map(|_| Cell {
+                    extra: 0,
+                    width: Default::default(),
                     c: fill,
                     fg: [200, 200, 200],
                     bg: [0, 0, 0],
@@ -1507,7 +1729,7 @@ mod tests {
     /// The cursor shape is not decoration in these tests: `Block` inverts the
     /// whole cell and `Underline` only its last row, so a test about
     /// inversion landing on the right row must say which one it means.
-    fn raster_with(cursor: Cursor) -> Raster {
+    pub(super) fn raster_with(cursor: Cursor) -> Raster {
         Raster::new(1.0, 13.0, cursor)
             .expect("a monospace font; set TERM_SPIKE_FONT to point at one")
     }
@@ -1609,9 +1831,8 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        // Wide/combining characters deliberately keep the existing one-cell
-        // clipping semantics. NUL represents a wide-cell continuation.
-        let chars = [' ', '\0', 'M', 'j', 'g', 'W', '界', '🙂', '\u{301}', '█'];
+        // Frozen ASCII oracle. Unicode frames have a separate full painter.
+        let chars = [' ', '\0', 'M', 'j', 'g', 'W', '@', '.', '~', '#'];
         for scale in [1.0, 1.25, 1.5, 2.5] {
             for cursor in [Cursor::Block, Cursor::Underline] {
                 let mut raster = base.resized(scale, 13.0).unwrap();

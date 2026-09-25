@@ -224,6 +224,7 @@ mod tests {
                 damage: Mutex::new(rx),
                 captured_cursor: Mutex::new(None),
                 captured_selection: Mutex::new(None),
+                clusters: Mutex::new(Default::default()),
                 pid: 0,
                 thread: None,
             },

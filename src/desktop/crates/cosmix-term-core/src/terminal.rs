@@ -1,10 +1,11 @@
+use crate::clusters::ClusterInterner;
+pub use crate::clusters::{CellWidth, Clusters};
 use crate::metrics::Metrics;
 #[path = "mouse.rs"]
 mod mouse;
 pub use mouse::MouseModifiers;
 #[path = "selection.rs"]
 mod selection;
-pub use rio_vt::{crosswords::pos::Side as SelectionSide, selection::SelectionType};
 use rio_vt::selection::SelectionRange;
 use rio_vt::{
     ansi::CursorShape,
@@ -14,6 +15,7 @@ use rio_vt::{
     performer::Machine,
     teletypewriter::{self, ChildEvent, EventedPty, ProcessReadWrite, WinsizeBuilder},
 };
+pub use rio_vt::{crosswords::pos::Side as SelectionSide, selection::SelectionType};
 use std::{
     borrow::Cow,
     collections::VecDeque,
@@ -231,9 +233,12 @@ impl Listener {
         Ok(())
     }
     pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
+        self.keys(&[key], at)
+    }
+    fn keys(&self, keys: &[Key], at: Instant) -> Result<(), String> {
         let mut writes = self.writes.lock().unwrap();
         Self::revoke_writer(&mut writes);
-        let bytes = encode(key);
+        let bytes: Vec<u8> = keys.iter().flat_map(|key| encode(*key)).collect();
         let sends_bytes = !bytes.is_empty();
         self.enqueue(&mut writes, bytes, Some(at), None, false)?;
         drop(writes);
@@ -372,7 +377,7 @@ pub enum Key {
 }
 pub fn encode(key: Key) -> Vec<u8> {
     match key {
-        Key::Char(c) if c.is_ascii() && !c.is_control() => vec![c as u8],
+        Key::Char(c) if !c.is_control() => c.encode_utf8(&mut [0; 4]).as_bytes().to_vec(),
         Key::Char(_) => Vec::new(),
         Key::Enter => vec![b'\r'],
         Key::Backspace => vec![127],
@@ -546,11 +551,15 @@ impl EventedPty for MeteredPty {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
+    /// Full cluster in `Screen::clusters`; zero keeps a scalar inline.
+    pub extra: u32,
+    pub width: CellWidth,
     pub fg: [u8; 3],
     pub bg: [u8; 3],
     pub bold: bool,
 }
 pub struct Screen {
+    pub clusters: Clusters,
     pub cols: usize,
     pub rows: usize,
     /// Viewport identity for raster invalidation; captured under the grid lock.
@@ -591,6 +600,7 @@ pub struct Terminal {
     damage: Mutex<Receiver<()>>,
     captured_cursor: Mutex<Option<((usize, usize), bool)>>,
     captured_selection: Mutex<Option<SelectionRange>>,
+    clusters: Mutex<ClusterInterner>,
     pub pid: i32,
     thread: Option<JoinHandle<(Machine<MeteredPty, Listener>, rio_vt::performer::State)>>,
 }
@@ -751,6 +761,7 @@ impl Terminal {
             damage: Mutex::new(rx),
             captured_cursor: Mutex::new(None),
             captured_selection: Mutex::new(None),
+            clusters: Mutex::new(ClusterInterner::default()),
             pid: 0,
             thread: None,
         }
@@ -984,6 +995,7 @@ impl Terminal {
             damage: Mutex::new(rx),
             captured_cursor: Mutex::new(None),
             captured_selection: Mutex::new(None),
+            clusters: Mutex::new(ClusterInterner::default()),
             pid,
             thread: Some(thread),
         })
@@ -1053,6 +1065,11 @@ impl Terminal {
         self.listener.key(key, at)
     }
 
+    /// One seat event, including a whole IME commit, occupies one FIFO entry.
+    pub fn keys(&self, keys: &[Key], at: Instant) -> Result<(), String> {
+        self.listener.keys(keys, at)
+    }
+
     pub fn alternate_screen(&self) -> bool {
         self.grid
             .lock()
@@ -1093,6 +1110,8 @@ impl Terminal {
         let cols = term.columns();
         let rows = term.screen_lines();
         let mut cells = Vec::with_capacity(cols * rows);
+        let mut clusters = self.clusters.lock().unwrap();
+        clusters.begin_capture();
         let offset = term.display_offset();
         let selection = term.selection.as_ref().and_then(|s| s.to_range(&term));
         for y in 0..rows {
@@ -1127,6 +1146,31 @@ impl Terminal {
                 }
                 cells.push(Cell {
                     c: square.c(),
+                    extra: if square
+                        .extras_id_checked()
+                        .and_then(|id| term.grid.extras_table.get(id))
+                        .is_some_and(|extras| !extras.zerowidth.is_empty())
+                    {
+                        let pos = rio_vt::crosswords::pos::Pos::new(
+                            rio_vt::crosswords::pos::Line(y as i32 - offset as i32),
+                            Column(x),
+                        );
+                        // Bound our temporary string even for pathological VT extras.
+                        let text: String = term
+                            .grid
+                            .cell_text(pos)
+                            .take(super::clusters::MAX_CLUSTER_BYTES + 1)
+                            .collect();
+                        clusters.intern(&text)
+                    } else {
+                        0
+                    },
+                    width: match square.wide() {
+                        rio_vt::crosswords::square::Wide::Narrow => CellWidth::Narrow,
+                        rio_vt::crosswords::square::Wide::Wide => CellWidth::Wide,
+                        rio_vt::crosswords::square::Wide::Spacer => CellWidth::Spacer,
+                        rio_vt::crosswords::square::Wide::LeadingSpacer => CellWidth::LeadingSpacer,
+                    },
                     fg,
                     bg,
                     bold,
@@ -1187,6 +1231,7 @@ impl Terminal {
             .vt_updated
             .unwrap_or_else(Instant::now);
         Screen {
+            clusters: clusters.snapshot.clone(),
             cols,
             rows,
             display_offset: offset,
@@ -1604,6 +1649,7 @@ mod tests {
                 damage: Mutex::new(rx),
                 captured_cursor: Mutex::new(None),
                 captured_selection: Mutex::new(None),
+                clusters: Mutex::new(ClusterInterner::default()),
                 pid: 0,
                 thread: None,
             };

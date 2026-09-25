@@ -191,6 +191,7 @@ mod tests {
 
     fn screen() -> Screen {
         Screen {
+            clusters: Default::default(),
             cols: 8,
             rows: 4,
             cursor: (0, 0),
@@ -198,6 +199,8 @@ mod tests {
             display_offset: 0,
             cells: (0..32)
                 .map(|_| Cell {
+                    extra: 0,
+                    width: Default::default(),
                     c: 'M',
                     fg: [200, 200, 200],
                     bg: [10, 20, 30],

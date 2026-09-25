@@ -33,6 +33,7 @@ fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
         let mut raster = Raster::new(scale, 13.0, Cursor::Underline).unwrap();
         raster.height = cell_height;
         let screen = Screen {
+            clusters: Default::default(),
             cols: 9,
             rows: 61,
             cursor: (2, 4),
@@ -40,6 +41,8 @@ fn band_widget_matches_exact_pixels_at_fractional_scales_and_offsets() {
             display_offset: 0,
             cells: (0..9 * 61)
                 .map(|i| Cell {
+                    extra: 0,
+                    width: Default::default(),
                     c: 'M',
                     fg: [210, 220, 230],
                     bg: [20 + (i / 9) as u8, 25, 30],
@@ -124,6 +127,7 @@ fn tiny_skia_frame_bench() {
             raster.width = 25;
             raster.height = 50;
             let mut screen = Screen {
+                clusters: Default::default(),
                 cols: 90,
                 rows: 25,
                 cursor: (0, 12),
@@ -131,6 +135,8 @@ fn tiny_skia_frame_bench() {
                 display_offset: 0,
                 cells: (0..2250)
                     .map(|i| Cell {
+                        extra: 0,
+                        width: Default::default(),
                         c: char::from(b'!' + (i % 90) as u8),
                         fg: [210, 220, 230],
                         bg: [20, 25, 30],
@@ -281,6 +287,7 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
         let mut scale = scale;
         let mut raster = Raster::new(scale, 13.0, Cursor::Block).unwrap();
         let mut screen = Screen {
+            clusters: Default::default(),
             cols: 9,
             rows: 9,
             cursor: (2, 3),
@@ -288,6 +295,8 @@ fn native_history_matches_rgba_with_clip_overlay_resize_and_age_loss() {
             display_offset: 0,
             cells: (0..81)
                 .map(|i| Cell {
+                    extra: 0,
+                    width: Default::default(),
                     c: ['M', 'g', ' ', '@'][i % 4],
                     fg: [[255, 0, 127], [0, 255, 0], [0, 0, 255]][i % 3],
                     bg: [i as u8, 255 - i as u8, 31],
@@ -484,6 +493,7 @@ fn raster_warm_spans_bench() {
     for spaces in [false, true] {
         for run_cells in [90, 7, 1] {
             let mut screen = Screen {
+                clusters: Default::default(),
                 cols: 90,
                 rows: 25,
                 cursor: (0, 0),
@@ -491,6 +501,8 @@ fn raster_warm_spans_bench() {
                 display_offset: 0,
                 cells: (0..2250)
                     .map(|i| Cell {
+                        extra: 0,
+                        width: Default::default(),
                         c: if spaces {
                             ' '
                         } else {
@@ -579,6 +591,7 @@ fn tiny_skia_foot_phases_bench() {
     raster.width = 25;
     raster.height = 50;
     let mut screen = Screen {
+        clusters: Default::default(),
         cols: 90,
         rows: 25,
         cursor: (0, 12),
@@ -586,6 +599,8 @@ fn tiny_skia_foot_phases_bench() {
         display_offset: 0,
         cells: (0..2250)
             .map(|i| Cell {
+                extra: 0,
+                width: Default::default(),
                 c: char::from(b'!' + (i % 90) as u8),
                 fg: [210, 220, 230],
                 bg: [20, 25, 30],
