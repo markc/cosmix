@@ -254,6 +254,66 @@ fn tiny_skia_frame_bench() {
 /// Isolated costs, not additive frame timings. No window/presentation is
 /// created. Keep allocations outside the timer except where explicitly named.
 #[test]
+#[ignore = "release-only rank-6 warm-paint measurement"]
+fn raster_warm_spans_bench() {
+    use cosmix_term_core::raster::PaintState;
+    use std::hint::black_box;
+
+    let mut raster = Raster::new(2.5, 13.0, Cursor::Underline).unwrap();
+    raster.width = 25;
+    raster.height = 50;
+    for spaces in [false, true] {
+        for run_cells in [90, 7, 1] {
+            let mut screen = Screen {
+                cols: 90,
+                rows: 25,
+                cursor: (0, 0),
+                cursor_visible: false,
+                cells: (0..2250)
+                    .map(|i| Cell {
+                        c: if spaces { ' ' } else { char::from(b'!' + (i % 90) as u8) },
+                        fg: [210, 220, 230],
+                        bg: [20, 25, 30],
+                        bold: false,
+                    })
+                    .collect(),
+                updated: Instant::now(),
+            };
+            let mut pixels = vec![0; 2250 * 1250 * 4];
+            let mut state = PaintState::default();
+            let mut samples = Vec::with_capacity(200);
+            for n in 0..220 {
+                // Change real content without changing the warmed glyph keys.
+                // Set up the colours outside the timed region.
+                for (i, cell) in screen.cells.iter_mut().enumerate() {
+                    cell.bg[0] = 20 + (n % 40) as u8
+                        + (((i % 90) / run_cells) % 2) as u8;
+                }
+                let start = Instant::now();
+                black_box(raster.paint(
+                    black_box(&screen), &mut pixels, 2250 * 4, &mut state, &[true; 25],
+                ));
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                black_box(&pixels);
+                if n >= 20 {
+                    samples.push(ms);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "rank6 warm {} bg_run={run_cells} cells 2250x1250 scale=2.5: mean={:.3} p50={:.3} p99={:.3} ms",
+                if spaces { "spaces" } else { "glyphs" },
+                samples.iter().sum::<f64>() / samples.len() as f64,
+                samples[100],
+                samples[198],
+            );
+        }
+    }
+}
+
+/// Isolated costs, not additive frame timings. No window/presentation is
+/// created. Keep allocations outside the timer except where explicitly named.
+#[test]
 #[ignore = "release-only headless performance measurement"]
 fn tiny_skia_foot_phases_bench() {
     use cosmix_term_core::raster::PaintState;

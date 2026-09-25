@@ -460,6 +460,193 @@ impl Raster {
             }
         }
         let rgba = dst;
+        for (row, cells) in screen.cells[..screen.cols * rows]
+            .chunks_exact(screen.cols)
+            .enumerate()
+        {
+            if !dirty_rows[row] {
+                continue;
+            }
+            let y = row * self.height as usize;
+            // Glyphs cannot escape their cells, so filling the row's backgrounds
+            // before its glyphs preserves the old per-cell overwrite order.
+            let mut first = 0;
+            while first < cells.len() {
+                let bg = cells[first].bg;
+                let mut end = first + 1;
+                while end < cells.len() && cells[end].bg == bg {
+                    end += 1;
+                }
+                let left = first * self.width as usize * 4;
+                let right = end * self.width as usize * 4;
+                let pixel = destination_pixel(bg);
+                for cy in y..y + self.height as usize {
+                    // [u8; 4] has byte alignment: arbitrary slice origins and
+                    // odd padded strides are valid, without unsafe casts.
+                    let (pixels, tail) =
+                        rgba[cy * stride + left..cy * stride + right].as_chunks_mut::<4>();
+                    debug_assert!(tail.is_empty());
+                    pixels.fill(pixel);
+                }
+                first = end;
+            }
+            for (col, cell) in cells.iter().enumerate() {
+                if cell.c == ' ' || cell.c == '\0' {
+                    continue;
+                }
+                let key = (cell.c, cell.bold, cell.fg);
+                if !self.cache.contains_key(&key) {
+                    if self.cache.len() >= 4096 {
+                        self.cache.clear();
+                    }
+                    let font = FontRef::from_index(&self.data, 0).unwrap();
+                    let mut scaler = self.context.builder(font).size(self.px).hint(true).build();
+                    let glyph = Render::new(&[Source::Outline])
+                        .format(Format::Alpha)
+                        .render(&mut scaler, font.charmap().map(cell.c));
+                    self.cache.insert(key, glyph);
+                }
+                if let Some(glyph) = &self.cache[&key] {
+                    let p = glyph.placement;
+                    // Clip in cell-local coordinates once. i64 also avoids
+                    // negation overflow for a negative placement bearing.
+                    let left = i64::from(p.left);
+                    let top = i64::from(self.baseline) - i64::from(p.top);
+                    let gx0 = (-left).max(0);
+                    let gy0 = (-top).max(0);
+                    let gx1 = (i64::from(self.width) - left).min(i64::from(p.width));
+                    let gy1 = (i64::from(self.height) - top).min(i64::from(p.height));
+                    if gx0 >= gx1 || gy0 >= gy1 {
+                        continue;
+                    }
+                    let count = (gx1 - gx0) as usize;
+                    let x = col * self.width as usize + (left + gx0) as usize;
+                    let fg = cell.fg.map(u32::from);
+                    let bg = cell.bg.map(u32::from);
+                    let opaque = destination_pixel(cell.fg);
+                    for gy in gy0..gy1 {
+                        let mask_start = gy as usize * p.width as usize + gx0 as usize;
+                        let mask = &glyph.data[mask_start..mask_start + count];
+                        let dy = y + (top + gy) as usize;
+                        let offset = dy * stride + x * 4;
+                        let (pixels, _) =
+                            rgba[offset..offset + count * 4].as_chunks_mut::<4>();
+                        for (&alpha, pixel) in mask.iter().zip(pixels) {
+                            match alpha {
+                                0 => {}
+                                255 => *pixel = opaque,
+                                alpha => {
+                                    let alpha = u32::from(alpha);
+                                    let inverse = 255 - alpha;
+                                    // Exactly the original integer expression.
+                                    // This pixel still holds its cell's bg:
+                                    // each mask sample visits it at most once.
+                                    *pixel = destination_pixel(std::array::from_fn(|channel| {
+                                        ((fg[channel] * alpha + bg[channel] * inverse) / 255)
+                                            as u8
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Steady cursor; invert a block so its glyph remains readable.
+        let (cx, cy) = screen.cursor;
+        let drawn = screen.cursor_visible && cx < screen.cols && cy < rows;
+        if drawn {
+            let bottom = (cy + 1) * self.height as usize;
+            let top = match self.cursor {
+                crate::config::Cursor::Block => cy * self.height as usize,
+                crate::config::Cursor::Underline => bottom - 1,
+            };
+            for y in top..bottom {
+                for x in cx * self.width as usize..(cx + 1) * self.width as usize {
+                    let offset = y * stride + x * 4;
+                    match self.cursor {
+                        crate::config::Cursor::Block => {
+                            for channel in &mut rgba[offset..offset + 3] {
+                                *channel = 255 - *channel;
+                            }
+                        }
+                        crate::config::Cursor::Underline => {
+                            rgba[offset..offset + 4]
+                                .copy_from_slice(&destination_pixel([220, 220, 220]));
+                        }
+                    }
+                }
+            }
+        }
+        state.cursor = drawn.then_some(screen.cursor);
+        bands_into(dirty_rows, self.height, &mut state.bands);
+        &state.bands
+    }
+    // Frozen pre-rank-6 painter: deliberately retains independent per-pixel
+    // RGBA writes and clipping as the byte-equality oracle.
+    #[cfg(test)]
+    fn paint_reference<'a>(
+        &mut self,
+        screen: &Screen,
+        dst: &mut [u8],
+        stride: usize,
+        state: &'a mut PaintState,
+        dirty: &[bool],
+    ) -> &'a [DamageBand] {
+        state.bands.clear();
+        // `Screen`'s fields are public, so a cell array shorter than
+        // `cols * rows` is constructible even though `Terminal::capture` never
+        // produces one. Paint only the whole rows that actually exist: the
+        // alternative is a returned band claiming a row was repainted while
+        // the loop skipped it, which is a lie a renderer cannot detect and
+        // which leaves the old pixels — including an old cursor — on screen.
+        let cell = (self.width, self.height);
+        let (width, height, rows) = target(self, screen);
+        if screen.cols == 0
+            || rows == 0
+            || stride < width * 4
+            || dst.len() < stride * height
+        {
+            state.invalidate();
+            return &state.bands;
+        }
+        let buffer = (dst.as_ptr() as usize, dst.len());
+        // The state's own record decides, never the caller's: a Raster
+        // rebuilt at a new scale changes `cell` while cols/rows stay put, and
+        // that must still force a full repaint.
+        let full = state.cols != screen.cols
+            || state.rows != rows
+            || state.cell != cell
+            || state.buffer != buffer;
+        if full {
+            state.cols = screen.cols;
+            state.rows = rows;
+            state.cell = cell;
+            state.buffer = buffer;
+            state.cursor = None;
+        }
+        let dirty_rows = &mut state.rows_scratch;
+        dirty_rows.clear();
+        dirty_rows.resize(rows, full);
+        if !full {
+            // `dirty` is indexed against the VT's row count; a short cell
+            // array shrinks the painted area but not the snapshot, so the
+            // slice is only trustworthy when both agree.
+            if dirty.len() == screen.rows && screen.rows == rows {
+                dirty_rows.copy_from_slice(dirty);
+            } else {
+                dirty_rows.fill(true);
+            }
+            if let Some((_, previous)) = state.cursor
+                && previous < rows
+            {
+                dirty_rows[previous] = true;
+            }
+            if screen.cursor_visible && screen.cursor.1 < rows {
+                dirty_rows[screen.cursor.1] = true;
+            }
+        }
+        let rgba = dst;
         for (i, cell) in screen.cells.iter().take(screen.cols * rows).enumerate() {
             if !dirty_rows[i / screen.cols] {
                 continue;
@@ -545,6 +732,12 @@ impl Raster {
     }
 }
 
+/// The sole RGB-to-destination channel-order boundary for the optimised loops.
+#[inline]
+fn destination_pixel(rgb: [u8; 3]) -> [u8; 4] {
+    [rgb[0], rgb[1], rgb[2], 255]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +793,134 @@ mod tests {
     fn raster_with(cursor: Cursor) -> Raster {
         Raster::new(1.0, 13.0, cursor)
             .expect("a monospace font; set TERM_SPIKE_FONT to point at one")
+    }
+
+    /// Compare entire guarded allocations, including padding and untouched
+    /// rows, as well as damage. The slice begins at a nonzero physical origin
+    /// in a larger canvas; Raster itself has no origin argument.
+    fn compare_painters(raster: &mut Raster, grid: &mut Screen, padding: usize) {
+        let (width, height) = raster.target_size(grid);
+        let stride = width as usize * 4 + padding + 28;
+        let origin = 2 * stride + 12 + 1; // also deliberately byte-unaligned
+        let len = stride * height as usize;
+        let mut fast = vec![0x5a; origin + len + stride];
+        let mut slow = fast.clone();
+        let mut fast_state = PaintState::default();
+        let mut slow_state = PaintState::default();
+        for frame in 0..5 {
+            if frame == 2 {
+                grid.cursor = (grid.cols.saturating_sub(1), grid.rows.saturating_sub(1));
+            }
+            if frame == 3 {
+                grid.cursor_visible = false;
+            }
+            let dirty: Vec<_> = (0..grid.rows)
+                .map(|row| frame == 1 || (frame == 4 && row % 2 == 1))
+                .collect();
+            if frame == 4 {
+                for (i, cell) in grid.cells.iter_mut().enumerate() {
+                    if dirty[i / grid.cols] {
+                        cell.bg = [17, 231, i as u8];
+                        cell.fg = [255, 0, 128];
+                    }
+                }
+            }
+            let bands = raster.paint(
+                grid, &mut fast[origin..origin + len], stride, &mut fast_state, &dirty,
+            ).to_vec();
+            let reference = raster.paint_reference(
+                grid, &mut slow[origin..origin + len], stride, &mut slow_state, &dirty,
+            );
+            assert_eq!(bands, reference, "damage frame={frame}");
+            assert_eq!(fast, slow, "pixels frame={frame} scale={}", raster.scale);
+            assert!(fast[..origin].iter().all(|&b| b == 0x5a));
+            assert!(fast[origin + len..].iter().all(|&b| b == 0x5a));
+            for row in 0..height as usize {
+                let pad = origin + row * stride + width as usize * 4;
+                assert!(fast[pad..origin + (row + 1) * stride].iter().all(|&b| b == 0x5a));
+            }
+        }
+    }
+
+    #[test]
+    fn span_and_mask_paint_matches_reference_on_varied_grids() {
+        let base = raster();
+        let mut seed = 0x6a09_e667_f3bc_c909_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Wide/combining characters deliberately keep the existing one-cell
+        // clipping semantics. NUL represents a wide-cell continuation.
+        let chars = [' ', '\0', 'M', 'j', 'g', 'W', '界', '🙂', '\u{301}', '█'];
+        for scale in [1.0, 1.25, 1.5, 2.5] {
+            for cursor in [Cursor::Block, Cursor::Underline] {
+                let mut raster = base.resized(scale, 13.0).unwrap();
+                raster.cursor = cursor;
+                for case in 0..16 {
+                    let cols = 1 + (next() % 23) as usize;
+                    let rows = 2 + (next() % 6) as usize;
+                    let mut grid = screen(cols, rows, ' ');
+                    let mut bg = [0, 0, 0];
+                    for (i, cell) in grid.cells.iter_mut().enumerate() {
+                        let value = next();
+                        // Uniform rows, alternating backgrounds, and mixed runs.
+                        if i % cols == 0
+                            || case % 3 == 1
+                            || (case % 3 == 2 && value % 5 == 0)
+                        {
+                            bg = [value as u8, (value >> 8) as u8, (value >> 16) as u8];
+                        }
+                        cell.bg = bg;
+                        cell.fg = [(value >> 24) as u8, (value >> 32) as u8, (value >> 40) as u8];
+                        cell.bold = value & 1 != 0;
+                        cell.c = chars[(value >> 48) as usize % chars.len()];
+                    }
+                    grid.cursor_visible = true;
+                    grid.cursor = (cols / 2, rows / 2);
+                    if case % 4 == 0 {
+                        grid.cells.pop(); // partial final rows must still be ignored
+                    }
+                    compare_painters(&mut raster, &mut grid, case % 4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mask_endpoints_rounding_and_clipping_match_reference() {
+        let mut raster = raster();
+        raster.baseline = 0;
+        // Synthetic masks guarantee coverage of all alpha values and all
+        // clipping directions independently of the installed font's outlines.
+        for (width, height) in [(256, 1), (7, 5)] {
+            raster.width = width;
+            raster.height = height;
+            for (left, top) in [(0, 0), (-3, 2), (3, -2), (-300, 0), (300, 0), (0, 300), (0, -300)] {
+                for (fg, bg) in [
+                    ([0, 255, 127], [255, 0, 128]),
+                    ([1, 17, 254], [254, 239, 1]),
+                    ([37, 37, 37], [37, 37, 37]),
+                ] {
+                    let mut glyph = Image::default();
+                    glyph.placement.left = left;
+                    glyph.placement.top = top;
+                    glyph.placement.width = 256;
+                    glyph.placement.height = 9;
+                    glyph.data = (0..256 * 9).map(|i| i as u8).collect();
+                    raster.cache.insert(('M', true, fg), Some(glyph));
+                    let mut grid = screen(3, 3, 'M');
+                    for cell in &mut grid.cells {
+                        cell.fg = fg;
+                        cell.bg = bg;
+                        cell.bold = true;
+                    }
+                    compare_painters(&mut raster, &mut grid, 1);
+                }
+            }
+        }
     }
 
     /// `bands_into` through a Vec, for asserting on runs directly.
