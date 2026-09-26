@@ -13,9 +13,9 @@
 //!
 //! **Resolution:** `from` if given, else the reference's `origin` —
 //! advisory, first try only. The node's lane URL comes from a
-//! mesh-open `blobd.props.get {path:"lane"}` (or `blobd-<name>.props.get`
-//! when the reference carries an instance) addressed through the local
-//! noded as `blobd[.<instance>].<node>`; on `Service 'blobd' not
+//! mesh-open `blob.props.get {path:"lane"}` (the verb namespace is
+//! `blob.*`; the service is `blobd`, addressed `blobd[.<instance>].<node>`
+//! through the local noded); on `Service 'blobd' not
 //! found` / `disconnected` (both rc=10, discriminated by message text)
 //! or a lane 404, the fetch fans `blob.has {blobs:[hash]}` out over
 //! `noded.peers` (all peers, one round, bounded concurrency 4) and
@@ -123,16 +123,35 @@ pub struct FetchTarget {
 }
 
 /// Resolves a node's byte-lane base URL (`http://<wg-ip>:<port>`).
-/// Production wires noded: a mesh-open `blobd.props.get {path:"lane"}`
-/// addressed `blobd[.<instance>].<node>` through the local broker.
-/// Every failure is "this source is unreachable" — the caller falls
-/// back.
+/// Production wires noded: a mesh-open `blob.props.get` (the citizen's
+/// `blob.*` namespace — the service is `blobd`, the verb never carries
+/// the `blobd.` prefix) addressed `blobd[.<instance>].<node>` through
+/// the local broker. Every failure is "this source is unreachable" —
+/// the caller falls back.
 pub trait Resolver: Send + Sync {
     fn lane_url<'a>(
         &'a self,
         node: &'a str,
         instance: Option<&'a str>,
     ) -> BoxFuture<'a, Result<String, String>>;
+}
+
+/// The props verb [`NodedResolver`] sends — `blob.props.get`, the
+/// citizen's own namespace (the service is `blobd`, the verb is not
+/// `blobd.props.get`; B1). A shared constant so the citizen test can
+/// push the resolver's exact command string through
+/// [`crate::citizen::Citizen::dispatch`] and the two can never drift.
+pub(crate) const RESOLVER_PROPS_VERB: &str = "blob.props.get";
+
+/// The `to` address [`NodedResolver`] uses: `blobd.<node>`, or
+/// `blobd-<name>.<node>` when the reference carries an instance (the
+/// same service name `Config::service_name` mints for a named
+/// instance).
+pub(crate) fn resolver_to(node: &str, instance: Option<&str>) -> String {
+    match instance {
+        Some(name) => format!("blobd-{name}.{node}"),
+        None => format!("blobd.{node}"),
+    }
 }
 
 /// The fallback roster. Production wires noded: `noded.peers` for the
@@ -177,7 +196,8 @@ impl ClientSlot {
 
 // ---- Production wiring (noded through the client slot) ----
 
-/// Resolves lane URLs with `blobd.props.get` through the local noded.
+/// Resolves lane URLs with `blob.props.get` (the citizen's `blob.*`
+/// verb namespace) through the local noded.
 pub struct NodedResolver {
     client: ClientSlot,
 }
@@ -199,18 +219,14 @@ impl Resolver for NodedResolver {
                 .client
                 .get()
                 .ok_or_else(|| "not connected to the broker".to_string())?;
-            let service = match instance {
-                Some(name) => format!("blobd-{name}"),
-                None => "blobd".to_string(),
-            };
-            let to = format!("{service}.{node}");
+            let to = resolver_to(node, instance);
             let reply = tokio::time::timeout(
                 BUS_CALL_TIMEOUT,
-                client.call_typed(&to, "blobd.props.get", json!({"path": "lane"})),
+                client.call_typed(&to, RESOLVER_PROPS_VERB, json!({"path": "lane"})),
             )
             .await
-            .map_err(|_| format!("blobd.props.get on {to} timed out"))?
-            .map_err(|e| format!("blobd.props.get on {to}: {e}"))?;
+            .map_err(|_| format!("{RESOLVER_PROPS_VERB} on {to} timed out"))?
+            .map_err(|e| format!("{RESOLVER_PROPS_VERB} on {to}: {e}"))?;
             match reply {
                 PortReply::Ok { value, .. } => {
                     let bind = value
@@ -1311,6 +1327,57 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    // ---- B1: the resolver's exact command must be a citizen verb ----
+
+    #[test]
+    fn resolver_props_command_dispatches_through_the_citizen() {
+        // B1 was exactly this drift: the resolver sent `blobd.props.get`,
+        // the citizen routes only `blob.*`, and every remote resolution
+        // answered "unknown blob verb". Push the resolver's command
+        // string through Citizen::dispatch so the two can never drift
+        // again.
+        let (_dir, store) = bare_store("B");
+        let lane: SocketAddr = "10.42.0.9:4210".parse().unwrap();
+        let fetcher = Fetcher::new(
+            Arc::clone(&store),
+            FetchConfig::default(),
+            Some(lane),
+            "default".into(),
+            Arc::new(crate::fetch::test_support::NullResolver),
+            Arc::new(crate::fetch::test_support::NullPeers),
+            Arc::new(TestSink::default()),
+        );
+        let citizen = Citizen::new(
+            store,
+            "blobd".into(),
+            "default".into(),
+            Some(lane),
+            Arc::new(fetcher),
+        );
+        let (rc, body, _) = citizen.dispatch(&command(
+            RESOLVER_PROPS_VERB,
+            "maild",
+            json!({"path": "lane"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["bind"], "10.42.0.9:4210");
+
+        // The addressing side of the same contract: instance targets
+        // carry the service name Config::service_name mints.
+        assert_eq!(resolver_to("alpha", None), "blobd.alpha");
+        assert_eq!(resolver_to("alpha", Some("two")), "blobd-two.alpha");
+        assert_eq!(
+            resolver_to("alpha", Some("two")),
+            format!(
+                "{}.alpha",
+                crate::core::config::Config::parse("name: two")
+                    .unwrap()
+                    .service_name()
+            )
+        );
     }
 
     // ---- The main lane: A holds ≥ 32 MiB, B fetches ----

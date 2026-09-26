@@ -59,7 +59,7 @@ The response contains the absolute CAS `path` for zero-copy same-node reads, or 
 |---|---|
 | `blob` | Blob id |
 
-The response contains `url`, `http://<lane_bind>/blob/<hex>` — exactly the path the byte lane serves (`GET` with `Range`, `HEAD`; see the README's Byte lane section). Requires the bytes to be present and `lane_bind` to be configured; the lane publishes `lane.port`/`lane.bind` props only once its socket is listening, so a remote resolves the port with a mesh-open `blobd.props.get` on the origin node.
+The response contains `url`, `http://<lane_bind>/blob/<hex>` — exactly the path the byte lane serves (`GET` with `Range`, `HEAD`; see the README's Byte lane section). Requires the bytes to be present and `lane_bind` to be configured; the lane publishes `lane.port`/`lane.bind` props only once its socket is listening, so a remote resolves the port with a mesh-open `blob.props.get` on the origin node's `blobd` service.
 
 ### `blob.has`
 

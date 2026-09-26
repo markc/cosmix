@@ -481,7 +481,7 @@
 <table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
 <tr><td><code>blob</code></td><td>Blob id</td></tr>
 </tbody></table>
-<p>The response contains <code>url</code>, <code>http://&lt;lane_bind&gt;/blob/&lt;hex&gt;</code> — exactly the path the byte lane serves (<code>GET</code> with <code>Range</code>, <code>HEAD</code>; see the README's Byte lane section). Requires the bytes to be present and <code>lane_bind</code> to be configured; the lane publishes <code>lane.port</code>/<code>lane.bind</code> props only once its socket is listening, so a remote resolves the port with a mesh-open <code>blobd.props.get</code> on the origin node.</p>
+<p>The response contains <code>url</code>, <code>http://&lt;lane_bind&gt;/blob/&lt;hex&gt;</code> — exactly the path the byte lane serves (<code>GET</code> with <code>Range</code>, <code>HEAD</code>; see the README's Byte lane section). Requires the bytes to be present and <code>lane_bind</code> to be configured; the lane publishes <code>lane.port</code>/<code>lane.bind</code> props only once its socket is listening, so a remote resolves the port with a mesh-open <code>blob.props.get</code> on the origin node's <code>blobd</code> service.</p>
 <h3 id="blobhas"><code>blob.has</code></h3>
 <table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
 <tr><td><code>blobs</code></td><td>Array of blob ids</td></tr>
