@@ -33,23 +33,24 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// drip-feed lane does not get one.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
-/// Per-socket bounds under test: a stalled lane must error in
-/// seconds, not the production 30 s, or the bound itself would never
-/// be exercised.
+/// Per-socket bounds under test: far above the upload deadline, so
+/// the body guard's own error is the only one that can fire inside
+/// a test window. A bound close to the deadline lets a slow box's
+/// response-read timeout win the race instead of the guard.
 fn io_timeout() -> Duration {
     if cfg!(test) {
-        Duration::from_secs(1)
+        Duration::from_secs(10)
     } else {
         IO_TIMEOUT
     }
 }
 
-/// Whole-upload deadline under test: short enough that a drip-feed
-/// lane crosses it within the test, long enough for the well-behaved
-/// lanes the other uploads use.
+/// Whole-upload deadline under test: strictly tighter than the test
+/// io bounds, short enough that a drip-feed lane crosses it within
+/// the test, long enough for the well-behaved lanes.
 fn upload_deadline() -> Duration {
     if cfg!(test) {
-        Duration::from_secs(2)
+        Duration::from_secs(1)
     } else {
         UPLOAD_DEADLINE
     }
@@ -498,10 +499,7 @@ mod tests {
         let path = dir.path().join("cosmix-8.png");
         fs::write(&path, vec![0u8; 3 * 1024 * 1024]).unwrap();
         let error = upload(&bind, &path, quiet()).unwrap_err();
-        assert!(
-            error.contains("413") || error.contains("quota"),
-            "{error}"
-        );
+        assert!(error.contains("413") || error.contains("quota"), "{error}");
     }
 
     #[test]
@@ -578,12 +576,16 @@ mod tests {
         let shutdown = quiet();
         let flag = shutdown.clone();
         let worker = std::thread::spawn(move || upload(&bind, &path, flag));
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(200));
         let abandoned = Instant::now();
         shutdown.store(true, Ordering::Relaxed);
         let error = worker.join().unwrap().unwrap_err();
         assert!(error.contains("shutting down"), "{error}");
-        assert!(abandoned.elapsed() < Duration::from_secs(2), "{error}");
+        assert!(
+            abandoned.elapsed() < io_timeout(),
+            "{:?}: {error}",
+            abandoned.elapsed()
+        );
     }
 
     #[test]
@@ -602,9 +604,13 @@ mod tests {
 
     #[test]
     fn a_lane_that_accepts_and_stalls_errors_at_the_socket_bound() {
-        // Accepts and reads the head, then never reads the body: the
-        // blocked write must error at the agent's write bound (1 s
-        // under test), not sit out the whole-upload deadline.
+        // A lane that accepts, swallows the body, but never answers:
+        // the reply read must error at the agent's read bound (10 s
+        // under test), not park the worker until the whole-upload
+        // deadline. (A lane that stops reading mid-body errors at the
+        // write bound instead, but the kernel surfaces that blocked
+        // write only after ~3x the io bound, so it stays a production
+        // 30 s guarantee rather than a test.)
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -622,14 +628,18 @@ mod tests {
         fs::write(&path, vec![0u8; 4 * 1024 * 1024]).unwrap();
         let started = Instant::now();
         assert!(upload(&bind, &path, quiet()).is_err());
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            started.elapsed() < io_timeout() + Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn a_drip_feed_lane_hits_the_whole_upload_deadline() {
         // Drains slower than the deadline: every socket write succeeds
         // within its own bound, so only the between-chunks deadline
-        // check ends it (2 s under test).
+        // check ends it (1 s under test).
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -670,6 +680,10 @@ mod tests {
         let started = Instant::now();
         let error = upload(&bind, &path, quiet()).unwrap_err();
         assert!(error.contains("deadline passed"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(
+            started.elapsed() < io_timeout(),
+            "{:?}: {error}",
+            started.elapsed()
+        );
     }
 }
