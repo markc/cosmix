@@ -72,6 +72,19 @@ impl Mds for MemMds {
     fn blob_exists(&self, _hash: &BlobHash) -> Result<bool> {
         unimplemented!()
     }
+    fn put_blob_path(
+        &self,
+        _src: &std::path::Path,
+        _mode: crate::blob::PutMode,
+    ) -> Result<BlobHash> {
+        unimplemented!()
+    }
+    fn put_blob_reader(&self, _r: &mut dyn std::io::Read) -> Result<BlobHash> {
+        unimplemented!()
+    }
+    fn blob_file(&self, _hash: &BlobHash) -> Result<std::fs::File> {
+        unimplemented!()
+    }
 
     fn add_item(
         &self,

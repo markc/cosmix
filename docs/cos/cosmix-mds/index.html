@@ -448,7 +448,7 @@
 <tr><td>Cargo package</td><td><code>cosmix-mds</code></td></tr>
 <tr><td>Rust library</td><td><code>cosmix_mds</code></td></tr>
 <tr><td>Operator binary</td><td><code>cosmix-mds</code></td></tr>
-<tr><td>Current crate version</td><td><code>0.1.5</code></td></tr>
+<tr><td>Current crate version</td><td><code>0.3.2</code></td></tr>
 <tr><td>Licence</td><td>MIT</td></tr>
 </tbody></table>
 <p>The package also declares <code>cosmix-mds-stress-writer</code>. That binary is an internal crash-recovery test helper, is gated by <code>_stress-helper</code>, and is not part of the operator surface.</p>
@@ -480,7 +480,7 @@
 <table><thead><tr><th>Group</th><th>Methods</th></tr></thead><tbody>
 <tr><td>Set lifecycle</td><td><code>create_set</code>, <code>delete_set</code>, <code>list_sets</code></td></tr>
 <tr><td>Container lifecycle</td><td><code>create_container</code>, <code>rename_container</code>, <code>delete_container</code>, <code>list_containers</code>, <code>container_status</code></td></tr>
-<tr><td>Blob CAS</td><td><code>put_blob</code>, <code>get_blob</code>, <code>blob_size</code>, <code>blob_exists</code></td></tr>
+<tr><td>Blob CAS</td><td><code>put_blob</code>, <code>get_blob</code>, <code>blob_size</code>, <code>blob_exists</code>, <code>put_blob_path</code>, <code>put_blob_reader</code>, <code>blob_file</code></td></tr>
 <tr><td>Item mutation</td><td><code>add_item</code>, <code>copy_item</code>, <code>move_item</code>, <code>remove_membership</code>, <code>store_flags</code></td></tr>
 <tr><td>Keywords</td><td><code>store_membership_keywords</code>, <code>store_item_keywords</code>, <code>item_memberships</code></td></tr>
 <tr><td>Item lookup</td><td><code>fetch_item</code>, <code>fetch_item_meta</code>, <code>find_items_by_blob_hash</code>, <code>search_items</code>, <code>list_items</code></td></tr>
@@ -492,6 +492,16 @@
 <p>The principal identifier wrappers are <code>SetId</code>, <code>ContainerId</code>, <code>ItemId</code>, and <code>BlobHash</code>. Ordering and change tracking use the distinct <code>Seq</code>, <code>ChangeToken</code>, <code>SetChangeToken</code>, and <code>ContainerChangeSetToken</code> types.</p>
 <p><code>Flags</code> stores the system-flag bitmap. Allocated bits represent seen, flagged, answered, draft, and deleted states. <code>Tags</code> stores sorted, unique user keywords.</p>
 <p><code>ItemRecord</code> is a per-membership view joining item metadata with its container sequence, flags, tags, and change token. It is constructed from SQLite on reads and is not a persisted wire snapshot.</p>
+<h2 id="streaming-ingest-and-reads">Streaming ingest and reads</h2>
+<p><code>blob::put_reader</code> streams any <code>Read</code> into the CAS, hashing with BLAKE3 while the bytes are staged under <code>blobs/.tmp</code>; the hash is only known at stream end and the write protocol already tolerates that. A reader error mid-stream removes the staged file and leaves no CAS entry. <code>blob::put</code> is a thin wrapper over it. <code>blob::open</code> returns the CAS file for streaming reads, and <code>Mds::blob_file</code> is its trait-level counterpart.</p>
+<p><code>blob::put_path</code> ingests a local file under a <code>PutMode</code>:</p>
+<ul>
+<li><code>Copy</code> — plain userspace copy.</li>
+<li><code>Reflink</code> — kernel-side copy (<code>FICLONE</code>, then <code>copy_file_range</code>) that falls through to a full copy on <code>EOPNOTSUPP</code>, <code>EXDEV</code>, <code>EINVAL</code>, or <code>ENOSYS</code>; it never fails merely because the filesystem lacks reflink support.</li>
+<li><code>HardLink</code> — links the source inode into the CAS; only callers that promise the source path immutable from the call onward may use it. A mutable path such as a filesd place must use <code>Copy</code> or <code>Reflink</code>.</li>
+</ul>
+<p>Every mode re-hashes the staged bytes against the ingest-time hash before they are linked in, so a source rewritten mid-copy cannot enter the store under a stale hash. <code>SqliteCasMds::blobs_root</code> is public, so an out-of-process CAS owner reaches <code>blob::put_path</code> and <code>blob::open</code> with the same root the store itself uses.</p>
+<p><code>blob_index::BlobRow</code>, <code>blob_row</code>, and <code>list_blob_rows</code> expose the box-wide blob table read-only — a row's hash, size, first and last seen, and refcount — taking the direct <code>blobs.sqlite</code> connection.</p>
 <h2 id="transaction-scope">Transaction scope</h2>
 <p><code>SqliteCasMds::with_set_tx</code> runs a closure inside one <code>BEGIN IMMEDIATE</code> transaction for a set. The set database already has <code>blobs.sqlite</code> attached, so metadata, sidecar tables, and blob references can commit atomically.</p>
 <p><code>SqliteSetTx</code> provides typed operations for:</p>
@@ -560,8 +570,8 @@
 <tr><td><code>store</code></td><td><code>Mds</code>, <code>SqliteCasMds</code>, per-set locking, transactions, and maintenance orchestration</td></tr>
 <tr><td><code>types</code></td><td>Identifiers, flags, tags, records, events, scopes, and reports</td></tr>
 <tr><td><code>container</code></td><td>Container, item, membership, search, and changelog SQL operations</td></tr>
-<tr><td><code>blob</code></td><td>BLAKE3 hashing and atomic CAS file operations</td></tr>
-<tr><td><code>blob_index</code></td><td>Shared blob index, references, refcounts, and verification ledger</td></tr>
+<tr><td><code>blob</code></td><td>BLAKE3 hashing, streaming ingest (<code>put_reader</code>, <code>put_path</code>), <code>open</code>, and atomic CAS file operations</td></tr>
+<tr><td><code>blob_index</code></td><td>Shared blob index, references, refcounts, verification ledger, and the read-only <code>BlobRow</code> inventory API</td></tr>
 <tr><td><code>schema</code></td><td>Versioned SQLite migration runners</td></tr>
 <tr><td><code>notifier</code></td><td>Per-container in-process broadcast channels</td></tr>
 <tr><td><code>bus</code></td><td>Typed event taxonomy, event sink, and optional Bus publisher</td></tr>
@@ -573,7 +583,7 @@
 <tr><td><code>mem</code></td><td>Feature-gated in-memory stub</td></tr>
 </tbody></table>
 <h2 id="dependencies">Dependencies</h2>
-<p>SQLite persistence uses <code>rusqlite</code>; hashing uses <code>blake3</code>; identifiers use UUID v7 support. Tokio provides broadcast channels, <code>parking_lot</code> provides locks, and Serde supplies typed JSON payloads. The operator binary uses Clap and <code>humantime</code>; archive transfer uses <code>tar</code> and <code>chrono</code>. Bus dependencies remain optional.</p></div></div>
+<p>SQLite persistence uses <code>rusqlite</code>; hashing uses <code>blake3</code>; identifiers use UUID v7 support; <code>put_path</code>'s kernel-side copy uses <code>libc</code> (<code>FICLONE</code>, <code>copy_file_range</code>). Tokio provides broadcast channels, <code>parking_lot</code> provides locks, and Serde supplies typed JSON payloads. The operator binary uses Clap and <code>humantime</code>; archive transfer uses <code>tar</code> and <code>chrono</code>. Bus dependencies remain optional.</p></div></div>
     </div>
 
 </main>

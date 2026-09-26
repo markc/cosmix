@@ -36,6 +36,8 @@ use crate::types::*;
 use parking_lot::{FairMutex, FairMutexGuard, Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +123,17 @@ pub trait Mds: Send + Sync {
     fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>>;
     fn blob_size(&self, hash: &BlobHash) -> Result<u64>;
     fn blob_exists(&self, hash: &BlobHash) -> Result<bool>;
+    /// Ingest a local file into the CAS without reading it into
+    /// memory. See [`blob::put_path`] for the [`blob::PutMode`]
+    /// contract — in particular, `HardLink` is only for callers that
+    /// promise the source path immutable from the call onward.
+    fn put_blob_path(&self, src: &Path, mode: blob::PutMode) -> Result<BlobHash>;
+    /// Ingest a stream into the CAS, hashing while staging; the bytes
+    /// are never held in memory as a whole.
+    fn put_blob_reader(&self, r: &mut dyn Read) -> Result<BlobHash>;
+    /// Open the CAS file for streaming reads — the read-side
+    /// counterpart of [`Mds::put_blob_reader`].
+    fn blob_file(&self, hash: &BlobHash) -> Result<File>;
 
     // ---- Item ----
     fn add_item(
@@ -527,7 +540,11 @@ impl SqliteCasMds {
         f(c)
     }
 
-    fn blobs_root(&self) -> PathBuf {
+    /// Root of the flat CAS directory tree (`<root>/blobs`). Public
+    /// so an out-of-process CAS owner (blobd) reaches
+    /// `blob::put_path` / `blob::open` with the exact root the store
+    /// itself uses.
+    pub fn blobs_root(&self) -> PathBuf {
         self.root.join("blobs")
     }
 
@@ -1407,6 +1424,15 @@ impl Mds for SqliteCasMds {
     }
     fn blob_exists(&self, hash: &BlobHash) -> Result<bool> {
         blob::exists(&self.blobs_root(), hash)
+    }
+    fn put_blob_path(&self, src: &Path, mode: blob::PutMode) -> Result<BlobHash> {
+        blob::put_path(&self.blobs_root(), src, mode).map(|(hash, _)| hash)
+    }
+    fn put_blob_reader(&self, r: &mut dyn Read) -> Result<BlobHash> {
+        blob::put_reader(&self.blobs_root(), r).map(|(hash, _)| hash)
+    }
+    fn blob_file(&self, hash: &BlobHash) -> Result<File> {
+        blob::open(&self.blobs_root(), hash)
     }
 
     // ---- Per-set delivery transactions (Phase 1b) ----
