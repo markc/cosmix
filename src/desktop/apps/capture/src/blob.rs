@@ -57,6 +57,9 @@ fn upload_deadline() -> Duration {
 /// Bound on the 201 body: the reference is a few hundred bytes, so a
 /// lane answering with a stream is cut short, not slurped.
 const REFERENCE_BODY_LIMIT: u64 = 64 * 1024;
+/// Bound on an error reply body folded into `blob_error` — enough for
+/// blobd's `{"error":"quota: capture"}`, not enough to echo a page.
+const ERROR_BODY_LIMIT: u64 = 512;
 /// Timeout around the lane-resolution props call: above the 30 s mesh
 /// response timeout, below the client's 60 s safety net, so a hung
 /// hop becomes `blob_error`, not a parked worker.
@@ -177,7 +180,21 @@ pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result
             deadline,
         })
         .map_err(|e| match e {
-            ureq::Error::Status(status, _) => format!("lane answered {status} for {url}"),
+            ureq::Error::Status(status, response) => {
+                // The refusal body says why (blobd's quota reason); a
+                // bounded prefix of it belongs in blob_error. Best
+                // effort: an unreadable or non-UTF-8 body just omits.
+                let mut body = String::new();
+                let _ = response
+                    .into_reader()
+                    .take(ERROR_BODY_LIMIT)
+                    .read_to_string(&mut body);
+                if body.is_empty() {
+                    format!("lane answered {status} for {url}")
+                } else {
+                    format!("lane answered {status} for {url}: {body}")
+                }
+            }
             other => format!("POST {url}: {other}"),
         })?;
     if Instant::now() >= deadline {
@@ -385,7 +402,55 @@ mod tests {
         fs::write(&path, b"png bytes").unwrap();
         let error = upload(&bind, &path, quiet()).unwrap_err();
         assert!(error.contains("413"), "{error}");
+        assert!(error.contains("quota: capture"), "{error}");
         rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+
+    #[test]
+    fn an_early_413_carries_the_refusal_body_over_a_multi_mib_upload() {
+        // blobd refuses a 413 after the head, before the body. This
+        // lane answers the same way and keeps draining so the client
+        // finishes its write and reads the refusal; blob_error must
+        // name the status or the quota reason. (A lane that refuses
+        // AND stops reading instead breaks the client's write — ureq
+        // cannot read a response after that, so a true early-413
+        // surfaces as a transport error; see the manual.)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                let blank = {
+                    reader.read_line(&mut line).unwrap();
+                    line.trim_end().is_empty()
+                };
+                head.push_str(&line);
+                if blank {
+                    break;
+                }
+            }
+            let reply = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"error\":\"quota: capture\"}";
+            use std::io::Write;
+            reader.get_mut().write_all(reply.as_bytes()).unwrap();
+            let mut scratch = [0u8; 16384];
+            loop {
+                match reader.read(&mut scratch) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cosmix-8.png");
+        fs::write(&path, vec![0u8; 3 * 1024 * 1024]).unwrap();
+        let error = upload(&bind, &path, quiet()).unwrap_err();
+        assert!(
+            error.contains("413") || error.contains("quota"),
+            "{error}"
+        );
     }
 
     #[test]

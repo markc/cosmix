@@ -43,7 +43,12 @@ older job's upload finishes, the stale upload's result is dropped (and
 logged), never written into the new job's status. A
 failed upload never fails the capture: the phase stays `complete`, the file
 is where it always was, and `blob_error` says why the second copy did not
-land. One attempt, 30-second connect/read/write bounds on the lane socket
+land. A refused upload names the lane's status in `blob_error` and, when the
+refusal's reply body is readable, a bounded prefix of it — blobd's
+`{"error":"quota: capture"}` is what an operator needs. One caveat inherent
+to the HTTP client: a refusal sent before the request body is read breaks
+the write mid-stream and no response can be read after that, so a truly
+early 413 surfaces as a transport error rather than a status error. One attempt, 30-second connect/read/write bounds on the lane socket
 (including the 201 reply read), and a 10-minute whole-upload deadline
 enforced between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
 loss — abandons lane
