@@ -90,9 +90,9 @@ pub fn land_verified(
         })?;
     }
     drop(cleanup);
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
-    }
+    sync_directory_with(dir, |path, error| {
+        eprintln!("cosmix-files: directory fsync {}: {error}", path.display());
+    });
     Ok(count)
 }
 
@@ -170,7 +170,22 @@ struct TempFile(std::path::PathBuf);
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        cleanup_temp_with(&self.0, |path, error| {
+            eprintln!("cosmix-files: staging cleanup {}: {error}", path.display());
+        });
+    }
+}
+
+fn cleanup_temp_with(path: &Path, report: impl FnOnce(&Path, &std::io::Error)) {
+    if let Err(error) = fs::remove_file(path) {
+        // Successful rename has already consumed the staging name.
+        if error.kind() != std::io::ErrorKind::NotFound { report(path, &error); }
+    }
+}
+
+fn sync_directory_with(path: &Path, report: impl FnOnce(&Path, &std::io::Error)) {
+    if let Err(error) = File::open(path).and_then(|dir| dir.sync_all()) {
+        report(path, &error);
     }
 }
 
@@ -335,6 +350,28 @@ mod tests {
         let dir = scratch_dir();
         assert!(land_verified(&dir.join("absent/blob"), &b"x"[..], 1, &hash(b"x"), false).is_err());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_and_directory_sync_failures_are_reported_nonfatally() {
+        let dir = scratch_dir();
+        let mut cleanup_reported = false;
+        // remove_file cannot unlink a directory: preserve it and report it.
+        cleanup_temp_with(&dir, |path, _| {
+            assert_eq!(path, dir);
+            cleanup_reported = true;
+        });
+        assert!(cleanup_reported && dir.is_dir());
+        let absent = dir.join("absent");
+        cleanup_temp_with(&absent, |_, _| panic!("rename-consumed temp is not a failure"));
+        let mut sync_reported = false;
+        sync_directory_with(&absent, |path, error| {
+            assert_eq!(path, absent);
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            sync_reported = true;
+        });
+        assert!(sync_reported);
         fs::remove_dir_all(dir).unwrap();
     }
 
