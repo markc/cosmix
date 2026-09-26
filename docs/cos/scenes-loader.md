@@ -353,7 +353,8 @@ whose original has been removed cannot be promoted (`SCENES_NOT_FOUND`); a
 promote or reset while an unfinished record of its kind is on disk is refused
 `SCENES_RECOVERY`, naming that record, and nothing is staged or stopped. Once
 the swap is on disk, a failure to retire the fork is a reply (rc 10,
-`context.phase:"finish"`), not an undo: the `placed` record is finished by
+`context.phase:"finish"`, with `context.sandbox` naming where the fork
+went if it had already been moved to `.recovery/`), not an undo: the `placed` record is finished by
 the next `scenes.reload` of either scene or the next loader start.
 
 Crash recovery at start is decided by what is on disk, `(to, stage, backup)`,

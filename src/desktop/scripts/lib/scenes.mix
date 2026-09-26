@@ -759,7 +759,21 @@ fn recover_records($s, $only)
     $s.recovery_attempted[$key] = true
     try
       $s = recover_one($s, $kind, $r)
-      $s.recovery_diagnostics = delete($s.recovery_diagnostics, $name)
+      if $s.finish_error != nil then
+        -- Recorded, not raised: the side effects before it must stay in $s.
+        $f = $s.finish_error
+        $s.finish_error = nil
+        $s.recovery_diagnostics[$name] = {error_code:"SCENES_RECOVERY", message:$kind .. " record could not be finished", context:{record:$kind, upstream:$f}}
+        if type($s.desired[$kind]) == "map" then
+          $s.desired[$kind].error = {error_code:$f.error_code, message:$f.message}
+          try
+            $s = persist($s)
+          catch $ignored
+          end
+        end
+      else
+        $s.recovery_diagnostics = delete($s.recovery_diagnostics, $name)
+      end
     catch $message, $error
       $context = $error.details ?? {}
       if $error.code != "SCENES_RECOVERY" then $context = {record:$kind, upstream:{error_code:$error.code, message:$message, context:$error.details}} end
@@ -825,28 +839,40 @@ fn finish_record($s, $kind, $r)
 end
 
 -- Promote step 6: retire the sandbox and clear the record.
+-- Never raises: it stops the sandbox's behaviour and moves its directory, and
+-- a raise would hand the caller a state from before those side effects (a
+-- stale pid whose exit counts as a crash, a sandbox nobody can find). A
+-- failure is left in $s.finish_error with where the sandbox went; the placed
+-- record stays and the next recovery finishes it (review round 2).
 fn promote_finish($s, $r)
-  fault($s, "promoting:finish")
   $from = $r.from
   $s.last_removed = nil
-  if has_key($s.scenes, $from) then
-    $s = invalidate($s, $from)
-    if $s.open == $from then $s.open = nil end
+  $s.finish_error = nil
+  try
+    if has_key($s.scenes, $from) then
+      $s = invalidate($s, $from)
+      if $s.open == $from then $s.open = nil end
+    end
+    $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $from)
+    $s = persist($s)
+    if has_key($s.scenes, $from) then $s = reconcile_one($s, $from, false) end
+    $installation = $s.root .. "/" .. $from
+    if exists($installation, {follow_symlinks:false}) then
+      $backup = recovery_directory($s) .. "/" .. $from .. "-" .. uuid()
+      recovery_move($s, $installation, $backup)
+      $s.last_removed = $backup
+    end
+    fault($s, "promoting:finish")
+    $s.scenes = delete($s.scenes, $from)
+    $s.desired.origins = delete($s.desired.origins, $from)
+    if $s.desired.forks != nil then $s.desired.forks = delete($s.desired.forks, $from) end
+    $s.desired = delete($s.desired, "promoting")
+    $s = persist($s)
+  catch $message, $error
+    $s.finish_error = {error_code:$error.code, message:$message,
+      context:{phase:"finish", name:$r.to, removed:$from, sandbox:$s.last_removed, upstream:$error.details}}
   end
-  $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $from)
-  $s = persist($s)
-  if has_key($s.scenes, $from) then $s = reconcile_one($s, $from, false) end
-  $installation = $s.root .. "/" .. $from
-  if exists($installation, {follow_symlinks:false}) then
-    $backup = recovery_directory($s) .. "/" .. $from .. "-" .. uuid()
-    recovery_move($s, $installation, $backup)
-    $s.last_removed = $backup
-  end
-  $s.scenes = delete($s.scenes, $from)
-  $s.desired.origins = delete($s.desired.origins, $from)
-  if $s.desired.forks != nil then $s.desired.forks = delete($s.desired.forks, $from) end
-  $s.desired = delete($s.desired, "promoting")
-  return persist($s)
+  return $s
 end
 
 -- The handover is owed, not a one-shot: while the host is live and the
@@ -1834,15 +1860,16 @@ fn promote($s, $args)
   -- and never a raise that would drop the process records reconcile just
   -- changed (review m1). The placed record is finished by the next rescan.
   $s = reconcile_safe($s, $to, true)
-  try
-    $s = promote_finish($s, {from:$from, to:$to})
-  catch $message, $error
-    $s.rc = 10
-    $s.response = {error_code:$error.code, message:$message, context:{phase:"finish", name:$to, removed:$from, recovery:[$backup], upstream:$error.details}}
-    return $s
-  end
+  $s = promote_finish($s, {from:$from, to:$to})
   $recovery = [$backup]
   if $s.last_removed != nil then push($recovery, $s.last_removed) end
+  if $s.finish_error != nil then
+    $s.rc = 10
+    $s.response = $s.finish_error
+    $s.response.context.recovery = $recovery
+    $s.finish_error = nil
+    return $s
+  end
   $s.response = {name:$to, recovery:$recovery, removed:$from}
   return $s
 end

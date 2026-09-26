@@ -750,7 +750,8 @@ whose original has been removed cannot be promoted (<code>SCENES_NOT_FOUND</code
 promote or reset while an unfinished record of its kind is on disk is refused
 <code>SCENES_RECOVERY</code>, naming that record, and nothing is staged or stopped. Once
 the swap is on disk, a failure to retire the fork is a reply (rc 10,
-<code>context.phase:"finish"</code>), not an undo: the <code>placed</code> record is finished by
+<code>context.phase:"finish"</code>, with <code>context.sandbox</code> naming where the fork
+went if it had already been moved to <code>.recovery/</code>), not an undo: the <code>placed</code> record is finished by
 the next <code>scenes.reload</code> of either scene or the next loader start.</p>
 <p>Crash recovery at start is decided by what is on disk, <code>(to, stage, backup)</code>,
 not by the phase alone:</p>

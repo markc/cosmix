@@ -1165,6 +1165,14 @@ try
   $s = $l.request($s, "promote", {from:"alpha-sandbox"})
   $s.faults = []
   check($s.rc == 10 and $s.response.context.phase == "finish" and contains(read_file($s.root .. "/alpha/scene.mix"), "finish title") and $s.scenes.alpha.mounted and ($s.retiring.alpha != nil or $s.scenes.alpha.pid != nil) and data_parse(read_file($s.root .. "/state.conf.mix")).promoting.phase == "placed", "m1: finish failure keeps the swap and its records: " .. json_encode($s.response))
+  -- Round 2: the seam fires after the sandbox was stopped and moved; the
+  -- reply says where it went and the stop is still recorded.
+  $moved = $s.response.context.sandbox
+  check(type($moved) == "string" and is_dir($moved) and not exists($sandbox) and contains($s.response.context.recovery, $moved), "round 2: the reply names where the sandbox went: " .. json_encode($s.response))
+  check($s.scenes["alpha-sandbox"].pid == nil and $s.retiring["alpha-sandbox"] != nil and not contains($s.desired.enabled, "alpha-sandbox"), "round 2: the sandbox stop stays recorded (its exit is a retirement, not a crash)")
+  $old_sb = $s.retiring["alpha-sandbox"]
+  $s = $l.exited($s, {pid:$old_sb.pid, tag:{name:"alpha-sandbox", generation:$old_sb.generation}, exit_code:0, signal:nil})
+  check($s.retiring["alpha-sandbox"] == nil and ($s.scenes["alpha-sandbox"].crashes ?? 0) == 0, "round 2: the sandbox exit is consumed as its retirement")
   $s = $l.request($s, "reload", {name:"alpha"})
   check($s.rc == 0 and not exists($sandbox) and $s.desired.promoting == nil and ($s.desired.forks ?? {})["alpha-sandbox"] == nil, "m1: reload finishes the placed promote")
   -- Review m4: a sandbox whose original was removed cannot be promoted.
