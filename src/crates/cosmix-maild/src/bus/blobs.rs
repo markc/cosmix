@@ -48,7 +48,12 @@ struct Row {
     size: i64,
 }
 
-pub async fn dispatch(cmd: &IncomingCommand, db: &Db, ms: &Arc<SqliteMailStore>, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> (u8, String) {
+pub async fn dispatch(
+    cmd: &IncomingCommand,
+    db: &Db,
+    ms: &Arc<SqliteMailStore>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> (u8, String) {
     match super::try_resolve_args(cmd) {
         Ok(args) => migrate_admitted(db, ms, args, permit).await,
         Err(e) => error(format!("invalid_arguments: {e}")),
@@ -67,8 +72,12 @@ pub async fn migrate(db: &Db, ms: &Arc<SqliteMailStore>, args: Value) -> (u8, St
     migrate_admitted(db, ms, args, Arc::new(permit)).await
 }
 
-async fn migrate_admitted(db: &Db, ms: &Arc<SqliteMailStore>, args: Value,
-    permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> (u8, String) {
+async fn migrate_admitted(
+    db: &Db,
+    ms: &Arc<SqliteMailStore>,
+    args: Value,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> (u8, String) {
     let args = if args.is_null() { json!({}) } else { args };
     if !args.is_object() {
         return error("invalid_arguments: expected object".into());
@@ -92,7 +101,9 @@ async fn migrate_admitted(db: &Db, ms: &Arc<SqliteMailStore>, args: Value,
     match tokio::task::spawn_blocking(move || {
         let _permit = permit; // cancellation cannot release a running blocking page
         page(&db, &ms, request, limit)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => error(format!("migration: {e}")),
         Err(e) => error(format!("migration: worker failed: {e}")),
@@ -151,28 +162,29 @@ fn page(
         let counts = accounts.entry(row.account).or_default();
         if !row.account_exists {
             counts.orphan += 1;
-        } else { match migrate_row(db, ms, row, request.apply) {
-            Ok(true) => counts.already_migrated += 1,
-            Ok(false) if request.apply => counts.migrated += 1,
-            Ok(false) => counts.planned += 1,
-            Err(e) => {
-                let message = e.to_string();
-                if message.starts_with("missing:") {
-                    counts.missing += 1;
-                } else if message.starts_with("corrupt:") {
-                    counts.corrupt += 1;
-                } else if message.contains("conflicting:") {
-                    counts.conflicting += 1;
-                } else {
-                    counts.failed += 1;
-                }
-                // Bounded diagnostics; the full counts always remain available.
-                if failures.len() < 20 {
-                    failures.push(json!({"cursor": row.cursor, "account_id": row.account,
+        } else {
+            match migrate_row(db, ms, row, request.apply) {
+                Ok(true) => counts.already_migrated += 1,
+                Ok(false) if request.apply => counts.migrated += 1,
+                Ok(false) => counts.planned += 1,
+                Err(e) => {
+                    let message = e.to_string();
+                    if message.starts_with("missing:") {
+                        counts.missing += 1;
+                    } else if message.starts_with("corrupt:") {
+                        counts.corrupt += 1;
+                    } else if message.contains("conflicting:") {
+                        counts.conflicting += 1;
+                    } else {
+                        counts.failed += 1;
+                    }
+                    // Bounded diagnostics; the full counts always remain available.
+                    if failures.len() < 20 {
+                        failures.push(json!({"cursor": row.cursor, "account_id": row.account,
                         "error": message.chars().take(256).collect::<String>()}));
+                    }
                 }
             }
-        }
         }
         bytes = bytes.saturating_add(row.size.max(0) as u64);
         consumed = index + 1;

@@ -29,9 +29,19 @@ pub async fn blocking<T: Send + 'static>(
     let item = key.item.to_owned();
     let message_hash = key.message_hash.to_owned();
     let part = key.part.map(str::to_owned);
-    tokio::task::spawn_blocking(move || operation(&db, &Key {
-        account, item: &item, message_hash: &message_hash, part: part.as_deref(),
-    })).await.map_err(error)?
+    tokio::task::spawn_blocking(move || {
+        operation(
+            &db,
+            &Key {
+                account,
+                item: &item,
+                message_hash: &message_hash,
+                part: part.as_deref(),
+            },
+        )
+    })
+    .await
+    .map_err(error)?
 }
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Reference> {
@@ -112,19 +122,34 @@ mod tests {
     async fn reference_operations_use_blocking_workers() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(super::super::SCHEMA).unwrap();
-        let db = Db { conn: Arc::new(Mutex::new(conn)), blob_dir: Default::default(),
-            migration: Arc::new(tokio::sync::Semaphore::new(1)) };
-        let key = Key { account: 1, item: "item", message_hash: "hash", part: Some("1") };
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+            blob_dir: Default::default(),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let key = Key {
+            account: 1,
+            item: "item",
+            message_hash: "hash",
+            part: Some("1"),
+        };
         let worker = std::thread::current().id();
         blocking(&db, &key, move |db, key| {
             assert_ne!(std::thread::current().id(), worker);
             assert!(get(db, key)?.is_none());
             assert!(parts(db, key)?.is_empty());
-            let r = Reference { blob: format!("b3:{}", "a".repeat(64)), size: 0,
-                mime: "text/plain".into(), name: None, origin: "alpha".into() };
+            let r = Reference {
+                blob: format!("b3:{}", "a".repeat(64)),
+                size: 0,
+                mime: "text/plain".into(),
+                name: None,
+                origin: "alpha".into(),
+            };
             assert_eq!(save(db, key, &r)?, r);
             Ok(())
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -183,5 +208,19 @@ mod tests {
             .execute("DELETE FROM accounts WHERE id=1", [])
             .unwrap();
         assert_eq!(get(&db, &key).unwrap(), Some(reference));
+        key.part = Some("1");
+        for (item, size) in [("empty", 0), ("largest", i64::MAX as u64)] {
+            key.item = item;
+            let reference = Reference {
+                blob: format!("b3:{}", "a".repeat(64)),
+                size,
+                mime: "application/octet-stream".into(),
+                name: None,
+                origin: "alpha".into(),
+            };
+            assert_eq!(save(&db, &key, &reference).unwrap(), reference);
+            assert_eq!(get(&db, &key).unwrap(), Some(reference.clone()));
+            assert_eq!(parts(&db, &key).unwrap().get("1"), Some(&reference));
+        }
     }
 }

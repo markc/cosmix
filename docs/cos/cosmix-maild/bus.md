@@ -334,7 +334,8 @@ Property changes are published without broker retention. `maild.props.watch` obt
 ## Availability
 
 Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.
-# Structural inspection cap
+
+## Structural inspection cap
 
 The raw-message inspection cap is always 64 MiB, even when admission's
 `max_message_size` is larger (startup warns once). Over-cap messages have

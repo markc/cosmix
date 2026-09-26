@@ -163,7 +163,8 @@ async fn execute(
     };
     let expected_blob = format!("b3:{}", blake3::hash(&bytes).to_hex());
     let expected_size = bytes.len() as u64;
-    let reference = if let Some(reference) = references::blocking(db, &key, references::get).await? {
+    let reference = if let Some(reference) = references::blocking(db, &key, references::get).await?
+    {
         if reference.blob != expected_blob || reference.size != expected_size {
             return Err("verify_failed: stored reference differs from exported bytes".into());
         }
@@ -188,7 +189,10 @@ async fn execute(
         if current.blob_hash != hash {
             return Err("not_found: message or part".into());
         }
-        references::blocking(db, &key, move |db, key| references::save(db, key, &reference)).await?
+        references::blocking(db, &key, move |db, key| {
+            references::save(db, key, &reference)
+        })
+        .await?
     };
     reply(reference, item_string, part)
 }

@@ -24,13 +24,59 @@ struct Fixture {
 
 struct LocalLane(Option<String>);
 #[tokio::test]
+async fn expunged_staging_item_cannot_authorise_a_live_alias_hash() {
+    let f = Fixture::new().await;
+    let ms = &f.built.app_state.mailstore;
+    let hash = ms.mds().put_blob(b"staged").unwrap();
+    let alias = ms.create_blob_ref(1, hash, 6, i64::MAX).unwrap();
+    assert!(ms.owns_blob_hash(1, &hash).unwrap());
+    let set = cosmix_maild::mailstore::account_id_to_setid(1);
+    ms.mds().with_set_tx(&set, |tx| {
+        let (item, container): (String, String) = tx.tx().query_row(
+            "SELECT r.temp_item_id, m.container_id FROM blob_refs r JOIN membership m ON m.item_id=r.temp_item_id WHERE r.blob_id=?1",
+            [alias.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| cosmix_mds::Error::Other(e.to_string()))?;
+        tx.remove_membership(&cosmix_mds::ItemId(uuid::Uuid::parse_str(&item).unwrap()),
+            &ContainerId(uuid::Uuid::parse_str(&container).unwrap()))?;
+        Ok(())
+    }).unwrap();
+    assert!(ms.mds().blob_exists(&hash).unwrap());
+    assert!(!ms.owns_blob_hash(1, &hash).unwrap());
+    assert_eq!(
+        f.download(1, &cosmix_mds::blob::hex(&hash)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_filename_download_has_only_safe_header_octets() {
+    let f = Fixture::new().await;
+    let item = f.deliver(b"Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"bad\xff.bin\"\r\n\r\nx");
+    let email = get_email(&f, item, Value::Null).await;
+    let id = email["attachments"][0]["blobId"].as_str().unwrap();
+    let response = jmap::blob_download(State(f.state()), Fixture::headers(1), Path(id.into()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response.headers()["content-disposition"].to_str().unwrap();
+    assert!(value.starts_with("attachment; filename*=UTF-8''"));
+    assert!(value.bytes().all(|b| b.is_ascii() && !b.is_ascii_control()));
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+}
+
+#[tokio::test]
 async fn orphan_legacy_rows_advance_without_provisioning_or_copy() {
     let f = Fixture::new().await;
     let state = f.state();
-    db::blob::store(&state.db.conn, &state.db.blob_dir, 1, b"orphan").await.unwrap();
+    db::blob::store(&state.db.conn, &state.db.blob_dir, 1, b"orphan")
+        .await
+        .unwrap();
     {
         let conn = state.db.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=OFF; UPDATE blobs SET account_id=999; PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF; UPDATE blobs SET account_id=999; PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
     }
     let before = item_count(&f);
     for apply in [false, true] {
@@ -41,7 +87,22 @@ async fn orphan_legacy_rows_advance_without_provisioning_or_copy() {
         assert_eq!(page["done"], true);
         assert_eq!(page["next"], Value::Null);
         assert_eq!(item_count(&f), before);
-        assert!(!state.mailstore.mds().blob_exists(&cosmix_mds::blob::hash_bytes(b"orphan")).unwrap());
+        assert!(matches!(
+            state
+                .mailstore
+                .mds()
+                .with_set_tx(&cosmix_maild::mailstore::account_id_to_setid(999), |_| Ok(
+                    ()
+                )),
+            Err(cosmix_mds::Error::SetNotFound(_))
+        ));
+        assert!(
+            !state
+                .mailstore
+                .mds()
+                .blob_exists(&cosmix_mds::blob::hash_bytes(b"orphan"))
+                .unwrap()
+        );
     }
 }
 
@@ -50,10 +111,18 @@ async fn migration_page_budget_checks_next_row_and_allows_one_oversized_row() {
     let f = Fixture::new().await;
     let state = f.state();
     for bytes in [b"first".as_slice(), b"second"] {
-        db::blob::store(&state.db.conn, &state.db.blob_dir, 1, bytes).await.unwrap();
+        db::blob::store(&state.db.conn, &state.db.blob_dir, 1, bytes)
+            .await
+            .unwrap();
     }
     for declared in [40_i64 * 1024 * 1024, 80_i64 * 1024 * 1024] {
-        state.db.conn.lock().unwrap().execute("UPDATE blobs SET size=?1", [declared]).unwrap();
+        state
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE blobs SET size=?1", [declared])
+            .unwrap();
         // Files intentionally differ: byte admission still bounds failed rows.
         let (rc, first) = migrate(&f, json!({})).await;
         assert_eq!(rc, 5);
@@ -85,8 +154,12 @@ async fn concurrent_apply_pages_refuse_and_cancelled_page_keeps_maintenance_slot
         cosmix_maild::bus::blobs::migrate(&task_db, &ms, json!({"apply": true})).await
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while db.migration.available_permits() != 0 { tokio::task::yield_now().await; }
-    }).await.unwrap();
+        while db.migration.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let (rc, reply) = migrate(&f, json!({"apply": true})).await;
     assert_eq!(rc, 10);
     assert_eq!(reply["error"], "busy: migration already running");
@@ -96,8 +169,12 @@ async fn concurrent_apply_pages_refuse_and_cancelled_page_keeps_maintenance_slot
     release.send(()).unwrap();
     holder.join().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while db.migration.available_permits() == 0 { tokio::task::yield_now().await; }
-    }).await.unwrap();
+        while db.migration.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(migrate(&f, json!({"apply": true})).await.0, 0);
 }
 
@@ -107,12 +184,17 @@ async fn html_part_download_is_forced_attachment_and_sandboxed() {
     let item = f.deliver(b"Content-Type: text/html\r\nContent-Disposition: attachment; filename*=utf-8''caf%C3%A9%0A.html\r\n\r\n<script>alert(1)</script>");
     let email = get_email(&f, item, Value::Null).await;
     let id = email["attachments"][0]["blobId"].as_str().unwrap();
-    let response = jmap::blob_download(State(f.state()), Fixture::headers(1), Path(id.into())).await.into_response();
+    let response = jmap::blob_download(State(f.state()), Fixture::headers(1), Path(id.into()))
+        .await
+        .into_response();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/html");
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(response.headers()["content-security-policy"], "sandbox");
-    assert_eq!(response.headers()["content-disposition"], "attachment; filename*=UTF-8''caf%C3%A9%0A.html");
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename*=UTF-8''caf%C3%A9%0A.html"
+    );
 }
 
 // Exercise the actual typed Bus decoder, including warning-band preservation.
@@ -129,15 +211,21 @@ async fn migrate_over_port(f: &Fixture, args: Value) -> (u8, Value) {
         let mut bytes = Vec::new();
         socket.read_to_end(&mut bytes).await.unwrap();
         let request = cosmix_bus::bus::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
-        let (rc, body) = cosmix_maild::bus::blobs::migrate(&db, &ms,
-            serde_json::from_str(&request.body).unwrap()).await;
+        let (rc, body) = cosmix_maild::bus::blobs::migrate(
+            &db,
+            &ms,
+            serde_json::from_str(&request.body).unwrap(),
+        )
+        .await;
         let mut reply = cosmix_bus::bus::BusMessage::new();
         reply.set("rc", &rc.to_string());
         reply.body = body;
         socket.write_all(&reply.to_bytes()).await.unwrap();
         socket.shutdown().await.unwrap();
     });
-    let reply = cosmix_bus::call_port_typed(path.to_str().unwrap(), "maild.blob.migrate", args).await.unwrap();
+    let reply = cosmix_bus::call_port_typed(path.to_str().unwrap(), "maild.blob.migrate", args)
+        .await
+        .unwrap();
     worker.await.unwrap();
     match reply {
         cosmix_bus::PortReply::Ok { rc, value } => (rc, value),
@@ -150,18 +238,26 @@ async fn failed_migration_page_keeps_cursor_and_counts_through_bus() {
     let f = Fixture::new().await;
     let state = f.state();
     for bytes in [b"missing".as_slice(), b"good"] {
-        db::blob::store(&state.db.conn, &state.db.blob_dir, 1, bytes).await.unwrap();
+        db::blob::store(&state.db.conn, &state.db.blob_dir, 1, bytes)
+            .await
+            .unwrap();
     }
-    std::fs::remove_file(cosmix_mds::blob::blob_path(&state.db.blob_dir,
-        &cosmix_mds::blob::hash_bytes(b"missing"))).unwrap();
+    std::fs::remove_file(cosmix_mds::blob::blob_path(
+        &state.db.blob_dir,
+        &cosmix_mds::blob::hash_bytes(b"missing"),
+    ))
+    .unwrap();
     let (rc, page) = migrate_over_port(&f, json!({"apply": true, "limit": 1})).await;
     assert_eq!(rc, 5);
     assert_eq!(page["failed"], true);
     assert_eq!(page["done"], false);
     assert_eq!(page["accounts"]["1"]["missing"], 1);
     assert_eq!(page["errors"][0]["cursor"], page["next"]);
-    let (rc, last) = migrate_over_port(&f,
-        json!({"apply": true, "limit": 1, "cursor": page["next"]})).await;
+    let (rc, last) = migrate_over_port(
+        &f,
+        json!({"apply": true, "limit": 1, "cursor": page["next"]}),
+    )
+    .await;
     assert_eq!(rc, 0);
     assert_eq!(last["done"], true);
     assert_eq!(last["failed"], false);
@@ -172,16 +268,24 @@ async fn failed_migration_page_keeps_cursor_and_counts_through_bus() {
 async fn broken_sibling_preserves_body_and_projects_undecodable_attachment() {
     let f = Fixture::new().await;
     for tail in ["AP!8=\r\n--x--\r\n", "AP!8="] {
-        let raw = format!("Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=bad.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n{tail}");
+        let raw = format!(
+            "Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=bad.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n{tail}"
+        );
         let item = f.deliver(raw.as_bytes());
         let email = get_email(&f, item, Value::Null).await;
         assert_eq!(email["hasAttachment"], true);
         assert_eq!(email["textBody"][0]["partId"], "1.1");
-        assert!(email["bodyValues"]["1.1"]["value"].as_str().unwrap().contains("hello"));
+        assert!(
+            email["bodyValues"]["1.1"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("hello")
+        );
         assert_eq!(email["attachments"][0]["undecodable"], true);
         assert!(email["attachments"][0].get("blobId").is_none());
         let args = json!({"account_id": 1, "email_id": item.0.to_string()});
-        let (rc, list) = attachment_bus(&f, "maild.attachment.list", args.clone(), &LocalLane(None)).await;
+        let (rc, list) =
+            attachment_bus(&f, "maild.attachment.list", args.clone(), &LocalLane(None)).await;
         assert_eq!(rc, 0);
         assert_eq!(list["parts"][1]["undecodable"], true);
         let mut args = args;
@@ -402,10 +506,14 @@ async fn failed_export_validation_or_database_write_never_records_a_reference() 
             Ok(json!({"present": true, "pins": ["maild:1"], "size": 2,
                 "mime": "application/octet-stream", "origin": "alpha"}))
         }
-        async fn bind(&self) -> Result<String, String> { panic!("retry must not use HTTP") }
+        async fn bind(&self) -> Result<String, String> {
+            panic!("retry must not use HTTP")
+        }
         async fn quota(&self, _: &str) -> Result<Value, String> {
-            Ok(json!({"owners": {"maild:1": {"limit": 2, "used": 2, "reserved": 0}},
-                "total": {"limit": 2, "used": 2, "reserved": 0}}))
+            Ok(
+                json!({"owners": {"maild:1": {"limit": 2, "used": 2, "reserved": 0}},
+                "total": {"limit": 2, "used": 2, "reserved": 0}}),
+            )
         }
     }
     assert_eq!(

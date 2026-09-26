@@ -163,14 +163,24 @@ impl Lane {
     ) -> Result<Reference, String> {
         let blob = format!("b3:{}", blake3::hash(&bytes).to_hex());
         match discovery.stat(&blob).await {
-            Ok(stat) if stat["present"] == true && stat["pins"].as_array()
-                .is_some_and(|pins| pins.iter().any(|pin| pin.as_str() == Some(owner))) => {
+            Ok(stat)
+                if stat["present"] == true
+                    && stat["pins"]
+                        .as_array()
+                        .is_some_and(|pins| pins.iter().any(|pin| pin.as_str() == Some(owner))) =>
+            {
                 let reference = Reference {
                     blob,
                     size: stat["size"].as_u64().ok_or("lane: invalid stat size")?,
-                    mime: stat["mime"].as_str().ok_or("lane: invalid stat mime")?.into(),
+                    mime: stat["mime"]
+                        .as_str()
+                        .ok_or("lane: invalid stat mime")?
+                        .into(),
                     name: stat["name"].as_str().map(str::to_owned),
-                    origin: stat["origin"].as_str().ok_or("lane: invalid stat origin")?.into(),
+                    origin: stat["origin"]
+                        .as_str()
+                        .ok_or("lane: invalid stat origin")?
+                        .into(),
                 };
                 reference.validate()?;
                 if reference.size != bytes.len() as u64 {
@@ -438,17 +448,24 @@ mod tests {
         for _ in 0..8 {
             let (mut sink, reader) = tokio::io::duplex(1);
             readers.push(reader); // held open, never drained
-            transfers.spawn(async move {
-                response_with_timeout(sink.write_all(&[0; 64]), Duration::from_millis(20)).await;
-            }).unwrap();
+            transfers
+                .spawn(async move {
+                    response_with_timeout(sink.write_all(&[0; 64]), Duration::from_millis(20))
+                        .await;
+                })
+                .unwrap();
         }
         assert!(transfers.is_full());
         let (mut busy_sink, _reader) = tokio::io::duplex(1);
         timeout(Duration::from_secs(1), async {
             response_with_timeout(busy_sink.write_all(&[0; 64]), Duration::from_millis(20)).await;
-            while transfers.is_full() { tokio::task::yield_now().await; }
+            while transfers.is_full() {
+                tokio::task::yield_now().await;
+            }
             transfers.spawn(async {}).unwrap(); // next command admitted
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         transfers.shutdown().await;
     }
     use std::{

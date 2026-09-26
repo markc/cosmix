@@ -485,11 +485,14 @@ text-only IDs; part IDs are per-response and must not be persisted by clients.
 Part blob IDs are <code>mp1_&lt;32hex item UUID&gt;_&lt;64hex message hash&gt;_&lt;path with underscores&gt;</code>.
 They are canonical lowercase ASCII and bind a part to the account-owned message
 and its current content hash. <code>Email/import</code> still accepts upload UUIDs, not part
-blob IDs.</p>
+blob IDs.
+Part downloads retain the sender's content type, but force attachment disposition
+with an RFC 5987 filename, <code>X-Content-Type-Options: nosniff</code> and
+<code>Content-Security-Policy: sandbox</code>.</p>
 <p>Inspection reads at most 64 MiB of raw message, with a 64 MiB decoded-part cap,
 depth 32, 1,000 MIME parts and path length 64. These limits apply independently
 of the configured inbound message limit, so messages admitted through IMAP can
-be inspected. Unreadable, corrupt or over-limit messages return
+be inspected. Unreadable storage, corrupt message hashes or over-limit messages return
 <code>hasAttachment: null</code> and omit <code>attachments</code> and body projections; they never
 report a false negative or a partial attachment list. Property filtering still
 applies. Downloadable parts preserve transfer-decoded octets, including original
@@ -518,7 +521,7 @@ bytes. Blobd's first-writer-wins name and MIME are returned unchanged.
 Downloads use only the local lane and verify BLAKE3 and length before use;
 an absent local blob is never fetched implicitly from its reference origin.</p>
 <p>The Bus verbs <code>maild.attachment.list</code>, <code>maild.attachment.ref</code> and
-<code>maild.message.ref</code> inspect or export account-owned mail. Exports run in
+<code>maild.message.ref</code> inspect or export account-owned mail. Lists and exports run in
 eight tracked tasks; a full pool returns <code>busy:</code> immediately, and a session
 end cancels outstanding transfers. Validated references are saved separately
 from messages, including origin and the message hash; repeats reuse the
@@ -657,7 +660,7 @@ restart; there is no local migration CLI or second writer. See <a href="/cos/cos
 for cursors, per-account counts, refusal tokens and the retained-data contract.</p>
 <p>Mail metadata and operational state use SQLite. Mailbox content uses <code>cosmix-mds</code> through <code>SqliteMailStore</code>. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.</p>
 <p>Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.</p>
-<h1 id="mime-inspection-limits">MIME inspection limits</h1>
+<h2 id="mime-inspection-limits">MIME inspection limits</h2>
 <p>MIME inspection has a hard 64 MiB raw-message cap regardless of
 <code>max_message_size</code>. Startup logs one warning if the configured admission
 limit exceeds it. Larger admitted messages project <code>hasAttachment: null</code>

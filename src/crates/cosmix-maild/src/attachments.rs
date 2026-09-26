@@ -243,9 +243,12 @@ fn structure_preflight(data: &[u8]) -> Result<(), Error> {
         (b"content-type:".as_slice(), 2 * MAX_PARTS),
         (b"message/rfc822".as_slice(), MAX_DEPTH),
     ] {
-        if data.windows(needle.len())
+        if data
+            .windows(needle.len())
             .filter(|w| w.eq_ignore_ascii_case(needle))
-            .take(limit + 1).count() > limit
+            .take(limit + 1)
+            .count()
+            > limit
         {
             return Err(Error::TooLarge("MIME pre-parse structure limit"));
         }
@@ -253,7 +256,11 @@ fn structure_preflight(data: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn inspect_inner(data: &[u8], selected: Option<&str>, body_values: bool) -> Result<Inspection, Error> {
+fn inspect_inner(
+    data: &[u8],
+    selected: Option<&str>,
+    body_values: bool,
+) -> Result<Inspection, Error> {
     let message = MessageParser::default()
         .parse(data)
         .ok_or_else(|| Error::Unreadable("cannot parse message".into()))?;
@@ -320,10 +327,15 @@ impl Walker<'_> {
         if !matches!(part.body, PartType::Multipart(_)) || attachment {
             let bytes = match decoded(message, part) {
                 Ok(bytes) => Some(bytes),
-                Err(Error::Unreadable(_)) => { undecodable = true; None }
+                Err(Error::Unreadable(_)) => {
+                    undecodable = true;
+                    None
+                }
                 Err(e) => return Err(e),
             };
-            if let Some(bytes) = &bytes { self.charge(bytes.len())?; }
+            if let Some(bytes) = &bytes {
+                self.charge(bytes.len())?;
+            }
             let text = !embedded
                 && !attachment
                 && !attached_parent
@@ -378,11 +390,15 @@ impl Walker<'_> {
                 value,
             });
             if self.selected == Some(path.as_str()) {
-                self.result.extracted = Some(bytes.ok_or_else(||
-                    Error::Unreadable("invalid MIME transfer encoding".into()))?);
+                self.result.extracted =
+                    Some(bytes.ok_or_else(|| {
+                        Error::Unreadable("invalid MIME transfer encoding".into())
+                    })?);
             }
         }
-        if undecodable { return Ok(()); }
+        if undecodable {
+            return Ok(());
+        }
         match &part.body {
             PartType::Multipart(children) => {
                 for (n, child) in children.iter().enumerate() {
@@ -401,11 +417,11 @@ impl Walker<'_> {
                     self.charge(inner.raw_message.len())?;
                 }
                 self.visit(
-                inner,
-                0,
-                format!("{path}.1"),
-                true,
-                attached_parent || attachment,
+                    inner,
+                    0,
+                    format!("{path}.1"),
+                    true,
+                    attached_parent || attachment,
                 )?;
             }
             _ if part.is_content_type("message", "rfc822") => {
@@ -440,12 +456,19 @@ mod tests {
 
     #[test]
     fn quoted_printable_nesting_has_one_global_decoded_budget() {
-        let mut raw = format!("Content-Type: text/plain\r\n\r\n{}", "x".repeat(22 * 1024 * 1024));
+        let mut raw = format!(
+            "Content-Type: text/plain\r\n\r\n{}",
+            "x".repeat(22 * 1024 * 1024)
+        );
         for _ in 0..6 {
-            raw = format!("Content-Type: message/rfc822\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n{raw}");
+            raw = format!(
+                "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n{raw}"
+            );
         }
-        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
-            Error::TooLarge("MIME decoded-byte budget (128 MiB)"));
+        assert_eq!(
+            inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME decoded-byte budget (128 MiB)")
+        );
     }
 
     #[test]
@@ -453,28 +476,40 @@ mod tests {
         use base64::Engine;
         let mut raw = "Content-Type: text/plain\r\n\r\nx".to_owned();
         for _ in 0..16 {
-            raw = format!("Content-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
-                base64::engine::general_purpose::STANDARD.encode(raw));
+            raw = format!(
+                "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+                base64::engine::general_purpose::STANDARD.encode(raw)
+            );
         }
-        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
-            Error::TooLarge("MIME encoded re-parse limit (2)"));
+        assert_eq!(
+            inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME encoded re-parse limit (2)")
+        );
     }
 
     #[test]
     fn preflight_refuses_unencoded_nesting_before_parse_and_walker_bounds_multipart() {
-        let raw = format!("{}Content-Type: text/plain\r\n\r\nx",
-            "cOnTeNt-TyPe: MeSsAgE/RfC822\r\n\r\n".repeat(5000));
-        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
-            Error::TooLarge("MIME pre-parse structure limit"));
+        let raw = format!(
+            "{}Content-Type: text/plain\r\n\r\nx",
+            "cOnTeNt-TyPe: MeSsAgE/RfC822\r\n\r\n".repeat(5000)
+        );
+        assert_eq!(
+            inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit")
+        );
         // Forty rfc822 wrappers exceed the preflight cap of 32. Multipart
         // nesting exercises depth 40 BELOW both occurrence-count caps instead.
         let mut raw = "Content-Type: text/plain\r\n\r\nx".to_owned();
         for n in 0..40 {
-            raw = format!("Content-Type: multipart/mixed; boundary=b{n}\r\n\r\n--b{n}\r\n{raw}\r\n--b{n}--\r\n");
+            raw = format!(
+                "Content-Type: multipart/mixed; boundary=b{n}\r\n\r\n--b{n}\r\n{raw}\r\n--b{n}--\r\n"
+            );
         }
         structure_preflight(raw.as_bytes()).unwrap();
-        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
-            Error::TooLarge("MIME structure limit (depth 32, parts 1000, path 64)"));
+        assert_eq!(
+            inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME structure limit (depth 32, parts 1000, path 64)")
+        );
     }
 
     #[test]
@@ -500,19 +535,55 @@ mod tests {
     }
 
     #[test]
-    fn truncated_and_garbage_mime_never_panics_or_escapes_bounds() {
+    fn malformed_mime_has_explicit_projection_and_refusal_outcomes() {
+        assert!(
+            inspect(b"", None, false)
+                .unwrap_err()
+                .to_string()
+                .starts_with("unreadable:")
+        );
+        let raw = b"Content-Type: text/plain\r\n\r\nhello";
+        let result = inspect(raw, Some("1"), true).unwrap();
+        assert_eq!(result.parts.len(), 1);
+        assert_eq!(result.parts[0].path, "1");
+        assert!(result.parts[0].text);
+        assert!(!result.parts[0].undecodable);
+        assert_eq!(result.extracted.unwrap(), b"hello");
+        assert_eq!(
+            inspect(raw, Some("1.2"), false).unwrap_err(),
+            Error::NotFound
+        );
         for raw in [
-            b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--".as_slice(),
-            b"Content-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!!\xff\x00",
-            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n=Z=\xff\x00",
+            b"Content-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!!\xff\x00".as_slice(),
+            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: 8-bit\r\n\r\nhello",
         ] {
-            for end in 0..=raw.len() {
-                if let Ok(result) = inspect(&raw[..end], None, false) {
-                    assert!(result.parts.len() <= MAX_PARTS);
-                    for part in result.parts { assert!(valid_path(&part.path)); assert!(part.size <= MAX_PART); }
-                }
-            }
+            let result = inspect(raw, None, true).unwrap();
+            assert_eq!(result.parts.len(), 1);
+            assert_eq!(result.parts[0].path, "1");
+            assert!(result.parts[0].undecodable);
+            assert!(result.extracted.is_none());
+            assert!(inspect(raw, Some("1"), false).unwrap_err().to_string().starts_with("unreadable:"));
         }
+        assert_eq!(
+            inspect(&vec![0; MAX_MESSAGE + 1], None, false).unwrap_err(),
+            Error::TooLarge("raw message exceeds 64 MiB")
+        );
+    }
+
+    #[test]
+    fn two_embedded_messages_inside_multipart_keep_paths_and_octets() {
+        let raw = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n";
+        let result = inspect(raw, Some("1.1.1.1"), false).unwrap();
+        assert_eq!(
+            result
+                .parts
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>(),
+            ["1.1", "1.1.1", "1.1.1.1"]
+        );
+        assert!(result.parts[1].embedded && result.parts[2].embedded);
+        assert_eq!(result.extracted.unwrap(), [0, 255]);
     }
 
     #[test]
@@ -527,15 +598,22 @@ mod tests {
 
     #[test]
     fn undecodable_text_and_html_keep_recovered_display_values() {
-        for (mime, encoding, body) in [("text/plain", "8-bit", "hello"),
-            ("text/html", "base64", "<b>recovered!</b>")] {
-            let raw = format!("Content-Type: {mime}\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n{body}");
+        for (mime, encoding, body) in [
+            ("text/plain", "8-bit", "hello"),
+            ("text/html", "base64", "<b>recovered!</b>"),
+        ] {
+            let raw = format!(
+                "Content-Type: {mime}\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n{body}"
+            );
             let result = inspect(raw.as_bytes(), None, true).unwrap();
             assert!(result.parts[0].undecodable);
             assert_eq!(result.parts[0].html, mime == "text/html");
             assert_eq!(result.parts[0].text, mime == "text/plain");
             assert!(result.parts[0].value.as_deref().unwrap().contains(body));
-            assert!(matches!(inspect(raw.as_bytes(), Some("1"), true), Err(Error::Unreadable(_))));
+            assert!(matches!(
+                inspect(raw.as_bytes(), Some("1"), true),
+                Err(Error::Unreadable(_))
+            ));
         }
     }
 

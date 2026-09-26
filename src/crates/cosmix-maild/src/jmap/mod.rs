@@ -394,12 +394,19 @@ pub async fn blob_download(
                     StatusCode::OK,
                     [
                         (axum::http::header::CONTENT_TYPE, content_type),
-                        (axum::http::header::CONTENT_DISPOSITION,
-                            axum::http::HeaderValue::from_str(&disposition).expect("ASCII RFC 5987 value")),
-                        (axum::http::header::X_CONTENT_TYPE_OPTIONS,
-                            axum::http::HeaderValue::from_static("nosniff")),
-                        (axum::http::header::CONTENT_SECURITY_POLICY,
-                            axum::http::HeaderValue::from_static("sandbox")),
+                        (
+                            axum::http::header::CONTENT_DISPOSITION,
+                            axum::http::HeaderValue::from_str(&disposition)
+                                .expect("ASCII RFC 5987 value"),
+                        ),
+                        (
+                            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                            axum::http::HeaderValue::from_static("nosniff"),
+                        ),
+                        (
+                            axum::http::header::CONTENT_SECURITY_POLICY,
+                            axum::http::HeaderValue::from_static("sandbox"),
+                        ),
                     ],
                     bytes,
                 )

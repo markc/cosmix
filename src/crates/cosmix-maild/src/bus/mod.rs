@@ -640,11 +640,14 @@ async fn dispatch_loop(
             break;
         }
         while let Some(result) = maintenance.try_join_next() {
-            if let Err(e) = result { tracing::warn!(error = %e, "migration task failed"); }
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "migration task failed");
+            }
         }
         if cmd.command == "maild.blob.migrate" {
             let Ok(permit) = db.migration.clone().try_acquire_owned() else {
-                let body = serde_json::json!({"error": "busy: migration already running"}).to_string();
+                let body =
+                    serde_json::json!({"error": "busy: migration already running"}).to_string();
                 crate::blob_lane::bounded_response(client.respond(&cmd, 10, &body)).await;
                 continue;
             };
@@ -676,17 +679,43 @@ async fn dispatch_loop(
             let hostname = hostname.clone();
             let overrides_runtime = overrides_runtime.clone();
             let bayesian_state = bayesian_state.clone();
-            transfers.spawn(async move {
-                let input = diagnostics::Input { discovery: client.as_ref(), max_message_size };
-                let (rc, body) = match cmd.command.as_str() {
-                    "maild.rules.explain" => rules::dispatch("explain", &cmd, &rule_engine,
-                        &rule_stats, &hostname, &overrides_runtime, &db, &input).await,
-                    "maild.bayesian.classify" => bayesian::dispatch("classify", &cmd,
-                        &classifier, &db, &mailstore, &bayesian_state, &input).await,
-                    _ => dispatch_attachment(&cmd, &db, &mailstore, &client).await,
-                };
-                crate::blob_lane::bounded_response(client.respond(&cmd, rc, &body)).await;
-            }).expect("slot checked without yielding or sharing the task set");
+            transfers
+                .spawn(async move {
+                    let input = diagnostics::Input {
+                        discovery: client.as_ref(),
+                        max_message_size,
+                    };
+                    let (rc, body) = match cmd.command.as_str() {
+                        "maild.rules.explain" => {
+                            rules::dispatch(
+                                "explain",
+                                &cmd,
+                                &rule_engine,
+                                &rule_stats,
+                                &hostname,
+                                &overrides_runtime,
+                                &db,
+                                &input,
+                            )
+                            .await
+                        }
+                        "maild.bayesian.classify" => {
+                            bayesian::dispatch(
+                                "classify",
+                                &cmd,
+                                &classifier,
+                                &db,
+                                &mailstore,
+                                &bayesian_state,
+                                &input,
+                            )
+                            .await
+                        }
+                        _ => dispatch_attachment(&cmd, &db, &mailstore, &client).await,
+                    };
+                    crate::blob_lane::bounded_response(client.respond(&cmd, rc, &body)).await;
+                })
+                .expect("slot checked without yielding or sharing the task set");
             continue;
         }
         let input = diagnostics::Input {
@@ -745,7 +774,10 @@ async fn dispatch_loop(
 }
 
 fn is_transfer(command: &str) -> bool {
-    matches!(command, "maild.attachment.list" | "maild.attachment.ref" | "maild.message.ref")
+    matches!(
+        command,
+        "maild.attachment.list" | "maild.attachment.ref" | "maild.message.ref"
+    )
 }
 
 fn is_blob_diagnostic(cmd: &IncomingCommand) -> bool {

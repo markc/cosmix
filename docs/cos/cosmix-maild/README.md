@@ -56,11 +56,14 @@ Part blob IDs are `mp1_<32hex item UUID>_<64hex message hash>_<path with undersc
 They are canonical lowercase ASCII and bind a part to the account-owned message
 and its current content hash. `Email/import` still accepts upload UUIDs, not part
 blob IDs.
+Part downloads retain the sender's content type, but force attachment disposition
+with an RFC 5987 filename, `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox`.
 
 Inspection reads at most 64 MiB of raw message, with a 64 MiB decoded-part cap,
 depth 32, 1,000 MIME parts and path length 64. These limits apply independently
 of the configured inbound message limit, so messages admitted through IMAP can
-be inspected. Unreadable, corrupt or over-limit messages return
+be inspected. Unreadable storage, corrupt message hashes or over-limit messages return
 `hasAttachment: null` and omit `attachments` and body projections; they never
 report a false negative or a partial attachment list. Property filtering still
 applies. Downloadable parts preserve transfer-decoded octets, including original
@@ -95,7 +98,7 @@ Downloads use only the local lane and verify BLAKE3 and length before use;
 an absent local blob is never fetched implicitly from its reference origin.
 
 The Bus verbs `maild.attachment.list`, `maild.attachment.ref` and
-`maild.message.ref` inspect or export account-owned mail. Exports run in
+`maild.message.ref` inspect or export account-owned mail. Lists and exports run in
 eight tracked tasks; a full pool returns `busy:` immediately, and a session
 end cancels outstanding transfers. Validated references are saved separately
 from messages, including origin and the message hash; repeats reuse the
@@ -278,7 +281,8 @@ for cursors, per-account counts, refusal tokens and the retained-data contract.
 Mail metadata and operational state use SQLite. Mailbox content uses `cosmix-mds` through `SqliteMailStore`. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.
 
 Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.
-# MIME inspection limits
+
+## MIME inspection limits
 
 MIME inspection has a hard 64 MiB raw-message cap regardless of
 `max_message_size`. Startup logs one warning if the configured admission
