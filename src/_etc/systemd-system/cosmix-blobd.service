@@ -83,6 +83,9 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# blobd chgrps its state/CAS root to cosmix-blob at open so group
+# members can traverse the setgid 2750 CAS; rest of @privileged denied.
+SystemCallFilter=@chown
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
