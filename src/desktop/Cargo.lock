@@ -3308,10 +3308,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-files"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "cosmix-lib-bus",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

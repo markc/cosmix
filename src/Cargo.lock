@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-filesd"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1193,6 +1193,7 @@ dependencies = [
  "notify",
  "serde_json",
  "tokio",
+ "ureq",
 ]
 
 [[package]]
@@ -1408,10 +1409,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-files"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "cosmix-lib-bus",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

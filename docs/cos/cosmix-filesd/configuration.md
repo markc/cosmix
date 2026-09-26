@@ -40,6 +40,7 @@ Filesystem mode requires `mode: fs`, `trash_root`, and at least one `place:` lin
 ```text
 mode: fs
 bus_service: filesd-fs
+blob_service: blobd
 trash_root: /var/lib/cosmix/filesd/trash
 delegated_peers: webd
 
@@ -51,11 +52,20 @@ place: public | Public | /var/lib/cosmix/public | writable=false | allow=*.md,ma
 |---|---|---|---|
 | `mode` | Yes | None | Must be `fs` |
 | `bus_service` | No | `filesd-fs` | Bus service registration name |
+| `blob_service` | No | `blobd` | Local blob-store Bus service used by `fs.blob.ref` and `fs.blob.materialise`; use `blobd-two` for an instance named `two` |
 | `trash_root` | Yes | None | Root used by trash operations |
 | `delegated_peers` | No | `webd` | Comma-separated peers allowed to send delegated calls |
 | `place` | One or more | None | Place definition; repeated lines are allowed |
 
 An explicitly empty `delegated_peers:` disables delegated calls in this mode as well.
+
+The blob verbs resolve `blob.props.get {"path":"lane"}` on `blob_service` for
+each call, under a 10-second timeout. The bind is never cached. An empty bind,
+failed props call or timeout reports `lane_unavailable:`. Other filesystem
+verbs make no blob-store call. Uploads pin to the filesd `bus_service` name.
+
+`blob_service` must match `^[a-z][a-z0-9-]{1,30}$` (2–31 ASCII characters).
+An empty, malformed or node-qualified service name is a startup config error.
 
 ## Place definitions
 

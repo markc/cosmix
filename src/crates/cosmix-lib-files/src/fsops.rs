@@ -271,6 +271,32 @@ pub struct FsLayer {
     trash_root: PathBuf,
 }
 
+/// Validate the descriptor, not just the pathname vetted before this call.
+/// Linux flags prevent a final-component symlink/FIFO swap from following or
+/// blocking. Ancestor containment still has resolve_within's documented posture.
+fn open_plain_blob(path: &Path, label: &str) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(FilesError::BadRequest(format!("source is not a regular file: {label}")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(FilesError::BadRequest(format!("source is not a single-link file: {label}")));
+        }
+    }
+    Ok(file)
+}
+
 impl FsLayer {
     pub fn new(places: Vec<Place>, trash_root: PathBuf) -> Self {
         FsLayer { places, trash_root }
@@ -384,6 +410,48 @@ impl FsLayer {
     }
 
     // ── reads ────────────────────────────────────────────────────────────────
+
+    /// Open a blob source under the read jail, always requiring a plain file.
+    /// Returns the open stream, default name and the same MIME as `read_blob`.
+    pub fn open_blob(&self, place_rel: &str) -> Result<(fs::File, String, &'static str)> {
+        let (place, full) = self.resolve(place_rel, false)?;
+        let rel = place_rel.split_once('/').map(|(_, rel)| rel).unwrap_or("");
+        if rel.is_empty() {
+            return Err(FilesError::Denied("refusing to read the place root as a blob".into()));
+        }
+        if place.policied()
+            && !matches!(policy_access(&place.allow, &place.deny, rel), Access::Node)
+        {
+            return Err(FilesError::Denied(format!(
+                "path is a policy prefix, not a blob source: {place_rel}"
+            )));
+        }
+        require_plain_file(&full, place_rel)?;
+        let file = open_plain_blob(&full, place_rel)?;
+        Ok((file, file_name(place_rel).to_string(), mime_for(file_name(place_rel))))
+    }
+
+    /// Vet a materialisation target. The first pass is check-only; set
+    /// `create_parents` only after GET succeeds, immediately before landing.
+    pub fn blob_target(&self, place_rel: &str, overwrite: bool, create_parents: bool) -> Result<PathBuf> {
+        let (_place, full) = self.resolve(place_rel, true)?;
+        match fs::symlink_metadata(&full) {
+            Ok(_) if !overwrite => return Err(FilesError::Exists(format!(
+                "already exists (overwrite=false): {place_rel}"
+            ))),
+            Ok(meta) if meta.file_type().is_symlink() => return Err(FilesError::BadRequest(format!(
+                "target is a symlink: {place_rel}"
+            ))),
+            Ok(meta) if !meta.is_file() => return Err(FilesError::BadRequest(format!(
+                "target is not a regular file: {place_rel}"
+            ))),
+            Ok(_) => {}, // rename replaces this entry, not its other hard links
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if create_parents { ensure_parent(&full)?; }
+        Ok(full)
+    }
 
     /// The Places sidebar source.
     pub fn places(&self) -> Value {
@@ -1190,6 +1258,38 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opened_blob_refuses_swapped_symlink_fifo_and_hardlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch();
+        let path = dir.join("source");
+        let other = dir.join("other");
+        fs::write(&other, b"secret").unwrap();
+        for kind in ["symlink", "fifo", "hardlink"] {
+            fs::write(&path, b"safe").unwrap();
+            require_plain_file(&path, "source").unwrap();
+            fs::remove_file(&path).unwrap(); // swap after the path check
+            match kind {
+                "symlink" => std::os::unix::fs::symlink(&other, &path).unwrap(),
+                "hardlink" => fs::hard_link(&other, &path).unwrap(),
+                _ => {
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: name is a live, NUL-terminated pathname.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+            }
+            // A FIFO has no writer: a blocking open would never return.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let source = path.clone();
+            let worker = std::thread::spawn(move || tx.send(open_plain_blob(&source, "source").is_err()).unwrap());
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap());
+            worker.join().unwrap();
+            fs::remove_file(&path).unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn scratch() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
@@ -1253,6 +1353,28 @@ mod tests {
             "symlink escape blocked"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_overwrite_replaces_unscoped_hardlink_and_names_bad_targets() {
+        let dir = scratch();
+        let (fs_, home) = layer(&dir, true);
+        fs::write(home.join("target"), b"old").unwrap();
+        fs::hard_link(home.join("target"), home.join("other")).unwrap();
+        let mut scoped = fs_.clone();
+        scoped.places[0].allow = vec!["target".into()];
+        assert!(matches!(scoped.blob_target("home/target", true, false), Err(FilesError::Denied(_))));
+        let target = fs_.blob_target("home/target", true, true).unwrap();
+        crate::atomic::land_verified(&target, &b"new"[..], 3, &crate::hash::content_hash(b"new"), true).unwrap();
+        assert_eq!(fs::read(home.join("target")).unwrap(), b"new");
+        assert_eq!(fs::read(home.join("other")).unwrap(), b"old");
+        std::os::unix::fs::symlink(home.join("target"), home.join("link")).unwrap();
+        fs::create_dir(home.join("folder")).unwrap();
+        for path in ["home/link", "home/folder"] {
+            assert!(fs_.blob_target(path, true, false).unwrap_err().to_string().starts_with("bad request: target"));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
