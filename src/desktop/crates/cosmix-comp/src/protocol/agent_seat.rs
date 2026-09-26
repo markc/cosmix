@@ -347,7 +347,15 @@ impl WaylandState {
         }) {
             // Smithay can retain dismissed resources until client destruction;
             // current_grab already falls back to the root when no popup remains.
-            self.agent.popup_grab = None;
+            // Retire the installed handles as well as our stored chain: an
+            // ended PopupPointerGrab must not block a later targeted key.
+            self.dismiss_agent_popups();
+        }
+        let pointer = self.agent.pointer.clone();
+        if pointer.current_pressed().is_empty()
+            && pointer.with_grab(|_, grab| grab.is::<smithay::input::pointer::ClickGrab<WaylandState>>()).unwrap_or(false)
+        {
+            pointer.unset_grab_without_focus_restore(self, SERIAL_COUNTER.next_serial(), monotonic_millis());
         }
     }
 

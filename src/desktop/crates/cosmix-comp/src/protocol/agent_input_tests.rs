@@ -579,6 +579,10 @@ fn destroying_agent_popup_preserves_queued_parent_input() {
     h.dispatch_client();
     assert_eq!(h.server.state.injection.sequences.len(), 1);
     assert!(h.server.state.agent.pointer.current_focus().is_none());
+    assert!(h.server.state.agent.popup_grab.is_none());
+    assert!(!h.server.state.agent.pointer.is_grabbed(), "ended popup must not block the queued parent key");
+    assert!(!h.server.state.agent.keyboard.is_grabbed());
+    assert!(h.server.state.agent.pointer.current_pressed().is_empty());
     assert_eq!(h.server.state.agent.keyboard.current_focus().and_then(|target| target.owned_surface()).map(|s| s.id()), Some(alpha));
     finish_test_sequences(&mut h);
     let reply = runtime.block_on(receiver).unwrap().wire_json();
