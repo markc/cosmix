@@ -87,6 +87,59 @@ impl MessageLoader for Legacy {
 }
 
 #[cfg(test)]
+pub(crate) struct TestLane {
+    bind: String,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+#[cfg(test)]
+impl TestLane {
+    pub async fn new(bytes: &[u8], status: u16) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        let bytes = bytes.to_vec();
+        let worker = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(b"GET /blob/"));
+            let reply = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            let _ = socket.write_all(&bytes).await;
+        });
+        Self {
+            bind,
+            worker: Some(worker),
+        }
+    }
+    pub async fn finish(mut self) {
+        self.worker.take().unwrap().await.unwrap();
+    }
+}
+#[cfg(test)]
+impl Drop for TestLane {
+    fn drop(&mut self) {
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
+    }
+}
+#[cfg(test)]
+impl Discovery for TestLane {
+    async fn bind(&self) -> Result<String, String> {
+        Ok(self.bind.clone())
+    }
+    async fn quota(&self, _: &str) -> Result<Value, String> {
+        panic!("diagnostic GET must not ask quota")
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -191,58 +244,5 @@ mod tests {
             }
             server.await.unwrap();
         }
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct TestLane {
-    bind: String,
-    worker: Option<tokio::task::JoinHandle<()>>,
-}
-#[cfg(test)]
-impl TestLane {
-    pub async fn new(bytes: &[u8], status: u16) -> Self {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind = listener.local_addr().unwrap().to_string();
-        let bytes = bytes.to_vec();
-        let worker = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut head = Vec::new();
-            while !head.ends_with(b"\r\n\r\n") {
-                head.push(socket.read_u8().await.unwrap());
-            }
-            assert!(head.starts_with(b"GET /blob/"));
-            let reply = format!(
-                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                bytes.len()
-            );
-            socket.write_all(reply.as_bytes()).await.unwrap();
-            let _ = socket.write_all(&bytes).await;
-        });
-        Self {
-            bind,
-            worker: Some(worker),
-        }
-    }
-    pub async fn finish(mut self) {
-        self.worker.take().unwrap().await.unwrap();
-    }
-}
-#[cfg(test)]
-impl Drop for TestLane {
-    fn drop(&mut self) {
-        if let Some(worker) = &self.worker {
-            worker.abort();
-        }
-    }
-}
-#[cfg(test)]
-impl Discovery for TestLane {
-    async fn bind(&self) -> Result<String, String> {
-        Ok(self.bind.clone())
-    }
-    async fn quota(&self, _: &str) -> Result<Value, String> {
-        panic!("diagnostic GET must not ask quota")
     }
 }
