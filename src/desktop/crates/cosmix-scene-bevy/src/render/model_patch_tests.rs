@@ -132,6 +132,7 @@ item: {widget: "text", text: "{cells[0]}"}
         },
         page: world.spawn_empty().id(),
         edge: scene_edge(tree),
+        dialog: false,
         registered: false,
         nodes: BTreeMap::new(),
     };

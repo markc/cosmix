@@ -180,6 +180,7 @@ fn configure_content(
             state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
     settings::install(app, all_panels || hidden);
+    dialog_bus::install(app);
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {

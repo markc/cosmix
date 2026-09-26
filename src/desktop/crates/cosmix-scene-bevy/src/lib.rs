@@ -6,12 +6,23 @@ pub use render::{Events as SceneEvents, reconcile as reconcile_scene_mounts};
 
 use bevy::prelude::*;
 use cosmix_scene::{ResolvedScene, SceneDocument, Severity};
-use cosmix_shell::core::{OutputKey, SubPanelRegistry, SubPanelSeat};
+use cosmix_shell::core::{
+    DialogSeat, DialogSeatError, DialogSlot, OutputKey, SubPanelRegistry, SubPanelSeat,
+};
 use cosmix_shell::runtime::{SceneVerb, ShellRuntimeSet};
 use ctk::bus::BusBridge;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+/// `shell.scene.layout` geometry (scene-editor plan §4.3): `{scene, revision,
+/// applied_revision, nodes:{id:{x,y,w,h,hidden}}, instances:{list:{item:
+/// {x,y,w,h}}}}` in logical px relative to the scene's surface, measured from
+/// the engine's last layout. `node` narrows to one document node (and, for a
+/// list, its rows). The caller adds `visible` and `surface`.
+pub fn scene_layout(world: &mut World, scene: &str, node: Option<&str>) -> Result<Value, Value> {
+    render::layout(world, scene, node)
+}
 
 pub struct ScenePlugin;
 impl Plugin for ScenePlugin {
@@ -65,6 +76,19 @@ impl SceneEntry {
                 && seat.output == *output
         })
     }
+
+    /// A dialog scene's reservation is the host's one dialog seat, held by
+    /// this scene under the same loader receipt.
+    fn holds_dialog_seat(&self, slot: &DialogSlot) -> bool {
+        let Some(owner) = self.owner.as_ref() else {
+            return false;
+        };
+        slot.seat().is_some_and(|seat| {
+            seat.scene == self.tree.name
+                && seat.owner == owner.citizen
+                && seat.accepted_at == owner.accepted_at
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -87,16 +111,74 @@ pub struct SceneStore {
     pub(crate) scenes: BTreeMap<String, SceneEntry>,
     pub(crate) removed: Vec<render::Mounted>,
     revisions: BTreeMap<String, u64>,
+    /// The host's one dialog seat (scene-editor plan §4.3 Q2). A dialog-kind
+    /// load takes it here and never a carousel seat.
+    pub(crate) dialog: DialogSlot,
+    /// `shell.scene.changed` notices for displaced dialog holders, published
+    /// by `dispatch` after the pre-empting load is accepted.
+    notices: Vec<Value>,
 }
 
 impl SceneStore {
+    /// The dialog seat, if a dialog scene holds it.
+    pub fn dialog_seat(&self) -> Option<&DialogSeat> {
+        self.dialog.seat()
+    }
+
+    /// `Some(true)` for a loaded dialog scene, `Some(false)` for a loaded
+    /// edge scene, `None` when no scene of that name is loaded.
+    pub fn is_dialog(&self, name: &str) -> Option<bool> {
+        self.scenes.get(name).map(|entry| render::is_dialog(&entry.tree))
+    }
+
+    /// Carousel page id and edge of a loaded edge scene; `None` for a dialog
+    /// or an unknown scene.
+    pub fn edge_page(&self, name: &str) -> Option<(String, cosmix_shell::core::Edge)> {
+        self.scenes
+            .get(name)
+            .filter(|entry| !render::is_dialog(&entry.tree))
+            .map(|entry| (render::page_id(&entry.tree), render::scene_edge(&entry.tree)))
+    }
+
+    /// Move the seated dialog to `output` (it maps on the selected output
+    /// when shown). False when `scene` does not hold the seat.
+    pub fn retarget_dialog(&mut self, scene: &str, output: &OutputKey) -> bool {
+        let Some(mut seat) = self.dialog.seat().filter(|seat| seat.scene == scene).cloned() else {
+            return false;
+        };
+        if seat.output == *output {
+            return true;
+        }
+        seat.output = output.clone();
+        self.dialog.register_dialog(seat).is_ok()
+    }
+
     /// Read-only inventory in scene-name order for the host output.
     /// `citizen` is authored routing metadata; `owner` is the verified loader.
+    /// A dialog scene's row adds `kind:"dialog"` and has no page and no edge;
+    /// it is `registered` while it holds the dialog seat. Edge rows are
+    /// unchanged (no `kind`).
     pub fn list(&self, registry: &SubPanelRegistry, output: &OutputKey) -> Value {
         Value::Array(
             self.scenes
                 .iter()
                 .map(|(name, entry)| {
+                    if render::is_dialog(&entry.tree) {
+                        return json!({
+                            "name": name,
+                            "kind": "dialog",
+                            "page": null,
+                            "edge": null,
+                            "citizen": entry.document.citizen,
+                            "owner": entry.owner.as_ref().map(|owner| &owner.citizen),
+                            "revision": entry.revision,
+                            "applied_revision": entry.mounted.as_ref().map_or(0, |m| m.revision),
+                            "diagnostics": entry.render_error.as_ref().map(|e| &e["diagnostics"]).cloned().unwrap_or_else(|| json!([])),
+                            "model_generation": entry.model_generation,
+                            "digest": digest(&entry.tree),
+                            "registered": entry.holds_dialog_seat(&self.dialog),
+                        });
+                    }
                     let page = render::page_id(&entry.tree);
                     let seat = entry.matching_seat(registry, output);
                     json!({
@@ -127,7 +209,18 @@ impl SceneStore {
         mount: &mut SceneMount<'_>,
     ) -> (u8, String) {
         let changes_scene = matches!(verb, SceneVerb::Load | SceneVerb::Patch);
-        match self.request_mounted(verb, body, args, Some(mount)) {
+        let result = self.request_mounted(verb, body, args, Some(mount));
+        // A pre-empted dialog holder hears about it before the new holder's
+        // own summary, so an owner never sees its successor first.
+        for notice in std::mem::take(&mut self.notices) {
+            let wire = format!("---\ncommand: shell.scene.changed\n---\n{notice}");
+            if let Err(error) =
+                bridge.try_publish_topic(format!("{}.scene.changed", bridge.service_name()), false, wire)
+            {
+                warn!("dialog pre-emption notice publish failed: {error}");
+            }
+        }
+        match result {
             Ok((reply, summary)) => {
                 if let Some(summary) = summary {
                     let wire = format!("---\ncommand: shell.scene.changed\n---\n{summary}");
@@ -207,7 +300,10 @@ impl SceneStore {
                     return Err(model_authority_refusal(&document.name));
                 }
                 let name = document.name.clone();
-                let result = self.accept(document, mount, true)?;
+                // The loader's envelope flag: a dialog load that must win
+                // the seat (the Scene Editor), so a squatter cannot brick it.
+                let preempt = args["preempt_dialog"].as_bool() == Some(true);
+                let result = self.accept(document, mount, true, preempt)?;
                 self.scenes.get_mut(&name).unwrap().model_generation = managed_generation;
                 Ok(result)
             }
@@ -284,7 +380,10 @@ impl SceneStore {
                     check_size(&document)?;
                     let prepared = render::validate_templates(&result.tree)?;
                     if render::page_id(&result.tree) != render::page_id(&entry.tree)
-                        || render::scene_edge(&result.tree) != render::scene_edge(&entry.tree) {
+                        || render::scene_edge(&result.tree) != render::scene_edge(&entry.tree)
+                        || render::is_dialog(&result.tree) != render::is_dialog(&entry.tree)
+                        || (render::is_dialog(&entry.tree)
+                            && render::dialog_geometry(&result.tree) != render::dialog_geometry(&entry.tree)) {
                         return Err(json!({"scene":name,"error_code":"SUBPANEL_COLLISION",
                             "message":"model patch cannot move a scene mount; unload before moving it"}));
                     }
@@ -324,14 +423,20 @@ impl SceneStore {
                     node.ports.insert(port.into(), value.clone());
                 }
                 check_size(&document)?;
-                self.accept(document, mount, false)
+                self.accept(document, mount, false, false)
             }
             SceneVerb::Unload => {
                 let entry = self
                     .scenes
                     .remove(name)
                     .ok_or_else(|| json!({"error":"unknown scene"}))?;
-                if let Some(mount) = mount {
+                if render::is_dialog(&entry.tree) {
+                    // Only this scene's own seat; a pre-empting successor's
+                    // seat is not ours to free.
+                    if entry.holds_dialog_seat(&self.dialog) {
+                        let _ = self.dialog.release_dialog(name);
+                    }
+                } else if let Some(mount) = mount {
                     mount.registry.forget(&render::page_id(&entry.tree));
                 }
                 if let Some(mounted) = entry.mounted {
@@ -412,10 +517,13 @@ impl SceneStore {
             .map(|entry| entry.tree.name.clone())
             .collect();
         for name in &names {
-            if let Some(entry) = self.scenes.remove(name)
-                && let Some(mounted) = entry.mounted
-            {
-                self.removed.push(mounted);
+            if let Some(entry) = self.scenes.remove(name) {
+                if entry.holds_dialog_seat(&self.dialog) {
+                    let _ = self.dialog.release_dialog(name);
+                }
+                if let Some(mounted) = entry.mounted {
+                    self.removed.push(mounted);
+                }
             }
         }
         names
@@ -426,6 +534,7 @@ impl SceneStore {
         document: SceneDocument,
         mount: Option<&mut SceneMount<'_>>,
         loading: bool,
+        preempt: bool,
     ) -> Result<(Value, Option<Value>), Value> {
         check_size(&document)?;
         let diagnostics = cosmix_scene::lint(&document);
@@ -446,6 +555,17 @@ impl SceneStore {
             return Err(json!({"scene": tree.name, "error_code": "SUBPANEL_COLLISION",
                 "error": "scene mount address is occupied or changed; unload before renaming"}));
         }
+        // A dialog and an edge page are different mounts: a live scene
+        // cannot switch between them any more than it can change edges.
+        let dialog = render::is_dialog(&tree);
+        if self
+            .scenes
+            .get(&tree.name)
+            .is_some_and(|old| render::is_dialog(&old.tree) != dialog)
+        {
+            return Err(json!({"scene": tree.name, "error_code": "SUBPANEL_COLLISION",
+                "error": "a loaded scene cannot switch between dialog and edge; unload it first"}));
+        }
         let old_owner = self
             .scenes
             .get(&tree.name)
@@ -464,12 +584,16 @@ impl SceneStore {
                     accepted_at: mount.accepted_at,
                 })
             };
-            mount.registry.mount(
-                &render::page_id(&tree), mount.output.clone(), render::scene_edge(&tree),
-                &owner.citizen, owner.accepted_at,
-            ).map_err(|error| json!({
-                "scene":tree.name, "error_code":"SUBPANEL_COLLISION", "error":error.to_string()
-            }))?;
+            if dialog {
+                self.seat_dialog(&tree, &owner, mount.output, preempt)?;
+            } else {
+                mount.registry.mount(
+                    &render::page_id(&tree), mount.output.clone(), render::scene_edge(&tree),
+                    &owner.citizen, owner.accepted_at,
+                ).map_err(|error| json!({
+                    "scene":tree.name, "error_code":"SUBPANEL_COLLISION", "error":error.to_string()
+                }))?;
+            }
             Some(owner)
         } else {
             old_owner
@@ -503,6 +627,67 @@ impl SceneStore {
             },
         );
         Ok((reply, Some(summary)))
+    }
+}
+
+impl SceneStore {
+    /// Take (or keep) the dialog seat for `tree`. Refuses `DIALOG_BUSY` when
+    /// another scene or owner holds it, unless the load pre-empts; then the
+    /// displaced holder's scene is unloaded here and its notice queued. Last
+    /// in `accept`: nothing after it can refuse, so a refused load leaves
+    /// the incumbent untouched.
+    fn seat_dialog(
+        &mut self,
+        tree: &ResolvedScene,
+        owner: &SceneOwner,
+        output: &OutputKey,
+        preempt: bool,
+    ) -> Result<(), Value> {
+        let (w, h, title, chrome) = render::dialog_geometry(tree);
+        let seat = DialogSeat {
+            scene: tree.name.clone(),
+            owner: owner.citizen.clone(),
+            accepted_at: owner.accepted_at,
+            output: output.clone(),
+            w,
+            h,
+            title,
+            chrome,
+        };
+        if !preempt {
+            return self.dialog.register_dialog(seat).map_err(|error| match error {
+                DialogSeatError::Busy { scene, owner } => json!({
+                    "scene": tree.name, "error_code": "DIALOG_BUSY",
+                    "message": "the dialog seat is held by another scene",
+                    "holder": {"scene": scene, "owner": owner},
+                }),
+                other => json!({"scene": tree.name, "error_code": "SCENE_REFUSED",
+                    "message": other.to_string()}),
+            });
+        }
+        let displaced = self.dialog.preempt_dialog(seat).map_err(|error| {
+            json!({"scene": tree.name, "error_code": "SCENE_REFUSED", "message": error.to_string()})
+        })?;
+        if let Some(displaced) = displaced {
+            // A different scene is unloaded outright; the same scene under a
+            // new owner is replaced by this load's own commit.
+            if displaced.scene != tree.name
+                && let Some(entry) = self.scenes.remove(&displaced.scene)
+                && let Some(mounted) = entry.mounted
+            {
+                self.removed.push(mounted);
+            }
+            let revision = self.revisions.get(&displaced.scene).copied().unwrap_or(0);
+            self.notices.push(json!({
+                "scene": displaced.scene,
+                "revision": revision,
+                "ops": ["unloaded"],
+                "reason": "preempted",
+                "by": {"scene": tree.name, "owner": owner.citizen},
+                "diagnostics": [],
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -811,5 +996,145 @@ item: {widget: "text", text: "{cells[0]}"}
             json!(expected)
         );
         assert_eq!(store.scenes["conformance"].revision, 1);
+    }
+
+    fn dialog_source(name: &str, w: u32) -> String {
+        format!(
+            "---\nscene: 1\nname: {name}\ncitizen: scene-{name}\nwindow: {{\"chrome\":true,\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":{w}}}\n---\n```mix\nroot: {{widget: \"column\", children: [\"caption\"]}}\ncaption: {{widget: \"text\", text: \"hi\"}}\n```\n"
+        )
+    }
+
+    fn load(
+        store: &mut SceneStore,
+        registry: &mut SubPanelRegistry,
+        owner: &str,
+        receipt: u64,
+        source: &str,
+        preempt: bool,
+    ) -> Result<(Value, Option<Value>), Value> {
+        let output = OutputKey::new("DP-1").unwrap();
+        let mut mount = SceneMount { registry, output: &output, owner, accepted_at: receipt };
+        let mut args = json!({"source": source, "model_generation": 3});
+        if preempt {
+            args["preempt_dialog"] = json!(true);
+        }
+        store.request_mounted(SceneVerb::Load, "", &args, Some(&mut mount))
+    }
+
+    #[test]
+    fn a_dialog_load_takes_the_dialog_seat_never_an_edge_page() {
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        load(&mut store, &mut registry, "scenes", 1, &dialog_source("editor", 880), false).unwrap();
+        let seat = store.dialog_seat().unwrap();
+        assert_eq!((seat.scene.as_str(), seat.owner.as_str(), seat.w, seat.h), ("editor", "scenes", 880.0, 620.0));
+        assert_eq!((seat.title.as_deref(), seat.chrome), (Some("Scene Editor"), true));
+        assert!(registry.seat("scene-editor").is_none(), "no carousel seat, no right-edge page");
+        assert_eq!(store.is_dialog("editor"), Some(true));
+        assert_eq!(store.edge_page("editor"), None);
+        let row = &store.list(&registry, &OutputKey::new("DP-1").unwrap())[0];
+        assert_eq!((row["kind"].as_str(), row["edge"].is_null(), row["registered"].as_bool()), (Some("dialog"), true, Some(true)));
+        // The same holder reloads (a new size) in place.
+        load(&mut store, &mut registry, "scenes", 1, &dialog_source("editor", 900), false).unwrap();
+        assert_eq!(store.dialog_seat().unwrap().w, 900.0);
+        // A loaded dialog cannot become an edge page in place.
+        let edge = dialog_source("editor", 880).replace(
+            "{\"chrome\":true,\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":880}",
+            "{\"kind\":\"edge\",\"edge\":\"right\"}",
+        );
+        let error = load(&mut store, &mut registry, "scenes", 1, &edge, false).unwrap_err();
+        assert_eq!(error["error_code"], "SUBPANEL_COLLISION");
+        assert!(registry.seat("scene-editor").is_none());
+    }
+
+    #[test]
+    fn a_second_dialog_is_busy_unless_it_preempts_and_the_incumbent_is_told() {
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        load(&mut store, &mut registry, "some-citizen", 1, &dialog_source("other-dialog", 400), false).unwrap();
+        let before = store.scenes["other-dialog"].revision;
+        let error = load(&mut store, &mut registry, "scenes", 2, &dialog_source("editor", 880), false).unwrap_err();
+        assert_eq!(error["error_code"], "DIALOG_BUSY");
+        assert_eq!(error["holder"], json!({"scene":"other-dialog","owner":"some-citizen"}));
+        assert!(store.scenes.contains_key("other-dialog") && !store.scenes.contains_key("editor"));
+        assert!(store.notices.is_empty());
+
+        load(&mut store, &mut registry, "scenes", 3, &dialog_source("editor", 880), true).unwrap();
+        assert_eq!(store.dialog_seat().unwrap().scene, "editor");
+        assert!(!store.scenes.contains_key("other-dialog"), "the incumbent is unloaded");
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../scripts/tests/fixtures/scene-editor/shell-verbs.json"
+        ))
+        .unwrap();
+        let mut expected = fixture["shell.scene.load"]["preemption_notice"]["body"].clone();
+        expected["revision"] = json!(before);
+        assert_eq!(std::mem::take(&mut store.notices), vec![expected]);
+        // Pre-empting again by the holder itself displaces nobody.
+        load(&mut store, &mut registry, "scenes", 3, &dialog_source("editor", 880), true).unwrap();
+        assert!(store.notices.is_empty());
+    }
+
+    #[test]
+    fn unload_and_owner_disconnect_release_the_dialog_seat() {
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        load(&mut store, &mut registry, "scenes", 1, &dialog_source("editor", 880), false).unwrap();
+        let output = OutputKey::new("DP-1").unwrap();
+        let mut mount = SceneMount { registry: &mut registry, output: &output, owner: "scenes", accepted_at: 2 };
+        store
+            .request_mounted(SceneVerb::Unload, "", &json!({"scene":"editor"}), Some(&mut mount))
+            .unwrap();
+        assert!(store.dialog_seat().is_none());
+
+        load(&mut store, &mut registry, "scenes", 3, &dialog_source("editor", 880), false).unwrap();
+        assert!(store.unload_owned_before("scenes", 3).is_empty(), "accepted at the cutoff stays");
+        assert_eq!(store.unload_owned_before("scenes", 4), ["editor"]);
+        assert!(store.dialog_seat().is_none());
+        // The freed seat is anyone's.
+        load(&mut store, &mut registry, "someone", 5, &dialog_source("other-dialog", 400), false).unwrap();
+    }
+
+    #[test]
+    fn a_preempting_dispatch_publishes_the_incumbents_notice_first() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        let output = OutputKey::new("DP-1").unwrap();
+        for (owner, receipt, name, preempt) in
+            [("some-citizen", 1, "other-dialog", false), ("scenes", 2, "editor", true)]
+        {
+            let mut args = json!({"source": dialog_source(name, 880), "model_generation": 3});
+            if preempt {
+                args["preempt_dialog"] = json!(true);
+            }
+            let mut mount = SceneMount { registry: &mut registry, output: &output, owner, accepted_at: receipt };
+            let (rc, body) = store.dispatch(SceneVerb::Load, "", &args, &bridge, &mut mount);
+            assert_eq!(rc, 0, "{body}");
+        }
+        let changes: Vec<Value> = peer
+            .drain_publishes()
+            .iter()
+            .filter(|publish| publish.headers.get("name").is_some_and(|n| n == "shell.scene.changed"))
+            .map(|publish| serde_json::from_str(publish.body.split_once("\n---\n").unwrap().1).unwrap())
+            .collect();
+        let scenes: Vec<_> = changes.iter().map(|c| (c["scene"].as_str().unwrap(), c["reason"].as_str())).collect();
+        assert_eq!(
+            scenes,
+            [("other-dialog", None), ("other-dialog", Some("preempted")), ("editor", None)],
+            "the displaced owner hears before its successor's summary"
+        );
+        assert_eq!(changes[1]["by"], json!({"scene":"editor","owner":"scenes"}));
+        assert!(store.notices.is_empty());
+    }
+
+    #[test]
+    fn show_targets_the_selected_output() {
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        load(&mut store, &mut registry, "scenes", 1, &dialog_source("editor", 880), false).unwrap();
+        let hdmi = OutputKey::new("HDMI-A-1").unwrap();
+        assert!(store.retarget_dialog("editor", &hdmi));
+        assert_eq!(store.dialog_seat().unwrap().output, hdmi);
+        assert!(!store.retarget_dialog("other", &hdmi));
     }
 }

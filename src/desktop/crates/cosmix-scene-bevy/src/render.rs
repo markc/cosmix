@@ -245,6 +245,9 @@ pub(crate) struct Mounted {
     tree: ResolvedScene,
     page: Entity,
     edge: Edge,
+    /// Mounted in the dialog chrome, not in an edge carousel. Fixed for the
+    /// life of a mount: ingress refuses a live dialog/edge switch.
+    dialog: bool,
     registered: bool,
     nodes: BTreeMap<String, View>,
 }
@@ -280,19 +283,34 @@ pub fn reconcile(world: &mut World) {
         .is_none_or(|old| old.0 != scale);
     world.insert_resource(IconScale(scale));
     world.resource_scope(|world, mut store: Mut<SceneStore>| {
-        for mounted in store.removed.drain(..) {
+        let SceneStore {
+            scenes,
+            removed,
+            dialog: slot,
+            ..
+        } = &mut *store;
+        for mounted in removed.drain(..) {
             destroy(world, mounted);
         }
-        for entry in store.scenes.values_mut() {
+        for entry in scenes.values_mut() {
             // Retain failures as readable state. A new accepted revision clears
             // the diagnostic and retries; repeated frames are not a retry loop.
             if entry.render_error.is_some() {
                 continue;
             }
             let edge = scene_edge(&entry.tree);
+            let dialog = is_dialog(&entry.tree);
             // Production ingress reserved this exact name before replying.
             // Rendering never creates or steals a registry seat.
-            if entry.owner.is_some() {
+            if entry.owner.is_some() && dialog {
+                if !entry.holds_dialog_seat(slot) {
+                    warn!(
+                        scene = entry.tree.name,
+                        "dialog scene does not hold the dialog seat"
+                    );
+                    continue;
+                }
+            } else if entry.owner.is_some() {
                 let valid = world
                     .get_resource::<cosmix_shell::runtime::SubPanelRegistryState>()
                     .is_some_and(|registry| {
@@ -335,6 +353,7 @@ pub fn reconcile(world: &mut World) {
                     })
                     .id(),
                 edge,
+                dialog: is_dialog(&entry.tree),
                 registered: false,
                 nodes: BTreeMap::new(),
             });
@@ -365,7 +384,7 @@ pub fn reconcile(world: &mut World) {
                     }
                 }
             }
-            if mounted.edge != edge {
+            if !mounted.dialog && mounted.edge != edge {
                 // Reparent only after application succeeds. The page ID is
                 // stable across accepted revisions; its contents retain focus.
                 world.entity_mut(mounted.page).remove::<ChildOf>();
@@ -373,7 +392,24 @@ pub fn reconcile(world: &mut World) {
                 mounted.edge = edge;
                 mounted.registered = false;
             }
-            if !mounted.registered {
+            if !mounted.registered && dialog {
+                // A seated dialog renders in the dialog chrome. An unowned
+                // one (a minimal host or layout fixture) has no seat and no
+                // chrome: its page stays a root node, as an unregistered
+                // edge page does.
+                if entry.owner.is_some()
+                    && world.contains_resource::<cosmix_shell::chrome::dialog::QuoinDialog>()
+                {
+                    let (_, _, title, chrome) = dialog_geometry(&entry.tree);
+                    cosmix_shell::chrome::dialog::mount_dialog_content(
+                        world,
+                        mounted.page,
+                        title.as_deref().unwrap_or(&entry.tree.name),
+                        chrome,
+                    );
+                    mounted.registered = true;
+                }
+            } else if !mounted.registered {
                 let config = mount_config(&entry.tree);
                 let title = config
                     .as_ref()
@@ -406,6 +442,15 @@ pub fn reconcile(world: &mut World) {
                 }
             }
         }
+        // Hosts read the seat from the shell-side mirror, never from here.
+        if let Some(mut mirror) =
+            world.get_resource_mut::<cosmix_shell::chrome::dialog::QuoinDialog>()
+        {
+            let seat = slot.seat().cloned();
+            if mirror.seat != seat {
+                mirror.set_seat(seat);
+            }
+        }
     });
 }
 
@@ -418,9 +463,12 @@ pub(crate) fn remove_unseated_scenes(world: &mut World) {
         else {
             return;
         };
+        // Dialog scenes are seated in the store's own dialog slot, released
+        // in the same transaction that removes them; none is ever unseated.
         let removed: Vec<_> = store
             .scenes
             .iter()
+            .filter(|(_, entry)| !is_dialog(&entry.tree))
             .filter_map(|(name, entry)| {
                 entry
                     .owner
@@ -458,13 +506,132 @@ pub(crate) fn remove_unseated_scenes(world: &mut World) {
     });
 }
 
+/// Engine geometry of a mounted scene: every document node's border box and
+/// every realised list row, in logical px relative to the surface the scene
+/// renders into (its window). Read from `ComputedNode` + `UiGlobalTransform`
+/// of the last laid-out frame, never from styles. `hidden` is true when the
+/// node or an ancestor up to the scene page is `Display::None`. A virtual
+/// list reports only the rows it has realised.
+pub(crate) fn layout(world: &mut World, scene: &str, node: Option<&str>) -> Result<Value, Value> {
+    let not_found = |message: String| {
+        json!({"error_code":"NOT_FOUND", "message":message, "scene":scene})
+    };
+    let (revision, applied, page, views) = {
+        let store = world.resource::<SceneStore>();
+        let entry = store
+            .scenes
+            .get(scene)
+            .ok_or_else(|| not_found(format!("no scene named {scene} is loaded")))?;
+        let mounted = entry.mounted.as_ref();
+        let views: Vec<(String, Entity)> = mounted
+            .map(|mounted| {
+                mounted
+                    .nodes
+                    .iter()
+                    .filter(|(id, _)| entry.tree.nodes.contains_key(*id))
+                    .map(|(id, view)| (id.clone(), view.root))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            entry.revision,
+            mounted.map_or(0, |mounted| mounted.revision),
+            mounted.map(|mounted| mounted.page),
+            views,
+        )
+    };
+    if let Some(id) = node
+        && !views.iter().any(|(view, _)| view == id)
+    {
+        return Err(not_found(format!("scene {scene} has no mounted node {id}")));
+    }
+    let mut nodes = serde_json::Map::new();
+    for (id, entity) in &views {
+        if node.is_some_and(|wanted| wanted != id) {
+            continue;
+        }
+        if let Some(rect) = logical_box(world, *entity) {
+            let hidden = hidden_below(world, *entity, page);
+            nodes.insert(id.clone(), rect_json(rect, Some(hidden)));
+        }
+    }
+    let mut instances = serde_json::Map::new();
+    let mut rows = world.query::<(Entity, &RowInstances, &Binding)>();
+    let realised: Vec<(String, String, Entity)> = rows
+        .iter(world)
+        .filter(|(_, _, binding)| binding.scene == scene)
+        .filter(|(_, _, binding)| node.is_none_or(|wanted| wanted == binding.node))
+        .map(|(entity, row, binding)| (binding.node.clone(), row.key.clone(), entity))
+        .collect();
+    for (list, key, entity) in realised {
+        if let Some(rect) = logical_box(world, entity) {
+            let list = instances
+                .entry(list)
+                .or_insert_with(|| Value::Object(Default::default()));
+            list[key] = rect_json(rect, None);
+        }
+    }
+    Ok(json!({
+        "scene": scene,
+        "revision": revision,
+        "applied_revision": applied,
+        "nodes": nodes,
+        "instances": instances,
+    }))
+}
+
+fn logical_box(world: &World, entity: Entity) -> Option<Rect> {
+    let node = world.get::<ComputedNode>(entity)?;
+    let transform = world.get::<UiGlobalTransform>(entity)?;
+    let border = node.border_box();
+    Some(Rect::from_corners(
+        transform.transform_point2(border.min) * node.inverse_scale_factor,
+        transform.transform_point2(border.max) * node.inverse_scale_factor,
+    ))
+}
+
+fn hidden_below(world: &World, mut entity: Entity, page: Option<Entity>) -> bool {
+    loop {
+        if world
+            .get::<Node>(entity)
+            .is_some_and(|node| node.display == Display::None)
+        {
+            return true;
+        }
+        if Some(entity) == page {
+            return false;
+        }
+        match world.get::<ChildOf>(entity) {
+            Some(parent) => entity = parent.parent(),
+            None => return false,
+        }
+    }
+}
+
+fn rect_json(rect: Rect, hidden: Option<bool>) -> Value {
+    let mut value = json!({
+        "x": rect.min.x, "y": rect.min.y, "w": rect.width(), "h": rect.height(),
+    });
+    if let Some(hidden) = hidden {
+        value["hidden"] = json!(hidden);
+    }
+    value
+}
+
 fn destroy(world: &mut World, mounted: Mounted) {
     let id = page_id(&mounted.tree);
-    // The acceptance/unload transaction owns the reservation. An old mounted
-    // tree can be destroyed after a same-name replacement has reserved it.
-    // Explicit unload lands here; registry-driven removal instead tears down
-    // content through remove_unseated_scenes without a second carousel remove.
-    cosmix_shell::chrome::unmount_page(world, mounted.edge, &id);
+    if mounted.dialog {
+        if world.contains_resource::<cosmix_shell::chrome::dialog::QuoinDialog>() {
+            cosmix_shell::chrome::dialog::unmount_dialog_content(world, mounted.page);
+        }
+    } else {
+        // The acceptance/unload transaction owns the reservation. An old
+        // mounted tree can be destroyed after a same-name replacement has
+        // reserved it. Explicit unload lands here; registry-driven removal
+        // instead tears down content through remove_unseated_scenes without
+        // a second carousel remove.
+        cosmix_shell::chrome::unmount_page(world, mounted.edge, &id);
+    }
     if world.get_entity(mounted.page).is_ok() {
         world.despawn(mounted.page);
     }
@@ -502,6 +669,24 @@ pub(crate) fn scene_edge(tree: &ResolvedScene) -> Edge {
         "bottom" => Edge::Bottom,
         _ => Edge::Right,
     }
+}
+
+/// A `kind:"dialog"` window: the centred dialog seat, never an edge page.
+pub(crate) fn is_dialog(tree: &ResolvedScene) -> bool {
+    mount_config(tree).is_some_and(|window| window["kind"] == "dialog")
+}
+
+/// Authored dialog size (validated 240..=2048 by cosmix-scene), title and
+/// chrome flag (default true).
+pub(crate) fn dialog_geometry(tree: &ResolvedScene) -> (f32, f32, Option<String>, bool) {
+    let config = mount_config(tree).unwrap_or(Value::Null);
+    let size = |key: &str| config[key].as_f64().unwrap_or(480.0).clamp(240.0, 2048.0) as f32;
+    (
+        size("w"),
+        size("h"),
+        config["title"].as_str().map(str::to_owned),
+        config["chrome"].as_bool() != Some(false),
+    )
 }
 
 fn mount_config(tree: &ResolvedScene) -> Option<Value> {
@@ -2104,6 +2289,7 @@ mod tests {
             },
             page: world.spawn_empty().id(),
             edge: scene_edge(tree),
+            dialog: false,
             registered: false,
             nodes: BTreeMap::new(),
         }
@@ -2964,6 +3150,7 @@ mod tests {
             },
             page,
             edge: Edge::Left,
+            dialog: false,
             registered: false,
             nodes: BTreeMap::new(),
         };

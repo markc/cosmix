@@ -1053,3 +1053,58 @@ fn conflicting_patch_preserves_the_mounted_last_good_scene() {
         before,
     );
 }
+
+/// Scene-editor plan §4.3 Q2: a seated dialog renders in the dialog chrome,
+/// never as an edge page, and its seat reaches the shell-side mirror hosts
+/// read; unloading takes both away.
+#[test]
+fn a_seated_dialog_mounts_in_the_dialog_chrome_and_leaves_on_unload() {
+    use cosmix_shell::chrome::dialog::{QuoinDialog, QuoinDialogParts};
+    use cosmix_shell::core::{OutputKey, SubPanelRegistry};
+    let mut harness = Harness::load(r#"root: {widget: "text", text: "Sentinel", fill: true}"#);
+    harness.app.init_resource::<QuoinDialog>();
+    let source = "---\nscene: 1\nname: editor\ncitizen: scene-editor\nwindow: {\"chrome\":true,\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":880}\n---\n```mix\nroot: {widget: \"column\", children: [\"caption\"]}\ncaption: {widget: \"text\", text: \"Dialog body\"}\n```\n";
+    let output = OutputKey::new("DP-1").unwrap();
+    let mut registry = SubPanelRegistry::default();
+    let mut request = |harness: &mut Harness, verb, args: Value| {
+        harness
+            .app
+            .world_mut()
+            .resource_mut::<SceneStore>()
+            .request_mounted(
+                verb,
+                "",
+                &args,
+                Some(&mut crate::SceneMount {
+                    registry: &mut registry,
+                    output: &output,
+                    owner: "scenes",
+                    accepted_at: 1,
+                }),
+            )
+            .unwrap();
+    };
+    request(&mut harness, SceneVerb::Load, json!({"source": source}));
+    for _ in 0..3 {
+        harness.app.update();
+    }
+    let world = harness.app.world();
+    let page = world.resource::<SceneStore>().scenes["editor"]
+        .mounted
+        .as_ref()
+        .expect("dialog reconciled")
+        .page;
+    let dialog = world.resource::<QuoinDialog>();
+    assert_eq!(dialog.seat.as_ref().map(|seat| seat.scene.as_str()), Some("editor"));
+    assert_eq!(dialog.content, Some(page));
+    let parts = world.get::<QuoinDialogParts>(dialog.root.unwrap()).unwrap();
+    assert_eq!(world.get::<ChildOf>(page).unwrap().parent(), parts.content_host);
+    assert_eq!(world.get::<Text>(parts.title_label).unwrap().0, "Scene Editor");
+
+    request(&mut harness, SceneVerb::Unload, json!({"scene":"editor"}));
+    harness.app.update();
+    let world = harness.app.world();
+    let dialog = world.resource::<QuoinDialog>();
+    assert_eq!((dialog.seat.is_none(), dialog.content), (true, None));
+    assert!(world.get_entity(page).is_err(), "the dialog page is despawned");
+}

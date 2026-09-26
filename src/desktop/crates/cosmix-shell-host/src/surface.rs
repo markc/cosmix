@@ -410,6 +410,9 @@ pub struct PanelSurface {
     preferred_fractional_scale: Option<f64>,
     configured_logical_size: Option<(u32, u32)>,
     announced_scale: Option<f64>,
+    /// A surface with an authored size (the dialog) requests it instead of
+    /// the edge/thickness strip.
+    fixed_size: Option<(u32, u32)>,
 }
 
 impl PanelSurface {
@@ -486,6 +489,7 @@ impl PanelSurface {
             preferred_fractional_scale: None,
             configured_logical_size: None,
             announced_scale: None,
+            fixed_size: None,
         })
     }
 
@@ -516,6 +520,12 @@ impl PanelSurface {
         self.invalidate_frame_request();
         self.waiting_configure_since = None;
         Ok(())
+    }
+
+    /// Request `size` (logical px) on every configure instead of an edge
+    /// strip. The compositor's configure still wins when it names a size.
+    pub(crate) fn set_fixed_size(&mut self, size: (u32, u32)) {
+        self.fixed_size = Some(size);
     }
 
     pub(crate) fn has_wayland_objects(&self) -> bool {
@@ -678,7 +688,9 @@ impl PanelSurface {
             .as_ref()
             .or(self.last_committed.as_ref())
             .map_or(1.0, |panel| panel.thickness_px);
-        let requested = requested_logical_size(self.edge, self.output_size, thickness);
+        let requested = self
+            .fixed_size
+            .unwrap_or_else(|| requested_logical_size(self.edge, self.output_size, thickness));
         let logical = resolve_configure_size(configure.new_size, requested);
         let effect = configure_effect(self.phase, self.configured_logical_size, logical);
         if effect == ConfigureEffect::Ignore {
@@ -1028,6 +1040,7 @@ impl PanelSurface {
             preferred_fractional_scale: None,
             configured_logical_size: None,
             announced_scale: None,
+            fixed_size: None,
         }
     }
 

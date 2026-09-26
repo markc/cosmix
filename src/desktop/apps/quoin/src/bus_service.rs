@@ -153,9 +153,12 @@ fn publish_panel_state(
     bridge: Res<BusBridge>,
     (frame, config): (Res<ShellFrameState>, Res<crate::config::ShellConfig>),
     mut state: ResMut<ShellBusState>,
+    dialog: Option<Res<cosmix_shell::chrome::dialog::QuoinDialog>>,
 ) {
     if state.live_generation.is_none() { return; }
-    let panels = panel_notice_snapshot(&frame.0, &config.panels);
+    let mut panels = panel_notice_snapshot(&frame.0, &config.panels);
+    // Compared with the panels: a dialog-only change is a new revision.
+    panels["dialog"] = crate::dialog_bus::notice(dialog.as_deref());
     if panels == state.applied_panels { return; }
     let revision = state.panel_revision.saturating_add(1);
     let mut body = panels.clone();
@@ -237,7 +240,7 @@ fn panel_notice_snapshot(frame: &ShellFrame, declared: &[Vec<String>; 4]) -> Val
             "output": frame.geometry.output.as_str(),
         }));
     }
-    // The dialog seat is null until Stage Q2 mounts dialog scenes.
+    // `publish_panel_state` fills in the dialog seat (dialog_bus::notice).
     json!({"dialog": Value::Null, "panels": panels})
 }
 
@@ -273,7 +276,7 @@ fn reply_panels(
         }
         // A pointer/holder reveal does not undo the applied persistent mode.
         // Report its actual visible:true state instead of a false refusal.
-        let snapshot = Value::from(&ShellProps(&frame.0, &config.panels).snapshot());
+        let snapshot = Value::from(&ShellProps(&frame.0, &config.panels, PropValue::Null).snapshot());
         let body = if applied {
             json!({"accepted":true, "applied":true, "panels":snapshot["panels"]})
         } else {
@@ -294,6 +297,8 @@ struct SceneBus<'w> {
     config: ResMut<'w, crate::config::ShellConfig>,
     schemes: MessageWriter<'w, cosmix_shell::chrome::QuoinSchemeSelected>,
     settings: Option<ResMut<'w, crate::settings::SettingsScene>>,
+    dialog: Option<ResMut<'w, crate::dialog_bus::DialogRequests>>,
+    dialog_state: Option<Res<'w, cosmix_shell::chrome::dialog::QuoinDialog>>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -600,9 +605,15 @@ fn service_bus(
                 (rc, body, None)
             } else if crate::dialog_bus::handles(&request.command) {
                 // Scene Editor plan §4.3 Q2: dialog and layout verbs live in
-                // dialog_bus.rs (Stage S routes them; Q2 implements them).
-                let (rc, body) = crate::dialog_bus::dispatch(&request.command);
-                (rc, body, None)
+                // dialog_bus.rs, answered with world access in the Model stage.
+                // Fixtures that install the Bus service alone have no queue.
+                let Some(queue) = content.dialog.as_deref_mut() else {
+                    let body = json!({"error_code":"UNIMPLEMENTED", "message":"dialog verbs are not installed in this host"});
+                    stash_or_respond(&bridge, &mut state, request, 10, body.to_string(), None, &mut dispatch);
+                    continue;
+                };
+                queue.defer(request);
+                continue;
             } else if request.command == "shell.panel.order" {
                 // Scene Editor plan §4.3 Q1; request/reply frozen in
                 // tests/fixtures/scene-editor/shell-verbs.json. The same
@@ -731,7 +742,13 @@ fn service_bus(
                     None,
                 )
             } else {
-                dispatch_with_declared(&request, &frame.0, &content.config.panels, time.elapsed())
+                dispatch_with_declared(
+                    &request,
+                    &frame.0,
+                    &content.config.panels,
+                    &crate::dialog_bus::notice_prop(content.dialog_state.as_deref()),
+                    time.elapsed(),
+                )
             };
         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         state.diagnostics.record(rc, command.is_some(), elapsed_us);
@@ -1129,7 +1146,7 @@ fn dispatch_shell_request(
     frame: &ShellFrame,
     at: std::time::Duration,
 ) -> (u8, String, Option<ShellCommand>) {
-    dispatch_with_declared(request, frame, &NO_DECLARED, at)
+    dispatch_with_declared(request, frame, &NO_DECLARED, &PropValue::Null, at)
 }
 
 /// `declared` is the last accepted `conf.mix` page order per edge, which the
@@ -1138,6 +1155,7 @@ fn dispatch_with_declared(
     request: &InboundRequest,
     frame: &ShellFrame,
     declared: &[Vec<String>; 4],
+    dialog: &PropValue,
     at: std::time::Duration,
 ) -> (u8, String, Option<ShellCommand>) {
     if request.command == "shell.ping" {
@@ -1152,7 +1170,7 @@ fn dispatch_with_declared(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scene.layout","scenes.list","dialog.show","dialog.hide"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1169,7 +1187,7 @@ fn dispatch_with_declared(
     if let Some(suffix) = request.command.strip_prefix("shell.props.") {
         let args = parse_args(request);
         let response = cosmix_props_core::bus::dispatch_props(
-            &ShellProps(frame, declared),
+            &ShellProps(frame, declared, dialog.clone()),
             suffix,
             args.as_ref(),
             false,
@@ -1188,7 +1206,7 @@ fn dispatch_with_declared(
                 None,
             );
         };
-        let snapshot = Value::from(&ShellProps(frame, declared).snapshot());
+        let snapshot = Value::from(&ShellProps(frame, declared, PropValue::Null).snapshot());
         let mut state = snapshot["panels"][edge_name(edge)].clone();
         let panel = frame.panel(edge);
         state["keyboard_focused"] = json!(panel.keyboard_focused);
@@ -1503,13 +1521,14 @@ const NO_DECLARED: [Vec<String>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::
 
 /// The live frame plus the last accepted `conf.mix` page order per edge
 /// (`ShellConfig::panels`, indexed by `Edge::index`).
-struct ShellProps<'a>(&'a ShellFrame, &'a [Vec<String>; 4]);
+/// The third field is the dialog seat (`dialog_bus::notice_prop`).
+struct ShellProps<'a>(&'a ShellFrame, &'a [Vec<String>; 4], PropValue);
 
 impl PropTree for ShellProps<'_> {
     fn snapshot(&self) -> PropValue {
         // The one dialog seat (scene-editor plan §4.3): null until a dialog
-        // scene is loaded, which needs Stage Q2.
-        let mut leaves = vec![leaf("dialog".to_owned(), PropValue::Null)];
+        // scene is loaded.
+        let mut leaves = vec![leaf("dialog".to_owned(), self.2.clone())];
         for edge in Edge::ALL {
             let name = edge_name(edge);
             let panel = self.0.panel(edge);
@@ -3041,6 +3060,63 @@ mod tests {
             .collect()
     }
 
+    /// Scene-editor plan §4.3 Q2 (round-2 Opus N7): every `dialog.visible`
+    /// or `dialog.scene` change publishes `panel.changed` with a strictly
+    /// greater revision even when no panel changed, so the loader's revision
+    /// filter never drops a hide; `props.get` reports the same seat.
+    #[test]
+    fn a_dialog_only_change_publishes_a_new_revision_and_reaches_props() {
+        let (mut app, peer) = mounted_bus_app();
+        crate::dialog_bus::install(&mut app);
+        app.update();
+        panel_notices(&peer);
+        let source = "---\nscene: 1\nname: editor\ncitizen: scene-editor\nwindow: {\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":880}\n---\n```mix\nroot: {widget: \"column\", children: []}\n```\n";
+        let mut load = local("shell.scene.load");
+        load.from = "scenes".into();
+        load.body = json!({"source": source, "model_generation": 1}).to_string();
+        peer.send(load);
+        app.update();
+        let loaded = panel_notices(&peer).pop().expect("loading the dialog publishes");
+        assert_eq!(loaded["dialog"]["scene"], "editor");
+        assert_eq!(loaded["dialog"]["visible"], false);
+        let panels = loaded["panels"].clone();
+        let mut revision = loaded["revision"].as_u64().unwrap();
+        for (verb, visible) in [
+            ("shell.dialog.show", true),
+            ("shell.dialog.hide", false),
+            ("shell.dialog.show", true),
+        ] {
+            let mut request = local(verb);
+            request.body = json!({"scene":"editor"}).to_string();
+            peer.send(request);
+            app.update();
+            let notices = panel_notices(&peer);
+            assert_eq!(notices.len(), 1, "{verb}: exactly one notice");
+            assert_eq!(notices[0]["dialog"]["visible"], visible, "{verb}");
+            assert_eq!(notices[0]["panels"], panels, "{verb}: a dialog-only change");
+            let next = notices[0]["revision"].as_u64().unwrap();
+            assert!(next > revision, "{verb}: revision {next} after {revision}");
+            revision = next;
+        }
+        app.update();
+        assert!(panel_notices(&peer).is_empty(), "an unchanged snapshot publishes nothing");
+        let mut props = local("shell.props.get");
+        props.body = json!({"path": "dialog"}).to_string();
+        peer.send(props);
+        app.update();
+        let replies = peer.drain_responses();
+        let reply = replies
+            .iter()
+            .find(|reply| reply.command == "shell.props.get")
+            .expect("props.get answered");
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"scene":"editor","visible":true,"w":880.0,"h":620.0,"output":"test"}),
+            "{body}"
+        );
+    }
+
     /// Scene-editor plan §4.3 Q1: `panel.changed` and `props.get` carry the
     /// dialog seat (null before Q2) and each panel's `conf.mix` order; a new
     /// declared order publishes once with a new revision, an unchanged
@@ -3096,7 +3172,7 @@ mod tests {
             let mut props = request("shell.props.get");
             props.body = json!({"path": path}).to_string();
             let (rc, body, _) =
-                dispatch_with_declared(&props, &frame, &reordered.panels, Default::default());
+                dispatch_with_declared(&props, &frame, &reordered.panels, &PropValue::Null, Default::default());
             assert_eq!(rc, 0, "{path}: {body}");
             serde_json::from_str::<Value>(&body).unwrap()
         };
@@ -3140,7 +3216,7 @@ mod tests {
             assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
             let body: Value = serde_json::from_str(&replies[0].body).unwrap();
             assert_eq!(body["applied"], true);
-            let snapshot = Value::from(&ShellProps(&app.world().resource::<ShellFrameState>().0, &NO_DECLARED).snapshot());
+            let snapshot = Value::from(&ShellProps(&app.world().resource::<ShellFrameState>().0, &NO_DECLARED, PropValue::Null).snapshot());
             assert_eq!(body["panels"], snapshot["panels"]);
             if verb == "shell.panel.pin" {
                 // Let reveal progress before hiding; otherwise concealment
