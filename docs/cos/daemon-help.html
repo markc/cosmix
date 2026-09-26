@@ -591,7 +591,9 @@ Ctrl+Alt+Shift+P. Both rows swallow every edge, so no application sees the
 chord. The verb fires once per press and never on auto-repeat. The scenes
 loader answers it by opening the shipped Scene Editor in safe mode, or hiding
 it when it is already visible, so the chord toggles.</p>
-<p>The rows only reach a keymap file when the defaults are seeded. A host that
+<p>The rows only reach a keymap file when the defaults are seeded, so upgrading
+inputd does not add them: the existing keymap is served unchanged, and a
+deploy that ships 0.4.5 to an existing host must bind them itself. A host that
 already has a keymap file gets them through <code>input.bind</code>, one row per stroke.
 Check <code>input.query</code> first, because <code>input.bind</code> replaces whatever row holds
 the stroke:</p>

@@ -1677,6 +1677,12 @@ impl Controller {
     // ── the ced.v1 port ──────────────────────────────────────────────────────
 
     fn bus_command(&mut self, cmd: &BusCommand, fx: &mut Vec<Effect>) {
+        // The declared body limit is enforced before the body is parsed at all
+        // (review m7), not after a full DOM parse of up to the Bus's 16 MiB.
+        if cmd.verb == "ced.diagnostics" && cmd.body.len() > verbs::MAX_DIAGNOSTICS_BODY {
+            let msg = format!("the request is {} bytes (at most {})", cmd.body.len(), verbs::MAX_DIAGNOSTICS_BODY);
+            return fx.push(Effect::Respond { id: cmd.id, rc: 10, body: refusal(code::INVALID_ARGUMENT, msg, Some("too_large")) });
+        }
         let body: Value = serde_json::from_str(&cmd.body).unwrap_or_else(|_| json!({}));
         macro_rules! parse {
             ($t:ty) => {
@@ -1954,10 +1960,6 @@ impl Controller {
                 fx.push(Effect::Quit);
             }
             "ced.diagnostics" => {
-                if cmd.body.len() > verbs::MAX_DIAGNOSTICS_BODY {
-                    let msg = format!("the request is {} bytes (at most {})", cmd.body.len(), verbs::MAX_DIAGNOSTICS_BODY);
-                    return refuse(fx, code::INVALID_ARGUMENT, msg, Some("too_large"));
-                }
                 let r = parse!(verbs::DiagnosticsReq);
                 if let Err((msg, reason)) = external::check(&r, cmd.body.len()) {
                     return refuse(fx, code::INVALID_ARGUMENT, msg, Some(reason));
@@ -1969,7 +1971,7 @@ impl Controller {
                         continue;
                     }
                     out.tabs.push(t.id);
-                    let applied = external::apply(&self.external, t, Some(&r.source));
+                    let applied = external::apply(&self.external, t, Some(&r.source), true);
                     out.shown += applied.shown;
                     out.stale |= applied.stale;
                 }
@@ -2139,8 +2141,9 @@ impl Controller {
             x.ext_live = live;
             x.ext_dirty = dirty;
             if live && (x.ext_due || went_live || went_clean) {
+                let undigested = x.ext_due || went_live;
                 x.ext_due = false;
-                external::apply(&self.external, t, None);
+                external::apply(&self.external, t, None, undigested);
             }
         }
     }
@@ -2739,6 +2742,27 @@ mod tests {
         let fx = c.on_bus_command(cmd("ced.type", json!({"text": "?"})));
         assert_eq!(response(&fx).0, 0);
         assert_eq!(problems(&mut c), [scenes(2, 1)]);
+    }
+
+    #[test]
+    fn an_undigested_set_dropped_by_an_edit_stays_dropped_when_the_tab_goes_clean() {
+        let mut c = ctl();
+        live(&mut c);
+        diags(&mut c, None, &[1, 2]);
+        assert_eq!(problems(&mut c), [scenes(1, 1), scenes(2, 1)]);
+        // An edit on line 1 drops that row (covered-range invalidation).
+        c.on_incoming(event(1, "edit", json!([{"offset": 0, "delete": 0, "insert": "!"}])));
+        assert_eq!(problems(&mut c), [scenes(2, 1)]);
+        // Going clean re-checks digested sets only: nothing says this one
+        // still describes the text, so the dropped row must not come back
+        // (review m9).
+        c.on_incoming(event(2, "reload", json!([])));
+        let (_, v) = response(&c.on_bus_command(cmd("ced.tabs", json!({}))));
+        assert_eq!(v["tabs"][0]["dirty"].as_bool(), Some(false));
+        assert_eq!(problems(&mut c), [scenes(2, 1)]);
+        // The verb itself still applies an undigested set.
+        diags(&mut c, None, &[1]);
+        assert_eq!(problems(&mut c), [scenes(1, 1)]);
     }
 
     #[test]

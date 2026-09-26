@@ -614,6 +614,20 @@ check(length($d6.changed) == 1 and $d6.changed[0].path == $panel_scene and lengt
 check(deep_eq($e.open_paths({active: 1, tabs: [{tab: 1, path: "/a"}, {tab: 2, path: nil}, {tab: 3, path: "/a"}]}), ["/a"]), "open paths from ced.tabs")
 check($e.ced_severity("Error") == "error" and $e.ced_severity("info") == "note", "severity mapped to ced's enum")
 
+-- A hidden editor's quiet key: counters alone never change it (review m10).
+$bumped = $list
+$bumped.revision = ($list.revision ?? 0) + 7
+$bumped.scenes[0].revision = ($list.scenes[0].revision ?? 0) + 3
+$bumped.scenes[1].generation = ($list.scenes[1].generation ?? 0) + 1
+check($e.quiet_key($bumped) == $e.quiet_key($list), "revision and generation bumps keep the quiet key")
+$shown = $list
+$shown.scenes[0].problems = []
+check($e.quiet_key($shown) != $e.quiet_key($list), "a problem change moves the quiet key")
+$opened = $list
+$opened.editor = merge($list.editor ?? {}, {visible: true})
+check($e.quiet_key($opened) != $e.quiet_key($list), "the editor record is part of the quiet key")
+check($e.quiet_key(nil) == nil, "no inventory, no key")
+
 -- refusal unwrapping
 check(deep_eq($e.refusal(refused("SCENES_RESERVED", "no")), {code: "SCENES_RESERVED", message: "no"}), "loader refusal unwrapped")
 check($e.refusal({ok: false, rc: 20, value: {error_code: "upstream_transport", message: "Scene request failed: scenes scenes.list"}}).code == "upstream_transport", "transport failure")

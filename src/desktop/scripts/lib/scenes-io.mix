@@ -45,7 +45,9 @@ end
 -- (only the shipped Scene Editor): lint findings come back as problems.
 fn check($path, $opts)
   $mode = ($opts ?? {}).lint ?? "deny"
-  $digest = hash_sha256(read_file($path))
+  -- Streamed: candidate caps the file at 256 KiB, this read must not be the
+  -- unbounded one (review NIT).
+  $digest = hash_file($path, "sha256")
   $parsed = run_argv([interpreter(), "--check", $path], {timeout:10, max_output:65536})
   $argv = [interpreter(), "lint", "--json"]
   if $mode == "deny" then push($argv, "--deny-warnings") end

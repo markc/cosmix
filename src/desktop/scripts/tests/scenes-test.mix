@@ -28,6 +28,7 @@ fn rpc($host, $verb, $body)
   if $verb == $host_state.nil_verb then return nil end
   if $verb == $host_state.refuse_verb then return {accepted:false, error_code:"PANEL_NOT_APPLIED"} end
   if $verb == "noded.props.get" then return {services:{registered:$host_state.names}} end
+  if $verb == "shell.info" and $host_state.info_verbs != nil then return {verbs:$host_state.info_verbs} end
   if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_error then raise("SCENES_UPSTREAM", "unload refused", {}) end
   if contains(["shell.scene.load", "shell.scene.validate"], $verb) then
     $source = type($body) == "map" ? $body.source : $body
@@ -321,6 +322,13 @@ try
   $s = $l.request($s, "enable", {name:"probe"})
   check($s.rc == 10 and $s.response.error_code == "SCENES_UPSTREAM", "enable still reports the standing refusal: " .. json_encode($s.response))
   $s = $l.services($s, [], false)
+  -- Review m5: with the host away a later edit is observed but not loaded;
+  -- the standing refusal's rows keep the digest they describe.
+  write_file($s.root .. "/probe/scene.mix", fixture_source("probe", "BROKEN again"))
+  $s = $l.filesystem($s, $batch)
+  $row = probe_row($s)
+  $attempted = $s.scenes.probe.load_diagnostic.attempted_digest
+  check($row.digests.scene == hash_sha256(read_file($s.root .. "/probe/scene.mix")) and $row.digests.scene != $attempted and all($row.problems, fn($p) = $p.digest == $attempted), "m5: problem rows carry the attempted digest: " .. json_encode($row.problems))
   $s = $l.services($s, ["test-shell"], true)
   check($s.scenes.probe.mounted and $s.scenes.probe.model.text == "runtime", "restart remounts last-good despite bad disk")
   write_file($s.root .. "/probe/scene.mix", fixture_source("probe", "new layout"))
@@ -854,6 +862,30 @@ try
   check($s.scenes.editor.pid != nil and $s.scenes.editor.generation > $e.generation and since($m, "launch")[0].body.dir == $tpl .. "/editor", "E7: the deadline relaunches")
   $s = $l.request($s, "ready", {name:"editor", generation:$s.scenes.editor.generation})
   check($s.rc == 0 and $s.scenes.editor.status == "running", "E7: running again")
+  -- Review m7: a crash-looped editor is revived by the next explicit open.
+  for each $k in range(1, 8)
+    if $s.scenes.editor.status == "crash_loop" then break end
+    $e = $s.scenes.editor
+    $s = process_exit($s, {pid:$e.pid, tag:{name:"editor", generation:$e.generation}, exit_code:1, signal:nil})
+    if $s.scenes.editor.status == "backoff" then $s = deadline($s, "editor", $s.scenes.editor.generation) end
+  end
+  check($s.scenes.editor.status == "crash_loop" and $s.scenes.editor.pid == nil, "m7: quick crashes loop the editor")
+  $m = log_mark()
+  $s = $l.request($s, "editor.open", {safe:true})
+  check($s.rc == 0 and $s.scenes.editor.pid != nil and $s.scenes.editor.crashes == 0 and $s.scenes.editor.status == "starting" and len(since($m, "launch")) == 1, "m7: the chord restarts a crash-looped editor: " .. json_encode($s.response))
+  -- Review m1: a refused show after the mount keeps the mount and behaviour.
+  $pid = $s.scenes.editor.pid
+  $host_state.dialog_mode = "none"
+  $s = $l.request($s, "editor.open", {safe:true})
+  $host_state.dialog_mode = "q2"
+  check($s.rc == 10 and $s.response.context.phase == "show" and $s.scenes.editor.mounted and $s.scenes.editor.summoned and $s.scenes.editor.pid == $pid, "m1: a refused show keeps the mounted editor: " .. json_encode($s.response))
+  -- Review n4: a host listing its verbs is probed without a hide.
+  $host_state.info_verbs = ["dialog.show", "dialog.hide", "scene.load"]
+  $n4 = se_fresh("n4", $tpl)
+  $m = log_mark()
+  $n4 = $l.request($n4, "editor.open", {safe:true})
+  $host_state.info_verbs = nil
+  check($n4.rc == 0 and len(since($m, "shell.dialog.hide")) == 0 and len(since($m, "shell.info")) == 1, "n4: shell.info decides dialog support without a hide")
 
   -- E8: the D3 edge header uses the popup path with a recovery record.
   $tpl_edge = $tmp .. "/se-tpl-edge"
@@ -1047,6 +1079,27 @@ try
   $y = $l.services($y, ["test-shell"], true)
   $host_state.nil_verb = nil
   check($y.diagnostic != nil and $y.state_ok, "FR5: a services failure leaves state_ok true")
+  -- Review m9: a popup mid-transition does not fail ready/model while the
+  -- state file is unreadable; the record waits for the next good read.
+  $z = se_fresh("m9", $tpl)
+  $z = $l.request($z, "install", {template:"alpha", enable:true})
+  $z.panels = {left:{pages:["scene-alpha", "other"], page:"other", mode:"hidden", visible:false}}
+  $host_state.panels = $z.panels
+  $z = $l.request($z, "open", {name:"alpha"})
+  check($z.rc == 0 and $z.open == "alpha", "m9: popup open queued")
+  $zb = read_file($z.root .. "/state.conf.mix")
+  write_file($z.root .. "/state.conf.mix", "BROKEN")
+  $z = $l.rescan($z, false)
+  check(not $z.state_ok, "m9: the state file became unreadable")
+  $z.panels = {left:{pages:["scene-alpha", "other"], page:"scene-alpha", mode:"hidden", visible:false}}
+  $host_state.panels = $z.panels
+  $gen = $z.scenes.alpha.generation
+  $z = $l.request($z, "ready", {name:"alpha", generation:$gen})
+  check($z.rc == 0 and $z.scenes.alpha.ready, "m9: ready still answers: " .. json_encode($z.response))
+  $z = $l.request($z, "model", {name:"alpha", generation:$gen, value:{text:"m9"}})
+  check($z.rc == 0 and read_file($z.root .. "/state.conf.mix") == "BROKEN", "m9: model still answers and nothing was written")
+  write_file($z.root .. "/state.conf.mix", $zb)
+  $host_state.panels = {}
 
   -- F1-F5: fork and promote.
   $s = se_fresh("f", $tpl)
@@ -1098,6 +1151,33 @@ try
   $s = refused($s, "reset", {name:"alpha"}, "SCENES_FAULT")
   $s.faults = []
   check(tree_digest($s.root .. "/alpha") == $original and len(stages($s.root)) == 0 and data_parse(read_file($s.root .. "/state.conf.mix")).resetting == nil, "F5: a reset failure after the swap restores the original")
+  -- Review m2: a failure at promoting:staged leaves no record to finish later.
+  $s.faults = ["promoting:staged"]
+  $s = refused($s, "promote", {from:"alpha-sandbox"}, "SCENES_FAULT")
+  $s.faults = []
+  check(tree_digest($s.root .. "/alpha") == $original and is_dir($sandbox) and len(stages($s.root)) == 0 and $s.desired.promoting == nil and data_parse(read_file($s.root .. "/state.conf.mix")).promoting == nil, "m2: a staged failure clears its record")
+  $s = $l.rescan($s, false)
+  check(is_dir($sandbox) and $s.desired.forks["alpha-sandbox"] != nil and contains($s.desired.enabled, "alpha-sandbox"), "m2: a later rescan keeps the sandbox")
+  -- Review m1: a failure finishing step 6 is a reply, the swap stands, and
+  -- the placed record is finished by an explicit reload.
+  write_file($sandbox .. "/scene.mix", replace(read_file($sandbox .. "/scene.mix"), "promoted title", "finish title"))
+  $s.faults = ["promoting:finish"]
+  $s = $l.request($s, "promote", {from:"alpha-sandbox"})
+  $s.faults = []
+  check($s.rc == 10 and $s.response.context.phase == "finish" and contains(read_file($s.root .. "/alpha/scene.mix"), "finish title") and $s.scenes.alpha.mounted and ($s.retiring.alpha != nil or $s.scenes.alpha.pid != nil) and data_parse(read_file($s.root .. "/state.conf.mix")).promoting.phase == "placed", "m1: finish failure keeps the swap and its records: " .. json_encode($s.response))
+  $s = $l.request($s, "reload", {name:"alpha"})
+  check($s.rc == 0 and not exists($sandbox) and $s.desired.promoting == nil and ($s.desired.forks ?? {})["alpha-sandbox"] == nil, "m1: reload finishes the placed promote")
+  -- Review m4: a sandbox whose original was removed cannot be promoted.
+  $s = $l.request($s, "install", {template:"beta", enable:true})
+  $s = $l.request($s, "fork", {name:"beta"})
+  $s = $l.request($s, "remove", {name:"beta"})
+  $s = refused($s, "promote", {from:"beta-sandbox"}, "SCENES_NOT_FOUND")
+  check(is_dir($s.root .. "/beta-sandbox") and contains($s.desired.enabled, "beta-sandbox") and not exists($s.root .. "/beta") and len(stages($s.root)) == 0, "m4: the sandbox stays enabled, nothing staged")
+  -- Fork falls through to -sb when <name>-sandbox is taken.
+  mkdir($s.root .. "/gamma-sandbox")
+  $s = $l.request($s, "fork", {name:"gamma"})
+  check($s.rc == 0 and $s.response.name == "gamma-sb", "fork falls back to -sb: " .. json_encode($s.response))
+  remove_dir($s.root .. "/gamma-sandbox")
 
   -- F6: every row of the rule-9 disk table, for both records.
   for each $kind in ["promoting", "resetting"]
@@ -1116,9 +1196,31 @@ try
     $row = filter($l.inventory($x).scenes, fn($r) = $r.name == "alpha")[0]
     check($row.diagnostic.error_code == "SCENES_RECOVERY" and $row.diagnostic.context.to and $row.diagnostic.context.stage and $row.diagnostic.context.backup and $x.desired[$kind].error != nil, "F6 " .. $kind .. ": unrecoverable triple -> SCENES_RECOVERY: " .. json_encode($row.diagnostic))
     check($x.scenes.beta.mounted and $x.scenes.alpha.mounted and exists($x.f6.stage), "F6 " .. $kind .. ": the rest of rescan completes, nothing moved")
+    -- Review m3: the stuck record refuses the next one instead of being overwritten.
+    $held = $x.desired[$kind]
+    $pids = [$x.scenes.alpha.pid, $x.scenes.beta.pid]
+    $bytes = read_file($x.root .. "/state.conf.mix")
+    if $kind == "promoting" then
+      $x = refused($x, "promote", {from:"alpha-sandbox"}, "SCENES_RECOVERY")
+    else
+      $x = refused($x, "reset", {name:"beta"}, "SCENES_RECOVERY")
+    end
+    check($x.desired[$kind].stage == $held.stage and len(stages($x.root)) == 1 and read_file($x.root .. "/state.conf.mix") == $bytes and deep_eq([$x.scenes.alpha.pid, $x.scenes.beta.pid], $pids), "m3 " .. $kind .. ": a stuck record is kept, nothing staged or stopped")
     remove_dir($x.f6.stage)
     $x = $l.request($x, "reload", {name:"alpha"})
     check($x.rc == 0 and $x.desired[$kind] == nil and ($x.recovery_diagnostics ?? {}).alpha == nil, "F6 " .. $kind .. ": an explicit reload retries the record")
+  end
+
+  -- Review m2/m3: the rows for a $to that never existed, and a staged record
+  -- whose stage is gone.
+  for each $kind in ["promoting", "resetting"]
+    $x = crash_root($kind .. "-f", $kind, false, true, false, "swapped", "", $tpl)
+    check(contains(text_of($x.root .. "/alpha"), "STAGED") and not exists($x.f6.stage) and $x.desired[$kind] == nil, "m3 " .. $kind .. ": no original, swapped -> rolled forward")
+    $x = crash_root($kind .. "-g", $kind, false, true, false, "staged", "", $tpl)
+    check(not exists($x.root .. "/alpha") and not exists($x.f6.stage) and $x.desired[$kind] == nil, "m3 " .. $kind .. ": no original, staged -> stage dropped")
+    $x = crash_root($kind .. "-h", $kind, true, false, false, "staged", "ORIGINAL", $tpl)
+    check(contains(text_of($x.root .. "/alpha"), "ORIGINAL") and $x.desired[$kind] == nil, "m2 " .. $kind .. ": staged, stage gone -> record cleared, original kept")
+    if $kind == "promoting" then check(is_dir($x.root .. "/alpha-sandbox") and $x.desired.forks["alpha-sandbox"] != nil, "m2: the refused promote's sandbox is kept") end
   end
 
   -- M1/M2: move rewrites the header line and remounts through rule 6.
@@ -1144,6 +1246,12 @@ try
   $host_state.refuse_edge = nil
   $last = loads_of($m, "beta")
   check($s.rc == 10 and $s.response.error_code == "SCENES_UPSTREAM" and $s.scenes.beta.mounted and $s.scenes.beta.edge == "top" and $l.document($last[len($last) - 1].body.source).window.edge == "top", "M2b: refused load re-loads the old address: " .. json_encode($s.response))
+  -- Review m6: the refused move puts its header back and clears the refusal,
+  -- so later rescans neither retry the move nor flicker the panel.
+  check($l.document(read_file($path)).window.edge == "top" and $s.scenes.beta.load_diagnostic == nil, "M2b: the header is restored and the refusal cleared")
+  $m = log_mark()
+  $s = $l.rescan($s, false)
+  check(len(filter(since($m, nil), fn($c) = contains(["shell.scene.unload", "shell.scene.load"], $c.verb))) == 0, "M2b: a later rescan does not remount beta")
   $host_state.refuse_edge = "right"
   $host_state.rollback_fail = "beta"
   $s = $l.request($s, "move", {name:"beta", edge:"right"})
@@ -1153,7 +1261,8 @@ try
   $row = filter($l.inventory($s).scenes, fn($r) = $r.name == "beta")[0]
   check(not $row.mounted and $row.problems[0].code == "SCENES_REMOUNT_FAILED", "M2c: red in scenes.list")
   $s = $l.request($s, "reload", {name:"beta"})
-  check($s.rc == 0 and $s.scenes.beta.mounted and $s.scenes.beta.edge == "right", "M2c: reload retries and mounts")
+  check($l.document(read_file($path)).window.edge == "top", "M2c: the refused move's header is restored")
+  check($s.rc == 0 and $s.scenes.beta.mounted and $s.scenes.beta.edge == "top", "M2c: reload retries and mounts the old address")
   $_ = refused($s, "move", {name:"beta", edge:"middle"}, "SCENES_ARGUMENT")
   install_fixture($s.root, "nowin", false)
   write_file($s.root .. "/nowin/scene.mix", replace(fixture_source("nowin", "x"), "window: {\"kind\":\"edge\",\"edge\":\"right\"}\n", ""))
