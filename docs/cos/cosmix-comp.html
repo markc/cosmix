@@ -1336,163 +1336,140 @@ origin.</li>
 the left or top output edge, can still project one pixel short. The renderer
 rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
-<p>Since 0.71.0, the compositor advertises a second seat, <code>cosmix-agent</code>, with
-its own keyboard and pointer (hidden from Xwayland). It is not yet driven:
-input injection still uses the human <code>cosmix</code> seat.
-In this chunk, Bus injection follows <code>inject → handle_host_input → notify_idle_activity(SeatKind::Human)</code>: it reports <code>last_origin:"human"</code>,
-updates the human <code>last_input_us</code>, and resets both seats' idle notifications.
-The agent delivery path is chunk 2 work.</p>
-<p><code>comp.input.key</code> (including its <code>{text}</code> form) and <code>comp.input.pointer.button</code>
-accept <code>window:{id,generation}</code> and <code>raise?:bool</code> (default true). Both identity
-fields are required; <code>raise</code> requires <code>window</code>. The compositor focuses the window
-using the focus verb's path, applies the requested raise policy, then injects
-within the same compositor-thread operation. The input reply includes
-<code>{input_seq,injected_at_us,pointer,target,targeted,completed_events}</code>.
-<code>targeted:{id,generation}</code> records the requested window; <code>target</code> records client
-delivery of the key/text payload or button (null for a compositor-consumed
-binding). Modifier setup and release cleanup do not claim payload delivery.
-Target continuity is checked before every generated key press. A binding that
-changes focus stops subsequent presses with rc 10 <code>target_changed</code>, reporting
-<code>completed_events</code> and releasing this operation's new holds. Completed events
-are not rolled back. Sequence steps accept exactly the same arguments.</p>
-<p>The focus-and-inject ordering guarantee applies to Wayland seat delivery.
-For Xwayland, Smithay sends X focus requests (<code>SetInputFocus</code> / <code>WM_TAKE_FOCUS</code>)
-without waiting for X focus confirmation; keys travel over the Wayland
-connection. A successful reply therefore does not guarantee that the X client
-has taken focus before the first key, especially with client-driven focus.
-Use client-side acknowledgement when X client focus ordering matters.</p>
-<p>Targeted buttons direct the seat pointer to the named window at the current
-cursor position, expressed relative to its buffer origin; they do not warp the
-cursor. The ordinary device-click focus/raise policy is skipped because the
-targeted operation has already applied it, including <code>raise:false</code>. Buttons
-still pass through region, corner-release, KMS quarantine and delivery gates.
-After delivery, pointer focus is reconciled with the cursor position (respecting
-an ongoing implicit grab), so the next device click uses the ordinary target.
-An unmapped, minimised, off-workspace or non-presentable window, a session lock,
-an exclusive layer, an active region-selection run (<code>reason:"region_select"</code>),
-or an interfering grab returns rc 10
-<code>target_unfocusable</code> with <code>reason</code>, <code>id</code> and <code>generation</code>, and injects no key or
-button. Unlike the standalone focus verb, targeted input never switches workspace
-or restores a window. Unknown or stale identities retain the existing target errors.
-If focus arbitration itself returns <code>focus_refused</code>, focus/stacking changes made
-by that arbitration may remain; no payload key or button was injected.
-Targeted key releases still validate the window identity, but do not require
-focus eligibility or refocus/raise the window; the seat's modal and lock gates
-continue to handle those releases.</p>
-<p>Without <code>window</code>, <code>no_keyboard_target</code> is returned only after the seat finds no
-client/native focus, compositor binding or modal owner for a non-modifier payload press.
-Bare modifier presses are accepted and held as prefixes for later bindings;
-an engaged hot corner alone does not consume keyboard input.
-Releases and keys already held by injection are always processed; generated new
-holds are cleaned up on refusal. Modifier setup can advance XKB before the
-payload is refused. Empty workspaces still accept compositor chords, and Escape
-still cancels region selection. Untargeted buttons retain their existing
-behaviour: a null pointer delivery target can also mean chrome, a panel or a hot
-corner, so it is not a reliable empty-space refusal.</p>
-<p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event
-enters the one seat entry point with user activity on, so these all apply
-unchanged: bindings (an injected <code>Super+Shift+M</code> restores a window, and the
-client never sees the M), pointer grabs and constraints, click-to-focus and
-raise, idle notification, and the session lock. Under a session lock,
-injected input reaches only the lock surface.</p>
-<p>Event timestamps are CLOCK_MONOTONIC milliseconds, wrapping at 32 bits. That
-is the clock <code>wp_presentation</code> reports, so a client can subtract an input
-event time from a presentation time. Real input from the nested host window
-uses the same clock.</p>
-<table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
-<tr><td><code>comp.input.pointer.move</code></td><td>One of three forms. <code>{x,y,output?}</code>: output-local absolute; <code>output</code> is an <code>outputs</code> key or output name, and defaults to the default output. <code>{dx,dy}</code>: relative. <code>{window:{id,generation},x,y,require_hit?}</code>: relative to the window-geometry origin. Any form takes <code>corners?</code> (default <code>true</code>); <code>false</code> keeps the move from arming a hot corner.</td></tr>
-<tr><td><code>comp.input.pointer.button</code></td><td><code>{button?,action?,window?,raise?}</code>. <code>button</code>: <code>left</code> (default), <code>right</code>, <code>middle</code>, or an evdev code <code>0x100..=0x2ff</code>. <code>action</code>: <code>press</code>, <code>release</code> or <code>click</code> (default).</td></tr>
-<tr><td><code>comp.input.pointer.scroll</code></td><td><code>{dx?,dy?,source?,v120?}</code>. At least one axis is required; an omitted axis stays absent. Positive <code>dy</code> scrolls down. <code>source</code>: <code>wheel</code> (default), <code>finger</code> or <code>continuous</code>; a zero on <code>finger</code> or <code>continuous</code> is an axis stop. <code>v120:{dx?,dy?}</code> sets wheel detents; without it, a wheel derives 120 per 15 units.</td></tr>
-<tr><td><code>comp.input.key</code></td><td><code>{key,action?,modifiers?,window?,raise?}</code>. <code>key</code>: an XKB keysym name (<code>Return</code>, <code>a</code>, <code>F5</code>, <code>Super_L</code>) or an evdev code. <code>action</code>: <code>press</code>, <code>release</code> or <code>tap</code> (default). <code>modifiers</code>: any of <code>shift</code>, <code>ctrl</code>, <code>alt</code>, <code>super</code>, <code>altgr</code>, held around the key. A keysym that needs Shift gets Shift added. <strong>Or</strong> <code>{text,window?,raise?}</code>, at most 256 characters.</td></tr>
-<tr><td><code>comp.input.release_all</code></td><td><code>{}</code></td></tr>
-<tr><td><code>comp.input.sequence</code></td><td><code>{steps:[{verb,args?,delay_ms?}],interval_ms?}</code></td></tr>
+<p><strong>0.71.0 (unreleased):</strong> <code>cosmix-agent</code> now has a delivery path, with its own
+keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
+hidden from Xwayland. Every <code>comp.input.*</code> verb accepts <code>seat:"human"</code> or
+<code>seat:"agent"</code>; there are no caller authorisation gates on either choice.</p>
+<p>The default is still <strong>human</strong> (<code>cosmix</code>). It changes to agent only in the
+release that also migrates the hub's human-input gates. The deliberate exception
+is <code>release_all</code>: without a seat it releases <strong>agent</strong> holds only. A sequence's
+explicit <code>seat</code> is inherited by its steps; <code>args.seat</code> overrides it for a step.
+Without a sequence-level seat, each verb uses its own default.</p>
+<table><thead><tr><th>Behaviour</th><th><code>seat:"human"</code></th><th><code>seat:"agent"</code></th></tr></thead><tbody>
+<tr><td>Keyboard</td><td>Human keymap/modifiers and compositor bindings</td><td>Independent keymap/modifiers; every key forwards, no compositor chords</td></tr>
+<tr><td>Targeted focus</td><td>Existing window focus arbitration</td><td>Agent keyboard only; no <code>Activated</code>, restack, restore or workspace switch</td></tr>
+<tr><td>Omitted <code>raise</code></td><td><code>true</code> for a targeted key/button</td><td><code>false</code>; explicit <code>true</code> returns <code>invalid_argument</code></td></tr>
+<tr><td>Idle</td><td>Human activity resumes idle notifications on both seats</td><td>Neither seat's idle notification is reset; no user-activity observation</td></tr>
+<tr><td>Session lock</td><td>Untargeted input retains the lock-screen path</td><td>All verbs refuse with <code>session_lock</code></td></tr>
+<tr><td>Pointer</td><td>Device path, including chrome, corners and constraints</td><td>Client surfaces only; independent position; human cursor image/position unchanged</td></tr>
+<tr><td>Clipboard</td><td>Existing human clipboard/XWM bridge</td><td>Still per-seat; the cross-seat relay is not implemented yet</td></tr>
 </tbody></table>
-<p>Each single verb replies:</p>
-<pre><code class="language-text">{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null, targeted:{id,generation}|null, completed_events}
+<p>Successful agent delivery updates <code>input.seats.agent.last_input_us</code> and
+<code>input.last_origin:"agent"</code>. Human delivery updates the human leaves and reports
+<code>last_origin:"human"</code>. The existing focus/pointer leaves retain their human
+meaning. Human Bus injection still follows <code>inject → handle_host_input → notify_idle_activity(Human)</code>; agent delivery uses the agent Smithay handles.</p>
+<table><thead><tr><th>Verb</th><th>Arguments, in addition to <code>seat?</code></th></tr></thead><tbody>
+<tr><td><code>comp.input.pointer.move</code></td><td><code>{x,y,output?}</code> for output-local absolute coordinates; <code>{dx,dy}</code> for displacement; or <code>{window:{id,generation},x,y,require_hit?}</code>. <code>output</code> is an output key or name, defaulting to the default output. <code>corners?</code> defaults to <code>true</code> on the human path and has no effect on the agent path.</td></tr>
+<tr><td><code>comp.input.pointer.button</code></td><td><code>{button?,action?,window?,raise?}</code>. <code>button</code>: <code>left</code> (default), <code>right</code>, <code>middle</code>, or evdev <code>0x100..=0x2ff</code>. <code>action</code>: <code>press</code>, <code>release</code> or <code>click</code> (default).</td></tr>
+<tr><td><code>comp.input.pointer.scroll</code></td><td><code>{dx?,dy?,source?,v120?}</code>. At least one axis; positive <code>dy</code> scrolls down. <code>source</code>: <code>wheel</code> (default), <code>finger</code> or <code>continuous</code>; zero on finger/continuous is an axis stop. <code>v120:{dx?,dy?}</code> supplies wheel detents; otherwise a wheel derives 120 per 15 units.</td></tr>
+<tr><td><code>comp.input.key</code></td><td><code>{key,action?,modifiers?,window?,raise?}</code> or <code>{text,window?,raise?}</code>. <code>key</code> is an XKB keysym name or evdev code; <code>action</code> is <code>press</code>, <code>release</code> or <code>tap</code> (default). <code>modifiers</code> accepts <code>shift</code>, <code>ctrl</code>, <code>alt</code>, <code>super</code>, <code>altgr</code>. <code>text</code> is at most 256 characters.</td></tr>
+<tr><td><code>comp.input.release_all</code></td><td><code>{seat?}</code>; omitted seat means agent.</td></tr>
+<tr><td><code>comp.input.sequence</code></td><td><code>{seat?,steps:[{verb,args?,delay_ms?}],interval_ms?}</code>.</td></tr>
+</tbody></table>
+<p>Targeted keys, text and buttons require both identity fields in
+<code>window:{id,generation}</code>. Resolve, focus and injection run without yielding to
+the event loop. Before each generated press, the compositor rechecks the
+identity against the <strong>driven seat's</strong> delivery target. A change returns
+<code>target_changed</code> and releases this operation's new holds; already delivered
+events are not rolled back. <code>raise</code> requires a window.</p>
+<p>Agent targeting accepts mapped windows on other workspaces, minimised windows
+and windows hidden from the human view, including while an exclusive layer has
+human focus. It retains mapping, presentation and session-lock checks. An
+interfering agent grab returns <code>keyboard_grab</code> or <code>pointer_grab</code>; a matching
+popup chain is allowed. Untargeted keys use the agent keyboard's existing focus
+or return <code>no_keyboard_target</code>. Agent shortcuts reach the client: use compositor
+verbs for window management, or explicitly choose the human seat to test a
+compositor binding.</p>
+<p>Agent reachability checks run <strong>before either device's focus changes</strong>:</p>
+<ul>
+<li><code>x11_unsupported</code>: X11 targets, including coordinate-selected descendants.</li>
+<li><code>agent_seat_unbound</code>: the target client is <strong>currently unbound</strong> on the
+agent keyboard or pointer needed by the operation. There is no silent fallback.</li>
+<li><code>chrome_target</code>: compositor chrome, decoration or a requested root-local
+point that does not hit that window's client tree.</li>
+</ul>
+<p>These errors include <code>hint:{seat:"human"}</code>. Clients that bind only one seat
+need that explicit opt-in. Toolkit compatibility still needs the release's
+toolkit matrix; successful protocol tests do not establish toolkit support.</p>
+<p>For agent <code>{window,x,y}</code>, coordinates are relative to the root <strong>wl_surface
+origin</strong>, including the offset of its committed window geometry. Hit-testing
+considers only that root's mapped client tree, including subsurfaces and popups,
+in committed stacking order and with committed input regions. Every ancestor
+must remain mapped. Workspace, minimisation, visibility and other windows'
+occlusion do not exclude it; <code>require_hit</code> adds no human-visibility restriction.
+Outside that tree, the move refuses without changing focus.</p>
+<p>For agent <code>{x,y,output}</code>, hit-testing considers visible mapped client surfaces;
+chrome refuses. Empty space clears agent pointer focus and permits a subsequent
+click to dismiss an agent popup. <code>{dx,dy}</code> offsets the known agent position;
+it sends ordinary pointer motion, never relative-pointer protocol events. A
+targeted agent button uses the current agent position when it belongs to that
+window, otherwise the centre of the root buffer, and validates the client hit
+before focusing. Untargeted buttons/scroll need an agent pointer target (or a
+popup grab handling an outside click), otherwise <code>no_pointer_target</code> is returned.</p>
+<p>Agent input does not drive hot corners, pointer constraints, interactive
+move/resize, compositor decorations or drag and drop. A client <code>StartDrag</code> on
+the agent seat is refused before Smithay assigns an icon role or installs a
+grab; its supplied data source is cancelled. Popup grabs use the agent seat's
+own input serials and survive changes to human focus.</p>
+<p>Human window-relative moves retain the window-geometry-origin contract.
+<code>require_hit:true</code> additionally requires an on-output hit of that window/frame;
+failure is <code>off_output</code> or <code>occluded</code> (with <code>under</code>). Human targeted keys/buttons
+retain <code>target_unfocusable</code> with <code>reason</code>, <code>id</code> and <code>generation</code> for unmapped,
+minimised, off-workspace, invisible or non-presentable windows, session lock,
+exclusive layers, region selection or interfering grabs. They never restore a
+window or switch workspace. Targeted releases reconcile holds without refocusing.
+Human targeted buttons use the existing pointer route at the human cursor and
+then reconcile pointer focus. Untargeted human input retains bindings, modal
+owners and lock-screen delivery. Human pointer moves arm corners unless
+<code>corners:false</code>; that option still permits leaving an engaged corner.</p>
+<p>For human Xwayland targets, Smithay sends <code>SetInputFocus</code> / <code>WM_TAKE_FOCUS</code>
+without waiting for X focus confirmation. A successful injection reply does
+not guarantee X focus has completed before the first key; use client-side
+acknowledgement when that ordering matters.</p>
+<p>Each successful single verb replies:</p>
+<pre><code class="language-text">{seat, input_seq, injected_at_us, pointer:{output,x,y}|null,
+ target:{id,generation}|null, targeted:{id,generation}|null, completed_events}
 </code></pre>
-<ul>
-<li><code>input_seq</code> increases by one per verb.</li>
-<li><code>injected_at_us</code> is CLOCK_MONOTONIC microseconds.</li>
-<li><code>pointer</code> is the cursor after the verb, in output-local coordinates.</li>
-<li><code>targeted</code> is the requested window, or null for untargeted input.</li>
-<li><code>target</code> records client delivery of the payload for keys and targeted buttons,
-not the keyboard focus after a binding runs. It is null when a binding consumes
-the payload. Untargeted pointer verbs retain their pointer-focus fallback.
-A delivery target can be a layer or lock surface, not only a window.</li>
-<li><code>completed_events</code> counts generated key events processed before completion or refusal.</li>
-</ul>
-<p><code>text</code> maps each character through the live seat keymap, honouring Caps Lock
-and the active layout. Only characters on the first two shift levels map; each
-is typed as press and release, with Shift where needed. A newline types
-Return. Characters that need AltGr (the third and fourth levels), a dead
-key or a compose sequence are refused as unmappable. If any character cannot
-be typed, nothing is sent and the reply is
-<code>{"error":"unmappable","char","index"}</code>. While an input method holds the
-keyboard, <code>text</code> is refused with <code>{"error":"ime_active"}</code>, because the IME
-would turn the keys into something other than the text sent. Some input
-methods hold that grab whenever a text field has focus; with one of those,
-every <code>text</code> call is refused, so type with <code>comp.input.key</code> instead. An unknown key
-name replies <code>{"error":"unknown_key","key"}</code>.</p>
-<p>An absolute or window-relative move is real pointer motion, so moving into an
-output corner arms the hot corner exactly as a mouse would; pass
-<code>corners:false</code> to move without arming one. Such a move still leaves an
-engaged corner and cancels a pending dwell.</p>
-<p>One verb injects at most 4096 seat events (a whole sequence included; a text
-character counts four, a key with modifiers two per key). A larger request is
-refused before anything is sent with <code>invalid_value</code> naming the limit.</p>
-<p>Every refusal is decided before anything is sent:</p>
-<ul>
-<li><code>stale_target</code>, or another window-target error, for the <code>window</code> form;</li>
-<li><code>occluded</code> when <code>require_hit</code> is true and the point is not on that window or
-its frame. <code>under</code> names the window actually at that point, or is null;</li>
-<li><code>off_output</code> when <code>require_hit</code> is true and no output shows the point;</li>
-<li><code>unknown_output</code>;</li>
-<li><code>out_of_bounds</code>, with the output size, for a point outside the output.</li>
-</ul>
-<p>Untargeted input is not refused while the session is locked; the seat decides
-where it goes. Targeted input refuses the locked window as described above.</p>
-<p><code>release_all</code> releases the keys and buttons that injection pressed and has not
-released. It never releases anything a physical device holds. Taps and clicks
-never leave a key or button down; only <code>action: press</code> holds one.</p>
-<p><code>comp.input.sequence</code> runs up to 256 steps in order:</p>
-<ul>
-<li>Each step is one of the single input verbs above, with its usual arguments.</li>
-<li><code>delay_ms</code> is a wait before that step, on a compositor timer. It defaults to
-<code>interval_ms</code>, which defaults to 0. The delays together may total at most 60
-seconds.</li>
-<li>A drag is a <code>press</code>, some moves, and a <code>release</code>.</li>
-<li>The reply is <code>{steps:[&lt;each step's reply&gt;],elapsed_ms}</code>.</li>
-<li>A run yields to the event loop after every 256 injected events, so a long
-zero-delay stretch cannot fill a client's socket in one pass. A run is
-therefore not atomic even without delays: other runs and single verbs can
-interleave at those yields (and at every delay).</li>
-<li>If a step is refused, the run stops and gives up the keys and buttons it
-pressed. A hold is released only when no other owner (another run, or a
-single verb that pressed the same key) still holds it; an explicit release
-by anyone lets the key go for every owner.
-The reply is rc 10
-<code>{"error":"step_failed",index,verb,step:&lt;the refusal&gt;,completed:[...],released:true}</code>.</li>
-<li>If the caller stops waiting, the run also stops and releases its own holds.</li>
-</ul>
-<p>Sequences use their own pool of eight permits. Each waits for its own delays
-plus one second, not the two-second budget of other verbs. When all eight
-permits are in use, a new sequence gets <code>busy</code>.</p>
-<p><code>input.host.passthrough</code> exists only on the nested backend; on KMS the path is
-<code>unknown_path</code>. Setting it to <code>false</code> stops the host window's pointer motion,
-buttons, scroll and keys reaching the seat, so the host cursor cannot
-overwrite an injected position. Output resize and scale, pointer leave and
-touch still pass. A host key or button pressed before the switch still gets
-its release. A host focus loss releases only those host keys, never an
-injected hold, and still resets compositor chrome state (a title-bar drag,
-hover, cursor override). The value persists until it is set back to <code>true</code>
-or the compositor exits; a script that turns it off should turn it on again.</p>
-<p>The frame trace records each injected verb as <code>comp_input_injected</code>:</p>
-<ul>
-<li>subject: <code>input_seq</code>;</li>
-<li>detail: the verb kind (1 move, 2 button, 3 scroll, 4 key, 5 text,
-6 release_all);</li>
-<li>aux: the target id, or 0.</li>
-</ul>
+<p><code>input_seq</code> increases per verb. <code>pointer</code> is the driven seat's output-local
+position; <code>targeted</code> identifies an explicit targeted key/button. <code>target</code> is
+payload delivery, not a later focus state; consumed human bindings report null.
+<code>completed_events</code> counts generated key events processed before completion or
+refusal. Runtime refusals also identify the seat. Unknown/stale window identities
+retain the existing target errors; moves retain <code>unknown_output</code> and
+<code>out_of_bounds</code>. Later target changes can refuse after partial key delivery.</p>
+<p>Timestamps use CLOCK_MONOTONIC: microseconds in replies, wrapping 32-bit
+milliseconds on input events, matching the clock advertised by <code>wp_presentation</code>.
+Text resolves against the driven keyboard's live keymap, locked modifiers and
+layout. It uses the first two shift levels, adding Shift where required; newline
+types Return. AltGr-only, dead-key and compose characters are <code>unmappable</code>
+(<code>char</code> and <code>index</code>) before anything is typed. Unknown key names return
+<code>unknown_key</code>; human text under an input-method grab retains <code>ime_active</code>.</p>
+<p>Holds belong to a seat and an operation owner. <code>release_all</code> releases only the
+chosen seat's injected holds, never a physical-device hold. An explicit release
+clears injected ownership of that key/button on that seat. Taps and clicks
+release their generated presses; <code>action:"press"</code> can retain a hold.</p>
+<p>A sequence has at most 256 steps and 4096 generated events in total. Delays
+run on compositor timers, before the step, defaulting to <code>interval_ms</code> (default
+0), and total at most 60 seconds. It yields after 256 injected events; runs can
+interleave at delays and yields. The reply is
+<code>{seat,steps:[&lt;each step's reply, including its seat&gt;],elapsed_ms}</code>.
+On a failed step, it returns <code>step_failed</code> with <code>index</code>, <code>verb</code>, <code>step</code>,
+<code>completed</code> and <code>released:true</code>, and gives up its holds on <strong>both</strong> seats.
+Other owners' holds remain. Caller cancellation also releases the run's holds.
+Eight sequence permits are available; admission beyond that returns <code>busy</code>.</p>
+<p>Lock entry, VT switching, session pause and input-authority loss clear agent
+holds, grabs and focus and cancel sequences using the agent seat with
+<code>input_cleared</code>. Unmapping or destroying an agent-focused tree also clears its
+input without human focus arbitration. Unlock reconciliation samples human
+pressed state only. Agent cleanup does not reset idle notifications.</p>
+<p><code>input.host.passthrough</code> remains nested-only (<code>unknown_path</code> on KMS) and controls
+the <strong>human</strong> host path. Setting it false suppresses host keys, motion, buttons
+and scroll; resize, scale, pointer leave and touch still pass. Pre-existing host
+holds still receive releases. Restore it to true when finished; the value lasts
+until changed or comp exits.</p>
+<p>The frame trace retains <code>comp_input_injected</code>: subject <code>input_seq</code>, detail
+1 move / 2 button / 3 scroll / 4 key / 5 text / 6 release_all, aux target id or 0.
+Presentation input marks also retain the originating seat.</p>
 <p>The compositor publishes non-retained messages under the registered service
 namespace. The seat instance therefore uses <code>comp.*</code>, the default nested
 instance uses <code>comp-nested.*</code>, and <code>--bus-service NAME</code> moves the complete
