@@ -19,16 +19,23 @@ use sha2::{Digest, Sha256};
 use super::Tab;
 use crate::verbs::{self, DiagSeverity};
 
-/// One stored set: the file digest it describes (if the sender gave one).
+/// Sets kept per path. A caller looping over fresh source names evicts its
+/// own oldest set, never grows the store without bound (review m8).
+const SOURCES_PER_PATH: usize = 8;
+
+/// One stored set: the file digest it describes (if the sender gave one),
+/// and when it was stored (for per-path eviction).
 pub(super) struct StoredSet {
     digest: Option<String>,
     items: Vec<DiagItem>,
+    seq: u64,
 }
 
 /// Sets per path, least recently stored first.
 #[derive(Default)]
 pub(super) struct Store {
     paths: Vec<(String, BTreeMap<String, StoredSet>)>,
+    seq: u64,
 }
 
 impl Store {
@@ -40,7 +47,15 @@ impl Store {
             sets.remove(&req.source);
         } else {
             let items = req.diagnostics.iter().map(item).collect();
-            sets.insert(req.source.clone(), StoredSet { digest: req.digest.clone(), items });
+            self.seq += 1;
+            sets.insert(req.source.clone(), StoredSet { digest: req.digest.clone(), items, seq: self.seq });
+            while sets.len() > SOURCES_PER_PATH {
+                let oldest = sets.iter().min_by_key(|(_, s)| s.seq).map(|(k, _)| k.clone());
+                match oldest {
+                    Some(k) => sets.remove(&k),
+                    None => break,
+                };
+            }
         }
         if !sets.is_empty() {
             self.paths.push((req.path.clone(), sets));
@@ -142,7 +157,12 @@ pub(super) struct Applied {
 /// Apply the stored sets for the tab's path — every source, or only `only`
 /// (which is cleared when nothing is stored for it) — to a live tab. A
 /// non-live tab is left alone; it is applied when it goes live.
-pub(super) fn apply(store: &Store, t: &mut Tab, only: Option<&str>) -> Applied {
+///
+/// `undigested`: whether sets sent without a digest are applied. Nothing can
+/// tell such a set is still about this text, so the tab going clean (the one
+/// trigger that is only about the text) must not bring back rows an edit
+/// dropped (review m9); the verb, a tab opening and a Resync apply them.
+pub(super) fn apply(store: &Store, t: &mut Tab, only: Option<&str>, undigested: bool) -> Applied {
     let mut out = Applied::default();
     let Some(m) = t.mirror.as_ref().filter(|m| matches!(m.phase(), Phase::Live)) else { return out };
     let Some(path) = tab_path(t).map(str::to_owned) else { return out };
@@ -165,6 +185,9 @@ pub(super) fn apply(store: &Store, t: &mut Tab, only: Option<&str>) -> Applied {
     let mut digest = None;
     for source in sources {
         let set = sets.and_then(|s| s.get(&source));
+        if set.is_some_and(|set| set.digest.is_none()) && !undigested {
+            continue;
+        }
         let items: &[DiagItem] = match set {
             Some(set) => {
                 let fresh = match &set.digest {
@@ -208,6 +231,23 @@ mod tests {
         assert_eq!(s.sets("/p/2").unwrap().keys().collect::<Vec<_>>(), ["scenes"]);
         s.put(&req("/p/2", "scenes", 0));
         assert!(s.sets("/p/2").is_none(), "a path with no set left is dropped");
+    }
+
+    #[test]
+    fn a_path_keeps_at_most_its_newest_sources() {
+        let mut s = Store::default();
+        s.put(&req("/p", "scenes", 1));
+        for i in 0..SOURCES_PER_PATH + 3 {
+            s.put(&req("/p", &format!("flood-{i}"), 1));
+        }
+        let sets = s.sets("/p").unwrap();
+        assert_eq!(sets.len(), SOURCES_PER_PATH);
+        assert!(!sets.contains_key("scenes") && !sets.contains_key("flood-0"), "the oldest sets went first");
+        assert!(sets.contains_key(&format!("flood-{}", SOURCES_PER_PATH + 2)));
+        // Re-storing a source makes it the newest again.
+        s.put(&req("/p", "flood-3", 2));
+        s.put(&req("/p", "late", 1));
+        assert!(s.sets("/p").unwrap().contains_key("flood-3"));
     }
 
     #[test]

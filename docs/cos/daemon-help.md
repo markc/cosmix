@@ -181,7 +181,9 @@ chord. The verb fires once per press and never on auto-repeat. The scenes
 loader answers it by opening the shipped Scene Editor in safe mode, or hiding
 it when it is already visible, so the chord toggles.
 
-The rows only reach a keymap file when the defaults are seeded. A host that
+The rows only reach a keymap file when the defaults are seeded, so upgrading
+inputd does not add them: the existing keymap is served unchanged, and a
+deploy that ships 0.4.5 to an existing host must bind them itself. A host that
 already has a keymap file gets them through `input.bind`, one row per stroke.
 Check `input.query` first, because `input.bind` replaces whatever row holds
 the stroke:

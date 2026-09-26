@@ -198,6 +198,10 @@ fn problem_rows($diag, $files, $digests)
   $ctx = $diag.context ?? {}
   if type($ctx) != "map" then $ctx = {} end
   $file = $diag.file ?? $ctx.file ?? ($files ?? {}).scene
+  -- A load refusal describes the bytes it attempted, not whatever the file
+  -- holds now (review m5): ced must see such rows as stale after an edit.
+  $digest = digest_for($file, $files, $digests)
+  if $file == ($files ?? {}).scene and type($diag.attempted_digest) == "string" then $digest = $diag.attempted_digest end
   $rows = []
   if type($ctx.problems) == "list" and len($ctx.problems) > 0 then
     for each $p in $ctx.problems
@@ -210,11 +214,11 @@ fn problem_rows($diag, $files, $digests)
   if type($host) == "list" and len($host) > 0 then
     for each $d in $host
       if type($d) != "map" then continue end
-      push($rows, host_row($d, $file, digest_for($file, $files, $digests), $diag))
+      push($rows, host_row($d, $file, $digest, $diag))
     end
     return $rows
   end
-  push($rows, {file:$file, digest:digest_for($file, $files, $digests), line:1, severity:"error",
+  push($rows, {file:$file, digest:$digest, line:1, severity:"error",
     code:$diag.error_code, message:$diag.message})
   return $rows
 end
@@ -791,7 +795,19 @@ fn recover_one($s, $kind, $r)
     -- Stage lost: restore the original.
     recovery_move($s, $backup, $to)
     return clear_record($s, $kind)
+  elif not $t and $st and not $b then
+    -- $to did not exist before (nothing to back up). Only a record that got
+    -- past staged had committed to the swap (review m3).
+    if $r.phase == "staged" then
+      remove_dir($stage)
+      return clear_record($s, $kind)
+    end
+    recovery_move($s, $stage, $to)
+    return finish_record($s, $kind, $r)
   elif $t and not $st then
+    -- A staged record never swapped: the stage is gone, $to is the original
+    -- (review m2). Only swapped/placed means $to is the replacement.
+    if $r.phase == "staged" then return clear_record($s, $kind) end
     return finish_record($s, $kind, $r)
   end
   fail("SCENES_RECOVERY", $kind .. " record could not be finished", {record:$kind, to:$t, stage:$st, backup:$b})
@@ -810,6 +826,7 @@ end
 
 -- Promote step 6: retire the sandbox and clear the record.
 fn promote_finish($s, $r)
+  fault($s, "promoting:finish")
   $from = $r.from
   $s.last_removed = nil
   if has_key($s.scenes, $from) then
@@ -1054,12 +1071,25 @@ fn swap_in($s, $kind, $record, $to, $stage, $backup)
   $record.stage = substr($stage, len($s.root) + 1)
   $record.backup = substr($backup, len($s.root) + 1)
   $record.phase = "staged"
+  if type($s.desired[$kind]) == "map" then
+    -- A stuck record is someone's stage and backup; overwriting it would
+    -- orphan both (review m3). reload of its scene or a restart retries it.
+    remove_dir($stage)
+    $held = $s.desired[$kind]
+    fail("SCENES_RECOVERY", "an unfinished " .. $kind .. " record must be recovered first", {record:$kind, name:record_target($kind, $held), stage:$held.stage, backup:$held.backup, error:$held.error})
+  end
   try
     $s.desired[$kind] = $record
     $s = persist($s)
     fault($s, $kind .. ":staged")
   catch $message, $error
     remove_dir($stage)
+    -- Never leave a staged record behind a refused swap (review m2).
+    $s.desired = delete($s.desired, $kind)
+    try
+      $s = persist($s)
+    catch $ignored
+    end
     raise($error.code, $message, $error.details)
   end
   $moved = false
@@ -1088,12 +1118,24 @@ fn swap_in($s, $kind, $record, $to, $stage, $backup)
   return persist($s)
 end
 
+-- A stuck promote/reset record must be recovered before another of its kind
+-- starts (review m3); checked before anything is staged or stopped.
+fn require_no_record($s, $kind)
+  $held = $s.desired[$kind]
+  if type($held) == "map" then
+    fail("SCENES_RECOVERY", "an unfinished " .. $kind .. " record must be recovered first (scenes.reload of its scene retries it)", {record:$kind, name:record_target($kind, $held), stage:$held.stage, backup:$held.backup, error:$held.error})
+  end
+end
+
 fn known($s, $name)
   if not valid_name($name) then fail("SCENES_NAME", "expected a safe scene name", {name:$name}) end
   if not has_key($s.scenes, $name) then fail("SCENES_NOT_FOUND", "scene is not installed", {name:$name}) end
 end
 
 fn drive_popups($s)
+  -- Popup records cannot move without a readable state file: leave them for
+  -- the next successful read instead of failing ready/model (review m9).
+  if $s.state_ok == false then return $s end
   try
     return drive_popups_inner($s)
   catch $message, $error
@@ -1439,6 +1481,16 @@ end
 -- capability probe is shell.dialog.hide: NOT_FOUND or success means dialogs.
 fn dialog_probe($s)
   if $s.dialog_capable == true then return $s end
+  -- shell.info lists the verbs without touching a visible dialog; hosts that
+  -- answer no verb list fall back to the hide probe.
+  try
+    $info = $s.io.rpc($s.host, "shell.info", {})
+    if type($info) == "map" and type($info.verbs) == "list" then
+      $s.dialog_capable = contains($info.verbs, "dialog.show") or contains($info.verbs, "shell.dialog.show")
+      return $s
+    end
+  catch $ignored
+  end
   try
     $s.io.rpc($s.host, "shell.dialog.hide", {scene:"editor"})
     $s.dialog_capable = true
@@ -1568,6 +1620,14 @@ fn editor_open($s, $args)
   $s = editor_pick($s, $safe)
   $pick = $s.editor_pick
   if $pick.kind != "dialog" then require_state($s) end
+  -- The recovery chord must bring back a dead editor, not show its tree with
+  -- nothing behind the clicks (review m7): an explicit open resets the crash
+  -- record so the mount below starts a behaviour at once.
+  if contains(["crash_loop", "backoff"], $s.scenes.editor.status) and $s.scenes.editor.pid == nil then
+    $s.scenes.editor.crashes = 0
+    $s.scenes.editor.restart_at = nil
+    $s.scenes.editor.status = "disabled"
+  end
   $s = editor_mount($s, $pick, $s.editor_fallback)
   $s.editor_pick = nil
   $s.editor_fallback = nil
@@ -1577,23 +1637,33 @@ fn editor_open($s, $args)
   $s.scenes.editor.scene = $args.scene
   $s.scenes.editor.first_run = $args.first_run == true
   $s.scenes.editor.hide_requested = false
-  if $s.scenes.editor.kind == "dialog" then
-    $r = $s.io.rpc($s.host, "shell.dialog.show", {scene:"editor"})
-    if type($r) != "map" then fail("SCENES_SNAPSHOT", "missing dialog show receipt", {}) end
-    -- Visibility settles from shell.panel.changed, never from this reply.
-    $s.scenes.editor.pending = not ($s.scenes.editor.visible == true)
-  else
-    -- D3 fallback: the popup path selects and pins the page.
-    $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
-    if type(($snapshot ?? {}).panels) != "map" then fail("SCENES_SNAPSHOT", "missing panel snapshot", {}) end
-    $s.panels = $snapshot.panels
-    for each $edge in keys($s.desired.recovery)
-      if $s.desired.recovery[$edge].phase == "failed" then $s.desired.recovery[$edge].phase = "recover" end
+  -- Mounted from here (a behaviour may be running): a refused show is a
+  -- reply, never a raise that would drop those records (review m1).
+  try
+    if $s.scenes.editor.kind == "dialog" then
+      $r = $s.io.rpc($s.host, "shell.dialog.show", {scene:"editor"})
+      if type($r) != "map" then fail("SCENES_SNAPSHOT", "missing dialog show receipt", {}) end
+      -- Visibility settles from shell.panel.changed, never from this reply.
+      $s.scenes.editor.pending = not ($s.scenes.editor.visible == true)
+    else
+      -- D3 fallback: the popup path selects and pins the page.
+      $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
+      if type(($snapshot ?? {}).panels) != "map" then fail("SCENES_SNAPSHOT", "missing panel snapshot", {}) end
+      $s.panels = $snapshot.panels
+      for each $edge in keys($s.desired.recovery)
+        if $s.desired.recovery[$edge].phase == "failed" then $s.desired.recovery[$edge].phase = "recover" end
+      end
+      $s.open = "editor"
+      $s.scenes.editor.pending = true
+      $s = drive_popups($s)
+      if $s.rc != 0 then return $s end
     end
-    $s.open = "editor"
-    $s.scenes.editor.pending = true
-    $s = drive_popups($s)
-    if $s.rc != 0 then return $s end
+  catch $message, $error
+    $s.scenes.editor.pending = false
+    $s.scenes.editor.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    $s.rc = 10
+    $s.response = {error_code:$error.code, message:$message, context:{phase:"show", name:"editor", mounted:$s.scenes.editor.mounted, upstream:$error.details}}
+    return $s
   end
   $e = $s.scenes.editor
   $s.response = {name:"editor", source:$e.copy, safe:$e.safe, visible:editor_visible($s), pending:$e.pending,
@@ -1651,6 +1721,10 @@ end
 fn editor_reset($s)
   $user = $s.root .. "/editor"
   if exists($user, {follow_symlinks:false}) and not stat($user, {follow_symlinks:false}).is_dir then fail("SCENES_FILES", "installation must be a real directory", {file:$user}) end
+  -- Reset (re)creates the user copy from the template (plan rule 1); there
+  -- is a recovery copy only when one existed (review n2).
+  $had = exists($user, {follow_symlinks:false})
+  require_no_record($s, "resetting")
   $tmp = stage($s, "editor", "editor")
   $backup = recovery_directory($s) .. "/editor-" .. uuid()
   $s = swap_in($s, "resetting", {name:"editor"}, $user, $tmp, $backup)
@@ -1659,13 +1733,22 @@ fn editor_reset($s)
   $s = persist($s)
   $e = $s.scenes.editor
   if $e.copy == "user" and $e.summoned then
+    $model = $s.scenes.editor.model
     $s.scenes.editor.model = nil
     $s = reconcile_one($s, "editor", true)
     $s.scenes.editor.user_dirty = false
+    if failure($s.scenes.editor) != nil then
+      $s.scenes.editor.model = $model
+      $s.rc = 10
+      $s.response = failure($s.scenes.editor)
+      if $had then $s.response.recovery = $backup end
+      return $s
+    end
   else
     $s.scenes.editor.user_dirty = true
   end
-  $s.response = {name:"editor", recovery:$backup}
+  $s.response = {name:"editor"}
+  if $had then $s.response.recovery = $backup end
   return $s
 end
 
@@ -1682,7 +1765,7 @@ fn fork($s, $args)
   if $as == nil then
     $tried = [$name .. "-sandbox", $name .. "-sb"]
     for each $t in $tried
-      if valid_name($t) and (not $behaviour or bus_name_ok($t)) then
+      if valid_name($t) and (not $behaviour or bus_name_ok($t)) and not exists($s.root .. "/" .. $t, {follow_symlinks:false}) then
         $as = $t
         break
       end
@@ -1726,6 +1809,12 @@ fn promote($s, $args)
   $f = ($s.desired.forks ?? {})[$from]
   if type($f) != "map" then fail("SCENES_NOT_FORK", "only a fork can be promoted", {name:$from}) end
   $to = $f.from
+  -- The original was removed: promoting would recreate it disabled and
+  -- without an origin while retiring the enabled sandbox (review m4).
+  if not has_key($s.scenes, $to) or not exists($s.root .. "/" .. $to, {follow_symlinks:false}) then
+    fail("SCENES_NOT_FOUND", "the scene this sandbox was forked from is no longer installed", {name:$from, forked_from:$to})
+  end
+  require_no_record($s, "promoting")
   $src = $s.root .. "/" .. $from
   try
     $tmp = stage_from($s, $src, $to, $f.panel ?? "")
@@ -1741,9 +1830,17 @@ fn promote($s, $args)
   end
   $backup = recovery_directory($s) .. "/" .. $to .. "-" .. uuid()
   $s = swap_in($s, "promoting", {from:$from, to:$to}, $s.root .. "/" .. $to, $tmp, $backup)
-  -- Complete on disk from here: a failure is a diagnostic, never an undo.
+  -- Complete on disk from here: a failure is a diagnostic, never an undo,
+  -- and never a raise that would drop the process records reconcile just
+  -- changed (review m1). The placed record is finished by the next rescan.
   $s = reconcile_safe($s, $to, true)
-  $s = promote_finish($s, {from:$from, to:$to})
+  try
+    $s = promote_finish($s, {from:$from, to:$to})
+  catch $message, $error
+    $s.rc = 10
+    $s.response = {error_code:$error.code, message:$message, context:{phase:"finish", name:$to, removed:$from, recovery:[$backup], upstream:$error.details}}
+    return $s
+  end
   $recovery = [$backup]
   if $s.last_removed != nil then push($recovery, $s.last_removed) end
   $s.response = {name:$to, recovery:$recovery, removed:$from}
@@ -1784,6 +1881,15 @@ fn move($s, $args)
   if failure($s.scenes[$name]) != nil then
     $s.rc = 10
     $s.response = failure($s.scenes[$name])
+    -- The new address was refused and the mount rolled back: restore the
+    -- header, or every rescan would retry and flicker the panel (review m6).
+    -- With the rollback mounted, reconciling the restored bytes clears the
+    -- refusal; after a double failure the refusal stands (red) and reload,
+    -- a file event or host return remounts the old address (rule 6.5).
+    if $s.scenes[$name].load_diagnostic != nil and $text != $source then
+      write_atomic($path, $source)
+      if $s.scenes[$name].mounted then $s = reconcile_one($s, $name, false) end
+    end
   else
     $s.response = {name:$name, edge:$args.edge, revision:$s.scenes[$name].revision}
   end
@@ -1798,6 +1904,7 @@ fn reset_scene($s, $name, $e)
   end
   $origin = $s.desired.origins[$name]
   if $origin == nil then fail("SCENES_NO_ORIGIN", "reset requires a recorded shipped template origin", {name:$name}) end
+  require_no_record($s, "resetting")
   $tmp = stage($s, $origin, $name)
   $backup = $recovery .. "/" .. $name .. "-" .. uuid()
   if $s.open == $name then $s.open = nil end
@@ -1838,7 +1945,7 @@ fn request($s, $verb, $args)
     if $verb == "fork" then return fork($s, $args) end
     if $verb == "promote" then return promote($s, $args) end
     if $verb == "move" then return move($s, $args) end
-    if contains(["install", "remove", "enable", "disable", "reset", "open", "toggle"], $verb) then require_state($s) end
+    if contains(["install", "remove", "enable", "disable", "reset", "open", "close", "toggle"], $verb) then require_state($s) end
     if $verb == "install" then
       $name = $args.name ?? authored_name($s, $args.template)
       if not valid_name($name) then fail("SCENES_NAME", "invalid installation name", {}) end

@@ -722,6 +722,9 @@ mounted source; a broken reload keeps the last good tree.</p>
 <li>A host diagnostic (<code>context.upstream.diagnostics</code>) keeps its line.</li>
 <li>A behaviour check carries <code>mix lint --json</code> lines and columns.</li>
 </ul>
+<p>A row's <code>digest</code> is the sha256 of the bytes its diagnostic describes. For a
+refused load that is the attempted bytes, not whatever the file holds now, so
+ced shows the row as stale once the file has moved on.</p>
 <p>A refusal of the file itself (candidate, behaviour check, load or remount)
 stands until a later reconcile of that scene succeeds: a good save, a
 <code>scenes.reload</code>, or a host-return remount. A model publish, a behaviour's
@@ -742,14 +745,21 @@ origin, so <code>reset</code> works on it, and it is enabled unless <code>enable
 page. It validates that staged copy, then swaps it in through persisted phase
 records: <code>promoting {from,to,stage,backup,phase:"staged"|"swapped"|"placed"}</code>.
 The old original goes to <code>.recovery/&lt;to&gt;-&lt;uuid&gt;</code>, and the fork is removed to
-<code>.recovery/</code> too. <code>reset</code> uses the same records under <code>resetting</code>.</p>
+<code>.recovery/</code> too. <code>reset</code> uses the same records under <code>resetting</code>. A fork
+whose original has been removed cannot be promoted (<code>SCENES_NOT_FOUND</code>); a
+promote or reset while an unfinished record of its kind is on disk is refused
+<code>SCENES_RECOVERY</code>, naming that record, and nothing is staged or stopped. Once
+the swap is on disk, a failure to retire the fork is a reply (rc 10,
+<code>context.phase:"finish"</code>), not an undo: the <code>placed</code> record is finished by
+the next <code>scenes.reload</code> of either scene or the next loader start.</p>
 <p>Crash recovery at start is decided by what is on disk, <code>(to, stage, backup)</code>,
 not by the phase alone:</p>
 <table><thead><tr><th>On disk</th><th>Action</th></tr></thead><tbody>
 <tr><td><code>to</code> and <code>stage</code> present, no <code>backup</code></td><td>not swapped yet: delete the stage</td></tr>
 <tr><td>no <code>to</code>, <code>stage</code> and <code>backup</code> present</td><td>crashed between renames: place the stage, then finish</td></tr>
 <tr><td>only <code>backup</code> present</td><td>stage lost: restore the backup</td></tr>
-<tr><td><code>to</code> present, no <code>stage</code></td><td>placed: finish</td></tr>
+<tr><td>only <code>stage</code> present (there was no <code>to</code> to back up)</td><td>phase <code>staged</code>: delete the stage; later phases: place it, then finish</td></tr>
+<tr><td><code>to</code> present, no <code>stage</code></td><td>phase <code>staged</code>: never swapped, clear the record; later phases: placed, finish</td></tr>
 <tr><td>anything else</td><td>leave it; <code>SCENES_RECOVERY</code> diagnostic with the triple</td></tr>
 </tbody></table>
 <p>Each record recovers in its own error boundary, so one bad record never stops
@@ -763,7 +773,8 @@ candidate first, then unloads, then loads. If the new load is refused, it
 re-loads the last accepted source at the old address. If that rollback fails
 too, the scene is <code>mounted:false</code> with <code>SCENES_REMOUNT_FAILED</code>
 (<code>context:{new,rollback}</code>), retried by <code>scenes.reload</code>, the next file event or
-the next host return. The loader never writes Quoin's <code>conf.mix</code>; the editor
+the next host return. Either way a refused <code>scenes.move</code> puts the original
+header back on disk, so later rescans do not retry the move. The loader never writes Quoin's <code>conf.mix</code>; the editor
 follows a move with one <code>shell.panel.order</code> naming both edges. A dialog
 scene, or one without a <code>window</code> header, is refused <code>SCENES_MOUNT</code>.</p>
 <h3 id="unreadable-state">Unreadable state</h3>

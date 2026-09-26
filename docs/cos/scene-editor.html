@@ -465,6 +465,14 @@ is left out on purpose, because it is level-3 shift on some layouts. The
 chord needs inputd's keyboard grab, so it does not work on hosts without one
 (desk containers, a nested harness); the corner menu and the launcher still
 do.</p>
+<p><strong>An upgraded host does not get the chord by itself.</strong> inputd seeds its
+default rows only into a missing or unusable keymap file; an existing keymap
+is the user's and is served as it is. After upgrading to inputd 0.4.5, bind
+both strokes with <code>input.bind</code> (the row is in
+<a href="/cos/daemon-help">daemon-help</a>), after checking <code>input.query</code> that neither
+stroke is already bound to something else, because <code>input.bind</code> replaces a
+row silently. Until then the corner menu's <strong>Edit panels…</strong> is the recovery
+path.</p>
 <p><code>view</code> is <code>gallery</code>, <code>installed</code> or <code>arrange</code>, and <code>scene</code> preselects an
 installed scene. An open increments the editor's <code>request_seq</code>, and the
 behaviour applies <code>view</code>/<code>scene</code> from the loader's <code>editor</code> record. So
@@ -472,12 +480,16 @@ behaviour applies <code>view</code>/<code>scene</code> from the loader's <code>e
 the UI.</p>
 <p><code>scenes.editor.close {unload?}</code> hides it. With <code>unload:true</code> the loader also
 stops its behaviour and unmounts it. Otherwise it stays mounted, hidden and
-idle, for the loader's lifetime.</p>
+idle, for the loader's lifetime: while hidden it ignores inventory changes that
+only bump revision or generation counters (every model publish of every
+scene does), and rebuilds only for something it would show.</p>
 <h2 id="safe-mode-and-the-user-copy">Safe mode and the user copy</h2>
 <p><strong>Safe mode is the shipped copy</strong>, read in place from <code>$SCENES_TEMPLATES/editor</code>
 (root-owned on a system install), and never copied. The chord and the corner
 item always open it, like a BIOS setup key: the recovery path never reads a
-user file. A <code>safe mode</code> badge shows in the tab row. Lint <em>warnings</em> in the
+user file. An explicit open also revives an editor whose behaviour has
+crash-looped or is backing off, instead of showing a tree with nothing behind
+it. A <code>safe mode</code> badge shows in the tab row. Lint <em>warnings</em> in the
 shipped behaviour never refuse it. They show as an amber banner ("the
 editor's behaviour has N lint findings; it still runs"), because the one path
 with no fallback must not break when a Mix upgrade adds a warning.</p>
@@ -549,11 +561,13 @@ scene recovers. <code>digest</code> is the sha256 of the bytes the loader attemp
 ced shows the set only while the tab's text matches them. The digest is part
 of the change key, so a re-save that produces the same problems still
 re-pushes. If ced was not running when <em>Edit</em> launched it, the push is sent
-once ced registers.</p>
+once ced registers. A verdict is counted as delivered only once ced has taken
+it: changes that happen while ced is away, or a push ced refused, are sent
+again when it is back.</p>
 <h2 id="sandbox-try-then-promote">Sandbox: try, then promote</h2>
 <p><em>Try in sandbox</em> (<code>scenes.fork {name}</code>) copies your installation as
 <code>&lt;name&gt;-sandbox</code>, or <code>&lt;name&gt;-sb</code> when the longer name would break the Bus name
-rule. The copy is installed as another carousel page on the same edge and
+rule or is already taken. The copy is installed as another carousel page on the same edge and
 enabled, so the original keeps working while you edit the copy. On a
 single-page edge such as the bottom panel, selecting the sandbox page hides
 the original until you page back.</p>

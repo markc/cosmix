@@ -18,7 +18,7 @@ $NODED = env("NODED_SERVICE", "noded")
 $SVC = {loader: $ctx.loader, host: $ctx.host, ced: env("CED_SERVICE", "ced"), apps: env("APPS_SERVICE", "apps")}
 $state = {ready: false, model: nil, ui: $e.default_ui(),
   data: {list: nil, templates: nil, props: nil, services: [], svc: $SVC},
-  templates_root: nil, stale: true, dirty: false, rebuilding: false, busy: false,
+  templates_root: nil, stale: true, dirty: false, rebuilding: false, busy: false, quiet: nil,
   running: nil, last: nil, seen: {}, pending_push: []}
 
 -- ── reads (events are hints; these are the truth) ───────────────────────
@@ -53,26 +53,41 @@ end
 -- while ced was not yet running is pushed once ced registers.
 fn push_diagnostics()
   if $state.data.list == nil then return end
+  -- Nothing is marked seen while ced is away, or for a send that failed:
+  -- a verdict must reach ced, not just be computed (review GLM m2).
+  if not ced_live() then return end
   $current = $e.file_problems($state.data.list)
   $diff = $e.diag_diff($state.seen, $current)
-  $state.seen = $diff.seen
-  if not ced_live() then return end
+  $next = $diff.seen
   $sends = $diff.changed
   if length($state.pending_push) > 0 then
     for each $path in $state.pending_push
       push($sends, $e.ced_request($path, $current[$path]))
     end
-    $state.pending_push = []
   end
-  if length($sends) == 0 then return end
+  if length($sends) == 0 then
+    $state.seen = $next
+    $state.pending_push = []
+    return
+  end
   $tabs = $r.call($SVC.ced, "ced.tabs", {})
-  $open = $tabs.ok ? $e.open_paths($tabs.value) : []
+  if not $tabs.ok then return end
+  $state.pending_push = []
+  $open = $e.open_paths($tabs.value)
   for each $req in $sends
     if contains($open, $req.path) then
       $out = $r.call($SVC.ced, "ced.diagnostics", $req)
-      if not $out.ok then eprint("scene-editor: ced.diagnostics " .. $req.path .. ": " .. json_encode($out.value)) end
+      if not $out.ok then
+        eprint("scene-editor: ced.diagnostics " .. $req.path .. ": " .. json_encode($out.value))
+        if has_key($state.seen, $req.path) then
+          $next[$req.path] = $state.seen[$req.path]
+        else
+          $next = delete($next, $req.path)
+        end
+      end
     end
   end
+  $state.seen = $next
 end
 
 -- ── one queued rebuild (dirty-state batching, as the panel does) ────────
@@ -249,6 +264,16 @@ end
 
 -- ── events ──────────────────────────────────────────────────────────────
 on scenes.changed
+  -- Hidden, the editor skips inventories that differ only in the counters
+  -- every model publish bumps (review m10); a gap always re-reads.
+  $a = $r.event_args($event)
+  if ($event.headers.gap ?? "") != "true" and type($a) == "map" and (($a.editor ?? {}).visible != true) then
+    $key = $e.quiet_key($a)
+    if $key != nil and $key == $state.quiet then return end
+    $state.quiet = $key
+  else
+    $state.quiet = nil
+  end
   schedule(true)
 end
 

@@ -815,6 +815,19 @@ fn diag_diff($seen, $current)
   return {seen: $next, changed: $changed}
 end
 
+-- What a hidden editor would show from one scenes.changed inventory: the
+-- inventory without the counters every model publish of every scene bumps
+-- (the top-level and per-row revision and generation). Equal keys mean the
+-- change is nothing a hidden editor displays (review m10).
+fn quiet_key($list)
+  if type($list) != "map" then return nil end
+  $plain = []
+  for each $r in rows($list)
+    push($plain, type($r) == "map" ? delete(delete($r, "revision"), "generation") : $r)
+  end
+  return hash_sha256(json_encode([delete(delete($list, "revision"), "scenes"), $plain]))
+end
+
 -- Paths ced.tabs reports open.
 fn open_paths($tabs)
   $out = []

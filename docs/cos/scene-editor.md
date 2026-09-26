@@ -28,6 +28,15 @@ chord needs inputd's keyboard grab, so it does not work on hosts without one
 (desk containers, a nested harness); the corner menu and the launcher still
 do.
 
+**An upgraded host does not get the chord by itself.** inputd seeds its
+default rows only into a missing or unusable keymap file; an existing keymap
+is the user's and is served as it is. After upgrading to inputd 0.4.5, bind
+both strokes with `input.bind` (the row is in
+[daemon-help](daemon-help.md)), after checking `input.query` that neither
+stroke is already bound to something else, because `input.bind` replaces a
+row silently. Until then the corner menu's **Edit panels…** is the recovery
+path.
+
 `view` is `gallery`, `installed` or `arrange`, and `scene` preselects an
 installed scene. An open increments the editor's `request_seq`, and the
 behaviour applies `view`/`scene` from the loader's `editor` record. So
@@ -36,14 +45,18 @@ the UI.
 
 `scenes.editor.close {unload?}` hides it. With `unload:true` the loader also
 stops its behaviour and unmounts it. Otherwise it stays mounted, hidden and
-idle, for the loader's lifetime.
+idle, for the loader's lifetime: while hidden it ignores inventory changes that
+only bump revision or generation counters (every model publish of every
+scene does), and rebuilds only for something it would show.
 
 ## Safe mode and the user copy
 
 **Safe mode is the shipped copy**, read in place from `$SCENES_TEMPLATES/editor`
 (root-owned on a system install), and never copied. The chord and the corner
 item always open it, like a BIOS setup key: the recovery path never reads a
-user file. A `safe mode` badge shows in the tab row. Lint *warnings* in the
+user file. An explicit open also revives an editor whose behaviour has
+crash-looped or is backing off, instead of showing a tree with nothing behind
+it. A `safe mode` badge shows in the tab row. Lint *warnings* in the
 shipped behaviour never refuse it. They show as an amber banner ("the
 editor's behaviour has N lint findings; it still runs"), because the one path
 with no fallback must not break when a Mix upgrade adds a warning.
@@ -121,13 +134,15 @@ scene recovers. `digest` is the sha256 of the bytes the loader attempted, so
 ced shows the set only while the tab's text matches them. The digest is part
 of the change key, so a re-save that produces the same problems still
 re-pushes. If ced was not running when *Edit* launched it, the push is sent
-once ced registers.
+once ced registers. A verdict is counted as delivered only once ced has taken
+it: changes that happen while ced is away, or a push ced refused, are sent
+again when it is back.
 
 ## Sandbox: try, then promote
 
 *Try in sandbox* (`scenes.fork {name}`) copies your installation as
 `<name>-sandbox`, or `<name>-sb` when the longer name would break the Bus name
-rule. The copy is installed as another carousel page on the same edge and
+rule or is already taken. The copy is installed as another carousel page on the same edge and
 enabled, so the original keeps working while you edit the copy. On a
 single-page edge such as the bottom panel, selecting the sandbox page hides
 the original until you page back.

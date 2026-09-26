@@ -113,7 +113,7 @@ if $me == nil then
   $interpreter = "/proc/" .. to_string(pid()) .. "/exe"
   $worker = "scenes-cli-" .. slice(replace(uuid(), "-", ""), 0, 6)
   $r = run_argv([$interpreter, "--serve", realpath($0), "--name", $worker],
-    {timeout:60, env:{SCENES_CLI_REQUEST:json_encode($req), MIX_STATS:"off"}, stdout:"inherit", stderr:"inherit"})
+    {timeout:120, env:{SCENES_CLI_REQUEST:json_encode($req), MIX_STATS:"off"}, stdout:"inherit", stderr:"inherit"})
   exit($r.ok ? 0 : 1)
 end
 
@@ -122,7 +122,8 @@ $req = json_parse(env("SCENES_CLI_REQUEST"))
 $target = $req.target
 $verb = $req.verb
 $wire = json_encode($req.body)
-send $target $verb body=$wire timeout=30
+-- An editor open that falls back runs two behaviour checks (review NIT).
+send $target $verb body=$wire timeout=90
 $code = $rc
 $value = $result
 if type($value) == "string" then
