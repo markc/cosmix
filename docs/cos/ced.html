@@ -570,9 +570,13 @@ from the caret with one wrap; matches in view are highlighted. Replace All
 finds every match and applies them as <strong>one</strong> transaction, so it is one
 undo step, and refuses up front beyond 10,000 matches or 1 MiB of inserted
 text. <code>$1</code>-style group references are expanded by ced.</li>
-<li><strong>Lint.</strong> Mix, scene and mix-data buffers with a path are linted with
+<li><strong>Lint.</strong> Mix and mix-data buffers with a path are linted with
 <code>mix lint --json -</code> on open and after each save (and 1 s after the last edit
 for buffers under 1 MiB), in the file's directory so <code>require()</code> resolves.
+Scene buffers (<code>scene.mix</code>) are linted in-process with <code>cosmix-scene</code>
+(parse, lint, resolve, on a worker thread): the same registry Quoin uses,
+and free of the false <code>MIX-E1003</code> that <code>mix lint</code> reports at an AMP fence.
+Scene diagnostics carry a line only, so their column is 1.
 Problems appear as squiggles, in the gutter and in the Problems panel
 (<code>Ctrl+Shift+M</code>). A diagnostic on a line edited since is dropped rather than
 shown in the wrong place.</li>
@@ -612,6 +616,8 @@ Positions (<code>POINT</code>, <code>POS</code>) are the edit service's forms.</
 <tr><td><code>ced.wait</code></td><td><code>tab?</code>, exactly one of <code>rev</code> / <code>idle:true</code> / <code>epoch</code> / <code>phase</code>, <code>timeout_ms</code> (1–30000)</td><td><code>{tab, rev, phase, epoch, waited_ms}</code></td></tr>
 <tr><td><code>ced.layout</code></td><td><code>tab?</code></td><td>the last frame's geometry in logical px: <code>{window, menubar, tabstrip, editor, gutter_w, line_height, cell_w, first_line, visible_rows, caret, statusbar}</code></td></tr>
 <tr><td><code>ced.stats</code></td><td>—</td><td><code>{keys, frames, model_us, view_us, next_frame_us, events, history_recoveries, snapshot_recoveries, conflicts, retries, uncertain}</code> (latencies as <code>{p50, p95, p99, max}</code> µs)</td></tr>
+<tr><td><code>ced.diagnostics</code></td><td><code>path</code>, <code>source</code>, <code>digest?</code>, <code>diagnostics:[{line, col?, severity, code, message}]</code></td><td><code>{path, tabs:[tab], shown, stale}</code> — see <a href="/cos/ced#external-diagnostics">External diagnostics</a></td></tr>
+<tr><td><code>ced.problems</code></td><td><code>tab?</code></td><td><code>{tab, path, problems:[{line, col, severity, code, message, source}]}</code> — exactly the Problems panel</td></tr>
 <tr><td><code>app.describe</code></td><td>—</td><td>the <code>ctk-app-control.v0</code> shape: <code>{contract, app:"ced", title, view, engine:"iced", version, description, controls, verbs}</code></td></tr>
 <tr><td><code>app.quit</code></td><td>—</td><td><code>{quitting:true}</code>, then ced detaches and exits</td></tr>
 </tbody></table>
@@ -669,6 +675,38 @@ tab reattaching each time:</p>
 <pre><code class="language-sh">COSMIX=$PWD mix src/desktop/apps/ced/tests/ced-bus-test.mix \
   --editd src/target/release/cosmix-editd --ced src/desktop/target/release/ced
 </code></pre>
+<h3 id="external-diagnostics">External diagnostics</h3>
+<p>Other tools can show their verdicts in ced without ced knowing about them.
+Diagnostics are kept as one set per <strong>source</strong>. ced's own lint is the source
+<code>lint</code>; external callers use <code>ced.diagnostics</code> with any other source matching
+<code>^[a-z][a-z0-9-]{0,31}$</code>. The <a href="scene-editor">Scene Editor</a> pushes the scenes
+loader's verdicts as source <code>scenes</code>.</p>
+<ul>
+<li><strong>Request.</strong> <code>path</code> is absolute. Each diagnostic has a 1-based <code>line</code>, an
+optional 1-based <code>col</code>, a <code>severity</code> of <code>error</code>, <code>warning</code> or <code>note</code>, a
+<code>code</code> and a <code>message</code>. The limits are 500 diagnostics and a 64 KiB body;
+anything else is refused <code>INVALID_ARGUMENT</code>.</li>
+<li><strong>Storage.</strong> ced stores the set per <code>(path, source)</code>, keeping the most
+recent 64 paths. It applies the set, replacing only that source's
+diagnostics, to every tab showing <code>path</code>:
+<ul>
+<li>when the verb arrives;</li>
+<li>when a tab for the path opens;</li>
+<li>after a tab resyncs (reconnect, reload);</li>
+<li>whenever a tab's <code>dirty</code> flag goes false (a save, or an undo back to the
+disk text).</li>
+</ul>
+</li>
+<li><strong>Digest.</strong> <code>digest</code> is the lower-hex sha256 of the file bytes the
+diagnostics describe. A tab whose text does not hash to it shows none of
+the set (<code>stale:true</code>), but the set stays stored for when the text matches
+again.</li>
+<li><strong>Clearing.</strong> An empty <code>diagnostics</code> list clears that source and drops the
+stored set. Like lint rows, an external row on a line edited since is
+dropped rather than shown in the wrong place.</li>
+</ul>
+<p>The Problems panel shows every source's rows as <code>source: code message</code>.
+<code>ced.problems {tab?}</code> returns the same rows.</p>
 <h2 id="files-configuration-and-theme">Files, configuration and theme</h2>
 <p>ced keeps its files under one app directory, resolved in this order:
 <code>$COSMIX_APP_HOME</code>, <code>$COSMIX_APPS_HOME/ced</code>, <code>$XDG_STATE_HOME/cosmix/apps/ced</code>,

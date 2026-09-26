@@ -714,7 +714,10 @@ discovery. Live panel state is read through the uniform
 plus <code>dialog</code>. <code>declared</code> is the edge's page order as last ingested from
 <code>conf.mix</code> (the live <code>pages</code> may hold fewer, or tail pages it does not name).
 <code>dialog</code> is the one dialog seat, <code>{scene, visible, w, h, output}</code>, or null
-when no dialog scene is loaded; until dialog scenes land it is always null.</p>
+when no dialog scene is loaded. The seat and its verbs (<code>shell.dialog.show</code>,
+<code>shell.dialog.hide</code>, <code>shell.scene.layout</code>) are described in
+<a href="scenes#dialog-scenes">Dialog scenes</a>; in v1 only the
+<a href="scene-editor">Scene Editor</a> uses it.</p>
 <p><code>shell.panel.state {edge}</code> returns those eight leaves in one JSON object,
 plus the host's <code>keyboard_focused</code> and <code>keyboard_requested</code> booleans for that
 edge. <code>edge</code> is <code>left</code>, <code>bottom</code>, <code>right</code> or <code>top</code>; an invalid or missing edge

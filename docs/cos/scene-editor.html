@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/scenes-loader</title>
+    <title>CosMix — cos/scene-editor</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,378 +441,212 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/scenes-loader.md"><div class="prose"><h1 id="scenes-loader">Scenes loader</h1>
-<p><code>mix --serve scenes.mix --name scenes</code> owns file-backed scene lifecycles.
-It starts with no enabled scenes and reports <code>needs_setup:true</code> until scenes
-are explicitly enabled. From Stage B it owns the bottom panel, launcher,
-calendar and notes pages once they are seeded and enabled, replacing
-<code>quoin-panel.mix</code> (see <a href="/cos/scenes-loader#stage-b-legacy-handover">the legacy handover</a>).
-It also hosts the <a href="scene-editor">Scene Editor</a> as a reserved entry, and
-serves its gallery, fork/promote/move and first-run verbs
-(<a href="/cos/scenes-loader#scene-editor">below</a>).</p>
-<h2 id="files-and-installation">Files and installation</h2>
-<pre><code>~/.config/cosmix/scenes/
-  state.conf.mix
-  &lt;name&gt;/scene.mix
-  &lt;name&gt;/template.conf.mix
-  &lt;name&gt;/behaviour.mix       # optional
-</code></pre>
-<p><code>scene.mix</code> is an AMP scene document, never executable Mix. Metadata and
-state are strict data, parsed with <code>data_parse</code>. Only <code>behaviour.mix</code> runs.
-The document name must match its installation directory. Names contain
-lower-case ASCII letters, digits, <code>-</code> and <code>_</code>, at most 64 characters; leading
-<code>-</code> and <code>_</code> are refused. The scene/metadata/behaviour files and installation
-directory cannot be symlinks. Shipped templates live at <code>$COSMIX/share/scenes</code>.</p>
-<p>Without <code>name</code>, <code>scenes.install</code> uses the scene name the template authors:
-the directory name for every template except <code>settings</code>, which authors
-<code>quoin-settings</code>. An authored <code>window.panel</code> is kept when installing under
-the authored name and rewritten to <code>scene-&lt;name&gt;</code> on a rename. So
-<code>{template:"settings"}</code> installs <code>quoin-settings</code> on Quoin's declared page
-<code>settings.appearance</code>. While Quoin's built-in fallback holds that page, the
-loader's load takes it over (see <a href="quoin">Quoin</a>). Disabling or removing the
-scene gives the page back to the fallback.</p>
-<p>State has <code>{schema_version:1,enabled:[],origins:{},recovery:{}}</code>. Writes use
-<code>write_atomic</code> with full durability and mode <code>0600</code>. Enablement is separate
-from template metadata. A directory discovered through the filesystem remains
-disabled. A loader lock prevents two loaders sharing one directory.</p>
-<p><code>setup.mix --desktop</code> installs <code>bin/scenes.mix</code> and its helpers; the checkout's
-<code>share/scenes</code> is the canonical template installation. Adding <code>--system</code>
-copies the loader/helpers and templates under <code>/opt/cosmix</code> too. No unit is
-enabled, no user scenes are seeded and Quoin configuration is not rewritten.
-The example <code>src/_etc/systemd/cosmix-desk-scenes.service.in</code> must be rendered by
-the session installer, with a desktop user, session environment and paths.</p>
-<p>Environment overrides:</p>
-<table><thead><tr><th>Variable</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>SCENES_DIR</code></td><td>User scene root; default <code>$XDG_CONFIG_HOME/cosmix/scenes</code></td></tr>
-<tr><td><code>SCENES_TEMPLATES</code></td><td>Shipped template root; otherwise <code>$COSMIX/share/scenes</code>, or discover the checkout from the script</td></tr>
-<tr><td><code>SCENE_HOST</code></td><td>Quoin service; default <code>shell</code></td></tr>
-<tr><td><code>SCENES_LEGACY_SERVICE</code></td><td>Legacy panel citizen whose registration holds the four legacy pages; default <code>quoin-panel</code></td></tr>
-<tr><td><code>SCENES_FIRST_RUN</code></td><td><code>0</code> turns off the first-run open of the Scene Editor; default on</td></tr>
+        <div id="content-doc" data-prerendered="cos/scene-editor.md"><div class="prose"><h1 id="scene-editor">Scene Editor</h1>
+<p>The Scene Editor chooses, installs, arranges and repairs the scenes on your
+desktop edges: the panel, launcher, calendar, notifications and settings
+pages. It is itself a scene. It is the shipped template <code>share/scenes/editor/</code>,
+mounted by the same <a href="scenes-loader">scenes loader</a> and rendered by the same
+<a href="quoin">Quoin</a> as every other page. Its behaviour is the Mix citizen
+<code>scene-editor</code>. Everything it does is a <code>scenes.*</code> or <code>shell.*</code> Bus verb, so an
+agent can do all of it without the UI, locally or over the mesh.</p>
+<p>It opens as a centred 880×620 dialog titled <em>Scene Editor</em>. The dialog takes
+the keyboard when it opens. Escape or the title bar's <strong>×</strong> hides it.</p>
+<h2 id="opening-it">Opening it</h2>
+<table><thead><tr><th>Route</th><th>Sends</th><th>Opens</th></tr></thead><tbody>
+<tr><td><strong>Ctrl+Alt+P</strong> (left or right Ctrl, left Alt)</td><td><code>scenes.editor.open {safe:true}</code></td><td>the shipped copy (safe mode)</td></tr>
+<tr><td>Corner menu → <strong>Edit panels…</strong> (every corner)</td><td><code>scenes.editor.open {safe:true}</code></td><td>the shipped copy (safe mode)</td></tr>
+<tr><td>Launcher → <strong>Scene Editor</strong></td><td><code>scenes-cli.mix editor</code> → <code>scenes.editor.open {}</code></td><td>your user copy if one validates, else the shipped copy</td></tr>
+<tr><td>An agent</td><td><code>scenes.editor.open {safe?, view?, scene?}</code></td><td>as asked</td></tr>
 </tbody></table>
-<p>The native Mix binary is resolved from the running interpreter. Behaviour
-children inherit the session and existing <code>COMP_SERVICE</code>, <code>APPS_SERVICE</code>,
-<code>TRAY_SERVICE</code>, <code>NOTIFY_SERVICE</code> and other overrides. They additionally receive
-<code>SCENE_NAME</code>, <code>SCENE_HOST</code>, <code>SCENES_SERVICE</code>, <code>SCENE_GENERATION</code>, and <code>SCENE_DIR</code>;
-their working directory is their scene directory. Each runs as <code>scene-&lt;name&gt;</code>.
-<code>SCENE_DIR</code> is the directory the behaviour runs from. For the Scene Editor's
-reserved entry that is either the shipped template or the user copy, so
-helpers kept beside a template load with <code>require($SCENE_DIR .. "/lib.mix")</code>.
-<code>SCENES_LIB</code> defaults to the shipped catalogue's <code>lib</code> directory, matching the
-shared behaviour helpers, and can be overridden explicitly. Generations are
-positive exact integers, allocated from an atomically persisted <code>.generation</code>
-counter before spawning. Disabling invalidates the active generation to zero.
-The document's citizen must match that routing name when it has a behaviour.
-Behaviours should use <code>serve_name()</code> for their actual identity.
-Without a <code>window</code> header, the loader follows Quoin's first <code>window</code> node
-for popup routing; an absent edge defaults to <code>right</code>.
-Managed popup page and edge values must be static; the loader refuses bindings
-on those routing fields. Host model patches also refuse a changed mount address
-without advancing the revision; unload and load to move a mount explicitly.</p>
-<h2 id="public-bus-contract">Public Bus contract</h2>
-<p>Verbs are mesh-open, with the same implementation for local and attested mesh
-requests. A refusal has nonzero RC and <code>{error_code,message,context?}</code>. Upstream
-RC, diagnostics and original payload remain under <code>context</code>; filesystem
-diagnostics also report file, attempted digest and last-good revision.</p>
-<table><thead><tr><th>Verb</th><th>Arguments and result</th></tr></thead><tbody>
-<tr><td><code>scenes.list</code></td><td><code>{}</code> → <code>{needs_setup,root,templates_root,state_ok,editor,scenes,diagnostic}</code>; each scene reports installation, enablement, mounted state, revision, generation, behaviour status, ready/open/pending, origin, digests, diagnostics, last exit and journal location</td></tr>
-<tr><td><code>scenes.install</code></td><td><code>{template,name?,enable?}</code> → installation receipt; stage, validate through <code>shell.scene.validate</code>, atomically rename, record origin; default disabled; refuse collisions</td></tr>
-<tr><td><code>scenes.remove</code></td><td><code>{name}</code> → <code>{name,recovery}</code>; disable, stop, unload and move the installation to <code>.recovery/</code></td></tr>
-<tr><td><code>scenes.enable</code> / <code>scenes.disable</code></td><td><code>{name}</code> → acceptance/revision; persist desire and reconcile idempotently</td></tr>
-<tr><td><code>scenes.reload</code></td><td><code>{name}</code> → acceptance/revision; retry files and failed behaviour, retaining runtime model</td></tr>
-<tr><td><code>scenes.reset</code></td><td><code>{name}</code> → <code>{name,recovery}</code>; stage recorded shipped origin, validate, retain old copy, restore defaults; refuse unknown origin</td></tr>
-<tr><td><code>scenes.ready</code></td><td><code>{name,generation}</code> → <code>{name,generation,publish_model:true}</code>; the behaviour then publishes its initial complete model</td></tr>
-<tr><td><code>scenes.model</code></td><td><code>{name,generation,value}</code> → acceptance/revision; <code>value</code> is a complete map, submitted by the loader as <code>shell.scene.patch {scene,path:"model",generation,value}</code></td></tr>
-<tr><td><code>scenes.open</code> / <code>scenes.close</code> / <code>scenes.toggle</code></td><td><code>{name}</code> → <code>{name,open,pending}</code>; desired popup state, with applied completion reported through <code>scenes.changed</code></td></tr>
-</tbody></table>
-<p>Installation rewrites the scene name, behaviour routing citizen and an
-explicitly authored panel name to the installation name, so
-<code>{template:"launcher",name:"preview-launcher"}</code> mounts a second, distinct
-page.</p>
-<h3 id="stage-b-legacy-handover">Stage B legacy handover</h3>
-<p><code>scene-panel</code>, <code>scene-launcher</code>, <code>scene-calendar</code> and <code>scene-notes</code> were
-mounted by <code>quoin-panel.mix</code>. Quoin's seats are owner-exclusive: whichever
-citizen holds a page keeps it, and the other one's load of that page is
-refused (<code>SUBPANEL_COLLISION</code>) until the holder unloads or disconnects.
-Neither owner can take a page from the other. While the <code>SCENES_LEGACY_SERVICE</code> registration (default
-<code>quoin-panel</code>) is present, a scene on one of those pages installs and enables
-normally but is not mounted: its diagnostic is <code>SCENES_LEGACY_HELD</code> with the
-holder name, and <code>enable</code>/<code>reload</code> reply rc 10 with it. That registration
-disappearing from the broker snapshot triggers one rescan, which mounts the
-held scenes and starts their behaviours. The handover is state, not that one
-edge: while the legacy citizen stays absent, an enabled, installed scene on a
-legacy page that is still unmounted (a load that timed out, or a
-<code>SUBPANEL_COLLISION</code> because Quoin had not yet applied the old citizen's
-disconnect) is retried on every later broker snapshot and <code>shell.panel.changed</code>
-notice. For a failure no later event would retry, the loader starts one local
-<code>task_start</code> backoff (1, 2 … 32 s, then it stops and leaves the diagnostic until
-nothing is owed); it never self-emits over the Bus.</p>
-<p>The guard only stops the loader racing a live legacy citizen. It does not
-stop the reverse. If <code>quoin-panel</code> starts again while the loader holds the
-pages, the loader keeps them mounted (it never unloads for the legacy
-citizen), and the legacy citizen's own loads are refused by the seat rule, so
-it runs with no pages. While it stays registered the loader also will not
-reload or remount those pages, so their accepted content stays as it was.
-<strong>Operator rule: do not run both.</strong> Stop and disable the legacy unit before
-enabling the templates; starting it again is not a rollback until the
-loader's four scenes are disabled.</p>
-<p><code>scenes.changed</code> publishes a change-only inventory with a loader revision.
-Subscribers should take <code>scenes.list</code> after subscribing and repeat that
-snapshot after reconnection/gaps. Invalid edits leave accepted content visible.
-Unchanged accepted files and repeated model/exit/applied-state events are
-suppressed. Temporary and backup files are ignored.</p>
-<h2 id="lifecycle-and-events">Lifecycle and events</h2>
-<p>The loader registers filesystem watches and Bus subscriptions before reading
-state and directories. It takes the broker registration snapshot after
-subscribing, then mounts enabled documents as the loading citizen and starts
-behaviours. Quoin directs authored click commands to the document's citizen,
-with <code>{scene,node,kind,value?,item?}</code> in <code>$event.args</code>. Behaviours never load
-or unload their scenes.</p>
-<p><code>fs_watch</code> / <code>on fs.changed</code> batches trigger one reconciliation per affected
-scene; <code>overflow:true</code> triggers one rescan. The stable parent is watched too.
-Layout changes use full <code>shell.scene.load</code>, carrying the last accepted runtime
-model in the candidate. Model updates use the patch endpoint. Behaviour edits
-pass <code>mix --check</code> and <code>mix lint --deny-warnings</code> before replacement. Generation
-invalidation precedes stop; replacement waits for the retiring child's exit.
-The retiring record survives removal and reinstallation of the same name.
-Before spawning, the loader also reads the broker registry and waits for any
-old <code>scene-&lt;name&gt;</code> registration to disappear. Service snapshots resume that
-handover. A held <code>scene-&lt;name&gt;</code> registration reports <code>SCENES_NAME_HELD</code> with
-the holder name in <code>scenes.list</code> and <code>scenes.changed</code>; it waits for the
-name-release event without a timeout loop.
-Each name in a filesystem batch or rescan has its own error boundary,
-so one refused unload does not discard the rest of the batch.</p>
-<p>Loader <code>RELOAD</code> is refused during candidate initialisation, before filesystem
-or process side effects; the old evaluator continues serving. Restart the
-loader process to update its script. Native Mix currently has no post-commit
-hook for starting replacement children after the old registry retires.
-<code>scenes.reload {name}</code> still replaces an individual behaviour normally.</p>
-<p>Managed spawn uses <code>{die_with_parent:true,exit_event:true,tag:&lt;JSON string&gt;}</code>.
-The string encodes <code>{name,generation}</code>; <code>on proc.exited</code> receives
-<code>{pid,tag,exit_code,signal}</code> in <code>$event.args</code>. A crash leaves the scene mounted.
-Four failure-triggered restart deadlines are 1, 2, 4 and 8 seconds; the fifth
-consecutive exit enters <code>crash_loop</code>. Running at least 60 seconds resets the
-count at the next exit, without a health timer. Explicit reload retries the
-failed scene. Disable during a deadline invalidates its generation. Deadlines
-use a separate in-process <code>task_start</code> task, never a Bus self-emit. The native
-exit handler performs synchronous bookkeeping only. The task's async phase
-waits without carrying writable state; its synchronous phase re-reads current
-state under the writer lock and performs the fenced restart. Concurrent exits
-retain both successors, and disable during the wait stays disabled.
-An elapsed deadline stays eligible when Quoin is absent and resumes on remount;
-reconnect reconciliation also checks the computed deadline directly.</p>
-<p>The process adapter uses W1's registry-backed <code>kill(pid,9)</code> to stop the owned
-child through its retained pidfd. Generation checks precede stop and exit
-bookkeeping precedes the async deadline: the numeric PID is discarded as soon
-as its exit event is handled. Replacement waits for that event; the native reaper owns
-descendant cleanup. SIGKILL is deliberate so a stuck behaviour needs no stop
-poll or escalation timer. The installed pre-W1 interpreter cannot run this
-watcher/child path; deterministic tests fake only that boundary. The integration
-gate must confirm W1's PID retention and exit-delivery guarantees before
-enabling the unit.</p>
-<p><code>on bus.connected</code> and <code>noded.props.changed</code> repair state with full service
-snapshots and <code>shell.scenes.list</code> mount inventory. This also removes mounts
-disabled or removed while the broker was unavailable but still present in Quoin.
-A returning shell is remounted from accepted source/model even when
-the current on-disk edit is broken. Behaviour service disappearance alone
-never unloads a scene. The owner is the verified loading citizen.</p>
-<p>Popup selection, temporary pinning, mutual exclusion and saved-mode recovery
-advance from command replies followed by <code>shell.panel.state</code> reads. Already
-satisfied phases complete immediately. <code>shell.panel.changed</code> is a hint to read
-state, and every subscribed topic's gap causes a full resynchronisation.
-Recovery requires both the saved page and mode to be restored before its
-record is removed, including when both pages were already pinned.
-Hidden mode can remain visible because the pointer or a holder reveals it;
-matching page and mode completes restoration without cancelling that reveal.
-Quoin replies <code>applied:true</code> with the actual <code>visible:true</code> snapshot in this
-case. Refused popup commands settle with <code>pending:false</code> and a diagnostic in
-<code>scenes.list</code>; failed recovery records wait for an explicit open/close retry,
-not another hint. The legacy panel logs refusals and clears the pending attempt,
-retaining its pin recovery record for a later explicit retry or resynchronisation.
-Recovery is persisted before pinning. If another page takes the edge, recovery
-does not hide it. The legacy panel remains in use in Stage A but consumes the
-same applied-state stream; its network/audio conversion belongs to Stage C.
-Its minute clock and the calendar template use local async deadline tasks;
-<code>bus.connected</code> starts a clock only when it is not running. Gaps received
-during a resynchronisation coalesce into one further pass.</p>
-<p>Render failures retain readable diagnostics and the last applied revision.
-A subsequent accepted revision or remount recreates missing renderer entities.
-The initial connection notice reuses the startup snapshot without remounting.</p>
-<p>Deferred: <code>.recovery</code> retention remains manual until the editor offers a
-reviewable prune policy; automatic deletion could destroy the only saved edit.
-Deferred: the parent filesystem watch is retained for root replacement and
-shares the evaluator's inotify fd and worker.
-Deferred: per-expression <code>Instant::now()</code> budget checks remain until measured
-optimisation preserves the deadline guarantee for always-ready expressions.</p>
-<h2 id="scene-editor">Scene Editor</h2>
-<p>The <a href="scene-editor">Scene Editor</a> is the shipped template <code>editor</code>, run by this
-loader. These verbs serve it, and any agent can use them directly. All are
-mesh-open.</p>
-<table><thead><tr><th>Verb</th><th>Arguments and result</th></tr></thead><tbody>
-<tr><td><code>scenes.templates</code></td><td><code>{}</code> → <code>{root,templates:[{template,name,title,description,edge,kind,behaviour,recommended,order,requires,installed_as,diagnostic?}]}</code>. Every template directory except <code>lib</code> and those with <code>hidden:true</code>, sorted by <code>order</code> then <code>template</code>. An unreadable template is a row with a <code>diagnostic</code>, never a refusal</td></tr>
-<tr><td><code>scenes.editor.open</code></td><td><code>{safe?,view?,scene?,first_run?}</code> → <code>{name:"editor",source,safe,visible,pending,fallback,request_seq}</code></td></tr>
-<tr><td><code>scenes.editor.close</code></td><td><code>{unload?}</code> → <code>{name:"editor",visible:false,mounted}</code></td></tr>
-<tr><td><code>scenes.fork</code></td><td><code>{name,as?,enable?=true}</code> → <code>{name,installed:true,enabled,forked_from}</code></td></tr>
-<tr><td><code>scenes.promote</code></td><td><code>{from}</code> → <code>{name,recovery:[paths],removed}</code></td></tr>
-<tr><td><code>scenes.move</code></td><td><code>{name,edge}</code> → <code>{name,edge,revision}</code></td></tr>
-</tbody></table>
-<h3 id="the-reserved-editor-entry">The reserved <code>editor</code> entry</h3>
-<p><code>editor</code> is created once at loader start, with <code>reserved:true</code>, and lives in
-the scene table like any other scene. Crash restarts, generation fencing,
-retiring and host-return remounts therefore apply to it unchanged. It is
-never <em>enabled</em>: its <code>enabled</code> always equals an in-memory <code>summoned</code> flag,
-which <code>scenes.editor.open</code> sets and <code>scenes.editor.close {unload:true}</code>
-clears. It is never in the persisted <code>enabled</code> list, never counts toward
-<code>needs_setup</code>, and is reported as <code>scenes.list.editor</code>, not as a row:</p>
-<pre><code>{user_copy, user_dirty, mounted, visible, source:"shipped"|"user", safe, fallback,
- behaviour, view, scene, first_run, request_seq, generation, kind, dir, diagnostic, problems}
-</code></pre>
-<p><code>enable</code>, <code>disable</code>, <code>fork</code>, <code>move</code>, <code>open</code>, <code>close</code> and <code>toggle</code> of <code>editor</code>
-are refused <code>SCENES_RESERVED</code>. So is installing the <code>editor</code> template under
-another name or with <code>enable:true</code>. A plain <code>scenes.install {template:"editor"}</code>
-creates the user copy at <code>$SCENES_DIR/editor</code>. <code>scenes.remove {name:"editor"}</code>
-and <code>scenes.reset {name:"editor"}</code> act on that user copy only, never on the
-shipped directory, and never delete the entry. If the user copy was mounted,
-remove switches to the shipped copy first, and reset reloads the restored copy.</p>
-<p>For any other scene, <code>candidate</code> refuses the page id <code>scene-editor</code> and
-<code>window.kind:"dialog"</code> with <code>SCENES_RESERVED</code>. The one dialog seat belongs to
-the editor in v1.</p>
-<p><strong>Open.</strong> A non-safe open checks the user copy with candidate,
-<code>shell.scene.validate</code> and a behaviour check with <code>mix lint --deny-warnings</code>.
-If that fails, or the copy then fails to mount, the shipped copy is used and
-<code>fallback {error_code,message,file}</code> names why. The shipped copy is always
-checked in <code>report</code> mode: <code>mix --check</code> is a hard gate, but its lint findings
-become <code>editor.problems</code>, never a refusal. A safe open while the shipped copy
-is visible hides it (the chord's toggle). The loader loads a dialog-kind
-editor with <code>preempt_dialog:true</code>, so a squatter cannot hold the seat, and
-shows it with <code>shell.dialog.show</code>. <code>visible</code> settles from
-<code>shell.panel.changed</code> (<code>dialog.visible</code>), never from the command reply. A
-Quoin-side hide (× or Escape) records <code>visible:false</code>; during <code>needs_setup</code>
-it also sets <code>dismissed</code>. A pre-emption notice, or a snapshot whose <code>dialog</code>
-no longer names the editor, also records <code>visible:false</code>.</p>
-<p><code>SCENES_EDITOR_UNAVAILABLE</code> is the one refusal with no fallback. It covers a
-missing or invalid shipped editor, a scene host that is not registered
-(<code>context.shipped.error_code:"SCENES_HOST_ABSENT"</code>), and a host without dialogs
-(<code>SCENES_HOST_KIND</code>). The dialog probe is <code>shell.dialog.hide {scene:"editor"}</code>:
-<code>NOT_FOUND</code>, <code>NOT_DIALOG</code> or success mean the host has dialogs, while
-<code>UNIMPLEMENTED</code> or an unknown verb mean it does not. <code>shell.scene.describe</code>
-alone is not enough, because from cosmix-scene 0.6 it lists <code>dialog</code> before
-the host can mount one. An editor whose header is <code>kind:"edge"</code> (the
-fallback when the host has no dialogs) takes the popup path instead: select,
-pin, then restore the saved mode on close.</p>
-<p><strong>First run.</strong> On the transition of the scene host to live (including the
-loader's own first snapshot), after the remount, the loader opens the editor
-on <code>gallery</code> with <code>first_run:true</code>. It does so only if <code>needs_setup</code>, the
-state file read cleanly, the editor was not dismissed in this process, and
-<code>SCENES_FIRST_RUN</code> is not <code>0</code>.</p>
-<p><strong>Events under <code>$SCENES_DIR/editor/</code></strong> are not reconciled as a scene. They
-set <code>user_dirty</code>, and reload the entry only while the user copy is the
-mounted source; a broken reload keeps the last good tree.</p>
-<h3 id="problems-and-digests">Problems and digests</h3>
-<p>Each <code>scenes.list</code> row also carries:</p>
+<p>The chord and the corner item <strong>toggle</strong>: while the shipped editor is visible,
+either one hides it. The chord is two inputd default rows on <code>KEY_P</code>, one with
+<code>{left_ctrl, left_alt}</code> and one with <code>{right_ctrl, left_alt}</code>. Right Alt/AltGr
+is left out on purpose, because it is level-3 shift on some layouts. The
+chord needs inputd's keyboard grab, so it does not work on hosts without one
+(desk containers, a nested harness); the corner menu and the launcher still
+do.</p>
+<p><code>view</code> is <code>gallery</code>, <code>installed</code> or <code>arrange</code>, and <code>scene</code> preselects an
+installed scene. An open increments the editor's <code>request_seq</code>, and the
+behaviour applies <code>view</code>/<code>scene</code> from the loader's <code>editor</code> record. So
+<code>scenes.editor.open {view:"installed", scene:"panel"}</code> from an agent navigates
+the UI.</p>
+<p><code>scenes.editor.close {unload?}</code> hides it. With <code>unload:true</code> the loader also
+stops its behaviour and unmounts it. Otherwise it stays mounted, hidden and
+idle, for the loader's lifetime.</p>
+<h2 id="safe-mode-and-the-user-copy">Safe mode and the user copy</h2>
+<p><strong>Safe mode is the shipped copy</strong>, read in place from <code>$SCENES_TEMPLATES/editor</code>
+(root-owned on a system install), and never copied. The chord and the corner
+item always open it, like a BIOS setup key: the recovery path never reads a
+user file. A <code>safe mode</code> badge shows in the tab row. Lint <em>warnings</em> in the
+shipped behaviour never refuse it. They show as an amber banner ("the
+editor's behaviour has N lint findings; it still runs"), because the one path
+with no fallback must not break when a Mix upgrade adds a warning.</p>
+<p>To change the editor itself:</p>
+<ol>
+<li>Install a user copy with <code>scenes.install {template:"editor"}</code>. This creates
+<code>~/.config/cosmix/scenes/editor/</code>. It is never enabled; <code>enable:true</code> is
+refused <code>SCENES_RESERVED</code>.</li>
+<li>Edit it in ced. Its helpers live in its own <code>lib.mix</code>, beside
+<code>behaviour.mix</code>.</li>
+<li>Open the editor from the launcher, not the chord.</li>
+</ol>
+<p>If the user copy fails the install bar (scene lint, citizen mismatch,
+<code>mix --check</code>, or <code>mix lint --deny-warnings</code> on the behaviour), or fails to
+mount, the shipped copy opens instead. A red banner names the reason:
+<code>editor.fallback {error_code, message, file}</code> in <code>scenes.list</code>. Once the user
+copy is mounted, a broken reload of it keeps the last good tree. While the
+shipped copy is mounted, edits to the user copy change nothing until the next
+non-safe open (<code>editor.user_dirty</code> records that they happened).</p>
+<p>A hand-made <code>~/.config/cosmix/scenes/editor/</code> is treated as a user copy: it
+is validated and falls back with its diagnostic. It is never silently ignored.</p>
+<h2 id="the-three-tabs">The three tabs</h2>
+<p><strong>Gallery</strong> lists the shipped templates from <code>scenes.templates</code>: title, the
+one-line description, edge, and "installed as …". Its buttons are <em>Install</em>,
+<em>Install and enable</em>, and the highlighted <strong>Recommended set</strong>. That set
+installs and enables, in gallery order, every template with
+<code>recommended:true</code> that is not already on, and stops at the first refusal.
+If a template name is taken, <em>Install</em> retries once as <code>&lt;template&gt;-2</code>.
+Templates whose <code>requires</code> services are not registered show "needs …".
+Nothing is applied until you click.</p>
+<p><strong>Installed</strong> lists every installed scene with a status dot:</p>
 <ul>
-<li><code>title</code>, <code>edge</code>, <code>page</code>, <code>kind</code>;</li>
-<li><code>files {scene,behaviour,metadata}</code>;</li>
-<li><code>digests</code>: the sha256 of each file's current bytes, whatever was accepted;</li>
-<li><code>forked_from</code>;</li>
-<li><code>problems:[{file,digest,line,col?,severity,code,message}]</code>.</li>
+<li>green: mounted and running;</li>
+<li>amber: a diagnostic, or still starting/in backoff;</li>
+<li>red: crash loop, or refused and not mounted;</li>
+<li>grey: disabled.</li>
 </ul>
-<p><code>problems</code> is derived, never persisted:</p>
+<p>Selecting a scene shows its edge, template and problems (at most 20 rows; ced
+has the full list), and these buttons:</p>
 <ul>
-<li>A loader diagnostic maps to its file at line 1.</li>
-<li>A host diagnostic (<code>context.upstream.diagnostics</code>) keeps its line.</li>
-<li>A behaviour check carries <code>mix lint --json</code> lines and columns.</li>
+<li><em>Enable/Disable</em>, <em>Reload</em>, <em>Reset to template</em>;</li>
+<li><em>Remove</em>, which is two-step: the first click arms it ("Confirm remove"),
+and any other action disarms it. There is no timer;</li>
+<li><em>Edit scene</em>, <em>Edit behaviour</em>;</li>
+<li><em>Try in sandbox</em>, and <em>Promote</em> (offered on a sandbox only);</li>
+<li><em>move to</em> left/top/bottom/right.</li>
 </ul>
-<p><code>scenes.changed</code> carries the same inventory. Names of scenes with a behaviour
-must fit the Bus name rule: at most 25 characters and no <code>_</code>, so that
-<code>scene-&lt;name&gt;</code> is a legal service name. Install, fork and reconcile refuse
-others with <code>SCENES_BUS_NAME</code>.</p>
-<h3 id="fork-promote-and-move">Fork, promote and move</h3>
-<p><code>scenes.fork {name}</code> stages a copy of the <em>installation</em>, not the template. It
-rewrites the name, citizen and page to the new name (<code>&lt;name&gt;-sandbox</code>, else
-<code>&lt;name&gt;-sb</code>), and records <code>forks[as] = {from, panel?}</code>. The fork inherits the
-origin, so <code>reset</code> works on it, and it is enabled unless <code>enable:false</code>.
-<code>scenes.promote {from}</code> stages the fork back under the original name and
-page. It validates that staged copy, then swaps it in through persisted phase
-records: <code>promoting {from,to,stage,backup,phase:"staged"|"swapped"|"placed"}</code>.
-The old original goes to <code>.recovery/&lt;to&gt;-&lt;uuid&gt;</code>, and the fork is removed to
-<code>.recovery/</code> too. <code>reset</code> uses the same records under <code>resetting</code>.</p>
-<p>Crash recovery at start is decided by what is on disk, <code>(to, stage, backup)</code>,
-not by the phase alone:</p>
-<table><thead><tr><th>On disk</th><th>Action</th></tr></thead><tbody>
-<tr><td><code>to</code> and <code>stage</code> present, no <code>backup</code></td><td>not swapped yet: delete the stage</td></tr>
-<tr><td>no <code>to</code>, <code>stage</code> and <code>backup</code> present</td><td>crashed between renames: place the stage, then finish</td></tr>
-<tr><td>only <code>backup</code> present</td><td>stage lost: restore the backup</td></tr>
-<tr><td><code>to</code> present, no <code>stage</code></td><td>placed: finish</td></tr>
-<tr><td>anything else</td><td>leave it; <code>SCENES_RECOVERY</code> diagnostic with the triple</td></tr>
+<p><strong>Arrange</strong> shows the four edges. Each has its pages in carousel order, the
+mode buttons (hidden, pinned, docked) and a thickness stepper (−/+). Select
+a page, then use ←/→ to swap it with its neighbour.</p>
+<p>Action buttons answer at once with <code>{queued:true}</code>. The action runs in the
+behaviour as one local task, one at a time; a second click while one runs
+gets "Still working on the last change". The status line at the bottom says
+what happened.</p>
+<h2 id="editing-a-scene-in-ced">Editing a scene in ced</h2>
+<p><em>Edit scene</em> (or <em>Edit behaviour</em>) opens the file in <a href="ced">ced</a> and hides the
+dialog. If a <code>ced</code> service is registered, the behaviour sends
+<code>ced.open {paths:[&lt;absolute path&gt;], line?}</code>, where <code>line</code> is the first
+problem's line. Otherwise it sends
+<code>apps.launch {id:"dev.cosmix.ced", uris:[&lt;path&gt;]}</code>. It never spawns ced
+itself: a child of the behaviour would sit in the loader's cgroup and die with
+a loader restart.</p>
+<p>Save with <code>Ctrl+S</code> and the loader reloads the scene live. A broken save leaves
+the old tree applied. ced shows its own in-process scene lint straight away.
+After the save it also shows the loader's verdict: the editor pushes
+<code>ced.diagnostics {path, source:"scenes", digest, diagnostics}</code> for every scene
+file open in ced whose (problems, digest) pair changed. It sends <code>[]</code> when a
+scene recovers. <code>digest</code> is the sha256 of the bytes the loader attempted, so
+ced shows the set only while the tab's text matches them. The digest is part
+of the change key, so a re-save that produces the same problems still
+re-pushes. If ced was not running when <em>Edit</em> launched it, the push is sent
+once ced registers.</p>
+<h2 id="sandbox-try-then-promote">Sandbox: try, then promote</h2>
+<p><em>Try in sandbox</em> (<code>scenes.fork {name}</code>) copies your installation as
+<code>&lt;name&gt;-sandbox</code>, or <code>&lt;name&gt;-sb</code> when the longer name would break the Bus name
+rule. The copy is installed as another carousel page on the same edge and
+enabled, so the original keeps working while you edit the copy. On a
+single-page edge such as the bottom panel, selecting the sandbox page hides
+the original until you page back.</p>
+<p><em>Promote</em> (<code>scenes.promote {from}</code>) validates the staged replacement, the
+sandbox rewritten back to the original name and page, before it moves
+anything. It then swaps the replacement in, and moves the old original and
+the sandbox to <code>.recovery/</code>. A refusal moves nothing. A crash mid-swap is
+finished or rolled back by the next loader start, decided by what is on disk
+(see <a href="scenes-loader#fork-promote-and-move">the loader</a>). A fork keeps its
+original's template origin, so <em>Reset</em> works on it too.</p>
+<h2 id="arrange">Arrange</h2>
+<ul>
+<li><strong>Order</strong>: one <code>shell.panel.order {edges:{&lt;edge&gt;:[…]}}</code> per change, written
+to Quoin's <code>conf.mix</code>.</li>
+<li><strong>Mode</strong>: <code>shell.panel.mode {edge, mode}</code>.</li>
+<li><strong>Thickness</strong>: <code>shell.panel.resize {edge, thickness_px}</code>. The steps are 4 px
+on top/bottom and 20 px on left/right, clamped to 24–200 and 120–500 and to
+the panel's output budget. At a bound it is a no-op with a status line.</li>
+<li><strong>Move to edge</strong>: <code>scenes.move {name, edge}</code> rewrites only the scene's
+<code>window</code> header (dropping <code>w</code>/<code>h</code> across orientations). One
+<code>shell.panel.order</code> then names both edges, so the page leaves the old
+edge's declared list and joins the new one.</li>
+</ul>
+<p>Pages shown per edge are the declared (<code>conf.mix</code>) order first, then any live
+pages it does not name. An empty declared slot shows dimmed; move it past the
+end to drop it. <code>shell.panel.order</code> re-encodes the whole <code>conf.mix</code>: other
+values are kept, comments and formatting are not.</p>
+<h2 id="first-run">First run</h2>
+<p>When the loader sees Quoin come live with no enabled scenes (<code>needs_setup</code>),
+it opens the editor on the Gallery with <code>first_run:true</code>. This happens only
+if the state file read cleanly. The Gallery then shows "Nothing is on your
+desktop yet. Pick panels to add." and highlights the Recommended set. Hiding
+it with Escape or × sets <code>dismissed</code>, so the same loader process does not
+reopen it;
+the next login does, while <code>needs_setup</code> holds. A desktop with any scene
+enabled never auto-opens. <code>SCENES_FIRST_RUN=0</code> in the loader's environment
+turns first run off; test harnesses set it.</p>
+<h2 id="verbs">Verbs</h2>
+<p>All of these are mesh-open, with no authorization gate. Refusals are rc 10
+with <code>{error_code, message, context?}</code>.</p>
+<table><thead><tr><th>Verb</th><th>Args → reply</th></tr></thead><tbody>
+<tr><td><code>scenes.templates</code></td><td><code>{}</code> → <code>{root, templates:[{template, name, title, description, edge, kind, behaviour, recommended, order, requires, installed_as, diagnostic?}]}</code>, sorted by <code>order</code> then <code>template</code>; <code>hidden:true</code> templates are omitted</td></tr>
+<tr><td><code>scenes.editor.open</code></td><td><code>{safe?, view?, scene?, first_run?}</code> → <code>{name:"editor", source:"shipped"|"user", safe, visible, pending, fallback, request_seq}</code></td></tr>
+<tr><td><code>scenes.editor.close</code></td><td><code>{unload?}</code> → <code>{name:"editor", visible:false, mounted}</code></td></tr>
+<tr><td><code>scenes.fork</code></td><td><code>{name, as?, enable?=true}</code> → <code>{name, installed:true, enabled, forked_from}</code></td></tr>
+<tr><td><code>scenes.promote</code></td><td><code>{from}</code> → <code>{name, recovery:[paths], removed}</code></td></tr>
+<tr><td><code>scenes.move</code></td><td><code>{name, edge}</code> → <code>{name, edge, revision}</code></td></tr>
+<tr><td><code>shell.panel.order</code></td><td><code>{edges:{&lt;edge&gt;:[page]}}</code> → <code>{edges}</code> (<a href="quoin">Quoin</a>)</td></tr>
+<tr><td><code>shell.dialog.show</code> / <code>shell.dialog.hide</code></td><td><code>{scene}</code> → <code>{scene, visible, applied}</code> (<a href="scenes#dialog-scenes">Mix Scenes</a>)</td></tr>
+<tr><td><code>shell.scene.layout</code></td><td><code>{scene, node?}</code> → surface and node rects in logical px (<a href="scenes#dialog-scenes">Mix Scenes</a>)</td></tr>
+<tr><td><code>editor.state</code> (on <code>scene-editor</code>)</td><td><code>{}</code> → <code>{model, ui, busy, last, services}</code>; the published model, the selection, whether an action is running and the last outcome</td></tr>
 </tbody></table>
-<p>Each record recovers in its own error boundary, so one bad record never stops
-the rescan. It is retried on <code>scenes.reload {name}</code> or the next loader start.
-<code>stage</code> and <code>backup</code> are stored relative to the scene root. <code>.stage-*</code>
-directories never count as scenes.</p>
-<p><code>scenes.move {name,edge}</code> rewrites only the <code>window</code> header line of the user's
-<code>scene.mix</code>. A move between orientations drops <code>w</code>/<code>h</code>. The loader then
-reconciles: when a mounted scene's page or edge changes, it validates the
-candidate first, then unloads, then loads. If the new load is refused, it
-re-loads the last accepted source at the old address. If that rollback fails
-too, the scene is <code>mounted:false</code> with <code>SCENES_REMOUNT_FAILED</code>
-(<code>context:{new,rollback}</code>), retried by <code>scenes.reload</code>, the next file event or
-the next host return. The loader never writes Quoin's <code>conf.mix</code>; the editor
-follows a move with one <code>shell.panel.order</code> naming both edges. A dialog
-scene, or one without a <code>window</code> header, is refused <code>SCENES_MOUNT</code>.</p>
-<h3 id="unreadable-state">Unreadable state</h3>
-<p><code>state_ok</code> is the outcome of the last <code>read_state</code> and nothing else. While it
-is false, every persist refuses <code>SCENES_STATE_UNREADABLE</code> without writing, so
-an unreadable state file is never overwritten and its origins are not lost.
-The same refusal applies to every mutating verb, before any side effect, and
-to popup opens that would persist a recovery record. First run is
-suppressed. The dialog editor needs no persist, so safe mode still opens.
-State <code>schema_version</code> stays 1; <code>forks</code>, <code>promoting</code> and <code>resetting</code> are
-optional maps.</p>
-<h2 id="gates-and-installer-follow-up">Gates and installer follow-up</h2>
-<p>Run <code>mix src/desktop/scripts/tests/scenes-test.mix</code> for deterministic loader
-transitions with real temporary files. <code>scenes-mesh-test.mix</code> checks list and
-all mutation refusals over local and attested mesh routes, using the two target
-environment variables documented in that test. Rust regression tests cover
-aggregate model bounds, transactional refusals, retained bindings/ports,
-existing list models and bound row refresh, authored-source round trips,
-behaviour disconnect and applied panel notices.
-The build cluster runs the Rust gates and native W1/Quoin integration tests.</p>
-<p>The private session installer must install the loader, helpers and templates;
-render the example unit in the desktop session; and supply the matching native
-Mix binary and Quoin. For Stage B it explicitly seeds the chosen set (never a
-fresh install's default), retains popup recovery and rollback material, and
-stops the old citizen; the loader's handover rule above then mounts the
-existing page IDs. Readiness checks must consume service/readiness/applied-state
-events. No private installer is changed by this public workstream.</p>
-<p>Limits and remaining operational assumptions: at most 128 installed scene
-records, 256 KiB per scene/behaviour file and runtime model, and 64 KiB state or
-metadata. Recovery copies are retained for the operator to manage. Recovery
-mutations reject symlinks (including dangling links), non-directory recovery
-paths and destinations outside the canonical scene root. Source and parent
-checks use no-follow stat; rename does not follow its final components. Trusted
-desktop-user edits are still assumed: Mix has no directory-handle-relative
-rename, so these prechecks cannot exclude a simultaneous hostile parent swap.
-Reset uses two
-renames with rollback on an ordinary error; power loss between those renames
-leaves the preserved copy under <code>.recovery</code>. Multiple processes directly
-editing state do not share the loader's advisory lock. A transport timeout can
-leave the upstream mutation applied before a later event repairs local state.
-The private <code>.generation</code> counter must not be removed or rolled back while
-old behaviour messages can still be delivered; ordinary install/reset never
-touches it.
-The advisory loader lock assumes the root directory itself remains in place;
-replacing the root can detach that lock inode even though native watches
-recover. Stop the loader before replacing its whole root. Runtime model writes
-for managed scenes must use <code>scenes.model</code>. The loader mounts with a JSON
-<code>shell.scene.load {source,model_generation}</code> envelope and updates the fence
-before each spawn; zero disables model writes. The host requires both the
-verified loading citizen and matching positive <code>generation</code> for <code>model</code> and
-<code>model.*</code> patches. Direct behaviour/editor writes are refused without changing
-the model or revision, and a raw load cannot strip a managed fence. Local and
-mesh editors keep access through the loader's generation-aware verbs, so its
-retained model survives remounts. Unmanaged scenes keep direct model patches.
-The local/mesh gate
-assumes its two configured targets reach the same citizen over distinct routes.</p></div></div>
+<p><code>scenes.list</code> carries the editor as <code>editor</code> (not as a row in <code>scenes</code>), plus
+<code>state_ok</code>, per-scene <code>files</code>/<code>digests</code>/<code>problems</code>/<code>forked_from</code>. The loader
+documents these in <a href="scenes-loader#scene-editor">the loader</a>.</p>
+<p>Directed click verbs on <code>scene-editor</code> (<code>editor.view</code>, <code>editor.recommended</code>,
+<code>editor.scene.*</code>, <code>editor.edge.*</code>, …) are UI glue for Quoin's clicks. They are
+not a stable API; drive the <code>scenes.*</code>/<code>shell.*</code> verbs instead.</p>
+<h2 id="recovery">Recovery</h2>
+<p>The editor is a dialog on Quoin, so a Quoin that never comes up means no
+editor. The out-of-band path is <code>scenes-cli.mix</code>, from any terminal and over
+the mesh (<code>--target scenes.&lt;node&gt;.bus</code>):</p>
+<pre><code class="language-sh">mix scenes-cli.mix list
+mix scenes-cli.mix reset panel         # restore a scene from its template
+mix scenes-cli.mix remove notes        # disable, unload, keep a copy in .recovery
+mix scenes-cli.mix reset editor        # restore the editor's user copy from the shipped template
+mix scenes-cli.mix editor --safe       # open the shipped editor
+</code></pre>
+<p>It is installed next to the loader: <code>$COSMIX/bin/scenes-cli.mix</code> on the dev
+tier and <code>/opt/cosmix/share/desktop/scenes-cli.mix</code> on a system install. It
+exits 0 on success, and otherwise prints <code>{error_code, message}</code> and exits 1.</p>
+<p>A wedged editor behaviour can still be dismissed with <strong>×</strong>, which is Quoin
+frame chrome, not a scene node. <code>scenes.remove {name:"editor"}</code> removes only
+your user copy (moved to <code>.recovery/</code>); the shipped editor stays. With an
+unreadable <code>state.conf.mix</code>, every mutating verb is refused
+<code>SCENES_STATE_UNREADABLE</code> rather than overwrite the file. Safe mode still
+opens, with a red banner naming the file.</p>
+<h2 id="limits-v1">Limits (v1)</h2>
+<ul>
+<li>No drag-and-drop, selection overlays on the live shell, node tree, property
+inspector, bindings editor or undo. Arrange is buttons.</li>
+<li>One dialog seat, and it is the editor's: other scenes may not use
+<code>window.kind:"dialog"</code> (<code>SCENES_RESERVED</code>).</li>
+<li>No template previews in the gallery, and no template sharing across the mesh.</li>
+<li>The editor's colours are Breeze Dark literals, like every shipped template;
+scene theme tokens are separate work.</li>
+<li><code>.recovery/</code> is never pruned automatically. The status line names the
+recovery path after a reset, remove or promote.</li>
+<li>An enabled scene left unmounted by a double remount failure is retried only
+by <em>Reload</em>, the next file event or the next Quoin return; there is no timer.</li>
+<li><code>mix lint</code> run directly on a scene file still reports a false <code>MIX-E1003</code>
+at the fence line. ced lints scenes in-process and is not affected.</li>
+</ul></div></div>
     </div>
 
 </main>

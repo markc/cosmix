@@ -310,7 +310,10 @@ discovery. Live panel state is read through the uniform
 plus `dialog`. `declared` is the edge's page order as last ingested from
 `conf.mix` (the live `pages` may hold fewer, or tail pages it does not name).
 `dialog` is the one dialog seat, `{scene, visible, w, h, output}`, or null
-when no dialog scene is loaded; until dialog scenes land it is always null.
+when no dialog scene is loaded. The seat and its verbs (`shell.dialog.show`,
+`shell.dialog.hide`, `shell.scene.layout`) are described in
+[Dialog scenes](scenes#dialog-scenes); in v1 only the
+[Scene Editor](scene-editor) uses it.
 
 `shell.panel.state {edge}` returns those eight leaves in one JSON object,
 plus the host's `keyboard_focused` and `keyboard_requested` booleans for that
