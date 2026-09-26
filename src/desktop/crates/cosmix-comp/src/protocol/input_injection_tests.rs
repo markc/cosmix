@@ -39,7 +39,7 @@ fn keyboard_without_an_owner_refuses_and_cleans_up_generated_holds() {
         let (rc, body) = inject(&mut harness, &ingress, &runtime, op);
         assert_eq!(rc, 10);
         assert_eq!(body["error"], "no_keyboard_target");
-        assert!(harness.server.state.injection.held.is_empty());
+        assert!(harness.server.state.human.held.is_empty());
         assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
         assert_eq!(body["target"], Value::Null);
     }
@@ -70,7 +70,7 @@ fn bare_modifier_without_focus_is_held_for_a_following_binding() {
     );
     assert_eq!(rc, 0, "{body}");
     assert_eq!(body["target"], Value::Null);
-    assert!(!harness.server.state.injection.held.is_empty());
+    assert!(!harness.server.state.human.held.is_empty());
     assert!(harness.server.state.human.keyboard.modifier_state().logo);
 
     // An unhandled payload is refused without releasing the earlier prefix.
@@ -98,7 +98,7 @@ fn bare_modifier_without_focus_is_held_for_a_following_binding() {
         key("Super_L", PressAction::Release),
     );
     assert_eq!(rc, 0, "{body}");
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
     assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     assert!(!harness.server.state.human.keyboard.modifier_state().logo);
 }
@@ -128,7 +128,7 @@ fn release_and_already_held_keys_work_after_focus_is_lost() {
         let (rc, body) = inject(&mut harness, &ingress, &runtime, key(action));
         assert_eq!(rc, 0, "{body}");
     }
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
     assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     assert!(!harness.server.state.human.keyboard.modifier_state().shift);
 }
@@ -177,7 +177,7 @@ fn targeted_text_stops_after_a_binding_changes_focus() {
         let keys = keyboard_key_events(&harness.sync());
         assert!(keys.iter().all(|(key, _)| *key != blocked), "{keys:?}");
         let _ = inject(&mut harness, &ingress, &runtime, InputOp::ReleaseAll);
-        assert!(harness.server.state.injection.held.is_empty());
+        assert!(harness.server.state.human.held.is_empty());
         assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     }
 }
@@ -209,7 +209,7 @@ fn restore_binding_works_with_every_window_minimized() {
     assert_eq!(rc, 0, "{body}");
     assert_eq!(body["target"], Value::Null);
     assert!(!harness.server.state.surfaces[&beta].minimized);
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn targeted_binding_reports_consumption_separately_from_intended_window() {
     assert_eq!(harness.server.state.workspace_current(), 2);
     assert_eq!(body["target"], Value::Null);
     assert_eq!(body["targeted"], json!({"id":id,"generation":generation}));
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn targeted_buttons_obey_kms_delivery_and_quarantine_gates() {
                 .suppressed_buttons
                 .contains(&BTN_LEFT)
         );
-        assert!(harness.server.state.injection.held.is_empty());
+        assert!(harness.server.state.human.held.is_empty());
     }
 }
 
@@ -327,7 +327,7 @@ fn targeted_button_release_respects_corner_ownership() {
     assert_eq!(rc, 10, "a corner does not consume keys: {body}");
     assert_eq!(body["error"], "no_keyboard_target");
     assert_eq!(body["target"], Value::Null);
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
     assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     route_pointer_button(&mut harness, BTN_LEFT, ButtonState::Pressed);
     route_pointer_to(&mut harness, 100.0, 100.0);
@@ -798,7 +798,7 @@ fn injected_binding_chord_is_consumed_by_the_binding() {
         "the binding swallowed M: {keys:?}"
     );
     assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
 
     // An unknown key name is refused and sends nothing.
     let (rc, body) = inject(
@@ -924,7 +924,7 @@ fn injected_workspace_chord_is_consumed() {
         "the move chord swallowed the digit under Shift: {keys:?}"
     );
     assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
 }
 
 #[test]
@@ -1728,13 +1728,13 @@ fn shared_holds_are_released_by_their_last_owner() {
     });
     assert_eq!(rc, 10);
     assert_eq!(pressed_evdev(&harness), [KEY_A], "the keeper still holds A");
-    assert_eq!(harness.server.state.injection.held.owners_of(key_a), 1);
+    assert_eq!(harness.server.state.human.held.owners_of(key_a), 1);
     let (rc, _) = long_reply(&mut harness, &runtime, keeper, |state| {
         state.injection.sequences.is_empty()
     });
     assert_eq!(rc, 0);
     assert!(pressed_evdev(&harness).is_empty());
-    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.human.held.is_empty());
 
     // A single verb re-presses what a run held after releasing it: the run's
     // abort leaves the single verb's hold down.
@@ -1754,7 +1754,7 @@ fn shared_holds_are_released_by_their_last_owner() {
         assert_eq!(rc, 0);
     }
     assert_eq!(
-        harness.server.state.injection.held.owners_of(key_a),
+        harness.server.state.human.held.owners_of(key_a),
         1,
         "the release cleared the run's claim; the press is the verb's"
     );

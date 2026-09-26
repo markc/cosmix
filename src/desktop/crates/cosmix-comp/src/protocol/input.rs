@@ -56,7 +56,7 @@ use smithay::reexports::calloop::channel;
 use smithay::reexports::calloop::{EventSource, LoopHandle};
 use smithay::utils::{Logical, Point};
 
-use super::{HostAxis, HostButtonState, HostInput, WaylandState};
+use super::{HostAxis, HostButtonState, HostInput, SeatKind, WaylandState};
 
 /// The held input contributions attributed to one device lifetime.
 #[derive(Default)]
@@ -765,7 +765,7 @@ pub(crate) fn route_input_event<B: InputBackend>(state: &mut WaylandState, event
             }
         }
         InputRouting::ActivityOnly(reason) => {
-            state.notify_idle_activity();
+            state.notify_idle_activity(SeatKind::Human);
             tracing::trace!(reason, "input event carries activity but no seat operation");
         }
         InputRouting::Ignored(reason) => {

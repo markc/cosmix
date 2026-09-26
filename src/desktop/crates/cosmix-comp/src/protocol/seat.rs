@@ -35,6 +35,10 @@ pub(super) struct CompSeat {
     pub seat: Seat<WaylandState>,
     pub keyboard: KeyboardHandle<WaylandState>,
     pub pointer: PointerHandle<WaylandState>,
+    /// Injected holds are owned by this seat; physical pressed state lives
+    /// in its Smithay keyboard/pointer handles.
+    #[cfg(feature = "bus")]
+    pub held: super::input_injection::Holds,
     #[allow(dead_code)]
     pub pose: Option<SeatPose>,
 }

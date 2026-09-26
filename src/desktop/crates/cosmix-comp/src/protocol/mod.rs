@@ -3350,6 +3350,8 @@ impl ProtocolServer {
             seat_state,
             human: CompSeat {
                 kind: SeatKind::Human,
+                #[cfg(feature = "bus")]
+                held: Default::default(),
                 seat,
                 keyboard,
                 pointer,
@@ -3358,6 +3360,8 @@ impl ProtocolServer {
             input_ingress: input::InputIngressState::default(),
             agent: CompSeat {
                 kind: SeatKind::Agent,
+                #[cfg(feature = "bus")]
+                held: Default::default(),
                 seat: agent_seat,
                 keyboard: agent_keyboard,
                 pointer: agent_pointer,
@@ -8162,6 +8166,7 @@ impl WaylandState {
     }
 
     fn teardown_input_for_session_lock(&mut self) {
+        self.clear_agent_input_for_lock();
         #[cfg(feature = "bus")]
         self.finish_region_selection(crate::port::ControlReply::Locked);
         #[cfg(feature = "bus")]
@@ -8932,14 +8937,14 @@ impl WaylandState {
             && self.consume_corner_release(*button)
         {
             if user_activity {
-                self.notify_idle_activity();
+                self.notify_idle_activity(SeatKind::Human);
             }
             return;
         }
         #[cfg(feature = "bus")]
         if self.region_input(&input) {
             if user_activity {
-                self.notify_idle_activity();
+                self.notify_idle_activity(SeatKind::Human);
             }
             return;
         }
@@ -8957,7 +8962,7 @@ impl WaylandState {
                 | HostInput::TouchCancel
         );
         if user_activity && exposure_sensitive {
-            self.notify_idle_activity();
+            self.notify_idle_activity(SeatKind::Human);
         }
         if user_activity && matches!(self.backend, BackendData::Kms(_)) {
             self.kms_session_lock_gate.observe_physical_touch(&input);
@@ -9088,9 +9093,41 @@ impl WaylandState {
         }
     }
 
-    fn notify_idle_activity(&mut self) {
-        let seat = self.human.seat.clone();
-        self.idle_notifier_state.notify_activity(&seat);
+    fn notify_idle_activity(&mut self, origin: SeatKind) {
+        if origin == SeatKind::Human {
+            self.idle_notifier_state.notify_activity(&self.human.seat);
+            self.idle_notifier_state.notify_activity(&self.agent.seat);
+        }
+    }
+
+    fn clear_agent_input_for_lock(&mut self) {
+        let keyboard = self.agent.keyboard.clone();
+        let pointer = self.agent.pointer.clone();
+        keyboard.unset_grab(self);
+        pointer.unset_grab_without_focus_restore(
+            self, SERIAL_COUNTER.next_serial(), monotonic_millis(),
+        );
+        let time = monotonic_millis();
+        for key in keyboard.pressed_keys() {
+            keyboard.input::<(), _>(
+                self, key, KeyState::Released, SERIAL_COUNTER.next_serial(), time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+        for button in pointer.current_pressed() {
+            pointer.button(self, &ButtonEvent {
+                serial: SERIAL_COUNTER.next_serial(), time, button,
+                state: ButtonState::Released,
+            });
+        }
+        #[cfg(feature = "bus")]
+        { self.agent.held = Default::default(); }
+        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        pointer.motion(self, None, &MotionEvent {
+            location: pointer.current_location(),
+            serial: SERIAL_COUNTER.next_serial(), time,
+        });
+        pointer.frame(self);
     }
 
     fn with_client_state<T>(

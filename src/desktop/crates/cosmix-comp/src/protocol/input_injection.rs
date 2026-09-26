@@ -107,8 +107,6 @@ pub(crate) struct InjectionState {
     pub(super) targeted_button: Option<(u64, u64)>,
     pub(super) button_delivery: Option<(u64, u64)>,
     next_seq: u64,
-    /// Everything injection holds, by owner; `release_all` releases all.
-    pub(super) held: Holds,
     /// The sequence whose step is running (the owner of what it presses).
     current_run: Option<u64>,
     /// Injected events so far (for the sequence yield).
@@ -132,7 +130,6 @@ impl Default for InjectionState {
             targeted_button: None,
             button_delivery: None,
             next_seq: 0,
-            held: Holds::default(),
             current_run: None,
             events: 0,
             host_passthrough: true,
@@ -248,7 +245,7 @@ impl WaylandState {
 
     fn inject(&mut self, input: HostInput) {
         let owner = self.injection.current_run;
-        self.injection.held.note(owner, &input);
+        self.human.held.note(owner, &input);
         self.injection.events = self.injection.events.wrapping_add(1);
         self.handle_host_input(input);
     }
@@ -330,7 +327,7 @@ impl WaylandState {
                 break;
             }
             let was_held = self
-                .injection
+                .human
                 .held
                 .owners
                 .contains_key(&Hold::Key(keycode.raw()));
@@ -640,7 +637,7 @@ impl WaylandState {
 
     /// `release_all`: release everything injection holds, and only that.
     fn release_injected(&mut self, time: u32) {
-        let holds = std::mem::take(&mut self.injection.held);
+        let holds = std::mem::take(&mut self.human.held);
         self.release_holds(holds.owners.into_keys().collect(), time);
     }
 
@@ -941,7 +938,7 @@ impl WaylandState {
     /// owner (another run, a single verb) still holds.
     fn abort_sequence(&mut self, id: u64) -> Option<SequenceRun> {
         let run = self.injection.sequences.remove(&id)?;
-        let orphaned = self.injection.held.drop_owner(Some(id));
+        let orphaned = self.human.held.drop_owner(Some(id));
         self.release_holds(orphaned, monotonic_millis());
         Some(run)
     }
