@@ -552,11 +552,18 @@ impl Dopus {
                         Ok(mut child) => {
                             // Reap off the UI thread: an unreaped Child stays
                             // a zombie until dopus exits. One detached wait
-                            // per open; the UI stays fire-and-forget.
-                            std::thread::Builder::new()
+                            // per open; the UI stays fire-and-forget. If the
+                            // reaper thread cannot start (thread limit), the
+                            // child merely stays a zombie until exit — the
+                            // filemgr precedent — never a UI-thread panic
+                            // over an open (round-2 finding).
+                            if std::thread::Builder::new()
                                 .name("dopus-xdg-open-reap".to_owned())
                                 .spawn(move || drop(child.wait()))
-                                .expect("spawning the xdg-open reaper");
+                                .is_err()
+                            {
+                                tracing::warn!("dopus: xdg-open reaper did not start; the child stays unreaped until exit");
+                            }
                         }
                         Err(error) => {
                             self.status = Some(format!(
