@@ -132,6 +132,28 @@ async fn async_main() -> Result<()> {
         "Starting cosmix-noded",
     );
 
+    // DIAGNOSTIC ONLY (never merge): SIGUSR1 writes an async task dump.
+    #[cfg(tokio_taskdump)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut usr1 = signal(SignalKind::user_defined1()).expect("sigusr1");
+        while usr1.recv().await.is_some() {
+            let handle = tokio::runtime::Handle::current();
+            let dump = tokio::time::timeout(std::time::Duration::from_secs(10), handle.dump()).await;
+            let mut out = String::new();
+            match dump {
+                Ok(dump) => {
+                    for (i, task) in dump.tasks().iter().enumerate() {
+                        out.push_str(&format!("TASK {i}:\n{}\n\n", task.trace()));
+                    }
+                }
+                Err(_) => out.push_str("dump timed out\n"),
+            }
+            let path = std::env::var("NODED_TASKDUMP").unwrap_or_else(|_| "/tmp/noded-taskdump.txt".into());
+            let _ = std::fs::write(path, out);
+        }
+    });
+
     // Start the broker with a readiness signal
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let noded_node = node.clone();
