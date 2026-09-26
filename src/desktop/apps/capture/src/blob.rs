@@ -11,7 +11,16 @@
 
 use cosmix_client::{PortReply, SupervisedClient};
 use serde_json::{Value, json};
-use std::{fs::File, io::Read, path::Path, sync::Arc, time::Duration};
+use std::{
+    fs::File,
+    io::Read,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 /// Pin owner for lane uploads. The bare service name; a
 /// session-qualified owner (`capture:session-12`) comes with the
@@ -79,13 +88,39 @@ fn mime(path: &Path) -> &'static str {
     }
 }
 
+/// The upload body: the file, gated on shutdown and the whole-upload
+/// deadline. ureq's copy loop calls `read` between socket writes, so
+/// an abandoned or over-deadline upload errors at the next chunk
+/// instead of parking the worker until a kernel timeout.
+struct GuardedBody {
+    file: File,
+    shutdown: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl Read for GuardedBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other(
+                "upload abandoned: capture is shutting down",
+            ));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::other("upload deadline passed"));
+        }
+        self.file.read(buf)
+    }
+}
+
 /// POST the finished file to the lane and return the blob reference.
 ///
 /// The body streams from disk under an explicit `Content-Length` —
 /// never chunked: blobd's quota admission reads the declared length
 /// before the first byte. The three `X-Cosmix-*` headers are the pin
-/// owner and the attributes the lane records.
-pub fn upload(lane_bind: &str, path: &Path) -> Result<Value, String> {
+/// owner and the attributes the lane records. `shutdown` abandons the
+/// upload mid-body (the reader above), so process exit never waits
+/// out a stalled lane.
+pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result<Value, String> {
     let url = format!("http://{lane_bind}/blob");
     let name = path
         .file_name()
@@ -96,6 +131,7 @@ pub fn upload(lane_bind: &str, path: &Path) -> Result<Value, String> {
         .metadata()
         .map_err(|e| format!("stat {}: {e}", path.display()))?
         .len();
+    let deadline = Instant::now() + UPLOAD_DEADLINE;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(IO_TIMEOUT)
         .timeout_read(IO_TIMEOUT)
@@ -108,7 +144,11 @@ pub fn upload(lane_bind: &str, path: &Path) -> Result<Value, String> {
         .set("X-Cosmix-Name", name)
         .set("X-Cosmix-Mime", mime(path))
         .timeout(UPLOAD_DEADLINE)
-        .send(file)
+        .send(GuardedBody {
+            file,
+            shutdown,
+            deadline,
+        })
         .map_err(|e| match e {
             ureq::Error::Status(status, _) => format!("lane answered {status} for {url}"),
             other => format!("POST {url}: {other}"),
@@ -172,6 +212,11 @@ mod tests {
     /// A reference body from a well-behaved lane, for tests to tweak.
     fn reference_body(blob: &str, extra: &str) -> String {
         format!("{{\"blob\":\"{blob}\",\"size\":9,\"mime\":\"image/png\"{extra}}}")
+    }
+
+    /// A shutdown flag nobody sets: uploads in ordinary tests.
+    fn quiet() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
     }
 
     /// One-shot loopback lane: accepts a single request, reads it
@@ -267,7 +312,7 @@ mod tests {
         let path = dir.path().join("cosmix-1.png");
         let bytes = b"png bytes";
         fs::write(&path, bytes).unwrap();
-        let reference = upload(&bind, &path).unwrap();
+        let reference = upload(&bind, &path, quiet()).unwrap();
         assert_eq!(reference["blob"], id.as_str());
         assert_eq!(reference["size"], 9);
         assert_eq!(reference["origin"], "alpha");
@@ -292,7 +337,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cosmix-1.mp4");
         fs::write(&path, b"mp4!").unwrap();
-        let reference = upload(&bind, &path).unwrap();
+        let reference = upload(&bind, &path, quiet()).unwrap();
         assert_eq!(reference["mime"], "video/mp4");
         let (head, _) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(
@@ -308,7 +353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cosmix-1.png");
         fs::write(&path, b"png bytes").unwrap();
-        let error = upload(&bind, &path).unwrap_err();
+        let error = upload(&bind, &path, quiet()).unwrap_err();
         assert!(error.contains("413"), "{error}");
         rx.recv_timeout(Duration::from_secs(10)).unwrap();
     }
@@ -323,6 +368,75 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cosmix-2.png");
         fs::write(&path, b"x").unwrap();
-        assert!(upload(&bind, &path).is_err());
+        assert!(upload(&bind, &path, quiet()).is_err());
+    }
+
+    #[test]
+    fn the_body_guard_errors_once_shutdown_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cosmix-3.png");
+        fs::write(&path, b"png bytes").unwrap();
+        let shutdown = quiet();
+        let mut body = GuardedBody {
+            file: File::open(&path).unwrap(),
+            shutdown: shutdown.clone(),
+            deadline: Instant::now() + UPLOAD_DEADLINE,
+        };
+        let mut buffer = [0u8; 4];
+        assert_eq!(body.read(&mut buffer).unwrap(), 4);
+        shutdown.store(true, Ordering::Relaxed);
+        let error = body.read(&mut buffer).unwrap_err();
+        assert!(error.to_string().contains("shutting down"), "{error}");
+    }
+
+    #[test]
+    fn an_in_flight_upload_is_abandoned_promptly_at_shutdown() {
+        // A lane that drains slowly keeps the guard's checks running
+        // between chunks; shutdown set mid-body errors the upload at
+        // the next one, not at any socket deadline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let blank = line.trim_end().is_empty();
+                head.push_str(&line);
+                if blank {
+                    break;
+                }
+            }
+            let length: usize = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse().ok())
+                .unwrap_or(0);
+            let mut scratch = [0u8; 8192];
+            let mut read = 0;
+            while read < length {
+                let n = reader.read(&mut scratch).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                read += n;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cosmix-4.png");
+        fs::write(&path, vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let shutdown = quiet();
+        let flag = shutdown.clone();
+        let worker = std::thread::spawn(move || upload(&bind, &path, flag));
+        std::thread::sleep(Duration::from_millis(300));
+        let abandoned = Instant::now();
+        shutdown.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("shutting down"), "{error}");
+        assert!(abandoned.elapsed() < Duration::from_secs(2), "{error}");
     }
 }

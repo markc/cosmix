@@ -172,6 +172,7 @@ fn run_job(
     cancel: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
     lane: blob::Lane,
+    shutdown: Arc<AtomicBool>,
 ) {
     // Whether the finished file landed at `path` — publish succeeded,
     // so the blob-store copy is owed even when encoding then reports
@@ -324,10 +325,15 @@ fn run_job(
     // records `blob_error` and never demotes the terminal phase. The
     // lock is dropped across the upload (a five-minute MP4 takes
     // minutes): status meanwhile shows the terminal phase with
-    // `blob: null`, then the reference.
-    if published {
+    // `blob: null`, then the reference. Process shutdown skips and
+    // abandons the upload: exit never waits out a stalled lane. The
+    // flag is deliberately not `cancel` — `capture.stop` sets that,
+    // and a stopped recording still owes its dual-write.
+    if published && !shutdown.load(Ordering::Relaxed) {
         drop(state);
-        let outcome = lane.bind().and_then(|bind| blob::upload(&bind, &path));
+        let outcome =
+            lane.bind()
+                .and_then(|bind| blob::upload(&bind, &path, shutdown.clone()));
         let mut state = status.lock().unwrap();
         match outcome {
             Ok(reference) => state.blob = Some(reference),
@@ -335,6 +341,22 @@ fn run_job(
         }
     }
 }
+/// Stop the active job for process shutdown and wait for its worker
+/// without ever joining inside the runtime: on this current-thread
+/// runtime only the main thread drives the IO and timers the worker's
+/// `block_on` parks on, so a synchronous join deadlocks (worker waits
+/// for the timer that only main's loop would fire; main waits for the
+/// join). The blocking pool owns the join, bounded — a worker that
+/// will not stop in `bound` is abandoned, not waited out. Returns
+/// whether the worker finished within the bound.
+async fn reap(job: Job, shutdown: &AtomicBool, bound: Duration) -> bool {
+    job.cancel.store(true, Ordering::Relaxed);
+    shutdown.store(true, Ordering::Relaxed);
+    let thread = job.thread;
+    let joined = tokio::task::spawn_blocking(move || thread.join().is_ok());
+    tokio::time::timeout(bound, joined).await.is_ok_and(|joined| joined.is_ok())
+}
+
 fn recording_target(elapsed: Duration, fps: u32) -> u64 {
     ((elapsed.as_secs_f64() * fps as f64).floor() as u64)
         .saturating_add(1)
@@ -448,6 +470,10 @@ async fn async_main() -> Result<(), String> {
     // handle, never the Bus loop below.
     let lane = blob::Lane::new(client.clone(), tokio::runtime::Handle::current());
     let mut job: Option<Job> = None;
+    // Set only on the process-exit paths (SIGTERM, SIGINT, Bus loss)
+    // — never by `capture.stop`, whose recordings still owe their
+    // dual-write. Abandons lane resolution and an in-flight upload.
+    let shutdown = Arc::new(AtomicBool::new(false));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -470,10 +496,10 @@ async fn async_main() -> Result<(), String> {
                         let (path,partial) = reserve(&options,video)?;
                         *status.lock().unwrap() = Status {phase:if video {"starting"}else{"screenshot"},path:Some(path.clone()),vaapi_device:options.vaapi_device.clone(),..Default::default()};
                         let cancel = Arc::new(AtomicBool::new(false));
-                        let (mut opts,flag,state,lane) = (options.clone(),cancel.clone(),status.clone(),lane.clone());
+                        let (mut opts,flag,state,job_lane,exit) = (options.clone(),cancel.clone(),status.clone(),lane.clone(),shutdown.clone());
                         if output.is_some() { opts.output=output; }
                         opts.region=region;
-                        let thread = std::thread::Builder::new().name("cosmix-capture".into()).spawn(move ||run_job(opts,video,fps,path,partial,flag,state,lane)).map_err(|e|e.to_string())?;
+                        let thread = std::thread::Builder::new().name("cosmix-capture".into()).spawn(move ||run_job(opts,video,fps,path,partial,flag,state,job_lane,exit)).map_err(|e|e.to_string())?;
                         job = Some(Job {cancel,thread});
                     } else if command.command=="capture.stop" && let Some(job)=&job {
                         job.cancel.store(true,Ordering::Relaxed); status.lock().unwrap().stopping();
@@ -485,9 +511,10 @@ async fn async_main() -> Result<(), String> {
             }
         }
     }
+    // Both exit paths — signal and Bus loss — land here; neither may
+    // join the worker synchronously inside the runtime (see `reap`).
     if let Some(job) = job {
-        job.cancel.store(true, Ordering::Relaxed);
-        let _ = job.thread.join();
+        let _ = reap(job, &shutdown, Duration::from_secs(5)).await;
     }
     client.close().await;
     Ok(())
@@ -656,5 +683,42 @@ mod tests {
         fs::write(&final_path, b"keep").unwrap();
         assert!(publish(&partial, &final_path).is_err());
         assert_eq!(fs::read(final_path).unwrap(), b"keep");
+    }
+
+    fn parked_job(park: impl FnOnce() + Send + 'static) -> Job {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn(park);
+        Job {
+            cancel,
+            thread,
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaps_a_worker_that_honours_the_flag() {
+        // A worker mid-upload ignores `cancel` (a stopped recording
+        // still uploads) and exits on `shutdown` — the reap case.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let job = parked_job(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert!(
+            reap(job, &shutdown, Duration::from_secs(5)).await,
+            "worker honours shutdown, must join within the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_stuck_worker_within_the_bound() {
+        // A worker parked past the bound is abandoned, not waited out;
+        // it exits shortly after so the blocking pool drains too.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let job = parked_job(|| std::thread::sleep(Duration::from_secs(2)));
+        let started = Instant::now();
+        assert!(!reap(job, &shutdown, Duration::from_millis(150)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
