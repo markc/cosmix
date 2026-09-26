@@ -109,6 +109,7 @@ pub enum DeleteOutcome {
 /// Application database state.
 #[derive(Clone)]
 pub struct Db {
+    pub migration: Arc<tokio::sync::Semaphore>,
     pub conn: Arc<Mutex<Connection>>,
     pub blob_dir: std::path::PathBuf,
 }
@@ -132,6 +133,7 @@ impl Db {
         std::fs::create_dir_all(&blob_dir)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
             blob_dir,
         })
     }

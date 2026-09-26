@@ -78,16 +78,24 @@ size are verified against returned references. The current `blob.stat` reply
 omits the optional filename, so a reference recovered through stat omits
 `name` rather than inventing a new first-writer hint.
 
-Exports run in a session-owned pool of eight tasks outside serial Bus
+Attachment lists and exports run in a session-owned pool of eight tasks outside serial Bus
 dispatch. A full pool immediately returns rc 10
 `busy: maild blob transfer pool is full (8)`. Reconnect or session shutdown
 cancels the tasks. Lane failures use `lane_unavailable:`, `quota:`, `lane:`,
 `not_present:` or `verify_failed:`; all are rc 10. There is no detach,
 message rewrite, shared-root access or implicit remote fetch.
+Transfer replies and busy refusals have a 30-second Bus send deadline;
+timeout logs once and releases the task slot. A stalled broker cannot retain
+a completed transfer indefinitely.
 `message.ref` is export, not import: JMAP `Email/import` still requires an
 upload UUID, and `/jmap/blob` still reads maild's own MDS store.
 
 ## Legacy blob migration
+
+Migration runs outside serial dispatch in its own single maintenance slot.
+A concurrent page receives rc 10 `busy: migration already running`.
+The slot remains held until blocking work finishes, including across Bus
+cancellation or reconnect, and through the bounded response send.
 
 `maild.blob.migrate {apply?: false, account_id?, cursor?: 0, limit?: 500}`
 runs on the daemon's own store handle. It accepts at most 500 rows per call;

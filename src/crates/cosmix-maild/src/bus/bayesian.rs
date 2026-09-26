@@ -1836,6 +1836,7 @@ mod tests {
         }
         db::Db {
             conn: Arc::new(Mutex::new(conn)),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
             blob_dir: std::env::temp_dir(),
         }
     }

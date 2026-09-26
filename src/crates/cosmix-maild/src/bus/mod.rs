@@ -634,9 +634,30 @@ async fn dispatch_loop(
     };
 
     let mut transfers = crate::blob_lane::Transfers::default();
+    let mut maintenance = tokio::task::JoinSet::new();
     while let Some(cmd) = rx.recv().await {
         if !client.is_connected() {
             break;
+        }
+        while let Some(result) = maintenance.try_join_next() {
+            if let Err(e) = result { tracing::warn!(error = %e, "migration task failed"); }
+        }
+        if cmd.command == "maild.blob.migrate" {
+            let Ok(permit) = db.migration.clone().try_acquire_owned() else {
+                let body = serde_json::json!({"error": "busy: migration already running"}).to_string();
+                crate::blob_lane::bounded_response(client.respond(&cmd, 10, &body)).await;
+                continue;
+            };
+            let permit = Arc::new(permit);
+            let client = client.clone();
+            let db = db.clone();
+            let mailstore = mailstore.clone();
+            maintenance.spawn(async move {
+                let (rc, body) = blobs::dispatch(&cmd, &db, &mailstore, permit.clone()).await;
+                crate::blob_lane::bounded_response(client.respond(&cmd, rc, &body)).await;
+                drop(permit);
+            });
+            continue;
         }
         if is_transfer(&cmd.command) || is_blob_diagnostic(&cmd) {
             if transfers.is_full() {
@@ -672,11 +693,7 @@ async fn dispatch_loop(
             discovery: client.as_ref(),
             max_message_size,
         };
-        let (rc, body) = if cmd.command == "maild.attachment.list" {
-            dispatch_attachment(&cmd, &db, &mailstore, &client).await
-        } else if cmd.command == "maild.blob.migrate" {
-            blobs::dispatch(&cmd, &db, &mailstore).await
-        } else if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
+        let (rc, body) = if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
             rules::dispatch(
                 action,
                 &cmd,
@@ -723,11 +740,12 @@ async fn dispatch_loop(
         }
     }
     transfers.shutdown().await;
+    maintenance.shutdown().await;
     DispatchLoopExit::StreamEnded
 }
 
 fn is_transfer(command: &str) -> bool {
-    matches!(command, "maild.attachment.ref" | "maild.message.ref")
+    matches!(command, "maild.attachment.list" | "maild.attachment.ref" | "maild.message.ref")
 }
 
 fn is_blob_diagnostic(cmd: &IncomingCommand) -> bool {
@@ -850,7 +868,7 @@ mod tests {
             cmd.headers.insert("args".into(), "invalid JSON".into());
             assert!(!is_blob_diagnostic(&cmd)); // strict dispatcher refuses it
         }
-        assert!(!is_transfer("maild.attachment.list"));
+        assert!(is_transfer("maild.attachment.list"));
         assert!(!is_transfer("maild.blob.migrate"));
     }
 

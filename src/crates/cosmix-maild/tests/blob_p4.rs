@@ -24,6 +24,41 @@ struct Fixture {
 
 struct LocalLane(Option<String>);
 #[tokio::test]
+async fn concurrent_apply_pages_refuse_and_cancelled_page_keeps_maintenance_slot() {
+    let f = Fixture::new().await;
+    let db = f.state().db.clone();
+    let conn = db.conn.clone();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _lock = conn.lock().unwrap();
+        locked.send(()).unwrap();
+        wait.recv().unwrap();
+    });
+    ready.await.unwrap();
+    let ms = f.state().mailstore.clone();
+    let task_db = db.clone();
+    let first = tokio::spawn(async move {
+        cosmix_maild::bus::blobs::migrate(&task_db, &ms, json!({"apply": true})).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while db.migration.available_permits() != 0 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let (rc, reply) = migrate(&f, json!({"apply": true})).await;
+    assert_eq!(rc, 10);
+    assert_eq!(reply["error"], "busy: migration already running");
+    first.abort();
+    let _ = first.await;
+    assert_eq!(db.migration.available_permits(), 0);
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while db.migration.available_permits() == 0 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert_eq!(migrate(&f, json!({"apply": true})).await.0, 0);
+}
+
+#[tokio::test]
 async fn html_part_download_is_forced_attachment_and_sandboxed() {
     let f = Fixture::new().await;
     let item = f.deliver(b"Content-Type: text/html\r\nContent-Disposition: attachment; filename*=utf-8''caf%C3%A9%0A.html\r\n\r\n<script>alert(1)</script>");

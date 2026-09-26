@@ -535,6 +535,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let db_handle = db::Db {
             conn: Arc::new(Mutex::new(conn)),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
             blob_dir: tmp.path().to_path_buf(),
         };
         (overrides_runtime, db_handle, tmp)

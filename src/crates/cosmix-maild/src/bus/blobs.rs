@@ -46,9 +46,9 @@ struct Row {
     size: i64,
 }
 
-pub async fn dispatch(cmd: &IncomingCommand, db: &Db, ms: &Arc<SqliteMailStore>) -> (u8, String) {
+pub async fn dispatch(cmd: &IncomingCommand, db: &Db, ms: &Arc<SqliteMailStore>, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> (u8, String) {
     match super::try_resolve_args(cmd) {
-        Ok(args) => migrate(db, ms, args).await,
+        Ok(args) => migrate_admitted(db, ms, args, permit).await,
         Err(e) => error(format!("invalid_arguments: {e}")),
     }
 }
@@ -59,6 +59,14 @@ fn error(message: String) -> (u8, String) {
 
 /// Public for in-process conformance tests; production invokes this via Bus.
 pub async fn migrate(db: &Db, ms: &Arc<SqliteMailStore>, args: Value) -> (u8, String) {
+    let Ok(permit) = db.migration.clone().try_acquire_owned() else {
+        return error("busy: migration already running".into());
+    };
+    migrate_admitted(db, ms, args, Arc::new(permit)).await
+}
+
+async fn migrate_admitted(db: &Db, ms: &Arc<SqliteMailStore>, args: Value,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> (u8, String) {
     let args = if args.is_null() { json!({}) } else { args };
     if !args.is_object() {
         return error("invalid_arguments: expected object".into());
@@ -79,7 +87,10 @@ pub async fn migrate(db: &Db, ms: &Arc<SqliteMailStore>, args: Value) -> (u8, St
     }
     let db = db.clone();
     let ms = ms.clone();
-    match tokio::task::spawn_blocking(move || page(&db, &ms, request, limit)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit; // cancellation cannot release a running blocking page
+        page(&db, &ms, request, limit)
+    }).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(e)) => error(format!("migration: {e}")),
         Err(e) => error(format!("migration: worker failed: {e}")),

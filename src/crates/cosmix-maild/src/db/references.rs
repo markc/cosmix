@@ -103,6 +103,7 @@ mod tests {
         conn.execute_batch(super::super::SCHEMA).unwrap();
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
             blob_dir: Default::default(),
         };
         let mut key = Key {
