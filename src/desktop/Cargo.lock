@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-capture"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-client",
@@ -3046,6 +3046,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "ureq",
  "wayland-client",
  "wayland-protocols-wlr",
 ]
@@ -10366,6 +10367,18 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "once_cell",
+ "url",
+]
 
 [[package]]
 name = "url"
