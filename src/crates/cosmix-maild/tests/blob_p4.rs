@@ -169,7 +169,7 @@ async fn attachment_bus(
     f: &Fixture,
     command: &str,
     args: Value,
-    discovery: &LocalLane,
+    discovery: &impl cosmix_maild::blob_lane::Discovery,
 ) -> (u8, Value) {
     let state = f.state();
     let lane = cosmix_maild::blob_lane::Lane::new().unwrap();
@@ -203,6 +203,7 @@ async fn attachment_and_message_exports_are_idempotent_and_retain_bookkeeping() 
         attachment_bus(&f, "maild.attachment.ref", part_args.clone(), &discovery).await;
     assert_eq!(rc, 0, "{reference}");
     let headers = server.await.unwrap().to_ascii_lowercase();
+    assert!(headers.starts_with(&format!("put /blob/{} ", blake3::hash(&[0, 255]).to_hex())));
     assert!(headers.contains("x-cosmix-owner: maild:1"));
     assert!(headers.contains("x-cosmix-name: caf%c3%a9.bin"));
     assert_eq!(reference["name"], "first-writer");
@@ -302,14 +303,25 @@ async fn failed_export_validation_or_database_write_never_records_a_reference() 
         .unwrap()
         .execute_batch("DROP TRIGGER fail_reference;")
         .unwrap();
-    let (discovery, server) = export_server(&f, &[0, 255], false).await;
+    struct Pinned;
+    impl cosmix_maild::blob_lane::Discovery for Pinned {
+        async fn stat(&self, blob: &str) -> Result<Value, String> {
+            assert_eq!(blob, format!("b3:{}", blake3::hash(&[0, 255]).to_hex()));
+            Ok(json!({"present": true, "pins": ["maild:1"], "size": 2,
+                "mime": "application/octet-stream", "origin": "alpha"}))
+        }
+        async fn bind(&self) -> Result<String, String> { panic!("retry must not use HTTP") }
+        async fn quota(&self, _: &str) -> Result<Value, String> {
+            Ok(json!({"owners": {"maild:1": {"limit": 2, "used": 2, "reserved": 0}},
+                "total": {"limit": 2, "used": 2, "reserved": 0}}))
+        }
+    }
     assert_eq!(
-        attachment_bus(&f, "maild.attachment.ref", args, &discovery)
+        attachment_bus(&f, "maild.attachment.ref", args, &Pinned)
             .await
             .0,
         0
     );
-    server.await.unwrap();
 }
 
 #[tokio::test]

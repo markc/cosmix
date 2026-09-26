@@ -70,6 +70,14 @@ belongs to later reconciliation. An interrupted export or a DB failure
 after upload can leave a pin without a reference row; retry is safe and
 does not remove that pin. No DB mutex is held across HTTP.
 
+Before quota or HTTP, exports hash their local bytes and call `blob.stat`.
+A present blob already pinned by this owner repairs missing bookkeeping
+without quota or HTTP. Otherwise the advisory quota preflight precedes
+`PUT /blob/<hex>`; a present hash uses blobd's pin-and-return path. Hash and
+size are verified against returned references. The current `blob.stat` reply
+omits the optional filename, so a reference recovered through stat omits
+`name` rather than inventing a new first-writer hint.
+
 Exports run in a session-owned pool of eight tasks outside serial Bus
 dispatch. A full pool immediately returns rc 10
 `busy: maild blob transfer pool is full (8)`. Reconnect or session shutdown

@@ -17,11 +17,17 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const REFERENCE_LIMIT: usize = 64 * 1024;
 
 pub trait Discovery: Send + Sync {
+    fn stat(&self, _blob: &str) -> impl Future<Output = Result<Value, String>> + Send {
+        std::future::ready(Err("lane_unavailable: blob.stat unavailable".into()))
+    }
     fn bind(&self) -> impl Future<Output = Result<String, String>> + Send;
     fn quota(&self, owner: &str) -> impl Future<Output = Result<Value, String>> + Send;
 }
 
 impl Discovery for NodedClient {
+    async fn stat(&self, blob: &str) -> Result<Value, String> {
+        call(self, "blob.stat", json!({"blob": blob})).await
+    }
     async fn bind(&self) -> Result<String, String> {
         let value = call(self, "blob.props.get", json!({"path": "lane"})).await?;
         let bind = value["bind"]
@@ -155,6 +161,26 @@ impl Lane {
         mime: &str,
         name: Option<&str>,
     ) -> Result<Reference, String> {
+        let blob = format!("b3:{}", blake3::hash(&bytes).to_hex());
+        match discovery.stat(&blob).await {
+            Ok(stat) if stat["present"] == true && stat["pins"].as_array()
+                .is_some_and(|pins| pins.iter().any(|pin| pin.as_str() == Some(owner))) => {
+                let reference = Reference {
+                    blob,
+                    size: stat["size"].as_u64().ok_or("lane: invalid stat size")?,
+                    mime: stat["mime"].as_str().ok_or("lane: invalid stat mime")?.into(),
+                    name: stat["name"].as_str().map(str::to_owned),
+                    origin: stat["origin"].as_str().ok_or("lane: invalid stat origin")?.into(),
+                };
+                reference.validate()?;
+                if reference.size != bytes.len() as u64 {
+                    return Err("verify_failed: stat size differs from exported bytes".into());
+                }
+                return Ok(reference);
+            }
+            Ok(_) => (),
+            Err(reason) => tracing::warn!(%reason, "blob stat unavailable; trying lane admission"),
+        }
         // Advisory failure is fail-open; authoritative HTTP admission is not.
         match discovery
             .quota(owner)
@@ -166,10 +192,10 @@ impl Lane {
             Err(reason) => tracing::warn!(%reason, "skipping advisory blob quota preflight"),
         }
         let bind = discovery.bind().await?;
-        self.post(&bind, owner, bytes, mime, name).await
+        self.put(&bind, owner, bytes, mime, name).await
     }
 
-    pub async fn post(
+    pub async fn put(
         &self,
         bind: &str,
         owner: &str,
@@ -191,7 +217,7 @@ impl Lane {
         };
         let mut request = self
             .http
-            .post(format!("http://{bind}/blob"))
+            .put(format!("http://{bind}/blob/{hash}"))
             .header("Content-Length", size)
             .header("X-Cosmix-Owner", owner)
             .header("X-Cosmix-Mime", mime)
@@ -306,7 +332,7 @@ impl Lane {
         upload: bool,
     ) -> Result<Response, String> {
         let status = response.status().as_u16();
-        if status == expected {
+        if status == expected || (upload && status == 200) {
             return Ok(response);
         }
         if status == 404 && !upload {
@@ -501,13 +527,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_hash_checks_and_preserves_canonical_metadata_and_headers() {
+    async fn put_hash_checks_and_preserves_canonical_metadata_and_headers() {
         for name in ["café% file.bin".to_owned(), "a".repeat(129)] {
             let reply = reference(b"hello").to_string();
             let (bind, worker) = serve("201 Created", reply.as_bytes(), "", reply.len());
             let result = Lane::new()
                 .unwrap()
-                .post(
+                .put(
                     &bind,
                     "maild:7",
                     b"hello".to_vec(),
@@ -633,7 +659,7 @@ mod tests {
             let reply = reply.to_string();
             let (bind, worker) = serve("201 Created", reply.as_bytes(), "", reply.len());
             assert!(
-                lane.post(&bind, "maild:7", vec![1], "text/plain", None)
+                lane.put(&bind, "maild:7", vec![1], "text/plain", None)
                     .await
                     .is_err()
             );
