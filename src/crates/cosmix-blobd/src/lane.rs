@@ -24,12 +24,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Router;
 use cosmix_mds::blob;
 use cosmix_mds::types::BlobHash;
 use http_body_util::BodyExt;
@@ -206,14 +206,19 @@ async fn get_blob(
             Err(e) => return lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
     };
-    builder.body(body).unwrap_or_else(|e| {
-        lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-    })
+    builder
+        .body(body)
+        .unwrap_or_else(|e| lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
 }
 
 /// Stream `len` bytes from the CAS file at offset `start` — the blob is
 /// never read into memory whole.
-async fn stream_range(root: &Path, hash: &BlobHash, start: u64, len: u64) -> Result<Body, cosmix_mds::Error> {
+async fn stream_range(
+    root: &Path,
+    hash: &BlobHash,
+    start: u64,
+    len: u64,
+) -> Result<Body, cosmix_mds::Error> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let file = tokio::fs::File::from(blob::open(root, hash)?);
     let mut reader = tokio::io::BufReader::with_capacity(128 * 1024, file);
@@ -476,9 +481,7 @@ impl Lane {
                     Some(LaneAbort::Idle) => {
                         lane_error(StatusCode::REQUEST_TIMEOUT, &e.to_string())
                     }
-                    None => {
-                        lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-                    }
+                    None => lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
                 }
             }
             Ok(Err(UploadError::Store(e))) => {
@@ -585,8 +588,7 @@ fn stream_into_store(
     // put_reader hashes while staging and commits under the hash of the
     // bytes that actually arrived; on a read error it removes the
     // staged file and leaves no CAS entry.
-    let (landed, size) =
-        blob::put_reader(&store.blobs_root(), reader).map_err(UploadError::Io)?;
+    let (landed, size) = blob::put_reader(&store.blobs_root(), reader).map_err(UploadError::Io)?;
 
     if let Some(expected) = expected
         && expected != landed
@@ -673,4 +675,492 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .expect("static response parts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::store::StoreOptions;
+    use std::collections::BTreeMap;
+    // `Read` arrives via `use super::*`; `BufRead` and `Write` are
+    // test-local.
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::TcpStream;
+    use tempfile::TempDir;
+
+    /// TESTS ONLY: a lane bound to loopback. In production a lane is
+    /// constructed only by main, and only after `bind_is_wg` has proved
+    /// the bind is this node's own WG address — fail closed, exit 2
+    /// before any socket; loopback is never a legal production bind.
+    /// The proof itself is a pure function with its own unit test
+    /// below (the arm-6 shape).
+    async fn test_lane(options: StoreOptions) -> (TempDir, Arc<Store>, SocketAddr) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path(), options).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_lane(listener, Arc::clone(&store), 4));
+        (dir, store, addr)
+    }
+
+    fn options() -> StoreOptions {
+        StoreOptions {
+            origin: "testnode".into(),
+            quota_total_bytes: crate::core::DEFAULT_QUOTA_TOTAL_BYTES,
+            quota_owner_default_bytes: crate::core::DEFAULT_QUOTA_OWNER_BYTES,
+            owner_limits: BTreeMap::new(),
+        }
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64*): incompressible
+    /// enough that no accidental dedup hides a wrong-range read, and
+    /// reproducible across runs.
+    fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state = seed | 1;
+        while out.len() < len {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            out.extend(state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// A whole HTTP/1.1 exchange over a raw socket: the lane only ever
+    /// answers with Content-Length bodies, so the response is read
+    /// exactly (HEAD excepted — headers only, by definition). Returns
+    /// (status, lowercase-header map, body).
+    fn request(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: blobd.test\r\n");
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        read_response(&mut stream, method == "HEAD")
+    }
+
+    /// Read a status line, headers and a Content-Length body (absent
+    /// for `is_head`).
+    fn read_response(
+        stream: &mut TcpStream,
+        is_head: bool,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let status: u16 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("bad status line {line:?}"));
+        let mut headers = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            let (name, value) = line.split_once(':').expect("header colon");
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+        let len: usize = if is_head {
+            0
+        } else {
+            headers
+                .iter()
+                .find(|(name, _)| name == "content-length")
+                .and_then(|(_, value)| value.parse().ok())
+                .unwrap_or(0)
+        };
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).unwrap();
+        (status, headers, body)
+    }
+
+    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> &'a str {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default()
+    }
+
+    /// `blobs/.tmp` holds nothing — the abort paths' no-residue claim.
+    fn tmp_is_empty(store: &Store) -> bool {
+        match std::fs::read_dir(store.blobs_root().join(".tmp")) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
+    }
+
+    // ---- Gate arm 1: size-forced lane ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn arm1_put_32mib_get_back_whole_and_via_two_ranges() {
+        let (_dir, store, addr) = test_lane(options()).await;
+        // Above MAX_MESSAGE_BYTES (16 MiB), so this body can never ride
+        // a Bus frame — the lane is the only path.
+        let bytes = pseudo_random(32 * 1024 * 1024 + 123, 0x5EED);
+        let hash = blob::hash_bytes(&bytes);
+        let path = format!("/blob/{}", blob::hex(&hash));
+
+        let (status, _, body) = request(addr, "PUT", &path, &[], &bytes);
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+        let reference: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reference["blob"], format!("b3:{}", blob::hex(&hash)));
+        assert_eq!(reference["size"], bytes.len() as u64);
+        assert_eq!(reference["origin"], "testnode");
+
+        // The upload is pinned to the lane owner and accounted.
+        let stat = store.stat(&hash).unwrap();
+        assert!(stat.present);
+        assert_eq!(stat.pins, vec!["lane:127.0.0.1".to_string()]);
+        assert_eq!(
+            store.quota_report(None).unwrap().total.used,
+            bytes.len() as u64
+        );
+
+        // Whole read.
+        let (status, headers, body) = request(addr, "GET", &path, &[], b"");
+        assert_eq!(status, 200);
+        assert_eq!(
+            header_value(&headers, "content-length"),
+            bytes.len().to_string()
+        );
+        assert_eq!(
+            header_value(&headers, "etag"),
+            format!("\"{}\"", blob::hex(&hash))
+        );
+        assert_eq!(header_value(&headers, "accept-ranges"), "bytes");
+        assert_eq!(header_value(&headers, "cache-control"), "immutable");
+        assert_eq!(
+            header_value(&headers, "content-type"),
+            "application/octet-stream"
+        );
+        assert_eq!(body, bytes);
+
+        // Range one: an interior window.
+        let (status, headers, body) = request(
+            addr,
+            "GET",
+            &path,
+            &[("Range", "bytes=1048576-2097151")],
+            b"",
+        );
+        let size = bytes.len() as u64;
+        assert_eq!(status, 206);
+        assert_eq!(
+            header_value(&headers, "content-range"),
+            format!("bytes 1048576-2097151/{size}")
+        );
+        assert_eq!(body, bytes[1_048_576..2_097_152]);
+
+        // Range two: a suffix.
+        let (status, headers, body) = request(addr, "GET", &path, &[("Range", "bytes=-4096")], b"");
+        assert_eq!(status, 206);
+        assert_eq!(
+            header_value(&headers, "content-range"),
+            format!("bytes {}-{}/{size}", size - 4096, size - 1)
+        );
+        assert_eq!(body, bytes[bytes.len() - 4096..]);
+    }
+
+    // ---- Gate arm 4: wrong bytes ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn arm4_put_of_wrong_hash_is_422_with_no_residue() {
+        let (_dir, store, addr) = test_lane(options()).await;
+        let bytes = pseudo_random(1024 * 1024, 0xBEEF);
+        let claimed = blob::hash_bytes(b"entirely different bytes");
+        let path = format!("/blob/{}", blob::hex(&claimed));
+
+        let (status, headers, body) = request(addr, "PUT", &path, &[], &bytes);
+        assert_eq!(status, 422, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(header_value(&headers, "content-type"), "application/json");
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(error["error"].as_str().unwrap().contains("hash mismatch"));
+
+        // No entry for the claimed hash, none for what the body hashed
+        // to (the landed entry this request created was unlinked), and
+        // nothing left staging.
+        assert!(!blob::exists(&store.blobs_root(), &claimed).unwrap());
+        assert!(!blob::exists(&store.blobs_root(), &blob::hash_bytes(&bytes)).unwrap());
+        assert!(tmp_is_empty(&store));
+        assert_eq!(store.quota_report(None).unwrap().total.used, 0);
+    }
+
+    // ---- Gate arm 5: quota, refused cleanly mid-stream ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn arm5_owner_cap_refuses_413_with_no_residue() {
+        let capped = options();
+        let StoreOptions {
+            quota_total_bytes,
+            quota_owner_default_bytes,
+            ..
+        } = capped.clone();
+        let capped = StoreOptions {
+            owner_limits: BTreeMap::from([("capped".to_string(), 1024 * 1024)]),
+            quota_total_bytes,
+            quota_owner_default_bytes,
+            ..capped
+        };
+        let (_dir, store, addr) = test_lane(capped).await;
+
+        // A declared Content-Length over the cap is refused before the
+        // body is read: headers claim 2 MiB, only a prefix is sent.
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let head = "PUT /blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+                    HTTP/1.1\r\nHost: blobd.test\r\nX-Cosmix-Owner: capped\r\n\
+                    Content-Length: 2097152\r\n\r\n";
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(b"pref").unwrap();
+        let (status, _, _) = read_response(&mut stream, false);
+        assert_eq!(status, 413);
+
+        // A lying length meets the same limit mid-stream: chunked (no
+        // Content-Length to pre-check), 2 MiB total, abort at the cap.
+        // The reader runs on its own thread because the server stops
+        // reading at the cap and the remaining writes can fail — the
+        // 413 is what matters, and it is consumed as it arrives.
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut response_stream = stream.try_clone().unwrap();
+        let reader = std::thread::spawn(move || read_response(&mut response_stream, false));
+        let head = "POST /blob HTTP/1.1\r\nHost: blobd.test\r\nX-Cosmix-Owner: capped\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n";
+        stream.write_all(head.as_bytes()).unwrap();
+        let chunk = pseudo_random(128 * 1024, 0xCA11);
+        for _ in 0..16 {
+            // 2 MiB total: past the 1 MiB cap.
+            let piece = format!("{:x}\r\n", chunk.len()).into_bytes();
+            if stream.write_all(&piece).is_err()
+                || stream.write_all(&chunk).is_err()
+                || stream.write_all(b"\r\n").is_err()
+            {
+                break; // the abort closed its end; the 413 is already out
+            }
+        }
+        let (status, _, body) = reader.join().expect("reader thread");
+        assert_eq!(status, 413, "{}", String::from_utf8_lossy(&body));
+        assert!(String::from_utf8_lossy(&body).contains("quota"));
+
+        // No residue, quota untouched.
+        assert!(tmp_is_empty(&store));
+        let report = store.quota_report(None).unwrap();
+        assert_eq!(report.owners["capped"].used, 0);
+        assert_eq!(report.total.used, 0);
+        assert!(store.list(None, 10, None).unwrap().is_empty());
+    }
+
+    // ---- Lane idempotence: PUT of a hash the CAS already holds ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_of_present_hash_answers_200_without_reading_the_body() {
+        let (dir, store, addr) = test_lane(options()).await;
+        let bytes = pseudo_random(64 * 1024, 0x01D0);
+        let src = dir.path().join("present.bin");
+        std::fs::write(&src, &bytes).unwrap();
+        let outcome = store
+            .put(&src, &crate::core::store::PutOptions::new("filesd"))
+            .unwrap();
+        let hash = outcome.reference.hash;
+        let path = format!("/blob/{}", blob::hex(&hash));
+
+        // Declare 10 MiB, send 3 bytes, and expect the 200 anyway: the
+        // hash is the identity, so the body is never consumed (a server
+        // that tried to read it would block on the missing bytes and
+        // the 5-second read timeout below would fire instead).
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let head =
+            format!("PUT {path} HTTP/1.1\r\nHost: blobd.test\r\nContent-Length: 10485760\r\n\r\n");
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(b"abc").unwrap();
+        let (status, headers, body) = read_response(&mut stream, false);
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(header_value(&headers, "content-type"), "application/json");
+        let reference: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reference["blob"], format!("b3:{}", blob::hex(&hash)));
+        assert_eq!(reference["size"], bytes.len() as u64);
+
+        // Pinned to the lane owner beside the original pin.
+        let stat = store.stat(&hash).unwrap();
+        assert!(stat.pins.contains(&"filesd".to_string()));
+        assert!(stat.pins.contains(&"lane:127.0.0.1".to_string()));
+    }
+
+    // ---- POST: origin and stat ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_201_reference_origin_is_the_node_name_and_stat_sees_it() {
+        let (_dir, store, addr) = test_lane(options()).await;
+        let bytes = pseudo_random(4096, 0xB057);
+        let (status, _, body) = request(
+            addr,
+            "POST",
+            "/blob",
+            &[
+                ("X-Cosmix-Mime", "image/png"),
+                ("X-Cosmix-Name", "shot.png"),
+                ("X-Cosmix-Owner", "capture"),
+            ],
+            &bytes,
+        );
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+        let reference: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reference["origin"], "testnode");
+        assert_eq!(reference["mime"], "image/png");
+        assert_eq!(reference["name"], "shot.png");
+        assert_eq!(reference["size"], bytes.len() as u64);
+
+        let hash = blob::from_hex(
+            reference["blob"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("b3:")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hash, blob::hash_bytes(&bytes));
+        let stat = store.stat(&hash).unwrap();
+        assert!(stat.present);
+        assert_eq!(stat.mime.as_deref(), Some("image/png"));
+        assert_eq!(stat.pins, vec!["capture".to_string()]);
+        assert_eq!(stat.origin.as_deref(), Some("testnode"));
+
+        // And the lane serves what the POST landed.
+        let (status, headers, body) = request(
+            addr,
+            "GET",
+            &format!("/blob/{}", blob::hex(&hash)),
+            &[("Range", "bytes=0-99")],
+            b"",
+        );
+        assert_eq!(status, 206);
+        assert_eq!(header_value(&headers, "content-type"), "image/png");
+        assert_eq!(body, bytes[..100]);
+    }
+
+    // ---- Gate arm 6: WG bind proof (unit test on the pure function) ----
+
+    #[test]
+    fn arm6_bind_is_wg_fails_closed() {
+        let wg = "10.42.0.5";
+        // Only the node's own WG address passes.
+        assert!(bind_is_wg("10.42.0.5:4210", wg));
+        assert!(bind_is_wg("[fd00::5]:4210", "fd00::5"));
+        // Unspecified, loopback, another interface: all refuse.
+        assert!(!bind_is_wg("0.0.0.0:4210", wg));
+        assert!(!bind_is_wg("[::]:4210", wg));
+        assert!(!bind_is_wg("127.0.0.1:4210", wg));
+        assert!(!bind_is_wg("[::1]:4210", wg));
+        assert!(!bind_is_wg("10.42.0.6:4210", wg));
+        assert!(!bind_is_wg("192.168.1.10:4210", wg));
+        // Unparseable bind, absent or unparseable wg_ip: fail closed.
+        assert!(!bind_is_wg("10.42.0.5", wg));
+        assert!(!bind_is_wg("not-an-addr:4210", wg));
+        assert!(!bind_is_wg("10.42.0.5:4210", ""));
+        assert!(!bind_is_wg("10.42.0.5:4210", "wg.invalid"));
+    }
+
+    // ---- HEAD mirrors GET; 404 and 416 shapes ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn head_mirrors_get_and_error_shapes() {
+        let (_dir, _store, addr) = test_lane(options()).await;
+        let bytes = pseudo_random(8192, 0x4EA2);
+        let hash = blob::hash_bytes(&bytes);
+        let (status, _, _) = request(
+            addr,
+            "PUT",
+            &format!("/blob/{}", blob::hex(&hash)),
+            &[],
+            &bytes,
+        );
+        assert_eq!(status, 201);
+        let path = format!("/blob/{}", blob::hex(&hash));
+
+        let (.., get_headers, _) = request(addr, "GET", &path, &[], b"");
+        let (status, head_headers, body) = request(addr, "HEAD", &path, &[], b"");
+        assert_eq!(status, 200);
+        assert!(body.is_empty(), "HEAD carries no body");
+        for name in [
+            "content-length",
+            "content-type",
+            "etag",
+            "accept-ranges",
+            "cache-control",
+        ] {
+            assert_eq!(
+                header_value(&get_headers, name),
+                header_value(&head_headers, name),
+                "HEAD must mirror GET's {name}"
+            );
+        }
+        assert_eq!(header_value(&head_headers, "content-length"), "8192");
+
+        // Unknown hash → 404 with the verb-style error token.
+        let (status, _, body) = request(
+            addr,
+            "GET",
+            "/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &[],
+            b"",
+        );
+        assert_eq!(status, 404);
+        assert!(String::from_utf8_lossy(&body).contains("not_present"));
+
+        // A non-hash id → 400.
+        let (status, _, body) = request(addr, "GET", "/blob/b3:not-hex-at-all", &[], b"");
+        assert_eq!(status, 400);
+        assert!(String::from_utf8_lossy(&body).contains("invalid blob id"));
+
+        // Start at EOF → 416 with bytes */size.
+        let (status, headers, _) = request(addr, "GET", &path, &[("Range", "bytes=8192-")], b"");
+        assert_eq!(status, 416);
+        assert_eq!(header_value(&headers, "content-range"), "bytes */8192");
+
+        // A zero suffix → 416.
+        let (status, _, _) = request(addr, "GET", &path, &[("Range", "bytes=-0")], b"");
+        assert_eq!(status, 416);
+
+        // Malformed and multi-range specs are ignored: whole blob, 200.
+        let (status, _, body) = request(addr, "GET", &path, &[("Range", "bytes=9000-1")], b"");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 8192);
+        let (status, _, body) = request(addr, "GET", &path, &[("Range", "bytes=0-1,3-4")], b"");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 8192);
+
+        // A past-EOF last byte is clamped: whole-file 206.
+        let (status, headers, body) =
+            request(addr, "GET", &path, &[("Range", "bytes=0-99999999")], b"");
+        assert_eq!(status, 206);
+        assert_eq!(header_value(&headers, "content-range"), "bytes 0-8191/8192");
+        assert_eq!(body.len(), 8192);
+    }
 }

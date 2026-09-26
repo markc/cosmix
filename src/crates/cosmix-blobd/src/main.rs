@@ -102,8 +102,8 @@ async fn async_main() -> anyhow::Result<()> {
             let lane_store = Arc::clone(&store);
             let max_uploads = cfg.lane_max_uploads;
             tokio::spawn(async move {
-                if let Err(error) = cosmix_blobd::lane::serve_lane(listener, lane_store, max_uploads)
-                    .await
+                if let Err(error) =
+                    cosmix_blobd::lane::serve_lane(listener, lane_store, max_uploads).await
                 {
                     eprintln!("cosmix-blobd: byte lane stopped: {error}");
                 }
@@ -114,11 +114,6 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     let instance = cfg.name.clone().unwrap_or_else(|| "default".to_string());
-    let citizen = Arc::new(Citizen::new(
-        store,
-        cfg.service_name(),
-        instance,
-        lane,
-    ));
+    let citizen = Arc::new(Citizen::new(store, cfg.service_name(), instance, lane));
     cosmix_blobd::citizen::serve(citizen).await
 }
