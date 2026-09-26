@@ -2677,7 +2677,8 @@ impl ClientDndGrabHandler for WaylandState {
         seat: Seat<Self>,
     ) {
         if seat != self.human.seat {
-            // Smithay has already installed the grab; interception is chunk 2.
+            // Smithay calls started BEFORE installing the grab. Returning (or
+            // unsetting here) cannot prevent that install; interception is chunk 2.
             tracing::debug!("ignored non-human drag icon update");
             return;
         }

@@ -2543,6 +2543,19 @@ fn xwayland_tagged_client_sees_only_human_seat() {
     }));
     assert_eq!(h.server.state.human.seat.client_seats(&xclient).len(), 1);
     assert!(h.server.state.agent.seat.client_seats(&xclient).is_empty());
+    // Guess the global name observed by the native client (human is first).
+    // Hiding the advertisement must also forbid a direct wl_registry.bind.
+    let (agent_global, version) = h.registry_globals.all("wl_seat")[1];
+    bind_global_for(&mut client, globals.registry_id, agent_global, "wl_seat", version.min(9), 6);
+    h.dispatch_client();
+    let (object, code, message) = read_protocol_error(&mut client);
+    assert_eq!(object, 1, "bind rejection is a wl_display error: {message}");
+    assert_eq!(
+        code,
+        smithay::reexports::wayland_server::protocol::wl_display::Error::InvalidObject as u32,
+        "{message}"
+    );
+    assert!(h.server.state.agent.seat.client_seats(&xclient).is_empty());
 }
 
 #[test]

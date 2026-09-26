@@ -914,6 +914,10 @@ input.corners.{holders,enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance
                enforced.{top,bottom,left,right},
                held.{top,bottom,left,right}}     (enforced, held: volatile)
 input.host.passthrough            (nested backend only)
+input.seats.{human,agent}.{name,keyboard_focus:{id,generation}|null,
+                          pointer_focus:{id,generation}|null,
+                          pointer:{output,x,y}|null,last_input_us}  (volatile)
+input.last_origin                (human|agent|null; volatile)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
@@ -1334,7 +1338,10 @@ rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
 <p>Since 0.71.0, the compositor advertises a second seat, <code>cosmix-agent</code>, with
 its own keyboard and pointer (hidden from Xwayland). It is not yet driven:
-input injection still uses the human <code>cosmix</code> seat.</p>
+input injection still uses the human <code>cosmix</code> seat.
+In this chunk, Bus injection follows <code>inject → handle_host_input → notify_idle_activity(SeatKind::Human)</code>: it reports <code>last_origin:"human"</code>,
+updates the human <code>last_input_us</code>, and resets both seats' idle notifications.
+The agent delivery path is chunk 2 work.</p>
 <p><code>comp.input.key</code> (including its <code>{text}</code> form) and <code>comp.input.pointer.button</code>
 accept <code>window:{id,generation}</code> and <code>raise?:bool</code> (default true). Both identity
 fields are required; <code>raise</code> requires <code>window</code>. The compositor focuses the window
@@ -1851,6 +1858,13 @@ application probes at once, and a second later the keyboard returns to the
 application and the panel and menu are enforced. After <code>SIGCONT</code> the shell's
 own conceal returns <code>enforced</code> to 0, and <code>held.&lt;edge&gt;</code> returns to 0 once its
 menus have closed.</p>
+<p>The per-seat <code>input.seats.*</code> observations and <code>input.last_origin</code> are also
+read-only and volatile: <code>get</code>, <code>list</code> and <code>describe</code> serve them, but
+<code>props.changed</code> never reports them. Focus identifies a surface by <code>{id,generation}</code>
+or is null; pointer coordinates are output-local logical coordinates or null
+when unknown or locked. <code>last_input_us</code> uses CLOCK_MONOTONIC microseconds and
+is null before input. An unset <code>last_origin</code> is omitted from the serialised
+tree (a direct read returns null). Existing focus and pointer leaves remain human.</p>
 <p>Hot-corner detection is compositor-side and uses the current logical output.
 It emits one <code>entered</code>, then one <code>left</code> on deadzone exit, output or geometry
 change, session lock, disable, or config invalidation. <code>corner</code> is <code>tl</code>, <code>tr</code>,
@@ -2169,7 +2183,8 @@ percentiles over them, null without samples.</li>
 started (the first update, registration, compositor start, or the last
 reset).</li>
 </ul>
-<p>The presentation leaves and the whole <code>sources</code> subtree are <strong>volatile</strong>:
+<p>The presentation leaves, the whole <code>sources</code> subtree, <code>input.seats.*</code> and
+<code>input.last_origin</code> are <strong>volatile</strong>:
 <code>get</code>, <code>list</code> and <code>describe</code> serve them (<code>describe</code> says <code>volatile: true</code>),
 but <code>props.changed</code> never reports them, so a watched client presenting at
 60 Hz does not flood the topic. Row add and remove events carry no

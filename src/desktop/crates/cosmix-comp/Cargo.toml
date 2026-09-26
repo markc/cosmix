@@ -136,4 +136,5 @@ wgpu = { version = "=29.0.4", features = ["noop"] }
 # call site is a compile error there.
 smithay = { version = "=0.7.0", default-features = false, features = [
     "cosmix_offline_test",
+    "test-support",
 ] }

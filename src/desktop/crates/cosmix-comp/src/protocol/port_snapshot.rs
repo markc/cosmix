@@ -353,6 +353,7 @@ pub(crate) struct BindingRowSnapshot {
 pub(crate) struct InputSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) seats: Option<BTreeMap<&'static str, SeatSnapshot>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_origin: Option<&'static str>,
     pub(crate) corners: CornersSnapshot,
     /// Nested backend only: whether host pointer/key input reaches the seat.
@@ -3423,7 +3424,7 @@ mod tests {
                         last_input_us: None,
                     }),
                 ])),
-                last_origin: None,
+                last_origin: Some("human"),
                 // A read snapshot, with the volatile holder-plane counts.
                 corners: CornersSnapshot {
                     enforced: Some(EdgeCounts { left: 1, ..EdgeCounts::default() }),

@@ -535,6 +535,10 @@ input.corners.{holders,enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance
                enforced.{top,bottom,left,right},
                held.{top,bottom,left,right}}     (enforced, held: volatile)
 input.host.passthrough            (nested backend only)
+input.seats.{human,agent}.{name,keyboard_focus:{id,generation}|null,
+                          pointer_focus:{id,generation}|null,
+                          pointer:{output,x,y}|null,last_input_us}  (volatile)
+input.last_origin                (human|agent|null; volatile)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
@@ -952,6 +956,10 @@ rounds half away from zero on both sides of the origin.
 Since 0.71.0, the compositor advertises a second seat, `cosmix-agent`, with
 its own keyboard and pointer (hidden from Xwayland). It is not yet driven:
 input injection still uses the human `cosmix` seat.
+In this chunk, Bus injection follows `inject → handle_host_input →
+notify_idle_activity(SeatKind::Human)`: it reports `last_origin:"human"`,
+updates the human `last_input_us`, and resets both seats' idle notifications.
+The agent delivery path is chunk 2 work.
 
 `comp.input.key` (including its `{text}` form) and `comp.input.pointer.button`
 accept `window:{id,generation}` and `raise?:bool` (default true). Both identity
@@ -1513,6 +1521,14 @@ application and the panel and menu are enforced. After `SIGCONT` the shell's
 own conceal returns `enforced` to 0, and `held.<edge>` returns to 0 once its
 menus have closed.
 
+The per-seat `input.seats.*` observations and `input.last_origin` are also
+read-only and volatile: `get`, `list` and `describe` serve them, but
+`props.changed` never reports them. Focus identifies a surface by `{id,generation}`
+or is null; pointer coordinates are output-local logical coordinates or null
+when unknown or locked. `last_input_us` uses CLOCK_MONOTONIC microseconds and
+is null before input. An unset `last_origin` is omitted from the serialised
+tree (a direct read returns null). Existing focus and pointer leaves remain human.
+
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry
 change, session lock, disable, or config invalidation. `corner` is `tl`, `tr`,
@@ -1849,7 +1865,8 @@ the updates it skipped count as `discarded`.
   started (the first update, registration, compositor start, or the last
   reset).
 
-The presentation leaves and the whole `sources` subtree are **volatile**:
+The presentation leaves, the whole `sources` subtree, `input.seats.*` and
+`input.last_origin` are **volatile**:
 `get`, `list` and `describe` serve them (`describe` says `volatile: true`),
 but `props.changed` never reports them, so a watched client presenting at
 60 Hz does not flood the topic. Row add and remove events carry no

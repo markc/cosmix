@@ -3,8 +3,9 @@
 Smithay agent-seat additions (comp 0.71.0): `SeatState::new_wl_seat_with_filter`
 stores a client predicate in `SeatGlobalData` and delegates visibility through
 `GlobalDispatch::can_view`; `new_wl_seat` keeps its always-visible behaviour.
-The hidden `XWaylandClientData::for_test` constructor supplies the real client
-tag without a child process for headless registry-filter tests.
+The `test-support`-gated `XWaylandClientData::for_test` constructor supplies the
+real client tag without a child process for headless registry-filter tests.
+Only comp's dev-dependency enables it; production builds have no constructor.
 
 ## iced_tiny_skia 0.14.1
 

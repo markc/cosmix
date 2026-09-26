@@ -405,6 +405,7 @@ impl ClientData for XWaylandClientData {
 impl XWaylandClientData {
     /// Construct the real client tag for headless protocol tests, without a child process.
     /// Production Xwayland clients must be created by [`XWayland::spawn`].
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn for_test() -> Self {
         Self {
