@@ -2607,6 +2607,15 @@ mod tests {
         // A redelivered v2 sibling is a genuine duplicate.
         assert!(!clicks.accept(&pin, 13_183, true));
         assert_eq!(clicks.sequence_rejections, 1);
+        // A redelivered legacy record before its twin counts once; the twin
+        // is still the silent dedup.
+        let mut clicks = ClickPreference::default();
+        assert!(clicks.accept(&CornerKind::Clicked, 40, false));
+        assert!(!clicks.accept(&CornerKind::Clicked, 40, false));
+        assert_eq!(clicks.sequence_rejections, 1);
+        assert!(!clicks.accept(&pin, 41, true));
+        assert_eq!(clicks.sequence_rejections, 1);
+        assert_eq!(clicks.last_sequence, Some(40));
         // A v2 record that does not pair with the legacy number is stale.
         let mut clicks = ClickPreference::default();
         assert!(clicks.accept(&CornerKind::Clicked, 50, false));
