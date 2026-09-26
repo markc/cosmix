@@ -560,6 +560,21 @@ fn legacy_guard($s, $page)
   end
 end
 
+-- Unload a hosted scene. A scene the host no longer has is already
+-- unloaded: Quoin drops a departed owner's scenes on its own, so a listing
+-- adopted at start can be gone by the time an address change unloads it
+-- (live gate G2e, 2026-09-26). Every other refusal still raises.
+fn unload_scene($s, $name)
+  try
+    return $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
+  catch $message, $error
+    if $error.code == "SCENES_UPSTREAM" and ((($error.details ?? {}).upstream ?? {}).error ?? "") == "unknown scene" then
+      return {scene:$name, absent:true}
+    end
+    raise($error.code, $message, $error.details)
+  end
+end
+
 -- Plan rule 6: Quoin refuses an edge/page change on a live scene, so the
 -- new address needs an unload. Validate first so a bad edit costs nothing;
 -- a refused load re-loads the last accepted document at the old address.
@@ -568,7 +583,7 @@ fn remount($s, $name, $c, $model)
   $e = $s.scenes[$name]
   $v = $s.io.rpc($s.host, "shell.scene.validate", $c.source)
   if type($v) != "map" then fail("SCENES_SNAPSHOT", "missing scene validation receipt", {}) end
-  $u = $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
+  $u = unload_scene($s, $name)
   if type($u) != "map" then fail("SCENES_SNAPSHOT", "missing scene unload receipt", {}) end
   $s.scenes[$name].mounted = false
   $s.remount_error = nil
@@ -623,7 +638,7 @@ fn reconcile_one($s, $name, $force)
     $e = $s.scenes[$name]
     if $e.mounted then
       try
-        $unloaded = $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
+        $unloaded = unload_scene($s, $name)
         if type($unloaded) != "map" then fail("SCENES_SNAPSHOT", "missing scene unload receipt", {}) end
         $e.mounted = false
         $e.visible = false
@@ -1367,7 +1382,7 @@ fn services($s, $names, $reconnect)
         if has_key($s.scenes, $row.name) then
           $s.scenes[$row.name].mounted = true
         else
-          $s.io.rpc($s.host, "shell.scene.unload", {scene:$row.name})
+          $_u = unload_scene($s, $row.name)
         end
       end
     end
@@ -1719,7 +1734,7 @@ fn editor_to_shipped($s)
   if $e.copy != "user" then return $s end
   $s = invalidate($s, "editor")
   if $s.scenes.editor.mounted and $s.host_live then
-    $s.io.rpc($s.host, "shell.scene.unload", {scene:"editor"})
+    $_u = unload_scene($s, "editor")
   end
   $s.scenes.editor.mounted = false
   $s.scenes.editor.visible = false

@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.2.1
 -- Stage B: owns the panel/launcher/calendar/notes pages once seeded and
 -- enabled; while the legacy quoin-panel citizen (SCENES_LEGACY_SERVICE) is
 -- registered those scenes stay unmounted, and its departure mounts them.

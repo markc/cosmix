@@ -4,7 +4,7 @@ $l = require("../lib/scenes.mix")
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-scenes-test.XXXXXXXX"]))
 $log = $tmp .. "/calls"
 $checks = {count:0}
-$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, load_error:nil, names:["test-shell"],
+$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, unload_absent:nil, load_error:nil, names:["test-shell"],
   dialog:nil, dialog_mode:"q2", refuse_edge:nil, rollback_fail:nil, hosted:nil, rev:0}
 write_file($log, "")
 
@@ -30,6 +30,9 @@ fn rpc($host, $verb, $body)
   if $verb == "noded.props.get" then return {services:{registered:$host_state.names}} end
   if $verb == "shell.info" and $host_state.info_verbs != nil then return {verbs:$host_state.info_verbs} end
   if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_error then raise("SCENES_UPSTREAM", "unload refused", {}) end
+  if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_absent then
+    raise("SCENES_UPSTREAM", "scene host refused request", {rc:10, upstream:{error:"unknown scene", error_code:"SCENE_REFUSED", message:"unknown scene"}})
+  end
   if contains(["shell.scene.load", "shell.scene.validate"], $verb) then
     $source = type($body) == "map" ? $body.source : $body
     $d = $l.document($source)
@@ -640,6 +643,14 @@ try
   $s = $l.rescan($s, false)
   check($s.scenes["zz-good"].revision > $revision, "raising reconcile isolated within full rescan")
   $host_state.unload_error = nil
+
+  -- A scene the host already dropped (Quoin unloads a departed owner's
+  -- scenes; a restarted loader can adopt the stale listing first) is
+  -- unloaded: disable succeeds and leaves nothing mounted (live gate G2e).
+  $host_state.unload_absent = "zz-good"
+  $s = $l.request($s, "disable", {name:"zz-good"})
+  check($s.rc == 0 and not $s.scenes["zz-good"].mounted and $s.scenes["zz-good"].diagnostic == nil, "unloading a scene the host already dropped counts as unloaded: " .. json_encode($s.scenes["zz-good"].diagnostic))
+  $host_state.unload_absent = nil
 
   -- m6/m7: retiring ownership outlives an installation and its replacement.
   install_fixture($s.templates, "worker", true)
