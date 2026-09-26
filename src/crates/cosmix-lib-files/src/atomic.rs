@@ -28,22 +28,21 @@ pub fn land_verified(
     let dir = path.parent().ok_or_else(|| FilesError::BadRequest("target has no parent".into()))?;
     let name = path.file_name().ok_or_else(|| FilesError::BadRequest("target has no name".into()))?;
     let tmp = dir.join(format!(".{}.tmp.{}", name.to_string_lossy(), Uuid::new_v4()));
-    let existing_permissions = if overwrite {
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_file() => Some(meta.permissions()),
-            Ok(_) => return Err(FilesError::BadRequest("target is not a regular file".into())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        }
-    } else { None };
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let target_exists = if overwrite {
+            match fs::symlink_metadata(path) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            }
+        } else { false };
         // Replacement bytes must stay private throughout streaming, before
         // restoring the target's permissions immediately prior to publication.
-        options.mode(if existing_permissions.is_some() { 0o600 } else { 0o666 });
+        options.mode(if target_exists { 0o600 } else { 0o666 });
     }
     let mut file = options.open(&tmp)?;
     // Arm only after create_new succeeds: never unlink someone else's entry.
@@ -78,8 +77,15 @@ pub fn land_verified(
             "hash mismatch: expected {expected_hex}, got {actual}"
         )));
     }
-    if let Some(permissions) = existing_permissions {
-        file.set_permissions(permissions)?;
+    if overwrite {
+        // The early lookup chooses staging mode only. Streaming may take a
+        // long time: validate the live target and preserve its current mode.
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => file.set_permissions(meta.permissions())?,
+            Ok(_) => return Err(FilesError::BadRequest("target is not a regular file".into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     file.sync_all()?;
     drop(file);
@@ -413,6 +419,55 @@ mod tests {
             assert!(reader.reads > 2);
             assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, mode);
             assert_eq!(fs::read(&path).unwrap(), b"secret");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_overwrite_rechecks_live_target_after_streaming() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        struct ChangingReader<'a> {
+            path: &'a Path,
+            link: bool,
+            body: &'a [u8],
+            changed: bool,
+        }
+        impl Read for ChangingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.changed {
+                    if self.link {
+                        fs::remove_file(self.path)?;
+                        symlink("other", self.path)?;
+                    } else {
+                        fs::set_permissions(self.path, fs::Permissions::from_mode(0o600))?;
+                    }
+                    self.changed = true;
+                }
+                self.body.read(buf)
+            }
+        }
+        let dir = scratch_dir();
+        let path = dir.join("target");
+        fs::write(dir.join("other"), b"untouched").unwrap();
+        for link in [false, true] {
+            fs::write(&path, b"old").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut reader = ChangingReader { path: &path, link, body: b"new", changed: false };
+            let result = land_verified(&path, &mut reader, 3, &hash(b"new"), true);
+            assert!(reader.changed);
+            if link {
+                assert!(matches!(result, Err(FilesError::BadRequest(ref message))
+                    if message == "target is not a regular file"));
+                assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+                assert_eq!(fs::read_link(&path).unwrap(), Path::new("other"));
+                assert_eq!(fs::read(dir.join("other")).unwrap(), b"untouched");
+            } else {
+                result.unwrap();
+                assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(fs::read(&path).unwrap(), b"new");
+            }
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "staging file leaked");
         }
         fs::remove_dir_all(dir).unwrap();
     }
