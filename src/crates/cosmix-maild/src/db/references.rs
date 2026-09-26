@@ -20,7 +20,11 @@ fn error(e: impl std::fmt::Display) -> String {
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Reference> {
     Ok(Reference {
         blob: r.get(0)?,
-        size: r.get(1)?,
+        // SQLite has no unsigned column; the writer stores the u64 size as
+        // a non-negative i64 (CHECK constraint), read back the same way.
+        size: u64::try_from(r.get::<_, i64>(1)?).map_err(|_| {
+            rusqlite::Error::IntegralValueOutOfRange(1, r.get::<_, i64>(1).unwrap_or(-1))
+        })?,
         mime: r.get(2)?,
         name: r.get(3)?,
         origin: r.get(4)?,
