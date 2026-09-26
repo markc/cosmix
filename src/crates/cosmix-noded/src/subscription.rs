@@ -1271,8 +1271,8 @@ impl SubscriptionBroker {
     /// count, total retained snapshot bytes). Active = has subscribers
     /// or has retained snapshot.
     pub async fn props_summary(&self) -> (u64, u64) {
-        let inner = self.inner.read().await;
         let topics = self.topics.read().await;
+        let inner = self.inner.read().await;
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for sub in inner.subscriptions.values() {
             if let SubKind::Topic { name } = &sub.kind {
@@ -1300,8 +1300,8 @@ impl SubscriptionBroker {
     }
 
     pub async fn list(&self, prefix: Option<&str>) -> Vec<TopicInfo> {
-        let inner = self.inner.read().await;
         let topics = self.topics.read().await;
+        let inner = self.inner.read().await;
 
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for sub in inner.subscriptions.values() {
