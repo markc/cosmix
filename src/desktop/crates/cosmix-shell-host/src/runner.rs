@@ -3614,7 +3614,7 @@ mod tests {
 
     #[test]
     fn agent_seat_name_is_excluded_before_human_name_arrives() {
-        // Contract paired with comp's production_seat_remains_single_named_human_without_touch.
+        // Contract paired with comp's production_seats_advertise_human_first_and_agent_without_touch.
         let candidates = vec![(1, Some(AGENT_SEAT_NAME.into())), (2, None)];
         assert_eq!(preferred_seat(&candidates, None), None);
         assert_eq!(preferred_seat(&candidates, Some(&1)), None);

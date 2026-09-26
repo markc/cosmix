@@ -1,5 +1,4 @@
 use super::*;
-use super::seat::AGENT_SEAT_NAME;
 use crate::backend::kms::OutputKey;
 
 /// Canonicalise a seat focus target back to the `wl_surface` most assertions
@@ -2401,6 +2400,14 @@ fn seat_discovery_traffic(
     h: &mut KeybindingHarness,
     reverse: bool,
 ) -> (RegistryGlobals, u32, WireEvents) {
+    named_seat_discovery_traffic(h, HUMAN_SEAT_NAME, reverse)
+}
+
+fn named_seat_discovery_traffic(
+    h: &mut KeybindingHarness,
+    name: &str,
+    reverse: bool,
+) -> (RegistryGlobals, u32, WireEvents) {
     let registry = h.allocate_object_id();
     let callback = h.allocate_object_id();
     send_display_request(&mut h.client, 1, registry);
@@ -2412,7 +2419,7 @@ fn seat_discovery_traffic(
     }
     let seat_id = h.allocate_object_id();
     let server = &mut h.server;
-    let mut traffic = bind_named_seat(&mut h.client, &globals, HUMAN_SEAT_NAME, 9, seat_id, callback, || {
+    let mut traffic = bind_named_seat(&mut h.client, &globals, name, 9, seat_id, callback, || {
         server.display.dispatch_clients(&mut server.state).unwrap();
         server.display.flush_clients().unwrap();
     });
@@ -2421,10 +2428,12 @@ fn seat_discovery_traffic(
 }
 
 #[test]
-fn production_seat_remains_single_named_human_without_touch() {
+fn production_seats_advertise_human_first_and_agent_without_touch() {
     let mut h = KeybindingHarness::new(false);
     let (globals, seat_id, traffic) = seat_discovery_traffic(&mut h, false);
-    assert_eq!(globals.all("wl_seat").len(), 1);
+    assert_eq!(globals.all("wl_seat").len(), 2);
+    let seats = globals.all("wl_seat");
+    assert!(seats[0].0 < seats[1].0);
     assert!(traffic.iter().any(|(object, opcode, body)| {
         *object == seat_id && *opcode == 1 && wire_string(body, &mut 0) == HUMAN_SEAT_NAME
     }), "production wl_seat.name must match the shell-host contract");
@@ -2435,6 +2444,21 @@ fn production_seat_remains_single_named_human_without_touch() {
         &h.subsurface().client().unwrap(),
     ).into_iter().find(|seat| seat.id().protocol_id() == seat_id);
     assert!(resource.is_some(), "the named binding belongs to the production human seat");
+    let (_, agent_id, traffic) = named_seat_discovery_traffic(&mut h, AGENT_SEAT_NAME, false);
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == agent_id && *opcode == 1 && wire_string(body, &mut 0) == AGENT_SEAT_NAME
+    }));
+    assert_eq!(seat_capabilities(&traffic, agent_id), vec![SEAT_CAPS_WITHOUT_TOUCH]);
+    assert_eq!(h.server.state.agent.kind, SeatKind::Agent);
+    assert_eq!(h.server.state.agent.pose, None);
+    assert_ne!(h.server.state.human.keyboard, h.server.state.agent.keyboard);
+    // Bind the lower global explicitly: registry order alone is not a name check.
+    let lower_id = h.allocate_object_id();
+    bind_global_for(&mut h.client, globals.registry_id, seats[0].0, "wl_seat", 9, lower_id);
+    let traffic = h.sync();
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == lower_id && *opcode == 1 && wire_string(body, &mut 0) == HUMAN_SEAT_NAME
+    }));
 }
 
 #[test]
@@ -2444,7 +2468,7 @@ fn named_seat_binding_discovers_human_announced_after_initial_sync() {
         let mut h = KeybindingHarness::new(false);
         let dh = h.server.state.display_handle.clone();
         dh.disable_global::<WaylandState>(h.server.state.human.seat.global().unwrap());
-        let agent = h.server.state.seat_state.new_wl_seat(&dh, AGENT_SEAT_NAME);
+        let agent = h.server.state.agent.seat.clone();
         let registry = h.allocate_object_id();
         let callback = h.allocate_object_id();
         send_display_request(&mut h.client, 1, registry);
@@ -2481,10 +2505,7 @@ fn named_seat_binding_discovers_human_announced_after_initial_sync() {
 fn named_seat_binding_chooses_human_in_both_registry_orders() {
     for reverse in [false, true] {
         let mut h = KeybindingHarness::new(false);
-        let dh = h.server.state.display_handle.clone();
-        let mut agent = h.server.state.seat_state.new_wl_seat(&dh, AGENT_SEAT_NAME);
-        agent.add_keyboard(Default::default(), 500, 30).unwrap();
-        agent.add_pointer();
+        let agent = h.server.state.agent.seat.clone();
         let (globals, seat_id, traffic) = seat_discovery_traffic(&mut h, reverse);
         assert_eq!(globals.all("wl_seat").len(), 2);
         assert_eq!(seat_capabilities(&traffic, seat_id), vec![SEAT_CAPS_WITHOUT_TOUCH]);
@@ -2493,6 +2514,176 @@ fn named_seat_binding_chooses_human_in_both_registry_orders() {
             .any(|seat| seat.id().protocol_id() == seat_id));
         assert!(agent.client_seats(&client).is_empty(), "probe bindings are released");
     }
+}
+
+#[cfg(feature = "xwayland")]
+#[test]
+fn xwayland_tagged_client_sees_only_human_seat() {
+    let mut h = KeybindingHarness::new(false);
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let xclient = h.server.state.display_handle.insert_client(
+        server, Arc::new(smithay::xwayland::XWaylandClientData::for_test()),
+    ).unwrap();
+    send_display_request(&mut client, 1, 2);
+    send_display_request(&mut client, 0, 3);
+    h.dispatch_client();
+    let globals = registry_globals(&mut client, 3);
+    assert_eq!(globals.all("wl_seat").len(), 1);
+    let server = &mut h.server;
+    let mut traffic = bind_named_seat(&mut client, &globals, HUMAN_SEAT_NAME, 9, 4, 3, || {
+        server.display.dispatch_clients(&mut server.state).unwrap();
+        server.display.flush_clients().unwrap();
+    });
+    send_display_request(&mut client, 0, 5);
+    h.dispatch_client();
+    traffic.extend(events_until_callback(&mut client, 5));
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == 4 && *opcode == 1 && wire_string(body, &mut 0) == HUMAN_SEAT_NAME
+    }));
+    assert_eq!(h.server.state.human.seat.client_seats(&xclient).len(), 1);
+    assert!(h.server.state.agent.seat.client_seats(&xclient).is_empty());
+}
+
+#[test]
+fn both_seats_idle_and_only_human_activity_resumes_them() {
+    let mut h = KeybindingHarness::new(false);
+    let (_, agent_seat, _) = named_seat_discovery_traffic(&mut h, AGENT_SEAT_NAME, false);
+    let notifier = h.bind_test_global("ext_idle_notifier_v1", 2);
+    let human_idle = h.allocate_object_id();
+    let agent_idle = h.allocate_object_id();
+    for (notification, seat) in [(human_idle, TEST_SEAT_ID), (agent_idle, agent_seat)] {
+        send_request(&mut h.client, notifier, 1, &words(&[notification, 20, seat]));
+    }
+    h.dispatch_client();
+    h.server.state.notify_idle_activity(SeatKind::Agent);
+    h.server.event_loop.dispatch(Some(Duration::from_millis(40)), &mut h.server.state).unwrap();
+    let mut traffic = h.sync();
+    // calloop can return after the first of two adjacent deadlines.
+    h.server.event_loop.dispatch(Some(Duration::from_millis(40)), &mut h.server.state).unwrap();
+    traffic.extend(h.sync());
+    for notification in [human_idle, agent_idle] {
+        assert!(traffic.iter().any(|(object, opcode, _)| *object == notification && *opcode == 0),
+            "both seats must idle without human activity: {traffic:?}");
+    }
+    h.server.state.notify_idle_activity(SeatKind::Agent);
+    let traffic = h.sync();
+    assert!(!traffic.iter().any(|(object, opcode, _)| {
+        [human_idle, agent_idle].contains(object) && *opcode == 1
+    }), "agent activity must not resume either notification: {traffic:?}");
+    h.key(24, HostButtonState::Pressed);
+    let traffic = h.sync();
+    for notification in [human_idle, agent_idle] {
+        assert!(traffic.iter().any(|(object, opcode, _)| *object == notification && *opcode == 1),
+            "human input must resume both notifications: {traffic:?}");
+    }
+}
+
+#[test]
+fn session_lock_clears_agent_focus_and_pressed_state() {
+    let mut h = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut h);
+    let surface = test_toplevel_record(&h).role.wl_surface().clone();
+    let keyboard = h.server.state.agent.keyboard.clone();
+    let pointer = h.server.state.agent.pointer.clone();
+    keyboard.set_focus(&mut h.server.state, Some(surface.clone().into()), SERIAL_COUNTER.next_serial());
+    let key = Keycode::new(50);
+    keyboard.input::<(), _>(&mut h.server.state, key, KeyState::Pressed,
+        SERIAL_COUNTER.next_serial(), 1, |_, _, _| FilterResult::Forward);
+    pointer.motion(&mut h.server.state, Some((surface.into(), (0.0, 0.0).into())), &MotionEvent {
+        location: (10.0, 10.0).into(), serial: SERIAL_COUNTER.next_serial(), time: 1,
+    });
+    pointer.button(&mut h.server.state, &ButtonEvent {
+        button: 0x110, state: ButtonState::Pressed, serial: SERIAL_COUNTER.next_serial(), time: 1,
+    });
+    assert!(!keyboard.pressed_keys().is_empty());
+    assert!(!pointer.current_pressed().is_empty());
+    let _ = request_test_session_lock(&mut h);
+    assert!(h.server.state.session_lock_active());
+    assert!(keyboard.current_focus().is_none());
+    assert!(pointer.current_focus().is_none());
+    assert!(keyboard.pressed_keys().is_empty());
+    assert!(pointer.current_pressed().is_empty());
+    assert!(!keyboard.is_grabbed());
+    assert!(!pointer.is_grabbed());
+}
+
+#[test]
+fn agent_popup_grab_survives_human_focus_change() {
+    let mut h = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut h);
+    let root = test_toplevel_record(&h).role.wl_surface().clone();
+    let other = map_test_undecorated_toplevel(&mut h);
+    let (_, agent_seat, _) = named_seat_discovery_traffic(&mut h, AGENT_SEAT_NAME, false);
+    let keyboard_id = h.allocate_object_id();
+    send_request(&mut h.client, agent_seat, 1, &words(&[keyboard_id]));
+    let _ = h.sync();
+    let keyboard = h.server.state.agent.keyboard.clone();
+    keyboard.set_focus(&mut h.server.state, Some(root.clone().into()), SERIAL_COUNTER.next_serial());
+    let serial = SERIAL_COUNTER.next_serial();
+    keyboard.input::<(), _>(&mut h.server.state, Keycode::new(38), KeyState::Pressed,
+        serial, 1, |_, _, _| FilterResult::Forward);
+    h.server.state.agent.last_keyboard_action = Some((serial, root));
+    let (_, popup) = map_test_popup_on_seat(&mut h, Some((agent_seat, serial.into())));
+    assert!(keyboard.has_grab(serial));
+    assert!(h.server.state.agent.pointer.has_grab(serial));
+    assert!(!h.server.state.human.keyboard.is_grabbed());
+    assert!(!h.server.state.human.pointer.is_grabbed());
+    let target = h.server.state.surfaces[&other].role.wl_surface().clone();
+    h.server.state.human.keyboard.clone().set_focus(
+        &mut h.server.state, Some(target.into()), SERIAL_COUNTER.next_serial(),
+    );
+    let traffic = h.sync();
+    assert!(keyboard.has_grab(serial));
+    assert!(h.server.state.agent.pointer.has_grab(serial));
+    assert!(!traffic.iter().any(|(object, opcode, _)| *object == popup && *opcode == 1),
+        "human focus must not dismiss an agent popup: {traffic:?}");
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn seat_props_are_volatile_read_only_and_preserve_human_observations() {
+    let mut h = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut h);
+    route_pointer_to(&mut h, 10.0, 10.0);
+    h.server.state.notify_idle_activity(SeatKind::Human);
+    let context = snapshot_context("nested");
+    let snapshot = port_snapshot::read_snapshot(&h.server.state, &context, &port_snapshot::ReadScopes::All).unwrap();
+    let input = serde_json::to_value(&snapshot.input).unwrap();
+    let human = &input["seats"]["human"];
+    let agent = &input["seats"]["agent"];
+    assert_eq!(human["name"], HUMAN_SEAT_NAME);
+    assert_eq!(agent["name"], AGENT_SEAT_NAME);
+    assert_eq!(human["keyboard_focus"]["id"], serde_json::to_value(snapshot.focus.keyboard).unwrap());
+    assert_eq!(human["pointer_focus"]["id"], serde_json::to_value(snapshot.focus.pointer).unwrap());
+    let cursor = *h.server.state.cursor_position_snapshot.lock().unwrap();
+    let output = snapshot.outputs.values().next().unwrap();
+    assert_eq!(human["pointer"]["output"], output.name.as_str());
+    assert_eq!(human["pointer"]["x"], cursor.x - f64::from(output.x));
+    assert_eq!(human["pointer"]["y"], cursor.y - f64::from(output.y));
+    for focus in ["keyboard_focus", "pointer_focus"] {
+        if let Some(id) = human[focus]["id"].as_u64() {
+            let record = h.server.state.surfaces.values().find(|record| record.id.0 == id).unwrap();
+            assert_eq!(human[focus]["generation"], record.generation);
+        }
+    }
+    assert!(human["last_input_us"].is_u64());
+    assert!(agent["last_input_us"].is_null());
+    assert!(agent["keyboard_focus"].is_null());
+    assert!(agent["pointer_focus"].is_null());
+    assert!(agent["pointer"].is_null());
+    assert_eq!(input["last_origin"], "human");
+    for path in ["input.seats.human.name", "input.seats.agent.pointer", "input.last_origin"] {
+        assert!(port_snapshot::volatile_path(path));
+        assert!(matches!(port_observation::validate_set_request(path, &serde_json::Value::Null),
+            Err(port_observation::SetValidationError::ReadOnly)));
+    }
+    h.server.state.notify_idle_activity(SeatKind::Agent);
+    let next = port_snapshot::read_snapshot(&h.server.state, &context, &port_snapshot::ReadScopes::All).unwrap();
+    let next = serde_json::to_value(next.input).unwrap();
+    assert_eq!(next["last_origin"], "agent");
+    assert_eq!(next["seats"]["human"]["last_input_us"], human["last_input_us"]);
+    assert!(next["seats"]["agent"]["last_input_us"].is_u64());
 }
 
 #[test]
@@ -12799,6 +12990,10 @@ fn stage_test_synchronized_subsurface(harness: &mut KeybindingHarness, parent: u
 }
 
 fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> (ObjectId, u32) {
+    map_test_popup_on_seat(harness, grab_serial.map(|serial| (TEST_SEAT_ID, serial)))
+}
+
+fn map_test_popup_on_seat(harness: &mut KeybindingHarness, grab: Option<(u32, u32)>) -> (ObjectId, u32) {
     let positioner = harness.allocate_object_id();
     let surface = harness.allocate_object_id();
     let xdg_surface = harness.allocate_object_id();
@@ -12829,12 +13024,12 @@ fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> 
         2,
         &words(&[popup, TEST_XDG_SURFACE_ID, positioner]),
     );
-    if let Some(serial) = grab_serial {
+    if let Some((seat, serial)) = grab {
         send_request(
             &mut harness.client,
             popup,
             1,
-            &words(&[TEST_SEAT_ID, serial]),
+            &words(&[seat, serial]),
         );
     }
     send_request(&mut harness.client, surface, 6, &[]);

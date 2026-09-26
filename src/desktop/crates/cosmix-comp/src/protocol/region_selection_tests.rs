@@ -64,7 +64,7 @@ fn injected_escape_without_client_focus_cancels_region_and_releases() {
     assert!(matches!(reply, ControlReply::Body(_)), "{reply:?}");
     clean_frame(&mut h);
     assert_eq!(body(&mut rx)["status"], "cancelled");
-    assert!(h.server.state.injection.held.is_empty());
+    assert!(h.server.state.human.held.is_empty());
     assert!(h.server.state.human.keyboard.pressed_keys().is_empty());
 }
 

@@ -3206,7 +3206,12 @@ impl ProtocolServer {
         let mut agent_seat = seat_state.new_wl_seat_with_filter(
             &display_handle,
             AGENT_SEAT_NAME,
-            |client| client.get_data::<smithay::xwayland::XWaylandClientData>().is_none(),
+            |_client| {
+                #[cfg(feature = "xwayland")]
+                { _client.get_data::<smithay::xwayland::XWaylandClientData>().is_none() }
+                #[cfg(not(feature = "xwayland"))]
+                { true }
+            },
         );
         let agent_keyboard = agent_seat
             .add_keyboard(Default::default(), 500, 30)
