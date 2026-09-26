@@ -30,11 +30,7 @@ $POPUPS = {launcher: env("PANEL_LAUNCHER_SCENE", "launcher"),
 fn scene_dir()
   $dir = env("SCENE_DIR", "")
   if $dir == "" then $dir = cwd() end
-  try
-    return realpath($dir)
-  catch $ignored
-    return $dir
-  end
+  return realpath($dir) ?? $dir
 end
 $SETTINGS = scene_dir() .. "/settings.conf.mix"
 
@@ -65,8 +61,9 @@ fn settings_text($data)
   end
   for each $k in $keys
     if not has_key($data, $k) then continue end
-    if not re_match($k, "^[a-z_][a-z0-9_]*$") then return $out .. data_encode($data, true) .. "\n" end
-    $out = $out .. $k .. ": " .. data_encode($data[$k]) .. "\n"
+    -- A key that is not a bare identifier is written quoted (load_data reads both).
+    $name = re_match($k, "^[a-z_][a-z0-9_]*$") ? $k : data_encode($k)
+    $out = $out .. $name .. ": " .. data_encode($data[$k]) .. "\n"
   end
   return $out
 end
@@ -508,11 +505,11 @@ on panel.state desc "panel model {model}; the last model the loader accepted"
 end
 
 on panel.tasks_scope desc "set the task scope {scope: all|current}, or toggle it {}; persisted beside the scene; replies {scope, file}"
-  if $event.args != nil and type($event.args) != "map" then
+  if $event.args != nil and $event.args != "" and type($event.args) != "map" then
     reply(10, json_encode({error_code: "invalid_args", message: "args must be {} or {scope}"}))
     return
   end
-  $args = $event.args ?? {}
+  $args = type($event.args) == "map" ? $event.args : {}
   $current = read_settings()
   $scope = $args.scope
   if $scope == nil then

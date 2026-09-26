@@ -1,5 +1,5 @@
--- The bottom panel's settings (edit here, in the Scene Editor, or with
--- `send scene-panel panel.tasks_scope {"scope":"current"}`).
+-- The bottom panel's settings: edit here (ced), or send
+-- `panel.tasks_scope {"scope":"current"}` to scene-panel ({} toggles).
 -- tasks_scope: "all" shows windows from every workspace (Plasma's default);
 -- "current" shows only the current workspace's windows.
 schema: 1
