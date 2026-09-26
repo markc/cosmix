@@ -384,6 +384,7 @@ fn service_bus(
         ResMut<cosmix_shell::chrome::QuoinHotspotSize>,
         Option<Res<crate::state::StateStore>>,
     ),
+    mut commands: Commands,
 ) {
     // This system is the app's single inbound drain + reply owner (see
     // `BusBridge::claim_inbound`); Quoin installs no `AppPortPlugin`.
@@ -682,6 +683,14 @@ fn service_bus(
                     panel_order(&request.body, &crate::config::conf_mix_path())
                 };
                 (rc, body.to_string(), None)
+            } else if request.command == "shell.session.confirm" {
+                // Opens the confirm step as a corner menu; the layer host maps
+                // it after this update, like a corner-summoned menu.
+                let (rc, body, step) = session_confirm(&request, &frame.0);
+                if let Some(step) = step {
+                    commands.insert_resource(step);
+                }
+                (rc, body, None)
             } else if request.command == "shell.scenes.list" {
                 (
                     0,
@@ -1233,7 +1242,7 @@ fn dispatch_with_declared(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","focus.next","panel.show","panel.hide","panel.toggle","panel.pin","panel.pin.toggle","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scene.layout","scenes.list","dialog.show","dialog.hide"],
+            "verbs":["quit","focus.next","session.confirm","panel.show","panel.hide","panel.toggle","panel.pin","panel.pin.toggle","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scene.layout","scenes.list","dialog.show","dialog.hide"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1514,15 +1523,63 @@ fn provenance_refusal(error: &impl std::fmt::Debug) -> Value {
         "message":format!("caller provenance could not be established: {error:?}")})
 }
 
-/// The edge a `shell.corner.*` verb's `corner` summons (clockwise mapping).
-fn corner_edge(corner: &str) -> Option<Edge> {
+fn corner_named(corner: &str) -> Option<Corner> {
     Some(match corner {
-        "top-left" => Corner::TopLeft.summoned_edge(),
-        "bottom-left" => Corner::BottomLeft.summoned_edge(),
-        "bottom-right" => Corner::BottomRight.summoned_edge(),
-        "top-right" => Corner::TopRight.summoned_edge(),
+        "top-left" => Corner::TopLeft,
+        "bottom-left" => Corner::BottomLeft,
+        "bottom-right" => Corner::BottomRight,
+        "top-right" => Corner::TopRight,
         _ => return None,
     })
+}
+
+/// `shell.session.confirm {action, corner?}`: the Confirm/Cancel step for a
+/// session action (`restart` or `leave`), shown as a corner menu at `corner`
+/// (default `top-left`) of this output. What global chords bind to, so a
+/// chord opens the same human confirm step as the corner-menu entry and
+/// never restarts or leaves on its own. The session verbs themselves
+/// (`desktop.session.*`, the session-control citizen) need no confirm.
+fn session_confirm(
+    request: &InboundRequest,
+    frame: &ShellFrame,
+) -> (u8, String, Option<cosmix_shell::chrome::corner_menu::CornerMenuRequest>) {
+    let refuse = |code: &str, message: String| {
+        (10, json!({"error_code": code, "message": message}).to_string(), None)
+    };
+    if let Err(error) = verify_caller_provenance(request) {
+        return (10, provenance_refusal(&error).to_string(), None);
+    }
+    let actions = crate::corner_menu::SESSION_ACTIONS.join(", ");
+    let Some(action) = argument(request, "action") else {
+        return refuse("INVALID_ARGUMENT", format!("action is required ({actions})"));
+    };
+    let corner = match argument(request, "corner") {
+        None => Corner::TopLeft,
+        Some(name) => match corner_named(&name) {
+            Some(corner) => corner,
+            None => {
+                return refuse(
+                    "INVALID_ARGUMENT",
+                    "corner must be top-left, bottom-left, bottom-right or top-right".into(),
+                );
+            }
+        },
+    };
+    let output = frame.geometry.output.clone();
+    let Some(step) = crate::corner_menu::session_confirm_request(&action, output.clone(), corner) else {
+        return refuse("INVALID_ARGUMENT", format!("unknown action {action} ({actions})"));
+    };
+    let corner_name = argument(request, "corner").unwrap_or_else(|| "top-left".into());
+    (
+        0,
+        json!({"accepted": true, "action": action, "corner": corner_name, "output": output.as_str()}).to_string(),
+        Some(step),
+    )
+}
+
+/// The edge a `shell.corner.*` verb's `corner` summons (clockwise mapping).
+fn corner_edge(corner: &str) -> Option<Edge> {
+    corner_named(corner).map(Corner::summoned_edge)
 }
 
 /// A queued panel reply's edge: its `edge`, or the edge its `corner` summons.
@@ -3655,6 +3712,53 @@ mod tests {
         );
         assert_eq!(rc, 0, "{body}");
         assert_eq!(settled(&app), (460.0, 460.0));
+    }
+
+    /// `shell.session.confirm` opens the session action's confirm step as a
+    /// corner menu (what the Ctrl+Alt+Backspace / leave chords bind to); it
+    /// never calls the session verb itself.
+    #[test]
+    fn session_confirm_opens_the_confirm_step_and_calls_nothing() {
+        use cosmix_shell::chrome::corner_menu::{CornerMenuRequest, MenuAction};
+        let (mut app, peer) = mounted_bus_app();
+        let mut req = local("shell.session.confirm");
+        req.body = json!({"action":"restart", "corner":"bottom-right"}).to_string();
+        peer.send(req);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+        assert_eq!((body["accepted"].clone(), body["action"].clone(), body["corner"].clone()), (json!(true), json!("restart"), json!("bottom-right")));
+        let step = app.world().resource::<CornerMenuRequest>();
+        assert_eq!(step.corner, Corner::BottomRight);
+        assert_eq!(step.items.len(), 3);
+        let MenuAction::Extra(extra) = &step.items[1].action else { panic!("action row") };
+        assert_eq!(extra.verb, "desktop.session.restart");
+        assert!(peer.drain_calls().is_empty(), "the verb itself was called");
+        // Refusals: {error_code, message}, and no step opens.
+        for args in [json!({}), json!({"action":"reboot"}), json!({"action":"leave", "corner":"middle"})] {
+            app.world_mut().remove_resource::<CornerMenuRequest>();
+            let mut bad = local("shell.session.confirm");
+            bad.body = args.to_string();
+            let (rc, body, _) = session_confirm(&bad, &test_frame());
+            assert_eq!(rc, 10, "{args}: {body}");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error_code"], "INVALID_ARGUMENT", "{args}");
+            assert!(body["message"].is_string());
+        }
+        let mut spoofed = local("shell.session.confirm");
+        spoofed.body = json!({"action":"leave"}).to_string();
+        spoofed.headers.insert("signed_ident".into(), "i-said-so".into());
+        let (rc, body, step) = session_confirm(&spoofed, &test_frame());
+        assert_eq!(rc, 10);
+        assert!(step.is_none());
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error_code"], "CALLER_PROVENANCE");
+        let mut leave = local("shell.session.confirm");
+        leave.body = json!({"action":"leave"}).to_string();
+        let (rc, _, step) = session_confirm(&leave, &test_frame());
+        assert_eq!(rc, 0);
+        assert_eq!(step.unwrap().corner, Corner::TopLeft, "default corner");
     }
 
     /// Review m4: the new verbs refuse in the unified `{error_code, message}`

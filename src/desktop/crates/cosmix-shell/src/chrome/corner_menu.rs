@@ -11,6 +11,11 @@ pub struct MenuExtra {
     pub target: String,
     pub verb: String,
     pub args: Vec<String>,
+    /// A question to confirm first: choosing the extra opens a confirm step
+    /// ([`confirm_items`]) instead of calling the verb, so a misclick does
+    /// nothing. A human affordance of the menu only; the verb itself needs no
+    /// confirmation.
+    pub confirm: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +29,9 @@ pub enum MenuAction {
     /// it right after the mode items on every corner. Safe open toggles, so
     /// choosing it while the shipped editor is visible closes the editor.
     EditPanels,
+    /// A row that does nothing when chosen: a confirm step's question (shown
+    /// disabled) and its Cancel.
+    Inert,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +51,7 @@ impl MenuItem {
                 edge,
                 input: PanelInput::SetMode(mode),
             }),
-            MenuAction::Extra(_) | MenuAction::EditPanels => None,
+            MenuAction::Extra(_) | MenuAction::EditPanels | MenuAction::Inert => None,
         }
     }
 }
@@ -76,6 +84,32 @@ pub fn menu_items(mode: PanelMode, extras: &[MenuExtra]) -> Vec<MenuItem> {
         action: MenuAction::Extra(extra),
     }))
     .collect()
+}
+
+/// Label of a confirm step's cancelling row.
+pub const CANCEL_LABEL: &str = "Cancel";
+
+/// A confirm step: the question (disabled), the confirming row, then Cancel.
+/// Choosing the confirming row performs `action`; Cancel, Escape or a click
+/// away does nothing.
+pub fn confirm_items(question: &str, confirm_label: &str, action: MenuAction) -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            label: question.into(),
+            checked: true,
+            action: MenuAction::Inert,
+        },
+        MenuItem {
+            label: confirm_label.into(),
+            checked: false,
+            action,
+        },
+        MenuItem {
+            label: CANCEL_LABEL.into(),
+            checked: false,
+            action: MenuAction::Inert,
+        },
+    ]
 }
 
 /// Snapshot supplied by the hook. Reopening reads the latest accepted config.
@@ -163,11 +197,14 @@ pub fn spawn_menu(
             if item.checked {
                 world.entity_mut(row).insert(bevy::ui::InteractionDisabled);
             }
+            // Only a mode row's disabled state means "current"; a confirm
+            // step's question is disabled without a checkmark.
+            let current = item.checked && matches!(item.action, MenuAction::Mode(_));
             let label = world
                 .spawn((
                     Text::new(format!(
                         "{}{}",
-                        if item.checked { "✓  " } else { "    " },
+                        if current { "✓  " } else { "    " },
                         item.label
                     )),
                     TextFont::from_font_size(14.0),
@@ -254,6 +291,7 @@ mod tests {
                 target: "tools".into(),
                 verb: "tools.open".into(),
                 args: vec![],
+                confirm: None,
             };
             let items = menu_items(mode, std::slice::from_ref(&extra));
             assert_eq!(
@@ -286,6 +324,39 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn confirm_step_is_question_action_cancel_and_only_the_action_acts() {
+        let extra = MenuExtra {
+            label: "Restart session".into(),
+            target: "desktop-session".into(),
+            verb: "desktop.session.restart".into(),
+            args: vec![],
+            confirm: None,
+        };
+        let items = confirm_items("Restart the session?", "Restart", MenuAction::Extra(extra.clone()));
+        assert_eq!(
+            items.iter().map(|i| (i.label.as_str(), i.checked)).collect::<Vec<_>>(),
+            [("Restart the session?", true), ("Restart", false), (CANCEL_LABEL, false)]
+        );
+        assert_eq!(items[1].action, MenuAction::Extra(extra));
+        for item in &items {
+            assert_eq!(item.command(Edge::Left), None, "a confirm row is never a mode change");
+        }
+        assert_eq!((&items[0].action, &items[2].action), (&MenuAction::Inert, &MenuAction::Inert));
+        // The question renders disabled but without a checkmark.
+        let mut world = World::new();
+        let mount = world.spawn(Node::default()).id();
+        let request = CornerMenuRequest {
+            output: OutputKey::new("test-output").unwrap(),
+            corner: Corner::TopLeft,
+            items,
+        };
+        let rows = spawn_menu(&mut world, mount, &request, Vec2::new(1000.0, 800.0));
+        assert!(world.get::<bevy::ui::InteractionDisabled>(rows[0]).is_some());
+        let label = world.get::<Children>(rows[0]).unwrap()[0];
+        assert!(!world.get::<Text>(label).unwrap().0.starts_with('✓'));
+    }
+
     #[test]
     fn menu_choice_emits_setmode_command() {
         for edge in Edge::ALL {

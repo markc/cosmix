@@ -1,0 +1,96 @@
+-- Real isolated noded + the production session-control citizen driven over
+-- the Bus, in forced dry-run mode (COSMIX_SESSION_DRY_RUN=1): the verbs'
+-- wiring, reply and refusal shapes, and that a dry run starts nothing. The
+-- broker gets a private TCP port and unix socket, so nothing here reaches
+-- the host's real Bus, and no restart, chvt or systemd-run ever happens
+-- (the worker unit name is unique to this run, so even the is-active probe
+-- the citizen makes names a unit that cannot exist).
+-- Run from the repo root: COSMIX=$PWD mix src/desktop/scripts/tests/session-bus-test.mix
+$root = env("COSMIX")
+if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
+$scripts = $root .. "/src/desktop/scripts"
+$mix = env("COSMIX_TEST_MIX") ?? ""
+if $mix == "" then $mix = "/opt/cosmix/bin/mix" end
+$noded = env("COSMIX_TEST_NODED") ?? ""
+if $noded == "" then $noded = "/opt/cosmix/bin/cosmix-noded" end
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-session-bus-test.XXXXXXXX"]))
+$tag = uuid()
+$port = random(46000, 46999)
+$node = $tmp .. "/node.conf.mix"
+write_file($node, json_encode({node: "session-bus-test-" .. $tag, wg_ip: "", mesh: "session-bus-test.invalid",
+  noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
+$env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin"}
+$user = trim(run_argv_must(["id", "-un"]))
+$svc_pid = nil
+$noded_pid = nil
+fn check($condition, $message)
+  if not $condition then raise("SESSION_BUS_TEST", $message) end
+end
+fn read_file_or_nil($path)
+  try
+    return read_file($path)
+  catch $err
+    return nil
+  end
+end
+fn call($verb, $body)
+  return json_parse(run_argv_must([$mix, $tmp .. "/cli.mix", "desktop-session", $verb, $body], {env: $env, timeout: 25}))
+end
+fn wait_ready()
+  for each $i in range(1, 80)
+    $r = run_argv([$mix, $tmp .. "/cli.mix", "desktop-session", "desktop.session.leave", "{}"], {env: $env, timeout: 25})
+    if $r.ok then
+      $parsed = json_parse($r.stdout)
+      if type($parsed) == "map" and $parsed.rc == 0 then return nil end
+    end
+    sleep(0.2)
+  end
+  print("noded log: " .. (read_file_or_nil($tmp .. "/noded.log") ?? ""))
+  print("citizen log: " .. (read_file_or_nil($tmp .. "/svc.log") ?? ""))
+  raise("SESSION_BUS_TEST", "session citizen did not register")
+end
+try
+  write_file($tmp .. "/cli.mix", "send $1 $2 timeout=15 body=$3\nprint(json_encode({rc: $rc, result: $result}))\n")
+  $noded_pid = spawn([$noded, "serve", "--listen", "127.0.0.1:" .. to_string($port),
+    "--node", "session-bus-test-" .. $tag, "--no-monitor", "--no-log"],
+    {detach: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+  -- One live fixture session: its pid is the broker's, which is alive.
+  mkdir($tmp .. "/home/.claude/sessions")
+  write_file($tmp .. "/home/.claude/sessions/1.json", json_encode({pid: $noded_pid, kind: "interactive", sessionId: "fixture-1", cwd: $tmp}))
+  $citizen_env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin", HOME: $tmp .. "/home",
+    COSMIX_SESSION_DRY_RUN: "1", COSMIX_SESSION_USER: $user, COSMIX_SESSION_HOME: $tmp .. "/home",
+    COSMIX_SESSION_WORKER_UNIT: "cosmix-session-bus-test-" .. $tag, COSMIX_LEAVE_VT: "2"}
+  $svc_pid = spawn([$mix, "--serve", $scripts .. "/session-control.mix", "--name", "desktop-session"],
+    {detach: true, env: $citizen_env, stdout: {file: $tmp .. "/svc.log"}, stderr: "stdout"})
+  wait_ready()
+
+  -- leave: a dry run reports the chvt it would run, and runs nothing.
+  $r = call("desktop.session.leave", "{}")
+  check($r.rc == 0 and $r.result.accepted == true and $r.result.dry_run == true and $r.result.vt == 2, "leave reply wrong: " .. json_encode($r))
+  check(json_encode($r.result.argv) == "[\"chvt\",\"2\"]", "leave argv wrong: " .. json_encode($r.result))
+  -- The corner menu's extra body shape.
+  check(call("desktop.session.leave", "{\"args\":[]}").rc == 0, "the menu's {args:[]} body was refused")
+
+  -- restart: the capture and the detached worker plan, nothing started.
+  $r = call("desktop.session.restart", "{\"args\":[]}")
+  check($r.rc == 0 and $r.result.action == "restart" and $r.result.dry_run == true, "restart reply wrong: " .. json_encode($r))
+  check(json_encode($r.result.sessions) == "[\"fixture-1\"]", "restart did not capture the fixture session: " .. json_encode($r.result))
+  check($r.result.argv[0] == "systemd-run" and contains($r.result.argv, "--phase2"), "restart plan is not the detached worker: " .. json_encode($r.result.argv))
+  check(ends_with($r.result.argv[len($r.result.argv) - 3], "/session-resume.mix"), "worker script not resolved beside the citizen: " .. json_encode($r.result.argv))
+  check(not exists($r.result.state_file), "a dry run wrote the state file")
+
+  -- Refusals: rc 10 {error_code, message}.
+  for each $bad in ["{\"force\":1}", "{\"args\":[\"--now\"]}", "[]", "not json"]
+    $r = call("desktop.session.restart", $bad)
+    check($r.rc == 10, "restart accepted " .. $bad)
+    $body = type($r.result) == "map" ? $r.result : json_parse(to_string($r.result))
+    check($body.error_code == "INVALID_ARGUMENT" and type($body.message) == "string", "refusal shape wrong for " .. $bad .. ": " .. to_string($r.result))
+  end
+  print("PASS session-control Bus surface: dry-run leave/restart plans over a private broker, menu body shape, refusal shape")
+finally
+  if $svc_pid != nil then $_kill_svc = run_argv(["kill", "--", to_string($svc_pid)], {timeout: 10}) end
+  if $noded_pid != nil then $_kill_noded = run_argv(["kill", "--", to_string($noded_pid)], {timeout: 10}) end
+  if starts_with($tmp, "/tmp/cosmix-session-bus-test.") then
+    $_rm = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end

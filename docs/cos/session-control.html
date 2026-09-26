@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/desktop</title>
+    <title>CosMix — cos/session-control</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,95 +441,125 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/desktop.md"><div class="prose"><h1 id="cosmix-desktop--the-desktop-surface">CosMix Desktop — the desktop surface</h1>
-<p>The CosMix desktop is a <strong>native Wayland compositor plus a family of Bevy
-applications</strong>, all Bus citizens. It lives in its own Cargo workspace at
-<code>$COSMIX/src/desktop/</code> (separate because it pins its own toolchain and vendors
-patched Smithay/wgpu) and is built with <code>setup.mix --desktop</code>.</p>
-<p>This page is the orientation. The compositor's protocol coverage has its own
-page: <a href="/cos/cosmix-comp">cosmix-comp</a>.</p>
-<p>FileMgr, Studio, Tower, Interact GUI and bg-showcase install their Bus
-app-control bridge only when <code>node.conf.mix</code> loads successfully. Without that
-configuration they retain their local app setup and print one standalone
-notice to stderr. FileMgr, Studio and Tower also accept <code>--noded-url</code>; an
-explicit URL takes precedence and enables the port even without node
-configuration. Other broker clients are unaffected by this app-control gate.</p>
-<p>The initial <a href="/cos/desktop-bus">desktop Bus capability provider</a> adds session
-discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
-It serves registered local callers and explicitly granted mesh clipboard
-callers through admitted noded connections.
-The <a href="/cos/session-control">session-control citizen</a> restarts the session
-(resuming agent sessions into terminal panes) or leaves the seat for another
-VT, behind Quoin's Confirm/Cancel step for humans.</p>
-<h2 id="what-it-is">What it is</h2>
-<table><thead><tr><th>Part</th><th>Crate</th><th>What it is</th></tr></thead><tbody>
-<tr><td>Compositor</td><td><code>cosmix-comp</code></td><td>Smithay protocol frontend with Bevy 0.19 / wgpu rendering. Runs nested inside an existing Wayland session (<code>--nested</code>) or on a KMS seat.</td></tr>
-<tr><td>Toolkit</td><td><code>ctk</code></td><td>Cosmix Tool Kit — the shared Bus-citizen Bevy widget toolkit every desktop app builds on (<code>bevy_ui</code> + <code>bevy_feathers</code>).</td></tr>
-<tr><td>Decorations</td><td><code>cosmix-deco</code></td><td>Server-side decoration theme engine: chrome styles, tokens, layout and hit-testing. Dependency-free.</td></tr>
-<tr><td>Design system</td><td><code>cosmix-design</code></td><td>Headless compiler and family-schema registry for the <code>.mix</code> design source — one styling contract for chrome and app widgets.</td></tr>
-<tr><td>Shell</td><td><code>cosmix-shell</code></td><td>Pure core and host seams for the Quoin desktop shell.</td></tr>
-<tr><td>GPU bridge</td><td><a href="/cos/cosmix-wgpu-dmabuf"><code>cosmix-wgpu-dmabuf</code></a></td><td>Role-specific DMA-BUF import for client textures, scan-out targets and screencopy destinations.</td></tr>
-<tr><td>Apps</td><td><code>apps/*</code></td><td>Studio (DAW / mixer), FileMgr, Mail, Tower (mesh mission control), Tray + trayd, Interact GUI (native presenter for <code>interactd</code> dialogs). Registry and identity rules in <code>src/desktop/APPS.md</code>.</td></tr>
+        <div id="content-doc" data-prerendered="cos/session-control.md"><div class="prose"><h1 id="session-control-restart-the-session-leave-the-seat">Session control: restart the session, leave the seat</h1>
+<p><code>src/desktop/scripts/session-control.mix</code> is the session-control citizen. It
+registers the Bus service <code>desktop-session</code> and answers two verbs:</p>
+<table><thead><tr><th>verb</th><th>what it does</th></tr></thead><tbody>
+<tr><td><code>desktop.session.restart</code></td><td>restarts the desktop unit (<code>cosmix-desktop.service</code>), then types a resume line into a terminal pane for each agent (Claude Code) session that was running</td></tr>
+<tr><td><code>desktop.session.leave</code></td><td>switches to another VT (<code>chvt 1</code> by default); the desktop keeps running on its own VT, so you can switch back to it</td></tr>
 </tbody></table>
-<h2 id="how-it-hangs-together">How it hangs together</h2>
-<p>CosMix BTerm (<code>apps/bterm</code>, the Bevy frontend — renamed from <code>term</code> 2026-09-21,
-TODO-term D1, so the global Bus name <code>term</code> is free for the iced+wgpu
-frontend, <a href="/cos/term">CosMix Term</a>) has a menu bar and tabs, with one Mix terminal pane
-per tab. It admits at most 32 terminals, including pending closes. Closing
-removes a tab immediately; one cleanup worker performs bounded terminal
-shutdown outside the shared tab lock. Closing the last tab exits the app.
-Tab listings use cached dimensions and process metadata, without copying grids.</p>
-<p>With the terminal focused, menus closed and no modal capture, Ctrl+Shift+T/W
-opens/closes a tab and Ctrl+PageUp/PageDown changes tabs. These shortcuts require
-exact modifiers and do not repeat. The basic shell encoder supports printable
-ASCII, Enter, Backspace, Tab, arrows, Escape, Home, End, Delete, PageUp/PageDown
-and Ctrl+A through Ctrl+Z. Modifier state follows keyboard event order and resets
-on keyboard focus loss. This is not kitty or modifyOtherKeys support. The
-<code>term.*</code> Bus surface remains diagnostic, pending authenticated per-instance
-identity (P0-I) and full ABP control (P3a).</p>
-<p><code>cosmix-comp</code> is one process with three planes and strict ownership:</p>
+<p>Both verbs are open to mesh callers and need no confirmation: agents drive
+them directly. The human confirm step belongs to Quoin: its "Restart session…"
+and "Leave seat…" corner-menu entries (<code>menu_items</code> with <code>confirm</code>) and the
+<code>shell.session.confirm {action}</code> verb that global chords bind to both open a
+Confirm/Cancel step first. See <a href="/cos/quoin">Quoin</a>.</p>
+<h2 id="requests-and-replies">Requests and replies</h2>
+<p>The body is empty, or a JSON object with optional fields:</p>
 <ul>
-<li><strong>Protocol</strong> — Smithay on calloop owns all authoritative state: surfaces,
-toplevels, focus, buffers, explicit sync, the DRM/KMS session, libinput,
-decorations and canvas geometry.</li>
-<li><strong>Render</strong> — Bevy / wgpu paints. The scene is a <em>view</em> of protocol-plane
-state, never an owner of it; client DMA-BUFs import zero-copy.</li>
-<li><strong>Control</strong> — the Bus: <code>comp.*</code> verbs, the property tree and event topics.
-No frame ever waits on the bus; the compositor runs with no broker at all.</li>
+<li><code>args</code>: a list of strings. This is the shape a Quoin corner-menu extra sends
+(<code>{"args":[]}</code>). The only string accepted is <code>--dry-run</code>.</li>
+<li><code>dry_run</code>: <code>true</code> or <code>false</code>.</li>
 </ul>
-<p>Apps follow the same model. A CTK app draws itself at 60 fps but keeps an
-addressable Bus command port (the ARexx idea): it answers <code>app.describe</code>,
-can opt in to <code>app.controls.list/get/set</code> so an agent enumerates and drives
-its native controls without screen scraping, and registers as
-<code>&lt;slug&gt;-&lt;engine&gt;-&lt;pid&gt;</code>. Application chrome — menu bar, toolbar, sidebars,
-centre, status row — is one composed <code>DcsAppShell</code> component that apps fill
-by slot and never assemble by hand.</p>
-<h2 id="what-it-replaced">What it replaced</h2>
-<p>Before 2026-07 the desktop was a <strong>markdown-over-Bus display lane</strong>: producers
-sent <code>ui.window</code> messages and a domain-blind CPU renderer (<code>cosmix-disp-skia</code>,
-tiny-skia + cosmic-text) painted them. That lane was retired by the
-2026-07-18 control-plane decision — the Bus controls apps, it does not paint
-pixels — and archived on 2026-07-20 together with <code>cosmix-lib-display</code> and the
-<code>ui.*</code> vocabulary. Nothing of it is in this repository; the source survives on
-the frozen <code>markc/cos</code> repo under the git tag <code>amp-display-archive</code>, and the
-documentation page was removed from this site on 2026-08-31. Any material
-describing <code>disp-skia</code>, <code>cosmix-deskd</code>, <code>cosmix-disp-wgpu</code> or <code>ui.panel</code> as the
-current desktop is historical.</p>
-<h2 id="running-it">Running it</h2>
-<pre><code class="language-sh">cd $COSMIX/src/desktop
-cargo run --release -p cosmix-comp -- --nested     # inside an existing Wayland session
-cargo run --release -p ctk --example widget_gallery
+<p>A dry run replies with the plan (the argv it would run, the captured
+sessions, the state file) and runs nothing. <code>COSMIX_SESSION_DRY_RUN=1</code> in
+the citizen's environment makes every request a dry run.</p>
+<pre><code class="language-mix">send "desktop-session" desktop.session.restart body='{"dry_run":true}'
+send "desktop-session" desktop.session.leave
 </code></pre>
-<p>The compositor's supported Wayland protocols, stacking rules and session-lock
-behaviour are documented on <a href="/cos/cosmix-comp">cosmix-comp</a>.</p>
-<h2 id="see-also">See also</h2>
 <ul>
-<li><a href="/cos/busviewer">BusViewer</a> — browse ABP services and verbs, inspect mesh membership and call verbs with JSON</li>
-<li><a href="/cos/cosmix-comp">cosmix-comp</a> — protocol globals, layer strata, session lock</li>
-<li><a href="/cos/cosmix-wgpu-dmabuf">cosmix-wgpu-dmabuf</a> — Vulkan import roles and ownership contracts</li>
-<li><a href="/cos/overview">overview</a> — the daemon family the desktop sits on</li>
-<li><a href="/cos/noded">noded</a> — the Bus broker every app and the compositor talk to</li>
-<li><a href="/cos/cosmix-interactd/">interactd</a> — system-to-human dialogs, presented natively by Interact GUI</li>
+<li><strong>restart</strong> replies at once:
+<code>{accepted:true, action:"restart", dry_run, unit, state_file, sessions}</code>.
+<code>sessions</code> lists the captured session ids; a dry run adds <code>argv</code>. The
+restart itself happens after the reply (see below).</li>
+<li><strong>leave</strong> replies <code>{accepted:true, action:"leave", dry_run, vt}</code> after
+<code>chvt</code> returns; a dry run adds <code>argv</code>.</li>
+<li><strong>Refusals</strong> are rc 10 <code>{error_code, message}</code>:
+<ul>
+<li><code>INVALID_ARGUMENT</code>: a malformed body, an unknown field, or an unknown arg.</li>
+<li><code>SESSION_CONFIG</code>: a missing <code>COSMIX_SESSION_USER</code>, an unknown user or
+home, or a bad <code>COSMIX_LEAVE_VT</code>.</li>
+<li><code>RESTART_IN_PROGRESS</code>: the restart unit is already running.</li>
+<li><code>STATE_WRITE</code>: the state file could not be written.</li>
+<li><code>RESTART_START</code>: <code>systemd-run</code> failed.</li>
+<li><code>CHVT_FAILED</code>: <code>chvt</code> failed.</li>
+</ul>
+</li>
+</ul>
+<h2 id="how-a-restart-survives-itself">How a restart survives itself</h2>
+<p>A restart closes every desktop window, including the terminal the request
+came from. So nothing that the desktop owns can carry the restart out.</p>
+<ol>
+<li>The <strong>citizen</strong> runs as root from its own system unit. The unit is not
+<code>PartOf=</code> or <code>BindsTo=</code> the desktop, so the restart does not stop it. The
+citizen reads the desktop user's live interactive sessions from
+<code>~/.claude/sessions/&lt;pid&gt;.json</code> (live means <code>/proc/&lt;pid&gt;</code> exists). It
+writes them to a state file owned by that user,
+<code>~/.cache/cosmix/session-resume/sessions-&lt;time&gt;.json</code>. It then starts the
+worker with <code>systemd-run --unit=cosmix-session-restart --collect</code> and
+replies.</li>
+<li>The <strong>worker</strong> (<code>session-resume.mix --phase2</code>) runs in that transient
+unit, outside both the desktop's cgroup and the citizen's, so neither
+going down can stop it. It:
+<ul>
+<li>restarts the desktop unit;</li>
+<li>waits until the unit is <code>active</code> AND its boot terminal
+(<code>cosmix-boot-term.service</code>) is a NEW process. An old terminal still on
+the Bus would take the keys into whatever runs in its active tab;</li>
+<li>runs <code>--resume-fresh</code> as the desktop user.</li>
+</ul>
+</li>
+<li><strong><code>--resume-fresh</code></strong> waits for the terminal on the Bus. For each session it
+opens a pane: the boot tab's for the first session, a new tab for each
+later one. It then sends a <code>term.type</code> with <code>{pane, instance, text, request_id}</code> of
+<code>cd &lt;cwd&gt; &amp;&amp; claude [--dangerously-skip-permissions] --resume &lt;id&gt;</code>.
+<ul>
+<li>Sessions resume by id, because <code>claude -c</code> reopens the most recent
+conversation of a directory, and two sessions in one directory would
+both reopen the same one.</li>
+<li>The <code>request_id</code>s are stable (keyed on the state file and the session)
+and every resumed id is appended to <code>&lt;state&gt;.done</code>. A rerun after a lost
+reply replays; it never types the same keys twice.</li>
+<li>A directory or id that would need shell quoting is not typed. The worker
+logs it for a by-hand resume.</li>
+</ul>
+</li>
+</ol>
+<p>The worker logs to <code>journalctl -u cosmix-session-restart</code>. Its first line
+names the recovery command:</p>
+<pre><code>mix /opt/cosmix/share/desktop/session-resume.mix --resume-only STATE
+</code></pre>
+<p>Run it as the desktop user. It skips <code>&lt;state&gt;.done</code> and opens a new tab for
+each remaining session.</p>
+<h2 id="settings-environment">Settings (environment)</h2>
+<table><thead><tr><th>variable</th><th>default</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>COSMIX_SESSION_USER</code></td><td>(required for restart)</td><td>the desktop user whose sessions are resumed; never guessed</td></tr>
+<tr><td><code>COSMIX_SESSION_HOME</code></td><td>from <code>getent passwd</code></td><td>that user's home</td></tr>
+<tr><td><code>COSMIX_DESKTOP_UNIT</code></td><td><code>cosmix-desktop.service</code></td><td>the unit a restart restarts</td></tr>
+<tr><td><code>COSMIX_BOOT_TERM_UNIT</code></td><td><code>cosmix-boot-term.service</code></td><td>the boot terminal that must come back as a new process</td></tr>
+<tr><td><code>COSMIX_SESSION_TERM_SERVICE</code></td><td><code>term</code></td><td>the terminal's Bus service</td></tr>
+<tr><td><code>COSMIX_LEAVE_VT</code></td><td><code>1</code></td><td>the VT <code>leave</code> switches to (1–63)</td></tr>
+<tr><td><code>COSMIX_SESSION_WORKER_UNIT</code></td><td><code>cosmix-session-restart</code></td><td>the transient unit's name</td></tr>
+<tr><td><code>COSMIX_SESSION_DRY_RUN</code></td><td>unset</td><td><code>1</code>: every request is a dry run</td></tr>
+</tbody></table>
+<h2 id="install">Install</h2>
+<p>The citizen needs <code>lib/session.mix</code> and <code>session-resume.mix</code> beside it:</p>
+<pre><code>install -D -m 0644 src/desktop/scripts/session-control.mix /opt/cosmix/share/desktop/session-control.mix
+install -D -m 0644 src/desktop/scripts/session-resume.mix /opt/cosmix/share/desktop/session-resume.mix
+install -D -m 0644 src/desktop/scripts/lib/session.mix /opt/cosmix/share/desktop/lib/session.mix
+</code></pre>
+<p>Copy <code>src/desktop/scripts/cosmix-session-control.service</code> to
+<code>/etc/systemd/system/</code> and set <code>COSMIX_SESSION_USER</code>. Then run:</p>
+<pre><code>systemctl daemon-reload
+systemctl enable --now cosmix-session-control.service
+</code></pre>
+<p>Check it with a dry run before trusting it with the live desktop.</p>
+<h2 id="tests">Tests</h2>
+<p>The tests never restart or switch anything:</p>
+<ul>
+<li><code>mix src/desktop/scripts/tests/session-test.mix</code>: request handling, plans,
+session capture and resume lines, using pure functions against fixtures.</li>
+<li><code>COSMIX=$PWD mix src/desktop/scripts/tests/session-bus-test.mix</code>: the
+production citizen over a private broker in forced dry-run mode.</li>
 </ul></div></div>
     </div>
 

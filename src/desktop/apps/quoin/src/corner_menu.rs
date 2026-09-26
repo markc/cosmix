@@ -2,7 +2,7 @@
 use crate::config::ShellConfig;
 use bevy::prelude::*;
 use cosmix_shell::chrome::corner_menu::{
-    CornerMenuActionHook, CornerMenuRequest, MenuAction, MenuExtra, menu_items,
+    CornerMenuActionHook, CornerMenuRequest, MenuAction, MenuExtra, confirm_items, menu_items,
 };
 use cosmix_shell::core::{Corner, OutputKey};
 use cosmix_shell::runtime::ShellFrameState;
@@ -15,7 +15,18 @@ pub(crate) fn install(app: &mut App) {
         .insert_resource(CornerMenuActionHook(invoke));
 }
 
+/// Where the last corner menu opened: a confirm step reopens there.
+#[derive(Resource, Clone)]
+struct MenuAnchor {
+    output: OutputKey,
+    corner: Corner,
+}
+
 fn open(world: &mut World, output: &OutputKey, corner: Corner) {
+    world.insert_resource(MenuAnchor {
+        output: output.clone(),
+        corner,
+    });
     let edge = corner.summoned_edge();
     let extras = world
         .get_resource::<ShellConfig>()
@@ -27,6 +38,7 @@ fn open(world: &mut World, output: &OutputKey, corner: Corner) {
                     target: item.target.clone(),
                     verb: item.verb.clone(),
                     args: item.args.clone(),
+                    confirm: item.confirm.clone(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -57,7 +69,7 @@ fn scenes_service() -> String {
 /// with body exactly `{"safe":true}` (scene-editor plan §4.3 Q1).
 fn bus_call(action: MenuAction, scenes: String) -> Option<(String, String, Value)> {
     match action {
-        MenuAction::Mode(_) => None,
+        MenuAction::Mode(_) | MenuAction::Inert => None,
         MenuAction::Extra(extra) => Some((extra.target, extra.verb, json!({"args": extra.args}))),
         MenuAction::EditPanels => {
             Some((scenes, "scenes.editor.open".to_owned(), json!({"safe": true})))
@@ -65,9 +77,91 @@ fn bus_call(action: MenuAction, scenes: String) -> Option<(String, String, Value
     }
 }
 
+/// The session-control citizen's Bus name: `DESKTOP_SESSION_SERVICE`, else
+/// `desktop-session`.
+fn session_service() -> String {
+    std::env::var("DESKTOP_SESSION_SERVICE")
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "desktop-session".to_owned())
+}
+
+/// The built-in session actions `shell.session.confirm` opens a confirm step
+/// for: `(label, verb, question)`.
+fn session_action(action: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match action {
+        "restart" => Some((
+            "Restart session",
+            "desktop.session.restart",
+            "Restart the session? Every window closes; agent sessions resume.",
+        )),
+        "leave" => Some((
+            "Leave seat",
+            "desktop.session.leave",
+            "Leave this seat? The desktop keeps running on its VT.",
+        )),
+        _ => None,
+    }
+}
+
+/// The names `shell.session.confirm` accepts, for its refusal message.
+pub(crate) const SESSION_ACTIONS: [&str; 2] = ["restart", "leave"];
+
+/// The confirm step for a built-in session action, at `corner` of `output`:
+/// the question, the action (a `desktop.session.*` call to the session-control
+/// citizen), then Cancel. `None` for an unknown action.
+pub(crate) fn session_confirm_request(
+    action: &str,
+    output: OutputKey,
+    corner: Corner,
+) -> Option<CornerMenuRequest> {
+    let (label, verb, question) = session_action(action)?;
+    let extra = MenuExtra {
+        label: label.to_owned(),
+        target: session_service(),
+        verb: verb.to_owned(),
+        args: Vec::new(),
+        confirm: None,
+    };
+    Some(CornerMenuRequest {
+        output,
+        corner,
+        items: confirm_items(question, label, MenuAction::Extra(extra)),
+    })
+}
+
+/// A chosen extra that asks to be confirmed reopens the menu as its confirm
+/// step, where the menu last opened; the verb is only called from there.
+fn confirm_request(world: &World, extra: &MenuExtra) -> Option<CornerMenuRequest> {
+    let question = extra.confirm.as_ref()?;
+    let anchor = world.get_resource::<MenuAnchor>()?;
+    let confirmed = MenuExtra {
+        confirm: None,
+        ..extra.clone()
+    };
+    Some(CornerMenuRequest {
+        output: anchor.output.clone(),
+        corner: anchor.corner,
+        items: confirm_items(question, &extra.label, MenuAction::Extra(confirmed)),
+    })
+}
+
 fn invoke(world: &mut World, action: MenuAction) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0x4d_0000_0000);
+    if let MenuAction::Extra(extra) = &action
+        && extra.confirm.is_some()
+    {
+        // Never the verb itself: without an anchor (no menu ever opened) the
+        // step cannot be shown, and the choice does nothing.
+        if let Some(request) = confirm_request(world, extra) {
+            world.insert_resource(request);
+        } else {
+            warn!("Corner menu confirm step unavailable: no menu anchor");
+        }
+        return;
+    }
     let Some((to, command, body)) = bus_call(action, scenes_service()) else {
         return;
     };
@@ -119,6 +213,7 @@ mod tests {
             target: "tools".into(),
             verb: "tools.open".into(),
             args: vec!["main".into()],
+            confirm: None,
         });
         app.insert_resource(config);
         open(app.world_mut(), &output, Corner::TopLeft);
@@ -152,6 +247,7 @@ mod tests {
                         target: "tools".into(),
                         verb: "tools.open".into(),
                         args: vec![],
+                        confirm: None,
                     });
                 }
             }
@@ -175,6 +271,66 @@ mod tests {
                 assert_eq!(calls[0].body, r#"{"safe":true}"#);
             }
         }
+    }
+
+    /// A config extra with `confirm` never calls its verb when chosen: it
+    /// reopens the menu, where it opened, as Question / action / Cancel, and
+    /// only the action row calls the verb.
+    #[test]
+    fn a_confirming_extra_calls_its_verb_only_from_the_confirm_step() {
+        use cosmix_shell::chrome::corner_menu::CANCEL_LABEL;
+        let output = OutputKey::new("test-output").unwrap();
+        let mut app = menu_app(&output);
+        let mut config = ShellConfig::default();
+        config.menu_items[Corner::BottomLeft.summoned_edge().index()].push(crate::config::MenuItem {
+            label: "Leave seat…".into(),
+            target: "desktop-session".into(),
+            verb: "desktop.session.leave".into(),
+            args: vec![],
+            confirm: Some("Leave this seat?".into()),
+        });
+        app.insert_resource(config);
+        let (bridge, peer) = ctk::bus::test_bridge("menu-test");
+        app.insert_resource(bridge);
+        open(app.world_mut(), &output, Corner::BottomLeft);
+        let chosen = app.world_mut().remove_resource::<CornerMenuRequest>().unwrap().items[4].clone();
+        assert_eq!(chosen.label, "Leave seat…");
+        invoke(app.world_mut(), chosen.action);
+        assert!(peer.drain_calls().is_empty(), "a confirming extra called its verb directly");
+        let step = app.world_mut().remove_resource::<CornerMenuRequest>().expect("confirm step");
+        assert_eq!((step.output.clone(), step.corner), (output.clone(), Corner::BottomLeft));
+        assert_eq!(
+            step.items.iter().map(|i| (i.label.as_str(), i.checked)).collect::<Vec<_>>(),
+            [("Leave this seat?", true), ("Leave seat…", false), (CANCEL_LABEL, false)]
+        );
+        // Cancel does nothing.
+        invoke(app.world_mut(), step.items[2].action.clone());
+        assert!(peer.drain_calls().is_empty());
+        assert!(!app.world().contains_resource::<CornerMenuRequest>());
+        // The action row calls the verb, once, with the extra's body.
+        invoke(app.world_mut(), step.items[1].action.clone());
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("desktop-session", "desktop.session.leave"));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), json!({"args": []}));
+        assert!(!app.world().contains_resource::<CornerMenuRequest>(), "the confirmed choice reopened the menu");
+    }
+
+    #[test]
+    fn session_confirm_request_is_question_action_cancel() {
+        let output = OutputKey::new("test-output").unwrap();
+        for (action, verb) in [("restart", "desktop.session.restart"), ("leave", "desktop.session.leave")] {
+            let request = session_confirm_request(action, output.clone(), Corner::TopRight).unwrap();
+            assert_eq!(request.corner, Corner::TopRight);
+            assert_eq!(request.items.len(), 3);
+            assert!(request.items[0].checked);
+            let MenuAction::Extra(extra) = &request.items[1].action else {
+                panic!("{action}: the action row is not a Bus call");
+            };
+            assert_eq!((extra.target.as_str(), extra.verb.as_str(), extra.confirm.as_ref()), ("desktop-session", verb, None));
+            assert_eq!(request.items[2].action, MenuAction::Inert);
+        }
+        assert!(session_confirm_request("reboot", output, Corner::TopLeft).is_none());
     }
 
     #[test]

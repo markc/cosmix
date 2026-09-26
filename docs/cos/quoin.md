@@ -822,6 +822,31 @@ body exactly `{"safe":true}` to the scenes loader (`SCENES_SERVICE`, default
 toggles: choosing it while that editor is visible closes it. Each mode
 choice uses the same `SetMode` command as the precise mode verbs. Extra items
 invoke their declared Bus target and verb, with the string list in `args`.
+An extra with `confirm: "<question>"` never calls its verb when chosen: the
+menu reopens where it was as a confirm step, the question (disabled), the
+extra's own row, then **Cancel**, and only choosing the extra's row there calls
+the verb. Cancel, Escape and click-away do nothing. The confirm is a human
+affordance of the menu; the verb itself stays callable directly, without one.
+The session entries use it:
+
+```mix
+{menu_items: {top: [
+  {label: "Restart session…", target: "desktop-session", verb: "desktop.session.restart",
+   confirm: "Restart the session? Every window closes; agent sessions resume."},
+  {label: "Leave seat…", target: "desktop-session", verb: "desktop.session.leave",
+   confirm: "Leave this seat? The desktop keeps running on its VT."}]}}
+```
+
+`shell.session.confirm {action, corner?}` opens that same confirm step for a
+built-in session action without a corner click: `action` is `restart` or
+`leave`, `corner` one of `top-left` (default), `bottom-left`, `bottom-right`,
+`top-right`. The step's action row calls `desktop.session.restart` or
+`desktop.session.leave` on the session-control citizen (`DESKTOP_SESSION_SERVICE`,
+default `desktop-session`; see [session-control](session-control.md)). It
+replies `{accepted:true, action, corner, output}` once the step is queued and
+calls nothing itself, so a global chord bound to it can only ever open the
+question. Refusals are rc 10 `{error_code, message}`: `INVALID_ARGUMENT` for a
+missing or unknown action or corner, `CALLER_PROVENANCE`.
 The menu uses the panel chrome theme tokens. Arrow keys or Tab select an item;
 Return or Space chooses it. Escape, click-away and item choice close the menu,
 end its local reveal hold and release its exclusive keyboard layer. Without the

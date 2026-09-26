@@ -1,0 +1,219 @@
+-- Session-control library for the `desktop-session` citizen
+-- (../session-control.mix) and its detached resume worker
+-- (../session-resume.mix): configuration, request validation, session
+-- capture and command plans as functions with no `on` handlers and no Bus.
+-- The citizen, the worker and the unit test (../tests/session-test.mix) all
+-- require this module.
+--
+-- Two verbs, both mesh-open (the mesh is the trust boundary; only
+-- well-formedness is checked here):
+--   desktop.session.restart  restart the desktop unit, then resume the agent
+--                            (Claude Code) sessions that were running into
+--                            fresh terminal panes
+--   desktop.session.leave    switch to another VT (chvt), leaving the desktop
+--                            running on its own VT to come back to
+--
+-- Request body: empty, or a JSON object with optional
+--   args     list of strings (what a Quoin corner-menu extra sends); the
+--            string "--dry-run" in it asks for a dry run
+--   dry_run  boolean
+-- A dry run replies the plan (argv, state file, sessions) and runs nothing.
+-- COSMIX_SESSION_DRY_RUN=1 forces every request to be a dry run (tests).
+--
+-- Refusals are rc 10 {error_code, message}.
+
+fn env_or($name, $default)
+  $v = trim(env($name, ""))
+  if $v == "" then return $default end
+  return $v
+end
+
+-- Everything the verbs need, from the environment. `user` is the desktop
+-- user whose agent sessions are resumed (required for restart, never
+-- guessed); `home` is read from the password database when not given.
+fn config()
+  $user = env_or("COSMIX_SESSION_USER", "")
+  $home = env_or("COSMIX_SESSION_HOME", "")
+  if $home == "" and $user != "" then $home = user_home($user) end
+  return {
+    user: $user,
+    home: $home,
+    desktop_unit: env_or("COSMIX_DESKTOP_UNIT", "cosmix-desktop.service"),
+    boot_term_unit: env_or("COSMIX_BOOT_TERM_UNIT", "cosmix-boot-term.service"),
+    term_service: env_or("COSMIX_SESSION_TERM_SERVICE", "term"),
+    leave_vt: env_or("COSMIX_LEAVE_VT", "1"),
+    worker_unit: env_or("COSMIX_SESSION_WORKER_UNIT", "cosmix-session-restart"),
+    mix: env_or("COSMIX_SESSION_MIX", "/opt/cosmix/bin/mix"),
+    resume_script: env_or("COSMIX_SESSION_RESUME", ""),
+    state_dir: env_or("COSMIX_SESSION_STATE_DIR", $home == "" ? "" : $home .. "/.cache/cosmix/session-resume"),
+    dry_run: env_or("COSMIX_SESSION_DRY_RUN", "") == "1"
+  }
+end
+
+-- The user's home from getent, or "" when the user is unknown.
+fn user_home($user)
+  $r = run_argv(["getent", "passwd", $user], {timeout: 5})
+  if $r.exit_code != 0 then return "" end
+  $fields = split(trim($r.stdout), ":")
+  if len($fields) < 7 then return "" end
+  return $fields[5]
+end
+
+-- Numeric uid and gid for chown, or nil.
+fn user_ids($user)
+  $r = run_argv(["getent", "passwd", $user], {timeout: 5})
+  if $r.exit_code != 0 then return nil end
+  $fields = split(trim($r.stdout), ":")
+  if len($fields) < 7 then return nil end
+  return {uid: to_number($fields[2]), gid: to_number($fields[3])}
+end
+
+fn refuse($code, $message)
+  return {rc: 10, body: {error_code: $code, message: $message}}
+end
+
+-- {ok, dry_run} for a well-formed body, else a refusal {rc, body}.
+fn request($body, $cfg)
+  $args = {}
+  if $body != nil and trim($body) != "" then
+    $v = nil
+    try
+      $v = json_parse($body)
+    catch $err
+      return refuse("INVALID_ARGUMENT", "body is not JSON")
+    end
+    if type($v) != "map" then return refuse("INVALID_ARGUMENT", "body must be a JSON object") end
+    $args = $v
+  end
+  for each $k in keys($args)
+    if not contains(["args", "dry_run"], $k) then
+      return refuse("INVALID_ARGUMENT", "unknown field " .. $k .. " (expected args, dry_run)")
+    end
+  end
+  $dry = $cfg.dry_run
+  if $args.dry_run != nil then
+    if type($args.dry_run) != "bool" then return refuse("INVALID_ARGUMENT", "dry_run must be true or false") end
+    $dry = $dry or $args.dry_run
+  end
+  if $args.args != nil then
+    if type($args.args) != "list" then return refuse("INVALID_ARGUMENT", "args must be a list of strings") end
+    for each $a in $args.args
+      if type($a) != "string" then return refuse("INVALID_ARGUMENT", "args must be a list of strings") end
+      if $a == "--dry-run" then
+        $dry = true
+      else
+        return refuse("INVALID_ARGUMENT", "unknown arg " .. $a .. " (only --dry-run)")
+      end
+    end
+  end
+  return {ok: true, dry_run: $dry}
+end
+
+-- A VT number 1..63 as a string, or nil.
+fn vt_number($vt)
+  if not re_match(to_string($vt), "^[0-9]{1,2}$") then return nil end
+  $n = to_number($vt)
+  if $n < 1 or $n > 63 then return nil end
+  return to_string($n)
+end
+
+-- The leave plan: {argv, vt}, or a refusal.
+fn plan_leave($cfg)
+  $vt = vt_number($cfg.leave_vt)
+  if $vt == nil then return refuse("SESSION_CONFIG", "COSMIX_LEAVE_VT must be a VT number 1-63, got " .. $cfg.leave_vt) end
+  return {ok: true, vt: $vt, argv: ["chvt", $vt]}
+end
+
+-- Live interactive agent sessions under $sessions_dir: one record per
+-- <pid>.json whose process is still alive under $proc_root. Records the
+-- permission-skipping flag so a resumed session keeps it. Unreadable
+-- records are skipped.
+fn capture($sessions_dir, $proc_root)
+  $sessions = []
+  for each $f in sort(glob($sessions_dir .. "/*.json"))
+    try
+      $j = json_parse(read_file($f))
+      $pid = to_string($j.pid)
+      if $j.kind == "interactive" and type($j.sessionId) == "string" and type($j.cwd) == "string" and exists($proc_root .. "/" .. $pid) then
+        $flags = []
+        $cmdline = $proc_root .. "/" .. $pid .. "/cmdline"
+        if exists($cmdline) then
+          for each $w in split(trim(replace(read_file($cmdline), "\0", " ")), " ")
+            if $w == "--dangerously-skip-permissions" then push($flags, $w) end
+          end
+        end
+        push($sessions, {id: $j.sessionId, cwd: $j.cwd, pid: $j.pid, flags: join($flags, " ")})
+      end
+    catch $e
+      $_ = $e
+    end
+  end
+  return $sessions
+end
+
+-- The environment the detached worker needs, as systemd-run -E pairs: a
+-- transient unit starts with a clean environment, so the session settings
+-- and the Bus location are handed over explicitly.
+fn worker_env($cfg)
+  $pairs = []
+  for each $k in ["COSMIX_NODE_CONFIG", "COSMIX_RUN", "COSMIX_SESSION_TERM_SERVICE", "COSMIX_DESKTOP_UNIT", "COSMIX_BOOT_TERM_UNIT", "COSMIX_SESSION_MIX", "MIX_STATS"]
+    $v = env($k, "")
+    if $v != "" then push($pairs, $k .. "=" .. $v) end
+  end
+  push($pairs, "COSMIX_SESSION_USER=" .. $cfg.user)
+  push($pairs, "COSMIX_SESSION_HOME=" .. $cfg.home)
+  return $pairs
+end
+
+-- The restart plan: {state_file, sessions, argv} where argv starts the
+-- detached worker, or a refusal. $now names the state file.
+fn plan_restart($cfg, $sessions, $now)
+  if $cfg.user == "" then return refuse("SESSION_CONFIG", "COSMIX_SESSION_USER is not set: whose sessions to resume is never guessed") end
+  if $cfg.home == "" then return refuse("SESSION_CONFIG", "no home directory for user " .. $cfg.user) end
+  if $cfg.resume_script == "" then return refuse("SESSION_CONFIG", "the resume worker script is unknown") end
+  $state_file = $cfg.state_dir .. "/sessions-" .. to_string($now) .. ".json"
+  $argv = ["systemd-run", "--unit=" .. $cfg.worker_unit, "--collect", "--quiet"]
+  for each $pair in worker_env($cfg)
+    push($argv, "-E")
+    push($argv, $pair)
+  end
+  for each $a in ["--", $cfg.mix, $cfg.resume_script, "--phase2", $state_file]
+    push($argv, $a)
+  end
+  return {ok: true, state_file: $state_file, sessions: $sessions, argv: $argv}
+end
+
+-- The reply body for an accepted (or dry-run) plan.
+fn restart_reply($plan, $dry_run, $unit)
+  $ids = []
+  for each $s in $plan.sessions
+    push($ids, $s.id)
+  end
+  $body = {accepted: true, action: "restart", dry_run: $dry_run, unit: $unit, state_file: $plan.state_file, sessions: $ids}
+  if $dry_run then $body.argv = $plan.argv end
+  return {rc: 0, body: $body}
+end
+
+fn leave_reply($plan, $dry_run)
+  $body = {accepted: true, action: "leave", dry_run: $dry_run, vt: to_number($plan.vt)}
+  if $dry_run then $body.argv = $plan.argv end
+  return {rc: 0, body: $body}
+end
+
+-- The command line one session is resumed with, typed into its pane, or nil
+-- when the directory or id could not be typed safely. The pane's login shell
+-- may be Mix or a POSIX shell, whose quoting differs, so the words are typed
+-- bare and anything that would need quoting is refused rather than guessed.
+fn resume_line($s)
+  if not re_match($s.cwd, "^[A-Za-z0-9_./@+~-]+$") or not re_match($s.id, "^[A-Za-z0-9-]+$") then return nil end
+  $flags = $s.flags == "" ? "" : $s.flags .. " "
+  return "cd " .. $s.cwd .. " && claude " .. $flags .. "--resume " .. $s.id .. "\n"
+end
+
+-- The integer after `key=` in a term reply line ("opened id=4 tab=4 pane=9"),
+-- or nil.
+fn reply_int($line, $key)
+  $m = re_find($line, "(?:^| )" .. $key .. "=([0-9]+)")
+  if len($m) == 0 then return nil end
+  return to_number($m[0].groups[0])
+end

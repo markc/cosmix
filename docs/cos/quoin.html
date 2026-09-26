@@ -1184,6 +1184,28 @@ body exactly <code>{"safe":true}</code> to the scenes loader (<code>SCENES_SERVI
 toggles: choosing it while that editor is visible closes it. Each mode
 choice uses the same <code>SetMode</code> command as the precise mode verbs. Extra items
 invoke their declared Bus target and verb, with the string list in <code>args</code>.
+An extra with <code>confirm: "&lt;question&gt;"</code> never calls its verb when chosen: the
+menu reopens where it was as a confirm step, the question (disabled), the
+extra's own row, then <strong>Cancel</strong>, and only choosing the extra's row there calls
+the verb. Cancel, Escape and click-away do nothing. The confirm is a human
+affordance of the menu; the verb itself stays callable directly, without one.
+The session entries use it:</p>
+<pre><code class="language-mix">{menu_items: {top: [
+  {label: "Restart session…", target: "desktop-session", verb: "desktop.session.restart",
+   confirm: "Restart the session? Every window closes; agent sessions resume."},
+  {label: "Leave seat…", target: "desktop-session", verb: "desktop.session.leave",
+   confirm: "Leave this seat? The desktop keeps running on its VT."}]}}
+</code></pre>
+<p><code>shell.session.confirm {action, corner?}</code> opens that same confirm step for a
+built-in session action without a corner click: <code>action</code> is <code>restart</code> or
+<code>leave</code>, <code>corner</code> one of <code>top-left</code> (default), <code>bottom-left</code>, <code>bottom-right</code>,
+<code>top-right</code>. The step's action row calls <code>desktop.session.restart</code> or
+<code>desktop.session.leave</code> on the session-control citizen (<code>DESKTOP_SESSION_SERVICE</code>,
+default <code>desktop-session</code>; see <a href="/cos/session-control">session-control</a>). It
+replies <code>{accepted:true, action, corner, output}</code> once the step is queued and
+calls nothing itself, so a global chord bound to it can only ever open the
+question. Refusals are rc 10 <code>{error_code, message}</code>: <code>INVALID_ARGUMENT</code> for a
+missing or unknown action or corner, <code>CALLER_PROVENANCE</code>.
 The menu uses the panel chrome theme tokens. Arrow keys or Tab select an item;
 Return or Space chooses it. Escape, click-away and item choice close the menu,
 end its local reveal hold and release its exclusive keyboard layer. Without the

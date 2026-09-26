@@ -1,0 +1,51 @@
+# Example SYSTEM unit for the session-control citizen (Bus service
+# `desktop-session`): desktop.session.restart / desktop.session.leave, which
+# Quoin's "Restart session…" / "Leave seat…" confirm steps fire.
+# Not installed by default. See docs/cos/session-control.md.
+#
+# It runs as ROOT (it restarts the desktop unit and switches VT) and is
+# deliberately NOT PartOf=/BindsTo= the desktop unit: it must outlive the
+# restart it performs. The restart itself runs in a transient unit
+# (cosmix-session-restart, started with systemd-run), so it completes even if
+# this citizen is restarted mid-way; nothing here is killed by the desktop
+# going down.
+#
+# Install: the citizen requires lib/session.mix and session-resume.mix beside
+# it, so install all three into /opt/cosmix/share/desktop/:
+#   install -D -m 0644 src/desktop/scripts/session-control.mix /opt/cosmix/share/desktop/session-control.mix
+#   install -D -m 0644 src/desktop/scripts/session-resume.mix /opt/cosmix/share/desktop/session-resume.mix
+#   install -D -m 0644 src/desktop/scripts/lib/session.mix /opt/cosmix/share/desktop/lib/session.mix
+# Then copy this file to /etc/systemd/system/, replace the
+# COSMIX_SESSION_USER=CHANGE-ME placeholder with the desktop user (whose
+# agent sessions are resumed), and
+#   systemctl daemon-reload && systemctl enable --now cosmix-session-control.service
+# Try it without restarting anything first:
+#   send "desktop-session" desktop.session.restart body='{"dry_run":true}'
+[Unit]
+Description=CosMix session-control citizen (desktop.session.restart / leave)
+After=cosmix-noded.service
+Wants=cosmix-noded.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/desktop/session-control.mix --name desktop-session
+Environment=COSMIX_NODE_CONFIG=/etc/cosmix/node.conf.mix
+Environment=COSMIX_RUN=/run/cosmix
+Environment=MIX_STATS=off
+# The desktop user (placeholder, set per host):
+Environment=COSMIX_SESSION_USER=CHANGE-ME
+# Defaults, shown for reference:
+Environment=COSMIX_DESKTOP_UNIT=cosmix-desktop.service
+Environment=COSMIX_BOOT_TERM_UNIT=cosmix-boot-term.service
+Environment=COSMIX_SESSION_TERM_SERVICE=term
+Environment=COSMIX_LEAVE_VT=1
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
