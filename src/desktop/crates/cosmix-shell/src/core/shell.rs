@@ -899,18 +899,19 @@ mod page_minimum_tests {
 
     /// Review M1: two docked opposite edges both widened by their pages share
     /// the room their remembered zones leave; the zones never exceed the
-    /// output (960 px: remembered 300 + 300, pages 440 and 600).
+    /// output (800 px: remembered 300 + 300, pages 440 and 480, which would
+    /// need 920).
     #[test]
     fn widened_opposite_docked_edges_fit_the_output_together() {
         let mut model = ShellModel::new(
             OutputKey::new("test-output").unwrap(),
-            LogicalSize::new(960.0, 800.0).unwrap(),
+            LogicalSize::new(800.0, 800.0).unwrap(),
             Duration::ZERO,
             Duration::from_millis(800),
             Duration::from_millis(200),
         )
         .unwrap();
-        for (edge, page, minimum) in [(Edge::Left, "wide", 440.0), (Edge::Right, "wider", 600.0)] {
+        for (edge, page, minimum) in [(Edge::Left, "wide", 440.0), (Edge::Right, "wider", 480.0)] {
             model.set_carousel(edge, Carousel::new([page]).unwrap());
             model.restore_thickness(edge, 300.0).unwrap();
             model.restore_mode(edge, Duration::ZERO, PanelMode::Docked).unwrap();
@@ -918,12 +919,12 @@ mod page_minimum_tests {
         }
         let (left, right) = (model.panel(Edge::Left), model.panel(Edge::Right));
         let zones = left.exclusive_zone_px + right.exclusive_zone_px;
-        assert!(zones <= 959.0 + 1e-3, "zones {zones} overflow 960");
-        // Shared in proportion to each widening (140 and 300 of 359 spare).
+        assert!(zones <= 799.0 + 1e-3, "zones {zones} overflow 800");
+        // Shared in proportion to each widening (140 and 180 of 199 spare).
         assert!(left.thickness_px > 300.0 && left.thickness_px < 440.0, "{}", left.thickness_px);
-        assert!(right.thickness_px > 300.0 && right.thickness_px < 600.0, "{}", right.thickness_px);
+        assert!(right.thickness_px > 300.0 && right.thickness_px < 480.0, "{}", right.thickness_px);
         let ratio = (left.thickness_px - 300.0) / (right.thickness_px - 300.0);
-        assert!((ratio - 140.0 / 300.0).abs() < 1e-3, "{ratio}");
+        assert!((ratio - 140.0 / 180.0).abs() < 1e-3, "{ratio}");
         assert_eq!((left.settled_thickness_px, right.settled_thickness_px), (300.0, 300.0));
         // One widened edge beside a plain docked one gets all the spare room.
         model.set_page_minimum_thickness(Edge::Right, "wider", None);
