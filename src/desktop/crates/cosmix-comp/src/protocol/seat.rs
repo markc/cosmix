@@ -29,13 +29,16 @@ pub(super) struct SeatPose {
 }
 
 pub(super) struct CompSeat {
-    // The groundwork carries these without creating an observer or agent seat.
-    #[allow(dead_code)]
     pub kind: SeatKind,
     pub seat: Seat<WaylandState>,
     pub keyboard: KeyboardHandle<WaylandState>,
     pub pointer: PointerHandle<WaylandState>,
     pub last_keyboard_action: Option<(Serial, WlSurface)>,
+    #[cfg(feature = "bus")]
+    pub last_input_us: Option<u64>,
+    /// Agent pointer coordinates become known only when its delivery path moves it.
+    #[cfg(feature = "bus")]
+    pub pointer_position: Option<(f64, f64)>,
     /// Injected holds are owned by this seat; physical pressed state lives
     /// in its Smithay keyboard/pointer handles.
     #[cfg(feature = "bus")]

@@ -3350,6 +3350,10 @@ impl ProtocolServer {
             seat_state,
             human: CompSeat {
                 kind: SeatKind::Human,
+                #[cfg(feature = "bus")]
+                last_input_us: None,
+                #[cfg(feature = "bus")]
+                pointer_position: None,
                 last_keyboard_action: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
@@ -3359,8 +3363,14 @@ impl ProtocolServer {
                 pose: None,
             },
             input_ingress: input::InputIngressState::default(),
+            #[cfg(feature = "bus")]
+            last_input_origin: None,
             agent: CompSeat {
                 kind: SeatKind::Agent,
+                #[cfg(feature = "bus")]
+                last_input_us: None,
+                #[cfg(feature = "bus")]
+                pointer_position: None,
                 last_keyboard_action: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
@@ -6269,6 +6279,8 @@ struct WaylandState {
     seat_state: SeatState<Self>,
     human: CompSeat,
     agent: CompSeat,
+    #[cfg(feature = "bus")]
+    last_input_origin: Option<SeatKind>,
     input_ingress: input::InputIngressState,
     /// How many attached devices report a touch capability.
     ///
@@ -9094,6 +9106,15 @@ impl WaylandState {
     }
 
     fn notify_idle_activity(&mut self, origin: SeatKind) {
+        #[cfg(feature = "bus")]
+        {
+            let seat = match origin {
+                SeatKind::Human => &mut self.human,
+                SeatKind::Agent => &mut self.agent,
+            };
+            seat.last_input_us = Some(monotonic_micros());
+            self.last_input_origin = Some(origin);
+        }
         if origin == SeatKind::Human {
             self.idle_notifier_state.notify_activity(&self.human.seat);
             self.idle_notifier_state.notify_activity(&self.agent.seat);
