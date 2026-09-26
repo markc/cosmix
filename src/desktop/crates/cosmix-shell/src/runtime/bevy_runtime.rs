@@ -524,8 +524,11 @@ fn update_model(
                 } else {
                     *thickness_px
                 };
-                if let Err(error) = runtime.model.resize_thickness(*edge, thickness_px) {
-                    bevy::log::warn!("panel drag rejected: {error}");
+                match runtime.model.resize_thickness(*edge, thickness_px) {
+                    // Dragging below the shown page's extent is ordinary: the
+                    // edge stays at the extent and the saved size is untouched.
+                    Ok(()) | Err(crate::core::PanelConfigError::PageMinimum { .. }) => {}
+                    Err(error) => bevy::log::warn!("panel drag rejected: {error}"),
                 }
             }
             ShellCommandKind::ResizeCommit { edge, thickness_px }

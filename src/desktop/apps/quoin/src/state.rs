@@ -206,20 +206,17 @@ impl SavedState {
             let mut edge_fields = Vec::with_capacity(Edge::ALL.len());
             for edge in Edge::ALL {
                 let state = &output.edges[edge.index()];
-                let thickness = state.thickness_px.ok_or_else(|| {
-                    StateError::Data("state has no model dimensions".into())
-                })?;
+                let mut fields = vec![
+                    ("mode".to_owned(), Value::String(state.mode.as_str().into())),
+                    ("page".to_owned(), Value::String(state.page.clone())),
+                ];
+                // An unremembered edge omits its thickness (see save).
+                if let Some(thickness) = state.thickness_px {
+                    fields.push(("thickness_px".to_owned(), Value::Number(f64::from(thickness))));
+                }
                 edge_fields.push((
                     crate::edge_name(edge).into(),
-                    Value::map(
-                        [
-                            ("thickness_px".into(), Value::Number(f64::from(thickness))),
-                            ("mode".into(), Value::String(state.mode.as_str().into())),
-                            ("page".into(), Value::String(state.page.clone())),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ),
+                    Value::map(fields.into_iter().collect()),
                 ));
             }
             output_fields.push((identity.clone(), Value::map(edge_fields.into_iter().collect())));
@@ -251,12 +248,17 @@ fn parse_edge_set(edges: &Value, legacy: bool) -> Result<[EdgeState; 4], StateEr
         let Some(Value::Map(entry)) = fields.get(crate::edge_name(edge)) else {
             return Err(invalid());
         };
-        let (Some(Value::Number(thickness)), Some(Value::String(page))) =
-            (entry.get("thickness_px"), entry.get("page"))
-        else {
+        let Some(Value::String(page)) = entry.get("page") else {
             return Err(invalid());
         };
-        if entry.len() != 3 {
+        // Thickness is optional: an edge that had none of its own at save
+        // time (it presented its page's extent) omits it.
+        let thickness = match entry.get("thickness_px") {
+            Some(Value::Number(thickness)) => Some(*thickness as f32),
+            None if !legacy => None,
+            _ => return Err(invalid()),
+        };
+        if entry.len() != 2 + usize::from(thickness.is_some()) {
             return Err(invalid());
         }
         let mode = if legacy {
@@ -276,15 +278,16 @@ fn parse_edge_set(edges: &Value, legacy: bool) -> Result<[EdgeState; 4], StateEr
                 _ => return Err(invalid()),
             }
         };
-        let thickness = *thickness as f32;
-        PanelConfig::new(
-            thickness,
-            Duration::from_millis(800),
-            Duration::from_millis(200),
-        )
-        .map_err(|error| StateError::Data(error.to_string()))?;
+        if let Some(thickness) = thickness {
+            PanelConfig::new(
+                thickness,
+                Duration::from_millis(800),
+                Duration::from_millis(200),
+            )
+            .map_err(|error| StateError::Data(error.to_string()))?;
+        }
         set[edge.index()] = EdgeState {
-            thickness_px: Some(thickness),
+            thickness_px: thickness,
             mode,
             page: page.clone(),
         };
@@ -505,7 +508,12 @@ pub(crate) fn persist_transitions(
                 .or_else(|| panel.active_page_id.clone())
                 .unwrap_or_default();
             EdgeState {
-                thickness_px: Some(panel.settled_thickness_px),
+                // An edge with no thickness of its own (it presents its
+                // page's extent or the default) saves none, so it stays
+                // unremembered across a restart.
+                thickness_px: panel
+                    .thickness_remembered
+                    .then_some(panel.settled_thickness_px),
                 mode: panel.mode,
                 page,
             }
@@ -682,6 +690,43 @@ mod tests {
         assert_eq!(app.world().resource::<StateStore>().writes(), 1);
         let saved = StateStore::load(Some(path)).snapshot();
         assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, Some(starting));
+    }
+
+    /// Review round 2, item 2: a save taken while an unremembered edge shows
+    /// its page's extent must not persist that extent as the edge's width;
+    /// after a restart the edge is still unremembered.
+    #[test]
+    fn a_shown_extent_is_not_saved_as_an_unremembered_edge_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut app = resize_app(&path);
+        let page = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left)
+            .active_page_id
+            .clone()
+            .expect("fixture left page");
+        cosmix_shell::runtime::set_page_minimum_thickness(
+            app.world_mut(),
+            Edge::Left,
+            &page,
+            Some(440.0),
+        );
+        let left = app.world().resource::<ShellFrameState>().0.panel(Edge::Left).clone();
+        assert!(!left.thickness_remembered);
+        assert_eq!(left.thickness_px, 440.0);
+        // Any transition saves every edge; the left one saves no width.
+        resize_input(&mut app, PanelInput::Dock);
+        assert_eq!(app.world().resource::<StateStore>().writes(), 1);
+        let saved = StateStore::load(Some(path.clone())).snapshot();
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, None);
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].mode, PanelMode::Docked);
+        let mut restored = model();
+        StateStore::load(Some(path)).restore(&mut restored);
+        assert!(!restored.has_remembered_thickness(Edge::Left));
+        assert_eq!(restored.panel(Edge::Left).mode, PanelMode::Docked);
     }
 
     fn model() -> ShellModel {

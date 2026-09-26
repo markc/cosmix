@@ -114,7 +114,8 @@ impl ShellModel {
     /// share what their remembered zones leave, in proportion to how much
     /// each widens, so their zones never exceed the output. A remembered
     /// `settled_thickness_px` never records a widening; an unremembered one
-    /// reports the presented seed, so the first save persists what was shown.
+    /// reports what is shown, and persistence saves no width for it (it
+    /// stays unremembered across a restart).
     pub fn panel(&self, edge: Edge) -> PanelSnapshot {
         let mut panel = self.remembered_panel(edge);
         let Some(wanted) = self.wanted_thickness(edge, &panel) else {
@@ -155,8 +156,8 @@ impl ShellModel {
 
     /// The smallest size a resize of `edge` may leave while its active page
     /// declares an authored extent: that extent within the resize range and
-    /// the output budget. [`Self::resize_thickness`] raises any smaller input
-    /// to it; steppers read it to report the size they will actually save.
+    /// the output budget. [`Self::resize_thickness`] refuses anything smaller
+    /// (`PageMinimum`); steppers read it to step from what is shown.
     pub fn resize_floor(&self, edge: Edge) -> Option<f32> {
         let range = super::resize_thickness_range(edge);
         let minimum = self.active_page_minimum(edge)?;
@@ -341,12 +342,20 @@ impl ShellModel {
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
         let max = self.max_thickness(edge);
         // Below the shown page's authored extent a resize would be invisible
-        // and still saved: clamp it, so what is shown is what is saved.
+        // yet saved. Refuse it without writing the extent over a smaller
+        // remembered size: a drag in progress goes back to where it started
+        // (the edge keeps showing the extent), a commit changes nothing.
+        if let Some(minimum) = self.resize_floor(edge)
+            && thickness < minimum
+        {
+            self.panels[edge.index()].revert_to_resize_start();
+            return Err(PanelConfigError::PageMinimum {
+                edge,
+                requested: thickness,
+                minimum,
+            });
+        }
         let range = super::resize_thickness_range(edge);
-        let thickness = match self.resize_floor(edge) {
-            Some(floor) if thickness.is_finite() => thickness.max(floor),
-            _ => thickness,
-        };
         if thickness > max {
             return Err(PanelConfigError::ThicknessBudget {
                 edge,
@@ -967,18 +976,70 @@ mod page_minimum_tests {
         assert_eq!(model.panel(Edge::Bottom).thickness_px, 70.0);
     }
 
-    /// Review m1: a resize below the shown page's extent is clamped to it, so
-    /// the value saved is the value shown.
+    /// Review round 2, item 1: saved 300 with a 440 page shown. A shrink
+    /// request below the extent is refused and never writes the extent over
+    /// the smaller remembered size; a request above it applies.
     #[test]
-    fn a_resize_below_the_shown_extent_saves_the_extent() {
+    fn a_resize_below_the_shown_extent_is_refused_and_saves_nothing() {
         let mut model = model();
+        model.restore_thickness(Edge::Left, 300.0).unwrap();
         model.set_page_minimum_thickness(Edge::Left, "launcher", Some(440.0));
-        model.resize_thickness(Edge::Left, 300.0).unwrap();
+        assert_eq!(model.resize_floor(Edge::Left), Some(440.0));
+        assert_eq!(
+            model.resize_thickness(Edge::Left, 292.0),
+            Err(PanelConfigError::PageMinimum { edge: Edge::Left, requested: 292.0, minimum: 440.0 })
+        );
         let panel = model.panel(Edge::Left);
-        assert_eq!((panel.thickness_px, panel.settled_thickness_px), (440.0, 440.0));
-        // A page without an extent resizes freely.
-        model.carousel_mut(Edge::Left).select_id("notes");
-        model.resize_thickness(Edge::Left, 300.0).unwrap();
+        assert_eq!((panel.thickness_px, panel.settled_thickness_px), (440.0, 300.0));
+        // A drag that goes above the extent and back below it returns to
+        // where it started; completing it saves the untouched 300.
+        let at = Duration::ZERO;
+        model.panel_input(Edge::Left, at, PanelInput::ResizeStarted).unwrap();
+        model.resize_thickness(Edge::Left, 450.0).unwrap();
+        assert_eq!(model.panel(Edge::Left).thickness_px, 450.0);
+        assert!(model.resize_thickness(Edge::Left, 430.0).is_err());
+        assert_eq!(model.panel(Edge::Left).thickness_px, 440.0);
+        model.panel_input(Edge::Left, at, PanelInput::ResizeCompleted).unwrap();
         assert_eq!(model.panel(Edge::Left).settled_thickness_px, 300.0);
+        // The notes page (no extent) still shows the remembered 300.
+        model.carousel_mut(Edge::Left).select_id("notes");
+        assert_eq!(model.panel(Edge::Left).thickness_px, 300.0);
+        // Above the extent a resize applies normally.
+        model.carousel_mut(Edge::Left).select_id("launcher");
+        model.resize_thickness(Edge::Left, 460.0).unwrap();
+        assert_eq!(model.panel(Edge::Left).settled_thickness_px, 460.0);
+    }
+
+    /// Review round 2, item 5: a docked widening edge beside a docked
+    /// opposite edge that NARROWS (unremembered, extent below its default)
+    /// gets the room the narrowing frees, and no more.
+    #[test]
+    fn a_widening_edge_uses_the_room_an_unremembered_opposite_frees() {
+        let mut model = ShellModel::new(
+            OutputKey::new("test-output").unwrap(),
+            LogicalSize::new(600.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model.set_carousel(Edge::Left, Carousel::new(["wide"]).unwrap());
+        model.set_carousel(Edge::Right, Carousel::new(["slim"]).unwrap());
+        model.restore_thickness(Edge::Left, 150.0).unwrap();
+        for edge in [Edge::Left, Edge::Right] {
+            model.restore_mode(edge, Duration::ZERO, PanelMode::Docked).unwrap();
+        }
+        let default = model.panel(Edge::Right).thickness_px;
+        assert!(!model.has_remembered_thickness(Edge::Right) && default > 130.0);
+        model.set_page_minimum_thickness(Edge::Left, "wide", Some(450.0));
+        model.set_page_minimum_thickness(Edge::Right, "slim", Some(130.0));
+        let (left, right) = (model.panel(Edge::Left), model.panel(Edge::Right));
+        assert_eq!(right.thickness_px, 130.0);
+        // 599 of budget less 150 and the default leaves less than the +300
+        // the left page asks for; the 130 page frees the rest.
+        assert!(599.0 - 150.0 - default < 300.0, "precondition: needs the freed room");
+        let expected = (599.0 - 150.0 - 130.0_f32).min(300.0) + 150.0;
+        assert_eq!(left.thickness_px, expected);
+        assert!(left.exclusive_zone_px + right.exclusive_zone_px <= 599.0 + 1e-3);
     }
 }

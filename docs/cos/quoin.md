@@ -516,7 +516,10 @@ the panel's marks follow the ingested value). A motion write re-encodes the
 whole `conf.mix`: other authored values are preserved, but comments and
 formatting are not. `shell.settings.size` takes `edge` and `delta_px` and
 enqueues the same resize commit an edge-drag completion produces, clamped to
-that edge's thickness range and the output budget. Like the scene and
+that edge's thickness range and the output budget. While the shown page
+declares an extent it steps from what is shown; a step that would land below
+the extent changes nothing and replies `{accepted:true, unchanged:true,
+thickness_px, minimum_px}` with the size that stays saved. Like the scene and
 sub-panel verbs, settings verbs from a stale Quoin connection are refused.
 Read back `shell.props.get path="panels.<edge>.width_px"` to verify a size
 change.
@@ -599,7 +602,8 @@ placeholder) restores nothing, claims nothing and is never persisted —
 protocol ids are reassigned across sessions and must not anchor state.
 
 Modes are the strings `hidden`, `pinned` or `docked`. Thickness must be finite
-and positive; saved page IDs wait for their scene to register, while any live
+and positive, and is omitted for an edge with no width of its own (one that
+presents its page's extent or the default), which restores unremembered; saved page IDs wait for their scene to register, while any live
 page remains available as the reveal default. On restore, an
 output with an entry under its own identity reuses it as-is. The strict
 legacy five-field root (no version) with three-field edges containing

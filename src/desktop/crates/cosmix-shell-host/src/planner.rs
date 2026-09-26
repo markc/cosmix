@@ -334,6 +334,7 @@ mod tests {
             resize_active: false,
             settled_thickness_px: 101.0,
             resize_floor_px: None,
+            thickness_remembered: true,
             exclusive_zone_px: if mode == PanelMode::Docked {
                 101.0
             } else {

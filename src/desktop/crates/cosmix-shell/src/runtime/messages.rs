@@ -197,6 +197,11 @@ pub struct PanelPresentation {
     /// While the active page declares an authored extent, the smallest size
     /// a resize may save (see [`crate::core::ShellModel::resize_floor`]).
     pub resize_floor_px: Option<f32>,
+    /// The edge has a restored or resized thickness of its own. Without one
+    /// it presents its page's extent (or the output default), and
+    /// persistence records no thickness, so a page's extent never becomes a
+    /// saved width by being shown at a save.
+    pub thickness_remembered: bool,
     pub exclusive_zone_px: f32,
     pub keyboard_interactivity: KeyboardInteractivity,
     /// The shell asks for the keyboard in this panel (a focus-cycle stop or
@@ -243,6 +248,7 @@ impl ShellFrame {
                 resize_active: panel.resize_active,
                 settled_thickness_px: panel.settled_thickness_px,
                 resize_floor_px: model.resize_floor(edge),
+                thickness_remembered: model.has_remembered_thickness(edge),
                 exclusive_zone_px: panel.exclusive_zone_px,
                 keyboard_interactivity: match model.focus_directive() {
                     _ if !panel.mapped => KeyboardInteractivity::None,

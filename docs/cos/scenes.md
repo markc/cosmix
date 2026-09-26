@@ -22,13 +22,17 @@ active page the edge is at least that thick, and showing another page returns
 it to the remembered value. The request never rewrites what a drag or
 `shell.panel.resize` saved, and `panels.<edge>.width_px` keeps reporting that
 saved value. An edge with nothing remembered (a fresh install) takes the
-extent itself as its size, even below the output-derived default, and that
-size is what the first save records. The extent is clamped to the edge's
+extent itself as its size, even below the output-derived default. It stays
+unremembered: a save records no width for it, so a page's extent never
+becomes a saved width just because it was shown at a save. The extent is clamped to the edge's
 resize range (24–200 px top and bottom, 120–500 left and right) and fitted to
 the output: two docked opposite edges widened at once share the room their
 remembered zones leave, in proportion to how much each widens, so their zones
-never cover the output. A drag or `shell.panel.resize` below the shown page's
-extent is clamped to it, so the saved size is the size you see. An absent or
+never cover the output. A resize below the shown page's extent would be
+invisible, so it never saves: `shell.panel.resize` is refused rc 10
+`{error_code:"PAGE_MINIMUM", message, minimum_px}`, a drag stays at the extent
+and keeps the remembered size, and a settings step that would land below it
+changes nothing. Above the extent a resize applies normally. An absent or
 cleared extent, or the page's unmount, imposes no minimum.
 Authored extents fit the output space left by opposing exclusive zones;
 pinning and output changes recheck that budget. Pointer resizes exceeding the

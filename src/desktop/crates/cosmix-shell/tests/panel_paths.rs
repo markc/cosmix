@@ -428,3 +428,41 @@ fn e2_thickness_seeds_are_clamped_logical_pixels() {
     assert_eq!(seed_panel_thickness(Edge::Top, large), 64.0);
     assert_eq!(seed_panel_thickness(Edge::Bottom, large), 128.0);
 }
+
+/// Review round 2, item 4a: a deliberate reveal during the intro claims the
+/// edge, so the edgeless pin chord can target it.
+#[test]
+fn a_deliberate_reveal_during_the_intro_claims_the_edge() {
+    for claim in [
+        PanelInput::Reveal,
+        PanelInput::CornerEntered,
+        PanelInput::PointerEntered,
+    ] {
+        let mut panel = panel();
+        panel.start_intro(ms(2_000));
+        assert!(panel.snapshot().intro_revealed, "{claim:?}");
+        panel.apply(ms(500), claim).unwrap();
+        let snapshot = panel.snapshot();
+        assert!(snapshot.transient_revealed, "{claim:?}");
+        assert!(!snapshot.intro_revealed, "{claim:?}");
+    }
+}
+
+/// Review round 2, item 4b: after the intro's deadline its reveal stays the
+/// intro's through the closing grace, until it conceals.
+#[test]
+fn the_intro_reveal_stays_the_intros_through_its_closing_grace() {
+    let mut panel = panel();
+    panel.start_intro(ms(2_000));
+    panel.tick(ms(2_100)).unwrap();
+    let closing = panel.snapshot();
+    assert!(closing.transient_revealed, "precondition: still in the grace");
+    assert!(closing.intro_revealed);
+    panel.tick(ms(4_000)).unwrap();
+    let after = panel.snapshot();
+    assert!(!after.transient_revealed);
+    assert!(!after.intro_revealed);
+    // A later hover reveal is a deliberate one.
+    panel.apply(ms(4_100), PanelInput::Reveal).unwrap();
+    assert!(!panel.snapshot().intro_revealed);
+}

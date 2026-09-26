@@ -343,6 +343,14 @@ fn reply_resizes(
                     10,
                     json!({"error_code":"PANEL_THICKNESS_BUDGET", "error":error.to_string(), "edge":format!("{edge:?}").to_lowercase(), "requested":requested, "max":max}),
                 ),
+                // Below the shown page's extent: invisible if applied, so it
+                // is refused and the remembered size is untouched.
+                Err(cosmix_shell::runtime::ShellResizeError::Configuration(
+                    error @ cosmix_shell::core::PanelConfigError::PageMinimum { minimum, .. },
+                )) => (
+                    10,
+                    json!({"error_code":"PAGE_MINIMUM", "message":format!("{error}; resize to at least {minimum} or show another page"), "minimum_px":minimum, "edge":argument(&request, "edge"), "requested":result.requested}),
+                ),
                 Err(cosmix_shell::runtime::ShellResizeError::OutputChanged) => (
                     10,
                     json!({"error_code":"PANEL_OUTPUT_CHANGED", "error":"output geometry changed before the resize applied", "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
@@ -3598,6 +3606,47 @@ mod tests {
             app.world().resource::<ShellFrameState>().0.panel(Edge::Right).mode,
             PanelMode::Pinned
         );
+    }
+
+    /// Review round 2, item 1: saved 300 with a 440 page shown. Bus resize
+    /// below the extent is refused PAGE_MINIMUM and never saves the extent;
+    /// above it, it applies.
+    #[test]
+    fn bus_resize_below_the_page_extent_is_refused() {
+        use cosmix_shell::runtime::set_page_thickness;
+        let (mut app, peer) = mounted_bus_app();
+        set_page_thickness(app.world_mut(), Edge::Left, 300.0);
+        // The launcher scene asks for w:440.
+        let mut load = scene_load("launcher", "owner", "left");
+        load.body = load.body.replace("\"edge\":\"left\"}", "\"edge\":\"left\",\"w\":440}");
+        peer.send(load);
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        app.update();
+        let settled = |app: &App| {
+            let panel = app.world().resource::<ShellFrameState>().0.panel(Edge::Left);
+            (panel.thickness_px, panel.settled_thickness_px)
+        };
+        assert_eq!(settled(&app), (440.0, 300.0));
+        let (rc, body) = send_until_reply(
+            &mut app,
+            &peer,
+            "shell.panel.resize",
+            json!({"edge":"left", "thickness_px":292}),
+        );
+        assert_eq!(rc, 10, "{body}");
+        assert_eq!(body["error_code"], "PAGE_MINIMUM");
+        assert_eq!(body["minimum_px"].as_f64(), Some(440.0));
+        assert!(body["message"].is_string());
+        assert_eq!(settled(&app), (440.0, 300.0), "the extent was not saved");
+        let (rc, body) = send_until_reply(
+            &mut app,
+            &peer,
+            "shell.panel.resize",
+            json!({"edge":"left", "thickness_px":460}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(settled(&app), (460.0, 460.0));
     }
 
     /// Review m4: the new verbs refuse in the unified `{error_code, message}`
