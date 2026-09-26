@@ -5,6 +5,9 @@ use super::*;
 use crate::port::{ControlReply, InputOp, PointerMoveTarget, PressAction};
 use serde_json::json;
 
+type AgentMotionFocus = Option<(WlSurface, Point<f64, Logical>)>;
+type ResolvedAgentMotion = (AgentMotionFocus, (f64, f64));
+
 impl WaylandState {
     fn agent_refusal(reason: &'static str) -> ControlReply {
         let mut detail = json!({});
@@ -406,6 +409,22 @@ impl WaylandState {
         target: &PointerMoveTarget,
         time: u32,
     ) -> Result<(), ControlReply> {
+        let (hit, position) = self.resolve_agent_motion(target, time)?;
+        self.agent_motion(
+            hit.map(|(surface, origin)| (SeatFocusTarget::Wayland(surface), origin)),
+            position,
+            time,
+        );
+        Ok(())
+    }
+
+    // Pure preview for dispatch coalescing. Delivery resolves again, without
+    // yielding, so a discarded motion never mutates focus or press provenance.
+    pub(super) fn resolve_agent_motion(
+        &self,
+        target: &PointerMoveTarget,
+        time: u32,
+    ) -> Result<ResolvedAgentMotion, ControlReply> {
         let (root, x, y) = match target {
             PointerMoveTarget::Window {
                 id,
@@ -484,12 +503,7 @@ impl WaylandState {
         if let Some((surface, _)) = &hit {
             self.validate_agent_surface(surface, false)?;
         }
-        self.agent_motion(
-            hit.map(|(surface, origin)| (SeatFocusTarget::Wayland(surface), origin)),
-            (x, y),
-            time,
-        );
-        Ok(())
+        Ok((hit, (x, y)))
     }
 
     pub(super) fn deliver_agent_input(&mut self, input: HostInput) {

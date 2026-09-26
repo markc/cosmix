@@ -3459,6 +3459,8 @@ impl ProtocolServer {
             #[cfg(feature = "bus")]
             pending_port_controls: Vec::with_capacity(PORT_QUEUE_CAPACITY),
             #[cfg(feature = "bus")]
+            input_wakeup: event_loop.get_signal(),
+            #[cfg(feature = "bus")]
             injection: input_injection::InjectionState::default(),
             #[cfg(feature = "bus")]
             region: region_selection::RegionSelection::default(),
@@ -4082,6 +4084,11 @@ impl ProtocolServer {
         self.state.backend.maintain_after_protocol_dispatch();
         self.state.popup_manager.cleanup();
         self.state.refresh_occlusion();
+        // All ready HostInput sources have run before bounded Bus delivery.
+        // Calloop's channels bound their own drain and re-ping when still ready,
+        // so continuously arriving host motion cannot starve this stage.
+        #[cfg(feature = "bus")]
+        self.state.service_ready_agent_sequence();
         #[cfg(feature = "bus")]
         port_observation::service_observations(&mut self.state);
         #[cfg(feature = "bus")]
@@ -6379,6 +6386,8 @@ struct WaylandState {
     pending_port_requests: Vec<PortRequest>,
     #[cfg(feature = "bus")]
     pending_port_controls: Vec<PortControl>,
+    #[cfg(feature = "bus")]
+    input_wakeup: smithay::reexports::calloop::LoopSignal,
     /// Bus-injected input: held keys/buttons, sequences, host passthrough.
     #[cfg(feature = "bus")]
     injection: input_injection::InjectionState,

@@ -465,6 +465,7 @@ fn agent_live_surface_unmap_clears_click_grab_without_disturbing_keyboard_or_seq
         step("comp.input.key", first, 0),
         step("comp.input.key", next, 1_000),
     ]), sender, Instant::now());
+    h.server.state.service_ready_agent_sequence();
     let keyboard_focus = h.server.state.agent.keyboard.current_focus();
     let keys = h.server.state.agent.keyboard.pressed_keys();
     let key_hold = input_injection::Hold::Key(KEY_LEFTSHIFT + 8);
@@ -624,6 +625,7 @@ fn destroying_agent_popup_preserves_queued_parent_input() {
         }), 0),
         step("comp.input.key", next, 20),
     ]), sender, Instant::now());
+    h.server.state.service_ready_agent_sequence();
     let _ = h.sync();
     send_request(&mut h.client, popup, 0, &[]);
     send_request(&mut h.client, popup - 1, 0, &[]); // xdg_surface
@@ -805,6 +807,7 @@ fn nested_human_focus_loss_preserves_agent_holds_and_queued_work() {
             step("comp.input.key", first, 0),
             step("comp.input.key", on_agent(agent_key(PressAction::Both, KEY_B)), 1_000),
         ]), sender, Instant::now());
+        h.server.state.service_ready_agent_sequence();
         let before = h.server.state.agent.keyboard.current_focus();
         h.server.state.handle_host_input(event);
         assert_eq!(h.server.state.agent.keyboard.current_focus(), before);
@@ -902,6 +905,7 @@ fn agent_sequence_is_cancelled_at_authority_loss_without_resuming_a_queued_step(
         sender,
         Instant::now(),
     );
+    h.server.state.service_ready_agent_sequence();
     assert_eq!(h.server.state.injection.sequences.len(), 1);
     h.server.state.reconcile_all_input_authority_loss();
     assert!(h.server.state.injection.sequences.is_empty());

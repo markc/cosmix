@@ -26,7 +26,7 @@ use crate::hotspot_scene::{HotspotBridge, Square, View as HotspotView};
 use crate::port::{ControlReply, PortControl, PortSetRequest};
 
 use super::{
-    CursorPositionSnapshot, StackBand, SurfaceId, WaylandState,
+    CursorPositionSnapshot, SeatKind, StackBand, SurfaceId, WaylandState,
     corner::{Corner, CornerConfig, CornerDetector, CornerEvent},
     pointer_observation::{LEASE, PointerLease, PointerPosition, PointerSample},
     port_snapshot::{
@@ -3134,11 +3134,55 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
         }
     }
     controls.sort_by_key(PortControl::order);
+    // HostInput ready this turn has already drained. Bound agent verbs without
+    // reordering the remaining controls: a suffix stays queued and wakes the
+    // next dispatch. Each admitted verb also has the parser's event bound.
+    const AGENT_CONTROL_BATCH: usize = 8;
+    let mut agent_ops = 0;
+    let end = controls.iter().position(|control| {
+        if matches!(control, PortControl::Input(request)
+            if matches!(request.op, crate::port::InputOp::OnSeat { seat: SeatKind::Agent, .. }))
+        {
+            agent_ops += 1;
+        }
+        agent_ops > AGENT_CONTROL_BATCH
+    }).unwrap_or(controls.len());
+    state.pending_port_controls = controls.split_off(end);
+    if !state.pending_port_controls.is_empty() { state.input_wakeup.wakeup(); }
     let mut changes = PendingPropChanges::new();
     let mut mutated = ControlMutation::None;
     // Mutations run in arrival order, so a script's set -> minimise ->
     // restore -> click lands in the order it was sent.
-    for control in &mut controls {
+    let mut cursor = 0;
+    while cursor < controls.len() {
+        // Complete every reply only after the group's final motion is delivered.
+        // Shared input_seq/coordinates describe that delivery, not intermediate
+        // coordinates which the client never saw. Every other control is a fence.
+        if let PortControl::Input(request) = &controls[cursor] {
+            let mut op = request.op.clone();
+            let mut end = cursor + 1;
+            while let Some(PortControl::Input(next)) = controls.get(end) {
+                let Some(combined) = state.coalesce_agent_motion(&op, &next.op) else { break };
+                op = combined;
+                end += 1;
+            }
+            if end > cursor + 1 {
+                mutated = mutated.max(ControlMutation::Input);
+                let mut reply = state.service_input_op(&op);
+                if let ControlReply::Body(body) = &mut reply {
+                    body["coalesced"] = serde_json::json!(end - cursor);
+                }
+                for control in &mut controls[cursor..end] {
+                    if let PortControl::Input(request) = control
+                        && let Some(sender) = request.reply.take()
+                    { let _ = sender.send(reply.clone()); }
+                }
+                cursor = end;
+                continue;
+            }
+        }
+        let control = &mut controls[cursor];
+        cursor += 1;
         match control {
             PortControl::Panel(request) => {
                 state.observations.panel_request_serviced = true;

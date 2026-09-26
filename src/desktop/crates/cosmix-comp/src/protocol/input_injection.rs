@@ -124,6 +124,7 @@ pub(crate) struct InjectionState {
     /// Pointer moves skip hot-corner sampling while set (`corners: false`).
     pub(super) suppress_corners: bool,
     pub(super) sequences: HashMap<u64, SequenceRun>,
+    ready_agent_sequences: VecDeque<u64>,
     next_sequence: u64,
 }
 
@@ -139,6 +140,7 @@ impl Default for InjectionState {
             host_held_buttons: BTreeSet::new(),
             suppress_corners: false,
             sequences: HashMap::new(),
+            ready_agent_sequences: VecDeque::new(),
             next_sequence: 0,
         }
     }
@@ -366,6 +368,39 @@ impl WaylandState {
             self.release_holds(seat, pressed_here.into_iter().map(Hold::Key).collect(), time);
         }
         (failure, completed, delivery)
+    }
+
+    /// Only adjacent agent motions with the same coordinate contract and live
+    /// client surface are compatible. Grabs are ordering barriers: their motion
+    /// callbacks may change the popup chain. Relative deltas accumulate rather
+    /// than overwriting one another. No preview changes seat state.
+    pub(super) fn coalesce_agent_motion(&self, previous: &InputOp, next: &InputOp) -> Option<InputOp> {
+        if self.agent.pointer.is_grabbed() || self.session_lock_active() { return None; }
+        let motion = |op: &InputOp| match op {
+            InputOp::OnSeat { seat: SeatKind::Agent, op } => match op.as_ref() {
+                InputOp::PointerMove { target, .. } => Some(target.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let previous = motion(previous)?;
+        let next = motion(next)?;
+        let combined = match (&previous, &next) {
+            (PointerMoveTarget::Relative { dx, dy }, PointerMoveTarget::Relative { dx: nx, dy: ny }) =>
+                PointerMoveTarget::Relative { dx: dx + nx, dy: dy + ny },
+            (PointerMoveTarget::Window { id, generation, require_hit, .. },
+                PointerMoveTarget::Window { id: next_id, generation: next_generation, require_hit: next_hit, .. })
+                if (id, generation, require_hit) == (next_id, next_generation, next_hit) => next.clone(),
+            (PointerMoveTarget::Output { output, .. }, PointerMoveTarget::Output { output: next_output, .. })
+                if output == next_output => next.clone(),
+            _ => return None,
+        };
+        let (before, _) = self.resolve_agent_motion(&previous, monotonic_millis()).ok()?;
+        let (after, _) = self.resolve_agent_motion(&combined, monotonic_millis()).ok()?;
+        if before.as_ref()?.0 != after.as_ref()?.0 { return None; }
+        Some(InputOp::OnSeat { seat: SeatKind::Agent, op: Box::new(InputOp::PointerMove {
+            target: combined, corners: false,
+        }) })
     }
 
     /// `comp.input.*` (one verb). Target candidacy is checked before focus;
@@ -1019,7 +1054,11 @@ impl WaylandState {
                         reply,
                     },
                 );
-                self.advance_sequence(id);
+                if self.injection.sequences[&id].uses_agent {
+                    self.queue_agent_sequence(id);
+                } else {
+                    self.advance_sequence(id);
+                }
             }
             LongOp::Wait(spec) => self.start_window_wait(spec, reply, admitted),
             LongOp::RegionSelect { output, timeout } => {
@@ -1037,6 +1076,7 @@ impl WaylandState {
     /// owner (another run, a single verb) still holds.
     fn abort_sequence(&mut self, id: u64) -> Option<SequenceRun> {
         let run = self.injection.sequences.remove(&id)?;
+        self.injection.ready_agent_sequences.retain(|ready| *ready != id);
         let reconciling = std::mem::replace(&mut self.injection.reconciling, true);
         for seat in [SeatKind::Human, SeatKind::Agent] {
             let orphaned = self.comp_seat_mut(seat).held.drop_owner(Some(id));
@@ -1064,7 +1104,11 @@ impl WaylandState {
                 if elapses_delay && let Some(run) = state.injection.sequences.get_mut(&id) {
                     run.delay_elapsed = true;
                 }
-                state.advance_sequence(id);
+                if state.injection.sequences.get(&id).is_some_and(|run| run.uses_agent) {
+                    state.queue_agent_sequence(id);
+                } else {
+                    state.advance_sequence(id);
+                }
                 TimeoutAction::Drop
             },
         );
@@ -1076,6 +1120,23 @@ impl WaylandState {
         }
     }
 
+    fn queue_agent_sequence(&mut self, id: u64) {
+        if !self.injection.ready_agent_sequences.contains(&id) {
+            self.injection.ready_agent_sequences.push_back(id);
+        }
+        self.input_wakeup.wakeup();
+    }
+
+    /// Round-robin one bounded sequence burst after ready host input, even when
+    /// more host input is arriving. Only caller-requested delays use a timer;
+    /// runnable agent work schedules an event-loop wakeup, never a polling tick.
+    pub(super) fn service_ready_agent_sequence(&mut self) {
+        if let Some(id) = self.injection.ready_agent_sequences.pop_front() {
+            self.advance_sequence(id);
+        }
+        if !self.injection.ready_agent_sequences.is_empty() { self.input_wakeup.wakeup(); }
+    }
+
     /// Run a sequence's due steps. A delayed step arms one calloop timer
     /// and resumes from it; a long zero-delay stretch yields to the loop
     /// every [`SEQUENCE_YIELD_EVENTS`] events. A failed step ends the run
@@ -1083,6 +1144,7 @@ impl WaylandState {
     /// button down (and never lets go of another caller's hold).
     pub(super) fn advance_sequence(&mut self, id: u64) {
         let events_at_start = self.injection.events;
+        let mut steps_this_turn = 0;
         loop {
             let Some(run) = self.injection.sequences.get_mut(&id) else {
                 return;
@@ -1113,21 +1175,40 @@ impl WaylandState {
                 self.arm_sequence_timer(id, delay, true);
                 return;
             }
-            if self.injection.events.wrapping_sub(events_at_start) >= SEQUENCE_YIELD_EVENTS {
-                self.arm_sequence_timer(id, SEQUENCE_YIELD, false);
+            if self.injection.events.wrapping_sub(events_at_start) >= SEQUENCE_YIELD_EVENTS
+                || steps_this_turn >= SEQUENCE_YIELD_EVENTS
+            {
+                if run.uses_agent {
+                    self.queue_agent_sequence(id);
+                } else {
+                    self.arm_sequence_timer(id, SEQUENCE_YIELD, false);
+                }
                 return;
             }
-            let step = run.steps.pop_front().expect("front step present");
+            let mut step = run.steps.pop_front().expect("front step present");
             let index = run.index;
             run.index += 1;
             run.delay_elapsed = false;
+            let mut coalesced = 1;
+            while steps_this_turn + coalesced < SEQUENCE_YIELD_EVENTS {
+                let Some(next) = self.injection.sequences.get(&id).and_then(|run| run.steps.front()) else { break };
+                if !next.delay.is_zero() { break; }
+                let Some(combined) = self.coalesce_agent_motion(&step.op, &next.op) else { break };
+                step.op = combined;
+                let run = self.injection.sequences.get_mut(&id).expect("sequence present");
+                run.steps.pop_front();
+                run.index += 1;
+                coalesced += 1;
+            }
+            steps_this_turn += coalesced;
             self.injection.current_run = Some(id);
             let reply = self.service_input_op(&step.op);
             self.injection.current_run = None;
             match reply {
-                ControlReply::Body(body) => {
+                ControlReply::Body(mut body) => {
+                    if coalesced > 1 { body["coalesced"] = json!(coalesced); }
                     if let Some(run) = self.injection.sequences.get_mut(&id) {
-                        run.replies.push(body);
+                        for _ in 0..coalesced { run.replies.push(body.clone()); }
                     }
                 }
                 refusal => {
