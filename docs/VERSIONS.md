@@ -39,7 +39,7 @@ Mix — the language and shell
 | crate | version |
 |---|---|
 | `cosmix-lib-mix` | 0.96.1 |
-| `cosmix-mix` | 0.96.1 |
+| `cosmix-mix` | 0.96.2 |
 | `mix-bench` | 0.1.1 |
 
 ## cos
@@ -88,7 +88,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-mixer-schema` | 0.5.0 |
 | `cosmix-mprisd` | 0.1.2 |
 | `cosmix-musicd` | 0.25.1 |
-| `cosmix-noded` | 0.18.1 |
+| `cosmix-noded` | 0.18.2 |
 | `cosmix-nspawnd` | 0.2.2 |
 | `cosmix-powerd` | 0.1.1 |
 | `cosmix-song` | 0.2.0 |
@@ -112,7 +112,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-design` | 0.15.0 |
 | `cosmix-filemgr` | 0.9.8 |
 | `cosmix-flock` | 0.1.0 |
-| `cosmix-iced-widgets` | 0.1.1 |
+| `cosmix-iced-widgets` | 0.1.2 |
 | `cosmix-imeprobe` | 0.2.1 |
 | `cosmix-interactgui` | 0.1.3 |
 | `cosmix-mail` | 0.1.1 |
