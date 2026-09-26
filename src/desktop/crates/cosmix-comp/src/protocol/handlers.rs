@@ -2082,7 +2082,6 @@ impl SeatHandler for WaylandState {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&SeatFocusTarget>) {
-        invalidate_keyboard_action(&mut self.last_keyboard_action);
         let focused_surface = focused
             .and_then(SeatFocusTarget::surface)
             .map(Cow::into_owned);
@@ -2106,13 +2105,17 @@ impl SeatHandler for WaylandState {
             })
             .flatten();
         set_data_device_focus(&self.display_handle, seat, data_device_client);
-        // Text-input focus is NOT automatic: nothing in Smithay's keyboard
-        // touches `text_input`, so the compositor must drive it or a client's
-        // `zwp_text_input_v3` never learns which surface is focused and an IME
-        // has nothing to attach to. Routed through the same
-        // resolved-focus surface every other consumer here uses, so text input
-        // cannot disagree with keyboard focus about where typing goes.
+        // Keep text-input bookkeeping on the supplied seat. Smithay also
+        // updates it from WlSurface keyboard enter/leave; this assignment is
+        // idempotent and uses the same resolved surface as data-device focus.
         seat.text_input().set_focus(focused_surface.clone());
+        // Seat identity, not its advertised name, owns desktop activation.
+        // Other seats retain their own protocol focus without disturbing the
+        // human's popup provenance, window state or fullscreen stacking.
+        if seat != &self.human.seat {
+            return;
+        }
+        invalidate_keyboard_action(&mut self.last_keyboard_action);
         // Temporary native modal focus is a seat transition, not window
         // deactivation: do not configure clients or demote fullscreen stacking.
         #[cfg(feature = "bus")]
@@ -2200,8 +2203,10 @@ impl SeatHandler for WaylandState {
         );
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        self.set_cursor_image(image);
+    fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) {
+        if seat == &self.human.seat {
+            self.set_cursor_image(image);
+        }
     }
 }
 
