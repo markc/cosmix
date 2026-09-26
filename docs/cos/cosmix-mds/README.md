@@ -9,7 +9,7 @@
 | Cargo package | `cosmix-mds` |
 | Rust library | `cosmix_mds` |
 | Operator binary | `cosmix-mds` |
-| Current crate version | `0.3.2` |
+| Current crate version | `0.3.3` |
 | Licence | MIT |
 
 The package also declares `cosmix-mds-stress-writer`. That binary is an internal crash-recovery test helper, is gated by `_stress-helper`, and is not part of the operator surface.
@@ -53,7 +53,7 @@ The crate root re-exports:
 |---|---|
 | Set lifecycle | `create_set`, `delete_set`, `list_sets` |
 | Container lifecycle | `create_container`, `rename_container`, `delete_container`, `list_containers`, `container_status` |
-| Blob CAS | `put_blob`, `get_blob`, `blob_size`, `blob_exists`, `put_blob_path`, `put_blob_reader`, `blob_file` |
+| Blob CAS | `put_blob`, `get_blob`, `blob_size`, `blob_exists`, `put_blob_path`, `put_blob_reader`, `put_blob_reader_expect`, `blob_file` |
 | Item mutation | `add_item`, `copy_item`, `move_item`, `remove_membership`, `store_flags` |
 | Keywords | `store_membership_keywords`, `store_item_keywords`, `item_memberships` |
 | Item lookup | `fetch_item`, `fetch_item_meta`, `find_items_by_blob_hash`, `search_items`, `list_items` |
@@ -71,6 +71,8 @@ The principal identifier wrappers are `SetId`, `ContainerId`, `ItemId`, and `Blo
 ## Streaming ingest and reads
 
 `blob::put_reader` streams any `Read` into the CAS, hashing with BLAKE3 while the bytes are staged under `blobs/.tmp`; the hash is only known at stream end and the write protocol already tolerates that. A reader error mid-stream removes the staged file and leaves no CAS entry. `blob::put` is a thin wrapper over it. `blob::open` returns the CAS file for streaming reads, and `Mds::blob_file` is its trait-level counterpart.
+
+`blob::put_reader_expect` is `put_reader` for a caller that already knows the hash the bytes must land under (a blob-lane `PUT /blob/<hex>`, a fetch by reference): the staged bytes are compared against `expected` **before** anything commits, and a mismatch removes the staging and returns `Error::BlobCorrupt` naming both hashes — a wrong body never enters the CAS under either hash, so no caller has to unlink a wrong-hash landing afterwards. `Mds::put_blob_reader_expect` is its trait-level counterpart.
 
 `blob::put_path` ingests a local file under a `PutMode`:
 

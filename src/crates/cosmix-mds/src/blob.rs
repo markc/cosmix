@@ -94,19 +94,7 @@ pub enum PutMode {
 /// count. A reader error mid-stream removes the staged file and
 /// leaves no CAS entry.
 pub fn put_reader(blobs_root: &Path, r: impl Read) -> Result<(BlobHash, u64)> {
-    // 1. Stage in .tmp/<uuid>. UUIDv4 is fine here — uniqueness over
-    // a tiny temp window, no ordering needed.
-    let tmp_dir = blobs_root.join(".tmp");
-    fs::create_dir_all(&tmp_dir)?;
-    let tmp_path = tmp_dir.join(uuid::Uuid::new_v4().to_string());
-    let mut hasher = blake3::Hasher::new();
-    let mut size: u64 = 0;
-    if let Err(e) = stream_to_tmp(r, &tmp_path, &mut hasher, &mut size) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    let hash = BlobHash(hasher.finalize().into());
+    let (hash, size, tmp_path) = stage(blobs_root, r)?;
     if blob_path(blobs_root, &hash).exists() {
         // Idempotent: identical bytes are already committed. Drop the
         // staged copy rather than rewriting the entry.
@@ -116,6 +104,62 @@ pub fn put_reader(blobs_root: &Path, r: impl Read) -> Result<(BlobHash, u64)> {
 
     commit_staged(blobs_root, &tmp_path, &hash)?;
     Ok((hash, size))
+}
+
+/// [`put_reader`] for a caller that already knows the hash the bytes
+/// must land under (a lane `PUT /blob/<hex>`, a cross-node fetch by
+/// reference). The stream is staged and hashed exactly like
+/// `put_reader`, but the comparison happens **before**
+/// [`commit_staged`]: a body that does not hash to `expected` is
+/// removed from staging and reported as [`Error::BlobCorrupt`] — it
+/// never enters the CAS under either its real hash or the expected
+/// one, so no caller has to unlink a wrong-hash landing afterwards.
+///
+/// Idempotent: the stream is always consumed and hashed (whether the
+/// body is read at all is the caller's decision — the blob lane
+/// answers `200` without reading when the expected hash is already
+/// present), and a mismatch is reported even then: the arriving bytes
+/// are wrong for the id regardless of what the CAS already holds.
+pub fn put_reader_expect(
+    blobs_root: &Path,
+    r: impl Read,
+    expected: &BlobHash,
+) -> Result<(BlobHash, u64)> {
+    let (landed, size, tmp_path) = stage(blobs_root, r)?;
+    if &landed != expected {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(Error::BlobCorrupt(format!(
+            "hash mismatch: body hashes to {}, not the expected {}",
+            hex(&landed),
+            hex(expected)
+        )));
+    }
+    if blob_path(blobs_root, &landed).exists() {
+        let _ = fs::remove_file(&tmp_path);
+        return Ok((landed, size));
+    }
+
+    commit_staged(blobs_root, &tmp_path, &landed)?;
+    Ok((landed, size))
+}
+
+/// Step 1 of the write protocol, shared by [`put_reader`] and
+/// [`put_reader_expect`] so the two can never drift: stage `r` in
+/// `.tmp/<uuid>` while hashing with BLAKE3. A reader error mid-stream
+/// removes the staged file.
+fn stage(blobs_root: &Path, r: impl Read) -> Result<(BlobHash, u64, PathBuf)> {
+    // UUIDv4 is fine here — uniqueness over a tiny temp window, no
+    // ordering needed.
+    let tmp_dir = blobs_root.join(".tmp");
+    fs::create_dir_all(&tmp_dir)?;
+    let tmp_path = tmp_dir.join(uuid::Uuid::new_v4().to_string());
+    let mut hasher = blake3::Hasher::new();
+    let mut size: u64 = 0;
+    if let Err(e) = stream_to_tmp(r, &tmp_path, &mut hasher, &mut size) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(Error::Io(e));
+    }
+    Ok((BlobHash(hasher.finalize().into()), size, tmp_path))
 }
 
 /// In-memory ingest; a thin wrapper over [`put_reader`].
@@ -527,6 +571,69 @@ mod tests {
         let tmp: Vec<_> = std::fs::read_dir(d.path().join(".tmp")).unwrap().collect();
         assert!(tmp.is_empty(), "tmp leftovers: {:?}", tmp);
         assert_eq!(cas_file_count(d.path()), 0, "no CAS entry may exist");
+    }
+
+    #[test]
+    fn put_reader_expect_roundtrips_matching_stream() {
+        let d = root();
+        let bytes = pseudo_random(1024 * 1024 + 99);
+        let expected = hash_bytes(&bytes);
+        let (h, size) = put_reader_expect(d.path(), &bytes[..], &expected).unwrap();
+        assert_eq!(h, expected);
+        assert_eq!(size, bytes.len() as u64);
+        assert_eq!(get(d.path(), &h).unwrap(), bytes);
+        // Idempotent: a second identical stream is consumed and lands
+        // on the same entry, still one CAS file.
+        let (h2, _) = put_reader_expect(d.path(), &bytes[..], &expected).unwrap();
+        assert_eq!(h2, expected);
+        assert_eq!(cas_file_count(d.path()), 1);
+    }
+
+    #[test]
+    fn put_reader_expect_mismatch_never_enters_the_cas() {
+        let d = root();
+        let bytes = pseudo_random(64 * 1024);
+        let landed = hash_bytes(&bytes);
+        let expected = hash_bytes(b"what the caller promised");
+        let err = put_reader_expect(d.path(), &bytes[..], &expected).unwrap_err();
+        assert!(matches!(err, Error::BlobCorrupt(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains(&hex(&landed)), "message names landed: {msg}");
+        assert!(msg.contains(&hex(&expected)), "message names expected: {msg}");
+
+        // No CAS file under either hash, nothing staging.
+        assert!(!blob_path(d.path(), &expected).exists());
+        assert!(!blob_path(d.path(), &landed).exists());
+        assert_eq!(cas_file_count(d.path()), 0);
+        let tmp: Vec<_> = std::fs::read_dir(d.path().join(".tmp")).unwrap().collect();
+        assert!(tmp.is_empty(), "tmp leftovers: {:?}", tmp);
+    }
+
+    #[test]
+    fn put_reader_expect_mismatch_when_expected_already_exists() {
+        // The CAS already holds verified bytes for the expected hash;
+        // a wrong body must still be refused (it is wrong for the id),
+        // must not disturb the existing entry, and must never land
+        // under its own hash.
+        let d = root();
+        let good = b"the real bytes";
+        let expected = hash_bytes(good);
+        put(d.path(), good).unwrap();
+
+        let wrong = pseudo_random(32 * 1024);
+        let landed = hash_bytes(&wrong);
+        let err = put_reader_expect(d.path(), &wrong[..], &expected).unwrap_err();
+        assert!(matches!(err, Error::BlobCorrupt(_)), "got {err:?}");
+
+        assert!(
+            blob_path(d.path(), &expected).exists(),
+            "the pre-existing expected entry is untouched"
+        );
+        assert_eq!(get(d.path(), &expected).unwrap(), good);
+        assert!(!blob_path(d.path(), &landed).exists());
+        let tmp: Vec<_> = std::fs::read_dir(d.path().join(".tmp")).unwrap().collect();
+        assert!(tmp.is_empty(), "tmp leftovers: {:?}", tmp);
+        assert_eq!(cas_file_count(d.path()), 1);
     }
 
     #[test]

@@ -131,6 +131,15 @@ pub trait Mds: Send + Sync {
     /// Ingest a stream into the CAS, hashing while staging; the bytes
     /// are never held in memory as a whole.
     fn put_blob_reader(&self, r: &mut dyn Read) -> Result<BlobHash>;
+    /// [`Mds::put_blob_reader`] for a caller that already knows the
+    /// hash: a body that does not hash to `expected` never enters the
+    /// CAS under either hash (see [`blob::put_reader_expect`]). On
+    /// success the returned hash equals `expected`.
+    fn put_blob_reader_expect(
+        &self,
+        r: &mut dyn Read,
+        expected: &BlobHash,
+    ) -> Result<(BlobHash, u64)>;
     /// Open the CAS file for streaming reads — the read-side
     /// counterpart of [`Mds::put_blob_reader`].
     fn blob_file(&self, hash: &BlobHash) -> Result<File>;
@@ -1430,6 +1439,13 @@ impl Mds for SqliteCasMds {
     }
     fn put_blob_reader(&self, r: &mut dyn Read) -> Result<BlobHash> {
         blob::put_reader(&self.blobs_root(), r).map(|(hash, _)| hash)
+    }
+    fn put_blob_reader_expect(
+        &self,
+        r: &mut dyn Read,
+        expected: &BlobHash,
+    ) -> Result<(BlobHash, u64)> {
+        blob::put_reader_expect(&self.blobs_root(), r, expected)
     }
     fn blob_file(&self, hash: &BlobHash) -> Result<File> {
         blob::open(&self.blobs_root(), hash)

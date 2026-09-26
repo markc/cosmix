@@ -82,6 +82,13 @@ impl Mds for MemMds {
     fn put_blob_reader(&self, _r: &mut dyn std::io::Read) -> Result<BlobHash> {
         unimplemented!()
     }
+    fn put_blob_reader_expect(
+        &self,
+        _r: &mut dyn std::io::Read,
+        _expected: &BlobHash,
+    ) -> Result<(BlobHash, u64)> {
+        unimplemented!()
+    }
     fn blob_file(&self, _hash: &BlobHash) -> Result<std::fs::File> {
         unimplemented!()
     }
