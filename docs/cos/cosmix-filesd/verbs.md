@@ -198,7 +198,10 @@ bare lowercase hex, or a reference map containing `blob`. It streams
 `GET /blob/<hex>` from that local store. A missing blob must first be fetched
 with `blob.fetch`; materialise does not initiate a cross-node fetch.
 
-The destination uses the write jail and rejects existing non-plain targets.
+The destination uses the write jail and rejects symlink or non-regular targets
+on overwrite. In unrestricted places a hard-linked target is replaced by
+rename, leaving its other links unchanged, like `fs.write`; policy-scoped
+places still reject hard-linked targets in the resolver.
 Missing parent directories are created only after a successful GET response,
 immediately before landing; a 404 or connection failure creates none. Bytes stream into
 a unique sibling temporary file, with length and BLAKE3 verification before

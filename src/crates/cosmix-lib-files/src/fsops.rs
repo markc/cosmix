@@ -439,7 +439,13 @@ impl FsLayer {
             Ok(_) if !overwrite => return Err(FilesError::Exists(format!(
                 "already exists (overwrite=false): {place_rel}"
             ))),
-            Ok(_) => require_plain_file(&full, place_rel)?,
+            Ok(meta) if meta.file_type().is_symlink() => return Err(FilesError::BadRequest(format!(
+                "target is a symlink: {place_rel}"
+            ))),
+            Ok(meta) if !meta.is_file() => return Err(FilesError::BadRequest(format!(
+                "target is not a regular file: {place_rel}"
+            ))),
+            Ok(_) => {}, // rename replaces this entry, not its other hard links
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -1347,6 +1353,28 @@ mod tests {
             "symlink escape blocked"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_overwrite_replaces_unscoped_hardlink_and_names_bad_targets() {
+        let dir = scratch();
+        let (fs_, home) = layer(&dir, true);
+        fs::write(home.join("target"), b"old").unwrap();
+        fs::hard_link(home.join("target"), home.join("other")).unwrap();
+        let mut scoped = fs_.clone();
+        scoped.places[0].allow = vec!["target".into()];
+        assert!(matches!(scoped.blob_target("home/target", true, false), Err(FilesError::Denied(_))));
+        let target = fs_.blob_target("home/target", true, true).unwrap();
+        crate::atomic::land_verified(&target, &b"new"[..], 3, &crate::hash::content_hash(b"new"), true).unwrap();
+        assert_eq!(fs::read(home.join("target")).unwrap(), b"new");
+        assert_eq!(fs::read(home.join("other")).unwrap(), b"old");
+        std::os::unix::fs::symlink(home.join("target"), home.join("link")).unwrap();
+        fs::create_dir(home.join("folder")).unwrap();
+        for path in ["home/link", "home/folder"] {
+            assert!(fs_.blob_target(path, true, false).unwrap_err().to_string().starts_with("bad request: target"));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

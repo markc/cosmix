@@ -577,7 +577,10 @@ ureq reads the 413, yielding <code>lane:</code> with a quota hint rather than <c
 bare lowercase hex, or a reference map containing <code>blob</code>. It streams
 <code>GET /blob/&lt;hex&gt;</code> from that local store. A missing blob must first be fetched
 with <code>blob.fetch</code>; materialise does not initiate a cross-node fetch.</p>
-<p>The destination uses the write jail and rejects existing non-plain targets.
+<p>The destination uses the write jail and rejects symlink or non-regular targets
+on overwrite. In unrestricted places a hard-linked target is replaced by
+rename, leaving its other links unchanged, like <code>fs.write</code>; policy-scoped
+places still reject hard-linked targets in the resolver.
 Missing parent directories are created only after a successful GET response,
 immediately before landing; a 404 or connection failure creates none. Bytes stream into
 a unique sibling temporary file, with length and BLAKE3 verification before
