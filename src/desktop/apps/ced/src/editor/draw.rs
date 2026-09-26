@@ -529,7 +529,9 @@ fn quad<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color
 /// `ced.action` waited behind it — ced first save, 2026-09-26). Cut to the
 /// layer, a full-layer frame masks only the boxes that really cross its edge
 /// (the partial last row, a line running past the right edge), and the mask
-/// still clips those.
+/// clips only those. Boxes flush with the text area's own edge (column 0, the
+/// top row) are inside it, so they are NOT layer-clipped: ink overhanging into
+/// the gutter padding or above the widget is drawn unclipped.
 ///
 /// The slack is the whole budget for ink outside a text's box: each damage
 /// rectangle is filled with the background before drawing, so ink overhanging

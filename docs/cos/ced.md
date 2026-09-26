@@ -342,7 +342,9 @@ typography role and the chrome the `Ui` role.
 - Ink that overhangs its row by more than the half-line slack (tall stacks of
   combining marks, an outsized fallback glyph) can be cut off, or drawn twice,
   where it crosses the edge of a partly redrawn region. Ink within the slack
-  is unaffected.
+  is unaffected, except at the text area's own edges: text in column 0 and on
+  the top row is not clipped to the text area, so ink overhanging into the
+  gutter padding or above the editor is drawn unclipped.
 - A recovered **scratch** buffer with CRLF line endings, reattached by its
   recovery id, is edited as LF: Enter inserts `\n` (the service's list row
   carries no line-ending field yet). Path buffers are unaffected.
