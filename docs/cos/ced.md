@@ -334,6 +334,11 @@ typography role and the chrome the `Ui` role.
   list, recent files, hidden files toggle); there is no portal picker.
 - End-to-end key-to-photon latency is not measured yet; `ced.stats` reports
   ced's own stages (`model_us`, `view_us`, `next_frame_us`).
+- The window draws on the thread that serves the `ced` port, in software
+  (tiny-skia), so a verb that arrives mid-frame waits for that frame. After an
+  edit a frame of a full editor costs tens of milliseconds, so a
+  `ced.action file.save` answers in about 100–300 ms on a nested desktop, of
+  which the edit service's write and fsync are about 50–100 ms.
 - A recovered **scratch** buffer with CRLF line endings, reattached by its
   recovery id, is edited as LF: Enter inserts `\n` (the service's list row
   carries no line-ending field yet). Path buffers are unaffected.
