@@ -460,6 +460,11 @@ fn plan_click($verb, $args, $ui, $data)
       return plan($ui, "ui", [], "That row names no page")
     end
     $ui.page = {edge: $parts[1], page: $page}
+    -- Arrange acts on what you click: a page a scene owns also selects that
+    -- scene, so Installed's Move/Edit and the status line follow it (live
+    -- gate G9). A page no scene owns (Quoin's own) leaves the selection.
+    $owner = page_owners($data.list)[$page]
+    if $owner != nil then $ui.scene = $owner.name end
     return plan($ui, "ui", [], "")
   end
   if $verb == "editor.edge.mode" then return plan_mode($node, $ui, $data) end

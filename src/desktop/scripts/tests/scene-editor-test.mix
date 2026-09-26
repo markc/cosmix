@@ -563,6 +563,11 @@ check(click("editor.edge.size", cargs("size_top_plus", nil), $ui).steps[0].args.
 -- page select + order
 $p = click("editor.edge.page", cargs("pages_right", {id: "g_scene-notes", page: "scene-notes"}), $ui)
 check(deep_eq($p.ui.page, {edge: "right", page: "scene-notes"}), "page select")
+check($p.ui.scene == "notes", "selecting a scene's page selects the scene: " .. to_string($p.ui.scene))
+$held = $ui
+$held.scene = "panel"
+$q = click("editor.edge.page", cargs("pages_right", {page: "settings.appearance"}), $held)
+check($q.ui.scene == "panel" and $q.ui.page.page == "settings.appearance", "a page no scene owns keeps the selection")
 $pg = $p.ui
 $x = run_plan(click("editor.edge.order", cargs("order_right_up", nil), $pg), [])
 check(deep_eq($x.calls, [["shell", "shell.panel.order", {edges: {right: ["settings.appearance", "scene-notes", "scene-calendar"]}}]]), "swap with the left neighbour: " .. json_encode($x.calls))
