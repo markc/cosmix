@@ -308,11 +308,13 @@ impl WaylandState {
         if pointer_dead {
             self.agent.last_pointer_action = None;
             let pointer = self.agent.pointer.clone();
+            // ClickGrab ignores motion's requested focus. Retire its buttons
+            // first so the clearing motion runs after the implicit grab ends.
+            self.release_agent_device_holds(false);
             pointer.motion(self, None, &MotionEvent {
                 location: pointer.current_location(),
                 serial: SERIAL_COUNTER.next_serial(), time: monotonic_millis(),
             });
-            self.release_agent_device_holds(false);
             pointer.frame(self);
         }
         if keyboard_dead {

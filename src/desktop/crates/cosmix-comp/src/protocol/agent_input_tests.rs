@@ -438,6 +438,54 @@ fn agent_vt_switch_and_unmap_clear_holds_and_focus() {
 }
 
 #[test]
+fn agent_live_surface_unmap_clears_click_grab_without_disturbing_keyboard_or_sequence() {
+    let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
+    bind_agent_devices(&mut h);
+    let first = agent_target(&h, &beta, agent_key(PressAction::Press, KEY_LEFTSHIFT));
+    let next = agent_target(&h, &beta, agent_key(PressAction::Both, KEY_B));
+    let (sender, _receiver) = tokio::sync::oneshot::channel();
+    h.server.state.start_long_op(crate::port::LongOp::Sequence(vec![
+        step("comp.input.key", first, 0),
+        step("comp.input.key", next, 1_000),
+    ]), sender, Instant::now());
+    let keyboard_focus = h.server.state.agent.keyboard.current_focus();
+    let keys = h.server.state.agent.keyboard.pressed_keys();
+    let key_hold = input_injection::Hold::Key(KEY_LEFTSHIFT + 8);
+    assert_eq!(h.server.state.agent.held.owners_of(key_hold), 1);
+    assert!(h.server.state.agent.keyboard.modifier_state().shift);
+
+    let (id, generation) = window_id_and_generation(&h, &alpha);
+    let motion = on_agent(move_op(PointerMoveTarget::Window {
+        id, generation, x: 20.0, y: 20.0, require_hit: true,
+    }));
+    assert_eq!(inject(&mut h, &ingress, &runtime, motion).0, 0);
+    assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(InputOp::PointerButton {
+        button: BTN_LEFT, action: PressAction::Press,
+    })).0, 0);
+    assert!(h.server.state.agent.pointer.with_grab(|_, grab|
+        grab.is::<smithay::input::pointer::ClickGrab<WaylandState>>()
+    ).unwrap_or(false));
+    let button_hold = input_injection::Hold::Button(BTN_LEFT);
+    assert_eq!(h.server.state.agent.held.owners_of(button_hold), 1);
+    let surface = h.server.state.surfaces[&alpha].role.wl_surface().clone();
+
+    // Keep the resource alive and run exactly one unmap visibility pass: a
+    // second reconciliation must not be needed to clear the stale focus.
+    h.server.state.surfaces.get_mut(&alpha).unwrap().mapped = false;
+    h.server.state.recompute_effective_visibility();
+    assert!(surface.is_alive());
+    assert!(h.server.state.agent.pointer.current_focus().is_none());
+    assert!(!h.server.state.agent.pointer.is_grabbed());
+    assert!(h.server.state.agent.pointer.current_pressed().is_empty());
+    assert_eq!(h.server.state.agent.held.owners_of(button_hold), 0);
+    assert_eq!(h.server.state.agent.keyboard.current_focus(), keyboard_focus);
+    assert_eq!(h.server.state.agent.keyboard.pressed_keys(), keys);
+    assert!(h.server.state.agent.keyboard.modifier_state().shift);
+    assert_eq!(h.server.state.agent.held.owners_of(key_hold), 1);
+    assert_eq!(h.server.state.injection.sequences.len(), 1);
+}
+
+#[test]
 fn destroying_agent_popup_preserves_queued_parent_input() {
     let (mut h, ingress, runtime, _, alpha, _) = two_windows();
     let (seat, keyboard, _) = bind_agent_devices(&mut h);
