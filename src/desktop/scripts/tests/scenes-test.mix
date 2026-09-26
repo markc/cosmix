@@ -4,7 +4,8 @@ $l = require("../lib/scenes.mix")
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-scenes-test.XXXXXXXX"]))
 $log = $tmp .. "/calls"
 $checks = {count:0}
-$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, load_error:nil, names:["test-shell"]}
+$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, load_error:nil, names:["test-shell"],
+  dialog:nil, dialog_mode:"q2", refuse_edge:nil, rollback_fail:nil, hosted:nil, rev:0}
 write_file($log, "")
 
 fn check($ok, $message)
@@ -32,20 +33,38 @@ fn rpc($host, $verb, $body)
     $source = type($body) == "map" ? $body.source : $body
     $d = $l.document($source)
     if $d.name == $host_state.load_error then raise("SCENES_UPSTREAM", "load timed out", {rpc:"shell.scene.load"}) end
-    if contains($source, "BROKEN") then raise("SCENES_UPSTREAM", "invalid document", {rc:10, upstream:{diagnostics:[{line:7, code:"mix-parse"}]}}) end
+    if contains($source, "BROKEN") then raise("SCENES_UPSTREAM", "invalid document", {rc:10, upstream:{diagnostics:[{line:7, code:"mix-parse", severity:"Error", message:"parse"}]}}) end
+    if $verb == "shell.scene.load" then
+      -- Seat occupancy is invisible to validate (plan rule 6.5).
+      if $host_state.refuse_edge != nil and $d.window.edge == $host_state.refuse_edge then
+        raise("SCENES_UPSTREAM", "scene host refused request", {rc:10, upstream:{error_code:"SUBPANEL_COLLISION", message:"page is held by another owner"}})
+      end
+      if $host_state.rollback_fail == $d.name then raise("SCENES_TRANSPORT", "scene host request failed", {rc:20}) end
+      if $d.window.kind == "dialog" then $host_state.dialog = {scene:$d.name, visible:false, w:880, h:620, output:"TEST-1"} end
+    end
     return {revision:len(calls("shell.scene.load")), scene:$d.name}
   end
+  if $verb == "shell.dialog.show" or $verb == "shell.dialog.hide" then
+    if $host_state.dialog_mode == "none" then raise("SCENES_UPSTREAM", "scene host refused request", {rc:10, upstream:{error_code:"UNIMPLEMENTED", message:"no dialogs"}}) end
+    if type($host_state.dialog) != "map" or $host_state.dialog.scene != $body.scene then
+      raise("SCENES_UPSTREAM", "scene host refused request", {rc:10, upstream:{error_code:"NOT_FOUND", message:"no dialog", scene:$body.scene}})
+    end
+    $host_state.dialog.visible = $verb == "shell.dialog.show"
+    return {scene:$body.scene, visible:$host_state.dialog.visible, applied:true}
+  end
+  if $verb == "shell.scene.unload" and type($host_state.dialog) == "map" and $host_state.dialog.scene == $body.scene then $host_state.dialog = nil end
   if $verb == "shell.scene.patch" then
     if $body.value.refuse == true then raise("SCENES_UPSTREAM", "refused model", {rc:10, upstream:{error_code:"DOCUMENT_TOO_LARGE", message:"large"}}) end
     return {revision:100 + len(calls("shell.scene.patch"))}
   end
-  if $verb == "shell.props.get" then return {panels:$host_state.panels} end
+  if $verb == "shell.props.get" then return {panels:$host_state.panels, dialog:$host_state.dialog} end
   if $verb == "shell.panel.state" then return $host_state.panels[$body.edge] end
   if $host_state.apply and $verb == "shell.panel.page.set" then $host_state.panels[$body.edge].page = $body.id end
   if $host_state.apply and $verb == "shell.panel.mode" then
     $host_state.panels[$body.edge].mode = $body.mode
     $host_state.panels[$body.edge].visible = $body.mode != "hidden"
   end
+  if $verb == "shell.scenes.list" and $host_state.hosted != nil then return $host_state.hosted end
   if $verb == "shell.scenes.list" then
     $mounted = {}
     for each $line in read_lines($log)
@@ -82,12 +101,20 @@ fn process_exit($s, $event)
   end
   return $s
 end
-fn check_behaviour($path)
-  record("check", $path)
-  if contains(read_file($path), "BROKEN") then raise("SCENES_BEHAVIOUR_INVALID", "invalid behaviour", {file:$path}) end
+fn check_behaviour($path, $opts)
+  record("check", {path:$path, mode:$opts.lint})
+  $text = read_file($path)
+  $digest = hash_sha256($text)
+  if contains($text, "BROKEN") then raise("SCENES_BEHAVIOUR_INVALID", "invalid behaviour", {file:$path, problems:[{file:$path, digest:$digest, line:1, col:1, severity:"error", code:"MIX-E1002", message:"broken"}]}) end
+  $problems = []
+  if contains($text, "LINTWARN") then
+    $problems = [{file:$path, digest:$digest, line:2, col:3, severity:"warning", code:"MIX-W2001", message:"lint warning"}]
+    if $opts.lint == "deny" then raise("SCENES_BEHAVIOUR_INVALID", "behaviour check failed", {file:$path, problems:$problems}) end
+  end
+  return {ok:true, problems:$problems}
 end
-fn launch($path, $name, $generation, $host, $me)
-  record("launch", {name:$name, generation:$generation, host:$host, me:$me})
+fn launch($dir, $name, $generation, $host, $me)
+  record("launch", {dir:$dir, name:$name, generation:$generation, host:$host, me:$me})
   return 1000 + len(calls("launch"))
 end
 fn stop($pid, $tag)
@@ -112,13 +139,105 @@ fn refused($s, $verb, $args, $code)
   check($r.rc != 0 and $r.response.error_code == $code and type($r.response.message) == "string", $verb .. " expected " .. $code .. ": " .. json_encode($r.response))
   return $r
 end
+
+-- Scene Editor (plan §4.1) helpers: every case gets its own scene root.
+fn log_mark()
+  return len(read_lines($log))
+end
+fn since($mark, $verb)
+  $out = []
+  $lines = read_lines($log)
+  for $i = $mark to len($lines) - 1
+    $v = json_parse($lines[$i])
+    if $verb == nil or $v.verb == $verb then push($out, $v) end
+  end
+  return $out
+end
+fn loads_of($mark, $name)
+  return filter(since($mark, "shell.scene.load"), fn($c) = $l.document($c.body.source).name == $name)
+end
+fn tree_digest($dir)
+  $acc = ""
+  for each $p in sort(walk($dir, {follow_symlinks:false}))
+    if is_file($p) then $acc = $acc .. $p .. "\n" .. hash_sha256(read_file($p)) .. "\n" end
+  end
+  return hash_sha256($acc)
+end
+fn se_fresh($label, $templates)
+  $root = $tmp .. "/se-" .. $label
+  mkdir($root)
+  $host_state.dialog = nil
+  $host_state.hosted = nil
+  $x = $l.initial($root, $templates, "test-shell", "test-scenes", $io)
+  $x.first_run_enabled = false
+  $x = $l.rescan($x, false)
+  return $l.services($x, ["test-shell"], false)
+end
+fn notice($s)
+  $host_state.rev = $host_state.rev + 1
+  return $l.panel_changed($s, {generation:99, revision:$host_state.rev, panels:$host_state.panels})
+end
+fn tpl_fixture($dir, $name, $meta, $behaviour, $window)
+  mkdir($dir .. "/" .. $name)
+  write_file($dir .. "/" .. $name .. "/scene.mix", replace(fixture_source($name, "tpl " .. $name), "window: {\"kind\":\"edge\",\"edge\":\"right\"}", "window: " .. $window))
+  write_file($dir .. "/" .. $name .. "/template.conf.mix", $meta)
+  if $behaviour then write_file($dir .. "/" .. $name .. "/behaviour.mix", "on ping\n  reply(0, \"ok\")\nend\n") end
+end
+fn state_bytes($s)
+  $p = $s.root .. "/state.conf.mix"
+  return exists($p) ? read_file($p) : ""
+end
+fn stages($root)
+  return filter(ls($root), fn($n) = starts_with($n, ".stage-"))
+end
+fn install_text($dir, $name, $text)
+  mkdir($dir)
+  write_file($dir .. "/scene.mix", replace(fixture_source($name, $text), "\"edge\":\"right\"", "\"edge\":\"left\""))
+  write_file($dir .. "/template.conf.mix", "{title: \"Test\"}\n")
+end
+fn text_of($dir)
+  return $l.document(read_file($dir .. "/scene.mix")).body
+end
+-- F6: one crash-left disk triple plus its record, recovered by a fresh
+-- loader's startup rescan. beta shows that the rest of rescan completes.
+fn crash_root($label, $kind, $t, $st, $b, $phase, $to_text, $tpl)
+  $root = $tmp .. "/se-f6-" .. $label
+  mkdir($root)
+  mkdir($root .. "/.recovery")
+  $stage = ".stage-" .. uuid()
+  $backup = ".recovery/alpha-" .. uuid()
+  if $t then install_text($root .. "/alpha", "alpha", $to_text) end
+  if $st then install_text($root .. "/" .. $stage, "alpha", "STAGED") end
+  if $b then install_text($root .. "/" .. $backup, "alpha", "ORIGINAL") end
+  copy_tree($tpl .. "/beta", $root .. "/beta")
+  $state = {schema_version:1, enabled:["alpha", "beta"], origins:{alpha:"alpha", beta:"beta"}, recovery:{}}
+  if $kind == "promoting" then
+    install_text($root .. "/alpha-sandbox", "alpha-sandbox", "SANDBOX")
+    $state.enabled = ["alpha", "beta", "alpha-sandbox"]
+    $state.origins["alpha-sandbox"] = "alpha"
+    $state.forks = {"alpha-sandbox":{from:"alpha"}}
+    $state.promoting = {from:"alpha-sandbox", to:"alpha", stage:$stage, backup:$backup, phase:$phase}
+  else
+    $state.resetting = {name:"alpha", stage:$stage, backup:$backup, phase:$phase}
+  end
+  write_file($root .. "/state.conf.mix", data_encode($state, true) .. "\n")
+  $host_state.dialog = nil
+  $host_state.hosted = nil
+  $x = $l.initial($root, $tpl, "test-shell", "test-scenes", $io)
+  $x.first_run_enabled = false
+  $x = $l.rescan($x, false)
+  $x = $l.services($x, ["test-shell"], false)
+  $x.f6 = {stage:$root .. "/" .. $stage, backup:$root .. "/" .. $backup}
+  return $x
+end
 try
   mkdir($tmp .. "/scenes")
   mkdir($tmp .. "/templates")
-  $io = {rpc:fn($a,$b,$c) = rpc($a,$b,$c), check:fn($a) = check_behaviour($a),
+  $io = {rpc:fn($a,$b,$c) = rpc($a,$b,$c), check:fn($a,$b) = check_behaviour($a,$b),
     launch:fn($a,$b,$c,$d,$e) = launch($a,$b,$c,$d,$e),
     stop:fn($a,$b) = stop($a,$b), notify:fn($a) = notify($a)}
   $s = $l.initial($tmp .. "/scenes", $tmp .. "/templates", "test-shell", "test-scenes", $io)
+  $s.first_run_enabled = false
   $s = $l.rescan($s, false)
   check($l.inventory($s).needs_setup and len(calls("shell.scene.load")) == 0, "empty startup must stay empty")
   $s = $l.services($s, ["test-shell"], false)
@@ -576,7 +695,7 @@ try
   $installed = $l.candidate($s, "quoin-settings", $s.root .. "/quoin-settings")
   $doc = $l.document($installed.source)
   check($installed.page == "settings.appearance" and $installed.edge == "right" and $doc.citizen == "scene-quoin-settings", "authored page, edge and behaviour routing kept")
-  check(len(filter(calls("check"), fn($c) = ends_with($c.body, "/behaviour.mix") and contains($c.body, ".stage-"))) > 0, "settings behaviour checked while staging")
+  check(len(filter(calls("check"), fn($c) = ends_with($c.body.path, "/behaviour.mix") and contains($c.body.path, ".stage-"))) > 0, "settings behaviour checked while staging")
   $s = $l.request($s, "install", {template:"settings", name:"preview-settings"})
   $preview = $l.candidate($s, "preview-settings", $s.root .. "/preview-settings")
   check($s.rc == 0 and $preview.page == "scene-preview-settings", "renamed install gets a distinct page: " .. json_encode($s.response))
@@ -585,6 +704,480 @@ try
   write_file($s.root .. "/state.conf.mix", "BROKEN")
   $s = $l.rescan($s, false)
   check($s.diagnostic != nil and $s.scenes.probe.enabled, "bad state retains last-good desire")
+
+  -- ===== Scene Editor v1 (plan §4.1 rules 1-13, Stage L acceptance) =====
+  $host_state.apply = false
+  $host_state.panels = {}
+  $repo = dirname(dirname(dirname(dirname(dirname(realpath($0))))))
+  $tpl = $tmp .. "/se-tpl"
+  mkdir($tpl)
+  copy_tree($repo .. "/share/scenes/editor", $tpl .. "/editor")
+  tpl_fixture($tpl, "alpha", "{title: \"Alpha\", description: \"the alpha scene\", recommended: true, order: 20, requires: [\"apps\"]}\n", true, "{\"kind\":\"edge\",\"edge\":\"left\"}")
+  tpl_fixture($tpl, "beta", "{title: \"Beta\", order: 10}\n", false, "{\"kind\":\"edge\",\"edge\":\"right\",\"w\":300}")
+  tpl_fixture($tpl, "gamma", "{title: \"Gamma\"}\n", false, "{\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"custom.page\"}")
+  mkdir($tpl .. "/lib")
+  $shipped_digest = tree_digest($tpl .. "/editor")
+
+  -- E1: no user copy -> shipped, a pre-empting dialog load, behaviour in place.
+  $s = se_fresh("e1", $tpl)
+  check($s.scenes.editor.reserved and not $s.scenes.editor.enabled and not $s.scenes.editor.mounted, "E1: editor reserved and idle at start")
+  $m = log_mark()
+  $s = $l.request($s, "editor.open", {})
+  check($s.rc == 0 and $s.response.source == "shipped" and $s.response.pending and not $s.response.visible and $s.response.request_seq == 1, "E1: no user copy opens shipped: " .. json_encode($s.response))
+  $ld = loads_of($m, "editor")
+  check(len($ld) >= 1 and $ld[0].body.preempt_dialog == true, "E1: the dialog load pre-empts the seat")
+  $ln = since($m, "launch")
+  check(len($ln) == 1 and $ln[0].body.dir == $tpl .. "/editor" and $ln[0].body.name == "editor", "E1: behaviour launched with SCENE_DIR = shipped dir: " .. json_encode($ln))
+  check(len(since($m, "shell.dialog.show")) == 1, "E1: dialog shown")
+  $inv = $l.inventory($s)
+  check($inv.needs_setup and len($inv.scenes) == 0 and $inv.editor.mounted and $inv.editor.source == "shipped" and $inv.state_ok, "E1: the editor is never a scenes row")
+
+  -- E5: visibility settles from panel.changed; a second safe open toggles.
+  $s = notice($s)
+  check($s.scenes.editor.visible and $l.inventory($s).editor.visible and not $s.scenes.editor.pending, "E5: visible from the applied snapshot")
+  $m = log_mark()
+  $s = $l.request($s, "editor.open", {safe:true})
+  check($s.rc == 0 and not $s.response.visible and len(since($m, "shell.dialog.hide")) == 1 and len(since($m, "shell.dialog.show")) == 0, "E5: second safe open toggles off: " .. json_encode($s.response))
+  $s = notice($s)
+  check(not $s.scenes.editor.visible and not $s.scenes.editor.dismissed, "E5: the loader's own hide is not a dismissal")
+
+  -- E2: a valid user copy is used.
+  $s = se_fresh("e2", $tpl)
+  $s = $l.request($s, "install", {template:"editor"})
+  check($s.rc == 0 and $s.response.name == "editor" and not $s.response.enabled and is_dir($s.root .. "/editor"), "E2: user copy installed: " .. json_encode($s.response))
+  $s = $l.request($s, "editor.open", {})
+  check($s.rc == 0 and $s.response.source == "user" and $s.response.fallback == nil and $s.scenes.editor.dir == $s.root .. "/editor", "E2: valid user copy opens: " .. json_encode($s.response))
+
+  -- E3: an invalid user copy falls back to shipped, with the reason.
+  for each $variant in [["scene", "SCENES_UPSTREAM"], ["citizen", "SCENES_CITIZEN"], ["lint", "SCENES_BEHAVIOUR_INVALID"]]
+    $s = se_fresh("e3-" .. $variant[0], $tpl)
+    $s = $l.request($s, "install", {template:"editor"})
+    $scene_path = $s.root .. "/editor/scene.mix"
+    if $variant[0] == "scene" then write_file($scene_path, read_file($scene_path) .. "\n-- BROKEN\n") end
+    if $variant[0] == "citizen" then write_file($scene_path, replace(read_file($scene_path), "citizen: scene-editor", "citizen: scene-other")) end
+    if $variant[0] == "lint" then write_file($s.root .. "/editor/behaviour.mix", read_file($s.root .. "/editor/behaviour.mix") .. "-- LINTWARN\n") end
+    $s = $l.request($s, "editor.open", {})
+    check($s.rc == 0 and $s.response.source == "shipped" and ($s.response.fallback ?? {}).error_code == $variant[1] and type($s.response.fallback.message) == "string", "E3 " .. $variant[0] .. ": falls back with the reason: " .. json_encode($s.response))
+    check($l.inventory($s).editor.fallback.error_code == $variant[1], "E3 " .. $variant[0] .. ": fallback published")
+  end
+
+  -- E4: a safe open over the mounted user copy invalidates, unloads, mounts shipped.
+  $s = se_fresh("e4", $tpl)
+  $s = $l.request($s, "install", {template:"editor"})
+  $s = $l.request($s, "editor.open", {})
+  $user_pid = $s.scenes.editor.pid
+  check($s.response.source == "user" and $user_pid != nil, "E4: user copy mounted first")
+  $m = log_mark()
+  $s = $l.request($s, "editor.open", {safe:true})
+  check($s.rc == 0 and $s.response.source == "shipped" and $s.response.safe and $s.scenes.editor.dir == $tpl .. "/editor", "E4: safe open mounts shipped: " .. json_encode($s.response))
+  $order = map(filter(since($m, nil), fn($c) = contains(["stop", "shell.scene.unload", "shell.scene.load", "launch"], $c.verb)), fn($c) = $c.verb)
+  $stops = since($m, "stop")
+  check(len($stops) == 1 and $stops[0].body.pid == $user_pid, "E4: the user behaviour is stopped")
+  check(index_of($order, "stop") < index_of($order, "shell.scene.unload") and $order[len($order) - 1] == "shell.scene.load", "E4: invalidate, unload, then mount shipped: " .. json_encode($order))
+  -- The shipped behaviour starts once the owned user child has exited.
+  $s = process_exit($s, {pid:$user_pid, tag:{name:"editor", generation:$stops[0].body.tag.generation}, exit_code:0, signal:nil})
+  check(len(since($m, "launch")) == 1 and since($m, "launch")[0].body.dir == $tpl .. "/editor" and $s.scenes.editor.pid != nil, "E4: shipped behaviour launched after the user child exits")
+
+  -- E6: a Quoin-side hide, stale notices, dismissal and pre-emption.
+  $s = se_fresh("e6", $tpl)
+  $s = $l.request($s, "editor.open", {safe:true})
+  $s = notice($s)
+  check($s.scenes.editor.visible, "E6: shown")
+  $m = log_mark()
+  $s = $l.panel_changed($s, {generation:99, revision:$host_state.rev, panels:$host_state.panels})
+  check(len(since($m, "shell.props.get")) == 0, "E6: a stale revision is dropped")
+  $host_state.dialog.visible = false
+  $s = notice($s)
+  check(not $s.scenes.editor.visible and $s.scenes.editor.dismissed, "E6: Quoin-side hide recorded and dismissed under needs_setup")
+  $s = se_fresh("e6b", $tpl)
+  $s = $l.request($s, "install", {template:"alpha", enable:true})
+  $s = $l.request($s, "editor.open", {safe:true})
+  $s = notice($s)
+  $host_state.dialog.visible = false
+  $s = notice($s)
+  check(not $s.scenes.editor.visible and not $s.scenes.editor.dismissed, "E6: no dismissal once scenes are enabled")
+  $s = $l.request($s, "editor.open", {safe:true})
+  $s = notice($s)
+  check($s.scenes.editor.visible, "E6: reopened")
+  $host_state.dialog = {scene:"squatter", visible:true, w:400, h:300, output:"TEST-1"}
+  $host_state.hosted = []
+  $s = notice($s)
+  $host_state.hosted = nil
+  check(not $s.scenes.editor.visible and not $s.scenes.editor.mounted, "E6: pre-emption records visible:false and mounted:false")
+  $m = log_mark()
+  $s = $l.request($s, "editor.open", {safe:true})
+  check($s.rc == 0 and $s.response.pending and len(loads_of($m, "editor")) >= 1 and len(since($m, "shell.dialog.show")) == 1 and len(since($m, "shell.dialog.hide")) == 0, "E6: the next safe open shows it again: " .. json_encode($s.response))
+  $s = $l.scene_notice($s, {scene:"editor", revision:4, ops:["unloaded"], reason:"preempted", by:{scene:"other", owner:"x"}, diagnostics:[]})
+  check(not $s.scenes.editor.mounted, "E6: the pre-emption notice unmounts the record")
+
+  -- E7: an editor crash takes the ordinary restart deadline.
+  $s = se_fresh("e7", $tpl)
+  $s = $l.request($s, "editor.open", {})
+  $e = $s.scenes.editor
+  $s = process_exit($s, {pid:$e.pid, tag:{name:"editor", generation:$e.generation}, exit_code:1, signal:nil})
+  check($s.scenes.editor.status == "backoff" and $s.scenes.editor.mounted and $s.scenes.editor.restart_at != nil, "E7: crash backs off, stays mounted")
+  $m = log_mark()
+  $s = deadline($s, "editor", $e.generation)
+  check($s.scenes.editor.pid != nil and $s.scenes.editor.generation > $e.generation and since($m, "launch")[0].body.dir == $tpl .. "/editor", "E7: the deadline relaunches")
+  $s = $l.request($s, "ready", {name:"editor", generation:$s.scenes.editor.generation})
+  check($s.rc == 0 and $s.scenes.editor.status == "running", "E7: running again")
+
+  -- E8: the D3 edge header uses the popup path with a recovery record.
+  $tpl_edge = $tmp .. "/se-tpl-edge"
+  mkdir($tpl_edge)
+  copy_tree($repo .. "/share/scenes/editor", $tpl_edge .. "/editor")
+  $edge_scene = replace(read_file($tpl_edge .. "/editor/scene.mix"), "window: {\"chrome\":true,\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":880}", "window: {\"kind\":\"edge\",\"edge\":\"right\",\"w\":480,\"title\":\"Scene Editor\"}")
+  check(contains($edge_scene, "\"edge\":\"right\",\"w\":480"), "E8: edge header fixture")
+  write_file($tpl_edge .. "/editor/scene.mix", $edge_scene)
+  $s = se_fresh("e8", $tpl_edge)
+  $host_state.apply = true
+  $host_state.panels = {right:{pages:["scene-editor", "other"], page:"other", mode:"hidden", visible:false}}
+  $m = log_mark()
+  $s = $l.request($s, "editor.open", {})
+  check($s.rc == 0 and $s.response.pending and not $s.response.visible and len(since($m, "shell.dialog.hide")) == 0 and $s.scenes.editor.kind == "edge", "E8: the edge editor waits for ready: " .. json_encode($s.response))
+  $s = $l.request($s, "ready", {name:"editor", generation:$s.scenes.editor.generation})
+  check($host_state.panels.right.page == "scene-editor" and $host_state.panels.right.mode == "pinned" and $l.editor_visible($s), "E8: selected and pinned")
+  check($s.desired.recovery.right.name == "editor" and $s.desired.recovery.right.previous == "other" and $s.desired.recovery.right.mode == "hidden" and data_parse(read_file($s.root .. "/state.conf.mix")).recovery.right.name == "editor", "E8: persisted recovery record")
+  $s = $l.request($s, "editor.close", {})
+  check($s.rc == 0 and $host_state.panels.right.page == "other" and $host_state.panels.right.mode == "hidden" and $s.desired.recovery.right == nil and not $l.editor_visible($s) and $s.scenes.editor.mounted, "E8: close restores: " .. json_encode($s.response))
+  $s = $l.request($s, "editor.open", {safe:true})
+  check($l.editor_visible($s), "E8: chord opens")
+  $s = $l.request($s, "editor.open", {safe:true})
+  check(not $l.editor_visible($s) and $host_state.panels.right.page == "other" and $host_state.panels.right.mode == "hidden", "E8: chord toggles off and restores")
+  $host_state.apply = false
+  $host_state.panels = {}
+
+  -- E9: host return keeps the behaviour: remount, no second spawn, no handover.
+  $s = se_fresh("e9", $tpl)
+  $s = $l.request($s, "editor.open", {})
+  $pid = $s.scenes.editor.pid
+  $m = log_mark()
+  $s = $l.services($s, [], false)
+  $s = $l.services($s, ["test-shell"], false)
+  check($s.scenes.editor.mounted and $s.scenes.editor.pid == $pid and len(since($m, "launch")) == 0 and $s.scenes.editor.status != "handover" and len(loads_of($m, "editor")) >= 1, "E9: remounted with the same behaviour")
+  check(not $s.scenes.editor.visible and len(since($m, "shell.dialog.show")) == 0, "E9: visibility is not replayed")
+
+  -- E10: a lint warning in the shipped behaviour is a problem, never a refusal.
+  $tpl_warn = $tmp .. "/se-tpl-warn"
+  mkdir($tpl_warn)
+  copy_tree($repo .. "/share/scenes/editor", $tpl_warn .. "/editor")
+  write_file($tpl_warn .. "/editor/behaviour.mix", read_file($tpl_warn .. "/editor/behaviour.mix") .. "-- LINTWARN\n")
+  $s = se_fresh("e10", $tpl_warn)
+  $m = log_mark()
+  $s = $l.request($s, "editor.open", {safe:true})
+  $modes = map(filter(since($m, "check"), fn($c) = starts_with($c.body.path, $tpl_warn)), fn($c) = $c.body.mode)
+  check($s.rc == 0 and deep_eq($modes, ["report", "report"]), "E10: source selection and reconcile both check in report mode: " .. json_encode($modes) .. " " .. json_encode($s.response))
+  check(len(filter($l.inventory($s).editor.problems, fn($p) = $p.code == "MIX-W2001" and $p.line == 2)) == 1, "E10: the warning is in editor.problems")
+  $m = log_mark()
+  $s = $l.request($s, "reload", {name:"editor"})
+  $modes = map(since($m, "check"), fn($c) = $c.body.mode)
+  check($s.rc == 0 and deep_eq($modes, ["report"]) and $s.scenes.editor.mounted, "E10: a force reload stays in report mode: " .. json_encode($modes))
+
+  -- E11: a host without dialogs refuses; nothing mounts.
+  $host_state.dialog_mode = "none"
+  $s = se_fresh("e11", $tpl)
+  $m = log_mark()
+  $s = refused($s, "editor.open", {safe:true}, "SCENES_EDITOR_UNAVAILABLE")
+  check($s.response.context.shipped.error_code == "SCENES_HOST_KIND" and len(loads_of($m, "editor")) == 0 and len(since($m, "launch")) == 0 and not $s.scenes.editor.mounted, "E11: no dialog host, nothing mounted: " .. json_encode($s.response))
+  check(len(since($m, "shell.dialog.hide")) == 1, "E11: probed with shell.dialog.hide")
+  $host_state.dialog_mode = "q2"
+
+  -- E12: persist, the state fs event, rescan and host return keep the editor.
+  $s = se_fresh("e12", $tpl)
+  $s = $l.request($s, "editor.open", {})
+  $pid = $s.scenes.editor.pid
+  $s = $l.request($s, "install", {template:"alpha"})
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$s.root .. "/state.conf.mix", kind:"modified"}]})
+  $s = $l.rescan($s, false)
+  $s = $l.services($s, [], false)
+  $s = $l.services($s, ["test-shell"], false)
+  check($s.scenes.editor.mounted and $s.scenes.editor.pid == $pid and $s.scenes.editor.enabled == $s.scenes.editor.summoned and $s.scenes.editor.enabled, "E12: still mounted, same pid, enabled == summoned")
+
+  -- E13: user-copy edits reach only a mounted user copy.
+  $s = se_fresh("e13", $tpl)
+  $s = $l.request($s, "editor.open", {safe:true})
+  $s = $l.request($s, "install", {template:"editor"})
+  $user_scene = $s.root .. "/editor/scene.mix"
+  $m = log_mark()
+  write_file($user_scene, replace(read_file($user_scene), "Loading…", "Loading (mine)"))
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$user_scene, kind:"modified"}]})
+  check(len(loads_of($m, "editor")) == 0 and $s.scenes.editor.user_dirty and $l.inventory($s).editor.user_dirty and $s.scenes.editor.copy == "shipped", "E13: shipped mounted, user edit only marks dirty")
+  $s = $l.request($s, "editor.open", {})
+  check($s.rc == 0 and $s.response.source == "user" and not $s.scenes.editor.user_dirty, "E13: the next non-safe open takes the user copy")
+  $m = log_mark()
+  write_file($user_scene, replace(read_file($user_scene), "Loading (mine)", "Loading (mine 2)"))
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$user_scene, kind:"modified"}]})
+  check(len(loads_of($m, "editor")) >= 1 and contains($s.scenes.editor.source, "Loading (mine 2)"), "E13: a mounted user copy reloads")
+  $good = $s.scenes.editor.source
+  write_file($user_scene, read_file($user_scene) .. "\n-- BROKEN\n")
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$user_scene, kind:"modified"}]})
+  check($s.scenes.editor.diagnostic != nil and $s.scenes.editor.source == $good and $s.scenes.editor.mounted, "E13: a broken edit keeps the last good tree")
+
+  -- E14: the editor install never enables; the key stays reserved.
+  $s = se_fresh("e14", $tpl)
+  $s = refused($s, "install", {template:"editor", enable:true}, "SCENES_RESERVED")
+  check(not exists($s.root .. "/editor") and len($s.desired.enabled) == 0, "E14: refused install leaves nothing")
+  $s = $l.request($s, "install", {template:"editor"})
+  check($s.rc == 0 and $s.scenes.editor.reserved and not contains(data_parse(read_file($s.root .. "/state.conf.mix")).enabled, "editor") and $s.desired.origins.editor == "editor", "E14: plain install creates the user copy only")
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$s.root .. "/editor", kind:"created"}, {path:$user_scene, kind:"modified"}]})
+  $s = $l.rescan($s, false)
+  check($s.scenes.editor.reserved and len($l.inventory($s).scenes) == 0 and not $s.scenes.editor.summoned and not $s.scenes.editor.mounted, "E14: fs events create no unreserved entry or row")
+
+  -- E15: remove and reset act on the user copy only.
+  $s = se_fresh("e15", $tpl)
+  $s = $l.request($s, "install", {template:"editor"})
+  $s = $l.request($s, "editor.open", {})
+  $s = $l.request($s, "remove", {name:"editor"})
+  check($s.rc == 0 and $s.scenes.editor.copy == "shipped" and $s.scenes.editor.mounted and $s.scenes.editor.dir == $tpl .. "/editor" and not exists($s.root .. "/editor") and is_dir($s.response.recovery) and has_key($s.scenes, "editor") and $s.desired.origins.editor == nil, "E15: remove switches to shipped and keeps the entry: " .. json_encode($s.response))
+  $s = $l.request($s, "install", {template:"editor"})
+  $fresh_install = read_file($s.root .. "/editor/scene.mix")
+  $s = $l.request($s, "editor.open", {})
+  write_file($s.root .. "/editor/scene.mix", replace($fresh_install, "Loading…", "Loading (mine)"))
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$s.root .. "/editor/scene.mix", kind:"modified"}]})
+  $m = log_mark()
+  $s = $l.request($s, "reset", {name:"editor"})
+  check($s.rc == 0 and read_file($s.root .. "/editor/scene.mix") == $fresh_install and len(loads_of($m, "editor")) >= 1 and $s.scenes.editor.copy == "user" and is_dir($s.response.recovery) and $s.desired.resetting == nil, "E15: reset restores the user copy and reloads it: " .. json_encode($s.response))
+
+  -- FR1-FR5: first run.
+  $root = $tmp .. "/se-fr1"
+  mkdir($root)
+  $x = $l.initial($root, $tpl, "test-shell", "test-scenes", $io)
+  check($x.first_run_enabled, "FR: on by default")
+  $x = $l.rescan($x, false)
+  $host_state.dialog = nil
+  $m = log_mark()
+  $x = $l.services($x, ["test-shell"], false)
+  $verbs = map(since($m, nil), fn($c) = $c.verb)
+  check(len(since($m, "shell.dialog.show")) == 1 and $x.scenes.editor.first_run and $x.scenes.editor.view == "gallery" and $x.scenes.editor.request_seq == 1, "FR1: first run opens the gallery")
+  check(index_of($verbs, "shell.scenes.list") < index_of($verbs, "shell.props.get") and index_of($verbs, "shell.props.get") < index_of($verbs, "shell.dialog.show"), "FR1: opened after the remount: " .. json_encode($verbs))
+  $x = $l.services($x, ["test-shell"], false)
+  check(len(since($m, "shell.dialog.show")) == 1, "FR1: opens once")
+  $x = notice($x)
+  $host_state.dialog.visible = false
+  $x = notice($x)
+  check($x.scenes.editor.dismissed, "FR2: dismissed")
+  $m = log_mark()
+  $x = $l.services($x, [], false)
+  $x = $l.services($x, ["test-shell"], false)
+  check(len(since($m, "shell.dialog.show")) == 0, "FR2: not after dismiss")
+  $root = $tmp .. "/se-fr3"
+  mkdir($root)
+  copy_tree($tpl .. "/beta", $root .. "/beta")
+  write_file($root .. "/state.conf.mix", data_encode({schema_version:1, enabled:["beta"], origins:{beta:"beta"}, recovery:{}}, true) .. "\n")
+  $x = $l.initial($root, $tpl, "test-shell", "test-scenes", $io)
+  $x = $l.rescan($x, false)
+  $m = log_mark()
+  $x = $l.services($x, ["test-shell"], false)
+  check(len(since($m, "shell.dialog.show")) == 0 and $x.scenes.beta.mounted, "FR3: not with scenes enabled")
+  export SCENES_FIRST_RUN = "0"
+  $root = $tmp .. "/se-fr4"
+  mkdir($root)
+  $x = $l.initial($root, $tpl, "test-shell", "test-scenes", $io)
+  export SCENES_FIRST_RUN = "1"
+  $x = $l.rescan($x, false)
+  $m = log_mark()
+  $x = $l.services($x, ["test-shell"], false)
+  check(not $x.first_run_enabled and len(since($m, "shell.dialog.show")) == 0, "FR4: not with SCENES_FIRST_RUN=0")
+  $root = $tmp .. "/se-fr5"
+  mkdir($root)
+  $state_path = $root .. "/state.conf.mix"
+  write_file($state_path, read_file($repo .. "/src/desktop/scripts/tests/fixtures/scene-editor/state-unreadable.txt"))
+  $bytes = read_file($state_path)
+  $x = $l.initial($root, $tpl, "test-shell", "test-scenes", $io)
+  $x = $l.rescan($x, false)
+  $m = log_mark()
+  $x = $l.services($x, ["test-shell"], false)
+  check(not $x.state_ok and not $l.inventory($x).state_ok and len(since($m, "shell.dialog.show")) == 0, "FR5: no first run with an unreadable state")
+  for each $case in [["install", {template:"alpha"}], ["remove", {name:"alpha"}], ["enable", {name:"alpha"}], ["disable", {name:"alpha"}], ["reset", {name:"alpha"}], ["fork", {name:"alpha"}], ["promote", {from:"alpha"}], ["move", {name:"alpha", edge:"left"}], ["open", {name:"alpha"}], ["toggle", {name:"alpha"}]]
+    $x = refused($x, $case[0], $case[1], "SCENES_STATE_UNREADABLE")
+    check(read_file($state_path) == $bytes, "FR5: " .. $case[0] .. " wrote nothing")
+  end
+  $threw = ""
+  try
+    $l.persist($x)
+  catch $message, $error
+    $threw = $error.code
+  end
+  check($threw == "SCENES_STATE_UNREADABLE" and read_file($state_path) == $bytes, "FR5: persist itself refuses")
+  $x = $l.request($x, "editor.open", {safe:true})
+  check($x.rc == 0 and $x.scenes.editor.mounted and read_file($state_path) == $bytes, "FR5: the dialog safe open still works: " .. json_encode($x.response))
+  $root = $tmp .. "/se-fr5-edge"
+  mkdir($root)
+  write_file($root .. "/state.conf.mix", $bytes)
+  $x = $l.initial($root, $tpl_edge, "test-shell", "test-scenes", $io)
+  $x = $l.rescan($x, false)
+  $x = $l.services($x, ["test-shell"], false)
+  $x = refused($x, "editor.open", {safe:true}, "SCENES_STATE_UNREADABLE")
+  check(read_file($root .. "/state.conf.mix") == $bytes, "FR5: the edge editor open refuses without writing")
+  $y = se_fresh("fr5b", $tpl)
+  $host_state.nil_verb = "shell.props.get"
+  $y = $l.services($y, ["test-shell"], true)
+  $host_state.nil_verb = nil
+  check($y.diagnostic != nil and $y.state_ok, "FR5: a services failure leaves state_ok true")
+
+  -- F1-F5: fork and promote.
+  $s = se_fresh("f", $tpl)
+  $s = $l.request($s, "install", {template:"alpha", enable:true})
+  $s = $l.request($s, "fork", {name:"alpha"})
+  check($s.rc == 0 and $s.response.name == "alpha-sandbox" and $s.response.enabled and $s.response.forked_from == "alpha", "F1: fork defaults: " .. json_encode($s.response))
+  check($s.desired.forks["alpha-sandbox"].from == "alpha" and contains($s.desired.enabled, "alpha-sandbox") and $s.scenes["alpha-sandbox"].mounted, "F1: fork recorded, enabled, mounted")
+  check($l.inventory($s).scenes[1].forked_from == "alpha", "F1: forked_from in the inventory")
+  $long = "abcdefghijklmnopqrst"
+  $s = $l.request($s, "install", {template:"alpha", name:$long})
+  $s = $l.request($s, "fork", {name:$long, enable:false})
+  check($s.rc == 0 and $s.response.name == $long .. "-sb" and not $s.response.enabled, "F1: name fallback: " .. json_encode($s.response))
+  $longer = "abcdefghijklmnopqrstuvwx"
+  $s = $l.request($s, "install", {template:"alpha", name:$longer})
+  $s = refused($s, "fork", {name:$longer}, "SCENES_BUS_NAME")
+  check(deep_eq($s.response.context.tried, [$longer .. "-sandbox", $longer .. "-sb"]), "F1: tried names reported")
+  $sandbox = $s.root .. "/alpha-sandbox"
+  check(read_file($sandbox .. "/behaviour.mix") == read_file($s.root .. "/alpha/behaviour.mix") and $s.desired.origins["alpha-sandbox"] == "alpha", "F2: fork copies the installation and its origin")
+  $fc = $l.candidate($s, "alpha-sandbox", $sandbox)
+  check($fc.page == "scene-alpha-sandbox" and $fc.edge == "left", "F2: sandbox page on the same edge")
+  write_file($sandbox .. "/scene.mix", replace(read_file($sandbox .. "/scene.mix"), "tpl alpha", "sandbox edit"))
+  $s = $l.request($s, "reset", {name:"alpha-sandbox"})
+  check($s.rc == 0 and contains(read_file($sandbox .. "/scene.mix"), "tpl alpha") and $l.document(read_file($sandbox .. "/scene.mix")).name == "alpha-sandbox", "F2: reset of a fork: " .. json_encode($s.response))
+  $original = tree_digest($s.root .. "/alpha")
+  $clean = read_file($sandbox .. "/scene.mix")
+  write_file($sandbox .. "/scene.mix", $clean .. "\n-- BROKEN\n")
+  $s = refused($s, "promote", {from:"alpha-sandbox"}, "SCENES_UPSTREAM")
+  check($s.response.context.phase == "validate-staged" and tree_digest($s.root .. "/alpha") == $original and is_dir($sandbox) and $s.desired.forks["alpha-sandbox"] != nil and $s.desired.promoting == nil and len(stages($s.root)) == 0, "F3: an invalid sandbox moves nothing: " .. json_encode($s.response))
+  $_ = refused($s, "promote", {from:"alpha"}, "SCENES_NOT_FORK")
+  write_file($sandbox .. "/scene.mix", replace($clean, "tpl alpha", "promoted title"))
+  $s = $l.request($s, "promote", {from:"alpha-sandbox"})
+  check($s.rc == 0 and $s.response.name == "alpha" and $s.response.removed == "alpha-sandbox" and len($s.response.recovery) == 2 and is_dir($s.response.recovery[0]) and is_dir($s.response.recovery[1]), "F4: promote receipt: " .. json_encode($s.response))
+  $promoted = $l.document(read_file($s.root .. "/alpha/scene.mix"))
+  check(contains($promoted.body, "promoted title") and $promoted.name == "alpha" and $promoted.citizen == "scene-alpha" and $l.candidate($s, "alpha", $s.root .. "/alpha").page == "scene-alpha", "F4: the sandbox is the original now")
+  $disk = data_parse(read_file($s.root .. "/state.conf.mix"))
+  check(not exists($sandbox) and $s.scenes["alpha-sandbox"] == nil and not contains($s.desired.enabled, "alpha-sandbox") and ($disk.forks ?? {})["alpha-sandbox"] == nil and $disk.promoting == nil and $s.scenes.alpha.mounted and contains($s.scenes.alpha.source, "promoted title"), "F4: sandbox gone, forks and promoting cleared")
+  $s = $l.request($s, "install", {template:"gamma"})
+  $s = $l.request($s, "fork", {name:"gamma"})
+  check($l.candidate($s, "gamma-sandbox", $s.root .. "/gamma-sandbox").page == "scene-gamma-sandbox" and $s.desired.forks["gamma-sandbox"].panel == "custom.page", "F4: a fork of an authored page gets its own page")
+  $s = $l.request($s, "promote", {from:"gamma-sandbox"})
+  check($s.rc == 0 and $l.candidate($s, "gamma", $s.root .. "/gamma").page == "custom.page", "F4: promote restores the authored page: " .. json_encode($s.response))
+  $s = $l.request($s, "fork", {name:"alpha"})
+  $original = tree_digest($s.root .. "/alpha")
+  $s.faults = ["promoting:swapped"]
+  $s = refused($s, "promote", {from:"alpha-sandbox"}, "SCENES_FAULT")
+  $s.faults = []
+  check(tree_digest($s.root .. "/alpha") == $original and is_dir($sandbox) and len(stages($s.root)) == 0 and data_parse(read_file($s.root .. "/state.conf.mix")).promoting == nil, "F5: a failure after the swap restores the original")
+  $s.faults = ["resetting:swapped"]
+  $s = refused($s, "reset", {name:"alpha"}, "SCENES_FAULT")
+  $s.faults = []
+  check(tree_digest($s.root .. "/alpha") == $original and len(stages($s.root)) == 0 and data_parse(read_file($s.root .. "/state.conf.mix")).resetting == nil, "F5: a reset failure after the swap restores the original")
+
+  -- F6: every row of the rule-9 disk table, for both records.
+  for each $kind in ["promoting", "resetting"]
+    $x = crash_root($kind .. "-a", $kind, true, true, false, "staged", "ORIGINAL", $tpl)
+    check(not exists($x.f6.stage) and contains(text_of($x.root .. "/alpha"), "ORIGINAL") and $x.desired[$kind] == nil, "F6 " .. $kind .. ": not swapped -> stage deleted")
+    if $kind == "promoting" then check(is_dir($x.root .. "/alpha-sandbox") and $x.desired.forks["alpha-sandbox"] != nil, "F6: sandbox kept when nothing was swapped") end
+    $x = crash_root($kind .. "-b", $kind, false, true, true, "staged", "", $tpl)
+    check(contains(text_of($x.root .. "/alpha"), "STAGED") and not exists($x.f6.stage) and $x.desired[$kind] == nil and $x.scenes.alpha.mounted, "F6 " .. $kind .. ": staged with the backup made -> rolled forward")
+    if $kind == "promoting" then check(not exists($x.root .. "/alpha-sandbox") and ($x.desired.forks ?? {})["alpha-sandbox"] == nil and not contains($x.desired.enabled, "alpha-sandbox"), "F6: roll-forward finishes step 6") end
+    $x = crash_root($kind .. "-c", $kind, false, false, true, "swapped", "", $tpl)
+    check(contains(text_of($x.root .. "/alpha"), "ORIGINAL") and not exists($x.f6.backup) and $x.desired[$kind] == nil, "F6 " .. $kind .. ": stage lost -> backup restored")
+    $x = crash_root($kind .. "-d", $kind, true, false, true, "swapped", "STAGED", $tpl)
+    check(contains(text_of($x.root .. "/alpha"), "STAGED") and $x.desired[$kind] == nil and data_parse(read_file($x.root .. "/state.conf.mix"))[$kind] == nil, "F6 " .. $kind .. ": swapped with the stage placed -> finished")
+    if $kind == "promoting" then check(not exists($x.root .. "/alpha-sandbox"), "F6: placed finishes step 6") end
+    $x = crash_root($kind .. "-e", $kind, true, true, true, "placed", "ORIGINAL", $tpl)
+    $row = filter($l.inventory($x).scenes, fn($r) = $r.name == "alpha")[0]
+    check($row.diagnostic.error_code == "SCENES_RECOVERY" and $row.diagnostic.context.to and $row.diagnostic.context.stage and $row.diagnostic.context.backup and $x.desired[$kind].error != nil, "F6 " .. $kind .. ": unrecoverable triple -> SCENES_RECOVERY: " .. json_encode($row.diagnostic))
+    check($x.scenes.beta.mounted and $x.scenes.alpha.mounted and exists($x.f6.stage), "F6 " .. $kind .. ": the rest of rescan completes, nothing moved")
+    remove_dir($x.f6.stage)
+    $x = $l.request($x, "reload", {name:"alpha"})
+    check($x.rc == 0 and $x.desired[$kind] == nil and ($x.recovery_diagnostics ?? {}).alpha == nil, "F6 " .. $kind .. ": an explicit reload retries the record")
+  end
+
+  -- M1/M2: move rewrites the header line and remounts through rule 6.
+  $s = se_fresh("m", $tpl)
+  $s = $l.request($s, "install", {template:"beta", enable:true})
+  $path = $s.root .. "/beta/scene.mix"
+  $before = split(read_file($path), "\n")
+  $m = log_mark()
+  $s = $l.request($s, "move", {name:"beta", edge:"left"})
+  $after = split(read_file($path), "\n")
+  $diffs = filter(range(0, len($before) - 1), fn($i) = $before[$i] != $after[$i])
+  check($s.rc == 0 and $s.response.edge == "left" and len($before) == len($after) and len($diffs) == 1 and starts_with($after[$diffs[0]], "window: "), "M1: only the window line changes: " .. json_encode($s.response))
+  $w = $l.document(read_file($path)).window
+  check($w.edge == "left" and $w.w == 300 and $s.scenes.beta.edge == "left" and $s.scenes.beta.mounted, "M1: same orientation keeps w")
+  $order = map(filter(since($m, nil), fn($c) = contains(["shell.scene.validate", "shell.scene.unload", "shell.scene.load"], $c.verb)), fn($c) = $c.verb)
+  check(deep_eq(slice($order, 0, 3), ["shell.scene.validate", "shell.scene.unload", "shell.scene.load"]), "M2: validate, unload, then load: " .. json_encode($order))
+  $s = $l.request($s, "move", {name:"beta", edge:"top"})
+  $w = $l.document(read_file($path)).window
+  check($s.rc == 0 and $w.edge == "top" and $w.w == nil and $w.h == nil and $s.scenes.beta.edge == "top", "M1: across orientation w/h are dropped")
+  $host_state.refuse_edge = "bottom"
+  $m = log_mark()
+  $s = $l.request($s, "move", {name:"beta", edge:"bottom"})
+  $host_state.refuse_edge = nil
+  $last = loads_of($m, "beta")
+  check($s.rc == 10 and $s.response.error_code == "SCENES_UPSTREAM" and $s.scenes.beta.mounted and $s.scenes.beta.edge == "top" and $l.document($last[len($last) - 1].body.source).window.edge == "top", "M2b: refused load re-loads the old address: " .. json_encode($s.response))
+  $host_state.refuse_edge = "right"
+  $host_state.rollback_fail = "beta"
+  $s = $l.request($s, "move", {name:"beta", edge:"right"})
+  $host_state.refuse_edge = nil
+  $host_state.rollback_fail = nil
+  check($s.rc == 10 and $s.response.error_code == "SCENES_REMOUNT_FAILED" and $s.response.context.new.error_code == "SCENES_UPSTREAM" and $s.response.context.rollback.error_code == "SCENES_TRANSPORT" and not $s.scenes.beta.mounted, "M2c: both failures reported: " .. json_encode($s.response))
+  $row = filter($l.inventory($s).scenes, fn($r) = $r.name == "beta")[0]
+  check(not $row.mounted and $row.problems[0].code == "SCENES_REMOUNT_FAILED", "M2c: red in scenes.list")
+  $s = $l.request($s, "reload", {name:"beta"})
+  check($s.rc == 0 and $s.scenes.beta.mounted and $s.scenes.beta.edge == "right", "M2c: reload retries and mounts")
+  $_ = refused($s, "move", {name:"beta", edge:"middle"}, "SCENES_ARGUMENT")
+  install_fixture($s.root, "nowin", false)
+  write_file($s.root .. "/nowin/scene.mix", replace(fixture_source("nowin", "x"), "window: {\"kind\":\"edge\",\"edge\":\"right\"}\n", ""))
+  $s = $l.rescan($s, false)
+  $_ = refused($s, "move", {name:"nowin", edge:"left"}, "SCENES_MOUNT")
+
+  -- N1, R1-R3: Bus names and reserved names.
+  $s = se_fresh("n", $tpl)
+  $_ = refused($s, "install", {template:"alpha", name:"abcdefghijklmnopqrstuvwxyz"}, "SCENES_BUS_NAME")
+  $_ = refused($s, "install", {template:"alpha", name:"al_pha"}, "SCENES_BUS_NAME")
+  $s = $l.request($s, "install", {template:"beta", name:"abcdefghijklmnopqrstuvwxyz0123"})
+  check($s.rc == 0 and len(stages($s.root)) == 0, "N1: a scene without a behaviour is not bound by the Bus rule")
+  for each $verb in ["enable", "disable", "open", "close", "toggle"]
+    $_ = refused($s, $verb, {name:"editor"}, "SCENES_RESERVED")
+  end
+  $_ = refused($s, "fork", {name:"editor"}, "SCENES_RESERVED")
+  $_ = refused($s, "move", {name:"editor", edge:"left"}, "SCENES_RESERVED")
+  $_ = refused($s, "install", {template:"editor", name:"my-editor"}, "SCENES_RESERVED")
+  $_ = refused($s, "install", {template:"alpha", name:"editor"}, "SCENES_RESERVED")
+  install_fixture($s.root, "squat", false)
+  write_file($s.root .. "/squat/scene.mix", replace(fixture_source("squat", "x"), "\"edge\":\"right\"}", "\"edge\":\"right\",\"panel\":\"scene-editor\"}"))
+  install_fixture($s.root, "dlg", false)
+  write_file($s.root .. "/dlg/scene.mix", replace(fixture_source("dlg", "x"), "{\"kind\":\"edge\",\"edge\":\"right\"}", "{\"kind\":\"dialog\",\"w\":400,\"h\":300}"))
+  $s = $l.rescan($s, false)
+  $_ = refused($s, "enable", {name:"squat"}, "SCENES_RESERVED")
+  $_ = refused($s, "enable", {name:"dlg"}, "SCENES_RESERVED")
+
+  -- P1: problems carry lines and the attempted per-file digests.
+  $s = se_fresh("p", $tpl)
+  $s = $l.request($s, "install", {template:"alpha", enable:true})
+  $scene_path = $s.root .. "/alpha/scene.mix"
+  $clean = read_file($scene_path)
+  write_file($scene_path, $clean .. "\n-- BROKEN\n")
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$scene_path, kind:"modified"}]})
+  $row = filter($l.inventory($s).scenes, fn($r) = $r.name == "alpha")[0]
+  check($row.problems[0].line == 7 and $row.problems[0].digest == $row.digests.scene and $row.problems[0].digest == hash_sha256(read_file($scene_path)) and $row.problems[0].file == $row.files.scene and $row.problems[0].severity == "error", "P1: host diagnostic lines and digest: " .. json_encode($row.problems))
+  write_file($scene_path, $clean)
+  $behaviour_path = $s.root .. "/alpha/behaviour.mix"
+  write_file($behaviour_path, read_file($behaviour_path) .. "-- LINTWARN\n")
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$scene_path, kind:"modified"}, {path:$behaviour_path, kind:"modified"}]})
+  $row = filter($l.inventory($s).scenes, fn($r) = $r.name == "alpha")[0]
+  check($row.problems[0].line == 2 and $row.problems[0].col == 3 and $row.problems[0].code == "MIX-W2001" and $row.problems[0].digest == $row.digests.behaviour and $row.problems[0].file == $row.files.behaviour, "P1: behaviour lint lines and digest: " .. json_encode($row.problems))
+
+  -- T1: the gallery listing.
+  mkdir($tpl .. "/broken")
+  write_file($tpl .. "/broken/template.conf.mix", "{{ not strict data")
+  write_file($tpl .. "/broken/scene.mix", fixture_source("broken", "x"))
+  $s = se_fresh("t", $tpl)
+  $s = $l.request($s, "install", {template:"alpha", name:"alpha-two"})
+  $s = $l.request($s, "templates", {})
+  $names = map($s.response.templates, fn($r) = $r.template)
+  check($s.rc == 0 and $s.response.root == $tpl and deep_eq($names, ["beta", "alpha", "broken", "gamma"]), "T1: order, hidden and lib omitted: " .. json_encode($names))
+  $a = $s.response.templates[1]
+  check($a.title == "Alpha" and $a.description == "the alpha scene" and $a.recommended and $a.order == 20 and deep_eq($a.requires, ["apps"]) and $a.behaviour and $a.edge == "left" and $a.kind == "edge" and deep_eq($a.installed_as, ["alpha-two"]), "T1: metadata row: " .. json_encode($a))
+  check($s.response.templates[2].diagnostic.error_code == "SCENES_METADATA" and $s.response.templates[2].order == 1000, "T1: an invalid template is a row with a diagnostic")
+
+  check(tree_digest($tpl .. "/editor") == $shipped_digest, "the loader never writes the shipped editor")
   print("PASS scenes loader: " .. to_string($checks.count) .. " assertions covering startup, verbs/refusals, last-good, generations, exit races, crash loop, snapshots, popup receipts, persistence, recovery and deduplication")
 finally
   remove_dir($tmp)
