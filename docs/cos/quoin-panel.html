@@ -536,7 +536,8 @@ remain required before migrating the host.</p>
 <p><code>share/scenes/panel/</code> is the bottom panel as a file-backed scene. The page ID
 stays <code>scene-panel</code>; the mount is today's slim chromeless bottom edge
 (<code>window: {kind:"edge", edge:"bottom", h:52, chrome:false}</code>). The authored
-<code>h</code> seeds an untouched edge only: Quoin's saved thickness wins, and the
+<code>h</code> is a minimum over Quoin's saved thickness while the page is shown
+(a taller saved bottom edge stays taller), and the
 loader never pins, docks or selects the page, so a bottom edge kept hidden
 stays hidden. Quoin's carousel activates the registered page on its own
 (the page is the edge's only declared slot).</p>

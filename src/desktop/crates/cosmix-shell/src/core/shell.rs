@@ -4,6 +4,7 @@
 //! than pointer samples. Q-0's detector and the future compositor topic source
 //! are interchangeable producers; neither is a window host concern.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
@@ -24,6 +25,10 @@ pub struct ShellModel {
     /// Quoin's scene-only frame. Generic shell hosts can choose their policy.
     suppress_empty_edges: bool,
     thickness_set: [bool; 4],
+    /// Authored page extents: while a listed page is its edge's active page,
+    /// that edge is at least this thick. Never written into the remembered
+    /// thickness, so the edge returns to it when another page is shown.
+    page_minimums: [BTreeMap<String, f32>; 4],
     /// The panel whose surface holds the keyboard, as the host last reported.
     keyboard_focus: Option<Edge>,
     /// Whether the host has ever reported keyboard focus. A host without
@@ -73,6 +78,7 @@ impl ShellModel {
             carousels: std::array::from_fn(|_| Carousel::empty()),
             suppress_empty_edges: false,
             thickness_set: [false; 4],
+            page_minimums: std::array::from_fn(|_| BTreeMap::new()),
             keyboard_focus: None,
             focus_reported: false,
             focus_directive: FocusDirective::Follow,
@@ -100,7 +106,29 @@ impl ShellModel {
         self.fit_output_budget();
     }
 
+    /// The edge as presented: the active page's authored minimum widens the
+    /// remembered thickness while that page is shown. `settled_thickness_px`
+    /// stays the remembered value, so persistence never saves the minimum.
     pub fn panel(&self, edge: Edge) -> PanelSnapshot {
+        let mut panel = self.remembered_panel(edge);
+        if let Some(minimum) = self.active_page_minimum(edge) {
+            // Budgeted against the opposite edge's remembered zone: its own
+            // effective zone would clamp against this one in turn.
+            let (opposite, _) = self.opposite_extent(edge);
+            let budget = self.max_thickness_against(edge, self.remembered_panel(opposite));
+            let minimum = minimum.min(budget);
+            if minimum > panel.thickness_px {
+                panel.thickness_px = minimum;
+                if panel.exclusive_zone_px > 0.0 {
+                    panel.exclusive_zone_px = minimum;
+                }
+            }
+        }
+        panel
+    }
+
+    /// The edge without any page minimum: what a resize or restore changed.
+    fn remembered_panel(&self, edge: Edge) -> PanelSnapshot {
         let mut panel = self.panels[edge.index()].snapshot();
         if self.edge_is_empty(edge) {
             // Keep the saved mode and dimensions, but never present or reserve
@@ -167,7 +195,10 @@ impl ShellModel {
         thickness: f32,
     ) -> Result<(), PanelConfigError> {
         let thickness = if thickness.is_finite() && thickness > 0.0 {
-            thickness.min(self.max_thickness(edge))
+            // Remembered values budget against remembered values: an opposite
+            // page's minimum must not shrink what this edge remembers.
+            let (opposite, _) = self.opposite_extent(edge);
+            thickness.min(self.max_thickness_against(edge, self.remembered_panel(opposite)))
         } else {
             thickness
         };
@@ -178,17 +209,55 @@ impl ShellModel {
 
     /// Maximum thickness that leaves space for the opposite panel and work area.
     pub fn max_thickness(&self, edge: Edge) -> f32 {
-        let (opposite, extent) = match edge {
+        let (opposite, _) = self.opposite_extent(edge);
+        self.max_thickness_against(edge, self.panel(opposite))
+    }
+
+    fn opposite_extent(&self, edge: Edge) -> (Edge, f32) {
+        match edge {
             Edge::Left => (Edge::Right, self.geometry.width()),
             Edge::Right => (Edge::Left, self.geometry.width()),
             Edge::Top => (Edge::Bottom, self.geometry.height()),
             Edge::Bottom => (Edge::Top, self.geometry.height()),
-        };
+        }
+    }
+
+    fn max_thickness_against(&self, edge: Edge, opposite: PanelSnapshot) -> f32 {
+        let (_, extent) = self.opposite_extent(edge);
         // Leave a positive extent for the opposing surface and the work area.
         // A zero-sized layer configure means "client chooses", not a valid
         // empty viewport, and can otherwise disconnect opposing panels.
         let minimum = 1.0_f32.min(extent / 4.0);
-        (extent - self.panel(opposite).exclusive_zone_px.max(minimum) - minimum).max(minimum)
+        (extent - opposite.exclusive_zone_px.max(minimum) - minimum).max(minimum)
+    }
+
+    /// Record `page`'s authored extent on `edge` (`None` clears it). While
+    /// that page is the edge's active page the edge is at least this thick;
+    /// the remembered thickness is untouched, so showing another page returns
+    /// the edge to it. Returns whether anything changed.
+    pub fn set_page_minimum_thickness(
+        &mut self,
+        edge: Edge,
+        page: &str,
+        minimum: Option<f32>,
+    ) -> bool {
+        let minimums = &mut self.page_minimums[edge.index()];
+        match minimum.filter(|minimum| minimum.is_finite() && *minimum > 0.0) {
+            Some(minimum) => minimums.insert(page.to_owned(), minimum) != Some(minimum),
+            None => minimums.remove(page).is_some(),
+        }
+    }
+
+    /// Take the outgoing model's authored page extents. They describe mounted
+    /// pages rather than an output, so every replacement keeps them.
+    pub fn adopt_page_minimums(&mut self, outgoing: &Self) {
+        self.page_minimums = outgoing.page_minimums.clone();
+    }
+
+    /// The active page's authored extent on `edge`, if it declared one.
+    pub fn active_page_minimum(&self, edge: Edge) -> Option<f32> {
+        let page = self.carousel(edge).active_id()?;
+        self.page_minimums[edge.index()].get(page).copied()
     }
 
     fn fit_output_budget(&mut self) {
@@ -197,16 +266,17 @@ impl ShellModel {
             (Edge::Left, Edge::Right, self.geometry.width()),
             (Edge::Top, Edge::Bottom, self.geometry.height()),
         ] {
-            let total = self.panel(a).exclusive_zone_px + self.panel(b).exclusive_zone_px;
+            let total = self.remembered_panel(a).exclusive_zone_px
+                + self.remembered_panel(b).exclusive_zone_px;
             if total > (extent - 1.0).max(2.0) {
                 let ratio = (extent - 1.0).max(2.0) / total;
                 for edge in [a, b] {
-                    let size = (self.panel(edge).thickness_px * ratio).max(1.0);
+                    let size = (self.remembered_panel(edge).thickness_px * ratio).max(1.0);
                     let _ = self.panels[edge.index()].restore_thickness(size);
                 }
             }
             for edge in [a, b] {
-                let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+                let _ = self.restore_thickness(edge, self.remembered_panel(edge).thickness_px);
             }
         }
         self.thickness_set = thickness_set;
@@ -281,6 +351,7 @@ impl ShellModel {
         }
         self.carousels = outgoing.carousels.clone();
         self.thickness_set = outgoing.thickness_set;
+        self.page_minimums = outgoing.page_minimums.clone();
         self.last_update = outgoing.last_update;
         self.fit_output_budget();
     }
@@ -334,7 +405,7 @@ impl ShellModel {
             PanelInput::Dock | PanelInput::DockToggle | PanelInput::SetMode(PanelMode::Docked)
         ) {
             let remembered = self.thickness_set[edge.index()];
-            let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+            let _ = self.restore_thickness(edge, self.remembered_panel(edge).thickness_px);
             self.thickness_set[edge.index()] = remembered;
         }
         let panel = &mut self.panels[edge.index()];
@@ -698,5 +769,65 @@ mod empty_edge_tests {
             .unwrap();
         assert!(!model.panel(Edge::Bottom).mapped);
         assert_eq!(model.panel(Edge::Bottom).exclusive_zone_px, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod page_minimum_tests {
+    use super::*;
+
+    fn model() -> ShellModel {
+        let mut model = ShellModel::new(
+            OutputKey::new("test-output").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model
+            .set_carousel(Edge::Left, Carousel::new(["launcher", "notes"]).unwrap());
+        model.restore_thickness(Edge::Left, 422.0).unwrap();
+        model
+    }
+
+    #[test]
+    fn active_page_minimum_widens_the_saved_thickness_while_shown() {
+        let mut model = model();
+        assert!(model.set_page_minimum_thickness(Edge::Left, "launcher", Some(440.0)));
+        assert!(!model.set_page_minimum_thickness(Edge::Left, "launcher", Some(440.0)));
+        model
+            .restore_mode(Edge::Left, Duration::ZERO, PanelMode::Docked)
+            .unwrap();
+        let panel = model.panel(Edge::Left);
+        assert_eq!(panel.thickness_px, 440.0);
+        assert_eq!(panel.exclusive_zone_px, 440.0);
+        assert_eq!(panel.settled_thickness_px, 422.0);
+        // Geometry fitting and dock entry work on the remembered value.
+        model.set_geometry(LogicalSize::new(1200.0, 900.0).unwrap());
+        model.set_mode(Edge::Left, Duration::ZERO, PanelMode::Pinned).unwrap();
+        model.set_mode(Edge::Left, Duration::ZERO, PanelMode::Docked).unwrap();
+        assert_eq!(model.panel(Edge::Left).settled_thickness_px, 422.0);
+        assert_eq!(model.panel(Edge::Left).thickness_px, 440.0);
+        model.carousel_mut(Edge::Left).select_id("notes");
+        assert_eq!(model.panel(Edge::Left).thickness_px, 422.0);
+        assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 422.0);
+        model.carousel_mut(Edge::Left).select_id("launcher");
+        assert_eq!(model.panel(Edge::Left).thickness_px, 440.0);
+        // Clearing the request, or a smaller one, leaves the saved width.
+        model.set_page_minimum_thickness(Edge::Left, "launcher", Some(100.0));
+        assert_eq!(model.panel(Edge::Left).thickness_px, 422.0);
+        assert!(model.set_page_minimum_thickness(Edge::Left, "launcher", None));
+        assert_eq!(model.panel(Edge::Left).thickness_px, 422.0);
+    }
+
+    #[test]
+    fn page_minimum_is_bounded_by_the_output_budget() {
+        let mut model = model();
+        model.set_page_minimum_thickness(Edge::Left, "launcher", Some(50_000.0));
+        let panel = model.panel(Edge::Left);
+        assert_eq!(panel.thickness_px, model.max_thickness(Edge::Left));
+        assert!(panel.thickness_px < 1000.0);
+        assert_eq!(panel.settled_thickness_px, 422.0);
     }
 }

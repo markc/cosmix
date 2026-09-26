@@ -20,8 +20,8 @@ use bevy::prelude::*;
 use bevy::time::Real;
 use cosmix_shell::core::{Edge, PanelMode};
 use cosmix_shell::runtime::{
-    KeyboardCommand, ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimeSet,
-    ShellSemanticVerb, ShellStagedIngress, semantic_shell_command,
+    ShellCommand, ShellFrameState, ShellRuntimeSet, ShellSemanticVerb, ShellStagedIngress,
+    focus_next_command, semantic_shell_command,
 };
 
 use crate::config::{ConfigIngest, ShellConfig};
@@ -248,11 +248,8 @@ fn dispatch_bindings(
             KeyAction::Mode(edge, mode) => {
                 semantic_shell_command(output, at, edge, ShellSemanticVerb::PanelMode(mode))
             }
-            KeyAction::CycleFocus => ShellCommand {
-                output,
-                at,
-                kind: ShellCommandKind::Keyboard(KeyboardCommand::CycleFocus),
-            },
+            // The same step `shell.focus.next` enqueues from the Bus.
+            KeyAction::CycleFocus => focus_next_command(output, at),
         });
     }
 }
@@ -261,7 +258,7 @@ fn dispatch_bindings(
 mod tests {
     use super::*;
     use cosmix_shell::core::{LogicalSize, OutputKey, PanelInput, ShellModel};
-    use cosmix_shell::runtime::ShellRuntimePlugin;
+    use cosmix_shell::runtime::{KeyboardCommand, ShellCommandKind, ShellRuntimePlugin};
     use std::time::Duration;
 
     const SUPER: Modifiers = Modifiers {

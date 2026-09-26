@@ -8,7 +8,7 @@ use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
 use cosmix_shell::core::{Corner, Edge, PanelMode};
 use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
-    ShellSemanticVerb, SubPanelRegistryState, remove_owned_subpanels_before,
+    ShellSemanticVerb, SubPanelRegistryState, focus_next_command, remove_owned_subpanels_before,
     semantic_shell_command,
 };
 use ctk::app_control::verify_caller_provenance;
@@ -267,6 +267,10 @@ fn reply_panels(
             "shell.panel.page.set" => panel.active_page_id == argument(&request, "id"),
             "shell.panel.pin" => panel.mode == PanelMode::Docked && panel.mapped,
             "shell.panel.mode" => Some(panel.mode.as_str().to_owned()) == argument(&request, "mode"),
+            // Hide only conceals a transient reveal. Its concealment is
+            // observable at once (no longer revealed); it is not held until
+            // unmapped, as nothing about a hidden mode is being committed.
+            "shell.panel.hide" => panel.mode == PanelMode::Hidden && !panel.transient_revealed,
             _ => unreachable!("only applied panel verbs are queued"),
         };
         // Hidden mode is applied before its outgoing motion completes. The
@@ -284,6 +288,12 @@ fn reply_panels(
         let snapshot = Value::from(&ShellProps(&frame.0, &config.panels, PropValue::Null).snapshot());
         let body = if applied {
             json!({"accepted":true, "applied":true, "panels":snapshot["panels"]})
+        } else if request.command == "shell.panel.hide" && panel.mode != PanelMode::Hidden {
+            // A pinned or docked edge is a persistent mode, which hide never
+            // changes: say so rather than accept and do nothing.
+            json!({"error_code":"PANEL_NOT_APPLIED",
+                "message":format!("the {} edge is {}; shell.panel.hide only conceals a transient reveal. Use shell.panel.mode {{edge:\"{}\", mode:\"hidden\"}} to hide it", edge_name(edge), panel.mode.as_str(), edge_name(edge)),
+                "panels":snapshot["panels"]})
         } else {
             json!({"error_code":"PANEL_NOT_APPLIED", "message":"panel command was superseded or could not apply", "panels":snapshot["panels"]})
         };
@@ -828,7 +838,7 @@ fn service_bus(
             continue;
         }
         if rc == 0 && matches!(request.command.as_str(),
-            "shell.panel.page.set" | "shell.panel.pin" | "shell.panel.mode")
+            "shell.panel.page.set" | "shell.panel.pin" | "shell.panel.mode" | "shell.panel.hide")
             && let Some(command) = &command
         {
             if state.pending_panels.len() < MAX_PENDING_REPLIES {
@@ -1209,7 +1219,7 @@ fn dispatch_with_declared(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scene.layout","scenes.list","dialog.show","dialog.hide"],
+            "verbs":["quit","focus.next","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scene.layout","scenes.list","dialog.show","dialog.hide"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1269,6 +1279,24 @@ fn dispatch_with_declared(
                 at,
                 kind: ShellCommandKind::Quit,
             }),
+        );
+    }
+    // The in-Quoin cycle-focus chord's step, reachable from the Bus so a
+    // compositor-grabbed chord (inputd) can drive it while an application
+    // holds the keyboard. Output-wide: no edge argument.
+    if request.command == "shell.focus.next" {
+        if let Err(error) = verify_caller_provenance(request) {
+            return (
+                10,
+                json!({"error":format!("caller provenance could not be established: {error:?}")})
+                    .to_string(),
+                None,
+            );
+        }
+        return (
+            0,
+            json!({"accepted":true}).to_string(),
+            Some(focus_next_command(frame.geometry.output.clone(), at)),
         );
     }
     if request.command == "shell.panel.resize" {
@@ -3320,6 +3348,100 @@ mod tests {
         assert_eq!(body["applied"], true);
         assert_eq!(body["panels"]["left"]["mode"], "hidden");
         assert_eq!(body["panels"]["left"]["visible"], true);
+    }
+
+    /// `shell.focus.next` is the cycle-focus chord's step over the Bus: the
+    /// same command, so the same stops (visible pinned/docked panels, then
+    /// the application).
+    #[test]
+    fn focus_next_cycles_like_the_chord() {
+        let frame = test_frame();
+        let (rc, body, command) =
+            dispatch_shell_request(&local("shell.focus.next"), &frame, Default::default());
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(
+            command.unwrap().kind,
+            ShellCommandKind::Keyboard(cosmix_shell::runtime::KeyboardCommand::CycleFocus)
+        );
+
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "focus-left", "owner", "left");
+        load_scene(&mut app, &peer, "focus-right", "owner", "right");
+        for edge in ["left", "right"] {
+            let mut pin = local("shell.panel.mode");
+            pin.body = json!({"edge":edge, "mode":"pinned"}).to_string();
+            peer.send(pin);
+        }
+        for _ in 0..30 { app.update(); }
+        peer.drain_responses();
+        let requested = |app: &App| {
+            let frame = &app.world().resource::<ShellFrameState>().0;
+            Edge::ALL
+                .into_iter()
+                .filter(|&edge| frame.panel(edge).keyboard_requested)
+                .collect::<Vec<_>>()
+        };
+        assert!(requested(&app).is_empty());
+        for expected in [vec![Edge::Left], vec![Edge::Right], vec![]] {
+            peer.send(local("shell.focus.next"));
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+            assert_eq!(requested(&app), expected);
+        }
+    }
+
+    /// Item 8b: hide on a pinned or docked edge used to answer
+    /// `{accepted:true}` and change nothing. It is a truthful refusal now,
+    /// naming the verb that does hide a persistent mode.
+    #[test]
+    fn hide_on_a_pinned_or_docked_edge_is_refused_with_the_mode_verb() {
+        for mode in ["pinned", "docked"] {
+            let (mut app, peer) = mounted_bus_app();
+            load_scene(&mut app, &peer, "persistent", "owner", "left");
+            let mut set = local("shell.panel.mode");
+            set.body = json!({"edge":"left", "mode":mode}).to_string();
+            peer.send(set);
+            for _ in 0..30 { app.update(); }
+            peer.drain_responses();
+            let mut hide = local("shell.panel.hide");
+            hide.body = json!({"edge":"left"}).to_string();
+            peer.send(hide);
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies.len(), 1, "{mode}");
+            assert_eq!(replies[0].rc, 10, "{mode}: {}", replies[0].body);
+            let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+            assert_eq!(body["error_code"], "PANEL_NOT_APPLIED", "{mode}");
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("shell.panel.mode"), "{message}");
+            assert!(message.contains(mode), "{message}");
+            assert_eq!(body["panels"]["left"]["mode"], mode);
+            assert_eq!(
+                app.world().resource::<ShellFrameState>().0.panel(Edge::Left).mode.as_str(),
+                mode
+            );
+        }
+        // A transient reveal is what hide is for: it still applies.
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "transient", "owner", "left");
+        let mut show = local("shell.panel.show");
+        show.body = json!({"edge":"left"}).to_string();
+        peer.send(show);
+        for _ in 0..30 { app.update(); }
+        peer.drain_responses();
+        assert!(app.world().resource::<ShellFrameState>().0.panel(Edge::Left).transient_revealed);
+        let mut hide = local("shell.panel.hide");
+        hide.body = json!({"edge":"left"}).to_string();
+        peer.send(hide);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+        assert_eq!(body["applied"], true);
+        assert!(!app.world().resource::<ShellFrameState>().0.panel(Edge::Left).transient_revealed);
     }
 
     #[test]

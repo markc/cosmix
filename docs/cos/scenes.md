@@ -16,7 +16,12 @@ node supplies edge, title and extent. Patching that node reapplies the mount.
 fill its panel without the Quoin header bar, for panel-style furniture.
 Chromeless pages have no in-panel page navigation or pin control: use them
 alone on an edge or drive navigation and pinning through Bus verbs.
-An absent or cleared extent uses the shell's output-derived default thickness.
+An authored extent (`w` on a side edge, `h` on the top or bottom) is a
+MINIMUM over the edge's remembered thickness: while the page is the edge's
+active page the edge is at least that thick, and showing another page returns
+it to the remembered value. The request never rewrites what a drag or
+`shell.panel.resize` saved, and `panels.<edge>.width_px` keeps reporting that
+saved value. An absent or cleared extent imposes no minimum.
 Authored extents fit the output space left by opposing exclusive zones;
 pinning and output changes recheck that budget. Pointer resizes exceeding the
 remaining budget are rejected without changing panel thickness. Clearing ports resets their

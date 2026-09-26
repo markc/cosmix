@@ -395,6 +395,15 @@ legacy verbs it never leaves a transient reveal behind, and `mode=hidden`
 conceals at once with no grace delay, because it is a deliberate action. Read
 back `shell.props.get path="panels.<edge>.mode"` to verify the applied mode.
 
+`shell.panel.hide` conceals a transient reveal and never changes a persistent
+mode. Its reply waits for the model: `{accepted:true, applied:true, panels}`
+once the edge is hidden and no longer revealed. On a pinned or docked edge it
+is refused rc 10 `{error_code:"PANEL_NOT_APPLIED", message, panels}`, and
+the message names the edge's mode and the verb that does hide it,
+`shell.panel.mode {edge, mode:"hidden"}`. A reveal held by a resize or an
+open menu is refused the same way with a generic message. The corner alias
+`shell.corner.hide` keeps its acceptance-only reply.
+
 Sub-panels are addressed by their stable name, unique across every edge and
 output. `shell.sub.register` takes `edge` and `name` (the owner is the
 broker-attested caller) and fills a carousel slot without revealing or
@@ -924,6 +933,16 @@ Quoin's own panels holds the keyboard, after a click into it or a cycle stop.
 So a binding can never shadow an application's shortcut. It also means that a
 binding cannot reveal a panel while an application is focused. That route
 needs a chord grab in the compositor, which does not exist yet.
+
+`shell.focus.next` (no arguments) is the Bus form of `cycle_focus`: it
+enqueues exactly the command the chord does, so it moves the keyboard to the
+same next stop and follows the same rules. It is how a global chord (an
+inputd binding) reaches the cycle while an application holds the keyboard.
+It replies `{accepted:true}` on enqueueing; read the result back from
+`shell.panel.state edge=<edge>`, whose `keyboard_requested` is true on the
+stop the cycle asked for (none after the last panel, when focus goes back to
+the application). Like the other panel verbs it is open to any caller the
+broker stamps, mesh callers included.
 
 Keyboard actions target the output of the focused window, or the pointer's
 output when no window has focus. The keys Quoin receives always come from its
