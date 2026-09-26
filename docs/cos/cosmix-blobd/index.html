@@ -454,6 +454,8 @@
 name: two
 lane_bind: 10.42.0.5:4210
 lane_max_uploads: 4
+fetch_max_concurrent: 2
+fetch_queue_max: 32
 quota_total_bytes: 50GiB
 quota_owner_default_bytes: 10GiB
 quota_owner: maild=1GiB
@@ -464,6 +466,8 @@ quota_owner: capture=2GiB
 <tr><td><code>name</code></td><td>unset (service <code>blobd</code>)</td><td>Instance name; Bus service becomes <code>blobd-&lt;name&gt;</code></td></tr>
 <tr><td><code>lane_bind</code></td><td>unset (no lane)</td><td>Byte-lane bind <code>&lt;ip&gt;:&lt;port&gt;</code>; the IP must be this node's <code>wg_ip</code> (see <a href="/cos/cosmix-blobd/#byte-lane">Byte lane</a>)</td></tr>
 <tr><td><code>lane_max_uploads</code></td><td><code>4</code></td><td>Concurrent lane uploads admitted; beyond it the lane answers <code>503</code> — no queueing</td></tr>
+<tr><td><code>fetch_max_concurrent</code></td><td><code>2</code></td><td>Concurrent <code>blob.fetch</code> downloads; beyond it a fetch queues (see <a href="/cos/cosmix-blobd/#fetching">Fetching</a>)</td></tr>
+<tr><td><code>fetch_queue_max</code></td><td><code>32</code></td><td>In-process fetch queue depth; beyond it the verb replies rc 10 <code>busy</code></td></tr>
 <tr><td><code>quota_total_bytes</code></td><td><code>50GiB</code></td><td>Total cap on accounted (pinned) bytes</td></tr>
 <tr><td><code>quota_owner_default_bytes</code></td><td><code>10GiB</code></td><td>Per-owner cap unless overridden</td></tr>
 <tr><td><code>quota_owner: &lt;owner&gt;=&lt;bytes&gt;</code></td><td>none (repeatable)</td><td>Per-owner cap; later lines for the same owner win</td></tr>
@@ -493,6 +497,22 @@ quota_owner: capture=2GiB
 <h3 id="caps-and-bounds">Caps and bounds</h3>
 <p>The total cap and the lane owner's remaining quota are enforced <strong>mid-stream</strong> by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers <code>413</code>; a declared <code>Content-Length</code> over the cap is refused <code>413</code> before any byte is read. An idle request body (no data for 30 s) aborts with <code>408</code>. At most <code>lane_max_uploads</code> (default 4) uploads run concurrently; beyond that the lane answers <code>503</code> immediately — there is no queue (the no-poll/no-flood law).</p>
 <p>Uploads are <strong>restart-only</strong> in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction.</p>
+<p>A <code>blob.fetch</code> interrupted by a restart leaves at most staging residue under <code>blobs/.tmp</code>, which startup cleanup removes — the same crash-safety the lane's uploads have.</p>
+<h2 id="fetching">Fetching</h2>
+<p><code>blob.fetch</code> pulls bytes from another node over its byte lane. The verb <strong>replies immediately</strong> — never a deferred reply, because the mesh response timeout is 30 s and a multi-GiB pull outlives it: <code>{accepted:true, blob, origin, in_flight, present}</code>. If the CAS already holds the blob it is pinned to the caller (<code>present:true</code>) and the reply is the completion. Otherwise completion is the <code>blob.fetched</code> event (<code>retain: false</code>) plus the <code>blob.stat</code> transition <code>present:false → true</code>.</p>
+<p><strong>Single-flight per hash.</strong> A second <code>blob.fetch</code> for an in-flight hash joins it (<code>in_flight:true</code>), adds its pin on completion, and never starts a second download. <code>in_flight</code> is <code>true</code> when this call joined an existing fetch or queued behind the concurrency bound; <code>false</code> when it started the download itself.</p>
+<p><strong>Resolution order.</strong> The first try is <code>from</code> if given, else the reference's <code>origin</code> (a node name — or <code>blobd-&lt;name&gt;</code> when the reference carries an <code>instance</code> member). The node's lane URL is resolved with a mesh-open <code>blobd.props.get {path:"lane"}</code> addressed <code>blobd[.&lt;instance&gt;].&lt;node&gt;</code> through the local noded, so the port is never a constant. The origin is advisory, first try only: on <code>Service 'blobd' not found</code> / <code>disconnected</code> (both rc=10, discriminated by message text), any other unreachable-source error, or a lane 404, the fetch fans <code>blob.has {blobs:[hash]}</code> out over <code>noded.peers</code> — all peers, one round, bounded concurrency 4 — and pulls from the first <code>present</code>, resolving that peer's lane the same way. Nothing found → <code>not_found_anywhere</code>.</p>
+<p><strong>Transfer and verification.</strong> <code>GET http://&lt;peer lane&gt;/blob/&lt;hex&gt;</code> streams straight into mds staging — bytes are never buffered whole. The landed hash must equal the requested id or the outcome is <code>verify_failed</code>, the wrong-hash entry this fetch created is unlinked, and the CAS keeps nothing; <code>verify_failed</code> is terminal, never retried against another peer. Quota (the fetching owner's cap and the total) is checked from <code>Content-Length</code> before the first byte and enforced mid-stream like the lane's uploads; a refusal leaves no staging residue. On success the attributes record the mime from the response <code>Content-Type</code> and <code>origin</code> = the node the bytes came from, and every joining owner is pinned.</p>
+<p><strong>Outcome taxonomy</strong> (the <code>outcome</code> field of <code>blob.fetched</code>):</p>
+<table><thead><tr><th>Outcome</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>ok</code></td><td>Fetched, verified, pinned; <code>size</code> carries the byte count</td></tr>
+<tr><td><code>origin_unreachable</code></td><td>Nothing was reachable at all — the origin would not resolve and no peer answered</td></tr>
+<tr><td><code>not_found_anywhere</code></td><td>Sources answered and none holds the blob (a lane 404 or a peer's <code>has: false</code>)</td></tr>
+<tr><td><code>verify_failed</code></td><td>The bytes a source served do not hash to the requested id; terminal</td></tr>
+<tr><td><code>quota</code></td><td>The owner or total cap would be exceeded (declared <code>Content-Length</code> or the mid-stream counter); terminal</td></tr>
+<tr><td><code>io</code></td><td>A holder was reached but the transfer or the local ingest failed</td></tr>
+</tbody></table>
+<p><strong>Bounds.</strong> At most <code>fetch_max_concurrent</code> (default 2) downloads run; beyond that the verb still replies <code>accepted</code> and the fetch queues in-process up to <code>fetch_queue_max</code> (default 32) — above that the verb replies rc 10 <code>busy</code>; never an unbounded queue. A stalled body aborts after a 30 s idle read timeout (staging deleted). The <code>fetch.in_flight</code>, <code>fetch.queued</code>, <code>fetch.completed</code> and <code>fetch.failed</code> props expose the live gauges and lifetime counters.</p>
 <h2 id="storage-layout">Storage layout</h2>
 <pre><code class="language-text">/var/lib/cosmix/blobd/
 ├── blobs/&lt;h2&gt;/&lt;h2&gt;/&lt;hash64&gt;   mds CAS: immutable, sharded, BLAKE3-named
@@ -513,12 +533,12 @@ quota_owner: capture=2GiB
 <ul>
 <li><code>blob.pinned {blob, owner}</code></li>
 <li><code>blob.unpinned {blob, owner}</code></li>
+<li><code>blob.fetched {blob, outcome, origin_used, size?, error?}</code> — the <code>blob.fetch</code> completion; <code>outcome</code> is the taxonomy above, <code>origin_used</code> the node the bytes came from (null on failure)</li>
 <li><code>blob.swept {count}</code></li>
 <li><code>blob.props.changed</code> (SPEC-07 shape; <code>lifecycle.generation</code> is transient)</li>
 </ul>
-<p><code>blob.fetch</code> is reserved and replies <code>not_implemented</code> until P1 slice 4.</p>
 <h2 id="bus-interface">Bus interface</h2>
-<p>The verb reference is <a href="/cos/cosmix-blobd/verbs">verbs.md</a>; the props surface is <code>blob.props.{get,list,describe,watch}</code> over <code>lane.bind</code>, <code>lane.port</code>, <code>root</code>, <code>instance</code>, <code>counts.blobs</code>, <code>counts.pins</code>, <code>quota.total.used</code>, <code>quota.total.limit</code> and <code>lifecycle.generation</code>.</p></div></div>
+<p>The verb reference is <a href="/cos/cosmix-blobd/verbs">verbs.md</a>; the props surface is <code>blob.props.{get,list,describe,watch}</code> over <code>lane.bind</code>, <code>lane.port</code>, <code>root</code>, <code>instance</code>, <code>counts.blobs</code>, <code>counts.pins</code>, <code>quota.total.used</code>, <code>quota.total.limit</code>, <code>fetch.in_flight</code>, <code>fetch.queued</code>, <code>fetch.completed</code>, <code>fetch.failed</code> and <code>lifecycle.generation</code>.</p></div></div>
     </div>
 
 </main>

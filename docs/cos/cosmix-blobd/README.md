@@ -21,6 +21,8 @@ root: /var/lib/cosmix/blobd
 name: two
 lane_bind: 10.42.0.5:4210
 lane_max_uploads: 4
+fetch_max_concurrent: 2
+fetch_queue_max: 32
 quota_total_bytes: 50GiB
 quota_owner_default_bytes: 10GiB
 quota_owner: maild=1GiB
@@ -33,6 +35,8 @@ quota_owner: capture=2GiB
 | `name` | unset (service `blobd`) | Instance name; Bus service becomes `blobd-<name>` |
 | `lane_bind` | unset (no lane) | Byte-lane bind `<ip>:<port>`; the IP must be this node's `wg_ip` (see [Byte lane](#byte-lane)) |
 | `lane_max_uploads` | `4` | Concurrent lane uploads admitted; beyond it the lane answers `503` — no queueing |
+| `fetch_max_concurrent` | `2` | Concurrent `blob.fetch` downloads; beyond it a fetch queues (see [Fetching](#fetching)) |
+| `fetch_queue_max` | `32` | In-process fetch queue depth; beyond it the verb replies rc 10 `busy` |
 | `quota_total_bytes` | `50GiB` | Total cap on accounted (pinned) bytes |
 | `quota_owner_default_bytes` | `10GiB` | Per-owner cap unless overridden |
 | `quota_owner: <owner>=<bytes>` | none (repeatable) | Per-owner cap; later lines for the same owner win |
@@ -77,6 +81,31 @@ The total cap and the lane owner's remaining quota are enforced **mid-stream** b
 
 Uploads are **restart-only** in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction.
 
+A `blob.fetch` interrupted by a restart leaves at most staging residue under `blobs/.tmp`, which startup cleanup removes — the same crash-safety the lane's uploads have.
+
+## Fetching
+
+`blob.fetch` pulls bytes from another node over its byte lane. The verb **replies immediately** — never a deferred reply, because the mesh response timeout is 30 s and a multi-GiB pull outlives it: `{accepted:true, blob, origin, in_flight, present}`. If the CAS already holds the blob it is pinned to the caller (`present:true`) and the reply is the completion. Otherwise completion is the `blob.fetched` event (`retain: false`) plus the `blob.stat` transition `present:false → true`.
+
+**Single-flight per hash.** A second `blob.fetch` for an in-flight hash joins it (`in_flight:true`), adds its pin on completion, and never starts a second download. `in_flight` is `true` when this call joined an existing fetch or queued behind the concurrency bound; `false` when it started the download itself.
+
+**Resolution order.** The first try is `from` if given, else the reference's `origin` (a node name — or `blobd-<name>` when the reference carries an `instance` member). The node's lane URL is resolved with a mesh-open `blobd.props.get {path:"lane"}` addressed `blobd[.<instance>].<node>` through the local noded, so the port is never a constant. The origin is advisory, first try only: on `Service 'blobd' not found` / `disconnected` (both rc=10, discriminated by message text), any other unreachable-source error, or a lane 404, the fetch fans `blob.has {blobs:[hash]}` out over `noded.peers` — all peers, one round, bounded concurrency 4 — and pulls from the first `present`, resolving that peer's lane the same way. Nothing found → `not_found_anywhere`.
+
+**Transfer and verification.** `GET http://<peer lane>/blob/<hex>` streams straight into mds staging — bytes are never buffered whole. The landed hash must equal the requested id or the outcome is `verify_failed`, the wrong-hash entry this fetch created is unlinked, and the CAS keeps nothing; `verify_failed` is terminal, never retried against another peer. Quota (the fetching owner's cap and the total) is checked from `Content-Length` before the first byte and enforced mid-stream like the lane's uploads; a refusal leaves no staging residue. On success the attributes record the mime from the response `Content-Type` and `origin` = the node the bytes came from, and every joining owner is pinned.
+
+**Outcome taxonomy** (the `outcome` field of `blob.fetched`):
+
+| Outcome | Meaning |
+|---|---|
+| `ok` | Fetched, verified, pinned; `size` carries the byte count |
+| `origin_unreachable` | Nothing was reachable at all — the origin would not resolve and no peer answered |
+| `not_found_anywhere` | Sources answered and none holds the blob (a lane 404 or a peer's `has: false`) |
+| `verify_failed` | The bytes a source served do not hash to the requested id; terminal |
+| `quota` | The owner or total cap would be exceeded (declared `Content-Length` or the mid-stream counter); terminal |
+| `io` | A holder was reached but the transfer or the local ingest failed |
+
+**Bounds.** At most `fetch_max_concurrent` (default 2) downloads run; beyond that the verb still replies `accepted` and the fetch queues in-process up to `fetch_queue_max` (default 32) — above that the verb replies rc 10 `busy`; never an unbounded queue. A stalled body aborts after a 30 s idle read timeout (staging deleted). The `fetch.in_flight`, `fetch.queued`, `fetch.completed` and `fetch.failed` props expose the live gauges and lifetime counters.
+
 ## Storage layout
 
 ```text
@@ -108,11 +137,10 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 
 - `blob.pinned {blob, owner}`
 - `blob.unpinned {blob, owner}`
+- `blob.fetched {blob, outcome, origin_used, size?, error?}` — the `blob.fetch` completion; `outcome` is the taxonomy above, `origin_used` the node the bytes came from (null on failure)
 - `blob.swept {count}`
 - `blob.props.changed` (SPEC-07 shape; `lifecycle.generation` is transient)
 
-`blob.fetch` is reserved and replies `not_implemented` until P1 slice 4.
-
 ## Bus interface
 
-The verb reference is [verbs.md](verbs.md); the props surface is `blob.props.{get,list,describe,watch}` over `lane.bind`, `lane.port`, `root`, `instance`, `counts.blobs`, `counts.pins`, `quota.total.used`, `quota.total.limit` and `lifecycle.generation`.
+The verb reference is [verbs.md](verbs.md); the props surface is `blob.props.{get,list,describe,watch}` over `lane.bind`, `lane.port`, `root`, `instance`, `counts.blobs`, `counts.pins`, `quota.total.used`, `quota.total.limit`, `fetch.in_flight`, `fetch.queued`, `fetch.completed`, `fetch.failed` and `lifecycle.generation`.

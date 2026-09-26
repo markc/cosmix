@@ -1,6 +1,6 @@
 # Bus verbs
 
-`cosmix-blobd` registers the `blob.*` namespace as the `blobd` service (or `blobd-<name>` for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is `blob.path`, cross-node is the byte lane (`GET blob.url`).
+`cosmix-blobd` registers the `blob.*` namespace as the `blobd` service (or `blobd-<name>` for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is `blob.path`, cross-node is the byte lane (`GET blob.url`, or `blob.fetch` to pull and pin).
 
 ## Calling convention
 
@@ -16,7 +16,7 @@ Success uses result code `0`. Errors use result code `10` and a body shaped as:
 {"error":"message"}
 ```
 
-Error tokens worth matching on: `not_present` (blob not held), `invalid blob id` (malformed `b3:` reference), `quota:` (an owner or total cap refusal — the message carries the numbers), `not_implemented` (`blob.fetch` until P1 slice 4).
+Error tokens worth matching on: `not_present` (blob not held), `invalid blob id` (malformed `b3:` reference), `quota:` (an owner or total cap refusal — the message carries the numbers), `busy` (the `blob.fetch` queue is full — retry later).
 
 A blob reference is `{"blob":"b3:<64 hex>","size":N,"mime":"…","name":"…"?, "origin":"<node name>"}` (`name` present only when the ingester knew one; `origin` is a node name, never an IP).
 
@@ -110,4 +110,27 @@ No arguments. Version, git sha, build time, `root`, `instance`, `lane_bind` and 
 
 ### `blob.fetch`
 
-Reserved (P1 slice 4). Replies rc 10 `not_implemented`.
+Cross-node pull over the origin's byte lane. **Replies immediately** — never a deferred reply (the mesh response timeout is 30 s; a multi-GiB pull outlives it).
+
+| Argument | Requirement | Notes |
+|---|---|---|
+| `blob` | Blob id, or a full reference object | From a reference, the `origin` (and an `instance` member, if present) drive first-try resolution |
+| `from` | Optional | Node name; overrides the reference's `origin` for the first try |
+| `instance` | Optional | Remote instance name; the target service becomes `blobd-<name>` |
+| `owner` | The calling service (`from`) | Pin owner for this caller |
+
+The reply is `{accepted:true, blob, origin, in_flight, present}`:
+
+- `present:true` — the CAS already had it; the caller's pin landed and this reply is the completion.
+- `present:false, in_flight:false` — this call started the download.
+- `present:false, in_flight:true` — a fetch for this hash was already in the system (running or queued) and this call joined it: **single-flight per hash**, one download, the joiner's pin lands on completion.
+
+Completion is the `blob.fetched` event (`retain: false`, so a late subscriber sees nothing) plus the `blob.stat` transition `present:false → true`:
+
+```json
+{"blob":"b3:…","outcome":"ok","origin_used":"alpha","size":184320}
+```
+
+`outcome` ∈ `ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io` (`origin_used` is null and `error` carries the reason on every non-`ok` outcome). Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a `blob.has` fan-out over `noded.peers`; `verify_failed` is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's [Fetching] section.
+
+[Fetching]: ../cosmix-blobd/#fetching

@@ -442,7 +442,7 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/cosmix-blobd/verbs.md"><div class="prose"><h1 id="bus-verbs">Bus verbs</h1>
-<p><code>cosmix-blobd</code> registers the <code>blob.*</code> namespace as the <code>blobd</code> service (or <code>blobd-&lt;name&gt;</code> for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is <code>blob.path</code>, cross-node is the byte lane (<code>GET blob.url</code>).</p>
+<p><code>cosmix-blobd</code> registers the <code>blob.*</code> namespace as the <code>blobd</code> service (or <code>blobd-&lt;name&gt;</code> for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is <code>blob.path</code>, cross-node is the byte lane (<code>GET blob.url</code>, or <code>blob.fetch</code> to pull and pin).</p>
 <h2 id="calling-convention">Calling convention</h2>
 <p>For a bare command, arguments are resolved in this order:</p>
 <ol>
@@ -453,7 +453,7 @@
 <p>Success uses result code <code>0</code>. Errors use result code <code>10</code> and a body shaped as:</p>
 <pre><code class="language-json">{"error":"message"}
 </code></pre>
-<p>Error tokens worth matching on: <code>not_present</code> (blob not held), <code>invalid blob id</code> (malformed <code>b3:</code> reference), <code>quota:</code> (an owner or total cap refusal — the message carries the numbers), <code>not_implemented</code> (<code>blob.fetch</code> until P1 slice 4).</p>
+<p>Error tokens worth matching on: <code>not_present</code> (blob not held), <code>invalid blob id</code> (malformed <code>b3:</code> reference), <code>quota:</code> (an owner or total cap refusal — the message carries the numbers), <code>busy</code> (the <code>blob.fetch</code> queue is full — retry later).</p>
 <p>A blob reference is <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…","name":"…"?, "origin":"&lt;node name&gt;"}</code> (<code>name</code> present only when the ingester knew one; <code>origin</code> is a node name, never an IP).</p>
 <h2 id="verbs">Verbs</h2>
 <h3 id="blobput"><code>blob.put</code></h3>
@@ -513,7 +513,23 @@
 <h3 id="blobinfo"><code>blob.info</code></h3>
 <p>No arguments. Version, git sha, build time, <code>root</code>, <code>instance</code>, <code>lane_bind</code> and <code>counts</code> (<code>blobs</code>, <code>pins</code>).</p>
 <h3 id="blobfetch"><code>blob.fetch</code></h3>
-<p>Reserved (P1 slice 4). Replies rc 10 <code>not_implemented</code>.</p></div></div>
+<p>Cross-node pull over the origin's byte lane. <strong>Replies immediately</strong> — never a deferred reply (the mesh response timeout is 30 s; a multi-GiB pull outlives it).</p>
+<table><thead><tr><th>Argument</th><th>Requirement</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>blob</code></td><td>Blob id, or a full reference object</td><td>From a reference, the <code>origin</code> (and an <code>instance</code> member, if present) drive first-try resolution</td></tr>
+<tr><td><code>from</code></td><td>Optional</td><td>Node name; overrides the reference's <code>origin</code> for the first try</td></tr>
+<tr><td><code>instance</code></td><td>Optional</td><td>Remote instance name; the target service becomes <code>blobd-&lt;name&gt;</code></td></tr>
+<tr><td><code>owner</code></td><td>The calling service (<code>from</code>)</td><td>Pin owner for this caller</td></tr>
+</tbody></table>
+<p>The reply is <code>{accepted:true, blob, origin, in_flight, present}</code>:</p>
+<ul>
+<li><code>present:true</code> — the CAS already had it; the caller's pin landed and this reply is the completion.</li>
+<li><code>present:false, in_flight:false</code> — this call started the download.</li>
+<li><code>present:false, in_flight:true</code> — a fetch for this hash was already in the system (running or queued) and this call joined it: <strong>single-flight per hash</strong>, one download, the joiner's pin lands on completion.</li>
+</ul>
+<p>Completion is the <code>blob.fetched</code> event (<code>retain: false</code>, so a late subscriber sees nothing) plus the <code>blob.stat</code> transition <code>present:false → true</code>:</p>
+<pre><code class="language-json">{"blob":"b3:…","outcome":"ok","origin_used":"alpha","size":184320}
+</code></pre>
+<p><code>outcome</code> ∈ <code>ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io</code> (<code>origin_used</code> is null and <code>error</code> carries the reason on every non-<code>ok</code> outcome). Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a <code>blob.has</code> fan-out over <code>noded.peers</code>; <code>verify_failed</code> is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's <a href="../cosmix-blobd/#fetching">Fetching</a> section.</p></div></div>
     </div>
 
 </main>
