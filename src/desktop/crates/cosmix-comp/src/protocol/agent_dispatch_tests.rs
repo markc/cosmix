@@ -1,6 +1,37 @@
 // Included by input_injection_tests.rs: real queued Bus controls and wire devices.
 
 #[test]
+fn initial_agent_sequence_motion_precedes_a_later_standalone_click() {
+    let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
+    let (_, _, pointer) = bind_agent_devices(&mut h);
+    let motion = |object: &ObjectId| {
+        let (id, generation) = window_id_and_generation(&h, object);
+        on_agent(move_op(PointerMoveTarget::Window { id, generation, x: 10.0, y: 10.0, require_hit: true }))
+    };
+    let to_alpha = motion(&alpha);
+    let to_beta = motion(&beta);
+    assert_eq!(inject(&mut h, &ingress, &runtime, to_alpha).0, 0);
+    let _ = h.sync();
+    let sequence = ingress.request_long(crate::port::LongOp::Sequence(vec![
+        step("comp.input.pointer.move", to_beta, 0),
+    ])).unwrap();
+    let click = ingress.request_input(on_agent(InputOp::PointerButton {
+        button: BTN_LEFT, action: PressAction::Both,
+    })).unwrap();
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    let click = runtime.block_on(click.receive()).unwrap().wire_json();
+    let (id, generation) = window_id_and_generation(&h, &beta);
+    assert_eq!(click["target"], json!({"id":id, "generation":generation}));
+    assert!(runtime.block_on(sequence.receive()).unwrap().wire_json().get("error").is_none());
+    let events = h.sync();
+    let enter = events.iter().position(|(object, opcode, body)|
+        *object == pointer && *opcode == 0 && word(body, 1) == beta.protocol_id()).unwrap();
+    let press = events.iter().position(|(object, opcode, body)|
+        *object == pointer && *opcode == 3 && word(body, 3) == 1).unwrap();
+    assert!(enter < press, "motion/enter reaches B before its click");
+}
+
+#[test]
 fn authority_loss_refuses_parked_agent_controls_without_recreating_holds() {
     let (mut h, ingress, runtime, _, alpha, _) = two_windows();
     bind_agent_devices(&mut h);

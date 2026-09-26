@@ -125,6 +125,7 @@ pub(crate) struct InjectionState {
     pub(super) suppress_corners: bool,
     pub(super) sequences: HashMap<u64, SequenceRun>,
     ready_agent_sequences: VecDeque<u64>,
+    pub(super) agent_sequence_serviced: bool,
     next_sequence: u64,
 }
 
@@ -141,6 +142,7 @@ impl Default for InjectionState {
             suppress_corners: false,
             sequences: HashMap::new(),
             ready_agent_sequences: VecDeque::new(),
+            agent_sequence_serviced: false,
             next_sequence: 0,
         }
     }
@@ -1132,6 +1134,7 @@ impl WaylandState {
     /// runnable agent work schedules an event-loop wakeup, never a polling tick.
     pub(super) fn service_ready_agent_sequence(&mut self) {
         if let Some(id) = self.injection.ready_agent_sequences.pop_front() {
+            self.injection.agent_sequence_serviced = true;
             self.advance_sequence(id);
         }
         if !self.injection.ready_agent_sequences.is_empty() { self.input_wakeup.wakeup(); }
