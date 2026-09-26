@@ -2705,8 +2705,8 @@ mod tests {
         // A Resync clears every set; the stored one comes back with the
         // same transition.
         let tab = c.active.unwrap();
-        let gen = c.tab(tab).and_then(|t| t.mirror.as_ref()).unwrap().view_gen();
-        let resync = cosmix_edit_client::types::ViewDelta { edits: vec![], origin: None, kind: DeltaKind::Resync, rev: 0, view_gen: gen + 1 };
+        let view_gen = c.tab(tab).and_then(|t| t.mirror.as_ref()).unwrap().view_gen() + 1;
+        let resync = cosmix_edit_client::types::ViewDelta { edits: vec![], origin: None, kind: DeltaKind::Resync, rev: 0, view_gen };
         let mut fx = Vec::new();
         c.drive(tab, Step { deltas: vec![resync], ..Step::default() }, &mut fx);
         assert!(c.tab(tab).unwrap().diagnostics.items().is_empty(), "the Resync cleared it");
