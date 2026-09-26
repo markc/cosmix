@@ -5,13 +5,16 @@
 //! gate (the full-mesh-access law). Success = rc 0; refusal = rc 10 with a
 //! [`Refusal`] body.
 //!
-//! **Security posture (P2):** `dopus.action` serves the navigation, view,
+//! **Security posture (P3):** `dopus.action` serves the navigation, view,
 //! pane and theme actions (`nav.*`, `view.*`, `theme.*`, plus the selection
-//! actions, which are view-ish: they move the highlight). File-mutating
-//! actions and `file.open` are keyboard-only until P3 — refused with
-//! [`code::FORBIDDEN`], matching filemgr's rule that a Bus caller never
-//! mutates the filesystem through a file manager. `dopus.open` navigates the
-//! two panes (P1 accepted and ignored the paths).
+//! actions, which are view-ish: they move the highlight). The file
+//! operations exist — keyboard + dialogs in the windowed app since P3
+//! (`file.open`, `file.new-folder`, `file.rename`, `file.copy-other-pane`,
+//! `file.move-other-pane`, `file.delete`) — but the Bus NEVER mutates the
+//! filesystem through a file manager: every `file.*` id is pre-refused with
+//! [`code::FORBIDDEN`] before the shared [`apply_action`] layer runs
+//! (filemgr's rule, unchanged since P2). `dopus.open` navigates the two
+//! panes.
 
 use std::path::{Path, PathBuf};
 
@@ -41,8 +44,9 @@ pub mod code {
     pub const UNAVAILABLE: &str = "UNAVAILABLE";
     pub const INTERNAL: &str = "INTERNAL";
     pub const UNKNOWN_VERB: &str = "UNKNOWN_VERB";
-    /// A P2/P3 verb surface: file operations and file opening are refused on
-    /// the Bus until their UI exists.
+    /// A permanent verb-surface boundary: file operations and file opening
+    /// are keyboard-only forever — the Bus never mutates the filesystem
+    /// through a file manager.
     pub const FORBIDDEN: &str = "FORBIDDEN";
 }
 
@@ -248,12 +252,18 @@ impl Served {
     }
 }
 
-/// The action table: `(action, label)`. `app.quit` is served; everything
-/// `file.*`/`place.*` is keyboard-only until P3 (see the module header) —
-/// `file.open` too: the Bus arm refuses every `file.*`, so it appears here
-/// for the keyboard path and `dopus.actions.list` only.
+/// The action table: `(action, label)`. `app.quit` is served; the `file.*`
+/// operations are keyboard-only (the Bus arm refuses every `file.*` — see
+/// the module header), so they appear here for the keyboard path and
+/// `dopus.actions.list` only; their `enabled` flag is per-frame from the
+/// core's availability ([`apply_availability`]).
 pub const ACTIONS: &[(ActionId, &str)] = &[
     (filemgr::FILE_OPEN, "Open the selection"),
+    (filemgr::FILE_NEW_FOLDER, "New folder"),
+    (filemgr::FILE_RENAME, "Rename the selection"),
+    (filemgr::FILE_COPY, "Copy the selection to the other pane"),
+    (filemgr::FILE_MOVE, "Move the selection to the other pane"),
+    (filemgr::FILE_DELETE, "Delete the selection"),
     (filemgr::NAV_BACK, "Go back"),
     (filemgr::NAV_FORWARD, "Go forward"),
     (filemgr::NAV_PARENT, "Go to parent folder"),
@@ -321,19 +331,89 @@ pub enum Applied {
     Quit,
 }
 
+/// A keyboard invocation of an action the availability gate has taken off
+/// the table: a no-op WITH an explanation (the status line the keyboard
+/// path makes of it), never a silent nothing. `UNAVAILABLE`: the action is
+/// real, the current state just cannot take it.
+fn gated(message: &str) -> Refusal {
+    Refusal {
+        error_code: code::UNAVAILABLE.to_owned(),
+        message: message.to_owned(),
+        reason: Some("not_offered".to_owned()),
+    }
+}
+
 /// Apply one action to the core. Everything pane-targeted acts on the ACTIVE
 /// pane (the keyboard and the Bus are one keystroke each); the pane headers
 /// activate their pane first (the app calls `set_active_pane` before these).
 /// Law 5 is the core's (`set_sort` toggles a same-column sort itself); every
 /// column switch passes `ascending: true`.
+///
+/// The `file.*` arms are keyboard-only (the Bus pre-refuses every `file.*`
+/// id before this layer — see the module header): each checks the core's
+/// [`AvailabilitySnapshot`] first and refuses with [`gated`] when the table
+/// would show the row disabled, mirroring what the core itself refuses
+/// (single-flight: "Another file operation is still running"; selection:
+/// nothing to act on).
 pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, Refusal> {
     let done = Ok(Applied::Done);
     let pane = core.active();
+    let availability = core.availability();
+    let busy = || gated("A file operation is still running");
     if action == filemgr::FILE_OPEN {
-        // A directory opens in place; a file derives an `OpenFile` event,
-        // which the app surfaces as a status line (law 4's P2 posture: no
-        // spawn until there is an operations surface to own it).
+        // A directory opens in place; a non-directory derives an `OpenFile`
+        // event, which the app serves by spawning `xdg-open` (law 4).
+        if !availability.has_selection {
+            return Err(gated("Nothing is selected"));
+        }
         core.open_selection();
+        return done;
+    }
+    if action == filemgr::FILE_NEW_FOLDER {
+        if availability.operation_running {
+            return Err(busy());
+        }
+        core.begin_new_folder();
+        return done;
+    }
+    if action == filemgr::FILE_RENAME {
+        if !availability.has_selection {
+            return Err(gated("Nothing is selected"));
+        }
+        if availability.operation_running {
+            return Err(busy());
+        }
+        core.begin_rename();
+        return done;
+    }
+    if action == filemgr::FILE_COPY {
+        if !availability.has_selection {
+            return Err(gated("Nothing is selected"));
+        }
+        if availability.operation_running {
+            return Err(busy());
+        }
+        core.copy_selection_to_other_pane();
+        return done;
+    }
+    if action == filemgr::FILE_MOVE {
+        if !availability.has_selection {
+            return Err(gated("Nothing is selected"));
+        }
+        if availability.operation_running {
+            return Err(busy());
+        }
+        core.move_selection_to_other_pane();
+        return done;
+    }
+    if action == filemgr::FILE_DELETE {
+        if !availability.has_selection {
+            return Err(gated("Nothing is selected"));
+        }
+        if availability.operation_running {
+            return Err(busy());
+        }
+        core.delete_selection();
         return done;
     }
     if action == filemgr::NAV_BACK {
@@ -402,10 +482,11 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
         return Ok(Applied::Theme(theme));
     }
     // The fallthrough serves two different callers' mistakes: a KNOWN
-    // action that is keyboard-only until P3 (file.*/place.* — FORBIDDEN,
-    // filemgr's posture) and an id nothing defines (INVALID_ARGUMENT —
-    // the caller misspelled it; "forbidden" would claim a vocabulary
-    // entry that does not exist).
+    // action nothing serves on this path (FORBIDDEN — since P3 every id in
+    // the vocabulary IS served by the keyboard and pre-refused on the Bus,
+    // so this arm is defensive) and an id nothing defines
+    // (INVALID_ARGUMENT — the caller misspelled it; "forbidden" would
+    // claim a vocabulary entry that does not exist).
     let known = filemgr::MENU_ACTION_IDS.contains(&action)
         || filemgr::DEFAULT_KEYMAP_ACTION_IDS.contains(&action)
         || ACTIONS.iter().any(|(known, _)| *known == action);
@@ -416,12 +497,33 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
             code::INVALID_ARGUMENT.to_owned()
         },
         message: if known {
-            format!("{action} is keyboard-only in P2 (no file-operation UI yet)")
+            format!("{action} is keyboard-only (the Bus never mutates the filesystem)")
         } else {
             format!("{action} is not a dopus action")
         },
-        reason: Some("p2_scope".to_owned()),
+        // Only a real, keyboard-served action is "keyboard_only"; an unknown
+        // id has no posture to name.
+        reason: known.then(|| "keyboard_only".to_owned()),
     })
+}
+
+/// Refresh the table's `enabled` flags from the core's live availability
+/// (P3): a `file.*` row the current state cannot take reads as disabled —
+/// no selection, or an operation holding the single-flight slot — and the
+/// keyboard path agrees ([`apply_action`] refuses with the same verdict).
+/// Everything non-file stays enabled. Applied per frame by the windowed
+/// app and per call by `dopus.actions.list` ([`serve_command`]).
+pub fn apply_availability(actions: &mut [ActionRow], availability: &cosmix_dopus_core::AvailabilitySnapshot) {
+    for row in actions {
+        let selection = availability.has_selection;
+        let idle = !availability.operation_running;
+        row.enabled = match row.id.as_str() {
+            "file.open" => selection,
+            "file.new-folder" => idle,
+            "file.rename" | "file.copy-other-pane" | "file.move-other-pane" | "file.delete" => selection && idle,
+            _ => true,
+        };
+    }
 }
 
 /// `dopus.actions.list`'s table: the served actions with their effective
@@ -528,7 +630,7 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                 view: "dopus".to_owned(),
                 engine: "iced".to_owned(),
                 version: info.version.to_owned(),
-                description: "the CosMix twin-pane file manager (P2: twin panes, Places, per-pane location bars)".to_owned(),
+                description: "the CosMix twin-pane file manager (P3: file operations via keyboard and dialogs; the Bus never mutates)".to_owned(),
                 controls: Vec::new(),
                 verbs: VERBS.iter().map(|(verb, _)| (*verb).to_owned()).collect(),
             },
@@ -555,14 +657,15 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
         "dopus.action" => match serde_json::from_str::<ActionReq>(&command.body) {
             Ok(req) => match ActionId::intern(&req.id) {
                 // The Bus never opens (or otherwise touches) files: `file.*`
-                // is keyboard-only in P2, even though the keyboard arm of
-                // `apply_action` serves `file.open` (a directory in place, a
-                // file as a status line). Matching filemgr's rule — a remote
-                // caller never mutates the filesystem through a file manager.
+                // is keyboard-only, even though `apply_action` serves the
+                // keyboard arms (a directory in place, a file via `xdg-open`,
+                // the confirm/prompt dialogs). Matching filemgr's rule — a
+                // remote caller never mutates the filesystem through a file
+                // manager.
                 Ok(action) if action.as_str().starts_with("file.") => vec![Served::error(
                     command.id,
                     code::FORBIDDEN,
-                    format!("{action} is keyboard-only in P2 — the Bus never opens files"),
+                    format!("{action} is keyboard-only — the Bus never mutates the filesystem through a file manager"),
                 )],
                 Ok(action) => match apply_action(action, core) {
                     Ok(Applied::Done) => vec![Served::reply_json(
@@ -591,7 +694,14 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
             },
             Err(error) => vec![Served::error(command.id, code::INVALID_ARGUMENT, format!("body: {error}"))],
         },
-        "dopus.actions.list" => vec![Served::reply_json(command.id, &ActionsReply { actions: meta.actions.clone() })],
+        "dopus.actions.list" => {
+            // `enabled` is per-frame from the core's availability (P3): the
+            // table this call returns reflects what the keyboard could do
+            // right now.
+            let mut actions = meta.actions.clone();
+            apply_availability(&mut actions, &core.availability());
+            vec![Served::reply_json(command.id, &ActionsReply { actions })]
+        }
         "dopus.theme.set" => match serde_json::from_str::<ThemeSetReq>(&command.body) {
             Ok(req) => vec![Served::ThemeSet { id: command.id, scheme: req.scheme, mode: req.mode }],
             Err(error) => vec![Served::error(command.id, code::INVALID_ARGUMENT, format!("body: {error}"))],

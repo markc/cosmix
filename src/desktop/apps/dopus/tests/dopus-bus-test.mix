@@ -1,4 +1,4 @@
--- End-to-end (dopus P2): a private noded and the real `cosmix-dopus
+-- End-to-end (dopus P3): a private noded and the real `cosmix-dopus
 -- --headless --service dopus-test --noded-url …`, driven by one-shot Mix
 -- clients. The twin panes are proven over the Bus: dopus.info reports two
 -- panes; dopus.open lands the first PATH in the left pane and the second in
@@ -6,15 +6,22 @@
 -- flips the active pane and every active-pane verb (view.sort-* with law 5's
 -- same-column toggle, view.toggle-hidden, nav.parent/back/forward/home,
 -- selection.*) moves only the active pane while dopus.state shows both;
--- refusals stay honest (file.* FORBIDDEN — the Bus never opens files,
--- unknown action INVALID_ARGUMENT, unknown verb UNKNOWN_VERB, theme.set
--- AND the theme.* actions UNAVAILABLE headless). dopus.quit answers rc 0
+-- refusals stay honest (unknown action INVALID_ARGUMENT, unknown verb
+-- UNKNOWN_VERB, theme.set AND the theme.* actions UNAVAILABLE headless).
+-- The P3 posture is pinned: EVERY `file.*` id (all six) stays FORBIDDEN —
+-- the file operations are keyboard + dialog only in the windowed app; the
+-- Bus never mutates the filesystem, permanently. dopus.quit answers rc 0
 -- BEFORE the process exits
 -- (reply-then-exit: the client's send would time out otherwise).
 --
 -- NOT reachable over the Bus, so not drivable here: the listing's directory
 -- expansion (core `toggle_expand`) has no verb and `file.*` is refused — the
--- window exercises it; the wire cannot. Documented, not faked.
+-- window exercises both (dialogs included); the wire cannot. The confirm/
+-- prompt dialogs are raised ONLY by the windowed keyboard actions
+-- (file.delete confirms; file.new-folder/file.rename prompt): no Bus verb
+-- triggers one, so the headless fail-closed answers (law 3) are trivially
+-- satisfied, and `dopus.state` deliberately carries no dialog fields.
+-- Documented, not faked.
 --
 -- Nothing here can reach the host Bus: private TCP port, private unix
 -- socket, admission off, HOME and state dirs in the temp dir.
@@ -223,8 +230,6 @@ try
   check($active.selected != nil, "selection.first selected nothing: " .. json_encode($active))
 
   -- 10. refusals stay honest
-  refused('dopus.action id="file.open"', {}, "FORBIDDEN")
-  refused('dopus.action id="file.delete"', {}, "FORBIDDEN")
   refused('dopus.action id="no.such-action"', {}, "INVALID_ARGUMENT")
   refused('dopus.frobnicate', {}, "UNKNOWN_VERB")
   refused('dopus.theme.set mode="dark"', {}, "UNAVAILABLE")
@@ -238,6 +243,43 @@ try
   check(not $dupe.ok, "a second dopus-test registered")
   check(contains($dupe.stderr, "already registered"), "duplicate diagnostics: " .. $dupe.stderr)
 
+  -- 10b. P3 posture: EVERY file.* id (all six) stays FORBIDDEN over the
+  -- Bus. The file operations are keyboard + dialog only in the windowed
+  -- app; the Bus never mutates the filesystem, permanently — listed in
+  -- dopus.actions.list for the keyboard path is NOT served on the wire.
+  refused('dopus.action id="file.open"', {}, "FORBIDDEN")
+  refused('dopus.action id="file.new-folder"', {}, "FORBIDDEN")
+  refused('dopus.action id="file.rename"', {}, "FORBIDDEN")
+  refused('dopus.action id="file.copy-other-pane"', {}, "FORBIDDEN")
+  refused('dopus.action id="file.move-other-pane"', {}, "FORBIDDEN")
+  refused('dopus.action id="file.delete"', {}, "FORBIDDEN")
+  -- The confirm/prompt dialogs are raised ONLY by the windowed keyboard
+  -- actions: there is deliberately no Bus verb that triggers one, so the
+  -- headless fail-closed answers (law 3) are trivially satisfied and
+  -- nothing here can drive a dialog. dopus.state's shape is the whole
+  -- contract and P3 added NO verb-visible fields — assert every documented
+  -- one (selected is legitimately nil before a selection).
+  $st = ok('dopus.state', {})
+  check(length($st.panes) == 2, "dopus.state panes: " .. json_encode($st))
+  $p = $st.panes[0]
+  check($p.pane == 0 and $p.path != nil and $p.active != nil and $p.show_hidden != nil
+    and $p.sort != nil and $p.ascending != nil and $p.rows != nil and $p.status != nil
+    and $st.theme_scheme != nil and $st.theme_mode != nil,
+    "dopus.state shape: " .. json_encode($st))
+  -- actions.list: the six file.* rows are listed with a per-frame enabled
+  -- flag (availability), while dopus.action refuses them all — the table
+  -- describes the keyboard, never the Bus.
+  $acts = ok('dopus.actions.list', {})
+  $file_rows = 0
+  for each $row in $acts.actions
+    if starts_with($row.id, "file.") then
+      $file_rows = $file_rows + 1
+      check($row.enabled != nil, "file row without enabled: " .. json_encode($row))
+      refused('dopus.action id=$a.id', {id: $row.id}, "FORBIDDEN")
+    end
+  end
+  check($file_rows == 6, "expected 6 file.* rows in actions.list, got " .. to_string($file_rows))
+
   -- 11. dopus.quit answers rc 0 BEFORE the process exits (item 6: the reply
   -- arrives on this client's send — an exit-first shape would time out here)
   $q = ok('dopus.quit', {})
@@ -249,7 +291,7 @@ try
   end
   check($exited, "dopus still running 10 s after dopus.quit")
   $dopus_pid = nil
-  print("PASS dopus headless e2e: boot twin-pane state, dopus.open pane routing + extras ignored + tilde, F6, active-pane sort (law 5 toggle)/hidden/nav/selection, refusals (file.*, unknown action/verb, theme.set + theme.*), single instance, reply-then-exit quit")
+  print("PASS dopus headless e2e: boot twin-pane state, dopus.open pane routing + extras ignored + tilde, F6, active-pane sort (law 5 toggle)/hidden/nav/selection, refusals (unknown action/verb, theme.set + theme.*), P3 posture (all six file.* FORBIDDEN, state shape unchanged, actions.list availability flags), single instance, reply-then-exit quit")
 catch $err
   for each $log in glob($tmp .. "/*.log")
     print("--- " .. $log .. "\n" .. read_file($log))

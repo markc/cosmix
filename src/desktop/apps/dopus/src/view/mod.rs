@@ -1,9 +1,12 @@
 //! Window composition: the Places sidebar · left pane · divider · right
 //! pane, over the status bar — [`places`] · [`panes::pane_column`] (pane
 //! header, [`location`] bar, sort header, [`rows::FileList`]) ·
-//! [`panes::Divider`] · [`status::bar`]. Built-ins everywhere except the
-//! list and the divider; every colour from the compiled tokens via [`Look`].
+//! [`panes::Divider`] · [`status::bar`] — with a [`dialogs`] modal card
+//! stacked over it all while a core reservation is unanswered. Built-ins
+//! everywhere except the list and the divider; every colour from the
+//! compiled tokens via [`Look`].
 
+pub mod dialogs;
 pub mod location;
 pub mod panes;
 pub mod places;
@@ -58,7 +61,9 @@ pub const STATUS_H: f32 = 26.0;
 /// The whole window: sidebar · left pane · divider · right pane, then the
 /// status bar. `split_ratio` (the core's live value) quantises the pane
 /// Fill portions; `editing` is `(pane, real path text)` while a location
-/// bar is being edited; the listed `rows` are the app's per-pane snapshots.
+/// bar is being edited; the listed `rows` are the app's per-pane snapshots;
+/// `dialog` is the outstanding core reservation rendered as a modal card
+/// over a scrim (nothing else on this surface while it is up).
 // The window's whole projection in one call (ced's editor/draw.rs precedent
 // for the allow).
 #[allow(clippy::too_many_arguments)]
@@ -74,6 +79,7 @@ pub fn root<'a>(
     right_rows: &'a [VisibleRow],
     editing: Option<(PaneId, &'a str)>,
     info: &'a str,
+    dialog: Option<&'a dialogs::Dialog>,
 ) -> Element<'a, Msg> {
     let (left_edit, right_edit) = match editing {
         Some((PaneId::Left, text)) => (Some(text), None),
@@ -87,7 +93,7 @@ pub fn root<'a>(
     // The ratio quantised to whole Fill portions out of 100 (the drag clamp
     // already keeps it in 0.1–0.9, so both sides get at least 10).
     let left_portion = (split_ratio.clamp(panes::SPLIT_MIN, panes::SPLIT_MAX) * 100.0).round() as u16;
-    column![
+    let content = column![
         row![
             places::sidebar(look, icons, tint, active, active_pane),
             panes::pane_column(
@@ -105,8 +111,14 @@ pub fn root<'a>(
         status::bar(look, active_pane, info),
     ]
     .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    .height(Length::Fill);
+    match dialog {
+        // The modal card is stacked OVER the window; the scrim takes every
+        // click not on the card, and the router's modal scope takes every
+        // chord plus Enter/Escape.
+        Some(dialog) => iced::widget::stack![content, dialogs::Dialog::view(dialog, look)].into(),
+        None => content.into(),
+    }
 }
 
 /// A ghost button style over the secondary strip: quiet until hovered. The

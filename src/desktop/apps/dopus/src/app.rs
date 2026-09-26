@@ -14,11 +14,16 @@
 //!   re-formats the rows' relative modified times), a 200 ms `Msg::Tick`
 //!   heartbeat ticks when the window is idle (frames only fire on redraws),
 //!   and `quit` ticks once before exit so pending config persists.
-//! - derived `ConfirmRequested`/`PromptRequested` are answered immediately
-//!   (`No`/dismissal): P2 has no dialog surface, and law 3 forbids letting
-//!   one wedge — a P3 dialog UI replaces these arms.
-//! - derived `OpenFile` becomes a status line: no spawn surface until P3 —
-//!   law 4's P2 posture.
+//! - derived `ConfirmRequested`/`PromptRequested` join the modal queue
+//!   ([`dialogs::ModalQueue`]; the core queues concurrent modals and the
+//!   oldest renders first) and are answered through the dialog surface —
+//!   law 3. While one is up the key router's modal scope suppresses every
+//!   chord and hands Enter/Escape to the dialog.
+//! - derived `OpenFile` spawns `xdg-open` detached (fire-and-forget, like
+//!   filemgr's browser.rs:3270); a spawn failure becomes a status line —
+//!   law 4.
+//! - derived `Status` lands in the status bar (operation progress, errors);
+//!   `InfoChanged` hands the line back to the core's info text.
 //! - sort-column switches pass `ascending: true` — law 5 (the core toggles a
 //!   same-column sort itself).
 //! - the divider drives `set_split_ratio` — law 7 (persistence derives from
@@ -27,8 +32,9 @@
 //! Focus: the key router resolves against a real [`FocusContext`] — while a
 //! location bar is being edited the router's `focus_editable` is on, so the
 //! chord resolver routes keys into the editor (every default binding is
-//! `allow_in_editable: false`). P1 resolved `global()` everywhere; P2
-//! threads the focus.
+//! `allow_in_editable: false`), and while a dialog is up the router's modal
+//! scope suppresses every chord and routes Enter/Escape into the dialog.
+//! P1 resolved `global()` everywhere; P2 threads the focus.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -45,10 +51,10 @@ use cosmix_dopus_core::{ConfigFile, ConfirmAnswer, CoreEvent, DOpusConfig, Dopus
 use crate::bus::{self, BusHandle, Delivery};
 use crate::dirs::AppDirs;
 use crate::icons::{self, Icons};
-use crate::keys;
+use crate::keys::{self, ModalKey};
 use crate::theme::{self, Theme};
 use crate::verbs::{self, ActionRow, ServerMeta, Served};
-use crate::view::{self, rows, Look};
+use crate::view::{self, dialogs, rows, Look};
 
 /// The Wayland application id.
 pub const APP_ID: &str = "dev.cosmix.dopus";
@@ -91,7 +97,29 @@ pub enum Msg {
     Frame(Instant),
     /// The 200 ms heartbeat (law 1's tick while idle + the chord-deadline poll).
     Tick(Instant),
+    /// The open dialog's buttons (Yes/No, OK/Cancel, field input).
+    Dialog(DialogMsg),
+    /// Enter/Escape while a dialog is up, from the key router's modal
+    /// capture.
+    DialogKey(ModalKey),
     Noop,
+}
+
+/// A dialog control ([`dialogs::Dialog`]'s buttons and field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogMsg {
+    /// A confirm answered: `true` = Yes (the confirming action), `false` =
+    /// No. Both consume the reservation.
+    Answer(bool),
+    /// A prompt submitted (OK / Enter): the CORE re-validates — an invalid
+    /// name is not a resolution, so this only fires when the live
+    /// validator is satisfied.
+    Submit,
+    /// A prompt dismissed (Cancel / Escape / scrim): `prompt_text(token,
+    /// None)` — fail-closed, nothing runs.
+    Dismiss,
+    /// The prompt field's text changed (live `validate_filename` feedback).
+    Input(String),
 }
 
 /// A pane-local control, applied after activating its pane.
@@ -124,6 +152,11 @@ pub struct Dopus {
     theme_override: Option<(Scheme, Mode)>,
     /// A transient message the next core status replaces.
     status: Option<String>,
+    /// The dialog on screen (the OLDEST outstanding reservation), if any.
+    dialog: Option<dialogs::Dialog>,
+    /// Reservations that arrived while a dialog was up (the core queues
+    /// them; this mirrors that order — oldest first).
+    modal_queue: dialogs::ModalQueue<dialogs::Dialog>,
     bus: Option<BusHandle>,
     action_table: Vec<ActionRow>,
     dirs: Option<AppDirs>,
@@ -190,6 +223,8 @@ pub fn run(
         theme,
         theme_override: None,
         status: None,
+        dialog: None,
+        modal_queue: dialogs::ModalQueue::default(),
         bus,
         action_table,
         dirs,
@@ -398,30 +433,30 @@ impl Dopus {
             Msg::Core(event) => {
                 // Law 2: every raw event through on_event exactly once.
                 let derived = self.core.on_event(event);
-                self.on_derived(derived);
-                Task::none()
+                self.on_derived(derived)
             }
             Msg::Window(event) => self.on_window(event),
             Msg::Frame(now) => {
                 // Law 1: tick every frame. Also ages the status line's
                 // replacement cycle: nothing to do, the view re-renders.
                 let derived = self.core.tick(now);
-                self.on_derived(derived);
-                Task::none()
+                self.on_derived(derived)
             }
             Msg::Tick(now) => {
                 // Law 1 while idle (frames only fire on redraws), plus the
                 // chord-deadline poll: an expired chord resolves without
                 // waiting for the next keypress.
                 let derived = self.core.tick(now);
-                self.on_derived(derived);
+                let derived_task = self.on_derived(derived);
                 let actions = keys::poll_timeout(&self.router);
                 if actions.is_empty() {
-                    Task::none()
+                    derived_task
                 } else {
-                    self.on_actions(&actions)
+                    Task::batch([derived_task, self.on_actions(&actions)])
                 }
             }
+            Msg::Dialog(msg) => self.on_dialog(msg),
+            Msg::DialogKey(key) => self.on_dialog_key(key),
             Msg::Noop => Task::none(),
         }
     }
@@ -486,19 +521,45 @@ impl Dopus {
         }
     }
 
-    /// Law 3 and law 4's P2 posture, applied to the core's derived events.
-    fn on_derived(&mut self, events: Vec<CoreEvent>) {
+    /// Law 3 and law 4, applied to the core's derived events: dialogs join
+    /// the modal queue, `OpenFile` spawns `xdg-open` detached (fire and
+    /// forget, filemgr's browser.rs:3270 shape; only the spawn FAILURE is
+    /// reported — a status line), and core status lines surface in the
+    /// status bar until the next info change. `RefreshAll` needs no arm: the
+    /// core re-lists both panes itself before emitting it, and the view
+    /// re-snapshots after every message.
+    fn on_derived(&mut self, events: Vec<CoreEvent>) -> Task<Msg> {
+        let mut task = Task::none();
         for event in events {
             match event {
-                CoreEvent::ConfirmRequested { token, .. } => self.core.confirm(token, ConfirmAnswer::No),
-                CoreEvent::PromptRequested { token, .. } => self.core.prompt_text(token, None),
-                CoreEvent::OpenFile(path) => {
-                    self.status = Some(format!(
-                        "Opening {} needs the P3 file operations",
-                        cosmix_dopus_core::sanitise_display_path(&path)
-                    ));
+                CoreEvent::ConfirmRequested { token, message } => {
+                    // A dialog takes the keyboard from anything else (the
+                    // core queued it; the oldest renders first).
+                    self.stop_editing();
+                    self.modal_queue.offer(&mut self.dialog, dialogs::Dialog::Confirm { token, message });
+                    self.sync_modal();
                 }
-                CoreEvent::Status { .. } | CoreEvent::InfoChanged | CoreEvent::SelectionChanged { .. } => {}
+                CoreEvent::PromptRequested { token, kind, initial } => {
+                    self.stop_editing();
+                    self.modal_queue.offer(&mut self.dialog, dialogs::Dialog::prompt(token, kind, initial));
+                    self.sync_modal();
+                    if matches!(self.dialog, Some(dialogs::Dialog::Prompt { .. })) {
+                        task = focus_prompt();
+                    }
+                }
+                CoreEvent::OpenFile(path) => {
+                    if let Err(error) = std::process::Command::new("xdg-open").arg(&path).spawn() {
+                        self.status = Some(format!(
+                            "Opening {}: {error}",
+                            cosmix_dopus_core::sanitise_display_path(&path)
+                        ));
+                    }
+                }
+                CoreEvent::Status { text, .. } => self.status = Some(text),
+                // The core's info line (operation results among them) is
+                // authoritative again.
+                CoreEvent::InfoChanged => self.status = None,
+                CoreEvent::SelectionChanged { .. } => {}
                 CoreEvent::ListingStarted { .. }
                 | CoreEvent::ListingArrived { .. }
                 | CoreEvent::CountArrived { .. }
@@ -509,6 +570,93 @@ impl Dopus {
                 | CoreEvent::RefreshAll => {}
             }
         }
+        task
+    }
+
+    /// Mirror the dialog state into the key router: while a dialog is up its
+    /// modal scope suppresses every chord and the router hands Enter/Escape
+    /// to the dialog.
+    fn sync_modal(&mut self) {
+        keys::set_modal(&self.router, self.dialog.is_some());
+    }
+
+    /// A dialog control: the confirm's buttons, or the prompt's field and
+    /// buttons.
+    fn on_dialog(&mut self, msg: DialogMsg) -> Task<Msg> {
+        match msg {
+            DialogMsg::Answer(yes) => {
+                let Some(dialogs::Dialog::Confirm { token, .. }) = &self.dialog else { return Task::none() };
+                let token = *token;
+                self.core.confirm(token, if yes { ConfirmAnswer::Yes } else { ConfirmAnswer::No });
+                self.advance_dialog()
+            }
+            DialogMsg::Input(text) => {
+                if let Some(dialog) = &mut self.dialog {
+                    dialog.input(text);
+                }
+                Task::none()
+            }
+            DialogMsg::Submit => self.submit_prompt(),
+            DialogMsg::Dismiss => {
+                let Some(dialogs::Dialog::Prompt { token, .. }) = &self.dialog else { return Task::none() };
+                let token = *token;
+                self.core.prompt_text(token, None);
+                self.advance_dialog()
+            }
+        }
+    }
+
+    /// Enter/Escape under a dialog (the router's modal capture): confirm/
+    /// submit and dismiss respectively. A prompt only submits while its live
+    /// validation is satisfied — an invalid name is not a resolution.
+    fn on_dialog_key(&mut self, key: ModalKey) -> Task<Msg> {
+        let Some(dialog) = &self.dialog else { return Task::none() };
+        match (dialog, key) {
+            (dialogs::Dialog::Confirm { token, .. }, ModalKey::Confirm) => {
+                let token = *token;
+                self.core.confirm(token, ConfirmAnswer::Yes);
+                self.advance_dialog()
+            }
+            (dialogs::Dialog::Confirm { token, .. }, ModalKey::Dismiss) => {
+                let token = *token;
+                self.core.confirm(token, ConfirmAnswer::No);
+                self.advance_dialog()
+            }
+            (dialogs::Dialog::Prompt { .. }, ModalKey::Confirm) => self.submit_prompt(),
+            (dialogs::Dialog::Prompt { token, .. }, ModalKey::Dismiss) => {
+                let token = *token;
+                self.core.prompt_text(token, None);
+                self.advance_dialog()
+            }
+        }
+    }
+
+    /// Submit the front prompt: gated on the live validator (the core
+    /// re-validates; this keeps the field from ever reaching it invalid).
+    fn submit_prompt(&mut self) -> Task<Msg> {
+        let Some(dialogs::Dialog::Prompt { token, text, .. }) = &self.dialog else {
+            return Task::none();
+        };
+        let (token, text) = (*token, text.clone());
+        let Ok(name) = cosmix_dopus_core::validate_filename(&text) else {
+            // The field already shows the validator's message; the
+            // reservation stays open for a correction or a dismissal.
+            return Task::none();
+        };
+        self.core.prompt_text(token, Some(name));
+        self.advance_dialog()
+    }
+
+    /// The front dialog was answered: consume it and show the next queued
+    /// one (the keyboard follows whatever is on screen).
+    fn advance_dialog(&mut self) -> Task<Msg> {
+        self.dialog = None;
+        self.modal_queue.next(&mut self.dialog);
+        self.sync_modal();
+        if matches!(self.dialog, Some(dialogs::Dialog::Prompt { .. })) {
+            return focus_prompt();
+        }
+        Task::none()
     }
 
     fn on_delivery(&mut self, delivery: Delivery) -> Task<Msg> {
@@ -716,9 +864,10 @@ impl Dopus {
         }
         self.quitting = true;
         // Law 1's final tick: persist the pending config before the window
-        // (and its frames) go away.
+        // (and its frames) go away. Any task the last events produce (a
+        // prompt focus) is moot in a quitting process.
         let derived = self.core.tick(Instant::now());
-        self.on_derived(derived);
+        let _ = self.on_derived(derived);
         if let Some(bus) = &self.bus {
             bus.quit();
             // Reply-then-exit, the windowed twin of headless's join: the
@@ -759,27 +908,30 @@ impl Dopus {
     fn view(&self) -> Element<'_, Msg, iced::Theme, Renderer> {
         let info = self.status.as_deref().unwrap_or(self.core.info());
         let editing = self.editing.as_ref().map(|(pane, text)| (*pane, text.as_str()));
+        let content = view::root(
+            self.look(),
+            &self.icons,
+            &self.tint,
+            self.core.active(),
+            self.split_ratio,
+            self.core.pane(PaneId::Left),
+            self.core.pane(PaneId::Right),
+            &self.rows[0],
+            &self.rows[1],
+            editing,
+            info,
+            self.dialog.as_ref(),
+        );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops
-        // keys under load — the ced/term rule).
-        keys::router(
-            view::root(
-                self.look(),
-                &self.icons,
-                &self.tint,
-                self.core.active(),
-                self.split_ratio,
-                self.core.pane(PaneId::Left),
-                self.core.pane(PaneId::Right),
-                &self.rows[0],
-                &self.rows[1],
-                editing,
-                info,
-            ),
-            self.router.clone(),
-            Msg::Actions,
-        )
-        .into()
+        // keys under load — the ced/term rule). While a dialog is up it
+        // resolves nothing (the modal scope) and hands Enter/Escape to the
+        // dialog instead.
+        let mut routed = keys::router(content, self.router.clone(), Msg::Actions).modal(self.dialog.is_some());
+        if self.dialog.is_some() {
+            routed = routed.on_modal_key(Msg::DialogKey);
+        }
+        routed.into()
     }
 }
 
@@ -788,4 +940,14 @@ impl Dopus {
 /// lossy form).
 fn pane_path_text(core: &DopusCore, pane: PaneId) -> String {
     core.pane(pane).path.to_string_lossy().into_owned()
+}
+
+/// Hand keyboard focus to the prompt dialog's field, selecting its seeded
+/// text (filemgr's name-edit shape: the whole initial name is selected, so
+/// typing replaces it).
+fn focus_prompt() -> Task<Msg> {
+    Task::batch([
+        iced::widget::operation::focus(dialogs::PROMPT_INPUT),
+        iced::widget::operation::select_all(dialogs::PROMPT_INPUT),
+    ])
 }
