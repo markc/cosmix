@@ -8,6 +8,7 @@ use std::{
 use swash::{
     FontRef,
     scale::{Render, ScaleContext, Source as GlyphSource},
+    tag_from_bytes,
     zeno::Format,
 };
 
@@ -152,7 +153,7 @@ fn query_family(db: &mut Database, family: &Family<'_>, weight: Weight) -> Optio
 }
 
 fn usable(font: FontRef<'_>) -> bool {
-    if font.metrics(&[]).units_per_em == 0 {
+    if font.metrics(&[]).units_per_em == 0 || !horizontal_metrics_readable(font) {
         return false;
     }
     let metrics = font.glyph_metrics(&[]);
@@ -173,6 +174,21 @@ fn usable(font: FontRef<'_>) -> bool {
                         && image.data.iter().any(|sample| *sample != 0)
                 })
     })
+}
+
+/// Swash reads a listed-but-unreadable `hhea` as zero long metrics and then
+/// computes `count - 1` unchecked in `advance_width`, so refuse such a face
+/// before asking it for any advance. `table` is None for a table that is
+/// listed but lies past the end of the file; hhea is required anyway.
+fn horizontal_metrics_readable(font: FontRef<'_>) -> bool {
+    let count = font
+        .table(tag_from_bytes(b"hhea"))
+        .and_then(|hhea| hhea.get(34..36))
+        .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
+    count > 0
+        && font
+            .table(tag_from_bytes(b"hmtx"))
+            .is_some_and(|hmtx| hmtx.len() >= count as usize * 4)
 }
 
 #[cfg(any(test, feature = "test-support"))]
