@@ -36,6 +36,32 @@ use crate::core::{DialogSeat, OutputKey};
 /// chromed dialog.
 pub const DIALOG_TITLE_BAR_PX: f32 = 32.0;
 
+/// Clear space kept between a fitted dialog and each side of the zone it
+/// fits in, in logical px.
+pub const DIALOG_FIT_MARGIN_PX: f32 = 24.0;
+
+/// A fitted dialog never shrinks below this (the smallest size
+/// cosmix-scene accepts for an authored dialog).
+pub const DIALOG_MIN_PX: f32 = 240.0;
+
+/// The dialog's actual size (Stage R, live nested gate): each authored side
+/// is kept when it fits, else shrunk to the zone less a margin on both
+/// sides, never below [`DIALOG_MIN_PX`]; whole logical px.
+///
+/// `w = max(240, min(declared_w, zone_w − 2·24))`, and likewise for `h`.
+/// `zone` is the output less the exclusive zones of Quoin's docked panels
+/// (`host::panel_layout(..).canvas`), the same area comp centres an
+/// unanchored overlay in.
+pub fn fit_dialog_size(declared: Vec2, zone: Vec2) -> Vec2 {
+    let fit = |declared: f32, zone: f32| {
+        declared
+            .min((zone - 2.0 * DIALOG_FIT_MARGIN_PX).floor())
+            .max(DIALOG_MIN_PX)
+            .round()
+    };
+    Vec2::new(fit(declared.x, zone.x), fit(declared.y, zone.y))
+}
+
 /// Shared dialog state. See the module documentation for who writes what.
 #[derive(Resource, Debug, Default)]
 pub struct QuoinDialog {
@@ -55,6 +81,9 @@ pub struct QuoinDialog {
     /// An IME preedit is active in the dialog window: Escape belongs to the
     /// IME. Tracked from `Ime` messages; cleared when the surface unmaps.
     pub preedit: bool,
+    /// The size hosts map and notices report: the authored size fitted to
+    /// the current zone ([`fit_dialog_size`]); `None` without a seat.
+    pub fitted: Option<Vec2>,
     /// `window` also serves other shell surfaces (the embedded host's one
     /// output window). Keys and IME events then count for the dialog only
     /// while the input focus is inside the dialog root, so Escape in a panel
@@ -111,17 +140,22 @@ impl QuoinDialog {
         self.visible && self.seat.is_some() && self.root.is_some() && self.content.is_some()
     }
 
-    /// Logical surface size a host maps: the authored size.
+    /// Logical surface size a host maps: the fitted size once computed,
+    /// else the authored size.
     pub fn size(&self) -> Option<Vec2> {
-        self.seat.as_ref().map(|seat| Vec2::new(seat.w, seat.h))
+        self.seat
+            .as_ref()
+            .map(|seat| self.fitted.unwrap_or(Vec2::new(seat.w, seat.h)))
     }
 
+    /// `w`/`h` are the actual (fitted) size, not the authored one.
     pub fn notice(&self) -> Option<DialogNotice> {
+        let size = self.size()?;
         self.seat.as_ref().map(|seat| DialogNotice {
             scene: seat.scene.clone(),
             visible: self.visible,
-            w: seat.w,
-            h: seat.h,
+            w: size.x,
+            h: size.y,
             output: seat.output.as_str().to_owned(),
         })
     }
@@ -158,8 +192,26 @@ pub(crate) fn install(app: &mut App) {
         )
         .add_systems(
             Update,
+            fit_dialog
+                .after(crate::runtime::ShellRuntimeSet::Model)
+                .before(crate::runtime::ShellRuntimeSet::Presentation),
+        )
+        .add_systems(
+            Update,
             present_dialog.in_set(crate::runtime::ShellRuntimeSet::Presentation),
         );
+}
+
+/// Re-fit after every model update: an output change or a docked panel's
+/// exclusive zone moving changes the zone, and hosts remap at the new size.
+fn fit_dialog(frame: Res<crate::runtime::ShellFrameState>, mut dialog: ResMut<QuoinDialog>) {
+    let fitted = dialog.seat.as_ref().map(|seat| {
+        let canvas = crate::host::panel_layout(&frame.0).canvas;
+        fit_dialog_size(Vec2::new(seat.w, seat.h), Vec2::new(canvas.width, canvas.height))
+    });
+    if dialog.fitted != fitted {
+        dialog.fitted = fitted;
+    }
 }
 
 /// Spawn the chrome root once; later calls return the same root.
@@ -434,6 +486,39 @@ mod tests {
         dialog.set_seat(None);
         assert!(!dialog.visible);
         assert_eq!(dialog.notice(), None);
+    }
+
+    /// Live nested gate (1105×560 output): the 880×620 editor must fit.
+    #[test]
+    fn a_dialog_fits_the_zone_with_a_margin_and_keeps_its_size_when_it_fits() {
+        let declared = Vec2::new(880.0, 620.0);
+        assert_eq!(fit_dialog_size(declared, Vec2::new(1105.0, 560.0)), Vec2::new(880.0, 512.0));
+        assert_eq!(fit_dialog_size(declared, Vec2::new(1920.0, 1080.0)), declared);
+        assert_eq!(fit_dialog_size(declared, Vec2::new(928.0, 668.0)), declared, "exactly fits");
+        assert_eq!(fit_dialog_size(declared, Vec2::new(927.0, 667.0)), Vec2::new(879.0, 619.0));
+        assert_eq!(
+            fit_dialog_size(declared, Vec2::new(300.0, 200.0)),
+            Vec2::new(252.0, DIALOG_MIN_PX),
+            "never below the minimum"
+        );
+    }
+
+    #[test]
+    fn the_fitted_size_is_what_notices_report() {
+        let mut app = app();
+        let mut wide = seat("editor", "scenes");
+        wide.w = 980.0;
+        app.world_mut().resource_mut::<QuoinDialog>().set_seat(Some(wide));
+        app.update();
+        let dialog = app.world().resource::<QuoinDialog>();
+        // The 1000×800 test output leaves 952 px of width after the margins.
+        assert_eq!(dialog.fitted, Some(Vec2::new(952.0, 620.0)));
+        assert_eq!(dialog.size(), Some(Vec2::new(952.0, 620.0)));
+        let notice = dialog.notice().unwrap();
+        assert_eq!((notice.w, notice.h), (952.0, 620.0));
+        app.world_mut().resource_mut::<QuoinDialog>().set_seat(None);
+        app.update();
+        assert_eq!(app.world().resource::<QuoinDialog>().fitted, None);
     }
 
     fn app() -> App {

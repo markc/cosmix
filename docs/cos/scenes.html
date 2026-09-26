@@ -547,6 +547,13 @@ Refusals are <code>NOT_FOUND</code> (no such scene) and <code>NOT_DIALOG</code> 
 px. The surface rect is in output coordinates and node rects are relative to
 the surface. While unmapped it reports <code>visible:false</code> and empty <code>nodes</code>. It
 is how gates and agents click a node: take the centre of its rect.
+A dialog is fitted to the zone it centres in (the output less Quoin's docked
+panels' exclusive zones): each authored side is kept when it fits, else it
+becomes the zone less 24 px on both sides, never below 240 px, i.e.
+<code>w = max(240, min(declared_w, zone_w − 48))</code> and likewise for <code>h</code>. It re-fits
+on every output or exclusive-zone change. <code>props.dialog.w/h</code>,
+<code>panel.changed</code>'s <code>dialog</code> and this verb's <code>surface.w/h</code> all report that
+actual size; the scene's content reflows into it (its lists scroll).
 A dialog's surface <code>x</code>/<code>y</code> on the layer host is Quoin's placement estimate
 (the output centred within its own docked panels' exclusive zones); comp
 places the pixels, so another client's exclusive zone can move the real
