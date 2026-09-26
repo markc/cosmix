@@ -1298,35 +1298,42 @@ async fn serve_bus_fs(
     service: &str,
     blob_service: &str,
 ) {
-    let Some(mut rx) = client.incoming_async().await else {
+    let Some(rx) = client.incoming_async().await else {
         return;
     };
-    let slots = Arc::new(tokio::sync::Semaphore::new(64));
-    while let Some(cmd) = rx.recv().await {
+    run_fs_commands(rx, |cmd| {
         let client = client.clone();
         let fs = fs.clone();
         let peers = peers.clone();
         let service = service.to_string();
         let blob_service = blob_service.to_string();
-        spawn_fs_task(slots.clone(), async move {
+        async move {
             let (from, command, id) = (cmd.from.clone(), cmd.command.clone(), cmd.id.clone());
             let (rc, body) = dispatch_fs(cmd, fs, peers, &service, &blob_service, &client).await;
             let _ = client.respond_parts(&from, &command, id.as_deref(), rc, &body).await;
-        }).await;
-    }
+        }
+    }).await;
 }
 
-/// Admission waits rather than rejecting or creating an unbounded task queue.
-async fn spawn_fs_task<F>(slots: Arc<tokio::sync::Semaphore>, work: F) -> tokio::task::JoinHandle<F::Output>
+/// The production receive/dispatch/respond loop. Admission waits rather than
+/// rejecting or creating an unbounded task queue; each task owns its response.
+async fn run_fs_commands<D, F>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<IncomingCommand>,
+    mut dispatch_and_respond: D,
+)
 where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
+    D: FnMut(IncomingCommand) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let permit = slots.acquire_owned().await.expect("fs semaphore is never closed");
-    tokio::spawn(async move {
-        let _permit = permit;
-        work.await
-    })
+    let slots = Arc::new(tokio::sync::Semaphore::new(64));
+    while let Some(cmd) = rx.recv().await {
+        let permit = slots.clone().acquire_owned().await.expect("fs semaphore is never closed");
+        let work = dispatch_and_respond(cmd);
+        tokio::spawn(async move {
+            let _permit = permit;
+            work.await;
+        });
+    }
 }
 
 /// fs-mode dispatch: the shared delegation gate, then the (blocking) fs op off the
@@ -2333,25 +2340,38 @@ mod tests {
     async fn slow_fs_dispatch_does_not_block_places() {
         let (fs, dir) = fs_layer(true);
         let fs = Arc::new(fs);
-        let slots = Arc::new(tokio::sync::Semaphore::new(64));
         let (started_tx, started_rx) = oneshot::channel();
-        let slow_fs = fs.clone();
-        let slow = spawn_fs_task(slots.clone(), async move {
-            tokio::task::spawn_blocking(move || {
-                started_tx.send(()).unwrap();
-                std::thread::sleep(Duration::from_secs(2));
-                fs_verb(&slow_fs, "places", &json!({}))
-            }).await.unwrap()
-        }).await;
+        let mut started_tx = Some(started_tx);
+        let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, mut replies_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_task = tokio::spawn(run_fs_commands(rx, move |command| {
+            let fs = fs.clone();
+            let replies = replies.clone();
+            let started = if command.command == "fs.slow" { started_tx.take() } else { None };
+            async move {
+                let name = command.command.clone();
+                let (rc, _) = if let Some(started) = started {
+                    tokio::task::spawn_blocking(move || {
+                        started.send(()).unwrap();
+                        std::thread::sleep(Duration::from_secs(2));
+                        fs_verb(&fs, "places", &json!({}))
+                    }).await.unwrap()
+                } else {
+                    dispatch_fs_with_bind(command, fs, Arc::new(vec![]),
+                        "filesd-fs", async { panic!("places must not resolve the lane") }).await
+                };
+                replies.send((name, rc)).unwrap();
+            }
+        }));
+        commands.send(cmd("fs.slow", json!({}))).unwrap();
         started_rx.await.unwrap(); // a handshake, never a scheduling sleep
-        let fast = spawn_fs_task(slots, async move {
-            dispatch_fs_with_bind(cmd("fs.places", json!({})), fs, Arc::new(vec![]),
-                "filesd-fs", async { panic!("places must not resolve the lane") }).await
-        }).await;
-        let (rc, _) = tokio::time::timeout(Duration::from_millis(500), fast)
+        commands.send(cmd("fs.places", json!({}))).unwrap();
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies_rx.recv())
             .await.expect("places queued behind a slow dispatch").unwrap();
-        assert_eq!(rc, 0);
-        assert_eq!(slow.await.unwrap().0, 0);
+        assert_eq!(reply, ("fs.places".to_string(), 0));
+        assert_eq!(replies_rx.recv().await.unwrap(), ("fs.slow".to_string(), 0));
+        drop(commands);
+        loop_task.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
