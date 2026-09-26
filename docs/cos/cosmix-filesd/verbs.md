@@ -208,7 +208,7 @@ step and refuse a destination created during the download. Unsupported
 rename flags fall back to link/unlink (a crash between those steps can leave
 two names). Where links are unsupported, the last tier is best-effort
 check-then-rename and cannot exclude a concurrent target creation. New files
-are mode 0600 on Unix. Ownership is not
+use mode 0666 filtered by the process umask, like `fs.write`. Ownership is not
 preserved. Staging is removed on errors; the old target survives failed reads
 or verification. Directory fsync is best-effort after publication.
 

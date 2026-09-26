@@ -14,7 +14,7 @@ use crate::error::{FilesError, Result};
 /// Stream, verify and publish a file without buffering the body in memory.
 /// The parent must already exist. Failed reads, length/hash checks and local IO
 /// leave the old target intact and remove staging. Existing mode bits survive;
-/// new files are private (0600 on Unix). Ownership is not preserved.
+/// new files use 0666 filtered by the umask. Ownership is not preserved.
 /// With `overwrite=false`, Linux uses renameat2(RENAME_NOREPLACE), falling back
 /// to link/unlink, then best-effort check/rename on filesystems without links.
 /// Overwrites use rename, as `write_atomic` does.
@@ -33,7 +33,7 @@ pub fn land_verified(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o666);
     }
     let mut file = options.open(&tmp)?;
     // Arm only after create_new succeeds: never unlink someone else's entry.
@@ -335,6 +335,20 @@ mod tests {
         let dir = scratch_dir();
         assert!(land_verified(&dir.join("absent/blob"), &b"x"[..], 1, &hash(b"x"), false).is_err());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_new_file_matches_write_atomic_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir();
+        let ordinary = dir.join("ordinary");
+        let blob = dir.join("blob");
+        write_atomic(&ordinary, b"x").unwrap();
+        land_verified(&blob, &b"x"[..], 1, &hash(b"x"), false).unwrap();
+        assert_eq!(fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&ordinary).unwrap().permissions().mode() & 0o777);
         fs::remove_dir_all(dir).unwrap();
     }
 
