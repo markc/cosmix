@@ -385,6 +385,43 @@ impl FsLayer {
 
     // ── reads ────────────────────────────────────────────────────────────────
 
+    /// Open a blob source under the read jail, always requiring a plain file.
+    /// Returns the open stream, default name and the same MIME as `read_blob`.
+    pub fn open_blob(&self, place_rel: &str) -> Result<(fs::File, String, &'static str)> {
+        let (place, full) = self.resolve(place_rel, false)?;
+        let rel = place_rel.split_once('/').map(|(_, rel)| rel).unwrap_or("");
+        if rel.is_empty() {
+            return Err(FilesError::Denied("refusing to read the place root as a blob".into()));
+        }
+        if place.policied()
+            && !matches!(policy_access(&place.allow, &place.deny, rel), Access::Node)
+        {
+            return Err(FilesError::Denied(format!(
+                "path is a policy prefix, not a blob source: {place_rel}"
+            )));
+        }
+        require_plain_file(&full, place_rel)?;
+        let file = fs::File::open(&full)?;
+        Ok((file, file_name(place_rel).to_string(), mime_for(file_name(place_rel))))
+    }
+
+    /// Vet a materialisation target before fetching bytes. Like `write`, creates
+    /// missing parents; unlike unrestricted `write`, refuses symlink/special
+    /// targets. Call again after connecting to the lane to refresh the jail check.
+    pub fn blob_target(&self, place_rel: &str, overwrite: bool) -> Result<PathBuf> {
+        let (_place, full) = self.resolve(place_rel, true)?;
+        match fs::symlink_metadata(&full) {
+            Ok(_) if !overwrite => return Err(FilesError::Exists(format!(
+                "already exists (overwrite=false): {place_rel}"
+            ))),
+            Ok(_) => require_plain_file(&full, place_rel)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        ensure_parent(&full)?;
+        Ok(full)
+    }
+
     /// The Places sidebar source.
     pub fn places(&self) -> Value {
         let arr: Vec<Value> = self
