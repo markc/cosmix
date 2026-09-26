@@ -494,11 +494,17 @@ struct BrokerInner {
 
 /// The shared subscription broker.
 ///
-/// Lock order: `inner` before `topics`, whenever both are held. tokio's
-/// `RwLock` is fair, so a queued writer blocks later readers: a reader that
-/// holds `topics` while waiting for `inner` deadlocks against `remove_peer`
-/// (holds `inner.read`, wants `topics.write`) as soon as any `inner.write`
-/// queues between them — which a peer disconnect storm does (2026-09-26).
+/// Lock order: `inner` before `topics`, whenever both are held — and only
+/// through [`Self::read_both`] / [`Self::read_inner_write_topics`], never by
+/// nesting the two fields by hand. tokio's `RwLock` is fair, so a queued
+/// writer blocks later readers: a reader holding `topics` while waiting for
+/// `inner` deadlocks against `remove_peer` (holds `inner.read`, wants
+/// `topics.write`) as soon as any `inner.write` queues between them, which a
+/// peer disconnect storm does (2026-09-26).
+///
+/// Crate-wide order around it: registry → native `Sessions`; ChangeBus
+/// mutexes → broker locks; broker locks → `Sessions`. Nothing may hold
+/// `Sessions` or the registry across a broker call.
 pub struct SubscriptionBroker {
     native_sessions:
         std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<crate::noded::session::Sessions>>>,
@@ -1270,9 +1276,32 @@ impl SubscriptionBroker {
     /// Aggregate stats for SPEC 07 noded.props.* surface: (active topic
     /// count, total retained snapshot bytes). Active = has subscribers
     /// or has retained snapshot.
-    pub async fn props_summary(&self) -> (u64, u64) {
+    /// Both locks for reading, in the one legal order (see the struct doc).
+    async fn read_both(
+        &self,
+    ) -> (
+        tokio::sync::RwLockReadGuard<'_, BrokerInner>,
+        tokio::sync::RwLockReadGuard<'_, HashMap<String, TopicState>>,
+    ) {
         let inner = self.inner.read().await;
         let topics = self.topics.read().await;
+        (inner, topics)
+    }
+
+    /// `inner` to read and `topics` to write, in the one legal order.
+    async fn read_inner_write_topics(
+        &self,
+    ) -> (
+        tokio::sync::RwLockReadGuard<'_, BrokerInner>,
+        tokio::sync::RwLockWriteGuard<'_, HashMap<String, TopicState>>,
+    ) {
+        let inner = self.inner.read().await;
+        let topics = self.topics.write().await;
+        (inner, topics)
+    }
+
+    pub async fn props_summary(&self) -> (u64, u64) {
+        let (inner, topics) = self.read_both().await;
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for sub in inner.subscriptions.values() {
             if let SubKind::Topic { name } = &sub.kind {
@@ -1300,8 +1329,7 @@ impl SubscriptionBroker {
     }
 
     pub async fn list(&self, prefix: Option<&str>) -> Vec<TopicInfo> {
-        let inner = self.inner.read().await;
-        let topics = self.topics.read().await;
+        let (inner, topics) = self.read_both().await;
 
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for sub in inner.subscriptions.values() {
@@ -1593,8 +1621,7 @@ impl SubscriptionBroker {
         // the TopicState entry if it has no snapshot left to keep alive.
         let mut notifications = Vec::new();
         {
-            let inner = self.inner.read().await;
-            let mut topics = self.topics.write().await;
+            let (inner, mut topics) = self.read_inner_write_topics().await;
             let mut dead: Vec<String> = Vec::new();
             for topic_name in &affected_topics {
                 let count = inner
@@ -1792,8 +1819,7 @@ impl SubscriptionBroker {
         if topic_names.is_empty() {
             return Vec::new();
         }
-        let inner = self.inner.read().await;
-        let topics = self.topics.read().await;
+        let (inner, topics) = self.read_both().await;
         let mut out = Vec::new();
         for topic_name in topic_names {
             let live_count = inner
@@ -1906,9 +1932,9 @@ mod tests {
             };
             queue(&summary).await;
             // remove_peer step 3, second half: topics.write while still
-            // holding inner.read. With the inverted order the reader holds
-            // topics.read here and this never completes.
-            let topics = tokio::time::timeout(Duration::from_secs(2), broker.topics.write()).await;
+            // holding inner.read. With the inverted order the queued reader
+            // holds topics.read here, so this would wait forever.
+            let topics = broker.topics.try_write();
             assert!(topics.is_ok(), "{reader} holds topics while waiting for inner: deadlock");
             drop(topics);
             drop(held);
