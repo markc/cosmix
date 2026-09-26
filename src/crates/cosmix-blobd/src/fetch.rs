@@ -30,7 +30,7 @@
 //! and peer roster sit behind small traits so tests inject them and
 //! production wires noded; no unit test touches the Bus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -182,19 +182,93 @@ pub trait EventSink: Send + Sync {
 /// The broker connection of the moment, shared by the production
 /// resolver, peer source and event sink: blobd's own `NodedClient`
 /// exists per connection (it reconnects), while the fetch machinery
-/// lives across reconnects. `None` between connections — a fetch
-/// completing then drops its events with a log line (the `blob.stat`
-/// transition still happened), and resolution falls back.
+/// lives across reconnects. `None` between connections — resolution
+/// falls back, and events published then are buffered (bounded, F7)
+/// for replay on the next connection.
 #[derive(Clone, Default)]
-pub struct ClientSlot(Arc<RwLock<Option<Arc<NodedClient>>>>);
+pub struct ClientSlot {
+    client: Arc<RwLock<Option<Arc<NodedClient>>>>,
+    pending: Arc<PendingEvents>,
+}
 
 impl ClientSlot {
     pub fn set(&self, client: Option<Arc<NodedClient>>) {
-        *self.0.write().unwrap() = client;
+        match client {
+            Some(client) => {
+                *self.client.write().unwrap() = Some(Arc::clone(&client));
+                // F7: replay what was published while disconnected,
+                // oldest first, before anything new publishes.
+                let backlog = self.pending.drain();
+                if !backlog.is_empty() {
+                    tokio::spawn(async move {
+                        for event in &backlog {
+                            publish_event_via(&client, event).await;
+                        }
+                    });
+                }
+            }
+            None => *self.client.write().unwrap() = None,
+        }
     }
 
     fn get(&self) -> Option<Arc<NodedClient>> {
-        self.0.read().unwrap().clone()
+        self.client.read().unwrap().clone()
+    }
+
+    fn buffer(&self, event: BusEvent) {
+        self.pending.push(event);
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    fn drain_pending_for_test(&self) -> Vec<BusEvent> {
+        self.pending.drain()
+    }
+}
+
+/// Events published while no broker connection exists, held for
+/// replay on the next connection (F7). Bounded at 256 — a long
+/// partition must not grow an unbounded queue — and beyond the bound
+/// the OLDEST drop with a log line (recovery for a missed
+/// `blob.fetched` is `blob.stat` present + the waiter's timeout).
+#[derive(Default)]
+pub(crate) struct PendingEvents {
+    queue: Mutex<VecDeque<BusEvent>>,
+}
+
+impl PendingEvents {
+    const CAP: usize = 256;
+
+    pub(crate) fn push(&self, event: BusEvent) {
+        let mut queue = self.queue.lock().unwrap();
+        let dropped = if queue.len() >= Self::CAP {
+            queue.pop_front()
+        } else {
+            None
+        };
+        queue.push_back(event);
+        drop(queue);
+        if let Some(dropped) = dropped {
+            eprintln!(
+                "cosmix-blobd: fetch event backlog full ({}); dropping the oldest {} \
+                 (recovery: blob.stat present + the waiter's timeout)",
+                Self::CAP,
+                dropped.topic
+            );
+        }
+    }
+
+    pub(crate) fn drain(&self) -> Vec<BusEvent> {
+        self.queue.lock().unwrap().drain(..).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.queue.lock().unwrap().len()
     }
 }
 
@@ -321,8 +395,9 @@ impl PeerSource for NodedPeers {
 }
 
 /// Publishes completion events `retain: false` through the live
-/// connection; between connections the event is dropped with a log
-/// line (best-effort, exactly like the citizen's own publish path).
+/// connection; between connections the event is buffered (bounded,
+/// see [`PendingEvents`]) and replayed on reconnect — best-effort
+/// with a log line only if the backlog overflows (F7).
 pub struct BusSink {
     client: ClientSlot,
 }
@@ -337,36 +412,41 @@ impl EventSink for BusSink {
     fn publish<'a>(&'a self, event: BusEvent) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let Some(client) = self.client.get() else {
-                eprintln!(
-                    "cosmix-blobd: fetch event on {} dropped (no broker connection)",
-                    event.topic
-                );
+                self.client.buffer(event);
                 return;
             };
-            let headers = std::collections::BTreeMap::from([
-                ("name".to_string(), event.topic.to_string()),
-                // noded's topic.publish defaults retain: true; these
-                // events must never replay to a late subscriber.
-                ("retain".to_string(), "false".to_string()),
-            ]);
-            let wire = event.message.to_wire();
-            match tokio::time::timeout(
-                PUBLISH_TIMEOUT,
-                client.send_with_headers("noded", "topic.publish", &headers, &wire),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!(
-                    "cosmix-blobd: fetch publish on {} failed (continuing): {error}",
-                    event.topic
-                ),
-                Err(_) => eprintln!(
-                    "cosmix-blobd: fetch publish on {} timed out (continuing)",
-                    event.topic
-                ),
-            }
+            publish_event_via(&client, &event).await
         })
+    }
+}
+
+/// One `retain: false` `topic.publish` through a live connection —
+/// the shared home of the publication both the live sink and the
+/// reconnect replay use. Never fails the caller: a lost broker logs
+/// and continues (the `blob.stat` transition still happened).
+async fn publish_event_via(client: &Arc<NodedClient>, event: &BusEvent) {
+    let headers = std::collections::BTreeMap::from([
+        ("name".to_string(), event.topic.to_string()),
+        // noded's topic.publish defaults retain: true; these
+        // events must never replay to a late subscriber.
+        ("retain".to_string(), "false".to_string()),
+    ]);
+    let wire = event.message.to_wire();
+    match tokio::time::timeout(
+        PUBLISH_TIMEOUT,
+        client.send_with_headers("noded", "topic.publish", &headers, &wire),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!(
+            "cosmix-blobd: fetch publish on {} failed (continuing): {error}",
+            event.topic
+        ),
+        Err(_) => eprintln!(
+            "cosmix-blobd: fetch publish on {} timed out (continuing)",
+            event.topic
+        ),
     }
 }
 
@@ -1867,6 +1947,53 @@ mod tests {
         let reply: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(reply["present"], true);
         assert_eq!(store_b.stat(&hash).unwrap().pins, vec!["maild".to_string()]);
+    }
+
+    // ---- F7: events published while disconnected wait for reconnect ----
+
+    #[test]
+    fn pending_events_hold_order_and_bound() {
+        let pending = PendingEvents::default();
+        for i in 0..300 {
+            pending.push(domain_event(TOPIC_FETCHED, json!({"i": i})));
+        }
+        assert_eq!(pending.len(), PendingEvents::CAP, "the backlog is bounded");
+        let drained = pending.drain();
+        // The oldest 44 dropped; replay order is still publication order.
+        assert_eq!(
+            drained.first().and_then(|e| {
+                serde_json::from_str::<Value>(&e.message.body).ok()
+            }),
+            Some(json!({"i": 44}))
+        );
+        assert_eq!(
+            drained.last().and_then(|e| {
+                serde_json::from_str::<Value>(&e.message.body).ok()
+            }),
+            Some(json!({"i": 299}))
+        );
+        assert!(pending.drain().is_empty(), "drain empties the backlog");
+    }
+
+    #[tokio::test]
+    async fn bus_sink_buffers_while_disconnected() {
+        // With no connection the event is held for the next
+        // set(Some), not dropped; the drain the reconnect performs
+        // (ClientSlot::set's replay) picks it up. Publishing it needs
+        // a live broker, which a unit test never touches — the live
+        // delivery is the hub gate's arms 1/2/3/9.
+        let slot = ClientSlot::default();
+        let sink = BusSink::new(slot.clone());
+        sink.publish(domain_event(TOPIC_FETCHED, json!({"i": 1}))).await;
+        sink.publish(domain_event(TOPIC_FETCHED, json!({"i": 2}))).await;
+        assert_eq!(slot.pending_len(), 2);
+        let backlog = slot.drain_pending_for_test();
+        assert_eq!(backlog.len(), 2);
+        assert_eq!(backlog[0].topic, TOPIC_FETCHED);
+        assert_eq!(
+            serde_json::from_str::<Value>(&backlog[0].message.body).unwrap(),
+            json!({"i": 1})
+        );
     }
 
     // ---- Quota: refused from Content-Length before the first byte ----

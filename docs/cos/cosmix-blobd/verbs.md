@@ -135,4 +135,6 @@ Completion is the `blob.fetched` event (`retain: false`, so a late subscriber se
 
 `outcome` ∈ `ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io` (`origin_used` is null and `error` carries the reason on every non-`ok` outcome). Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a `blob.has` fan-out over `noded.peers`; `verify_failed` is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's [Fetching] section.
 
+`blob.fetched` is **best-effort across a broker reconnect**: events published while blobd has no broker connection are buffered (bounded, 256 — the oldest drop beyond it) and replayed on the next connection, oldest first. Recovery when an event may have been missed: `blob.stat` showing `present:true`, and `blob_fetch_wait`'s own timeout — never polling, never a retained event.
+
 [Fetching]: ../cosmix-blobd/#fetching
