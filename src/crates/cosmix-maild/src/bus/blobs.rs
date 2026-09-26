@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs::File, io::Read, sync::Arc};
 
 const MAX_ROWS: usize = 500;
-// End a page after this much declared source data, always allowing one row.
+// Bound declared source data, always allowing the first row even if oversized.
 // A single legacy blob is streamed, never accumulated in memory.
 const PAGE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -141,7 +141,7 @@ fn page(
     let mut bytes = 0u64;
     let mut cursor = request.cursor;
     for (index, row) in rows.iter().take(limit).enumerate() {
-        if index > 0 && bytes >= PAGE_BYTES {
+        if index > 0 && row.size.max(0) as u64 > PAGE_BYTES.saturating_sub(bytes) {
             break;
         }
         let counts = accounts.entry(row.account).or_default();

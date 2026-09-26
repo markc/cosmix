@@ -24,6 +24,27 @@ struct Fixture {
 
 struct LocalLane(Option<String>);
 #[tokio::test]
+async fn migration_page_budget_checks_next_row_and_allows_one_oversized_row() {
+    let f = Fixture::new().await;
+    let state = f.state();
+    for bytes in [b"first".as_slice(), b"second"] {
+        db::blob::store(&state.db.conn, &state.db.blob_dir, 1, bytes).await.unwrap();
+    }
+    for declared in [40_i64 * 1024 * 1024, 80_i64 * 1024 * 1024] {
+        state.db.conn.lock().unwrap().execute("UPDATE blobs SET size=?1", [declared]).unwrap();
+        // Files intentionally differ: byte admission still bounds failed rows.
+        let (rc, first) = migrate(&f, json!({})).await;
+        assert_eq!(rc, 5);
+        assert_eq!(first["accounts"]["1"]["corrupt"], 1);
+        assert_eq!(first["done"], false);
+        let (rc, last) = migrate(&f, json!({"cursor": first["next"]})).await;
+        assert_eq!(rc, 5);
+        assert_eq!(last["accounts"]["1"]["corrupt"], 1);
+        assert_eq!(last["done"], true);
+    }
+}
+
+#[tokio::test]
 async fn concurrent_apply_pages_refuse_and_cancelled_page_keeps_maintenance_slot() {
     let f = Fixture::new().await;
     let db = f.state().db.clone();

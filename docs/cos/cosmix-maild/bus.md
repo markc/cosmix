@@ -99,7 +99,7 @@ cancellation or reconnect, and through the bounded response send.
 
 `maild.blob.migrate {apply?: false, account_id?, cursor?: 0, limit?: 500}`
 runs on the daemon's own store handle. It accepts at most 500 rows per call;
-pages also end after 64 MiB of declared source data (one large row can exceed
+pages stop before a subsequent row would exceed 64 MiB of declared source data (only the first row can exceed
 that budget). Copy and verification stream through a fixed-size buffer.
 
 The default is read-only inspection: no set provisioning, CAS writes, aliases
