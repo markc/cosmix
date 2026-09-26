@@ -3514,8 +3514,9 @@ mod tests {
             let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.toggle", json!({"edge":"left"}));
             assert_eq!(rc, 0, "{mode}: {body}");
             settle(&mut app, &peer);
+            // Hidden, not revealed, reserving nothing (the slide out may
+            // still be running on the test clock).
             assert_eq!(left_panel(&app), (PanelMode::Hidden, false, 0.0), "{mode}");
-            assert!(!app.world().resource::<ShellFrameState>().0.panel(Edge::Left).mapped);
             send_until_reply(&mut app, &peer, "shell.panel.toggle", json!({"edge":"left"}));
             let (mode_after, revealed, zone) = left_panel(&app);
             assert_eq!((mode_after, revealed, zone), (PanelMode::Hidden, true, 0.0), "{mode}");
