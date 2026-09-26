@@ -77,6 +77,10 @@ const FANOUT_CONCURRENCY: usize = 4;
 const BUS_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 /// Timeout around one event publication (the citizen's own bound).
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Backoff before the single record_fetch retry in the completion
+/// path (F2): enough for a transient db hiccup to clear, short enough
+/// not to hold the fetch task.
+const PIN_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -864,6 +868,12 @@ impl Inner {
     /// Ingest on success, counters, and the completion events: one
     /// `blob.pinned` per newly pinned owner, the props diff, then
     /// `blob.fetched` last — it is the completion signal.
+    ///
+    /// The pin is the completion's contract: `ok` is never published
+    /// without it (F2). A failed `record_fetch` is retried once after
+    /// a short backoff (a transient db hiccup); a second failure turns
+    /// the attempt into outcome `io` with the error, so every joined
+    /// caller learns the truth instead of trusting an unpinned blob.
     async fn complete(self: &Arc<Self>, hash: BlobHash, mut attempt: Attempt, owners: Vec<String>) {
         let id = reference::blob_id(&hash);
         let mut events = Vec::new();
@@ -873,38 +883,71 @@ impl Inner {
             // already dropped with the attempt's failure.
             let reservation = attempt.reservation.take();
             let before = self.props_input();
-            let newly_pinned = self
-                .store
-                .record_fetch(
-                    &hash,
-                    attempt.size.unwrap_or(0),
-                    attempt
-                        .mime
-                        .as_deref()
-                        .unwrap_or("application/octet-stream"),
-                    attempt.origin_used.as_deref().unwrap_or("unknown"),
-                    &owners,
-                )
-                .unwrap_or_default();
-            drop(reservation);
-            for owner in &newly_pinned {
-                events.push(domain_event(
-                    TOPIC_PINNED,
-                    json!({"blob": id, "owner": owner}),
-                ));
+            let pin_result = match self.store.record_fetch(
+                &hash,
+                attempt.size.unwrap_or(0),
+                attempt
+                    .mime
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
+                attempt.origin_used.as_deref().unwrap_or("unknown"),
+                &owners,
+            ) {
+                Ok(pinned) => Ok(pinned),
+                Err(first) => {
+                    eprintln!(
+                        "cosmix-blobd: record_fetch for {id} failed ({first}); retrying once"
+                    );
+                    tokio::time::sleep(PIN_RETRY_DELAY).await;
+                    self.store
+                        .record_fetch(
+                            &hash,
+                            attempt.size.unwrap_or(0),
+                            attempt
+                                .mime
+                                .as_deref()
+                                .unwrap_or("application/octet-stream"),
+                            attempt.origin_used.as_deref().unwrap_or("unknown"),
+                            &owners,
+                        )
+                        .map_err(|second| format!("{first}; retry: {second}"))
+                }
+            };
+            match pin_result {
+                Ok(newly_pinned) => {
+                    for owner in &newly_pinned {
+                        events.push(domain_event(
+                            TOPIC_PINNED,
+                            json!({"blob": id, "owner": owner}),
+                        ));
+                    }
+                    self.completed.fetch_add(1, Ordering::Relaxed);
+                    let after = self.props_input();
+                    events.extend(props_diff_events(&before, &after));
+                    events.push(domain_event(
+                        TOPIC_FETCHED,
+                        json!({
+                            "blob": id,
+                            "outcome": attempt.outcome.as_str(),
+                            "origin_used": attempt.origin_used,
+                            "size": attempt.size,
+                        }),
+                    ));
+                }
+                Err(error) => {
+                    self.failed.fetch_add(1, Ordering::Relaxed);
+                    events.push(domain_event(
+                        TOPIC_FETCHED,
+                        json!({
+                            "blob": id,
+                            "outcome": FetchOutcome::Io.as_str(),
+                            "origin_used": Value::Null,
+                            "error": format!("pin failed after the download landed: {error}"),
+                        }),
+                    ));
+                }
             }
-            self.completed.fetch_add(1, Ordering::Relaxed);
-            let after = self.props_input();
-            events.extend(props_diff_events(&before, &after));
-            events.push(domain_event(
-                TOPIC_FETCHED,
-                json!({
-                    "blob": id,
-                    "outcome": attempt.outcome.as_str(),
-                    "origin_used": attempt.origin_used,
-                    "size": attempt.size,
-                }),
-            ));
+            drop(reservation);
         } else {
             self.failed.fetch_add(1, Ordering::Relaxed);
             events.push(domain_event(
@@ -1761,6 +1804,69 @@ mod tests {
         assert!(!blob::exists(&store_b.blobs_root(), &hostile_hash).unwrap());
         assert!(tmp_is_empty(&store_b));
         assert_eq!(store_b.quota_report(None).unwrap().total.used, 0);
+    }
+
+    // ---- F2: a failed pin publishes io, never a pinless ok ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_record_fetch_publishes_io_never_a_pinless_ok() {
+        // The download lands and then record_fetch fails every time:
+        // the completion must be outcome io — the old code swallowed
+        // the failure (.unwrap_or_default()) and published `ok` for a
+        // blob no pin protected, so the first blob.gc swept it.
+        let (dir_a, store_a, addr_a, _lane_a) = counted_lane(options_for("A")).await;
+        let bytes = pseudo_random(64 * 1024, 0x71A1);
+        let src = dir_a.path().join("pinfail.bin");
+        std::fs::write(&src, &bytes).unwrap();
+        let outcome = store_a.put(&src, &PutOptions::new("filesd")).unwrap();
+        let hash = outcome.reference.hash;
+        let id = reference::blob_id(&hash);
+
+        let (_dir_b, store_b) = bare_store("B");
+        store_b.fail_record_fetch.store(true, Ordering::Relaxed);
+        let resolver = MapResolver::default().map("A", format!("http://{addr_a}"));
+        let (citizen, fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, ListPeers::default()).await;
+
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": id, "from": "A"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("blob.fetched fired");
+        assert_eq!(event["outcome"], "io");
+        assert!(event["error"].as_str().unwrap().contains("pin"));
+        assert_eq!(event["origin_used"], Value::Null);
+
+        // Never an ok, never a pinned event; the bytes sit unpinned
+        // (GC's grace covers them) and the counter landed on failed.
+        assert!(
+            sink.bodies(TOPIC_FETCHED)
+                .iter()
+                .all(|v| v["outcome"] != "ok")
+        );
+        assert!(sink.bodies(crate::citizen::TOPIC_PINNED).is_empty());
+        assert!(blob::exists(&store_b.blobs_root(), &hash).unwrap());
+        assert!(store_b.stat(&hash).unwrap().pins.is_empty());
+        let gauges = fetcher.gauges();
+        assert_eq!((gauges.in_flight, gauges.queued, gauges.completed, gauges.failed), (0, 0, 0, 1));
+
+        // Recovery: with the injection off, a re-fetch finds the bytes
+        // present and pins them — the reply is the completion.
+        store_b.fail_record_fetch.store(false, Ordering::Relaxed);
+        let (rc, body, _) = citizen.dispatch(&command("blob.fetch", "maild", json!({"blob": id})));
+        assert_eq!(rc, 0, "{body}");
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["present"], true);
+        assert_eq!(store_b.stat(&hash).unwrap().pins, vec!["maild".to_string()]);
     }
 
     // ---- Quota: refused from Content-Length before the first byte ----

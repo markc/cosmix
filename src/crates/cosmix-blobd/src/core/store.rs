@@ -19,7 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use cosmix_mds::Mds;
@@ -345,6 +345,10 @@ pub struct Store {
     options: StoreOptions,
     startup: StartupReport,
     generation: AtomicU64,
+    /// TEST ONLY (F2): when true, `record_fetch` fails — the fetch
+    /// completion must publish outcome io, never a pinless ok.
+    #[cfg(test)]
+    pub(crate) fail_record_fetch: AtomicBool,
 }
 
 impl Store {
@@ -395,6 +399,8 @@ impl Store {
             options,
             startup: StartupReport::default(),
             generation: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_record_fetch: AtomicBool::new(false),
         };
         store.startup_housekeeping()?;
         Ok(store)
@@ -644,6 +650,12 @@ impl Store {
         source_node: &str,
         owners: &[String],
     ) -> Result<Vec<String>> {
+        #[cfg(test)]
+        if self.fail_record_fetch.load(Ordering::Relaxed) {
+            return Err(StoreError::Db(
+                "injected record_fetch failure (test)".to_string(),
+            ));
+        }
         let mut db = self.db.lock().unwrap();
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
