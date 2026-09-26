@@ -272,8 +272,10 @@ loader's verdicts as source `scenes`.
 
 - **Request.** `path` is absolute. Each diagnostic has a 1-based `line`, an
   optional 1-based `col`, a `severity` of `error`, `warning` or `note`, a
-  `code` and a `message`. The limits are 500 diagnostics and a 64 KiB body;
-  anything else is refused `INVALID_ARGUMENT`.
+  `code` and a `message`. The limits are 500 diagnostics and a 64 KiB body.
+  A refusal is `INVALID_ARGUMENT` with a reason: `too_large`, `bad_source`
+  (not the pattern, or `lint`, which is ced's own), `bad_path` (not
+  absolute), `too_many` or `bad_digest` (not 64 lower-hex characters).
 - **Storage.** ced stores the set per `(path, source)`, keeping the most
   recent 64 paths. It applies the set, replacing only that source's
   diagnostics, to every tab showing `path`:
@@ -283,7 +285,8 @@ loader's verdicts as source `scenes`.
   - whenever a tab's `dirty` flag goes false (a save, or an undo back to the
     disk text).
 - **Digest.** `digest` is the lower-hex sha256 of the file bytes the
-  diagnostics describe. A tab whose text does not hash to it shows none of
+  diagnostics describe; ced compares it with the bytes the tab would save
+  (its text, with the BOM restored when the file has one). A tab whose text does not hash to it shows none of
   the set (`stale:true`), but the set stays stored for when the text matches
   again.
 - **Clearing.** An empty `diagnostics` list clears that source and drops the
@@ -292,6 +295,9 @@ loader's verdicts as source `scenes`.
 
 The Problems panel shows every source's rows as `source: code message`.
 `ced.problems {tab?}` returns the same rows.
+In-process scene lint reports lines only, so its rows have `col: null`.
+`ced --headless` answers both verbs; it runs no lint of its own, so its
+`ced.problems` holds only external sets.
 
 ## Files, configuration and theme
 

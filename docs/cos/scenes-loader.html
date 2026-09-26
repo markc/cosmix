@@ -722,6 +722,13 @@ mounted source; a broken reload keeps the last good tree.</p>
 <li>A host diagnostic (<code>context.upstream.diagnostics</code>) keeps its line.</li>
 <li>A behaviour check carries <code>mix lint --json</code> lines and columns.</li>
 </ul>
+<p>A refusal of the file itself (candidate, behaviour check, load or remount)
+stands until a later reconcile of that scene succeeds: a good save, a
+<code>scenes.reload</code>, or a host-return remount. A model publish, a behaviour's
+<code>ready</code> and a crash restart never clear it, so a broken save stays visible
+while the last good tree keeps running. Runtime faults (a behaviour exit, a
+refused model patch) are reported beside it, and the row's <code>diagnostic</code> is
+the file's refusal when there is one.</p>
 <p><code>scenes.changed</code> carries the same inventory. Names of scenes with a behaviour
 must fit the Bus name rule: at most 25 characters and no <code>_</code>, so that
 <code>scene-&lt;name&gt;</code> is a legal service name. Install, fork and reconcile refuse

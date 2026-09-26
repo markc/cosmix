@@ -112,7 +112,7 @@ fn entry($name)
   return {name:$name, installed:true, enabled:false, mounted:false, revision:0,
     source:nil, model:nil, digest:"", attempted:"", behaviour_digest:"", meta_digest:"",
     generation:0, pid:nil, retiring:nil, status:"disabled", ready:false, crashes:0, started:0, restart_at:nil,
-    diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, kind:nil, pending:false, legacy_page:false,
+    diagnostic:nil, load_diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, kind:nil, pending:false, legacy_page:false,
     dir:nil, files:nil, digests:{}, shown:{}, check_problems:[]}
 end
 
@@ -180,6 +180,12 @@ fn editor_visible($s)
 end
 
 -- Loader, host and lint diagnostics as one row shape (plan D10).
+-- What went wrong last: the file's own refusal first (it stands until a good
+-- save or reload of the file clears it), else the runtime diagnostic.
+fn failure($e)
+  return $e.load_diagnostic ?? $e.diagnostic
+end
+
 fn digest_for($file, $files, $digests)
   for each $k in keys($files ?? {})
     if $files[$k] == $file then return ($digests ?? {})[$k] end
@@ -246,7 +252,7 @@ fn editor_record($s)
     visible:editor_visible($s), source:$e.copy, safe:$e.safe, fallback:$e.fallback,
     behaviour:$e.status, view:$e.view, scene:$e.scene, first_run:$e.first_run,
     request_seq:$e.request_seq, generation:$e.generation, kind:$e.kind, dir:$e.dir,
-    diagnostic:$e.diagnostic, problems:scene_problems($s, "editor", $e, $e.diagnostic, $e.diagnostics)}
+    diagnostic:failure($e), problems:scene_problems($s, "editor", $e, failure($e), $e.diagnostics)}
 end
 
 fn inventory($s)
@@ -254,11 +260,13 @@ fn inventory($s)
   for each $name in sort(keys($s.scenes))
     $e = $s.scenes[$name]
     if $e.reserved == true then continue end
-    $diagnostic = $e.diagnostic
+    $diagnostic = failure($e)
     $diagnostics = []
     for each $d in $e.diagnostics ?? []
       push($diagnostics, $d)
     end
+    -- A runtime fault behind a standing file refusal is still reported.
+    if $e.load_diagnostic != nil and $e.diagnostic != nil then push($diagnostics, $e.diagnostic) end
     for each $r in values($s.desired.recovery)
       if $r.name == $name and $r.phase == "failed" and $r.diagnostic != nil then
         $diagnostic = $diagnostic ?? $r.diagnostic
@@ -623,6 +631,10 @@ fn reconcile_one($s, $name, $force)
     return $s
   end
   if not $s.host_live then return $s end
+  -- A refusal before the mount commits is the file's verdict (load_diagnostic:
+  -- only this function sets or clears it, so a model publish, a ready or a
+  -- crash restart never hides it); one after it is the runtime's (diagnostic).
+  $phase = "load"
   try
     $s.scenes[$name].attempted = hash_sha256(bounded_read($dir .. "/scene.mix", 262144))
     $c = candidate($s, $name, $dir)
@@ -663,7 +675,9 @@ fn reconcile_one($s, $name, $force)
     $restart = $force or $e.behaviour_digest != $c.behaviour_digest
     $e.meta_digest = $c.meta_digest
     $e.diagnostic = nil
+    $e.load_diagnostic = nil
     $s.scenes[$name] = $e
+    $phase = "start"
     if $restart then
       $s = invalidate($s, $name)
       $s.scenes[$name].behaviour_digest = $c.behaviour_digest
@@ -671,9 +685,14 @@ fn reconcile_one($s, $name, $force)
     end
     if $s.scenes[$name].status != "crash_loop" then $s = start($s, $name) end
   catch $message, $error
-    $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details,
+    $d = {error_code:$error.code, message:$message, context:$error.details,
       file:($error.details ?? {}).file ?? ($dir .. "/scene.mix"), attempted_digest:$s.scenes[$name].attempted,
       last_good_revision:$s.scenes[$name].revision}
+    if $phase == "load" then
+      $s.scenes[$name].load_diagnostic = $d
+    else
+      $s.scenes[$name].diagnostic = $d
+    end
   end
   return $s
 end
@@ -1501,11 +1520,11 @@ fn editor_mount($s, $pick, $fallback)
   $s.scenes.editor.fallback = $fallback
   $s = reconcile_one($s, "editor", false)
   $e = $s.scenes.editor
-  if $e.diagnostic == nil and $e.mounted then
+  if failure($e) == nil and $e.mounted then
     if $pick.copy == "shipped" and len($e.check_problems) == 0 then $s.scenes.editor.check_problems = $pick.problems end
     return $s
   end
-  $failure = $e.diagnostic ?? {error_code:"SCENES_MOUNT", message:"the Scene Editor did not mount"}
+  $failure = failure($e) ?? {error_code:"SCENES_MOUNT", message:"the Scene Editor did not mount"}
   if $pick.copy == "user" then
     $fb = fallback_of($failure.error_code, $failure.message, $failure.context, $pick.dir .. "/scene.mix")
     $s = editor_pick($s, true)
@@ -1692,9 +1711,9 @@ fn fork($s, $args)
   $s = persist($s)
   $s = reconcile_one($s, $as, false)
   $s.response = {name:$as, installed:true, enabled:$enable, forked_from:$name}
-  if $s.scenes[$as].diagnostic != nil then
+  if failure($s.scenes[$as]) != nil then
     $s.rc = 10
-    $s.response = $s.scenes[$as].diagnostic
+    $s.response = failure($s.scenes[$as])
   end
   return $s
 end
@@ -1762,9 +1781,9 @@ fn move($s, $args)
   $text = join($lines, "\n")
   if $text != $source then write_atomic($path, $text) end
   $s = reconcile_one($s, $name, true)
-  if $s.scenes[$name].diagnostic != nil then
+  if failure($s.scenes[$name]) != nil then
     $s.rc = 10
-    $s.response = $s.scenes[$name].diagnostic
+    $s.response = failure($s.scenes[$name])
   else
     $s.response = {name:$name, edge:$args.edge, revision:$s.scenes[$name].revision}
   end
@@ -1789,10 +1808,10 @@ fn reset_scene($s, $name, $e)
   $s = persist($s)
   $s.scenes[$name].model = nil
   $s = reconcile_one($s, $name, true)
-  if $s.scenes[$name].diagnostic != nil then
+  if failure($s.scenes[$name]) != nil then
     $s.scenes[$name].model = $e.model
     $s.rc = 10
-    $s.response = $s.scenes[$name].diagnostic
+    $s.response = failure($s.scenes[$name])
     $s.response.recovery = $backup
     return $s
   end
@@ -1844,9 +1863,9 @@ fn request($s, $verb, $args)
       $s = persist($s)
       $s = reconcile_one($s, $name, false)
       $s.response = {name:$name, installed:true, enabled:$args.enable == true}
-      if $s.scenes[$name].diagnostic != nil then
+      if failure($s.scenes[$name]) != nil then
         $s.rc = 10
-        $s.response = $s.scenes[$name].diagnostic
+        $s.response = failure($s.scenes[$name])
       end
       return $s
     end
@@ -1942,9 +1961,9 @@ fn request($s, $verb, $args)
     else
       fail("SCENES_VERB", "unknown scenes verb", {verb:$verb})
     end
-    if $s.scenes[$name].diagnostic != nil and contains(["reload", "enable"], $verb) then
+    if failure($s.scenes[$name]) != nil and contains(["reload", "enable"], $verb) then
       $s.rc = 10
-      $s.response = $s.scenes[$name].diagnostic
+      $s.response = failure($s.scenes[$name])
     elif len(keys($s.response)) == 0 then
       $s.response = {name:$name, accepted:true, revision:$s.scenes[$name].revision}
     end

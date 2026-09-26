@@ -321,6 +321,14 @@ Each `scenes.list` row also carries:
 - A host diagnostic (`context.upstream.diagnostics`) keeps its line.
 - A behaviour check carries `mix lint --json` lines and columns.
 
+A refusal of the file itself (candidate, behaviour check, load or remount)
+stands until a later reconcile of that scene succeeds: a good save, a
+`scenes.reload`, or a host-return remount. A model publish, a behaviour's
+`ready` and a crash restart never clear it, so a broken save stays visible
+while the last good tree keeps running. Runtime faults (a behaviour exit, a
+refused model patch) are reported beside it, and the row's `diagnostic` is
+the file's refusal when there is one.
+
 `scenes.changed` carries the same inventory. Names of scenes with a behaviour
 must fit the Bus name rule: at most 25 characters and no `_`, so that
 `scene-<name>` is a legal service name. Install, fork and reconcile refuse

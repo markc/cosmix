@@ -684,8 +684,10 @@ loader's verdicts as source <code>scenes</code>.</p>
 <ul>
 <li><strong>Request.</strong> <code>path</code> is absolute. Each diagnostic has a 1-based <code>line</code>, an
 optional 1-based <code>col</code>, a <code>severity</code> of <code>error</code>, <code>warning</code> or <code>note</code>, a
-<code>code</code> and a <code>message</code>. The limits are 500 diagnostics and a 64 KiB body;
-anything else is refused <code>INVALID_ARGUMENT</code>.</li>
+<code>code</code> and a <code>message</code>. The limits are 500 diagnostics and a 64 KiB body.
+A refusal is <code>INVALID_ARGUMENT</code> with a reason: <code>too_large</code>, <code>bad_source</code>
+(not the pattern, or <code>lint</code>, which is ced's own), <code>bad_path</code> (not
+absolute), <code>too_many</code> or <code>bad_digest</code> (not 64 lower-hex characters).</li>
 <li><strong>Storage.</strong> ced stores the set per <code>(path, source)</code>, keeping the most
 recent 64 paths. It applies the set, replacing only that source's
 diagnostics, to every tab showing <code>path</code>:
@@ -698,7 +700,8 @@ disk text).</li>
 </ul>
 </li>
 <li><strong>Digest.</strong> <code>digest</code> is the lower-hex sha256 of the file bytes the
-diagnostics describe. A tab whose text does not hash to it shows none of
+diagnostics describe; ced compares it with the bytes the tab would save
+(its text, with the BOM restored when the file has one). A tab whose text does not hash to it shows none of
 the set (<code>stale:true</code>), but the set stays stored for when the text matches
 again.</li>
 <li><strong>Clearing.</strong> An empty <code>diagnostics</code> list clears that source and drops the
@@ -706,7 +709,10 @@ stored set. Like lint rows, an external row on a line edited since is
 dropped rather than shown in the wrong place.</li>
 </ul>
 <p>The Problems panel shows every source's rows as <code>source: code message</code>.
-<code>ced.problems {tab?}</code> returns the same rows.</p>
+<code>ced.problems {tab?}</code> returns the same rows.
+In-process scene lint reports lines only, so its rows have <code>col: null</code>.
+<code>ced --headless</code> answers both verbs; it runs no lint of its own, so its
+<code>ced.problems</code> holds only external sets.</p>
 <h2 id="files-configuration-and-theme">Files, configuration and theme</h2>
 <p>ced keeps its files under one app directory, resolved in this order:
 <code>$COSMIX_APP_HOME</code>, <code>$COSMIX_APPS_HOME/ced</code>, <code>$XDG_STATE_HOME/cosmix/apps/ced</code>,
