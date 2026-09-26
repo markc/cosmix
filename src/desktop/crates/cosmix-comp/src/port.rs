@@ -2707,11 +2707,8 @@ fn modifier_spec(value: &Value) -> Result<KeySpec, ControlReply> {
 /// and `comp.input.sequence` steps, so a step is exactly the verb.
 pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, ControlReply> {
     use crate::protocol::SeatKind;
-    let seat = parse_input_seat(args.get("seat"))?.unwrap_or(if verb == "comp.input.release_all" {
-        SeatKind::Agent
-    } else {
-        DEFAULT_INPUT_SEAT
-    });
+    let explicit_seat = parse_input_seat(args.get("seat"))?;
+    let seat = explicit_seat.unwrap_or(DEFAULT_INPUT_SEAT);
     let mut args = args.clone();
     if let Some(object) = args.as_object_mut() {
         object.remove("seat");
@@ -2724,7 +2721,9 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
     }
     let op = parse_seated_input_op(verb, &args, seat)?;
     // Keep the internal human operation shape stable for existing call sites.
-    Ok(if seat == SeatKind::Human { op } else { InputOp::OnSeat { seat, op: Box::new(op) } })
+    Ok(if seat == SeatKind::Human && !(verb == "comp.input.release_all" && explicit_seat.is_some()) {
+        op
+    } else { InputOp::OnSeat { seat, op: Box::new(op) } })
 }
 
 // Flip only in the release that also migrates the hub's human-input gates.
@@ -3284,8 +3283,8 @@ mod agent_seat_parse_tests {
         for seat in [json!(null), json!(false), json!("other")] {
             assert!(parse_input_op("comp.input.key", &json!({"key":"a","seat":seat})).is_err());
         }
-        assert!(matches!(parse_input_op("comp.input.release_all", &json!({})).unwrap(), InputOp::OnSeat { seat:SeatKind::Agent, .. }));
-        assert_eq!(parse_input_op("comp.input.release_all", &json!({"seat":"human"})).unwrap(), InputOp::ReleaseAll);
+        assert_eq!(parse_input_op("comp.input.release_all", &json!({})).unwrap(), InputOp::ReleaseAll);
+        assert_eq!(parse_input_op("comp.input.release_all", &json!({"seat":"human"})).unwrap(), InputOp::OnSeat { seat: SeatKind::Human, op: Box::new(InputOp::ReleaseAll) });
     }
 
     #[test]
@@ -5443,7 +5442,7 @@ mod tests {
         );
         assert_eq!(
             parse_input_op("comp.input.release_all", &json!({})),
-            Ok(InputOp::OnSeat { seat: crate::protocol::SeatKind::Agent, op: Box::new(InputOp::ReleaseAll) })
+            Ok(InputOp::ReleaseAll)
         );
     }
 

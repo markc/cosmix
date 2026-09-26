@@ -38,6 +38,42 @@ fn on_agent(op: InputOp) -> InputOp {
     }
 }
 
+#[test]
+fn bare_release_all_cleans_both_seats_but_scoped_cleanup_preserves_the_other() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    for seat in ["human", "agent", "both"] {
+        let agent = agent_target(&h, &alpha, agent_key(PressAction::Press, KEY_A));
+        assert_eq!(inject(&mut h, &ingress, &runtime, agent).0, 0);
+        assert_eq!(inject(&mut h, &ingress, &runtime, agent_key(PressAction::Press, KEY_B)).0, 0);
+        let args = if seat == "both" { json!({}) } else { json!({"seat":seat}) };
+        let op = crate::port::parse_input_op("comp.input.release_all", &args).unwrap();
+        let (rc, body) = inject(&mut h, &ingress, &runtime, op);
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["seat"], seat);
+        assert_eq!(h.server.state.human.held.is_empty(), seat != "agent");
+        assert_eq!(h.server.state.agent.held.is_empty(), seat != "human");
+        assert_eq!(inject(&mut h, &ingress, &runtime, InputOp::ReleaseAll).0, 0);
+    }
+}
+
+#[test]
+fn legacy_sequence_cleanup_does_not_make_it_an_agent_sequence() {
+    let (mut h, _, runtime, _, _, _) = two_windows();
+    let release = crate::port::parse_input_op("comp.input.release_all", &json!({})).unwrap();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    h.server.state.start_long_op(crate::port::LongOp::Sequence(vec![
+        step("comp.input.key", agent_key(PressAction::Press, KEY_A), 0),
+        step("comp.input.release_all", release, 1),
+    ]), sender, Instant::now());
+    h.server.state.cancel_agent_sequences();
+    assert_eq!(h.server.state.injection.sequences.len(), 1);
+    h.server.event_loop.dispatch(Some(Duration::from_millis(20)), &mut h.server.state).unwrap();
+    let reply = runtime.block_on(receiver).unwrap().wire_json();
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert!(h.server.state.human.held.is_empty());
+}
+
 fn device_key_events(traffic: &[(u32, u16, Vec<u8>)], keyboard: u32) -> Vec<(u32, u32)> {
     traffic
         .iter()

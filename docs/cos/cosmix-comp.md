@@ -960,7 +960,7 @@ hidden from Xwayland. Every `comp.input.*` verb accepts `seat:"human"` or
 
 The default is still **human** (`cosmix`). It changes to agent only in the
 release that also migrates the hub's human-input gates. The deliberate exception
-is `release_all`: without a seat it releases **agent** holds only. A sequence's
+is `release_all`: without a seat it releases **both seats' injected holds**. A sequence's
 explicit `seat` is inherited by its steps; `args.seat` overrides it for a step.
 Without a sequence-level seat, each verb uses its own default.
 
@@ -986,7 +986,7 @@ notify_idle_activity(Human)`; agent delivery uses the agent Smithay handles.
 | `comp.input.pointer.button` | `{button?,action?,window?,raise?}`. `button`: `left` (default), `right`, `middle`, or evdev `0x100..=0x2ff`. `action`: `press`, `release` or `click` (default). |
 | `comp.input.pointer.scroll` | `{dx?,dy?,source?,v120?}`. At least one axis; positive `dy` scrolls down. `source`: `wheel` (default), `finger` or `continuous`; zero on finger/continuous is an axis stop. `v120:{dx?,dy?}` supplies wheel detents; otherwise a wheel derives 120 per 15 units. |
 | `comp.input.key` | `{key,action?,modifiers?,window?,raise?}` or `{text,window?,raise?}`. `key` is an XKB keysym name or evdev code; `action` is `press`, `release` or `tap` (default). `modifiers` accepts `shift`, `ctrl`, `alt`, `super`, `altgr`. `text` is at most 256 characters. |
-| `comp.input.release_all` | `{seat?}`; omitted seat means agent. |
+| `comp.input.release_all` | `{seat?}`; omitted seat cleans both seats (`seat:"both"` in the reply). |
 | `comp.input.sequence` | `{seat?,steps:[{verb,args?,delay_ms?}],interval_ms?}`. |
 
 Targeted keys, text and buttons require both identity fields in
@@ -1080,8 +1080,9 @@ types Return. AltGr-only, dead-key and compose characters are `unmappable`
 (`char` and `index`) before anything is typed. Unknown key names return
 `unknown_key`; human text under an input-method grab retains `ime_active`.
 
-Holds belong to a seat and an operation owner. `release_all` releases only the
-chosen seat's injected holds, never a physical-device hold. An explicit release
+Holds belong to a seat and an operation owner. `release_all` releases both seats'
+injected holds unless explicitly scoped with `seat`, never a physical-device or
+host hold. An explicit release
 clears injected ownership of that key/button on that seat. Taps and clicks
 release their generated presses; `action:"press"` can retain a hold.
 

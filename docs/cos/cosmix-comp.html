@@ -1342,7 +1342,7 @@ hidden from Xwayland. Every <code>comp.input.*</code> verb accepts <code>seat:"h
 <code>seat:"agent"</code>; there are no caller authorisation gates on either choice.</p>
 <p>The default is still <strong>human</strong> (<code>cosmix</code>). It changes to agent only in the
 release that also migrates the hub's human-input gates. The deliberate exception
-is <code>release_all</code>: without a seat it releases <strong>agent</strong> holds only. A sequence's
+is <code>release_all</code>: without a seat it releases <strong>both seats' injected holds</strong>. A sequence's
 explicit <code>seat</code> is inherited by its steps; <code>args.seat</code> overrides it for a step.
 Without a sequence-level seat, each verb uses its own default.</p>
 <table><thead><tr><th>Behaviour</th><th><code>seat:"human"</code></th><th><code>seat:"agent"</code></th></tr></thead><tbody>
@@ -1363,7 +1363,7 @@ meaning. Human Bus injection still follows <code>inject â†’ handle_host_input â†
 <tr><td><code>comp.input.pointer.button</code></td><td><code>{button?,action?,window?,raise?}</code>. <code>button</code>: <code>left</code> (default), <code>right</code>, <code>middle</code>, or evdev <code>0x100..=0x2ff</code>. <code>action</code>: <code>press</code>, <code>release</code> or <code>click</code> (default).</td></tr>
 <tr><td><code>comp.input.pointer.scroll</code></td><td><code>{dx?,dy?,source?,v120?}</code>. At least one axis; positive <code>dy</code> scrolls down. <code>source</code>: <code>wheel</code> (default), <code>finger</code> or <code>continuous</code>; zero on finger/continuous is an axis stop. <code>v120:{dx?,dy?}</code> supplies wheel detents; otherwise a wheel derives 120 per 15 units.</td></tr>
 <tr><td><code>comp.input.key</code></td><td><code>{key,action?,modifiers?,window?,raise?}</code> or <code>{text,window?,raise?}</code>. <code>key</code> is an XKB keysym name or evdev code; <code>action</code> is <code>press</code>, <code>release</code> or <code>tap</code> (default). <code>modifiers</code> accepts <code>shift</code>, <code>ctrl</code>, <code>alt</code>, <code>super</code>, <code>altgr</code>. <code>text</code> is at most 256 characters.</td></tr>
-<tr><td><code>comp.input.release_all</code></td><td><code>{seat?}</code>; omitted seat means agent.</td></tr>
+<tr><td><code>comp.input.release_all</code></td><td><code>{seat?}</code>; omitted seat cleans both seats (<code>seat:"both"</code> in the reply).</td></tr>
 <tr><td><code>comp.input.sequence</code></td><td><code>{seat?,steps:[{verb,args?,delay_ms?}],interval_ms?}</code>.</td></tr>
 </tbody></table>
 <p>Targeted keys, text and buttons require both identity fields in
@@ -1444,8 +1444,9 @@ layout. It uses the first two shift levels, adding Shift where required; newline
 types Return. AltGr-only, dead-key and compose characters are <code>unmappable</code>
 (<code>char</code> and <code>index</code>) before anything is typed. Unknown key names return
 <code>unknown_key</code>; human text under an input-method grab retains <code>ime_active</code>.</p>
-<p>Holds belong to a seat and an operation owner. <code>release_all</code> releases only the
-chosen seat's injected holds, never a physical-device hold. An explicit release
+<p>Holds belong to a seat and an operation owner. <code>release_all</code> releases both seats'
+injected holds unless explicitly scoped with <code>seat</code>, never a physical-device or
+host hold. An explicit release
 clears injected ownership of that key/button on that seat. Taps and clicks
 release their generated presses; <code>action:"press"</code> can retain a hold.</p>
 <p>A sequence has at most 256 steps and 4096 generated events in total. Delays

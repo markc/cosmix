@@ -375,6 +375,13 @@ impl WaylandState {
     /// `comp.input.*` (one verb). Target candidacy is checked before focus;
     /// a refused target injects no key or button.
     pub(crate) fn service_input_op(&mut self, op: &InputOp) -> ControlReply {
+        if matches!(op, InputOp::ReleaseAll) {
+            // Legacy safety-net cleanup spans both seats, but only injected holds.
+            self.release_injected(SeatKind::Agent, monotonic_millis());
+            let mut reply = self.service_input_payload(SeatKind::Human, op, None);
+            if let ControlReply::Body(body) = &mut reply { body["seat"] = json!("both"); }
+            return reply;
+        }
         let (seat, op) = match op {
             InputOp::OnSeat { seat, op } => (*seat, op.as_ref()),
             _ => (SeatKind::Human, op),
