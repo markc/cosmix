@@ -4,14 +4,11 @@ use super::{KeyboardHandle, PointerHandle, Seat, WaylandState};
 
 // Keep in step with cosmix-shell-host/src/runner.rs; no unconditional shared desktop crate.
 pub const HUMAN_SEAT_NAME: &str = "cosmix";
-#[allow(dead_code)] // The agent global arrives in the next chunk.
 pub const AGENT_SEAT_NAME: &str = "cosmix-agent";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SeatKind {
     Human,
-    // Reserved for the separate injected-input seat; no second global yet.
-    #[allow(dead_code)]
     Agent,
 }
 

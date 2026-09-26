@@ -1332,6 +1332,9 @@ origin.</li>
 the left or top output edge, can still project one pixel short. The renderer
 rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
+<p>Since 0.71.0, the compositor advertises a second seat, <code>cosmix-agent</code>, with
+its own keyboard and pointer (hidden from Xwayland). It is not yet driven:
+input injection still uses the human <code>cosmix</code> seat.</p>
 <p><code>comp.input.key</code> (including its <code>{text}</code> form) and <code>comp.input.pointer.button</code>
 accept <code>window:{id,generation}</code> and <code>raise?:bool</code> (default true). Both identity
 fields are required; <code>raise</code> requires <code>window</code>. The compositor focuses the window

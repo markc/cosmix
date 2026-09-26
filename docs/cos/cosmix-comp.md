@@ -949,6 +949,10 @@ rounds half away from zero on both sides of the origin.
 
 ### Input injection
 
+Since 0.71.0, the compositor advertises a second seat, `cosmix-agent`, with
+its own keyboard and pointer (hidden from Xwayland). It is not yet driven:
+input injection still uses the human `cosmix` seat.
+
 `comp.input.key` (including its `{text}` form) and `comp.input.pointer.button`
 accept `window:{id,generation}` and `raise?:bool` (default true). Both identity
 fields are required; `raise` requires `window`. The compositor focuses the window

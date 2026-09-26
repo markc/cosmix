@@ -3202,6 +3202,16 @@ impl ProtocolServer {
             .add_keyboard(Default::default(), 500, 30)
             .map_err(|error| error.to_string())?;
         let pointer = seat.add_pointer();
+        // The human global is deliberately created first for legacy clients.
+        let mut agent_seat = seat_state.new_wl_seat_with_filter(
+            &display_handle,
+            AGENT_SEAT_NAME,
+            |client| client.get_data::<smithay::xwayland::XWaylandClientData>().is_none(),
+        );
+        let agent_keyboard = agent_seat
+            .add_keyboard(Default::default(), 500, 30)
+            .map_err(|error| error.to_string())?;
+        let agent_pointer = agent_seat.add_pointer();
         let diagnostic_sender = spawn_shm_diagnostic_worker();
 
         let backend = match backend_kind {
@@ -3346,6 +3356,13 @@ impl ProtocolServer {
                 pose: None,
             },
             input_ingress: input::InputIngressState::default(),
+            agent: CompSeat {
+                kind: SeatKind::Agent,
+                seat: agent_seat,
+                keyboard: agent_keyboard,
+                pointer: agent_pointer,
+                pose: None,
+            },
             touch_devices: 0,
             bindings: BindingState::for_profile(binding_profile, keybindings_enabled)
                 .with_bus_key(f9_bus.is_some()),
@@ -6246,6 +6263,7 @@ struct WaylandState {
     ext_data_control_state: ExtDataControlState,
     seat_state: SeatState<Self>,
     human: CompSeat,
+    agent: CompSeat,
     input_ingress: input::InputIngressState,
     /// How many attached devices report a touch capability.
     ///
@@ -16473,7 +16491,7 @@ pub(crate) mod workspaces;
 mod xwayland;
 
 use focus::{SeatFocusTarget, focus_targets_surface};
-use seat::{CompSeat, HUMAN_SEAT_NAME, SeatKind};
+use seat::{AGENT_SEAT_NAME, CompSeat, HUMAN_SEAT_NAME, SeatKind};
 
 struct WaylandClientState {
     compositor_state: CompositorClientState,
