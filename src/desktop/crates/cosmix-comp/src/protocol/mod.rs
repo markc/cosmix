@@ -4088,10 +4088,7 @@ impl ProtocolServer {
         // Calloop's channels bound their own drain and re-ping when still ready,
         // so continuously arriving host motion cannot starve this stage.
         #[cfg(feature = "bus")]
-        {
-            self.state.injection.agent_sequence_serviced = false;
-            self.state.service_ready_agent_sequence();
-        }
+        self.state.service_ready_agent_sequence();
         #[cfg(feature = "bus")]
         port_observation::service_observations(&mut self.state);
         #[cfg(feature = "bus")]

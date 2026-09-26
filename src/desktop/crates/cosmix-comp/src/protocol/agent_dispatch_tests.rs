@@ -1,6 +1,56 @@
 // Included by input_injection_tests.rs: real queued Bus controls and wire devices.
 
 #[test]
+fn agent_resumptions_do_not_block_initial_bursts_window_controls_or_snapshots() {
+    for running_count in [1, 2] {
+        let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
+        bind_agent_devices(&mut h);
+        let mut running_replies = Vec::new();
+        for _ in 0..running_count {
+            let steps = (0..200).map(|index| step("comp.input.key",
+                agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A)),
+                if index == 0 { 0 } else { 1 },
+            )).collect();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            running_replies.push(receiver);
+            h.server.state.start_long_op(crate::port::LongOp::Sequence(steps), sender, Instant::now());
+            h.server.state.service_ready_agent_sequence();
+        }
+        // Make the real one-shot delay timers ready before admitting new work.
+        // With two runs, one remains queued after this dispatch's resumption:
+        // an initial burst must advance its own ID, not pop that older run.
+        std::thread::sleep(Duration::from_millis(5));
+        let events_before = h.server.state.injection.events;
+        let (id, generation) = window_id_and_generation(&h, &beta);
+        let initial = ingress.request_long(crate::port::LongOp::Sequence(vec![
+            step("comp.input.pointer.move", on_agent(move_op(PointerMoveTarget::Window {
+                id, generation, x: 10.0, y: 10.0, require_hit: true,
+            })), 0),
+        ])).unwrap();
+        let (id, generation) = window_id_and_generation(&h, &alpha);
+        let window = ingress.request_window(crate::port::WindowOp::Focus {
+            id, generation, raise: false,
+        }).unwrap();
+        let snapshot = ingress.request_snapshot().unwrap();
+        h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+        assert!(h.server.state.injection.events >= events_before + 3,
+            "a resumed key tap and the new motion must both run");
+        assert!(h.server.state.pending_port_controls.is_empty(), "resumption cannot park the fresh admission and following window verb");
+        assert!(h.server.state.pending_port_requests.is_empty(), "snapshot cannot be stranded behind that admission");
+        assert_eq!(h.server.state.injection.sequences.len(), running_count);
+        assert!(runtime.block_on(initial.receive()).unwrap().wire_json().get("error").is_none());
+        assert!(runtime.block_on(window.receive()).unwrap().wire_json().get("error").is_none());
+        let snapshot = runtime.block_on(snapshot.receive()).unwrap();
+        assert_eq!(serde_json::to_value(&snapshot.input).unwrap()["seats"]["agent"]["pointer"]["x"], 310.0);
+        assert_eq!(focused_object(&h), Some(alpha));
+        h.server.state.cancel_agent_sequences();
+        for reply in running_replies {
+            assert_eq!(runtime.block_on(reply).unwrap().wire_json()["error"], "input_cleared");
+        }
+    }
+}
+
+#[test]
 fn human_sequence_scheduler_yields_on_events_not_agent_step_scans() {
     let (mut h, _, runtime, _, _, _) = two_windows();
     // White-box scheduler boundary: the public parser caps runs at 256 steps.

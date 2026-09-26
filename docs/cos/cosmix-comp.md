@@ -1161,9 +1161,11 @@ one entry per requested step, sharing those delivery fields for a coalesced run.
 
 Ready human `HostInput` drains before Bus delivery. Each dispatch services at
 most eight agent controls (standalone verbs or sequence admissions) and one
-agent sequence burst. An initial sequence burst runs at its admission position,
-before later standalone controls. If its burst budget is unavailable, it and
-all later controls remain queued together. Snapshot/props reads admitted after
+resumption burst, plus a separate allowance for one initial sequence burst.
+The initial burst counts toward the eight-control budget and runs its own
+sequence at its admission position, before later controls. Resumptions cannot
+spend that allowance. A second initial sequence and all later controls remain
+queued for the next dispatch. Snapshot/props reads admitted after
 parked controls wait for those controls to finish; earlier reads can complete.
 Sequences yield at the existing 256-event boundary between atomic operations.
 Sequences using the agent seat also yield after visiting 256 steps so

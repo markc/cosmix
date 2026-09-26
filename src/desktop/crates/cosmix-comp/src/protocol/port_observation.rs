@@ -3143,14 +3143,16 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
     // next dispatch. Each admitted verb also has the parser's event bound.
     const AGENT_CONTROL_BATCH: usize = 8;
     let mut agent_ops = 0;
-    let mut sequence_available = !state.injection.agent_sequence_serviced;
+    // Resumptions cannot consume the admission allowance and repeatedly park
+    // unrelated controls behind a fresh sequence. Both allowances are bounded.
+    let mut initial_sequence_available = true;
     let end = controls.iter().position(|control| {
         if control.uses_agent() {
             if matches!(control, PortControl::Long(_)) {
-                // Initial bursts participate in arrival order. If this turn's
-                // sequence budget is spent, park it AND all later controls.
-                if !sequence_available { return true; }
-                sequence_available = false;
+                // Only a second fresh admission spends this allowance. Running
+                // sequences retain their separate round-robin resumption slot.
+                if !initial_sequence_available { return true; }
+                initial_sequence_available = false;
             }
             agent_ops += 1;
         }
@@ -3232,13 +3234,7 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
                 // its own permit and deadline, not on the bounded queue.
                 request.slot.take();
                 if let (Some(op), Some(reply)) = (request.op.take(), request.reply.take()) {
-                    state.start_long_op(op, reply, request.admitted);
-                    if !state.injection.agent_sequence_serviced {
-                        // A newly queued initial burst must run before a later
-                        // button can observe its motion. Resumptions still rotate
-                        // through the bounded ready-sequence stage next dispatch.
-                        state.service_ready_agent_sequence();
-                    }
+                    state.start_ordered_long_op(op, reply, request.admitted);
                 }
             }
             PortControl::Watch(_)

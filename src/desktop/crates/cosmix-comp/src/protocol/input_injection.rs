@@ -125,7 +125,6 @@ pub(crate) struct InjectionState {
     pub(super) suppress_corners: bool,
     pub(super) sequences: HashMap<u64, SequenceRun>,
     ready_agent_sequences: VecDeque<u64>,
-    pub(super) agent_sequence_serviced: bool,
     next_sequence: u64,
 }
 
@@ -142,7 +141,6 @@ impl Default for InjectionState {
             suppress_corners: false,
             sequences: HashMap::new(),
             ready_agent_sequences: VecDeque::new(),
-            agent_sequence_serviced: false,
             next_sequence: 0,
         }
     }
@@ -1025,14 +1023,34 @@ impl WaylandState {
         passed
     }
 
-    /// Take ownership of a long verb's reply and start it. `admitted` is
-    /// when the worker admitted it: deadlines run from there, so the reply
-    /// is due when the caller's own budget says.
+    /// Seed a ready run in fixtures without spending the ordered admission slot.
+    #[cfg(test)]
     pub(crate) fn start_long_op(
         &mut self,
         op: LongOp,
         reply: tokio::sync::oneshot::Sender<ControlReply>,
         admitted: Instant,
+    ) {
+        self.start_long_op_inner(op, reply, admitted, false);
+    }
+
+    /// The ordered control stage has reserved its separate initial-burst slot.
+    /// Advance the newly allocated ID directly, never another ready run.
+    pub(super) fn start_ordered_long_op(
+        &mut self,
+        op: LongOp,
+        reply: tokio::sync::oneshot::Sender<ControlReply>,
+        admitted: Instant,
+    ) {
+        self.start_long_op_inner(op, reply, admitted, true);
+    }
+
+    fn start_long_op_inner(
+        &mut self,
+        op: LongOp,
+        reply: tokio::sync::oneshot::Sender<ControlReply>,
+        admitted: Instant,
+        initial_burst: bool,
     ) {
         let (op, sequence_seat) = match op {
             LongOp::SeatedSequence { seat, steps } => (LongOp::Sequence(steps), seat),
@@ -1056,7 +1074,7 @@ impl WaylandState {
                         reply,
                     },
                 );
-                if self.injection.sequences[&id].uses_agent {
+                if self.injection.sequences[&id].uses_agent && !initial_burst {
                     self.queue_agent_sequence(id);
                 } else {
                     self.advance_sequence(id);
@@ -1134,7 +1152,6 @@ impl WaylandState {
     /// runnable agent work schedules an event-loop wakeup, never a polling tick.
     pub(super) fn service_ready_agent_sequence(&mut self) {
         if let Some(id) = self.injection.ready_agent_sequences.pop_front() {
-            self.injection.agent_sequence_serviced = true;
             self.advance_sequence(id);
         }
         if !self.injection.ready_agent_sequences.is_empty() { self.input_wakeup.wakeup(); }
