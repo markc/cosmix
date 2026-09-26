@@ -271,6 +271,32 @@ pub struct FsLayer {
     trash_root: PathBuf,
 }
 
+/// Validate the descriptor, not just the pathname vetted before this call.
+/// Linux flags prevent a final-component symlink/FIFO swap from following or
+/// blocking. Ancestor containment still has resolve_within's documented posture.
+fn open_plain_blob(path: &Path, label: &str) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(FilesError::BadRequest(format!("source is not a regular file: {label}")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(FilesError::BadRequest(format!("source is not a single-link file: {label}")));
+        }
+    }
+    Ok(file)
+}
+
 impl FsLayer {
     pub fn new(places: Vec<Place>, trash_root: PathBuf) -> Self {
         FsLayer { places, trash_root }
@@ -401,7 +427,7 @@ impl FsLayer {
             )));
         }
         require_plain_file(&full, place_rel)?;
-        let file = fs::File::open(&full)?;
+        let file = open_plain_blob(&full, place_rel)?;
         Ok((file, file_name(place_rel).to_string(), mime_for(file_name(place_rel))))
     }
 
@@ -1226,6 +1252,38 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opened_blob_refuses_swapped_symlink_fifo_and_hardlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch();
+        let path = dir.join("source");
+        let other = dir.join("other");
+        fs::write(&other, b"secret").unwrap();
+        for kind in ["symlink", "fifo", "hardlink"] {
+            fs::write(&path, b"safe").unwrap();
+            require_plain_file(&path, "source").unwrap();
+            fs::remove_file(&path).unwrap(); // swap after the path check
+            match kind {
+                "symlink" => std::os::unix::fs::symlink(&other, &path).unwrap(),
+                "hardlink" => fs::hard_link(&other, &path).unwrap(),
+                _ => {
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: name is a live, NUL-terminated pathname.
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+            }
+            // A FIFO has no writer: a blocking open would never return.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let source = path.clone();
+            let worker = std::thread::spawn(move || tx.send(open_plain_blob(&source, "source").is_err()).unwrap());
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap());
+            worker.join().unwrap();
+            fs::remove_file(&path).unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn scratch() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
