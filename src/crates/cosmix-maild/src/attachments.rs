@@ -761,8 +761,8 @@ mod tests {
             inspect(raw.as_bytes(), None, false).unwrap_err(),
             Error::TooLarge("MIME pre-parse structure limit")
         );
-        // Empty implicit headers also need charging, even without a boundary
-        // between them: the parser inherits the digest parent while nesting.
+        // The conservative approximation also charges consecutive empty
+        // separators, without trying to reconstruct the parser's parent state.
         let empty = format!(
             "Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n{}",
             "\r\n".repeat(40)
@@ -793,6 +793,28 @@ mod tests {
         }
         assert!(!valid_path(&format!("1{}", ".1".repeat(32))));
         assert!(!valid_path("1.1001"));
+    }
+
+    #[test]
+    fn every_truncated_prefix_returns_a_projection_or_known_error() {
+        let raw = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=a.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n";
+        assert_eq!(
+            inspect(raw, Some("1.2"), true).unwrap().extracted.unwrap(),
+            [0, 255]
+        );
+        for end in 0..=raw.len() {
+            let result = std::panic::catch_unwind(|| inspect(&raw[..end], None, true))
+                .unwrap_or_else(|_| panic!("inspection panic escaped at prefix {end}"));
+            if let Err(error) = result {
+                let token = error.to_string();
+                assert!(
+                    token.starts_with("unreadable:")
+                        || token.starts_with("too_large:")
+                        || token.starts_with("not_found:"),
+                    "prefix {end}: {token}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -544,6 +544,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn present_stat_without_owner_pin_still_checks_quota_and_puts() {
+        struct Unpinned {
+            bind: String,
+            calls: AtomicUsize,
+            pins: Value,
+        }
+        impl Discovery for Unpinned {
+            async fn stat(&self, blob: &str) -> Result<Value, String> {
+                assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+                let mut value = reference(b"hello");
+                assert_eq!(value["blob"], blob);
+                value["present"] = json!(true);
+                value["pins"] = self.pins.clone();
+                Ok(value)
+            }
+            async fn quota(&self, owner: &str) -> Result<Value, String> {
+                assert_eq!(owner, "maild:7");
+                assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 1);
+                let room = json!({"limit": 100, "used": 0, "reserved": 0});
+                Ok(json!({"total": room, "owners": {"maild:7": room}}))
+            }
+            async fn bind(&self) -> Result<String, String> {
+                assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 2);
+                Ok(self.bind.clone())
+            }
+        }
+        for pins in [json!([]), json!(["maild:8"])] {
+            let reply = reference(b"hello").to_string();
+            let (bind, worker) = serve("200 OK", reply.as_bytes(), "", reply.len());
+            let discovery = Unpinned {
+                bind,
+                calls: AtomicUsize::new(0),
+                pins,
+            };
+            let result = Lane::new()
+                .unwrap()
+                .reference(&discovery, "maild:7", b"hello".to_vec(), "text/plain", None)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.blob,
+                format!("b3:{}", blake3::hash(b"hello").to_hex())
+            );
+            assert_eq!(discovery.calls.load(Ordering::SeqCst), 3);
+            let (head, body) = worker.join().unwrap();
+            assert!(head.starts_with(&format!(
+                "PUT /blob/{} HTTP/1.1\r\n",
+                blake3::hash(b"hello").to_hex()
+            )));
+            assert_eq!(body, b"hello");
+        }
+    }
+
+    #[tokio::test]
     async fn put_hash_checks_and_preserves_canonical_metadata_and_headers() {
         for name in ["café% file.bin".to_owned(), "a".repeat(129)] {
             let reply = reference(b"hello").to_string();
