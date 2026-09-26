@@ -5,8 +5,9 @@ It starts with no enabled scenes and reports `needs_setup:true` until scenes
 are explicitly enabled. From Stage B it owns the bottom panel, launcher,
 calendar and notes pages once they are seeded and enabled, replacing
 `quoin-panel.mix` (see [the legacy handover](#stage-b-legacy-handover)).
-The Scene Editor gallery and recovery chord are later work; this loader does
-not claim to implement them.
+It also hosts the [Scene Editor](scene-editor) as a reserved entry, and
+serves its gallery, fork/promote/move and first-run verbs
+([below](#scene-editor)).
 
 ## Files and installation
 
@@ -54,12 +55,16 @@ Environment overrides:
 | `SCENES_TEMPLATES` | Shipped template root; otherwise `$COSMIX/share/scenes`, or discover the checkout from the script |
 | `SCENE_HOST` | Quoin service; default `shell` |
 | `SCENES_LEGACY_SERVICE` | Legacy panel citizen whose registration holds the four legacy pages; default `quoin-panel` |
+| `SCENES_FIRST_RUN` | `0` turns off the first-run open of the Scene Editor; default on |
 
 The native Mix binary is resolved from the running interpreter. Behaviour
 children inherit the session and existing `COMP_SERVICE`, `APPS_SERVICE`,
 `TRAY_SERVICE`, `NOTIFY_SERVICE` and other overrides. They additionally receive
 `SCENE_NAME`, `SCENE_HOST`, `SCENES_SERVICE`, `SCENE_GENERATION`, and `SCENE_DIR`;
 their working directory is their scene directory. Each runs as `scene-<name>`.
+`SCENE_DIR` is the directory the behaviour runs from. For the Scene Editor's
+reserved entry that is either the shipped template or the user copy, so
+helpers kept beside a template load with `require($SCENE_DIR .. "/lib.mix")`.
 `SCENES_LIB` defaults to the shipped catalogue's `lib` directory, matching the
 shared behaviour helpers, and can be overridden explicitly. Generations are
 positive exact integers, allocated from an atomically persisted `.generation`
@@ -81,7 +86,7 @@ diagnostics also report file, attempted digest and last-good revision.
 
 | Verb | Arguments and result |
 | --- | --- |
-| `scenes.list` | `{}` → `{needs_setup,scenes,diagnostic}`; each scene reports installation, enablement, mounted state, revision, generation, behaviour status, ready/open/pending, origin, digests, diagnostics, last exit and journal location |
+| `scenes.list` | `{}` → `{needs_setup,root,templates_root,state_ok,editor,scenes,diagnostic}`; each scene reports installation, enablement, mounted state, revision, generation, behaviour status, ready/open/pending, origin, digests, diagnostics, last exit and journal location |
 | `scenes.install` | `{template,name?,enable?}` → installation receipt; stage, validate through `shell.scene.validate`, atomically rename, record origin; default disabled; refuse collisions |
 | `scenes.remove` | `{name}` → `{name,recovery}`; disable, stop, unload and move the installation to `.recovery/` |
 | `scenes.enable` / `scenes.disable` | `{name}` → acceptance/revision; persist desire and reconcile idempotently |
@@ -190,6 +195,12 @@ enabling the unit.
 `on bus.connected` and `noded.props.changed` repair state with full service
 snapshots and `shell.scenes.list` mount inventory. This also removes mounts
 disabled or removed while the broker was unavailable but still present in Quoin.
+An unload the host answers with "unknown scene" counts as unloaded: Quoin has
+already dropped it (an owner departure), so there is nothing left to remove.
+Any `<host>.scene.changed` notice with `ops:["unloaded"]` marks the scene not
+mounted; an enabled page is remounted at once (reason `owner_departed`), while
+a pre-empted editor waits for the next open. A notice older than the mount the
+loader holds (a lower revision) changes nothing.
 A returning shell is remounted from accepted source/model even when
 the current on-disk edit is broken. Behaviour service disappearance alone
 never unloads a scene. The owner is the verified loading citizen.
@@ -224,6 +235,173 @@ Deferred: the parent filesystem watch is retained for root replacement and
 shares the evaluator's inotify fd and worker.
 Deferred: per-expression `Instant::now()` budget checks remain until measured
 optimisation preserves the deadline guarantee for always-ready expressions.
+
+## Scene Editor
+
+The [Scene Editor](scene-editor) is the shipped template `editor`, run by this
+loader. These verbs serve it, and any agent can use them directly. All are
+mesh-open.
+
+| Verb | Arguments and result |
+| --- | --- |
+| `scenes.templates` | `{}` → `{root,templates:[{template,name,title,description,edge,kind,behaviour,recommended,order,requires,installed_as,diagnostic?}]}`. Every template directory except `lib` and those with `hidden:true`, sorted by `order` then `template`. An unreadable template is a row with a `diagnostic`, never a refusal |
+| `scenes.editor.open` | `{safe?,view?,scene?,first_run?}` → `{name:"editor",source,safe,visible,pending,fallback,request_seq}` |
+| `scenes.editor.close` | `{unload?}` → `{name:"editor",visible:false,mounted}` |
+| `scenes.fork` | `{name,as?,enable?=true}` → `{name,installed:true,enabled,forked_from}` |
+| `scenes.promote` | `{from}` → `{name,recovery:[paths],removed}` |
+| `scenes.move` | `{name,edge}` → `{name,edge,revision}` |
+
+### The reserved `editor` entry
+
+`editor` is created once at loader start, with `reserved:true`, and lives in
+the scene table like any other scene. Crash restarts, generation fencing,
+retiring and host-return remounts therefore apply to it unchanged. It is
+never *enabled*: its `enabled` always equals an in-memory `summoned` flag,
+which `scenes.editor.open` sets and `scenes.editor.close {unload:true}`
+clears. It is never in the persisted `enabled` list, never counts toward
+`needs_setup`, and is reported as `scenes.list.editor`, not as a row:
+
+```
+{user_copy, user_dirty, mounted, visible, source:"shipped"|"user", safe, fallback,
+ behaviour, view, scene, first_run, request_seq, generation, kind, dir, diagnostic, problems}
+```
+
+`enable`, `disable`, `fork`, `move`, `open`, `close` and `toggle` of `editor`
+are refused `SCENES_RESERVED`. So is installing the `editor` template under
+another name or with `enable:true`. A plain `scenes.install {template:"editor"}`
+creates the user copy at `$SCENES_DIR/editor`. `scenes.remove {name:"editor"}`
+and `scenes.reset {name:"editor"}` act on that user copy only, never on the
+shipped directory, and never delete the entry. If the user copy was mounted,
+remove switches to the shipped copy first, and reset reloads the restored copy.
+
+For any other scene, `candidate` refuses the page id `scene-editor` and
+`window.kind:"dialog"` with `SCENES_RESERVED`. The one dialog seat belongs to
+the editor in v1.
+
+**Open.** A non-safe open checks the user copy with candidate,
+`shell.scene.validate` and a behaviour check with `mix lint --deny-warnings`.
+If that fails, or the copy then fails to mount, the shipped copy is used and
+`fallback {error_code,message,file}` names why. The shipped copy is always
+checked in `report` mode: `mix --check` is a hard gate, but its lint findings
+become `editor.problems`, never a refusal. A safe open while the shipped copy
+is visible hides it (the chord's toggle). The loader loads a dialog-kind
+editor with `preempt_dialog:true`, so a squatter cannot hold the seat, and
+shows it with `shell.dialog.show`. `visible` settles from
+`shell.panel.changed` (`dialog.visible`), never from the command reply. A
+Quoin-side hide (× or Escape) records `visible:false`; during `needs_setup`
+it also sets `dismissed`. A pre-emption notice, or a snapshot whose `dialog`
+no longer names the editor, also records `visible:false`.
+
+`SCENES_EDITOR_UNAVAILABLE` is the one refusal with no fallback. It covers a
+missing or invalid shipped editor, a scene host that is not registered
+(`context.shipped.error_code:"SCENES_HOST_ABSENT"`), and a host without dialogs
+(`SCENES_HOST_KIND`). The dialog probe is `shell.dialog.hide {scene:"editor"}`:
+`NOT_FOUND`, `NOT_DIALOG` or success mean the host has dialogs, while
+`UNIMPLEMENTED` or an unknown verb mean it does not. `shell.scene.describe`
+alone is not enough, because from cosmix-scene 0.6 it lists `dialog` before
+the host can mount one. An editor whose header is `kind:"edge"` (the
+fallback when the host has no dialogs) takes the popup path instead: select,
+pin, then restore the saved mode on close.
+
+**First run.** On the transition of the scene host to live (including the
+loader's own first snapshot), after the remount, the loader opens the editor
+on `gallery` with `first_run:true`. It does so only if `needs_setup`, the
+state file read cleanly, the editor was not dismissed in this process, and
+`SCENES_FIRST_RUN` is not `0`.
+
+**Events under `$SCENES_DIR/editor/`** are not reconciled as a scene. They
+set `user_dirty`, and reload the entry only while the user copy is the
+mounted source; a broken reload keeps the last good tree.
+
+### Problems and digests
+
+Each `scenes.list` row also carries:
+- `title`, `edge`, `page`, `kind`;
+- `files {scene,behaviour,metadata}`;
+- `digests`: the sha256 of each file's current bytes, whatever was accepted;
+- `forked_from`;
+- `problems:[{file,digest,line,col?,severity,code,message}]`.
+
+`problems` is derived, never persisted:
+- A loader diagnostic maps to its file at line 1.
+- A host diagnostic (`context.upstream.diagnostics`) keeps its line.
+- A behaviour check carries `mix lint --json` lines and columns.
+
+A row's `digest` is the sha256 of the bytes its diagnostic describes. For a
+refused load that is the attempted bytes, not whatever the file holds now, so
+ced shows the row as stale once the file has moved on.
+
+A refusal of the file itself (candidate, behaviour check, load or remount)
+stands until a later reconcile of that scene succeeds: a good save, a
+`scenes.reload`, or a host-return remount. A model publish, a behaviour's
+`ready` and a crash restart never clear it, so a broken save stays visible
+while the last good tree keeps running. Runtime faults (a behaviour exit, a
+refused model patch) are reported beside it, and the row's `diagnostic` is
+the file's refusal when there is one.
+
+`scenes.changed` carries the same inventory. Names of scenes with a behaviour
+must fit the Bus name rule: at most 25 characters and no `_`, so that
+`scene-<name>` is a legal service name. Install, fork and reconcile refuse
+others with `SCENES_BUS_NAME`.
+
+### Fork, promote and move
+
+`scenes.fork {name}` stages a copy of the *installation*, not the template. It
+rewrites the name, citizen and page to the new name (`<name>-sandbox`, else
+`<name>-sb`), and records `forks[as] = {from, panel?}`. The fork inherits the
+origin, so `reset` works on it, and it is enabled unless `enable:false`.
+`scenes.promote {from}` stages the fork back under the original name and
+page. It validates that staged copy, then swaps it in through persisted phase
+records: `promoting {from,to,stage,backup,phase:"staged"|"swapped"|"placed"}`.
+The old original goes to `.recovery/<to>-<uuid>`, and the fork is removed to
+`.recovery/` too. `reset` uses the same records under `resetting`. A fork
+whose original has been removed cannot be promoted (`SCENES_NOT_FOUND`); a
+promote or reset while an unfinished record of its kind is on disk is refused
+`SCENES_RECOVERY`, naming that record, and nothing is staged or stopped. Once
+the swap is on disk, a failure to retire the fork is a reply (rc 10,
+`context.phase:"finish"`, with `context.sandbox` naming where the fork
+went if it had already been moved to `.recovery/`), not an undo: the `placed` record is finished by
+the next `scenes.reload` of either scene or the next loader start.
+
+Crash recovery at start is decided by what is on disk, `(to, stage, backup)`,
+not by the phase alone:
+
+| On disk | Action |
+| --- | --- |
+| `to` and `stage` present, no `backup` | not swapped yet: delete the stage |
+| no `to`, `stage` and `backup` present | crashed between renames: place the stage, then finish |
+| only `backup` present | stage lost: restore the backup |
+| only `stage` present (there was no `to` to back up) | phase `staged`: delete the stage; later phases: place it, then finish |
+| `to` present, no `stage` | phase `staged`: never swapped, clear the record; later phases: placed, finish |
+| anything else | leave it; `SCENES_RECOVERY` diagnostic with the triple |
+
+Each record recovers in its own error boundary, so one bad record never stops
+the rescan. It is retried on `scenes.reload {name}` or the next loader start.
+`stage` and `backup` are stored relative to the scene root. `.stage-*`
+directories never count as scenes.
+
+`scenes.move {name,edge}` rewrites only the `window` header line of the user's
+`scene.mix`. A move between orientations drops `w`/`h`. The loader then
+reconciles: when a mounted scene's page or edge changes, it validates the
+candidate first, then unloads, then loads. If the new load is refused, it
+re-loads the last accepted source at the old address. If that rollback fails
+too, the scene is `mounted:false` with `SCENES_REMOUNT_FAILED`
+(`context:{new,rollback}`), retried by `scenes.reload`, the next file event or
+the next host return. Either way a refused `scenes.move` puts the original
+header back on disk, so later rescans do not retry the move. The loader never writes Quoin's `conf.mix`; the editor
+follows a move with one `shell.panel.order` naming both edges. A dialog
+scene, or one without a `window` header, is refused `SCENES_MOUNT`.
+
+### Unreadable state
+
+`state_ok` is the outcome of the last `read_state` and nothing else. While it
+is false, every persist refuses `SCENES_STATE_UNREADABLE` without writing, so
+an unreadable state file is never overwritten and its origins are not lost.
+The same refusal applies to every mutating verb, before any side effect, and
+to popup opens that would persist a recovery record. First run is
+suppressed. The dialog editor needs no persist, so safe mode still opens.
+State `schema_version` stays 1; `forks`, `promoting` and `resetting` are
+optional maps.
 
 ## Gates and installer follow-up
 

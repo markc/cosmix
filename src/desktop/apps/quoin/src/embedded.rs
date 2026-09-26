@@ -158,7 +158,10 @@ impl EmbeddedQuoinPlugin {
                 .in_set(ShellRuntimeSet::Input)
                 .before(crate::bus_service::ShellBusDispatch),
         )
-            .add_systems(Update, present.in_set(ShellRuntimeSet::Host))
+            .add_systems(
+                Update,
+                (present, present_dialog).chain().in_set(ShellRuntimeSet::Host),
+            )
             .add_observer(grip_start)
             .add_observer(grip_move)
             .add_observer(grip_end)
@@ -412,12 +415,84 @@ fn present(
     }
 }
 
+/// The dialog (scene-editor plan §4.3 Q2) in comp's renderer: the chrome
+/// root, centred in the canvas the docked panels leave, above every panel
+/// band, and an input region like a panel's. `origin` tells
+/// `shell.scene.layout` where it is.
+fn present_dialog(
+    mut commands: Commands,
+    output: Res<EmbeddedOutput>,
+    frame: Res<ShellFrameState>,
+    mut dialog: ResMut<cosmix_shell::chrome::dialog::QuoinDialog>,
+    mut regions: ResMut<EmbeddedPanelRegions>,
+    mut nodes: Query<(&mut Node, Option<&UiTargetCamera>)>,
+    targets: Query<&bevy::camera::RenderTarget>,
+) {
+    let placed = match (output.active, output.camera, dialog.root, dialog.size()) {
+        (true, Some(camera), Some(root), Some(size)) if dialog.wants_surface() => {
+            let canvas = panel_layout(&frame.0).canvas;
+            let origin = (Vec2::new(canvas.x, canvas.y)
+                + (Vec2::new(canvas.width, canvas.height) - size) / 2.0)
+                .round();
+            if let Ok((mut node, target)) = nodes.get_mut(root) {
+                let desired = (
+                    PositionType::Absolute,
+                    px(origin.x),
+                    px(origin.y),
+                    px(size.x),
+                    px(size.y),
+                );
+                if (node.position_type, node.left, node.top, node.width, node.height) != desired {
+                    (node.position_type, node.left, node.top, node.width, node.height) = desired;
+                }
+                if target.is_none_or(|target| target.0 != camera) {
+                    commands
+                        .entity(root)
+                        .insert((UiTargetCamera(camera), GlobalZIndex(DIALOG_Z_INDEX)));
+                }
+            }
+            regions.0.push(PanelRect {
+                x: origin.x,
+                y: origin.y,
+                width: size.x,
+                height: size.y,
+            });
+            Some(origin)
+        }
+        _ => None,
+    };
+    if dialog.origin != placed {
+        dialog.origin = placed;
+    }
+    // The dialog's keys arrive on the output camera's window here: naming it
+    // lets Escape (and the IME-preedit guard) dismiss the dialog as on the
+    // layer host (Stage R, GLM M1 / Opus m8). There is no grab to demote:
+    // comp owns keyboard focus for its own renderer.
+    let window = placed.and(output.camera).and_then(|camera| match targets.get(camera) {
+        Ok(bevy::camera::RenderTarget::Window(bevy::window::WindowRef::Entity(window))) => {
+            Some(*window)
+        }
+        _ => None,
+    });
+    if dialog.window != window {
+        dialog.window = window;
+    }
+    // That window is every panel's too: the dialog owns its keys only while
+    // the focus is inside it (Stage R round 2).
+    if !dialog.window_shared {
+        dialog.window_shared = true;
+    }
+}
+
+/// Above the highest panel band (`panel_z_index` tops out below 200).
+const DIALOG_Z_INDEX: i32 = 300;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn production_plugins_update_headlessly_without_scenes() {
+    /// The production assembly on headless Bevy platform services.
+    fn headless_app() -> App {
         use bevy::asset::AssetApp;
 
         let mut app = App::new();
@@ -466,7 +541,12 @@ mod tests {
         );
         app.finish();
         app.cleanup();
+        app
+    }
 
+    #[test]
+    fn production_plugins_update_headlessly_without_scenes() {
+        let mut app = headless_app();
         for step in 0..12 {
             if step == 1 {
                 // Exercise both the startup placeholder and the host's first
@@ -498,6 +578,302 @@ mod tests {
             }
             assert!(world.resource::<EmbeddedPanelRegions>().0.is_empty());
         }
+    }
+
+    /// Scene-editor plan §4.3 Q2 in comp's renderer: a shown, mounted dialog
+    /// is centred in the canvas, takes an input region like a panel's and
+    /// reports its origin; hidden, it gives both back.
+    #[test]
+    fn a_shown_dialog_is_centred_with_an_input_region() {
+        use cosmix_shell::chrome::dialog::QuoinDialog;
+        let mut app = headless_app();
+        let camera = app.world_mut().spawn(Camera2d).id();
+        *app.world_mut().resource_mut::<EmbeddedOutput>() = EmbeddedOutput {
+            camera: Some(camera),
+            size: Vec2::new(1000.0, 800.0),
+            name: "test-output".into(),
+            active: true,
+            ..default()
+        };
+        app.update();
+        // The real ingress: a dialog load takes the seat, reconcile mounts it
+        // in the dialog chrome, and the Bus verb shows it.
+        let source = "---\nscene: 1\nname: editor\ncitizen: scene-editor\nwindow: {\"h\":300,\"kind\":\"dialog\",\"w\":400}\n---\n```mix\nroot: {widget: \"column\", children: [\"caption\"]}\ncaption: {widget: \"text\", text: \"Dialog body\"}\n```\n";
+        app.world_mut().resource_scope(|world, mut store: Mut<cosmix_scene_bevy::SceneStore>| {
+            world.resource_scope(|world, bridge: Mut<ctk::bus::BusBridge>| {
+                world.resource_scope(
+                    |world, mut registry: Mut<cosmix_shell::runtime::SubPanelRegistryState>| {
+                        let output = world.resource::<ShellFrameState>().0.geometry.output.clone();
+                        let (rc, body) = store.dispatch(
+                            cosmix_shell::runtime::SceneVerb::Load,
+                            "",
+                            &serde_json::json!({"source": source, "model_generation": 1}),
+                            &bridge,
+                            &mut cosmix_scene_bevy::SceneMount {
+                                registry: &mut registry.0,
+                                output: &output,
+                                owner: "scenes",
+                                accepted_at: 1,
+                            },
+                        );
+                        assert_eq!(rc, 0, "{body}");
+                    },
+                );
+            });
+        });
+        app.update();
+        let (rc, body) = crate::dialog_bus::respond(
+            app.world_mut(),
+            "shell.dialog.show",
+            &serde_json::json!({"scene":"editor"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        app.update();
+        let origin = Vec2::new(300.0, 250.0);
+        assert_eq!(app.world().resource::<QuoinDialog>().origin, Some(origin));
+        assert!(app.world().resource::<EmbeddedPanelRegions>().0.contains(&PanelRect {
+            x: origin.x,
+            y: origin.y,
+            width: 400.0,
+            height: 300.0,
+        }));
+        let root = app.world().resource::<QuoinDialog>().root.unwrap();
+        assert_eq!(app.world().get::<UiTargetCamera>(root).map(|t| t.0), Some(camera));
+        app.world_mut().resource_mut::<QuoinDialog>().hide("editor");
+        app.update();
+        assert_eq!(app.world().resource::<QuoinDialog>().origin, None);
+        assert!(app.world().resource::<EmbeddedPanelRegions>().0.is_empty());
+    }
+
+    /// Scene-editor plan §4.3 Q2 acceptance: a pointer click at the centre of
+    /// a node rect from `shell.scene.layout`, placed through the dialog's
+    /// origin, hits that node and its handler fires on the Bus. Real UI
+    /// picking over the real Taffy layout, driven by the same window events
+    /// the layer host's pointer bridge emits.
+    #[test]
+    fn a_click_at_a_layout_rect_centre_fires_that_nodes_handler() {
+        use bevy::input::ButtonState;
+        use bevy::input::mouse::MouseButtonInput;
+        use bevy::window::{CursorMoved, WindowEvent, WindowRef, WindowResolution};
+        let mut app = headless_app();
+        // BusBridgePlugin starts its real bridge in PreStartup: run Startup
+        // first, then swap in the test peer.
+        app.update();
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        app.insert_resource(bridge);
+        let window = app
+            .world_mut()
+            .spawn(Window {
+                resolution: WindowResolution::new(1000, 800),
+                ..default()
+            })
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                bevy::camera::RenderTarget::Window(WindowRef::Entity(window)),
+            ))
+            .id();
+        *app.world_mut().resource_mut::<EmbeddedOutput>() = EmbeddedOutput {
+            camera: Some(camera),
+            size: Vec2::new(1000.0, 800.0),
+            name: "test-output".into(),
+            active: true,
+            ..default()
+        };
+        app.update();
+        let source = "---\nscene: 1\nname: editor\ncitizen: scene-editor\nwindow: {\"h\":300,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":400}\n---\n```mix\nroot: {widget: \"column\", fill: true, padding: 20, gap: 12, children: [\"caption\", \"go\"]}\ncaption: {widget: \"text\", text: \"Pick a view\"}\ngo: {widget: \"button\", label: \"Gallery\", on_click: \"editor.view\"}\n```\n";
+        app.world_mut().resource_scope(|world, mut store: Mut<cosmix_scene_bevy::SceneStore>| {
+            world.resource_scope(|world, bridge: Mut<ctk::bus::BusBridge>| {
+                world.resource_scope(
+                    |world, mut registry: Mut<cosmix_shell::runtime::SubPanelRegistryState>| {
+                        let output = world.resource::<ShellFrameState>().0.geometry.output.clone();
+                        let (rc, body) = store.dispatch(
+                            cosmix_shell::runtime::SceneVerb::Load,
+                            "",
+                            &serde_json::json!({"source": source, "model_generation": 1}),
+                            &bridge,
+                            &mut cosmix_scene_bevy::SceneMount {
+                                registry: &mut registry.0,
+                                output: &output,
+                                owner: "scenes",
+                                accepted_at: 1,
+                            },
+                        );
+                        assert_eq!(rc, 0, "{body}");
+                    },
+                );
+            });
+        });
+        app.update();
+        let (rc, _) = crate::dialog_bus::respond(
+            app.world_mut(),
+            "shell.dialog.show",
+            &serde_json::json!({"scene":"editor"}),
+        );
+        assert_eq!(rc, 0);
+        for _ in 0..8 {
+            app.update();
+        }
+        let (rc, layout) = crate::dialog_bus::respond(
+            app.world_mut(),
+            "shell.scene.layout",
+            &serde_json::json!({"scene":"editor"}),
+        );
+        assert_eq!(rc, 0, "{layout}");
+        let layout: serde_json::Value = serde_json::from_str(&layout).unwrap();
+        assert_eq!(layout["visible"], true, "{layout}");
+        let origin = Vec2::new(
+            layout["surface"]["x"].as_f64().unwrap() as f32,
+            layout["surface"]["y"].as_f64().unwrap() as f32,
+        );
+        assert_eq!(origin, Vec2::new(300.0, 250.0));
+        let go = &layout["nodes"]["go"];
+        let rect = |key: &str| go[key].as_f64().unwrap() as f32;
+        // Surface-relative: inside the dialog, below its 32 px title bar.
+        assert!(rect("x") >= 0.0 && rect("y") >= 32.0 && rect("w") > 0.0 && rect("h") > 0.0, "{go}");
+        assert!(rect("x") + rect("w") <= 400.0 && rect("y") + rect("h") <= 300.0, "{go}");
+        let centre = origin + Vec2::new(rect("x") + rect("w") / 2.0, rect("y") + rect("h") / 2.0);
+        peer.drain_calls();
+        #[derive(Resource, Default)]
+        struct Seen(Vec<String>);
+        app.init_resource::<Seen>();
+        app.add_observer(
+            |event: On<bevy::picking::events::Pointer<bevy::picking::events::Click>>,
+             mut seen: ResMut<Seen>| {
+                seen.0.push(format!("click {:?}", event.entity));
+            },
+        );
+        app.add_observer(|event: On<bevy::ui_widgets::Activate>, mut seen: ResMut<Seen>| {
+            seen.0.push(format!("activate {:?}", event.entity));
+        });
+
+        let cursor = CursorMoved {
+            window,
+            position: centre,
+            delta: None,
+        };
+        app.world_mut().write_message(cursor.clone());
+        app.world_mut().write_message(WindowEvent::from(cursor));
+        // The test peer's outbound queue holds 16 messages and every update
+        // publishes; drain after each one so the click's call has room.
+        let mut calls = Vec::new();
+        for _ in 0..2 {
+            app.update();
+            calls.extend(peer.drain_calls());
+        }
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            let button = MouseButtonInput {
+                button: MouseButton::Left,
+                state,
+                window,
+            };
+            app.world_mut().write_message(button);
+            app.world_mut().write_message(WindowEvent::from(button));
+            app.update();
+            calls.extend(peer.drain_calls());
+        }
+        let fired: Vec<_> = calls
+            .iter()
+            .filter(|call| call.to == "scene-editor" && call.command == "editor.view")
+            .collect();
+        let seen: Vec<_> = calls.iter().map(|call| (&call.to, &call.command)).collect();
+        let world = app.world_mut();
+        let hover = format!("{:?}", world.resource::<bevy::picking::hover::HoverMap>().iter().collect::<Vec<_>>());
+        let pointers = world
+            .query::<(&bevy::picking::pointer::PointerId, &bevy::picking::pointer::PointerLocation)>()
+            .iter(world)
+            .map(|(id, location)| format!("{id:?}@{:?}", location.location))
+            .collect::<Vec<_>>();
+        let target = world.get::<Camera>(camera).map(|camera| format!("{:?}", camera.computed.target_info));
+        let observed = world.resource::<Seen>().0.clone();
+        assert_eq!(
+            fired.len(),
+            1,
+            "one click, one handler call: calls {seen:?}; observed {observed:?}; hover {hover}; pointers {pointers:?}; camera target {target:?}; centre {centre}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&fired[0].body).unwrap();
+        assert_eq!(body["node"], "go");
+        assert_eq!(body["kind"], "click");
+
+        // The × frame control: measured by the engine into the same surface
+        // coordinates, in the title band at the right end; its centre hides
+        // the dialog with no behaviour involved.
+        let close = layout["chrome"]["close"].clone();
+        let at = |key: &str| close[key].as_f64().unwrap() as f32;
+        assert_eq!((at("w"), at("h")), (28.0, 24.0), "{close}");
+        assert!(at("y") >= 0.0 && at("y") + at("h") <= 33.0, "in the title band: {close}");
+        assert!(at("x") + at("w") <= 400.0 && at("x") > 300.0, "at the right end: {close}");
+        let centre = origin + Vec2::new(at("x") + at("w") / 2.0, at("y") + at("h") / 2.0);
+        let cursor = CursorMoved {
+            window,
+            position: centre,
+            delta: None,
+        };
+        app.world_mut().write_message(cursor.clone());
+        app.world_mut().write_message(WindowEvent::from(cursor));
+        app.update();
+        app.update();
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            let button = MouseButtonInput {
+                button: MouseButton::Left,
+                state,
+                window,
+            };
+            app.world_mut().write_message(button);
+            app.world_mut().write_message(WindowEvent::from(button));
+            app.update();
+        }
+        assert!(
+            !app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>().visible,
+            "× hides the dialog"
+        );
+        let (_, hidden) = crate::dialog_bus::respond(
+            app.world_mut(),
+            "shell.scene.layout",
+            &serde_json::json!({"scene":"editor"}),
+        );
+        let hidden: serde_json::Value = serde_json::from_str(&hidden).unwrap();
+        assert_eq!((hidden["visible"].as_bool(), &hidden["chrome"]), (Some(false), &serde_json::json!({})));
+
+        // Escape on the output window dismisses it here too, but only with
+        // the focus inside the dialog: that window is every panel's as well.
+        crate::dialog_bus::respond(app.world_mut(), "shell.dialog.show", &serde_json::json!({"scene":"editor"}));
+        app.update();
+        let dialog = app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>();
+        assert_eq!((dialog.visible, dialog.window, dialog.window_shared), (true, Some(window), true));
+        let root = dialog.root.unwrap();
+        let escape = bevy::input::keyboard::KeyboardInput {
+            key_code: KeyCode::Escape,
+            logical_key: bevy::input::keyboard::Key::Escape,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        };
+        app.world_mut().resource_mut::<bevy::input_focus::InputFocus>().clear();
+        app.world_mut().write_message(escape.clone());
+        app.update();
+        assert!(
+            app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>().visible,
+            "Escape with the focus outside the dialog is a panel's"
+        );
+        *app.world_mut().resource_mut::<bevy::input_focus::InputFocus>() =
+            bevy::input_focus::InputFocus::from_entity(root);
+        app.world_mut().write_message(bevy::input::keyboard::KeyboardInput {
+            key_code: KeyCode::Escape,
+            logical_key: bevy::input::keyboard::Key::Escape,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        });
+        app.update();
+        assert!(
+            !app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>().visible,
+            "Escape hides the embedded dialog"
+        );
     }
 
     /// A legacy v2 state file as today's Quoin writes it, for the migration

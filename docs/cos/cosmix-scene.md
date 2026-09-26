@@ -5,9 +5,22 @@ For the retained CTK renderer and shell verbs, see [Mix Scenes in Quoin](scenes)
 `cosmix-scene` parses a bounded Mix Scenes v0 document into a renderer-neutral
 tree. A document is a Bus envelope with required `scene: 1`, `name` and
 `citizen` headers. `window`, `subscribe`, `targets` and `model` are optional
-single-line JSON headers. `window.kind` is `edge` in v0; the envelope is the
-mount request and a window-family node is optional. If both exist, their kinds
-must agree.
+single-line JSON headers. The envelope is the mount request and a
+window-family node is optional. If both exist, they must agree.
+
+`window.kind` is `edge` or `dialog` (0.6). Absent on the header, it means
+`edge`. An edge window takes an `edge` (`right` by default), optional `w`/`h`
+and `title`. A `dialog` is a centred window, not a page on an edge. It needs
+numeric `w` and `h` in 240..=2048 logical px and takes no `edge` or `panel`,
+which lint reports as `window-dialog-edge`. `chrome` defaults to true for
+both kinds. From 0.6 the header is validated on its own, not only against a
+window node: an unknown `kind` is `window-kind`, a bad `edge` is
+`enum-value`, and a non-numeric or negative `w`/`h` or a non-string `title`
+is `port-type`. Earlier versions accepted a header-only kind they could not
+honour and mounted it on the right edge, so citizens that author a dialog
+check `shell.scene.describe {family:"window"}` for the `dialog` enum value
+first. In v1 only the Scene Editor mounts as a dialog: the scenes loader
+refuses `kind:"dialog"` for every other scene.
 
 The body contains exactly one fenced `mix` strict-data map. Nodes have the
 shape `id: { widget: family, ...ports }`. The ten families are `window`,

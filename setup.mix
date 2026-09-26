@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.1.1
 -- setup.mix — CosMix setup, stage 2. Runs under the `mix` that `bootstrap`
 -- just built; re-run it any time to rebuild and reinstall (idempotent).
 --
@@ -233,6 +233,24 @@ if $want_desktop then
     rename($entry_path .. ".new", $entry_path)
     print(">> installed " .. $entry_path)
   end
+  -- The Scene Editor entry runs scenes-cli.mix from the directory the loader
+  -- is installed in; the template's @SHARE_DESKTOP@ becomes that path, as one
+  -- quoted argument, and its explanatory comment lines are dropped.
+  install_bin($desktop .. "/scripts/scenes-cli.mix", $bin .. "/scenes-cli.mix")
+  $qcli = replace($bin .. "/scenes-cli.mix", "\\", "\\\\\\\\")
+  $qcli = replace($qcli, "\"", "\\\\\"")
+  $qcli = replace($qcli, "`", "\\\\`")
+  $qcli = replace($qcli, "$", "\\\\$")
+  $qcli = replace($qcli, "%", "%%")
+  $se_lines = filter(read_lines($desktop .. "/scripts/dev.cosmix.scene-editor.desktop"), fn($l) = not starts_with($l, "#"))
+  $se_entry = replace(join($se_lines, "\n") .. "\n", "@SHARE_DESKTOP@/scenes-cli.mix", "\"" .. $qcli .. "\"")
+  if contains($se_entry, "@SHARE_DESKTOP@") or not contains($se_entry, "Exec=mix \"" .. $qcli .. "\" editor") then
+    raise("SETUP_LAUNCHER", "dev.cosmix.scene-editor.desktop has no `Exec=mix @SHARE_DESKTOP@/scenes-cli.mix editor` line to render", {})
+  end
+  $se_path = $applications .. "/dev.cosmix.scene-editor.desktop"
+  write_file($se_path .. ".new", $se_entry)
+  rename($se_path .. ".new", $se_path)
+  print(">> installed " .. $se_path)
 end
 
 -- 4. optional system install (sudo). Binaries only — see the header.
@@ -257,6 +275,10 @@ if $want_system then
       $_helper = run_argv_must(["sudo", "install", "-m", "644", $bin .. "/lib/" .. $helper, "/opt/cosmix/bin/lib/" .. $helper])
     end
     $_templates = run_argv_must(["sudo", "cp", "-a", $root .. "/share/scenes/.", "/opt/cosmix/share/scenes/"])
+    -- scenes-cli.mix sits beside the system desktop scripts (plan §4.7); the
+    -- installed launcher entry keeps pointing at the dev tier's copy.
+    $_cli_dir = run_argv_must(["sudo", "install", "-d", "-m", "755", "/opt/cosmix/share/desktop"])
+    $_cli = run_argv_must(["sudo", "install", "-m", "755", $bin .. "/scenes-cli.mix", "/opt/cosmix/share/desktop/scenes-cli.mix"])
     print(">> system scenes templates: /opt/cosmix/share/scenes; set SCENES_TEMPLATES in the unit environment")
   end
   print(">> /opt/cosmix/bin updated. systemd units, polkit rules and sysusers live in")

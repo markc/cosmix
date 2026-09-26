@@ -21,4 +21,24 @@ for each $verb in ["install", "remove", "enable", "disable", "reload", "reset", 
     raise("SCENES_MESH_TEST", "local and mesh refusal differ", {verb:$verb, local:$a, remote:$b})
   end
 end
-print("PASS scenes local/attested-mesh list and all mutation refusals")
+-- Scene Editor verbs (plan §4.1): every one is mesh-open with identical replies.
+$a = call($local, "scenes.templates", {})
+$b = call($remote, "scenes.templates", {})
+if $a.rc != 0 or not deep_eq($a, $b) or type($a.body.templates) != "list" then raise("SCENES_MESH_TEST", "templates differ", {local:$a, remote:$b}) end
+$cases = [
+  ["scenes.editor.open", {view:"sideways"}, "SCENES_ARGUMENT"],
+  ["scenes.editor.close", {unload:"yes"}, "SCENES_ARGUMENT"],
+  ["scenes.fork", {name:"editor"}, "SCENES_RESERVED"],
+  ["scenes.promote", {from:"../invalid"}, "SCENES_NAME"],
+  ["scenes.move", {name:"editor", edge:"left"}, "SCENES_RESERVED"],
+  ["scenes.enable", {name:"editor"}, "SCENES_RESERVED"],
+  ["scenes.install", {template:"editor", enable:true}, "SCENES_RESERVED"]
+]
+for each $case in $cases
+  $a = call($local, $case[0], $case[1])
+  $b = call($remote, $case[0], $case[1])
+  if $a.rc != 10 or $a.body.error_code != $case[2] or $b.rc != $a.rc or not deep_eq($a.body, $b.body) then
+    raise("SCENES_MESH_TEST", "local and mesh editor-verb refusal differ", {verb:$case[0], expected:$case[2], local:$a, remote:$b})
+  end
+end
+print("PASS scenes local/attested-mesh list, templates and all mutation refusals")

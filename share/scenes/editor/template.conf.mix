@@ -1,0 +1,6 @@
+schema: 1
+name: "editor"
+title: "Scene Editor"
+description: "Choose, install and arrange the scenes on your desktop edges"
+behaviour: "behaviour.mix"
+hidden: true

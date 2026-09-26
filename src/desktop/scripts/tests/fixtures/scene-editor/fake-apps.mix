@@ -1,0 +1,21 @@
+-- An apps-shaped citizen for scene-editor-e2e.mix (Scene Editor plan §7,
+-- Stage T): apps.launch is recorded and accepted, apps.list answers an empty
+-- catalogue so the launcher and panel behaviours of the Recommended set have
+-- something to read. Every request is appended as one JSON line to
+-- FAKE_APPS_LOG ({verb, args}).
+-- Serve it as `apps`: mix --serve fake-apps.mix --name apps
+$LOG = env("FAKE_APPS_LOG", "")
+
+fn note($verb)
+  if $LOG != "" then append_file($LOG, json_encode({verb:$verb, args:type($event.args) == "map" ? $event.args : {}}) .. "\n") end
+end
+
+on apps.launch
+  note("apps.launch")
+  reply(0, json_encode({launched:true, id:($event.args ?? {}).id}))
+end
+
+on apps.list
+  note("apps.list")
+  reply(0, json_encode({apps:[], count:0}))
+end

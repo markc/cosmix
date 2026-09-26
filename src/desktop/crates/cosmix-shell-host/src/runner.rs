@@ -66,7 +66,7 @@ use crate::corner_bus::{
     CornerAction, CornerBusHandle, CornerIngress, gate_ingress, start as start_corner_bus,
 };
 use crate::input::{
-    KeyboardBridge, PointerBridge, SurfaceTarget, TouchBridge, configure_ingress,
+    KeyboardBridge, PointerBridge, SurfaceKind, SurfaceTarget, TouchBridge, configure_ingress,
     stage_shell_command, staged_shell_commands_pending,
 };
 use crate::output::{
@@ -1353,6 +1353,8 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
 mod ime;
 #[path = "corner_menu.rs"]
 mod corner_menu;
+#[path = "dialog.rs"]
+mod dialog;
 
 struct RunnerState {
     text_input: ime::TextInputBridge,
@@ -1395,6 +1397,7 @@ struct RunnerState {
     corner_engaged: BTreeSet<cosmix_shell::core::Corner>,
     corner_epoch: u64,
     menu: Option<corner_menu::NativeCornerMenu>,
+    dialog: Option<dialog::NativeDialog>,
 }
 
 impl WakeTimerTarget for RunnerState {
@@ -1685,6 +1688,7 @@ fn run_layer_host(
         corner_engaged: BTreeSet::new(),
         corner_epoch: 0,
         menu: None,
+        dialog: None,
     };
 
     // wl_output and xdg-output each use done boundaries. Two roundtrips make
@@ -1912,6 +1916,7 @@ fn state_setup_error(mut state: RunnerState, reason: String) -> AppExit {
 
 fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
     state.dismiss_corner_menu(None);
+    state.close_dialog();
     state.wake_timer.token = None;
     state.apply_corner_ingress(CornerIngress::Reset {
         epoch: state.corner_epoch,
@@ -2083,6 +2088,9 @@ impl RunnerState {
             .next()
             .ok_or_else(|| LayerHostError::new("removed output runtime was unavailable"))?;
         let retained_mounts = PanelSurface::mounts(&retired.panels);
+        // Output removal unmaps the dialog and publishes visible:false; the
+        // next show maps it on the selected output (§4.3 Q2).
+        self.drop_dialog();
         if let Some(output) = self.selected_key.clone() {
             self.pointer_bridge.cleanup(&mut self.app, &output, None);
         }
@@ -2234,8 +2242,9 @@ impl RunnerState {
                 }
             }
         }
-        // Create the menu after newly mapped panels so its click-away layer
-        // is above them in the compositor's overlay insertion order.
+        // The dialog maps above the panels, and the menu (created last)
+        // above both, in the compositor's overlay insertion order.
+        self.reconcile_dialog(qh)?;
         self.reconcile_corner_menu(qh)?;
         Ok(())
     }
@@ -2254,6 +2263,7 @@ impl RunnerState {
                 .values()
                 .flat_map(|output| output.panels.iter())
                 .chain(self.menu.iter().map(|menu| &menu.surface))
+                .chain(self.dialog.iter().map(|dialog| &dialog.surface))
                 .filter_map(PanelSurface::pending_frame_requested_at),
         );
         let configure_deadlines = self
@@ -2261,6 +2271,7 @@ impl RunnerState {
             .values()
             .flat_map(|output| output.panels.iter())
             .chain(self.menu.iter().map(|menu| &menu.surface))
+            .chain(self.dialog.iter().map(|dialog| &dialog.surface))
             .filter_map(|panel| {
                 (panel.phase == SurfacePhase::WaitingConfigure)
                     .then_some(panel.waiting_configure_since)
@@ -2358,6 +2369,18 @@ impl RunnerState {
             self.exit_reason = Some(format!("configure-timeout-{edge:?}"));
             return;
         }
+        // A dialog the compositor never configures is not worth the host:
+        // drop it (and its visibility) instead of exiting.
+        if self.dialog.as_ref().is_some_and(|dialog| {
+            dialog.surface.phase == SurfacePhase::WaitingConfigure
+                && dialog
+                    .surface
+                    .waiting_configure_since
+                    .is_some_and(|started| elapsed >= started.saturating_add(CONFIGURE_TIMEOUT))
+        }) {
+            tracing::warn!(event = "quoin_dialog_configure_timeout");
+            self.drop_dialog();
+        }
 
         for panel in self
             .outputs
@@ -2369,6 +2392,9 @@ impl RunnerState {
         if let Some(menu) = self.menu.as_mut() {
             menu.surface.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
         }
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.surface.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
+        }
     }
 
     fn panel_for_surface_mut(
@@ -2379,6 +2405,11 @@ impl RunnerState {
             && menu.surface.matches_surface(surface)
         {
             return Some(&mut menu.surface);
+        }
+        if let Some(dialog) = self.dialog.as_mut()
+            && dialog.surface.matches_surface(surface)
+        {
+            return Some(&mut dialog.surface);
         }
         self.outputs
             .values_mut()
@@ -2478,7 +2509,7 @@ impl CompositorHandler for RunnerState {
         surface: &wl_surface::WlSurface,
         scale: i32,
     ) {
-        if self.menu_scale(qh, surface, scale) {
+        if self.menu_scale(qh, surface, scale) || self.dialog_scale(qh, surface, scale) {
             return;
         }
         debug_assert_render_device_texture_limit(&self.app, self.max_texture_dimension_2d);
@@ -2614,6 +2645,10 @@ impl LayerShellHandler for RunnerState {
             self.dismiss_corner_menu(None);
             return;
         }
+        if self.dialog_matches_layer(layer) {
+            self.drop_dialog();
+            return;
+        }
         let Some((output_key, panel_output, edge)) =
             self.outputs.iter().find_map(|(key, output)| {
                 output
@@ -2667,7 +2702,8 @@ impl LayerShellHandler for RunnerState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if self.configure_menu(qh, layer, &configure) {
+        if self.configure_menu(qh, layer, &configure) || self.configure_dialog(qh, layer, &configure)
+        {
             return;
         }
         debug_assert_render_device_texture_limit(&self.app, self.max_texture_dimension_2d);
@@ -2834,6 +2870,7 @@ impl KeyboardHandler for RunnerState {
         if let Some(target) = target {
             self.keyboard_bridge
                 .enter(&mut self.app, &target, raw, keysyms);
+            self.dialog_keyboard_entered(surface);
             self.needs_update = true;
         }
     }
@@ -3040,6 +3077,9 @@ impl TouchHandler for RunnerState {
 }
 
 impl RunnerState {
+    /// Every surface input may land on: the four panels and, while mapped,
+    /// the dialog (scene-editor plan D16: a `SurfaceTarget`, not a special
+    /// case like the corner menu).
     fn surface_targets(&self) -> Vec<SurfaceTarget> {
         self.outputs
             .values()
@@ -3049,15 +3089,18 @@ impl RunnerState {
                 panel.wayland_surface().map(|surface| SurfaceTarget {
                     surface,
                     window: panel.window,
-                    edge: panel.edge,
                     output_size: Vec2::new(
                         output.logical_size.width(),
                         output.logical_size.height(),
                     ),
-                    thickness: presentation.thickness_px,
-                    committed_margin: committed_edge_margin(presentation),
+                    kind: SurfaceKind::Panel {
+                        edge: panel.edge,
+                        thickness: presentation.thickness_px,
+                        committed_margin: committed_edge_margin(presentation),
+                    },
                 })
             })
+            .chain(self.dialog_target())
             .collect()
     }
 
@@ -3318,6 +3361,9 @@ impl Dispatch<WpFractionalScaleV1, SurfaceTag> for RunnerState {
             return;
         };
         debug_assert_render_device_texture_limit(&state.app, state.max_texture_dimension_2d);
+        if state.dialog_fractional_scale(qh, proxy, scale) {
+            return;
+        }
         let elapsed = state
             .app
             .world()

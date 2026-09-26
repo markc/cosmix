@@ -92,3 +92,83 @@ fn virtual_list_real_schedule_retains_content_on_model_rebind_and_reorder() {
     assert!(harness.app.world().get_entity(before["a"].0).is_err());
     assert!(harness.app.world().get_entity(before["b"].0).is_err());
 }
+
+/// `shell.scene.layout` reads the same engine rectangles this harness
+/// measures: document nodes and every realised row, keyed by item id.
+#[test]
+fn scene_layout_reports_engine_rects_for_nodes_and_realised_rows() {
+    for flow in ["horizontal", "vertical"] {
+        let mut harness = Harness::load(&body(flow));
+        let layout = crate::scene_layout(harness.app.world_mut(), "layout", None).unwrap();
+        assert_eq!(layout["scene"], "layout");
+        assert_eq!(layout["applied_revision"], layout["revision"]);
+        for id in ["root", "sentinel", "list"] {
+            let expected = rect(&harness, harness.entity(id));
+            let got = &layout["nodes"][id];
+            let context = format!("{flow} node {id}");
+            close(&context, got["x"].as_f64().unwrap() as f32, expected.min.x);
+            close(&context, got["y"].as_f64().unwrap() as f32, expected.min.y);
+            close(&context, got["w"].as_f64().unwrap() as f32, expected.width());
+            close(&context, got["h"].as_f64().unwrap() as f32, expected.height());
+            assert_eq!(got["hidden"], false, "{context}");
+        }
+        let contents: Vec<(String, Entity)> = {
+            let world = harness.app.world_mut();
+            world
+                .query::<(Entity, &RowInstances)>()
+                .iter(world)
+                .map(|(entity, row)| (row.key.clone(), entity))
+                .collect()
+        };
+        assert_eq!(contents.len(), 2, "{flow}: both rows realised");
+        for (key, entity) in contents {
+            let expected = rect(&harness, entity);
+            let got = &layout["instances"]["list"][key.as_str()];
+            let context = format!("{flow} row {key}");
+            close(&context, got["x"].as_f64().unwrap() as f32, expected.min.x);
+            close(&context, got["y"].as_f64().unwrap() as f32, expected.min.y);
+            close(&context, got["w"].as_f64().unwrap() as f32, expected.width());
+            close(&context, got["h"].as_f64().unwrap() as f32, expected.height());
+            assert!(expected.width() > 0.0 && expected.height() > 0.0, "{context}");
+        }
+        let narrowed = crate::scene_layout(harness.app.world_mut(), "layout", Some("list")).unwrap();
+        assert_eq!(
+            narrowed["nodes"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["list"]
+        );
+        assert_eq!(narrowed["instances"]["list"].as_object().unwrap().len(), 2);
+        for (scene, node) in [("layout", Some("nope")), ("absent", None)] {
+            let error = crate::scene_layout(harness.app.world_mut(), scene, node).unwrap_err();
+            assert_eq!(error["error_code"], "NOT_FOUND");
+        }
+    }
+}
+
+#[test]
+fn layout_hidden_follows_display_none_up_to_the_scene_page() {
+    let mut world = World::new();
+    let page = world.spawn(Node::default()).id();
+    let folded = world
+        .spawn(Node {
+            display: Display::None,
+            ..default()
+        })
+        .id();
+    let inside = world.spawn(Node::default()).id();
+    let shown = world.spawn(Node::default()).id();
+    world.entity_mut(page).add_children(&[folded, shown]);
+    world.entity_mut(folded).add_child(inside);
+    assert!(hidden_below(&world, inside, Some(page)));
+    assert!(hidden_below(&world, folded, Some(page)));
+    assert!(!hidden_below(&world, shown, Some(page)));
+    // Beyond the page is the host's business (an unmapped dialog), not a
+    // node's own visibility.
+    let host = world
+        .spawn(Node {
+            display: Display::None,
+            ..default()
+        })
+        .id();
+    world.entity_mut(host).add_child(page);
+    assert!(!hidden_below(&world, shown, Some(page)));
+}

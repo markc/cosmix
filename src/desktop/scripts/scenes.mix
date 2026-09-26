@@ -1,9 +1,12 @@
--- version: 0.1.0
+-- version: 0.2.2
 -- Stage B: owns the panel/launcher/calendar/notes pages once seeded and
 -- enabled; while the legacy quoin-panel citizen (SCENES_LEGACY_SERVICE) is
 -- registered those scenes stay unmounted, and its departure mounts them.
 -- Never auto-enables. Requires W1 native fs events, managed exits/stops and
 -- bus.connected.
+-- Scene Editor v1: the reserved `editor` entry (summoned, never enabled),
+-- scenes.templates/editor.open/editor.close/fork/promote/move, first run
+-- (SCENES_FIRST_RUN=0 disables it) and the unreadable-state write guard.
 $loader = require("lib/scenes.mix")
 $io = require("lib/scenes-io.mix")
 $ROOT = env("SCENES_DIR", env("XDG_CONFIG_HOME", env("HOME") .. "/.config") .. "/cosmix/scenes")
@@ -115,6 +118,7 @@ on "shell.scene.changed"
   if has_key($state.scenes, $notice.scene ?? "") and $state.scenes[$notice.scene].revision == $notice.revision then
     $state.scenes[$notice.scene].diagnostics = $notice.diagnostics ?? []
   end
+  $state = $loader.scene_notice($state, $notice)
   $state = $loader.changed($state)
 end
 
@@ -250,6 +254,41 @@ end
 
 on scenes.model desc "Publish complete runtime model {name,generation,value}; reject stale generations"
   $state = $loader.request($state, "model", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.templates desc "Shipped templates with gallery metadata and installed_as; hidden templates omitted"
+  $state = $loader.request($state, "templates", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+end
+
+on scenes.editor.open desc "Open the Scene Editor {safe?,view?,scene?,first_run?}; safe uses the shipped copy and toggles it"
+  $state = $loader.request($state, "editor.open", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.editor.close desc "Hide the Scene Editor {unload?}; unload stops its behaviour"
+  $state = $loader.request($state, "editor.close", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.fork desc "Copy an installation into a sandbox scene {name,as?,enable?=true}"
+  $state = $loader.request($state, "fork", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.promote desc "Validate a sandbox and swap it over its original {from}; the old copy goes to .recovery"
+  $state = $loader.request($state, "promote", $event.args ?? {})
+  reply($state.rc, json_encode($state.response))
+  $state = $loader.changed($state)
+end
+
+on scenes.move desc "Move a scene to another edge {name,edge}; rewrites only its window header"
+  $state = $loader.request($state, "move", $event.args ?? {})
   reply($state.rc, json_encode($state.response))
   $state = $loader.changed($state)
 end

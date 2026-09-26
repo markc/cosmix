@@ -58,6 +58,7 @@ pub const ALL_CODES: &[&str] = &[
     "missing-root",
     "multiple-parents",
     "window-disagreement",
+    "window-dialog-edge",
     "orphan-node",
     "cycle",
     "invalid-binding",
@@ -262,7 +263,7 @@ fn schema(f: &str) -> Option<Vec<Port>> {
     static EDGE: &[&str] = &["right", "left", "top", "bottom"];
     static ALIGN: &[&str] = &["start", "center", "end", "stretch"];
     static TONE: &[&str] = &["normal", "danger", "primary"];
-    static KIND: &[&str] = &["edge"];
+    static KIND: &[&str] = &["edge", "dialog"];
     static WINDOW: [Port; 6] = [
         Port {
             name: "kind",
@@ -410,6 +411,95 @@ fn schema(f: &str) -> Option<Vec<Port>> {
 
 // Check presence before defaults are inserted. Even fill:false + grow is
 // ambiguous author intent; require removing the legacy shorthand first.
+/// Smallest and largest logical size a dialog may author for `w` and `h`.
+pub const DIALOG_MIN_PX: f64 = 240.0;
+pub const DIALOG_MAX_PX: f64 = 2048.0;
+
+/// Validate a window declaration: the envelope `window` header (`node:
+/// false`) or a window-family node (`node: true`). The header was only ever
+/// checked for disagreement with a node, so a header-only kind Quoin cannot
+/// honour used to pass lint and mount on the right edge.
+///
+/// - `kind` is `edge` or `dialog`; it is required on a node (the schema says
+///   so) and optional on the header, where absence means `edge`.
+/// - `edge` must be one of the four edges; `w`/`h` non-negative numbers;
+///   `title` a string.
+/// - A `dialog` takes no `edge` or `panel` (`window-dialog-edge`): it is
+///   centred, not on an edge, and has no carousel page. It needs numeric `w`
+///   and `h` in `DIALOG_MIN_PX..=DIALOG_MAX_PX`.
+fn check_window_declaration<'a>(
+    get: impl Fn(&str) -> Option<&'a JsonValue>,
+    line: usize,
+    node: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    let kind = match get("kind") {
+        None if node => return, // missing-port is reported by the schema check
+        None => "edge",
+        Some(value) => match value.as_str() {
+            Some(k @ ("edge" | "dialog")) => k,
+            _ => {
+                out.push(Diagnostic::error(
+                    "window-kind",
+                    line,
+                    "window kind must be edge or dialog",
+                ));
+                return;
+            }
+        },
+    };
+    if !node {
+        if let Some(edge) = get("edge")
+            && !matches!(edge.as_str(), Some("right" | "left" | "top" | "bottom"))
+        {
+            out.push(Diagnostic::error(
+                "enum-value",
+                line,
+                "window.edge must be right, left, top or bottom",
+            ));
+        }
+        for key in ["w", "h"] {
+            if get(key).is_some_and(|v| v.as_f64().is_none_or(|n| n < 0.0)) {
+                out.push(Diagnostic::error(
+                    "port-type",
+                    line,
+                    format!("window.{key} must be a non-negative number"),
+                ));
+            }
+        }
+        if get("title").is_some_and(|v| !v.is_string()) {
+            out.push(Diagnostic::error("port-type", line, "window.title must be a string"));
+        }
+    }
+    if kind != "dialog" {
+        return;
+    }
+    for key in ["edge", "panel"] {
+        if get(key).is_some() {
+            out.push(Diagnostic::error(
+                "window-dialog-edge",
+                line,
+                format!("a dialog window takes no {key}: it is centred, not mounted on an edge"),
+            ));
+        }
+    }
+    for key in ["w", "h"] {
+        match get(key).and_then(JsonValue::as_f64) {
+            None if get(key).is_none() => out.push(Diagnostic::error(
+                "missing-port",
+                line,
+                format!("a dialog window needs {key}"),
+            )),
+            Some(n) if (DIALOG_MIN_PX..=DIALOG_MAX_PX).contains(&n) => {}
+            _ => out.push(Diagnostic::error(
+                "port-type",
+                line,
+                format!("dialog {key} must be a number in 240..=2048"),
+            )),
+        }
+    }
+}
+
 fn check_layout_declarations(id: &str, node: &RawNode, out: &mut Vec<Diagnostic>) {
     let ports = &node.ports;
     let explicit = ["grow", "shrink", "basis"].iter().any(|p| ports.contains_key(*p));
@@ -783,12 +873,8 @@ fn lint_structure(doc: &SceneDocument) -> Vec<Diagnostic> {
                 }
             }
         }
-        if n.widget == "window" && n.ports.get("kind").and_then(JsonValue::as_str) != Some("edge") {
-            out.push(Diagnostic::error(
-                "window-kind",
-                n.line,
-                "window kind must be edge in v0",
-            ));
+        if n.widget == "window" {
+            check_window_declaration(|k| n.ports.get(k), n.line, true, &mut out);
         }
         if n.widget == "list" {
             if let Some(row) = n.ports.get("row").and_then(JsonValue::as_str) {
@@ -858,6 +944,7 @@ fn lint_structure(doc: &SceneDocument) -> Vec<Diagnostic> {
                 "window.chrome must be bool",
             ));
         }
+        check_window_declaration(|k| w.get(k), 1, false, &mut out);
         for n in doc.nodes.values().filter(|n| n.widget == "window") {
             if ["kind", "edge", "title", "w", "h", "chrome"]
                 .iter()
@@ -1382,6 +1469,99 @@ mod tests {
         assert!(lint(&document).iter().any(|d| d.code == "port-type"));
     }
 
+    fn codes(document: &SceneDocument) -> Vec<String> {
+        lint(document)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.code)
+            .collect()
+    }
+
+    #[test]
+    fn dialog_window_kind_is_described_and_accepted() {
+        let window = describe("window").unwrap();
+        let kind = window.iter().find(|p| p.path == "kind").unwrap();
+        assert_eq!(kind.enum_values, Some(vec!["edge".to_string(), "dialog".to_string()]));
+        let mut document = doc("root: {widget: \"column\", children: []}");
+        document.window = Some(json!({"kind":"dialog","w":880,"h":620,"title":"Scene Editor","chrome":true}));
+        assert!(codes(&document).is_empty(), "{:?}", lint(&document));
+        assert!(resolve(&document).is_ok());
+        let node = doc("root: {widget: \"window\", kind: \"dialog\", w: 880, h: 620}");
+        assert!(codes(&node).is_empty(), "{:?}", lint(&node));
+    }
+
+    #[test]
+    fn dialog_refuses_edge_panel_and_needs_bounded_size() {
+        let mut document = doc("root: {widget: \"column\", children: []}");
+        for (header, expected) in [
+            (json!({"kind":"dialog","edge":"right","w":880,"h":620}), "window-dialog-edge"),
+            (json!({"kind":"dialog","panel":"scene-x","w":880,"h":620}), "window-dialog-edge"),
+            (json!({"kind":"dialog","h":620}), "missing-port"),
+            (json!({"kind":"dialog","w":880}), "missing-port"),
+            (json!({"kind":"dialog","w":239,"h":620}), "port-type"),
+            (json!({"kind":"dialog","w":880,"h":2049}), "port-type"),
+            (json!({"kind":"dialog","w":"880","h":620}), "port-type"),
+        ] {
+            document.window = Some(header.clone());
+            assert!(codes(&document).iter().any(|c| c == expected), "{header}: {:?}", lint(&document));
+            assert!(resolve(&document).is_err(), "{header} resolved");
+        }
+        for (w, h) in [(240, 240), (2048, 2048)] {
+            document.window = Some(json!({"kind":"dialog","w":w,"h":h}));
+            assert!(codes(&document).is_empty(), "{w}x{h}: {:?}", lint(&document));
+        }
+    }
+
+    #[test]
+    fn header_only_window_declaration_is_validated() {
+        // 0.5 checked the header only against a window node, so these
+        // passed lint and a host mounted them on the right edge.
+        let mut document = doc("root: {widget: \"column\", children: []}");
+        for (header, expected) in [
+            (json!({"kind":"floating"}), "window-kind"),
+            (json!({"kind":7}), "window-kind"),
+            (json!({"kind":"edge","edge":"middle"}), "enum-value"),
+            (json!({"kind":"edge","w":-1}), "port-type"),
+            (json!({"kind":"edge","h":"52"}), "port-type"),
+            (json!({"kind":"edge","title":3}), "port-type"),
+        ] {
+            document.window = Some(header.clone());
+            assert!(codes(&document).iter().any(|c| c == expected), "{header}: {:?}", lint(&document));
+        }
+        // Edge headers the shipped templates author stay valid, kind or not.
+        for header in [
+            json!({"kind":"edge","edge":"bottom","h":52,"chrome":false}),
+            json!({"edge":"left","w":440,"title":"Applications","chrome":false}),
+            json!({"kind":"edge","edge":"right","panel":"settings.appearance","title":"Settings"}),
+            json!({"chrome":true}),
+        ] {
+            document.window = Some(header.clone());
+            assert!(codes(&document).is_empty(), "{header}: {:?}", lint(&document));
+        }
+    }
+
+    /// The shipped Scene Editor template (scene-editor plan §4.6, Stage S):
+    /// it must parse, lint and resolve under both window headers — the
+    /// dialog it ships with and the D3 edge fallback.
+    #[test]
+    fn scene_editor_template_is_valid_as_dialog_and_as_edge() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../share/scenes/editor/scene.mix");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let dialog_header = "window: {\"chrome\":true,\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":880}";
+        let edge_header = "window: {\"edge\":\"right\",\"kind\":\"edge\",\"title\":\"Scene Editor\",\"w\":480}";
+        assert!(source.contains(dialog_header), "template must ship the dialog header");
+        for variant in [source.clone(), source.replacen(dialog_header, edge_header, 1)] {
+            let document = parse(&variant).unwrap_or_else(|d| panic!("parse: {d:?}"));
+            assert_eq!(document.name, "editor");
+            assert_eq!(document.citizen, "scene-editor");
+            let diagnostics = lint(&document);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            resolve(&document).unwrap_or_else(|d| panic!("resolve: {d:?}"));
+        }
+    }
+
     #[test]
     fn column_align_and_text_align_validate_enums() {
         for (family, ports, default, values) in [
@@ -1757,6 +1937,7 @@ b: {widget: "window", kind: "edge", edge: "right", title: "ok", w: 1, h: 2}
             ("missing-root", valid("x: {widget: \"text\", text: \"x\"}").into()),
             ("multiple-parents", valid("root: {widget: \"column\", children: [\"a\", \"b\"]}\na: {widget: \"column\", children: [\"x\"]}\nb: {widget: \"column\", children: [\"x\"]}\nx: {widget: \"text\", text: \"x\"}").into()),
             ("window-disagreement", valid("root: {widget: \"window\", kind: \"edge\", title: \"node\"}").replacen("citizen: c", "citizen: c\nwindow: {\"kind\":\"edge\",\"title\":\"header\"}", 1)),
+            ("window-dialog-edge", valid("root: {widget: \"window\", kind: \"dialog\", edge: \"left\", w: 400, h: 300}").into()),
             ("orphan-node", valid("root: {widget: \"text\", text: \"x\"}\nother: {widget: \"text\", text: \"y\"}").into()),
             ("cycle", valid("root: {widget: \"column\", children: [\"a\"]}\na: {widget: \"column\", children: [\"root\"]}").into()),
             ("invalid-binding", valid("root: {widget: \"text\", text: \"= \"}").into()),

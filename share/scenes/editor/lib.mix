@@ -1,0 +1,844 @@
+-- Scene Editor helpers (scene-editor plan §4.6). They live beside the
+-- template, not in the shared lib/, so a user copy of the editor can edit its
+-- own logic. The behaviour loads them with require($SCENE_DIR .. "/lib.mix").
+--
+-- Everything here is pure: the model builder (loader inventory + templates +
+-- shell snapshot + registered services + UI selection -> one complete model),
+-- click planning (a click -> a list of Bus steps, driven by the behaviour
+-- through next_step/advance/finish) and the ced diagnostics diff. No Bus
+-- traffic, no clock, no files except header_model().
+
+$EDGES = ["top", "bottom", "left", "right"]
+$MODES = ["hidden", "pinned", "docked"]
+$VIEWS = ["gallery", "installed", "arrange"]
+$FILE_KINDS = ["scene", "behaviour", "metadata"]
+-- Breeze Dark literals, as in every shipped template (plan D15).
+$C = {accent: "#3daee9", selected: "#3daee933", idle: "#ffffff0f", slot: "#ffffff08",
+  clear: "#00000000", text: "#fcfcfc", muted: "#a1a9b1", green: "#27ae60",
+  amber: "#f67400", red: "#da4453", grey: "#6e7680",
+  banner_red: "#da445333", banner_amber: "#f6740033"}
+-- Thickness ranges per orientation (Quoin's shell.panel.resize, plan §4.3 Q1)
+-- and the stepper's increments (§4.6).
+$RANGE = {top: [24, 200], bottom: [24, 200], left: [120, 500], right: [120, 500]}
+$STEP = {top: 4, bottom: 4, left: 20, right: 20}
+$MAX_PROBLEM_ROWS = 20
+$MAX_CED_DIAGNOSTICS = 500
+$CED_APP_ID = "dev.cosmix.ced"
+$DIAG_SOURCE = "scenes"
+
+-- Every directed verb a node of scene.mix names (§4.6 "Clicks → behaviour
+-- verbs"). The behaviour answers each.
+fn verbs()
+  return ["editor.view", "editor.template.select", "editor.template.install",
+    "editor.recommended", "editor.scene.select", "editor.scene.action",
+    "editor.scene.remove", "editor.scene.edit", "editor.scene.fork",
+    "editor.scene.promote", "editor.scene.move", "editor.edge.mode",
+    "editor.edge.size", "editor.edge.page", "editor.edge.order"]
+end
+
+-- The default model is the scene document's own `model:` header, so the
+-- document and the behaviour cannot disagree about its shape.
+fn header_model($dir)
+  for each $line in read_lines($dir .. "/scene.mix")
+    if starts_with($line, "model: ") then return json_parse(substr($line, 7)) end
+    if $line == "```mix" then break end
+  end
+  raise("EDITOR_MODEL", "scene.mix has no model header", {dir: $dir})
+end
+
+-- ── UI state (selection only; everything else is re-read) ───────────────
+
+fn default_ui()
+  return {view: "gallery", template: nil, scene: nil, page: nil, armed: nil, message: "", seq: nil}
+end
+
+-- scenes.editor.open {view, scene} from anyone (an agent, the chord, the
+-- launcher) navigates the UI: the loader bumps request_seq and the behaviour
+-- applies the record once per new value.
+fn apply_request($ui, $editor)
+  if type($editor) != "map" or $editor.request_seq == nil or $editor.request_seq == $ui.seq then return $ui end
+  $ui.seq = $editor.request_seq
+  if contains($VIEWS, $editor.view ?? "") then $ui.view = $editor.view end
+  if type($editor.scene) == "string" and $editor.scene != "" then
+    $ui.scene = $editor.scene
+    if $editor.view == nil then $ui.view = "installed" end
+  end
+  $ui.armed = nil
+  return $ui
+end
+
+-- ── small readers over the loader inventory and shell snapshot ──────────
+
+fn rows($list)
+  if type($list) != "map" or type($list.scenes) != "list" then return [] end
+  return $list.scenes
+end
+
+fn row($list, $name)
+  if $name == nil then return nil end
+  for each $r in rows($list)
+    if $r.name == $name then return $r end
+  end
+  return nil
+end
+
+fn templates_of($templates)
+  if type($templates) != "map" or type($templates.templates) != "list" then return [] end
+  return $templates.templates
+end
+
+fn template_of($templates, $template)
+  if $template == nil then return nil end
+  for each $t in templates_of($templates)
+    if $t.template == $template then return $t end
+  end
+  return nil
+end
+
+fn panel_of($props, $edge)
+  if type($props) != "map" or type($props.panels) != "map" or type($props.panels[$edge]) != "map" then return nil end
+  return $props.panels[$edge]
+end
+
+fn strings($v)
+  if type($v) != "list" then return [] end
+  $out = []
+  for each $s in $v
+    if type($s) == "string" and $s != "" and not contains($out, $s) then push($out, $s) end
+  end
+  return $out
+end
+
+-- Arrange shows declared (conf.mix) order first, then live pages not
+-- declared (plan §6).
+fn edge_pages($props, $edge)
+  $panel = panel_of($props, $edge)
+  if $panel == nil then return [] end
+  $out = strings($panel.declared)
+  for each $page in strings($panel.pages)
+    if not contains($out, $page) then push($out, $page) end
+  end
+  return $out
+end
+
+fn edge_label($edge)
+  return upper(substr($edge, 0, 1)) .. substr($edge, 1)
+end
+
+fn px($n)
+  return to_string(round($n)) .. " px"
+end
+
+-- ── the refusal inside a runtime.call outcome ───────────────────────────
+
+-- runtime.call wraps an upstream refusal as upstream_refused with the body in
+-- context.reply; the loader's or Quoin's own {error_code, message} is what a
+-- human needs to read.
+fn refusal($out)
+  $v = type($out) == "map" ? $out.value : nil
+  if type($v) != "map" then return {code: "UNKNOWN", message: "request failed"} end
+  $reply = type($v.context) == "map" ? $v.context.reply : nil
+  if type($reply) == "map" and type($reply.error_code) == "string" then
+    return {code: $reply.error_code, message: to_string($reply.message ?? $reply.error ?? $reply.error_code)}
+  end
+  if type($reply) == "map" and type($reply.error) == "string" then
+    return {code: $v.error_code ?? "UNKNOWN", message: $reply.error}
+  end
+  return {code: $v.error_code ?? "UNKNOWN", message: to_string($v.message ?? "request failed")}
+end
+
+-- ── the model ───────────────────────────────────────────────────────────
+
+-- {status, color} of one installed scene: grey disabled, red crash-loop or
+-- refused, amber diagnostic or not settled, green mounted and running.
+fn scene_state($r)
+  if $r.enabled != true then return {status: "disabled", color: $C.grey} end
+  if $r.behaviour == "crash_loop" then return {status: "crash_loop", color: $C.red} end
+  if $r.mounted != true then
+    if $r.diagnostic != nil then return {status: "refused", color: $C.red} end
+    $waiting = contains(["handover", "starting", "backoff"], $r.behaviour ?? "") ? $r.behaviour : "not mounted"
+    return {status: $waiting, color: $C.amber}
+  end
+  if $r.diagnostic != nil or length($r.problems ?? []) > 0 then return {status: "diagnostic", color: $C.amber} end
+  if contains(["handover", "starting", "backoff"], $r.behaviour ?? "") then return {status: $r.behaviour, color: $C.amber} end
+  return {status: $r.behaviour ?? "running", color: $C.green}
+end
+
+fn scene_title($r)
+  return type($r.title) == "string" and $r.title != "" ? $r.title : $r.name
+end
+
+fn problem_text($p)
+  $where = basename(to_string($p.file ?? "")) .. ":" .. to_string($p.line ?? 1)
+  if $p.col != nil then $where = $where .. ":" .. to_string($p.col) end
+  return $where .. "  " .. to_string($p.code ?? "") .. "  " .. to_string($p.message ?? "")
+end
+
+fn severity_color($severity)
+  $s = lower(to_string($severity ?? ""))
+  if $s == "error" then return $C.red end
+  if $s == "warning" then return $C.amber end
+  return $C.muted
+end
+
+-- At most MAX_PROBLEM_ROWS rows; the last says how many more ced shows.
+fn problem_rows($problems)
+  $all = type($problems) == "list" ? $problems : []
+  $out = []
+  $n = length($all)
+  $shown = $n > $MAX_PROBLEM_ROWS ? $MAX_PROBLEM_ROWS - 1 : $n
+  for $i = 0 to $shown - 1
+    push($out, {id: "p_" .. to_string($i), cells: [problem_text($all[$i])], color: severity_color($all[$i].severity)})
+  end
+  if $n > $shown then
+    push($out, {id: "p_more", cells: ["… " .. to_string($n - $shown) .. " more: Edit scene shows every problem in ced"], color: $C.muted})
+  end
+  return $out
+end
+
+fn scene_rows($list, $ui)
+  $out = []
+  for each $r in rows($list)
+    $st = scene_state($r)
+    push($out, {id: "s_" .. $r.name, cells: ["●", scene_title($r), $r.name, $st.status, to_string($r.edge ?? "")],
+      name: $r.name, dot: $st.color, background: $r.name == $ui.scene ? $C.selected : $C.clear})
+  end
+  return $out
+end
+
+fn selected_model($list, $ui)
+  $r = row($list, $ui.scene)
+  if $r == nil then
+    return {shown: false, name: "", title: "", status: "", status_color: $C.muted, problems: [],
+      enabled_label: "Enable", has_behaviour: false, is_fork: false, remove_label: "Remove"}
+  end
+  $st = scene_state($r)
+  $parts = [$r.mounted == true ? "mounted" : "not mounted"]
+  if $r.diagnostic != nil and $r.attempted_digest != nil and $r.attempted_digest != "" and $r.attempted_digest != $r.accepted_digest then
+    push($parts, "last edit refused")
+  end
+  if $st.status == "crash_loop" then push($parts, "crash loop: Reload restarts it") end
+  if type($r.edge) == "string" then push($parts, $r.edge .. " edge") end
+  if type($r.template) == "string" then push($parts, "template " .. $r.template) end
+  if type($r.forked_from) == "string" then push($parts, "sandbox of " .. $r.forked_from) end
+  $files = type($r.files) == "map" ? $r.files : {}
+  return {shown: true, name: $r.name, title: scene_title($r), status: join($parts, " · "), status_color: $st.color,
+    problems: problem_rows($r.problems),
+    enabled_label: $r.enabled == true ? "Disable" : "Enable",
+    has_behaviour: type($files.behaviour) == "string",
+    is_fork: type($r.forked_from) == "string",
+    remove_label: $ui.armed == $r.name ? "Confirm remove" : "Remove"}
+end
+
+fn installed_label($t)
+  $as = strings($t.installed_as)
+  if length($as) == 0 then return "" end
+  if length($as) == 1 and $as[0] == $t.name then return "installed" end
+  return "installed as " .. join($as, ", ")
+end
+
+fn template_rows($templates, $ui)
+  $out = []
+  for each $t in templates_of($templates)
+    $desc = type($t.diagnostic) == "map" ? "Invalid template: " .. to_string($t.diagnostic.message) : to_string($t.description ?? "")
+    push($out, {id: "t_" .. $t.template, cells: [to_string($t.title ?? $t.template), $desc, to_string($t.edge ?? ""), installed_label($t)],
+      template: $t.template, recommended: $t.recommended == true,
+      background: $t.template == $ui.template ? $C.selected : $C.clear})
+  end
+  return $out
+end
+
+fn missing_services($t, $services)
+  $out = []
+  for each $s in strings($t.requires)
+    if not contains($services ?? [], $s) then push($out, $s) end
+  end
+  return $out
+end
+
+fn tpl_model($templates, $services, $ui)
+  $t = template_of($templates, $ui.template)
+  if $t == nil then return {shown: false, title: "", desc: "", needs: "", installed: "", can_install: false} end
+  $missing = missing_services($t, $services)
+  $as = strings($t.installed_as)
+  $valid = type($t.diagnostic) != "map"
+  $desc = $valid ? to_string($t.description ?? "") : "Invalid template: " .. to_string($t.diagnostic.message)
+  return {shown: true, title: to_string($t.title ?? $t.template), desc: $desc,
+    needs: length($missing) == 0 ? "" : "Needs " .. join($missing, ", ") .. " (not running)",
+    installed: length($as) == 0 ? "Not installed" : "Installed as " .. join($as, ", "),
+    can_install: $valid}
+end
+
+-- A recommended template still to do: not installed, or installed but off.
+fn recommended_pending($templates, $list)
+  $out = []
+  for each $t in templates_of($templates)
+    if $t.recommended == true and type($t.diagnostic) != "map" then
+      $as = strings($t.installed_as)
+      if length($as) == 0 then
+        push($out, {template: $t.template, title: to_string($t.title ?? $t.template), name: nil})
+      else
+        $r = row($list, $as[0])
+        if $r == nil or $r.enabled != true then push($out, {template: $t.template, title: to_string($t.title ?? $t.template), name: $as[0]}) end
+      end
+    end
+  end
+  return $out
+end
+
+fn recommended_model($templates, $list, $first_run)
+  $pending = recommended_pending($templates, $list)
+  $all = 0
+  for each $t in templates_of($templates)
+    if $t.recommended == true and type($t.diagnostic) != "map" then $all = $all + 1 end
+  end
+  $label = length($pending) == $all ? "Recommended set" : "Recommended set · " .. to_string(length($pending)) .. " to add"
+  return {label: $label, background: $first_run ? $C.accent : $C.idle, shown: length($pending) > 0}
+end
+
+-- Page id -> the installed scene that authors it.
+fn page_owners($list)
+  $out = {}
+  for each $r in rows($list)
+    if type($r.page) == "string" then $out[$r.page] = $r end
+  end
+  return $out
+end
+
+fn page_rows($props, $list, $ui, $edge)
+  $panel = panel_of($props, $edge)
+  $live = $panel == nil ? [] : strings($panel.pages)
+  $owners = page_owners($list)
+  $out = []
+  for each $page in edge_pages($props, $edge)
+    $owner = $owners[$page]
+    $label = $owner != nil ? $owner.name : $page
+    if not contains($live, $page) then
+      $label = $owner == nil ? "(empty slot)" : $label .. " (off)"
+    end
+    $selected = type($ui.page) == "map" and $ui.page.edge == $edge and $ui.page.page == $page
+    push($out, {id: "g_" .. $page, cells: [$label], page: $page,
+      background: $selected ? $C.selected : (contains($live, $page) ? $C.idle : $C.slot)})
+  end
+  return $out
+end
+
+fn edge_model($props, $list, $ui, $edge)
+  $panel = panel_of($props, $edge)
+  $mode = $panel != nil and contains($MODES, $panel.mode ?? "") ? $panel.mode : "hidden"
+  $modes = {}
+  for each $m in $MODES
+    $modes[$m] = $m == $mode ? $C.accent : $C.idle
+  end
+  $width = $panel != nil and type($panel.width_px) == "number" ? $panel.width_px : 0
+  return {mode: $mode, modes: $modes, size: $width > 0 ? px($width) : "—", pages: page_rows($props, $list, $ui, $edge)}
+end
+
+fn banner_model($data)
+  $list = $data.list
+  $none = {shown: false, text: "", color: $C.text, background: $C.clear}
+  if type($list) != "map" then
+    return {shown: true, text: "The scenes loader is not answering; showing the last state it reported", color: $C.text, background: $C.banner_red}
+  end
+  if $list.state_ok == false then
+    return {shown: true, text: "Cannot read " .. to_string($list.root ?? "the scenes directory") .. "/state.conf.mix; changes are refused until it is fixed", color: $C.text, background: $C.banner_red}
+  end
+  $editor = type($list.editor) == "map" ? $list.editor : {}
+  if type($editor.fallback) == "map" then
+    return {shown: true, text: "Your editor copy failed to load (" .. to_string($editor.fallback.error_code) .. ": " .. to_string($editor.fallback.message) .. "); showing the shipped editor", color: $C.text, background: $C.banner_red}
+  end
+  $n = length($editor.problems ?? [])
+  if $n > 0 then
+    return {shown: true, text: "The editor's behaviour has " .. to_string($n) .. ($n == 1 ? " lint finding" : " lint findings") .. "; it still runs", color: $C.text, background: $C.banner_amber}
+  end
+  return $none
+end
+
+fn status_line($data, $ui)
+  if $ui.message != nil and $ui.message != "" then return $ui.message end
+  $list = $data.list
+  if type($list) != "map" then return "Waiting for the scenes loader" end
+  $n = length(rows($list))
+  if $n == 0 then return "Nothing installed yet" end
+  $bad = 0
+  for each $r in rows($list)
+    if $r.diagnostic != nil or length($r.problems ?? []) > 0 then $bad = $bad + 1 end
+  end
+  $parts = [to_string($n) .. ($n == 1 ? " scene" : " scenes")]
+  if $bad > 0 then push($parts, to_string($bad) .. " with problems") end
+  if type($data.props) != "map" then push($parts, "shell not answering") end
+  if $list.revision != nil then push($parts, "loader revision " .. to_string($list.revision)) end
+  return join($parts, " · ")
+end
+
+-- The complete model. $data = {list, templates, props, services}; any of
+-- them may be nil (that service is not answering) and the model still has
+-- the frozen shape (fixtures/scene-editor/model-*.json).
+fn build($data, $ui)
+  $list = $data.list
+  $editor = type($list) == "map" and type($list.editor) == "map" ? $list.editor : {}
+  $first_run = $editor.first_run == true and type($list) == "map" and $list.needs_setup == true
+  $view = contains($VIEWS, $ui.view ?? "") ? $ui.view : "gallery"
+  $tabs = {}
+  for each $v in $VIEWS
+    $tabs[$v] = {background: $v == $view ? $C.accent : $C.idle}
+  end
+  $edges = {}
+  for each $e in $EDGES
+    $edges[$e] = edge_model($data.props, $list, $ui, $e)
+  end
+  return {view: $view, first_run: $first_run, safe: $editor.safe == true,
+    source: $editor.source == "user" ? "user" : "shipped",
+    banner: banner_model($data), tabs: $tabs,
+    templates: template_rows($data.templates, $ui),
+    tpl: tpl_model($data.templates, $data.services, $ui),
+    recommended: recommended_model($data.templates, $list, $first_run),
+    scenes: scene_rows($list, $ui),
+    selected: selected_model($list, $ui),
+    edges: $edges,
+    status: status_line($data, $ui)}
+end
+
+-- ── click planning ──────────────────────────────────────────────────────
+-- plan_click returns {ui, kind, steps, message}. Steps are {target, verb,
+-- args, label, soft?, retry?}; the behaviour runs them in order through
+-- next_step/advance and hands the result to finish(). A refused step stops
+-- the plan unless it is soft; retry {code, args} re-runs that step once with
+-- new args when the refusal carries that code. $data also carries svc =
+-- {loader, host, ced, apps} (service names).
+
+fn plan($ui, $kind, $steps, $message)
+  return {ui: $ui, kind: $kind, steps: $steps, i: 0, done: length($steps) == 0, retried: false,
+    results: [], failed: nil, warnings: [], message: $message, subject: nil}
+end
+
+fn bus_step($target, $verb, $args, $label)
+  return {target: $target, verb: $verb, args: $args, label: $label, soft: false, retry: nil}
+end
+
+fn node_of($args)
+  return type($args) == "map" and type($args.node) == "string" ? $args.node : ""
+end
+
+fn item_of($args)
+  return type($args) == "map" and type($args.item) == "map" ? $args.item : {}
+end
+
+-- "mode_left_pinned" -> ["mode", "left", "pinned"]
+fn node_parts($node)
+  return split($node, "_")
+end
+
+fn plan_click($verb, $args, $ui, $data)
+  $node = node_of($args)
+  if $verb != "editor.scene.remove" then $ui.armed = nil end
+  $ui.message = ""
+  if $verb == "editor.view" then
+    $v = after($node, "tab_") ?? ""
+    if not contains($VIEWS, $v) then return plan($ui, "ui", [], "Unknown tab " .. $node) end
+    $ui.view = $v
+    return plan($ui, "ui", [], "")
+  end
+  if $verb == "editor.template.select" then
+    $t = item_of($args).template
+    if type($t) != "string" then return plan($ui, "ui", [], "That row names no template") end
+    $ui.template = $t
+    return plan($ui, "ui", [], "")
+  end
+  if $verb == "editor.template.install" then return plan_install($node, $ui, $data) end
+  if $verb == "editor.recommended" then return plan_recommended($ui, $data) end
+  if $verb == "editor.scene.select" then
+    $name = item_of($args).name
+    if type($name) != "string" then return plan($ui, "ui", [], "That row names no scene") end
+    $ui.scene = $name
+    return plan($ui, "ui", [], "")
+  end
+  if $verb == "editor.edge.page" then
+    $parts = node_parts($node)
+    $page = item_of($args).page
+    if length($parts) != 2 or $parts[0] != "pages" or not contains($EDGES, $parts[1]) or type($page) != "string" then
+      return plan($ui, "ui", [], "That row names no page")
+    end
+    $ui.page = {edge: $parts[1], page: $page}
+    -- Arrange acts on what you click: a page a scene owns also selects that
+    -- scene, so Installed's Move/Edit and the status line follow it (live
+    -- gate G9). A page no scene owns (Quoin's own) leaves the selection.
+    $owner = page_owners($data.list)[$page]
+    if $owner != nil then $ui.scene = $owner.name end
+    return plan($ui, "ui", [], "")
+  end
+  if $verb == "editor.edge.mode" then return plan_mode($node, $ui, $data) end
+  if $verb == "editor.edge.size" then return plan_size($node, $ui, $data) end
+  if $verb == "editor.edge.order" then return plan_order($node, $ui, $data) end
+  -- Everything below acts on the selected installed scene.
+  $r = row($data.list, $ui.scene)
+  if $r == nil then return plan($ui, "ui", [], "Select a scene first") end
+  if $verb == "editor.scene.action" then return plan_action($node, $r, $ui, $data) end
+  if $verb == "editor.scene.remove" then
+    if $ui.armed != $r.name then
+      $ui.armed = $r.name
+      return plan($ui, "ui", [], "Click Confirm remove to remove " .. $r.name .. "; a copy is kept in .recovery")
+    end
+    $ui.armed = nil
+    return plan($ui, "remove", [bus_step($data.svc.loader, "scenes.remove", {name: $r.name}, "Remove " .. $r.name)], "")
+  end
+  if $verb == "editor.scene.edit" then return plan_edit($node, $r, $ui, $data) end
+  if $verb == "editor.scene.fork" then
+    if type($r.forked_from) == "string" then return plan($ui, "ui", [], $r.name .. " is already a sandbox") end
+    return plan($ui, "fork", [bus_step($data.svc.loader, "scenes.fork", {name: $r.name}, "Sandbox of " .. $r.name)], "")
+  end
+  if $verb == "editor.scene.promote" then
+    if type($r.forked_from) != "string" then return plan($ui, "ui", [], "Only a sandbox can be promoted") end
+    return plan($ui, "promote", [bus_step($data.svc.loader, "scenes.promote", {from: $r.name}, "Promote " .. $r.name)], "")
+  end
+  if $verb == "editor.scene.move" then return plan_move($node, $r, $ui, $data) end
+  return plan($ui, "ui", [], "Unknown action " .. $verb)
+end
+
+fn plan_install($node, $ui, $data)
+  $t = template_of($data.templates, $ui.template)
+  if $t == nil then return plan($ui, "ui", [], "Pick a template first") end
+  if type($t.diagnostic) == "map" then return plan($ui, "ui", [], "Template " .. $t.template .. " is invalid: " .. to_string($t.diagnostic.message)) end
+  $enable = $node == "btn_install_enable"
+  $s = bus_step($data.svc.loader, "scenes.install", {template: $t.template, enable: $enable}, "Install " .. $t.template)
+  $s.retry = {code: "SCENES_COLLISION", args: {template: $t.template, name: $t.template .. "-2", enable: $enable}}
+  $p = plan($ui, "install", [$s], "")
+  $p.subject = {enable: $enable}
+  return $p
+end
+
+-- Recommended templates in gallery order: install and enable what is
+-- missing, enable what is installed but off; the first refusal stops it.
+fn plan_recommended($ui, $data)
+  $steps = []
+  for each $x in recommended_pending($data.templates, $data.list)
+    if $x.name == nil then
+      push($steps, bus_step($data.svc.loader, "scenes.install", {template: $x.template, enable: true}, "Install " .. $x.title))
+    else
+      push($steps, bus_step($data.svc.loader, "scenes.enable", {name: $x.name}, "Enable " .. $x.title))
+    end
+  end
+  if length($steps) == 0 then return plan($ui, "ui", [], "The recommended set is already on your desktop") end
+  $ui.view = "installed"
+  return plan($ui, "recommended", $steps, "")
+end
+
+fn plan_action($node, $r, $ui, $data)
+  $loader = $data.svc.loader
+  if $node == "btn_toggle" then
+    $verb = $r.enabled == true ? "scenes.disable" : "scenes.enable"
+    return plan($ui, "action", [bus_step($loader, $verb, {name: $r.name}, ($r.enabled == true ? "Disable " : "Enable ") .. $r.name)], "")
+  end
+  if $node == "btn_reload" then return plan($ui, "action", [bus_step($loader, "scenes.reload", {name: $r.name}, "Reload " .. $r.name)], "") end
+  if $node == "btn_reset" then return plan($ui, "action", [bus_step($loader, "scenes.reset", {name: $r.name}, "Reset " .. $r.name .. " to its template")], "") end
+  return plan($ui, "ui", [], "Unknown scene action " .. $node)
+end
+
+-- D7: ced.open when a ced service is registered, else apps.launch (never a
+-- spawn from the behaviour: ced must outlive a loader restart).
+fn edit_route($services, $svc, $path, $line)
+  if contains($services ?? [], $svc.ced) then
+    $args = {paths: [$path]}
+    if type($line) == "number" and $line > 0 then $args.line = $line end
+    return bus_step($svc.ced, "ced.open", $args, "Open " .. basename($path) .. " in ced")
+  end
+  return bus_step($svc.apps, "apps.launch", {id: $CED_APP_ID, uris: [$path]}, "Launch ced on " .. basename($path))
+end
+
+fn plan_edit($node, $r, $ui, $data)
+  $files = type($r.files) == "map" ? $r.files : {}
+  $path = $node == "btn_edit_behaviour" ? $files.behaviour : $files.scene
+  if type($path) != "string" then return plan($ui, "ui", [], $r.name .. " has no " .. ($node == "btn_edit_behaviour" ? "behaviour" : "scene") .. " file") end
+  $entry = file_problems($data.list)[$path]
+  $line = nil
+  if $entry != nil and length($entry.diagnostics) > 0 then $line = $entry.diagnostics[0].line end
+  $steps = [edit_route($data.services, $data.svc, $path, $line)]
+  $close = bus_step($data.svc.loader, "scenes.editor.close", {}, "Hide the Scene Editor")
+  $close.soft = true
+  push($steps, $close)
+  if contains($data.services ?? [], $data.svc.ced) then
+    $push = bus_step($data.svc.ced, "ced.diagnostics", ced_request($path, $entry), "Show the loader's verdict in ced")
+    $push.soft = true
+    push($steps, $push)
+  end
+  $p = plan($ui, "edit", $steps, "")
+  $p.subject = {path: $path, pushed: contains($data.services ?? [], $data.svc.ced)}
+  return $p
+end
+
+-- scenes.move, then one shell.panel.order naming both edges: the page leaves
+-- the old edge's declared list and joins the new one's (plan §4.6).
+fn plan_move($node, $r, $ui, $data)
+  $parts = node_parts($node)
+  $edge = length($parts) == 2 ? $parts[1] : ""
+  if $parts[0] != "move" or not contains($EDGES, $edge) then return plan($ui, "ui", [], "Unknown edge " .. $node) end
+  if $r.kind == "dialog" then return plan($ui, "ui", [], $r.name .. " is a dialog; it has no edge") end
+  if $r.edge == $edge then return plan($ui, "ui", [], $r.name .. " is already on the " .. $edge .. " edge") end
+  $steps = [bus_step($data.svc.loader, "scenes.move", {name: $r.name, edge: $edge}, "Move " .. $r.name .. " to the " .. $edge .. " edge")]
+  -- Without both edges in the snapshot the order write is skipped rather
+  -- than guessed: an empty list would wipe that edge's declared order.
+  if type($r.page) == "string" and contains($EDGES, $r.edge ?? "") and panel_of($data.props, $r.edge) != nil and panel_of($data.props, $edge) != nil then
+    $old = []
+    for each $page in edge_pages($data.props, $r.edge)
+      if $page != $r.page then push($old, $page) end
+    end
+    $new = []
+    for each $page in edge_pages($data.props, $edge)
+      if $page != $r.page then push($new, $page) end
+    end
+    push($new, $r.page)
+    $order = {}
+    $order[$r.edge] = $old
+    $order[$edge] = $new
+    push($steps, bus_step($data.svc.host, "shell.panel.order", {edges: $order}, "Save the page order"))
+  end
+  $p = plan($ui, "move", $steps, "")
+  $p.subject = {name: $r.name, edge: $edge}
+  return $p
+end
+
+fn plan_mode($node, $ui, $data)
+  $parts = node_parts($node)
+  if length($parts) != 3 or $parts[0] != "mode" or not contains($EDGES, $parts[1]) or not contains($MODES, $parts[2]) then
+    return plan($ui, "ui", [], "Unknown mode " .. $node)
+  end
+  $p = plan($ui, "mode", [bus_step($data.svc.host, "shell.panel.mode", {edge: $parts[1], mode: $parts[2]}, edge_label($parts[1]) .. " edge " .. $parts[2])], "")
+  $p.subject = {edge: $parts[1], mode: $parts[2]}
+  return $p
+end
+
+-- Four px steps across the short edges, twenty along the tall ones, clamped
+-- to Quoin's per-orientation range and, when the snapshot says, the
+-- panel's output budget. At a bound it is a no-op with a status line.
+fn plan_size($node, $ui, $data)
+  $parts = node_parts($node)
+  if length($parts) != 3 or $parts[0] != "size" or not contains($EDGES, $parts[1]) or not contains(["minus", "plus"], $parts[2]) then
+    return plan($ui, "ui", [], "Unknown size control " .. $node)
+  end
+  $edge = $parts[1]
+  $panel = panel_of($data.props, $edge)
+  if $panel == nil or type($panel.width_px) != "number" then return plan($ui, "ui", [], "The shell has not reported the " .. $edge .. " edge") end
+  $lo = $RANGE[$edge][0]
+  $hi = $RANGE[$edge][1]
+  if type($panel.max_thickness_px) == "number" and $panel.max_thickness_px < $hi then $hi = floor($panel.max_thickness_px) end
+  $now = round($panel.width_px)
+  $want = $parts[2] == "plus" ? $now + $STEP[$edge] : $now - $STEP[$edge]
+  $want = max($lo, min($hi, $want))
+  if $want == $now then
+    return plan($ui, "ui", [], edge_label($edge) .. " edge is already at its " .. ($parts[2] == "plus" ? "largest" : "smallest") .. " (" .. px($now) .. ")")
+  end
+  $p = plan($ui, "size", [bus_step($data.svc.host, "shell.panel.resize", {edge: $edge, thickness_px: $want}, edge_label($edge) .. " edge " .. px($want))], "")
+  $p.subject = {edge: $edge, px: $want}
+  return $p
+end
+
+-- Swap the selected page with its neighbour in declared ∪ live order. An
+-- empty declared slot moved past the end is dropped from conf.mix.
+fn plan_order($node, $ui, $data)
+  $parts = node_parts($node)
+  if length($parts) != 3 or $parts[0] != "order" or not contains($EDGES, $parts[1]) or not contains(["up", "down"], $parts[2]) then
+    return plan($ui, "ui", [], "Unknown order control " .. $node)
+  end
+  $edge = $parts[1]
+  if type($ui.page) != "map" or $ui.page.edge != $edge then return plan($ui, "ui", [], "Select a page on the " .. $edge .. " edge first") end
+  $pages = edge_pages($data.props, $edge)
+  $i = index_of($pages, $ui.page.page)
+  if $i < 0 then return plan($ui, "ui", [], $ui.page.page .. " is no longer on the " .. $edge .. " edge") end
+  $j = $parts[2] == "up" ? $i - 1 : $i + 1
+  $out = []
+  if $j >= length($pages) then
+    $panel = panel_of($data.props, $edge)
+    if contains(strings($panel.pages), $ui.page.page) then return plan($ui, "ui", [], $ui.page.page .. " is already last") end
+    for each $page in $pages
+      if $page != $ui.page.page then push($out, $page) end
+    end
+    $ui.page = nil
+  elif $j < 0 then
+    return plan($ui, "ui", [], $ui.page.page .. " is already first")
+  else
+    $out = $pages
+    $out[$i] = $pages[$j]
+    $out[$j] = $pages[$i]
+  end
+  $order = {}
+  $order[$edge] = $out
+  $p = plan($ui, "order", [bus_step($data.svc.host, "shell.panel.order", {edges: $order}, edge_label($edge) .. " edge order")], "")
+  $p.subject = {edge: $edge}
+  return $p
+end
+
+-- ── running a plan ──────────────────────────────────────────────────────
+
+fn next_step($p)
+  if $p.done or $p.i >= length($p.steps) then return nil end
+  return $p.steps[$p.i]
+end
+
+-- $out is a runtime.call outcome {ok, rc, value}.
+fn advance($p, $out)
+  $s = $p.steps[$p.i]
+  if not $out.ok then
+    $why = refusal($out)
+    if $s.retry != nil and not $p.retried and $why.code == $s.retry.code then
+      $p.retried = true
+      $s.args = $s.retry.args
+      $p.steps[$p.i] = $s
+      return $p
+    end
+    if $s.soft then
+      $p.warnings = concat($p.warnings, [$s.label .. ": " .. $why.message])
+    else
+      $p.failed = {label: $s.label, code: $why.code, message: $why.message, index: $p.i}
+      $p.done = true
+      return $p
+    end
+  end
+  $p.results = concat($p.results, [$out.ok ? $out.value : nil])
+  $p.i = $p.i + 1
+  $p.done = $p.i >= length($p.steps)
+  return $p
+end
+
+fn reply_name($p, $index, $fallback)
+  $v = $index < length($p.results) ? $p.results[$index] : nil
+  return type($v) == "map" and type($v.name) == "string" ? $v.name : $fallback
+end
+
+-- The UI after a plan ran, and the one status line that says what happened.
+fn finish($p)
+  $ui = $p.ui
+  if $p.kind == "ui" then
+    $ui.message = $p.message
+    return {ui: $ui, message: $p.message}
+  end
+  if $p.failed != nil then
+    $done = $p.failed.index > 0 ? " (" .. to_string($p.failed.index) .. " done before it)" : ""
+    $ui.message = $p.failed.label .. " failed: " .. $p.failed.message .. " [" .. $p.failed.code .. "]" .. $done
+    return {ui: $ui, message: $ui.message}
+  end
+  $m = ""
+  if $p.kind == "install" then
+    $name = reply_name($p, 0, $p.steps[0].args.template)
+    $m = ($p.subject.enable ? "Installed and enabled " : "Installed ") .. $name
+    if $p.retried then $m = $m .. " (the name " .. $p.steps[0].args.template .. " was taken)" end
+    $ui.scene = $name
+  elif $p.kind == "recommended" then
+    $m = "Recommended set: " .. to_string(length($p.steps)) .. " added"
+  elif $p.kind == "action" then
+    $m = $p.steps[0].label .. ": done"
+  elif $p.kind == "remove" then
+    $m = "Removed " .. $p.steps[0].args.name .. "; a copy is kept in .recovery"
+    $ui.scene = nil
+  elif $p.kind == "edit" then
+    $m = "Editing " .. basename($p.subject.path) .. " in ced"
+  elif $p.kind == "fork" then
+    $name = reply_name($p, 0, $p.steps[0].args.name .. "-sandbox")
+    $m = "Sandbox " .. $name .. " is live beside " .. $p.steps[0].args.name
+    $ui.scene = $name
+  elif $p.kind == "promote" then
+    $name = reply_name($p, 0, $p.steps[0].args.from)
+    $m = $p.steps[0].args.from .. " promoted over " .. $name
+    $ui.scene = $name
+  elif $p.kind == "move" then
+    $m = "Moved " .. $p.subject.name .. " to the " .. $p.subject.edge .. " edge"
+  elif $p.kind == "mode" then
+    $m = edge_label($p.subject.edge) .. " edge: " .. $p.subject.mode
+  elif $p.kind == "size" then
+    $m = edge_label($p.subject.edge) .. " edge: " .. px($p.subject.px)
+  elif $p.kind == "order" then
+    $m = edge_label($p.subject.edge) .. " edge order saved"
+  end
+  if length($p.warnings) > 0 then $m = $m .. " (" .. join($p.warnings, "; ") .. ")" end
+  $ui.message = $m
+  return {ui: $ui, message: $m}
+end
+
+-- ── ced diagnostics (source "scenes") ───────────────────────────────────
+
+fn ced_severity($s)
+  $v = lower(to_string($s ?? ""))
+  if $v == "error" or $v == "warning" then return $v end
+  return "note"
+end
+
+-- Every file of every installed scene -> {digest, diagnostics}, including
+-- the clean ones, so a recovery can be pushed as [].
+fn file_problems($list)
+  $out = {}
+  for each $r in rows($list)
+    $files = type($r.files) == "map" ? $r.files : {}
+    $digests = type($r.digests) == "map" ? $r.digests : {}
+    for each $kind in $FILE_KINDS
+      if type($files[$kind]) == "string" then $out[$files[$kind]] = {digest: $digests[$kind], diagnostics: []} end
+    end
+    for each $p in $r.problems ?? []
+      if type($p.file) == "string" then
+        $e = $out[$p.file] ?? {digest: nil, diagnostics: []}
+        if type($p.digest) == "string" then $e.digest = $p.digest end
+        if length($e.diagnostics) < $MAX_CED_DIAGNOSTICS then
+          $d = {line: max(1, floor(to_number($p.line ?? 1) ?? 1)), severity: ced_severity($p.severity),
+            code: to_string($p.code ?? "scenes"), message: to_string($p.message ?? "")}
+          if type($p.col) == "number" then $d.col = $p.col end
+          $e.diagnostics = concat($e.diagnostics, [$d])
+        end
+        $out[$p.file] = $e
+      end
+    end
+  end
+  return $out
+end
+
+fn ced_request($path, $entry)
+  $req = {path: $path, source: $DIAG_SOURCE, diagnostics: $entry == nil ? [] : $entry.diagnostics}
+  if $entry != nil and type($entry.digest) == "string" then $req.digest = $entry.digest end
+  return $req
+end
+
+-- $seen: path -> {key, problems:bool} from the previous inventory. Returns
+-- {seen, changed:[ced.diagnostics request]}: a path is changed when its
+-- (problems, digest) pair differs (the digest is in the key, so a re-save
+-- with identical problems still re-pushes), and a path that had problems
+-- and now has none, or has vanished, gets [].
+fn diag_diff($seen, $current)
+  $next = {}
+  $changed = []
+  for each $path in sort(keys($current))
+    $e = $current[$path]
+    $key = hash_sha256(json_encode([$e.digest, $e.diagnostics]))
+    $has = length($e.diagnostics) > 0
+    $next[$path] = {key: $key, problems: $has}
+    $before = $seen[$path]
+    if $before == nil then
+      if $has then push($changed, ced_request($path, $e)) end
+    elif $before.key != $key and ($has or $before.problems) then
+      push($changed, ced_request($path, $e))
+    end
+  end
+  for each $path in sort(keys($seen ?? {}))
+    if not has_key($current, $path) and $seen[$path].problems then push($changed, ced_request($path, nil)) end
+  end
+  return {seen: $next, changed: $changed}
+end
+
+-- What a hidden editor would show from one scenes.changed inventory: the
+-- inventory without the counters every model publish of every scene bumps
+-- (the top-level and per-row revision and generation). Equal keys mean the
+-- change is nothing a hidden editor displays (review m10).
+fn quiet_key($list)
+  if type($list) != "map" then return nil end
+  $plain = []
+  for each $r in rows($list)
+    push($plain, type($r) == "map" ? delete(delete($r, "revision"), "generation") : $r)
+  end
+  return hash_sha256(json_encode([delete(delete($list, "revision"), "scenes"), $plain]))
+end
+
+-- Paths ced.tabs reports open.
+fn open_paths($tabs)
+  $out = []
+  if type($tabs) != "map" or type($tabs.tabs) != "list" then return $out end
+  for each $t in $tabs.tabs
+    if type($t.path) == "string" and not contains($out, $t.path) then push($out, $t.path) end
+  end
+  return $out
+end

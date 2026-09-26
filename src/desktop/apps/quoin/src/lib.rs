@@ -5,12 +5,14 @@ mod bus_service;
 pub mod config;
 mod corner_menu;
 mod desktop_font;
+mod dialog_bus;
 pub mod embedded;
 #[cfg(test)]
 mod font_tests;
 mod holders;
 mod hotspot;
 mod keyboard;
+mod order_writer;
 mod settings;
 mod state;
 
@@ -179,6 +181,8 @@ fn configure_content(
             state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
     settings::install(app, all_panels || hidden);
+    dialog_bus::install(app);
+    order_writer::install(app);
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {

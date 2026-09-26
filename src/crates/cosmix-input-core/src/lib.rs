@@ -259,8 +259,10 @@ fn action_is_valid(action: &ActionId) -> bool {
 /// menu/rotate on the [`CLIPBOARD_SERVICE`] citizen (an explicit `service`
 /// target: the citizen is registered as `desktop-vt1` but answers
 /// `desktop.clipboard.*`, so first-segment routing cannot reach it), and
-/// `RightShift+←/→/↑/↓` as reserved passthrough (Konsole tab nav survives).
-/// Evdev codes are the Linux `input-event-codes.h` values.
+/// `RightShift+←/→/↑/↓` as reserved passthrough (Konsole tab nav survives),
+/// and the Scene Editor recovery chord `Ctrl+Alt+P` as two side-exact rows
+/// (see [`SCENE_EDITOR_CHORDS`]). Evdev codes are the Linux
+/// `input-event-codes.h` values.
 pub fn default_keymap() -> InputKeymap {
     // input-event-codes.h
     const KEY_LEFT: u16 = 105;
@@ -308,6 +310,9 @@ pub fn default_keymap() -> InputKeymap {
             passthrough: true,
         });
     }
+    for modifiers in SCENE_EDITOR_CHORDS {
+        physical.push(scene_editor_row(modifiers));
+    }
     InputKeymap {
         version: cosmix_input_schema::KEYMAP_SCHEMA_VERSION,
         semantic: cosmix_input_schema::Keymap::default(),
@@ -348,6 +353,47 @@ fn clipboard_row(code: u16, verb: &'static str) -> PhysicalBinding {
         scope: BindingScope::default(),
         // One press, one menu toggle / one rotation — a held key must not
         // flicker the menu or spin the history.
+        repeat: RepeatPolicy::Ignore,
+        passthrough: false,
+    }
+}
+
+/// `KEY_P` (input-event-codes.h), the Scene Editor chord's key.
+pub const SCENE_EDITOR_KEY: u16 = 25;
+
+/// The registered name of the scenes loader the Scene Editor chord targets.
+pub const SCENES_SERVICE: &str = "scenes";
+
+/// The Scene Editor recovery chord's modifier states: Left Ctrl or Right Ctrl,
+/// each with Left Alt. Physical matching is side-exact, hence one row per
+/// state. Right Alt is left out on purpose: it is AltGr (level-3 shift) on
+/// some layouts, so `Ctrl+AltGr+P` may be a character someone types.
+pub const SCENE_EDITOR_CHORDS: [SideModifiers; 2] = [
+    SideModifiers {
+        left_ctrl: true,
+        left_alt: true,
+        ..SideModifiers::NONE
+    },
+    SideModifiers {
+        right_ctrl: true,
+        left_alt: true,
+        ..SideModifiers::NONE
+    },
+];
+
+/// A Scene Editor chord row: `scenes.editor.open {"safe":true}` sent to the
+/// loader. The loader treats a safe open while the shipped editor is visible
+/// as a close, so the one chord toggles; a held key must not flap it.
+fn scene_editor_row(modifiers: SideModifiers) -> PhysicalBinding {
+    PhysicalBinding {
+        stroke: PhysicalStroke {
+            code: SCENE_EDITOR_KEY,
+            modifiers,
+        },
+        action: ActionId::from_static("scenes.editor.open"),
+        args: Some(serde_json::json!({"safe": true})),
+        service: Some(SCENES_SERVICE.to_string()),
+        scope: BindingScope::default(),
         repeat: RepeatPolicy::Ignore,
         passthrough: false,
     }
@@ -621,5 +667,128 @@ mod tests {
             );
         }
         assert!(service_is_valid("desktop-vt1"));
+    }
+
+    fn mods(set: &[&str]) -> SideModifiers {
+        let mut m = SideModifiers::NONE;
+        for name in set {
+            match *name {
+                "lctrl" => m.left_ctrl = true,
+                "rctrl" => m.right_ctrl = true,
+                "lshift" => m.left_shift = true,
+                "rshift" => m.right_shift = true,
+                "lalt" => m.left_alt = true,
+                "ralt" => m.right_alt = true,
+                "lsuper" => m.left_super = true,
+                "rsuper" => m.right_super = true,
+                other => panic!("unknown modifier {other}"),
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn scene_editor_chords_fire_once_per_press_and_swallow_every_edge() {
+        let r = resolver();
+        for held in [mods(&["lctrl", "lalt"]), mods(&["rctrl", "lalt"])] {
+            let press = r.resolve(SCENE_EDITOR_KEY, held, Edge::Press);
+            assert_eq!(
+                press.verb.as_ref().map(|a| a.as_str()),
+                Some("scenes.editor.open"),
+                "{held:?}"
+            );
+            assert_eq!(press.args, Some(serde_json::json!({"safe": true})));
+            assert_eq!(press.service.as_deref(), Some("scenes"));
+            assert!(press.swallow, "ced and apps never see the chord");
+            // A held chord must not flap the toggle.
+            let repeat = r.resolve(SCENE_EDITOR_KEY, held, Edge::Repeat);
+            assert_eq!(repeat.verb, None, "{held:?}: no fire on repeat");
+            assert_eq!(repeat.args, None);
+            assert!(repeat.swallow);
+            let release = r.resolve(SCENE_EDITOR_KEY, held, Edge::Release);
+            assert_eq!(release.verb, None, "{held:?}: no fire on release");
+            assert!(release.swallow, "{held:?}: release swallowed (no stuck key)");
+        }
+    }
+
+    #[test]
+    fn scene_editor_release_after_alt_lifts_is_not_matched_so_the_press_is_latched() {
+        // Letting go of Alt before P is normal typing. The release then
+        // resolves under LCtrl alone and would pass; only the grab reader's
+        // per-key latch (decided on the press) keeps it swallowed. This pins
+        // the core's half of that contract: the verdict differs, so the
+        // reader must not re-resolve releases.
+        let r = resolver();
+        let press = r.resolve(SCENE_EDITOR_KEY, mods(&["lctrl", "lalt"]), Edge::Press);
+        assert!(press.swallow);
+        let late = r.resolve(SCENE_EDITOR_KEY, mods(&["lctrl"]), Edge::Release);
+        assert_eq!(late, Resolution::PASS);
+    }
+
+    #[test]
+    fn scene_editor_chord_is_side_exact_and_leaves_typing_alone() {
+        let r = resolver();
+        for held in [
+            // AltGr is level-3 shift on some layouts: never the chord.
+            mods(&["lctrl", "ralt"]),
+            mods(&["rctrl", "ralt"]),
+            // Partial and extended chords are ordinary strokes.
+            mods(&[]),
+            mods(&["lshift"]),
+            mods(&["lctrl"]),
+            mods(&["rctrl"]),
+            mods(&["lalt"]),
+            mods(&["lctrl", "rctrl", "lalt"]),
+            mods(&["lctrl", "lalt", "lshift"]),
+            mods(&["lctrl", "lalt", "lsuper"]),
+        ] {
+            assert_eq!(
+                r.resolve(SCENE_EDITOR_KEY, held, Edge::Press),
+                Resolution::PASS,
+                "{held:?} must pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn default_rows_are_collision_free_and_admissible() {
+        // One row per stroke: a duplicate would shadow the later row (the
+        // first match wins), and bind admission would replace it.
+        let rows = default_keymap().physical;
+        for (i, row) in rows.iter().enumerate() {
+            assert!(
+                rows[i + 1..].iter().all(|other| other.stroke != row.stroke),
+                "duplicate default stroke {:?}",
+                row.stroke
+            );
+        }
+        // Every shipped row passes the same admission as an input.bind.
+        let mut fresh = Resolver::new(InputKeymap {
+            physical: Vec::new(),
+            ..default_keymap()
+        });
+        for row in rows {
+            fresh.bind_physical(row.clone()).unwrap_or_else(|e| panic!("{row:?}: {e:?}"));
+        }
+        assert_eq!(fresh.physical_rows(), default_keymap().physical.as_slice());
+    }
+
+    #[test]
+    fn scene_editor_rows_are_the_only_rows_on_key_p() {
+        let rows: Vec<_> = default_keymap()
+            .physical
+            .into_iter()
+            .filter(|row| row.stroke.code == SCENE_EDITOR_KEY)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|row| row.stroke.modifiers).collect::<Vec<_>>(),
+            SCENE_EDITOR_CHORDS.to_vec()
+        );
+        for row in &rows {
+            assert_eq!(row.repeat, RepeatPolicy::Ignore);
+            assert!(!row.passthrough);
+            assert_eq!(row.scope, BindingScope::default());
+        }
     }
 }

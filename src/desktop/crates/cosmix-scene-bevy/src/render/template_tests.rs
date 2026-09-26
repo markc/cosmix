@@ -276,6 +276,7 @@ fn mounted(world: &mut World, tree: &ResolvedScene) -> Mounted {
         },
         page: world.spawn_empty().id(),
         edge: Edge::Right,
+        dialog: false,
         registered: false,
         nodes: BTreeMap::new(),
     }

@@ -1,0 +1,65 @@
+{
+  "_contract": "Scene Editor plan §4.3, frozen in Stage S. Quoin (`shell`) verbs; mesh-open, no owner gate. Refusals are rc 10 {error_code, message, ...context}. shell.panel.order is Q1 (bus_service.rs); shell.dialog.* and shell.scene.layout are Q2 (dialog_bus.rs). Until implemented each answers rc 10 UNIMPLEMENTED (see `refusals.UNIMPLEMENTED`).",
+  "shell.panel.order": {
+    "request": {"edges": {"right": ["scene-notes", "settings.appearance"], "left": ["scene-launcher", "scene-calendar"]}},
+    "reply": {"edges": {"right": ["scene-notes", "settings.appearance"], "left": ["scene-launcher", "scene-calendar"]}},
+    "refusals": {
+      "INVALID_ARGUMENT": {"error_code": "INVALID_ARGUMENT", "message": "page scene-notes is named on two edges", "edges": ["left", "right"]},
+      "CONFIG_WRITE": {"error_code": "CONFIG_WRITE", "message": "could not replace conf.mix: permission denied"},
+      "UNIMPLEMENTED": {"error_code": "UNIMPLEMENTED", "message": "shell.panel.order arrives in Stage Q1 of the Scene Editor plan"}
+    }
+  },
+  "shell.dialog.show": {
+    "request": {"scene": "editor"},
+    "reply": {"scene": "editor", "visible": true, "applied": true},
+    "refusals": {
+      "NOT_FOUND": {"error_code": "NOT_FOUND", "message": "no scene named editor is loaded", "scene": "editor"},
+      "NOT_DIALOG": {"error_code": "NOT_DIALOG", "message": "scene panel is an edge page, not a dialog", "scene": "panel"},
+      "UNIMPLEMENTED": {"error_code": "UNIMPLEMENTED", "message": "shell.dialog.show arrives in Stage Q2 of the Scene Editor plan"}
+    }
+  },
+  "shell.dialog.hide": {
+    "request": {"scene": "editor"},
+    "reply": {"scene": "editor", "visible": false, "applied": true},
+    "refusals": {
+      "NOT_FOUND": {"error_code": "NOT_FOUND", "message": "no scene named editor is loaded", "scene": "editor"},
+      "NOT_DIALOG": {"error_code": "NOT_DIALOG", "message": "scene panel is an edge page, not a dialog", "scene": "panel"},
+      "UNIMPLEMENTED": {"error_code": "UNIMPLEMENTED", "message": "shell.dialog.hide arrives in Stage Q2 of the Scene Editor plan"}
+    }
+  },
+  "shell.scene.layout": {
+    "request": {"scene": "editor", "node": null},
+    "reply": {
+      "scene": "editor",
+      "revision": 9,
+      "applied_revision": 9,
+      "visible": true,
+      "surface": {"kind": "dialog", "edge": null, "output": "DP-1", "x": 520.0, "y": 230.0, "w": 880.0, "h": 620.0},
+      "nodes": {
+        "root": {"x": 0.0, "y": 32.0, "w": 880.0, "h": 588.0, "hidden": false},
+        "btn_recommended": {"x": 12.0, "y": 556.0, "w": 158.0, "h": 32.0, "hidden": false},
+        "installed": {"x": 12.0, "y": 80.0, "w": 856.0, "h": 460.0, "hidden": true}
+      },
+      "instances": {"templates": {"t_panel": {"x": 12.0, "y": 110.0, "w": 422.0, "h": 52.0}}},
+      "chrome": {"close": {"x": 841.0, "y": 5.0, "w": 28.0, "h": 24.0}}
+    },
+    "_chrome": "Frame controls measured from the engine like node rects (surface coords). `chrome.close` is the dialog's × while mapped with chrome:true; {} otherwise (unmapped, chrome:false, or an edge scene).",
+    "reply_unmapped": {"scene": "editor", "revision": 9, "applied_revision": 9, "visible": false, "surface": {"kind": "dialog", "edge": null, "output": "DP-1", "x": 520.0, "y": 230.0, "w": 880.0, "h": 620.0}, "nodes": {}, "instances": {}, "chrome": {}},
+    "refusals": {
+      "NOT_FOUND": {"error_code": "NOT_FOUND", "message": "no scene named editor is loaded", "scene": "editor"},
+      "UNIMPLEMENTED": {"error_code": "UNIMPLEMENTED", "message": "shell.scene.layout arrives in Stage Q2 of the Scene Editor plan"}
+    }
+  },
+  "shell.scene.load": {
+    "_note": "Existing verb. The loader's JSON envelope gains optional preempt_dialog (dialog loads only). DIALOG_BUSY is new.",
+    "request": {"source": "---\nscene: 1\nname: editor\ncitizen: scene-editor\nwindow: {\"chrome\":true,\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":880}\n---\n```mix\nroot: {\"children\":[],\"widget\":\"column\"}\n```\n", "model_generation": 3, "preempt_dialog": true},
+    "reply": {"scene": "editor", "revision": 1},
+    "refusals": {
+      "DIALOG_BUSY": {"error_code": "DIALOG_BUSY", "message": "the dialog seat is held by another scene", "holder": {"scene": "other-dialog", "owner": "some-citizen"}}
+    },
+    "preemption_notice": {
+      "_topic": "<host>.scene.changed (command shell.scene.changed), sent when preempt_dialog releases an incumbent",
+      "body": {"scene": "other-dialog", "revision": 4, "ops": ["unloaded"], "reason": "preempted", "by": {"scene": "editor", "owner": "scenes"}, "diagnostics": []}
+    }
+  }
+}

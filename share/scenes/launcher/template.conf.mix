@@ -2,3 +2,7 @@ schema: 1
 name: "launcher"
 title: "Applications"
 behaviour: "behaviour.mix"
+description: "Searchable application launcher"
+recommended: true
+order: 20
+requires: ["apps"]

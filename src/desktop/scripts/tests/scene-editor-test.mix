@@ -1,0 +1,644 @@
+-- Scene Editor template gate (scene-editor plan §7 Stage E). Two halves:
+--  1. the template's bindings, evaluated by the real interpreter against each
+--     frozen model fixture and against models lib.build() makes from the
+--     contract fixtures, give the expected visible tree, with the shipped
+--     dialog header and with the D3 edge header;
+--  2. pure tests of share/scenes/editor/lib.mix: the model builder, click
+--     planning for every node, remove arming, recommended sequencing, the ced
+--     route and the diagnostics diff; plus the size bounds.
+-- No broker, no Cargo. Run with TZ=UTC (scene-editor-gates.mix does).
+$here = dirname(realpath($0))
+$root = realpath($here .. "/../../../..")
+$fx = $here .. "/fixtures/scene-editor"
+$editor = $root .. "/share/scenes/editor"
+$e = require($editor .. "/lib.mix")
+$MIX = realpath("/proc/self/exe")
+$checks = {count: 0}
+
+fn check($ok, $message)
+  $checks.count = $checks.count + 1
+  if not $ok then raise("SCENE_EDITOR_TEST", $message) end
+end
+
+fn load($name)
+  return json_parse(read_file($fx .. "/" .. $name))
+end
+
+fn shape($v, $prefix, $out)
+  if type($v) == "map" then
+    for each $k in sort(keys($v))
+      push($out, $prefix .. "." .. $k)
+      $out = shape($v[$k], $prefix .. "." .. $k, $out)
+    end
+  end
+  return $out
+end
+
+fn has_keys($row, $want)
+  return deep_eq(sort(keys($row)), sort($want))
+end
+
+-- ── 1. the template, evaluated ──────────────────────────────────────────
+$source = read_file($editor .. "/scene.mix")
+check(len($source) < 262144, "scene.mix stays under the 256 KiB document bound")
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-scene-editor.XXXXXXXX"]))
+
+fn fence($src)
+  return data_parse(before(after($src, "```mix\n"), "\n```"))
+end
+fn header($src, $key)
+  for each $line in split(before(after($src, "---\n"), "\n---"), "\n")
+    if starts_with($line, $key .. ": ") then return after($line, $key .. ": ") end
+  end
+  return nil
+end
+fn bound($value)
+  return type($value) == "string" and starts_with($value, "= ")
+end
+fn subtree($nodes, $queue)
+  $out = []
+  while length($queue) > 0
+    $id = $queue[0]
+    $queue = slice($queue, 1)
+    if not contains($out, $id) then
+      push($out, $id)
+      for each $child in $nodes[$id].children ?? []
+        push($queue, $child)
+      end
+    end
+  end
+  return $out
+end
+fn template_ids($nodes)
+  $queue = []
+  for each $id, $node in $nodes
+    if $node.widget == "list" then push($queue, $node.row) end
+  end
+  return subtree($nodes, $queue)
+end
+-- One interpreter run per pass: [key, item index or -1, expression] rows.
+fn evaluate($model, $items, $jobs)
+  write_file($tmp .. "/data.json", json_encode({model: $model, items: $items}))
+  $src = "$d = json_parse(read_file(" .. json_encode($tmp .. "/data.json") .. "))\n$model = $d.model\n$item = nil\n$out = {}\n"
+  for each $job in $jobs
+    $src = $src .. "$item = " .. ($job[1] < 0 ? "nil" : "$d.items[" .. to_string($job[1]) .. "]") .. "\n"
+    $src = $src .. "$out[" .. json_encode($job[0]) .. "] = (" .. after($job[2], "= ") .. ")\n"
+  end
+  write_file($tmp .. "/eval.mix", $src .. "print(json_encode($out))\n")
+  $run = run_argv([$MIX, $tmp .. "/eval.mix"], {timeout: 60, max_output: 4194304})
+  check($run.ok, "binding evaluation failed: " .. $run.stderr)
+  return json_parse(trim($run.stdout))
+end
+
+-- {nodes, values}: every binding of every static node, and of every list
+-- row-template node per row item ("<list>#<k>.<node>.<port>").
+fn resolve($src, $model)
+  $nodes = fence($src)
+  $templated = template_ids($nodes)
+  $jobs = []
+  for each $id, $node in $nodes
+    if not contains($templated, $id) then
+      for each $port, $value in $node
+        if bound($value) then push($jobs, [$id .. "." .. $port, -1, $value]) end
+      end
+    end
+  end
+  $values = evaluate($model, [], $jobs)
+  $items = []
+  $jobs = []
+  for each $id, $node in $nodes
+    if $node.widget == "list" then
+      $k = 0
+      for each $row in $values[$id .. ".rows"] ?? []
+        push($items, $row)
+        for each $tid in subtree($nodes, [$node.row])
+          for each $port, $value in $nodes[$tid]
+            if bound($value) then push($jobs, [$id .. "#" .. to_string($k) .. "." .. $tid .. "." .. $port, length($items) - 1, $value]) end
+          end
+        end
+        $k = $k + 1
+      end
+    end
+  end
+  for each $key, $value in evaluate($model, $items, $jobs)
+    $values[$key] = $value
+  end
+  return {nodes: $nodes, values: $values}
+end
+
+-- Port type contract of every evaluated binding.
+fn port_ok($port, $value)
+  if $port == "hidden" then return type($value) == "bool" end
+  if $port == "rows" then return type($value) == "list" end
+  if $port == "background" or $port == "color" then return type($value) == "string" and re_match($value, "^#[0-9a-f]{6}([0-9a-f]{2})?$") end
+  if $port == "text" or $port == "label" then return type($value) == "string" end
+  return true
+end
+
+-- The visible static tree: id -> true for each node reachable from root
+-- through non-hidden nodes (Display::None removes a subtree).
+fn visible_ids($r)
+  $out = {}
+  $queue = ["root"]
+  while length($queue) > 0
+    $id = $queue[0]
+    $queue = slice($queue, 1)
+    $node = $r.nodes[$id]
+    $hidden = bound($node.hidden) ? $r.values[$id .. ".hidden"] : ($node.hidden == true)
+    if not $hidden then
+      $out[$id] = true
+      if $node.widget != "list" then
+        for each $child in $node.children ?? []
+          push($queue, $child)
+        end
+      end
+    end
+  end
+  return $out
+end
+
+fn port($r, $id, $name)
+  $node = $r.nodes[$id]
+  return bound($node[$name]) ? $r.values[$id .. "." .. $name] : $node[$name]
+end
+
+fn rows_of($r, $list)
+  return $r.values[$list .. ".rows"] ?? []
+end
+
+fn row_port($r, $list, $k, $tid, $name)
+  $node = $r.nodes[$tid]
+  return bound($node[$name]) ? $r.values[$list .. "#" .. to_string($k) .. "." .. $tid .. "." .. $name] : $node[$name]
+end
+
+fn evaluated($src, $model, $label)
+  $r = resolve($src, $model)
+  for each $key, $value in $r.values
+    $parts = split($key, ".")
+    $name = $parts[length($parts) - 1]
+    check(port_ok($name, $value), $label .. ": binding " .. $key .. " has the wrong type: " .. json_encode($value))
+  end
+  $r.visible = visible_ids($r)
+  return $r
+end
+
+fn shown($r, $id)
+  return $r.visible[$id] == true
+end
+
+-- The D3 fallback: the same document with the edge header.
+$edge_header = "window: {\"kind\":\"edge\",\"edge\":\"right\",\"w\":480,\"title\":\"Scene Editor\"}"
+$dialog_line = "window: " .. header($source, "window")
+check(json_parse(header($source, "window")).kind == "dialog", "the shipped header is the dialog")
+$edge_source = replace($source, $dialog_line, $edge_header)
+check($edge_source != $source and json_parse(header($edge_source, "window")).edge == "right", "the edge header substitutes")
+check(deep_eq(fence($edge_source), fence($source)), "both headers share one node block")
+
+$nodes = fence($source)
+check($nodes.root.widget == "column", "root is a column")
+-- Row templates hold only row/column/text/spacer/image (plan §4.6).
+for each $tid in template_ids($nodes)
+  check(contains(["row", "column", "text", "spacer", "image"], $nodes[$tid].widget), "row template node " .. $tid .. " is a " .. $nodes[$tid].widget)
+end
+for each $id, $node in $nodes
+  check($node.widget != "field", "v1 has no field: " .. $id)
+end
+
+fn both($model, $label)
+  $a = evaluated($source, $model, $label .. " (dialog)")
+  $b = evaluated($edge_source, $model, $label .. " (edge)")
+  check(deep_eq($a.visible, $b.visible) and deep_eq($a.values, $b.values), $label .. ": the edge header renders the same tree")
+  return $a
+end
+
+-- first run: gallery, welcome, five recommended templates, nothing selected.
+$fr = both(load("model-first-run.json"), "first-run")
+check(shown($fr, "gallery") and not shown($fr, "installed") and not shown($fr, "arrange"), "first-run shows only the gallery")
+check(shown($fr, "welcome_t") and shown($fr, "btn_recommended") and shown($fr, "safe_badge"), "first-run: welcome, Recommended and the safe badge")
+check(not shown($fr, "banner") and not shown($fr, "tpl_detail"), "first-run: no banner, no template detail")
+check(length(rows_of($fr, "templates")) == 5 and row_port($fr, "templates", 0, "tpl_row_title", "text") == "Panel", "first-run: five template rows")
+check(port($fr, "tab_gallery", "background") == "#3daee9" and port($fr, "tab_installed", "background") == "#ffffff0f", "first-run: gallery tab lit")
+check(port($fr, "status_t", "text") == "Nothing installed yet", "first-run status")
+
+-- installed with problems and a crash-loop row.
+$in = both(load("model-installed.json"), "installed")
+check(shown($in, "installed") and not shown($in, "gallery") and not shown($in, "arrange"), "installed view only")
+check(shown($in, "banner") and contains(port($in, "banner_t", "text"), "SCENES_CITIZEN"), "fallback banner shown")
+check(not shown($in, "safe_badge"), "user copy has no safe badge")
+check(shown($in, "sc_detail") and shown($in, "problems") and length(rows_of($in, "problems")) == 2, "detail with two problem rows")
+check(row_port($in, "problems", 0, "pr_row_t", "color") == "#da4453" and row_port($in, "problems", 1, "pr_row_t", "color") == "#f67400", "problem rows coloured by severity")
+check(shown($in, "btn_edit_behaviour") and shown($in, "btn_fork") and not shown($in, "btn_promote"), "a non-fork with a behaviour: edit behaviour + sandbox, no promote")
+check(port($in, "btn_toggle", "label") == "Disable" and port($in, "btn_remove", "label") == "Remove", "button labels bound")
+$crash = nil
+for each $k in [0, 1, 2, 3]
+  if row_port($in, "scenes", $k, "sc_row_status", "text") == "crash_loop" then $crash = $k end
+end
+check($crash != nil and row_port($in, "scenes", $crash, "sc_row_dot", "color") == "#da4453", "crash-loop row has a red dot")
+check(row_port($in, "scenes", 0, "sc_row", "background") == "#3daee933", "selected scene row highlighted")
+
+-- arrange with an empty declared slot.
+$ar = both(load("model-arrange.json"), "arrange")
+check(shown($ar, "arrange") and not shown($ar, "installed") and not shown($ar, "gallery"), "arrange view only")
+for each $edge in ["top", "bottom", "left", "right"]
+  check(shown($ar, "edge_" .. $edge) and shown($ar, "pages_" .. $edge) and shown($ar, "order_" .. $edge .. "_up"), "arrange shows the " .. $edge .. " edge")
+end
+check(length(rows_of($ar, "pages_right")) == 3 and row_port($ar, "pages_right", 1, "page_right_row_t", "text") == "(empty slot)", "right edge lists its empty declared slot")
+check(row_port($ar, "pages_right", 1, "page_right_row", "background") == "#ffffff08", "empty slot is dimmed")
+check(port($ar, "mode_right_pinned", "background") == "#3daee9" and port($ar, "mode_right_hidden", "background") == "#ffffff0f", "current mode lit")
+check(port($ar, "size_bottom_value", "text") == "52 px" and port($ar, "size_top_value", "text") == "—", "sizes")
+
+-- empty (the header model) renders.
+$em = both($e.header_model($editor), "header model")
+check(shown($em, "gallery") and not shown($em, "recommended") and not shown($em, "btn_recommended"), "header model: gallery, nothing to recommend")
+
+-- ── 2. lib.mix ──────────────────────────────────────────────────────────
+$SVC = {loader: "scenes", host: "shell", ced: "ced", apps: "apps"}
+$list = load("scenes-list.json")
+$templates = load("loader-verbs.json")["scenes.templates"].reply
+$props = load("props-snapshots.json").props_get
+$want_shape = shape(load("model-empty.json"), "", [])
+
+fn data($l, $t, $p, $services)
+  return {list: $l, templates: $t, props: $p, services: $services, svc: $SVC}
+end
+$D = data($list, $templates, $props, ["comp", "apps", "noded"])
+
+fn model_ok($m, $label)
+  check(deep_eq(shape($m, "", []), $want_shape), $label .. ": model has the frozen shape")
+  for each $r in $m.scenes
+    check(has_keys($r, ["id", "cells", "name", "dot", "background"]) and length($r.cells) == 5, $label .. ": scene row keys")
+  end
+  for each $r in $m.templates
+    check(has_keys($r, ["id", "cells", "template", "recommended", "background"]) and length($r.cells) == 4, $label .. ": template row keys")
+  end
+  for each $r in $m.selected.problems
+    check(has_keys($r, ["id", "cells", "color"]), $label .. ": problem row keys")
+  end
+  for each $edge in ["top", "bottom", "left", "right"]
+    for each $r in $m.edges[$edge].pages
+      check(has_keys($r, ["id", "cells", "page", "background"]), $label .. ": page row keys")
+    end
+  end
+  check(len(json_encode($m)) < 65536, $label .. ": model under 64 KiB")
+end
+
+-- The builder from the contract fixtures.
+$ui = $e.default_ui()
+$m = $e.build($D, $ui)
+model_ok($m, "fixtures")
+check($m.view == "gallery" and $m.source == "shipped" and $m.safe == false and $m.first_run == false, "editor record carried")
+check($m.banner.shown and contains($m.banner.text, "SCENES_CITIZEN") and $m.banner.background == "#da445333", "fallback banner")
+check(length($m.scenes) == 3 and $m.scenes[0].id == "s_panel", "one row per installed scene, never the editor")
+$by = {}
+for each $r in $m.scenes
+  $by[$r.name] = $r
+end
+check($by.panel.cells[3] == "diagnostic" and $by.panel.dot == "#f67400", "a mounted scene with a refused edit is amber")
+check($by["launcher-sandbox"].cells[3] == "refused" and $by["launcher-sandbox"].dot == "#da4453", "enabled, unmounted, diagnosed is red")
+check($by.notes.cells[3] == "diagnostic", "a recovery diagnostic is amber")
+check($m.templates[0].cells[3] == "installed" and $m.templates[1].cells[3] == "" and contains($m.templates[2].cells[1], "Invalid template"), "gallery rows")
+check($m.recommended.shown and $m.recommended.label == "Recommended set · 1 to add" and $m.recommended.background == "#ffffff0f", "recommended: one left (launcher)")
+check($m.edges.right.mode == "hidden" and $m.edges.right.size == "380 px" and $m.edges.bottom.modes.docked == "#3daee9", "edge modes and sizes")
+$right = $m.edges.right.pages
+check(length($right) == 3 and $right[0].page == "settings.appearance" and $right[1].cells[0] == "(empty slot)" and $right[1].background == "#ffffff08" and $right[2].cells[0] == "notes", "declared order first, empty slot dimmed, labelled by scene")
+check($m.edges.top.size == "—" and length($m.edges.top.pages) == 0, "an unused edge")
+check($m.status == "3 scenes · 3 with problems · loader revision 42", "status summary: " .. $m.status)
+
+-- Selection: the panel, with problems.
+$ui.scene = "panel"
+$ui.view = "installed"
+$m = $e.build($D, $ui)
+check($m.selected.shown and $m.selected.name == "panel" and $m.selected.status_color == "#f67400", "selected scene")
+check(contains($m.selected.status, "last edit refused") and contains($m.selected.status, "bottom edge") and contains($m.selected.status, "template panel"), "selected status: " .. $m.selected.status)
+check(length($m.selected.problems) == 1 and $m.selected.problems[0].cells[0] == 'scene.mix:12  binding-policy  ${env.HOME} is not a model path' and $m.selected.problems[0].color == "#da4453", "problem row")
+check($m.selected.enabled_label == "Disable" and $m.selected.has_behaviour and not $m.selected.is_fork and $m.scenes[0].background == "#3daee933", "selected labels")
+$ui.scene = "launcher-sandbox"
+check($e.build($D, $ui).selected.is_fork, "a fork is a fork")
+$ui.template = "panel"
+$m = $e.build($D, $ui)
+check($m.tpl.shown and $m.tpl.title == "Panel" and $m.tpl.installed == "Installed as panel" and $m.tpl.needs == "" and $m.tpl.can_install, "template detail")
+check($m.templates[0].background == "#3daee933", "selected template row")
+$m = $e.build(data($list, $templates, $props, ["noded"]), $ui)
+check($m.tpl.needs == "Needs comp, apps (not running)", "needs lists unregistered services")
+$ui.template = "broken"
+check(not $e.build($D, $ui).tpl.can_install, "an invalid template cannot be installed")
+
+-- 20-row problem cap.
+$many = []
+for $i = 1 to 30
+  push($many, {file: "/x/panel/scene.mix", digest: "d", line: $i, severity: "warning", code: "c", message: "m"})
+end
+$big = $list
+$big.scenes[0].problems = $many
+$ui.scene = "panel"
+$p20 = $e.build(data($big, $templates, $props, []), $ui).selected.problems
+check(length($p20) == 20 and $p20[19].id == "p_more" and contains($p20[19].cells[0], "11 more"), "problems capped at 20 rows")
+
+-- First run: an empty loader with first_run, templates listed.
+$fresh = {needs_setup: true, root: "/home/user/.config/cosmix/scenes", templates_root: "/opt/cosmix/share/scenes", state_ok: true, revision: 1, diagnostic: nil,
+  editor: {user_copy: false, user_dirty: false, mounted: true, visible: true, source: "shipped", safe: true, fallback: nil, behaviour: "running",
+    view: "gallery", scene: nil, first_run: true, request_seq: 1, problems: []}, scenes: []}
+$five = []
+$k = 10
+for each $t in ["panel", "launcher", "calendar", "notes", "settings"]
+  push($five, {template: $t, name: $t, title: $t, description: "d", edge: "right", kind: "edge", behaviour: true, recommended: true, order: $k, requires: [], installed_as: []})
+  $k = $k + 10
+end
+$fresh_t = {root: "/opt/cosmix/share/scenes", templates: $five}
+$fui = $e.apply_request($e.default_ui(), $fresh.editor)
+$fm = $e.build(data($fresh, $fresh_t, nil, []), $fui)
+model_ok($fm, "first run")
+check($fm.first_run and $fm.safe and $fm.view == "gallery" and $fm.recommended.shown and $fm.recommended.background == "#3daee9" and $fm.recommended.label == "Recommended set", "first-run model")
+check($fm.status == "Nothing installed yet" and not $fm.banner.shown and $fm.edges.left.size == "—", "first-run status, no shell snapshot")
+$fr2 = evaluated($source, $fm, "built first run")
+check(shown($fr2, "welcome_t") and length(rows_of($fr2, "templates")) == 5, "built first-run model renders the welcome and five rows")
+
+-- request_seq navigation applies once per new value.
+$nav = $e.apply_request($e.default_ui(), {request_seq: 4, view: "installed", scene: "notes"})
+check($nav.view == "installed" and $nav.scene == "notes" and $nav.seq == 4, "request navigates")
+$nav.view = "arrange"
+check($e.apply_request($nav, {request_seq: 4, view: "installed", scene: "notes"}).view == "arrange", "the same request_seq is not re-applied")
+$kept = $e.apply_request($nav, {request_seq: 5, view: nil, scene: nil})
+check($kept.view == "arrange" and $kept.scene == "notes" and $kept.seq == 5, "an open without a view or scene keeps the tab and the selection")
+
+-- Unreachable loader and unreadable state.
+$gone = $e.build(data(nil, nil, nil, []), $e.default_ui())
+model_ok($gone, "no loader")
+check($gone.banner.shown and contains($gone.banner.text, "not answering") and $gone.status == "Waiting for the scenes loader", "loader down")
+$bad = $fresh
+$bad.state_ok = false
+check(contains($e.build(data($bad, nil, nil, []), $e.default_ui()).banner.text, "state.conf.mix"), "unreadable state banner names the file")
+$warn = $fresh
+$warn.editor.problems = [{file: "/opt/x/behaviour.mix", digest: "d", line: 1, severity: "warning", code: "W", message: "m"}]
+$wb = $e.build(data($warn, nil, nil, []), $e.default_ui()).banner
+check($wb.shown and $wb.background == "#f6740033" and contains($wb.text, "1 lint finding"), "shipped-editor lint warnings are an amber note")
+
+-- 128 scenes stay under 64 KiB.
+$huge = $list
+$rows = []
+$declared = []
+for $i = 1 to 128
+  $n = "scene-number-" .. to_string($i)
+  push($rows, {name: $n, installed: true, enabled: true, mounted: true, behaviour: "running", template: "panel", diagnostic: nil,
+    title: "Scene " .. to_string($i), edge: "right", page: "scene-" .. $n, kind: "edge", forked_from: nil,
+    files: {scene: "/home/user/.config/cosmix/scenes/" .. $n .. "/scene.mix"}, digests: {}, problems: [],
+    attempted_digest: "", accepted_digest: ""})
+  push($declared, "scene-" .. $n)
+end
+$huge.scenes = $rows
+$hp = $props
+$hp.panels.right.declared = $declared
+$hp.panels.right.pages = $declared
+model_ok($e.build(data($huge, $templates, $hp, []), $e.default_ui()), "128 scenes")
+
+-- ── click planning ──────────────────────────────────────────────────────
+fn ok($value)
+  return {ok: true, rc: 0, value: $value}
+end
+fn refused($code, $message)
+  return {ok: false, rc: 21, value: {error_code: "upstream_refused", message: "Scene request failed", context: {reply: {error_code: $code, message: $message}}}}
+end
+-- Run a plan against scripted outcomes (one per step taken).
+fn run_plan($p, $outcomes)
+  $calls = []
+  $k = 0
+  $s = $e.next_step($p)
+  while $s != nil
+    push($calls, [$s.target, $s.verb, $s.args])
+    $out = $k < length($outcomes) ? $outcomes[$k] : ok({})
+    $k = $k + 1
+    $p = $e.advance($p, $out)
+    $s = $e.next_step($p)
+  end
+  $done = $e.finish($p)
+  return {calls: $calls, ui: $done.ui, message: $done.message, plan: $p}
+end
+fn click($verb, $args, $ui)
+  return $e.plan_click($verb, $args, $ui, $D)
+end
+fn cargs($node, $item)
+  $a = {scene: "editor", node: $node, kind: "click"}
+  if $item != nil then $a.item = $item end
+  return $a
+end
+$ui = $e.default_ui()
+
+-- tabs
+for each $v in ["gallery", "installed", "arrange"]
+  $p = click("editor.view", cargs("tab_" .. $v, nil), $ui)
+  check($p.kind == "ui" and length($p.steps) == 0 and $p.ui.view == $v, "tab_" .. $v)
+end
+check(click("editor.view", cargs("tab_nowhere", nil), $ui).ui.view == "gallery", "unknown tab changes nothing")
+
+-- template select + install (+ enable), collision retry once as <template>-2.
+$p = click("editor.template.select", cargs("templates", {id: "t_launcher", template: "launcher"}), $ui)
+check($p.kind == "ui" and $p.ui.template == "launcher", "template select")
+$ui = $p.ui
+$x = run_plan(click("editor.template.install", cargs("btn_install", nil), $ui), [ok({name: "launcher", installed: true, enabled: false})])
+check(deep_eq($x.calls, [["scenes", "scenes.install", {template: "launcher", enable: false}]]) and $x.message == "Installed launcher" and $x.ui.scene == "launcher", "install")
+$x = run_plan(click("editor.template.install", cargs("btn_install_enable", nil), $ui), [refused("SCENES_COLLISION", "installation already exists"), ok({name: "launcher-2", installed: true, enabled: true})])
+check(deep_eq($x.calls, [["scenes", "scenes.install", {template: "launcher", enable: true}], ["scenes", "scenes.install", {template: "launcher", name: "launcher-2", enable: true}]]), "collision retries once as <template>-2")
+check(contains($x.message, "Installed and enabled launcher-2") and $x.ui.scene == "launcher-2", "retry message: " .. $x.message)
+$x = run_plan(click("editor.template.install", cargs("btn_install", nil), $ui), [refused("SCENES_COLLISION", "taken"), refused("SCENES_COLLISION", "taken too")])
+check(length($x.calls) == 2 and $x.plan.failed.code == "SCENES_COLLISION" and contains($x.message, "failed"), "a second collision stops")
+$x = run_plan(click("editor.template.install", cargs("btn_install", nil), $ui), [refused("SCENES_STATE_UNREADABLE", "state.conf.mix could not be read")])
+check(length($x.calls) == 1 and contains($x.message, "SCENES_STATE_UNREADABLE"), "other refusals are not retried")
+check(click("editor.template.install", cargs("btn_install", nil), $e.default_ui()).kind == "ui", "install needs a selected template")
+
+-- recommended: install what is missing, enable what is off, stop at the first refusal.
+$rl = $list
+$rl.scenes[0].enabled = false
+$rt = {root: "/opt/cosmix/share/scenes", templates: [
+  {template: "panel", name: "panel", title: "Panel", recommended: true, order: 10, requires: [], installed_as: ["panel"]},
+  {template: "launcher", name: "launcher", title: "Applications", recommended: true, order: 20, requires: [], installed_as: []},
+  {template: "notes", name: "notes", title: "Notifications", recommended: true, order: 40, requires: [], installed_as: ["notes"]},
+  {template: "calendar", name: "calendar", title: "Calendar", recommended: true, order: 30, requires: [], installed_as: []},
+  {template: "extra", name: "extra", title: "Extra", recommended: false, order: 60, requires: [], installed_as: []}]}
+$RD = data($rl, $rt, $props, [])
+$p = $e.plan_click("editor.recommended", cargs("btn_recommended", nil), $e.default_ui(), $RD)
+$x = run_plan($p, [])
+check(deep_eq($x.calls, [["scenes", "scenes.enable", {name: "panel"}], ["scenes", "scenes.install", {template: "launcher", enable: true}], ["scenes", "scenes.install", {template: "calendar", enable: true}]]), "recommended in gallery order, enabled notes skipped: " .. json_encode($x.calls))
+check($x.message == "Recommended set: 3 added" and $x.ui.view == "installed", "recommended success")
+$x = run_plan($p, [ok({}), refused("SCENES_BUS_NAME", "name too long"), ok({})])
+check(length($x.calls) == 2 and contains($x.message, "Install Applications failed") and contains($x.message, "(1 done before it)"), "recommended stops at the first refusal: " .. $x.message)
+$done_list = $list
+$done_list.scenes[0].enabled = true
+$p = $e.plan_click("editor.recommended", cargs("btn_recommended", nil), $e.default_ui(), data($done_list, {templates: [$rt.templates[0]]}, $props, []))
+check($p.kind == "ui" and contains($p.message, "already"), "nothing to recommend")
+
+-- scene select + actions
+$p = click("editor.scene.select", cargs("scenes", {id: "s_panel", name: "panel"}), $e.default_ui())
+check($p.ui.scene == "panel", "scene select")
+$sel = $p.ui
+check(click("editor.scene.action", cargs("btn_reload", nil), $e.default_ui()).kind == "ui", "actions need a selection")
+check(deep_eq(run_plan(click("editor.scene.action", cargs("btn_toggle", nil), $sel), []).calls, [["scenes", "scenes.disable", {name: "panel"}]]), "toggle an enabled scene disables it")
+$off = $list
+$off.scenes[0].enabled = false
+check(deep_eq(run_plan($e.plan_click("editor.scene.action", cargs("btn_toggle", nil), $sel, data($off, $templates, $props, [])), []).calls, [["scenes", "scenes.enable", {name: "panel"}]]), "toggle a disabled scene enables it")
+check(deep_eq(run_plan(click("editor.scene.action", cargs("btn_reload", nil), $sel), []).calls, [["scenes", "scenes.reload", {name: "panel"}]]), "reload")
+check(deep_eq(run_plan(click("editor.scene.action", cargs("btn_reset", nil), $sel), []).calls, [["scenes", "scenes.reset", {name: "panel"}]]), "reset")
+
+-- remove: arm, then remove; any other click disarms. No timer.
+$p = click("editor.scene.remove", cargs("btn_remove", nil), $sel)
+check($p.kind == "ui" and $p.ui.armed == "panel" and length($p.steps) == 0, "first click arms")
+check($e.build($D, $p.ui).selected.remove_label == "Confirm remove", "armed label")
+$armed = $p.ui
+$x = run_plan(click("editor.scene.remove", cargs("btn_remove", nil), $armed), [ok({})])
+check(deep_eq($x.calls, [["scenes", "scenes.remove", {name: "panel"}]]) and $x.ui.scene == nil and $x.ui.armed == nil, "second click removes")
+for each $pair in [["editor.scene.action", "btn_reload"], ["editor.view", "tab_gallery"], ["editor.scene.select", "scenes"], ["editor.edge.mode", "mode_top_pinned"]]
+  $q = click($pair[0], cargs($pair[1], {name: "panel"}), $armed)
+  check($q.ui.armed == nil, $pair[1] .. " disarms remove")
+end
+$q = click("editor.scene.select", cargs("scenes", {name: "notes"}), $armed)
+check(click("editor.scene.remove", cargs("btn_remove", nil), $q.ui).kind == "ui", "after disarming, remove arms again")
+
+-- edit: ced.open when ced is registered, else apps.launch; then hide the editor; then push problems.
+$x = run_plan($e.plan_click("editor.scene.edit", cargs("btn_edit_scene", nil), $sel, data($list, $templates, $props, ["ced"])), [])
+check(deep_eq($x.calls[0], ["ced", "ced.open", {paths: ["/home/user/.config/cosmix/scenes/panel/scene.mix"], line: 12}]), "ced.open at the first problem line: " .. json_encode($x.calls[0]))
+check(deep_eq($x.calls[1], ["scenes", "scenes.editor.close", {}]), "then the editor hides")
+check($x.calls[2][1] == "ced.diagnostics" and $x.calls[2][2].source == "scenes" and $x.calls[2][2].digest == "0f6a0c8f1d2b3e4a5968778695a4b3c2d1e0f1a2b3c4d5e6f708192a3b4c5d6e" and $x.calls[2][2].diagnostics[0].line == 12 and $x.calls[2][2].diagnostics[0].severity == "error", "then the scene's problems are pushed")
+$x = run_plan($e.plan_click("editor.scene.edit", cargs("btn_edit_behaviour", nil), $sel, data($list, $templates, $props, [])), [])
+check(deep_eq($x.calls, [["apps", "apps.launch", {id: "dev.cosmix.ced", uris: ["/home/user/.config/cosmix/scenes/panel/behaviour.mix"]}], ["scenes", "scenes.editor.close", {}]]), "no ced: apps.launch, never a spawn")
+check($x.plan.subject.pushed == false and $x.message == "Editing behaviour.mix in ced", "the push waits for ced")
+$x = run_plan($e.plan_click("editor.scene.edit", cargs("btn_edit_scene", nil), $sel, data($list, $templates, $props, ["ced"])), [ok({}), refused("NOT_FOUND", "gone"), refused("UNIMPLEMENTED", "later")])
+check(length($x.calls) == 3 and $x.plan.failed == nil and contains($x.message, "Hide the Scene Editor: gone"), "close and push are soft")
+$x = run_plan($e.plan_click("editor.scene.edit", cargs("btn_edit_scene", nil), $sel, data($list, $templates, $props, [])), [refused("NOT_FOUND", "no such app")])
+check(length($x.calls) == 1 and $x.plan.failed.code == "NOT_FOUND", "a failed launch stops before hiding the editor")
+check(deep_eq($e.edit_route(["ced"], $SVC, "/a/b.mix", nil), {target: "ced", verb: "ced.open", args: {paths: ["/a/b.mix"]}, label: "Open b.mix in ced", soft: false, retry: nil}), "ced route without a line")
+check($e.edit_route(["cedar"], $SVC, "/a/b.mix", 3).verb == "apps.launch", "only the ced service counts")
+
+-- fork / promote
+$x = run_plan(click("editor.scene.fork", cargs("btn_fork", nil), $sel), [ok({name: "panel-sandbox", installed: true, enabled: true, forked_from: "panel"})])
+check(deep_eq($x.calls, [["scenes", "scenes.fork", {name: "panel"}]]) and $x.ui.scene == "panel-sandbox", "fork selects the sandbox")
+check(click("editor.scene.promote", cargs("btn_promote", nil), $sel).kind == "ui", "promote needs a fork")
+$sb = $sel
+$sb.scene = "launcher-sandbox"
+check(click("editor.scene.fork", cargs("btn_fork", nil), $sb).kind == "ui", "a sandbox is not forked again")
+$x = run_plan(click("editor.scene.promote", cargs("btn_promote", nil), $sb), [ok({name: "launcher", recovery: [], removed: "launcher-sandbox"})])
+check(deep_eq($x.calls, [["scenes", "scenes.promote", {from: "launcher-sandbox"}]]) and $x.ui.scene == "launcher", "promote selects the original")
+
+-- move: scenes.move, then exactly one shell.panel.order for both edges.
+$mv = $sel
+$mv.scene = "notes"
+$x = run_plan(click("editor.scene.move", cargs("move_left", nil), $mv), [])
+check(length($x.calls) == 2 and deep_eq($x.calls[0], ["scenes", "scenes.move", {name: "notes", edge: "left"}]), "move first")
+check(deep_eq($x.calls[1], ["shell", "shell.panel.order", {edges: {right: ["settings.appearance", "scene-calendar"], left: ["scene-launcher", "scene-notes"]}}]), "one order write for both edges: " .. json_encode($x.calls[1]))
+$x = run_plan(click("editor.scene.move", cargs("move_top", nil), $mv), [refused("SCENES_MOUNT", "no window header")])
+check(length($x.calls) == 1, "a refused move writes no order")
+check(click("editor.scene.move", cargs("move_right", nil), $mv).kind == "ui", "moving to the current edge is a no-op")
+$np = $e.plan_click("editor.scene.move", cargs("move_left", nil), $mv, data($list, $templates, {lifecycle: {}}, []))
+check($np.kind == "move" and length($np.steps) == 1, "no panel snapshot: move without guessing an order")
+for each $edge in ["left", "top", "bottom", "right"]
+  $pm = click("editor.scene.move", cargs("move_" .. $edge, nil), $sel)
+  check($edge == "bottom" ? $pm.kind == "ui" : ($pm.kind == "move" and $pm.steps[0].args.edge == $edge), "move_" .. $edge)
+end
+
+-- mode
+for each $edge in ["top", "bottom", "left", "right"]
+  for each $mode in ["hidden", "pinned", "docked"]
+    $x = run_plan(click("editor.edge.mode", cargs("mode_" .. $edge .. "_" .. $mode, nil), $ui), [])
+    check(deep_eq($x.calls, [["shell", "shell.panel.mode", {edge: $edge, mode: $mode}]]), "mode_" .. $edge .. "_" .. $mode)
+  end
+end
+
+-- size: 4 px on top/bottom, 20 px on left/right, clamped, no-op at a bound.
+$x = run_plan(click("editor.edge.size", cargs("size_bottom_plus", nil), $ui), [])
+check(deep_eq($x.calls, [["shell", "shell.panel.resize", {edge: "bottom", thickness_px: 56}]]) and $x.message == "Bottom edge: 56 px", "bottom +4")
+check(click("editor.edge.size", cargs("size_bottom_minus", nil), $ui).steps[0].args.thickness_px == 48, "bottom -4")
+check(click("editor.edge.size", cargs("size_left_plus", nil), $ui).steps[0].args.thickness_px == 460, "left +20")
+check(click("editor.edge.size", cargs("size_right_minus", nil), $ui).steps[0].args.thickness_px == 360, "right -20")
+$edgy = $props
+$edgy.panels.left.width_px = 500
+$edgy.panels.bottom.width_px = 26
+$edgy.panels.right.width_px = 380
+$edgy.panels.right.max_thickness_px = 390
+$ED = data($list, $templates, $edgy, [])
+$q = $e.plan_click("editor.edge.size", cargs("size_left_plus", nil), $ui, $ED)
+check($q.kind == "ui" and contains($q.message, "largest"), "left at 500 is a no-op")
+check($e.plan_click("editor.edge.size", cargs("size_bottom_minus", nil), $ui, $ED).steps[0].args.thickness_px == 24, "bottom clamps to 24")
+check($e.plan_click("editor.edge.size", cargs("size_right_plus", nil), $ui, $ED).steps[0].args.thickness_px == 390, "the output budget clamps")
+check($e.plan_click("editor.edge.size", cargs("size_top_plus", nil), $ui, data($list, $templates, nil, [])).kind == "ui", "no snapshot, no resize")
+check(click("editor.edge.size", cargs("size_top_plus", nil), $ui).steps[0].args.thickness_px == 24, "top from 0 clamps up to 24")
+
+-- page select + order
+$p = click("editor.edge.page", cargs("pages_right", {id: "g_scene-notes", page: "scene-notes"}), $ui)
+check(deep_eq($p.ui.page, {edge: "right", page: "scene-notes"}), "page select")
+check($p.ui.scene == "notes", "selecting a scene's page selects the scene: " .. to_string($p.ui.scene))
+$held = $ui
+$held.scene = "panel"
+$q = click("editor.edge.page", cargs("pages_right", {page: "settings.appearance"}), $held)
+check($q.ui.scene == "panel" and $q.ui.page.page == "settings.appearance", "a page no scene owns keeps the selection")
+$pg = $p.ui
+$x = run_plan(click("editor.edge.order", cargs("order_right_up", nil), $pg), [])
+check(deep_eq($x.calls, [["shell", "shell.panel.order", {edges: {right: ["settings.appearance", "scene-notes", "scene-calendar"]}}]]), "swap with the left neighbour: " .. json_encode($x.calls))
+check(click("editor.edge.order", cargs("order_right_down", nil), $pg).kind == "ui", "the last live page cannot move right")
+check(click("editor.edge.order", cargs("order_left_up", nil), $pg).kind == "ui", "order needs a selection on that edge")
+$first = click("editor.edge.page", cargs("pages_right", {page: "settings.appearance"}), $ui).ui
+check(click("editor.edge.order", cargs("order_right_up", nil), $first).kind == "ui", "the first page cannot move left")
+$slot = click("editor.edge.page", cargs("pages_right", {page: "scene-calendar"}), $ui).ui
+$x = run_plan(click("editor.edge.order", cargs("order_right_down", nil), $slot), [])
+check(deep_eq($x.calls[0][2], {edges: {right: ["settings.appearance", "scene-notes", "scene-calendar"]}}), "an empty slot moves right")
+$sp = $props
+$sp.panels.right.declared = ["settings.appearance", "scene-notes", "scene-calendar"]
+$x = run_plan($e.plan_click("editor.edge.order", cargs("order_right_down", nil), $slot, data($list, $templates, $sp, [])), [])
+check(deep_eq($x.calls[0][2], {edges: {right: ["settings.appearance", "scene-notes"]}}) and $x.ui.page == nil, "an empty slot moved past the end is dropped")
+
+-- every node-driven verb refuses an unknown node without Bus steps
+check(length($e.verbs()) == 15, "fifteen verbs")
+for each $verb in $e.verbs()
+  if $verb == "editor.recommended" then continue end
+  $q = $e.plan_click($verb, cargs("nothing", nil), $e.default_ui(), $D)
+  check(type($q) == "map" and $q.kind == "ui", $verb .. " refuses a bad node without steps")
+end
+
+-- ── ced diagnostics diff ────────────────────────────────────────────────
+$cur = $e.file_problems($list)
+$panel_scene = "/home/user/.config/cosmix/scenes/panel/scene.mix"
+$panel_beh = "/home/user/.config/cosmix/scenes/panel/behaviour.mix"
+check(has_key($cur, $panel_beh) and length($cur[$panel_beh].diagnostics) == 0 and length($cur[$panel_scene].diagnostics) == 1, "every file is tracked, clean ones too")
+$d1 = $e.diag_diff({}, $cur)
+$paths = []
+for each $req in $d1.changed
+  push($paths, $req.path)
+end
+check(contains($paths, $panel_scene) and not contains($paths, $panel_beh), "first inventory pushes files with problems only")
+$d2 = $e.diag_diff($d1.seen, $cur)
+check(length($d2.changed) == 0, "an unchanged inventory pushes nothing")
+$resaved = $list
+$resaved.scenes[0].problems[0].digest = "1111111111111111111111111111111111111111111111111111111111111111"
+$d3 = $e.diag_diff($d1.seen, $e.file_problems($resaved))
+check(length($d3.changed) == 1 and $d3.changed[0].path == $panel_scene and $d3.changed[0].digest == "1111111111111111111111111111111111111111111111111111111111111111", "a re-save with identical problems re-pushes (the digest is in the key)")
+$fixed = $list
+$fixed.scenes[0].problems = []
+$d4 = $e.diag_diff($d1.seen, $e.file_problems($fixed))
+check(length($d4.changed) == 1 and $d4.changed[0].path == $panel_scene and deep_eq($d4.changed[0].diagnostics, []) and $d4.changed[0].source == "scenes", "a recovery pushes []")
+$d5 = $e.diag_diff($d4.seen, $e.file_problems($fixed))
+check(length($d5.changed) == 0, "a clean file stays quiet")
+$gone_list = $list
+$gone_list.scenes = [$list.scenes[1], $list.scenes[2]]
+$d6 = $e.diag_diff($d1.seen, $e.file_problems($gone_list))
+check(length($d6.changed) == 1 and $d6.changed[0].path == $panel_scene and length($d6.changed[0].diagnostics) == 0 and not has_key($d6.changed[0], "digest"), "a removed scene's problems are cleared")
+check(deep_eq($e.open_paths({active: 1, tabs: [{tab: 1, path: "/a"}, {tab: 2, path: nil}, {tab: 3, path: "/a"}]}), ["/a"]), "open paths from ced.tabs")
+check($e.ced_severity("Error") == "error" and $e.ced_severity("info") == "note", "severity mapped to ced's enum")
+
+-- A hidden editor's quiet key: counters alone never change it (review m10).
+$bumped = $list
+$bumped.revision = ($list.revision ?? 0) + 7
+$bumped.scenes[0].revision = ($list.scenes[0].revision ?? 0) + 3
+$bumped.scenes[1].generation = ($list.scenes[1].generation ?? 0) + 1
+check($e.quiet_key($bumped) == $e.quiet_key($list), "revision and generation bumps keep the quiet key")
+$shown = $list
+$shown.scenes[0].problems = []
+check($e.quiet_key($shown) != $e.quiet_key($list), "a problem change moves the quiet key")
+$opened = $list
+$opened.editor = merge($list.editor ?? {}, {visible: true})
+check($e.quiet_key($opened) != $e.quiet_key($list), "the editor record is part of the quiet key")
+check($e.quiet_key(nil) == nil, "no inventory, no key")
+
+-- refusal unwrapping
+check(deep_eq($e.refusal(refused("SCENES_RESERVED", "no")), {code: "SCENES_RESERVED", message: "no"}), "loader refusal unwrapped")
+check($e.refusal({ok: false, rc: 20, value: {error_code: "upstream_transport", message: "Scene request failed: scenes scenes.list"}}).code == "upstream_transport", "transport failure")
+check($e.refusal({ok: false, rc: 21, value: {error_code: "upstream_refused", context: {reply: {error: "thickness_px must be a number in 120..=500"}}}}).message == "thickness_px must be a number in 120..=500", "Quoin's {error} refusals read")
+
+remove_dir($tmp)
+print("PASS scene-editor template + lib: " .. to_string($checks.count) .. " assertions")

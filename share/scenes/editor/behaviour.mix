@@ -1,0 +1,329 @@
+-- version: 0.1.0
+-- Scene Editor behaviour (scene-editor plan §4.6). Loader inventory, the
+-- template gallery, Quoin's panel snapshot and the registered services in;
+-- one complete model out through the loader (scenes.model). Clicks arrive as
+-- {scene,node,kind,item?} and become scenes.* / shell.panel.* / ced / apps
+-- calls; this citizen never loads a scene or writes a scene file itself.
+-- Woken by scenes.changed, <host>.panel.changed and noded.props.changed:
+-- every event marks the model stale and one local task re-reads and
+-- publishes. No poll, no debounce sleep, no self-emit.
+-- Helpers come from $SCENE_DIR/lib.mix (beside this file, so a user copy of
+-- the editor edits its own logic); only runtime.mix comes from the shared lib.
+$LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
+$DIR = env("SCENE_DIR", cwd())
+$r = require($LIB .. "/runtime.mix")
+$e = require($DIR .. "/lib.mix")
+$ctx = $r.scene_context("editor")
+$NODED = env("NODED_SERVICE", "noded")
+$SVC = {loader: $ctx.loader, host: $ctx.host, ced: env("CED_SERVICE", "ced"), apps: env("APPS_SERVICE", "apps")}
+$state = {ready: false, model: nil, ui: $e.default_ui(),
+  data: {list: nil, templates: nil, props: nil, services: [], svc: $SVC},
+  templates_root: nil, stale: true, dirty: false, rebuilding: false, busy: false, quiet: nil,
+  running: nil, last: nil, seen: {}, pending_push: []}
+
+-- ── reads (events are hints; these are the truth) ───────────────────────
+fn registered()
+  $out = $r.call($NODED, "noded.props.get", {})
+  if not $out.ok or type($out.value) != "map" or type($out.value.services) != "map" then return nil end
+  return $out.value.services.registered
+end
+
+-- The gallery is re-read only when the loader's templates root changes, on
+-- reconnect, or when the last read failed.
+fn fetch()
+  $list = $r.call($ctx.loader, "scenes.list", {})
+  $state.data.list = $list.ok and type($list.value) == "map" ? $list.value : nil
+  $root = $state.data.list == nil ? nil : $state.data.list.templates_root
+  if $state.data.templates == nil or $root != $state.templates_root then
+    $t = $r.call($ctx.loader, "scenes.templates", {})
+    $state.data.templates = $t.ok and type($t.value) == "map" ? $t.value : nil
+    $state.templates_root = $root
+  end
+  $props = $r.call($ctx.host, "shell.props.get", {})
+  $state.data.props = $props.ok and type($props.value) == "map" and type($props.value.panels) == "map" ? $props.value : nil
+end
+
+fn ced_live()
+  return contains($state.data.services ?? [], $SVC.ced)
+end
+
+-- The loader's verdicts for scene files open in ced (source "scenes"): only
+-- changed (problems, digest) pairs, [] on recovery. ced.tabs is read only when
+-- something changed and ced is registered. A file the Edit button opened
+-- while ced was not yet running is pushed once ced registers.
+fn push_diagnostics()
+  if $state.data.list == nil then return end
+  -- Nothing is marked seen while ced is away, or for a send that failed:
+  -- a verdict must reach ced, not just be computed (review GLM m2).
+  if not ced_live() then return end
+  $current = $e.file_problems($state.data.list)
+  $diff = $e.diag_diff($state.seen, $current)
+  $next = $diff.seen
+  $sends = $diff.changed
+  if length($state.pending_push) > 0 then
+    for each $path in $state.pending_push
+      push($sends, $e.ced_request($path, $current[$path]))
+    end
+  end
+  if length($sends) == 0 then
+    $state.seen = $next
+    $state.pending_push = []
+    return
+  end
+  $tabs = $r.call($SVC.ced, "ced.tabs", {})
+  if not $tabs.ok then return end
+  $state.pending_push = []
+  $open = $e.open_paths($tabs.value)
+  for each $req in $sends
+    if contains($open, $req.path) then
+      $out = $r.call($SVC.ced, "ced.diagnostics", $req)
+      if not $out.ok then
+        eprint("scene-editor: ced.diagnostics " .. $req.path .. ": " .. json_encode($out.value))
+        if has_key($state.seen, $req.path) then
+          $next[$req.path] = $state.seen[$req.path]
+        else
+          $next = delete($next, $req.path)
+        end
+      end
+    end
+  end
+  $state.seen = $next
+end
+
+-- ── one queued rebuild (dirty-state batching, as the panel does) ────────
+fn rebuild()
+  if not $state.ready then return end
+  if $state.stale then
+    $state.stale = false
+    fetch()
+    try
+      push_diagnostics()
+    catch $message
+      eprint("scene-editor diagnostics: " .. to_string($message))
+    end
+  end
+  if $state.data.list != nil then $state.ui = $e.apply_request($state.ui, $state.data.list.editor) end
+  $model = $e.build($state.data, $state.ui)
+  if $state.model != nil and deep_eq($model, $state.model) then return end
+  $out = $r.publish_model($ctx, $model)
+  if $out.ok then
+    $state.model = $model
+  else
+    eprint("scene-editor model refused: " .. json_encode($out.value))
+  end
+end
+
+-- $refetch: the world may have changed (an event, an action); otherwise only
+-- the selection did and the cached inputs are rebuilt into a new model.
+fn schedule($refetch)
+  if $refetch then $state.stale = true end
+  $state.dirty = true
+  if $state.rebuilding or not $state.ready then return end
+  $state.rebuilding = true
+  try
+    task_start("editor.rebuild", "{}")
+  catch $message, $error
+    $state.rebuilding = false
+    raise($error.code, $message, $error.details)
+  end
+end
+
+-- Local task only (empty headers): drains every change queued while the
+-- previous pass was waiting on the Bus, then stops.
+on editor.rebuild async
+  if len(keys($event.headers)) != 0 then return end
+  try
+    while $state.dirty and $state.ready
+      $state.dirty = false
+      try
+        rebuild()
+      catch $message
+        eprint("scene-editor rebuild: " .. to_string($message))
+      end
+    end
+  finally
+    $state.rebuilding = false
+  end
+end
+
+-- ── clicks ──────────────────────────────────────────────────────────────
+-- A click is planned synchronously. Selection clicks only re-render. Action
+-- clicks are queued to one local task that runs the planned Bus steps in
+-- order (stopping at the first refusal), sets the status line from the
+-- outcome and re-reads everything; the click itself is answered at once
+-- with {queued:true}, so the host never waits on a slow install. One action
+-- at a time: a second while one runs is refused, never interleaved.
+fn click($verb, $event)
+  $p = $e.plan_click($verb, $r.event_args($event), $state.ui, $state.data)
+  if $p.kind == "ui" then
+    $state.ui = $e.finish($p).ui
+    schedule(false)
+    return {ok: true, rc: 0, value: {queued: false, message: $state.ui.message}}
+  end
+  if $state.busy then
+    $state.ui.message = "Still working on the last change"
+    schedule(false)
+    return $r.failure("busy", $state.ui.message)
+  end
+  $state.busy = true
+  $state.running = $p
+  $state.ui = $p.ui
+  $state.ui.message = "Working…"
+  try
+    task_start("editor.run", "{}")
+  catch $message
+    $state.busy = false
+    $state.running = nil
+    $state.ui.message = "Could not start the change: " .. to_string($message)
+    schedule(false)
+    return $r.failure("editor_failed", $state.ui.message)
+  end
+  schedule(false)
+  return {ok: true, rc: 0, value: {queued: true, kind: $p.kind, steps: length($p.steps)}}
+end
+
+on editor.run async
+  if len(keys($event.headers)) != 0 then return end
+  $p = $state.running
+  if $p == nil then return end
+  try
+    $s = $e.next_step($p)
+    while $s != nil
+      $p = $e.advance($p, $r.call($s.target, $s.verb, $s.args))
+      $s = $e.next_step($p)
+    end
+  catch $message
+    $p.failed = {label: "Request", code: "editor_failed", message: to_string($message), index: $p.i}
+  finally
+    $state.busy = false
+    $state.running = nil
+  end
+  -- Selection clicks made while the change ran survive; the outcome's own
+  -- selection (a new install, a fork) and status line win.
+  $done = $e.finish($p)
+  $ui = $state.ui
+  $ui.message = $done.ui.message
+  if $done.ui.scene != $p.ui.scene then $ui.scene = $done.ui.scene end
+  $state.ui = $ui
+  if $p.kind == "edit" and $p.failed == nil and not $p.subject.pushed then
+    $state.pending_push = concat($state.pending_push, [$p.subject.path])
+  end
+  $state.last = {kind: $p.kind, failed: $p.failed, message: $done.message}
+  schedule(true)
+end
+
+on editor.view
+  $r.respond(click("editor.view", $event))
+end
+on editor.template.select
+  $r.respond(click("editor.template.select", $event))
+end
+on editor.template.install
+  $r.respond(click("editor.template.install", $event))
+end
+on editor.recommended
+  $r.respond(click("editor.recommended", $event))
+end
+on editor.scene.select
+  $r.respond(click("editor.scene.select", $event))
+end
+on editor.scene.action
+  $r.respond(click("editor.scene.action", $event))
+end
+on editor.scene.remove
+  $r.respond(click("editor.scene.remove", $event))
+end
+on editor.scene.edit
+  $r.respond(click("editor.scene.edit", $event))
+end
+on editor.scene.fork
+  $r.respond(click("editor.scene.fork", $event))
+end
+on editor.scene.promote
+  $r.respond(click("editor.scene.promote", $event))
+end
+on editor.scene.move
+  $r.respond(click("editor.scene.move", $event))
+end
+on editor.edge.mode
+  $r.respond(click("editor.edge.mode", $event))
+end
+on editor.edge.size
+  $r.respond(click("editor.edge.size", $event))
+end
+on editor.edge.page
+  $r.respond(click("editor.edge.page", $event))
+end
+on editor.edge.order
+  $r.respond(click("editor.edge.order", $event))
+end
+
+on editor.state desc "Scene Editor state {}: the published model, the selection and the cached inputs"
+  reply(0, json_encode({model: $state.model, ui: $state.ui, busy: $state.busy, last: $state.last, services: $state.data.services}))
+end
+
+-- ── events ──────────────────────────────────────────────────────────────
+on scenes.changed
+  -- Hidden, the editor skips inventories that differ only in the counters
+  -- every model publish bumps (review m10); a gap always re-reads.
+  $a = $r.event_args($event)
+  if ($event.headers.gap ?? "") != "true" and type($a) == "map" and (($a.editor ?? {}).visible != true) then
+    $key = $e.quiet_key($a)
+    if $key != nil and $key == $state.quiet then return end
+    $state.quiet = $key
+  else
+    $state.quiet = nil
+  end
+  schedule(true)
+end
+
+on "shell.panel.changed"
+  if $event.headers.topic != $ctx.host .. ".panel.changed" then return end
+  schedule(true)
+end
+
+fn services_changed($live)
+  if type($live) != "list" then return end
+  $state.data.services = $live
+  if not $state.ready then
+    $ready = $r.ready($ctx)
+    $state.ready = $ready.ok
+    if $state.ready then $state.model = nil end
+  end
+  schedule(true)
+end
+
+on props.changed
+  if $event.headers.topic != $NODED .. ".props.changed" then return end
+  $a = $r.event_args($event)
+  if $event.headers.gap == "true" or $a.gap == true then
+    services_changed(registered())
+  elif $a.path == "services.registered" then
+    services_changed($a.new)
+  end
+end
+
+on bus.connected
+  if len(keys($event.headers)) != 0 then return end
+  $state.ready = false
+  $state.model = nil
+  $state.data.templates = nil
+  $state.data.services = registered() ?? $state.data.services
+  $ready = $r.ready($ctx)
+  $state.ready = $ready.ok
+  if $state.ready then schedule(true) end
+end
+
+-- ── init: subscribe before the first snapshot ───────────────────────────
+subscribe("scenes.changed")
+subscribe($ctx.host .. ".panel.changed")
+subscribe($NODED .. ".props.changed")
+$state.data.services = registered() ?? []
+$ready = $r.ready($ctx)
+if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
+$state.ready = true
+-- The document's default model is the first thing on screen; the real one
+-- follows as soon as the first rebuild has read the world.
+$first = $r.publish_model($ctx, $e.header_model($DIR))
+if not $first.ok then eprint("scene-editor default model refused: " .. json_encode($first.value)) end
+schedule(true)

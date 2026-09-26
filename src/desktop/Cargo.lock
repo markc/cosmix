@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-ced"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3064,11 +3064,13 @@ dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
+ "cosmix-scene",
  "iced",
  "proptest",
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -3128,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-edit-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "cosmix-edit-core",
@@ -3437,7 +3439,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.17.0"
+version = "0.18.1"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3459,7 +3461,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-mix",
@@ -3470,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene-bevy"
-version = "0.5.0"
+version = "0.6.1"
 dependencies = [
  "bevy",
  "cosmix-scene",
@@ -3486,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3495,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "bevy",
  "bevy_winit",

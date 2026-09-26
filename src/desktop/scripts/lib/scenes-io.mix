@@ -40,19 +40,43 @@ fn templates($script)
   raise("SCENES_TEMPLATES", "set SCENES_TEMPLATES or COSMIX for this installation", {})
 end
 
-fn check($path)
-  for each $argv in [[interpreter(), "--check", $path], [interpreter(), "lint", "--deny-warnings", $path]]
-    $r = run_argv($argv, {timeout:10, max_output:65536})
-    if not $r.ok then raise("SCENES_BEHAVIOUR_INVALID", "behaviour check failed", {file:$path, rc:$r.exit_code, upstream:$r}) end
+-- check($path, {lint:"deny"|"report"}) -> {ok, problems}. mix --check is a
+-- hard gate in both modes. deny: any lint error or warning refuses; report
+-- (only the shipped Scene Editor): lint findings come back as problems.
+fn check($path, $opts)
+  $mode = ($opts ?? {}).lint ?? "deny"
+  -- Streamed: candidate caps the file at 256 KiB, this read must not be the
+  -- unbounded one (review NIT).
+  $digest = hash_file($path, "sha256")
+  $parsed = run_argv([interpreter(), "--check", $path], {timeout:10, max_output:65536})
+  $argv = [interpreter(), "lint", "--json"]
+  if $mode == "deny" then push($argv, "--deny-warnings") end
+  push($argv, $path)
+  $lint = run_argv($argv, {timeout:10, max_output:1048576})
+  $problems = []
+  try
+    for each $d in json_parse($lint.stdout).diagnostics ?? []
+      $row = {file:$path, digest:$digest, line:$d.line ?? 1, severity:$d.severity ?? "error", code:$d.code, message:$d.message}
+      if type($d.column) == "number" then $row.col = $d.column end
+      push($problems, $row)
+    end
+  catch $ignored
   end
+  if not $parsed.ok or ($mode == "deny" and not $lint.ok) then
+    raise("SCENES_BEHAVIOUR_INVALID", "behaviour check failed", {file:$path, rc:$parsed.ok ? $lint.exit_code : $parsed.exit_code,
+      problems:$problems, upstream:{stderr:$parsed.stderr}})
+  end
+  return {ok:true, problems:$problems}
 end
 
-fn launch($path, $name, $generation, $host, $me)
-  return spawn([interpreter(), "--serve", $path, "--name", "scene-" .. $name], {
+-- launch($dir, …): cwd and SCENE_DIR are the scene directory, so a behaviour
+-- loads helpers beside it with require($SCENE_DIR .. "/lib.mix").
+fn launch($dir, $name, $generation, $host, $me)
+  return spawn([interpreter(), "--serve", $dir .. "/behaviour.mix", "--name", "scene-" .. $name], {
     die_with_parent:true, exit_event:true, tag:json_encode({name:$name, generation:$generation}),
-    cwd:dirname($path), stdout:"inherit", stderr:"inherit",
+    cwd:$dir, stdout:"inherit", stderr:"inherit",
     env:{SCENE_NAME:$name, SCENE_HOST:$host, SCENES_SERVICE:$me,
-      SCENE_GENERATION:to_string($generation), SCENE_DIR:dirname($path)}})
+      SCENE_GENERATION:to_string($generation), SCENE_DIR:$dir}})
 end
 
 fn stop($pid, $tag)

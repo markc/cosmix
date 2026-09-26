@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "enabled": [
+    "panel",
+    "launcher",
+    "launcher-sandbox"
+  ],
+  "origins": {
+    "panel": "panel",
+    "launcher": "launcher",
+    "launcher-sandbox": "launcher",
+    "editor": "editor"
+  },
+  "recovery": {},
+  "forks": {
+    "launcher-sandbox": {
+      "from": "launcher",
+      "panel": nil
+    }
+  }
+}

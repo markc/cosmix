@@ -86,3 +86,70 @@ fn touched_lines_drop_and_untouched_lines_map() {
     d.apply_delta(&ViewDelta { edits: vec![], origin: None, kind: DeltaKind::Resync, rev: 2, view_gen: 2 });
     assert!(d.items().is_empty());
 }
+
+fn item(line: usize, code: &str) -> DiagItem {
+    DiagItem { line, column: None, severity: Severity::Error, code: code.into(), message: "m".into(), hint: None }
+}
+
+fn codes(d: &Diagnostics) -> Vec<(String, String)> {
+    d.items().iter().map(|i| (i.source.clone(), i.code.clone())).collect()
+}
+
+fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+    v.iter().map(|(s, c)| (s.to_string(), c.to_string())).collect()
+}
+
+#[test]
+fn accept_items_replaces_only_its_own_source() {
+    let lint = report(r#"{"code":"L1","severity":"error","file":"-","line":1,"column":null,"message":"m","hint":null}"#);
+    let mut d = Diagnostics::default();
+    d.accept(&tag(0), tag(0), TEXT, &lint, &[]).unwrap();
+    d.accept_items("scenes", &tag(0), tag(0), TEXT, &[item(2, "S1"), item(3, "S2")], &[]).unwrap();
+    d.accept_items("other", &tag(0), tag(0), TEXT, &[item(1, "O1")], &[]).unwrap();
+    assert_eq!(codes(&d), pairs(&[("lint", "L1"), ("scenes", "S1"), ("scenes", "S2"), ("other", "O1")]));
+    assert_eq!(&TEXT[d.items()[1].range.clone()], "$bad_name = 2", "no column: the line past its indentation");
+
+    // A new lint result keeps the external sets, and stays first.
+    let lint = report(r#"{"code":"L2","severity":"warning","file":"-","line":3,"column":1,"message":"m","hint":null}"#);
+    d.accept(&tag(0), tag(0), TEXT, &lint, &[]).unwrap();
+    assert_eq!(codes(&d), pairs(&[("lint", "L2"), ("scenes", "S1"), ("scenes", "S2"), ("other", "O1")]));
+
+    // Replacing one external set keeps its slot and the others.
+    d.accept_items("scenes", &tag(0), tag(0), TEXT, &[item(1, "S3")], &[]).unwrap();
+    assert_eq!(codes(&d), pairs(&[("lint", "L2"), ("scenes", "S3"), ("other", "O1")]));
+
+    // An empty set clears only that source; in-process lint through
+    // accept_items is the lint set.
+    d.accept_items("scenes", &tag(0), tag(0), TEXT, &[], &[]).unwrap();
+    d.accept_items(LINT_SOURCE, &tag(0), tag(0), TEXT, &[item(2, "L3")], &[]).unwrap();
+    assert_eq!(codes(&d), pairs(&[("lint", "L3"), ("other", "O1")]));
+
+    // Stale tags change nothing.
+    let mut other = tag(0);
+    other.buffer = "x".into();
+    assert_eq!(d.accept_items("other", &tag(0), other, TEXT, &[], &[]), Err(DiagError::StaleTag));
+    assert_eq!(d.accept_items("other", &tag(0), tag(1), TEXT, &[], &[]), Err(DiagError::StaleTag), "a gen ahead");
+    assert_eq!(codes(&d), pairs(&[("lint", "L3"), ("other", "O1")]));
+
+    // A resync clears every set.
+    d.apply_delta(&ViewDelta { edits: vec![], origin: None, kind: DeltaKind::Resync, rev: 2, view_gen: 2 });
+    assert!(d.items().is_empty());
+}
+
+#[test]
+fn external_sets_follow_covered_range_invalidation() {
+    let mut d = Diagnostics::default();
+    // Located at gen 0, mapped through a whole line inserted above.
+    let above = delta(vec![Edit { offset: 0, delete: 0, insert: "new line\n".into() }]);
+    d.accept_items("scenes", &tag(1), tag(0), TEXT, &[item(2, "S1"), item(3, "S2")], std::slice::from_ref(&above)).unwrap();
+    let shifted = format!("new line\n{TEXT}");
+    assert_eq!(&shifted[d.items()[0].range.clone()], "$bad_name = 2");
+    assert_eq!(&shifted[d.items()[1].range.clone()], "c = 3");
+    // Typing on the first one's line drops it, maps the other.
+    let at = shifted.find("= 2").unwrap();
+    d.apply_delta(&delta(vec![Edit { offset: at, delete: 0, insert: "x".into() }]));
+    assert_eq!(codes(&d), pairs(&[("scenes", "S2")]));
+    let typed = "new line\na = 1\n  $bad_name x= 2\nc = 3\n";
+    assert_eq!(&typed[d.items()[0].range.clone()], "c = 3");
+    assert_eq!(d.items()[0].source, "scenes");
+}

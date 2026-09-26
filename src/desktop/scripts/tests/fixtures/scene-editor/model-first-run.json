@@ -1,0 +1,34 @@
+{
+  "view": "gallery",
+  "first_run": true,
+  "safe": true,
+  "source": "shipped",
+  "banner": {"shown": false, "text": "", "color": "#fcfcfc", "background": "#00000000"},
+  "tabs": {
+    "gallery": {"background": "#3daee9"},
+    "installed": {"background": "#ffffff0f"},
+    "arrange": {"background": "#ffffff0f"}
+  },
+  "templates": [
+    {"id": "t_panel", "cells": ["Panel", "Bottom panel: launcher, workspaces, tasks, tray, clock", "bottom", ""], "template": "panel", "recommended": true, "background": "#00000000"},
+    {"id": "t_launcher", "cells": ["Applications", "Searchable application launcher", "left", ""], "template": "launcher", "recommended": true, "background": "#00000000"},
+    {"id": "t_calendar", "cells": ["Calendar", "Month calendar with today marked", "right", ""], "template": "calendar", "recommended": true, "background": "#00000000"},
+    {"id": "t_notes", "cells": ["Notifications", "Live notifications with Clear all", "right", ""], "template": "notes", "recommended": true, "background": "#00000000"},
+    {"id": "t_settings", "cells": ["Appearance", "Colour scheme, carousel motion and panel sizes", "right", ""], "template": "settings", "recommended": true, "background": "#00000000"}
+  ],
+  "tpl": {"shown": false, "title": "", "desc": "", "needs": "", "installed": "", "can_install": false},
+  "recommended": {"label": "Recommended set", "background": "#3daee9", "shown": true},
+  "scenes": [],
+  "selected": {
+    "shown": false, "name": "", "title": "", "status": "", "status_color": "#a1a9b1",
+    "problems": [], "enabled_label": "Enable", "has_behaviour": false, "is_fork": false,
+    "remove_label": "Remove"
+  },
+  "edges": {
+    "top": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []},
+    "bottom": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []},
+    "left": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []},
+    "right": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []}
+  },
+  "status": "Nothing installed yet"
+}

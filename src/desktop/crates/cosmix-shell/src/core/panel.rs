@@ -28,10 +28,24 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
-use super::{MotionError, PanelMotion};
+use super::{Edge, MotionError, Orientation, PanelMotion};
 
-/// Interactive thickness limits in logical pixels; 120 keeps side chrome usable.
-pub const RESIZE_THICKNESS_RANGE: std::ops::RangeInclusive<f32> = 120.0..=500.0;
+/// Interactive thickness limits in logical pixels for the top and bottom
+/// edges: 24 fits a one-line strip, and a 52 px bottom panel can be stepped
+/// and restored.
+pub const HORIZONTAL_RESIZE_RANGE: std::ops::RangeInclusive<f32> = 24.0..=200.0;
+/// Interactive thickness limits for the left and right edges; 120 keeps side
+/// chrome usable.
+pub const VERTICAL_RESIZE_RANGE: std::ops::RangeInclusive<f32> = 120.0..=500.0;
+
+/// The one per-orientation resize range the `shell.panel.resize` verb, the
+/// settings stepper and pointer drag all share (scene-editor plan §4.3 Q1).
+pub fn resize_thickness_range(edge: Edge) -> std::ops::RangeInclusive<f32> {
+    match edge.orientation() {
+        Orientation::Horizontal => HORIZONTAL_RESIZE_RANGE,
+        Orientation::Vertical => VERTICAL_RESIZE_RANGE,
+    }
+}
 
 /// Stable semantic mode of one panel.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -604,10 +618,15 @@ impl PanelStateMachine {
         Ok(())
     }
 
-    /// Runtime commands reject invalid input; pointer adapters clamp before ingress.
-    pub fn resize_thickness(&mut self, thickness_px: f32) -> Result<(), PanelConfigError> {
+    /// Runtime commands reject input outside `range` (the edge's
+    /// [`resize_thickness_range`]); pointer adapters clamp before ingress.
+    pub fn resize_thickness(
+        &mut self,
+        thickness_px: f32,
+        range: std::ops::RangeInclusive<f32>,
+    ) -> Result<(), PanelConfigError> {
         let config = PanelConfig::new(thickness_px, self.config.grace, self.config.motion_time)?;
-        if !RESIZE_THICKNESS_RANGE.contains(&thickness_px) {
+        if !range.contains(&thickness_px) {
             return Err(PanelConfigError::InvalidThickness(thickness_px));
         }
         self.config = config;
@@ -1125,7 +1144,7 @@ mod intro_tests {
         let mut panel = panel();
         panel.apply(Duration::ZERO, PanelInput::Dock).unwrap();
         for thickness in [120.0, 250.0, 500.0] {
-            panel.resize_thickness(thickness).unwrap();
+            panel.resize_thickness(thickness, VERTICAL_RESIZE_RANGE).unwrap();
             assert_eq!(panel.snapshot().thickness_px, thickness);
             assert_eq!(panel.snapshot().exclusive_zone_px, thickness);
         }
@@ -1138,9 +1157,26 @@ mod intro_tests {
             119.0,
             501.0,
         ] {
-            assert!(panel.resize_thickness(invalid).is_err());
+            assert!(panel.resize_thickness(invalid, VERTICAL_RESIZE_RANGE).is_err());
             assert_eq!(panel.snapshot().thickness_px, 500.0);
         }
+        // Top/bottom use their own range: a 52 px strip is valid there.
+        for thickness in [24.0, 52.0, 200.0] {
+            panel.resize_thickness(thickness, HORIZONTAL_RESIZE_RANGE).unwrap();
+            assert_eq!(panel.snapshot().thickness_px, thickness);
+        }
+        for invalid in [23.0, 201.0] {
+            assert!(panel.resize_thickness(invalid, HORIZONTAL_RESIZE_RANGE).is_err());
+            assert_eq!(panel.snapshot().thickness_px, 200.0);
+        }
+    }
+
+    #[test]
+    fn resize_range_is_per_orientation() {
+        assert_eq!(resize_thickness_range(Edge::Top), 24.0..=200.0);
+        assert_eq!(resize_thickness_range(Edge::Bottom), 24.0..=200.0);
+        assert_eq!(resize_thickness_range(Edge::Left), 120.0..=500.0);
+        assert_eq!(resize_thickness_range(Edge::Right), 120.0..=500.0);
     }
 
     #[test]
@@ -1189,7 +1225,7 @@ mod intro_tests {
             panel
                 .apply(Duration::ZERO, PanelInput::ResizeStarted)
                 .unwrap();
-            panel.resize_thickness(300.0).unwrap();
+            panel.resize_thickness(300.0, VERTICAL_RESIZE_RANGE).unwrap();
             assert_eq!(panel.snapshot().settled_thickness_px, 100.0);
             if retire {
                 panel.leave_output();

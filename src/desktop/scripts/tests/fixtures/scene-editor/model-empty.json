@@ -1,0 +1,28 @@
+{
+  "view": "gallery",
+  "first_run": false,
+  "safe": false,
+  "source": "shipped",
+  "banner": {"shown": false, "text": "", "color": "#fcfcfc", "background": "#00000000"},
+  "tabs": {
+    "gallery": {"background": "#3daee9"},
+    "installed": {"background": "#ffffff0f"},
+    "arrange": {"background": "#ffffff0f"}
+  },
+  "templates": [],
+  "tpl": {"shown": false, "title": "", "desc": "", "needs": "", "installed": "", "can_install": false},
+  "recommended": {"label": "Recommended set", "background": "#3daee9", "shown": false},
+  "scenes": [],
+  "selected": {
+    "shown": false, "name": "", "title": "", "status": "", "status_color": "#a1a9b1",
+    "problems": [], "enabled_label": "Enable", "has_behaviour": false, "is_fork": false,
+    "remove_label": "Remove"
+  },
+  "edges": {
+    "top": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []},
+    "bottom": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []},
+    "left": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []},
+    "right": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []}
+  },
+  "status": "Loading…"
+}

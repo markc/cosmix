@@ -448,7 +448,9 @@ The request body is the complete AMP document with one <code>mix</code> fence. T
 Invalid loads and patches return diagnostics and retain the last good tree.
 For file discovery, enablement, supervised behaviours and popup coordination,
 see the <a href="scenes-loader">Stage A scenes loader</a>.</p>
-<p>Scenes mount as pages in an edge panel. Floating windows are outside v0.
+<p>Scenes mount as pages in an edge panel, or, for <code>window.kind:"dialog"</code>, in
+the host's one centred dialog seat (see <a href="/cos/scenes#dialog-scenes">Dialog scenes</a>).
+Other floating windows are outside v0.
 The envelope's <code>window</code> header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
 <code>window.chrome</code> must be a boolean and defaults to true; false lets the page
@@ -490,9 +492,10 @@ did not change but whose model dependencies did.
 Model patches that change a scene's mount page or edge are refused with
 <code>SUBPANEL_COLLISION</code>; unload and load explicitly to move that mount.</p>
 <p>Subscribe to <code>&lt;host&gt;.panel.changed</code> for inner command <code>shell.panel.changed</code>:
-<code>{generation,revision,panels:{left,...}}</code>. Each panel has the same applied
-<code>visible</code>, <code>pinned</code>, <code>mode</code>, <code>page</code>, <code>pages</code>, <code>width_px</code> and <code>output</code> values as
-<code>shell.props.get</code>. Publication follows scene reconciliation and model
+<code>{generation,revision,dialog,panels:{left,...}}</code>. Each panel has the same applied
+<code>visible</code>, <code>pinned</code>, <code>mode</code>, <code>page</code>, <code>pages</code>, <code>declared</code>, <code>width_px</code> and
+<code>output</code> values as <code>shell.props.get</code>, and <code>dialog</code> is the dialog seat or null.
+A <code>conf.mix</code> order change (<code>declared</code>) publishes like any other change. Publication follows scene reconciliation and model
 application; unchanged snapshots produce no event. Take a property snapshot
 after subscribing and resynchronise after a connection/gap. Enqueue replies
 are not applied-state receipts, so page selection and temporary pin release
@@ -507,6 +510,62 @@ through <code>scenes.model</code> and forwards the page's clicks unchanged to
 clamping stay in Quoin. Without the loader, Quoin serves the same node block
 as a built-in fallback and yields the page to a loader-managed load. Snapshot
 fields and the handover rules are in <a href="quoin">Quoin</a>.</p>
+<h2 id="dialog-scenes">Dialog scenes</h2>
+<p>A document whose <code>window</code> header says <code>kind:"dialog"</code> (cosmix-scene 0.6; <code>w</code>
+and <code>h</code> required, no <code>edge</code> or <code>panel</code>) mounts into the host's <strong>dialog seat</strong>,
+not an edge carousel. There is one seat per host. In v1 the scenes loader
+reserves it for the <a href="scene-editor">Scene Editor</a> and refuses dialog-kind
+documents from every other scene.</p>
+<ul>
+<li><strong>Seat.</strong> A dialog load reserves the seat and keeps the surface unmapped. A
+second dialog load from another scene is refused <code>DIALOG_BUSY</code>, unless its
+JSON load envelope carries <code>preempt_dialog:true</code>. In that case the
+incumbent is released, and its owner gets a <code>&lt;host&gt;.scene.changed</code> notice
+with <code>ops:["unloaded"]</code>, <code>reason:"preempted"</code> and <code>by:{scene,owner}</code>.
+(An owner departure unloads with the same notice shape, <code>reason: "owner_departed"</code>; see <a href="quoin">Quoin</a>.)
+Unloading the scene, or its owner disconnecting, releases the seat.</li>
+<li><strong>Surface.</strong> The dialog is an overlay layer surface with no anchors and
+exclusive zone 0. comp centres it in the output's usable area, net of the
+other layers' exclusive zones: with a 52 px bottom panel docked, it sits
+26 px above the output centre. On every show it takes the keyboard
+(<code>Exclusive</code>), then demotes to <code>OnDemand</code> once the keyboard enter lands, and
+keeps focus while mapped. Pointer, keyboard and touch reach it like a panel
+surface, but it never drives panel reveal, hold, pin or resize.</li>
+<li><strong>Chrome.</strong> A title bar with a <strong>×</strong>, which is frame chrome rather than a
+scene node. × hides the dialog, and so does Escape while the dialog holds
+the keyboard and no IME preedit is active. Neither involves the scene's
+behaviour. Output removal unmaps the dialog; the next show maps it on the
+current output.</li>
+</ul>
+<table><thead><tr><th>Verb</th><th>Args</th><th>Reply</th></tr></thead><tbody>
+<tr><td><code>shell.dialog.show</code></td><td><code>{scene}</code></td><td><code>{scene,visible:true,applied}</code>; maps and takes the keyboard</td></tr>
+<tr><td><code>shell.dialog.hide</code></td><td><code>{scene}</code></td><td><code>{scene,visible:false,applied}</code>; unmaps and keeps scene state</td></tr>
+<tr><td><code>shell.scene.layout</code></td><td><code>{scene,node?}</code></td><td><code>{scene,revision,applied_revision,visible,surface:{kind:"panel"|"dialog",edge?,output,x,y,w,h},nodes:{&lt;id&gt;:{x,y,w,h,hidden}},instances:{&lt;list&gt;:{&lt;item&gt;:{x,y,w,h}}},chrome:{close?:{x,y,w,h}}}</code></td></tr>
+</tbody></table>
+<p><code>applied</code> is false when the dialog was already in the requested state.
+Refusals are <code>NOT_FOUND</code> (no such scene) and <code>NOT_DIALOG</code> (an edge page).
+<code>shell.scene.layout</code> reads the applied revision's computed layout in logical
+px. The surface rect is in output coordinates and node rects are relative to
+the surface. While unmapped it reports <code>visible:false</code> and empty <code>nodes</code>. It
+is how gates and agents click a node: take the centre of its rect.
+A dialog is fitted to the zone it centres in (the output less Quoin's docked
+panels' exclusive zones): each authored side is kept when it fits, else it
+becomes the zone less 24 px on both sides, never below 240 px, i.e.
+<code>w = max(240, min(declared_w, zone_w − 48))</code> and likewise for <code>h</code>. It re-fits
+on every output or exclusive-zone change. <code>props.dialog.w/h</code>,
+<code>panel.changed</code>'s <code>dialog</code> and this verb's <code>surface.w/h</code> all report that
+actual size; the scene's content reflows into it (its lists scroll).
+A dialog's surface <code>x</code>/<code>y</code> on the layer host is Quoin's placement estimate
+(the output centred within its own docked panels' exclusive zones); comp
+places the pixels, so another client's exclusive zone can move the real
+surface. Node rects are unaffected: they are measured inside the surface.
+<code>chrome.close</code> is the dialog's × frame control, measured the same way and in
+the same surface coordinates, present only while a <code>chrome:true</code> dialog is
+mapped (<code>chrome</code> is <code>{}</code> otherwise). Clicking its centre hides the dialog.</p>
+<p>Every change of <code>dialog.visible</code> or <code>dialog.scene</code> publishes
+<code>shell.panel.changed</code> with a strictly greater revision; the snapshot's
+<code>dialog</code> is <code>{scene,visible,w,h,output}</code> or null. Page order is written with
+<code>shell.panel.order</code>, described in <a href="quoin">Quoin</a>.</p>
 <h2 id="v1-bindings">V1 bindings</h2>
 <p>A port value beginning <code>= </code> is one Mix expression. <code>== x</code> escapes to the
 literal <code>= x</code>, while <code>=x</code> remains a literal. For example:</p>

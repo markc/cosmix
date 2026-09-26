@@ -1,0 +1,77 @@
+{
+  "_contract": "Scene Editor plan §4.1, frozen in Stage S. Every verb is mesh-open. Success is rc 0 with `reply`; a refusal is rc 10 with a body of exactly {error_code, message, context?}. Each `refusals` key equals its body's error_code. Paths use /home/user; real values come from the running loader.",
+  "scenes.templates": {
+    "request": {},
+    "reply": {
+      "root": "/opt/cosmix/share/scenes",
+      "templates": [
+        {"template": "panel", "name": "panel", "title": "Panel", "description": "Bottom panel: launcher, workspaces, tasks, tray, clock", "edge": "bottom", "kind": "edge", "behaviour": true, "recommended": true, "order": 10, "requires": ["comp", "apps"], "installed_as": ["panel"]},
+        {"template": "launcher", "name": "launcher", "title": "Applications", "description": "Searchable application launcher", "edge": "left", "kind": "edge", "behaviour": true, "recommended": true, "order": 20, "requires": ["apps"], "installed_as": []},
+        {"template": "broken", "name": "broken", "title": "broken", "description": "", "edge": "right", "kind": "edge", "behaviour": false, "recommended": false, "order": 1000, "requires": [], "installed_as": [], "diagnostic": {"error_code": "SCENES_METADATA", "message": "invalid strict template metadata", "context": {"file": "/opt/cosmix/share/scenes/broken/template.conf.mix"}}}
+      ]
+    },
+    "refusals": {}
+  },
+  "scenes.editor.open": {
+    "request": {"safe": true, "view": "installed", "scene": "panel", "first_run": false},
+    "reply": {"name": "editor", "source": "shipped", "safe": true, "visible": false, "pending": true, "fallback": null, "request_seq": 4},
+    "reply_fallback": {"name": "editor", "source": "shipped", "safe": false, "visible": false, "pending": true, "fallback": {"error_code": "SCENES_CITIZEN", "message": "document citizen must address its behaviour", "file": "/home/user/.config/cosmix/scenes/editor/scene.mix"}, "request_seq": 5},
+    "refusals": {
+      "SCENES_EDITOR_UNAVAILABLE": {"error_code": "SCENES_EDITOR_UNAVAILABLE", "message": "the shipped Scene Editor cannot be mounted", "context": {"shipped": {"error_code": "SCENES_HOST_KIND", "message": "host shell.scene.describe lacks window.kind dialog", "host": "shell"}, "user": null}},
+      "SCENES_STATE_UNREADABLE": {"error_code": "SCENES_STATE_UNREADABLE", "message": "state.conf.mix could not be read; refusing to write it", "context": {"file": "/home/user/.config/cosmix/scenes/state.conf.mix", "path": "edge popup open persists a recovery record"}},
+      "SCENES_ARGUMENT": {"error_code": "SCENES_ARGUMENT", "message": "view must be gallery, installed or arrange", "context": {"view": "sideways"}}
+    }
+  },
+  "scenes.editor.close": {
+    "request": {"unload": false},
+    "reply": {"name": "editor", "visible": false, "mounted": true},
+    "reply_unload": {"name": "editor", "visible": false, "mounted": false},
+    "refusals": {}
+  },
+  "scenes.install": {
+    "_note": "Existing verb; only the editor rules are new.",
+    "request": {"template": "editor"},
+    "reply": {"name": "editor", "installed": true, "enabled": false},
+    "refusals": {
+      "SCENES_RESERVED": {"error_code": "SCENES_RESERVED", "message": "the editor is summoned, never enabled", "context": {"name": "editor", "request": {"template": "editor", "enable": true}}},
+      "SCENES_BUS_NAME": {"error_code": "SCENES_BUS_NAME", "message": "a scene with a behaviour needs a name of at most 25 characters without '_'", "context": {"name": "a-very-long-launcher-copy-name", "citizen": "scene-a-very-long-launcher-copy-name"}},
+      "SCENES_STATE_UNREADABLE": {"error_code": "SCENES_STATE_UNREADABLE", "message": "state.conf.mix could not be read; refusing to write it", "context": {"file": "/home/user/.config/cosmix/scenes/state.conf.mix"}}
+    }
+  },
+  "scenes.enable": {
+    "_note": "Existing verb; SCENES_RESERVED and SCENES_STATE_UNREADABLE are new. disable/fork/move refuse `editor` the same way.",
+    "request": {"name": "panel"},
+    "reply": {"name": "panel", "accepted": true, "revision": 7},
+    "refusals": {
+      "SCENES_RESERVED": {"error_code": "SCENES_RESERVED", "message": "the editor is summoned, never enabled", "context": {"name": "editor"}},
+      "SCENES_STATE_UNREADABLE": {"error_code": "SCENES_STATE_UNREADABLE", "message": "state.conf.mix could not be read; refusing to write it", "context": {"file": "/home/user/.config/cosmix/scenes/state.conf.mix"}}
+    }
+  },
+  "scenes.fork": {
+    "request": {"name": "launcher", "as": "launcher-sandbox", "enable": true},
+    "reply": {"name": "launcher-sandbox", "installed": true, "enabled": true, "forked_from": "launcher"},
+    "refusals": {
+      "SCENES_RESERVED": {"error_code": "SCENES_RESERVED", "message": "the editor cannot be forked; install its user copy instead", "context": {"name": "editor"}},
+      "SCENES_BUS_NAME": {"error_code": "SCENES_BUS_NAME", "message": "no sandbox name fits the Bus name rule", "context": {"name": "a-twenty-five-char-scene", "tried": ["a-twenty-five-char-scene-sandbox", "a-twenty-five-char-scene-sb"]}},
+      "SCENES_COLLISION": {"error_code": "SCENES_COLLISION", "message": "installation already exists", "context": {"name": "launcher-sandbox"}},
+      "SCENES_NOT_FOUND": {"error_code": "SCENES_NOT_FOUND", "message": "scene is not installed", "context": {"name": "nope"}}
+    }
+  },
+  "scenes.promote": {
+    "request": {"from": "launcher-sandbox"},
+    "reply": {"name": "launcher", "recovery": ["/home/user/.config/cosmix/scenes/.recovery/launcher-3f0c9a52", "/home/user/.config/cosmix/scenes/.recovery/launcher-sandbox-6b1e40d7"], "removed": "launcher-sandbox"},
+    "refusals": {
+      "SCENES_NOT_FORK": {"error_code": "SCENES_NOT_FORK", "message": "only a fork can be promoted", "context": {"name": "launcher"}},
+      "SCENES_UPSTREAM": {"error_code": "SCENES_UPSTREAM", "message": "scene host refused request", "context": {"target": "shell", "verb": "shell.scene.validate", "rc": 10, "upstream": {"error_code": "scene_invalid", "diagnostics": [{"line": 12, "code": "binding-policy", "severity": "Error", "message": "env is not a model path"}]}, "phase": "validate-staged"}}
+    }
+  },
+  "scenes.move": {
+    "request": {"name": "notes", "edge": "left"},
+    "reply": {"name": "notes", "edge": "left", "revision": 12},
+    "refusals": {
+      "SCENES_MOUNT": {"error_code": "SCENES_MOUNT", "message": "scene has no window header to move", "context": {"name": "notes"}},
+      "SCENES_RESERVED": {"error_code": "SCENES_RESERVED", "message": "the editor is a dialog; it has no edge", "context": {"name": "editor"}},
+      "SCENES_ARGUMENT": {"error_code": "SCENES_ARGUMENT", "message": "edge must be left, right, top or bottom", "context": {"edge": "middle"}}
+    }
+  }
+}

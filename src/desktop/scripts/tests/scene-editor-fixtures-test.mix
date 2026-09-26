@@ -1,0 +1,173 @@
+-- Scene Editor Stage S freeze check (scene-editor plan §7 Stage S): the
+-- contract fixtures are complete and self-consistent, and the shipped editor
+-- template names exactly the frozen node ids and verbs. No broker, no Cargo.
+$here = dirname(realpath($0))
+$root = realpath($here .. "/../../../..")
+$fx = $here .. "/fixtures/scene-editor"
+$editor = $root .. "/share/scenes/editor"
+$checks = {count:0}
+
+fn check($ok, $message)
+  $checks.count = $checks.count + 1
+  if not $ok then raise("SCENE_EDITOR_FIXTURES", $message) end
+end
+
+fn load($name)
+  return json_parse(read_file($fx .. "/" .. $name))
+end
+
+-- Key structure of a model: maps compare recursively; lists by their first
+-- element when present. Two models share a shape when their paths agree.
+fn shape($v, $prefix, $out)
+  if type($v) == "map" then
+    for each $k in sort(keys($v))
+      push($out, $prefix .. "." .. $k)
+      $out = shape($v[$k], $prefix .. "." .. $k, $out)
+    end
+  end
+  return $out
+end
+
+-- 1. Verb fixtures: every frozen verb, request + reply, refusal keys match.
+$loader = load("loader-verbs.json")
+$shell = load("shell-verbs.json")
+$verbs = {loader: ["scenes.templates", "scenes.editor.open", "scenes.editor.close", "scenes.install", "scenes.enable", "scenes.fork", "scenes.promote", "scenes.move"],
+  shell: ["shell.panel.order", "shell.dialog.show", "shell.dialog.hide", "shell.scene.layout", "shell.scene.load"]}
+for each $side in ["loader", "shell"]
+  $table = $side == "loader" ? $loader : $shell
+  check(type($table._contract) == "string", $side .. ": _contract missing")
+  for each $verb in $verbs[$side]
+    $entry = $table[$verb]
+    check(type($entry) == "map", $side .. ": no fixture for " .. $verb)
+    check(type($entry.request) == "map" and type($entry.reply) == "map", $verb .. ": request and reply must be maps")
+    check(type($entry.refusals) == "map", $verb .. ": refusals map missing")
+    for each $code in keys($entry.refusals)
+      $body = $entry.refusals[$code]
+      check($body.error_code == $code and type($body.message) == "string", $verb .. ": refusal " .. $code .. " must carry {error_code, message}")
+    end
+  end
+end
+$codes = []
+for each $verb in keys($loader)
+  if type($loader[$verb]) == "map" and type($loader[$verb].refusals) == "map" then
+    for each $code in keys($loader[$verb].refusals)
+      push($codes, $code)
+    end
+  end
+end
+for each $code in ["SCENES_RESERVED", "SCENES_NOT_FORK", "SCENES_MOUNT", "SCENES_BUS_NAME", "SCENES_STATE_UNREADABLE", "SCENES_EDITOR_UNAVAILABLE"]
+  check(contains($codes, $code), "loader refusal code without a fixture: " .. $code)
+end
+for each $verb in ["shell.panel.order", "shell.dialog.show", "shell.dialog.hide", "shell.scene.layout"]
+  check(has_key($shell[$verb].refusals, "UNIMPLEMENTED"), $verb .. ": the Stage S stub refusal needs a fixture")
+end
+check($shell["shell.scene.load"].request.preempt_dialog == true, "load envelope carries preempt_dialog")
+$close = $shell["shell.scene.layout"].reply.chrome.close
+for each $key in ["x", "y", "w", "h"]
+  check(has_key($close, $key), "layout reply chrome.close." .. $key)
+end
+check(length(keys($shell["shell.scene.layout"].reply_unmapped.chrome)) == 0, "unmapped layout has no frame controls")
+check(has_key($shell["shell.scene.load"].refusals, "DIALOG_BUSY"), "DIALOG_BUSY fixture")
+check($shell["shell.scene.load"].preemption_notice.body.reason == "preempted", "pre-emption notice")
+
+-- 2. scenes.list: editor record, state_ok, per-scene files/digests/problems,
+--    and the two new diagnostics.
+$list = load("scenes-list.json")
+check($list.state_ok == true and type($list.editor) == "map", "scenes.list editor/state_ok")
+for each $key in ["user_copy", "user_dirty", "mounted", "visible", "source", "safe", "fallback", "behaviour", "view", "scene", "first_run", "request_seq", "problems"]
+  check(has_key($list.editor, $key), "scenes.list editor." .. $key)
+end
+$diagnostic_codes = []
+for each $row in $list.scenes
+  check($row.name != "editor", "the editor is never a scenes row")
+  for each $key in ["title", "edge", "page", "kind", "files", "digests", "forked_from", "problems"]
+    check(has_key($row, $key), $row.name .. ": scenes.list row lacks " .. $key)
+  end
+  for each $problem in $row.problems
+    check(type($problem.digest) == "string" and len($problem.digest) == 64 and type($problem.line) == "number", $row.name .. ": problem rows carry digest and line")
+  end
+  if type($row.diagnostic) == "map" then push($diagnostic_codes, $row.diagnostic.error_code) end
+end
+check(contains($diagnostic_codes, "SCENES_REMOUNT_FAILED") and contains($diagnostic_codes, "SCENES_RECOVERY"), "diagnostic fixtures for rules 6.5 and 9")
+
+-- 3. Props snapshots: dialog + declared; a hide advances the revision.
+$props = load("props-snapshots.json")
+check(type($props.props_get.dialog) == "map", "props dialog")
+for each $edge in keys($props.props_get.panels)
+  check(type($props.props_get.panels[$edge].declared) == "list", "props declared: " .. $edge)
+end
+check($props.panel_changed_hide.revision > $props.panel_changed_show.revision and $props.panel_changed_hide.generation == $props.panel_changed_show.generation, "a hide advances the revision within the generation")
+check($props.panel_changed_hide.dialog.visible == false, "hide notice")
+check($props.panel_changed_no_dialog.dialog == nil, "dialog null when none is loaded")
+
+-- 4. State files parse (the unreadable one must not), with the frozen records.
+for each $name in ["state-forks", "state-promoting-staged", "state-promoting-swapped", "state-promoting-placed", "state-resetting-swapped"]
+  $state = data_parse(read_file($fx .. "/" .. $name .. ".conf.mix"))
+  check($state.schema_version == 1 and type($state.enabled) == "list" and type($state.origins) == "map", $name .. ": base shape")
+  check(not contains($state.enabled, "editor"), $name .. ": editor is never enabled")
+end
+for each $phase in ["staged", "swapped", "placed"]
+  $state = data_parse(read_file($fx .. "/state-promoting-" .. $phase .. ".conf.mix"))
+  check($state.promoting.phase == $phase and starts_with($state.promoting.stage, ".stage-") and starts_with($state.promoting.backup, ".recovery/"), "promoting " .. $phase)
+end
+$unreadable = true
+try
+  data_parse(read_file($fx .. "/state-unreadable.txt"))
+  $unreadable = false
+catch $ignored
+end
+check($unreadable, "state-unreadable must fail data_parse")
+check(type(load("io-adapter.json").check.signature) == "string", "io adapter contract")
+
+-- 5. Editor models: one shape, equal to the document's own default model.
+$source = read_file($editor .. "/scene.mix")
+$header = nil
+for each $line in split($source, "\n")
+  if starts_with($line, "model: ") then $header = json_parse(substr($line, 7)) end
+end
+check($header != nil, "editor scene.mix has a model header")
+$want = shape(load("model-empty.json"), "", [])
+check(deep_eq(shape($header, "", []), $want), "the scene header model is model-empty.json")
+for each $name in ["model-first-run.json", "model-installed.json", "model-arrange.json"]
+  check(deep_eq(shape(load($name), "", []), $want), $name .. " has the frozen model shape")
+end
+
+-- 6. Template: frozen node ids and the verb set, both ways.
+$nodes = data_parse(before(after($source, "```mix\n"), "\n```"))
+$frozen = ["banner", "tabs", "tab_gallery", "tab_installed", "tab_arrange", "safe_badge", "body",
+  "gallery", "welcome_t", "templates", "tpl_detail", "tpl_title", "tpl_desc", "tpl_needs", "tpl_installed",
+  "btn_install", "btn_install_enable", "btn_recommended",
+  "installed", "scenes", "sc_detail", "sc_title", "sc_status", "problems",
+  "btn_toggle", "btn_reload", "btn_reset", "btn_remove", "btn_edit_scene", "btn_edit_behaviour", "btn_fork", "btn_promote",
+  "move_left", "move_top", "move_bottom", "move_right", "arrange", "status_t"]
+for each $edge in ["top", "bottom", "left", "right"]
+  for each $id in ["edge_", "mode_%_hidden", "mode_%_pinned", "mode_%_docked", "size_%_minus", "size_%_plus", "pages_", "order_%_up", "order_%_down"]
+    push($frozen, contains($id, "%") ? replace($id, "%", $edge) : $id .. $edge)
+  end
+end
+for each $id in $frozen
+  check(has_key($nodes, $id), "editor template lacks frozen node " .. $id)
+end
+$lib = require($editor .. "/lib.mix")
+$named = []
+for each $id in keys($nodes)
+  if type($nodes[$id].on_click) == "string" and not contains($named, $nodes[$id].on_click) then push($named, $nodes[$id].on_click) end
+end
+check(deep_eq(sort($named), sort($lib.verbs())), "on_click verbs equal lib.verbs(): " .. json_encode(sort($named)))
+$behaviour = read_file($editor .. "/behaviour.mix")
+for each $verb in $lib.verbs()
+  check(contains($behaviour, "\non " .. $verb .. "\n"), "behaviour answers " .. $verb)
+end
+$meta = data_parse(read_file($editor .. "/template.conf.mix"))
+check($meta.name == "editor" and $meta.hidden == true and $meta.behaviour == "behaviour.mix", "editor metadata")
+check(contains($source, "\nname: editor\n") and contains($source, "\ncitizen: scene-editor\n"), "editor document name and citizen")
+check(contains($source, "window: {\"chrome\":true,\"h\":620,\"kind\":\"dialog\",\"title\":\"Scene Editor\",\"w\":880}\n"), "editor ships the dialog header")
+
+-- 7. Gallery metadata on the shipped templates (§4.2).
+$order = {panel:10, launcher:20, calendar:30, notes:40, settings:50}
+for each $t in keys($order)
+  $m = data_parse(read_file($root .. "/share/scenes/" .. $t .. "/template.conf.mix"))
+  check($m.recommended == true and $m.order == $order[$t] and type($m.description) == "string" and type($m.requires) == "list", "gallery metadata: " .. $t)
+end
+
+print("PASS scene-editor fixtures: " .. to_string($checks.count) .. " assertions")

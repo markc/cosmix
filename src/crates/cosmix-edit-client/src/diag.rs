@@ -1,5 +1,10 @@
 //! Diagnostics for one buffer view — frontend lint results (ced E1 plan
-//! §4.10). Stage S freezes the API; Stage E1e implements it.
+//! §4.10) and external source-tagged sets (Scene Editor plan §4.4.1).
+//!
+//! One set per `source`: [`LINT_SOURCE`] is the frontend's own lint
+//! ([`Diagnostics::accept`] or in-process `accept_items`); any other source
+//! is an external set (`ced.diagnostics`). Replacing one source's set never
+//! touches another's; [`Diagnostics::items`] is the union, the lint set first.
 //!
 //! Contracts:
 //! - Input is `mix lint --json -` output (`schema_version` 2:
@@ -36,6 +41,27 @@ pub struct Diagnostic {
     pub code: String,
     pub message: String,
     pub hint: Option<String>,
+    /// Which set it belongs to: [`LINT_SOURCE`] for the frontend lint,
+    /// otherwise the external source that sent it (e.g. `scenes`). The
+    /// Problems panel labels rows with it.
+    pub source: String,
+}
+
+/// The frontend's own lint set (`mix lint --json`, or in-process scene lint).
+pub const LINT_SOURCE: &str = "lint";
+
+/// An already-parsed diagnostic for [`Diagnostics::accept_items`]: in-process
+/// scene lint, or an external set from `ced.diagnostics`. 1-based `line`;
+/// `column` 1-based or `None` (the squiggle then covers the line past its
+/// indentation, as for lint results without a column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagItem {
+    pub line: usize,
+    pub column: Option<usize>,
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +73,8 @@ pub enum DiagError {
 
 #[derive(Debug, Clone, Default)]
 pub struct Diagnostics {
+    /// Every set, grouped by source: the lint set first, then external sets
+    /// in the order they first arrived.
     items: Vec<Diagnostic>,
     /// Per item: the whole source line it covers (incl. its `\n`), view coords.
     covered: Vec<Range<usize>>,
@@ -72,8 +100,9 @@ struct RawDiag {
 }
 
 impl Diagnostics {
-    /// Replace the set with a lint result for `tag`. `deltas_since` are the
-    /// view deltas after `tag.gen`, in order (for covered-range invalidation).
+    /// Replace the lint set ([`LINT_SOURCE`]) with a `mix lint --json`
+    /// result for `tag`. `deltas_since` are the view deltas after `tag.gen`,
+    /// in order (for covered-range invalidation). External sets are kept.
     pub fn accept(
         &mut self,
         current: &ResultTag,
@@ -82,31 +111,97 @@ impl Diagnostics {
         lint_json: &str,
         deltas_since: &[ViewDelta],
     ) -> Result<(), DiagError> {
-        let same = current.epoch == tag.epoch && current.buffer == tag.buffer && current.language == tag.language && current.cfg == tag.cfg;
-        if !same || tag.view_gen > current.view_gen {
-            return Err(DiagError::StaleTag);
-        }
+        check_tag(current, &tag)?;
         let report: Report = serde_json::from_str(lint_json).map_err(|e| DiagError::BadJson(e.to_string()))?;
         if report.schema_version != 2 {
             return Err(DiagError::UnsupportedSchema(report.schema_version));
         }
+        let items: Vec<DiagItem> = report
+            .diagnostics
+            .into_iter()
+            .map(|raw| DiagItem {
+                line: raw.line.unwrap_or(1),
+                column: raw.column,
+                severity: match raw.severity.as_str() {
+                    "error" => Severity::Error,
+                    "warning" => Severity::Warning,
+                    _ => Severity::Note,
+                },
+                code: raw.code,
+                message: raw.message,
+                hint: raw.hint,
+            })
+            .collect();
+        self.replace(LINT_SOURCE, text_at_tag, &items, deltas_since);
+        Ok(())
+    }
+
+    /// Replace **only `source`'s** set with `items` for `tag` (Scene Editor
+    /// plan §4.4.1).
+    ///
+    /// Same stale-tag rule and covered-range invalidation as [`accept`]: a
+    /// result for another epoch, buffer, language or `cfg`, or for a gen
+    /// ahead of `current`, is `StaleTag`; items are located in
+    /// `text_at_tag` and then mapped through `deltas_since`. Other sources'
+    /// sets are untouched; an empty `items` clears `source`'s set. Every
+    /// stored [`Diagnostic`] carries `source`. [`items`] returns the union of
+    /// all sets; `apply_delta` maps every set and `Resync` clears every set
+    /// (the caller re-applies stored external sets after a Resync).
+    ///
+    /// [`accept`]: Self::accept
+    /// [`items`]: Self::items
+    pub fn accept_items(
+        &mut self,
+        source: &str,
+        current: &ResultTag,
+        tag: ResultTag,
+        text_at_tag: &str,
+        items: &[DiagItem],
+        deltas_since: &[ViewDelta],
+    ) -> Result<(), DiagError> {
+        check_tag(current, &tag)?;
+        self.replace(source, text_at_tag, items, deltas_since);
+        Ok(())
+    }
+
+    /// `source`'s set, located in `text_at_tag` and mapped through `deltas`,
+    /// takes the place of its previous set (the lint set goes first; a new
+    /// external source goes last).
+    fn replace(&mut self, source: &str, text_at_tag: &str, items: &[DiagItem], deltas: &[ViewDelta]) {
         let mut next = Diagnostics::default();
-        for raw in report.diagnostics {
-            let severity = match raw.severity.as_str() {
-                "error" => Severity::Error,
-                "warning" => Severity::Warning,
-                _ => Severity::Note,
-            };
-            let line = raw.line.unwrap_or(1).max(1);
-            let Some((covered, range)) = locate(text_at_tag, line, raw.column) else { continue };
-            next.items.push(Diagnostic { range, line, severity, code: raw.code, message: raw.message, hint: raw.hint });
+        for item in items {
+            let line = item.line.max(1);
+            let Some((covered, range)) = locate(text_at_tag, line, item.column) else { continue };
+            next.items.push(Diagnostic {
+                range,
+                line,
+                severity: item.severity,
+                code: item.code.clone(),
+                message: item.message.clone(),
+                hint: item.hint.clone(),
+                source: source.to_owned(),
+            });
             next.covered.push(covered);
         }
-        for d in deltas_since {
+        for d in deltas {
             next.apply_delta(d);
         }
-        *self = next;
-        Ok(())
+        let at = if source == LINT_SOURCE {
+            0
+        } else {
+            self.items.iter().position(|d| d.source == source).unwrap_or(self.items.len())
+        };
+        let (mut items, mut covered): (Vec<_>, Vec<_>) = std::mem::take(&mut self.items)
+            .into_iter()
+            .zip(std::mem::take(&mut self.covered))
+            .filter(|(d, _)| d.source != source)
+            .unzip();
+        // Removing the old set only shifts later sources down: no item of
+        // `source` stood before `at`, so it is still the right slot.
+        items.splice(at..at, next.items);
+        covered.splice(at..at, next.covered);
+        self.items = items;
+        self.covered = covered;
     }
 
     /// Drop diagnostics whose covered line the delta touched; map the rest.
@@ -133,6 +228,16 @@ impl Diagnostics {
     pub fn items(&self) -> &[Diagnostic] {
         &self.items
     }
+}
+
+/// A result for another epoch, buffer, language or `cfg`, or for a gen ahead
+/// of `current`, is stale.
+fn check_tag(current: &ResultTag, tag: &ResultTag) -> Result<(), DiagError> {
+    let same = current.epoch == tag.epoch && current.buffer == tag.buffer && current.language == tag.language && current.cfg == tag.cfg;
+    if !same || tag.view_gen > current.view_gen {
+        return Err(DiagError::StaleTag);
+    }
+    Ok(())
 }
 
 /// The covered line (with its `\n`) and the squiggle range for a 1-based line

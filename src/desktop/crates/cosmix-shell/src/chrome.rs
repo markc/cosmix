@@ -13,6 +13,7 @@
 
 use accesskit::Role;
 pub mod corner_menu;
+pub mod dialog;
 use std::error::Error;
 use std::fmt::{Display as FmtDisplay, Formatter};
 use std::time::Duration;
@@ -571,6 +572,7 @@ impl Plugin for QuoinChromePlugin {
                 PostUpdate,
                 present_scheme_dots.before(bevy::ui::UiSystems::Layout),
             );
+        dialog::install(app);
     }
 }
 
