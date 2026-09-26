@@ -14235,7 +14235,18 @@ impl WaylandState {
     #[cfg(feature = "bus")]
     pub(super) fn set_stalled_layer_owners(&mut self, owners: Vec<ClientId>) {
         let usable_before = self.usable_output_rect();
-        self.mark_all_outputs_before_change("layer.stalled");
+        let mut outputs: Vec<Output> = Vec::new();
+        for record in self.surfaces.values() {
+            if let SurfaceRole::Layer(role) = &record.role
+                && let Some(output) = role.output.output()
+                && !outputs.contains(output)
+            {
+                outputs.push(output.clone());
+            }
+        }
+        for output in &outputs {
+            self.mark_output_before_change(output, "layer.stalled");
+        }
         self.observations.stalled_owners = owners;
         if self.usable_output_rect() != usable_before {
             self.reconfigure_window_states_for_output();
