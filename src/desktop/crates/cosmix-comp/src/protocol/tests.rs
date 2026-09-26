@@ -1171,7 +1171,37 @@ fn wire_string_argument(value: &str) -> Vec<u8> {
     body
 }
 
-fn registry_globals(client: &mut UnixStream, callback_id: u32) -> HashMap<String, (u32, u32)> {
+#[derive(Default, Debug)]
+struct RegistryGlobals {
+    registry_id: u32,
+    by_interface: HashMap<String, Vec<(u32, u32)>>,
+}
+
+impl RegistryGlobals {
+    fn all(&self, interface: &str) -> &[(u32, u32)] {
+        self.by_interface.get(interface).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn get(&self, interface: &str) -> Option<&(u32, u32)> {
+        let globals = self.all(interface);
+        assert!(globals.len() <= 1, "ambiguous global interface {interface}; select explicitly");
+        globals.first()
+    }
+
+    fn contains_key(&self, interface: &str) -> bool {
+        !self.all(interface).is_empty()
+    }
+}
+
+impl std::ops::Index<&str> for RegistryGlobals {
+    type Output = (u32, u32);
+
+    fn index(&self, interface: &str) -> &Self::Output {
+        self.get(interface).unwrap_or_else(|| panic!("missing global {interface}"))
+    }
+}
+
+fn registry_globals(client: &mut UnixStream, callback_id: u32) -> RegistryGlobals {
     registry_globals_for(client, 2, callback_id)
 }
 
@@ -1179,10 +1209,10 @@ fn registry_globals_for(
     client: &mut UnixStream,
     registry_id: u32,
     callback_id: u32,
-) -> HashMap<String, (u32, u32)> {
+) -> RegistryGlobals {
     let awaited = format!("registry globals before sync callback {callback_id}");
     let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
-    let mut globals = HashMap::new();
+    let mut globals = RegistryGlobals { registry_id, ..RegistryGlobals::default() };
     for _ in 0..64 {
         let (object_id, opcode, body) = read_event(client, deadline, &awaited);
         if object_id == callback_id && opcode == 0 {
@@ -1205,9 +1235,74 @@ fn registry_globals_for(
                 .try_into()
                 .expect("global version"),
         );
-        globals.insert(interface, (name, version));
+        globals.by_interface.entry(interface).or_default().push((name, version));
     }
     panic!("registry callback {callback_id} did not complete");
+}
+
+fn select_named_seat(seats: &[(String, (u32, u32))], requested: &str) -> (u32, u32) {
+    let matches = seats.iter().filter(|(name, _)| name == requested).collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "expected exactly one seat named {requested}: {seats:?}");
+    matches[0].1
+}
+
+/// Probe seats using a previously completed callback id, then bind the named
+/// global at `seat_id`. The latter must be the next available dense object id:
+/// it is temporarily a sync callback while the probe is alive. Each probe is
+/// released before reuse. Return unrelated traffic for the caller's next drain.
+fn bind_named_seat(
+    client: &mut UnixStream,
+    globals: &RegistryGlobals,
+    requested: &str,
+    maximum: u32,
+    seat_id: u32,
+    probe_id: u32,
+    mut dispatch: impl FnMut(),
+) -> Vec<(u32, u16, Vec<u8>)> {
+    let mut named = Vec::new();
+    let mut pending = Vec::new();
+    for &(global, version) in globals.all("wl_seat") {
+        assert!(version >= 5, "seat probing needs name and release requests");
+        bind_global_for(client, globals.registry_id, global, "wl_seat", version.min(9), probe_id);
+        send_display_request(client, 0, seat_id);
+        dispatch();
+        let events = events_until_callback(client, seat_id);
+        let mut name = None;
+        for (object, opcode, body) in events {
+            if object == probe_id {
+                if opcode == 1 {
+                    name = Some(wire_string(&body, &mut 0));
+                }
+            } else {
+                pending.push((object, opcode, body));
+            }
+        }
+        named.push((name.expect("wl_seat.name before sync"), (global, version)));
+        send_request(client, probe_id, 3, &[]); // wl_seat.release
+        // A barrier makes release/reuse explicit even for a threaded server.
+        send_display_request(client, 0, seat_id);
+        dispatch();
+        pending.extend(events_until_callback(client, seat_id));
+    }
+    let (global, version) = select_named_seat(&named, requested);
+    bind_global_for(client, globals.registry_id, global, "wl_seat", version.min(maximum), seat_id);
+    pending
+}
+
+#[test]
+fn registry_singleton_rejects_duplicate_interfaces() {
+    let mut globals = RegistryGlobals::default();
+    globals.by_interface.insert("wl_seat".into(), vec![(1, 9), (2, 9)]);
+    assert_eq!(globals.all("wl_seat"), &[(1, 9), (2, 9)]);
+    assert!(std::panic::catch_unwind(|| globals["wl_seat"]).is_err());
+}
+
+#[test]
+fn named_seat_requires_exactly_one_matching_name() {
+    let seats = vec![("cosmix-agent".into(), (1, 9))];
+    assert!(std::panic::catch_unwind(|| select_named_seat(&seats, "cosmix")).is_err());
+    let seats = vec![("cosmix".into(), (1, 9)), ("cosmix".into(), (2, 9))];
+    assert!(std::panic::catch_unwind(|| select_named_seat(&seats, "cosmix")).is_err());
 }
 
 fn registry_global_from_events(
@@ -1258,6 +1353,17 @@ fn bind_global(
     version: u32,
     new_id: u32,
 ) {
+    bind_global_for(client, 2, global_name, interface, version, new_id);
+}
+
+fn bind_global_for(
+    client: &mut UnixStream,
+    registry_id: u32,
+    global_name: u32,
+    interface: &str,
+    version: u32,
+    new_id: u32,
+) {
     let string_len = interface.len() + 1;
     let padded_len = string_len.div_ceil(4) * 4;
     let mut body = Vec::with_capacity(12 + padded_len);
@@ -1267,7 +1373,7 @@ fn bind_global(
     body.resize(8 + padded_len, 0);
     body.extend_from_slice(&version.to_ne_bytes());
     body.extend_from_slice(&new_id.to_ne_bytes());
-    send_request(client, 2, 0, &body);
+    send_request(client, registry_id, 0, &body);
 }
 
 const TEST_COMPOSITOR_ID: u32 = 4;
@@ -1293,7 +1399,8 @@ mod region_selection_tests;
 struct KeybindingHarness {
     server: ProtocolServer,
     client: UnixStream,
-    registry_globals: HashMap<String, (u32, u32)>,
+    registry_globals: RegistryGlobals,
+    pending_events: Vec<(u32, u16, Vec<u8>)>,
     ecs_actions: Receiver<EcsAction>,
     commands: CommandSender<ProtocolCommand>,
     renderer_events: Receiver<Vec<ProtocolEvent>>,
@@ -1657,7 +1764,8 @@ impl KeybindingHarness {
         let mut harness = Self {
             server,
             client,
-            registry_globals: HashMap::new(),
+            registry_globals: RegistryGlobals::default(),
+            pending_events: Vec::new(),
             ecs_actions,
             commands,
             renderer_events,
@@ -1689,7 +1797,9 @@ impl KeybindingHarness {
         send_display_request(&mut self.client, 0, callback_id);
         self.dispatch_client();
         self.assert_client_connected(&format!("before sync callback {callback_id}"));
-        events_until_callback(&mut self.client, callback_id)
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(events_until_callback(&mut self.client, callback_id));
+        events
     }
 
     fn arm_explicit_sync_withdrawal_probe(&mut self) -> GlobalId {
@@ -1753,7 +1863,6 @@ impl KeybindingHarness {
         let globals = registry_globals(&mut self.client, 3);
         let (compositor, compositor_version) = globals["wl_compositor"];
         let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
-        let (seat, seat_version) = globals["wl_seat"];
         let (subcompositor, subcompositor_version) = globals["wl_subcompositor"];
         let (linux_dmabuf, linux_dmabuf_version) = globals["zwp_linux_dmabuf_v1"];
         let (layer_shell, layer_shell_version) = globals["zwlr_layer_shell_v1"];
@@ -1771,13 +1880,19 @@ impl KeybindingHarness {
             xdg_version.min(6),
             TEST_XDG_WM_BASE_ID,
         );
-        bind_global(
+        let server = &mut self.server;
+        self.pending_events.extend(bind_named_seat(
             &mut self.client,
-            seat,
-            "wl_seat",
-            seat_version.min(9),
+            &globals,
+            "cosmix",
+            9,
             TEST_SEAT_ID,
-        );
+            3,
+            || {
+                server.display.dispatch_clients(&mut server.state).unwrap();
+                server.display.flush_clients().unwrap();
+            },
+        ));
         bind_global(
             &mut self.client,
             subcompositor,
@@ -2231,6 +2346,108 @@ impl KeybindingHarness {
             .to_strict_data()
             .contains("\"interception_enabled\": true")
     }
+}
+
+fn seat_discovery_traffic(h: &mut KeybindingHarness, reverse: bool) -> (RegistryGlobals, u32, Vec<(u32, u16, Vec<u8>)>) {
+    let registry = h.allocate_object_id();
+    let callback = h.allocate_object_id();
+    send_display_request(&mut h.client, 1, registry);
+    send_display_request(&mut h.client, 0, callback);
+    h.dispatch_client();
+    let mut globals = registry_globals_for(&mut h.client, registry, callback);
+    if reverse {
+        globals.by_interface.get_mut("wl_seat").unwrap().reverse();
+    }
+    let seat_id = h.allocate_object_id();
+    let server = &mut h.server;
+    let mut traffic = bind_named_seat(&mut h.client, &globals, "cosmix", 9, seat_id, callback, || {
+        server.display.dispatch_clients(&mut server.state).unwrap();
+        server.display.flush_clients().unwrap();
+    });
+    traffic.extend(h.sync());
+    (globals, seat_id, traffic)
+}
+
+#[test]
+fn production_seat_remains_single_named_human_without_touch() {
+    let mut h = KeybindingHarness::new(false);
+    let (globals, seat_id, traffic) = seat_discovery_traffic(&mut h, false);
+    assert_eq!(globals.all("wl_seat").len(), 1);
+    assert_eq!(seat_capabilities(&traffic, seat_id), vec![SEAT_CAPS_WITHOUT_TOUCH]);
+    assert_eq!(h.server.state.human.kind, SeatKind::Human);
+    assert_eq!(h.server.state.human.pose, None);
+    let resource = h.server.state.human.seat.client_seats(
+        &h.subsurface().client().unwrap(),
+    ).into_iter().find(|seat| seat.id().protocol_id() == seat_id);
+    assert!(resource.is_some(), "the named binding belongs to the production human seat");
+}
+
+#[test]
+fn named_seat_binding_chooses_human_in_both_registry_orders() {
+    for reverse in [false, true] {
+        let mut h = KeybindingHarness::new(false);
+        let dh = h.server.state.display_handle.clone();
+        let mut agent = h.server.state.seat_state.new_wl_seat(&dh, "cosmix-agent");
+        agent.add_keyboard(Default::default(), 500, 30).unwrap();
+        agent.add_pointer();
+        let (globals, seat_id, traffic) = seat_discovery_traffic(&mut h, reverse);
+        assert_eq!(globals.all("wl_seat").len(), 2);
+        assert_eq!(seat_capabilities(&traffic, seat_id), vec![SEAT_CAPS_WITHOUT_TOUCH]);
+        let client = h.subsurface().client().unwrap();
+        assert!(h.server.state.human.seat.client_seats(&client).iter()
+            .any(|seat| seat.id().protocol_id() == seat_id));
+        assert!(agent.client_seats(&client).is_empty(), "probe bindings are released");
+    }
+}
+
+#[test]
+fn other_seat_focus_preserves_human_activation_stacking_and_popup_serial() {
+    let (mut h, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let other = map_test_undecorated_toplevel(&mut h);
+    let target = h.server.state.surfaces[&other].role.wl_surface().clone();
+    let human_surface = h.server.state.surfaces[&object].role.wl_surface().clone();
+    h.server.state.human.keyboard.clone().set_focus(
+        &mut h.server.state, Some(human_surface.clone().into()), SERIAL_COUNTER.next_serial(),
+    );
+    let traffic = request_test_fullscreen(&mut h, true);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let before_focus = h.server.state.human.keyboard.current_focus();
+    assert!(h.server.state.surfaces[&object].committed_fullscreen);
+    assert!(h.server.state.surfaces[&object].focused);
+    let before_stack = h.server.state.surfaces.iter()
+        .map(|(id, record)| (id.clone(), (record.focused, record.layout.z)))
+        .collect::<HashMap<_, _>>();
+    let action = (SERIAL_COUNTER.next_serial(), human_surface);
+    h.server.state.last_keyboard_action = Some(action.clone());
+    let _ = h.sync();
+    // Deliberately duplicate the name: callback ownership must use identity.
+    let mut other_seat = h.server.state.seat_state.new_seat("cosmix");
+    let keyboard = other_seat.add_keyboard(Default::default(), 500, 30).unwrap();
+    keyboard.set_focus(&mut h.server.state, Some(target.into()), SERIAL_COUNTER.next_serial());
+    assert_eq!(h.server.state.human.keyboard.current_focus(), before_focus);
+    assert_eq!(h.server.state.last_keyboard_action, Some(action));
+    for (id, expected) in before_stack {
+        let record = &h.server.state.surfaces[&id];
+        assert_eq!((record.focused, record.layout.z), expected);
+    }
+    let traffic = h.sync();
+    assert!(toplevel_configure_states(&traffic, TEST_TOPLEVEL_ID).is_empty(),
+        "agent focus must not emit an activation configure: {traffic:?}");
+    assert!(keyboard.current_focus().is_some());
+}
+
+#[test]
+fn other_seat_cursor_callback_preserves_published_human_cursor() {
+    let mut h = KeybindingHarness::new(false);
+    let other = h.server.state.seat_state.new_seat("cosmix");
+    h.server.state.events.clear();
+    let before = h.server.state.cursor_selection.clone();
+    SeatHandler::cursor_image(&mut h.server.state, &other, CursorImageStatus::Hidden);
+    assert_eq!(h.server.state.cursor_selection, before);
+    assert!(h.server.state.events.is_empty());
+    let human = h.server.state.human.seat.clone();
+    SeatHandler::cursor_image(&mut h.server.state, &human, CursorImageStatus::Hidden);
+    assert_eq!(h.server.state.cursor_selection, CursorSelection::Hidden);
 }
 
 #[test]
@@ -4249,7 +4466,7 @@ fn live_syncobj_registry(
     render_dev_t: u64,
     adapter_name: &str,
     drm_adapter: &cosmix_wgpu_dmabuf::VulkanDrmAdapter,
-) -> (HashMap<String, (u32, u32)>, ExplicitSyncStartupReport) {
+) -> (RegistryGlobals, ExplicitSyncStartupReport) {
     let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
         .expect("XDG_RUNTIME_DIR is required for the live syncobj registry test");
     let unique = SystemTime::now()
@@ -4332,7 +4549,7 @@ fn live_syncobj_registry(
 /// third failure, distinct from both, and one no re-probe could ever have seen.
 #[cfg(feature = "explicit-sync-live-test")]
 fn assert_production_exposure_advertises(
-    globals: &HashMap<String, (u32, u32)>,
+    globals: &RegistryGlobals,
     report: &ExplicitSyncStartupReport,
     when: &str,
 ) {
@@ -21420,7 +21637,6 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
     let (compositor, compositor_version) = globals["wl_compositor"];
     let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
     let (shm, shm_version) = globals["wl_shm"];
-    let (seat, seat_version) = globals["wl_seat"];
     bind_global(
         &mut client,
         compositor,
@@ -21436,7 +21652,7 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
         5,
     );
     bind_global(&mut client, shm, "wl_shm", shm_version.min(1), 6);
-    bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 7);
+    let mut seat_setup = bind_named_seat(&mut client, &globals, "cosmix", 7, 7, 3, || {});
     send_request(&mut client, 7, 1, &words(&[8])); // wl_seat.get_keyboard
     send_request(&mut client, 7, 0, &words(&[9])); // wl_seat.get_pointer
 
@@ -21449,7 +21665,8 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
     send_request(&mut client, 11, 1, &words(&[12])); // xdg_surface.get_toplevel
     send_request(&mut client, 10, 6, &[]); // initial empty commit
     send_display_request(&mut client, 0, 13);
-    let serial = events_until_callback(&mut client, 13)
+    seat_setup.extend(events_until_callback(&mut client, 13));
+    let serial = seat_setup
         .iter()
         .find_map(|(object, opcode, body)| (*object == 11 && *opcode == 0).then(|| word(body, 0)))
         .expect("xdg_surface.configure follows the initial empty commit");
@@ -21760,7 +21977,6 @@ fn map_toplevel_without_touch_capability(client: &mut UnixStream) {
     let (compositor, compositor_version) = globals["wl_compositor"];
     let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
     let (shm, shm_version) = globals["wl_shm"];
-    let (seat, seat_version) = globals["wl_seat"];
     bind_global(
         client,
         compositor,
@@ -21770,7 +21986,7 @@ fn map_toplevel_without_touch_capability(client: &mut UnixStream) {
     );
     bind_global(client, xdg_wm_base, "xdg_wm_base", xdg_version.min(6), 5);
     bind_global(client, shm, "wl_shm", shm_version.min(1), 6);
-    bind_global(client, seat, "wl_seat", seat_version.min(7), 7);
+    let mut seat_setup = bind_named_seat(client, &globals, "cosmix", 7, 7, 3, || {});
     send_request(client, 7, 1, &words(&[8])); // wl_seat.get_keyboard
 
     // The capability before any touch device exists. A compositor that called
@@ -21778,7 +21994,8 @@ fn map_toplevel_without_touch_capability(client: &mut UnixStream) {
     // assertion below would still pass — which is exactly why the transition,
     // not the final value, is what this test pins.
     send_display_request(client, 0, 9);
-    let caps_before = seat_capabilities(&events_until_callback(client, 9), 7);
+    seat_setup.extend(events_until_callback(client, 9));
+    let caps_before = seat_capabilities(&seat_setup, 7);
     assert_eq!(
         caps_before.last(),
         Some(&SEAT_CAPS_WITHOUT_TOUCH),
@@ -22492,11 +22709,13 @@ fn connect_ssd_scene_client(socket_name: &str) -> UnixStream {
         ("wl_shm", 6, 1),
         ("wl_subcompositor", 7, 1),
         ("zxdg_decoration_manager_v1", 8, 1),
-        ("wl_seat", 9, 7),
     ] {
         let (global, version) = globals[interface];
         bind_global(&mut client, global, interface, version.min(maximum), id);
     }
+    let pending = bind_named_seat(&mut client, &globals, "cosmix", 7, 9, 3, || {});
+    assert!(pending.iter().all(|(object, opcode, _)| *object == 1 && *opcode == 1),
+        "seat discovery before creating surfaces only receives delete_id: {pending:?}");
     client
 }
 
@@ -22791,11 +23010,11 @@ impl RealCursorSceneClient {
         send_display_request(&mut client, 1, 13);
         send_display_request(&mut client, 0, 14);
         let globals = registry_globals_for(&mut client, 13, 14);
-        let (seat, seat_version) = globals["wl_seat"];
-        bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 15);
+        let mut seat_setup = bind_named_seat(&mut client, &globals, "cosmix", 7, 15, 14, || {});
         send_request(&mut client, 15, 0, &words(&[16]));
         send_display_request(&mut client, 0, 17);
-        events_until_callback(&mut client, 17);
+        seat_setup.extend(events_until_callback(&mut client, 17));
+        assert!(seat_setup.iter().all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)));
 
         runtime
             .finish_frame(vec![HostInput::PointerMotionAbsolute {
@@ -23105,12 +23324,11 @@ fn map_focus_client(socket_path: &std::path::Path, memfd_name: &str) -> FocusCli
     send_display_request(&mut socket, 1, 13); // second wl_registry
     send_display_request(&mut socket, 0, 14);
     let globals = registry_globals_for(&mut socket, 13, 14);
-    let (seat, seat_version) = globals["wl_seat"];
-    bind_global(&mut socket, seat, "wl_seat", seat_version.min(7), 15);
+    let mut ready = bind_named_seat(&mut socket, &globals, "cosmix", 7, 15, 14, || {});
     send_request(&mut socket, 15, 0, &words(&[FOCUS_POINTER_ID])); // wl_seat.get_pointer
     send_request(&mut socket, 15, 1, &words(&[FOCUS_KEYBOARD_ID])); // wl_seat.get_keyboard
     send_display_request(&mut socket, 0, 18);
-    let ready = events_until_callback(&mut socket, 18);
+    ready.extend(events_until_callback(&mut socket, 18));
     assert!(
         ready
             .iter()
@@ -25034,11 +25252,10 @@ fn destroying_a_surface_does_not_enter_its_orphaned_descendant() {
     send_display_request(&mut client, 1, 22); // wl_display.get_registry
     send_display_request(&mut client, 0, 23);
     let globals = registry_globals_for(&mut client, 22, 23);
-    let (seat, seat_version) = globals["wl_seat"];
-    bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 24);
+    let mut ready = bind_named_seat(&mut client, &globals, "cosmix", 7, 24, 23, || {});
     send_request(&mut client, 24, 0, &words(&[ORPHAN_POINTER_ID])); // wl_seat.get_pointer
     send_display_request(&mut client, 0, 26);
-    let ready = events_until_callback(&mut client, 26);
+    ready.extend(events_until_callback(&mut client, 26));
     assert!(
         ready
             .iter()
@@ -38819,7 +39036,7 @@ fn disconnect_test_client(harness: &mut KeybindingHarness) {
 
 fn connect_secondary_client(
     harness: &mut KeybindingHarness,
-) -> (UnixStream, HashMap<String, (u32, u32)>) {
+) -> (UnixStream, RegistryGlobals) {
     let (mut client, server) = UnixStream::pair().expect("secondary Wayland test socket pair");
     let client_state = Arc::new(WaylandClientState::new(
         harness.server.state.client_disconnect_sender.clone(),
