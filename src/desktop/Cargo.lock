@@ -3129,6 +3129,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-dopus-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cosmix-lib-config",
+ "cosmix-lib-files",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "cosmix-edit-client"
 version = "0.2.0"
 dependencies = [
@@ -3264,6 +3275,18 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tracing",
+]
+
+[[package]]
+name = "cosmix-lib-files"
+version = "0.7.0"
+dependencies = [
+ "blake3",
+ "cosmix-lib-bus",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

@@ -63,9 +63,10 @@ pub enum CoreEvent {
     /// the core only reports the intent.
     OpenFile(PathBuf),
     /// The session config settled after the 0.35 s debounce (filemgr
-    /// `persist_config`, browser.rs:3564). The core has already saved when it
-    /// holds a [`crate::config::ConfigFile`]; this event lets the app mirror
-    /// or react.
+    /// `persist_config`, browser.rs:3564) AND was actually persisted (or the
+    /// core holds no [`crate::config::ConfigFile`]). A poison-pill refusal or
+    /// a write failure does NOT emit this — an app mirroring "persisted" on
+    /// it is never lied to; failures arrive as [`CoreEvent::Status`].
     ConfigSettled(DOpusConfig),
     /// Both panes were relisted after an operation reply — every visible tree
     /// is stale and must be re-read.

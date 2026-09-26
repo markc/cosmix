@@ -15,7 +15,7 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -112,9 +112,10 @@ pub struct PaneModel {
     /// This pane's current listing generation; a reply is accepted only when
     /// it matches (browser.rs:1571).
     pub generation: u64,
-    /// Worker-side mirror of `generation` for count-job liveness re-checks
-    /// (browser.rs `ListingInbox.generations`, 137, 1367).
-    pub(crate) generation_arc: Arc<AtomicU64>,
+    // The worker-side mirror of `generation` lives in `WorkerHandle::
+    // generations` (worker.rs) — one array, updated only by
+    // `store_generation`; panes hold no second copy to drift.
+
     pub listing: bool,
     pub root: Vec<FileEntry>,
     pub children: HashMap<PathBuf, Vec<FileEntry>>,
@@ -139,7 +140,6 @@ impl PaneModel {
         Self {
             path,
             generation: 0,
-            generation_arc: Arc::new(AtomicU64::new(0)),
             listing: false,
             root: Vec::new(),
             children: HashMap::new(),
@@ -191,20 +191,42 @@ enum Reservation {
     Rename { source: PathBuf, pane: PaneId },
 }
 
-/// Token-keyed single-flight reservation book (browser.rs
-/// `FileActionState.pending_confirm`, 405-411). Tokens are minted by the core
-/// and echoed back by the app; each token is consumed exactly once — by a
-/// resolution, a withdrawal, or nothing at all (fail-closed).
+/// The public face of an outstanding reservation, for
+/// [`DopusCore::outstanding_reservations`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservationKind {
+    Delete,
+    NewFolder,
+    Rename,
+}
+
+impl Reservation {
+    fn kind(&self) -> ReservationKind {
+        match self {
+            Reservation::Delete { .. } => ReservationKind::Delete,
+            Reservation::NewFolder { .. } => ReservationKind::NewFolder,
+            Reservation::Rename { .. } => ReservationKind::Rename,
+        }
+    }
+}
+
+/// Token-keyed reservation book (browser.rs
+/// `FileActionState.pending_confirm`/`pending_name_edit`, 405-411 — MAPS, not
+/// slots, because "the service queues concurrent modals — a second confirm
+/// must not orphan the first"). Tokens are minted monotonically by the core
+/// and echoed back by the app; each is consumed exactly once — by a
+/// resolution, a withdrawal, or nothing at all (fail-closed). The BTreeMap
+/// keeps `outstanding_reservations` in mint order.
 struct ConfirmBook {
     next_token: u64,
-    entries: HashMap<u64, Reservation>,
+    entries: std::collections::BTreeMap<u64, Reservation>,
 }
 
 impl ConfirmBook {
     fn new() -> Self {
         Self {
             next_token: 1,
-            entries: HashMap::new(),
+            entries: std::collections::BTreeMap::new(),
         }
     }
 
@@ -319,7 +341,6 @@ impl DopusCore {
     /// itself is not ported — the app uses `cosmix-actions` directly.
     pub fn availability(&self) -> AvailabilitySnapshot {
         let pane = &self.panes[self.active.index()];
-        let rows = self.visible_rows(self.active);
         AvailabilitySnapshot {
             can_go_back: !pane.history.back.is_empty(),
             can_go_forward: !pane.history.forward.is_empty(),
@@ -643,9 +664,10 @@ impl DopusCore {
     }
 
     /// Raise the new-folder name prompt (browser.rs `open_name_edit`,
-    /// 3325-3381). Resolved through [`DopusCore::prompt_text`].
+    /// 3325-3381 — refused while an operation runs or a name edit is
+    /// pending). Resolved through [`DopusCore::prompt_text`].
     pub fn begin_new_folder(&mut self) {
-        if !self.is_idle() {
+        if !self.is_idle() || self.name_edit_pending() {
             return;
         }
         let pane = self.active;
@@ -663,7 +685,7 @@ impl DopusCore {
     /// when submitted, and a display projection here would silently rename an
     /// unchanged filename on Enter.
     pub fn begin_rename(&mut self) {
-        if !self.is_idle() {
+        if !self.is_idle() || self.name_edit_pending() {
             return;
         }
         let pane = self.active;
@@ -683,7 +705,9 @@ impl DopusCore {
     }
 
     /// Resolve a name prompt. `None` (dismissal) withdraws the reservation;
-    /// `Some(name)` starts the operation — unless another operation holds the
+    /// an INVALID name (per [`validate_filename`]) leaves it open — the
+    /// dialog is still up in the view — and explains on the status line;
+    /// a valid name starts the operation, unless another operation holds the
     /// single-flight slot, in which case the reservation is still consumed,
     /// a status line explains, and nothing runs (fails exactly once).
     pub fn prompt_text(&mut self, token: u64, text: Option<String>) {
@@ -692,21 +716,37 @@ impl DopusCore {
             // Unknown, stale or foreign (confirm) token: fail closed.
             _ => return,
         }
+        // Dismissed outcomes resolve fail-closed (browser.rs:1132-1158: a
+        // non-text interaction result consumes the edit and runs nothing).
+        let Some(text) = text else {
+            self.confirms.entries.remove(&token);
+            return;
+        };
+        // filemgr's text field refused submit on an invalid name (validator
+        // attached at browser.rs:3367, submit gated in ctk interaction.rs:2361),
+        // so its operation layer could never see one. The core is the last
+        // toolkit-free chokepoint for the same law: an invalid name is NOT a
+        // resolution — the reservation stays open for a corrected retry or a
+        // dismissal, and the status line carries the validator's message.
+        let name = match validate_filename(&text) {
+            Ok(name) => name,
+            Err(message) => {
+                self.set_status(None, &message);
+                return;
+            }
+        };
         let reservation = self
             .confirms
             .entries
             .remove(&token)
             .expect("reservation kind guarded above");
-        // Dismissed outcomes resolve fail-closed (browser.rs:1132-1158: a
-        // non-text interaction result consumes the edit and runs nothing).
-        let Some(name) = text else { return };
         match reservation {
             Reservation::NewFolder { parent, pane } => {
-                self.start_operation(FileOperation::new_folder(parent.join(name)), pane);
+                self.start_operation(FileOperation::new_folder(parent.join(&name)), pane);
             }
             Reservation::Rename { source, pane } => {
                 if let Some(parent) = source.parent().map(Path::to_path_buf) {
-                    self.start_operation(FileOperation::rename(source, parent.join(name)), pane);
+                    self.start_operation(FileOperation::rename(source, parent.join(&name)), pane);
                 }
                 // No resolvable parent: the reservation is consumed and
                 // nothing runs — fail closed.
@@ -741,8 +781,44 @@ impl DopusCore {
         true
     }
 
+    /// Outstanding reservations in mint (oldest-first) order. filemgr's
+    /// modals were always answerable on screen; the core's tokens exist only
+    /// in emitted events, so an app that loses one (UI restart, event bug)
+    /// needs this to re-show or withdraw it — see [`DopusCore::withdraw`].
+    pub fn outstanding_reservations(&self) -> Vec<(u64, ReservationKind)> {
+        self.confirms
+            .entries
+            .iter()
+            .map(|(token, reservation)| (*token, reservation.kind()))
+            .collect()
+    }
+
+    /// Withdraw a reservation without resolving it — fail-closed: no
+    /// operation runs. Idempotent; unknown tokens are ignored. The recovery
+    /// path for a dialog whose event was lost.
+    pub fn withdraw(&mut self, token: u64) {
+        self.confirms.entries.remove(&token);
+    }
+
     fn is_idle(&self) -> bool {
-        self.operation == OpState::Idle && self.confirms.entries.is_empty()
+        // filemgr's `FileActionState::is_idle` (browser.rs:419-421)
+        // deliberately EXCLUDES the pending-confirm/name-edit maps — "the
+        // service queues concurrent modals — a second confirm must not orphan
+        // the first" — so a dialog on screen never blocks an operation or a
+        // second dialog. The drop-decision slots it DOES include have no v1
+        // counterpart here (no drag-and-drop yet).
+        self.operation == OpState::Idle
+    }
+
+    /// filemgr's `open_name_edit` guard (browser.rs:3330): a second name
+    /// edit is refused while one is pending; delete confirms queue.
+    fn name_edit_pending(&self) -> bool {
+        self.confirms.entries.values().any(|reservation| {
+            matches!(
+                reservation,
+                Reservation::NewFolder { .. } | Reservation::Rename { .. }
+            )
+        })
     }
 
     // -- worker replies -----------------------------------------------------
@@ -766,10 +842,10 @@ impl DopusCore {
                 count,
             } => self.receive_count(pane, generation, path, count),
             CoreEvent::OperationArrived {
-                kind: _,
+                kind,
                 source_pane,
                 result,
-            } => self.receive_operation(source_pane, result),
+            } => self.receive_operation(kind, source_pane, result),
             // Mutators' outputs are already in the queue; a view event fed
             // back in passes through unchanged.
             other => self.emit(other),
@@ -920,7 +996,12 @@ impl DopusCore {
     /// tree before failing, so a failure is not evidence that the panes still
     /// match the disk. One relist per reply either way — never one per batch
     /// item.
-    fn receive_operation(&mut self, source_pane: PaneId, result: Result<String, String>) {
+    fn receive_operation(
+        &mut self,
+        kind: FileOpKind,
+        source_pane: PaneId,
+        result: Result<String, String>,
+    ) {
         self.operation = OpState::Idle;
         match result {
             Ok(message) => {
@@ -928,8 +1009,19 @@ impl DopusCore {
                 self.emit(CoreEvent::InfoChanged);
             }
             Err(error) => {
-                // Error text lands on the source pane's status line.
-                self.set_status(Some(source_pane), &error);
+                // Error text lands on the source pane's status line, prefixed
+                // by the failing kind exactly as filemgr wrote it
+                // (browser.rs:1861-1877).
+                let label = match kind {
+                    FileOpKind::Copy => "Copy",
+                    FileOpKind::Move => "Move",
+                    FileOpKind::Delete => "Delete",
+                    FileOpKind::NewFolder => "Create folder",
+                    FileOpKind::Rename => "Rename",
+                    FileOpKind::BatchCopy => "Batch copy",
+                    FileOpKind::BatchMove => "Batch move",
+                };
+                self.set_status(Some(source_pane), &format!("{label} failed: {error}"));
             }
         }
         for pane_id in [PaneId::Left, PaneId::Right] {
@@ -967,21 +1059,33 @@ impl DopusCore {
             self.pending_config = Some(snapshot);
             self.config_dirty_since = Some(now);
         }
-        if let Some(since) = self.config_dirty_since {
-            if now.duration_since(since) >= CONFIG_SETTLE {
-                self.config_dirty_since = None;
-                let mut save_error = None;
-                if let Some(snapshot) = self.pending_config.take() {
-                    if let Some(file) = &self.config_file {
-                        if let Err(error) = file.save(&snapshot) {
+        if let Some(since) = self.config_dirty_since
+            && now.duration_since(since) >= CONFIG_SETTLE
+        {
+            self.config_dirty_since = None;
+            let mut save_error = None;
+            if let Some(snapshot) = self.pending_config.take() {
+                let mut saved = true;
+                if let Some(file) = &self.config_file {
+                    match file.save(&snapshot) {
+                        Ok(false) => saved = false, // poison-pill refusal
+                        Ok(true) => {}
+                        Err(error) => {
+                            saved = false;
                             save_error = Some(error);
                         }
                     }
+                }
+                // Only a real write (or no file to write) counts as
+                // settled: an app mirroring "persisted" on this event
+                // must not be told the config was saved when the poison
+                // pill refused it or the write failed.
+                if saved {
                     self.emit(CoreEvent::ConfigSettled(snapshot));
                 }
-                if let Some(error) = save_error {
-                    self.set_status(None, &error);
-                }
+            }
+            if let Some(error) = save_error {
+                self.set_status(None, &error);
             }
         }
         self.take_events()
@@ -1067,10 +1171,11 @@ fn flatten_entries(
             entry: entry.clone(),
             depth,
         });
-        if entry.is_dir && expanded.contains(&entry.path) {
-            if let Some(entries) = children.get(&entry.path) {
-                flatten_entries(entries, depth + 1, expanded, children, output);
-            }
+        if entry.is_dir
+            && expanded.contains(&entry.path)
+            && let Some(entries) = children.get(&entry.path)
+        {
+            flatten_entries(entries, depth + 1, expanded, children, output);
         }
     }
 }
@@ -1115,6 +1220,22 @@ pub fn entry_visible(name: &str, show_hidden: bool) -> bool {
 /// `sanitise_display_text` (browser.rs:1482-1492): control characters become
 /// U+FFFD in the DISPLAY PROJECTION ONLY — real OsStr bytes are kept for
 /// operations, and rename input is deliberately NOT sanitised.
+/// `validate_filename` (ctk/src/text_field.rs:90, attached to every filemgr
+/// name prompt at browser.rs:3367 with submit gated in ctk
+/// interaction.rs:2361): trim, and reject empty, ".", ".." or any path
+/// separator. filemgr's operation layer could never see a bad name; the core
+/// enforces the same law at the prompt-resolution boundary, the last
+/// toolkit-free chokepoint. A name containing `/` would otherwise cross
+/// directories (`rename /data/a.txt` + `"sub/b.txt"` = a silent move).
+pub fn validate_filename(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        Err("Enter a single valid file name".into())
+    } else {
+        Ok(name.into())
+    }
+}
+
 pub fn sanitise_display_text(text: &str) -> String {
     text.chars()
         .map(|character| {
@@ -2307,6 +2428,237 @@ mod tests {
         core.copy_selection_to_other_pane();
         assert!(core.pane(PaneId::Left).status.contains("Another file operation is still running"));
         assert!(core.availability().operation_running);
+    }
+
+    // -- review round 1: restored laws (cold-review fix pass, 2026-09-27) ----
+
+    #[test]
+    fn invalid_prompt_names_keep_the_reservation_and_explain() {
+        let (_dir, mut core, _rx) = core_fixture();
+        core.tick(now_instant());
+        core.select_path(PaneId::Left, Some(PathBuf::from("/fixture/a.txt")));
+        core.begin_rename();
+        let events = core.tick(now_instant());
+        let token = events
+            .iter()
+            .find_map(|event| match event {
+                CoreEvent::PromptRequested { token, .. } => Some(*token),
+                _ => None,
+            })
+            .unwrap();
+
+        // A name that would cross directories ("../evil") or is empty is NOT
+        // a resolution: filemgr's field refused submit (ctk validate_filename,
+        // browser.rs:3367); the core keeps the dialog's reservation open and
+        // explains on the status line.
+        for bad in ["../evil", "sub/b.txt", "  ", "."] {
+            core.prompt_text(token, Some(bad.into()));
+            assert!(
+                !core.availability().operation_running,
+                "'{bad}' must never start an operation"
+            );
+            assert_eq!(
+                core.outstanding_reservations(),
+                vec![(token, ReservationKind::Rename)],
+                "'{bad}' must keep the reservation open for a corrected retry"
+            );
+        }
+        let events = core.tick(now_instant());
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                CoreEvent::Status { pane: None, .. }
+            )),
+            "the validator's message reaches the status line"
+        );
+
+        // Dismissal still withdraws the unresolvable dialog.
+        core.prompt_text(token, None);
+        assert!(core.outstanding_reservations().is_empty());
+    }
+
+    #[test]
+    fn prompt_text_trims_and_applies_through_the_real_pipeline() {
+        let (dir, mut core, rx) = core_fixture();
+        let source = dir.path().join("left/a.txt");
+        std::fs::write(&source, b"a").unwrap();
+        core.tick(now_instant());
+        core.select_path(PaneId::Left, Some(source.clone()));
+        core.begin_rename();
+        let events = core.tick(now_instant());
+        let token = events
+            .iter()
+            .find_map(|event| match event {
+                CoreEvent::PromptRequested { token, .. } => Some(*token),
+                _ => None,
+            })
+            .unwrap();
+
+        // Whitespace is trimmed by the validator, then the worker thread
+        // performs the rename for real. The channel also carries the real
+        // startup listing reply — drain until the operation lands.
+        core.prompt_text(token, Some("  b.txt  ".into()));
+        let deadline = std::time::Duration::from_secs(5);
+        let mut reply = rx.recv_timeout(deadline).expect("the workers must reply");
+        while !matches!(reply, CoreEvent::OperationArrived { .. }) {
+            reply = rx.recv_timeout(deadline).expect("the rename reply must arrive");
+        }
+        let CoreEvent::OperationArrived { result, .. } = reply else {
+            unreachable!("guarded by the loop")
+        };
+        assert!(result.is_ok(), "rename must succeed: {result:?}");
+        let target = dir.path().join("left/b.txt");
+        assert!(target.exists(), "the trimmed name is the rename target");
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn a_second_delete_confirm_queues_a_second_modal() {
+        let (_dir, mut core, _rx) = core_fixture();
+        core.tick(now_instant());
+        let first = confirm_token(&mut core);
+        // filemgr queues concurrent modals (browser.rs:405-409): a second
+        // confirm must not orphan the first.
+        let second = confirm_token(&mut core);
+        assert_ne!(first, second);
+        assert_eq!(
+            core.outstanding_reservations(),
+            vec![(first, ReservationKind::Delete), (second, ReservationKind::Delete)]
+        );
+        // Withdrawing one leaves the other answerable.
+        core.withdraw(second);
+        assert_eq!(core.outstanding_reservations(), vec![(first, ReservationKind::Delete)]);
+    }
+
+    #[test]
+    fn an_operation_runs_while_a_confirm_is_open() {
+        let (_dir, mut core, _rx) = core_fixture();
+        core.tick(now_instant());
+        let _token = confirm_token(&mut core);
+        core.select_path(PaneId::Left, Some(PathBuf::from("/fixture/a.txt")));
+
+        // A dialog on screen is not an operation (filemgr's is_idle excludes
+        // the confirm maps, browser.rs:419-421): the copy starts and the
+        // status says Copying, not the "another operation" refusal.
+        core.copy_selection_to_other_pane();
+        assert!(core.availability().operation_running);
+        assert!(core.pane(PaneId::Left).status.contains("Copying"));
+        assert!(!core
+            .pane(PaneId::Left)
+            .status
+            .contains("Another file operation is still running"));
+    }
+
+    #[test]
+    fn a_name_edit_refuses_while_another_is_pending() {
+        let (_dir, mut core, _rx) = core_fixture();
+        core.tick(now_instant());
+        core.select_path(PaneId::Left, Some(PathBuf::from("/fixture/a.txt")));
+        core.begin_rename();
+        let events = core.tick(now_instant());
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::PromptRequested { .. })));
+
+        // open_name_edit's own guard (browser.rs:3330): a second name edit
+        // while one is pending is refused; the delete confirm still queues.
+        core.begin_new_folder();
+        core.begin_rename();
+        assert_eq!(core.outstanding_reservations().len(), 1);
+        let _second_confirm = confirm_token(&mut core);
+        assert_eq!(core.outstanding_reservations().len(), 2);
+    }
+
+    #[test]
+    fn count_replies_repaint_the_information_panel_for_the_selected_row_only() {
+        let (_dir, mut core, _rx) = core_fixture();
+        core.tick(now_instant());
+        let generation = core.pane(PaneId::Left).generation;
+        let selected = PathBuf::from("/fixture/selected");
+        let other = PathBuf::from("/fixture/other");
+        core.on_event(CoreEvent::ListingArrived {
+            pane: PaneId::Left,
+            generation,
+            path: core.pane(PaneId::Left).path.clone(),
+            root: true,
+            result: Ok(vec![
+                {
+                    let mut row = entry("selected", true);
+                    row.path = selected.clone();
+                    row
+                },
+                {
+                    let mut row = entry("other", true);
+                    row.path = other.clone();
+                    row
+                },
+            ]),
+        });
+        core.select_path(PaneId::Left, Some(selected.clone()));
+
+        // count_reply_repaints_information (browser.rs:1753-1759, test
+        // ~:5165): active pane AND the selected row.
+        let events = core.on_event(CoreEvent::CountArrived {
+            pane: PaneId::Left,
+            generation,
+            path: selected.clone(),
+            count: Some(3),
+        });
+        assert!(events.iter().any(|event| matches!(event, CoreEvent::InfoChanged)));
+
+        // A foreign pane's count does not repaint.
+        let events = core.on_event(CoreEvent::CountArrived {
+            pane: PaneId::Right,
+            generation: core.pane(PaneId::Right).generation,
+            path: PathBuf::from("/fixture/right-row"),
+            count: Some(1),
+        });
+        assert!(!events.iter().any(|event| matches!(event, CoreEvent::InfoChanged)));
+
+        // Neither does the active pane's count for a different row.
+        let events = core.on_event(CoreEvent::CountArrived {
+            pane: PaneId::Left,
+            generation,
+            path: other,
+            count: Some(1),
+        });
+        assert!(!events.iter().any(|event| matches!(event, CoreEvent::InfoChanged)));
+    }
+
+    #[test]
+    fn failed_operations_prefix_their_kind_on_the_status_line() {
+        let (_dir, mut core, _rx) = core_fixture();
+        core.tick(now_instant());
+        core.on_event(CoreEvent::OperationArrived {
+            kind: FileOpKind::NewFolder,
+            source_pane: PaneId::Left,
+            result: Err("mkdir /x: permission denied".into()),
+        });
+        assert!(core
+            .pane(PaneId::Left)
+            .status
+            .contains("Create folder failed: mkdir /x: permission denied"));
+    }
+
+    #[test]
+    fn config_settled_is_not_emitted_when_the_poison_pill_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.conf.mix");
+        std::fs::write(&config_path, b"{ not conf.mix }").unwrap();
+        let (_config, file) = crate::config::ConfigFile::load(dir.path());
+        assert!(!file.allow_save, "malformed config must pill the file");
+
+        let (mut core, _rx) = DopusCore::new(DOpusConfig::default(), Some(file));
+        let _ = core.tick(now_instant());
+        core.set_split_ratio(0.7);
+        let _ = core.tick(now_instant());
+        let settled = core.tick(now_instant() + std::time::Duration::from_millis(400));
+        assert!(
+            !settled
+                .iter()
+                .any(|event| matches!(event, CoreEvent::ConfigSettled(_))),
+            "a pill-refused write must not be reported as settled"
+        );
     }
 
     // -- operation replies (browser.rs:1879-1894) -----------------------------

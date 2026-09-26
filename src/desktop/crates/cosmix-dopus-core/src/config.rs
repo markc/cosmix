@@ -156,15 +156,19 @@ impl ConfigFile {
         }
     }
 
-    pub fn save(&self, config: &DOpusConfig) -> Result<(), String> {
+    /// Persist the config. Returns `Ok(false)` — not an error — when the
+    /// poison pill refuses the write (malformed/foreign-schema/unreadable
+    /// file at load): the caller must not report the config as saved.
+    pub fn save(&self, config: &DOpusConfig) -> Result<bool, String> {
         if !self.allow_save {
-            return Ok(());
+            return Ok(false);
         }
         let content =
             to_conf_mix_string(config).map_err(|error| format!("serialising dopus config: {error}"))?;
         // `write_atomic` returns the typed cosmix-files error; this layer
         // speaks `String` (filemgr's convention, kept throughout the core).
         write_atomic(&self.path, content.as_bytes())
+            .map(|()| true)
             .map_err(|error| format!("writing {}: {error}", self.path.display()))
     }
 }
