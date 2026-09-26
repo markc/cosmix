@@ -23,7 +23,7 @@ fn keyboard_without_an_owner_refuses_and_cleans_up_generated_holds() {
             enabled: false,
             ..corner::CornerConfig::default()
         });
-    harness.server.state.keyboard.clone().set_focus(
+    harness.server.state.human.keyboard.clone().set_focus(
         &mut harness.server.state,
         None,
         SERIAL_COUNTER.next_serial(),
@@ -40,7 +40,7 @@ fn keyboard_without_an_owner_refuses_and_cleans_up_generated_holds() {
         assert_eq!(rc, 10);
         assert_eq!(body["error"], "no_keyboard_target");
         assert!(harness.server.state.injection.held.is_empty());
-        assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+        assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
         assert_eq!(body["target"], Value::Null);
     }
 }
@@ -50,12 +50,12 @@ fn bare_modifier_without_focus_is_held_for_a_following_binding() {
     let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
     let runtime = control_reply_runtime();
     // The harness maps a focused toplevel; this test wants no client focus.
-    harness.server.state.keyboard.clone().set_focus(
+    harness.server.state.human.keyboard.clone().set_focus(
         &mut harness.server.state,
         None,
         SERIAL_COUNTER.next_serial(),
     );
-    assert!(harness.server.state.keyboard.current_focus().is_none());
+    assert!(harness.server.state.human.keyboard.current_focus().is_none());
     assert_eq!(harness.server.state.workspace_current(), 1);
     let key = |name: &str, action| InputOp::Key {
         key: KeySpec::Name(name.into()),
@@ -71,7 +71,7 @@ fn bare_modifier_without_focus_is_held_for_a_following_binding() {
     assert_eq!(rc, 0, "{body}");
     assert_eq!(body["target"], Value::Null);
     assert!(!harness.server.state.injection.held.is_empty());
-    assert!(harness.server.state.keyboard.modifier_state().logo);
+    assert!(harness.server.state.human.keyboard.modifier_state().logo);
 
     // An unhandled payload is refused without releasing the earlier prefix.
     let (rc, body) = inject(
@@ -82,7 +82,7 @@ fn bare_modifier_without_focus_is_held_for_a_following_binding() {
     );
     assert_eq!(rc, 10, "{body}");
     assert_eq!(body["error"], "no_keyboard_target");
-    assert!(harness.server.state.keyboard.modifier_state().logo);
+    assert!(harness.server.state.human.keyboard.modifier_state().logo);
     let (rc, body) = inject(
         &mut harness,
         &ingress,
@@ -99,8 +99,8 @@ fn bare_modifier_without_focus_is_held_for_a_following_binding() {
     );
     assert_eq!(rc, 0, "{body}");
     assert!(harness.server.state.injection.held.is_empty());
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
-    assert!(!harness.server.state.keyboard.modifier_state().logo);
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
+    assert!(!harness.server.state.human.keyboard.modifier_state().logo);
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn release_and_already_held_keys_work_after_focus_is_lost() {
         inject(&mut harness, &ingress, &runtime, key(PressAction::Press)).0,
         0
     );
-    harness.server.state.keyboard.clone().set_focus(
+    harness.server.state.human.keyboard.clone().set_focus(
         &mut harness.server.state,
         None,
         SERIAL_COUNTER.next_serial(),
@@ -129,8 +129,8 @@ fn release_and_already_held_keys_work_after_focus_is_lost() {
         assert_eq!(rc, 0, "{body}");
     }
     assert!(harness.server.state.injection.held.is_empty());
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
-    assert!(!harness.server.state.keyboard.modifier_state().shift);
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
+    assert!(!harness.server.state.human.keyboard.modifier_state().shift);
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn targeted_text_stops_after_a_binding_changes_focus() {
         assert!(keys.iter().all(|(key, _)| *key != blocked), "{keys:?}");
         let _ = inject(&mut harness, &ingress, &runtime, InputOp::ReleaseAll);
         assert!(harness.server.state.injection.held.is_empty());
-        assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+        assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     }
 }
 
@@ -192,7 +192,7 @@ fn restore_binding_works_with_every_window_minimized() {
             .clone();
         harness.server.state.minimize_toplevel(&surface);
     }
-    assert!(harness.server.state.keyboard.current_focus().is_none());
+    assert!(harness.server.state.human.keyboard.current_focus().is_none());
     let (rc, body) = inject(
         &mut harness,
         &ingress,
@@ -280,7 +280,7 @@ fn targeted_buttons_obey_kms_delivery_and_quarantine_gates() {
             assert!(matches!(&reply, ControlReply::Body(_)), "{reply:?}");
             assert_eq!(reply.wire_json()["target"], Value::Null);
         }
-        assert!(harness.server.state.pointer.current_pressed().is_empty());
+        assert!(harness.server.state.human.pointer.current_pressed().is_empty());
         assert!(
             !harness
                 .server
@@ -309,7 +309,7 @@ fn targeted_button_release_respects_corner_ownership() {
         .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
         .unwrap();
     assert!(harness.server.state.corner_engaged());
-    harness.server.state.keyboard.clone().set_focus(
+    harness.server.state.human.keyboard.clone().set_focus(
         &mut harness.server.state,
         None,
         SERIAL_COUNTER.next_serial(),
@@ -328,7 +328,7 @@ fn targeted_button_release_respects_corner_ownership() {
     assert_eq!(body["error"], "no_keyboard_target");
     assert_eq!(body["target"], Value::Null);
     assert!(harness.server.state.injection.held.is_empty());
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     route_pointer_button(&mut harness, BTN_LEFT, ButtonState::Pressed);
     route_pointer_to(&mut harness, 100.0, 100.0);
     let _ = harness.sync();
@@ -407,11 +407,11 @@ fn targeted_key_and_button_focus_without_raising_when_requested() {
     let traffic = harness.sync();
     assert_eq!(pointer_bodies(&traffic, pointer, 3).len(), 2);
     assert_eq!(keyboard_key_events(&traffic), vec![(KEY_A, 1), (KEY_A, 0)]);
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     assert_ne!(
         harness
             .server
-            .state
+            .state.human
             .pointer
             .current_focus()
             .and_then(|target| target.owned_surface())
@@ -422,7 +422,7 @@ fn targeted_key_and_button_focus_without_raising_when_requested() {
     assert_eq!(
         harness
             .server
-            .state
+            .state.human
             .pointer
             .current_focus()
             .and_then(|target| target.owned_surface())
@@ -534,7 +534,7 @@ fn raise(harness: &mut KeybindingHarness, object: &ObjectId) {
 }
 
 fn focused_object(harness: &KeybindingHarness) -> Option<ObjectId> {
-    focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id())
+    focused_surface(harness.server.state.human.keyboard.current_focus()).map(|surface| surface.id())
 }
 
 fn two_windows() -> (
@@ -640,7 +640,7 @@ fn injected_move_and_click_reach_the_window_under_the_point() {
     assert_eq!(focused_object(&harness), Some(alpha.clone()));
     let surfaces = &harness.server.state.surfaces;
     assert!(surfaces[&alpha].layout.z > surfaces[&beta].layout.z);
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     // The mark went to the one store, the presentation stats registry.
     let injected_at_us = clicked["injected_at_us"].as_u64().unwrap();
     let input_seq = clicked["input_seq"].as_u64().unwrap();
@@ -797,7 +797,7 @@ fn injected_binding_chord_is_consumed_by_the_binding() {
         keys.iter().all(|(key, _)| *key != KEY_M),
         "the binding swallowed M: {keys:?}"
     );
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     assert!(harness.server.state.injection.held.is_empty());
 
     // An unknown key name is refused and sends nothing.
@@ -923,7 +923,7 @@ fn injected_workspace_chord_is_consumed() {
         keys.iter().all(|(key, _)| *key != KEY_2),
         "the move chord swallowed the digit under Shift: {keys:?}"
     );
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
     assert!(harness.server.state.injection.held.is_empty());
 }
 
@@ -968,7 +968,7 @@ fn text_types_through_the_keymap_and_refuses_unmappable_input_whole() {
         keyboard_key_events(&harness.sync()).is_empty(),
         "nothing of a refused text is typed"
     );
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
 }
 
 /// release_all releases what injections hold and nothing a device holds;
@@ -1009,7 +1009,7 @@ fn release_all_clears_only_injected_holds() {
     let pressed = |harness: &KeybindingHarness| {
         let mut keys = harness
             .server
-            .state
+            .state.human
             .keyboard
             .pressed_keys()
             .into_iter()
@@ -1019,13 +1019,13 @@ fn release_all_clears_only_injected_holds() {
         keys
     };
     assert_eq!(pressed(&harness), [KEY_A, KEY_B], "the tap left C up");
-    assert_eq!(harness.server.state.pointer.current_pressed(), [BTN_LEFT]);
+    assert_eq!(harness.server.state.human.pointer.current_pressed(), [BTN_LEFT]);
     let _ = harness.sync();
 
     let (rc, body) = inject(&mut harness, &ingress, &runtime, InputOp::ReleaseAll);
     assert_eq!(rc, 0, "{body}");
     assert_eq!(pressed(&harness), [KEY_B], "the device-held key stays down");
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     let traffic = harness.sync();
     assert_eq!(keyboard_key_events(&traffic), [(KEY_A, 0)]);
     assert_eq!(
@@ -1153,7 +1153,7 @@ fn injection_while_locked_reaches_only_the_lock_surface() {
             .all(|enter| word(enter, 1) == lock.surface)
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus())
+        focused_surface(harness.server.state.human.keyboard.current_focus())
             .map(|surface| surface.id().protocol_id()),
         Some(lock.surface)
     );
@@ -1229,9 +1229,9 @@ fn host_passthrough_off_drops_host_input_without_stranding_holds() {
     ]);
     let state = &harness.server.state;
     assert_eq!(state.cursor_position, (5.0, 5.0));
-    assert!(state.pointer.current_pressed().is_empty());
+    assert!(state.human.pointer.current_pressed().is_empty());
     assert_eq!(
-        state
+        state.human
             .keyboard
             .pressed_keys()
             .into_iter()
@@ -1372,7 +1372,7 @@ fn sequence_runs_timed_steps_and_releases_on_failure() {
             .all(|pair| pair[0]["input_seq"].as_u64() < pair[1]["input_seq"].as_u64())
     );
     assert_eq!(harness.server.state.cursor_position, (30.0, 15.0));
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     let traffic = harness.sync();
     assert_eq!(pointer_bodies(&traffic, pointer, 3).len(), 2);
 
@@ -1410,7 +1410,7 @@ fn sequence_runs_timed_steps_and_releases_on_failure() {
     assert_eq!(body["step"]["error"], "stale_target");
     assert_eq!(body["completed"].as_array().unwrap().len(), 1);
     assert_eq!(body["released"], true);
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     assert!(harness.server.state.injection.sequences.is_empty());
 }
 
@@ -1495,7 +1495,7 @@ fn a_failed_sequence_releases_only_its_own_holds() {
     assert_eq!(rc, 10);
     assert_eq!(body["error"], "step_failed");
     let state = &harness.server.state;
-    let mut keys = state
+    let mut keys = state.human
         .keyboard
         .pressed_keys()
         .into_iter()
@@ -1507,12 +1507,12 @@ fn a_failed_sequence_releases_only_its_own_holds() {
         [KEY_A],
         "the run's B was released, the other A was not"
     );
-    assert_eq!(state.pointer.current_pressed(), [BTN_LEFT]);
+    assert_eq!(state.human.pointer.current_pressed(), [BTN_LEFT]);
     // release_all is still global.
     let (rc, _) = inject(&mut harness, &ingress, &runtime, InputOp::ReleaseAll);
     assert_eq!(rc, 0);
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
 }
 
 /// Two sequences interleave on timers; one failing leaves the other's
@@ -1559,7 +1559,7 @@ fn concurrent_sequences_keep_separate_holds() {
     assert_eq!((rc, body["error"].clone()), (10, json!("step_failed")));
     let pressed = harness
         .server
-        .state
+        .state.human
         .keyboard
         .pressed_keys()
         .into_iter()
@@ -1574,7 +1574,7 @@ fn concurrent_sequences_keep_separate_holds() {
         state.injection.sequences.is_empty()
     });
     assert_eq!(rc, 0, "{body}");
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
 }
 
 /// A long zero-delay run yields to the loop instead of injecting
@@ -1678,7 +1678,7 @@ fn key_op(key: u32, action: PressAction) -> InputOp {
 fn pressed_evdev(harness: &KeybindingHarness) -> Vec<u32> {
     let mut keys = harness
         .server
-        .state
+        .state.human
         .keyboard
         .pressed_keys()
         .into_iter()

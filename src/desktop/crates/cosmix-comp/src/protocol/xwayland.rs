@@ -1127,7 +1127,7 @@ impl WaylandState {
         // generation actually held the keyboard; an unconditional fallback
         // would steal focus from an unrelated Wayland surface (and dismiss
         // its popup grabs) on every generation death.
-        let held_focus = match self.keyboard.current_focus() {
+        let held_focus = match self.human.keyboard.current_focus() {
             Some(SeatFocusTarget::X11(_)) => true,
             Some(SeatFocusTarget::Wayland(focused)) => surfaces.contains(&focused),
             None => false,
@@ -1596,7 +1596,7 @@ impl WaylandState {
         let Some(pending) = self.xwayland.refocus.take() else {
             return;
         };
-        if self.keyboard.current_focus() != pending.fallback {
+        if self.human.keyboard.current_focus() != pending.fallback {
             // A human or another surface made a deliberate focus choice
             // while the debt was pending. Yanking the keyboard back now
             // would send keystrokes to the wrong window, which is worse
@@ -1703,7 +1703,7 @@ impl WaylandState {
     /// returns, and never before `destroyed_window`; neither ordering is
     /// load-bearing here).
     fn x11_window_holds_keyboard_focus(&self, xid: X11Window, wl_surface: &WlSurface) -> bool {
-        match self.keyboard.current_focus() {
+        match self.human.keyboard.current_focus() {
             Some(SeatFocusTarget::X11(surface)) => surface.window_id() == xid,
             Some(SeatFocusTarget::Wayland(focused)) => focused == *wl_surface,
             None => false,
@@ -1717,10 +1717,10 @@ impl WaylandState {
         let Some(surface) = window.wl_surface() else {
             return false;
         };
-        if !self.pointer.is_grabbed() {
+        if !self.human.pointer.is_grabbed() {
             return false;
         }
-        let Some(start) = self.pointer.grab_start_data() else {
+        let Some(start) = self.human.pointer.grab_start_data() else {
             return false;
         };
         let Some((focus, _)) = start.focus else {
@@ -1853,7 +1853,7 @@ impl WaylandState {
                     // longer see that the seat is parked on the displaced
                     // surface.
                     let held_focus = self.x11_window_holds_keyboard_focus(xid, &displaced_surface);
-                    let pointer_on_window = match self.pointer.current_focus() {
+                    let pointer_on_window = match self.human.pointer.current_focus() {
                         Some(SeatFocusTarget::X11(target)) => target.window_id() == xid,
                         Some(SeatFocusTarget::Wayland(focused)) => focused == displaced_surface,
                         None => false,
@@ -1863,7 +1863,7 @@ impl WaylandState {
                     // grab arm resolves `start.focus` through the flipped
                     // `wl_surface()` and cannot match, which would leave a
                     // held button routing motion through a dead grab.
-                    let pointer_grab_on_window = self
+                    let pointer_grab_on_window = self.human
                         .pointer
                         .grab_start_data()
                         .and_then(|start| start.focus)
@@ -1906,7 +1906,7 @@ impl WaylandState {
                         }
                         self.xwayland.refocus = Some(PendingX11Refocus {
                             xid,
-                            fallback: self.keyboard.current_focus(),
+                            fallback: self.human.keyboard.current_focus(),
                         });
                     }
                     if pointer_on_window || pointer_grab_on_window {
@@ -1937,7 +1937,7 @@ impl WaylandState {
                                 // only that call should migrate for the
                                 // same reason — its own change, not a
                                 // rider on this one.)
-                                let pointer = self.pointer.clone();
+                                let pointer = self.human.pointer.clone();
                                 pointer.unset_grab_without_focus_restore(
                                     self,
                                     SERIAL_COUNTER.next_serial(),
@@ -2985,7 +2985,7 @@ impl WaylandState {
         // offering that" — and neither is worth reddening a gate: "no
         // selection" and "that mime type is not on offer" are ordinary answers
         // to an X client asking for something no Wayland client has.
-        let seat = self.seat.clone();
+        let seat = self.human.seat.clone();
         match selection {
             SelectionTarget::Clipboard => {
                 if let Err(error) =
@@ -3021,7 +3021,7 @@ impl WaylandState {
         mime_types: Vec<String>,
     ) {
         tracing::debug!(?selection, ?mime_types, "X11 selection offered to Wayland");
-        let seat = self.seat.clone();
+        let seat = self.human.seat.clone();
         // Installing this fires `SelectionHandler::new_selection` synchronously,
         // which would bridge straight back to X. The flag is the loop breaker;
         // see `bridge_selection_to_x11` for what the echo would otherwise do.

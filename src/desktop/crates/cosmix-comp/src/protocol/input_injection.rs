@@ -225,7 +225,7 @@ fn press_states(action: PressAction) -> &'static [HostButtonState] {
 
 impl WaylandState {
     fn keymap_index(&mut self) -> KeymapIndex {
-        let keyboard = self.keyboard.clone();
+        let keyboard = self.human.keyboard.clone();
         keyboard.with_xkb_state(self, |context| {
             let xkb = context
                 .xkb()
@@ -272,7 +272,7 @@ impl WaylandState {
         state: HostButtonState,
         time: u32,
     ) {
-        if !self.pointer.is_grabbed() {
+        if !self.human.pointer.is_grabbed() {
             let Ok(object) = self.resolve_window_target(id, Some(generation)) else {
                 return;
             };
@@ -280,7 +280,7 @@ impl WaylandState {
             let surface = record.role.wl_surface().clone();
             let origin = (f64::from(record.layout.x), f64::from(record.layout.y)).into();
             let focus = Some((self.seat_focus_target_for(&surface), origin));
-            let pointer = self.pointer.clone();
+            let pointer = self.human.pointer.clone();
             let location = self.cursor_position;
             pointer.motion(
                 self,
@@ -294,7 +294,7 @@ impl WaylandState {
             pointer.frame(self);
             self.record_pointer_focus_local_position(focus.as_ref(), location);
         }
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         self.injection.button_delivery = self.delivery_target(false);
         pointer.button(
             self,
@@ -412,12 +412,12 @@ impl WaylandState {
             Some("not_presentable")
         } else if !record.layout.visible {
             Some("not_visible")
-        } else if self.keyboard.is_grabbed() || self.seat.input_method().keyboard_grabbed() {
+        } else if self.human.keyboard.is_grabbed() || self.human.seat.input_method().keyboard_grabbed() {
             Some("keyboard_grab")
         } else if matches!(op, InputOp::PointerButton { .. })
             && (self.chrome_pointer_grab.is_some()
                 || self.interactive_pointer.is_some()
-                || (self.pointer.is_grabbed()
+                || (self.human.pointer.is_grabbed()
                     && self.delivery_target(false) != Some((id, generation))))
         {
             Some("pointer_grab")
@@ -560,7 +560,7 @@ impl WaylandState {
             InputOp::Text(text) => {
                 // An input method holding the keyboard would compose the
                 // keys into something else; typed text must arrive as sent.
-                if self.seat.input_method().keyboard_grabbed() {
+                if self.human.seat.input_method().keyboard_grabbed() {
                     return ControlReply::refused("ime_active", json!({}));
                 }
                 let index = self.keymap_index();
@@ -647,7 +647,7 @@ impl WaylandState {
     /// Release the given holds the seat still has pressed: keys (newest
     /// code first), then buttons.
     fn release_holds(&mut self, holds: Vec<Hold>, time: u32) {
-        let pressed = self.keyboard.pressed_keys();
+        let pressed = self.human.keyboard.pressed_keys();
         for hold in holds.iter().rev() {
             let Hold::Key(raw) = *hold else { continue };
             let keycode = Keycode::new(raw);
@@ -655,7 +655,7 @@ impl WaylandState {
                 self.inject_key(keycode, HostButtonState::Released, time);
             }
         }
-        let pressed = self.pointer.current_pressed();
+        let pressed = self.human.pointer.current_pressed();
         for hold in holds {
             let Hold::Button(button) = hold else { continue };
             if pressed.contains(&button) {
@@ -780,11 +780,11 @@ impl WaylandState {
     /// keyboard focus for key verbs, pointer focus otherwise.
     pub(super) fn delivery_target(&self, keyboard: bool) -> Option<(u64, u64)> {
         let surface = if keyboard {
-            self.keyboard
+            self.human.keyboard
                 .current_focus()
                 .and_then(|target| target.owned_surface())
         } else {
-            self.pointer
+            self.human.pointer
                 .current_focus()
                 .and_then(|target| target.owned_surface())
         }?;

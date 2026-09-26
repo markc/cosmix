@@ -742,8 +742,8 @@ pub(crate) fn route_input_event<B: InputBackend>(state: &mut WaylandState, event
     // pulse pacing events.
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     let _dispatch_span = crate::frame_trace::span("comp_input_dispatch", input_event_code(&event));
-    let keyboard = &state.keyboard;
-    let pointer = &state.pointer;
+    let keyboard = &state.human.keyboard;
+    let pointer = &state.human.pointer;
     let routing = host_input_from_event(
         &mut state.input_ingress,
         &event,

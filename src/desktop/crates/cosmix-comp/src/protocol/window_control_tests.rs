@@ -791,7 +791,7 @@ fn focus_under_an_exclusive_layer_is_refused_with_a_reason() {
         json!({"id": id, "generation": generation, "focused": false, "reason": "exclusive_layer"})
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             test_layer_record(&harness, layer.surface)
                 .role
@@ -1204,7 +1204,7 @@ fn send_to_workspace_follow_is_inert_under_an_exclusive_layer() {
     assert!(!state.surfaces[&beta].focused);
     assert!(state.surfaces[&alpha].layout.visible);
     assert_eq!(
-        focused_surface(state.keyboard.current_focus()),
+        focused_surface(state.human.keyboard.current_focus()),
         Some(layer_surface),
         "the exclusive layer keeps the keyboard"
     );
@@ -2242,7 +2242,7 @@ fn focus_on_an_off_workspace_window_switches_and_focuses() {
         assert!(state.surfaces[&alpha].focused);
         assert!(!state.surfaces[&beta].layout.visible);
         assert_eq!(
-            focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+            focused_surface(state.human.keyboard.current_focus()).map(|surface| surface.id()),
             Some(alpha.clone())
         );
         // Back to 1 for the focus-only pass.
@@ -2306,7 +2306,7 @@ fn focus_on_a_minimised_off_workspace_window_is_refused_without_switching() {
         assert!(!state.surfaces[&alpha].focused);
         assert!(state.surfaces[&beta].layout.visible);
         assert_eq!(
-            focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+            focused_surface(state.human.keyboard.current_focus()).map(|surface| surface.id()),
             Some(beta.clone())
         );
     }

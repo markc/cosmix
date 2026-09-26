@@ -1422,7 +1422,7 @@ impl WaylandState {
                 || button == super::PRIMARY_POINTER_BUTTON + 1)
         {
             // Read calloop-owned keyboard state now; release may have different modifiers.
-            let state = self.keyboard.modifier_state();
+            let state = self.human.keyboard.modifier_state();
             let modifiers = [
                 (state.shift, "shift"),
                 (state.ctrl, "ctrl"),
@@ -2094,7 +2094,7 @@ fn service_focus_edge(state: &mut WaylandState) {
 
 fn project_focus_edge(state: &WaylandState) -> FocusEdgeStart {
     FocusEdgeStart {
-        keyboard: state
+        keyboard: state.human
             .keyboard
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -3500,8 +3500,8 @@ fn focus_surface_id(
 ///   drop, its keyboard focus stops counting and its Exclusive grab goes, the
 ///   edge conceals, and the showing layers are hidden and excluded at once.
 fn track_panel_holders(state: &mut WaylandState, now: Instant) -> bool {
-    let pointer = focus_surface_id(state, state.pointer.current_focus());
-    let keyboard = focus_surface_id(state, state.keyboard.current_focus());
+    let pointer = focus_surface_id(state, state.human.pointer.current_focus());
+    let keyboard = focus_surface_id(state, state.human.keyboard.current_focus());
     let user_input = std::mem::take(&mut state.observations.user_input);
     // The hotspot the pointer is in, by output key; dwelling engages it.
     let detector = &state.observations.corner_detector;
@@ -3835,7 +3835,7 @@ fn service_popup_restores(state: &mut WaylandState) -> bool {
         else {
             continue;
         };
-        let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
+        let current = focus_surface_id(state, state.human.keyboard.current_focus()).map(|id| id.0);
         if current != fallback || current == Some(prior) {
             continue;
         }
@@ -3997,7 +3997,7 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
 /// then the one its own focus change replaced. A popup without focus yet
 /// records what it displaces when it takes focus ([`note_popup_focus`]).
 fn record_popup_focus(state: &mut WaylandState, popup: SurfaceId) {
-    let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
+    let current = focus_surface_id(state, state.human.keyboard.current_focus()).map(|id| id.0);
     let prior = (current == Some(popup.0))
         .then(|| {
             state

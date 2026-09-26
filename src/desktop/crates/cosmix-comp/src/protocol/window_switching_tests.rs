@@ -264,7 +264,7 @@ fn alt_tab_cycles_three_windows_and_reverse_uses_real_xkb() {
             harness.key(15, HostButtonState::Pressed); // Tab
             harness.key(15, HostButtonState::Released);
             assert_eq!(
-                focused_surface(harness.server.state.keyboard.current_focus()).as_ref(),
+                focused_surface(harness.server.state.human.keyboard.current_focus()).as_ref(),
                 Some(expected)
             );
             assert_eq!(
@@ -279,7 +279,7 @@ fn alt_tab_cycles_three_windows_and_reverse_uses_real_xkb() {
         harness.key(42, HostButtonState::Pressed); // Shift
         harness.key(15, HostButtonState::Pressed);
         assert_eq!(
-            focused_surface(harness.server.state.keyboard.current_focus()),
+            focused_surface(harness.server.state.human.keyboard.current_focus()),
             Some(first)
         );
         // Modifiers may be released before the swallowed Tab release.
@@ -319,7 +319,7 @@ fn switching_skips_minimised_and_unmapped_windows() {
     harness.server.state.activate_managed_window(&first);
     harness.server.state.cycle_window(false);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(first.clone())
     );
     let stale = harness.server.state.surfaces[&second]
@@ -328,7 +328,7 @@ fn switching_skips_minimised_and_unmapped_windows() {
         .clone();
     harness.server.state.activate_managed_window(&stale);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(first)
     );
 }
@@ -364,7 +364,7 @@ fn switching_skips_off_workspace_windows() {
     harness.server.state.activate_managed_window(&first);
     harness.server.state.cycle_window(false);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(first.clone())
     );
     let elsewhere = harness.server.state.surfaces[&second]
@@ -378,7 +378,7 @@ fn switching_skips_off_workspace_windows() {
     assert!(harness.server.state.surfaces[&second].layout.visible);
     assert!(!harness.server.state.surfaces[&first.id()].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(elsewhere)
     );
 }
@@ -397,12 +397,12 @@ fn switching_does_not_raise_or_focus_through_exclusive_layer_or_lock() {
             ..TestLayerSpec::default()
         },
     );
-    let focus = focused_surface(harness.server.state.keyboard.current_focus());
+    let focus = focused_surface(harness.server.state.human.keyboard.current_focus());
     let z = test_toplevel_record(&harness).layout.z;
     harness.server.state.cycle_window(false);
     harness.server.state.activate_managed_window(&target);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         focus
     );
     assert_eq!(test_toplevel_record(&harness).layout.z, z);
@@ -411,12 +411,12 @@ fn switching_does_not_raise_or_focus_through_exclusive_layer_or_lock() {
     map_initial_test_toplevel(&mut locked);
     let target = test_toplevel_record(&locked).role.wl_surface().clone();
     let _lock = begin_test_session_lock(&mut locked);
-    let focus = focused_surface(locked.server.state.keyboard.current_focus());
+    let focus = focused_surface(locked.server.state.human.keyboard.current_focus());
     let z = test_toplevel_record(&locked).layout.z;
     locked.server.state.cycle_window(false);
     locked.server.state.activate_managed_window(&target);
     assert_eq!(
-        focused_surface(locked.server.state.keyboard.current_focus()),
+        focused_surface(locked.server.state.human.keyboard.current_focus()),
         focus
     );
     assert_eq!(test_toplevel_record(&locked).layout.z, z);

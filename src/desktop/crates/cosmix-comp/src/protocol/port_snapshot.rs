@@ -1146,7 +1146,7 @@ fn project_workspaces(
 pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
     let session_lock_active = state.session_lock_active();
     FocusSnapshot {
-        keyboard: state
+        keyboard: state.human
             .keyboard
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -1157,7 +1157,7 @@ pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
             .as_ref()
             .and_then(|object| state.surfaces.get(object))
             .map(|record| record.id.0),
-        pointer: state
+        pointer: state.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -1569,7 +1569,7 @@ fn pointer_grab_name(state: &WaylandState) -> &'static str {
             InteractivePointer::Resize { .. } => "resize",
         };
     }
-    if state.pointer.is_grabbed() {
+    if state.human.pointer.is_grabbed() {
         "popup"
     } else {
         "none"

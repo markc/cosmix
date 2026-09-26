@@ -1415,10 +1415,10 @@ impl XdgShellHandler for WaylandState {
         serial: Serial,
     ) {
         if self.chrome_pointer_grab.is_some()
-            || !self.seat.owns(&seat_resource)
-            || !self.pointer.has_grab(serial)
+            || !self.human.seat.owns(&seat_resource)
+            || !self.human.pointer.has_grab(serial)
             || !pointer_grab_targets_surface(
-                &self.pointer,
+                &self.human.pointer,
                 &self.popup_manager,
                 surface.wl_surface(),
             )
@@ -1456,10 +1456,10 @@ impl XdgShellHandler for WaylandState {
     ) {
         if self.chrome_pointer_grab.is_some()
             || edges == xdg_toplevel::ResizeEdge::None
-            || !self.seat.owns(&seat_resource)
-            || !self.pointer.has_grab(serial)
+            || !self.human.seat.owns(&seat_resource)
+            || !self.human.pointer.has_grab(serial)
             || !pointer_grab_targets_surface(
-                &self.pointer,
+                &self.human.pointer,
                 &self.popup_manager,
                 surface.wl_surface(),
             )
@@ -1576,7 +1576,7 @@ impl XdgShellHandler for WaylandState {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat_resource: wl_seat::WlSeat, serial: Serial) {
-        if !self.seat.owns(&seat_resource) {
+        if !self.human.seat.owns(&seat_resource) {
             tracing::warn!("dismissed popup grab for an unknown seat");
             surface.send_popup_done();
             return;
@@ -1587,8 +1587,8 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         };
-        let pointer_action = self.pointer.has_grab(serial)
-            && pointer_grab_targets_surface(&self.pointer, &self.popup_manager, &root);
+        let pointer_action = self.human.pointer.has_grab(serial)
+            && pointer_grab_targets_surface(&self.human.pointer, &self.popup_manager, &root);
         let keyboard_action = keyboard_action_matches_root(
             self.last_keyboard_action
                 .as_ref()
@@ -1601,7 +1601,7 @@ impl XdgShellHandler for WaylandState {
             serial,
             canonical_root_surface(&self.popup_manager, &root),
         );
-        let touch_action = self.seat.get_touch().is_some_and(|touch| {
+        let touch_action = self.human.seat.get_touch().is_some_and(|touch| {
             touch.has_grab(serial)
                 && touch
                     .grab_start_data()
@@ -1635,7 +1635,7 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         }
-        let seat = self.seat.clone();
+        let seat = self.human.seat.clone();
         let root_target = SeatFocusTarget::Wayland(root);
         match self
             .popup_manager
@@ -1643,12 +1643,12 @@ impl XdgShellHandler for WaylandState {
         {
             Ok(grab) => {
                 self.cancel_chrome_pointer_grab(true);
-                let pointer = self.pointer.clone();
+                let pointer = self.human.pointer.clone();
                 pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
                 if self.layer_keyboard_interactivity_for_surface(surface.wl_surface())
                     != Some(KeyboardInteractivity::None)
                 {
-                    let keyboard = self.keyboard.clone();
+                    let keyboard = self.human.keyboard.clone();
                     keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
                 }
             }

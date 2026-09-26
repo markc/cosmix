@@ -85,7 +85,7 @@ fn active_window_tracks_managed_transfer_and_native_or_none_clears() {
         (&native, None),
     ] {
         harness.server.state.activate_managed_window(surface);
-        let focused = focused_surface(harness.server.state.keyboard.current_focus());
+        let focused = focused_surface(harness.server.state.human.keyboard.current_focus());
         assert_eq!(
             harness
                 .server
@@ -98,7 +98,7 @@ fn active_window_tracks_managed_transfer_and_native_or_none_clears() {
         .server
         .state
         .arbitrate_keyboard_focus(None, false, true);
-    let focused = focused_surface(harness.server.state.keyboard.current_focus());
+    let focused = focused_surface(harness.server.state.human.keyboard.current_focus());
     assert!(focused.is_none());
     assert!(
         harness
@@ -167,16 +167,16 @@ fn x11_activation_and_cycle_use_x11_focus_and_reject_unmapped_target() {
     harness.server.state.activate_managed_window(&native);
     harness.server.state.x11_activate_request(window.clone());
     assert!(matches!(
-        harness.server.state.keyboard.current_focus(),
+        harness.server.state.human.keyboard.current_focus(),
         Some(SeatFocusTarget::X11(_))
     ));
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface)
     );
     harness.server.state.cycle_window(false);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(native.clone())
     );
     harness
@@ -188,7 +188,7 @@ fn x11_activation_and_cycle_use_x11_focus_and_reject_unmapped_target() {
         .minimized = true;
     harness.server.state.x11_activate_request(window.clone());
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(native.clone())
     );
     harness
@@ -205,7 +205,7 @@ fn x11_activation_and_cycle_use_x11_focus_and_reject_unmapped_target() {
     }
     harness.server.state.x11_activate_request(window.clone());
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(native.clone())
     );
     if let SurfaceRole::X11(role) =
@@ -222,7 +222,7 @@ fn x11_activation_and_cycle_use_x11_focus_and_reject_unmapped_target() {
         .mapped = false;
     harness.server.state.x11_activate_request(window);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(native)
     );
 }
@@ -297,7 +297,7 @@ fn x11_unminimise_of_an_off_workspace_window_switches_first() {
     assert_eq!(harness.server.state.workspace_current(), 2);
     assert!(!harness.server.state.surfaces[&native].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface)
     );
     assert!(harness.server.state.minimized_toplevels.is_empty());
@@ -342,7 +342,7 @@ fn locked_x11_activation_and_unminimise_do_not_switch_workspace() {
     assert!(!window.is_minimized(), "on screen: resumed");
     assert!(!harness.server.state.surfaces[&native.id()].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface)
     );
 
@@ -357,7 +357,7 @@ fn locked_x11_activation_and_unminimise_do_not_switch_workspace() {
     assert!(!harness.server.state.surfaces[&object].layout.visible);
     assert!(window.is_minimized(), "off screen again: suspended");
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(native.clone())
     );
 
@@ -444,7 +444,7 @@ fn x11_active_window_still_refuses_a_minimised_target_but_xdg_activation_now_res
     assert!(window.is_minimized(), "still off screen: still suspended");
     assert!(harness.server.state.surfaces[&native.id()].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(native.clone())
     );
 
@@ -466,7 +466,7 @@ fn x11_active_window_still_refuses_a_minimised_target_but_xdg_activation_now_res
     assert!(!window.is_minimized(), "on screen again: not suspended");
     assert!(!harness.server.state.surfaces[&native.id()].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface)
     );
     assert!(
