@@ -362,4 +362,25 @@ mod tests {
             assert_eq!(fire_target(&f), Some(("desktop-vt1", verb)));
         }
     }
+
+    #[test]
+    fn default_scene_editor_chords_fire_a_safe_open_at_the_loader() {
+        // Through the shipped keymap: LCtrl+LAlt+P and RCtrl+LAlt+P both send
+        // `scenes.editor.open` to `scenes` with body exactly {"safe":true}.
+        let r = cosmix_input_core::Resolver::new(default_keymap());
+        for modifiers in cosmix_input_core::SCENE_EDITOR_CHORDS {
+            let out = r.resolve(
+                cosmix_input_core::SCENE_EDITOR_KEY,
+                modifiers,
+                cosmix_input_core::Edge::Press,
+            );
+            let f = reader::FiredVerb {
+                verb: out.verb.expect("bound").as_str().to_string(),
+                args: out.args,
+                service: out.service,
+            };
+            assert_eq!(fire_target(&f), Some(("scenes", "scenes.editor.open")));
+            assert_eq!(f.args, Some(serde_json::json!({"safe": true})));
+        }
+    }
 }

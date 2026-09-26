@@ -165,6 +165,32 @@ The two workspace rows are answered by the workspace citizen registered as
 `desktop`, which forwards them to comp's `comp.workspace.switch`. Its verbs are
 documented in [Desktop Bus capabilities](desktop-bus.md#workspace-citizen-desktop).
 
+Since inputd 0.4.5 (input-core 0.1.4), the default keymap also binds the Scene
+Editor recovery chord, Ctrl+Alt+P, as two rows on `KEY_P`:
+
+| Chord | Code | Modifiers | Action | Args | Service | Repeat |
+|---|---|---|---|---|---|---|
+| LeftCtrl+LeftAlt+P | 25 | `{"left_ctrl":true,"left_alt":true}` | `scenes.editor.open` | `{"safe":true}` | `scenes` | ignore |
+| RightCtrl+LeftAlt+P | 25 | `{"right_ctrl":true,"left_alt":true}` | `scenes.editor.open` | `{"safe":true}` | `scenes` | ignore |
+
+Modifiers match side-exactly, so each Ctrl needs its own row. Right Alt is left
+out on purpose: on some layouts it is AltGr, and Ctrl+AltGr+P can be a
+character. Any other modifier set on `KEY_P` passes through, including
+Ctrl+Alt+Shift+P. Both rows swallow every edge, so no application sees the
+chord. The verb fires once per press and never on auto-repeat. The scenes
+loader answers it by opening the shipped Scene Editor in safe mode, or hiding
+it when it is already visible, so the chord toggles.
+
+The rows only reach a keymap file when the defaults are seeded. A host that
+already has a keymap file gets them through `input.bind`, one row per stroke.
+Check `input.query` first, because `input.bind` replaces whatever row holds
+the stroke:
+
+```json
+{"layer":"physical","stroke":{"code":25,"modifiers":{"left_ctrl":true,"left_alt":true}},
+ "action":"scenes.editor.open","args":{"safe":true},"service":"scenes"}
+```
+
 The default keymap only seeds a missing keymap file, or one whose whole
 document is unusable. A document is unusable when its bytes are not UTF-8, are
 not JSON, are not a JSON object, lack a `physical` list, or lack an unsigned
