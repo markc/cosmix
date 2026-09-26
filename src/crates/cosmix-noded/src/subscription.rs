@@ -1273,9 +1273,6 @@ impl SubscriptionBroker {
 
     // ── `topic.list` ──
 
-    /// Aggregate stats for SPEC 07 noded.props.* surface: (active topic
-    /// count, total retained snapshot bytes). Active = has subscribers
-    /// or has retained snapshot.
     /// Both locks for reading, in the one legal order (see the struct doc).
     async fn read_both(
         &self,
@@ -1300,6 +1297,9 @@ impl SubscriptionBroker {
         (inner, topics)
     }
 
+    /// Aggregate stats for SPEC 07 noded.props.* surface: (active topic
+    /// count, total retained snapshot bytes). Active = has subscribers
+    /// or has retained snapshot.
     pub async fn props_summary(&self) -> (u64, u64) {
         let (inner, topics) = self.read_both().await;
         let mut counts: HashMap<&str, usize> = HashMap::new();
