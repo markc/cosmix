@@ -329,7 +329,14 @@ impl WaylandState {
         let grab = self.agent.popup_grab.as_ref().filter(|grab| !grab.has_ended())?;
         let surface = grab.current_grab()?.owned_surface()?;
         self.popup_manager.find_popup(&surface)?;
+        if !self.agent_popup_surface_mapped(&surface) { return None; }
         Some(surface)
+    }
+
+    fn agent_popup_surface_mapped(&self, surface: &WlSurface) -> bool {
+        let root = canonical_root_surface(&self.popup_manager, surface);
+        [&root, surface].into_iter().all(|surface| self.surfaces.get(&surface.id())
+            .is_some_and(|record| self.agent_tree_mapped(record)))
     }
 
     /// PopupKeyboardGrab refocuses on input. Validate that same destination
@@ -343,7 +350,17 @@ impl WaylandState {
     fn prune_agent_popup_grab(&mut self) {
         if self.agent.popup_grab.as_ref().is_some_and(|grab| {
             grab.has_ended() || grab.current_grab().and_then(|focus| focus.owned_surface())
-                .is_none_or(|surface| self.popup_manager.find_popup(&surface).is_none())
+                .is_none_or(|surface| {
+                    let root = canonical_root_surface(&self.popup_manager, &surface);
+                    self.popup_manager.find_popup(&surface).is_none()
+                        || self.surfaces.get(&root.id()).is_none_or(|record| !self.agent_tree_mapped(record))
+                        || self.surfaces.get(&surface.id()).is_none_or(|record| {
+                            // xdg_popup.grab precedes its first buffer commit.
+                            // Preserve that initial configure interval, but never
+                            // preserve a popup that has subsequently unmapped.
+                            record.content_seq > 0 && !self.agent_tree_mapped(record)
+                        })
+                })
         }) {
             // Smithay can retain dismissed resources until client destruction;
             // current_grab already falls back to the root when no popup remains.
