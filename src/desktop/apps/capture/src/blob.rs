@@ -46,8 +46,10 @@ fn io_timeout() -> Duration {
 }
 
 /// Whole-upload deadline under test: strictly tighter than the test
-/// io bounds, short enough that a drip-feed lane crosses it within
-/// the test, long enough for the well-behaved lanes.
+/// io bounds, short enough that a lane which never reads the body is
+/// ended between chunks where the buffers run out — long before the
+/// kernel surfaces a blocked write (around 3× the io bound) — and far
+/// past anything a well-behaved lane needs.
 fn upload_deadline() -> Duration {
     if cfg!(test) {
         Duration::from_secs(1)
@@ -123,31 +125,40 @@ fn mime(path: &Path) -> &'static str {
     }
 }
 
-/// The upload body: the file, gated on shutdown and the whole-upload
-/// deadline. ureq's copy loop calls `read` between socket writes — the
-/// checks never run inside a write — so an abandoned or over-deadline
-/// upload errors at the next chunk instead of parking the worker until
-/// a kernel timeout. ureq 2's plain-Content-Length path copies the body
-/// through std's 8 KiB `io::copy` buffer, so a chunk is 8 KiB: the chunk
-/// plus one socket write (bounded by the agent's write bound) is what
-/// bounds abandon latency and deadline overshoot together.
-struct GuardedBody {
-    file: File,
+/// The upload body: a reader over the file, gated on shutdown and the
+/// whole-upload deadline. ureq's copy loop calls `read` between socket
+/// writes — the checks never run inside a write — so an abandoned or
+/// over-deadline upload errors at the next chunk instead of parking the
+/// worker until a kernel timeout. ureq 2's plain-Content-Length path
+/// copies the body through std's 8 KiB `io::copy` buffer, so a chunk is
+/// 8 KiB: the chunk plus one socket write (bounded by the agent's write
+/// bound) is what bounds abandon latency and deadline overshoot
+/// together. The deadline bounds the body write alone: once the last
+/// chunk is handed to the kernel the guard has nothing left to gate,
+/// and the wait for the lane's reply is bounded by the agent's 30 s
+/// socket read bound, not the deadline — a host whose socket buffers
+/// swallow the whole body never sees the deadline mid-upload. The
+/// clock is injected so the guard's tests advance time per chunk
+/// instead of sleeping: whether a drip-paced write blocks at all is a
+/// property of the host's buffers, not of the guard.
+struct GuardedBody<R: Read> {
+    reader: R,
     shutdown: Arc<AtomicBool>,
     deadline: Instant,
+    now: Box<dyn Fn() -> Instant>,
 }
 
-impl Read for GuardedBody {
+impl<R: Read> Read for GuardedBody<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(std::io::Error::other(
                 "upload abandoned: capture is shutting down",
             ));
         }
-        if Instant::now() >= self.deadline {
+        if (self.now)() >= self.deadline {
             return Err(std::io::Error::other("upload deadline passed"));
         }
-        self.file.read(buf)
+        self.reader.read(buf)
     }
 }
 
@@ -214,9 +225,10 @@ pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result
         .set("X-Cosmix-Name", name)
         .set("X-Cosmix-Mime", mime(path))
         .send(GuardedBody {
-            file,
+            reader: file,
             shutdown,
             deadline,
+            now: Box::new(Instant::now),
         })
         .map_err(|e| match e {
             ureq::Error::Status(status, response) => {
@@ -292,9 +304,11 @@ pub fn parse_reference(body: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
     use std::{
+        cell::Cell,
         fs,
-        io::{BufRead, BufReader, Write},
+        io::{BufRead, BufReader, Cursor, Write},
         net::TcpListener,
+        rc::Rc,
         sync::mpsc,
     };
 
@@ -306,6 +320,24 @@ mod tests {
     /// A shutdown flag nobody sets: uploads in ordinary tests.
     fn quiet() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+
+    /// The body behind a drip-paced lane, without the socket: each
+    /// read serves the next chunk and advances the shared fake clock
+    /// by 50 ms — the time one chunk takes to drain. The guard
+    /// samples that clock between chunks exactly as it samples the
+    /// real clock between socket writes.
+    struct DrippingCursor {
+        bytes: Cursor<Vec<u8>>,
+        millis: Rc<Cell<u64>>,
+    }
+
+    impl Read for DrippingCursor {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.bytes.read(buf)?;
+            self.millis.set(self.millis.get() + 50);
+            Ok(n)
+        }
     }
 
     /// One-shot loopback lane: accepts a single request, reads it
@@ -549,20 +581,27 @@ mod tests {
 
     #[test]
     fn the_body_guard_errors_once_shutdown_is_set() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cosmix-3.png");
-        fs::write(&path, b"png bytes").unwrap();
+        // Shutdown is checked before every chunk: chunks stream off the
+        // reader, the flag lands, and the very next read errors with
+        // the guard's own text — the daemon's exit unwinds the upload
+        // at that error, within one socket write of the flag.
         let shutdown = quiet();
         let mut body = GuardedBody {
-            file: File::open(&path).unwrap(),
+            reader: Cursor::new(vec![0u8; 1024 * 1024]),
             shutdown: shutdown.clone(),
             deadline: Instant::now() + UPLOAD_DEADLINE,
+            now: Box::new(Instant::now),
         };
-        let mut buffer = [0u8; 4];
-        assert_eq!(body.read(&mut buffer).unwrap(), 4);
+        let mut buffer = [0u8; 8192];
+        for _ in 0..3 {
+            assert_eq!(body.read(&mut buffer).unwrap(), 8192);
+        }
         shutdown.store(true, Ordering::Relaxed);
         let error = body.read(&mut buffer).unwrap_err();
-        assert!(error.to_string().contains("shutting down"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "upload abandoned: capture is shutting down"
+        );
     }
 
     #[test]
@@ -673,17 +712,37 @@ mod tests {
     }
 
     #[test]
-    fn the_body_guard_errors_once_the_deadline_passes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cosmix-5.png");
-        fs::write(&path, b"png bytes").unwrap();
+    fn the_body_guard_errors_at_the_first_chunk_past_the_deadline() {
+        // Socket-free on purpose: whether a drip-paced write actually
+        // blocks — and so whether the deadline gets to run between
+        // chunks — is a property of the host's socket buffers, not of
+        // the guard. cbc2 and cbc3 swallowed the whole 1 MiB body
+        // into kernel buffers before the 1 s deadline could fire
+        // once, the client finished writing and sat in the reply read
+        // until the io bound. Here the drain pace is injected time
+        // instead: each 8 KiB chunk handed over costs 50 ms on the
+        // fake clock the guard samples, so the 200 ms deadline lands
+        // exactly on the fifth chunk's check — an exact chunk count,
+        // where a sleeping test could only bound it from below.
+        let epoch = Instant::now(); // arbitrary; only differences matter
+        let millis = Rc::new(Cell::new(0u64));
         let mut body = GuardedBody {
-            file: File::open(&path).unwrap(),
+            reader: DrippingCursor {
+                bytes: Cursor::new(vec![0u8; 1024 * 1024]),
+                millis: millis.clone(),
+            },
             shutdown: quiet(),
-            deadline: Instant::now(),
+            deadline: epoch + Duration::from_millis(200),
+            now: Box::new(move || epoch + Duration::from_millis(millis.get())),
         };
-        let error = body.read(&mut [0u8; 4]).unwrap_err();
-        assert!(error.to_string().contains("deadline passed"), "{error}");
+        let mut buffer = [0u8; 8192];
+        let mut streamed = 0;
+        for _ in 0..4 {
+            streamed += body.read(&mut buffer).unwrap();
+        }
+        assert_eq!(streamed, 4 * 8192);
+        let error = body.read(&mut buffer).unwrap_err();
+        assert_eq!(error.to_string(), "upload deadline passed");
     }
 
     #[test]
@@ -716,61 +775,6 @@ mod tests {
             started.elapsed() < io_timeout() + Duration::from_secs(2),
             "{:?}",
             started.elapsed()
-        );
-    }
-
-    #[test]
-    fn a_drip_feed_lane_hits_the_whole_upload_deadline() {
-        // Drains slower than the deadline and never closes first: the
-        // lane drips at its cadence and stays open until the client
-        // disconnects (a read returning 0 or an error on its side),
-        // with a 3 × io bound safety cap so a hung test still ends.
-        // cbc2's flake was the lane ending by count and closing the
-        // connection before the 1 s deadline fired on a slower box —
-        // an Unexpected EOF instead of the guard. Here every socket
-        // write succeeds within its own bound, so only the
-        // between-chunks deadline check ends it, within one further
-        // socket write of the deadline.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let bind = listener.local_addr().unwrap().to_string();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut head = String::new();
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let blank = line.trim_end().is_empty();
-                head.push_str(&line);
-                if blank {
-                    break;
-                }
-            }
-            let cap = Instant::now() + 3 * io_timeout();
-            let mut scratch = [0u8; 8192];
-            loop {
-                if reader.read(&mut scratch).unwrap_or(0) == 0 {
-                    // The client went away — on this test's terms, the
-                    // guard errored the upload and ureq dropped the
-                    // socket.
-                    return;
-                }
-                if Instant::now() >= cap {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cosmix-7.png");
-        fs::write(&path, vec![0u8; 1024 * 1024]).unwrap();
-        let started = Instant::now();
-        let error = upload(&bind, &path, quiet()).unwrap_err();
-        assert!(error.contains("deadline passed"), "{error}");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= upload_deadline() && elapsed < upload_deadline() + io_timeout(),
-            "{elapsed:?}: {error}"
         );
     }
 }

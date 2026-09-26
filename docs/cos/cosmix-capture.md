@@ -64,7 +64,10 @@ an empty `bind` — blobd publishing before its lane listens — is refused as
 `blobd lane not listening` rather than tried as a URL. One attempt,
 30-second connect/read/write bounds on the lane socket (including the
 201 reply read), and a 10-minute whole-upload deadline enforced
-between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
+between body chunks — the deadline bounds the body write; once the
+body is fully handed to the kernel, the wait for the lane's reply is
+bounded by the 30-second socket read bound, not the deadline. Process
+shutdown — SIGTERM, SIGINT or Bus
 loss — abandons lane
 resolution and an in-flight upload instead of waiting them out, so capture
 exits within about a second of SIGTERM; a worker parked on a stalled lane
