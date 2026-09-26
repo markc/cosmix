@@ -381,6 +381,7 @@ impl InputOp {
 
 pub(crate) struct PortInputRequest {
     pub(crate) order: u64,
+    pub(crate) agent_epoch: u64,
     pub(crate) op: InputOp,
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
 }
@@ -432,6 +433,7 @@ impl LongOp {
 
 pub(crate) struct PortLongRequest {
     pub(crate) order: u64,
+    pub(crate) agent_epoch: u64,
     pub(crate) op: Option<LongOp>,
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
     /// The queue slot this request holds until the protocol thread has
@@ -683,6 +685,36 @@ pub(crate) enum PortControl {
 }
 
 impl PortControl {
+    pub(crate) fn uses_agent(&self) -> bool {
+        match self {
+            Self::Input(request) => matches!(request.op, InputOp::OnSeat { seat: crate::protocol::SeatKind::Agent, .. }),
+            Self::Long(request) => match request.op.as_ref() {
+                Some(LongOp::Sequence(steps) | LongOp::SeatedSequence { steps, .. }) => steps.iter().any(|step|
+                    matches!(step.op, InputOp::OnSeat { seat: crate::protocol::SeatKind::Agent, .. })),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Refuse old admissions even if they were still in the ingress channel at
+    /// the lifecycle boundary. Other controls keep their relative order.
+    pub(crate) fn refuse_cleared_agent(&mut self, epoch: u64) -> bool {
+        if !self.uses_agent() { return false; }
+        let reply = match self {
+            Self::Input(request) if request.agent_epoch != epoch => request.reply.take(),
+            Self::Long(request) if request.agent_epoch != epoch => {
+                request.slot.take();
+                request.reply.take()
+            }
+            _ => return false,
+        };
+        if let Some(reply) = reply {
+            let _ = reply.send(ControlReply::refused("input_cleared", json!({"seat":"agent", "released":true})));
+        }
+        true
+    }
+
     pub(crate) fn order(&self) -> u64 {
         match self {
             Self::Panel(request) => request.order,
@@ -702,6 +734,7 @@ pub(crate) struct PortIngress {
     sender: channel::SyncSender<PortCommand>,
     queue_depth: Arc<AtomicUsize>,
     control_order: Arc<AtomicU64>,
+    agent_epoch: Arc<AtomicU64>,
     pending_idle_order: Arc<AtomicU64>,
     pending_active_order: Arc<AtomicU64>,
 }
@@ -786,6 +819,7 @@ impl PortIngress {
         self.admit(
             PortCommand::Input(PortInputRequest {
                 order: self.next_control_order(),
+                agent_epoch: self.agent_epoch.load(Ordering::Acquire),
                 op,
                 reply: Some(reply),
             }),
@@ -802,6 +836,7 @@ impl PortIngress {
         let slot = self.reserve_slot()?;
         let command = PortCommand::Long(PortLongRequest {
             order: self.next_control_order(),
+            agent_epoch: self.agent_epoch.load(Ordering::Acquire),
             op: Some(op),
             reply: Some(reply),
             slot: Some(slot),
@@ -940,6 +975,7 @@ pub(crate) fn test_wiring(
         sender,
         queue_depth: context.queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
+        agent_epoch: context.agent_epoch.clone(),
         pending_idle_order: context.pending_idle_order.clone(),
         pending_active_order: context.pending_active_order.clone(),
     };
@@ -966,6 +1002,7 @@ pub(crate) fn test_wiring_with_observation_capacity(
         sender,
         queue_depth: context.queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
+        agent_epoch: context.agent_epoch.clone(),
         pending_idle_order: context.pending_idle_order.clone(),
         pending_active_order: context.pending_active_order.clone(),
     };
@@ -1063,6 +1100,7 @@ pub(crate) fn prepare(
     let lost_count = Arc::new(AtomicU64::new(0));
     let pending_idle_order = Arc::new(AtomicU64::new(0));
     let pending_active_order = Arc::new(AtomicU64::new(0));
+    let agent_epoch = Arc::new(AtomicU64::new(0));
     let (observation_producer, observations) = port_observation::outbox(Arc::clone(&lost_count));
     let observation_notifier = observation_producer.notifier();
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
@@ -1070,6 +1108,7 @@ pub(crate) fn prepare(
         sender,
         queue_depth: queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
+        agent_epoch: agent_epoch.clone(),
         pending_idle_order: pending_idle_order.clone(),
         pending_active_order: pending_active_order.clone(),
     };
@@ -1090,6 +1129,7 @@ pub(crate) fn prepare(
         lost_count: lost_count.clone(),
         pending_idle_order,
         pending_active_order,
+        agent_epoch,
     });
     Ok((
         PortProtocolWiring {
@@ -4114,6 +4154,7 @@ mod tests {
                 sender,
                 queue_depth: Arc::clone(&queue_depth),
                 control_order: Arc::new(AtomicU64::new(0)),
+                agent_epoch: Arc::new(AtomicU64::new(0)),
                 pending_idle_order: Arc::new(AtomicU64::new(0)),
                 pending_active_order: Arc::new(AtomicU64::new(0)),
             },

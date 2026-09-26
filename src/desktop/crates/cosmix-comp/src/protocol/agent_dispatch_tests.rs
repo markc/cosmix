@@ -1,6 +1,62 @@
 // Included by input_injection_tests.rs: real queued Bus controls and wire devices.
 
 #[test]
+fn authority_loss_refuses_parked_agent_controls_without_recreating_holds() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    let (id, generation) = window_id_and_generation(&h, &alpha);
+    let mut admissions = Vec::new();
+    for x in 0..11 {
+        admissions.push(ingress.request_input(on_agent(move_op(PointerMoveTarget::Window {
+            id, generation, x: 10.0 + f64::from(x), y: 10.0, require_hit: true,
+        }))).unwrap());
+    }
+    admissions.push(ingress.request_input(on_agent(InputOp::PointerButton {
+        button: BTN_LEFT, action: PressAction::Press,
+    })).unwrap());
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(h.server.state.pending_port_controls.len(), 4);
+    h.server.state.reconcile_all_input_authority_loss();
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    for (index, admission) in admissions.into_iter().enumerate() {
+        let reply = runtime.block_on(admission.receive()).unwrap().wire_json();
+        if index < 8 { assert!(reply.get("error").is_none(), "{reply}"); }
+        else {
+            assert_eq!(reply["error"], "input_cleared");
+            assert_eq!(reply["seat"], "agent");
+            assert_eq!(reply["released"], true);
+        }
+    }
+    assert!(h.server.state.agent.held.is_empty());
+    assert!(h.server.state.agent.pointer.current_pressed().is_empty());
+    assert!(!h.server.state.agent.pointer.is_grabbed());
+    assert!(h.server.state.agent.pointer_position.is_none());
+}
+
+#[test]
+fn authority_loss_epoch_refuses_ingress_inputs_and_sequence_admissions_only_for_agent() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    let press = agent_target(&h, &alpha, agent_key(PressAction::Press, KEY_A));
+    let input = ingress.request_input(press.clone()).unwrap();
+    let sequence = ingress.request_long(crate::port::LongOp::Sequence(vec![
+        step("comp.input.key", press, 0),
+    ])).unwrap();
+    let human = ingress.request_input(move_op(PointerMoveTarget::Output {
+        output: None, x: 40.0, y: 30.0,
+    })).unwrap();
+    // All three requests are still in ingress, not pending_port_controls.
+    h.server.state.reconcile_all_input_authority_loss();
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(runtime.block_on(input.receive()).unwrap().wire_json()["error"], "input_cleared");
+    assert_eq!(runtime.block_on(sequence.receive()).unwrap().wire_json()["error"], "input_cleared");
+    assert!(runtime.block_on(human.receive()).unwrap().wire_json().get("error").is_none());
+    assert!(h.server.state.agent.held.is_empty());
+    assert!(h.server.state.injection.sequences.is_empty());
+    assert_eq!(h.server.state.human.pointer.current_location(), (40.0, 30.0).into());
+}
+
+#[test]
 fn agent_motion_burst_coalesces_without_crossing_buttons_or_human_motion() {
     let (mut h, ingress, runtime, human_pointer, alpha, _) = two_windows();
     let (_, _, agent_pointer) = bind_agent_devices(&mut h);

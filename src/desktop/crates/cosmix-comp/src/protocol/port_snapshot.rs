@@ -68,6 +68,7 @@ pub(super) fn exact_logical_output_rect(
 
 #[derive(Debug)]
 pub(crate) struct SnapshotContext {
+    pub(crate) agent_epoch: Arc<AtomicU64>,
     pub(crate) service: Arc<str>,
     pub(crate) version: Arc<str>,
     pub(crate) backend: &'static str,

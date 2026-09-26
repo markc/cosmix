@@ -9152,7 +9152,13 @@ impl WaylandState {
 
     fn clear_agent_input(&mut self) {
         #[cfg(feature = "bus")]
-        self.cancel_agent_sequences();
+        {
+            if let Some(context) = &self.port_context {
+                let epoch = context.agent_epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+                self.pending_port_controls.retain_mut(|control| !control.refuse_cleared_agent(epoch));
+            }
+            self.cancel_agent_sequences();
+        }
         self.agent.last_keyboard_action = None;
         self.agent.last_pointer_action = None;
         self.dismiss_agent_popups();

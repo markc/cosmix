@@ -48,6 +48,7 @@ const EVENT_LOOP_PUMP_LIMIT: usize = 200;
 #[cfg(feature = "bus")]
 fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
     port_snapshot::SnapshotContext {
+        agent_epoch: Arc::new(AtomicU64::new(0)),
         service: Arc::from(if backend == "kms" {
             "comp"
         } else {

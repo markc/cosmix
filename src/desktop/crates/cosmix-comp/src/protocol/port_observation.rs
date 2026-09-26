@@ -3134,6 +3134,10 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
         }
     }
     controls.sort_by_key(PortControl::order);
+    if let Some(context) = &state.port_context {
+        let epoch = context.agent_epoch.load(Ordering::Acquire);
+        controls.retain_mut(|control| !control.refuse_cleared_agent(epoch));
+    }
     // HostInput ready this turn has already drained. Bound agent verbs without
     // reordering the remaining controls: a suffix stays queued and wakes the
     // next dispatch. Each admitted verb also has the parser's event bound.
@@ -3155,6 +3159,14 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
     // restore -> click lands in the order it was sent.
     let mut cursor = 0;
     while cursor < controls.len() {
+        // An earlier human verb in this very batch can switch VT. Recheck the
+        // epoch here too: these controls are temporarily outside the state queue.
+        if let Some(context) = &state.port_context
+            && controls[cursor].refuse_cleared_agent(context.agent_epoch.load(Ordering::Acquire))
+        {
+            cursor += 1;
+            continue;
+        }
         // Complete every reply only after the group's final motion is delivered.
         // Shared input_seq/coordinates describe that delivery, not intermediate
         // coordinates which the client never saw. Every other control is a fence.
