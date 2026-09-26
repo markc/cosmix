@@ -571,11 +571,19 @@ struct Inner {
 pub struct Fetcher(Arc<Inner>);
 
 impl Fetcher {
+    /// `client` is the ONE connection slot the resolver, peer source and
+    /// event sink are wired around — the same slot
+    /// [`Fetcher::set_client`] keeps current. It is a parameter (not
+    /// created here) so `production` cannot hand the parts one slot
+    /// while `Inner` keeps another: that exact wiring bug left every
+    /// publish buffered and every resolution "not connected" with no
+    /// error anywhere (found live, 2026-09-26).
     pub fn new(
         store: Arc<Store>,
         config: FetchConfig,
         lane_bind: Option<SocketAddr>,
         instance: String,
+        client: ClientSlot,
         resolver: Arc<dyn Resolver>,
         peers: Arc<dyn PeerSource>,
         sink: Arc<dyn EventSink>,
@@ -588,7 +596,7 @@ impl Fetcher {
             resolver,
             peers,
             sink,
-            client: ClientSlot::default(),
+            client,
             http: OnceLock::new(),
             state: Mutex::new(FetchState::default()),
             slots: Arc::new(Semaphore::new(config.max_concurrent)),
@@ -602,7 +610,8 @@ impl Fetcher {
 
     /// The production wiring: noded-addressed resolution, `noded.peers`
     /// fallback and Bus publication, all through the live connection
-    /// slot [`Fetcher::set_client`] keeps current.
+    /// slot [`Fetcher::set_client`] keeps current — ONE slot, shared by
+    /// `Inner` and every part.
     pub fn production(
         store: Arc<Store>,
         cfg: &crate::core::config::Config,
@@ -615,6 +624,7 @@ impl Fetcher {
             FetchConfig::from_config(cfg),
             lane_bind,
             instance.to_string(),
+            client.clone(),
             Arc::new(NodedResolver::new(client.clone())),
             Arc::new(NodedPeers::new(client.clone())),
             Arc::new(BusSink::new(client)),
@@ -1537,6 +1547,7 @@ mod tests {
             FetchConfig::default(),
             lane_bind,
             "default".into(),
+            ClientSlot::default(),
             Arc::new(resolver),
             Arc::new(peers),
             Arc::new(sink.clone()),
@@ -1614,6 +1625,7 @@ mod tests {
             FetchConfig::default(),
             Some(lane),
             "default".into(),
+            ClientSlot::default(),
             Arc::new(crate::fetch::test_support::NullResolver),
             Arc::new(crate::fetch::test_support::NullPeers),
             Arc::new(TestSink::default()),
@@ -1646,6 +1658,41 @@ mod tests {
                     .unwrap()
                     .service_name()
             )
+        );
+    }
+
+    // ---- The production wiring: ONE slot for Inner and every part ----
+
+    #[tokio::test]
+    async fn production_sink_buffers_into_the_slot_set_client_writes() {
+        // Found live (2026-09-26): production handed the resolver, peer
+        // source and sink one ClientSlot while `Inner` kept another, and
+        // `set_client` wrote only Inner's — so every completion event
+        // published into a slot that was forever None (buffered, F7) and
+        // every resolution answered "not connected to the broker": each
+        // fetch classified origin_unreachable with no error line
+        // anywhere. The contract this pins: what the production sink
+        // buffers before any client exists must land in the very slot
+        // `set_client` writes.
+        let (_dir, store) = bare_store("P");
+        let fetcher = Fetcher::production(
+            store,
+            &crate::core::config::Config::default(),
+            None,
+            "p",
+        );
+        fetcher
+            .0
+            .sink
+            .publish(crate::citizen::domain_event(
+                TOPIC_FETCHED,
+                json!({"blob": "b3:wiring", "outcome": "ok"}),
+            ))
+            .await;
+        assert_eq!(
+            fetcher.0.client.pending_len(),
+            1,
+            "the production sink must buffer into the slot set_client writes"
         );
     }
 
@@ -2279,6 +2326,7 @@ mod tests {
             config,
             None,
             "default".into(),
+            ClientSlot::default(),
             Arc::new(resolver),
             Arc::new(ListPeers::default()),
             Arc::new(sink.clone()),
@@ -2419,6 +2467,7 @@ mod tests {
             },
             None,
             "default".into(),
+            ClientSlot::default(),
             Arc::new(MapResolver::default().map("A", format!("http://{addr}"))),
             Arc::new(ListPeers::default()),
             Arc::new(GatedSink {
@@ -2587,6 +2636,7 @@ mod tests {
             },
             None,
             "default".into(),
+            ClientSlot::default(),
             Arc::new(MapResolver::default().map("A", format!("http://{addr}"))),
             Arc::new(ListPeers::default()),
             Arc::new(sink.clone()),

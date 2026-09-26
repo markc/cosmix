@@ -879,6 +879,7 @@ mod tests {
             FetchConfig::default(),
             Some("10.42.0.5:4210".parse().unwrap()),
             "default".into(),
+            crate::fetch::ClientSlot::default(),
             Arc::new(NullResolver),
             Arc::new(NullPeers),
             Arc::new(TestSink::default()),
