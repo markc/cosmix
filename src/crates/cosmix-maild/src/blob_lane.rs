@@ -351,6 +351,24 @@ async fn upload_response(
 }
 
 /// Session-owned task set: no detached transfers, no unbounded waiting queue.
+pub(crate) async fn bounded_response<E: std::fmt::Display>(
+    response: impl Future<Output = Result<(), E>>,
+) {
+    response_with_timeout(response, IO_TIMEOUT).await;
+}
+
+async fn response_with_timeout<E: std::fmt::Display>(
+    response: impl Future<Output = Result<(), E>>,
+    bound: Duration,
+) {
+    match timeout(bound, response).await {
+        Ok(Ok(())) => (),
+        Ok(Err(e)) => tracing::warn!(error = %e, "Bus response failed"),
+        Err(_) => tracing::warn!("Bus response timed out; releasing worker"),
+    }
+}
+
+/// Session-owned task set: no detached transfers, no unbounded waiting queue.
 /// Drop (parent cancellation) aborts all members; reconnect drains explicitly.
 #[derive(Default)]
 pub struct Transfers {
@@ -386,6 +404,27 @@ impl Transfers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn stalled_response_releases_slots_and_busy_dispatch_continues() {
+        use tokio::io::AsyncWriteExt;
+        let mut transfers = Transfers::default();
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let (mut sink, reader) = tokio::io::duplex(1);
+            readers.push(reader); // held open, never drained
+            transfers.spawn(async move {
+                response_with_timeout(sink.write_all(&[0; 64]), Duration::from_millis(20)).await;
+            }).unwrap();
+        }
+        assert!(transfers.is_full());
+        let (mut busy_sink, _reader) = tokio::io::duplex(1);
+        timeout(Duration::from_secs(1), async {
+            response_with_timeout(busy_sink.write_all(&[0; 64]), Duration::from_millis(20)).await;
+            while transfers.is_full() { tokio::task::yield_now().await; }
+            transfers.spawn(async {}).unwrap(); // next command admitted
+        }).await.unwrap();
+        transfers.shutdown().await;
+    }
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,

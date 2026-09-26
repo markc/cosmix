@@ -643,9 +643,7 @@ async fn dispatch_loop(
                 let body =
                     serde_json::json!({"error": "busy: maild blob transfer pool is full (8)"})
                         .to_string();
-                if let Err(e) = client.respond(&cmd, 10, &body).await {
-                    tracing::warn!(error = %e, "Bus busy response failed");
-                }
+                crate::blob_lane::bounded_response(client.respond(&cmd, 10, &body)).await;
                 continue;
             }
             let client = client.clone();
@@ -666,9 +664,7 @@ async fn dispatch_loop(
                         &classifier, &db, &mailstore, &bayesian_state, &input).await,
                     _ => dispatch_attachment(&cmd, &db, &mailstore, &client).await,
                 };
-                if let Err(e) = client.respond(&cmd, rc, &body).await {
-                    tracing::warn!(error = %e, command = %cmd.command, "Bus transfer response failed");
-                }
+                crate::blob_lane::bounded_response(client.respond(&cmd, rc, &body)).await;
             }).expect("slot checked without yielding or sharing the task set");
             continue;
         }
