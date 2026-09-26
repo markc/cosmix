@@ -1659,7 +1659,10 @@ fn editor_open($s, $args)
   $s.editor_fallback = nil
   $s.scenes.editor.safe = $safe
   $s.scenes.editor.request_seq = $s.scenes.editor.request_seq + 1
-  if $args.view != nil then $s.scenes.editor.view = $args.view end
+  -- The record carries this open's request only: an open without a view
+  -- (the chord, the corner item) keeps whatever tab the user was on, instead
+  -- of re-applying the first run's gallery on every open (live gate G4).
+  $s.scenes.editor.view = $args.view
   $s.scenes.editor.scene = $args.scene
   $s.scenes.editor.first_run = $args.first_run == true
   $s.scenes.editor.hide_requested = false

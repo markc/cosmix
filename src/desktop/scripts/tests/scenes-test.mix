@@ -1021,6 +1021,10 @@ try
   $host_state.dialog.visible = false
   $x = notice($x)
   check($x.scenes.editor.dismissed, "FR2: dismissed")
+  -- Live gate G4: an open without a view carries none, so the editor keeps
+  -- its tab instead of going back to the first run's gallery.
+  $y2 = $l.request($x, "editor.open", {safe:true})
+  check($y2.rc == 0 and $y2.scenes.editor.view == nil and $y2.scenes.editor.request_seq == 2 and $l.inventory($y2).editor.view == nil, "an open without a view records none: " .. json_encode($l.inventory($y2).editor))
   $m = log_mark()
   $x = $l.services($x, [], false)
   $x = $l.services($x, ["test-shell"], false)

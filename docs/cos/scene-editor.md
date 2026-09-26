@@ -41,7 +41,8 @@ path.
 installed scene. An open increments the editor's `request_seq`, and the
 behaviour applies `view`/`scene` from the loader's `editor` record. So
 `scenes.editor.open {view:"installed", scene:"panel"}` from an agent navigates
-the UI.
+the UI. An open without `view` or `scene` (the chord, the corner item)
+leaves the editor on the tab and selection it last showed.
 
 `scenes.editor.close {unload?}` hides it. With `unload:true` the loader also
 stops its behaviour and unmounts it. Otherwise it stays mounted, hidden and

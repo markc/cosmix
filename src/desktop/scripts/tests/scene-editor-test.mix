@@ -358,6 +358,8 @@ $nav = $e.apply_request($e.default_ui(), {request_seq: 4, view: "installed", sce
 check($nav.view == "installed" and $nav.scene == "notes" and $nav.seq == 4, "request navigates")
 $nav.view = "arrange"
 check($e.apply_request($nav, {request_seq: 4, view: "installed", scene: "notes"}).view == "arrange", "the same request_seq is not re-applied")
+$kept = $e.apply_request($nav, {request_seq: 5, view: nil, scene: nil})
+check($kept.view == "arrange" and $kept.scene == "notes" and $kept.seq == 5, "an open without a view or scene keeps the tab and the selection")
 
 -- Unreachable loader and unreadable state.
 $gone = $e.build(data(nil, nil, nil, []), $e.default_ui())
