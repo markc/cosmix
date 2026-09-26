@@ -44,9 +44,11 @@ fn open(world: &mut World, output: &OutputKey, corner: Corner) {
 
 /// The scenes loader's Bus name: `SCENES_SERVICE`, else `scenes`.
 fn scenes_service() -> String {
+    // Trimmed: " scenes " must route to `scenes`, not a padded dead name.
     std::env::var("SCENES_SERVICE")
         .ok()
-        .filter(|name| !name.trim().is_empty())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "scenes".to_owned())
 }
 

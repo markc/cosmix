@@ -299,6 +299,7 @@ struct SceneBus<'w> {
     settings: Option<ResMut<'w, crate::settings::SettingsScene>>,
     dialog: Option<ResMut<'w, crate::dialog_bus::DialogRequests>>,
     dialog_state: Option<Res<'w, cosmix_shell::chrome::dialog::QuoinDialog>>,
+    order_writer: Option<Res<'w, crate::order_writer::OrderWriter>>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -627,6 +628,11 @@ fn service_bus(
                         10,
                         json!({"error_code":"STALE_CONNECTION", "message":"panel.order request belongs to a stale Quoin connection"}),
                     )
+                } else if let Some(writer) = content.order_writer.as_deref()
+                    && writer.submit(request.clone(), crate::config::conf_mix_path())
+                {
+                    // Written and answered off the render thread (order_writer.rs).
+                    continue;
                 } else {
                     panel_order(&request.body, &crate::config::conf_mix_path())
                 };
@@ -1119,7 +1125,7 @@ pub(crate) fn register_sub_panel(
 /// One atomic `conf.mix` replacement; the file watcher ingests it like a
 /// hand edit, so a later hand edit still wins. Mesh-open: what stays is
 /// well-formedness (edges, identifiers, no page on two edges).
-fn panel_order(body: &str, path: &std::path::Path) -> (u8, Value) {
+pub(crate) fn panel_order(body: &str, path: &std::path::Path) -> (u8, Value) {
     let order = serde_json::from_str::<Value>(body)
         .map_err(|error| crate::config::OrderRefusal {
             code: "INVALID_ARGUMENT",

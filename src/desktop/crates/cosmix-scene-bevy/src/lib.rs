@@ -290,8 +290,15 @@ impl SceneStore {
                 } else { None };
                 let source = args["source"].as_str().unwrap_or(body);
                 let document = cosmix_scene::parse(source).map_err(|d| json!({"diagnostics":d}))?;
+                // A pre-empting dialog load displaces whoever holds the name
+                // (accept/seat_dialog); another owner's model fence must not
+                // turn that into a refusal, or a squatter bricks safe mode.
+                let preempting = args["preempt_dialog"].as_bool() == Some(true)
+                    && mount.is_some()
+                    && cosmix_scene::resolve(&document).is_ok_and(|tree| render::is_dialog(&tree));
                 if let Some(entry) = self.scenes.get(&document.name)
                     && entry.model_generation.is_some()
+                    && (!preempting || entry.is_model_authority(mount.as_deref()))
                     && (managed_generation.is_none() || !entry.is_model_authority(mount.as_deref()))
                 {
                     return Err(model_authority_refusal(&document.name));
@@ -532,7 +539,7 @@ impl SceneStore {
     fn accept(
         &mut self,
         document: SceneDocument,
-        mount: Option<&mut SceneMount<'_>>,
+        mut mount: Option<&mut SceneMount<'_>>,
         loading: bool,
         preempt: bool,
     ) -> Result<(Value, Option<Value>), Value> {
@@ -547,24 +554,48 @@ impl SceneStore {
         // A declared mount address is unique across scenes, including scenes
         // from the same citizen. Content revisions cannot rename a live seat;
         // unload first so the old carousel entry is removed transactionally.
+        // A dialog takes no carousel page, so it is outside the page-id
+        // namespace in both directions: an edge scene declaring
+        // `panel:"scene-editor"` cannot squat the editor (Stage R, Opus M1).
         let page = render::page_id(&tree);
-        if self.scenes.iter().any(|(name, entry)| {
-            (name != &tree.name && render::page_id(&entry.tree) == page)
-                || (name == &tree.name && render::page_id(&entry.tree) != page)
-        }) {
+        let dialog = render::is_dialog(&tree);
+        if !dialog
+            && self.scenes.iter().filter(|(_, entry)| !render::is_dialog(&entry.tree)).any(
+                |(name, entry)| {
+                    (name != &tree.name && render::page_id(&entry.tree) == page)
+                        || (name == &tree.name && render::page_id(&entry.tree) != page)
+                },
+            )
+        {
             return Err(json!({"scene": tree.name, "error_code": "SUBPANEL_COLLISION",
                 "error": "scene mount address is occupied or changed; unload before renaming"}));
         }
         // A dialog and an edge page are different mounts: a live scene
-        // cannot switch between them any more than it can change edges.
-        let dialog = render::is_dialog(&tree);
+        // cannot switch between them any more than it can change edges. A
+        // pre-empting dialog load displaces a same-name edge scene instead,
+        // so an edge scene named `editor` cannot brick safe mode either.
         if self
             .scenes
             .get(&tree.name)
             .is_some_and(|old| render::is_dialog(&old.tree) != dialog)
         {
-            return Err(json!({"scene": tree.name, "error_code": "SUBPANEL_COLLISION",
-                "error": "a loaded scene cannot switch between dialog and edge; unload it first"}));
+            let Some(caller) = mount.as_deref_mut().filter(|_| dialog && preempt) else {
+                return Err(json!({"scene": tree.name, "error_code": "SUBPANEL_COLLISION",
+                    "error": "a loaded scene cannot switch between dialog and edge; unload it first"}));
+            };
+            let old = self.scenes.remove(&tree.name).expect("checked above");
+            caller.registry.forget(&render::page_id(&old.tree));
+            if let Some(mounted) = old.mounted {
+                self.removed.push(mounted);
+            }
+            self.notices.push(json!({
+                "scene": tree.name,
+                "revision": old.revision,
+                "ops": ["unloaded"],
+                "reason": "preempted",
+                "by": {"scene": tree.name, "owner": caller.owner},
+                "diagnostics": [],
+            }));
         }
         let old_owner = self
             .scenes
@@ -1072,6 +1103,57 @@ item: {widget: "text", text: "{cells[0]}"}
         // Pre-empting again by the holder itself displaces nobody.
         load(&mut store, &mut registry, "scenes", 3, &dialog_source("editor", 880), true).unwrap();
         assert!(store.notices.is_empty());
+    }
+
+    fn edge_source(name: &str, panel: Option<&str>) -> String {
+        let panel = panel.map_or_else(String::new, |panel| format!(",\"panel\":\"{panel}\""));
+        format!(
+            "---\nscene: 1\nname: {name}\ncitizen: squatter\nwindow: {{\"kind\":\"edge\",\"edge\":\"right\"{panel}}}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"
+        )
+    }
+
+    /// Stage R (Opus M1): an edge scene on page `scene-editor` cannot squat
+    /// the editor, because a dialog is outside the page-id namespace.
+    #[test]
+    fn an_edge_page_squatter_cannot_block_the_editor() {
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        load(&mut store, &mut registry, "someone", 1, &edge_source("squat", Some("scene-editor")), false)
+            .unwrap();
+        assert!(registry.seat("scene-editor").is_some());
+        for preempt in [false, true] {
+            load(&mut store, &mut registry, "scenes", 2, &dialog_source("editor", 880), preempt)
+                .unwrap();
+        }
+        assert_eq!(store.dialog_seat().unwrap().scene, "editor");
+        assert!(store.scenes.contains_key("squat"), "no conflict, nothing displaced");
+        assert!(store.notices.is_empty());
+        // Nor can a dialog take an edge page's address from it.
+        assert!(registry.seat("scene-editor").is_some_and(|seat| seat.owner == "someone"));
+    }
+
+    /// Stage R (Opus M1): an edge scene named `editor`, even another owner's
+    /// fenced one, is displaced by the pre-empting editor load; without the
+    /// flag the switch is refused as before.
+    #[test]
+    fn a_name_squatter_is_displaced_only_by_a_preempting_dialog_load() {
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        load(&mut store, &mut registry, "someone", 1, &edge_source("editor", None), false).unwrap();
+        assert!(registry.seat("scene-editor").is_some());
+        let error =
+            load(&mut store, &mut registry, "scenes", 2, &dialog_source("editor", 880), false)
+                .unwrap_err();
+        assert_eq!(error["error_code"], "SCENE_MODEL_AUTHORITY", "{error}");
+        load(&mut store, &mut registry, "scenes", 3, &dialog_source("editor", 880), true).unwrap();
+        assert_eq!(store.is_dialog("editor"), Some(true));
+        assert_eq!(store.dialog_seat().unwrap().owner, "scenes");
+        assert!(registry.seat("scene-editor").is_none(), "the squatter's page is released");
+        let notices = std::mem::take(&mut store.notices);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["reason"], "preempted");
+        assert_eq!(notices[0]["by"], json!({"scene":"editor","owner":"scenes"}));
+        assert_eq!(store.removed.len(), 0, "the squatter was never rendered in this fixture");
     }
 
     #[test]

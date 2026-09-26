@@ -135,6 +135,17 @@ impl RunnerState {
             }
             return Ok(());
         }
+        // An open corner menu holds the exclusive keyboard and catches every
+        // pointer frame on its output-sized layer; a dialog mapped under or
+        // over it would be dead. Dismiss it first, as a new menu replaces an
+        // old one (Stage R, GLM M2). A menu opened later is created after the
+        // dialog, so it stacks above it and dismisses like any menu.
+        if self.menu.is_some() || self.app.world().contains_resource::<cosmix_shell::chrome::corner_menu::CornerMenuRequest>() {
+            self.dismiss_corner_menu(None);
+        }
+        let Some(output) = self.outputs.get(&spec.output) else {
+            return Ok(());
+        };
         let wl = self.compositor_state.create_surface(qh);
         let identity = crate::holders::new_layer_identity(&format!("{}-dialog", self.namespace));
         let layer = self.layer_shell.create_layer_surface(

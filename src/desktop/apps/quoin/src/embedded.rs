@@ -426,6 +426,7 @@ fn present_dialog(
     mut dialog: ResMut<cosmix_shell::chrome::dialog::QuoinDialog>,
     mut regions: ResMut<EmbeddedPanelRegions>,
     mut nodes: Query<(&mut Node, Option<&UiTargetCamera>)>,
+    targets: Query<&bevy::camera::RenderTarget>,
 ) {
     let placed = match (output.active, output.camera, dialog.root, dialog.size()) {
         (true, Some(camera), Some(root), Some(size)) if dialog.wants_surface() => {
@@ -462,6 +463,19 @@ fn present_dialog(
     };
     if dialog.origin != placed {
         dialog.origin = placed;
+    }
+    // The dialog's keys arrive on the output camera's window here: naming it
+    // lets Escape (and the IME-preedit guard) dismiss the dialog as on the
+    // layer host (Stage R, GLM M1 / Opus m8). There is no grab to demote:
+    // comp owns keyboard focus for its own renderer.
+    let window = placed.and(output.camera).and_then(|camera| match targets.get(camera) {
+        Ok(bevy::camera::RenderTarget::Window(bevy::window::WindowRef::Entity(window))) => {
+            Some(*window)
+        }
+        _ => None,
+    });
+    if dialog.window != window {
+        dialog.window = window;
     }
 }
 
@@ -817,6 +831,25 @@ mod tests {
         );
         let hidden: serde_json::Value = serde_json::from_str(&hidden).unwrap();
         assert_eq!((hidden["visible"].as_bool(), &hidden["chrome"]), (Some(false), &serde_json::json!({})));
+
+        // Escape on the output window dismisses it here too.
+        crate::dialog_bus::respond(app.world_mut(), "shell.dialog.show", &serde_json::json!({"scene":"editor"}));
+        app.update();
+        let dialog = app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>();
+        assert_eq!((dialog.visible, dialog.window), (true, Some(window)));
+        app.world_mut().write_message(bevy::input::keyboard::KeyboardInput {
+            key_code: KeyCode::Escape,
+            logical_key: bevy::input::keyboard::Key::Escape,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        });
+        app.update();
+        assert!(
+            !app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>().visible,
+            "Escape hides the embedded dialog"
+        );
     }
 
     /// A legacy v2 state file as today's Quoin writes it, for the migration

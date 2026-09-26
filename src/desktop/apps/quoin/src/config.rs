@@ -407,10 +407,17 @@ pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Resu
 }
 
 /// Write `encoded` beside `path` and rename it over, so the watcher only ever
-/// observes a complete file.
+/// observes a complete file. A symlinked `conf.mix` (a dotfiles checkout)
+/// stays a link: the write replaces its target. The data is fsynced before
+/// the rename and the directory after it, so a successful return is durable.
 fn replace_atomically(path: &Path, encoded: &str) -> Result<(), String> {
     use std::io::Write;
-    let parent = path.parent().ok_or("config path has no parent")?;
+    let target = if path.is_symlink() {
+        std::fs::canonicalize(path).map_err(|error| error.to_string())?
+    } else {
+        path.to_path_buf()
+    };
+    let parent = target.parent().ok_or("config path has no parent")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
     temp.write_all(encoded.as_bytes())
@@ -418,7 +425,10 @@ fn replace_atomically(path: &Path, encoded: &str) -> Result<(), String> {
     temp.as_file()
         .sync_all()
         .map_err(|error| error.to_string())?;
-    temp.persist(path).map_err(|error| error.to_string())?;
+    temp.persist(&target).map_err(|error| error.to_string())?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -569,15 +579,17 @@ pub(crate) fn write_panel_order(
         .collect();
     check_unique(&merged)?;
     let mut value = parse_mix_data(&source).map_err(|error| OrderRefusal::write(error.to_string()))?;
+    // ShellConfig::parse above owns these shapes; if it ever relaxes, refuse
+    // the write rather than panic inside a Bus verb.
     let Value::Map(root) = &mut value else {
-        unreachable!("validated config map")
+        return Err(OrderRefusal::write("conf.mix is not a map".to_owned()));
     };
     let root = std::rc::Rc::make_mut(root);
     let panels = root
         .entry("panels".to_owned())
         .or_insert_with(|| Value::Map(Default::default()));
     let Value::Map(panels) = panels else {
-        unreachable!("validated panels map")
+        return Err(OrderRefusal::write("conf.mix panels is not a map".to_owned()));
     };
     let panels = std::rc::Rc::make_mut(panels);
     for (edge, pages) in order {
@@ -1172,6 +1184,22 @@ mod tests {
         );
         assert_eq!(hand.panels[Edge::Right.index()], ["settings.appearance"]);
         assert_eq!(hand.carousel_motion, CarouselMotion::Slide);
+    }
+
+    /// Opus n1: a dotfiles-managed conf.mix stays a symlink; its target is
+    /// what changes.
+    #[test]
+    fn panel_order_keeps_a_symlinked_conf_mix_a_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("dotfiles-conf.mix");
+        std::fs::write(&real, r#"{panels: {right: ["scene-notes"]}}"#).unwrap();
+        let link = directory.path().join("conf.mix");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let request = parse_panel_order(&serde_json::json!({"edges": {"right": ["a", "scene-notes"]}})).unwrap();
+        write_panel_order(&link, &request).unwrap();
+        assert!(link.is_symlink(), "the link survives the write");
+        let written = ShellConfig::parse(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(written.panels[Edge::Right.index()], ["a", "scene-notes"]);
     }
 
     #[test]
