@@ -409,6 +409,58 @@ mod tests {
     }
 
     #[test]
+    fn reference_shrink_aborts_without_waiting_for_lane_reply() {
+        let dir = Scratch::new();
+        let path = dir.0.join("file");
+        // Sparse and larger than socket buffers: the upload cannot have read
+        // the entire source when the server receives the first body byte.
+        fs::File::create(&path).unwrap().set_len(1024 * 1024 * 1024).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        let (release, hold) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                head.push_str(&line);
+                if line == "\r\n" { break; }
+            }
+            assert!(head.starts_with("POST /blob HTTP/1.1\r\n"));
+            assert!(head.to_ascii_lowercase().contains("content-length: 1073741824\r\n"));
+            reader.read_exact(&mut [0; 1]).unwrap();
+            // Truncate the same inode after reference() has opened and read it.
+            fs::OpenOptions::new().write(true).open(path).unwrap().set_len(1).unwrap();
+            reader.get_ref().set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            let mut buf = [0; 64 * 1024];
+            while hold.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty) {
+                // Drain already queued bytes so backpressure cannot mask EOF.
+                // Never reply or close our socket before the caller returns.
+                match reader.read(&mut buf) {
+                    Ok(0) => { let _ = hold.recv_timeout(Duration::from_secs(10)); break; }
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(e) => panic!("reading upload: {e}"),
+                }
+            }
+        });
+        let layer = dir.layer(false, vec![]);
+        let (done, result) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            done.send(reference(&layer, &json!({"path": "home/file"}), Ok(&bind), "filesd-test")).unwrap();
+        });
+        let result = result.recv_timeout(Duration::from_secs(5));
+        let _ = release.send(());
+        server.join().unwrap();
+        client.join().unwrap();
+        let error = result.expect("reference waited for the lane's reply after source EOF").unwrap_err();
+        assert!(error.starts_with("lane:") && error.contains("shrank"), "{error}");
+    }
+
+    #[test]
     fn changed_source_after_upload_is_not_success() {
         let dir = Scratch::new();
         for replacement in [&b"longer"[..], &b"other"[..]] {
@@ -437,7 +489,10 @@ mod tests {
             (Some("a\nb% c".to_string()), Some("a%0Ab%25%20c".to_string())),
             (Some("a".repeat(200)), None),
         ] {
-            let reply = json!({"blob": format!("b3:{}", content_hash(b"x")), "size": 1, "name": expected}).to_string();
+            // Deliberately independent of the sent name: reference must pass
+            // the server's name through rather than reconstructing it locally.
+            let reply_name = expected.as_ref().map(|_| "server-chosen-name");
+            let reply = json!({"blob": format!("b3:{}", content_hash(b"x")), "size": 1, "name": reply_name}).to_string();
             let (bind, worker) = serve_once("201 Created", reply.as_bytes(), reply.len());
             let (rc, value) = invoke(&dir.layer(true, vec![]), "fs.blob.ref",
                 json!({"path": "home/Résumé.pdf", "name": name}), &bind);
@@ -447,7 +502,11 @@ mod tests {
                 .find(|(key, _)| key.eq_ignore_ascii_case("x-cosmix-name"))
                 .map(|(_, value)| value.trim().to_string());
             assert_eq!(header, expected);
-            assert_eq!(value["name"], json!(expected));
+            if expected.is_none() {
+                assert!(!head.lines().filter_map(|line| line.split_once(':'))
+                    .any(|(key, _)| key.eq_ignore_ascii_case("x-cosmix-name")), "{head}");
+            }
+            assert_eq!(value["name"], json!(reply_name));
         }
     }
 
