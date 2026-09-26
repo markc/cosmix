@@ -1485,6 +1485,9 @@ fn dispatch_with_declared(
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
+/// A named frame predicate for [`pin_toggle_target`].
+type PinTargetRule = (&'static str, fn(&cosmix_shell::runtime::PanelPresentation) -> bool);
+
 /// The edge an edgeless `shell.panel.pin.toggle` (the Super+Alt+P chord)
 /// acts on, from the current frame, first rule that picks exactly one:
 /// 1. the panel holding the keyboard, else the one a focus request targets;
@@ -1494,7 +1497,7 @@ fn dispatch_with_declared(
 /// Otherwise a refusal naming the candidates: `PIN_TARGET_AMBIGUOUS` when a
 /// rule matched several edges, `PIN_TARGET_NONE` when nothing matched.
 fn pin_toggle_target(frame: &ShellFrame) -> Result<Edge, Value> {
-    let rules: [(&str, fn(&cosmix_shell::runtime::PanelPresentation) -> bool); 4] = [
+    let rules: [PinTargetRule; 4] = [
         ("keyboard_focused", |panel| panel.keyboard_focused),
         ("keyboard_requested", |panel| panel.keyboard_requested),
         ("transient_revealed", |panel| {
