@@ -120,8 +120,10 @@ fn parse_reference(body: &str) -> Result<Value, String> {
 /// it to this filesd service. Name/MIME defaults come from the filesystem layer.
 pub fn reference(fs: &FsLayer, a: &Value, bind: Result<&str, &str>, owner: &str) -> Result<Value, String> {
     let path = super::req(a, "path")?;
-    let (file, name, mime) = fs.open_blob(path).map_err(super::estr)?;
-    let length = file.metadata().map_err(|e| super::estr(e.into()))?.len();
+    let (mut file, name, mime) = fs.open_blob(path).map_err(super::estr)?;
+    let before = file.metadata().map_err(|e| super::estr(e.into()))?;
+    let length = before.len();
+    let modified = before.modified().map_err(|e| super::estr(e.into()))?;
     let bind = checked_bind(bind.map_err(str::to_string)?)?;
     let mut request = agent().post(&format!("http://{bind}/blob"))
         .set("Content-Length", &length.to_string())
@@ -130,8 +132,16 @@ pub fn reference(fs: &FsLayer, a: &Value, bind: Result<&str, &str>, owner: &str)
     if let Some(name) = encoded_name(a["name"].as_str().unwrap_or(&name)) {
         request = request.set("X-Cosmix-Name", &name);
     }
-    let response = request.send(file.take(length))
-        .map_err(|e| http_error(e, true))?;
+    let mut body = ExactSource { file: &mut file, remaining: length, shrank: false };
+    let response = request.send(&mut body);
+    if body.shrank {
+        return Err("lane: source shrank during upload".into());
+    }
+    let response = response.map_err(|e| http_error(e, true))?;
+    let after = file.metadata().map_err(|e| format!("lane: stat source after upload: {e}"))?;
+    if after.len() != length || after.modified().map_err(|e| format!("lane: stat source mtime: {e}"))? != modified {
+        return Err("lane: source changed during upload (blob may already be pinned)".into());
+    }
     if response.status() != 201 {
         return Err(format!("lane: expected HTTP 201, got {}", response.status()));
     }
@@ -147,6 +157,28 @@ pub fn reference(fs: &FsLayer, a: &Value, bind: Result<&str, &str>, owner: &str)
     }
     reference["path"] = json!(path);
     Ok(reference)
+}
+
+/// Unlike Take, a premature source EOF is an error, so ureq aborts its socket
+/// rather than waiting for the server's idle timeout with a short request body.
+struct ExactSource<'a> {
+    file: &'a mut std::fs::File,
+    remaining: u64,
+    shrank: bool,
+}
+
+impl Read for ExactSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() { return Ok(0); }
+        let want = self.remaining.min(buf.len() as u64) as usize;
+        let n = self.file.read(&mut buf[..want])?;
+        if n == 0 {
+            self.shrank = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "source shrank during upload"));
+        }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
 }
 
 /// `fs.blob.materialise`: GET only from the selected local store, then verify
@@ -241,6 +273,10 @@ mod tests {
     /// One HTTP exchange, with the received request returned by joining the
     /// thread. The caller can deliberately lie about length to test truncation.
     fn serve_once(status: &str, bytes: &[u8], length: usize) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
+        serve_once_with(status, bytes, length, || {})
+    }
+
+    fn serve_once_with(status: &str, bytes: &[u8], length: usize, before_reply: impl FnOnce() + Send + 'static) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         let status = status.to_string();
@@ -263,6 +299,7 @@ mod tests {
                 .map(|(_, value)| value.trim().parse::<usize>().unwrap()).unwrap_or(0);
             let mut body = vec![0; body_len];
             reader.read_exact(&mut body).unwrap();
+            before_reply();
             write!(reader.get_mut(), "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
             reader.get_mut().write_all(&bytes).unwrap();
             (head, body)
@@ -314,6 +351,41 @@ mod tests {
         let head = worker.join().unwrap().0.to_ascii_lowercase();
         assert!(head.contains("x-cosmix-name: x.png"));
         assert!(head.contains("x-cosmix-mime: image/png"));
+    }
+
+    #[test]
+    fn source_shrink_errors_at_eof_without_waiting_for_lane() {
+        let dir = Scratch::new();
+        let path = dir.0.join("file");
+        fs::write(&path, b"long source").unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let length = file.metadata().unwrap().len();
+        fs::write(&path, b"x").unwrap();
+        let mut source = ExactSource { file: &mut file, remaining: length, shrank: false };
+        let error = source.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "source shrank during upload");
+        assert!(source.shrank);
+    }
+
+    #[test]
+    fn changed_source_after_upload_is_not_success() {
+        let dir = Scratch::new();
+        for replacement in [&b"longer"[..], &b"other"[..]] {
+            let path = dir.0.join("file");
+            fs::write(&path, b"hello").unwrap();
+            let replacement = replacement.to_vec();
+            let reply = json!({"blob": format!("b3:{}", content_hash(b"hello")), "size": 5}).to_string();
+            let (bind, worker) = serve_once_with("201 Created", reply.as_bytes(), reply.len(), move || {
+                fs::write(&path, replacement).unwrap();
+                fs::File::options().write(true).open(&path).unwrap()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH).unwrap();
+            });
+            let result = invoke(&dir.layer(true, vec![]), "fs.blob.ref", json!({"path": "home/file"}), &bind);
+            assert!(result.1["error"].as_str().unwrap().contains("pinned"));
+            assert_error(result, "lane: source changed during upload");
+            worker.join().unwrap();
+        }
     }
 
     #[test]

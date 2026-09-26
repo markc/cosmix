@@ -181,6 +181,12 @@ printable non-space ASCII, plus `%`, for the HTTP header. blobd currently stores
 the encoded name verbatim, so `Résumé.pdf` returns as `R%C3%A9sum%C3%A9.pdf`.
 An encoded name longer than 128 bytes is omitted; the reference name is null.
 
+A source shrinking during the upload aborts immediately with
+`lane: source shrank during upload`. Filesd checks the same open descriptor's
+length and mtime after sending; a change reports `lane: source changed during
+upload (blob may already be pinned)`. This detects ordinary concurrent edits,
+not edits that deliberately restore both length and mtime.
+
 `fs.blob.materialise {blob, path, overwrite?}` accepts `b3:<64 lowercase hex>`,
 bare lowercase hex, or a reference map containing `blob`. It streams
 `GET /blob/<hex>` from that local store. A missing blob must first be fetched
