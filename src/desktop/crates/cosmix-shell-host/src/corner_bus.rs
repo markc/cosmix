@@ -77,6 +77,9 @@ pub(crate) enum CornerAction {
 struct ClickPreference {
     v2_seen: bool,
     last_sequence: Option<u64>,
+    /// True while `last_sequence` was set by a legacy record, whose paired
+    /// unmodified-LMB v2 sibling canonicalises onto that same number.
+    last_from_legacy: bool,
     sequence_rejections: u64,
 }
 
@@ -98,6 +101,15 @@ impl ClickPreference {
             }
             _ => return true,
         };
+        if pairs_with_legacy
+            && self.last_from_legacy
+            && self.last_sequence == Some(canonical)
+        {
+            // The v2 half of a legacy-first pair: the click already acted
+            // through the legacy record. A dedup, not a stale sequence.
+            self.last_from_legacy = false;
+            return false;
+        }
         if let Some(last) = self.last_sequence
             && canonical <= last
         {
@@ -117,6 +129,7 @@ impl ClickPreference {
             return false;
         }
         self.last_sequence = Some(canonical);
+        self.last_from_legacy = matches!(kind, CornerKind::Clicked);
         true
     }
 }
@@ -2230,8 +2243,8 @@ mod tests {
             assert!(channel.try_recv().is_err());
             assert_eq!(state.old_format_rejections, 2);
             assert_eq!(state.diagnostics, 0);
-            // Only the canonicalised v2 sibling of a legacy-first pair counts.
-            assert_eq!(state.clicks.sequence_rejections, u64::from(!v2_first));
+            // The v2 sibling of a legacy-first pair is a dedup, not a rejection.
+            assert_eq!(state.clicks.sequence_rejections, 0);
             assert_eq!(state.clicks.last_sequence, Some(7));
         }
     }
@@ -2518,8 +2531,11 @@ mod tests {
                         ]);
                     }
                     assert_eq!(state.clicks.last_sequence, Some(base + 12));
-                    // A rewind without reconnect remains stale, paired or not.
+                    // Only the redelivered copies count: 3 per index, whichever
+                    // half of the first pair arrived first.
                     let rejections = state.clicks.sequence_rejections;
+                    assert_eq!(rejections, 9);
+                    // A rewind without reconnect remains stale, paired or not.
                     for modifiers in [
                         Some(json!([])),
                         Some(json!(["ctrl"])),
@@ -2577,6 +2593,29 @@ mod tests {
         assert!(clicks.accept(&CornerKind::Clicked, 1, false));
         assert!(!clicks.accept(&CornerKind::Clicked, 1, false));
         assert!(clicks.accept(&CornerKind::Clicked, 2, false));
+    }
+
+    #[test]
+    fn legacy_first_pair_is_a_silent_dedup_and_real_duplicates_stay_loud() {
+        let mut clicks = ClickPreference::default();
+        let pin = CornerKind::Action(CornerAction::PinToggle);
+        // First click after connect: legacy 13182 then its v2 sibling 13183.
+        assert!(clicks.accept(&CornerKind::Clicked, 13_182, false));
+        assert!(!clicks.accept(&pin, 13_183, true));
+        assert_eq!(clicks.sequence_rejections, 0);
+        assert_eq!(clicks.last_sequence, Some(13_182));
+        // A redelivered v2 sibling is a genuine duplicate.
+        assert!(!clicks.accept(&pin, 13_183, true));
+        assert_eq!(clicks.sequence_rejections, 1);
+        // A v2 record that does not pair with the legacy number is stale.
+        let mut clicks = ClickPreference::default();
+        assert!(clicks.accept(&CornerKind::Clicked, 50, false));
+        assert!(!clicks.accept(&pin, 50, false));
+        assert_eq!(clicks.sequence_rejections, 1);
+        // Later pairs flow through the v2 lane as before.
+        assert!(clicks.accept(&pin, 52, true));
+        assert!(!clicks.accept(&CornerKind::Clicked, 51, false));
+        assert_eq!(clicks.sequence_rejections, 1);
     }
 
     #[test]

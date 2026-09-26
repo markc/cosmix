@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "bevy",
  "bevy_winit",
