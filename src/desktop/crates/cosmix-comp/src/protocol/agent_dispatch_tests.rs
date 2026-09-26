@@ -127,6 +127,36 @@ fn authority_loss_epoch_refuses_ingress_inputs_and_sequence_admissions_only_for_
 }
 
 #[test]
+fn authority_loss_refuses_parked_sequence_admission_and_preserves_human_control_order() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    let (id, generation) = window_id_and_generation(&h, &alpha);
+    let inputs: Vec<_> = (0..9).map(|_| ingress.request_input(on_agent(move_op(PointerMoveTarget::Window {
+        id, generation, x: 10.0, y: 10.0, require_hit: true,
+    }))).unwrap()).collect();
+    let sequence = ingress.request_long(crate::port::LongOp::Sequence(vec![
+        step("comp.input.key", agent_target(&h, &alpha, agent_key(PressAction::Press, KEY_A)), 0),
+    ])).unwrap();
+    let human: Vec<_> = [40.0, 60.0].into_iter().map(|x| ingress.request_input(move_op(PointerMoveTarget::Output {
+        output: None, x, y: 30.0,
+    })).unwrap()).collect();
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(h.server.state.pending_port_controls.len(), 4);
+    h.server.state.reconcile_all_input_authority_loss();
+    assert_eq!(h.server.state.pending_port_controls.len(), 2, "only ordered human controls survive");
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(runtime.block_on(sequence.receive()).unwrap().wire_json()["error"], "input_cleared");
+    for (index, input) in inputs.into_iter().enumerate() {
+        let reply = runtime.block_on(input.receive()).unwrap().wire_json();
+        assert_eq!(reply.get("error").is_some(), index == 8);
+    }
+    for input in human { assert!(runtime.block_on(input.receive()).unwrap().wire_json().get("error").is_none()); }
+    assert_eq!(h.server.state.human.pointer.current_location(), (60.0, 30.0).into());
+    assert!(h.server.state.agent.held.is_empty());
+    assert!(h.server.state.injection.sequences.is_empty());
+}
+
+#[test]
 fn agent_motion_burst_coalesces_without_crossing_buttons_or_human_motion() {
     let (mut h, ingress, runtime, human_pointer, alpha, _) = two_windows();
     let (_, _, agent_pointer) = bind_agent_devices(&mut h);

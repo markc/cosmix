@@ -582,6 +582,27 @@ fn agent_key_before_popup_first_buffer_refuses_the_actual_unmapped_destination()
 }
 
 #[test]
+fn popup_handle_retirement_drops_dead_root_actions_but_preserves_fresh_live_root_actions() {
+    let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
+    let (seat, _, _) = bind_agent_devices(&mut h);
+    let open = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A));
+    assert_eq!(inject(&mut h, &ingress, &runtime, open).0, 0);
+    let serial = h.server.state.agent.last_keyboard_action.as_ref().unwrap().0;
+    map_test_popup_on_seat(&mut h, Some((seat, serial.into())));
+    let old_root = h.server.state.surfaces[&alpha].role.wl_surface().clone();
+    let next_root = h.server.state.surfaces[&beta].role.wl_surface().clone();
+    h.server.state.agent.last_keyboard_action = Some((serial, old_root));
+    h.server.state.agent.last_pointer_action = Some((serial, next_root.clone()));
+    h.server.state.surfaces.get_mut(&alpha).unwrap().mapped = false;
+    // Isolate handle retirement from subsequent focus reconciliation, which
+    // might otherwise hide a stale action restored by this helper itself.
+    h.server.state.retire_agent_popup_handles();
+    assert!(h.server.state.agent.last_keyboard_action.is_none());
+    assert_eq!(h.server.state.agent.last_pointer_action, Some((serial, next_root)));
+    assert!(h.server.state.agent.popup_grab.is_none());
+}
+
+#[test]
 fn agent_submenu_destruction_keeps_keys_on_the_live_parent_menu() {
     for keep_keyboard_grab in [true, false] {
         let (mut h, ingress, runtime, _, alpha, _) = two_windows();
