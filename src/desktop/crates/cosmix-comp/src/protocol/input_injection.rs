@@ -691,6 +691,17 @@ impl WaylandState {
     }
 
     /// `release_all`: release everything injection holds, and only that.
+    pub(super) fn release_agent_device_holds(&mut self, keyboard: bool) {
+        let holds = self.agent.held.owners.keys().copied()
+            .filter(|hold| matches!(hold, Hold::Key(_)) == keyboard)
+            .collect();
+        let reconciling = std::mem::replace(&mut self.injection.reconciling, true);
+        self.release_holds(SeatKind::Agent, holds, monotonic_millis());
+        self.agent.held.owners.retain(|hold, _| matches!(hold, Hold::Key(_)) != keyboard);
+        self.injection.reconciling = reconciling;
+    }
+
+    /// `release_all`: release everything injection holds, and only that.
     fn release_injected(&mut self, seat: SeatKind, time: u32) {
         let holds = std::mem::take(&mut self.comp_seat_mut(seat).held);
         self.release_holds(seat, holds.owners.into_keys().collect(), time);

@@ -68,7 +68,7 @@ fn legacy_sequence_cleanup_does_not_make_it_an_agent_sequence() {
     ]), sender, Instant::now());
     h.server.state.cancel_agent_sequences();
     assert_eq!(h.server.state.injection.sequences.len(), 1);
-    h.server.event_loop.dispatch(Some(Duration::from_millis(20)), &mut h.server.state).unwrap();
+    finish_test_sequences(&mut h);
     let reply = runtime.block_on(receiver).unwrap().wire_json();
     assert!(reply.get("error").is_none(), "{reply}");
     assert!(h.server.state.human.held.is_empty());
@@ -80,6 +80,14 @@ fn device_key_events(traffic: &[(u32, u16, Vec<u8>)], keyboard: u32) -> Vec<(u32
         .filter(|(object, opcode, body)| *object == keyboard && *opcode == 3 && body.len() >= 16)
         .map(|(_, _, body)| (word(body, 2), word(body, 3)))
         .collect()
+}
+
+fn finish_test_sequences(h: &mut KeybindingHarness) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !h.server.state.injection.sequences.is_empty() {
+        assert!(Instant::now() < deadline, "sequence did not finish");
+        h.server.dispatch_cycle(Some(Duration::from_millis(5))).unwrap();
+    }
 }
 
 #[test]
@@ -361,6 +369,45 @@ fn agent_vt_switch_and_unmap_clear_holds_and_focus() {
     h.server.state.recompute_effective_visibility();
     assert!(h.server.state.agent.keyboard.current_focus().is_none());
     assert!(h.server.state.agent.held.is_empty());
+}
+
+#[test]
+fn destroying_agent_popup_preserves_queued_parent_input() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    let (seat, keyboard, _) = bind_agent_devices(&mut h);
+    let press = agent_target(&h, &alpha, InputOp::PointerButton {
+        button: BTN_LEFT, action: PressAction::Press,
+    });
+    assert_eq!(inject(&mut h, &ingress, &runtime, press).0, 0);
+    let serial = h.server.state.agent.pointer.with_grab(|serial, _| serial).unwrap();
+    let (popup_surface, popup) = map_test_popup_on_seat(&mut h, Some((seat, serial.into())));
+    let layout = h.server.state.surfaces[&popup_surface].layout;
+    let pointer = h.server.state.agent.pointer.clone();
+    let surface = h.server.state.surfaces[&popup_surface].role.wl_surface().clone();
+    pointer.motion(&mut h.server.state, Some((surface.into(), (f64::from(layout.x), f64::from(layout.y)).into())), &MotionEvent {
+        location: (f64::from(layout.x) + 1.0, f64::from(layout.y) + 1.0).into(),
+        serial: SERIAL_COUNTER.next_serial(), time: monotonic_millis(),
+    });
+    let next = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_B));
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    h.server.state.start_long_op(crate::port::LongOp::Sequence(vec![
+        step("comp.input.pointer.button", on_agent(InputOp::PointerButton {
+            button: BTN_LEFT, action: PressAction::Both,
+        }), 0),
+        step("comp.input.key", next, 20),
+    ]), sender, Instant::now());
+    let _ = h.sync();
+    send_request(&mut h.client, popup, 0, &[]);
+    send_request(&mut h.client, popup - 1, 0, &[]); // xdg_surface
+    send_request(&mut h.client, popup_surface.protocol_id(), 0, &[]);
+    h.dispatch_client();
+    assert_eq!(h.server.state.injection.sequences.len(), 1);
+    assert!(h.server.state.agent.pointer.current_focus().is_none());
+    assert_eq!(h.server.state.agent.keyboard.current_focus().and_then(|target| target.owned_surface()).map(|s| s.id()), Some(alpha));
+    finish_test_sequences(&mut h);
+    let reply = runtime.block_on(receiver).unwrap().wire_json();
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert!(device_key_events(&h.sync(), keyboard).contains(&(KEY_B, 1)));
 }
 
 #[test]

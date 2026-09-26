@@ -295,25 +295,31 @@ impl WaylandState {
     }
 
     pub(super) fn reconcile_agent_focus(&mut self) {
-        let invalid = [
-            self.agent
-                .keyboard
-                .current_focus()
-                .and_then(|target| target.owned_surface()),
-            self.agent
-                .pointer
-                .current_focus()
-                .and_then(|target| target.owned_surface()),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|surface| {
+        let invalid = |surface: &WlSurface| {
             self.surfaces
                 .get(&surface.id())
                 .is_none_or(|record| !self.agent_tree_mapped(record))
-        });
-        if invalid {
-            self.clear_agent_input();
+        };
+        let keyboard_dead = self.agent.keyboard.current_focus()
+            .and_then(|target| target.owned_surface()).as_ref().is_some_and(&invalid);
+        let pointer_dead = self.agent.pointer.current_focus()
+            .and_then(|target| target.owned_surface()).as_ref().is_some_and(&invalid);
+        let parent = self.agent.keyboard_root.clone().filter(|surface| !invalid(surface));
+        if pointer_dead {
+            let pointer = self.agent.pointer.clone();
+            pointer.unset_grab_without_focus_restore(self, SERIAL_COUNTER.next_serial(), monotonic_millis());
+            self.release_agent_device_holds(false);
+            pointer.motion(self, None, &MotionEvent {
+                location: pointer.current_location(),
+                serial: SERIAL_COUNTER.next_serial(), time: monotonic_millis(),
+            });
+            pointer.frame(self);
+        }
+        if keyboard_dead {
+            let keyboard = self.agent.keyboard.clone();
+            keyboard.unset_grab(self);
+            if parent.is_none() { self.release_agent_device_holds(true); }
+            keyboard.set_focus(self, parent.map(SeatFocusTarget::Wayland), SERIAL_COUNTER.next_serial());
         }
     }
 

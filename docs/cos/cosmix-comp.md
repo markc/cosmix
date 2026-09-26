@@ -1098,8 +1098,10 @@ Eight sequence permits are available; admission beyond that returns `busy`.
 
 Lock entry, VT switching, session pause and input-authority loss clear agent
 holds, grabs and focus and cancel sequences using the agent seat with
-`input_cleared`. Unmapping or destroying an agent-focused tree also clears its
-input without human focus arbitration. Unlock reconciliation samples human
+`input_cleared`. Surface loss is reconciled per device without cancelling sequences:
+a dead pointer target loses pointer focus and pointer holds; a dead keyboard
+target returns to its surviving canonical parent, or loses keyboard focus and
+key holds if no parent survives. This does not arbitrate human focus. Unlock reconciliation samples human
 pressed state only. Agent cleanup does not reset idle notifications.
 
 `input.host.passthrough` remains nested-only (`unknown_path` on KMS) and controls

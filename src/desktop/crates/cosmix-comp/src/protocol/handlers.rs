@@ -2132,6 +2132,7 @@ impl SeatHandler for WaylandState {
         if seat != &self.human.seat {
             if seat == &self.agent.seat {
                 invalidate_keyboard_action(&mut self.agent.last_keyboard_action);
+                self.agent.keyboard_root = focused_root;
             }
             return;
         }

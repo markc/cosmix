@@ -40,6 +40,8 @@ pub(super) struct CompSeat {
     pub keyboard: KeyboardHandle<WaylandState>,
     pub pointer: PointerHandle<WaylandState>,
     pub last_keyboard_action: Option<(Serial, WlSurface)>,
+    /// Surviving canonical parent used when an agent popup loses its surface.
+    pub keyboard_root: Option<WlSurface>,
     #[cfg(feature = "bus")]
     pub last_input_us: Option<u64>,
     /// Agent pointer coordinates become known only when its delivery path moves it.

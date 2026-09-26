@@ -3360,6 +3360,7 @@ impl ProtocolServer {
                 #[cfg(feature = "bus")]
                 pointer_position: None,
                 last_keyboard_action: None,
+                keyboard_root: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
                 #[cfg(feature = "bus")]
@@ -3379,6 +3380,7 @@ impl ProtocolServer {
                 #[cfg(feature = "bus")]
                 pointer_position: None,
                 last_keyboard_action: None,
+                keyboard_root: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
                 #[cfg(feature = "bus")]

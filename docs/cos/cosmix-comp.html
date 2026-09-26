@@ -1460,8 +1460,10 @@ Other owners' holds remain. Caller cancellation also releases the run's holds.
 Eight sequence permits are available; admission beyond that returns <code>busy</code>.</p>
 <p>Lock entry, VT switching, session pause and input-authority loss clear agent
 holds, grabs and focus and cancel sequences using the agent seat with
-<code>input_cleared</code>. Unmapping or destroying an agent-focused tree also clears its
-input without human focus arbitration. Unlock reconciliation samples human
+<code>input_cleared</code>. Surface loss is reconciled per device without cancelling sequences:
+a dead pointer target loses pointer focus and pointer holds; a dead keyboard
+target returns to its surviving canonical parent, or loses keyboard focus and
+key holds if no parent survives. This does not arbitrate human focus. Unlock reconciliation samples human
 pressed state only. Agent cleanup does not reset idle notifications.</p>
 <p><code>input.host.passthrough</code> remains nested-only (<code>unknown_path</code> on KMS) and controls
 the <strong>human</strong> host path. Setting it false suppresses host keys, motion, buttons
