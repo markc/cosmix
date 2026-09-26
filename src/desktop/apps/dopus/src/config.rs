@@ -9,10 +9,16 @@ use cosmix_dopus_core::{ConfigFile, DOpusConfig};
 
 /// Load `config.conf.mix` from `dir` (the core handles missing files,
 /// malformed files and foreign schemas). Without a directory there is
-/// nothing to load and nothing to save into.
+/// nothing to load and nothing to save into. The directory is created when
+/// missing: `write_atomic` does not create parents (cosmix-lib-files'
+/// contract), so an uncreated dir would otherwise turn every settle into a
+/// silent ENOENT — the write failure surfaces per-save as a Status line.
 pub fn load(dir: Option<&Path>) -> (DOpusConfig, Option<ConfigFile>) {
     match dir {
         Some(dir) => {
+            if let Err(error) = std::fs::create_dir_all(dir) {
+                eprintln!("cosmix-dopus: cannot create config dir {}: {error}", dir.display());
+            }
             let (config, file) = ConfigFile::load(dir);
             (config, Some(file))
         }
