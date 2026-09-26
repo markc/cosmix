@@ -75,9 +75,9 @@ pub enum PutMode {
     /// one (btrfs, XFS `reflink=1`, OpenZFS ≥ 2.3), then
     /// `copy_file_range` (block clone on OpenZFS 2.2, an ordinary
     /// copy elsewhere), then a userspace copy. Never fails merely
-    /// because the filesystem lacks reflink support — `EOPNOTSUPP`,
-    /// `EXDEV`, `EINVAL` and `ENOSYS` all fall through to the next
-    /// option.
+    /// because the kernel path did not work — any error from `FICLONE`
+    /// or `copy_file_range` falls through to the next option (OpenZFS
+    /// with block cloning off answers `EPERM`, not `EOPNOTSUPP`).
     Reflink,
     /// Hard-link the source inode into the CAS — no bytes copied.
     /// Only for publishers that promise the source path immutable
@@ -259,20 +259,22 @@ fn hash_file(p: &Path) -> Result<(BlobHash, u64)> {
     Ok((BlobHash(hasher.finalize().into()), size))
 }
 
-/// Errnos on which `Reflink` falls through to the next copy method
-/// instead of failing: the filesystem or kernel merely lacks
-/// server-side copy. Anything else is a real error.
-fn is_reflink_fallthrough(e: &std::io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::ENOSYS)
-    )
-}
-
 /// Kernel-side copy for [`PutMode::Reflink`]: `FICLONE` reflink
-/// first, `copy_file_range` second. Returns `Ok(false)` when the
-/// filesystem offers neither and the caller should finish with a
-/// userspace copy; `Err` only for real failures.
+/// first, `copy_file_range` second. Returns `Ok(false)` when neither
+/// completed and the caller should finish with a userspace copy.
+///
+/// The kernel path is best-effort by contract, so *any* failure falls
+/// through — not an errno allowlist. The allowlist version
+/// (`EOPNOTSUPP`/`EXDEV`/`EINVAL`/`ENOSYS`) failed on the build
+/// cluster: OpenZFS answers `FICLONE` with `EPERM` when block cloning
+/// is disabled (`zfs_bclone_enabled=0`, the 2.2.x default), and a
+/// container's seccomp profile can refuse the ioctl outright. Whatever
+/// the errno, the userspace copy that follows either succeeds or
+/// surfaces the real error itself — so nothing is hidden by falling
+/// through, and something is lost by not doing so.
+///
+/// Only `Err` for the rewind/truncate that resets the staging file: if
+/// that fails the fallback cannot start clean and the put must stop.
 fn try_kernel_copy(src: &mut File, dst: &mut File) -> std::io::Result<bool> {
     // SAFETY: both fds are live files; FICLONE takes the source fd as
     // its ioctl argument and clones from it into `dst`.
@@ -286,23 +288,18 @@ fn try_kernel_copy(src: &mut File, dst: &mut File) -> std::io::Result<bool> {
     if ret == 0 {
         return Ok(true);
     }
-    let e = std::io::Error::last_os_error();
-    if !is_reflink_fallthrough(&e) {
-        return Err(e);
+    // FICLONE is atomic: on failure nothing was written and neither fd
+    // moved, so copy_file_range starts from offset 0.
+    if copy_file_range_all(src, dst).is_ok() {
+        return Ok(true);
     }
-    match copy_file_range_all(src, dst) {
-        Ok(()) => Ok(true),
-        Err(e) if is_reflink_fallthrough(&e) => {
-            // Restart the userspace fallback from a clean slate: a
-            // fall-through mid-copy leaves both fds advanced and the
-            // staging file partially written.
-            src.rewind()?;
-            dst.set_len(0)?;
-            dst.rewind()?;
-            Ok(false)
-        }
-        Err(e) => Err(e),
-    }
+    // Restart the userspace fallback from a clean slate: a failure
+    // mid-copy leaves both fds advanced and the staging file partially
+    // written.
+    src.rewind()?;
+    dst.set_len(0)?;
+    dst.rewind()?;
+    Ok(false)
 }
 
 /// `copy_file_range(2)` loop using (and advancing) the fds' own
@@ -547,10 +544,13 @@ mod tests {
     #[test]
     fn put_path_reflink_falls_through_to_copy() {
         // On a filesystem without reflink (tmpfs, ext4, …) FICLONE and
-        // copy_file_range report a fall-through errno and the put must
-        // still succeed via the userspace copy; on one with reflink
-        // the kernel path runs instead. Either way the landed bytes
-        // hash to the source — that is the contract.
+        // copy_file_range fail and the put must still succeed via the
+        // userspace copy; on one with reflink the kernel path runs
+        // instead. The errno is deliberately not inspected: OpenZFS
+        // with block cloning disabled answers EPERM (caught on the
+        // build cluster, ZFS-in-LXC, 2026-09-26), which no allowlist
+        // anticipated. Either way the landed bytes hash to the source
+        // — that is the contract.
         let d = root();
         let bytes = pseudo_random(1024 * 1024 + 7);
         let src = d.path().join("src.bin");
