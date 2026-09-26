@@ -1,19 +1,22 @@
-//! Window composition: path header (navigation) · sort headers · the
-//! [`rows::FileList`] · the status bar. Built-ins everywhere except the list;
-//! every colour from the compiled tokens via [`Look`].
+//! Window composition: the Places sidebar · left pane · divider · right
+//! pane, over the status bar — [`places`] · [`panes::pane_column`] (pane
+//! header, [`location`] bar, sort header, [`rows::FileList`]) ·
+//! [`panes::Divider`] · [`status::bar`]. Built-ins everywhere except the
+//! list and the divider; every colour from the compiled tokens via [`Look`].
 
+pub mod location;
+pub mod panes;
+pub mod places;
 pub mod rows;
 pub mod status;
 
-use iced::widget::{button, column, container, image, row, text, Space};
-use iced::{Border, Element, Length};
+use iced::widget::{column, container, row};
+use iced::{Element, Length};
 
-use cosmix_actions::{filemgr, ActionId};
-use cosmix_dopus_core::{PaneModel, VisibleRow};
-use cosmix_iced_widgets::Tokens;
+use cosmix_dopus_core::{PaneId, PaneModel, VisibleRow};
 
 use crate::app::Msg;
-use crate::icons::{self, Icons};
+use crate::icons::Icons;
 use crate::theme::Chrome;
 
 /// What the view draws with: the compiled tokens plus the resolved fonts.
@@ -22,7 +25,7 @@ use crate::theme::Chrome;
 /// `'static` instead of borrowing a local `Look`).
 #[derive(Debug, Clone, Copy)]
 pub struct Look {
-    pub tokens: Tokens,
+    pub tokens: cosmix_iced_widgets::Tokens,
     pub chrome: Chrome,
     pub ui_font: iced::Font,
     pub mono_font: iced::Font,
@@ -31,7 +34,7 @@ pub struct Look {
 }
 
 impl Look {
-    /// A full-width strip (header, status bar) in the given token colours.
+    /// A full-width strip (headers, status bar) in the given token colours.
     pub fn strip(
         &self,
         background: iced::Color,
@@ -45,149 +48,85 @@ impl Look {
     }
 }
 
-/// Header height, logical px.
+/// Pane header height (nav strip + location bar), logical px.
 pub const HEADER_H: f32 = 34.0;
 /// Sort-header height.
 pub const SORT_H: f32 = 26.0;
 /// Status bar height.
 pub const STATUS_H: f32 = 26.0;
 
-/// The whole window: header strips, the listing, the status bar.
+/// The whole window: sidebar · left pane · divider · right pane, then the
+/// status bar. `split_ratio` (the core's live value) quantises the pane
+/// Fill portions; `editing` is `(pane, real path text)` while a location
+/// bar is being edited; the listed `rows` are the app's per-pane snapshots.
+// The window's whole projection in one call (ced's editor/draw.rs precedent
+// for the allow).
+#[allow(clippy::too_many_arguments)]
 pub fn root<'a>(
     look: Look,
     icons: &'a Icons,
     tint: &'a str,
-    pane: &'a PaneModel,
-    rows: &'a [VisibleRow],
+    active: PaneId,
+    split_ratio: f32,
+    left: &'a PaneModel,
+    right: &'a PaneModel,
+    left_rows: &'a [VisibleRow],
+    right_rows: &'a [VisibleRow],
+    editing: Option<(PaneId, &'a str)>,
     info: &'a str,
 ) -> Element<'a, Msg> {
+    let (left_edit, right_edit) = match editing {
+        Some((PaneId::Left, text)) => (Some(text), None),
+        Some((PaneId::Right, text)) => (None, Some(text)),
+        None => (None, None),
+    };
+    let (active_pane, _active_rows) = match active {
+        PaneId::Left => (left, left_rows),
+        PaneId::Right => (right, right_rows),
+    };
+    // The ratio quantised to whole Fill portions out of 100 (the drag clamp
+    // already keeps it in 0.1–0.9, so both sides get at least 10).
+    let left_portion = (split_ratio.clamp(panes::SPLIT_MIN, panes::SPLIT_MAX) * 100.0).round() as u16;
     column![
-        header(look, icons, tint, pane),
-        sort_header(look, pane),
-        rows::FileList::new(rows, pane.selected.as_deref(), &pane.path, &pane.expanded, icons, tint, look),
-        status::bar(look, pane, info),
+        row![
+            places::sidebar(look, icons, tint, active, active_pane),
+            panes::pane_column(
+                look, icons, tint, PaneId::Left, left, left_rows, left_portion, active == PaneId::Left, left_edit,
+            ),
+            panes::Divider::new(&look),
+            panes::pane_column(
+                look, icons, tint, PaneId::Right, right, right_rows, 100 - left_portion, active == PaneId::Right,
+                right_edit,
+            ),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Start),
+        status::bar(look, active_pane, info),
     ]
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
 }
 
-/// The navigation strip: back / forward / parent / home / refresh /
-/// toggle-hidden icon buttons, then the sanitised path.
-fn header<'a>(look: Look, icons: &'a Icons, tint: &'a str, pane: &'a PaneModel) -> Element<'a, Msg> {
-    let icon_button = |icon: icons::Icon, action: ActionId| {
-        let style = button_look(&look);
-        button(image_widget(icons, tint, icon))
-            .padding(4)
-            .on_press_maybe(
-                availability(pane, action)
-                    .then_some(Msg::Actions(vec![action])),
-            )
-            .style(style)
-    };
-    container(
-        row![
-            icon_button(icons::Icon::ArrowLeft, filemgr::NAV_BACK),
-            icon_button(icons::Icon::ArrowRight, filemgr::NAV_FORWARD),
-            icon_button(icons::Icon::ArrowUp, filemgr::NAV_PARENT),
-            icon_button(icons::Icon::House, filemgr::NAV_HOME),
-            icon_button(icons::Icon::Refresh, filemgr::VIEW_REFRESH),
-            icon_button(
-                if pane.show_hidden { icons::Icon::EyeOff } else { icons::Icon::Eye },
-                filemgr::VIEW_TOGGLE_HIDDEN
-            ),
-            text(cosmix_dopus_core::sanitise_display_path(&pane.path))
-                .font(look.mono_font)
-                .size(look.mono_px)
-                .color(look.chrome.secondary_text),
-        ]
-        .spacing(4)
-        .align_y(iced::Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(HEADER_H))
-    .padding([0, 8])
-    .align_y(iced::Alignment::Center)
-    .style(look.strip(look.chrome.secondary, look.chrome.secondary_text))
-    .into()
-}
-
-/// A directory can only be left when there is somewhere to go; the rest are
-/// always offered (the core re-checks and status-lines the no-ops).
-fn availability(pane: &PaneModel, action: ActionId) -> bool {
-    if action == filemgr::NAV_PARENT {
-        return pane.path.parent().is_some();
-    }
-    true
-}
-
 /// A ghost button style over the secondary strip: quiet until hovered. The
 /// colours are `Copy` tokens, so the closure captures values and is
 /// `'static` (the ced `chrome::Look::flat` shape).
-fn button_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
+pub fn button_look(look: &Look) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style + 'static {
     let (text, hover, radius) = (look.chrome.secondary_text, look.tokens.muted_surface, look.tokens.radius);
-    move |_theme, status| button::Style {
+    move |_theme, status| iced::widget::button::Style {
         background: match status {
-            button::Status::Hovered | button::Status::Pressed => Some(hover.into()),
+            iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed => Some(hover.into()),
             _ => None,
         },
         text_color: text,
-        border: Border { radius: radius.into(), ..Default::default() },
+        border: iced::Border { radius: radius.into(), ..Default::default() },
         ..Default::default()
     }
 }
 
 /// A cached icon handle as an iced image widget, at the header's 16 px; a
 /// blank 16 px filler while the rasterisation is still in flight.
-fn image_widget(icons: &Icons, tint: &str, icon: icons::Icon) -> Element<'static, Msg> {
-    match icons.get(icon, tint, icons::RASTER_PX) {
-        Some(handle) => image(handle).width(Length::Fixed(16.0)).height(Length::Fixed(16.0)).into(),
-        None => container(Space::new())
-            .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0))
-            .into(),
-    }
-}
-
-/// The sort headers: the three columns as buttons publishing the
-/// `view.sort-*` actions; the active column shows its direction. The two
-/// secondary columns are fixed-width, mirroring the row layout's right edge
-/// ([`rows::SIZE_W`] / [`rows::MODIFIED_W`]).
-fn sort_header<'a>(look: Look, pane: &'a PaneModel) -> Element<'a, Msg> {
-    let header_button = |label: &str, action: ActionId, column_sort| {
-        let style = button_look(&look);
-        let active = pane.sort == column_sort;
-        let label = if active {
-            format!("{label} {}", if pane.ascending { "↑" } else { "↓" })
-        } else {
-            label.to_owned()
-        };
-        button(
-            text(label)
-                .font(look.ui_font)
-                .size(look.px * 0.85)
-                .color(if active { look.chrome.secondary_text } else { look.tokens.muted_text }),
-        )
-        .padding([2, 6])
-        .on_press(Msg::Actions(vec![action]))
-        .style(style)
-    };
-    container(
-        row![
-            header_button("Name", filemgr::VIEW_SORT_NAME, cosmix_dopus_core::SortColumn::Name),
-            container(Space::new()).width(Length::Fill).height(Length::Fixed(0.0)),
-            header_button("Size", filemgr::VIEW_SORT_SIZE, cosmix_dopus_core::SortColumn::Size)
-                .width(Length::Fixed(rows::SIZE_W)),
-            container(Space::new()).width(Length::Fixed(rows::GAP)).height(Length::Fixed(0.0)),
-            header_button("Modified", filemgr::VIEW_SORT_MODIFIED, cosmix_dopus_core::SortColumn::Modified)
-                .width(Length::Fixed(rows::MODIFIED_W + 4.0)),
-        ]
-        .align_y(iced::Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(SORT_H))
-    .padding([0, 8])
-    .align_y(iced::Alignment::Center)
-    .style(look.strip(look.chrome.secondary, look.chrome.secondary_text))
-    .into()
+pub fn image_widget(icons: &Icons, tint: &str, icon: crate::icons::Icon) -> Element<'static, Msg> {
+    places::image_widget(icons, tint, icon)
 }

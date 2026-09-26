@@ -1,21 +1,24 @@
 //! `cosmix-dopus` — the CosMix twin-pane file manager (iced), the windowed
-//! frontend of the headless `cosmix-dopus-core`. P1: one live pane.
+//! frontend of the headless `cosmix-dopus-core`. P2: twin panes.
 //! `cosmix-dopus [PATH…]` starts the window registered on the Bus as
-//! `dopus`; a second launch forwards its paths to the running instance and
-//! exits (the instance accepts and ignores paths until P2).
+//! `dopus`, the first PATH in the left pane and the second in the right; a
+//! second launch forwards its paths to the running instance and exits.
 
 use cosmix_dopus::dirs::{AppDirs, COMPONENT};
 
-const HELP: &str = "cosmix-dopus — the CosMix twin-pane file manager (iced; P1: one live pane)\n\
+const HELP: &str = "cosmix-dopus — the CosMix twin-pane file manager (iced; twin panes,\n\
+Places sidebar, per-pane location bars)\n\
 Usage: cosmix-dopus [PATH…]\n\
-  --headless        no window: the core and the `dopus` Bus port only
-                    (PATH… arguments are currently ignored)\n\
+  PATH…             the first PATH opens in the left pane, the second in\n\
+                    the right; extras are ignored\n\
+  --headless        no window: the twin-pane core and the `dopus` Bus port\n\
+                    only (PATH… opens the panes as above)\n\
   --service NAME    register as NAME instead of `dopus` (tests)\n\
   --noded-url URL   Bus broker endpoint (default: node.conf.mix's noded_url)\n\
   --print-config    print the resolved configuration and exit\n\
   --version         print version and build hash, and nothing else\n\
 Bus: serves `dopus.*` (schema dopus.v1); file-mutating actions stay\n\
-keyboard-only in P1 and are refused on the Bus (FORBIDDEN).";
+keyboard-only in P2 and are refused on the Bus (FORBIDDEN).";
 
 struct Args {
     headless: bool,
@@ -108,10 +111,10 @@ fn main() {
     let paths = absolute(args.paths);
     let result = if args.headless {
         // Headless dopus IS the Bus port: no broker, no process.
-        cosmix_dopus::headless::run(config, config_file, dirs, &args.service, &noded_url)
+        cosmix_dopus::headless::run(config, config_file, dirs, &args.service, &noded_url, &paths)
     } else {
-        // Single instance: a running dopus takes the paths (which P1 accepts
-        // and ignores; P2 gives them panes).
+        // Single instance: a running dopus takes the paths (first → left
+        // pane, second → right).
         if cosmix_dopus::bus::probe_running(&noded_url, &args.service) {
             if paths.is_empty() {
                 eprintln!("cosmix-dopus: already running as {}", args.service);

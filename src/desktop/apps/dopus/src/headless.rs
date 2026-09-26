@@ -1,7 +1,6 @@
-//! Headless dopus: the same core and the same Bus surface, no window. The
-//! P1 shape — a real process neighbours can `dopus.state` and drive
-//! `dopus.action` against — so the verb layer is proven before the twin-pane
-//! window lands in P2. The windowed app and this loop share
+//! Headless dopus: the same core and the same Bus surface, no window — a
+//! real twin-pane process neighbours can `dopus.state` (two panes) and drive
+//! `dopus.action` against. The windowed app and this loop share
 //! [`verbs::serve_command`]; only the transports differ.
 //!
 //! Law wiring: a drainer thread owns `on_event`/`tick` exclusively (law 2:
@@ -29,15 +28,16 @@ use crate::verbs::{self, ServerMeta, Served};
 const DRAIN_TICK: Duration = Duration::from_millis(200);
 
 /// What the shared law-wiring does with the core's derived events: answer
-/// every dialog (law 3), refuse `OpenFile` with a log line (law 4's P1
-/// posture). Shared verbatim by the windowed app's handler.
+/// every dialog (law 3), refuse `OpenFile` with a log line (law 4's P2
+/// posture — no file-operations surface until P3). Shared verbatim by the
+/// windowed app's handler.
 pub fn answer_derived(core: &mut DopusCore, events: Vec<CoreEvent>, log: impl Fn(String)) {
     for event in events {
         match event {
             CoreEvent::ConfirmRequested { token, .. } => core.confirm(token, ConfirmAnswer::No),
             CoreEvent::PromptRequested { token, .. } => core.prompt_text(token, None),
             CoreEvent::OpenFile(path) => log(format!(
-                "refusing OpenFile({}), no file-operations surface in P1",
+                "refusing OpenFile({}), no file-operations surface until P3",
                 cosmix_dopus_core::sanitise_display_path(&path)
             )),
             CoreEvent::Status { .. }
@@ -59,14 +59,18 @@ fn lock(core: &Mutex<DopusCore>) -> MutexGuard<'_, DopusCore> {
     core.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Run headless until `dopus.quit`. The Bus is mandatory here — a headless
-/// dopus with nobody to talk to is just a memory leak.
+/// Run headless until `dopus.quit`. `paths` are the argv `dopus.open` PATHs:
+/// the first navigates the left pane, the second the right (extras logged and
+/// ignored) — applied before the Bus comes up, so the first `dopus.state`
+/// already shows them. The Bus is mandatory here — a headless dopus with
+/// nobody to talk to is just a memory leak.
 pub fn run(
     config: DOpusConfig,
     config_file: Option<ConfigFile>,
     dirs: Option<AppDirs>,
     service: &str,
     noded_url: &str,
+    paths: &[String],
 ) -> anyhow::Result<()> {
     let keymap_path: Option<PathBuf> = dirs.as_ref().map(|d| d.keymap_file());
     let keymap = keys::load(keymap_path.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -82,7 +86,8 @@ pub fn run(
         actions: verbs::action_table(&keymap),
     };
 
-    let (core, receiver) = DopusCore::new(config, config_file);
+    let (mut core, receiver) = DopusCore::new(config, config_file);
+    verbs::apply_open_paths(&mut core, paths);
     let core = Arc::new(Mutex::new(core));
     let (bus, mut deliveries) = bus::spawn(service, noded_url).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -125,7 +130,7 @@ pub fn run(
                     10,
                     serde_json::to_string(&verbs::Refusal {
                         error_code: verbs::code::UNAVAILABLE.to_owned(),
-                        message: "theme selection needs the windowed app (P1 headless paints nothing)".to_owned(),
+                        message: "theme selection needs the windowed app (headless paints nothing)".to_owned(),
                         reason: Some("headless".to_owned()),
                     })
                     .unwrap_or_default(),
@@ -153,5 +158,9 @@ pub fn run(
         }
     });
     bus.quit();
+    // Reply-then-exit: the quit reply is flushed by the bus thread's
+    // drain-before-break; joining it (bounded) means the reply is on the
+    // wire before this process disappears under the caller.
+    bus.wait_done(std::time::Duration::from_secs(3));
     Ok(())
 }

@@ -77,6 +77,20 @@ impl AppDirs {
     }
 }
 
+/// Expand a leading `~` (or `~/…`) to the user's home: the location bar and
+/// `dopus.open` accept both spellings. `~user` is left untouched — there is
+/// no passwd lookup behind a file manager's address field. The core's
+/// `home_directory` is the one source of the home path.
+pub fn expand_tilde(value: &str) -> PathBuf {
+    if value == "~" {
+        return cosmix_dopus_core::home_directory();
+    }
+    match value.strip_prefix("~/") {
+        Some(rest) => cosmix_dopus_core::home_directory().join(rest),
+        None => PathBuf::from(value),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +118,17 @@ mod tests {
         assert_eq!(AppDirs::resolve_with("dopus", env(rel)).unwrap().root(), Path::new("/h/.local/state/cosmix/apps/dopus"));
         assert!(AppDirs::resolve_with("../x", env(&[("HOME", "/h")])).is_none());
         assert!(AppDirs::resolve_with("", env(&[("HOME", "/h")])).is_none());
+    }
+
+    #[test]
+    fn tilde_expands_only_a_bare_or_slashed_tilde() {
+        // Edition 2024: env mutation is unsafe because other threads may
+        // read it. Only this test reads the process HOME (the AppDirs tests
+        // inject their env), and cargo runs it in isolation here.
+        unsafe { std::env::set_var("HOME", "/h") };
+        assert_eq!(expand_tilde("~"), PathBuf::from("/h"));
+        assert_eq!(expand_tilde("~/docs"), PathBuf::from("/h/docs"));
+        assert_eq!(expand_tilde("~user/x"), PathBuf::from("~user/x"));
+        assert_eq!(expand_tilde("/abs"), PathBuf::from("/abs"));
     }
 }

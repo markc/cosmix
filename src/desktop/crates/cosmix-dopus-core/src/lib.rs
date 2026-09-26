@@ -62,6 +62,7 @@ pub use events::{ConfirmAnswer, CoreEvent, PromptKind};
 pub use model::{
     AvailabilitySnapshot, DopusCore, DropAction, DropActionMask, DropModifiers, FileEntry,
     NavigationHistory, PaneId, PaneModel, VisibleRow, format_child_count, format_modified_at,
-    format_size, pane_summary, sanitise_display_path, sanitise_display_text, validate_filename,
+    format_size, home_directory, pane_summary, places, sanitise_display_path,
+    sanitise_display_text, validate_filename,
 };
 pub use ops::{FileOpKind, FileOperation};

@@ -1,8 +1,10 @@
 //! The iced application, in the shape of ced's `app.rs`: state = the
-//! [`DopusCore`] plus chrome; `view` composes header · sort headers ·
-//! [`rows::FileList`](crate::view::rows::FileList) · status bar. A normal xdg
-//! toplevel, `application_id = "dev.cosmix.dopus"`, SingleThread executor,
-//! tiny-skia.
+//! [`DopusCore`] plus chrome; `view` composes the Places sidebar · the twin
+//! [`panes::pane_column`](crate::view::panes) columns (pane header ·
+//! [`location`](crate::view::location) bar · sort headers ·
+//! [`rows::FileList`](crate::view::rows::FileList)) with the draggable
+//! divider between them, and the status bar. A normal xdg toplevel,
+//! `application_id = "dev.cosmix.dopus"`, SingleThread executor, tiny-skia.
 //!
 //! Event flow (the app contract, `cosmix-dopus-core`'s seven laws):
 //! - worker replies arrive on the core's `mpsc::Receiver`; a pumper thread
@@ -13,12 +15,20 @@
 //!   heartbeat ticks when the window is idle (frames only fire on redraws),
 //!   and `quit` ticks once before exit so pending config persists.
 //! - derived `ConfirmRequested`/`PromptRequested` are answered immediately
-//!   (`No`/dismissal): P1 has no dialog surface, and law 3 forbids letting
-//!   one wedge — a P2 dialog UI replaces these arms.
+//!   (`No`/dismissal): P2 has no dialog surface, and law 3 forbids letting
+//!   one wedge — a P3 dialog UI replaces these arms.
 //! - derived `OpenFile` becomes a status line: no spawn surface until P3 —
-//!   law 4's P1 posture.
+//!   law 4's P2 posture.
 //! - sort-column switches pass `ascending: true` — law 5 (the core toggles a
 //!   same-column sort itself).
+//! - the divider drives `set_split_ratio` — law 7 (persistence derives from
+//!   core state only).
+//!
+//! Focus: the key router resolves against a real [`FocusContext`] — while a
+//! location bar is being edited the router's `focus_editable` is on, so the
+//! chord resolver routes keys into the editor (every default binding is
+//! `allow_in_editable: false`). P1 resolved `global()` everywhere; P2
+//! threads the focus.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -30,7 +40,7 @@ use iced_tiny_skia::Renderer;
 
 use cosmix_actions::{ActionId, Keymap};
 use cosmix_design::{Mode, Scheme};
-use cosmix_dopus_core::{ConfigFile, ConfirmAnswer, CoreEvent, DOpusConfig, DopusCore, PaneId, VisibleRow};
+use cosmix_dopus_core::{ConfigFile, ConfirmAnswer, CoreEvent, DOpusConfig, DopusCore, PaneId, SortColumn, VisibleRow};
 
 use crate::bus::{self, BusHandle, Delivery};
 use crate::dirs::AppDirs;
@@ -52,10 +62,27 @@ const ICON_SCALE: u32 = 2;
 pub enum Msg {
     /// From the bus thread.
     Bus(Delivery),
-    /// Resolved chords and menu entries (`view.sort-*` headers, nav icons).
+    /// Resolved chords and menu entries (nav icons, theme actions).
     Actions(Vec<ActionId>),
-    /// The listing widget's clicks.
-    Rows(rows::RowsMsg),
+    /// A pane's listing widget: the pane id rides the message (the
+    /// [`FileList`](rows::FileList) itself is pane-agnostic).
+    PaneRows(PaneId, rows::RowsMsg),
+    /// A pane-local control: activate `pane`, then act on it (the core's
+    /// pane verbs act on the active pane; this is the activate-then-act
+    /// contract the pane headers and sort headers publish).
+    Pane(PaneId, PaneOp),
+    /// Navigate `pane` to a path (Places clicks, the location bar's submit).
+    Go(PaneId, PathBuf),
+    /// Begin editing `pane`'s location bar (the bar was clicked).
+    LocationEdit(PaneId),
+    /// The location editor's text changed (the REAL path text).
+    LocationInput(String),
+    /// Enter in `pane`'s editor: navigate there.
+    LocationSubmit(PaneId),
+    /// Escape in the editor: cancel.
+    LocationCancel,
+    /// The divider moved (ratio clamped 0.1–0.9) or double-clicked (0.5).
+    Split(f32),
     /// A raw core event, back from the pumper (law 2's feed).
     Core(CoreEvent),
     /// Window edges (focus reloads the keymap; close quits).
@@ -67,14 +94,33 @@ pub enum Msg {
     Noop,
 }
 
+/// A pane-local control, applied after activating its pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneOp {
+    NavBack,
+    NavForward,
+    NavParent,
+    NavHome,
+    Refresh,
+    ToggleHidden,
+    Sort(SortColumn),
+}
+
 pub struct Dopus {
     core: DopusCore,
-    /// The listing snapshot `view` draws; refreshed after every update.
-    rows: Vec<VisibleRow>,
+    /// The per-pane listing snapshot `view` draws; refreshed after every
+    /// update so no core mutation can be drawn stale.
+    rows: [Vec<VisibleRow>; 2],
+    /// The core's live split ratio, cached for the view (the core owns it;
+    /// the divider writes through `set_split_ratio` — law 7).
+    split_ratio: f32,
+    /// The pane whose location bar is being edited, and the REAL path text
+    /// (never display-sanitised — the sanitisation law covers display only).
+    editing: Option<(PaneId, String)>,
     router: keys::SharedRouter,
     icons: Icons,
     theme: Theme,
-    /// The in-session `theme.*` selection (P1 does not persist it).
+    /// The in-session `theme.*` selection (not persisted).
     theme_override: Option<(Scheme, Mode)>,
     /// A transient message the next core status replaces.
     status: Option<String>,
@@ -86,9 +132,9 @@ pub struct Dopus {
     quitting: bool,
 }
 
-/// Run the windowed app registered on the Bus as `service`, ignoring `paths`
-/// (P1 has no open-target handling; the single-instance forward still
-/// delivers them to the running instance, which also ignores them).
+/// Run the windowed app registered on the Bus as `service`. `paths` are the
+/// forwarded `dopus.open` PATHs: the first navigates the left pane, the
+/// second the right, extras are logged and ignored (verbs::apply_open_paths).
 pub fn run(
     config: DOpusConfig,
     config_file: Option<ConfigFile>,
@@ -97,7 +143,6 @@ pub fn run(
     noded_url: &str,
     paths: &[String],
 ) -> anyhow::Result<()> {
-    let _ = paths;
     let (bus, deliveries) = match bus::spawn(service, noded_url) {
         Ok(started) => (Some(started.0), Some(started.1)),
         Err(bus::StartError::NameTaken) => {
@@ -131,10 +176,15 @@ pub fn run(
     let icons = Icons::new();
     icons.ensure(&tint, ICON_PX, ICON_SCALE);
 
-    let (core, core_events) = DopusCore::new(config, config_file);
+    let (mut core, core_events) = DopusCore::new(config, config_file);
+    // Startup `dopus.open` PATHs land in the panes before the first frame.
+    verbs::apply_open_paths(&mut core, paths);
+    let split_ratio = core.config_snapshot().split_ratio;
     let mut app = Dopus {
         core,
-        rows: Vec::new(),
+        rows: [Vec::new(), Vec::new()],
+        split_ratio,
+        editing: None,
         router,
         icons,
         theme,
@@ -147,7 +197,7 @@ pub fn run(
         tint: tint.clone(),
         quitting: false,
     };
-    app.refresh_rows();
+    app.refresh_panes();
     if let Some(note) = app.theme.notes.clone() {
         app.status = Some(format!("Theme: {note}"));
     }
@@ -281,14 +331,14 @@ fn streams() -> impl iced::futures::Stream<Item = Msg> {
     }
 }
 
-/// `dopus.actions.list`'s table: the P1 actions with their effective chords.
+/// `dopus.actions.list`'s table: the served actions with their effective chords.
 fn action_table(keymap: &Keymap) -> Vec<ActionRow> {
     verbs::action_table(keymap)
 }
 
 impl Dopus {
     fn title(&self) -> String {
-        let pane = self.core.pane(PaneId::Left);
+        let pane = self.core.pane(self.core.active());
         format!("{} — CosMix DOpus", cosmix_dopus_core::sanitise_display_path(&pane.path))
     }
 
@@ -296,7 +346,7 @@ impl Dopus {
         let task = self.dispatch(msg);
         // The view snapshot: refreshed on every message, so no core mutation
         // can be drawn stale.
-        self.refresh_rows();
+        self.refresh_panes();
         task
     }
 
@@ -304,7 +354,37 @@ impl Dopus {
         match msg {
             Msg::Bus(delivery) => self.on_delivery(delivery),
             Msg::Actions(actions) => self.on_actions(&actions),
-            Msg::Rows(msg) => self.on_rows(msg),
+            Msg::PaneRows(pane, msg) => self.on_rows(pane, msg),
+            Msg::Pane(pane, op) => self.on_pane_op(pane, op),
+            Msg::Go(pane, path) => {
+                self.core.navigate(pane, path);
+                Task::none()
+            }
+            Msg::LocationEdit(pane) => self.begin_edit(pane),
+            Msg::LocationInput(text) => {
+                if let Some((_, current)) = &mut self.editing {
+                    *current = text;
+                }
+                Task::none()
+            }
+            Msg::LocationSubmit(pane) => {
+                let text = self.editing.as_ref().map(|(_, text)| text.clone()).unwrap_or_default();
+                self.stop_editing();
+                // Leading `~` expands to home; the core re-lists and
+                // status-lines a path it cannot read.
+                self.core.navigate(pane, crate::dirs::expand_tilde(&text));
+                Task::none()
+            }
+            Msg::LocationCancel => {
+                self.stop_editing();
+                Task::none()
+            }
+            Msg::Split(ratio) => {
+                // Law 7: persistence derives from core state only — the core
+                // settles the changed ratio through its own debounce.
+                self.core.set_split_ratio(ratio.clamp(view::panes::SPLIT_MIN, view::panes::SPLIT_MAX));
+                Task::none()
+            }
             Msg::Core(event) => {
                 // Law 2: every raw event through on_event exactly once.
                 let derived = self.core.on_event(event);
@@ -336,19 +416,62 @@ impl Dopus {
         }
     }
 
-    fn refresh_rows(&mut self) {
-        self.rows = self.core.visible_rows(PaneId::Left);
+    /// Refresh the per-pane view snapshots (listings + the split ratio).
+    fn refresh_panes(&mut self) {
+        self.rows = [self.core.visible_rows(PaneId::Left), self.core.visible_rows(PaneId::Right)];
+        self.split_ratio = self.core.config_snapshot().split_ratio;
     }
 
-    fn on_rows(&mut self, msg: rows::RowsMsg) -> Task<Msg> {
+    fn on_rows(&mut self, pane: PaneId, msg: rows::RowsMsg) -> Task<Msg> {
         match msg {
-            rows::RowsMsg::Select(path) => self.core.select_path(PaneId::Left, Some(path)),
-            rows::RowsMsg::Toggle(path) => self.core.toggle_expand(PaneId::Left, &path),
+            // Any press lands in the listing: clicking a pane makes it the
+            // active one (the divider/keyboard follow the same core state).
+            rows::RowsMsg::Press => self.core.set_active_pane(pane),
+            rows::RowsMsg::Select(path) => self.core.select_path(pane, Some(path)),
+            rows::RowsMsg::Toggle(path) => self.core.toggle_expand(pane, &path),
         }
         Task::none()
     }
 
-    /// Law 3 and law 4's P1 posture, applied to the core's derived events.
+    /// Activate `pane`, then act on it (the core's pane verbs act on the
+    /// active pane). Law 5: a sort-column switch passes `ascending: true`.
+    fn on_pane_op(&mut self, pane: PaneId, op: PaneOp) -> Task<Msg> {
+        self.core.set_active_pane(pane);
+        match op {
+            PaneOp::NavBack => self.core.go_back(),
+            PaneOp::NavForward => self.core.go_forward(),
+            PaneOp::NavParent => self.core.go_parent(),
+            PaneOp::NavHome => self.core.go_home(),
+            PaneOp::Refresh => self.core.refresh(),
+            PaneOp::ToggleHidden => self.core.toggle_hidden(),
+            PaneOp::Sort(column) => self.core.set_sort(column, true),
+        }
+        Task::none()
+    }
+
+    /// Enter edit mode on `pane`'s location bar: activate the pane (the bar
+    /// was clicked, so that pane takes the keyboard), seed the editor with
+    /// the pane's REAL path (the sanitisation law covers display text only)
+    /// and hand keyboard focus to the field.
+    fn begin_edit(&mut self, pane: PaneId) -> Task<Msg> {
+        self.core.set_active_pane(pane);
+        let path = pane_path_text(&self.core, pane);
+        self.editing = Some((pane, path));
+        keys::set_focus_editable(&self.router, true);
+        Task::batch([
+            iced::widget::operation::focus(view::location::location_id(pane)),
+            iced::widget::operation::select_all(view::location::location_id(pane)),
+        ])
+    }
+
+    /// Leave edit mode (submit, cancel) and give the chords back.
+    fn stop_editing(&mut self) {
+        if self.editing.take().is_some() {
+            keys::set_focus_editable(&self.router, false);
+        }
+    }
+
+    /// Law 3 and law 4's P2 posture, applied to the core's derived events.
     fn on_derived(&mut self, events: Vec<CoreEvent>) {
         for event in events {
             match event {
@@ -536,6 +659,10 @@ impl Dopus {
         self.on_derived(derived);
         if let Some(bus) = &self.bus {
             bus.quit();
+            // Reply-then-exit, the windowed twin of headless's join: the
+            // drain-before-break flushes any queued reply, and this wait
+            // puts it on the wire before iced exits the process.
+            bus.wait_done(std::time::Duration::from_secs(3));
         }
         iced::exit()
     }
@@ -569,14 +696,34 @@ impl Dopus {
 
     fn view(&self) -> Element<'_, Msg, iced::Theme, Renderer> {
         let info = self.status.as_deref().unwrap_or(self.core.info());
+        let editing = self.editing.as_ref().map(|(pane, text)| (*pane, text.as_str()));
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops
         // keys under load — the ced/term rule).
         keys::router(
-            view::root(self.look(), &self.icons, &self.tint, self.core.pane(PaneId::Left), &self.rows, info),
+            view::root(
+                self.look(),
+                &self.icons,
+                &self.tint,
+                self.core.active(),
+                self.split_ratio,
+                self.core.pane(PaneId::Left),
+                self.core.pane(PaneId::Right),
+                &self.rows[0],
+                &self.rows[1],
+                editing,
+                info,
+            ),
             self.router.clone(),
             Msg::Actions,
         )
         .into()
     }
+}
+
+/// The pane's REAL path as editor text (`to_string_lossy`: paths are OsStr;
+/// non-UTF-8 bytes cannot be edited in a text field and round-trip as the
+/// lossy form).
+fn pane_path_text(core: &DopusCore, pane: PaneId) -> String {
+    core.pane(pane).path.to_string_lossy().into_owned()
 }

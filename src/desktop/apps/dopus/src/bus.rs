@@ -9,7 +9,7 @@
 //! **No broker is not an error**: [`spawn`] returns [`StartError::Unreachable`]
 //! and the app runs windowed without a Bus — a file manager works standalone.
 //!
-//! P1 security posture (see `verbs.rs`): file-mutating verbs do not exist on
+//! Security posture (see `verbs.rs`): file-mutating verbs do not exist on
 //! the Bus surface; `dopus.action` refuses them in the app layer.
 
 use std::collections::{BTreeMap, HashMap};
@@ -55,6 +55,10 @@ pub enum Effect {
 #[derive(Clone)]
 pub struct BusHandle {
     tx: tokio::sync::mpsc::UnboundedSender<Effect>,
+    /// Fires when the bus thread has finished (replies flushed, client
+    /// closed) — `wait_done` before process exit guarantees the last
+    /// reply reached the wire instead of racing it.
+    done: std::sync::mpsc::Receiver<()>,
 }
 
 impl BusHandle {
@@ -64,6 +68,12 @@ impl BusHandle {
 
     pub fn quit(&self) {
         let _ = self.tx.send(Effect::Quit);
+    }
+
+    /// Block until the bus thread is finished (bounded). Call after
+    /// [`BusHandle::quit`] and before exiting the process.
+    pub fn wait_done(&self, timeout: Duration) {
+        let _ = self.done.recv_timeout(timeout);
     }
 }
 
@@ -118,6 +128,7 @@ pub fn spawn(service: &str, url: &str) -> Result<(BusHandle, UnboundedReceiver<D
     let (dtx, drx) = unbounded();
     let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let service = service.to_string();
     let url = url.to_owned();
     std::thread::Builder::new()
@@ -131,10 +142,11 @@ pub fn spawn(service: &str, url: &str) -> Result<(BusHandle, UnboundedReceiver<D
                 }
             };
             runtime.block_on(run(service, url, dtx, erx, ready_tx));
+            let _ = done_tx.send(());
         })
         .map_err(|e| StartError::Unreachable(format!("Bus thread: {e}")))?;
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok((BusHandle { tx: etx }, drx)),
+        Ok(Ok(())) => Ok((BusHandle { tx: etx, done: done_rx }, drx)),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(StartError::Unreachable("the Bus thread exited".into())),
     }
@@ -204,13 +216,34 @@ async fn run(
                 match effect {
                     Effect::Respond { id, rc, body } => {
                         if let Some(cmd) = commands.remove(&id) {
-                            let c = client.clone();
-                            tokio::spawn(async move {
-                                let _ = tokio::time::timeout(Duration::from_secs(2), c.respond(&cmd, rc, &body)).await;
-                            });
+                            // Awaited INLINE, not spawned: a reply —
+                            // `dopus.quit`'s above all — must be on the wire
+                            // before this loop can break (Effect::Quit) and
+                            // close the client under it. The 2 s cap keeps a
+                            // wedged broker from hanging the thread.
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(2), client.respond(&cmd, rc, &body)).await;
                         }
                     }
-                    Effect::Quit => break,
+                    Effect::Quit => {
+                        // A quit racing its own reply must not swallow it:
+                        // headless replies-then-quits in one breath, and
+                        // select! may pick this arm while the Respond is
+                        // still queued — drain every pending reply (each
+                        // awaited inline, same 2 s cap) before breaking.
+                        while let Ok(effect) = erx.try_recv() {
+                            if let Effect::Respond { id, rc, body } = effect
+                                && let Some(cmd) = commands.remove(&id)
+                            {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    client.respond(&cmd, rc, &body),
+                                )
+                                .await;
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             changed = state.changed() => {
@@ -254,9 +287,9 @@ pub fn probe_running(url: &str, service: &str) -> bool {
     matches!(anonymous_call(url, service, "dopus.ping", &serde_json::json!({}), PROBE_TIMEOUT), Some((0, _)))
 }
 
-/// Single-instance forward: send the argv paths as `dopus.open`. P1's running
-/// instance accepts and ignores the paths (`verbs::OpenReply.opened` is
-/// false), and this still reports success — the forward worked.
+/// Single-instance forward: send the argv paths as `dopus.open`. The running
+/// instance routes them into its panes (first → left, second → right), and
+/// this reports success — the forward worked.
 pub fn forward_open(url: &str, service: &str, paths: &[String]) -> Result<(), String> {
     match anonymous_call(url, service, "dopus.open", &serde_json::json!({ "paths": paths }), Duration::from_secs(5)) {
         Some((0, _)) => Ok(()),

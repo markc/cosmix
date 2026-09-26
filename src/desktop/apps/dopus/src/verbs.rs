@@ -5,12 +5,13 @@
 //! gate (the full-mesh-access law). Success = rc 0; refusal = rc 10 with a
 //! [`Refusal`] body.
 //!
-//! **P1 security posture:** `dopus.action` serves only navigation, view and
-//! theme actions (`nav.*`, `view.*`, `theme.*`, plus the selection actions,
-//! which are view-ish: they move the highlight). File-mutating actions and
-//! `file.open` are keyboard-only until P2/P3 — refused with
+//! **Security posture (P2):** `dopus.action` serves the navigation, view,
+//! pane and theme actions (`nav.*`, `view.*`, `theme.*`, plus the selection
+//! actions, which are view-ish: they move the highlight). File-mutating
+//! actions and `file.open` are keyboard-only until P3 — refused with
 //! [`code::FORBIDDEN`], matching filemgr's rule that a Bus caller never
-//! mutates the filesystem through a file manager.
+//! mutates the filesystem through a file manager. `dopus.open` navigates the
+//! two panes (P1 accepted and ignored the paths).
 
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +92,7 @@ pub struct InfoReply {
 
 // ── state ────────────────────────────────────────────────────────────────────
 
-/// One pane's state (`pane` 0-based; P1 only ever has pane 0).
+/// One pane's state (`pane` 0-based; two panes in P2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneState {
     pub pane: u8,
@@ -146,7 +147,7 @@ pub struct ActionsReply {
 // ── theme ────────────────────────────────────────────────────────────────────
 
 /// `scheme`/`mode` by name; `null` leaves it as resolved. An in-session
-/// selection only (P1 does not persist; see `theme.rs`).
+/// selection only (not persisted; see `theme.rs`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemeSetReq {
     #[serde(default)]
@@ -161,11 +162,11 @@ pub struct ThemeSetReply {
     pub mode: String,
 }
 
-// ── open (P1: accepted, paths ignored) ──────────────────────────────────────
+// ── open (P2: first path → left pane, second → right, extras ignored) ───────
 
 /// The single-instance forward: a second `cosmix-dopus` process sends its
-/// arguments here and exits. P1 accepts and ignores the paths — no
-/// multi-pane or open-target handling until P2.
+/// arguments here and exits. P2 applies the paths: the first navigates the
+/// left pane, the second the right, extras are logged and ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenReq {
     #[serde(default)]
@@ -175,7 +176,7 @@ pub struct OpenReq {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenReply {
     pub accepted: usize,
-    /// Always false in P1: paths are accepted and ignored.
+    /// True when at least one path landed in a pane.
     pub opened: bool,
 }
 
@@ -241,16 +242,17 @@ impl Served {
     }
 }
 
-/// The P1 action table: `(action, label)`. `app.quit` is served; everything
-/// `file.*`/`place.*` is keyboard-only until P2/P3 (see the module header) —
+/// The action table: `(action, label)`. `app.quit` is served; everything
+/// `file.*`/`place.*` is keyboard-only until P3 (see the module header) —
 /// `file.open` too: the Bus arm refuses every `file.*`, so it appears here
 /// for the keyboard path and `dopus.actions.list` only.
-pub const P1_ACTIONS: &[(ActionId, &str)] = &[
+pub const ACTIONS: &[(ActionId, &str)] = &[
     (filemgr::FILE_OPEN, "Open the selection"),
     (filemgr::NAV_BACK, "Go back"),
     (filemgr::NAV_FORWARD, "Go forward"),
     (filemgr::NAV_PARENT, "Go to parent folder"),
     (filemgr::NAV_HOME, "Go to home folder"),
+    (filemgr::NAV_SWITCH_PANE, "Switch active pane"),
     (filemgr::VIEW_REFRESH, "Refresh"),
     (filemgr::VIEW_TOGGLE_HIDDEN, "Toggle hidden files"),
     (filemgr::VIEW_SORT_NAME, "Sort by name"),
@@ -290,14 +292,17 @@ pub enum Applied {
     Quit,
 }
 
-/// Apply one action to the core. Law 5 is the core's (`set_sort` toggles a
-/// same-column sort itself); every P1 switch passes `ascending: true`.
+/// Apply one action to the core. Everything pane-targeted acts on the ACTIVE
+/// pane (the keyboard and the Bus are one keystroke each); the pane headers
+/// activate their pane first (the app calls `set_active_pane` before these).
+/// Law 5 is the core's (`set_sort` toggles a same-column sort itself); every
+/// column switch passes `ascending: true`.
 pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, Refusal> {
     let done = Ok(Applied::Done);
-    let pane = PaneId::Left;
+    let pane = core.active();
     if action == filemgr::FILE_OPEN {
         // A directory opens in place; a file derives an `OpenFile` event,
-        // which the app surfaces as a status line (law 4's P1 posture: no
+        // which the app surfaces as a status line (law 4's P2 posture: no
         // spawn until there is an operations surface to own it).
         core.open_selection();
         return done;
@@ -316,6 +321,10 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
     }
     if action == filemgr::NAV_HOME {
         core.go_home();
+        return done;
+    }
+    if action == filemgr::NAV_SWITCH_PANE {
+        core.switch_pane();
         return done;
     }
     if action == filemgr::VIEW_REFRESH {
@@ -357,17 +366,33 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
     if action == filemgr::APP_QUIT {
         return Ok(Applied::Quit);
     }
+    // The fallthrough serves two different callers' mistakes: a KNOWN
+    // action that is keyboard-only until P3 (file.*/place.* — FORBIDDEN,
+    // filemgr's posture) and an id nothing defines (INVALID_ARGUMENT —
+    // the caller misspelled it; "forbidden" would claim a vocabulary
+    // entry that does not exist).
+    let known = filemgr::MENU_ACTION_IDS.contains(&action)
+        || filemgr::DEFAULT_KEYMAP_ACTION_IDS.contains(&action)
+        || ACTIONS.iter().any(|(known, _)| *known == action);
     Err(Refusal {
-        error_code: code::FORBIDDEN.to_owned(),
-        message: format!("{action} is keyboard-only in P1 (no file-operation UI yet)"),
-        reason: Some("p1_scope".to_owned()),
+        error_code: if known {
+            code::FORBIDDEN.to_owned()
+        } else {
+            code::INVALID_ARGUMENT.to_owned()
+        },
+        message: if known {
+            format!("{action} is keyboard-only in P2 (no file-operation UI yet)")
+        } else {
+            format!("{action} is not a dopus action")
+        },
+        reason: Some("p2_scope".to_owned()),
     })
 }
 
-/// `dopus.actions.list`'s table: the P1 actions with their effective chords,
-/// from the effective keymap (windowed and headless share this).
+/// `dopus.actions.list`'s table: the served actions with their effective
+/// chords, from the effective keymap (windowed and headless share this).
 pub fn action_table(keymap: &cosmix_actions::Keymap) -> Vec<ActionRow> {
-    P1_ACTIONS
+    ACTIONS
         .iter()
         .map(|(action, label)| ActionRow {
             id: action.to_string(),
@@ -381,6 +406,45 @@ pub fn action_table(keymap: &cosmix_actions::Keymap) -> Vec<ActionRow> {
             enabled: true,
         })
         .collect()
+}
+
+/// Apply forwarded `dopus.open` PATHs to the panes: the first navigates the
+/// left pane, the second the right, extras are logged and ignored (the
+/// P2 open contract — the same path the windowed startup and the Bus verb
+/// take, so the two surfaces cannot drift).
+pub fn apply_open_paths(core: &mut DopusCore, paths: &[String]) {
+    for (index, raw) in paths.iter().enumerate() {
+        let pane = match index {
+            0 => PaneId::Left,
+            1 => PaneId::Right,
+            _ => {
+                tracing::info!("dopus.open: ignoring extra path {} ({raw})", index + 1);
+                continue;
+            }
+        };
+        core.navigate(pane, crate::dirs::expand_tilde(raw));
+    }
+}
+
+/// One pane's `dopus.state` row.
+fn pane_state(core: &DopusCore, pane_id: PaneId) -> PaneState {
+    let pane = core.pane(pane_id);
+    PaneState {
+        pane: pane_id.index() as u8,
+        path: cosmix_dopus_core::sanitise_display_path(&pane.path),
+        active: core.active() == pane_id,
+        show_hidden: pane.show_hidden,
+        sort: match pane.sort {
+            cosmix_dopus_core::SortColumn::Name => "name",
+            cosmix_dopus_core::SortColumn::Size => "size",
+            cosmix_dopus_core::SortColumn::Modified => "modified",
+        }
+        .to_owned(),
+        ascending: pane.ascending,
+        selected: pane.selected.as_ref().map(|p| cosmix_dopus_core::sanitise_display_path(p)),
+        rows: core.visible_rows(pane_id).len(),
+        status: pane.status.clone(),
+    }
 }
 
 /// Serve one Bus command. Never panics, never leaves a command unanswered:
@@ -406,7 +470,7 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                 view: "dopus".to_owned(),
                 engine: "iced".to_owned(),
                 version: info.version.to_owned(),
-                description: "the CosMix twin-pane file manager (P1: one live pane)".to_owned(),
+                description: "the CosMix twin-pane file manager (P2: twin panes, Places, per-pane location bars)".to_owned(),
                 controls: Vec::new(),
                 verbs: VERBS.iter().map(|(verb, _)| (*verb).to_owned()).collect(),
             },
@@ -418,29 +482,13 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                 git_sha: info.git_sha.to_owned(),
                 build_time: info.build_time.to_owned(),
                 headless: meta.headless,
-                panes: 1,
+                panes: 2,
                 config_path: meta.config_path.clone(),
             },
         )],
         "dopus.state" => {
-            let pane = core.pane(PaneId::Left);
             let state = StateReply {
-                panes: vec![PaneState {
-                    pane: 0,
-                    path: cosmix_dopus_core::sanitise_display_path(&pane.path),
-                    active: core.active() == PaneId::Left,
-                    show_hidden: pane.show_hidden,
-                    sort: match pane.sort {
-                        cosmix_dopus_core::SortColumn::Name => "name",
-                        cosmix_dopus_core::SortColumn::Size => "size",
-                        cosmix_dopus_core::SortColumn::Modified => "modified",
-                    }
-                    .to_owned(),
-                    ascending: pane.ascending,
-                    selected: pane.selected.as_ref().map(|p| cosmix_dopus_core::sanitise_display_path(p)),
-                    rows: core.visible_rows(PaneId::Left).len(),
-                    status: pane.status.clone(),
-                }],
+                panes: vec![pane_state(core, PaneId::Left), pane_state(core, PaneId::Right)],
                 theme_scheme: meta.theme_scheme.clone(),
                 theme_mode: meta.theme_mode.clone(),
             };
@@ -449,14 +497,14 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
         "dopus.action" => match serde_json::from_str::<ActionReq>(&command.body) {
             Ok(req) => match ActionId::intern(&req.id) {
                 // The Bus never opens (or otherwise touches) files: `file.*`
-                // is keyboard-only in P1, even though the keyboard arm of
+                // is keyboard-only in P2, even though the keyboard arm of
                 // `apply_action` serves `file.open` (a directory in place, a
                 // file as a status line). Matching filemgr's rule — a remote
                 // caller never mutates the filesystem through a file manager.
                 Ok(action) if action.as_str().starts_with("file.") => vec![Served::error(
                     command.id,
                     code::FORBIDDEN,
-                    format!("{action} is keyboard-only in P1 — the Bus never opens files"),
+                    format!("{action} is keyboard-only in P2 — the Bus never opens files"),
                 )],
                 Ok(action) => match apply_action(action, core) {
                     Ok(Applied::Done) => vec![Served::reply_json(
@@ -479,10 +527,13 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
             Err(error) => vec![Served::error(command.id, code::INVALID_ARGUMENT, format!("body: {error}"))],
         },
         "dopus.open" => match serde_json::from_str::<OpenReq>(&command.body) {
-            Ok(req) => vec![Served::reply_json(
-                command.id,
-                &OpenReply { accepted: req.paths.len(), opened: false },
-            )],
+            Ok(req) => {
+                apply_open_paths(core, &req.paths);
+                vec![Served::reply_json(
+                    command.id,
+                    &OpenReply { accepted: req.paths.len(), opened: !req.paths.is_empty() },
+                )]
+            }
             Err(error) => vec![Served::error(command.id, code::INVALID_ARGUMENT, format!("body: {error}"))],
         },
         "dopus.quit" => vec![

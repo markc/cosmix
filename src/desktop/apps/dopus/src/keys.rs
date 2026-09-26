@@ -12,10 +12,12 @@
 //!   replaces the keymap and cancels any pending chord (filemgr's
 //!   `reload_keymap_on_focus` rule).
 //! - Resolution: every key event through the widget becomes a [`RawInput`],
-//!   resolved against [`FocusContext::global`] (P1 has no editables, no
-//!   modals) with a monotonic [`Tick`]. Emitted actions are published to the
-//!   app; the app decides which are P1 (navigation/view/theme) and which
-//!   arrive in P2/P3.
+//!   resolved against a [`FocusContext`] built from the router's focus state
+//!   (no modals; `focus_editable` is on while a location bar is being edited,
+//!   so chords with `allow_in_editable: false` — every default — route the
+//!   keys into the editor instead of firing actions) with a monotonic
+//!   [`Tick`]. Emitted actions are published to the app; the app decides
+//!   which are keyboard-served and which are refused.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -54,12 +56,17 @@ pub fn load(custom_path: Option<&Path>) -> Result<Keymap, String> {
 }
 
 /// The keymap plus the chord-progress state one input adapter owns. Shared
-/// between the router widget and the app (hot reload, the tick poll) behind
-/// a mutex — both live on the UI thread, so contention is nil.
+/// between the router widget and the app (hot reload, the tick poll, the
+/// focus hand-off) behind a mutex — both live on the UI thread, so
+/// contention is nil.
 #[derive(Default)]
 pub struct Router {
     pub keymap: Keymap,
     pub state: ResolveState,
+    /// Whether the focused widget edits text (a location bar). The resolver
+    /// sees it through the [`FocusContext`]; the app flips it when a location
+    /// bar enters or leaves edit mode.
+    pub focus_editable: bool,
 }
 
 pub type SharedRouter = Arc<Mutex<Router>>;
@@ -69,7 +76,27 @@ pub fn initial(custom_path: Option<&Path>) -> Result<SharedRouter, String> {
     Ok(Arc::new(Mutex::new(Router {
         keymap: load(custom_path)?,
         state: ResolveState::default(),
+        focus_editable: false,
     })))
+}
+
+/// Hand focus to (or take it back from) a text editor. Every default binding
+/// is `allow_in_editable: false`, so while this is on the resolver emits no
+/// actions and keys fall through to the editor widget.
+pub fn set_focus_editable(shared: &SharedRouter, editable: bool) {
+    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if router.focus_editable != editable {
+        router.focus_editable = editable;
+        // Focus changed hands: a half-typed chord must not fire into (or
+        // out of) the new context.
+        router.state.cancel();
+    }
+}
+
+/// The context the resolver resolves against this tick: no modals, and the
+/// editable flag from [`Router::focus_editable`].
+fn focus_context(router: &Router) -> FocusContext {
+    FocusContext::global().with_editable(router.focus_editable)
 }
 
 /// Hot reload on window focus (filemgr's `reload_keymap_on_focus`): replace
@@ -94,9 +121,10 @@ pub fn reload(shared: &SharedRouter, custom_path: Option<&Path>) {
 pub fn poll_timeout(shared: &SharedRouter) -> Vec<ActionId> {
     let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = tick();
+    let context = focus_context(&router);
     let Router { keymap, state, .. } = &mut *router;
     if state.deadline().is_some_and(|deadline| now >= deadline) {
-        cosmix_actions::resolve_timeout(&FocusContext::global(), keymap, state, now).actions
+        cosmix_actions::resolve_timeout(&context, keymap, state, now).actions
     } else {
         Vec::new()
     }
@@ -261,19 +289,20 @@ where
             let resolved = {
                 let mut router = self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let now = tick();
+                let context = focus_context(&router);
                 // Split-borrow the router's own fields so the resolver can
                 // hold the keymap while mutating the chord state.
                 let Router { keymap, state, .. } = &mut *router;
-                let mut resolved = resolve(input, &FocusContext::global(), keymap, state, now);
+                let mut resolved = resolve(input, &context, keymap, state, now);
                 // A chord that was waiting for a second stroke expired while
-                // nothing was pressed: resolve it opportunistically here (P1
+                // nothing was pressed: resolve it opportunistically here (the
                 // defaults have no multi-stroke chords; users can add them).
                 if resolved.actions.is_empty()
                     && let Some(deadline) = state.deadline()
                     && now >= deadline
                 {
                     let late = cosmix_actions::resolve_timeout(
-                        &FocusContext::global(),
+                        &context,
                         keymap,
                         state,
                         now,

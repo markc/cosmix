@@ -1,0 +1,251 @@
+-- End-to-end (dopus P2): a private noded and the real `cosmix-dopus
+-- --headless --service dopus-test --noded-url …`, driven by one-shot Mix
+-- clients. The twin panes are proven over the Bus: dopus.info reports two
+-- panes; dopus.open lands the first PATH in the left pane and the second in
+-- the right (extras logged and ignored, `~` expanded); nav.switch-pane (F6)
+-- flips the active pane and every active-pane verb (view.sort-* with law 5's
+-- same-column toggle, view.toggle-hidden, nav.parent/back/forward/home,
+-- selection.*) moves only the active pane while dopus.state shows both;
+-- refusals stay honest (file.* FORBIDDEN — the Bus never opens files,
+-- unknown action INVALID_ARGUMENT, unknown verb UNKNOWN_VERB, theme.set
+-- UNAVAILABLE headless). dopus.quit answers rc 0 BEFORE the process exits
+-- (reply-then-exit: the client's send would time out otherwise).
+--
+-- NOT reachable over the Bus, so not drivable here: the listing's directory
+-- expansion (core `toggle_expand`) has no verb and `file.*` is refused — the
+-- window exercises it; the wire cannot. Documented, not faked.
+--
+-- Nothing here can reach the host Bus: private TCP port, private unix
+-- socket, admission off, HOME and state dirs in the temp dir.
+--
+-- Run: COSMIX=<checkout> mix src/desktop/apps/dopus/tests/dopus-bus-test.mix [--dopus PATH]
+-- Binaries: --dopus (or COSMIX_TEST_DOPUS), default
+-- $COSMIX/src/desktop/target/release/cosmix-dopus; COSMIX_TEST_MIX /
+-- COSMIX_TEST_NODED point at freshly built mix / noded, defaults are the
+-- system install.
+$root = env("COSMIX")
+if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
+$argv = args()
+$dopus = env("COSMIX_TEST_DOPUS") ?? ""
+for each $k in range(0, length($argv) - 2)
+  if $argv[$k] == "--dopus" then $dopus = $argv[$k + 1] end
+end
+if $dopus == "" then $dopus = $root .. "/src/desktop/target/release/cosmix-dopus" end
+$mix = env("COSMIX_TEST_MIX") ?? ""
+if $mix == "" then $mix = "/opt/cosmix/bin/mix" end
+$noded = env("COSMIX_TEST_NODED") ?? ""
+if $noded == "" then $noded = "/opt/cosmix/bin/cosmix-noded" end
+for each $bin in [$dopus, $mix, $noded]
+  if not exists($bin) then raise("TEST_CONFIG", "missing binary " .. $bin) end
+end
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-dopus-bus-test.XXXXXXXX"]))
+$tag = uuid()
+$node = $tmp .. "/node.conf.mix"
+$env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
+  HOME: $tmp, XDG_STATE_HOME: $tmp, XDG_RUNTIME_DIR: $tmp, XDG_CONFIG_HOME: $tmp .. "/config",
+  DOPUS_LOG: "info"}
+$noded_pid = nil
+$dopus_pid = nil
+$alpha = $tmp .. "/work/alpha"
+$beta = $tmp .. "/work/beta"
+$gamma = $tmp .. "/work/gamma"
+
+fn check($condition, $message)
+  if not $condition then raise("DOPUS_BUS_TEST", $message) end
+end
+-- One-shot client. `$line` is literal Mix source after `send dopus-test`;
+-- runtime values come in as `$a`, decoded from argv.
+fn call($line, $a)
+  $src = "$a = json_parse($1)\nsend dopus-test " .. $line ..
+    " timeout=15\nprint(json_encode({rc: $rc, result: $result, reply: $reply}))\n"
+  write_file($tmp .. "/step.mix", $src)
+  $run = run_argv([$mix, $tmp .. "/step.mix", json_encode($a)], {clear_env: true, env: $env, timeout: 20})
+  check($run.ok, "client step failed (exit " .. to_string($run.exit_code) .. "): " .. $run.stderr .. $run.stdout ..
+    "\n--- step.mix\n" .. $src .. "--- args " .. json_encode($a))
+  return json_parse($run.stdout)
+end
+fn ok($line, $a)
+  $r = call($line, $a)
+  check($r.rc == 0, "dopus-test " .. $line .. " failed: " .. json_encode($r))
+  return $r.reply
+end
+-- A call that must be refused with rc 10 + this error_code.
+fn refused($line, $a, $code)
+  $r = call($line, $a)
+  check($r.rc == 10, "dopus-test " .. $line .. " not refused: " .. json_encode($r))
+  check($r.reply.error_code == $code, "dopus-test " .. $line .. " wrong error_code: " .. json_encode($r.reply))
+  return $r.reply
+end
+fn act($id)
+  return ok('dopus.action id=$a.id', {id: $id})
+end
+-- The pane's row in dopus.state (re-fetched each time: state only moves
+-- through verbs, and every verb here answers before the next call).
+fn pane($index)
+  $st = ok('dopus.state', {})
+  check(length($st.panes) == 2, "dopus.state has " .. to_string(length($st.panes)) .. " panes")
+  return $st.panes[$index]
+end
+fn pane_is($index, $path, $what)
+  $p = pane($index)
+  check($p.path == $path, $what .. ": pane " .. to_string($index) .. " at " .. $p.path .. ", wanted " .. $path)
+  return $p
+end
+
+try
+  mkdir($tmp .. "/work")
+  mkdir($alpha)
+  mkdir($beta)
+  mkdir($beta .. "/sub")
+  mkdir($gamma)
+  write_file($alpha .. "/a.txt", "a\n")
+  write_file($beta .. "/b.txt", "b\n")
+
+  $broker_alive = false
+  for each $attempt in range(1, 5)
+    $port = random(48000, 48999)
+    -- The private-broker config shape ced_nested_gate.mix proves live: JSON
+    -- is legal node.conf.mix content, and noded REFUSES a set-but-missing
+    -- COSMIX_NODE_CONFIG — the file must exist.
+    write_file($node, json_encode({node: "dopus-bus-test-" .. $tag, wg_ip: "", mesh: "dopus-bus-test.invalid",
+      noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
+    $noded_pid = spawn([$noded, "serve", "--listen", "127.0.0.1:" .. to_string($port),
+      "--node", "dopus-bus-test-" .. $tag, "--no-monitor", "--no-log"],
+      {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+    sleep(0.5)
+    $broker_alive = run_argv(["kill", "-0", "--", to_string($noded_pid)]).ok
+    if $broker_alive then break end
+  end
+  check($broker_alive, "broker exhausted port retries")
+
+  -- Broker URLs carry the /ws path (cosmix-lib-config's own loopback
+  -- fallback is ws://127.0.0.1:4200/ws — a bare host:port never connects).
+  $url = "ws://127.0.0.1:" .. to_string($port) .. "/ws"
+  $dopus_pid = spawn([$dopus, "--headless", "--service", "dopus-test", "--noded-url", $url],
+    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/dopus.log"}, stderr: "stdout"})
+  -- Harness startup wait (bounded).
+  $pong = nil
+  for each $i in range(1, 80)
+    $r = call('dopus.ping', {})
+    if $r.rc == 0 then $pong = $r.reply; break end
+    sleep(0.2)
+  end
+  check($pong != nil, "dopus --headless did not register")
+  check($pong.pong and $pong.service == "dopus-test" and $pong.schema == "dopus.v1" and $pong.headless,
+    "dopus.ping: " .. json_encode($pong))
+  $desc = ok('dopus.describe', {})
+  check($desc.contract == "ctk-app-control.v0" and $desc.app == "dopus" and $desc.engine == "iced"
+    and contains(join($desc.verbs, " "), "dopus.state"), "dopus.describe: " .. json_encode($desc))
+
+  -- 1. boot: two panes, both at home, pane 0 active, name ascending
+  $info = ok('dopus.info', {})
+  check($info.headless and $info.panes == 2, "dopus.info: " .. json_encode($info))
+  $p0 = pane(0)
+  $p1 = pane(1)
+  check($p0.active and not $p1.active, "boot active pane: " .. json_encode([$p0, $p1]))
+  check($p0.path == $tmp and $p1.path == $tmp, "boot paths: " .. json_encode([$p0.path, $p1.path]))
+  check($p0.sort == "name" and $p0.ascending and $p1.sort == "name" and $p1.ascending, "boot sort: " .. json_encode([$p0, $p1]))
+  check(not $p0.show_hidden and not $p1.show_hidden, "boot hidden: " .. json_encode([$p0, $p1]))
+
+  -- 2. dopus.open: first path → left pane, second → right pane
+  $op = ok('dopus.open paths=[$a.l, $a.r]', {l: $alpha, r: $beta})
+  check($op.opened and $op.accepted == 2, "dopus.open: " .. json_encode($op))
+  pane_is(0, $alpha, "open left")
+  pane_is(1, $beta, "open right")
+  $p0 = pane(0)
+  check($p0.active, "open did not move the active pane")
+
+  -- 3. a third path is logged and ignored
+  $op = ok('dopus.open paths=[$a.l, $a.r, $a.x]', {l: $alpha, r: $beta, x: $gamma})
+  check($op.accepted == 3 and $op.opened, "dopus.open extras: " .. json_encode($op))
+  pane_is(0, $alpha, "extras left")
+  pane_is(1, $beta, "extras right")
+
+  -- 4. F6 (nav.switch-pane) flips the active pane
+  act("nav.switch-pane")
+  $p1 = pane(1)
+  check($p1.active and not pane(0).active, "F6 flipped active: " .. json_encode([$p0, $p1]))
+
+  -- 5. sort on the ACTIVE pane only; same-column repeats toggle (law 5)
+  act("view.sort-size")
+  $p1 = pane(1)
+  check($p1.sort == "size" and $p1.ascending, "sort size: " .. json_encode($p1))
+  check(pane(0).sort == "name", "sort leaked to the idle pane")
+  act("view.sort-size")
+  $p1 = pane(1)
+  check($p1.sort == "size" and not $p1.ascending, "same-column toggle: " .. json_encode($p1))
+  act("view.sort-name")
+  $p1 = pane(1)
+  check($p1.sort == "name" and $p1.ascending, "column switch is ascending: " .. json_encode($p1))
+
+  -- 6. hidden files on the ACTIVE pane only
+  act("view.toggle-hidden")
+  check(pane(1).show_hidden and not pane(0).show_hidden, "toggle-hidden: " .. json_encode([pane(0), pane(1)]))
+  act("view.toggle-hidden")
+  check(not pane(1).show_hidden, "toggle-hidden back")
+
+  -- 7. navigation on the ACTIVE pane (pane 1, at beta): parent, back, forward, home
+  act("nav.parent")
+  pane_is(1, $tmp .. "/work", "parent")
+  pane_is(0, $alpha, "parent left the idle pane alone")
+  act("nav.back")
+  pane_is(1, $beta, "back")
+  act("nav.forward")
+  pane_is(1, $tmp .. "/work", "forward")
+  act("nav.home")
+  pane_is(1, $tmp, "home")
+
+  -- 8. `~` expands to home in dopus.open paths
+  -- Single-quoted on purpose: Mix expands double-quoted "~/…" at PARSE time
+  -- (feedback_mix_tilde_needle_single_quotes), which would substitute the
+  -- harness's HOME before dopus ever sees the tilde. The tilde must reach
+  -- dopus raw so IT expands it against the process HOME under test ($tmp).
+  ok('dopus.open paths=[$a.t]', {t: '~/work/gamma'})
+  pane_is(0, $gamma, "tilde expand")
+  ok('dopus.open paths=[$a.l, $a.r]', {l: $alpha, r: $beta})
+
+  -- 9. selection acts on the ACTIVE pane (both panes have rows)
+  act("selection.next")
+  $active = if pane(0).active then pane(0) else pane(1) end
+  check($active.selected != nil, "selection.next selected nothing: " .. json_encode($active))
+  act("selection.first")
+  $active = if pane(0).active then pane(0) else pane(1) end
+  check($active.selected != nil, "selection.first selected nothing: " .. json_encode($active))
+
+  -- 10. refusals stay honest
+  refused('dopus.action id="file.open"', {}, "FORBIDDEN")
+  refused('dopus.action id="file.delete"', {}, "FORBIDDEN")
+  refused('dopus.action id="no.such-action"', {}, "INVALID_ARGUMENT")
+  refused('dopus.frobnicate', {}, "UNKNOWN_VERB")
+  refused('dopus.theme.set mode="dark"', {}, "UNAVAILABLE")
+  -- A second registration under the same name must fail (single instance):
+  $dupe = run_argv([$dopus, "--headless", "--service", "dopus-test", "--noded-url", $url],
+    {clear_env: true, env: $env, timeout: 20})
+  check(not $dupe.ok, "a second dopus-test registered")
+  check(contains($dupe.stderr, "already registered"), "duplicate diagnostics: " .. $dupe.stderr)
+
+  -- 11. dopus.quit answers rc 0 BEFORE the process exits (item 6: the reply
+  -- arrives on this client's send — an exit-first shape would time out here)
+  $q = ok('dopus.quit', {})
+  check($q.quitting, "dopus.quit: " .. json_encode($q))
+  $exited = false
+  for each $i in range(1, 100)
+    if not process_alive($dopus_pid) then $exited = true; break end
+    sleep(0.1)
+  end
+  check($exited, "dopus still running 10 s after dopus.quit")
+  $dopus_pid = nil
+  print("PASS dopus headless e2e: boot twin-pane state, dopus.open pane routing + extras ignored + tilde, F6, active-pane sort (law 5 toggle)/hidden/nav/selection, refusals (file.*, unknown action/verb, theme.set), single instance, reply-then-exit quit")
+catch $err
+  for each $log in glob($tmp .. "/*.log")
+    print("--- " .. $log .. "\n" .. read_file($log))
+  end
+  raise("DOPUS_BUS_TEST", to_string($err))
+finally
+  for each $child in [$dopus_pid, $noded_pid]
+    if $child != nil then $_kill = run_argv(["kill", "--", to_string($child)], {timeout: 10}) end
+  end
+  if starts_with($tmp, "/tmp/cosmix-dopus-bus-test.") then
+    $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end

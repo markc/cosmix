@@ -42,6 +42,8 @@ type Para = <Renderer as atext::Renderer>::Paragraph;
 /// Widget messages, mapped onto the app's by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowsMsg {
+    /// Any press in the listing — the pane it belongs to becomes active.
+    Press,
     /// A row was clicked — select it.
     Select(PathBuf),
     /// A directory row's toggle zone (or a double-click) — expand/collapse.
@@ -291,7 +293,7 @@ impl<'a> FileList<'a> {
     }
 }
 
-impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
+impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Fill)
     }
@@ -313,7 +315,7 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
         cursor: mouse::Cursor,
         _renderer: &Renderer,
         _clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, crate::app::Msg>,
+        shell: &mut Shell<'_, RowsMsg>,
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
@@ -338,6 +340,10 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(clip) => {
+                // Any press in the listing activates the pane it belongs to
+                // (the caller maps this onto `set_active_pane`), then the
+                // press starts the row-click tracker.
+                shell.publish(RowsMsg::Press);
                 let position = cursor.position().unwrap_or_default();
                 if let Some(index) = st.row_at(position.y - bounds.y, self.rows.len()) {
                     st.press = Some((position, index));
@@ -359,15 +365,15 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
                 let in_toggle = row.entry.is_dir && row_x < TOGGLE_W;
                 if in_toggle {
                     st.last_click = None;
-                    shell.publish(crate::app::Msg::Rows(RowsMsg::Toggle(row.entry.path.clone())));
+                    shell.publish(RowsMsg::Toggle(row.entry.path.clone()));
                 } else {
                     let double =
                         st.last_click.is_some_and(|(when, at)| when.elapsed() < DOUBLE_CLICK && at == index);
                     st.last_click = Some((Instant::now(), index));
                     if double && row.entry.is_dir {
-                        shell.publish(crate::app::Msg::Rows(RowsMsg::Toggle(row.entry.path.clone())));
+                        shell.publish(RowsMsg::Toggle(row.entry.path.clone()));
                     } else if !double {
-                        shell.publish(crate::app::Msg::Rows(RowsMsg::Select(row.entry.path.clone())));
+                        shell.publish(RowsMsg::Select(row.entry.path.clone()));
                     }
                 }
                 shell.capture_event();
@@ -469,7 +475,7 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
     }
 }
 
-impl<'a> From<FileList<'a>> for Element<'a, crate::app::Msg, iced::Theme, Renderer> {
+impl<'a> From<FileList<'a>> for Element<'a, RowsMsg, iced::Theme, Renderer> {
     fn from(list: FileList<'a>) -> Self {
         Element::new(list)
     }
