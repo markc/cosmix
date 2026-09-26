@@ -21,7 +21,11 @@ in the holding frontend's own namespace.
 These verbs act on the active tab/pane of the instance holding the name at
 delivery time; they carry no target binding. The exception is `term.type`,
 which requires a `pane` or `tab` selector and refuses a body with neither
-(`invalid-argument`) rather than typing into whatever pane holds focus.
+(`INVALID_ARGUMENT`) rather than typing into whatever pane holds focus.
+`pane` is the safe selector; `tab` resolves to that tab's active pane at
+delivery, so it still follows focus inside the tab. An optional `instance`
+(from `term.tabs`/`term.panes`/`INFO`) makes another term process refuse
+instead of typing into its own pane of the same id.
 `term.type` revokes any
 delegated control writer exactly as real keys do. Any mutating verb's body
 (`tab.*`, `pane.*`, `type`) may add `"request_id":"<string>"`: a resend of

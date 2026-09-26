@@ -533,14 +533,14 @@ broker and says which it was. That ping happens only on the failure path.</p>
 <p>All three say <strong>nothing was sent</strong>, so an agent whose mutation errored does not
 have to wonder whether it half-landed.</p>
 <table><thead><tr><th>Tool</th><th>Arguments</th><th>Behaviour</th></tr></thead><tbody>
-<tr><td><code>term_list</code></td><td><code>{}</code></td><td>Read-only JSON arrays <code>tabs</code> and <code>panes</code>: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic.</td></tr>
+<tr><td><code>term_list</code></td><td><code>{}</code></td><td>Read-only JSON: <code>service</code> (the frontend it read, <code>bterm</code> or <code>term</code>), <code>instance</code> (that process's token; null from a frontend older than term-core 0.8.0) and arrays <code>tabs</code> and <code>panes</code>: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic; if the two reads came from different processes it errors instead.</td></tr>
 <tr><td><code>term_snapshot</code></td><td><code>{}</code></td><td>Read-only active screen text, cols/rows, cursor, pid, byte counters and diagnostic timings.</td></tr>
-<tr><td><code>term_type</code></td><td><code>{"pane":3,"text":"echo hello\n"}</code> or <code>{"tab":1,"text":"…"}</code></td><td>DIAGNOSTIC keyboard-encoder input; newline is Enter. <code>pane</code> or <code>tab</code> is required (ids from <code>term_list</code>; a tab means its active pane); neither returns an error without an ABP call. Not the authenticated input API.</td></tr>
+<tr><td><code>term_type</code></td><td><code>{"pane":3,"service":"bterm","instance":123,"text":"echo hello\n"}</code></td><td>DIAGNOSTIC keyboard-encoder input; newline is Enter. <code>pane</code> or <code>tab</code> is required and never defaults to focus; <code>pane</code> is the safe selector, while <code>tab</code> means that tab's active pane at delivery and so still follows focus inside the tab. <strong>Pass back the <code>service</code> and <code>instance</code> <code>term_list</code> returned</strong>: pane ids are per-process counters from 1, so the call then goes to exactly that frontend with no fallback probe, and a different term process refuses (<code>INVALID_ARGUMENT</code>) instead of typing into its own pane 3. Missing selectors, a zero id and an unknown service are errors without an ABP call. Not the authenticated input API.</td></tr>
 <tr><td><code>term_tab</code></td><td><code>{"op":"new"}</code>, <code>{"op":"select","id":1}</code>, <code>{"op":"close","id":1}</code></td><td>Create/select/close a tab; closing the last tab quits.</td></tr>
 <tr><td><code>term_pane</code></td><td><code>{"op":"split","dir":"h"}</code>, <code>{"op":"select","id":1}</code>, <code>{"op":"close"}</code></td><td>Split/select/close active-tab panes; closing the last pane closes the tab.</td></tr>
 </tbody></table>
-<p>The MCP schemas use String for text/op, optional u64 for id/pane/tab, and
-optional String for dir. Invalid operations, missing required ids/directions, and
+<p>The MCP schemas use String for text/op, optional u64 for id/pane/tab/instance,
+and optional String for dir/service. Invalid operations, missing required ids/directions, and
 invalid split directions return errors without an ABP call.</p>
 <p>Term 0.3.0 changes every request to a JSON object. The verb column is written
 in the canonical <code>term.</code> namespace; on the wire the prefix is the <strong>resolved
@@ -548,7 +548,7 @@ frontend's name</strong>, so against the Bevy frontend these are <code>bterm.sna
 <code>bterm.tabs</code> and so on:</p>
 <table><thead><tr><th>Bus verb</th><th>JSON body</th></tr></thead><tbody>
 <tr><td><code>term.snapshot</code>, <code>term.tabs</code>, <code>term.tab.new</code>, <code>term.panes</code>, <code>term.pane.close</code></td><td><code>{}</code></td></tr>
-<tr><td><code>term.type</code></td><td><code>{"pane":3,"text":"..."}</code> or <code>{"tab":1,"text":"..."}</code> (one required)</td></tr>
+<tr><td><code>term.type</code></td><td><code>{"pane":3,"instance":123,"text":"..."}</code> (<code>pane</code> or <code>tab</code> required, <code>instance</code> optional)</td></tr>
 <tr><td><code>term.tab.select</code>, <code>term.tab.close</code>, <code>term.pane.select</code></td><td><code>{"id":1}</code> (non-negative u64 integer)</td></tr>
 <tr><td><code>term.pane.split</code></td><td><code>{"dir":"h"}</code> (h, horizontal, v, vertical)</td></tr>
 </tbody></table>

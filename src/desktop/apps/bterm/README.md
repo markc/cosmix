@@ -58,7 +58,10 @@ The diagnostic `bterm` Bus service accepts JSON objects, including `{"id":42}` f
 `bterm.tab.select` and `bterm.tab.close`. `bterm.tab.new` opens and activates a tab;
 `bterm.tabs` lists stable IDs, selection, titles, dimensions and child PIDs.
 `bterm.snapshot` targets the active pane by default; `bterm.type` requires a
-`pane` or `tab` (a tab means its active pane) and never defaults to focus. `bterm.panes` lists the
+`pane` or `tab` and never defaults to focus: `pane` is the safe selector, `tab`
+means that tab's active pane at delivery (it still follows focus inside the tab),
+and an optional `instance` from `bterm.tabs`/`bterm.panes` refuses a different
+process. `bterm.panes` lists the
 active tab's pane IDs, active flags, cached dimensions/PIDs and logical x/y/w/h
 (zero geometry until layout). `bterm.pane.split` accepts
 `{"dir":"h"}` (also horizontal, v, vertical); `bterm.pane.select` accepts `{"id":42}` belonging
