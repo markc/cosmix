@@ -2394,6 +2394,10 @@ process-lifetime constants in practice — poll them, don't watch them.
 
 ## Vendored changes
 
+Smithay's `SeatState::new_wl_seat_with_filter` filters seat-global visibility
+per client through `GlobalDispatch::can_view`. The existing `new_wl_seat`
+delegates with an always-true predicate.
+
 The vendored Smithay layer-surface handle has an additive `reset_after_unmap`
 helper so the compositor can clear Smithay's private configure queue while
 applying layer-shell's protocol-mandated post-unmap state reset. Smithay's

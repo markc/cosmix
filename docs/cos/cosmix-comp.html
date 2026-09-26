@@ -2663,6 +2663,9 @@ not covered by <code>comp.props.watch</code> diffs: after the loud-restart polic
 fault's unhealthy window is at most one dispatch cycle, so the leaves are
 process-lifetime constants in practice — poll them, don't watch them.</p>
 <h2 id="vendored-changes">Vendored changes</h2>
+<p>Smithay's <code>SeatState::new_wl_seat_with_filter</code> filters seat-global visibility
+per client through <code>GlobalDispatch::can_view</code>. The existing <code>new_wl_seat</code>
+delegates with an always-true predicate.</p>
 <p>The vendored Smithay layer-surface handle has an additive <code>reset_after_unmap</code>
 helper so the compositor can clear Smithay's private configure queue while
 applying layer-shell's protocol-mandated post-unmap state reset. Smithay's
