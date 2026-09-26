@@ -1,0 +1,15 @@
+# Template: setup.mix and the hub installer replace @SHARE_DESKTOP@ with the
+# directory holding scenes-cli.mix ($COSMIX/bin on the dev tier,
+# /opt/cosmix/share/desktop on the system install) before installing this
+# to ~/.local/share/applications/. It opens the user copy of the Scene
+# Editor if one validates, else the shipped copy (plan D4).
+[Desktop Entry]
+Type=Application
+Name=Scene Editor
+Comment=Choose and arrange desktop panels
+Exec=mix @SHARE_DESKTOP@/scenes-cli.mix editor
+Icon=preferences-desktop
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=panel;scene;launcher;edge;desktop;
+StartupNotify=false

@@ -1,0 +1,146 @@
+-- version: 0.1.0
+-- The scene loader from a terminal: anywhere, and over the mesh (Scene
+-- Editor plan §4.7, safety layer 3). Every command is one scenes.* verb.
+-- usage: mix scenes-cli.mix [--target SERVICE] COMMAND
+--   list [--json] | templates [--json] | editor [--safe] [--view V] [--scene NAME]
+--   install TEMPLATE [--as NAME] [--enable]
+--   enable|disable|reload|reset|remove|fork|promote NAME | move NAME EDGE
+-- --target defaults to scenes; use scenes.<node>.bus for another node.
+-- Anonymous sends are refused, so the command re-runs this script as a
+-- registered one-shot `mix --serve` worker named scenes-cli-<6 hex>.
+-- Exit 0 on rc 0; otherwise the refusal {error_code,message} and exit 1.
+
+$USAGE = "usage: scenes-cli.mix [--target SERVICE] list [--json] | templates [--json] | editor [--safe] [--view V] [--scene NAME] | install TEMPLATE [--as NAME] [--enable] | enable|disable|reload|reset|remove|fork|promote NAME | move NAME EDGE"
+
+fn usage($why)
+  print("scenes-cli: " .. $why)
+  print($USAGE)
+  exit(2)
+end
+
+-- Option values come after their flag; everything else is positional.
+fn parse_args($argv)
+  $opts = {target:"scenes", json:false, safe:false, enable:false}
+  $pos = []
+  $i = 0
+  while $i < len($argv)
+    $a = $argv[$i]
+    if contains(["--target", "--view", "--scene", "--as"], $a) then
+      if $i + 1 >= len($argv) then usage($a .. " needs a value") end
+      $opts[substr($a, 2)] = $argv[$i + 1]
+      $i = $i + 2
+      continue
+    end
+    if $a == "--json" or $a == "--safe" or $a == "--enable" then
+      $opts[substr($a, 2)] = true
+    elif starts_with($a, "--") then
+      usage("unknown option " .. $a)
+    else
+      push($pos, $a)
+    end
+    $i = $i + 1
+  end
+  $opts.pos = $pos
+  return $opts
+end
+
+fn build_request($o)
+  $p = $o.pos
+  if len($p) == 0 then usage("missing command") end
+  $cmd = $p[0]
+  if $cmd == "list" and len($p) == 1 then return {verb:"scenes.list", body:{}} end
+  if $cmd == "templates" and len($p) == 1 then return {verb:"scenes.templates", body:{}} end
+  if $cmd == "editor" and len($p) == 1 then
+    $body = {safe:$o.safe}
+    if $o.view != nil then $body.view = $o.view end
+    if $o.scene != nil then $body.scene = $o.scene end
+    return {verb:"scenes.editor.open", body:$body}
+  end
+  if $cmd == "install" and len($p) == 2 then
+    $body = {template:$p[1], enable:$o.enable}
+    if $o.as != nil then $body.name = $o.as end
+    return {verb:"scenes.install", body:$body}
+  end
+  if contains(["enable", "disable", "reload", "reset", "remove"], $cmd) and len($p) == 2 then
+    return {verb:"scenes." .. $cmd, body:{name:$p[1]}}
+  end
+  if $cmd == "fork" and len($p) == 2 then
+    $body = {name:$p[1]}
+    if $o.as != nil then $body.as = $o.as end
+    return {verb:"scenes.fork", body:$body}
+  end
+  if $cmd == "promote" and len($p) == 2 then return {verb:"scenes.promote", body:{from:$p[1]}} end
+  if $cmd == "move" and len($p) == 3 then return {verb:"scenes.move", body:{name:$p[1], edge:$p[2]}} end
+  usage("bad command: " .. join($p, " "))
+end
+
+fn scene_state($row)
+  if not $row.enabled then return "disabled" end
+  if $row.diagnostic != nil then return "error " .. ($row.diagnostic.error_code ?? "?") end
+  if not $row.mounted then return "unmounted" end
+  return $row.behaviour ?? "static"
+end
+
+fn show_list($v)
+  $ed = $v.editor ?? {}
+  print("editor: source=" .. to_string($ed.source) .. " mounted=" .. to_string($ed.mounted) ..
+    " visible=" .. to_string($ed.visible) .. " safe=" .. to_string($ed.safe) ..
+    " user_copy=" .. to_string($ed.user_copy) .. " problems=" .. to_string(len($ed.problems ?? [])))
+  if $v.state_ok == false then print("state: UNREADABLE — " .. to_string($v.root) .. "/state.conf.mix") end
+  if $v.needs_setup then print("needs_setup: no scenes enabled") end
+  for each $row in $v.scenes ?? []
+    print(rpad($row.name, 24) .. " " .. rpad(scene_state($row), 26) .. " " .. rpad(to_string($row.edge ?? "-"), 7) ..
+      " " .. to_string($row.title ?? "") .. (len($row.problems ?? []) > 0 ? "  (" .. to_string(len($row.problems)) .. " problems)" : ""))
+  end
+end
+
+fn show_templates($v)
+  for each $t in $v.templates ?? []
+    $mark = $t.recommended ? "*" : " "
+    $note = $t.diagnostic != nil ? "  [" .. $t.diagnostic.error_code .. "]" : ""
+    $as = len($t.installed_as ?? []) > 0 ? "  installed as " .. join($t.installed_as, ", ") : ""
+    print($mark .. " " .. rpad($t.template, 16) .. " " .. rpad(to_string($t.edge ?? "-"), 7) .. " " .. to_string($t.title) .. $as .. $note)
+  end
+end
+
+$me = serve_name()
+if $me == nil then
+  $o = parse_args(args())
+  $req = build_request($o)
+  $req.target = $o.target
+  $req.json = $o.json
+  -- This exact interpreter, so a checkout's mix drives its own loader.
+  $interpreter = "/proc/" .. to_string(pid()) .. "/exe"
+  $worker = "scenes-cli-" .. slice(replace(uuid(), "-", ""), 0, 6)
+  $r = run_argv([$interpreter, "--serve", realpath($0), "--name", $worker],
+    {timeout:60, env:{SCENES_CLI_REQUEST:json_encode($req), MIX_STATS:"off"}, stdout:"inherit", stderr:"inherit"})
+  exit($r.ok ? 0 : 1)
+end
+
+-- Worker: one send, print, exit.
+$req = json_parse(env("SCENES_CLI_REQUEST"))
+$target = $req.target
+$verb = $req.verb
+$wire = json_encode($req.body)
+send $target $verb body=$wire timeout=30
+$code = $rc
+$value = $result
+if type($value) == "string" then
+  try
+    $value = json_parse($value)
+  catch $ignored
+  end
+end
+if $code != 0 then
+  $v = type($value) == "map" ? $value : {}
+  print(json_encode({error_code:$v.error_code ?? "SCENES_CLI_RC_" .. to_string($code), message:$v.message ?? to_string($value)}))
+  exit(1)
+end
+if $req.verb == "scenes.list" and not $req.json then
+  show_list($value)
+elif $req.verb == "scenes.templates" and not $req.json then
+  show_templates($value)
+else
+  print(json_encode($value))
+end
+exit(0)
