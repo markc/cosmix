@@ -532,6 +532,8 @@
 <tr><td><code>fs.mkdir</code></td><td>Required <code>path</code>; optional <code>parents</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.touch</code></td><td>Required <code>path</code></td></tr>
 <tr><td><code>fs.write</code></td><td>Required <code>path</code>; optional <code>content</code> (empty string), <code>overwrite</code> (<code>false</code>)</td></tr>
+<tr><td><code>fs.blob.ref</code></td><td>Required <code>path</code>; optional <code>name</code> (source filename), <code>mime</code> (source extension)</td></tr>
+<tr><td><code>fs.blob.materialise</code></td><td>Required <code>blob</code>, <code>path</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.copy</code></td><td>Required <code>from</code> and <code>to</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.move</code></td><td>Required <code>from</code> and <code>to</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.trash</code></td><td>Required <code>path</code></td></tr>
@@ -539,6 +541,52 @@
 <tr><td><code>fs.trash.restore</code></td><td>Required <code>token</code></td></tr>
 </tbody></table>
 <p>Write operations fail for a read-only place.</p>
+<h3 id="binary-blob-bridge">Binary blob bridge</h3>
+<p>Both blob verbs have <code>read_only=false</code> and have no unprefixed aliases.
+<code>fs.blob.ref</code> changes blobd's pin state but only needs <strong>read</strong> access to its
+source place; a read-only place is a valid source. <code>fs.blob.materialise</code> needs
+a writable destination place. The existing delegation gate applies to both.</p>
+<p><code>fs.blob.ref {path, name?, mime?}</code> opens a plain, single-link regular file under
+the place jail and streams it to <code>POST /blob</code> on the configured <code>blob_service</code>'s
+byte lane. Place roots, directories, symlink files, hardlinks, special files and
+policy-prefix paths are refused. The body uses an explicit <code>Content-Length</code>;
+the pin owner is the filesd <code>bus_service</code>. The MIME default is the same extension
+table as <code>fs.read_blob</code>. A 201 response returns the validated blob reference
+with <code>path</code> added; optional reference attributes (including a named store's
+<code>instance</code>) are preserved. File bytes are never carried in a Bus frame.</p>
+<p><code>fs.blob.materialise {blob, path, overwrite?}</code> accepts <code>b3:&lt;64 lowercase hex&gt;</code>,
+bare lowercase hex, or a reference map containing <code>blob</code>. It streams
+<code>GET /blob/&lt;hex&gt;</code> from that local store. A missing blob must first be fetched
+with <code>blob.fetch</code>; materialise does not initiate a cross-node fetch.</p>
+<p>The destination uses the write jail and rejects existing non-plain targets.
+Missing parent directories are created, matching <code>fs.write</code>. Bytes stream into
+a unique sibling temporary file, with length and BLAKE3 verification before
+publication. An overwrite preserves mode bits and uses fsync then rename;
+<code>overwrite=false</code> uses atomic hard-link publication to refuse a destination
+created during the download. New files are mode 0600 on Unix. Ownership is not
+preserved. Staging is removed on errors; the old target survives failed reads
+or verification. Directory fsync is best-effort after publication.</p>
+<p>Success is <code>{"ok":true,"path":...,"blob":"b3:...","size":N}</code>. The HTTP
+client has 30-second connect/read/write bounds, refuses redirects and encoded
+responses, and requires <code>Content-Length</code> on GET. The reader-driven landing
+primitive checks short and long inputs. ureq 2 exposes only the declared HTTP
+body, so trailing wire bytes beyond <code>Content-Length</code> are not visible to it;
+the framed body must still match the requested hash. The existing resolver's
+documented path-based check/use race posture is unchanged.</p>
+<p>All failures use rc 10 and <code>{"error":...}</code>:</p>
+<table><thead><tr><th>Leading text</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>lane_unavailable:</code></td><td>Lane props failed, timed out, or supplied an empty/invalid bind</td></tr>
+<tr><td><code>quota:</code></td><td>HTTP 413, including a bounded prefix of blobd's error body</td></tr>
+<tr><td><code>lane:</code></td><td>Other HTTP/transport errors, invalid references or response framing; a mid-upload close includes <code>lane closed during upload</code> and a quota hint</td></tr>
+<tr><td><code>not_present:</code></td><td><code>blob is not on this node — blob.fetch it first</code> (GET 404)</td></tr>
+<tr><td><code>verify_failed:</code></td><td>Body length or BLAKE3 mismatch</td></tr>
+<tr><td><code>invalid blob id</code></td><td>Invalid materialise <code>blob</code> argument</td></tr>
+<tr><td><code>denied:</code>, <code>not found:</code>, <code>exists:</code>, <code>bad request:</code>, <code>i/o error:</code></td><td>Filesystem-layer errors, passed through unchanged</td></tr>
+</tbody></table>
+<p>A truncated HTTP body reported by ureq as a read error uses <code>lane:</code>. A short
+reader ending cleanly uses <code>verify_failed:</code>. A failed call may have created
+parent directories; a failed upload response does not undo a pin already
+committed by blobd.</p>
 <h3 id="irreversible-operations">Irreversible operations</h3>
 <table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
 <tr><td><code>fs.delete</code></td><td>Required <code>path</code> and <code>confirm: true</code>; optional <code>recursive</code> (<code>false</code>)</td></tr>
