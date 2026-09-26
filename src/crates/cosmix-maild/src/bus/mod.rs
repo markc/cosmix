@@ -17,6 +17,7 @@ pub mod accounts;
 pub mod attachments;
 pub mod bayesian;
 pub mod blobs;
+pub mod diagnostics;
 pub mod dkim;
 pub mod props_publisher;
 pub mod retention;
@@ -152,6 +153,7 @@ pub async fn run(
     retention_state: retention::RetentionBusState,
     vtoken_state: vtoken::VtokenBusState,
     bayesian_state: bayesian::BayesianBusState,
+    max_message_size: usize,
 ) {
     let bi = cosmix_buildinfo::build_info!();
     let prov = cosmix_bus::RegisterProvenance::from_parts(
@@ -275,6 +277,7 @@ pub async fn run(
             retention_state.clone(),
             vtoken_state.clone(),
             bayesian_state.clone(),
+            max_message_size,
         )
         .await
         {
@@ -392,6 +395,7 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
                 "envelope_to",
                 "peer_ip",
                 "message_b64",
+                "blob",
                 "sender_authenticated",
                 "mail_auth",
             ],
@@ -406,7 +410,7 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new(
             "maild.bayesian.classify",
-            &["account_id", "message_b64"],
+            &["account_id", "message_b64", "blob"],
             "Classify a message without training",
             true,
         ),
@@ -620,6 +624,7 @@ async fn dispatch_loop(
     retention_state: retention::RetentionBusState,
     vtoken_state: vtoken::VtokenBusState,
     bayesian_state: bayesian::BayesianBusState,
+    max_message_size: usize,
 ) -> DispatchLoopExit {
     let mut rx = match client.incoming_async().await {
         Some(rx) => rx,
@@ -633,7 +638,7 @@ async fn dispatch_loop(
         if !client.is_connected() {
             break;
         }
-        if is_transfer(&cmd.command) {
+        if is_transfer(&cmd.command) || is_blob_diagnostic(&cmd) {
             if transfers.is_full() {
                 let body =
                     serde_json::json!({"error": "busy: maild blob transfer pool is full (8)"})
@@ -646,14 +651,31 @@ async fn dispatch_loop(
             let client = client.clone();
             let db = db.clone();
             let mailstore = mailstore.clone();
+            let rule_engine = rule_engine.clone();
+            let rule_stats = rule_stats.clone();
+            let classifier = classifier.clone();
+            let hostname = hostname.clone();
+            let overrides_runtime = overrides_runtime.clone();
+            let bayesian_state = bayesian_state.clone();
             transfers.spawn(async move {
-                let (rc, body) = dispatch_attachment(&cmd, &db, &mailstore, &client).await;
+                let input = diagnostics::Input { discovery: client.as_ref(), max_message_size };
+                let (rc, body) = match cmd.command.as_str() {
+                    "maild.rules.explain" => rules::dispatch("explain", &cmd, &rule_engine,
+                        &rule_stats, &hostname, &overrides_runtime, &db, &input).await,
+                    "maild.bayesian.classify" => bayesian::dispatch("classify", &cmd,
+                        &classifier, &db, &mailstore, &bayesian_state, &input).await,
+                    _ => dispatch_attachment(&cmd, &db, &mailstore, &client).await,
+                };
                 if let Err(e) = client.respond(&cmd, rc, &body).await {
                     tracing::warn!(error = %e, command = %cmd.command, "Bus transfer response failed");
                 }
             }).expect("slot checked without yielding or sharing the task set");
             continue;
         }
+        let input = diagnostics::Input {
+            discovery: client.as_ref(),
+            max_message_size,
+        };
         let (rc, body) = if cmd.command == "maild.attachment.list" {
             dispatch_attachment(&cmd, &db, &mailstore, &client).await
         } else if cmd.command == "maild.blob.migrate" {
@@ -667,10 +689,20 @@ async fn dispatch_loop(
                 &hostname,
                 &overrides_runtime,
                 &db,
+                &input,
             )
             .await
         } else if let Some(action) = cmd.command.strip_prefix("maild.bayesian.") {
-            bayesian::dispatch(action, &cmd, &classifier, &db, &mailstore, &bayesian_state).await
+            bayesian::dispatch(
+                action,
+                &cmd,
+                &classifier,
+                &db,
+                &mailstore,
+                &bayesian_state,
+                &input,
+            )
+            .await
         } else if let Some(action) = cmd.command.strip_prefix("maild.accounts.") {
             accounts::dispatch(action, &cmd, &db, &mailstore, &accounts_runtime).await
         } else if let Some(action) = cmd.command.strip_prefix("maild.search.") {
@@ -700,6 +732,13 @@ async fn dispatch_loop(
 
 fn is_transfer(command: &str) -> bool {
     matches!(command, "maild.attachment.ref" | "maild.message.ref")
+}
+
+fn is_blob_diagnostic(cmd: &IncomingCommand) -> bool {
+    matches!(
+        cmd.command.as_str(),
+        "maild.rules.explain" | "maild.bayesian.classify"
+    ) && try_resolve_args(cmd).is_ok_and(|args| args.get("blob").is_some())
 }
 
 async fn dispatch_attachment(
@@ -791,6 +830,30 @@ mod tests {
         }
         assert!(is_transfer("maild.attachment.ref"));
         assert!(is_transfer("maild.message.ref"));
+        assert!(!is_transfer("maild.rules.explain"));
+        assert!(!is_transfer("maild.bayesian.classify"));
+        for name in ["maild.rules.explain", "maild.bayesian.classify"] {
+            let verb = manifest.iter().find(|v| v.name == name).unwrap();
+            assert!(verb.args.iter().any(|a| a == "blob"));
+            assert!(verb.args.iter().any(|a| a == "message_b64"));
+            assert!(verb.read_only);
+            let mut cmd = IncomingCommand {
+                from: "test".into(),
+                command: name.into(),
+                id: None,
+                args: serde_json::json!({"message_b64": ""}),
+                body: String::new(),
+                headers: Default::default(),
+            };
+            assert!(!is_blob_diagnostic(&cmd));
+            cmd.headers.insert(
+                "args".into(),
+                serde_json::json!({"blob": "b3:test"}).to_string(),
+            );
+            assert!(is_blob_diagnostic(&cmd));
+            cmd.headers.insert("args".into(), "invalid JSON".into());
+            assert!(!is_blob_diagnostic(&cmd)); // strict dispatcher refuses it
+        }
         assert!(!is_transfer("maild.attachment.list"));
         assert!(!is_transfer("maild.blob.migrate"));
     }

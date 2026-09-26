@@ -532,13 +532,56 @@ returned. All successful rows return rc 0; any failed row returns rc 10 with
 <code>conflicting:</code> and <code>unreadable:</code>; other storage errors count as <code>failed</code>.</p>
 <p>This is a Bus maintenance operation, not a local CLI subcommand. No second
 MDS instance is opened and no blobd service or shared root is involved.</p>
+<p>The complete successful page shape is:</p>
+<pre><code class="language-json">{
+  "apply": false,
+  "done": false,
+  "next": 742,
+  "accounts": {
+    "42": {
+      "planned": 500,
+      "migrated": 0,
+      "already_migrated": 0,
+      "missing": 0,
+      "corrupt": 0,
+      "conflicting": 0,
+      "failed": 0
+    }
+  },
+  "errors": []
+}
+</code></pre>
+<p><code>apply</code> echoes the boolean mode. <code>accounts</code> is an object keyed by decimal
+account ID, containing only accounts encountered in this page; every count
+is present and counts are per call, not cumulative. <code>planned</code> counts new
+work in dry-run, <code>migrated</code> counts completed new work in apply mode, and
+<code>already_migrated</code> counts verified existing holds in either mode. A retry
+that completes a previously failed queue backfill may count as already
+migrated. An empty page has <code>accounts: {}</code>, <code>errors: []</code>, <code>done: true</code>,
+<code>next: null</code>.</p>
+<p><code>cursor</code> is the last processed legacy <code>blobs.rowid</code>, not an offset or an
+account ID. It defaults to 0 and must be a nonnegative integer. Rows are
+selected in increasing rowid order with <code>rowid &gt; cursor</code>, optionally filtered
+by positive integer <code>account_id</code>. <code>limit</code> is an integer in 1..500, default
+500. <code>next</code> is the last processed rowid when more enumeration remains;
+otherwise it is null. Failed rows also advance the cursor. Use the returned
+cursor unchanged and keep the same filter and mode; begin apply at cursor 0
+after finishing dry-run, and restart at 0 to retry repaired failures.</p>
+<p>A page with failed rows retains all these fields, returns rc 10 and adds
+<code>"error":"migration: some rows failed; legacy data retained"</code>.
+<code>errors</code> contains up to 20 objects of the form
+<code>{"cursor":742,"account_id":42,"error":"missing: legacy file"}</code>;
+each diagnostic is truncated to 256 characters. Validation or page-level
+worker/database failure instead returns only <code>{"error":"..."}</code> with rc 10
+and an <code>invalid_arguments:</code> or <code>migration:</code> prefix; it supplies no resume
+cursor. Unknown argument names are rejected.</p>
 <h2 id="rules-and-bayesian-verbs">Rules and Bayesian verbs</h2>
 <table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
 <tr><td><code>maild.rules.reload</code></td><td>None</td><td>Reload the configured pack and return load metadata</td></tr>
 <tr><td><code>maild.rules.stats</code></td><td>Optional <code>top_n</code></td><td>Return pack metadata and persistent verdict and rule-hit counters</td></tr>
-<tr><td><code>maild.rules.explain</code></td><td>Envelope and base64 message</td><td>Explain rule evaluation without delivering</td></tr>
+<tr><td><code>maild.rules.explain</code></td><td>Envelope and exactly one of <code>message_b64</code> / <code>blob</code></td><td>Explain rule evaluation without delivering</td></tr>
 <tr><td><code>maild.bayesian.stats</code></td><td><code>account_id</code> or <code>email</code></td><td>Return per-account corpus statistics, read-only, echoing the resolved <code>account_id</code> and <code>email</code>; an account with no row is refused</td></tr>
-<tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, <code>message_b64</code></td><td>Classify without recording a training label</td></tr>
+<tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, exactly one of <code>message_b64</code> / <code>blob</code></td><td>Classify without recording a training label</td></tr>
 <tr><td><code>maild.bayesian.train</code></td><td><code>account_id</code> or <code>email</code>; <code>email_id</code> or <code>message_id</code>; <code>class</code> (<code>spam</code> / <code>ham</code>)</td><td>Train one stored message through the Junk-move path; returns <code>result</code> (<code>applied</code> / <code>already_labeled</code>)</td></tr>
 <tr><td><code>maild.bayesian.untrain</code></td><td><code>account_id</code> or <code>email</code>; <code>email_id</code> or <code>message_id</code></td><td>Remove the message's training label and reverse its counts; returns <code>removed</code> (<code>spam</code>, <code>ham</code>, or null)</td></tr>
 </tbody></table>
@@ -555,6 +598,36 @@ MDS instance is opened and no blobd service or shared root is involved.</p>
 }
 </code></pre>
 <p><code>account_id</code> may be omitted for engine defaults. It may otherwise be a non-negative JSON integer or an all-digit string. <code>mail_auth</code> is reserved; the handler currently synthesises a no-DNS verification result for explanation.</p>
+<p>Both diagnostic verbs require <strong>exactly one</strong> input key: <code>message_b64</code> must
+be a string, or <code>blob</code> must be a canonical lowercase <code>b3:&lt;64hex&gt;</code> string or
+a reference object with that <code>blob</code> member. Both keys (even if one is null)
+or neither key return rc 10 <code>invalid_arguments: exactly one of message_b64 or blob is required</code>. Invalid IDs return <code>invalid blob id</code>; invalid base64
+retains the <code>message_b64 decode:</code> prefix. Malformed argument JSON is refused.</p>
+<p><code>blob</code> downloads only from the local lane, ignores reference origin for
+routing, and verifies hash and length before rule evaluation/classification.
+If an input map supplies <code>size</code>, it must match the verified response length.
+HTTP 404 returns <code>not_present: blob is not on this node — blob.fetch it first</code>;
+there is no implicit mesh fetch. The configured <code>max_message_size</code> (default
+25 MiB) bounds both decoded legacy input and downloaded bytes. Oversized input
+returns <code>too_large: message exceeds max_message_size</code>. Other lane failures
+use the lane tokens documented above. Diagnostic replies keep their existing
+shape and do not include message bytes.</p>
+<p>Blob-input diagnostic calls share the eight-task pool with exports, so
+they can also return <code>busy:</code>. Legacy-input calls and other existing verbs
+retain serial dispatch. <code>message_b64</code> remains an explicit compatibility
+exception to the reference-only Bus rule; new callers should use <code>blob</code>.</p>
+<p>The complete P4 manifest additions and expanded argument lists are:</p>
+<table><thead><tr><th>Verb</th><th>Manifest args, in order</th><th>Read-only</th></tr></thead><tbody>
+<tr><td><code>maild.blob.migrate</code></td><td><code>apply</code>, <code>account_id</code>, <code>cursor</code>, <code>limit</code></td><td>no</td></tr>
+<tr><td><code>maild.attachment.list</code></td><td><code>account_id</code>, <code>email_id</code></td><td>yes</td></tr>
+<tr><td><code>maild.attachment.ref</code></td><td><code>account_id</code>, <code>email_id</code>, <code>part</code>, <code>name</code></td><td>no</td></tr>
+<tr><td><code>maild.message.ref</code></td><td><code>account_id</code>, <code>email_id</code></td><td>no</td></tr>
+<tr><td><code>maild.rules.explain</code></td><td><code>account_id</code>, <code>envelope_from</code>, <code>envelope_to</code>, <code>peer_ip</code>, <code>message_b64</code>, <code>blob</code>, <code>sender_authenticated</code>, <code>mail_auth</code></td><td>yes</td></tr>
+<tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, <code>message_b64</code>, <code>blob</code></td><td>yes</td></tr>
+</tbody></table>
+<p>The last two verbs already existed; their sole new manifest argument is
+<code>blob</code>. Manifest metadata advertises capabilities; broker policy still
+controls invocation.</p>
 <p><code>maild.rules.stats</code> returns at most 256 rule entries by default and clamps <code>top_n</code> to 4096. <code>top_n: 0</code> returns rule cardinality without the per-rule map.</p>
 <h2 id="search-and-statistics-verbs">Search and statistics verbs</h2>
 <table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>

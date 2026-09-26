@@ -74,6 +74,10 @@ an inspection limit returns HTTP 413 `too_large: …`; unreadable or corrupt
 owned messages return HTTP 500 `unreadable: message`. No part bytes are stored
 as new CAS blobs by inspection or download.
 
+Blobd export references (`b3:` IDs) are separate from JMAP part/upload IDs.
+Exporting a part or message does not replace its JMAP `blobId`, redirect
+`/jmap/blob` to blobd, or change `Email/import`'s upload-UUID input.
+
 ### Blob byte lane
 
 Maild uses the local blobd HTTP byte lane, discovered over Bus with
@@ -99,6 +103,15 @@ saved reference. Pins and bookkeeping survive mail/account deletion until
 later reconciliation. No detach or message rewrite occurs. `message.ref`
 is export, not a new `Email/import` input. See [bus.md](bus.md) for arguments,
 reply fields, errors and lifecycle details.
+
+`maild.rules.explain` and `maild.bayesian.classify` accept exactly one of a
+local `blob` reference/ID or the retained `message_b64` compatibility input.
+Both use the configured `max_message_size` bound (default 25 MiB), and blob
+downloads are verified before evaluation. Blob-input diagnostics share the
+export task pool; legacy calls retain serial dispatch. Replies retain the
+existing verdict/explanation
+shape; new clients should carry references over Bus. Missing local blobs
+return `not_present:` rather than initiating a mesh fetch.
 
 ### SMTP
 

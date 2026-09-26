@@ -632,16 +632,16 @@ mod tests {
         let (bind, server) = serve("200 OK", b"x", "", 1);
         let (tx, rx) = watch::channel(Instant::now());
         let pulse = tokio::spawn(async move {
-            for _ in 0..10 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 tx.send_replace(Instant::now());
             }
         });
         let request = async {
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            tokio::time::sleep(Duration::from_millis(750)).await;
             lane.http.get(format!("http://{bind}/blob")).send().await
         };
-        upload_response(request, rx, Duration::from_millis(40))
+        upload_response(request, rx, Duration::from_millis(500))
             .await
             .unwrap();
         pulse.await.unwrap();

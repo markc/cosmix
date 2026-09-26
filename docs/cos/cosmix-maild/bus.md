@@ -112,15 +112,64 @@ returned. All successful rows return rc 0; any failed row returns rc 10 with
 This is a Bus maintenance operation, not a local CLI subcommand. No second
 MDS instance is opened and no blobd service or shared root is involved.
 
+The complete successful page shape is:
+
+```json
+{
+  "apply": false,
+  "done": false,
+  "next": 742,
+  "accounts": {
+    "42": {
+      "planned": 500,
+      "migrated": 0,
+      "already_migrated": 0,
+      "missing": 0,
+      "corrupt": 0,
+      "conflicting": 0,
+      "failed": 0
+    }
+  },
+  "errors": []
+}
+```
+
+`apply` echoes the boolean mode. `accounts` is an object keyed by decimal
+account ID, containing only accounts encountered in this page; every count
+is present and counts are per call, not cumulative. `planned` counts new
+work in dry-run, `migrated` counts completed new work in apply mode, and
+`already_migrated` counts verified existing holds in either mode. A retry
+that completes a previously failed queue backfill may count as already
+migrated. An empty page has `accounts: {}`, `errors: []`, `done: true`,
+`next: null`.
+
+`cursor` is the last processed legacy `blobs.rowid`, not an offset or an
+account ID. It defaults to 0 and must be a nonnegative integer. Rows are
+selected in increasing rowid order with `rowid > cursor`, optionally filtered
+by positive integer `account_id`. `limit` is an integer in 1..500, default
+500. `next` is the last processed rowid when more enumeration remains;
+otherwise it is null. Failed rows also advance the cursor. Use the returned
+cursor unchanged and keep the same filter and mode; begin apply at cursor 0
+after finishing dry-run, and restart at 0 to retry repaired failures.
+
+A page with failed rows retains all these fields, returns rc 10 and adds
+`"error":"migration: some rows failed; legacy data retained"`.
+`errors` contains up to 20 objects of the form
+`{"cursor":742,"account_id":42,"error":"missing: legacy file"}`;
+each diagnostic is truncated to 256 characters. Validation or page-level
+worker/database failure instead returns only `{"error":"..."}` with rc 10
+and an `invalid_arguments:` or `migration:` prefix; it supplies no resume
+cursor. Unknown argument names are rejected.
+
 ## Rules and Bayesian verbs
 
 | Verb | Arguments | Result |
 |---|---|---|
 | `maild.rules.reload` | None | Reload the configured pack and return load metadata |
 | `maild.rules.stats` | Optional `top_n` | Return pack metadata and persistent verdict and rule-hit counters |
-| `maild.rules.explain` | Envelope and base64 message | Explain rule evaluation without delivering |
+| `maild.rules.explain` | Envelope and exactly one of `message_b64` / `blob` | Explain rule evaluation without delivering |
 | `maild.bayesian.stats` | `account_id` or `email` | Return per-account corpus statistics, read-only, echoing the resolved `account_id` and `email`; an account with no row is refused |
-| `maild.bayesian.classify` | `account_id`, `message_b64` | Classify without recording a training label |
+| `maild.bayesian.classify` | `account_id`, exactly one of `message_b64` / `blob` | Classify without recording a training label |
 | `maild.bayesian.train` | `account_id` or `email`; `email_id` or `message_id`; `class` (`spam` / `ham`) | Train one stored message through the Junk-move path; returns `result` (`applied` / `already_labeled`) |
 | `maild.bayesian.untrain` | `account_id` or `email`; `email_id` or `message_id` | Remove the message's training label and reverse its counts; returns `removed` (`spam`, `ham`, or null) |
 
@@ -142,6 +191,43 @@ MDS instance is opened and no blobd service or shared root is involved.
 ```
 
 `account_id` may be omitted for engine defaults. It may otherwise be a non-negative JSON integer or an all-digit string. `mail_auth` is reserved; the handler currently synthesises a no-DNS verification result for explanation.
+
+Both diagnostic verbs require **exactly one** input key: `message_b64` must
+be a string, or `blob` must be a canonical lowercase `b3:<64hex>` string or
+a reference object with that `blob` member. Both keys (even if one is null)
+or neither key return rc 10 `invalid_arguments: exactly one of message_b64
+or blob is required`. Invalid IDs return `invalid blob id`; invalid base64
+retains the `message_b64 decode:` prefix. Malformed argument JSON is refused.
+
+`blob` downloads only from the local lane, ignores reference origin for
+routing, and verifies hash and length before rule evaluation/classification.
+If an input map supplies `size`, it must match the verified response length.
+HTTP 404 returns `not_present: blob is not on this node — blob.fetch it first`;
+there is no implicit mesh fetch. The configured `max_message_size` (default
+25 MiB) bounds both decoded legacy input and downloaded bytes. Oversized input
+returns `too_large: message exceeds max_message_size`. Other lane failures
+use the lane tokens documented above. Diagnostic replies keep their existing
+shape and do not include message bytes.
+
+Blob-input diagnostic calls share the eight-task pool with exports, so
+they can also return `busy:`. Legacy-input calls and other existing verbs
+retain serial dispatch. `message_b64` remains an explicit compatibility
+exception to the reference-only Bus rule; new callers should use `blob`.
+
+The complete P4 manifest additions and expanded argument lists are:
+
+| Verb | Manifest args, in order | Read-only |
+|---|---|---|
+| `maild.blob.migrate` | `apply`, `account_id`, `cursor`, `limit` | no |
+| `maild.attachment.list` | `account_id`, `email_id` | yes |
+| `maild.attachment.ref` | `account_id`, `email_id`, `part`, `name` | no |
+| `maild.message.ref` | `account_id`, `email_id` | no |
+| `maild.rules.explain` | `account_id`, `envelope_from`, `envelope_to`, `peer_ip`, `message_b64`, `blob`, `sender_authenticated`, `mail_auth` | yes |
+| `maild.bayesian.classify` | `account_id`, `message_b64`, `blob` | yes |
+
+The last two verbs already existed; their sole new manifest argument is
+`blob`. Manifest metadata advertises capabilities; broker policy still
+controls invocation.
 
 `maild.rules.stats` returns at most 256 rule entries by default and clamps `top_n` to 4096. `top_n: 0` returns rule cardinality without the per-rule map.
 

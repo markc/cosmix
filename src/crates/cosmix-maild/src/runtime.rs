@@ -718,6 +718,7 @@ pub async fn build_runtime(cfg: &Config, opts: RuntimeOpts) -> Result<BuiltMaild
             retention_state,
             vtoken_state,
             bayesian_state,
+            cfg.max_message_size.unwrap_or(25 * 1024 * 1024),
         ))))
     } else {
         let _ = props_router;

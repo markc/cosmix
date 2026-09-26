@@ -394,6 +394,22 @@ mod tests {
     }
 
     #[test]
+    fn truncated_and_garbage_mime_never_panics_or_escapes_bounds() {
+        for raw in [
+            b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--".as_slice(),
+            b"Content-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!!\xff\x00",
+            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n=Z=\xff\x00",
+        ] {
+            for end in 0..=raw.len() {
+                if let Ok(result) = inspect(&raw[..end], None, false) {
+                    assert!(result.parts.len() <= MAX_PARTS);
+                    for part in result.parts { assert!(valid_path(&part.path)); assert!(part.size <= MAX_PART); }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn transfer_octets_are_not_charset_converted() {
         let raw = b"Content-Type: text/plain; charset=iso-8859-1\r\nContent-Disposition: attachment; filename=cafe.txt\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ncaf=E9";
         let result = inspect(raw, Some("1"), true).unwrap();

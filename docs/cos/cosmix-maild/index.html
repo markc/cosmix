@@ -501,6 +501,9 @@ same HTTP 404 <code>blob not found</code>. Malformed IDs return HTTP 400 <code>i
 an inspection limit returns HTTP 413 <code>too_large: …</code>; unreadable or corrupt
 owned messages return HTTP 500 <code>unreadable: message</code>. No part bytes are stored
 as new CAS blobs by inspection or download.</p>
+<p>Blobd export references (<code>b3:</code> IDs) are separate from JMAP part/upload IDs.
+Exporting a part or message does not replace its JMAP <code>blobId</code>, redirect
+<code>/jmap/blob</code> to blobd, or change <code>Email/import</code>'s upload-UUID input.</p>
 <h3 id="blob-byte-lane">Blob byte lane</h3>
 <p>Maild uses the local blobd HTTP byte lane, discovered over Bus with
 <code>blob.props.get {"path":"lane"}</code>. Uploads use owner <code>maild:&lt;account_id&gt;</code> and
@@ -523,6 +526,14 @@ saved reference. Pins and bookkeeping survive mail/account deletion until
 later reconciliation. No detach or message rewrite occurs. <code>message.ref</code>
 is export, not a new <code>Email/import</code> input. See <a href="/cos/cosmix-maild/bus">bus.md</a> for arguments,
 reply fields, errors and lifecycle details.</p>
+<p><code>maild.rules.explain</code> and <code>maild.bayesian.classify</code> accept exactly one of a
+local <code>blob</code> reference/ID or the retained <code>message_b64</code> compatibility input.
+Both use the configured <code>max_message_size</code> bound (default 25 MiB), and blob
+downloads are verified before evaluation. Blob-input diagnostics share the
+export task pool; legacy calls retain serial dispatch. Replies retain the
+existing verdict/explanation
+shape; new clients should carry references over Bus. Missing local blobs
+return <code>not_present:</code> rather than initiating a mesh fetch.</p>
 <h3 id="smtp">SMTP</h3>
 <p><code>smtp_inbound</code> enables inbound SMTP. <code>smtp_smtps</code> enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.</p>
 <p>Inbound delivery resolves local accounts and aliases, applies mail-auth checks, the rules engine, Bayesian classification, optional Mix routing, and retention-related metadata before committing mail to the mailbox store. Remote submissions enter the retry queue and outbound delivery path.</p>
