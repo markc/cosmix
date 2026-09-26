@@ -55,10 +55,11 @@ pub enum Effect {
 #[derive(Clone)]
 pub struct BusHandle {
     tx: tokio::sync::mpsc::UnboundedSender<Effect>,
-    /// Fires when the bus thread has finished (replies flushed, client
-    /// closed) — `wait_done` before process exit guarantees the last
-    /// reply reached the wire instead of racing it.
-    done: std::sync::mpsc::Receiver<()>,
+    /// Set + notified when the bus thread has finished (replies flushed,
+    /// client closed) — `wait_done` before process exit guarantees the
+    /// last reply reached the wire instead of racing it. Arc-shared so
+    /// the handle stays Clone (a raw Receiver is not).
+    done: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl BusHandle {
@@ -73,7 +74,14 @@ impl BusHandle {
     /// Block until the bus thread is finished (bounded). Call after
     /// [`BusHandle::quit`] and before exiting the process.
     pub fn wait_done(&self, timeout: Duration) {
-        let _ = self.done.recv_timeout(timeout);
+        let (lock, notified) = &*self.done;
+        let finished = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *finished {
+            return;
+        }
+        let _ = notified
+            .wait_timeout_while(finished, timeout, |finished| !*finished)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
@@ -128,7 +136,8 @@ pub fn spawn(service: &str, url: &str) -> Result<(BusHandle, UnboundedReceiver<D
     let (dtx, drx) = unbounded();
     let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let done_thread = std::sync::Arc::clone(&done);
     let service = service.to_string();
     let url = url.to_owned();
     std::thread::Builder::new()
@@ -142,11 +151,13 @@ pub fn spawn(service: &str, url: &str) -> Result<(BusHandle, UnboundedReceiver<D
                 }
             };
             runtime.block_on(run(service, url, dtx, erx, ready_tx));
-            let _ = done_tx.send(());
+            let (lock, notified) = &*done_thread;
+            *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            notified.notify_all();
         })
         .map_err(|e| StartError::Unreachable(format!("Bus thread: {e}")))?;
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok((BusHandle { tx: etx, done: done_rx }, drx)),
+        Ok(Ok(())) => Ok((BusHandle { tx: etx, done }, drx)),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(StartError::Unreachable("the Bus thread exited".into())),
     }
