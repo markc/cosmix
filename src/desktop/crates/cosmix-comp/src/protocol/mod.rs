@@ -3350,6 +3350,7 @@ impl ProtocolServer {
             seat_state,
             human: CompSeat {
                 kind: SeatKind::Human,
+                last_keyboard_action: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
                 seat,
@@ -3360,6 +3361,7 @@ impl ProtocolServer {
             input_ingress: input::InputIngressState::default(),
             agent: CompSeat {
                 kind: SeatKind::Agent,
+                last_keyboard_action: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
                 seat: agent_seat,
@@ -3458,7 +3460,6 @@ impl ProtocolServer {
             surface_count: 0,
             subsurface_topology: HashMap::new(),
             damage_requests_since_apply: HashMap::new(),
-            last_keyboard_action: None,
             shm_bytes: 0,
             diagnostic_sender,
             shutdown_cause: None,
@@ -6392,7 +6393,6 @@ struct WaylandState {
     surface_count: usize,
     subsurface_topology: HashMap<ObjectId, SubsurfaceTopology>,
     damage_requests_since_apply: HashMap<ObjectId, usize>,
-    last_keyboard_action: Option<(Serial, WlSurface)>,
     shm_bytes: usize,
     diagnostic_sender: SyncSender<ShmDiagnostic>,
     shutdown_cause: Option<ProtocolShutdownCause>,
@@ -8206,7 +8206,7 @@ impl WaylandState {
         self.finish_interactive_pointer(false);
         self.interactive_pointer = None;
         self.exclusive_keyboard_focus = None;
-        self.last_keyboard_action = None;
+        self.human.last_keyboard_action = None;
         self.human.keyboard
             .clone()
             .set_focus(self, None, SERIAL_COUNTER.next_serial());
@@ -9101,6 +9101,7 @@ impl WaylandState {
     }
 
     fn clear_agent_input_for_lock(&mut self) {
+        self.agent.last_keyboard_action = None;
         let keyboard = self.agent.keyboard.clone();
         let pointer = self.agent.pointer.clone();
         keyboard.unset_grab(self);
@@ -12443,7 +12444,7 @@ impl WaylandState {
 
         if pressed {
             if action.is_none() {
-                self.last_keyboard_action = keyboard
+                self.human.last_keyboard_action = keyboard
                     .current_focus()
                     .and_then(|target| target.owned_surface())
                     .map(|surface| {
@@ -12453,10 +12454,10 @@ impl WaylandState {
                         )
                     });
             } else {
-                invalidate_keyboard_action(&mut self.last_keyboard_action);
+                invalidate_keyboard_action(&mut self.human.last_keyboard_action);
             }
         } else {
-            invalidate_keyboard_action(&mut self.last_keyboard_action);
+            invalidate_keyboard_action(&mut self.human.last_keyboard_action);
         }
 
         if let Some(action) = action {
@@ -12498,7 +12499,7 @@ impl WaylandState {
                 },
             )
             .flatten();
-        invalidate_keyboard_action(&mut self.last_keyboard_action);
+        invalidate_keyboard_action(&mut self.human.last_keyboard_action);
         if let Some(action) = action {
             self.handle_binding_action(action);
         }

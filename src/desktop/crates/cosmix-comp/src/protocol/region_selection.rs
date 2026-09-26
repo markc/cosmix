@@ -155,7 +155,7 @@ impl WaylandState {
         self.reset_corner_detector();
         self.update_chrome_hover(None);
         self.titlebar_click_candidate = None;
-        self.last_keyboard_action = None;
+        self.human.last_keyboard_action = None;
         self.chrome_cursor_override = None;
         #[cfg(feature = "embedded-quoin")]
         if let Some(bridge) = &self.embedded_shell {
@@ -560,7 +560,7 @@ impl WaylandState {
                 },
             )
             .flatten();
-        self.last_keyboard_action = None;
+        self.human.last_keyboard_action = None;
         if let Some(action) = action {
             self.finish_region_selection(ControlReply::Busy);
             self.handle_binding_action(action);

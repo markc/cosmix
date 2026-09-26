@@ -1,6 +1,6 @@
 //! Compositor-owned input handles and optional observer pose.
 
-use super::{KeyboardHandle, PointerHandle, Seat, WaylandState};
+use super::{KeyboardHandle, PointerHandle, Seat, Serial, WaylandState, WlSurface};
 
 // Keep in step with cosmix-shell-host/src/runner.rs; no unconditional shared desktop crate.
 pub const HUMAN_SEAT_NAME: &str = "cosmix";
@@ -35,6 +35,7 @@ pub(super) struct CompSeat {
     pub seat: Seat<WaylandState>,
     pub keyboard: KeyboardHandle<WaylandState>,
     pub pointer: PointerHandle<WaylandState>,
+    pub last_keyboard_action: Option<(Serial, WlSurface)>,
     /// Injected holds are owned by this seat; physical pressed state lives
     /// in its Smithay keyboard/pointer handles.
     #[cfg(feature = "bus")]

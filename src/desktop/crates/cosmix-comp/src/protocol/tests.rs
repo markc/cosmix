@@ -2513,14 +2513,14 @@ fn other_seat_focus_preserves_human_activation_stacking_and_popup_serial() {
         .map(|(id, record)| (id.clone(), (record.focused, record.layout.z)))
         .collect::<HashMap<_, _>>();
     let action = (SERIAL_COUNTER.next_serial(), human_surface);
-    h.server.state.last_keyboard_action = Some(action.clone());
+    h.server.state.human.last_keyboard_action = Some(action.clone());
     let _ = h.sync();
     // Deliberately duplicate the name: callback ownership must use identity.
     let mut other_seat = h.server.state.seat_state.new_seat(HUMAN_SEAT_NAME);
     let keyboard = other_seat.add_keyboard(Default::default(), 500, 30).unwrap();
     keyboard.set_focus(&mut h.server.state, Some(target.into()), SERIAL_COUNTER.next_serial());
     assert_eq!(h.server.state.human.keyboard.current_focus(), before_focus);
-    assert_eq!(h.server.state.last_keyboard_action, Some(action));
+    assert_eq!(h.server.state.human.last_keyboard_action, Some(action));
     for (id, expected) in before_stack {
         let record = &h.server.state.surfaces[&id];
         assert_eq!((record.focused, record.layout.z), expected);
