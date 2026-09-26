@@ -225,6 +225,7 @@ pub fn inspect(
     structure_preflight(data)?;
     // Callers join from spawn_blocking. Parse, walk AND recursive tree drop
     // stay on this stack, including all error paths; only owned projections leave.
+    // A parser panic in any profile maps to unreadable:.
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("maild-mime".into())
@@ -572,7 +573,32 @@ mod tests {
 
     #[test]
     fn two_embedded_messages_inside_multipart_keep_paths_and_octets() {
-        let raw = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n";
+        // Each embedded message has its own multipart placeholder at index 0.
+        // In mail-parser 0.11.5 parsers/message.rs:440-490, closing z finds
+        // that placeholder, restores the message state and seeks y. Restoring
+        // y's message then finds y's index 0; closing y similarly seeks x and
+        // restores x's index 0. No message shares its parent's closing boundary.
+        // Mark y as an attached entity to retain its projected path 1.1.1.
+        let raw = concat!(
+            "From: sender@example.test\r\nDate: Fri, 25 Sep 2026 00:00:00 +0000\r\n",
+            "Subject: outer\r\nMIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=x\r\n\r\n",
+            "--x\r\nContent-Type: message/rfc822\r\n\r\n",
+            "From: sender@example.test\r\nDate: Fri, 25 Sep 2026 00:00:00 +0000\r\n",
+            "Subject: first embedded message\r\nMIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=y\r\n",
+            "Content-Disposition: attachment\r\n\r\n",
+            "--y\r\nContent-Type: application/octet-stream\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\nAP8=\r\n",
+            "--y\r\nContent-Type: message/rfc822\r\n\r\n",
+            "From: sender@example.test\r\nDate: Fri, 25 Sep 2026 00:00:00 +0000\r\n",
+            "Subject: second embedded message\r\nMIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=z\r\n\r\n",
+            "--z\r\nContent-Type: application/octet-stream\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\nAP8=\r\n",
+            "--z--\r\n--y--\r\n--x--\r\n",
+        )
+        .as_bytes();
         let result = inspect(raw, Some("1.1.1.1"), false).unwrap();
         assert_eq!(
             result
@@ -580,10 +606,38 @@ mod tests {
                 .iter()
                 .map(|p| p.path.as_str())
                 .collect::<Vec<_>>(),
-            ["1.1", "1.1.1", "1.1.1.1"]
+            ["1.1", "1.1.1", "1.1.1.1", "1.1.1.2", "1.1.1.2.1.1"]
         );
         assert!(result.parts[1].embedded && result.parts[2].embedded);
         assert_eq!(result.extracted.unwrap(), [0, 255]);
+        assert_eq!(
+            inspect(raw, Some("1.1.1.2.1.1"), false)
+                .unwrap()
+                .extracted
+                .unwrap(),
+            [0, 255]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn malformed_nested_messages_contain_the_parser_debug_panic() {
+        // mail-parser 0.11.5 parsers/message.rs:485 debug_asserts "Invalid
+        // part ID, could not find multipart." for this original fixture.
+        // Release builds parse it instead; panic-to-unreadable mapping stays.
+        let raw = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n";
+        assert_eq!(
+            inspect(raw, Some("1.1.1.1"), false).unwrap_err(),
+            Error::Unreadable("MIME worker panicked".into())
+        );
+        // The joined worker's panic never escapes the scope or kills its caller.
+        assert_eq!(
+            inspect(b"Content-Type: text/plain\r\n\r\nalive", Some("1"), false)
+                .unwrap()
+                .extracted
+                .unwrap(),
+            b"alive"
+        );
     }
 
     #[test]
