@@ -991,6 +991,58 @@ fn release_pointer(pointer: impl PointerRelease) {
     }
 }
 
+/// Prefer the compositor's human seat. Unknown names wait for discovery;
+/// an agent seat is never a fallback. Keep an existing ordinary fallback
+/// stable until the preferred seat becomes available.
+fn preferred_seat<T: Clone + PartialEq>(
+    candidates: &[(T, Option<String>)],
+    active: Option<&T>,
+) -> Option<T> {
+    candidates.iter()
+        .find(|(_, name)| name.as_deref() == Some("cosmix"))
+        .or_else(|| candidates.iter().find(|(seat, name)| {
+            Some(seat) == active && name.as_deref().is_some_and(|name| name != "cosmix-agent")
+        }))
+        .or_else(|| candidates.iter().find(|(_, name)| {
+            name.as_deref().is_some_and(|name| name != "cosmix-agent")
+        }))
+        .map(|(seat, _)| seat.clone())
+}
+
+enum SeatBindingChange<T> {
+    Release,
+    Bind(T),
+}
+
+/// One transition boundary for all capabilities: release the old bridge and
+/// protocol handle before attaching the replacement. Reconciliation is inert
+/// when dispatch did not change the selected seat.
+fn change_seat_binding<T: Clone + PartialEq>(
+    active: Option<&T>,
+    desired: Option<T>,
+    mut apply: impl FnMut(SeatBindingChange<T>),
+) {
+    if active == desired.as_ref() {
+        return;
+    }
+    if active.is_some() {
+        apply(SeatBindingChange::Release);
+    }
+    if let Some(seat) = desired {
+        apply(SeatBindingChange::Bind(seat));
+    }
+}
+
+fn bind_keyboard_with_text_input<S, K, E>(
+    seat: &S,
+    bind: impl FnOnce(&S) -> Result<K, E>,
+    attach_text_input: impl FnOnce(&S),
+) -> Result<K, E> {
+    let keyboard = bind(seat)?;
+    attach_text_input(seat);
+    Ok(keyboard)
+}
+
 fn release_keyboard(keyboard: wl_keyboard::WlKeyboard) {
     if keyboard.version() >= 3 {
         keyboard.release();
@@ -1698,6 +1750,7 @@ fn run_layer_host(
             return state_setup_error(state, format!("output-discovery-failed-{error}"));
         }
     }
+    state.reconcile_seats(&qh);
     let selected = match select_output(&state.output_state, config.output_name.as_deref()) {
         Ok(selected) => selected,
         Err(error) => {
@@ -1889,6 +1942,10 @@ fn run_layer_host(
         if let Err(error) = dispatch {
             state.abnormal_exit = true;
             state.exit_reason = Some(format!("calloop-dispatch-failed-{error}"));
+        } else {
+            // SCTK stores wl_seat.name without a SeatHandler callback. Read
+            // it after dispatched events, including names arriving after caps.
+            state.reconcile_seats(&qh);
         }
     }
 
@@ -2762,7 +2819,7 @@ impl SeatHandler for RunnerState {
     fn new_capability(
         &mut self,
         _connection: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
@@ -2771,19 +2828,16 @@ impl SeatHandler for RunnerState {
                 if !self.pointer_seats.contains(&seat) {
                     self.pointer_seats.push(seat);
                 }
-                self.promote_pointer(qh);
             }
             Capability::Keyboard => {
                 if !self.keyboard_seats.contains(&seat) {
                     self.keyboard_seats.push(seat);
                 }
-                self.promote_keyboard(qh);
             }
             Capability::Touch => {
                 if !self.touch_seats.contains(&seat) {
                     self.touch_seats.push(seat);
                 }
-                self.promote_touch(qh);
             }
             _ => {}
         }
@@ -3160,17 +3214,40 @@ impl RunnerState {
         }
     }
 
+    fn preferred_capability_seat(
+        &self,
+        seats: &[wl_seat::WlSeat],
+        active: Option<&wl_seat::WlSeat>,
+    ) -> Option<wl_seat::WlSeat> {
+        let candidates = seats.iter().filter_map(|seat| {
+            self.seat_state.info(seat).map(|info| {
+                // Version 1 has no name event; retain support for ordinary
+                // older compositors without treating a pending name as human.
+                let name = info.name.or_else(|| (seat.version() < 2).then(String::new));
+                (seat.clone(), name)
+            })
+        }).collect::<Vec<_>>();
+        preferred_seat(&candidates, active)
+    }
+
+    fn reconcile_seats(&mut self, qh: &QueueHandle<Self>) {
+        self.promote_pointer(qh);
+        self.promote_keyboard(qh);
+        self.promote_touch(qh);
+    }
+
     fn promote_pointer(&mut self, qh: &QueueHandle<Self>) {
-        if self.active_pointer.is_some() {
-            return;
-        }
-        for seat in self.pointer_seats.clone() {
-            if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
-                self.active_pointer_seat = Some(seat);
-                self.active_pointer = Some(pointer);
-                break;
+        let active = self.active_pointer_seat.clone();
+        let desired = self.preferred_capability_seat(&self.pointer_seats, active.as_ref());
+        change_seat_binding(active.as_ref(), desired, |change| match change {
+            SeatBindingChange::Release => self.clear_pointer_seat(),
+            SeatBindingChange::Bind(seat) => {
+                if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
+                    self.active_pointer_seat = Some(seat);
+                    self.active_pointer = Some(pointer);
+                }
             }
-        }
+        });
     }
 
     fn remove_pointer_seat(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
@@ -3178,6 +3255,11 @@ impl RunnerState {
         if self.active_pointer_seat.as_ref() != Some(seat) {
             return;
         }
+        self.clear_pointer_seat();
+        self.promote_pointer(qh);
+    }
+
+    fn clear_pointer_seat(&mut self) {
         if let Some(output) = self.selected_key.clone()
             && self.pointer_bridge.cleanup(&mut self.app, &output, None)
         {
@@ -3187,21 +3269,24 @@ impl RunnerState {
             release_pointer(pointer);
         }
         self.active_pointer_seat = None;
-        self.promote_pointer(qh);
     }
 
     fn promote_keyboard(&mut self, qh: &QueueHandle<Self>) {
-        if self.active_keyboard.is_some() {
-            return;
-        }
-        for seat in self.keyboard_seats.clone() {
-            if let Ok(keyboard) = self.seat_state.get_keyboard(qh, &seat, None) {
-                self.text_input.attach(&seat, qh);
-                self.active_keyboard_seat = Some(seat);
-                self.active_keyboard = Some(keyboard);
-                break;
+        let active = self.active_keyboard_seat.clone();
+        let desired = self.preferred_capability_seat(&self.keyboard_seats, active.as_ref());
+        change_seat_binding(active.as_ref(), desired, |change| match change {
+            SeatBindingChange::Release => self.clear_keyboard_seat(),
+            SeatBindingChange::Bind(seat) => {
+                if let Ok(keyboard) = bind_keyboard_with_text_input(
+                    &seat,
+                    |seat| self.seat_state.get_keyboard(qh, seat, None),
+                    |seat| self.text_input.attach(seat, qh),
+                ) {
+                    self.active_keyboard_seat = Some(seat);
+                    self.active_keyboard = Some(keyboard);
+                }
             }
-        }
+        });
     }
 
     fn remove_keyboard_seat(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
@@ -3209,6 +3294,11 @@ impl RunnerState {
         if self.active_keyboard_seat.as_ref() != Some(seat) {
             return;
         }
+        self.clear_keyboard_seat();
+        self.promote_keyboard(qh);
+    }
+
+    fn clear_keyboard_seat(&mut self) {
         if self.keyboard_bridge.cleanup(&mut self.app, None) {
             self.needs_update = true;
         }
@@ -3220,20 +3310,20 @@ impl RunnerState {
         }
         self.text_input.detach();
         self.active_keyboard_seat = None;
-        self.promote_keyboard(qh);
     }
 
     fn promote_touch(&mut self, qh: &QueueHandle<Self>) {
-        if self.active_touch.is_some() {
-            return;
-        }
-        for seat in self.touch_seats.clone() {
-            if let Ok(touch) = self.seat_state.get_touch(qh, &seat) {
-                self.active_touch_seat = Some(seat);
-                self.active_touch = Some(touch);
-                break;
+        let active = self.active_touch_seat.clone();
+        let desired = self.preferred_capability_seat(&self.touch_seats, active.as_ref());
+        change_seat_binding(active.as_ref(), desired, |change| match change {
+            SeatBindingChange::Release => self.clear_touch_seat(),
+            SeatBindingChange::Bind(seat) => {
+                if let Ok(touch) = self.seat_state.get_touch(qh, &seat) {
+                    self.active_touch_seat = Some(seat);
+                    self.active_touch = Some(touch);
+                }
             }
-        }
+        });
     }
 
     fn remove_touch_seat(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
@@ -3241,6 +3331,11 @@ impl RunnerState {
         if self.active_touch_seat.as_ref() != Some(seat) {
             return;
         }
+        self.clear_touch_seat();
+        self.promote_touch(qh);
+    }
+
+    fn clear_touch_seat(&mut self) {
         if self.touch_bridge.cancel(&mut self.app) {
             self.needs_update = true;
         }
@@ -3248,7 +3343,6 @@ impl RunnerState {
             release_touch(touch);
         }
         self.active_touch_seat = None;
-        self.promote_touch(qh);
     }
 }
 
@@ -3469,6 +3563,112 @@ mod tests {
     use cosmix_shell::runtime::{ShellEffects, ShellRuntimePlugin};
 
     use crate::surface::frame_request_overdue;
+
+    #[test]
+    fn human_seat_wins_in_both_discovery_orders() {
+        for candidates in [
+            vec![(1, Some("cosmix-agent".into())), (2, Some("cosmix".into()))],
+            vec![(2, Some("cosmix".into())), (1, Some("cosmix-agent".into()))],
+        ] {
+            assert_eq!(preferred_seat(&candidates, None), Some(2));
+            assert_eq!(preferred_seat(&candidates, Some(&1)), Some(2));
+        }
+    }
+
+    #[test]
+    fn capability_before_name_waits_and_late_human_replaces_fallback() {
+        let mut candidates = vec![(1, None), (2, None)];
+        assert_eq!(preferred_seat(&candidates, None), None);
+        candidates[0].1 = Some("seat0".into());
+        assert_eq!(preferred_seat(&candidates, None), Some(1));
+        candidates[1].1 = Some("cosmix".into());
+        assert_eq!(preferred_seat(&candidates, Some(&1)), Some(2));
+    }
+
+    #[test]
+    fn agent_seat_is_never_a_fallback_after_human_removal() {
+        let candidates = vec![(1, Some("cosmix-agent".into()))];
+        assert_eq!(preferred_seat(&candidates, Some(&2)), None);
+        assert_eq!(preferred_seat(&candidates, Some(&1)), None);
+    }
+
+    #[test]
+    fn ordinary_seat_fallback_stays_stable_until_human_arrives() {
+        let mut candidates = vec![(1, Some("seat0".into())), (2, Some("seat1".into()))];
+        assert_eq!(preferred_seat(&candidates, Some(&2)), Some(2));
+        candidates.push((3, Some("cosmix".into())));
+        assert_eq!(preferred_seat(&candidates, Some(&2)), Some(3));
+    }
+
+    #[test]
+    fn seat_switch_releases_once_before_binding_replacement() {
+        let candidates = vec![(1, Some("seat0".into())), (2, Some("cosmix".into()))];
+        let mut active = Some(1);
+        let mut operations = Vec::new();
+        // This is the shared transition boundary used by pointer, keyboard
+        // (including its text-input attachment), and touch promotion.
+        for _ in 0..3 {
+            let desired = preferred_seat(&candidates, active.as_ref());
+            let previous = active;
+            change_seat_binding(previous.as_ref(), desired, |change| match change {
+                SeatBindingChange::Release => {
+                    operations.push(("release", active.take()));
+                }
+                SeatBindingChange::Bind(seat) => {
+                    assert!(active.is_none(), "old handle released before attachment");
+                    active = Some(seat);
+                    operations.push(("bind", Some(seat)));
+                }
+            });
+        }
+        assert_eq!(operations, vec![("release", Some(1)), ("bind", Some(2))]);
+        assert_eq!(active, Some(2));
+    }
+
+    #[test]
+    fn seat_removal_cleans_up_once_without_binding_agent() {
+        let candidates = vec![(1, Some("cosmix-agent".into()))];
+        let mut active = Some(2);
+        let mut releases = 0;
+        for _ in 0..2 {
+            let desired = preferred_seat(&candidates, active.as_ref());
+            let previous = active;
+            change_seat_binding(previous.as_ref(), desired, |change| match change {
+                SeatBindingChange::Release => {
+                    releases += 1;
+                    active = None;
+                }
+                SeatBindingChange::Bind(_) => panic!("agent must not acquire a host binding"),
+            });
+        }
+        assert_eq!(releases, 1);
+    }
+
+    #[test]
+    fn keyboard_and_text_input_bind_to_selected_human_seat() {
+        let candidates = vec![(1, Some("cosmix-agent".into())), (2, Some("cosmix".into()))];
+        let chosen = preferred_seat(&candidates, None).unwrap();
+        let mut attached = None;
+        let keyboard = bind_keyboard_with_text_input(
+            &chosen,
+            |seat| Ok::<_, ()>(*seat),
+            |seat| attached = Some(*seat),
+        ).unwrap();
+        assert_eq!(keyboard, 2);
+        assert_eq!(attached, Some(2));
+    }
+
+    #[test]
+    fn failed_keyboard_binding_does_not_attach_text_input() {
+        let mut attached = false;
+        let result = bind_keyboard_with_text_input(
+            &2,
+            |_| Err::<(), _>("seat disappeared"),
+            |_| attached = true,
+        );
+        assert_eq!(result, Err("seat disappeared"));
+        assert!(!attached);
+    }
 
     struct FakePointer {
         version: u32,
