@@ -250,16 +250,6 @@ impl WaylandState {
     fn inject(&mut self, seat: SeatKind, input: HostInput) {
         let owner = self.injection.current_run;
         self.comp_seat_mut(seat).held.note(owner, &input);
-        // Injection cannot release (or duplicate) a physical device's hold.
-        if seat == SeatKind::Human && match &input {
-            HostInput::Key { keycode, .. } => self.input_ingress.physically_holds_key(*keycode)
-                || self.injection.host_held_keys.contains(&keycode.raw()),
-            HostInput::PointerButton { button, .. } => self.input_ingress.physically_holds_button(*button)
-                || self.injection.host_held_buttons.contains(button),
-            _ => false,
-        } {
-            return;
-        }
         self.injection.events = self.injection.events.wrapping_add(1);
         match seat {
             SeatKind::Human => self.handle_host_input(input),
@@ -700,12 +690,19 @@ impl WaylandState {
     }
 
     /// Release the given holds the seat still has pressed: keys (newest
-    /// code first), then buttons.
+    /// code first), then buttons. Cleanup must preserve physical holds;
+    /// explicit human events still pass through the ordinary host gates.
     fn release_holds(&mut self, seat: SeatKind, holds: Vec<Hold>, time: u32) {
         let pressed = self.comp_seat(seat).keyboard.pressed_keys();
         for hold in holds.iter().rev() {
             let Hold::Key(raw) = *hold else { continue };
             let keycode = Keycode::new(raw);
+            if seat == SeatKind::Human
+                && (self.input_ingress.physically_holds_key(keycode)
+                    || self.injection.host_held_keys.contains(&raw))
+            {
+                continue;
+            }
             if pressed.contains(&keycode) {
                 self.inject_key(seat, keycode, HostButtonState::Released, time);
             }
@@ -713,6 +710,12 @@ impl WaylandState {
         let pressed = self.comp_seat(seat).pointer.current_pressed();
         for hold in holds {
             let Hold::Button(button) = hold else { continue };
+            if seat == SeatKind::Human
+                && (self.input_ingress.physically_holds_button(button)
+                    || self.injection.host_held_buttons.contains(&button))
+            {
+                continue;
+            }
             if pressed.contains(&button) {
                 self.inject(seat, HostInput::PointerButton {
                     button,

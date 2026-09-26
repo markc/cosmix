@@ -379,8 +379,8 @@ fn agent_drag_start_never_installs_a_dnd_grab_or_icon_role() {
         .with_grab(|serial, _| serial)
         .unwrap();
     let manager = h.bind_test_global("wl_data_device_manager", 3);
-    let device = h.allocate_object_id();
     let source = h.allocate_object_id();
+    let device = h.allocate_object_id();
     let icon = h.allocate_object_id();
     send_request(&mut h.client, manager, 0, &words(&[source]));
     send_request(&mut h.client, manager, 1, &words(&[device, seat]));
