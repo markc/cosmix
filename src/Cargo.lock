@@ -1067,7 +1067,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-blobd"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mds"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "assert_cmd",
  "blake3",
