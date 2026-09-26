@@ -839,6 +839,7 @@ mod tests {
                 quota_total_bytes: crate::core::DEFAULT_QUOTA_TOTAL_BYTES,
                 quota_owner_default_bytes: crate::core::DEFAULT_QUOTA_OWNER_BYTES,
                 owner_limits: BTreeMap::new(),
+                cas_group: "cosmix-blob".into(),
             },
         )
         .unwrap();

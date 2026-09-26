@@ -38,6 +38,7 @@ quota_owner: capture=2GiB
 | `fetch_max_concurrent` | `2` | Concurrent `blob.fetch` downloads; beyond it a fetch queues (see [Fetching](#fetching)) |
 | `fetch_queue_max` | `32` | In-process fetch queue depth; beyond it the verb replies rc 10 `busy` |
 | `verb_max_concurrent` | `8` | Concurrent verb dispatches; beyond it a verb queues (its reply is late, never lost) instead of blocking every other verb |
+| `cas_group` | `cosmix-blob` | Shared-read group the state root and CAS root are chgrped to at open, with the setgid bit (mode 2750), so `blob.path` targets are traversable by members (see [Permissions](#permissions)) |
 | `quota_total_bytes` | `50GiB` | Total cap on accounted (pinned) bytes |
 | `quota_owner_default_bytes` | `10GiB` | Per-owner cap unless overridden |
 | `quota_owner: <owner>=<bytes>` | none (repeatable) | Per-owner cap; later lines for the same owner win |
@@ -130,7 +131,7 @@ Quotas are correctness, not authorisation: an upload (a `blob.put`, a lane body,
 
 ## Permissions
 
-Registry UID 521 (`cosmix-blobd`), shared-credential group 522 (`cosmix-blob`, SPEC 10a v1.4.7). `blob.put {path}` is daemon-local ingest: processes that share the `cosmix-blob` group (maild, filesd). Same-node readers of `blob.path` traverse the 0750 CAS as group members. User-side and remote producers (capture, webd, Thunderbird) push bytes through the byte lane — no cross-user path read exists or is needed. Under the 2026-09-15 full-mesh-access law the verbs are mesh-open with no authorisation gates; `blob.put`'s path argument is on record as the first verb to jail if a lock is ever opted in.
+Registry UID 521 (`cosmix-blobd`), shared-credential group 522 (`cosmix-blob`, SPEC 10a v1.4.7). `blob.put {path}` is daemon-local ingest: processes that share the `cosmix-blob` group (maild, filesd). At open blobd chgrps its state root and CAS root to `cosmix-blob` (`cas_group`, default `cosmix-blob`) and sets the setgid bit — mode 2750 — so every shard directory mds creates and every CAS file inherits the group; same-node readers of `blob.path` traverse the tree as group members (the unit's `SupplementaryGroups=cosmix-blob` is what allows the chown; the `StateDirectoryMode=0750` tree alone would be group `cosmix-blobd` and untraversable). An absent group or a refused chown is logged and skipped — a private CAS still serves verbs, it just has no same-node zero-copy readers. User-side and remote producers (capture, webd, Thunderbird) push bytes through the byte lane — no cross-user path read exists or is needed. Under the 2026-09-15 full-mesh-access law the verbs are mesh-open with no authorisation gates; `blob.put`'s path argument is on record as the first verb to jail if a lock is ever opted in.
 
 ## Events
 

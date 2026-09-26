@@ -25,7 +25,13 @@ User=cosmix-blobd
 Group=cosmix-blobd
 # blobd reads files other daemons hand to blob.put {path} (maild,
 # filesd) and serves CAS paths through blob.path to the same group:
-# shared-credential group cosmix-blob (GID 522, SPEC 10a §3.3).
+# shared-credential group cosmix-blob (GID 522, SPEC 10a §3.3). The
+# daemon chgrps its state root and CAS root to cosmix-blob and sets
+# the setgid bit (mode 2750) at open, so every shard directory and CAS
+# file inherits the group — StateDirectoryMode=0750 + UMask=0027
+# alone would leave the tree group cosmix-blobd, untraversable by
+# members. SupplementaryGroups below is what allows that chown: the
+# daemon must be a member of the group it chgrps to.
 SupplementaryGroups=cosmix-blob
 StateDirectory=cosmix/blobd
 StateDirectoryMode=0750

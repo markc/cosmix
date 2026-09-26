@@ -14,6 +14,8 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -162,6 +164,11 @@ pub struct StoreOptions {
     pub quota_total_bytes: u64,
     pub quota_owner_default_bytes: u64,
     pub owner_limits: BTreeMap<String, u64>,
+    /// Shared-read group for the state root and CAS root (M4):
+    /// chgrped and setgid at open, so `blob.path` targets are
+    /// traversable by the group's members. Default `cosmix-blob`
+    /// (SPEC 10a §3.3).
+    pub cas_group: String,
 }
 
 impl StoreOptions {
@@ -171,6 +178,7 @@ impl StoreOptions {
             quota_total_bytes: cfg.quota_total_bytes,
             quota_owner_default_bytes: cfg.quota_owner_default_bytes,
             owner_limits: cfg.owner_limits.clone(),
+            cas_group: cfg.cas_group.clone(),
         }
     }
 
@@ -368,6 +376,14 @@ impl Store {
 
         let db = open_blobd_db(&root)?;
         let index = open_index_conn(&root)?;
+
+        // M4: the CAS must be traversable by the shared-read group —
+        // the unit's 0750 StateDirectory + 0027 UMask alone leaves the
+        // tree owned cosmix-blobd:cosmix-blobd and no member can walk
+        // it. Chgrp the state root and the CAS root, setgid them: every
+        // shard directory mds creates below inherits group and bit, so
+        // CAS files inherit the group.
+        apply_cas_group(&root, &mds.blobs_root(), &options.cas_group);
 
         let mut store = Self {
             root,
@@ -1268,6 +1284,88 @@ fn shrink_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) ->
     Ok(())
 }
 
+/// Chgrp `dirs` to `group` and set the setgid bit (mode 2750), so
+/// members of the group traverse the roots and every directory or file
+/// created below the CAS root inherits the group (M4). Best-effort
+/// with a log line per failure mode: an absent group (a dev host —
+/// the tree stays daemon-owned), a refused chown (the daemon is not a
+/// member; the unit's `SupplementaryGroups=cosmix-blob` is what grants
+/// it), a refused chmod. Never fatal: a private CAS still serves
+/// verbs, it just has no same-node zero-copy readers.
+fn apply_cas_group(state_root: &Path, blobs_root: &Path, group: &str) {
+    let Some(gid) = group_gid(group) else {
+        tracing::warn!(
+            target: "cosmix_blobd",
+            "cas_group {group:?} does not exist on this host; the CAS stays owned by this \
+             daemon (no shared blob.path reads — SPEC 10a §3.3 expects the group)"
+        );
+        return;
+    };
+    for dir in [state_root, blobs_root] {
+        if !dir.is_dir() {
+            continue;
+        }
+        let cpath = match std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // SAFETY: chown(2) on a live path; uid -1 leaves the owner
+        // unchanged, so only the group moves.
+        let rc = unsafe { libc::chown(cpath.as_ptr(), u32::MAX, gid) };
+        if rc != 0 {
+            tracing::warn!(
+                target: "cosmix_blobd",
+                "chgrp {} to {group:?} failed (is the daemon a member? the unit carries \
+                 SupplementaryGroups=cosmix-blob): {}",
+                dir.display(),
+                io::Error::last_os_error()
+            );
+            continue;
+        }
+        if let Err(error) = fs::set_permissions(dir, PermissionsExt::from_mode(0o2750)) {
+            tracing::warn!(
+                target: "cosmix_blobd",
+                "setgid {} (mode 2750) failed: {error}",
+                dir.display()
+            );
+        }
+    }
+}
+
+/// Resolve a group name to its gid (`getgrnam`); `None` when the group
+/// does not exist on this host.
+fn group_gid(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: getgrnam returns a pointer to libc-owned storage valid
+    // until the next group call; the gid is copied out immediately.
+    unsafe {
+        let gr = libc::getgrnam(c.as_ptr());
+        if gr.is_null() {
+            None
+        } else {
+            Some((*gr).gr_gid)
+        }
+    }
+}
+
+/// Resolve a gid to its group name (`getgrgid`); `None` on failure.
+/// Test-side twin of [`group_gid`].
+#[cfg(test)]
+fn gid_group(gid: u32) -> Option<String> {
+    // SAFETY: as group_gid — the name is copied out immediately.
+    unsafe {
+        let gr = libc::getgrgid(gid);
+        if gr.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr((*gr).gr_name)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
 /// Open `<root>/blobd.sqlite`, apply migrations in the mds style
 /// (WAL, busy_timeout 5 s, `PRAGMA user_version` steps, refuse a db
 /// newer than the code).
@@ -1352,6 +1450,7 @@ mod tests {
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
             owner_limits: BTreeMap::new(),
+            cas_group: "cosmix-blob".into(),
         }
     }
 
@@ -1476,6 +1575,7 @@ mod tests {
             quota_total_bytes: 100,
             quota_owner_default_bytes: 100,
             owner_limits: BTreeMap::from([("small".into(), 10u64), ("other".into(), 1000u64)]),
+            cas_group: "cosmix-blob".into(),
         };
         let store = Store::open(dir.path(), opts).unwrap();
         let big = write_src(&dir, "big.bin", &[7u8; 80]);
@@ -1745,6 +1845,7 @@ mod tests {
                 quota_total_bytes: 2 * 1024 * 1024,
                 quota_owner_default_bytes: 2 * 1024 * 1024,
                 owner_limits: BTreeMap::from([(("race").to_string(), 1024 * 1024)]),
+                cas_group: "cosmix-blob".into(),
             },
         )
         .unwrap();
@@ -1781,6 +1882,83 @@ mod tests {
         // the mid-stream counter enforces it from the first byte.
         let r2 = store.reserve_upload("race", None).unwrap();
         assert_eq!(r2.cap(), 324 * 1024);
+    }
+
+    // ---- M4: the CAS carries the shared-read group, setgid ----
+
+    #[test]
+    fn cas_roots_and_shard_dirs_carry_the_group_and_setgid() {
+        // The test host may not have cosmix-blob, so drive the fix with
+        // this process's own primary group — the mechanics under test
+        // (chgrp, setgid, inheritance into mds's shard dirs and the CAS
+        // files) are group-name-agnostic.
+        let group = {
+            // SAFETY: getgid is a pure syscall.
+            let gid = unsafe { libc::getgid() };
+            match gid_group(gid) {
+                Some(name) => name,
+                None => {
+                    eprintln!("skipping: no group name for this process's gid");
+                    return;
+                }
+            }
+        };
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                cas_group: group.clone(),
+                ..options()
+            },
+        )
+        .unwrap();
+        let src = write_src(&dir, "grouped.bin", b"shared read");
+        let out = store.put(&src, &PutOptions::new("maild")).unwrap();
+
+        let assert_grouped = |path: &Path| {
+            let md = fs::metadata(path).unwrap();
+            assert_eq!(
+                md.gid(),
+                group_gid(&group).unwrap(),
+                "{} must carry the configured group",
+                path.display()
+            );
+            assert!(
+                md.mode() & 0o2000 != 0 || md.is_file(),
+                "{} must carry setgid (directories)",
+                path.display()
+            );
+        };
+        assert_grouped(dir.path());
+        assert_grouped(&store.blobs_root());
+        let cas = store.path(&out.reference.hash).unwrap();
+        // Both shard dirs inherit the setgid bit and the group; the CAS
+        // file inherits the group.
+        let shard = cas.parent().unwrap();
+        let top = shard.parent().unwrap();
+        assert_grouped(top);
+        assert_grouped(shard);
+        assert_eq!(fs::metadata(&cas).unwrap().gid(), group_gid(&group).unwrap());
+        // The setgid bit is on the shard dirs themselves.
+        assert!(fs::metadata(top).unwrap().mode() & 0o2000 != 0);
+        assert!(fs::metadata(shard).unwrap().mode() & 0o2000 != 0);
+    }
+
+    #[test]
+    fn an_absent_cas_group_is_skipped_without_failing_open() {
+        // A dev host without the group: open succeeds, the tree stays
+        // daemon-owned, and the store still serves verbs.
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                cas_group: "cosmix-blob-definitely-not-on-any-host".into(),
+                ..options()
+            },
+        )
+        .unwrap();
+        let src = write_src(&dir, "plain.bin", b"still works");
+        assert!(store.put(&src, &PutOptions::new("maild")).is_ok());
     }
 
     #[test]

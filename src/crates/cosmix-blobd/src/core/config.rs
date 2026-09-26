@@ -34,6 +34,11 @@ pub const DEFAULT_FETCH_QUEUE_MAX: usize = 32;
 /// never lost) instead of blocking every other verb past the 30 s
 /// mesh timeout (M2).
 pub const DEFAULT_VERB_MAX_CONCURRENT: usize = 8;
+/// Default CAS shared-read group (SPEC 10a §3.3): blobd chgrps its
+/// state root and CAS root to this group with the setgid bit at open,
+/// so members read `blob.path` targets and the daemon's supplementary
+/// groups must include it (the unit's `SupplementaryGroups` line).
+pub const DEFAULT_CAS_GROUP: &str = "cosmix-blob";
 
 /// Parsed configuration with defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +64,10 @@ pub struct Config {
     /// Concurrent verb dispatches; beyond it a verb queues (bounded,
     /// in-process) rather than blocking every other verb.
     pub verb_max_concurrent: usize,
+    /// The shared-read group the state root and CAS root are chgrped
+    /// to at open, with the setgid bit (mode 2750) so shard
+    /// directories and CAS files inherit it (M4).
+    pub cas_group: String,
     pub quota_total_bytes: u64,
     pub quota_owner_default_bytes: u64,
     /// Per-owner caps from repeated `quota_owner: <owner>=<bytes>`
@@ -76,6 +85,7 @@ impl Default for Config {
             fetch_max_concurrent: DEFAULT_FETCH_MAX_CONCURRENT,
             fetch_queue_max: DEFAULT_FETCH_QUEUE_MAX,
             verb_max_concurrent: DEFAULT_VERB_MAX_CONCURRENT,
+            cas_group: DEFAULT_CAS_GROUP.to_string(),
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
             owner_limits: BTreeMap::new(),
@@ -174,6 +184,12 @@ impl Config {
                     }
                     cfg.verb_max_concurrent = n;
                 }
+                "cas_group" => {
+                    if v.is_empty() {
+                        return Err("cas_group: empty group name".into());
+                    }
+                    cfg.cas_group = v.to_string();
+                }
                 "quota_total_bytes" => {
                     cfg.quota_total_bytes = parse_bytes(v)
                         .ok_or_else(|| format!("quota_total_bytes: bad byte size {v:?}"))?;
@@ -238,7 +254,7 @@ mod tests {
              lane_bind: 10.42.0.5:4210\nlane_max_uploads: 8\nfetch_max_concurrent: 3\n\
              fetch_queue_max: 8\nverb_max_concurrent: 2\nquota_total_bytes: 100GiB\n\
              quota_owner_default_bytes: 512MiB\nquota_owner: maild=1GiB\n\
-             quota_owner: capture=2 GiB\nignored_key: whatever\n",
+             quota_owner: capture=2 GiB\ncas_group: cosmix-blob\nignored_key: whatever\n",
         )
         .unwrap();
         assert_eq!(cfg.root, Some(PathBuf::from("/var/lib/cosmix/blobd-two")));
@@ -252,6 +268,7 @@ mod tests {
         assert_eq!(cfg.fetch_max_concurrent, 3);
         assert_eq!(cfg.fetch_queue_max, 8);
         assert_eq!(cfg.verb_max_concurrent, 2);
+        assert_eq!(cfg.cas_group, "cosmix-blob");
         assert_eq!(cfg.quota_total_bytes, 100 * 1024 * 1024 * 1024);
         assert_eq!(cfg.quota_owner_default_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.owner_limits["maild"], 1024 * 1024 * 1024);
@@ -276,6 +293,7 @@ mod tests {
         assert!(Config::parse("fetch_queue_max: lots\n").is_err());
         assert!(Config::parse("verb_max_concurrent: 0\n").is_err());
         assert!(Config::parse("verb_max_concurrent: few\n").is_err());
+        assert!(Config::parse("cas_group:\n").is_err());
         assert!(Config::parse("quota_total_bytes: lots\n").is_err());
         assert!(Config::parse("quota_owner: noequals\n").is_err());
         assert!(Config::parse("quota_owner: =5MiB\n").is_err());
