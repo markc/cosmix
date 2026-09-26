@@ -575,7 +575,7 @@ is a JSON object, and <code>{}</code> means no arguments.</p>
 <tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
 <tr><td><code>term.snapshot</code></td><td><code>{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}</code> (all optional)</td><td>read a pane anywhere; default is the focused pane in the selected/active tab; <code>contents</code> defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero)</td></tr>
-<tr><td><code>term.type</code></td><td><code>{"pane":N,"instance":I,"text":"..."}</code> (<code>pane</code> or <code>tab</code> <strong>required</strong>, <code>instance</code> optional)</td><td>type ASCII as keys without changing focus. <strong><code>pane</code> is the safe selector.</strong> <code>tab</code> means that tab's active pane <em>at delivery</em>, so it still follows focus inside the tab; with both, the pane must belong to the tab. Pane and tab ids are per-process counters from 1, so pass back the <code>instance</code> that <code>term.tabs</code>/<code>term.panes</code>/<code>INFO</code> reported: another term process refuses rather than typing into its own pane N. Neither selector, a disagreeing pair or a foreign instance is refused <code>{"error_code":"INVALID_ARGUMENT","message":…}</code> and never defaults to the focused pane (term-core 0.8.0: term 0.3.0, bterm 0.10.0) — keys that follow focus land wherever focus has moved (2026-09-25). A refused request is not cached under its <code>request_id</code>, so retry the same id with the argument fixed</td></tr>
+<tr><td><code>term.type</code></td><td><code>{"pane":N,"instance":I,"text":"..."}</code> (<code>pane</code> or <code>tab</code> <strong>required</strong>, <code>instance</code> optional)</td><td>type ASCII as keys without changing focus. <strong><code>pane</code> is the safe selector.</strong> <code>tab</code> means that tab's active pane <em>at delivery</em>, so it still follows focus inside the tab; with both, the pane must belong to the tab. Pane and tab ids are per-process counters from 1, so pass back the <code>instance</code> that <code>term.tabs</code>/<code>term.panes</code>/<code>INFO</code> reported: another term process refuses rather than typing into its own pane N. Neither selector, a disagreeing pair or a foreign instance is refused <code>{"error_code":"INVALID_ARGUMENT","message":…}</code> and never defaults to the focused pane (term-core 0.8.0: term 0.3.0, bterm 0.10.0) — keys that follow focus land wherever focus has moved (2026-09-25). These <code>INVALID_ARGUMENT</code> refusals are not recorded under a <code>request_id</code>, so retry the same id with the argument fixed; a <code>not-found</code> or non-ASCII refusal IS recorded and replays</td></tr>
 <tr><td><code>term.scroll</code></td><td><code>{"pane":N,"lines":3}</code> or <code>{"page":-1}</code> or <code>{"to":"top"}</code></td><td>move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed <code>lines</code>, signed <code>page</code>, or <code>to</code> (<code>top</code>/<code>bottom</code>)</td></tr>
 <tr><td><code>term.props.watch</code></td><td><code>{}</code></td><td>subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON <code>{topics,revision}</code>), then read state</td></tr>
 </tbody></table>
@@ -659,8 +659,12 @@ strict diagnostic-only targetless lane.</p>
 <code>moved id=N index=I tab=N pane=P revision=R</code>. Tab creation still replies
 <code>opened id=N tab=N pane=P revision=R binding=...</code>. All mutations, including
 title/move and pane-selected typing, accept <code>request_id</code>; a retry with the
-same verb and arguments replays the original success or refusal. Different
-arguments with the same ID are a conflict. The JSON envelope limit remains
+same verb and arguments replays the original success or state refusal
+(<code>not-found</code>, non-ASCII text, the tab limit). <code>starting</code>, an oversized body
+and validation refusals (malformed JSON, unexpected/missing/mistyped
+arguments, any <code>invalid-argument</code>/<code>INVALID_ARGUMENT</code> reply) are NOT recorded,
+so the same ID may be retried with the request fixed. Different arguments
+with an ID whose first attempt was recorded are a conflict. The JSON envelope limit remains
 8192 bytes. Index must be an integer; invalid optional argument
 types are refused.</p>
 <p>Watch publishes <code>&lt;service&gt;.tabs.changed</code> (added, removed, moved, selected,

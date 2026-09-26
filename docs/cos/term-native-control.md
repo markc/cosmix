@@ -31,9 +31,16 @@ delegated control writer exactly as real keys do. Any mutating verb's body
 (`tab.*`, `pane.*`, `type`) may add `"request_id":"<string>"`: a resend of
 the same request (same verb and arguments; JSON key order is free) replays
 the recorded reply instead of re-executing the verb (last 128 remembered) —
-use it on every mutation that might be resent after a lost reply. A reused
-id with a different verb or arguments is refused as a conflict, never
-answered with another request's reply; the replay is the recorded outcome
+use it on every mutation that might be resent after a lost reply. Not
+recorded, so the same id may be retried with the request fixed: `starting`,
+an oversized body, and every validation refusal (malformed JSON,
+unexpected/missing/mistyped arguments, any `invalid-argument` or
+`INVALID_ARGUMENT` reply — e.g. `term.type` without `pane`/`tab`, a pane/tab
+disagreement, a foreign `instance`). Successes and state refusals such as
+`not-found`, non-ASCII text and the tab limit ARE recorded and replayed. A
+reused id whose first attempt was recorded, sent with a different verb or
+arguments, is refused as a conflict, never answered with another request's
+reply; the replay is the recorded outcome
 of the original attempt, so retrying after changing state needs a fresh id.
 Reads never consult the cache and always answer current state. Replies echo
 the identity the targetless verb acted on as trailing `key=value` tokens —
