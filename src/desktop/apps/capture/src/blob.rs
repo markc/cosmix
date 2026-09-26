@@ -32,6 +32,28 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Whole-upload deadline: a five-minute MP4 needs headroom, a
 /// drip-feed lane does not get one.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// Per-socket bounds under test: a stalled lane must error in
+/// seconds, not the production 30 s, or the bound itself would never
+/// be exercised.
+fn io_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(1)
+    } else {
+        IO_TIMEOUT
+    }
+}
+
+/// Whole-upload deadline under test: short enough that a drip-feed
+/// lane crosses it within the test, long enough for the well-behaved
+/// lanes the other uploads use.
+fn upload_deadline() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(2)
+    } else {
+        UPLOAD_DEADLINE
+    }
+}
 /// Bound on the 201 body: the reference is a few hundred bytes, so a
 /// lane answering with a stream is cut short, not slurped.
 const REFERENCE_BODY_LIMIT: u64 = 64 * 1024;
@@ -119,7 +141,13 @@ impl Read for GuardedBody {
 /// before the first byte. The three `X-Cosmix-*` headers are the pin
 /// owner and the attributes the lane records. `shutdown` abandons the
 /// upload mid-body (the reader above), so process exit never waits
-/// out a stalled lane.
+/// out a stalled lane. The request carries no `.timeout()` of its
+/// own: in ureq 2 that overrides the agent's per-socket read/write
+/// bounds with "time left until the deadline", which is how a
+/// lane that accepts and stalls could hold the worker for the whole
+/// 10 minutes. The agent's 30 s connect/read/write bound every
+/// socket phase (including the 201 reply read); GuardedBody enforces
+/// the whole-upload deadline between chunks.
 pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result<Value, String> {
     let url = format!("http://{lane_bind}/blob");
     let name = path
@@ -131,11 +159,11 @@ pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result
         .metadata()
         .map_err(|e| format!("stat {}: {e}", path.display()))?
         .len();
-    let deadline = Instant::now() + UPLOAD_DEADLINE;
+    let deadline = Instant::now() + upload_deadline();
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(IO_TIMEOUT)
-        .timeout_read(IO_TIMEOUT)
-        .timeout_write(IO_TIMEOUT)
+        .timeout_connect(io_timeout())
+        .timeout_read(io_timeout())
+        .timeout_write(io_timeout())
         .build();
     let response = agent
         .post(&url)
@@ -143,7 +171,6 @@ pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result
         .set("X-Cosmix-Owner", OWNER)
         .set("X-Cosmix-Name", name)
         .set("X-Cosmix-Mime", mime(path))
-        .timeout(UPLOAD_DEADLINE)
         .send(GuardedBody {
             file,
             shutdown,
@@ -153,6 +180,9 @@ pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result
             ureq::Error::Status(status, _) => format!("lane answered {status} for {url}"),
             other => format!("POST {url}: {other}"),
         })?;
+    if Instant::now() >= deadline {
+        return Err(format!("upload deadline passed before the {url} reply"));
+    }
     if response.status() != 201 {
         return Err(format!("lane answered {} for {url}", response.status()));
     }
@@ -438,5 +468,92 @@ mod tests {
         let error = worker.join().unwrap().unwrap_err();
         assert!(error.contains("shutting down"), "{error}");
         assert!(abandoned.elapsed() < Duration::from_secs(2), "{error}");
+    }
+
+    #[test]
+    fn the_body_guard_errors_once_the_deadline_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cosmix-5.png");
+        fs::write(&path, b"png bytes").unwrap();
+        let mut body = GuardedBody {
+            file: File::open(&path).unwrap(),
+            shutdown: quiet(),
+            deadline: Instant::now(),
+        };
+        let error = body.read(&mut [0u8; 4]).unwrap_err();
+        assert!(error.to_string().contains("deadline passed"), "{error}");
+    }
+
+    #[test]
+    fn a_lane_that_accepts_and_stalls_errors_at_the_socket_bound() {
+        // Accepts and reads the head, then never reads the body: the
+        // blocked write must error at the agent's write bound (1 s
+        // under test), not sit out the whole-upload deadline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                    return;
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cosmix-6.png");
+        fs::write(&path, vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let started = Instant::now();
+        assert!(upload(&bind, &path, quiet()).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_drip_feed_lane_hits_the_whole_upload_deadline() {
+        // Drains slower than the deadline: every socket write succeeds
+        // within its own bound, so only the between-chunks deadline
+        // check ends it (2 s under test).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                let blank = {
+                    reader.read_line(&mut line).unwrap();
+                    line.trim_end().is_empty()
+                };
+                head.push_str(&line);
+                if blank {
+                    break;
+                }
+            }
+            let length: usize = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse().ok())
+                .unwrap_or(0);
+            let mut scratch = [0u8; 8192];
+            let mut read = 0;
+            while read < length {
+                let n = reader.read(&mut scratch).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                read += n;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cosmix-7.png");
+        fs::write(&path, vec![0u8; 1024 * 1024]).unwrap();
+        let started = Instant::now();
+        let error = upload(&bind, &path, quiet()).unwrap_err();
+        assert!(error.contains("deadline passed"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
     }
 }

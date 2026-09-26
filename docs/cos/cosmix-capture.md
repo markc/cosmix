@@ -37,8 +37,10 @@ with `blob: null` while it is in flight; the returned reference then appears
 additively as `blob` — `{"blob":"b3:<64 hex>","size":N,"mime":"…"}`. A
 failed upload never fails the capture: the phase stays `complete`, the file
 is where it always was, and `blob_error` says why the second copy did not
-land. One attempt, 30-second connect/read bounds, a 10-minute overall
-deadline. Process shutdown — SIGTERM, SIGINT or Bus loss — abandons lane
+land. One attempt, 30-second connect/read/write bounds on the lane socket
+(including the 201 reply read), and a 10-minute whole-upload deadline
+enforced between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
+loss — abandons lane
 resolution and an in-flight upload instead of waiting them out, so capture
 never lingers on a stalled lane at exit. The file under `~/Videos/Cosmix`
 remains the source of truth; not
