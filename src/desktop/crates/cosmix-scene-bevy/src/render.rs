@@ -2843,7 +2843,7 @@ mod tests {
         spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
         queue.apply(world);
         let mut store = SceneStore::default();
-        store.request(SceneVerb::Load, "---\nscene: 1\nname: mount-test\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"left\", w: 200}\n```\n", &Value::Null).unwrap();
+        store.request(SceneVerb::Load, "---\nscene: 1\nname: mount-test\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"left\", w: 300}\n```\n", &Value::Null).unwrap();
         world.insert_resource(store);
         reconcile(world);
         assert_eq!(
@@ -2886,6 +2886,10 @@ mod tests {
                 .as_ref(),
             &["scene-mount-test"]
         );
+        // The authored minimum moved with the page; the left edge dropped it.
+        let frame = &world.resource::<ShellFrameState>().0;
+        assert_eq!(frame.panel(Edge::Right).thickness_px, 300.0);
+        assert_eq!(frame.panel(Edge::Right).settled_thickness_px, 240.0);
         assert_eq!(
             world.resource::<SceneStore>().scenes["mount-test"]
                 .mounted
@@ -2904,8 +2908,9 @@ mod tests {
             .unwrap();
         reconcile(world);
         let frame = &world.resource::<ShellFrameState>().0;
-        // Clearing an authored extent cannot reset the edge's seeded size.
-        assert_eq!(frame.panel(Edge::Right).thickness_px, 200.0);
+        // Clearing the authored extent drops the minimum: the edge returns to
+        // its remembered (here the output-derived default) thickness.
+        assert_eq!(frame.panel(Edge::Right).thickness_px, 240.0);
         assert!(!frame.panel(Edge::Right).mapped);
         world
             .resource_mut::<SceneStore>()
