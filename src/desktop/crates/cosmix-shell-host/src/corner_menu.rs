@@ -151,22 +151,9 @@ impl RunnerState {
     /// Mode command precedes hold release in the same ingress queue. Dropping
     /// the exclusive layer happens only after the renderer drains its handle.
     pub(super) fn dismiss_corner_menu(&mut self, choice: Option<usize>) {
-        if let Some(request) = self.app.world_mut().remove_resource::<CornerMenuRequest>() {
-            stage_menu_hold(
-                &mut self.app,
-                &request.output,
-                request.corner.summoned_edge(),
-                false,
-            );
+        if dismiss_menu(&mut self.app, &mut self.menu, choice) {
             self.needs_update = true;
         }
-        let Some(mut menu) = self.menu.take() else {
-            return;
-        };
-        self.app.world_mut().remove_resource::<crate::holders::PopupLayerIdentity>();
-        dismiss(&mut self.app, &mut menu, choice);
-        menu.surface.retire(&mut self.app);
-        self.needs_update = true;
     }
 
     pub(super) fn menu_pointer(&mut self, events: &[PointerEvent]) -> bool {
@@ -337,6 +324,30 @@ impl RunnerState {
     }
 }
 
+/// Dismiss an open menu (and any pending request), releasing its hold and
+/// dropping its exclusive layer after the render drain. Returns whether
+/// anything changed. Shared by every dismissal, including a dialog mapping
+/// over an open menu (Stage R, GLM M2): the menu's exclusive keyboard and
+/// its whole-output pointer catch would otherwise leave the dialog dead.
+pub(super) fn dismiss_menu(
+    app: &mut App,
+    menu: &mut Option<NativeCornerMenu>,
+    choice: Option<usize>,
+) -> bool {
+    let mut changed = false;
+    if let Some(request) = app.world_mut().remove_resource::<CornerMenuRequest>() {
+        stage_menu_hold(app, &request.output, request.corner.summoned_edge(), false);
+        changed = true;
+    }
+    let Some(mut open) = menu.take() else {
+        return changed;
+    };
+    app.world_mut().remove_resource::<crate::holders::PopupLayerIdentity>();
+    dismiss(app, &mut open, choice);
+    open.surface.retire(app);
+    true
+}
+
 /// Stage the local popup hold for a menu's summoned edge. FIFO drain order
 /// is load-bearing: a choice stages its mode command before this release,
 /// and a replacement stages the incumbent's release before the successor's
@@ -504,6 +515,63 @@ mod tests {
         );
         assert_eq!(menu.surface.phase, SurfacePhase::Closed);
         menu.surface.retire(&mut app);
+    }
+
+    /// Stage R (GLM M2): the dismissal a dialog triggers when it maps over
+    /// an open menu leaves no menu, no pending request, no hold and no
+    /// exclusive layer behind, so the dialog gets the keyboard and pointer.
+    #[test]
+    fn dismiss_menu_for_a_dialog_releases_everything_the_menu_held() {
+        let output = OutputKey::new("test-output").unwrap();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::MenuHold(true))
+            .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        let sequence = Arc::new(Mutex::new(Vec::new()));
+        let surface =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, sequence.clone());
+        app.world_mut()
+            .entity_mut(surface.camera)
+            .insert(Camera::default());
+        let request = CornerMenuRequest {
+            output: output.clone(),
+            corner: cosmix_shell::core::Corner::TopLeft,
+            items: ui::menu_items(PanelMode::Hidden, &[]),
+        };
+        app.insert_resource(request.clone());
+        let mut menu = Some(NativeCornerMenu {
+            surface,
+            request,
+            origin: Vec2::ZERO,
+            rows: vec![],
+            selected: None,
+            pressed: None,
+        });
+        assert!(dismiss_menu(&mut app, &mut menu, None));
+        assert!(menu.is_none());
+        assert!(!app.world().contains_resource::<CornerMenuRequest>());
+        app.update();
+        assert!(!app.world().resource::<ShellFrameState>().0.panel(Edge::Left).transient_revealed);
+        assert_eq!(
+            sequence.lock().unwrap().iter().filter(|step| **step == "layer").count(),
+            1,
+            "the exclusive layer is dropped exactly once"
+        );
+        assert!(!dismiss_menu(&mut app, &mut menu, None), "nothing left to dismiss");
     }
 
     #[test]

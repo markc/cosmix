@@ -12,6 +12,7 @@ mod font_tests;
 mod holders;
 mod hotspot;
 mod keyboard;
+mod order_writer;
 mod settings;
 mod state;
 
@@ -181,6 +182,7 @@ fn configure_content(
         );
     settings::install(app, all_panels || hidden);
     dialog_bus::install(app);
+    order_writer::install(app);
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {

@@ -547,6 +547,10 @@ Refusals are <code>NOT_FOUND</code> (no such scene) and <code>NOT_DIALOG</code> 
 px. The surface rect is in output coordinates and node rects are relative to
 the surface. While unmapped it reports <code>visible:false</code> and empty <code>nodes</code>. It
 is how gates and agents click a node: take the centre of its rect.
+A dialog's surface <code>x</code>/<code>y</code> on the layer host is Quoin's placement estimate
+(the output centred within its own docked panels' exclusive zones); comp
+places the pixels, so another client's exclusive zone can move the real
+surface. Node rects are unaffected: they are measured inside the surface.
 <code>chrome.close</code> is the dialog's × frame control, measured the same way and in
 the same surface coordinates, present only while a <code>chrome:true</code> dialog is
 mapped (<code>chrome</code> is <code>{}</code> otherwise). Clicking its centre hides the dialog.</p>
