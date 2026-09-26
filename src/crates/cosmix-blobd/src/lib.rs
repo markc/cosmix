@@ -20,3 +20,5 @@ pub mod fetch;
 pub mod lane;
 #[cfg(feature = "cosmix")]
 pub mod props;
+#[cfg(feature = "cosmix")]
+pub mod refusal;

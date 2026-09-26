@@ -55,6 +55,8 @@ Byte values accept plain integers or a binary suffix (`KiB`, `MiB`, `GiB`, `TiB`
 
 Journald-primary through `cosmix_log::init` (the dnsd/wgd logging-only shape, stats off); `RUST_LOG` is honoured — the unit ships `RUST_LOG=cosmix_blobd=info`, and `RUST_LOG=cosmix_blobd=debug` follows each fetch submit, lane resolution, GET attempt, verify, pin and publish (a `warn` marks a publish into a broker-less client slot — the previously silent failure).
 
+A fatal startup refusal — the config unreadable or invalid, the root flock held by another instance, the WG bind proof failing, a lane bind I/O error — is printed to **stderr** as well as logged at `error` before the exit 2, so a binary run by hand (or the gate asserting the token) sees the reason without `journalctl`. The texts live in `cosmix_blobd::refusal` with tests pinning them.
+
 ## Byte lane
 
 The lane is the HTTP listener that moves bytes: blobs never ride a Bus frame, so cross-node reads and user-side producers (capture, webd, Thunderbird) use it. It serves only the WireGuard address — **the bind proof is fail-closed**: `lane_bind`'s IP must equal this node's `wg_ip` from `node.conf.mix` (the same source noded's `bind_is_wg` uses), never unspecified, never loopback, never another interface; a mismatch (or an absent `wg_ip`) exits with status 2 before any socket is opened. The `RestrictAddressFamilies` in the unit already allows INET for it. `lane.bind`/`lane.port` props exist only once the socket is actually listening — main binds before the citizen is constructed.

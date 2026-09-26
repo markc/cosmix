@@ -8,6 +8,7 @@ use cosmix_blobd::citizen::Citizen;
 use cosmix_blobd::core::config::Config;
 use cosmix_blobd::core::store::{Store, StoreError, StoreOptions};
 use cosmix_blobd::lane::LaneBindError;
+use cosmix_blobd::refusal;
 
 #[derive(Parser)]
 #[command(
@@ -49,11 +50,15 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = match &cli.config {
-        Some(path) => Config::parse(
-            &std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("read config {}: {e}", path.display()))?,
-        )
-        .map_err(|e| anyhow::anyhow!("parse config {}: {e}", path.display()))?,
+        Some(path) => {
+            let parsed = std::fs::read_to_string(path)
+                .map_err(|e| refusal::config_read(path, &e))
+                .and_then(|text| Config::parse(&text).map_err(|e| refusal::config_parse(path, &e)));
+            match parsed {
+                Ok(cfg) => cfg,
+                Err(message) => refusal::fatal(&message),
+            }
+        }
         None => Config::default(),
     };
 
@@ -80,11 +85,7 @@ async fn async_main() -> anyhow::Result<()> {
     let store = match Store::open(&root, StoreOptions::from_config(&cfg, origin)) {
         Ok(store) => Arc::new(store),
         Err(StoreError::Locked(path)) => {
-            error!(
-                "another instance holds {}; one GC owner per root — exiting",
-                path.display()
-            );
-            std::process::exit(2);
+            refusal::fatal(&refusal::root_locked(&path));
         }
         Err(error) => return Err(error.into()),
     };
@@ -107,14 +108,10 @@ async fn async_main() -> anyhow::Result<()> {
             let listener = match cosmix_blobd::lane::WgProvenBind::bind(bind, &wg_ip).await {
                 Ok(listener) => listener,
                 Err(LaneBindError::NotWg) => {
-                    error!(
-                        "lane_bind {bind} is not this node's WG address (wg_ip {:?}) — the lane serves only the mesh; refusing to start",
-                        if wg_ip.is_empty() { "<absent>" } else { &wg_ip }
-                    );
-                    std::process::exit(2);
+                    refusal::fatal(&refusal::not_wg(bind, &wg_ip));
                 }
                 Err(LaneBindError::Io(e)) => {
-                    return Err(anyhow::anyhow!("bind byte lane {bind}: {e}"));
+                    refusal::fatal(&refusal::lane_bind_io(bind, &e));
                 }
             };
             let addr = listener
