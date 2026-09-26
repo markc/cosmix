@@ -81,7 +81,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-maild-auth` | 0.2.0 |
 | `cosmix-maild-bayesian` | 0.7.1 |
 | `cosmix-maild-rules` | 0.3.1 |
-| `cosmix-mcp` | 0.5.4 |
+| `cosmix-mcp` | 0.6.0 |
 | `cosmix-mds` | 0.3.1 |
 | `cosmix-mesh-sign` | 0.8.1 |
 | `cosmix-midicomp` | 0.3.1 |
@@ -103,7 +103,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 |---|---|
 | `cosmix-bg-boing` | 0.1.0 |
 | `cosmix-bg-showcase` | 0.2.6 |
-| `cosmix-bterm` | 0.9.6 |
+| `cosmix-bterm` | 0.10.0 |
 | `cosmix-busviewer` | 0.1.2 |
 | `cosmix-capture` | 0.2.1 |
 | `cosmix-ced` | 0.1.1 |
@@ -121,10 +121,10 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-scene` | 0.6.0 |
 | `cosmix-scene-bevy` | 0.6.1 |
 | `cosmix-shell` | 0.17.0 |
-| `cosmix-shell-host` | 0.10.0 |
+| `cosmix-shell-host` | 0.10.1 |
 | `cosmix-studio` | 0.4.8 |
-| `cosmix-term` | 0.2.9 |
-| `cosmix-term-core` | 0.7.0 |
+| `cosmix-term` | 0.3.0 |
+| `cosmix-term-core` | 0.8.0 |
 | `cosmix-tower` | 0.5.5 |
 | `cosmix-tray` | 0.3.2 |
 | `cosmix-trayd` | 0.6.3 |
