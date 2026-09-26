@@ -64,6 +64,9 @@ each call, under a 10-second timeout. The bind is never cached. An empty bind,
 failed props call or timeout reports `lane_unavailable:`. Other filesystem
 verbs make no blob-store call. Uploads pin to the filesd `bus_service` name.
 
+`blob_service` must match `^[a-z][a-z0-9-]{1,30}$` (2–31 ASCII characters).
+An empty, malformed or node-qualified service name is a startup config error.
+
 ## Place definitions
 
 The place form is:

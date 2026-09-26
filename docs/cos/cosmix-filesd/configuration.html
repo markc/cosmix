@@ -489,6 +489,8 @@ place: public | Public | /var/lib/cosmix/public | writable=false | allow=*.md,ma
 each call, under a 10-second timeout. The bind is never cached. An empty bind,
 failed props call or timeout reports <code>lane_unavailable:</code>. Other filesystem
 verbs make no blob-store call. Uploads pin to the filesd <code>bus_service</code> name.</p>
+<p><code>blob_service</code> must match <code>^[a-z][a-z0-9-]{1,30}$</code> (2–31 ASCII characters).
+An empty, malformed or node-qualified service name is a startup config error.</p>
 <h2 id="place-definitions">Place definitions</h2>
 <p>The place form is:</p>
 <pre><code class="language-text">place: ID | LABEL | ROOT | group=GROUP | icon=ICON | writable=BOOL | allow=PATTERNS | deny=PATTERNS
