@@ -297,6 +297,15 @@ pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHas
             // fsyncs it, links it into the CAS, and drops the staging
             // link. The caller has promised the source immutable.
             fs::hard_link(src, &tmp_path)?;
+            // The staged link shares the source's inode, so without
+            // this the CAS file would carry the *source's* mtime — a
+            // months-old file is "old" the instant it commits, and a
+            // GC that judges on mtime sweeps it in the commit→pin
+            // window (F3). Refresh it to now. The inode is shared, so
+            // the source's mtime moves with it — the caller already
+            // promised the source immutable from the call onward, and
+            // an mtime is not content.
+            touch_path(&tmp_path)?;
         }
     }
 
@@ -711,6 +720,33 @@ mod tests {
             "HardLink must alias the source inode, not copy it"
         );
         assert_eq!(get(d.path(), &h).unwrap(), b"hard link me");
+    }
+
+    #[test]
+    fn put_path_hardlink_of_an_old_file_commits_young() {
+        // F3: the staged link shares the source inode, so an aged
+        // source would otherwise land in the CAS already "old" —
+        // sweepable inside the commit→pin grace window. The staged
+        // link is touched to now before commit, and (the documented
+        // cost of HardLink) the source's mtime moves with the shared
+        // inode.
+        let d = root();
+        let src = d.path().join("ancient.bin");
+        std::fs::write(&src, b"ancient but immutable").unwrap();
+        age_path(&src);
+        assert!(mtime_age(&src) >= std::time::Duration::from_secs(60));
+
+        let (h, _) = put_path(d.path(), &src, PutMode::HardLink).unwrap();
+        let cas = blob_path(d.path(), &h);
+        assert!(
+            mtime_age(&cas) < std::time::Duration::from_secs(60),
+            "a HardLink put of an old file must commit young (measured {:?})",
+            mtime_age(&cas)
+        );
+        assert_eq!(
+            std::fs::metadata(&cas).unwrap().ino(),
+            std::fs::metadata(&src).unwrap().ino()
+        );
     }
 
     /// Set a file's mtime two minutes into the past (beyond blobd's
