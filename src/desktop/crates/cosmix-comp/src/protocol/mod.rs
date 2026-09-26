@@ -9098,7 +9098,6 @@ impl WaylandState {
                 self.release_pressed_keys();
             }
             HostInput::KeyboardFocusLostKeepingKeys => {
-                self.clear_agent_input();
                 self.cancel_chrome_pointer_grab(true);
                 self.update_chrome_hover(None);
                 self.set_chrome_cursor_override(None);
@@ -9181,7 +9180,7 @@ impl WaylandState {
         self.agent.last_keyboard_action = None;
         self.agent.last_pointer_action = None;
         if let Some(mut grab) = self.agent.popup_grab.take() {
-            grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
+            let _ = grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
             let pointer = self.agent.pointer.clone();
             let keyboard = self.agent.keyboard.clone();
             if pointer.with_grab(|_, grab| grab.is::<PopupPointerGrab<WaylandState>>()).unwrap_or(false) {
@@ -12584,7 +12583,6 @@ impl WaylandState {
     /// loss: a pause-specific variant would be the first place the two disagree
     /// about what a stuck modifier means.
     fn release_pressed_keys(&mut self) {
-        self.clear_agent_input();
         let keyboard = self.human.keyboard.clone();
         let pressed_keys = keyboard.pressed_keys();
         if !pressed_keys.is_empty() {

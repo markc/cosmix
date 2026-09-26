@@ -1005,6 +1005,10 @@ or return `no_keyboard_target`. Agent shortcuts reach the client: use compositor
 verbs for window management, or explicitly choose the human seat to test a
 compositor binding.
 
+Hidden and off-workspace windows receive no frame callbacks. A FIFO client can
+receive these input events yet defer processing them until the window becomes
+visible: protocol delivery does not guarantee application progress.
+
 Agent reachability checks run **before either device's focus changes**:
 
 - `x11_unsupported`: X11 targets, including coordinate-selected descendants.
@@ -1017,8 +1021,9 @@ These errors include `hint:{seat:"human"}`. Clients that bind only one seat
 need that explicit opt-in. Toolkit compatibility still needs the release's
 toolkit matrix; successful protocol tests do not establish toolkit support.
 
-For agent `{window,x,y}`, coordinates are relative to the root **wl_surface
-origin**, including the offset of its committed window geometry. Hit-testing
+For agent `{window,x,y}`, coordinates are relative to the **window-geometry
+origin**, exactly as on the human seat (CSD shadows do not shift the requested
+point when switching seats). Hit-testing still uses wl_surface layout origins and
 considers only that root's mapped client tree, including subsurfaces and popups,
 in committed stacking order and with committed input regions. Every ancestor
 must remain mapped. Workspace, minimisation, visibility and other windows'
@@ -1039,7 +1044,9 @@ popup grab handling an outside click), otherwise `no_pointer_target` is returned
 Agent input does not drive hot corners, pointer constraints, interactive
 move/resize, compositor decorations or drag and drop. A client `StartDrag` on
 the agent seat is refused before Smithay assigns an icon role or installs a
-grab; its supplied data source is cancelled. Popup grabs use the agent seat's
+grab; its supplied data source is cancelled. A null-source `StartDrag` is also
+refused but has no data source through which to send cancellation feedback.
+Popup grabs use the agent seat's
 own input serials and survive changes to human focus.
 
 Human window-relative moves retain the window-geometry-origin contract.
@@ -1094,6 +1101,8 @@ press replaces it; relevant focus changes and cleanup invalidate it; a successfu
 popup grab consumes it. Human clicks outside do not dismiss agent popups.
 `release_all` with no seat or with `seat:"agent"` dismisses the agent popup chain
 and removes its keyboard/pointer grabs; `seat:"human"` leaves it alone.
+Explicit agent key/button releases bypass target candidacy and focus mutation,
+so a hold can be retired after its old target unmaps; session lock still refuses.
 
 A sequence has at most 256 steps and 4096 generated events in total. Delays
 run on compositor timers, before the step, defaulting to `interval_ms` (default
@@ -1112,6 +1121,7 @@ a dead pointer target loses pointer focus and pointer holds; a dead keyboard
 target returns to its surviving canonical parent, or loses keyboard focus and
 key holds if no parent survives. This does not arbitrate human focus. Unlock reconciliation samples human
 pressed state only. Agent cleanup does not reset idle notifications.
+Human region selection and nested keyboard-focus loss do not clear agent state.
 
 `input.host.passthrough` remains nested-only (`unknown_path` on KMS) and controls
 the **human** host path. Setting it false suppresses host keys, motion, buttons

@@ -72,6 +72,10 @@ impl WaylandState {
         if self.session_lock_active() {
             return Err(Self::agent_refusal("session_lock"));
         }
+        if matches!(op, InputOp::ReleaseAll | InputOp::Key { action: PressAction::Release, .. }
+            | InputOp::PointerButton { action: PressAction::Release, .. }) {
+            return Ok(());
+        }
         if matches!(op, InputOp::Key { .. } | InputOp::Text(_))
             && self
                 .agent
@@ -153,6 +157,12 @@ impl WaylandState {
         if self.session_lock_active() {
             return Self::agent_refusal("session_lock");
         }
+        // Releases retire the driven seat's hold even if its old target has gone.
+        // They never resolve or refocus that target.
+        if matches!(op, InputOp::Key { action: PressAction::Release, .. }
+            | InputOp::PointerButton { action: PressAction::Release, .. }) {
+            return self.service_input_payload(SeatKind::Agent, op, Some((id, generation)));
+        }
         let object = match self.resolve_window_target(id, Some(generation)) {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
@@ -177,17 +187,7 @@ impl WaylandState {
         {
             return Self::agent_refusal("pointer_grab");
         }
-        let release = matches!(
-            op,
-            InputOp::Key {
-                action: PressAction::Release,
-                ..
-            } | InputOp::PointerButton {
-                action: PressAction::Release,
-                ..
-            }
-        );
-        if !release {
+        {
             // Resolve every pointer check before mutating either device focus.
             let pointer_target = if keyboard_op {
                 None
@@ -231,8 +231,8 @@ impl WaylandState {
         self.service_input_payload(SeatKind::Agent, op, Some((id, generation)))
     }
 
-    /// Root-local means the root wl_surface's (0,0), including its committed
-    /// window-geometry offset. Descendant layouts already contain subsurface
+    /// Hit-testing uses wl_surface layout origins; callers translate window-local
+    /// coordinates from the window-geometry origin. Descendant layouts contain subsurface
     /// and popup offsets. Use committed input regions and compositor tree order;
     /// ignore visibility/workspace only when a particular root was requested.
     fn agent_hit(
@@ -301,19 +301,18 @@ impl WaylandState {
                 .is_none_or(|record| !self.agent_tree_mapped(record))
         };
         let keyboard_dead = self.agent.keyboard.current_focus()
-            .and_then(|target| target.owned_surface()).as_ref().is_some_and(&invalid);
+            .and_then(|target| target.owned_surface()).as_ref().is_some_and(invalid);
         let pointer_dead = self.agent.pointer.current_focus()
-            .and_then(|target| target.owned_surface()).as_ref().is_some_and(&invalid);
+            .and_then(|target| target.owned_surface()).as_ref().is_some_and(invalid);
         let parent = self.agent.keyboard_root.clone().filter(|surface| !invalid(surface));
         if pointer_dead {
             self.agent.last_pointer_action = None;
             let pointer = self.agent.pointer.clone();
-            pointer.unset_grab_without_focus_restore(self, SERIAL_COUNTER.next_serial(), monotonic_millis());
-            self.release_agent_device_holds(false);
             pointer.motion(self, None, &MotionEvent {
                 location: pointer.current_location(),
                 serial: SERIAL_COUNTER.next_serial(), time: monotonic_millis(),
             });
+            self.release_agent_device_holds(false);
             pointer.frame(self);
         }
         if keyboard_dead {
@@ -368,8 +367,8 @@ impl WaylandState {
                 let record = &self.surfaces[&object];
                 self.validate_agent_surface(record.role.wl_surface(), false)?;
                 let position = (
-                    f64::from(record.layout.x) + x,
-                    f64::from(record.layout.y) + y,
+                    f64::from(record.window_origin.0) + x,
+                    f64::from(record.window_origin.1) + y,
                 );
                 (Some(object), position.0, position.1)
             }

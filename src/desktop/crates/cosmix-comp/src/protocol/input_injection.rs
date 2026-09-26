@@ -303,10 +303,6 @@ impl WaylandState {
         }
         let pointer = self.human.pointer.clone();
         self.human.delivery.button_delivery = self.delivery_target(false);
-        if state == HostButtonState::Pressed
-            && self.human.delivery.button_delivery != Some((id, generation)) {
-            return;
-        }
         pointer.button(
             self,
             &ButtonEvent {
@@ -690,7 +686,7 @@ impl WaylandState {
         }
     }
 
-    /// `release_all`: release everything injection holds, and only that.
+    /// Surface loss retires only this device's injected holds, without activity.
     pub(super) fn release_agent_device_holds(&mut self, keyboard: bool) {
         let holds = self.agent.held.owners.keys().copied()
             .filter(|hold| matches!(hold, Hold::Key(_)) == keyboard)

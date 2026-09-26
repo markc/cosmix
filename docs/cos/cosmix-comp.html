@@ -1380,6 +1380,9 @@ popup chain is allowed. Untargeted keys use the agent keyboard's existing focus
 or return <code>no_keyboard_target</code>. Agent shortcuts reach the client: use compositor
 verbs for window management, or explicitly choose the human seat to test a
 compositor binding.</p>
+<p>Hidden and off-workspace windows receive no frame callbacks. A FIFO client can
+receive these input events yet defer processing them until the window becomes
+visible: protocol delivery does not guarantee application progress.</p>
 <p>Agent reachability checks run <strong>before either device's focus changes</strong>:</p>
 <ul>
 <li><code>x11_unsupported</code>: X11 targets, including coordinate-selected descendants.</li>
@@ -1391,8 +1394,9 @@ point that does not hit that window's client tree.</li>
 <p>These errors include <code>hint:{seat:"human"}</code>. Clients that bind only one seat
 need that explicit opt-in. Toolkit compatibility still needs the release's
 toolkit matrix; successful protocol tests do not establish toolkit support.</p>
-<p>For agent <code>{window,x,y}</code>, coordinates are relative to the root <strong>wl_surface
-origin</strong>, including the offset of its committed window geometry. Hit-testing
+<p>For agent <code>{window,x,y}</code>, coordinates are relative to the <strong>window-geometry
+origin</strong>, exactly as on the human seat (CSD shadows do not shift the requested
+point when switching seats). Hit-testing still uses wl_surface layout origins and
 considers only that root's mapped client tree, including subsurfaces and popups,
 in committed stacking order and with committed input regions. Every ancestor
 must remain mapped. Workspace, minimisation, visibility and other windows'
@@ -1411,7 +1415,9 @@ popup grab handling an outside click), otherwise <code>no_pointer_target</code> 
 <p>Agent input does not drive hot corners, pointer constraints, interactive
 move/resize, compositor decorations or drag and drop. A client <code>StartDrag</code> on
 the agent seat is refused before Smithay assigns an icon role or installs a
-grab; its supplied data source is cancelled. Popup grabs use the agent seat's
+grab; its supplied data source is cancelled. A null-source <code>StartDrag</code> is also
+refused but has no data source through which to send cancellation feedback.
+Popup grabs use the agent seat's
 own input serials and survive changes to human focus.</p>
 <p>Human window-relative moves retain the window-geometry-origin contract.
 <code>require_hit:true</code> additionally requires an on-output hit of that window/frame;
@@ -1456,7 +1462,9 @@ popup grab on the same root, without yielding inside the operation. A later
 press replaces it; relevant focus changes and cleanup invalidate it; a successful
 popup grab consumes it. Human clicks outside do not dismiss agent popups.
 <code>release_all</code> with no seat or with <code>seat:"agent"</code> dismisses the agent popup chain
-and removes its keyboard/pointer grabs; <code>seat:"human"</code> leaves it alone.</p>
+and removes its keyboard/pointer grabs; <code>seat:"human"</code> leaves it alone.
+Explicit agent key/button releases bypass target candidacy and focus mutation,
+so a hold can be retired after its old target unmaps; session lock still refuses.</p>
 <p>A sequence has at most 256 steps and 4096 generated events in total. Delays
 run on compositor timers, before the step, defaulting to <code>interval_ms</code> (default
 0), and total at most 60 seconds. It yields after 256 injected events; runs can
@@ -1472,7 +1480,8 @@ holds, grabs and focus and cancel sequences using the agent seat with
 a dead pointer target loses pointer focus and pointer holds; a dead keyboard
 target returns to its surviving canonical parent, or loses keyboard focus and
 key holds if no parent survives. This does not arbitrate human focus. Unlock reconciliation samples human
-pressed state only. Agent cleanup does not reset idle notifications.</p>
+pressed state only. Agent cleanup does not reset idle notifications.
+Human region selection and nested keyboard-focus loss do not clear agent state.</p>
 <p><code>input.host.passthrough</code> remains nested-only (<code>unknown_path</code> on KMS) and controls
 the <strong>human</strong> host path. Setting it false suppresses host keys, motion, buttons
 and scroll; resize, scale, pointer leave and touch still pass. Pre-existing host

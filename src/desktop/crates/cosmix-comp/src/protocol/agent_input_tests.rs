@@ -226,6 +226,10 @@ fn agent_background_click_preserves_workspace_and_human_cursor() {
     let (_, _, pointer) = bind_agent_devices(&mut h);
     h.server.state.surfaces.get_mut(&alpha).unwrap().workspace = 2;
     h.server.state.recompute_effective_visibility();
+    let callback = h.allocate_object_id();
+    send_request(&mut h.client, alpha.protocol_id(), 3, &words(&[callback]));
+    send_request(&mut h.client, alpha.protocol_id(), 6, &[]);
+    h.dispatch_client();
     let cursor = h.server.state.cursor_position;
     let status = h.server.state.cursor_selection.clone();
     let focus = focused_object(&h);
@@ -259,6 +263,29 @@ fn agent_background_click_preserves_workspace_and_human_cursor() {
     assert_eq!(h.server.state.cursor_position, cursor);
     assert_eq!(h.server.state.cursor_selection, status);
     assert!(!h.server.state.surfaces[&alpha].layout.visible);
+    h.server.state.handle_frame(Vec::new());
+    assert!(!h.sync().iter().any(|(object, opcode, _)| *object == callback && *opcode == 0),
+        "agent delivery does not wake off-workspace frame callbacks");
+}
+
+#[test]
+fn agent_popup_provenance_is_invalidated_by_device_focus_changes() {
+    let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
+    bind_agent_devices(&mut h);
+    let tap = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A));
+    assert_eq!(inject(&mut h, &ingress, &runtime, tap).0, 0);
+    assert!(h.server.state.agent.last_keyboard_action.is_some());
+    let other = h.server.state.surfaces[&beta].role.wl_surface().clone();
+    h.server.state.agent.keyboard.clone().set_focus(&mut h.server.state, Some(other.into()), SERIAL_COUNTER.next_serial());
+    assert!(h.server.state.agent.last_keyboard_action.is_none());
+    let click = agent_target(&h, &alpha, InputOp::PointerButton { button: BTN_LEFT, action: PressAction::Both });
+    assert_eq!(inject(&mut h, &ingress, &runtime, click).0, 0);
+    assert!(h.server.state.agent.last_pointer_action.is_some());
+    let (id, generation) = window_id_and_generation(&h, &beta);
+    assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(move_op(PointerMoveTarget::Window {
+        id, generation, x: 20.0, y: 20.0, require_hit: true,
+    }))).0, 0);
+    assert!(h.server.state.agent.last_pointer_action.is_none());
 }
 
 #[test]
@@ -538,10 +565,11 @@ fn agent_drag_start_never_installs_a_dnd_grab_or_icon_role() {
 }
 
 #[test]
-fn agent_root_local_motion_rejects_chrome_before_focus_and_uses_local_coordinates() {
+fn agent_window_geometry_coordinates_match_human_coordinates_with_csd_offset() {
     let (mut h, ingress, runtime, _, alpha, _) = two_windows();
     let (_, _, pointer) = bind_agent_devices(&mut h);
     place_record(&mut h, &alpha, (80.0, 90.0, 200.0, 150.0));
+    h.server.state.surfaces.get_mut(&alpha).unwrap().window_origin = (90.0, 105.0);
     let (id, generation) = window_id_and_generation(&h, &alpha);
     let moved = |x, y| {
         on_agent(move_op(PointerMoveTarget::Window {
@@ -552,16 +580,85 @@ fn agent_root_local_motion_rejects_chrome_before_focus_and_uses_local_coordinate
             require_hit: false,
         }))
     };
-    let (rc, body) = inject(&mut h, &ingress, &runtime, moved(-10.0, -10.0));
+    let (rc, body) = inject(&mut h, &ingress, &runtime, moved(-30.0, -30.0));
     assert_eq!(rc, 10);
     assert_eq!(body["error"], "chrome_target");
     assert!(h.server.state.agent.pointer.current_focus().is_none());
     assert_eq!(inject(&mut h, &ingress, &runtime, moved(20.0, 30.0)).0, 0);
-    assert_eq!(h.server.state.agent.pointer_position, Some((100.0, 120.0)));
+    assert_eq!(h.server.state.agent.pointer_position, Some((110.0, 135.0)));
+    let human = h.server.state.pointer_move_input(&PointerMoveTarget::Window {
+        id, generation, x: 20.0, y: 30.0, require_hit: false,
+    }, 0).unwrap();
+    assert!(matches!(human, HostInput::PointerMotionAbsolute { x: 110.0, y: 135.0, .. }));
     let traffic = h.sync();
     let enter = pointer_bodies(&traffic, pointer, 0);
     assert_eq!(enter.len(), 1);
-    assert_eq!((fixed(&enter[0], 2), fixed(&enter[0], 3)), (20.0, 30.0));
+    assert_eq!((fixed(&enter[0], 2), fixed(&enter[0], 3)), (30.0, 45.0));
+}
+
+#[test]
+fn agent_targeted_releases_retire_holds_after_target_unmaps() {
+    for keyboard in [true, false] {
+        let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+        bind_agent_devices(&mut h);
+        let payload = |action| if keyboard { agent_key(action, KEY_LEFTSHIFT) } else {
+            InputOp::PointerButton { button: BTN_LEFT, action }
+        };
+        let press = agent_target(&h, &alpha, payload(PressAction::Press));
+        let release = agent_target(&h, &alpha, payload(PressAction::Release));
+        assert_eq!(inject(&mut h, &ingress, &runtime, press).0, 0);
+        h.server.state.surfaces.get_mut(&alpha).unwrap().mapped = false;
+        let (rc, body) = inject(&mut h, &ingress, &runtime, release);
+        assert_eq!(rc, 0, "{body}");
+        assert!(h.server.state.agent.held.is_empty());
+        assert!(h.server.state.agent.keyboard.pressed_keys().is_empty());
+        assert!(h.server.state.agent.pointer.current_pressed().is_empty());
+    }
+}
+
+#[test]
+fn human_targeted_button_keeps_the_existing_implicit_grab_delivery_path() {
+    let (mut h, _, _, pointer, alpha, beta) = two_windows();
+    let (id, generation) = window_id_and_generation(&h, &alpha);
+    h.server.state.targeted_pointer_button(id, generation, BTN_LEFT, HostButtonState::Pressed, monotonic_millis());
+    let _ = h.sync();
+    let (id, generation) = window_id_and_generation(&h, &beta);
+    h.server.state.targeted_pointer_button(id, generation, 0x111, HostButtonState::Pressed, monotonic_millis());
+    assert!(h.server.state.human.pointer.current_pressed().contains(&0x111));
+    assert!(pointer_bodies(&h.sync(), pointer, 3).iter().any(|body| word(body, 2) == 0x111 && word(body, 3) == 1));
+}
+
+#[test]
+fn nested_human_focus_loss_preserves_agent_holds_and_queued_work() {
+    for event in [HostInput::KeyboardFocusLost, HostInput::KeyboardFocusLostKeepingKeys] {
+        let (mut h, _, _, _, alpha, _) = two_windows();
+        bind_agent_devices(&mut h);
+        let first = agent_target(&h, &alpha, agent_key(PressAction::Press, KEY_A));
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        h.server.state.start_long_op(crate::port::LongOp::Sequence(vec![
+            step("comp.input.key", first, 0),
+            step("comp.input.key", on_agent(agent_key(PressAction::Both, KEY_B)), 1_000),
+        ]), sender, Instant::now());
+        let before = h.server.state.agent.keyboard.current_focus();
+        h.server.state.handle_host_input(event);
+        assert_eq!(h.server.state.agent.keyboard.current_focus(), before);
+        assert!(!h.server.state.agent.held.is_empty());
+        assert_eq!(h.server.state.injection.sequences.len(), 1);
+    }
+}
+
+#[test]
+fn human_region_selection_preserves_agent_keyboard_hold() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    let op = agent_target(&h, &alpha, agent_key(PressAction::Press, KEY_A));
+    assert_eq!(inject(&mut h, &ingress, &runtime, op).0, 0);
+    h.server.state.region.bridge = Some(crate::region_scene::RegionBridge::default());
+    let (sender, _receiver) = tokio::sync::oneshot::channel();
+    h.server.state.start_region_selection(None, Duration::from_secs(5), sender, Instant::now());
+    assert!(h.server.state.region_selection_active());
+    assert!(h.server.state.agent.keyboard.pressed_keys().contains(&Keycode::new(KEY_A + 8)));
+    assert!(!h.server.state.agent.held.is_empty());
 }
 
 #[test]
