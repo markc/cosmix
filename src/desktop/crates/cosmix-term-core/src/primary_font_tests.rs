@@ -247,15 +247,22 @@ fn collection_face_index_survives_metrics_ascii_unicode_and_resize() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// Point each named table's directory entry at EOF with zero length.
-fn moved_to_eof(data: &[u8], offset: usize, tables: usize, tags: &[&[u8; 4]]) -> Vec<u8> {
+/// Point each named table's directory entry at EOF. A zero `length` leaves
+/// swash an empty-but-present table; a nonzero one makes it unreadable.
+fn moved_to_eof(
+    data: &[u8],
+    offset: usize,
+    tables: usize,
+    tags: &[&[u8; 4]],
+    length: u32,
+) -> Vec<u8> {
     let mut out = data.to_vec();
     let end = (out.len() as u32).to_be_bytes();
     for table in 0..tables {
         let at = offset + 12 + table * 16;
         if tags.iter().any(|tag| out[at..at + 4] == tag[..]) {
             out[at + 8..at + 12].copy_from_slice(&end);
-            out[at + 12..at + 16].copy_from_slice(&0_u32.to_be_bytes());
+            out[at + 12..at + 16].copy_from_slice(&length.to_be_bytes());
         }
     }
     out
@@ -267,7 +274,7 @@ fn damaged_optional_face_is_skipped_for_the_next_path() {
     let fixture = primary_font::fixture().unwrap();
     assert_eq!(fixture.index, 0);
     let tables = u16::from_be_bytes(fixture.data[4..6].try_into().unwrap()) as usize;
-    let damaged = moved_to_eof(&fixture.data, 0, tables, &[b"maxp"]);
+    let damaged = moved_to_eof(&fixture.data, 0, tables, &[b"maxp"], 32);
     assert_ne!(damaged[..], fixture.data[..]);
     let dir = std::env::temp_dir().join(format!("term-font-optional-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -302,10 +309,17 @@ fn damaged_candidate_is_removed_before_selecting_next_face() {
         u16::from_be_bytes(fixture.data[offset + 4..offset + 6].try_into().unwrap()) as usize;
     let truncated = fixture.data[..offset + 12 + tables * 16].to_vec();
     assert!(FontRef::from_index(&truncated, fixture.index as usize).is_some());
-    let no_outlines = moved_to_eof(&fixture.data, offset, tables, &[b"glyf", b"CFF ", b"CFF2"]);
-    // head, hhea and hmtx intact but maxp past EOF: swash's metrics proxy
-    // stops before counting long metrics, so advance_width must never be asked.
-    let no_maxp = moved_to_eof(&fixture.data, offset, tables, &[b"maxp"]);
+    let no_outlines = moved_to_eof(
+        &fixture.data,
+        offset,
+        tables,
+        &[b"glyf", b"CFF ", b"CFF2"],
+        0,
+    );
+    // head, hhea and hmtx intact but maxp unreadable past EOF: swash's metrics
+    // proxy stops before counting long metrics, so advance_width must never
+    // be asked (it would compute 0 - 1).
+    let no_maxp = moved_to_eof(&fixture.data, offset, tables, &[b"maxp"], 32);
     for damaged in [b"not a font".to_vec(), truncated, no_outlines, no_maxp] {
         std::fs::write(&path, damaged).unwrap();
         let mut db = Database::new();
