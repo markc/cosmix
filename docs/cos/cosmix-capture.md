@@ -68,7 +68,7 @@ between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
 loss — abandons lane
 resolution and an in-flight upload instead of waiting them out, so capture
 exits within about a second of SIGTERM; a worker parked on a stalled lane
-is abandoned within a few bounded seconds at most. The file under
+is abandoned within one socket write, at most the 30 s socket bound. The file under
 `~/Videos/Cosmix`
 remains the source of truth; not
 done yet are the `captures` collection over the references and dropping the

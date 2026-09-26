@@ -124,9 +124,13 @@ fn mime(path: &Path) -> &'static str {
 }
 
 /// The upload body: the file, gated on shutdown and the whole-upload
-/// deadline. ureq's copy loop calls `read` between socket writes, so
-/// an abandoned or over-deadline upload errors at the next chunk
-/// instead of parking the worker until a kernel timeout.
+/// deadline. ureq's copy loop calls `read` between socket writes — the
+/// checks never run inside a write — so an abandoned or over-deadline
+/// upload errors at the next chunk instead of parking the worker until
+/// a kernel timeout. ureq 2's plain-Content-Length path copies the body
+/// through std's 8 KiB `io::copy` buffer, so a chunk is 8 KiB: the chunk
+/// plus one socket write (bounded by the agent's write bound) is what
+/// bounds abandon latency and deadline overshoot together.
 struct GuardedBody {
     file: File,
     shutdown: Arc<AtomicBool>,
@@ -566,15 +570,20 @@ mod tests {
         // The lane drains at a fixed crawl and never finishes inside
         // the test: the writer paces on that drain, so GuardedBody runs
         // between chunks and shutdown set at 200 ms errors the upload
-        // at the next chunk, never a socket bound. The 16 MiB body is
-        // larger than any loopback socket buffering (Linux defaults
-        // cap wmem+rmem near 10 MiB), so the pass cannot hinge on the
-        // box's buffer sizes — the cbc2 flake was a 4 MiB body
-        // swallowed whole before the flag was set, parking the client
-        // on the reply read where the guard never runs. A lane that
-        // stopped reading entirely would be no better: it parks the
-        // writer inside a socket write, where only ureq's write bound
-        // (10 s under test, 30 s in production) can end it.
+        // at the next chunk with the guard's own text. How soon is
+        // bounded by one socket write: the guard never runs inside a
+        // write, and cbc2 (twice) had the writer sitting seconds inside
+        // a single write while the kernel drained its buffers — the
+        // guard fired with the right text at 4.4 s, past a 2 s bound.
+        // The daemon's real contract is abandon latency ≤ one socket
+        // write ≤ the io bound (10 s under test, 30 s in production),
+        // so that is the assertion; the daemon is not tightened to
+        // make a 2 s number true. The 16 MiB body is larger than any
+        // loopback socket buffering (Linux defaults cap wmem+rmem near
+        // 10 MiB), so the pass cannot hinge on the box's buffer sizes
+        // — the first cbc2 flake was a 4 MiB body swallowed whole
+        // before the flag was set, parking the client on the reply
+        // read where the guard never runs.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -618,8 +627,11 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         let error = worker.join().unwrap().unwrap_err();
         assert!(error.contains("shutting down"), "{error}");
+        // One socket write can hold the writer for seconds on a loaded
+        // box, so the io bound — not a wish about kernel drain speed —
+        // is the honest ceiling.
         assert!(
-            abandoned.elapsed() < Duration::from_secs(2),
+            abandoned.elapsed() < io_timeout(),
             "{:?}: {error}",
             abandoned.elapsed()
         );
@@ -709,9 +721,16 @@ mod tests {
 
     #[test]
     fn a_drip_feed_lane_hits_the_whole_upload_deadline() {
-        // Drains slower than the deadline: every socket write succeeds
-        // within its own bound, so only the between-chunks deadline
-        // check ends it (1 s under test).
+        // Drains slower than the deadline and never closes first: the
+        // lane drips at its cadence and stays open until the client
+        // disconnects (a read returning 0 or an error on its side),
+        // with a 3 × io bound safety cap so a hung test still ends.
+        // cbc2's flake was the lane ending by count and closing the
+        // connection before the 1 s deadline fired on a slower box —
+        // an Unexpected EOF instead of the guard. Here every socket
+        // write succeeds within its own bound, so only the
+        // between-chunks deadline check ends it, within one further
+        // socket write of the deadline.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -720,29 +739,25 @@ mod tests {
             let mut head = String::new();
             loop {
                 let mut line = String::new();
-                let blank = {
-                    reader.read_line(&mut line).unwrap();
-                    line.trim_end().is_empty()
-                };
+                reader.read_line(&mut line).unwrap();
+                let blank = line.trim_end().is_empty();
                 head.push_str(&line);
                 if blank {
                     break;
                 }
             }
-            let length: usize = head
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-                .and_then(|(_, value)| value.trim().parse().ok())
-                .unwrap_or(0);
+            let cap = Instant::now() + 3 * io_timeout();
             let mut scratch = [0u8; 8192];
-            let mut read = 0;
-            while read < length {
-                let n = reader.read(&mut scratch).unwrap_or(0);
-                if n == 0 {
-                    break;
+            loop {
+                if reader.read(&mut scratch).unwrap_or(0) == 0 {
+                    // The client went away — on this test's terms, the
+                    // guard errored the upload and ureq dropped the
+                    // socket.
+                    return;
                 }
-                read += n;
+                if Instant::now() >= cap {
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(25));
             }
         });
@@ -752,10 +767,10 @@ mod tests {
         let started = Instant::now();
         let error = upload(&bind, &path, quiet()).unwrap_err();
         assert!(error.contains("deadline passed"), "{error}");
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < io_timeout(),
-            "{:?}: {error}",
-            started.elapsed()
+            elapsed >= upload_deadline() && elapsed < upload_deadline() + io_timeout(),
+            "{elapsed:?}: {error}"
         );
     }
 }
