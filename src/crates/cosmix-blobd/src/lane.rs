@@ -63,6 +63,10 @@ enum LaneAbort {
     Cap,
     /// No body data for [`IDLE_TIMEOUT`].
     Idle,
+    /// The upload's total deadline ([`Lane::upload_deadline`],
+    /// `lane_upload_deadline_secs`) passed — a drip-feed client holds
+    /// a permit and a quota reservation for at most this long (F8).
+    Deadline,
 }
 
 impl std::fmt::Display for LaneAbort {
@@ -70,6 +74,10 @@ impl std::fmt::Display for LaneAbort {
         match self {
             Self::Cap => write!(f, "quota: upload exceeded the remaining cap mid-stream"),
             Self::Idle => write!(f, "request body idle for over 30s"),
+            Self::Deadline => write!(
+                f,
+                "upload exceeded its total deadline (lane_upload_deadline_secs)"
+            ),
         }
     }
 }
@@ -108,14 +116,18 @@ pub struct Lane {
     store: Arc<Store>,
     uploads: Semaphore,
     gets: AtomicU64,
+    /// Total per-upload deadline (F8): the idle timeout bounds
+    /// inter-frame gaps only, so this bounds the whole body.
+    upload_deadline: Duration,
 }
 
 impl Lane {
-    fn new(store: Arc<Store>, max_uploads: usize) -> Self {
+    fn new(store: Arc<Store>, max_uploads: usize, upload_deadline: Duration) -> Self {
         Self {
             store,
             uploads: Semaphore::new(max_uploads),
             gets: AtomicU64::new(0),
+            upload_deadline,
         }
     }
 
@@ -139,12 +151,15 @@ fn lane_router(lane: Arc<Lane>) -> Router {
 
 /// Serve the byte lane on an already-bound `listener`. The WG bind
 /// proof is the caller's (main's) job — see [`bind_is_wg`].
+/// `upload_deadline` (`lane_upload_deadline_secs`) bounds each
+/// upload's total duration (F8).
 pub async fn serve_lane(
     listener: TcpListener,
     store: Arc<Store>,
     max_uploads: usize,
+    upload_deadline: Duration,
 ) -> std::io::Result<()> {
-    let lane = Arc::new(Lane::new(store, max_uploads));
+    let lane = Arc::new(Lane::new(store, max_uploads, upload_deadline));
     axum::serve(
         listener,
         lane_router(lane).into_make_service_with_connect_info::<SocketAddr>(),
@@ -473,7 +488,8 @@ impl Lane {
         let cap = reservation.cap();
 
         let (tx, rx) = mpsc::channel::<Frame>(PUMP_FRAMES);
-        let pump = tokio::spawn(pump_body(body, tx, cap));
+        let deadline = tokio::time::Instant::now() + self.upload_deadline;
+        let pump = tokio::spawn(pump_body(body, tx, cap, deadline));
         let store = Arc::clone(&self.store);
         let landed = tokio::task::spawn_blocking(move || {
             stream_into_store(&store, rx, expected, mime, name, owner, reservation)
@@ -505,10 +521,8 @@ impl Lane {
                     _ => None,
                 };
                 match abort {
-                    Some(LaneAbort::Cap) => {
-                        lane_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string())
-                    }
-                    Some(LaneAbort::Idle) => {
+                    Some(LaneAbort::Cap) => lane_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string()),
+                    Some(LaneAbort::Idle) | Some(LaneAbort::Deadline) => {
                         lane_error(StatusCode::REQUEST_TIMEOUT, &e.to_string())
                     }
                     None => lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -551,30 +565,41 @@ impl Lane {
 }
 
 /// Pump the async request body into the channel the blocking CAS
-/// writer reads, enforcing the mid-stream cap and the idle timeout.
-/// Every exit path except a closed channel signals the reader
-/// explicitly (`Eof` or `Abort`); on a cap or idle abort the CAS
-/// writer's error path deletes the staging file before the handler
-/// answers.
-async fn pump_body(mut body: Body, tx: mpsc::Sender<Frame>, cap: u64) {
+/// writer reads, enforcing the mid-stream cap, the idle timeout and
+/// the upload's total `deadline` (F8 — a drip-feed client holds a
+/// permit and a quota reservation for at most the deadline, even
+/// while feeding a byte every few seconds). Every exit path except a
+/// closed channel signals the reader explicitly (`Eof` or `Abort`);
+/// on a cap, idle or deadline abort the CAS writer's error path
+/// deletes the staging file before the handler answers.
+async fn pump_body(mut body: Body, tx: mpsc::Sender<Frame>, cap: u64, deadline: tokio::time::Instant) {
     let mut count: u64 = 0;
     loop {
-        let frame = match tokio::time::timeout(IDLE_TIMEOUT, body.frame()).await {
+        let frame = match tokio::time::timeout_at(
+            deadline,
+            tokio::time::timeout(IDLE_TIMEOUT, body.frame()),
+        )
+        .await
+        {
             Err(_) => {
+                let _ = tx.send(Frame::Abort(abort_error(LaneAbort::Deadline))).await;
+                return;
+            }
+            Ok(Err(_)) => {
                 let _ = tx.send(Frame::Abort(abort_error(LaneAbort::Idle))).await;
                 return;
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 let _ = tx.send(Frame::Eof).await;
                 return;
             }
-            Ok(Some(Err(e))) => {
+            Ok(Ok(Some(Err(e)))) => {
                 let _ = tx
                     .send(Frame::Abort(io::Error::other(format!("request body: {e}"))))
                     .await;
                 return;
             }
-            Ok(Some(Ok(frame))) => frame,
+            Ok(Ok(Some(Ok(frame)))) => frame,
         };
         let Ok(bytes) = frame.into_data() else {
             continue; // trailers and other non-data frames carry no bytes
@@ -744,15 +769,29 @@ pub(crate) mod test_support {
     }
 
     /// A loopback lane with its GET counter exposed (the fetch tests
-    /// assert exactly one download per hash).
+    /// assert exactly one download per hash) and the default upload
+    /// deadline.
     pub(crate) async fn counted_lane(
         options: StoreOptions,
+    ) -> (TempDir, Arc<Store>, SocketAddr, Arc<Lane>) {
+        counted_lane_deadline(
+            options,
+            Duration::from_secs(crate::core::config::DEFAULT_LANE_UPLOAD_DEADLINE_SECS),
+        )
+        .await
+    }
+
+    /// [`counted_lane`] with an explicit upload deadline (F8's test
+    /// uses seconds, not hours).
+    pub(crate) async fn counted_lane_deadline(
+        options: StoreOptions,
+        upload_deadline: Duration,
     ) -> (TempDir, Arc<Store>, SocketAddr, Arc<Lane>) {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(Store::open(dir.path(), options).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let lane = Arc::new(Lane::new(Arc::clone(&store), 4));
+        let lane = Arc::new(Lane::new(Arc::clone(&store), 4, upload_deadline));
         let serve_lane = Arc::clone(&lane);
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
@@ -1093,6 +1132,48 @@ mod tests {
         assert_eq!(report.total.used, 700 * 1024);
         assert_eq!(report.total.reserved, 0, "the reservation settled");
         assert!(tmp_is_empty(&store));
+    }
+
+    // ---- F8: a total per-upload deadline ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drip_feed_upload_passes_its_total_deadline_with_408() {
+        // The idle timeout bounds inter-frame gaps only: a byte every
+        // few seconds never trips it, yet holds an upload permit and a
+        // quota reservation forever. The total deadline bounds the
+        // whole body: expiry aborts (staging deleted), 408.
+        let (_dir, store, addr, _lane) =
+            test_support::counted_lane_deadline(options(), Duration::from_secs(1)).await;
+        let bytes = pseudo_random(4096, 0xD31E);
+        let hex_id = blob::hex(&blob::hash_bytes(&bytes));
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let head = format!(
+            "PUT /blob/{hex_id} HTTP/1.1\r\nHost: blobd.test\r\nContent-Length: {}\r\n\r\n",
+            bytes.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        // Drip: one byte every 200 ms — never idle for 30 s, but the
+        // 1 s total deadline passes mid-body.
+        for _ in 0..3 {
+            stream.write_all(&bytes[..1]).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let (status, _, body) = read_response(&mut stream, false);
+        assert_eq!(status, 408, "{}", String::from_utf8_lossy(&body));
+        assert!(
+            String::from_utf8_lossy(&body).contains("deadline"),
+            "{body:?}"
+        );
+
+        // Staging deleted, no CAS entry, quota reservation released.
+        assert!(tmp_is_empty(&store));
+        assert!(!blob::exists(&store.blobs_root(), &blob::hash_bytes(&bytes)).unwrap());
+        let report = store.quota_report(None).unwrap();
+        assert_eq!(report.total.reserved, 0, "the reservation released");
     }
 
     // ---- Lane idempotence: PUT of a hash the CAS already holds ----

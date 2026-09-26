@@ -39,6 +39,12 @@ pub const DEFAULT_VERB_MAX_CONCURRENT: usize = 8;
 /// so members read `blob.path` targets and the daemon's supplementary
 /// groups must include it (the unit's `SupplementaryGroups` line).
 pub const DEFAULT_CAS_GROUP: &str = "cosmix-blob";
+/// Default total per-upload deadline (F8): a slow client holds an
+/// upload permit and quota reservation for at most this long; expiry
+/// aborts the upload (staging deleted) and answers `408`. The 30 s
+/// idle timeout bounds inter-frame gaps only, so the total deadline is
+/// what bounds a drip-feed client.
+pub const DEFAULT_LANE_UPLOAD_DEADLINE_SECS: u64 = 3600;
 
 /// Parsed configuration with defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +74,9 @@ pub struct Config {
     /// to at open, with the setgid bit (mode 2750) so shard
     /// directories and CAS files inherit it (M4).
     pub cas_group: String,
+    /// Total per-upload deadline on the lane; expiry aborts the
+    /// upload (staging deleted) with `408` (F8).
+    pub lane_upload_deadline_secs: u64,
     pub quota_total_bytes: u64,
     pub quota_owner_default_bytes: u64,
     /// Per-owner caps from repeated `quota_owner: <owner>=<bytes>`
@@ -86,6 +95,7 @@ impl Default for Config {
             fetch_queue_max: DEFAULT_FETCH_QUEUE_MAX,
             verb_max_concurrent: DEFAULT_VERB_MAX_CONCURRENT,
             cas_group: DEFAULT_CAS_GROUP.to_string(),
+            lane_upload_deadline_secs: DEFAULT_LANE_UPLOAD_DEADLINE_SECS,
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
             owner_limits: BTreeMap::new(),
@@ -190,6 +200,19 @@ impl Config {
                     }
                     cfg.cas_group = v.to_string();
                 }
+                "lane_upload_deadline_secs" => {
+                    let n: u64 = v.parse().map_err(|e| {
+                        format!("lane_upload_deadline_secs: bad seconds {v:?}: {e}")
+                    })?;
+                    if n == 0 {
+                        return Err(
+                            "lane_upload_deadline_secs: must be at least 1 (0 would abort every \
+                             upload at once; the idle timeout already covers dead peers)"
+                                .into(),
+                        );
+                    }
+                    cfg.lane_upload_deadline_secs = n;
+                }
                 "quota_total_bytes" => {
                     cfg.quota_total_bytes = parse_bytes(v)
                         .ok_or_else(|| format!("quota_total_bytes: bad byte size {v:?}"))?;
@@ -269,6 +292,10 @@ mod tests {
         assert_eq!(cfg.fetch_queue_max, 8);
         assert_eq!(cfg.verb_max_concurrent, 2);
         assert_eq!(cfg.cas_group, "cosmix-blob");
+        assert_eq!(
+            cfg.lane_upload_deadline_secs,
+            DEFAULT_LANE_UPLOAD_DEADLINE_SECS
+        );
         assert_eq!(cfg.quota_total_bytes, 100 * 1024 * 1024 * 1024);
         assert_eq!(cfg.quota_owner_default_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.owner_limits["maild"], 1024 * 1024 * 1024);
@@ -294,6 +321,8 @@ mod tests {
         assert!(Config::parse("verb_max_concurrent: 0\n").is_err());
         assert!(Config::parse("verb_max_concurrent: few\n").is_err());
         assert!(Config::parse("cas_group:\n").is_err());
+        assert!(Config::parse("lane_upload_deadline_secs: 0\n").is_err());
+        assert!(Config::parse("lane_upload_deadline_secs: soon\n").is_err());
         assert!(Config::parse("quota_total_bytes: lots\n").is_err());
         assert!(Config::parse("quota_owner: noequals\n").is_err());
         assert!(Config::parse("quota_owner: =5MiB\n").is_err());

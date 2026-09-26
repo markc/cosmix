@@ -35,6 +35,7 @@ quota_owner: capture=2GiB
 | `name` | unset (service `blobd`) | Instance name; Bus service becomes `blobd-<name>` |
 | `lane_bind` | unset (no lane) | Byte-lane bind `<ip>:<port>`; the IP must be this node's `wg_ip` (see [Byte lane](#byte-lane)) |
 | `lane_max_uploads` | `4` | Concurrent lane uploads admitted; beyond it the lane answers `503` — no queueing |
+| `lane_upload_deadline_secs` | `3600` | Total per-upload deadline; a drip-feed body is aborted (staging deleted) with `408` when it passes — the 30 s idle timeout bounds inter-frame gaps only |
 | `fetch_max_concurrent` | `2` | Concurrent `blob.fetch` downloads; beyond it a fetch queues (see [Fetching](#fetching)) |
 | `fetch_queue_max` | `32` | In-process fetch queue depth; beyond it the verb replies rc 10 `busy` |
 | `verb_max_concurrent` | `8` | Concurrent verb dispatches; beyond it a verb queues (its reply is late, never lost) instead of blocking every other verb |
@@ -81,7 +82,7 @@ Every successful upload records attributes (`origin` = this node) and a pin, so 
 
 The total cap and the lane owner's remaining quota are enforced **mid-stream** by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers `413`; a declared `Content-Length` over the cap is refused `413` before any byte is read. Quota is reserved at admission (the declared length, or the whole remaining room when absent), so concurrent uploads cannot each spend the same cap room — the mid-stream counter enforces the reservation. An idle request body (no data for 30 s) aborts with `408`. At most `lane_max_uploads` (default 4) uploads run concurrently; beyond that the lane answers `503` immediately — there is no queue (the no-poll/no-flood law).
 
-Uploads are **restart-only** in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction.
+Uploads are **restart-only** in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction. A slow client holds an upload permit and a quota reservation for at most `lane_upload_deadline_secs` (default 3600) in total: a body that is still dribbling when the deadline passes is aborted (staging deleted) with `408` — the idle timeout bounds inter-frame gaps, the deadline bounds the whole upload.
 
 A `blob.fetch` interrupted by a restart leaves at most staging residue under `blobs/.tmp`, which startup cleanup removes — the same crash-safety the lane's uploads have.
 
