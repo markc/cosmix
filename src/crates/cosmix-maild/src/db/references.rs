@@ -17,6 +17,23 @@ fn error(e: impl std::fmt::Display) -> String {
     format!("unreadable: reference database: {e}")
 }
 
+/// Own the key and database handle before crossing to the blocking pool.
+/// The synchronous functions below never run on a Tokio worker in Bus handlers.
+pub async fn blocking<T: Send + 'static>(
+    db: &Db,
+    key: &Key<'_>,
+    operation: impl FnOnce(&Db, &Key<'_>) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let db = db.clone();
+    let account = key.account;
+    let item = key.item.to_owned();
+    let message_hash = key.message_hash.to_owned();
+    let part = key.part.map(str::to_owned);
+    tokio::task::spawn_blocking(move || operation(&db, &Key {
+        account, item: &item, message_hash: &message_hash, part: part.as_deref(),
+    })).await.map_err(error)?
+}
+
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Reference> {
     Ok(Reference {
         blob: r.get(0)?,
@@ -90,6 +107,25 @@ pub fn save(db: &Db, key: &Key<'_>, reference: &Reference) -> Result<Reference, 
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn reference_operations_use_blocking_workers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::super::SCHEMA).unwrap();
+        let db = Db { conn: Arc::new(Mutex::new(conn)), blob_dir: Default::default(),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)) };
+        let key = Key { account: 1, item: "item", message_hash: "hash", part: Some("1") };
+        let worker = std::thread::current().id();
+        blocking(&db, &key, move |db, key| {
+            assert_ne!(std::thread::current().id(), worker);
+            assert!(get(db, key)?.is_none());
+            assert!(parts(db, key)?.is_empty());
+            let r = Reference { blob: format!("b3:{}", "a".repeat(64)), size: 0,
+                mime: "text/plain".into(), name: None, origin: "alpha".into() };
+            assert_eq!(save(db, key, &r)?, r);
+            Ok(())
+        }).await.unwrap();
+    }
 
     #[test]
     fn additive_schema_and_reference_keys_preserve_first_writer_and_old_rows() {
