@@ -183,7 +183,6 @@ impl Ctx<'_, '_> {
         let text = ed.text;
         let mut budget = SliceBudget::default();
         let mut buf = String::new();
-        let clip = self.g.text_rect();
         for row in rows {
             let (Some(first), Some(last)) = (row.cells.placed.first(), row.cells.placed.last()) else { continue };
             let base = first.range.start;
@@ -199,31 +198,31 @@ impl Ctx<'_, '_> {
                 let class = spans.get(si).filter(|(sr, _)| sr.start <= pc.range.start).map_or(HlClass::Plain, |s| s.1);
                 let slice = &buf[pc.range.start - base..pc.range.end - base];
                 if pc.is_tab || (pc.ascii && pc.cells == 0) {
-                    self.flush(r, &mut run, row, clip);
+                    self.flush(r, &mut run, row);
                     continue;
                 }
                 if pc.ascii {
                     if run.class != Some(class) || run.end_cell != pc.cell || !run.ascii {
-                        self.flush(r, &mut run, row, clip);
+                        self.flush(r, &mut run, row);
                         run = Run { start_cell: pc.cell, end_cell: pc.cell, class: Some(class), ascii: true, text: String::new() };
                     }
                     run.text.push_str(slice);
                     run.end_cell = pc.cell + pc.cells as usize;
                 } else {
-                    self.flush(r, &mut run, row, clip);
+                    self.flush(r, &mut run, row);
                     let shown = if slice.len() > HUGE_CLUSTER { floor_boundary(slice, CLUSTER_DRAW_CAP) } else { slice };
                     run = Run { start_cell: pc.cell, end_cell: pc.cell + pc.cells as usize, class: Some(class), ascii: false, text: shown.to_string() };
-                    self.flush(r, &mut run, row, clip);
+                    self.flush(r, &mut run, row);
                 }
             }
-            self.flush(r, &mut run, row, clip);
+            self.flush(r, &mut run, row);
             if ed.view.whitespace {
-                self.whitespace(r, row, clip);
+                self.whitespace(r, row);
             }
         }
     }
 
-    fn flush<R: atext::Renderer<Font = Font>>(&self, r: &mut R, run: &mut Run, row: &Row, clip: Rectangle) {
+    fn flush<R: atext::Renderer<Font = Font>>(&self, r: &mut R, run: &mut Run, row: &Row) {
         let Some(class) = run.class else { return };
         if run.text.is_empty() {
             *run = Run::default();
@@ -233,13 +232,13 @@ impl Ctx<'_, '_> {
         let colour = if class == HlClass::Plain { p.text } else { p.hl(class) };
         let shaping = if run.ascii { atext::Shaping::Basic } else { atext::Shaping::Advanced };
         let width = (run.end_cell - run.start_cell + 1) as f32 * self.g.metrics.cell_w;
-        self.text(r, std::mem::take(&mut run.text), Point::new(self.x(run.start_cell), row.y), width, colour, shaping, clip);
+        self.text(r, std::mem::take(&mut run.text), Point::new(self.x(run.start_cell), row.y), width, colour, shaping);
         *run = Run::default();
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn text<R: atext::Renderer<Font = Font>>(&self, r: &mut R, content: String, at: Point, width: f32, colour: Color, shaping: atext::Shaping, clip: Rectangle) {
+    fn text<R: atext::Renderer<Font = Font>>(&self, r: &mut R, content: String, at: Point, width: f32, colour: Color, shaping: atext::Shaping) {
         let v = &self.ed.view;
+        let clip = text_clip(at, width, self.g.metrics.cell_w, self.g.metrics.line_h);
         r.fill_text(
             atext::Text {
                 content,
@@ -259,7 +258,7 @@ impl Ctx<'_, '_> {
     }
 
     /// Show whitespace: `·` per space, `→` per tab, one text call per row.
-    fn whitespace<R: atext::Renderer<Font = Font>>(&self, r: &mut R, row: &Row, clip: Rectangle) {
+    fn whitespace<R: atext::Renderer<Font = Font>>(&self, r: &mut R, row: &Row) {
         let Some(first) = row.cells.placed.first() else { return };
         let mut s = String::new();
         let mut any = false;
@@ -285,7 +284,7 @@ impl Ctx<'_, '_> {
         }
         if any {
             let width = (s.chars().count() + 1) as f32 * self.g.metrics.cell_w;
-            self.text(r, s, Point::new(self.x(first.cell), row.y), width, self.ed.palette.gutter_text, atext::Shaping::Advanced, clip);
+            self.text(r, s, Point::new(self.x(first.cell), row.y), width, self.ed.palette.gutter_text, atext::Shaping::Advanced);
         }
     }
 
@@ -334,7 +333,7 @@ impl Ctx<'_, '_> {
                 let n = row.line.to_string();
                 let x = gr.x + (g.digits - n.len().min(g.digits)) as f32 * cw + cw * 0.5;
                 let colour = if row.line == caret_line { p.text } else { p.gutter_text };
-                self.text(r, n, Point::new(x, row.y), (g.digits + 1) as f32 * cw, colour, atext::Shaping::Basic, gr);
+                self.text(r, n, Point::new(x, row.y), (g.digits + 1) as f32 * cw, colour, atext::Shaping::Basic);
             }
         }
         // Origin strip: lines other origins changed since the tab was focused.
@@ -403,7 +402,7 @@ impl Ctx<'_, '_> {
         let rect = Rectangle { x, y: at.y, width: w, height: h };
         let bg = renderer::Quad { bounds: rect, border: Border { radius: 4.0.into(), width: 1.0, color: accent }, ..renderer::Quad::default() };
         r.fill_quad(bg, p.gutter_background);
-        self.text(r, label.to_string(), Point::new(x + cw * 0.5, at.y), w, p.text, atext::Shaping::Advanced, self.g.bounds);
+        self.text(r, label.to_string(), Point::new(x + cw * 0.5, at.y), w, p.text, atext::Shaping::Advanced);
     }
 
     fn preedit<R: atext::Renderer<Font = Font>>(&self, r: &mut R, rows: &[Row]) {
@@ -419,7 +418,7 @@ impl Ctx<'_, '_> {
         let w = cells as f32 * self.g.metrics.cell_w;
         let p = self.ed.palette;
         quad(r, Rectangle { x: caret.x, y: caret.y, width: w, height: caret.height }, p.background);
-        self.text(r, st.ime.preedit.clone(), Point::new(caret.x, caret.y), w + self.g.metrics.cell_w, p.text, atext::Shaping::Advanced, self.g.text_rect());
+        self.text(r, st.ime.preedit.clone(), Point::new(caret.x, caret.y), w + self.g.metrics.cell_w, p.text, atext::Shaping::Advanced);
         quad(r, Rectangle { x: caret.x, y: caret.y + caret.height - 2.0, width: w, height: 1.0 }, p.caret);
     }
 
@@ -511,6 +510,18 @@ fn quad<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color
         return;
     }
     r.fill_quad(renderer::Quad { bounds, ..renderer::Quad::default() }, colour);
+}
+
+/// The clip rectangle a `fill_text` at `at`, `width` wide, is handed: its own
+/// row box, a cell wider and half a line taller on every side (overhangs
+/// stay inside it). Never the whole text area: iced_tiny_skia draws every
+/// text whose clip rectangle meets the damage, and clears and refills a
+/// window-sized clip mask for every one whose clip rectangle is not inside
+/// layer ∩ damage — with the text area here each frame cost ~150 ms and a
+/// `ced.action` waited behind it (ced first save, 2026-09-26). The layer
+/// (`with_layer`) still clips a box that crosses it, through that mask.
+fn text_clip(at: Point, width: f32, cell_w: f32, line_h: f32) -> Rectangle {
+    Rectangle { x: at.x - cell_w, y: at.y - line_h * 0.5, width: width + 2.0 * cell_w, height: line_h * 2.0 }
 }
 
 fn rounded<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color) {
