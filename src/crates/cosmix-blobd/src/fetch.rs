@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use cosmix_bus::PortReply;
 use cosmix_client::NodedClient;
@@ -785,32 +785,32 @@ impl Inner {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        let started = SystemTime::now();
         let (tx, rx) = mpsc::channel::<Frame>(PUMP_FRAMES);
         let pump = tokio::spawn(pump_response(response, tx, cap));
         let reader_store = Arc::clone(&self.store);
         let expected = *hash;
         let landed = tokio::task::spawn_blocking(move || {
-            blob::put_reader(&reader_store.blobs_root(), ChannelReader::new(rx))
+            blob::put_reader_expect(&reader_store.blobs_root(), ChannelReader::new(rx), &expected)
         })
         .await;
         let _ = pump.await;
 
         match landed {
-            Ok(Ok((landed, size))) => {
-                if landed != expected {
-                    // The bytes landed under their own (wrong) hash;
-                    // remove that entry when this fetch created it and
-                    // nothing pins or describes it.
-                    self.store.discard_recently_created(&landed, started);
-                    return SourceOutcome::Verify { landed };
-                }
-                SourceOutcome::Fetched { size, mime }
+            // put_reader_expect compared before committing, so a
+            // success here is verified: the landed hash is the
+            // requested one.
+            Ok(Ok((_landed, size))) => SourceOutcome::Fetched { size, mime },
+            Ok(Err(cosmix_mds::Error::BlobCorrupt(message))) => {
+                // The body did not hash to the requested id. Nothing
+                // ever entered the CAS — mds removed the staging
+                // before any commit — so there is nothing to undo.
+                SourceOutcome::Verify(message)
             }
             Ok(Err(error)) => {
                 // The abort reason rode inside the io::Error that
-                // stopped the stream; put_reader has already deleted
-                // the staging file by the time it surfaces here.
+                // stopped the stream; put_reader_expect has already
+                // deleted the staging file by the time it surfaces
+                // here.
                 match abort_kind(&error) {
                     Some(FetchAbort::Cap) => SourceOutcome::Quota(
                         "quota: the body passed the remaining cap mid-stream".to_string(),
@@ -937,13 +937,7 @@ impl Attempt {
 
     fn terminal(source: SourceOutcome) -> Self {
         let (outcome, error) = match source {
-            SourceOutcome::Verify { landed } => (
-                FetchOutcome::VerifyFailed,
-                format!(
-                    "hash mismatch: the body hashes to {}, not the requested id",
-                    reference::blob_id(&landed)
-                ),
-            ),
+            SourceOutcome::Verify(message) => (FetchOutcome::VerifyFailed, message),
             SourceOutcome::Quota(error) => (FetchOutcome::Quota, error),
             SourceOutcome::Local(error) => (FetchOutcome::Io, error),
             other => (FetchOutcome::Io, format!("{other:?}")),
@@ -969,10 +963,11 @@ enum SourceOutcome {
         size: u64,
         mime: String,
     },
-    /// Bytes landed under the wrong hash; terminal, never retried.
-    Verify {
-        landed: BlobHash,
-    },
+    /// Bytes did not hash to the requested id; terminal, never
+    /// retried. mds's `put_reader_expect` rejected them before any
+    /// commit, so no CAS entry exists under either hash; the message
+    /// names both.
+    Verify(String),
     /// Over the owner/total cap; terminal (the bytes are the same size
     /// from any peer).
     Quota(String),
@@ -989,8 +984,9 @@ enum SourceOutcome {
 }
 
 /// Why a fetch stream was aborted mid-body. Travels through the pump
-/// channel inside an `io::Error` so `put_reader`'s error path (which
-/// deletes the staging file) runs before the classifier sees it.
+/// channel inside an `io::Error` so `put_reader_expect`'s error path
+/// (which deletes the staging file) runs before the classifier sees
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchAbort {
     Cap,
@@ -1648,8 +1644,8 @@ mod tests {
         assert!(event["error"].as_str().unwrap().contains("hash mismatch"));
 
         // Terminal: the peer that holds the real bytes was never
-        // asked, and neither hash has a CAS entry (the wrong-hash
-        // landing was unlinked; staging is empty).
+        // asked, and neither hash has a CAS entry (put_reader_expect
+        // rejected the body before any commit; staging is empty).
         assert_eq!(lane_c.gets(), 0, "verify_failed must not retry a peer");
         assert!(!blob::exists(&store_b.blobs_root(), &hash).unwrap());
         assert!(!blob::exists(&store_b.blobs_root(), &hostile_hash).unwrap());

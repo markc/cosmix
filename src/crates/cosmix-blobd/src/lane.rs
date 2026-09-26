@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -39,7 +39,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_util::io::ReaderStream;
 
 use crate::core::mime;
-use crate::core::reference::{Reference, blob_id};
+use crate::core::reference::Reference;
 use crate::core::store::{PutOutcome, Store, StoreError};
 
 /// Idle request-body timeout: no data frame for this long aborts the
@@ -54,7 +54,7 @@ const PUMP_FRAMES: usize = 4;
 const MAX_OWNER_HEADER: usize = 128;
 
 /// Why a streaming upload was aborted mid-body. Travels through the
-/// pump channel inside an `io::Error` so `put_reader`'s error path
+/// pump channel inside an `io::Error` so the CAS writer's error path
 /// (which deletes the staging file) runs before the handler maps it
 /// back to a status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,7 +357,8 @@ pub(crate) enum Frame {
 }
 
 /// The blocking half of the pump: an `io::Read` view of the async
-/// body, consumed by `blob::put_reader` on the blocking pool.
+/// body, consumed by `blob::put_reader`/`put_reader_expect` on the
+/// blocking pool.
 pub(crate) struct ChannelReader {
     rx: mpsc::Receiver<Frame>,
     chunk: axum::body::Bytes,
@@ -466,12 +467,11 @@ impl Lane {
             );
         }
 
-        let started = SystemTime::now();
         let (tx, rx) = mpsc::channel::<Frame>(PUMP_FRAMES);
         let pump = tokio::spawn(pump_body(body, tx, cap));
         let store = Arc::clone(&self.store);
         let landed = tokio::task::spawn_blocking(move || {
-            stream_into_store(&store, rx, expected, started, mime, name, owner)
+            stream_into_store(&store, rx, expected, mime, name, owner)
         })
         .await;
 
@@ -480,30 +480,19 @@ impl Lane {
                 let _ = pump.await;
                 reference_response(StatusCode::CREATED, &outcome.reference)
             }
-            Ok(Ok(UploadOutcome::Mismatch {
-                expected,
-                landed,
-                size,
-            })) => {
+            Ok(Ok(UploadOutcome::Mismatch { message })) => {
                 let _ = pump.await;
                 json_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    serde_json::json!({
-                        "error": format!(
-                            "hash mismatch: body hashes to {}, not {}; CAS unchanged",
-                            blob_id(&landed),
-                            blob_id(&expected),
-                        ),
-                        "blob": blob_id(&landed),
-                        "size": size,
-                    }),
+                    serde_json::json!({ "error": message }),
                 )
             }
             Ok(Err(UploadError::Io(e))) => {
                 let _ = pump.await;
                 // The abort reason rode inside the io::Error that
-                // stopped the stream; put_reader has already deleted
-                // the staging file by the time it surfaces here.
+                // stopped the stream; the staging writer has already
+                // deleted the staged file by the time it surfaces
+                // here.
                 let abort = match &e {
                     cosmix_mds::Error::Io(io) => io
                         .get_ref()
@@ -549,8 +538,9 @@ impl Lane {
 /// Pump the async request body into the channel the blocking CAS
 /// writer reads, enforcing the mid-stream cap and the idle timeout.
 /// Every exit path except a closed channel signals the reader
-/// explicitly (`Eof` or `Abort`); on a cap or idle abort `put_reader`'s
-/// error path deletes the staging file before the handler answers.
+/// explicitly (`Eof` or `Abort`); on a cap or idle abort the CAS
+/// writer's error path deletes the staging file before the handler
+/// answers.
 async fn pump_body(mut body: Body, tx: mpsc::Sender<Frame>, cap: u64) {
     let mut count: u64 = 0;
     loop {
@@ -590,11 +580,11 @@ async fn pump_body(mut body: Body, tx: mpsc::Sender<Frame>, cap: u64) {
 
 enum UploadOutcome {
     Committed(PutOutcome),
-    Mismatch {
-        expected: BlobHash,
-        landed: BlobHash,
-        size: u64,
-    },
+    /// The PUT's body did not hash to the claimed id. mds's
+    /// `put_reader_expect` rejected it before anything committed, so
+    /// the CAS holds no entry for either hash and staging is empty;
+    /// the message names both hashes.
+    Mismatch { message: String },
 }
 
 enum UploadError {
@@ -603,38 +593,31 @@ enum UploadError {
 }
 
 /// The blocking half of an upload: stream the body into mds staging
-/// via `blob::put_reader`, then either record the upload (hash as
-/// expected, or POST's server-hashed truth) or — for a PUT whose body
-/// hashed to something else — undo what this request did.
+/// and land it. A PUT (expected hash known) goes through
+/// `blob::put_reader_expect`, which compares **before** committing —
+/// a body that does not hash to the claimed id never enters the CAS
+/// under either hash and comes back as [`UploadOutcome::Mismatch`]. A
+/// POST is server-hashed: `blob::put_reader`, the landed hash is the
+/// truth.
 fn stream_into_store(
     store: &Arc<Store>,
     rx: mpsc::Receiver<Frame>,
     expected: Option<BlobHash>,
-    started: SystemTime,
     mime: String,
     name: Option<String>,
     owner: String,
 ) -> Result<UploadOutcome, UploadError> {
     let reader = ChannelReader::new(rx);
-    // put_reader hashes while staging and commits under the hash of the
-    // bytes that actually arrived; on a read error it removes the
-    // staged file and leaves no CAS entry.
-    let (landed, size) = blob::put_reader(&store.blobs_root(), reader).map_err(UploadError::Io)?;
-
-    if let Some(expected) = expected
-        && expected != landed
-    {
-        // The landed bytes committed under their own (wrong) hash.
-        // Remove that entry only when this request created it and
-        // nothing pins or describes it; a pre-existing entry is not
-        // ours to delete.
-        store.discard_recently_created(&landed, started);
-        return Ok(UploadOutcome::Mismatch {
-            expected,
-            landed,
-            size,
-        });
-    }
+    let (landed, size) = match expected {
+        Some(expected) => match blob::put_reader_expect(&store.blobs_root(), reader, &expected) {
+            Ok(landed) => landed,
+            Err(cosmix_mds::Error::BlobCorrupt(message)) => {
+                return Ok(UploadOutcome::Mismatch { message })
+            }
+            Err(other) => return Err(UploadError::Io(other)),
+        },
+        None => blob::put_reader(&store.blobs_root(), reader).map_err(UploadError::Io)?,
+    };
 
     let outcome = store
         .record_upload(&landed, size, &mime, name.as_deref(), &owner)
@@ -949,7 +932,7 @@ mod tests {
         assert!(error["error"].as_str().unwrap().contains("hash mismatch"));
 
         // No entry for the claimed hash, none for what the body hashed
-        // to (the landed entry this request created was unlinked), and
+        // to (put_reader_expect rejected it before any commit), and
         // nothing left staging.
         assert!(!blob::exists(&store.blobs_root(), &claimed).unwrap());
         assert!(!blob::exists(&store.blobs_root(), &blob::hash_bytes(&bytes)).unwrap());

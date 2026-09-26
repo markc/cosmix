@@ -38,12 +38,6 @@ pub const LOCK_FILE: &str = ".blobd.lock";
 /// never delete a fetch that has committed its bytes and not yet its
 /// pin.
 pub const DEFAULT_GC_GRACE_SECS: u64 = 60;
-/// Timestamp-granularity tolerance for "this stream created the CAS
-/// entry": some filesystems (OpenZFS rounds down; ext3 ticks at 1 s)
-/// stamp an mtime slightly *before* a wall-clock read taken earlier
-/// in the same write, so `mtime >= started` alone would misjudge a
-/// just-created entry as pre-existing.
-const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
 
 const BLOBD_APPLICATION_ID: i32 = 0x626C_6F62; // 'blob'
 const BLOBD_LATEST: u32 = 1;
@@ -561,33 +555,6 @@ impl Store {
             self.bump_generation();
         }
         Ok(newly_pinned)
-    }
-
-    /// Remove a CAS entry a streamed upload or fetch just created when
-    /// the bytes landed under the *wrong* hash: only when the file's
-    /// mtime falls inside the request (content-addressed writes never
-    /// refresh an existing file's mtime, so a pre-existing entry is not
-    /// ours to delete) and nothing pins or describes it. Returns
-    /// whether the file was removed.
-    pub fn discard_recently_created(&self, hash: &BlobHash, started: SystemTime) -> bool {
-        let path = blob::blob_path(&self.blobs_root(), hash);
-        let created_here = match path.metadata().and_then(|md| md.modified()) {
-            Ok(modified) => {
-                modified
-                    >= started
-                        .checked_sub(MTIME_GRANULARITY)
-                        .unwrap_or(SystemTime::UNIX_EPOCH)
-            }
-            Err(_) => false,
-        };
-        if !created_here {
-            return false;
-        }
-        let anonymous = self
-            .stat(hash)
-            .map(|s| s.pins.is_empty() && s.first_put.is_none())
-            .unwrap_or(true);
-        anonymous && std::fs::remove_file(&path).is_ok()
     }
 
     /// The largest upload `owner` may land right now: the tighter of
