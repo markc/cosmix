@@ -91,6 +91,30 @@ mix /opt/cosmix/share/desktop/session-resume.mix --resume-only STATE
 Run it as the desktop user. It skips `<state>.done` and opens a new tab for
 each remaining session.
 
+## Chords
+
+Global chords bind to Quoin's `shell.session.confirm {action}` (through
+inputd), never to the session verbs, so a keypress only ever opens the
+question. The proposed chords are Ctrl+Alt+Backspace (restart) and
+Ctrl+Alt+Delete (leave).
+
+**Ctrl+Alt+Delete is also the kernel's reboot key.** Holding a VT does not
+stop it:
+
+- seatd and logind put the desktop's VT in keyboard mode `K_OFF`.
+- The kernel still handles `KT_SPEC` keys in that mode
+  (`drivers/tty/vt/keyboard.c`, `kbd_keycode()`: the early return is
+  `(raw_mode || kbd->kbdmode == VC_OFF) && type != KT_SPEC && type != KT_SHIFT`).
+- Ctrl+Alt+Delete's Boot keysym is `KT_SPEC`: `ctrl_alt_del()` sends SIGINT
+  to PID 1, which starts `ctrl-alt-del.target`, an alias of `reboot.target`.
+
+It is safe only while the kernel never sees the keystroke. That holds when
+inputd holds an exclusive grab on the keyboard it reads and the chord is a
+bound row: the bound stroke is swallowed and not re-emitted. If inputd is not
+running or not grabbing, the kernel sees the chord and the machine reboots.
+Either choose another chord or run `systemctl mask ctrl-alt-del.target` on the
+host, which makes PID 1 ignore the key.
+
 ## Settings (environment)
 
 | variable | default | meaning |

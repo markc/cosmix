@@ -530,6 +530,27 @@ names the recovery command:</p>
 </code></pre>
 <p>Run it as the desktop user. It skips <code>&lt;state&gt;.done</code> and opens a new tab for
 each remaining session.</p>
+<h2 id="chords">Chords</h2>
+<p>Global chords bind to Quoin's <code>shell.session.confirm {action}</code> (through
+inputd), never to the session verbs, so a keypress only ever opens the
+question. The proposed chords are Ctrl+Alt+Backspace (restart) and
+Ctrl+Alt+Delete (leave).</p>
+<p><strong>Ctrl+Alt+Delete is also the kernel's reboot key.</strong> Holding a VT does not
+stop it:</p>
+<ul>
+<li>seatd and logind put the desktop's VT in keyboard mode <code>K_OFF</code>.</li>
+<li>The kernel still handles <code>KT_SPEC</code> keys in that mode
+(<code>drivers/tty/vt/keyboard.c</code>, <code>kbd_keycode()</code>: the early return is
+<code>(raw_mode || kbd-&gt;kbdmode == VC_OFF) &amp;&amp; type != KT_SPEC &amp;&amp; type != KT_SHIFT</code>).</li>
+<li>Ctrl+Alt+Delete's Boot keysym is <code>KT_SPEC</code>: <code>ctrl_alt_del()</code> sends SIGINT
+to PID 1, which starts <code>ctrl-alt-del.target</code>, an alias of <code>reboot.target</code>.</li>
+</ul>
+<p>It is safe only while the kernel never sees the keystroke. That holds when
+inputd holds an exclusive grab on the keyboard it reads and the chord is a
+bound row: the bound stroke is swallowed and not re-emitted. If inputd is not
+running or not grabbing, the kernel sees the chord and the machine reboots.
+Either choose another chord or run <code>systemctl mask ctrl-alt-del.target</code> on the
+host, which makes PID 1 ignore the key.</p>
 <h2 id="settings-environment">Settings (environment)</h2>
 <table><thead><tr><th>variable</th><th>default</th><th>meaning</th></tr></thead><tbody>
 <tr><td><code>COSMIX_SESSION_USER</code></td><td>(required for restart)</td><td>the desktop user whose sessions are resumed; never guessed</td></tr>
