@@ -102,7 +102,7 @@ try
   for each $text in ["", "  café\n\n", repeat("é",32768)]
     $plan = $d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100)
     check($plan.action == "write" and $plan.options.stdin == $text,"text modified")
-    check(len($plan.argv) == 5 and $plan.argv[1] == "--seat" and $plan.options.stdout == "null" and $plan.options.stderr == "capture","seat pin or output routing wrong")
+    check(len($plan.argv) == 5 and $plan.argv[1] == "--seat" and $plan.options.stdout == "null" and $plan.options.stderr == "null" and $plan.copy_runtime == $ctx.runtime,"seat pin or output routing wrong")
     $missing_seat = {ok:false, timed_out:false, stderr_truncated:false, stderr:"No such seat: " .. $plan.argv[2] .. "\n"}
     $retry = $d.clipboard_fallback($plan,$missing_seat)
     check(deep_eq($retry.argv,[$ctx.copy,"--type","text/plain;charset=utf-8"]) and $retry.options.stdin == $text,"foreign compositor retry changed payload")

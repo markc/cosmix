@@ -1,0 +1,9 @@
+#!/usr/bin/env mix
+-- A wl-copy stand-in: a background child keeps stderr and the process group.
+$arguments = args()
+if env("MISSING_SEAT") == "1" and contains($arguments, "--seat") then
+  eprint("No such seat: " .. $arguments[1])
+  exit(1)
+end
+$child = spawn(["sleep", "4"], {stdout:"null", stderr:"inherit"})
+write_file(env("CHILD_PID_FILE"), to_string($child))

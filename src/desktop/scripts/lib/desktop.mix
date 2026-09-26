@@ -1,4 +1,4 @@
--- Desktop Bus capability provider v0.3.7. Trusted session configuration only.
+-- Desktop Bus capability provider v0.3.8. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
 -- Keep in step with HUMAN_SEAT_NAME in cosmix-comp/src/protocol/seat.rs.
@@ -12,16 +12,37 @@ fn clipboard_fallback($plan, $result)
   if $plan.action == "open" or $result.ok or $result.timed_out or $result.stderr_truncated then return nil end
   if type($result.stderr) != "string" or trim($result.stderr) != "No such seat: " .. $_clipboard_seat then return nil end
   if $plan.argv[1] != "--seat" or $plan.argv[2] != $_clipboard_seat then return nil end
-  return {argv:concat([$plan.argv[0]],slice($plan.argv,3)), options:$plan.options}
+  return {argv:concat([$plan.argv[0]],slice($plan.argv,3)), options:$plan.options, copy_runtime:$plan.copy_runtime}
+end
+
+fn clipboard_attempt($plan)
+  if $plan.copy_runtime == nil then return run_argv($plan.argv, $plan.options) end
+  -- wl-copy's serving child inherits fd 2. A pipe would keep run_argv waiting
+  -- until its deadline, then kill the selection owner with the process group.
+  $path = path_join($plan.copy_runtime, "cosmix-clipboard-stderr-" .. uuid())
+  write_new($path, "", 0o600)
+  try
+    $options = $plan.options
+    $options.stderr = {file:$path, mode:0o600}
+    $result = run_argv($plan.argv, $options)
+    if not $result.ok and not $result.timed_out and $result.exit_code != nil and $result.exit_code != 0 then
+      $diagnostic = read_file_bytes($path, 4097)
+      $result.stderr = bytes_to_string($diagnostic, {lossy:true})
+      $result.stderr_truncated = len($diagnostic) > 4096
+    end
+    return $result
+  finally
+    remove($path)
+  end
 end
 
 fn execute($plan)
-  $result = run_argv($plan.argv, $plan.options)
+  $result = clipboard_attempt($plan)
   if $plan.action == "open" then return $result end
   $fallback = clipboard_fallback($plan, $result)
   if $fallback != nil then
     eprint("desktop clipboard: named human seat absent; retrying once with compositor-selected seat")
-    $result = run_argv($fallback.argv, $fallback.options)
+    $result = clipboard_attempt($fallback)
     eprint("desktop clipboard: compositor-selected seat path, ok=" .. json_encode($result.ok))
   else
     eprint("desktop clipboard: named human seat path, ok=" .. json_encode($result.ok))
@@ -454,7 +475,7 @@ fn implementation_version()
       return $v.version
     end
   end
-  return "0.3.7"
+  return "0.3.8"
 end
 
 fn caller_allowed($ctx,$verb,$headers)
@@ -635,9 +656,9 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
     end
     $entry = $ctx.history.entries[$idx]
     -- The wl-copy helper runs first; the ring commit happens in finish().
-    return {action:"clipboard_pick", entry_id:$entry.id, entry_index:$idx,
+    return {action:"clipboard_pick", entry_id:$entry.id, entry_index:$idx, copy_runtime:$ctx.runtime,
       argv:clipboard_argv($ctx.copy,["--type","text/plain;charset=utf-8"]),
-      options:{timeout:5, stdin:$entry.text, stdout:"null", stderr:"capture", max_output:4096}}
+      options:{timeout:5, stdin:$entry.text, stdout:"null", stderr:"null", max_output:4096}}
   end
   if $verb == "desktop.clipboard.rotate" then
     -- The clipboard ring: front goes to the back, the next entry becomes the
@@ -649,9 +670,9 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
     if $ctx.copy == nil or $ctx.wayland == "" or $ctx.runtime == "" then
       return error("CLIPBOARD_UNAVAILABLE", 11)
     end
-    return {action:"clipboard_rotate",
+    return {action:"clipboard_rotate", copy_runtime:$ctx.runtime,
       argv:clipboard_argv($ctx.copy,["--type","text/plain;charset=utf-8"]),
-      options:{timeout:5, stdin:$h.entries[1].text, stdout:"null", stderr:"capture", max_output:4096}}
+      options:{timeout:5, stdin:$h.entries[1].text, stdout:"null", stderr:"null", max_output:4096}}
   end
   if $verb == "desktop.clipboard.menu" then
     -- Keybind surface: publish a menu event; the picker panel toggles on it.
@@ -676,8 +697,8 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if type($body.text) != "string" or byte_length($body.text) > $ctx.max_bytes or contains($body.text, $_nul) then
     return error("INVALID_CLIPBOARD_TEXT", 10)
   end
-  return {action:"write", bytes:byte_length($body.text), argv:clipboard_argv($ctx.copy,["--type","text/plain;charset=utf-8"]),
-    options:{timeout:5, stdin:$body.text, stdout:"null", stderr:"capture", max_output:4096}}
+  return {action:"write", bytes:byte_length($body.text), copy_runtime:$ctx.runtime, argv:clipboard_argv($ctx.copy,["--type","text/plain;charset=utf-8"]),
+    options:{timeout:5, stdin:$body.text, stdout:"null", stderr:"null", max_output:4096}}
 end
 
 fn is_executable($path)
