@@ -1292,12 +1292,7 @@ fn dispatch_with_declared(
     // holds the keyboard. Output-wide: no edge argument.
     if request.command == "shell.focus.next" {
         if let Err(error) = verify_caller_provenance(request) {
-            return (
-                10,
-                json!({"error":format!("caller provenance could not be established: {error:?}")})
-                    .to_string(),
-                None,
-            );
+            return (10, provenance_refusal(&error).to_string(), None);
         }
         return (
             0,
@@ -1425,7 +1420,13 @@ fn dispatch_with_declared(
     // grants authority from the header. The correctness checks below (edge
     // valid, page id known on that edge) are what decide whether the
     // operation is well formed and aimed correctly, and they stay.
+    // Verbs added since the unified refusal shape (decision 10) use it; the
+    // older verbs keep their `{error}` bodies.
+    let unified = request.command == "shell.panel.pin.toggle";
     if let Err(error) = verify_caller_provenance(request) {
+        if unified {
+            return (10, provenance_refusal(&error).to_string(), None);
+        }
         return (
             10,
             json!({"error":format!("caller provenance could not be established: {error:?}")})
@@ -1445,6 +1446,13 @@ fn dispatch_with_declared(
         argument(request, "edge").and_then(parse_edge)
     };
     let Some(edge) = selected_edge else {
+        if unified {
+            return (
+                10,
+                json!({"error_code":"INVALID_ARGUMENT", "message":"edge must be left, bottom, right or top"}).to_string(),
+                None,
+            );
+        }
         return (
             10,
             json!({"error":if corner_command {
@@ -1484,6 +1492,12 @@ fn dispatch_with_declared(
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
+/// The unified (`{error_code, message}`) provenance refusal.
+fn provenance_refusal(error: &impl std::fmt::Debug) -> Value {
+    json!({"error_code":"CALLER_PROVENANCE",
+        "message":format!("caller provenance could not be established: {error:?}")})
+}
+
 /// The edge a `shell.corner.*` verb's `corner` summons (clockwise mapping).
 fn corner_edge(corner: &str) -> Option<Edge> {
     Some(match corner {
@@ -1509,19 +1523,20 @@ type PinTargetRule = (&'static str, fn(&cosmix_shell::runtime::PanelPresentation
 
 /// The edge an edgeless `shell.panel.pin.toggle` (the Super+Alt+P chord)
 /// acts on, from the current frame, first rule that picks exactly one:
-/// 1. the panel holding the keyboard, else the one a focus request targets;
-/// 2. the one transiently revealed edge (a hover or `show` about to be pinned);
+/// 1. the one live transient reveal (a hover, corner or `show` about to be
+///    pinned) — the cold-start intro's reveals do not count;
+/// 2. the panel holding the keyboard, else the one a focus request targets;
 /// 3. the one `Pinned` edge (about to be unpinned).
 ///
 /// Otherwise a refusal naming the candidates: `PIN_TARGET_AMBIGUOUS` when a
 /// rule matched several edges, `PIN_TARGET_NONE` when nothing matched.
 fn pin_toggle_target(frame: &ShellFrame) -> Result<Edge, Value> {
     let rules: [PinTargetRule; 4] = [
+        ("transient_revealed", |panel| {
+            panel.mode == PanelMode::Hidden && panel.transient_revealed && !panel.intro_revealed
+        }),
         ("keyboard_focused", |panel| panel.keyboard_focused),
         ("keyboard_requested", |panel| panel.keyboard_requested),
-        ("transient_revealed", |panel| {
-            panel.mode == PanelMode::Hidden && panel.transient_revealed
-        }),
         ("pinned", |panel| panel.mode == PanelMode::Pinned),
     ];
     for (rule, matches) in rules {
@@ -3583,6 +3598,67 @@ mod tests {
             app.world().resource::<ShellFrameState>().0.panel(Edge::Right).mode,
             PanelMode::Pinned
         );
+    }
+
+    /// Review m4: the new verbs refuse in the unified `{error_code, message}`
+    /// shape (provenance, bad edge).
+    #[test]
+    fn new_verbs_refuse_with_error_code_and_message() {
+        let frame = test_frame();
+        for command in ["shell.focus.next", "shell.panel.pin.toggle"] {
+            let mut spoofed = local(command);
+            spoofed.body = json!({"edge":"left"}).to_string();
+            spoofed.headers.insert("signed_ident".into(), "i-said-so".into());
+            let (rc, body, command_out) =
+                dispatch_shell_request(&spoofed, &frame, Default::default());
+            assert_eq!(rc, 10, "{command}: {body}");
+            assert!(command_out.is_none());
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error_code"], "CALLER_PROVENANCE", "{command}");
+            assert!(body["message"].is_string(), "{command}");
+        }
+        let mut bad = local("shell.panel.pin.toggle");
+        bad.body = json!({"edge":"sideways"}).to_string();
+        let (rc, body, _) = dispatch_shell_request(&bad, &frame, Default::default());
+        assert_eq!(rc, 10, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error_code"], "INVALID_ARGUMENT");
+        assert!(body["message"].as_str().unwrap().contains("edge"));
+    }
+
+    /// Review N2: a live hover reveal outranks keyboard focus, and the
+    /// cold-start intro's reveals are not candidates at all.
+    #[test]
+    fn pin_target_prefers_a_live_reveal_and_ignores_the_intro() {
+        use cosmix_shell::core::{Carousel, LogicalSize, OutputKey, PanelInput, ShellModel};
+        let model = || {
+            let mut model = ShellModel::new(
+                OutputKey::new("DP-1").unwrap(),
+                LogicalSize::new(1000.0, 800.0).unwrap(),
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(800),
+                std::time::Duration::from_millis(200),
+            )
+            .unwrap();
+            for edge in Edge::ALL {
+                model.set_carousel(edge, Carousel::new([edge_name(edge)]).unwrap());
+            }
+            model
+        };
+        let at = std::time::Duration::ZERO;
+        // Right pinned and holding the keyboard; bottom hovered open.
+        let mut focused = model();
+        focused.set_mode(Edge::Right, at, PanelMode::Pinned).unwrap();
+        focused.keyboard_focus_observed(Some(Edge::Right));
+        assert_eq!(pin_toggle_target(&ShellFrame::from_model(&focused)), Ok(Edge::Right));
+        focused.panel_input(Edge::Bottom, at, PanelInput::Reveal).unwrap();
+        assert_eq!(pin_toggle_target(&ShellFrame::from_model(&focused)), Ok(Edge::Bottom));
+        // The intro reveals every edge at once: not four candidates.
+        let mut intro = model();
+        intro.start_intro(std::time::Duration::from_secs(2));
+        let frame = ShellFrame::from_model(&intro);
+        assert!(frame.panel(Edge::Left).transient_revealed, "precondition: intro reveals");
+        assert_eq!(pin_toggle_target(&frame).unwrap_err()["error_code"], "PIN_TARGET_NONE");
     }
 
     /// Item 8b: hide on a pinned or docked edge used to answer

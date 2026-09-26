@@ -374,9 +374,12 @@ It replies `{accepted:true}` on enqueueing; read the state back.
 `shell.panel.pin.toggle {edge?}` releases a pinned edge into a transient
 reveal with normal grace, and pins any other edge (docked included). With
 no `edge` it picks one from the current state, using the first rule that
-matches exactly one edge: the panel holding the keyboard, else the one a
-focus request targets, else the one transiently revealed edge, else the one
-pinned edge. When a rule matches several edges the reply is rc 10
+matches exactly one edge: the one live transient reveal (a hover, corner or
+`show`; the cold-start intro's reveals do not count, so the chord is not
+ambiguous during the intro), else the panel holding the keyboard, else the
+one a focus request targets, else the one pinned edge. A bad `edge` is rc 10
+`{error_code:"INVALID_ARGUMENT", message}`; a caller whose provenance cannot
+be established gets `CALLER_PROVENANCE` (so does `shell.focus.next`). When a rule matches several edges the reply is rc 10
 `{error_code:"PIN_TARGET_AMBIGUOUS", message, edges}`; when none matches,
 `PIN_TARGET_NONE`. Pass `edge` to choose explicitly. It replies
 `{accepted:true}` on enqueueing.

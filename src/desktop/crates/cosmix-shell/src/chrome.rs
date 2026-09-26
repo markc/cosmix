@@ -690,6 +690,9 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
 
 /// Tear down chrome after a registry removal has already applied the landing.
 pub fn unmount_page_content(world: &mut World, edge: Edge, id: &str) {
+    // Every unmount (including a registry removal, whose landing is already
+    // applied) takes the page's authored extent with it.
+    crate::runtime::set_page_minimum_thickness(world, edge, id, None);
     let mut query = world.query::<(Entity, &QuoinPanelChrome)>();
     let Some(panel) = query
         .iter(world)

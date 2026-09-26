@@ -186,6 +186,9 @@ pub struct PanelPresentation {
     pub max_thickness_px: f32,
     pub mode: PanelMode,
     pub transient_revealed: bool,
+    /// The transient reveal is the cold-start intro (see
+    /// [`crate::core::PanelSnapshot::intro_revealed`]).
+    pub intro_revealed: bool,
     pub mapped: bool,
     pub visible_fraction: f32,
     pub thickness_px: f32,
@@ -230,6 +233,7 @@ impl ShellFrame {
                 max_thickness_px: model.max_thickness(edge),
                 mode: panel.mode,
                 transient_revealed: panel.transient_revealed,
+                intro_revealed: panel.intro_revealed,
                 mapped: panel.mapped,
                 visible_fraction: panel.visible_fraction,
                 thickness_px: panel.thickness_px,

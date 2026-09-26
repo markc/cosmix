@@ -1786,8 +1786,8 @@ mod tests {
             let world = app.world_mut();
             // The saved width is narrower than the scene asks for (the
             // launcher's w:440 against a dragged 422, scaled to every edge).
-            set_page_thickness(world, edge, 20.0);
-            load_mount_test_scene(world, "wide", edge, 40);
+            set_page_thickness(world, edge, 150.0);
+            load_mount_test_scene(world, "wide", edge, 200);
             reconcile(world);
             // (presented thickness, settled thickness) of the edge.
             let panel = |world: &World| {
@@ -1798,9 +1798,9 @@ mod tests {
                 world.resource::<ShellFrameState>().0.panel(edge).active_page_id.as_deref(),
                 Some("scene-wide")
             );
-            assert_eq!(panel(world), (40.0, 20.0), "{edge:?}");
+            assert_eq!(panel(world), (200.0, 150.0), "{edge:?}");
             // A page asking for less than the saved width gets the saved one.
-            load_mount_test_scene(world, "narrow", edge, 10);
+            load_mount_test_scene(world, "narrow", edge, 130);
             reconcile(world);
             set_shell_pages(
                 world,
@@ -1808,7 +1808,7 @@ mod tests {
                 vec!["scene-wide".into(), "scene-narrow".into()],
                 Some("scene-narrow"),
             );
-            assert_eq!(panel(world).0, 20.0, "{edge:?}");
+            assert_eq!(panel(world).0, 150.0, "{edge:?}");
             // Back on the wide page it grows again; the saved value never moved.
             set_shell_pages(
                 world,
@@ -1816,8 +1816,23 @@ mod tests {
                 vec!["scene-wide".into(), "scene-narrow".into()],
                 Some("scene-wide"),
             );
-            assert_eq!(panel(world), (40.0, 20.0), "{edge:?}");
+            assert_eq!(panel(world), (200.0, 150.0), "{edge:?}");
         }
+    }
+
+    /// Review M2: with nothing saved, the scene's extent is the edge's size
+    /// even below the output default (a fresh install's 52 px bottom bar).
+    #[test]
+    fn a_fresh_edge_takes_the_scene_extent() {
+        use cosmix_shell::runtime::ShellFrameState;
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        let default = world.resource::<ShellFrameState>().0.panel(Edge::Bottom).thickness_px;
+        assert!(default > 52.0, "precondition: default {default} is taller");
+        load_mount_test_scene(world, "bar", Edge::Bottom, 52);
+        reconcile(world);
+        let panel = world.resource::<ShellFrameState>().0.panel(Edge::Bottom);
+        assert_eq!((panel.thickness_px, panel.settled_thickness_px), (52.0, 52.0));
     }
 
     #[test]
@@ -2888,8 +2903,9 @@ mod tests {
         );
         // The authored minimum moved with the page; the left edge dropped it.
         let frame = &world.resource::<ShellFrameState>().0;
+        // Nothing is remembered on the right edge: the extent is its size.
         assert_eq!(frame.panel(Edge::Right).thickness_px, 300.0);
-        assert_eq!(frame.panel(Edge::Right).settled_thickness_px, 240.0);
+        assert_eq!(frame.panel(Edge::Right).settled_thickness_px, 300.0);
         assert_eq!(
             world.resource::<SceneStore>().scenes["mount-test"]
                 .mounted

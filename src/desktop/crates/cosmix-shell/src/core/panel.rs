@@ -229,6 +229,9 @@ pub struct PanelSnapshot {
     pub mode: PanelMode,
     /// Runtime visibility intent only; never persisted. Only true in Hidden.
     pub transient_revealed: bool,
+    /// The transient reveal is the cold-start discovery intro, not a
+    /// deliberate hover, corner or `show`.
+    pub intro_revealed: bool,
     pub visible_fraction: f32,
     pub target_fraction: f32,
     pub velocity_per_second: f32,
@@ -728,6 +731,7 @@ impl PanelStateMachine {
         PanelSnapshot {
             mode: self.mode,
             transient_revealed: self.transient_revealed,
+            intro_revealed: self.transient_revealed && self.intro_until.is_some(),
             visible_fraction,
             target_fraction: self.motion.target(),
             velocity_per_second: self.motion.velocity_per_second(),

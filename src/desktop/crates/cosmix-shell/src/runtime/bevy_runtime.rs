@@ -1234,6 +1234,11 @@ mod tests {
             );
             assert_eq!(left(world).0, 310.0, "{output}");
         }
+        // A content-only unmount (the registry-removal path, whose carousel
+        // landing is applied elsewhere) drops the extent too.
+        crate::chrome::unmount_page_content(world, Edge::Left, "launcher");
+        assert_eq!(left(world).0, 240.0);
+        set_page_minimum_thickness(world, Edge::Left, "launcher", Some(310.0));
         // Removing the page takes its extent with it.
         remove_shell_page(world, Edge::Left, "launcher");
         set_shell_pages(world, Edge::Left, vec!["launcher".into()], Some("launcher"));
