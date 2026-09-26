@@ -1413,6 +1413,7 @@ version = "0.8.0"
 dependencies = [
  "blake3",
  "cosmix-lib-bus",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
