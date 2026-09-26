@@ -70,6 +70,20 @@ pub(super) const EMOJI_PATHS: &[&str] = &[
     "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
 ];
 
+/// The first readable face among `paths`. A damaged file is refused here, as
+/// primary faces are, rather than panicking later in the shaper.
+pub(super) fn optional(paths: &[&str]) -> Option<Face> {
+    paths.iter().find_map(|path| {
+        let face = Face::new(std::fs::read(path).ok()?.into())?;
+        if super::primary_font::metrics_readable(face.font()) {
+            Some(face)
+        } else {
+            eprintln!("term font {path}: unreadable metrics; skipping");
+            None
+        }
+    })
+}
+
 impl Fonts {
     pub(super) fn discover(primary: Arc<[u8]>, index: u32) -> Option<Arc<Self>> {
         Some(Arc::new(Self {
@@ -80,11 +94,6 @@ impl Fonts {
 
     fn fallbacks(&self) -> &Fallbacks {
         static SHARED: OnceLock<Arc<Fallbacks>> = OnceLock::new();
-        fn optional(paths: &[&str]) -> Option<Face> {
-            paths
-                .iter()
-                .find_map(|path| Face::new(std::fs::read(path).ok()?.into()))
-        }
         self.fallbacks.get_or_init(|| {
             SHARED
                 .get_or_init(|| {

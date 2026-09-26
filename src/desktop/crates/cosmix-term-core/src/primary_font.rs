@@ -153,7 +153,7 @@ fn query_family(db: &mut Database, family: &Family<'_>, weight: Weight) -> Optio
 }
 
 fn usable(font: FontRef<'_>) -> bool {
-    if font.metrics(&[]).units_per_em == 0 || !horizontal_metrics_readable(font) {
+    if !metrics_readable(font) {
         return false;
     }
     let metrics = font.glyph_metrics(&[]);
@@ -176,16 +176,26 @@ fn usable(font: FontRef<'_>) -> bool {
     })
 }
 
-/// Swash reads a listed-but-unreadable `hhea` as zero long metrics and then
-/// computes `count - 1` unchecked in `advance_width`, so refuse such a face
-/// before asking it for any advance. `table` is None for a table that is
-/// listed but lies past the end of the file; hhea is required anyway.
-fn horizontal_metrics_readable(font: FontRef<'_>) -> bool {
+/// Whether swash can answer horizontal advances for `font` without panicking.
+///
+/// Derived from swash 0.2.10 internals, but decided only from public values:
+/// `MetricsProxy::fill` returns early when head or maxp is unreadable, leaving
+/// the long-metric count at its Default 0, and a readable hhea shorter than 36
+/// bytes (or a literal 0) also yields 0; `xmtx::advance` then computes
+/// `count - 1` unchecked (a panic with overflow checks, a wrong-but-safe 0
+/// without). `glyph_count` is set only after head and maxp both parsed, and
+/// `table` is None for a table missing or lying past EOF. The hmtx length check
+/// guards no panic (every hmtx read is bounds-checked); it is belt and braces.
+/// Vertical metrics share the flaw via vhea, but term never asks for them.
+pub(super) fn metrics_readable(font: FontRef<'_>) -> bool {
+    let metrics = font.metrics(&[]);
     let count = font
         .table(tag_from_bytes(b"hhea"))
         .and_then(|hhea| hhea.get(34..36))
         .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
-    count > 0
+    metrics.units_per_em > 0
+        && metrics.glyph_count > 0
+        && count > 0
         && font
             .table(tag_from_bytes(b"hmtx"))
             .is_some_and(|hmtx| hmtx.len() >= count as usize * 4)
