@@ -141,6 +141,26 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 - `blob.swept {count}`
 - `blob.props.changed` (SPEC-07 shape; `lifecycle.generation` is transient)
 
+## Mix
+
+`mix/blob.mix` (shipped beside the daemon) is the script surface: a `require()` library, not builtins — thin wrappers over `send` that inherit its non-fatal failure bands for free instead of re-encoding them. Load it beside the crate or from an install:
+
+```mix
+$b = require("/path/to/cosmix-blobd/mix/blob.mix")
+$r = $b.blob_put("/tmp/shot.png", {owner: "capture"})
+if not $r.ok then die $r.result end
+print($r.result.blob)          -- "b3:…"
+```
+
+Every Bus-touching function answers the same map — `{ok, rc, result}` — and never raises on a Bus failure: `ok` is true exactly when `rc` sits in send's success bands (`0`, or `1..9` delivered-with-warning); blobd absent comes back `ok:false, rc:10, result:"Service 'blobd' not found"`; a broker-less host `rc:-3`; a lost broker `rc:-1`. The functions mirror the verbs one for one — `blob_put(path[, opts])`, `blob_stat`, `blob_path`, `blob_url`, `blob_has(list)`, `blob_pin`/`blob_unpin(ref, owner)`, `blob_list`, `blob_quota`, `blob_gc(dry_run)` — plus the pure helpers `blob_ref(hash[, size, mime])` and `blob_hash(ref)`. Every wrapper takes a trailing opts map; `service` addresses a named instance (`{service: "blobd-two"}` for a `--name two` instance), and `blob_put`'s opts carry `mime`, `name`, `owner`, `mode` and `immutable`.
+
+`blob_fetch(ref[, opts])` returns the immediate `{accepted, …}` reply. `blob_fetch_wait(ref, timeout_s[, opts])` subscribes to `blob.fetched` **before** sending the fetch (the event is `retain: false` — a subscriber that arrives later never sees it), waits on the delivery — the `sleep` tick inside the wait is only the yield that lets the event pump dispatch; no `blob.stat` traffic — and answers the local CAS path on `ok` (plus the event under `event`), `rc:-2` on timeout and `rc:10` for a failed outcome (`verify_failed`, `quota`, …). Two Mix scoping facts shape its contract, stated here because they are the language's, not blobd's:
+
+- An `on` handler body writes the **calling script's** globals, and a handler cannot create one — so the event channel is a top-level global the caller owns. A script using `blob_fetch_wait` declares `$blobd_fetched = []` at its top level before the first call; the wait refuses cleanly (a `result` naming the line) when it is missing.
+- A plain (non-`--serve`) script that has registered a handler does not exit when its body ends — the event pump keeps it alive. End a one-shot with `quit()` (the ephemeral-citizen retirement); a serve citizen ignores this.
+
+`mix lint --allow-global blobd_fetched mix/blob.mix` is clean — the one declared global is the channel above. A self-test of the pure helpers runs with `BLOBD_MIX_SELFTEST=1 mix mix/blob.mix`; the Bus wrappers are exercised live by the hub's `blobd_gate.mix`.
+
 ## Bus interface
 
 The verb reference is [verbs.md](verbs.md); the props surface is `blob.props.{get,list,describe,watch}` over `lane.bind`, `lane.port`, `root`, `instance`, `counts.blobs`, `counts.pins`, `quota.total.used`, `quota.total.limit`, `fetch.in_flight`, `fetch.queued`, `fetch.completed`, `fetch.failed` and `lifecycle.generation`.

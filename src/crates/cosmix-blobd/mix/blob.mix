@@ -1,0 +1,288 @@
+-- version: 0.1.0
+-- mix/blob.mix — the Mix surface over cosmix-blobd's blob.* verbs (the
+-- design's §4.4: a require() library, not builtins). Every Bus-touching
+-- function is a thin wrapper over `send` and answers a uniform map
+-- {ok, rc, result} — never a raise on a Bus failure: blobd absent comes
+-- back rc=10 with "Service 'blobd' not found" in result, a broker-less
+-- host rc=-3, a lost broker rc=-1 (send's own non-fatal bands).
+--
+-- Load beside the daemon:
+--   $b = require("…/cosmix-blobd/mix/blob.mix")
+--   $r = $b.blob_put("/tmp/shot.png", {owner: "capture"})
+--   if not $r.ok then die $r.result end
+--
+-- A named instance (`cosmix-blobd --name two`, service `blobd-two`) is
+-- reached by passing {service: "blobd-two"} — every wrapper takes it.
+--
+-- ── blob_fetch_wait and the event channel ─────────────────────────────
+-- blob.fetched is retain:false, so it only reaches a subscriber that was
+-- subscribed BEFORE the fetch was sent; blob_fetch_wait subscribes first,
+-- sends second, and then waits on the delivery (a `sleep` tick is only the
+-- yield that lets the event pump dispatch — no blob.stat traffic, the
+-- no-poll law). Mix handler bodies write the CALLING script's globals,
+-- not module state, so the channel is a top-level global the caller owns:
+--
+--   $blobd_fetched = []          -- top level, before the first wait
+--   $w = $b.blob_fetch_wait($r.result, 60)
+--
+-- And because the wait registers an `on blob.fetched` handler, a ONE-SHOT
+-- script ends with quit() (the ephemeral-citizen retirement) or the event
+-- pump keeps the process alive; a serve citizen ignores this.
+
+-- Reference-semantic once-guard for the shared handler: module vars are
+-- injected by value per call, but a buffer aliases its storage, so the
+-- first caller arms and later callers see it armed.
+$_armed = buffer()
+
+-- ── arg helpers ────────────────────────────────────────────────────────
+
+-- The blob id of a reference: the map's `blob` member, a "b3:<hex>"
+-- string as-is, a bare hash normalised to "b3:<hex>".
+fn _id($ref)
+  if $ref == nil then return nil end
+  if type($ref) == "map" then return $ref.blob end
+  $s = to_string($ref)
+  if slice($s, 0, 3) == "b3:" then return $s end
+  return "b3:" .. $s
+end
+
+-- An opts member, nil-safe for a missing opts map.
+fn _opt($opts, $key)
+  if $opts == nil then return nil end
+  return $opts[$key]
+end
+
+-- The service to address: blobd, or blobd-<name> via {service: …}.
+fn _svc($opts)
+  return _opt($opts, "service") ?? "blobd"
+end
+
+-- The uniform reply of every send wrapper, taking the send's outcome as
+-- ARGUMENTS: `$rc`/`$result` set by a send inside a function bind that
+-- function's frame (a helper's free-name read cannot see them — function
+-- reads fall through to globals only), so each wrapper reads them in its
+-- own frame, immediately after its send, and hands them over.
+fn _done($rc, $reply)
+  return {ok: $rc >= 0 and $rc < 10, rc: $rc, result: $reply}
+end
+
+-- ── pure reference helpers ─────────────────────────────────────────────
+
+-- Build a reference map from a hash (and optional size/mime). `origin`
+-- is filled in by whichever node serves it; a fetch fills it from the
+-- reference it was given.
+fn blob_ref($hash, $size, $mime)
+  return {blob: _id($hash), size: $size ?? 0, mime: $mime ?? "application/octet-stream"}
+end
+
+-- The blob id ("b3:<64 hex>") of a reference map or id string.
+fn blob_hash($ref)
+  return _id($ref)
+end
+
+-- ── verb wrappers ──────────────────────────────────────────────────────
+
+-- blob.put: daemon-local ingest of a readable path. $opts: mime, name,
+-- owner, mode (copy|reflink|hardlink), immutable, service.
+fn blob_put($path, $opts)
+  $r = send _svc($opts) blob.put path=$path mime=_opt($opts, "mime") name=_opt($opts, "name") owner=_opt($opts, "owner") mode=_opt($opts, "mode") immutable=_opt($opts, "immutable")
+  return _done($rc, $r)
+end
+
+-- blob.stat: {present, size, mime, pins, origin, first_put}.
+fn blob_stat($ref, $opts)
+  $r = send _svc($opts) blob.stat blob=_id($ref)
+  return _done($rc, $r)
+end
+
+-- blob.path: the absolute CAS path for zero-copy same-node reads.
+fn blob_path($ref, $opts)
+  $r = send _svc($opts) blob.path blob=_id($ref)
+  return _done($rc, $r)
+end
+
+-- blob.url: the lane URL (needs the bytes present and a lane configured).
+fn blob_url($ref, $opts)
+  $r = send _svc($opts) blob.url blob=_id($ref)
+  return _done($rc, $r)
+end
+
+-- blob.has: bulk presence check. $list is a list of blob ids (or
+-- reference maps); the reply carries present/missing id arrays. (A plain
+-- loop, not map()+lambda: an expression lambda does not resolve module
+-- functions by free name.)
+fn blob_has($list, $opts)
+  $ids = []
+  for each $one in ($list ?? [])
+    push($ids, _id($one))
+  end
+  $r = send _svc($opts) blob.has blobs=$ids
+  return _done($rc, $r)
+end
+
+-- blob.pin / blob.unpin: owner-tagged pins; both idempotent.
+fn blob_pin($ref, $owner, $opts)
+  $r = send _svc($opts) blob.pin blob=_id($ref) owner=$owner
+  return _done($rc, $r)
+end
+
+fn blob_unpin($ref, $owner, $opts)
+  $r = send _svc($opts) blob.unpin blob=_id($ref) owner=$owner
+  return _done($rc, $r)
+end
+
+-- blob.list: inventory. $opts: owner, limit, cursor, service.
+fn blob_list($opts)
+  $r = send _svc($opts) blob.list owner=_opt($opts, "owner") limit=_opt($opts, "limit") cursor=_opt($opts, "cursor")
+  return _done($rc, $r)
+end
+
+-- blob.quota: used/limit per owner and total.
+fn blob_quota($owner, $opts)
+  $r = send _svc($opts) blob.quota owner=$owner
+  return _done($rc, $r)
+end
+
+-- blob.gc: refcount sweep; pass true for the dry run.
+fn blob_gc($dry_run, $opts)
+  $r = send _svc($opts) blob.gc dry_run=$dry_run
+  return _done($rc, $r)
+end
+
+-- ── fetch ──────────────────────────────────────────────────────────────
+
+-- blob.fetch: the immediate reply {accepted, blob, origin, in_flight,
+-- present} — completion is the blob.fetched event (see blob_fetch_wait).
+-- $opts: from (node name), instance (remote blobd-<name>), owner, service.
+fn blob_fetch($ref, $opts)
+  $r = send _svc($opts) blob.fetch blob=$ref from=_opt($opts, "from") instance=_opt($opts, "instance") owner=_opt($opts, "owner")
+  return _done($rc, $r)
+end
+
+-- blob.fetch + wait for the matching blob.fetched (or the timeout).
+-- Subscribe BEFORE sending, wait on the delivery, return the local path
+-- on ok. Requires the caller's top-level `$blobd_fetched = []` channel
+-- (see the header); rc=-2 is the timeout, rc=10 a failed outcome
+-- (verify_failed, quota, …) or a refused fetch.
+fn blob_fetch_wait($ref, $timeout_s, $opts)
+  $id = _id($ref)
+  if $id == nil then
+    return {ok: false, rc: 10, result: "blob_fetch_wait: no blob id in ref"}
+  end
+
+  -- The channel must exist before the handler can fire: an `on` body
+  -- writes the calling script's globals only when they exist.
+  $chan = false
+  try
+    if type($blobd_fetched) == "list" then $chan = true end
+  catch $msg
+  end
+  if not $chan then
+    return {ok: false, rc: 10, result: 'blob_fetch_wait needs `$blobd_fetched = []` at the top level of the calling script (the blob.fetched channel)'}
+  end
+
+  -- Subscribe first: blob.fetched is retain:false, so a subscriber that
+  -- arrives after the fetch never sees the event.
+  try
+    subscribe("blob.fetched")
+  catch $msg
+    return {ok: false, rc: -1, result: "subscribe failed: " .. $msg}
+  end
+
+  -- Arm the recorder once per process; the buffer is the shared cell.
+  if length(freeze($_armed)) == 0 then
+    buffer_push($_armed, 1)
+    on blob.fetched
+      push($blobd_fetched, $event.args)
+    end
+  end
+
+  -- Only events that land after this point count (a stale entry from an
+  -- earlier wait must not complete this one).
+  $base = length($blobd_fetched)
+  $r = send _svc($opts) blob.fetch blob=$ref from=_opt($opts, "from") instance=_opt($opts, "instance") owner=_opt($opts, "owner")
+  if $rc >= 10 or $rc < 0 then
+    try
+      unsubscribe("blob.fetched")
+    catch $msg
+    end
+    return _done($rc, $r)
+  end
+
+  -- Already present: the reply is the completion, no event follows.
+  if $r.present == true then
+    try
+      unsubscribe("blob.fetched")
+    catch $msg
+    end
+    return _fetch_wait_path($id, $opts, nil)
+  end
+
+  $deadline = monotonic() + $timeout_s
+  $event = nil
+  while $event == nil
+    $n = length($blobd_fetched)
+    $i = $base
+    while $i < $n
+      if $blobd_fetched[$i].blob == $id then
+        $event = $blobd_fetched[$i]
+      end
+      $i = $i + 1
+    end
+    if $event != nil then break end
+    if monotonic() >= $deadline then break end
+    sleep(0.05)
+  end
+
+  try
+    unsubscribe("blob.fetched")
+  catch $msg
+  end
+
+  if $event == nil then
+    return {ok: false, rc: -2, result: "timeout: no blob.fetched for " .. $id .. " within " .. to_string($timeout_s) .. "s"}
+  end
+  return _fetch_wait_path($id, $opts, $event)
+end
+
+-- The common tail of a completed wait: classify the outcome, then answer
+-- the local path on ok.
+fn _fetch_wait_path($id, $opts, $event)
+  if $event != nil and $event.outcome != "ok" then
+    $why = $event.outcome
+    if $event.error != nil then $why = $why .. ": " .. $event.error end
+    return {ok: false, rc: 10, result: $why, event: $event}
+  end
+  $r = send _svc($opts) blob.path blob=$id
+  if $rc >= 10 or $rc < 0 then
+    return _done($rc, $r)
+  end
+  return {ok: true, rc: 0, result: $r.path, event: $event}
+end
+
+-- ── self-test (BLOBD_MIX_SELFTEST=1 mix mix/blob.mix) ─────────────────
+-- Pure helpers only — the Bus wrappers need a live blobd and are covered
+-- by the hub's blobd gate instead. env() answers "" for a missing name,
+-- so the guard compares against the empty string, not nil.
+
+if env("BLOBD_MIX_SELFTEST") != "" then
+  fn _t($cond, $what)
+    if not $cond then die "self-test failed: " .. $what end
+  end
+  $h = "b3:" .. slice(replace(replace(to_string(monotonic()), ".", ""), "-", "") .. "0000000000000000000000000000000000000000000000000000000000000000", 0, 64)
+  _t(_id($h) == $h, "id of a b3 id")
+  _t(_id(slice($h, 3, 67)) == $h, "bare hash normalised")
+  $ref = blob_ref($h, 1234, "image/png")
+  _t($ref.blob == $h, "ref blob")
+  _t($ref.size == 1234, "ref size")
+  _t($ref.mime == "image/png", "ref mime")
+  _t(blob_hash($ref) == $h, "hash of ref")
+  _t(blob_hash($h) == $h, "hash of id")
+  $bare = blob_ref($h, nil, nil)
+  _t($bare.size == 0 and $bare.mime == "application/octet-stream", "ref defaults")
+  _t(_opt(nil, "service") == nil, "opt of nil opts")
+  _t(_opt({service: "blobd-two"}, "service") == "blobd-two", "opt reads member")
+  _t(_svc({service: "blobd-two"}) == "blobd-two", "svc override")
+  _t(_svc(nil) == "blobd", "svc default")
+  print("blob.mix self-test: ok")
+end

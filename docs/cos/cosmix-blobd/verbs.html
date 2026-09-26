@@ -499,7 +499,7 @@
 <tr><td><code>limit</code></td><td style="text-align: right"><code>100</code></td><td>Clamped 1 through 1000</td></tr>
 <tr><td><code>cursor</code></td><td style="text-align: right">unset</td><td>Blob id of the last entry of the previous page</td></tr>
 </tbody></table>
-<p>Inventory of blobs blobd knows (attributes or pins — an orphan file with neither is invisible, which is what the restart gate asserts). The response contains <code>blobs</code> (each a reference plus its <code>pins</code>) and <code>next</code> (a cursor, or <code>null</code> at the end).</p>
+<p>Inventory of blobs blobd knows (attributes or pins — an orphan file with neither is invisible, which is what the restart gate asserts). The response contains <code>blobs</code> (each a reference plus its <code>pins</code>) and <code>next</code>: the blob id of the last entry of the page — the cursor for the next page — or <code>null</code> when the page is empty. A page that comes back short (fewer entries than the limit) is the last; the page after it answers <code>blobs: []</code> with <code>next: null</code>.</p>
 <h3 id="blobquota"><code>blob.quota</code></h3>
 <table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>owner</code></td><td>unset (all owners)</td></tr>

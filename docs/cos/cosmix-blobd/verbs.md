@@ -86,7 +86,7 @@ Owner-tagged pins (`maild:acct7`, `capture:session-12`, `filesd:notes` style). B
 | `limit` | `100` | Clamped 1 through 1000 |
 | `cursor` | unset | Blob id of the last entry of the previous page |
 
-Inventory of blobs blobd knows (attributes or pins — an orphan file with neither is invisible, which is what the restart gate asserts). The response contains `blobs` (each a reference plus its `pins`) and `next` (a cursor, or `null` at the end).
+Inventory of blobs blobd knows (attributes or pins — an orphan file with neither is invisible, which is what the restart gate asserts). The response contains `blobs` (each a reference plus its `pins`) and `next`: the blob id of the last entry of the page — the cursor for the next page — or `null` when the page is empty. A page that comes back short (fewer entries than the limit) is the last; the page after it answers `blobs: []` with `next: null`.
 
 ### `blob.quota`
 
