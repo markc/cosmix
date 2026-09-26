@@ -1,6 +1,7 @@
-//! The Problems panel (ced E1 plan §4.10): the active tab's lint
-//! diagnostics, one row each — severity, `line:col`, code, message, hint.
-//! Clicking a row moves the caret to it.
+//! The Problems panel (ced E1 plan §4.10): the active tab's diagnostics —
+//! its own lint and every external set (Scene Editor plan §4.4.3) — one row
+//! each: severity, `line:col`, `source: code`, message, hint. Clicking a row
+//! moves the caret to it.
 
 use cosmix_edit_client::diag::{Diagnostic, Severity};
 use iced::widget::{button, column, container, row, scrollable};
@@ -16,6 +17,11 @@ pub fn severity_label(s: Severity) -> &'static str {
         Severity::Warning => "warning",
         Severity::Note => "note",
     }
+}
+
+/// A row's code cell: `source: code`.
+pub fn row_code(d: &Diagnostic) -> String {
+    format!("{}: {}", d.source, d.code)
 }
 
 /// `items` are the tab's diagnostics; `col_of(offset)` gives the editd col.
@@ -36,7 +42,7 @@ pub fn view<'a>(look: Look, items: &'a [Diagnostic], col_of: impl Fn(usize) -> u
         let mut line = row![
             look.small(severity_label(d.severity)).color(colour).width(Length::Fixed(64.0)),
             look.code(format!("{}:{}", d.line, col_of(d.range.start))).color(t.muted_text).width(Length::Fixed(72.0)),
-            look.code(d.code.as_str()).color(t.muted_text).width(Length::Fixed(120.0)),
+            look.code(row_code(d)).color(t.muted_text).width(Length::Fixed(200.0)),
             look.small(d.message.as_str()),
         ]
         .spacing(10)

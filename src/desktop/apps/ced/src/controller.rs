@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Instant;
 
-use cosmix_edit_client::diag::Diagnostics;
+use cosmix_edit_client::diag::{Diagnostics, Severity};
 use cosmix_edit_client::highlight::Highlight;
 use cosmix_edit_client::mirror::{DetachReason, LaneArg, Mirror, Outcome, Phase, ServerOp, Step};
 use cosmix_edit_client::model::{EditCfg, EditCommand, EditorModel};
@@ -40,6 +40,7 @@ use crate::editor::{EditorMsg, LayoutReport};
 use crate::session::{RECENT_MAX, Session, SessionTab};
 use crate::verbs::{self, PhaseW, code};
 
+mod external;
 mod ui;
 
 pub use ui::{MatchQuery, Prompt, RecoveredRow};
@@ -167,6 +168,11 @@ struct TabX {
     matches: Vec<Range<usize>>,
     rematch_due: bool,
     rematch_timer: bool,
+    /// Stored external sets are due for re-application (a Resync cleared
+    /// them), and the live / dirty state they were last checked against.
+    ext_due: bool,
+    ext_live: bool,
+    ext_dirty: bool,
 }
 
 /// What a request the controller sent is for.
@@ -279,6 +285,8 @@ pub struct Controller {
     /// (Opus m4), and the one being dispatched right now.
     op_waits: HashMap<String, OpWait>,
     op_cmd: Option<(u64, String)>,
+    /// `ced.diagnostics` sets per `(path, source)` (Scene Editor plan §4.4.3).
+    external: external::Store,
 }
 
 fn refusal(code: &str, message: impl Into<String>, reason: Option<&str>) -> String {
@@ -459,6 +467,7 @@ impl Controller {
             ui_pending: HashMap::new(),
             op_waits: HashMap::new(),
             op_cmd: None,
+            external: external::Store::default(),
         }
     }
 
@@ -1253,6 +1262,9 @@ impl Controller {
         }
         if resynced {
             self.stats.snapshot_recoveries += 1;
+            if let Some(x) = self.x.get_mut(&tab) {
+                x.ext_due = true;
+            }
         }
         for n in step.notices {
             if matches!(n, Notice::Conflict(_)) {
@@ -1941,12 +1953,56 @@ impl Controller {
                 fx.push(Effect::SaveSession);
                 fx.push(Effect::Quit);
             }
-            "ced.diagnostics" | "ced.problems" => refuse(
-                fx,
-                code::UNIMPLEMENTED,
-                format!("{} arrives in Stage C of the Scene Editor plan", cmd.verb),
-                None,
-            ),
+            "ced.diagnostics" => {
+                if cmd.body.len() > verbs::MAX_DIAGNOSTICS_BODY {
+                    let msg = format!("the request is {} bytes (at most {})", cmd.body.len(), verbs::MAX_DIAGNOSTICS_BODY);
+                    return refuse(fx, code::INVALID_ARGUMENT, msg, Some("too_large"));
+                }
+                let r = parse!(verbs::DiagnosticsReq);
+                if let Err((msg, reason)) = external::check(&r, cmd.body.len()) {
+                    return refuse(fx, code::INVALID_ARGUMENT, msg, Some(reason));
+                }
+                self.external.put(&r);
+                let mut out = verbs::DiagnosticsReply { path: r.path.clone(), tabs: Vec::new(), shown: 0, stale: false };
+                for t in &mut self.tabs {
+                    if external::tab_path(t) != Some(r.path.as_str()) {
+                        continue;
+                    }
+                    out.tabs.push(t.id);
+                    let applied = external::apply(&self.external, t, Some(&r.source));
+                    out.shown += applied.shown;
+                    out.stale |= applied.stale;
+                }
+                reply(fx, ok_body(&out));
+            }
+            "ced.problems" => {
+                let sel = parse!(verbs::TabSel);
+                let t = match self.resolve_tab(&sel) {
+                    Ok(t) => t,
+                    Err(e) => return refuse(fx, code::NOT_FOUND, e, None),
+                };
+                let Some(tab) = self.tab(t) else { return refuse(fx, code::NOT_FOUND, format!("no tab {t}"), None) };
+                let col_of = |offset: usize| tab.mirror.as_ref().map_or(1, |m| m.text().point(offset).col);
+                let problems = tab
+                    .diagnostics
+                    .items()
+                    .iter()
+                    .map(|d| verbs::ProblemRow {
+                        line: d.line,
+                        col: col_of(d.range.start),
+                        severity: match d.severity {
+                            Severity::Error => verbs::DiagSeverity::Error,
+                            Severity::Warning => verbs::DiagSeverity::Warning,
+                            Severity::Note => verbs::DiagSeverity::Note,
+                        },
+                        code: d.code.clone(),
+                        message: d.message.clone(),
+                        source: d.source.clone(),
+                    })
+                    .collect();
+                let path = external::tab_path(tab).map(str::to_owned);
+                reply(fx, ok_body(&verbs::ProblemsReply { tab: t, path, problems }));
+            }
             "INFO" | "HELP" => {
                 let verbs: Vec<&str> = verbs::VERBS.iter().map(|(v, _)| *v).collect();
                 reply(fx, json!({"service": verbs::SERVICE, "schema": verbs::SCHEMA, "verbs": verbs}).to_string());
@@ -2068,8 +2124,30 @@ impl Controller {
         }
     }
 
+    /// Re-apply stored external diagnostic sets to every tab that, since the
+    /// last transition, went live (opened or reattached), Resynced, or went
+    /// clean (`dirty` false: a save, or an undo back to the disk state — the
+    /// only time a stale set's digest can start matching again). Checks two
+    /// flags per tab; hashes only on those edges, never per keystroke.
+    fn sync_external(&mut self) {
+        for t in &mut self.tabs {
+            let Some(x) = self.x.get_mut(&t.id) else { continue };
+            let live = t.mirror.as_ref().is_some_and(|m| matches!(m.phase(), Phase::Live));
+            let dirty = t.mirror.as_ref().is_some_and(|m| m.meta().dirty);
+            let went_live = live && !x.ext_live;
+            let went_clean = x.ext_dirty && !dirty;
+            x.ext_live = live;
+            x.ext_dirty = dirty;
+            if live && (x.ext_due || went_live || went_clean) {
+                x.ext_due = false;
+                external::apply(&self.external, t, None);
+            }
+        }
+    }
+
     /// Re-evaluate every waiter (after every controller transition).
     fn eval_waiters(&mut self, fx: &mut Vec<Effect>) {
+        self.sync_external();
         let ready: Vec<u64> = self.waiters.iter().filter(|w| self.waiter_holds(w)).map(|w| w.id).collect();
         for w in ready {
             self.finish_waiter(w, Ok(()), fx);
@@ -2556,13 +2634,148 @@ mod tests {
         assert!(c.edit_info().is_none());
     }
 
+    const P: &str = "/nonexistent/ced-r/x.txt";
+
+    fn sha(text: &str) -> String {
+        use sha2::Digest;
+        use std::fmt::Write;
+        sha2::Sha256::digest(text.as_bytes()).iter().fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
+    fn diags(c: &mut Controller, digest: Option<String>, lines: &[usize]) -> Value {
+        let diagnostics: Vec<Value> =
+            lines.iter().map(|l| json!({"line": l, "severity": "error", "code": "binding-policy", "message": "m"})).collect();
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.diagnostics", json!({"path": P, "source": "scenes", "digest": digest, "diagnostics": diagnostics}))));
+        assert_eq!(rc, 0, "{v}");
+        v
+    }
+
+    /// `(source, line, col)` of every `ced.problems` row.
+    fn problems(c: &mut Controller) -> Vec<(String, u64, u64)> {
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.problems", json!({}))));
+        assert_eq!(rc, 0, "{v}");
+        assert_eq!(v["path"].as_str(), Some(P));
+        let row = |r: &Value| (r["source"].as_str().unwrap().to_string(), r["line"].as_u64().unwrap(), r["col"].as_u64().unwrap());
+        v["problems"].as_array().unwrap().iter().map(row).collect()
+    }
+
+    fn scenes(line: u64, col: u64) -> (String, u64, u64) {
+        ("scenes".into(), line, col)
+    }
+
+    fn event(seq: u64, kind: &str, edits: Value) -> Incoming {
+        let ev = json!({"event": "edit", "epoch": "0000e1e1", "buffer": B, "rev": seq, "base_rev": seq - 1, "origin": "agent:other",
+                        "lane": "agent:other", "kind": kind, "of": null, "op_id": null, "edits": edits, "event_seq": seq});
+        Incoming::Topic { topic: "edit.changed".into(), body: ev.to_string() }
+    }
+
     #[test]
-    fn scene_editor_verbs_are_registered_and_unimplemented_until_stage_c() {
+    fn external_diagnostics_are_digest_gated_and_cleared_by_an_empty_list() {
         let mut c = ctl();
-        for verb in ["ced.diagnostics", "ced.problems"] {
-            assert!(verbs::VERBS.iter().any(|(v, _)| *v == verb), "{verb} in the manifest");
-            let (rc, v) = response(&c.on_bus_command(cmd(verb, json!({}))));
-            assert_eq!((rc, v["error_code"].as_str()), (10, Some(verbs::code::UNIMPLEMENTED)), "{verb}: {v}");
-        }
+        live(&mut c);
+        let v = diags(&mut c, Some(sha("hello world\n")), &[1, 2]);
+        assert_eq!(v, json!({"path": P, "tabs": [1], "shown": 2, "stale": false}));
+        assert_eq!(problems(&mut c), [scenes(1, 1), scenes(2, 1)]);
+
+        // A digest of other bytes: nothing shown, and it says so.
+        let v = diags(&mut c, Some(sha("other\n")), &[1]);
+        assert_eq!((v["shown"].as_u64(), v["stale"].as_bool()), (Some(0), Some(true)));
+        assert!(problems(&mut c).is_empty());
+
+        // No digest: applied as is. An empty list clears the source.
+        diags(&mut c, None, &[2]);
+        assert_eq!(problems(&mut c), [scenes(2, 1)]);
+        let v = diags(&mut c, Some(sha("hello world\n")), &[]);
+        assert_eq!((v["shown"].as_u64(), v["stale"].as_bool()), (Some(0), Some(false)));
+        assert!(problems(&mut c).is_empty());
+        assert!(c.external.paths().is_empty(), "the stored set is gone too");
+    }
+
+    #[test]
+    fn external_diagnostics_reach_a_tab_opened_later_and_survive_a_resync() {
+        let mut c = ctl();
+        let v = diags(&mut c, Some(sha("hello world\n")), &[1]);
+        assert_eq!(v, json!({"path": P, "tabs": [], "shown": 0, "stale": false}), "stored with no tab open");
+        live(&mut c);
+        assert_eq!(problems(&mut c), [scenes(1, 1)], "applied when the tab went live");
+
+        // A Resync clears every set; the stored one comes back with the
+        // same transition.
+        let tab = c.active.unwrap();
+        let gen = c.tab(tab).and_then(|t| t.mirror.as_ref()).unwrap().view_gen();
+        let resync = cosmix_edit_client::types::ViewDelta { edits: vec![], origin: None, kind: DeltaKind::Resync, rev: 0, view_gen: gen + 1 };
+        let mut fx = Vec::new();
+        c.drive(tab, Step { deltas: vec![resync], ..Step::default() }, &mut fx);
+        assert!(c.tab(tab).unwrap().diagnostics.items().is_empty(), "the Resync cleared it");
+        c.eval_waiters(&mut fx);
+        assert_eq!(problems(&mut c), [scenes(1, 1)], "re-applied after the Resync");
+    }
+
+    #[test]
+    fn a_stale_set_is_rechecked_when_the_tab_goes_clean_and_edits_invalidate_it() {
+        let mut c = ctl();
+        live(&mut c);
+        // Another origin edits line 1: the text no longer hashes to the
+        // digest the loader will send.
+        c.on_incoming(event(1, "edit", json!([{"offset": 0, "delete": 0, "insert": "!"}])));
+        let v = diags(&mut c, Some(sha("hello world\n")), &[1]);
+        assert_eq!((v["stale"].as_bool(), v["shown"].as_u64()), (Some(true), Some(0)));
+        // Back to the described text, still dirty: not re-checked (no
+        // hashing per edit).
+        c.on_incoming(event(2, "edit", json!([{"offset": 0, "delete": 1, "insert": ""}])));
+        assert!(problems(&mut c).is_empty());
+        // A reload makes it clean: the stored set is checked again, and matches.
+        c.on_incoming(event(3, "reload", json!([])));
+        let (_, v) = response(&c.on_bus_command(cmd("ced.tabs", json!({}))));
+        assert_eq!(v["tabs"][0]["dirty"].as_bool(), Some(false));
+        assert_eq!(problems(&mut c), [scenes(1, 1)]);
+
+        // Covered-range invalidation: an edit on line 1 drops it; line 2's
+        // diagnostic maps.
+        diags(&mut c, Some(sha("hello world\n")), &[1, 2]);
+        let fx = c.on_bus_command(cmd("ced.type", json!({"text": "?"})));
+        assert_eq!(response(&fx).0, 0);
+        assert_eq!(problems(&mut c), [scenes(2, 1)]);
+    }
+
+    #[test]
+    fn problems_carry_the_lint_and_the_external_sources() {
+        let mut c = ctl();
+        live(&mut c);
+        let tab = c.active.unwrap();
+        let (tag, _, _) = c.lint_capture(tab, 5).unwrap();
+        let report = r#"{"schema_version":2,"diagnostics":[{"code":"E1","severity":"warning","file":"-","line":1,"column":7,"message":"m","hint":null}]}"#;
+        c.on_lint(tab, tag, Ok(report.into()));
+        diags(&mut c, Some(sha("hello world\n")), &[1]);
+        assert_eq!(problems(&mut c), [("lint".into(), 1, 7), scenes(1, 1)]);
+        let (_, v) = response(&c.on_bus_command(cmd("ced.problems", json!({"tab": tab}))));
+        assert_eq!(v["problems"][0], json!({"line": 1, "col": 7, "severity": "warning", "code": "E1", "message": "m", "source": "lint"}));
+        // A new lint result keeps the external set.
+        let (tag, _, _) = c.lint_capture(tab, 5).unwrap();
+        c.on_lint(tab, tag, Ok(r#"{"schema_version":2,"diagnostics":[]}"#.into()));
+        assert_eq!(problems(&mut c), [scenes(1, 1)]);
+        let (rc, v) = response(&c.on_bus_command(cmd("ced.problems", json!({"tab": 99}))));
+        assert_eq!((rc, v["error_code"].as_str()), (10, Some("NOT_FOUND")));
+    }
+
+    #[test]
+    fn diagnostics_requests_are_refused_with_the_fixture_shape() {
+        let mut c = ctl();
+        let fx = c.on_bus_command(cmd("ced.diagnostics", json!({"path": P, "source": "lint", "diagnostics": []})));
+        let (rc, v) = response(&fx);
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/verbs/refusal.diagnostics-source.json")).unwrap();
+        assert_eq!((rc, v), (10, fixture));
+        let reason = |c: &mut Controller, body: Value| response(&c.on_bus_command(cmd("ced.diagnostics", body))).1["reason"].clone();
+        assert_eq!(reason(&mut c, json!({"path": "x.txt", "source": "scenes", "diagnostics": []})), "bad_path");
+        let many: Vec<Value> = (0..=verbs::MAX_EXTERNAL_DIAGNOSTICS).map(|_| json!({"line": 1, "severity": "note", "code": "c", "message": ""})).collect();
+        assert_eq!(reason(&mut c, json!({"path": P, "source": "scenes", "diagnostics": many})), "too_many");
+        let big = "x".repeat(verbs::MAX_DIAGNOSTICS_BODY);
+        assert_eq!(reason(&mut c, json!({"path": P, "source": "scenes", "diagnostics": [{"line": 1, "severity": "note", "code": "c", "message": big}]})), "too_large");
+        assert_eq!(reason(&mut c, json!({"path": P, "source": "scenes"})), "bad_args");
+        let (rc, _) = response(&c.on_bus_command(cmd("ced.problems", json!({}))));
+        assert_eq!(rc, 10, "no tab open");
     }
 }
