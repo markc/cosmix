@@ -44,7 +44,7 @@ cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props
 cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
 
 # Common
-tokio.workspace = true
+tokio = { workspace = true, features = ["taskdump"] }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
