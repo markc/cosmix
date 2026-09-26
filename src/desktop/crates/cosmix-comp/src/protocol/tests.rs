@@ -1040,7 +1040,9 @@ fn read_event(client: &mut UnixStream, deadline: Instant, awaited: &str) -> (u32
     (object_id, opcode, body)
 }
 
-#[cfg(feature = "explicit-sync-live-test")]
+// Selection relay tests drain trailing sync/delete_id traffic before recvmsg
+// reads the source.send event carrying the transfer fd.
+#[cfg(any(feature = "explicit-sync-live-test", feature = "bus"))]
 fn drain_buffered_events(client: &mut UnixStream) -> Vec<(u32, u16, Vec<u8>)> {
     client
         .set_nonblocking(true)
