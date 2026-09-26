@@ -815,6 +815,30 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_dual_write_records_blob_error_not_a_failed_capture() {
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        settle_job(
+            &status,
+            1,
+            &settled,
+            Some(|| Err("blob.props.get on blobd timed out".into())),
+            Ok(()),
+        );
+        let state = status.lock().unwrap();
+        assert_eq!(state.phase, "complete");
+        assert!(state.error.is_none());
+        assert!(state.blob.is_none());
+        assert_eq!(
+            state.blob_error.as_deref(),
+            Some("blob.props.get on blobd timed out")
+        );
+    }
+
+    #[test]
     fn a_stale_upload_never_lands_in_a_newer_jobs_status() {
         let status = Arc::new(Mutex::new(Status {
             generation: 2,

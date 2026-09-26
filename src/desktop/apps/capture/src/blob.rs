@@ -339,6 +339,36 @@ mod tests {
     }
 
     #[test]
+    fn lane_binds_parse_from_the_props_reply_shapes() {
+        let listening = PortReply::Ok {
+            rc: 0,
+            value: json!({"bind": "10.42.0.5:4210", "port": 4210}),
+        };
+        assert_eq!(bind_from_reply(&listening).unwrap(), "10.42.0.5:4210");
+        let without_bind = PortReply::Ok {
+            rc: 0,
+            value: json!({"port": 4210}),
+        };
+        assert_eq!(
+            bind_from_reply(&without_bind).unwrap_err(),
+            "props lane carries no bind"
+        );
+        let non_string = PortReply::Ok {
+            rc: 0,
+            value: json!({"bind": 4210}),
+        };
+        assert_eq!(
+            bind_from_reply(&non_string).unwrap_err(),
+            "props lane carries no bind"
+        );
+        let refused = PortReply::AppError {
+            rc: 10,
+            message: "blobd has no lane".into(),
+        };
+        assert_eq!(bind_from_reply(&refused).unwrap_err(), "blobd has no lane");
+    }
+
+    #[test]
     fn parses_a_lane_reference_and_rejects_malformed_ones() {
         let id = format!("b3:{}", "0".repeat(64));
         let full = parse_reference(&reference_body(
