@@ -275,15 +275,36 @@ pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHas
     fs::create_dir_all(&tmp_dir)?;
     let tmp_path = tmp_dir.join(uuid::Uuid::new_v4().to_string());
 
+    // One remove-on-error guard over the whole staging window (F4):
+    // every failure below — the copy, the staged re-hash, the commit —
+    // removes the staged file before the error surfaces, exactly like
+    // stage() does for the streaming paths.
+    let staged = put_path_staged(blobs_root, src, mode, &hash, &tmp_path);
+    if staged.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    staged.map(|_| (hash, size))
+}
+
+/// The post-staging half of [`put_path`]: land the bytes under `mode`,
+/// re-hash them at the staging point, and commit. Only called with a
+/// fresh `tmp_path`; the caller owns the remove-on-error guard.
+fn put_path_staged(
+    blobs_root: &Path,
+    src: &Path,
+    mode: PutMode,
+    hash: &BlobHash,
+    tmp_path: &Path,
+) -> Result<()> {
     match mode {
         PutMode::Copy => {
             let mut src_f = File::open(src)?;
-            let mut tmp_f = File::create(&tmp_path)?;
+            let mut tmp_f = File::create(tmp_path)?;
             std::io::copy(&mut src_f, &mut tmp_f)?;
         }
         PutMode::Reflink => {
             let mut src_f = File::open(src)?;
-            let mut tmp_f = File::create(&tmp_path)?;
+            let mut tmp_f = File::create(tmp_path)?;
             if !try_kernel_copy(&mut src_f, &mut tmp_f)? {
                 // Soft fall-through: both fds sit at offset 0 with an
                 // empty staging file (FICLONE is atomic; a mid-copy
@@ -296,7 +317,7 @@ pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHas
             // Stage a link to the source inode; commit_staged then
             // fsyncs it, links it into the CAS, and drops the staging
             // link. The caller has promised the source immutable.
-            fs::hard_link(src, &tmp_path)?;
+            fs::hard_link(src, tmp_path)?;
             // The staged link shares the source's inode, so without
             // this the CAS file would carry the *source's* mtime — a
             // months-old file is "old" the instant it commits, and a
@@ -305,22 +326,21 @@ pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHas
             // the source's mtime moves with it — the caller already
             // promised the source immutable from the call onward, and
             // an mtime is not content.
-            touch_path(&tmp_path)?;
+            touch_path(tmp_path)?;
         }
     }
 
-    let (landed_hash, _) = hash_file(&tmp_path)?;
-    if landed_hash != hash {
-        let _ = fs::remove_file(&tmp_path);
+    let (landed_hash, _) = hash_file(tmp_path)?;
+    if landed_hash != *hash {
         return Err(Error::BlobCorrupt(format!(
             "put_path: staged bytes hash to {} but source hashed to {}",
             hex(&landed_hash),
-            hex(&hash)
+            hex(hash)
         )));
     }
 
-    commit_staged(blobs_root, &tmp_path, &hash)?;
-    Ok((hash, size))
+    commit_staged(blobs_root, tmp_path, hash)?;
+    Ok(())
 }
 
 /// Hash the file at `p` with BLAKE3, streaming — never more than the
@@ -811,6 +831,31 @@ mod tests {
         age_path(&p);
         let _ = put_path(d.path(), &src, PutMode::Copy).unwrap();
         assert!(mtime_age(&p) < std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn put_path_error_paths_leave_no_tmp_residue() {
+        // F4: a failure anywhere inside the staging window — the copy,
+        // the staged re-hash, the commit — must remove the staged
+        // file. A regular file squatting where the first shard
+        // directory must be created makes commit_staged's
+        // create_dir_all fail deterministically, after a fully
+        // successful copy and re-hash.
+        let d = root();
+        let bytes = b"doomed staging";
+        let h = hex(&hash_bytes(bytes));
+        std::fs::write(d.path().join(&h[0..2]), b"not a directory").unwrap();
+        let src = d.path().join("doomed.bin");
+        std::fs::write(&src, bytes).unwrap();
+
+        let err = put_path(d.path(), &src, PutMode::Copy).unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "the squatted shard dir must surface as io, got {err:?}"
+        );
+        let tmp: Vec<_> = std::fs::read_dir(d.path().join(".tmp")).unwrap().collect();
+        assert!(tmp.is_empty(), "tmp leftovers: {tmp:?}");
+        assert!(!blob_path(d.path(), &hash_bytes(bytes)).exists());
     }
 
     #[test]
