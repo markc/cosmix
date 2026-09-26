@@ -28,12 +28,22 @@ pub fn land_verified(
     let dir = path.parent().ok_or_else(|| FilesError::BadRequest("target has no parent".into()))?;
     let name = path.file_name().ok_or_else(|| FilesError::BadRequest("target has no name".into()))?;
     let tmp = dir.join(format!(".{}.tmp.{}", name.to_string_lossy(), Uuid::new_v4()));
+    let existing_permissions = if overwrite {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => Some(meta.permissions()),
+            Ok(_) => return Err(FilesError::BadRequest("target is not a regular file".into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        }
+    } else { None };
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o666);
+        // Replacement bytes must stay private throughout streaming, before
+        // restoring the target's permissions immediately prior to publication.
+        options.mode(if existing_permissions.is_some() { 0o600 } else { 0o666 });
     }
     let mut file = options.open(&tmp)?;
     // Arm only after create_new succeeds: never unlink someone else's entry.
@@ -68,13 +78,8 @@ pub fn land_verified(
             "hash mismatch: expected {expected_hex}, got {actual}"
         )));
     }
-    if overwrite {
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_file() => file.set_permissions(meta.permissions())?,
-            Ok(_) => return Err(FilesError::BadRequest("target is not a regular file".into())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+    if let Some(permissions) = existing_permissions {
+        file.set_permissions(permissions)?;
     }
     file.sync_all()?;
     drop(file);
@@ -372,6 +377,43 @@ mod tests {
             sync_reported = true;
         });
         assert!(sync_reported);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_overwrite_staging_is_private_while_streaming() {
+        use std::os::unix::fs::PermissionsExt;
+        struct InspectReader<'a> {
+            dir: &'a Path,
+            body: &'a [u8],
+            reads: usize,
+        }
+        impl Read for InspectReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let tmp = fs::read_dir(self.dir)?.map(|e| e.unwrap().path())
+                    .find(|p| p.file_name().unwrap().to_string_lossy().contains(".tmp."))
+                    .expect("staging file must exist while reading");
+                assert_eq!(fs::metadata(tmp)?.permissions().mode() & 0o777, 0o600);
+                self.reads += 1;
+                // Several reads inspect the file both before and after bytes land.
+                let count = buf.len().min(2).min(self.body.len());
+                buf[..count].copy_from_slice(&self.body[..count]);
+                self.body = &self.body[count..];
+                Ok(count)
+            }
+        }
+        let dir = scratch_dir();
+        let path = dir.join("private");
+        for mode in [0o600, 0o640] {
+            fs::write(&path, b"old").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let mut reader = InspectReader { dir: &dir, body: b"secret", reads: 0 };
+            land_verified(&path, &mut reader, 6, &hash(b"secret"), true).unwrap();
+            assert!(reader.reads > 2);
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, mode);
+            assert_eq!(fs::read(&path).unwrap(), b"secret");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
