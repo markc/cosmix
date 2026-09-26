@@ -1,0 +1,233 @@
+-- Scene Editor e2e, stub level (plan §7 Stage L, §8.2): a private noded, the
+-- real loader (scenes.mix as `scenes`), fixtures/scene-editor/fake-shell.mix
+-- as the scene host `fakeshell` (SCENE_HOST; it cannot be named `shell`), and the shipped editor template's behaviour. Checks first run,
+-- open/close, the safe-open toggle, a Quoin-side dismiss, the user-copy
+-- fallback, a behaviour crash, scenes-cli.mix (list, editor --safe, reset,
+-- a refusal), and a host without dialogs. Stage T extends this to the real
+-- editor behaviour. Nothing reaches the host Bus: private TCP port, private
+-- unix socket, admission off, HOME and state dirs in the temp dir.
+-- Run: mix src/desktop/scripts/tests/scene-editor-e2e.mix
+-- COSMIX_TEST_MIX / COSMIX_TEST_NODED point at freshly built binaries;
+-- defaults are the system install. SE_E2E_KEEP=1 keeps the temp dir (logs).
+$here = dirname(realpath($0))
+$repo = realpath($here .. "/../../../..")
+$scripts = $repo .. "/src/desktop/scripts"
+$mix = env("COSMIX_TEST_MIX", "")
+if $mix == "" then $mix = "/opt/cosmix/bin/mix" end
+$noded = env("COSMIX_TEST_NODED", "")
+if $noded == "" then $noded = "/opt/cosmix/bin/cosmix-noded" end
+for each $bin in [$mix, $noded]
+  if not exists($bin) then raise("TEST_CONFIG", "missing binary " .. $bin) end
+end
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-se-e2e.XXXXXXXX"]))
+$tag = slice(replace(uuid(), "-", ""), 0, 8)
+$node = $tmp .. "/node.conf.mix"
+$shell_log = $tmp .. "/shell-requests.jsonl"
+$env = {COSMIX_NODE_CONFIG:$node, MIX_STATS:"off", PATH:"/usr/bin:/bin",
+  HOME:$tmp, XDG_STATE_HOME:$tmp, XDG_RUNTIME_DIR:$tmp, XDG_CONFIG_HOME:$tmp .. "/config"}
+$pids = {noded:nil, shell:nil, scenes:nil}
+$checks = {count:0}
+
+fn check($ok, $message)
+  $checks.count = $checks.count + 1
+  if not $ok then raise("SE_E2E", $message) end
+end
+-- One-shot anonymous client; runtime values arrive as $a from argv.
+fn call($svc, $verb, $a)
+  $src = "$a = json_parse($1)\n$w = json_encode($a)\nsend " .. $svc .. " " .. $verb .. " body=$w timeout=30\n" ..
+    "$v = $result\nif type($v) == \"string\" then\n  try\n    $v = json_parse($v)\n  catch $ignored\n  end\nend\n" ..
+    "print(json_encode({rc: $rc, reply: $v}))\n"
+  write_file($tmp .. "/step.mix", $src)
+  $run = run_argv([$mix, $tmp .. "/step.mix", json_encode($a)], {clear_env:true, env:$env, timeout:45})
+  check($run.ok, "client step failed: " .. $svc .. " " .. $verb .. ": " .. $run.stderr .. $run.stdout)
+  return json_parse($run.stdout)
+end
+fn ok($svc, $verb, $a)
+  $r = call($svc, $verb, $a)
+  check($r.rc == 0, $svc .. " " .. $verb .. " failed: " .. json_encode($r))
+  return $r.reply
+end
+fn refused($svc, $verb, $a, $code)
+  $r = call($svc, $verb, $a)
+  check($r.rc == 10 and ($r.reply ?? {}).error_code == $code, $svc .. " " .. $verb .. " expected " .. $code .. ": " .. json_encode($r))
+  return $r.reply
+end
+fn editor()
+  return ok("scenes", "scenes.list", {}).editor
+end
+-- Harness wait (bounded) for event-driven state to settle; not a backend poll.
+fn until($what, $pred_field, $want)
+  for each $i in range(1, 100)
+    $ed = editor()
+    if deep_eq($ed[$pred_field], $want) then return $ed end
+    sleep(0.1)
+  end
+  raise("SE_E2E", "timed out waiting for " .. $what .. ": " .. json_encode(ok("scenes", "scenes.list", {})))
+end
+fn shell_calls($verb)
+  if not exists($shell_log) then return [] end
+  return filter(map(read_lines($shell_log), fn($l) = json_parse($l)), fn($c) = $c.verb == $verb)
+end
+fn start_citizen($name, $script, $extra, $log)
+  $e = {}
+  for each $k in keys($env)
+    $e[$k] = $env[$k]
+  end
+  for each $k in keys($extra)
+    $e[$k] = $extra[$k]
+  end
+  $pid = spawn([$mix, "--serve", $script, "--name", $name],
+    {detach:true, clear_env:true, env:$e, cwd:dirname($script), stdout:{file:$tmp .. "/" .. $log}, stderr:"stdout"})
+  for each $i in range(1, 100)
+    $r = run_argv([$mix, "-c", "send noded noded.props.get body=\"{}\" timeout=5\nprint(json_encode($result))"], {clear_env:true, env:$env, timeout:10})
+    if $r.ok and contains($r.stdout, "\"" .. $name .. "\"") then return $pid end
+    sleep(0.1)
+  end
+  raise("SE_E2E", $name .. " did not register; log " .. $tmp .. "/" .. $log .. ": " .. read_file($tmp .. "/" .. $log))
+end
+fn stop($pid)
+  if $pid != nil and process_alive($pid) then
+    $_ = kill($pid, 15)
+    for each $i in range(1, 50)
+      if not process_alive($pid) then return end
+      sleep(0.1)
+    end
+    $_ = kill($pid, 9)
+  end
+end
+-- The editor behaviour is the loader's child registered as scene-editor.
+fn editor_pid($loader)
+  for each $d in ls("/proc")
+    if not re_match($d, "^[0-9]+$") then continue end
+    try
+      $stat = read_file("/proc/" .. $d .. "/stat")
+      $ppid = to_number(split(trim(substr($stat, index_of($stat, ")") + 2)), " ")[1])
+      if $ppid == $loader and contains(read_file("/proc/" .. $d .. "/cmdline"), "scene-editor") then return to_number($d) end
+    catch $ignored
+    end
+  end
+  return nil
+end
+fn cli($argv)
+  $e = {}
+  for each $k in keys($env)
+    $e[$k] = $env[$k]
+  end
+  $full = [$mix, $scripts .. "/scenes-cli.mix"]
+  for each $a in $argv
+    push($full, $a)
+  end
+  return run_argv($full, {clear_env:true, env:$e, timeout:90})
+end
+
+try
+  $alive = false
+  for each $attempt in range(1, 5)
+    $port = random(49000, 49999)
+    write_file($node, json_encode({node:"se-e2e-" .. $tag, wg_ip:"", mesh:"se-e2e.invalid",
+      noded:{port:$port, admission:"off", unix_socket:$tmp .. "/bus.sock"}}))
+    $pids.noded = spawn([$noded, "serve", "--listen", "127.0.0.1:" .. to_string($port), "--node", "se-e2e-" .. $tag, "--no-monitor", "--no-log"],
+      {detach:true, clear_env:true, env:$env, stdout:{file:$tmp .. "/noded.log"}, stderr:"stdout"})
+    sleep(0.5)
+    $alive = process_alive($pids.noded)
+    if $alive then break end
+  end
+  check($alive, "broker exhausted port retries")
+
+  $shell_script = $here .. "/fixtures/scene-editor/fake-shell.mix"
+  $pids.shell = start_citizen("fakeshell", $shell_script, {FAKE_SHELL_LOG:$shell_log, FAKE_SHELL_OWNER:"scenes"}, "shell.log")
+  mkdir($tmp .. "/scenes")
+  $loader_env = {SCENES_DIR:$tmp .. "/scenes", SCENES_TEMPLATES:$repo .. "/share/scenes", SCENE_HOST:"fakeshell",
+    SCENES_LEGACY_SERVICE:"se-e2e-none"}
+  $pids.scenes = start_citizen("scenes", $scripts .. "/scenes.mix", $loader_env, "scenes.log")
+
+  -- First run: empty scenes, the shell live -> the editor opens on the gallery.
+  $ed = until("first-run editor visible", "visible", true)
+  check($ed.first_run and $ed.view == "gallery" and $ed.source == "shipped" and $ed.mounted and $ed.request_seq == 1, "first run opened the gallery: " .. json_encode($ed))
+  check(len(shell_calls("shell.dialog.show")) == 1 and shell_calls("shell.scene.load")[0].args.preempt_dialog == true, "one pre-empting dialog load and one show")
+  $ed = until("stub behaviour running", "behaviour", "running")
+  $first_pid = editor_pid($pids.scenes)
+  check($first_pid != nil, "the scene-editor behaviour is the loader's child")
+
+  -- Close, then the safe open and its toggle, then a Quoin-side dismiss.
+  $r = ok("scenes", "scenes.editor.close", {})
+  check($r.visible == false and $r.mounted, "close hides and keeps it mounted: " .. json_encode($r))
+  $ed = until("hidden", "visible", false)
+  $r = ok("scenes", "scenes.editor.open", {safe:true, view:"installed"})
+  check($r.source == "shipped" and $r.safe and $r.request_seq == 2, "safe open: " .. json_encode($r))
+  $ed = until("safe open visible", "visible", true)
+  check($ed.view == "installed" and $ed.safe, "view carried in the record")
+  $r = ok("scenes", "scenes.editor.open", {safe:true})
+  check($r.visible == false, "second safe open toggles: " .. json_encode($r))
+  $ed = until("toggled off", "visible", false)
+  $r = ok("scenes", "scenes.editor.open", {safe:true})
+  $ed = until("reopened", "visible", true)
+  ok("fakeshell", "fake.dismiss", {})
+  $ed = until("dismissed by Quoin", "visible", false)
+  check(editor_pid($pids.scenes) == $first_pid, "hide and show never restart the behaviour")
+
+  -- The user copy: installed, broken, and the non-safe open falls back.
+  $r = ok("scenes", "scenes.install", {template:"editor"})
+  check($r.name == "editor" and $r.enabled == false, "user copy installed: " .. json_encode($r))
+  refused("scenes", "scenes.install", {template:"editor", name:"editor-two"}, "SCENES_RESERVED")
+  $user_scene = $tmp .. "/scenes/editor/scene.mix"
+  write_file($user_scene, replace(read_file($user_scene), "citizen: scene-editor", "citizen: scene-other"))
+  $r = ok("scenes", "scenes.editor.open", {})
+  check($r.source == "shipped" and ($r.fallback ?? {}).error_code == "SCENES_CITIZEN", "a broken user copy falls back: " .. json_encode($r))
+  $ed = until("fallback visible", "visible", true)
+  check($ed.fallback.error_code == "SCENES_CITIZEN" and $ed.user_copy, "fallback published in scenes.list")
+
+  -- Crash: SIGKILL the behaviour; the restart deadline brings it back.
+  $gen = $ed.generation
+  check(kill($first_pid, 9), "could not SIGKILL scene-editor")
+  for each $i in range(1, 100)
+    $ed = editor()
+    if $ed.generation > $gen and $ed.behaviour == "running" then break end
+    sleep(0.1)
+  end
+  check($ed.generation > $gen and $ed.behaviour == "running" and $ed.mounted, "crashed editor restarted: " .. json_encode($ed))
+  check(editor_pid($pids.scenes) != nil and editor_pid($pids.scenes) != $first_pid, "a new behaviour process")
+
+  -- scenes-cli.mix: list, editor --safe, reset, and a refusal.
+  $c = cli(["list"])
+  check($c.ok and contains($c.stdout, "editor: source=shipped") and contains($c.stdout, "needs_setup"), "cli list: " .. $c.stdout .. $c.stderr)
+  $c = cli(["list", "--json"])
+  check($c.ok and json_parse($c.stdout).editor.user_copy == true, "cli list --json")
+  $c = cli(["editor", "--safe"])
+  check($c.ok and json_parse($c.stdout).name == "editor", "cli editor --safe: " .. $c.stdout .. $c.stderr)
+  $c = cli(["reset", "editor"])
+  check($c.ok and contains(read_file($user_scene), "citizen: scene-editor") and is_dir(json_parse($c.stdout).recovery), "cli reset restores the user copy: " .. $c.stdout .. $c.stderr)
+  $c = cli(["enable", "editor"])
+  check(not $c.ok and $c.exit_code == 1 and json_parse(trim($c.stdout)).error_code == "SCENES_RESERVED", "cli refusal exits 1 with the code: " .. $c.stdout .. $c.stderr)
+  $c = cli(["templates"])
+  check($c.ok and contains($c.stdout, "panel") and not contains($c.stdout, " editor "), "cli templates: " .. $c.stdout)
+
+  -- The mesh refusal table against the real loader, both routes local here
+  -- (the attested mesh route runs in the nested gate or live).
+  $mt = run_argv([$mix, $here .. "/scenes-mesh-test.mix"], {clear_env:true, timeout:120,
+    env:{COSMIX_NODE_CONFIG:$node, MIX_STATS:"off", PATH:"/usr/bin:/bin", HOME:$tmp, XDG_RUNTIME_DIR:$tmp,
+      SCENES_LOCAL_TARGET:"scenes", SCENES_REMOTE_TARGET:"scenes"}})
+  check($mt.ok and contains($mt.stdout, "PASS"), "scenes-mesh-test refusal table: " .. $mt.stdout .. $mt.stderr)
+
+  -- A host without dialogs: the shipped editor is unavailable, nothing mounts.
+  stop($pids.scenes)
+  stop($pids.shell)
+  $pids.shell = start_citizen("fakeshell", $shell_script, {FAKE_SHELL_LOG:$shell_log, FAKE_SHELL_OWNER:"scenes", FAKE_SHELL_DIALOGS:"0"}, "shell-nodialog.log")
+  mkdir($tmp .. "/scenes-nodialog")
+  $loader_env.SCENES_DIR = $tmp .. "/scenes-nodialog"
+  $loader_env.SCENES_FIRST_RUN = "0"
+  $pids.scenes = start_citizen("scenes", $scripts .. "/scenes.mix", $loader_env, "scenes-nodialog.log")
+  $r = refused("scenes", "scenes.editor.open", {safe:true}, "SCENES_EDITOR_UNAVAILABLE")
+  check($r.context.shipped.error_code == "SCENES_HOST_KIND", "no-dialog host named: " .. json_encode($r))
+  check(not editor().mounted and editor_pid($pids.scenes) == nil, "nothing mounted on a host without dialogs")
+  print("PASS scene-editor e2e (stub): " .. to_string($checks.count) .. " assertions over a private noded")
+finally
+  for each $k in ["scenes", "shell", "noded"]
+    stop($pids[$k])
+  end
+  if env("SE_E2E_KEEP", "") == "1" then
+    print("kept " .. $tmp)
+  else
+    remove_dir($tmp)
+  end
+end

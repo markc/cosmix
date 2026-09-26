@@ -2,6 +2,10 @@
 -- crash deadline yields, outside this module, with a generation fence.
 -- Bus/process I/O is injected so tests exercise this exact reconciliation path.
 
+$EDGES = ["left", "right", "top", "bottom"]
+$VIEWS = ["gallery", "installed", "arrange"]
+$STATE_UNREADABLE = "state.conf.mix could not be read; refusing to write it"
+
 fn valid_name($name)
   if type($name) != "string" or len($name) == 0 or len($name) > 64 then return false end
   for each $c in split($name, "")
@@ -10,8 +14,18 @@ fn valid_name($name)
   return not starts_with($name, "-") and not starts_with($name, "_")
 end
 
+-- A behaviour registers as scene-<name>; noded accepts ^[a-z][a-z0-9-]{1,30}$.
+fn bus_name_ok($name)
+  return len($name) <= 25 and not contains($name, "_")
+end
+
 fn fail($code, $message, $context)
   raise($code, $message, $context)
+end
+
+-- Test seam: a scripted software failure at a named step. Empty in production.
+fn fault($s, $point)
+  if contains($s.faults ?? [], $point) then fail("SCENES_FAULT", "injected failure", {point:$point}) end
 end
 
 fn check_loader_epoch($previous, $process)
@@ -94,6 +108,36 @@ fn with_model($source, $model)
   return $out .. "---\n" .. $doc.body
 end
 
+fn entry($name)
+  return {name:$name, installed:true, enabled:false, mounted:false, revision:0,
+    source:nil, model:nil, digest:"", attempted:"", behaviour_digest:"", meta_digest:"",
+    generation:0, pid:nil, retiring:nil, status:"disabled", ready:false, crashes:0, started:0, restart_at:nil,
+    diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, kind:nil, pending:false, legacy_page:false,
+    dir:nil, files:nil, digests:{}, shown:{}, check_problems:[]}
+end
+
+-- The reserved Scene Editor entry (plan D2). Created here and only here; its
+-- enablement is the in-memory summons, never desired.enabled.
+fn editor_entry($templates)
+  $e = entry("editor")
+  $e.installed = false
+  $e.reserved = true
+  $e.summoned = false
+  $e.dir = $templates .. "/editor"
+  $e.copy = "shipped"
+  $e.safe = false
+  $e.visible = false
+  $e.view = "gallery"
+  $e.scene = nil
+  $e.first_run = false
+  $e.request_seq = 0
+  $e.fallback = nil
+  $e.dismissed = false
+  $e.user_dirty = false
+  $e.hide_requested = false
+  return $e
+end
+
 fn initial($root, $templates, $host, $me, $io)
   if not stat($root, {follow_symlinks:false}).is_dir then fail("SCENES_FILES", "scene root must be a real directory", {}) end
   $root = realpath($root)
@@ -107,30 +151,139 @@ fn initial($root, $templates, $host, $me, $io)
   end
   return {root:$root, templates:$templates, host:$host, me:$me, io:$io,
     desired:{schema_version:1, enabled:[], origins:{}, recovery:{}}, state_digest:"",
-    scenes:{}, retiring:{}, panels:{}, panel_revision:0, panel_generation:nil, open:nil,
+    state_ok:true, state_error:nil,
+    scenes:{editor:editor_entry($templates)}, retiring:{}, panels:{}, panel_revision:0, panel_generation:nil, open:nil,
+    dialog:nil, dialog_capable:nil, first_run_enabled:env("SCENES_FIRST_RUN", "1") != "0",
+    recovery_attempted:{}, recovery_diagnostics:{}, faults:[],
     host_live:false, sync_needed:true, services:nil, legacy:"quoin-panel", connection:nil, revision:0, published:"",
     sequence:$sequence, diagnostic:nil, response:{}, rc:0}
+end
+
+fn scene_dir($s, $name)
+  $e = $s.scenes[$name]
+  if $e != nil and $e.dir != nil then return $e.dir end
+  return $s.root .. "/" .. $name
+end
+
+fn shipped_editor($s)
+  return $s.templates .. "/editor"
+end
+
+fn needs_setup($s)
+  return len(filter($s.desired.enabled, fn($n) = $n != "editor")) == 0
+end
+
+fn editor_visible($s)
+  $e = $s.scenes.editor
+  if $e.kind == "dialog" then return $e.visible == true end
+  return $s.open == "editor" and not $e.pending
+end
+
+-- Loader, host and lint diagnostics as one row shape (plan D10).
+fn digest_for($file, $files, $digests)
+  for each $k in keys($files ?? {})
+    if $files[$k] == $file then return ($digests ?? {})[$k] end
+  end
+  return nil
+end
+
+fn problem_rows($diag, $files, $digests)
+  if type($diag) != "map" then return [] end
+  $ctx = $diag.context ?? {}
+  if type($ctx) != "map" then $ctx = {} end
+  $file = $diag.file ?? $ctx.file ?? ($files ?? {}).scene
+  $rows = []
+  if type($ctx.problems) == "list" and len($ctx.problems) > 0 then
+    for each $p in $ctx.problems
+      if type($p) == "map" then push($rows, $p) end
+    end
+    return $rows
+  end
+  $upstream = $ctx.upstream ?? {}
+  $host = type($upstream) == "map" ? $upstream.diagnostics : nil
+  if type($host) == "list" and len($host) > 0 then
+    for each $d in $host
+      if type($d) != "map" then continue end
+      push($rows, host_row($d, $file, digest_for($file, $files, $digests), $diag))
+    end
+    return $rows
+  end
+  push($rows, {file:$file, digest:digest_for($file, $files, $digests), line:1, severity:"error",
+    code:$diag.error_code, message:$diag.message})
+  return $rows
+end
+
+fn host_row($d, $file, $digest, $parent)
+  $row = {file:$file, digest:$digest, line:$d.line ?? 1, severity:lower($d.severity ?? "error"),
+    code:$d.code ?? ($parent ?? {}).error_code, message:$d.message ?? ($parent ?? {}).message}
+  if type($d.column ?? $d.col) == "number" then $row.col = $d.column ?? $d.col end
+  return $row
+end
+
+fn scene_problems($s, $name, $e, $diagnostic, $diagnostics)
+  $files = $e.files
+  $digests = $e.digests
+  $rows = problem_rows($diagnostic, $files, $digests)
+  for each $d in $diagnostics ?? []
+    if type($d) != "map" or deep_eq($d, $diagnostic) then continue end
+    if $d.error_code != nil then
+      for each $r in problem_rows($d, $files, $digests)
+        push($rows, $r)
+      end
+    else
+      push($rows, host_row($d, ($files ?? {}).scene, ($digests ?? {}).scene, nil))
+    end
+  end
+  for each $p in $e.check_problems ?? []
+    push($rows, $p)
+  end
+  return $rows
+end
+
+fn editor_record($s)
+  $e = $s.scenes.editor
+  return {user_copy:is_dir($s.root .. "/editor"), user_dirty:$e.user_dirty, mounted:$e.mounted,
+    visible:editor_visible($s), source:$e.copy, safe:$e.safe, fallback:$e.fallback,
+    behaviour:$e.status, view:$e.view, scene:$e.scene, first_run:$e.first_run,
+    request_seq:$e.request_seq, generation:$e.generation, kind:$e.kind, dir:$e.dir,
+    diagnostic:$e.diagnostic, problems:scene_problems($s, "editor", $e, $e.diagnostic, $e.diagnostics)}
 end
 
 fn inventory($s)
   $rows = []
   for each $name in sort(keys($s.scenes))
     $e = $s.scenes[$name]
+    if $e.reserved == true then continue end
     $diagnostic = $e.diagnostic
-    $diagnostics = $e.diagnostics
+    $diagnostics = []
+    for each $d in $e.diagnostics ?? []
+      push($diagnostics, $d)
+    end
     for each $r in values($s.desired.recovery)
       if $r.name == $name and $r.phase == "failed" and $r.diagnostic != nil then
         $diagnostic = $diagnostic ?? $r.diagnostic
         push($diagnostics, $r.diagnostic)
       end
     end
+    $rd = ($s.recovery_diagnostics ?? {})[$name]
+    if $rd != nil then
+      $diagnostic = $diagnostic ?? $rd
+      push($diagnostics, $rd)
+    end
+    $shown = $e.shown ?? {}
+    $fork = ($s.desired.forks ?? {})[$name]
     push($rows, {name:$name, installed:$e.installed, enabled:$e.enabled, mounted:$e.mounted,
       revision:$e.revision, generation:$e.generation, behaviour:$e.status, ready:$e.ready,
       template:$s.desired.origins[$name], diagnostic:$diagnostic, diagnostics:$diagnostics, exit:$e.exit,
       attempted_digest:$e.attempted, accepted_digest:$e.digest,
-      journal:"journalctl -u cosmix-desk-scenes.service", open:$s.open == $name, pending:$e.pending})
+      journal:"journalctl -u cosmix-desk-scenes.service", open:$s.open == $name, pending:$e.pending,
+      title:$shown.title ?? $name, edge:$e.edge ?? $shown.edge, page:$e.page ?? $shown.page,
+      kind:$e.kind ?? $shown.kind ?? "edge", files:$e.files, digests:$e.digests ?? {},
+      forked_from:type($fork) == "map" ? $fork.from : nil,
+      problems:scene_problems($s, $name, $e, $diagnostic, $diagnostics)})
   end
-  return {needs_setup:len($s.desired.enabled) == 0, scenes:$rows, diagnostic:$s.diagnostic}
+  return {needs_setup:needs_setup($s), root:$s.root, templates_root:$s.templates, state_ok:$s.state_ok,
+    editor:editor_record($s), scenes:$rows, diagnostic:$s.diagnostic}
 end
 
 fn changed($s)
@@ -144,22 +297,32 @@ fn changed($s)
   return $s
 end
 
-fn entry($name)
-  return {name:$name, installed:true, enabled:false, mounted:false, revision:0,
-    source:nil, model:nil, digest:"", attempted:"", behaviour_digest:"", meta_digest:"",
-    generation:0, pid:nil, retiring:nil, status:"disabled", ready:false, crashes:0, started:0, restart_at:nil,
-    diagnostic:nil, diagnostics:[], exit:nil, page:nil, edge:nil, pending:false, legacy_page:false}
+fn state_file($s)
+  return $s.root .. "/state.conf.mix"
+end
+
+fn require_state($s)
+  if $s.state_ok == false then fail("SCENES_STATE_UNREADABLE", $STATE_UNREADABLE, {file:state_file($s)}) end
 end
 
 fn persist($s)
+  -- Never overwrite a state file the loader could not read: it holds every
+  -- origin. state_ok is only ever the outcome of read_state (plan rule 12).
+  require_state($s)
   $source = data_encode($s.desired, true) .. "\n"
-  write_atomic($s.root .. "/state.conf.mix", $source, {durability:"full", mode:0o600, max_bytes:65536})
+  write_atomic(state_file($s), $source, {durability:"full", mode:0o600, max_bytes:65536})
   $s.state_digest = hash_sha256($source)
   return $s
 end
 
+fn valid_record_path($path, $prefix)
+  if type($path) != "string" or contains($path, "..") then return false end
+  if $prefix == ".stage-" then return re_match($path, "^\\.stage-[A-Za-z0-9-]+$") end
+  return re_match($path, "^\\.recovery/[a-z0-9_-]+$")
+end
+
 fn read_state($s)
-  $path = $s.root .. "/state.conf.mix"
+  $path = state_file($s)
   if not exists($path, {follow_symlinks:false}) then return $s end
   if not regular($path) then fail("SCENES_STATE", "state must be a regular file", {file:$path}) end
   $text = bounded_read($path, 65536)
@@ -180,12 +343,42 @@ fn read_state($s)
   if type($v.recovery) != "map" then fail("SCENES_STATE", "invalid recovery map", {}) end
   for each $edge in keys($v.recovery)
     $r = $v.recovery[$edge]
-    if not contains(["left", "right", "top", "bottom"], $edge) or type($r) != "map" or not valid_name($r.name) or type($r.page) != "string" or not contains(["hidden", "pinned", "docked"], $r.mode) then
+    if not contains($EDGES, $edge) or type($r) != "map" or not valid_name($r.name) or type($r.page) != "string" or not contains(["hidden", "pinned", "docked"], $r.mode) then
       fail("SCENES_STATE", "invalid popup recovery record", {edge:$edge})
+    end
+  end
+  if $v.forks != nil then
+    if type($v.forks) != "map" then fail("SCENES_STATE", "invalid forks map", {}) end
+    for each $n in keys($v.forks)
+      $f = $v.forks[$n]
+      if not valid_name($n) or type($f) != "map" or not valid_name($f.from) or ($f.panel != nil and type($f.panel) != "string") then
+        fail("SCENES_STATE", "invalid fork record", {name:$n})
+      end
+    end
+  end
+  for each $kind in ["promoting", "resetting"]
+    $r = $v[$kind]
+    if $r == nil then continue end
+    $names_ok = $kind == "promoting" ? (valid_name($r.from) and valid_name($r.to)) : valid_name(($r ?? {}).name)
+    if type($r) != "map" or not $names_ok or not valid_record_path($r.stage, ".stage-") or not valid_record_path($r.backup, ".recovery/") or not contains(["staged", "swapped", "placed"], $r.phase) then
+      fail("SCENES_STATE", "invalid " .. $kind .. " record", {})
     end
   end
   $s.desired = $v
   $s.state_digest = $digest
+  return $s
+end
+
+-- The only writer of state_ok: the outcome of read_state.
+fn load_state($s)
+  try
+    $s = read_state($s)
+    $s.state_ok = true
+    $s.state_error = nil
+  catch $message, $error
+    $s.state_ok = false
+    $s.state_error = {error_code:$error.code, message:$message, context:$error.details, file:state_file($s)}
+  end
   return $s
 end
 
@@ -225,8 +418,8 @@ fn start($s, $name)
   $e = $s.scenes[$name]
   if $e == nil or not $e.enabled or not $e.mounted or $e.pid != nil or $s.retiring[$name] != nil or $e.retiring != nil then return $s end
   if $e.status == "backoff" and $e.restart_at != nil and monotonic() < $e.restart_at then return $s end
-  $path = $s.root .. "/" .. $name .. "/behaviour.mix"
-  if not regular($path) then
+  $dir = scene_dir($s, $name)
+  if not regular($dir .. "/behaviour.mix") then
     $e.status = "static"
     $e.ready = true
   else
@@ -253,7 +446,7 @@ fn start($s, $name)
     -- Install the host fence before admitting any messages from the child.
     $r = load_managed($s, $e.source, $e.model, $e.generation)
     $e.revision = $r.revision
-    $e.pid = $s.io.launch($path, $name, $e.generation, $s.host, $s.me)
+    $e.pid = $s.io.launch($dir, $name, $e.generation, $s.host, $s.me)
     $e.status = "starting"
     $e.diagnostic = nil
     $e.started = monotonic()
@@ -277,6 +470,12 @@ fn candidate($s, $name, $dir)
   end
   $page = $doc.mount.panel
   if type($page) != "string" or trim($page) == "" then $page = "scene-" .. $name end
+  $kind = $doc.mount.kind ?? "edge"
+  if $name != "editor" then
+    -- The recovery path must never be squatted (plan §3, rule 13).
+    if $page == "scene-editor" then fail("SCENES_RESERVED", "page scene-editor is reserved for the Scene Editor", {name:$name, page:$page}) end
+    if $kind == "dialog" then fail("SCENES_RESERVED", "window.kind dialog is reserved for the Scene Editor in v1", {name:$name}) end
+  end
   $meta_text = bounded_read($dir .. "/template.conf.mix", 65536)
   try
     $meta = data_parse($meta_text)
@@ -287,13 +486,49 @@ fn candidate($s, $name, $dir)
   $behaviour = ""
   if exists($dir .. "/behaviour.mix", {follow_symlinks:false}) then
     if not regular($dir .. "/behaviour.mix") then fail("SCENES_FILES", "behaviour must be a regular file", {}) end
+    if not bus_name_ok($name) then
+      fail("SCENES_BUS_NAME", "a scene with a behaviour needs a name of at most 25 characters without '_'", {name:$name, citizen:"scene-" .. $name})
+    end
     $behaviour = hash_sha256(bounded_read($dir .. "/behaviour.mix", 262144))
-    if $doc.citizen != "scene-" .. $name then fail("SCENES_CITIZEN", "document citizen must address its behaviour", {expected:"scene-" .. $name}) end
+    if $doc.citizen != "scene-" .. $name then fail("SCENES_CITIZEN", "document citizen must address its behaviour", {expected:"scene-" .. $name, file:$dir .. "/scene.mix"}) end
   end
   $edge = $doc.mount.edge
   if not contains(["left", "top", "bottom"], $edge) then $edge = "right" end
-  return {source:$source, model:$doc.model, page:$page, edge:$edge,
+  if $kind == "dialog" then $edge = nil end
+  return {source:$source, model:$doc.model, page:$page, edge:$edge, kind:$kind, title:$meta.title ?? $name,
     digest:hash_sha256($source), behaviour_digest:$behaviour, meta_digest:hash_sha256($meta_text)}
+end
+
+-- Per-file attempted digests and display fields, whatever the scene's state.
+fn observe($s, $name, $dir)
+  $files = {scene:$dir .. "/scene.mix", behaviour:$dir .. "/behaviour.mix", metadata:$dir .. "/template.conf.mix"}
+  $digests = {}
+  for each $k in keys($files)
+    if regular($files[$k]) then
+      try
+        $digests[$k] = hash_sha256(bounded_read($files[$k], 262144))
+      catch $ignored
+      end
+    end
+  end
+  $shown = {}
+  try
+    $doc = document(bounded_read($files.scene, 262144))
+    $shown.kind = $doc.mount.kind ?? "edge"
+    $shown.page = type($doc.mount.panel) == "string" ? $doc.mount.panel : "scene-" .. $name
+    $shown.edge = contains($EDGES, $doc.mount.edge) ? $doc.mount.edge : "right"
+    if $shown.kind == "dialog" then $shown.edge = nil end
+  catch $ignored
+  end
+  try
+    $meta = data_parse(bounded_read($files.metadata, 65536))
+    if type($meta) == "map" and type($meta.title) == "string" then $shown.title = $meta.title end
+  catch $ignored
+  end
+  $s.scenes[$name].files = $files
+  $s.scenes[$name].digests = $digests
+  $s.scenes[$name].shown = $shown
+  return $s
 end
 
 -- Stage B handover: the legacy panel citizen (quoin-panel.mix) mounts these
@@ -313,13 +548,58 @@ fn legacy_guard($s, $page)
   end
 end
 
-fn reconcile_one($s, $name, $force)
-  if not has_key($s.scenes, $name) then $s.scenes[$name] = entry($name) end
+-- Plan rule 6: Quoin refuses an edge/page change on a live scene, so the
+-- new address needs an unload. Validate first so a bad edit costs nothing;
+-- a refused load re-loads the last accepted document at the old address.
+-- Sets $s.remount_error (never raises after the unload) for the caller.
+fn remount($s, $name, $c, $model)
   $e = $s.scenes[$name]
-  $dir = $s.root .. "/" .. $name
+  $v = $s.io.rpc($s.host, "shell.scene.validate", $c.source)
+  if type($v) != "map" then fail("SCENES_SNAPSHOT", "missing scene validation receipt", {}) end
+  $u = $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
+  if type($u) != "map" then fail("SCENES_SNAPSHOT", "missing scene unload receipt", {}) end
+  $s.scenes[$name].mounted = false
+  $s.remount_error = nil
+  try
+    $r = load_managed($s, $c.source, $model, $e.generation)
+    $s.scenes[$name].revision = $r.revision
+    $s.scenes[$name].mounted = true
+    return $s
+  catch $message, $error
+    $new = {error_code:$error.code, message:$message, context:$error.details}
+    try
+      $r = load_managed($s, $e.source, $e.model, $e.generation)
+      $s.scenes[$name].revision = $r.revision
+      $s.scenes[$name].mounted = true
+      $s.remount_error = $new
+    catch $message2, $error2
+      $s.remount_error = {error_code:"SCENES_REMOUNT_FAILED", message:"address change failed and the rollback load failed too",
+        context:{new:$new, rollback:{error_code:$error2.code, message:$message2, context:$error2.details}}}
+    end
+  end
+  return $s
+end
+
+fn check_mode($s, $name, $dir)
+  if ($s.scenes[$name] ?? {}).reserved == true and $dir == shipped_editor($s) then return "report" end
+  return "deny"
+end
+
+fn reconcile_one($s, $name, $force)
+  if not has_key($s.scenes, $name) then
+    if $name == "editor" then fail("SCENES_RESERVED", "the editor entry is created only at loader start", {name:$name}) end
+    $s.scenes[$name] = entry($name)
+  end
+  $e = $s.scenes[$name]
+  $dir = scene_dir($s, $name)
   $e.installed = is_dir($dir) and regular($dir .. "/scene.mix")
-  $e.enabled = contains($s.desired.enabled, $name)
+  if $e.reserved == true then
+    $e.enabled = $e.summoned == true
+  else
+    $e.enabled = contains($s.desired.enabled, $name)
+  end
   $s.scenes[$name] = $e
+  if $e.installed then $s = observe($s, $name, $dir) end
   if not $e.enabled or not $e.installed then
     $s = invalidate($s, $name)
     if $s.open == $name then $s.open = nil end
@@ -334,6 +614,7 @@ fn reconcile_one($s, $name, $force)
         $unloaded = $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
         if type($unloaded) != "map" then fail("SCENES_SNAPSHOT", "missing scene unload receipt", {}) end
         $e.mounted = false
+        $e.visible = false
       catch $message, $error
         $e.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
       end
@@ -345,23 +626,39 @@ fn reconcile_one($s, $name, $force)
   try
     $s.scenes[$name].attempted = hash_sha256(bounded_read($dir .. "/scene.mix", 262144))
     $c = candidate($s, $name, $dir)
+    $e = $s.scenes[$name]
     $e.attempted = $c.digest
     $e.legacy_page = contains($LEGACY_PAGES, $c.page)
     $s.scenes[$name] = $e
-    if $c.behaviour_digest != "" and ($force or $c.behaviour_digest != $e.behaviour_digest) then
-      $s.io.check($dir .. "/behaviour.mix")
+    if $c.behaviour_digest == "" then
+      $e.check_problems = []
+    elif $force or $c.behaviour_digest != $e.behaviour_digest then
+      $checked = $s.io.check($dir .. "/behaviour.mix", {lint:check_mode($s, $name, $dir)})
+      $e.check_problems = ($checked ?? {}).problems ?? []
     end
+    $s.scenes[$name] = $e
     if $force or $c.digest != $e.digest or not $e.mounted then
       legacy_guard($s, $c.page)
       $model = $e.model ?? $c.model
-      $r = load_managed($s, $c.source, $model, $e.generation)
+      if $e.mounted and ($c.page != $e.page or $c.edge != $e.edge or $c.kind != ($e.kind ?? "edge")) then
+        $s = remount($s, $name, $c, $model)
+        if $s.remount_error != nil then
+          $failure = $s.remount_error
+          $s.remount_error = nil
+          fail($failure.error_code, $failure.message, $failure.context)
+        end
+        $e.revision = $s.scenes[$name].revision
+      else
+        $r = load_managed($s, $c.source, $model, $e.generation)
+        $e.revision = $r.revision
+      end
       $e.source = $c.source
       $e.model = $model
-      $e.revision = $r.revision
       $e.mounted = true
       $e.digest = $c.digest
       $e.page = $c.page
       $e.edge = $c.edge
+      $e.kind = $c.kind
     end
     $restart = $force or $e.behaviour_digest != $c.behaviour_digest
     $e.meta_digest = $c.meta_digest
@@ -385,20 +682,23 @@ fn reconcile_safe($s, $name, $force)
   try
     return reconcile_one($s, $name, $force)
   catch $message, $error
-    if $s.scenes[$name] == nil then $s.scenes[$name] = entry($name) end
-    $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    -- Never create (or de-reserve) the editor key outside initial().
+    if $s.scenes[$name] == nil and $name != "editor" then $s.scenes[$name] = entry($name) end
+    if $s.scenes[$name] != nil then
+      $s.scenes[$name].diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+    end
     return $s
   end
 end
 
 fn rescan($s, $force)
-  try
-    $s = read_state($s)
-    $s.diagnostic = nil
-  catch $message, $error
-    $s.diagnostic = {error_code:$error.code, message:$message, context:$error.details, file:$s.root .. "/state.conf.mix"}
+  $s = load_state($s)
+  if not $s.state_ok then
+    $s.diagnostic = $s.state_error
     return $s
   end
+  $s.diagnostic = nil
+  $s = recover_records($s, nil)
   $names = keys($s.scenes)
   for each $n in $s.desired.enabled
     if not contains($names, $n) then push($names, $n) end
@@ -408,11 +708,109 @@ fn rescan($s, $force)
       if valid_name($n) and is_dir($s.root .. "/" .. $n) and not contains($names, $n) then push($names, $n) end
     end
   end
-  if len($names) > 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
+  if len($names) > 129 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
   for each $n in $names
     $s = reconcile_safe($s, $n, $force)
   end
   return $s
+end
+
+-- Promote/reset crash records (plan rule 9). Recovery is decided by what is
+-- on disk, not the phase: (to, stage, backup) picks the action. Each record
+-- recovers in its own try, once per loader start or explicit reload.
+fn record_target($kind, $r)
+  return $kind == "promoting" ? $r.to : $r.name
+end
+
+fn recover_records($s, $only)
+  for each $kind in ["promoting", "resetting"]
+    $r = $s.desired[$kind]
+    if type($r) != "map" then continue end
+    $name = record_target($kind, $r)
+    $key = $kind .. ":" .. $r.stage
+    if $only != nil then
+      if $only != $name and $only != $r.from then continue end
+    elif ($s.recovery_attempted ?? {})[$key] == true then
+      continue
+    end
+    $s.recovery_attempted[$key] = true
+    try
+      $s = recover_one($s, $kind, $r)
+      $s.recovery_diagnostics = delete($s.recovery_diagnostics, $name)
+    catch $message, $error
+      $context = $error.details ?? {}
+      if $error.code != "SCENES_RECOVERY" then $context = {record:$kind, upstream:{error_code:$error.code, message:$message, context:$error.details}} end
+      $s.recovery_diagnostics[$name] = {error_code:"SCENES_RECOVERY", message:$kind .. " record could not be finished", context:$context}
+      if type($s.desired[$kind]) == "map" then
+        $s.desired[$kind].error = {error_code:$error.code, message:$message}
+        try
+          $s = persist($s)
+        catch $ignored
+        end
+      end
+    end
+  end
+  return $s
+end
+
+fn recover_one($s, $kind, $r)
+  $to = $s.root .. "/" .. record_target($kind, $r)
+  $stage = $s.root .. "/" .. $r.stage
+  $backup = $s.root .. "/" .. $r.backup
+  $t = exists($to, {follow_symlinks:false})
+  $st = exists($stage, {follow_symlinks:false})
+  $b = exists($backup, {follow_symlinks:false})
+  if $t and $st and not $b then
+    -- Not swapped yet.
+    remove_dir($stage)
+    return clear_record($s, $kind)
+  elif not $t and $st and $b then
+    -- Crashed between the renames: roll forward.
+    recovery_move($s, $stage, $to)
+    return finish_record($s, $kind, $r)
+  elif not $t and not $st and $b then
+    -- Stage lost: restore the original.
+    recovery_move($s, $backup, $to)
+    return clear_record($s, $kind)
+  elif $t and not $st then
+    return finish_record($s, $kind, $r)
+  end
+  fail("SCENES_RECOVERY", $kind .. " record could not be finished", {record:$kind, to:$t, stage:$st, backup:$b})
+end
+
+fn clear_record($s, $kind)
+  $s.desired = delete($s.desired, $kind)
+  return persist($s)
+end
+
+fn finish_record($s, $kind, $r)
+  if $kind == "promoting" then return promote_finish($s, $r) end
+  if has_key($s.scenes, $r.name) then $s.scenes[$r.name].model = nil end
+  return clear_record($s, $kind)
+end
+
+-- Promote step 6: retire the sandbox and clear the record.
+fn promote_finish($s, $r)
+  $from = $r.from
+  $s.last_removed = nil
+  if has_key($s.scenes, $from) then
+    $s = invalidate($s, $from)
+    if $s.open == $from then $s.open = nil end
+  end
+  $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $from)
+  $s = persist($s)
+  if has_key($s.scenes, $from) then $s = reconcile_one($s, $from, false) end
+  $installation = $s.root .. "/" .. $from
+  if exists($installation, {follow_symlinks:false}) then
+    $backup = recovery_directory($s) .. "/" .. $from .. "-" .. uuid()
+    recovery_move($s, $installation, $backup)
+    $s.last_removed = $backup
+  end
+  $s.scenes = delete($s.scenes, $from)
+  $s.desired.origins = delete($s.desired.origins, $from)
+  if $s.desired.forks != nil then $s.desired.forks = delete($s.desired.forks, $from) end
+  $s.desired = delete($s.desired, "promoting")
+  return persist($s)
 end
 
 -- The handover is owed, not a one-shot: while the host is live and the
@@ -439,12 +837,17 @@ end
 fn filesystem($s, $batch)
   if $batch.overflow then return rescan($s, false) end
   $names = []
+  $editor = false
   for each $change in $batch.changes
     for each $path in [$change.path, $change.old_path]
       if $path == nil then continue end
-      if $path == $s.root or $path == $s.root .. "/state.conf.mix" then return rescan($s, false) end
+      if $path == $s.root or $path == state_file($s) then return rescan($s, false) end
       if not starts_with($path, $s.root .. "/") then continue end
       $parts = split(substr($path, len($s.root) + 1), "/")
+      if $parts[0] == "editor" then
+        $editor = true
+        continue
+      end
       if valid_name($parts[0]) and (len($parts) == 1 or (len($parts) == 2 and contains(["scene.mix", "behaviour.mix", "template.conf.mix"], $parts[1]))) then
         if not contains($names, $parts[0]) then push($names, $parts[0]) end
       end
@@ -452,6 +855,17 @@ fn filesystem($s, $batch)
   end
   for each $name in $names
     $s = reconcile_safe($s, $name, false)
+  end
+  if $editor then
+    -- The editor's user copy is not a scene. Only a mounted user copy
+    -- reloads (a failed reload keeps the last good tree, plan D5).
+    $e = $s.scenes.editor
+    if $e.copy == "user" and $e.summoned then
+      $s = reconcile_safe($s, "editor", false)
+      $s.scenes.editor.user_dirty = false
+    else
+      $s.scenes.editor.user_dirty = true
+    end
   end
   return $s
 end
@@ -492,7 +906,12 @@ fn restart($s, $name, $generation)
 end
 
 fn load_managed($s, $source, $model, $generation)
-  $r = $s.io.rpc($s.host, "shell.scene.load", {source:with_model($source, $model), model_generation:$generation})
+  $body = {source:with_model($source, $model), model_generation:$generation}
+  -- Only the reserved editor can be a dialog (rule 13); a squatter must never
+  -- brick safe mode, so its load pre-empts the seat.
+  $doc = document($source)
+  if $doc.name == "editor" and $doc.window.kind == "dialog" then $body.preempt_dialog = true end
+  $r = $s.io.rpc($s.host, "shell.scene.load", $body)
   if type($r) != "map" or type($r.revision) != "number" then fail("SCENES_SNAPSHOT", "missing scene load receipt", {}) end
   return $r
 end
@@ -512,16 +931,23 @@ fn authored_name($s, $template)
   return $authored
 end
 
-fn rewrite_install($source, $name)
+-- $panel nil: an authored panel is kept under the authored name, a rename
+-- gets scene-<name>. A string restores that panel; "" drops it (promote).
+fn rewrite_install($source, $name, $panel)
   $d = document($source)
-  -- Installing under the authored name keeps an authored panel address
-  -- (quoin-settings keeps settings.appearance); a rename gets its own page.
   $renamed = $d.name != $name
   $d.headers.name = $name
   $d.headers.citizen = "scene-" .. $name
-  if $renamed and $d.window.panel != nil then
-    $d.window.panel = "scene-" .. $name
-    $d.headers.window = json_encode($d.window)
+  if $d.headers.window != nil then
+    if $panel == "" and $d.window.panel != nil then
+      $d.headers.window = json_encode(delete($d.window, "panel"))
+    elif type($panel) == "string" and $panel != "" then
+      $d.window.panel = $panel
+      $d.headers.window = json_encode($d.window)
+    elif $panel == nil and $renamed and $d.window.panel != nil then
+      $d.window.panel = "scene-" .. $name
+      $d.headers.window = json_encode($d.window)
+    end
   end
   $text = "---\n"
   for each $key in keys($d.headers)
@@ -534,6 +960,13 @@ fn stage($s, $template, $name)
   if not valid_name($template) then fail("SCENES_TEMPLATE", "invalid template name", {}) end
   $src = $s.templates .. "/" .. $template
   if not is_dir($src) or stat($src, {follow_symlinks:false}).is_symlink then fail("SCENES_TEMPLATE", "shipped template is unavailable", {template:$template}) end
+  return stage_from($s, $src, $name, nil)
+end
+
+-- Copy a template or a user installation into a fresh .stage-<uuid>, rewrite
+-- it to $name, and validate it exactly as it will be mounted.
+fn stage_from($s, $src, $name, $panel)
+  if not is_dir($src) or stat($src, {follow_symlinks:false}).is_symlink then fail("SCENES_FILES", "stage source must be a real directory", {file:$src}) end
   -- Templates are data and optional code, not filesystem aliases.
   for each $path in walk($src, {follow_symlinks:false, include_dirs:true})
     if stat($path, {follow_symlinks:false}).is_symlink then fail("SCENES_FILES", "template contains symlink", {file:$path}) end
@@ -541,16 +974,28 @@ fn stage($s, $template, $name)
   $dst = $s.root .. "/.stage-" .. uuid()
   try
     copy_tree($src, $dst)
-    write_atomic($dst .. "/scene.mix", rewrite_install(bounded_read($dst .. "/scene.mix", 262144), $name))
+    write_atomic($dst .. "/scene.mix", rewrite_install(bounded_read($dst .. "/scene.mix", 262144), $name, $panel))
     $c = candidate($s, $name, $dst)
     $validation = $s.io.rpc($s.host, "shell.scene.validate", $c.source)
     if type($validation) != "map" then fail("SCENES_SNAPSHOT", "missing scene validation receipt", {}) end
-    if $c.behaviour_digest != "" then $s.io.check($dst .. "/behaviour.mix") end
+    if $c.behaviour_digest != "" then $s.io.check($dst .. "/behaviour.mix", {lint:"deny"}) end
   catch $message, $error
     remove_dir($dst)
     raise($error.code, $message, $error.details)
   end
   return $dst
+end
+
+-- Exclusive reservation closes the check/rename collision window. The only
+-- visible intermediate is an empty, disabled directory.
+fn place_install($s, $tmp, $name)
+  try
+    mkdir($s.root .. "/" .. $name, {parents:false})
+  catch $message, $error
+    remove_dir($tmp)
+    fail("SCENES_COLLISION", "installation name was claimed during staging", {name:$name, upstream:$message})
+  end
+  rename($tmp, $s.root .. "/" .. $name)
 end
 
 fn recovery_directory($s)
@@ -583,6 +1028,47 @@ fn recovery_move($s, $from, $to)
   rename($from, $to)
 end
 
+-- Swap a validated stage into $to, keeping the original at $backup, with a
+-- persisted staged/swapped/placed record (plan rule 9). A software failure
+-- before placement restores the original; a crash is finished by rescan.
+fn swap_in($s, $kind, $record, $to, $stage, $backup)
+  $record.stage = substr($stage, len($s.root) + 1)
+  $record.backup = substr($backup, len($s.root) + 1)
+  $record.phase = "staged"
+  try
+    $s.desired[$kind] = $record
+    $s = persist($s)
+    fault($s, $kind .. ":staged")
+  catch $message, $error
+    remove_dir($stage)
+    raise($error.code, $message, $error.details)
+  end
+  $moved = false
+  try
+    if exists($to, {follow_symlinks:false}) then
+      recovery_move($s, $to, $backup)
+      $moved = true
+    end
+    $s.desired[$kind].phase = "swapped"
+    $s = persist($s)
+    fault($s, $kind .. ":swapped")
+    recovery_move($s, $stage, $to)
+  catch $message, $error
+    if $moved and exists($backup, {follow_symlinks:false}) and not exists($to, {follow_symlinks:false}) then
+      recovery_move($s, $backup, $to)
+    end
+    if exists($stage, {follow_symlinks:false}) then remove_dir($stage) end
+    $s.desired = delete($s.desired, $kind)
+    try
+      $s = persist($s)
+    catch $ignored
+    end
+    raise($error.code, $message, $error.details)
+  end
+  $s.desired[$kind].phase = "placed"
+  return persist($s)
+end
+
 fn known($s, $name)
   if not valid_name($name) then fail("SCENES_NAME", "expected a safe scene name", {name:$name}) end
   if not has_key($s.scenes, $name) then fail("SCENES_NOT_FOUND", "scene is not installed", {name:$name}) end
@@ -595,7 +1081,7 @@ fn drive_popups($s)
     -- Commands may have applied before a later refusal. Recover the durable
     -- record, settle this attempt, and retain it for an explicit user retry.
     $s.state_digest = ""
-    $s = read_state($s)
+    $s = load_state($s)
     $diagnostic = {error_code:$error.code, message:$message, context:$error.details}
     for each $edge in keys($s.desired.recovery)
       $name = $s.desired.recovery[$edge].name
@@ -694,12 +1180,43 @@ fn panel_command($s, $edge, $verb, $args)
   return $s
 end
 
+-- The dialog's visibility is Quoin's state (× and Escape hide it there); the
+-- record follows the applied snapshot, never a command reply (plan rule 3).
+fn editor_observe($s)
+  $e = $s.scenes.editor
+  if $e.kind != "dialog" then return $s end
+  $was = $e.visible == true
+  $d = $s.dialog
+  if type($d) == "map" and $d.scene == "editor" then
+    $e.visible = $d.visible == true
+    if $e.visible then $e.pending = false end
+  else
+    -- Pre-empted by another owner, or the output went away.
+    $e.visible = false
+    if $e.mounted and ($was or $e.pending) then
+      $hosted = $s.io.rpc($s.host, "shell.scenes.list", {})
+      if type($hosted) == "list" and not any($hosted, fn($row) = type($row) == "map" and $row.name == "editor" and $row.owner == $s.me) then
+        $e.mounted = false
+      end
+    end
+    $e.pending = false
+  end
+  if $was and not $e.visible then
+    if not $e.hide_requested and needs_setup($s) then $e.dismissed = true end
+    $e.hide_requested = false
+  end
+  $s.scenes.editor = $e
+  return $s
+end
+
 fn panel_snapshot($s)
   $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
   if type(($snapshot ?? {}).panels) != "map" then fail("SCENES_SNAPSHOT", "missing panel snapshot", {}) end
   $s.panels = $snapshot.panels
+  $s.dialog = $snapshot.dialog
   $s.panel_generation = nil
   $s.panel_revision = 0
+  $s = editor_observe($s)
   return drive_popups($s)
 end
 
@@ -716,12 +1233,24 @@ fn panel_changed($s, $event)
   return legacy_handover($s)
 end
 
+-- A host-side unload notice for one of our scenes (dialog pre-emption).
+fn scene_notice($s, $notice)
+  if type($notice) != "map" or not has_key($s.scenes, $notice.scene ?? "") then return $s end
+  if $notice.reason == "preempted" and type($notice.ops) == "list" and contains($notice.ops, "unloaded") then
+    $s.scenes[$notice.scene].mounted = false
+    $s.scenes[$notice.scene].visible = false
+    $s.scenes[$notice.scene].pending = false
+  end
+  return $s
+end
+
 fn services($s, $names, $reconnect)
   if type($names) != "list" then fail("SCENES_SNAPSHOT", "expected full service registration snapshot", {}) end
   for each $name in $names
     if type($name) != "string" then fail("SCENES_SNAPSHOT", "malformed service snapshot", {}) end
   end
   $live = contains($names, $s.host)
+  $was_live = $s.host_live
   $returning = $live and (not $s.host_live or $reconnect or $s.sync_needed)
   -- The legacy panel citizen leaving is the handover event for its pages.
   $released = type($s.services) == "list" and contains($s.services, $s.legacy) and not contains($names, $s.legacy)
@@ -729,12 +1258,16 @@ fn services($s, $names, $reconnect)
   $s.services = $names
   if not $live or $reconnect then
     $s.sync_needed = true
+    $s.dialog_capable = nil
     for each $name in keys($s.scenes)
       $s.scenes[$name].mounted = false
     end
   end
   if $returning then
     $s.sync_needed = true
+    $s.dialog_capable = nil
+    -- Visibility is not replayed: a remounted dialog comes back hidden.
+    $s.scenes.editor.visible = false
     try
     -- A broker reconnect need not mean Quoin restarted. Recover the actual
     -- loader-owned mounts so an offline disable cannot leave an old seat up.
@@ -777,6 +1310,15 @@ fn services($s, $names, $reconnect)
       $s.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
       return $s
     end
+    -- First run (plan D12), after the remount and in its own try so a
+    -- failure can never abort it.
+    if not $was_live then
+      try
+        $s = first_run($s)
+      catch $message, $error
+        $s.scenes.editor.diagnostic = {error_code:$error.code, message:$message, context:$error.details}
+      end
+    end
   end
   -- Release rescans the disk; every later snapshot retries an owed handover
   -- (state, not the edge: the first mount after release may have failed).
@@ -803,6 +1345,461 @@ fn services($s, $names, $reconnect)
   return $s
 end
 
+fn first_run($s)
+  if not $s.first_run_enabled or not $s.state_ok or $s.scenes.editor.dismissed or not needs_setup($s) then return $s end
+  $response = $s.response
+  $rc = $s.rc
+  $s = editor_open($s, {view:"gallery", first_run:true})
+  $s.response = $response
+  $s.rc = $rc
+  return $s
+end
+
+-- Gallery rows for every shipped template (plan §4.1 scenes.templates).
+fn templates_list($s)
+  $rows = []
+  $root = $s.templates
+  $names = is_dir($root) ? sort(ls($root)) : []
+  for each $t in $names
+    $dir = $root .. "/" .. $t
+    if $t == "lib" or not valid_name($t) or not is_dir($dir) or stat($dir, {follow_symlinks:false}).is_symlink then continue end
+    $row = {template:$t, name:$t, title:$t, description:"", edge:"right", kind:"edge", behaviour:false,
+      recommended:false, order:1000, requires:[], installed_as:[]}
+    $hidden = false
+    try
+      $meta = nil
+      try
+        $meta = data_parse(bounded_read($dir .. "/template.conf.mix", 65536))
+      catch $message, $error
+        fail("SCENES_METADATA", "invalid strict template metadata", {file:$dir .. "/template.conf.mix", upstream:{error_code:$error.code, message:$message}})
+      end
+      if type($meta) != "map" then fail("SCENES_METADATA", "template metadata must be strict map data", {file:$dir .. "/template.conf.mix"}) end
+      $hidden = $meta.hidden == true
+      $doc = document(bounded_read($dir .. "/scene.mix", 262144))
+      $row.name = $doc.name
+      $row.title = type($meta.title) == "string" ? $meta.title : $doc.name
+      if type($meta.description) == "string" then $row.description = substr($meta.description, 0, 200) end
+      $row.kind = $doc.mount.kind ?? "edge"
+      $row.edge = contains($EDGES, $doc.mount.edge) ? $doc.mount.edge : "right"
+      if $row.kind == "dialog" then $row.edge = nil end
+      $row.behaviour = regular($dir .. "/behaviour.mix")
+      $row.recommended = $meta.recommended == true
+      if type($meta.order) == "number" then $row.order = $meta.order end
+      if type($meta.requires) == "list" then $row.requires = filter($meta.requires, fn($r) = type($r) == "string") end
+    catch $message, $error
+      $row.diagnostic = {error_code:$error.code, message:$message, context:$error.details ?? {file:$dir}}
+    end
+    if $hidden then continue end
+    $installed = []
+    for each $n in sort(keys($s.scenes))
+      if ($s.scenes[$n].reserved ?? false) == false and $s.desired.origins[$n] == $t and $s.scenes[$n].installed then push($installed, $n) end
+    end
+    $row.installed_as = $installed
+    push($rows, $row)
+  end
+  $rows = sort_by($rows, fn($r) = lpad(to_string(floor(max($r.order, 0))), 12, "0") .. "/" .. $r.template)
+  return {root:$root, templates:$rows}
+end
+
+-- Editor source selection (plan D4/D5): a user copy is held to the full
+-- install bar; the shipped copy's lint findings are problems, not refusals.
+fn editor_candidate($s, $dir, $copy)
+  if not exists($dir, {follow_symlinks:false}) then fail("SCENES_FILES", "the Scene Editor directory is missing", {file:$dir}) end
+  $c = candidate($s, "editor", $dir)
+  $v = $s.io.rpc($s.host, "shell.scene.validate", $c.source)
+  if type($v) != "map" then fail("SCENES_SNAPSHOT", "missing scene validation receipt", {}) end
+  $problems = []
+  if $c.behaviour_digest != "" then
+    $checked = $s.io.check($dir .. "/behaviour.mix", {lint:$copy == "shipped" ? "report" : "deny"})
+    $problems = ($checked ?? {}).problems ?? []
+  end
+  return {dir:$dir, copy:$copy, kind:$c.kind, problems:$problems}
+end
+
+-- From Stage S on, describe lists dialog before Quoin can mount one, so the
+-- capability probe is shell.dialog.hide: NOT_FOUND or success means dialogs.
+fn dialog_probe($s)
+  if $s.dialog_capable == true then return $s end
+  try
+    $s.io.rpc($s.host, "shell.dialog.hide", {scene:"editor"})
+    $s.dialog_capable = true
+  catch $message, $error
+    $upstream = (($error.details ?? {}).upstream ?? {})
+    $code = type($upstream) == "map" ? $upstream.error_code : nil
+    $s.dialog_capable = $error.code == "SCENES_UPSTREAM" and contains(["NOT_FOUND", "NOT_DIALOG"], $code)
+  end
+  return $s
+end
+
+fn fallback_of($error_code, $message, $details, $file)
+  return {error_code:$error_code, message:$message, file:(($details ?? {}).file ?? $file)}
+end
+
+fn editor_pick($s, $safe)
+  $user = $s.root .. "/editor"
+  $pick = nil
+  $fallback = nil
+  if not $safe and exists($user, {follow_symlinks:false}) then
+    try
+      $pick = editor_candidate($s, $user, "user")
+    catch $message, $error
+      $fallback = fallback_of($error.code, $message, $error.details, $user .. "/scene.mix")
+    end
+    $s.scenes.editor.user_dirty = false
+  end
+  if $pick != nil and $pick.kind == "dialog" then
+    $s = dialog_probe($s)
+    if not $s.dialog_capable then
+      $fallback = {error_code:"SCENES_HOST_KIND", message:"the scene host cannot show dialogs", file:$user .. "/scene.mix"}
+      $pick = nil
+    end
+  end
+  if $pick == nil then
+    try
+      $pick = editor_candidate($s, shipped_editor($s), "shipped")
+    catch $message, $error
+      fail("SCENES_EDITOR_UNAVAILABLE", "the shipped Scene Editor cannot be mounted",
+        {shipped:{error_code:$error.code, message:$message, context:$error.details}, user:$fallback})
+    end
+    if $pick.kind == "dialog" then
+      $s = dialog_probe($s)
+      if not $s.dialog_capable then
+        fail("SCENES_EDITOR_UNAVAILABLE", "the shipped Scene Editor cannot be mounted",
+          {shipped:{error_code:"SCENES_HOST_KIND", message:"host " .. $s.host .. " cannot show dialogs (shell.dialog.hide unavailable)", host:$s.host}, user:$fallback})
+      end
+    end
+  end
+  $s.editor_pick = $pick
+  $s.editor_fallback = $fallback
+  return $s
+end
+
+-- Mount the picked copy; a user copy that fails to mount falls back to the
+-- shipped one at open time (plan D5).
+fn editor_mount($s, $pick, $fallback)
+  $e = $s.scenes.editor
+  if $e.dir != $pick.dir then
+    if $e.mounted or $e.pid != nil then
+      $s = invalidate($s, "editor")
+      if $s.scenes.editor.mounted then
+        try
+          $s.io.rpc($s.host, "shell.scene.unload", {scene:"editor"})
+        catch $ignored
+        end
+      end
+    end
+    $s.scenes.editor.mounted = false
+    $s.scenes.editor.visible = false
+    $s.scenes.editor.digest = ""
+    $s.scenes.editor.behaviour_digest = ""
+    $s.scenes.editor.source = nil
+    $s.scenes.editor.model = nil
+  end
+  $s.scenes.editor.summoned = true
+  $s.scenes.editor.dir = $pick.dir
+  $s.scenes.editor.copy = $pick.copy
+  $s.scenes.editor.fallback = $fallback
+  $s = reconcile_one($s, "editor", false)
+  $e = $s.scenes.editor
+  if $e.diagnostic == nil and $e.mounted then
+    if $pick.copy == "shipped" and len($e.check_problems) == 0 then $s.scenes.editor.check_problems = $pick.problems end
+    return $s
+  end
+  $failure = $e.diagnostic ?? {error_code:"SCENES_MOUNT", message:"the Scene Editor did not mount"}
+  if $pick.copy == "user" then
+    $fb = fallback_of($failure.error_code, $failure.message, $failure.context, $pick.dir .. "/scene.mix")
+    $s = editor_pick($s, true)
+    return editor_mount($s, $s.editor_pick, $fb)
+  end
+  fail("SCENES_EDITOR_UNAVAILABLE", "the shipped Scene Editor cannot be mounted", {shipped:$failure, user:$fallback})
+end
+
+fn editor_hide($s)
+  $e = $s.scenes.editor
+  if $e.kind == "dialog" then
+    if $e.mounted and $s.host_live then $s.io.rpc($s.host, "shell.dialog.hide", {scene:"editor"}) end
+    $s.scenes.editor.visible = false
+    $s.scenes.editor.pending = false
+    $s.scenes.editor.hide_requested = true
+  elif $s.open == "editor" then
+    $s.open = nil
+    $s.scenes.editor.pending = false
+    $s = drive_popups($s)
+  end
+  return $s
+end
+
+fn editor_open($s, $args)
+  if $args.safe != nil and type($args.safe) != "bool" then fail("SCENES_ARGUMENT", "safe must be a bool", {safe:$args.safe}) end
+  if $args.first_run != nil and type($args.first_run) != "bool" then fail("SCENES_ARGUMENT", "first_run must be a bool", {first_run:$args.first_run}) end
+  if $args.view != nil and not contains($VIEWS, $args.view) then fail("SCENES_ARGUMENT", "view must be gallery, installed or arrange", {view:$args.view}) end
+  if $args.scene != nil and not valid_name($args.scene) then fail("SCENES_ARGUMENT", "scene must be a scene name", {scene:$args.scene}) end
+  $safe = $args.safe == true
+  $e = $s.scenes.editor
+  if $safe and $e.summoned and $e.copy == "shipped" and editor_visible($s) then
+    -- The chord and "Edit panels…" toggle the shipped editor.
+    $s = editor_hide($s)
+    $e = $s.scenes.editor
+    $s.response = {name:"editor", source:$e.copy, safe:$e.safe, visible:false, pending:false, fallback:$e.fallback, request_seq:$e.request_seq}
+    return $s
+  end
+  if not $s.host_live then
+    fail("SCENES_EDITOR_UNAVAILABLE", "the shipped Scene Editor cannot be mounted", {shipped:{error_code:"SCENES_HOST_ABSENT", message:"the scene host is not registered", host:$s.host}, user:nil})
+  end
+  $s = editor_pick($s, $safe)
+  $pick = $s.editor_pick
+  if $pick.kind != "dialog" then require_state($s) end
+  $s = editor_mount($s, $pick, $s.editor_fallback)
+  $s.editor_pick = nil
+  $s.editor_fallback = nil
+  $s.scenes.editor.safe = $safe
+  $s.scenes.editor.request_seq = $s.scenes.editor.request_seq + 1
+  if $args.view != nil then $s.scenes.editor.view = $args.view end
+  $s.scenes.editor.scene = $args.scene
+  $s.scenes.editor.first_run = $args.first_run == true
+  $s.scenes.editor.hide_requested = false
+  if $s.scenes.editor.kind == "dialog" then
+    $r = $s.io.rpc($s.host, "shell.dialog.show", {scene:"editor"})
+    if type($r) != "map" then fail("SCENES_SNAPSHOT", "missing dialog show receipt", {}) end
+    -- Visibility settles from shell.panel.changed, never from this reply.
+    $s.scenes.editor.pending = not ($s.scenes.editor.visible == true)
+  else
+    -- D3 fallback: the popup path selects and pins the page.
+    $snapshot = $s.io.rpc($s.host, "shell.props.get", {})
+    if type(($snapshot ?? {}).panels) != "map" then fail("SCENES_SNAPSHOT", "missing panel snapshot", {}) end
+    $s.panels = $snapshot.panels
+    for each $edge in keys($s.desired.recovery)
+      if $s.desired.recovery[$edge].phase == "failed" then $s.desired.recovery[$edge].phase = "recover" end
+    end
+    $s.open = "editor"
+    $s.scenes.editor.pending = true
+    $s = drive_popups($s)
+    if $s.rc != 0 then return $s end
+  end
+  $e = $s.scenes.editor
+  $s.response = {name:"editor", source:$e.copy, safe:$e.safe, visible:editor_visible($s), pending:$e.pending,
+    fallback:$e.fallback, request_seq:$e.request_seq}
+  return $s
+end
+
+fn editor_close($s, $args)
+  if $args.unload != nil and type($args.unload) != "bool" then fail("SCENES_ARGUMENT", "unload must be a bool", {unload:$args.unload}) end
+  $s = editor_hide($s)
+  if $s.rc != 0 then return $s end
+  if $args.unload == true then
+    $s.scenes.editor.summoned = false
+    $s = reconcile_one($s, "editor", false)
+  end
+  $s.response = {name:"editor", visible:false, mounted:$s.scenes.editor.mounted}
+  return $s
+end
+
+-- The mounted user copy switches to the shipped one before its directory
+-- moves away (plan rule 1, remove).
+fn editor_to_shipped($s)
+  $e = $s.scenes.editor
+  if $e.copy != "user" then return $s end
+  $s = invalidate($s, "editor")
+  if $s.scenes.editor.mounted and $s.host_live then
+    $s.io.rpc($s.host, "shell.scene.unload", {scene:"editor"})
+  end
+  $s.scenes.editor.mounted = false
+  $s.scenes.editor.visible = false
+  $s.scenes.editor.digest = ""
+  $s.scenes.editor.behaviour_digest = ""
+  $s.scenes.editor.source = nil
+  $s.scenes.editor.model = nil
+  $s.scenes.editor.dir = shipped_editor($s)
+  $s.scenes.editor.copy = "shipped"
+  if $e.summoned then $s = reconcile_one($s, "editor", false) end
+  return $s
+end
+
+fn editor_remove($s)
+  $user = $s.root .. "/editor"
+  if not exists($user, {follow_symlinks:false}) then fail("SCENES_NOT_FOUND", "the editor has no user copy", {name:"editor"}) end
+  if not stat($user, {follow_symlinks:false}).is_dir then fail("SCENES_FILES", "installation must be a real directory", {file:$user}) end
+  $backup = recovery_directory($s) .. "/editor-" .. uuid()
+  $s = editor_to_shipped($s)
+  recovery_move($s, $user, $backup)
+  $s.desired.origins = delete($s.desired.origins, "editor")
+  $s = persist($s)
+  $s.scenes.editor.user_dirty = false
+  $s.response = {name:"editor", recovery:$backup}
+  return $s
+end
+
+fn editor_reset($s)
+  $user = $s.root .. "/editor"
+  if exists($user, {follow_symlinks:false}) and not stat($user, {follow_symlinks:false}).is_dir then fail("SCENES_FILES", "installation must be a real directory", {file:$user}) end
+  $tmp = stage($s, "editor", "editor")
+  $backup = recovery_directory($s) .. "/editor-" .. uuid()
+  $s = swap_in($s, "resetting", {name:"editor"}, $user, $tmp, $backup)
+  $s.desired.origins.editor = "editor"
+  $s.desired = delete($s.desired, "resetting")
+  $s = persist($s)
+  $e = $s.scenes.editor
+  if $e.copy == "user" and $e.summoned then
+    $s.scenes.editor.model = nil
+    $s = reconcile_one($s, "editor", true)
+    $s.scenes.editor.user_dirty = false
+  else
+    $s.scenes.editor.user_dirty = true
+  end
+  $s.response = {name:"editor", recovery:$backup}
+  return $s
+end
+
+fn fork($s, $args)
+  require_state($s)
+  $name = $args.name
+  if $name == "editor" then fail("SCENES_RESERVED", "the editor cannot be forked; install its user copy instead", {name:"editor"}) end
+  known($s, $name)
+  if not $s.scenes[$name].installed then fail("SCENES_NOT_FOUND", "scene document is missing", {name:$name}) end
+  if $args.enable != nil and type($args.enable) != "bool" then fail("SCENES_ARGUMENT", "enable must be a bool", {enable:$args.enable}) end
+  $src = $s.root .. "/" .. $name
+  $behaviour = regular($src .. "/behaviour.mix")
+  $as = $args.as
+  if $as == nil then
+    $tried = [$name .. "-sandbox", $name .. "-sb"]
+    for each $t in $tried
+      if valid_name($t) and (not $behaviour or bus_name_ok($t)) then
+        $as = $t
+        break
+      end
+    end
+    if $as == nil then fail("SCENES_BUS_NAME", "no sandbox name fits the Bus name rule", {name:$name, tried:$tried}) end
+  end
+  if not valid_name($as) then fail("SCENES_NAME", "invalid fork name", {name:$as}) end
+  if $as == "editor" then fail("SCENES_RESERVED", "the editor name is reserved", {name:$as}) end
+  if exists($s.root .. "/" .. $as, {follow_symlinks:false}) then fail("SCENES_COLLISION", "installation already exists", {name:$as}) end
+  if len(keys($s.scenes)) > 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
+  $panel = nil
+  try
+    $panel = document(bounded_read($src .. "/scene.mix", 262144)).window.panel
+  catch $ignored
+  end
+  $tmp = stage_from($s, $src, $as, nil)
+  place_install($s, $tmp, $as)
+  if $s.desired.origins[$name] != nil then $s.desired.origins[$as] = $s.desired.origins[$name] end
+  $forks = $s.desired.forks ?? {}
+  $record = {from:$name}
+  if type($panel) == "string" then $record.panel = $panel end
+  $forks[$as] = $record
+  $s.desired.forks = $forks
+  $enable = $args.enable != false
+  if $enable and not contains($s.desired.enabled, $as) then $s.desired.enabled = push($s.desired.enabled, $as) end
+  $s = persist($s)
+  $s = reconcile_one($s, $as, false)
+  $s.response = {name:$as, installed:true, enabled:$enable, forked_from:$name}
+  if $s.scenes[$as].diagnostic != nil then
+    $s.rc = 10
+    $s.response = $s.scenes[$as].diagnostic
+  end
+  return $s
+end
+
+fn promote($s, $args)
+  require_state($s)
+  $from = $args.from
+  if not valid_name($from) then fail("SCENES_NAME", "expected a safe scene name", {name:$from}) end
+  known($s, $from)
+  $f = ($s.desired.forks ?? {})[$from]
+  if type($f) != "map" then fail("SCENES_NOT_FORK", "only a fork can be promoted", {name:$from}) end
+  $to = $f.from
+  $src = $s.root .. "/" .. $from
+  try
+    $tmp = stage_from($s, $src, $to, $f.panel ?? "")
+  catch $message, $error
+    $context = $error.details ?? {}
+    if type($context) != "map" then $context = {detail:$context} end
+    $context.phase = "validate-staged"
+    raise($error.code, $message, $context)
+  end
+  if $s.open == $to then
+    $s.open = nil
+    $s = drive_popups($s)
+  end
+  $backup = recovery_directory($s) .. "/" .. $to .. "-" .. uuid()
+  $s = swap_in($s, "promoting", {from:$from, to:$to}, $s.root .. "/" .. $to, $tmp, $backup)
+  -- Complete on disk from here: a failure is a diagnostic, never an undo.
+  $s = reconcile_safe($s, $to, true)
+  $s = promote_finish($s, {from:$from, to:$to})
+  $recovery = [$backup]
+  if $s.last_removed != nil then push($recovery, $s.last_removed) end
+  $s.response = {name:$to, recovery:$recovery, removed:$from}
+  return $s
+end
+
+fn orientation($edge)
+  return contains(["top", "bottom"], $edge) ? "horizontal" : "vertical"
+end
+
+-- Rewrite only the window header line (plan rule 10); rule 6 remounts.
+fn move($s, $args)
+  require_state($s)
+  $name = $args.name
+  if $name == "editor" then fail("SCENES_RESERVED", "the editor is a dialog; it has no edge", {name:"editor"}) end
+  if not contains($EDGES, $args.edge) then fail("SCENES_ARGUMENT", "edge must be left, right, top or bottom", {edge:$args.edge}) end
+  known($s, $name)
+  if not $s.scenes[$name].installed then fail("SCENES_NOT_FOUND", "scene document is missing", {name:$name}) end
+  $path = $s.root .. "/" .. $name .. "/scene.mix"
+  $source = bounded_read($path, 262144)
+  $doc = document($source)
+  if $doc.headers.window == nil then fail("SCENES_MOUNT", "scene has no window header to move", {name:$name}) end
+  if $doc.window.kind == "dialog" then fail("SCENES_MOUNT", "a dialog scene has no edge", {name:$name}) end
+  $old = contains($EDGES, $doc.window.edge) ? $doc.window.edge : "right"
+  $window = $doc.window
+  $window.edge = $args.edge
+  if orientation($old) != orientation($args.edge) then
+    $window = delete(delete($window, "w"), "h")
+  end
+  $lines = split($source, "\n")
+  for $i = 1 to len($lines) - 1
+    if $lines[$i] == "---" then break end
+    if trim(split($lines[$i], ":")[0]) == "window" then $lines[$i] = "window: " .. json_encode($window) end
+  end
+  $text = join($lines, "\n")
+  if $text != $source then write_atomic($path, $text) end
+  $s = reconcile_one($s, $name, true)
+  if $s.scenes[$name].diagnostic != nil then
+    $s.rc = 10
+    $s.response = $s.scenes[$name].diagnostic
+  else
+    $s.response = {name:$name, edge:$args.edge, revision:$s.scenes[$name].revision}
+  end
+  return $s
+end
+
+fn reset_scene($s, $name, $e)
+  $recovery = recovery_directory($s)
+  $installation = $s.root .. "/" .. $name
+  if exists($installation, {follow_symlinks:false}) and not stat($installation, {follow_symlinks:false}).is_dir then
+    fail("SCENES_FILES", "installation must be a real directory", {file:$installation})
+  end
+  $origin = $s.desired.origins[$name]
+  if $origin == nil then fail("SCENES_NO_ORIGIN", "reset requires a recorded shipped template origin", {name:$name}) end
+  $tmp = stage($s, $origin, $name)
+  $backup = $recovery .. "/" .. $name .. "-" .. uuid()
+  if $s.open == $name then $s.open = nil end
+  $s = drive_popups($s)
+  $s = invalidate($s, $name)
+  $s = swap_in($s, "resetting", {name:$name}, $installation, $tmp, $backup)
+  $s.desired = delete($s.desired, "resetting")
+  $s = persist($s)
+  $s.scenes[$name].model = nil
+  $s = reconcile_one($s, $name, true)
+  if $s.scenes[$name].diagnostic != nil then
+    $s.scenes[$name].model = $e.model
+    $s.rc = 10
+    $s.response = $s.scenes[$name].diagnostic
+    $s.response.recovery = $backup
+    return $s
+  end
+  $s.response = {name:$name, recovery:$backup}
+  return $s
+end
+
 fn request($s, $verb, $args)
   $previous_desired = $s.desired
   $s.rc = 0
@@ -813,22 +1810,36 @@ fn request($s, $verb, $args)
       $s.response = inventory($s)
       return $s
     end
+    if $verb == "templates" then
+      $s.response = templates_list($s)
+      return $s
+    end
+    if $verb == "editor.open" then return editor_open($s, $args) end
+    if $verb == "editor.close" then return editor_close($s, $args) end
+    if $verb == "fork" then return fork($s, $args) end
+    if $verb == "promote" then return promote($s, $args) end
+    if $verb == "move" then return move($s, $args) end
+    if contains(["install", "remove", "enable", "disable", "reset", "open", "toggle"], $verb) then require_state($s) end
     if $verb == "install" then
       $name = $args.name ?? authored_name($s, $args.template)
       if not valid_name($name) then fail("SCENES_NAME", "invalid installation name", {}) end
-      if exists($s.root .. "/" .. $name, {follow_symlinks:false}) then fail("SCENES_COLLISION", "installation already exists", {name:$name}) end
-      if len(keys($s.scenes)) >= 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
-      $tmp = stage($s, $args.template, $name)
-      -- Exclusive reservation closes the check/rename collision window.
-      -- The only visible intermediate is an empty, disabled directory.
-      try
-        mkdir($s.root .. "/" .. $name, {parents:false})
-      catch $message, $error
-        remove_dir($tmp)
-        fail("SCENES_COLLISION", "installation name was claimed during staging", {name:$name, upstream:$message})
+      if ($name == "editor") != ($args.template == "editor") then
+        fail("SCENES_RESERVED", "the editor template installs only as editor", {name:$name, template:$args.template})
       end
-      rename($tmp, $s.root .. "/" .. $name)
+      if $name == "editor" and $args.enable == true then
+        fail("SCENES_RESERVED", "the editor is summoned, never enabled", {name:"editor", request:$args})
+      end
+      if exists($s.root .. "/" .. $name, {follow_symlinks:false}) then fail("SCENES_COLLISION", "installation already exists", {name:$name}) end
+      if len(keys($s.scenes)) > 128 then fail("SCENES_LIMIT", "at most 128 installed scenes", {}) end
+      $tmp = stage($s, $args.template, $name)
+      place_install($s, $tmp, $name)
       $s.desired.origins[$name] = $args.template
+      if $name == "editor" then
+        $s = persist($s)
+        $s.scenes.editor.user_dirty = true
+        $s.response = {name:"editor", installed:true, enabled:false}
+        return $s
+      end
       if $args.enable == true and not contains($s.desired.enabled, $name) then $s.desired.enabled = push($s.desired.enabled, $name) end
       $s = persist($s)
       $s = reconcile_one($s, $name, false)
@@ -841,8 +1852,14 @@ fn request($s, $verb, $args)
     end
     $name = $args.name
     known($s, $name)
+    if $name == "editor" then
+      if contains(["enable", "disable"], $verb) then fail("SCENES_RESERVED", "the editor is summoned, never enabled", {name:"editor"}) end
+      if contains(["open", "close", "toggle"], $verb) then fail("SCENES_RESERVED", "use scenes.editor.open and scenes.editor.close", {name:"editor"}) end
+      if $verb == "remove" then return editor_remove($s) end
+      if $verb == "reset" then return editor_reset($s) end
+    end
     $e = $s.scenes[$name]
-    if not $e.installed and not contains(["disable", "remove", "reset"], $verb) then fail("SCENES_NOT_FOUND", "scene document is missing", {name:$name}) end
+    if not $e.installed and not contains(["disable", "remove", "reset", "reload"], $verb) then fail("SCENES_NOT_FOUND", "scene document is missing", {name:$name}) end
     if $verb == "enable" or $verb == "disable" then
       $enable = $verb == "enable"
       if $enable and not contains($s.desired.enabled, $name) then $s.desired.enabled = push($s.desired.enabled, $name) end
@@ -854,51 +1871,31 @@ fn request($s, $verb, $args)
       $s = reconcile_one($s, $name, false)
       $s = drive_popups($s)
     elif $verb == "reload" then
+      -- An explicit reload also retries a crash record naming this scene.
+      $s = recover_records($s, $name)
       $s = reconcile_one($s, $name, true)
-    elif $verb == "remove" or $verb == "reset" then
+    elif $verb == "remove" then
       $recovery = recovery_directory($s)
       $installation = $s.root .. "/" .. $name
       if exists($installation, {follow_symlinks:false}) and not stat($installation, {follow_symlinks:false}).is_dir then
         fail("SCENES_FILES", "installation must be a real directory", {file:$installation})
       end
-      $tmp = nil
-      if $verb == "reset" then
-        $origin = $s.desired.origins[$name]
-        if $origin == nil then fail("SCENES_NO_ORIGIN", "reset requires a recorded shipped template origin", {name:$name}) end
-        $tmp = stage($s, $origin, $name)
-      end
       $backup = $recovery .. "/" .. $name .. "-" .. uuid()
       if $s.open == $name then $s.open = nil end
       $s = drive_popups($s)
       $s = invalidate($s, $name)
-      if $verb == "remove" then
-        $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $name)
-        $s = persist($s)
-        $s = reconcile_one($s, $name, false)
-        if exists($installation, {follow_symlinks:false}) then recovery_move($s, $installation, $backup) end
-        $s.scenes = delete($s.scenes, $name)
-        $s.desired.origins = delete($s.desired.origins, $name)
-        $s = persist($s)
-      else
-        if exists($installation, {follow_symlinks:false}) then recovery_move($s, $installation, $backup) end
-        try
-          recovery_move($s, $tmp, $installation)
-        catch $message, $error
-          if exists($backup, {follow_symlinks:false}) then recovery_move($s, $backup, $installation) end
-          raise($error.code, $message, $error.details)
-        end
-        $s.scenes[$name].model = nil
-        $s = reconcile_one($s, $name, true)
-        if $s.scenes[$name].diagnostic != nil then
-          $s.scenes[$name].model = $e.model
-          $s.rc = 10
-          $s.response = $s.scenes[$name].diagnostic
-          $s.response.recovery = $backup
-          return $s
-        end
-      end
+      $s.desired.enabled = filter($s.desired.enabled, fn($n) = $n != $name)
+      $s = persist($s)
+      $s = reconcile_one($s, $name, false)
+      if exists($installation, {follow_symlinks:false}) then recovery_move($s, $installation, $backup) end
+      $s.scenes = delete($s.scenes, $name)
+      $s.desired.origins = delete($s.desired.origins, $name)
+      if $s.desired.forks != nil then $s.desired.forks = delete($s.desired.forks, $name) end
+      $s = persist($s)
       $s.response = {name:$name, recovery:$backup}
       return $s
+    elif $verb == "reset" then
+      return reset_scene($s, $name, $e)
     elif $verb == "ready" or $verb == "model" then
       if not $e.enabled or $e.pid == nil or type($args.generation) != "number" or $e.generation != $args.generation then
         fail("SCENES_STALE_GENERATION", "behaviour generation is no longer current", {name:$name})
@@ -961,10 +1958,7 @@ fn request($s, $verb, $args)
     -- A full-durability write can fail after rename; reread the real file.
     $s.desired = $previous_desired
     $s.state_digest = ""
-    try
-      $s = read_state($s)
-    catch $ignored
-    end
+    $s = load_state($s)
   end
   return $s
 end

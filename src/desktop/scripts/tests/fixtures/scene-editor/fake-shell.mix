@@ -1,0 +1,241 @@
+-- A Quoin-shaped `shell` for scene-editor-e2e.mix (Scene Editor plan §7,
+-- Stage L): in-memory scenes, edge panels and the one dialog seat, driven by
+-- the real loader over a private noded. Run it under any name but `shell`
+-- (mix --serve fake-shell.mix --name fakeshell) with the loader SCENE_HOST
+-- set to that name: the verbs stay shell.*, and a citizen can never answer its
+-- own <name>.props.get (the runtime reserves it), so it must not be `shell`.
+-- Real revision semantics: every applied change publishes shell.panel.changed
+-- with a strictly greater revision; an unchanged snapshot publishes nothing.
+-- FAKE_SHELL_DIALOGS=0 answers shell.dialog.* UNIMPLEMENTED (a pre-Q2 host).
+-- FAKE_SHELL_LOG appends every request as one JSON line; FAKE_SHELL_OWNER is
+-- the owner reported by shell.scenes.list (the loader's service name).
+-- fake.dismiss plays Quoin's × / Escape; fake.state returns everything.
+$loader = require("../../../lib/scenes.mix")
+$LOG = env("FAKE_SHELL_LOG", "")
+$DIALOGS = env("FAKE_SHELL_DIALOGS", "1") != "0"
+$OWNER = env("FAKE_SHELL_OWNER", "scenes")
+$ME = serve_name() ?? "fakeshell"
+if $ME == "shell" then raise("FAKE_SHELL", "serve this fake under another name; shell.props.get is reserved for a citizen named shell") end
+$EDGES = ["left", "right", "top", "bottom"]
+$st = {generation:1, revision:1, counter:0, published:"", scenes:{}, dialog:nil, panels:{}}
+for each $edge in $EDGES
+  $st.panels[$edge] = {visible:false, pinned:false, mode:"hidden", page:nil, pages:[], declared:[], width_px:$edge == "bottom" ? 52 : 400, output:"FAKE-1"}
+end
+
+fn note($verb)
+  if $LOG != "" then append_file($LOG, json_encode({verb:$verb, args:$event.args, body:$event.args == nil ? $event.body : nil}) .. "\n") end
+end
+
+fn snapshot()
+  return {generation:$st.generation, revision:$st.revision, dialog:$st.dialog, panels:$st.panels}
+end
+
+fn changed()
+  $view = json_encode({dialog:$st.dialog, panels:$st.panels})
+  if $view == $st.published then return end
+  $st.published = $view
+  $st.revision = $st.revision + 1
+  publish($ME .. ".panel.changed", json_encode(snapshot()), {command:"shell.panel.changed"})
+end
+
+fn refuse($code, $message)
+  reply(10, json_encode({error_code:$code, message:$message}))
+end
+
+fn req()
+  return $event.args ?? {}
+end
+
+fn drop_page($page)
+  for each $edge in $EDGES
+    $p = $st.panels[$edge]
+    $p.pages = filter($p.pages, fn($x) = $x != $page)
+    if $p.page == $page then $p.page = len($p.pages) > 0 ? $p.pages[0] : nil end
+    $st.panels[$edge] = $p
+  end
+end
+
+fn unload($name)
+  $sc = $st.scenes[$name]
+  if $sc == nil then return end
+  if $sc.kind == "dialog" then
+    $st.dialog = nil
+  else
+    drop_page($sc.page)
+  end
+  $st.scenes = delete($st.scenes, $name)
+end
+
+on shell.scene.validate
+  note("shell.scene.validate")
+  if contains($event.body, "BROKEN") then
+    reply(10, json_encode({error_code:"scene_invalid", message:"invalid document", diagnostics:[{line:7, code:"mix-parse", severity:"Error", message:"parse"}]}))
+    return
+  end
+  $loader.document($event.body)
+  reply(0, json_encode({diagnostics:[]}))
+end
+
+on shell.scene.load
+  note("shell.scene.load")
+  $a = req()
+  if contains($a.source ?? "", "BROKEN") then
+    reply(10, json_encode({error_code:"scene_invalid", message:"invalid document", diagnostics:[{line:7, code:"mix-parse", severity:"Error", message:"parse"}]}))
+    return
+  end
+  $d = $loader.document($a.source)
+  $kind = $d.mount.kind ?? "edge"
+  if $kind == "dialog" and not $DIALOGS then $kind = "edge" end
+  $st.counter = $st.counter + 1
+  $old = $st.scenes[$d.name]
+  if $kind == "dialog" then
+    if type($st.dialog) == "map" and $st.dialog.scene != $d.name and $a.preempt_dialog != true then
+      reply(10, json_encode({error_code:"DIALOG_BUSY", message:"the dialog seat is held by another scene", holder:{scene:$st.dialog.scene}}))
+      return
+    end
+    if type($st.dialog) == "map" and $st.dialog.scene != $d.name then unload($st.dialog.scene) end
+    $visible = type($st.dialog) == "map" and $st.dialog.scene == $d.name and $st.dialog.visible
+    $st.dialog = {scene:$d.name, visible:$visible, w:$d.window.w ?? 880, h:$d.window.h ?? 620, output:"FAKE-1"}
+    $st.scenes[$d.name] = {name:$d.name, kind:"dialog", page:nil, edge:nil, revision:$st.counter}
+  else
+    $page = type($d.mount.panel) == "string" ? $d.mount.panel : "scene-" .. $d.name
+    $edge = contains($EDGES, $d.mount.edge) ? $d.mount.edge : "right"
+    if $old != nil and ($old.page != $page or $old.edge != $edge) then
+      refuse("SUBPANEL_ADDRESS", "a live scene cannot change its page or edge")
+      return
+    end
+    $p = $st.panels[$edge]
+    if not contains($p.pages, $page) then $p.pages = push($p.pages, $page) end
+    if $p.page == nil then $p.page = $page end
+    $st.panels[$edge] = $p
+    $st.scenes[$d.name] = {name:$d.name, kind:"edge", page:$page, edge:$edge, revision:$st.counter}
+  end
+  reply(0, json_encode({scene:$d.name, revision:$st.counter}))
+  changed()
+end
+
+on shell.scene.unload
+  note("shell.scene.unload")
+  unload(req().scene)
+  reply(0, json_encode({scene:req().scene, unloaded:true}))
+  changed()
+end
+
+on shell.scene.patch
+  note("shell.scene.patch")
+  $st.counter = $st.counter + 1
+  reply(0, json_encode({scene:req().scene, revision:$st.counter}))
+end
+
+on shell.scenes.list
+  note("shell.scenes.list")
+  $rows = []
+  for each $n in sort(keys($st.scenes))
+    push($rows, {name:$n, owner:$OWNER, revision:$st.scenes[$n].revision})
+  end
+  reply(0, json_encode($rows))
+end
+
+on shell.scene.describe
+  note("shell.scene.describe")
+  -- A port list, as Quoin answers it; runtime.mix ready() reads the list family.
+  if req().family == "window" then
+    reply(0, json_encode([{path:"kind", type:"enum", enum:$DIALOGS ? ["edge", "dialog"] : ["edge"]}]))
+    return
+  end
+  reply(0, json_encode([{path:"flow", type:"enum", enum:["vertical", "horizontal"]}, {path:"hidden", type:"bool"}]))
+end
+
+on shell.props.get
+  note("shell.props.get")
+  reply(0, json_encode(snapshot()))
+end
+
+on shell.panel.state
+  note("shell.panel.state")
+  $p = $st.panels[req().edge]
+  if $p == nil then
+    refuse("INVALID_ARGUMENT", "unknown edge")
+    return
+  end
+  reply(0, json_encode($p))
+end
+
+on shell.panel.page.set
+  note("shell.panel.page.set")
+  $a = req()
+  $st.panels[$a.edge].page = $a.id
+  reply(0, json_encode({accepted:true, applied:true}))
+  changed()
+end
+
+on shell.panel.mode
+  note("shell.panel.mode")
+  $a = req()
+  $st.panels[$a.edge].mode = $a.mode
+  $st.panels[$a.edge].visible = $a.mode != "hidden"
+  $st.panels[$a.edge].pinned = $a.mode == "pinned"
+  reply(0, json_encode({accepted:true, applied:true}))
+  changed()
+end
+
+on shell.panel.resize
+  note("shell.panel.resize")
+  $a = req()
+  $st.panels[$a.edge].width_px = $a.thickness_px
+  reply(0, json_encode({accepted:true, applied:true}))
+  changed()
+end
+
+on shell.panel.order
+  note("shell.panel.order")
+  $edges = req().edges ?? {}
+  for each $edge in keys($edges)
+    $st.panels[$edge].declared = $edges[$edge]
+  end
+  reply(0, json_encode({edges:$edges}))
+  changed()
+end
+
+fn dialog_verb($show)
+  if not $DIALOGS then
+    refuse("UNIMPLEMENTED", "no dialogs on this host")
+    return
+  end
+  $sc = $st.scenes[req().scene ?? ""]
+  if $sc == nil then
+    refuse("NOT_FOUND", "no scene named " .. to_string(req().scene) .. " is loaded")
+    return
+  end
+  if $sc.kind != "dialog" then
+    refuse("NOT_DIALOG", "scene " .. $sc.name .. " is an edge page, not a dialog")
+    return
+  end
+  $applied = $st.dialog.visible != $show
+  $st.dialog.visible = $show
+  reply(0, json_encode({scene:$sc.name, visible:$show, applied:$applied}))
+  changed()
+end
+
+on shell.dialog.show
+  note("shell.dialog.show")
+  dialog_verb(true)
+end
+
+on shell.dialog.hide
+  note("shell.dialog.hide")
+  dialog_verb(false)
+end
+
+on fake.dismiss
+  note("fake.dismiss")
+  if type($st.dialog) == "map" then $st.dialog.visible = false end
+  reply(0, json_encode({dialog:$st.dialog}))
+  changed()
+end
+
+on fake.state
+  reply(0, json_encode($st))
+end
+
+$st.published = json_encode({dialog:$st.dialog, panels:$st.panels})
