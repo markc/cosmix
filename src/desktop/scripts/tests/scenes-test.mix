@@ -125,6 +125,16 @@ fn notify($body)
   record("publish", $body)
   return true
 end
+fn probe_row($s)
+  return filter($l.inventory($s).scenes, fn($r) = $r.name == "probe")[0]
+end
+-- The standing file refusal: kept on the entry, shown as the row's
+-- diagnostic, and its host line in problems.
+fn refusal_shown($s, $refusal)
+  $row = probe_row($s)
+  $lines = filter($row.problems, fn($p) = $p.line == 7 and $p.code == "mix-parse")
+  return deep_eq($s.scenes.probe.load_diagnostic, $refusal) and deep_eq($row.diagnostic, $refusal) and len($lines) == 1
+end
 fn fixture_source($name, $text)
   return "---\nscene: 1\nname: " .. $name .. "\ncitizen: scene-" .. $name .. "\nwindow: {\"kind\":\"edge\",\"edge\":\"right\"}\nmodel: {\"text\":\"default\"}\n---\n```mix\nroot: {widget: \"text\", text: " .. data_encode($text) .. "}\n```\n"
 end
@@ -289,13 +299,34 @@ try
   write_file($s.root .. "/probe/scene.mix", fixture_source("probe", "BROKEN"))
   $last = $s.scenes.probe.revision
   $s = $l.filesystem($s, $batch)
-  check($s.scenes.probe.mounted and $s.scenes.probe.revision == $last and $s.scenes.probe.diagnostic.context.upstream.diagnostics[0].line == 7, "malformed keeps last-good and diagnostic")
+  check($s.scenes.probe.mounted and $s.scenes.probe.revision == $last and $s.scenes.probe.load_diagnostic.context.upstream.diagnostics[0].line == 7, "malformed keeps last-good and diagnostic")
+  -- The file's refusal stands until the file is fixed: a model publish, a
+  -- ready and a crash restart are the runtime's business and never clear it.
+  $refusal = $s.scenes.probe.load_diagnostic
+  check(refusal_shown($s, $refusal), "the refusal is the row's diagnostic with its line-7 problem: " .. json_encode(probe_row($s)))
+  $s = $l.request($s, "model", {name:"probe", generation:$gen, value:{text:"runtime"}})
+  check($s.rc == 0 and refusal_shown($s, $refusal), "a model publish keeps the file refusal")
+  $s = $l.request($s, "model", {name:"probe", generation:$gen, value:{text:"runtime again"}})
+  check($s.rc == 0 and refusal_shown($s, $refusal), "an applied model patch keeps the file refusal")
+  $s = $l.request($s, "model", {name:"probe", generation:$gen, value:{text:"runtime"}})
+  $s = $l.request($s, "ready", {name:"probe", generation:$gen})
+  check($s.rc == 0 and refusal_shown($s, $refusal), "a ready keeps the file refusal")
+  $s = process_exit($s, {pid:$s.scenes.probe.pid, tag:{name:"probe", generation:$gen}, exit_code:1, signal:nil})
+  check(refusal_shown($s, $refusal) and $s.scenes.probe.diagnostic.error_code == "SCENES_BEHAVIOUR_EXIT", "a crash adds the runtime diagnostic beside the refusal")
+  check(len(filter(probe_row($s).problems, fn($p) = $p.code == "SCENES_BEHAVIOUR_EXIT")) == 1, "the runtime fault is still a problem row")
+  $s = deadline($s, "probe", $gen)
+  check($s.scenes.probe.generation != $gen and $s.scenes.probe.pid != nil and refusal_shown($s, $refusal), "a crash restart keeps the file refusal")
+  $gen = $s.scenes.probe.generation
+  $s = $l.request($s, "ready", {name:"probe", generation:$gen})
+  $s = $l.request($s, "enable", {name:"probe"})
+  check($s.rc == 10 and $s.response.error_code == "SCENES_UPSTREAM", "enable still reports the standing refusal: " .. json_encode($s.response))
   $s = $l.services($s, [], false)
   $s = $l.services($s, ["test-shell"], true)
   check($s.scenes.probe.mounted and $s.scenes.probe.model.text == "runtime", "restart remounts last-good despite bad disk")
   write_file($s.root .. "/probe/scene.mix", fixture_source("probe", "new layout"))
   $s = $l.filesystem($s, $batch)
   check($s.scenes.probe.model.text == "runtime", "layout reload retains model")
+  check($s.scenes.probe.load_diagnostic == nil and probe_row($s).diagnostic == nil and len(probe_row($s).problems) == 0, "a good save clears the file refusal: " .. json_encode(probe_row($s)))
   $behaviour_before = $s.scenes.probe.pid
   write_file($s.root .. "/probe/behaviour.mix", "BROKEN")
   $s = $l.filesystem($s, {overflow:false, changes:[{path:$s.root .. "/probe/behaviour.mix",kind:"modified"}]})
@@ -306,8 +337,10 @@ try
   $exit = {pid:$pid, tag:{name:"probe", generation:$gen}, exit_code:1, signal:nil}
   $s = process_exit($s, $exit)
   check($s.scenes.probe.status == "backoff" and $s.scenes.probe.mounted, "crash leaves mounted")
+  -- Relative: the refusal checks above already crashed probe once this minute.
+  $crashes = $s.scenes.probe.crashes
   $s = process_exit($s, $exit)
-  check($s.scenes.probe.crashes == 1, "duplicate exit suppressed")
+  check($s.scenes.probe.crashes == $crashes, "duplicate exit suppressed")
   $s = $l.request($s, "disable", {name:"probe"})
   $s = $l.restart($s, "probe", $gen)
   check(not $s.scenes.probe.mounted and $s.scenes.probe.pid == nil, "disable wins backoff race")
@@ -343,7 +376,7 @@ try
   check($s.rc == 10 and not $s.scenes.panel.mounted and len(calls("shell.scene.load")) == $loads, "reload cannot take a held page")
   $s = $l.services($s, ["test-shell"], false)
   $last = calls("shell.scene.load")
-  check($s.scenes.panel.mounted and $s.scenes.panel.page == "scene-panel" and $s.scenes.panel.diagnostic == nil and $l.document($last[len($last) - 1].body.source).name == "panel", "legacy departure mounts the handed-over page")
+  check($s.scenes.panel.mounted and $s.scenes.panel.page == "scene-panel" and $l.failure($s.scenes.panel) == nil and $l.document($last[len($last) - 1].body.source).name == "panel", "legacy departure mounts the handed-over page")
   $s = $l.services($s, ["test-shell", "quoin-panel"], false)
   check($s.scenes.panel.mounted, "a returning legacy citizen does not unmount the loader's page")
   $s = $l.services($s, ["test-shell"], false)
@@ -355,13 +388,13 @@ try
   check($s.rc == 10 and $s.response.error_code == "SCENES_LEGACY_HELD" and not $s.scenes.calendar.mounted and $s.scenes.calendar.legacy_page, "legacy-held calendar is owed a handover")
   $host_state.load_error = "calendar"
   $s = $l.services($s, ["test-shell"], false)
-  check(not $s.scenes.calendar.mounted and $s.scenes.calendar.diagnostic.error_code == "SCENES_UPSTREAM" and deep_eq($l.legacy_handover_pending($s), ["calendar"]), "a failed handover load stays owed: " .. json_encode($s.scenes.calendar.diagnostic))
+  check(not $s.scenes.calendar.mounted and $l.failure($s.scenes.calendar).error_code == "SCENES_UPSTREAM" and deep_eq($l.legacy_handover_pending($s), ["calendar"]), "a failed handover load stays owed: " .. json_encode($l.failure($s.scenes.calendar)))
   $loads = len(calls("shell.scene.load"))
   $s = $l.services($s, ["test-shell"], false)
   check(not $s.scenes.calendar.mounted and len(calls("shell.scene.load")) == $loads + 1, "every services snapshot retries the owed handover")
   $host_state.load_error = nil
   $s = $l.services($s, ["test-shell"], false)
-  check($s.scenes.calendar.mounted and $s.scenes.calendar.diagnostic == nil and len($l.legacy_handover_pending($s)) == 0, "a later services snapshot mounts the owed page")
+  check($s.scenes.calendar.mounted and $l.failure($s.scenes.calendar) == nil and len($l.legacy_handover_pending($s)) == 0, "a later services snapshot mounts the owed page")
   $loads = len(calls("shell.scene.load"))
   $s = $l.services($s, ["test-shell"], false)
   check(len(calls("shell.scene.load")) == $loads, "a mounted handover is not retried")
@@ -374,7 +407,7 @@ try
   check(not $s.scenes.calendar.mounted, "second release fails its first load")
   $host_state.load_error = nil
   $s = panel_notice($s, {generation:7, revision:1, panels:$host_state.panels})
-  check($s.scenes.calendar.mounted and $s.scenes.calendar.diagnostic == nil, "a panel notice retries the owed handover")
+  check($s.scenes.calendar.mounted and $l.failure($s.scenes.calendar) == nil, "a panel notice retries the owed handover")
   $s = $l.request($s, "remove", {name:"calendar"})
   check($s.rc == 0 and $s.scenes.calendar == nil, "calendar fixture removed")
   $s = $l.request($s, "remove", {name:"panel"})
@@ -504,7 +537,7 @@ try
   $s = $l.request($s, "open", {name:"fast"})
   $host_state.refuse_verb = "shell.panel.mode"
   $s = refused($s, "close", {name:"fast"}, "SCENES_UPSTREAM")
-  check(not $s.scenes.fast.pending and $s.desired.recovery.right.phase == "failed" and $s.scenes.fast.diagnostic != nil, "refused release settles failed with diagnostic")
+  check(not $s.scenes.fast.pending and $s.desired.recovery.right.phase == "failed" and $l.failure($s.scenes.fast) != nil, "refused release settles failed with diagnostic")
   $host_state.refuse_verb = nil
   $s = $l.request($s, "close", {name:"fast"})
   check($s.rc == 0 and $s.desired.recovery.right == nil, "explicit close recovers refused release")
@@ -593,7 +626,7 @@ try
   write_file($s.root .. "/zz-good/scene.mix", fixture_source("zz-good", "batch edit"))
   $revision = $s.scenes["zz-good"].revision
   $s = $l.filesystem($s, {overflow:false,changes:[{path:$s.root .. "/aa-fails/scene.mix"},{path:$s.root .. "/zz-good/scene.mix"}]})
-  check($s.scenes["aa-fails"].diagnostic.error_code == "SCENES_UPSTREAM" and $s.scenes["zz-good"].revision > $revision, "raising reconcile isolated within fs batch")
+  check($l.failure($s.scenes["aa-fails"]).error_code == "SCENES_UPSTREAM" and $s.scenes["zz-good"].revision > $revision, "raising reconcile isolated within fs batch")
   write_file($s.root .. "/zz-good/scene.mix", fixture_source("zz-good", "rescan edit"))
   $revision = $s.scenes["zz-good"].revision
   $s = $l.rescan($s, false)
@@ -611,7 +644,7 @@ try
   $host_state.names = ["test-shell", "scene-handover"]
   $s = process_exit($s, {pid:$old.pid,tag:{name:"handover",generation:$old.generation},exit_code:0,signal:nil})
   check($s.scenes.handover.pid == nil and $s.scenes.handover.status == "handover", "reaped child still waits for broker name release")
-  check($s.scenes.handover.diagnostic.error_code == "SCENES_NAME_HELD" and $s.scenes.handover.diagnostic.context.holder == "scene-handover", "foreign holder is diagnosed")
+  check($l.failure($s.scenes.handover).error_code == "SCENES_NAME_HELD" and $l.failure($s.scenes.handover).context.holder == "scene-handover", "foreign holder is diagnosed")
   $s = $l.changed($s)
   $notices = calls("publish")
   $rows = $notices[len($notices)-1].body.scenes
@@ -911,7 +944,7 @@ try
   $good = $s.scenes.editor.source
   write_file($user_scene, read_file($user_scene) .. "\n-- BROKEN\n")
   $s = $l.filesystem($s, {overflow:false, changes:[{path:$user_scene, kind:"modified"}]})
-  check($s.scenes.editor.diagnostic != nil and $s.scenes.editor.source == $good and $s.scenes.editor.mounted, "E13: a broken edit keeps the last good tree")
+  check($l.failure($s.scenes.editor) != nil and $s.scenes.editor.source == $good and $s.scenes.editor.mounted, "E13: a broken edit keeps the last good tree")
 
   -- E14: the editor install never enables; the key stays reserved.
   $s = se_fresh("e14", $tpl)

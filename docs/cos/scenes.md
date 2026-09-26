@@ -7,7 +7,9 @@ Invalid loads and patches return diagnostics and retain the last good tree.
 For file discovery, enablement, supervised behaviours and popup coordination,
 see the [Stage A scenes loader](scenes-loader).
 
-Scenes mount as pages in an edge panel. Floating windows are outside v0.
+Scenes mount as pages in an edge panel, or, for `window.kind:"dialog"`, in
+the host's one centred dialog seat (see [Dialog scenes](#dialog-scenes)).
+Other floating windows are outside v0.
 The envelope's `window` header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
 `window.chrome` must be a boolean and defaults to true; false lets the page
@@ -71,6 +73,51 @@ through `scenes.model` and forwards the page's clicks unchanged to
 clamping stay in Quoin. Without the loader, Quoin serves the same node block
 as a built-in fallback and yields the page to a loader-managed load. Snapshot
 fields and the handover rules are in [Quoin](quoin).
+
+## Dialog scenes
+
+A document whose `window` header says `kind:"dialog"` (cosmix-scene 0.6; `w`
+and `h` required, no `edge` or `panel`) mounts into the host's **dialog seat**,
+not an edge carousel. There is one seat per host. In v1 the scenes loader
+reserves it for the [Scene Editor](scene-editor) and refuses dialog-kind
+documents from every other scene.
+
+- **Seat.** A dialog load reserves the seat and keeps the surface unmapped. A
+  second dialog load from another scene is refused `DIALOG_BUSY`, unless its
+  JSON load envelope carries `preempt_dialog:true`. In that case the
+  incumbent is released, and its owner gets a `<host>.scene.changed` notice
+  with `ops:["unloaded"]`, `reason:"preempted"` and `by:{scene,owner}`.
+  Unloading the scene, or its owner disconnecting, releases the seat.
+- **Surface.** The dialog is an overlay layer surface with no anchors and
+  exclusive zone 0. comp centres it in the output's usable area, net of the
+  other layers' exclusive zones: with a 52 px bottom panel docked, it sits
+  26 px above the output centre. On every show it takes the keyboard
+  (`Exclusive`), then demotes to `OnDemand` once the keyboard enter lands, and
+  keeps focus while mapped. Pointer, keyboard and touch reach it like a panel
+  surface, but it never drives panel reveal, hold, pin or resize.
+- **Chrome.** A title bar with a **×**, which is frame chrome rather than a
+  scene node. × hides the dialog, and so does Escape while the dialog holds
+  the keyboard and no IME preedit is active. Neither involves the scene's
+  behaviour. Output removal unmaps the dialog; the next show maps it on the
+  current output.
+
+| Verb | Args | Reply |
+| --- | --- | --- |
+| `shell.dialog.show` | `{scene}` | `{scene,visible:true,applied}`; maps and takes the keyboard |
+| `shell.dialog.hide` | `{scene}` | `{scene,visible:false,applied}`; unmaps and keeps scene state |
+| `shell.scene.layout` | `{scene,node?}` | `{scene,revision,applied_revision,visible,surface:{kind:"panel"\|"dialog",edge?,output,x,y,w,h},nodes:{<id>:{x,y,w,h,hidden}},instances:{<list>:{<item>:{x,y,w,h}}}}` |
+
+`applied` is false when the dialog was already in the requested state.
+Refusals are `NOT_FOUND` (no such scene) and `NOT_DIALOG` (an edge page).
+`shell.scene.layout` reads the applied revision's computed layout in logical
+px. The surface rect is in output coordinates and node rects are relative to
+the surface. While unmapped it reports `visible:false` and empty `nodes`. It
+is how gates and agents click a node: take the centre of its rect.
+
+Every change of `dialog.visible` or `dialog.scene` publishes
+`shell.panel.changed` with a strictly greater revision; the snapshot's
+`dialog` is `{scene,visible,w,h,output}` or null. Page order is written with
+`shell.panel.order`, described in [Quoin](quoin).
 
 ## V1 bindings
 

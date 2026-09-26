@@ -142,9 +142,13 @@ not by ced: ced writes none. What ced adds is its own full copy of each text.
   finds every match and applies them as **one** transaction, so it is one
   undo step, and refuses up front beyond 10,000 matches or 1 MiB of inserted
   text. `$1`-style group references are expanded by ced.
-- **Lint.** Mix, scene and mix-data buffers with a path are linted with
+- **Lint.** Mix and mix-data buffers with a path are linted with
   `mix lint --json -` on open and after each save (and 1 s after the last edit
   for buffers under 1 MiB), in the file's directory so `require()` resolves.
+  Scene buffers (`scene.mix`) are linted in-process with `cosmix-scene`
+  (parse, lint, resolve, on a worker thread): the same registry Quoin uses,
+  and free of the false `MIX-E1003` that `mix lint` reports at an AMP fence.
+  Scene diagnostics carry a line only, so their column is 1.
   Problems appear as squiggles, in the gutter and in the Problems panel
   (`Ctrl+Shift+M`). A diagnostic on a line edited since is dropped rather than
   shown in the wrong place.
@@ -189,6 +193,8 @@ Positions (`POINT`, `POS`) are the edit service's forms.
 | `ced.wait` | `tab?`, exactly one of `rev` / `idle:true` / `epoch` / `phase`, `timeout_ms` (1–30000) | `{tab, rev, phase, epoch, waited_ms}` |
 | `ced.layout` | `tab?` | the last frame's geometry in logical px: `{window, menubar, tabstrip, editor, gutter_w, line_height, cell_w, first_line, visible_rows, caret, statusbar}` |
 | `ced.stats` | — | `{keys, frames, model_us, view_us, next_frame_us, events, history_recoveries, snapshot_recoveries, conflicts, retries, uncertain}` (latencies as `{p50, p95, p99, max}` µs) |
+| `ced.diagnostics` | `path`, `source`, `digest?`, `diagnostics:[{line, col?, severity, code, message}]` | `{path, tabs:[tab], shown, stale}` — see [External diagnostics](#external-diagnostics) |
+| `ced.problems` | `tab?` | `{tab, path, problems:[{line, col, severity, code, message, source}]}` — exactly the Problems panel |
 | `app.describe` | — | the `ctk-app-control.v0` shape: `{contract, app:"ced", title, view, engine:"iced", version, description, controls, verbs}` |
 | `app.quit` | — | `{quitting:true}`, then ced detaches and exits |
 
@@ -255,6 +261,43 @@ tab reattaching each time:
 COSMIX=$PWD mix src/desktop/apps/ced/tests/ced-bus-test.mix \
   --editd src/target/release/cosmix-editd --ced src/desktop/target/release/ced
 ```
+
+### External diagnostics
+
+Other tools can show their verdicts in ced without ced knowing about them.
+Diagnostics are kept as one set per **source**. ced's own lint is the source
+`lint`; external callers use `ced.diagnostics` with any other source matching
+`^[a-z][a-z0-9-]{0,31}$`. The [Scene Editor](scene-editor) pushes the scenes
+loader's verdicts as source `scenes`.
+
+- **Request.** `path` is absolute. Each diagnostic has a 1-based `line`, an
+  optional 1-based `col`, a `severity` of `error`, `warning` or `note`, a
+  `code` and a `message`. The limits are 500 diagnostics and a 64 KiB body.
+  A refusal is `INVALID_ARGUMENT` with a reason: `too_large`, `bad_source`
+  (not the pattern, or `lint`, which is ced's own), `bad_path` (not
+  absolute), `too_many` or `bad_digest` (not 64 lower-hex characters).
+- **Storage.** ced stores the set per `(path, source)`, keeping the most
+  recent 64 paths. It applies the set, replacing only that source's
+  diagnostics, to every tab showing `path`:
+  - when the verb arrives;
+  - when a tab for the path opens;
+  - after a tab resyncs (reconnect, reload);
+  - whenever a tab's `dirty` flag goes false (a save, or an undo back to the
+    disk text).
+- **Digest.** `digest` is the lower-hex sha256 of the file bytes the
+  diagnostics describe; ced compares it with the bytes the tab would save
+  (its text, with the BOM restored when the file has one). A tab whose text does not hash to it shows none of
+  the set (`stale:true`), but the set stays stored for when the text matches
+  again.
+- **Clearing.** An empty `diagnostics` list clears that source and drops the
+  stored set. Like lint rows, an external row on a line edited since is
+  dropped rather than shown in the wrong place.
+
+The Problems panel shows every source's rows as `source: code message`.
+`ced.problems {tab?}` returns the same rows.
+In-process scene lint reports lines only, so its rows have `col: null`.
+`ced --headless` answers both verbs; it runs no lint of its own, so its
+`ced.problems` holds only external sets.
 
 ## Files, configuration and theme
 
