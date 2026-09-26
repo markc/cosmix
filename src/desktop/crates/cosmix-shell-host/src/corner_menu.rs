@@ -35,6 +35,7 @@ pub fn open(world: &mut World, output: &OutputKey, corner: cosmix_shell::core::C
         output: output.clone(),
         corner,
         items,
+        serial: ui::next_menu_serial(),
     });
 }
 
@@ -62,6 +63,10 @@ impl RunnerState {
             return Ok(());
         };
         if self.selected_key.as_ref() != Some(&request.output) {
+            // Dropped: release any hold kept for it (a reopened step), and
+            // update so its asker learns promptly that nothing was shown.
+            stage_menu_hold(&mut self.app, &request.output, request.corner.summoned_edge(), false);
+            self.needs_update = true;
             return Ok(());
         }
         // A request arriving while a menu is open replaces it. The incumbent
@@ -118,6 +123,7 @@ impl RunnerState {
         .map_err(|e| LayerHostError::new(e.to_string()))?;
         self.app.insert_resource(crate::holders::PopupLayerIdentity {
             output: request.output.clone(), edge: request.corner.summoned_edge(), surface: identity,
+            serial: request.serial,
         });
         self.app
             .world_mut()
@@ -391,12 +397,21 @@ fn dismiss(app: &mut App, menu: &mut NativeCornerMenu, choice: Option<usize>) {
     if let Some(command) = item.as_ref().and_then(|i| i.command(edge)) {
         stage_shell_command(app, menu.request.output.clone(), command);
     }
-    stage_menu_hold(app, &menu.request.output, edge, false);
     if let Some(ui::MenuItem { action, .. }) = item
         && !matches!(action, MenuAction::Mode(_))
         && let Some(hook) = app.world().get_resource::<CornerMenuActionHook>().copied()
     {
         (hook.0)(app.world_mut(), action);
+    }
+    // A hook that reopened the menu on this same edge (a confirm step) keeps
+    // the reveal held: releasing here would drain before the step opens and a
+    // transient edge would conceal under it. Opening re-stages the hold.
+    let reopened = app
+        .world()
+        .get_resource::<CornerMenuRequest>()
+        .is_some_and(|next| next.output == menu.request.output && next.corner.summoned_edge() == edge);
+    if !reopened {
+        stage_menu_hold(app, &menu.request.output, edge, false);
     }
     menu.surface.close(app);
     app.update();
@@ -440,6 +455,7 @@ mod tests {
                 output,
                 corner: cosmix_shell::core::Corner::TopLeft,
                 items: ui::menu_items(PanelMode::Hidden, &[]),
+                serial: 0,
             };
             let mut menu = NativeCornerMenu {
                 surface,
@@ -522,6 +538,7 @@ mod tests {
                 output,
                 corner: cosmix_shell::core::Corner::BottomRight,
                 items,
+                serial: 0,
             },
             origin: Vec2::ZERO,
             rows: vec![],
@@ -539,6 +556,80 @@ mod tests {
             PanelMode::Hidden
         );
         assert_eq!(menu.surface.phase, SurfacePhase::Closed);
+        menu.surface.retire(&mut app);
+    }
+
+    /// A choice whose hook reopens the menu on the same edge (a confirm step)
+    /// keeps the reveal held: the step opens over a still-revealed edge
+    /// instead of one the released hold let conceal.
+    #[test]
+    fn a_confirm_step_reopened_by_a_choice_keeps_the_reveal_held() {
+        fn reopen(world: &mut World, _: MenuAction) {
+            world.insert_resource(CornerMenuRequest {
+                output: OutputKey::new("test-output").unwrap(),
+                corner: cosmix_shell::core::Corner::TopLeft,
+                items: Vec::new(),
+                serial: 7,
+            });
+        }
+        let output = OutputKey::new("test-output").unwrap();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::MenuHold(true))
+            .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)));
+        app.insert_resource(CornerMenuActionHook(reopen));
+        let sequence = Arc::new(Mutex::new(Vec::new()));
+        let surface = PanelSurface::test_double(&mut app, SurfacePhase::Configured, sequence);
+        app.world_mut()
+            .entity_mut(surface.camera)
+            .insert(Camera::default());
+        let extra = ui::MenuExtra {
+            label: "Leave seat…".into(),
+            target: "desktop-session".into(),
+            verb: "desktop.session.leave".into(),
+            args: vec![],
+            confirm: Some("Leave?".into()),
+        };
+        let items = ui::menu_items(PanelMode::Hidden, std::slice::from_ref(&extra));
+        let choice = items.len() - 1;
+        let mut menu = NativeCornerMenu {
+            surface,
+            request: CornerMenuRequest {
+                output,
+                corner: cosmix_shell::core::Corner::TopLeft,
+                items,
+                serial: 6,
+            },
+            origin: Vec2::ZERO,
+            rows: vec![],
+            selected: None,
+            pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
+        };
+        dismiss(&mut app, &mut menu, Some(choice));
+        assert!(app.world().contains_resource::<CornerMenuRequest>(), "the hook reopened");
+        // Well past the grace: a released hold would have concealed it.
+        for _ in 0..3 {
+            app.update();
+        }
+        let panel = app.world().resource::<ShellFrameState>().0.panel(Edge::Left);
+        assert!(panel.transient_revealed, "the edge concealed under the confirm step");
         menu.surface.retire(&mut app);
     }
 
@@ -576,6 +667,7 @@ mod tests {
             output: output.clone(),
             corner: cosmix_shell::core::Corner::TopLeft,
             items: ui::menu_items(PanelMode::Hidden, &[]),
+            serial: 0,
         };
         app.insert_resource(request.clone());
         let mut menu = Some(NativeCornerMenu {
@@ -637,6 +729,7 @@ mod tests {
                 output: output.clone(),
                 corner: cosmix_shell::core::Corner::TopLeft,
                 items: ui::menu_items(PanelMode::Hidden, &[]),
+                serial: 0,
             },
             origin: Vec2::ZERO,
             rows: vec![],

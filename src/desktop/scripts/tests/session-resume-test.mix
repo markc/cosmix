@@ -36,13 +36,17 @@ end
 fn write_fake_term()
   write_file($tmp .. "/fake-term.mix", join([
     "$pid = env(\"FAKE_TERM_PID\")",
+    "$tab_pid = env(\"FAKE_TERM_TAB_PID\", \"\")",
+    "if $tab_pid == \"\" then $tab_pid = $pid end",
     "$log = env(\"FAKE_TERM_LOG\")",
     "on term.tabs",
     "  reply(0, \"id=1 active=true title=t cols=80 rows=24 child_pid=1 revision=1 instance=7\")",
     "end",
     "on term.panes",
-    "  $tab = $event.args == nil ? 1 : ($event.args.tab ?? 1)",
-    "  reply(0, \"id=\" .. to_string($tab) .. \" active=true cols=80 rows=24 child_pid=1 x=0 y=0 w=1 h=1 tab=\" .. to_string($tab) .. \" revision=1 instance=7 pid=\" .. $pid)",
+    "  $tab = $event.args == nil ? nil : $event.args.tab",
+    "  $p = $tab == nil ? $pid : $tab_pid",
+    "  $t = $tab ?? 1",
+    "  reply(0, \"id=\" .. to_string($t) .. \" active=true cols=80 rows=24 child_pid=1 x=0 y=0 w=1 h=1 tab=\" .. to_string($t) .. \" revision=1 instance=7 pid=\" .. $p)",
     "end",
     "on term.tab.new",
     "  reply(0, \"opened id=2 tab=2 pane=2 revision=2\")",
@@ -53,9 +57,12 @@ fn write_fake_term()
     "end"
   ], "\n") .. "\n")
 end
-fn start_term($pid)
+-- $tab_pid: the pid the term reports on a tab-scoped term.panes (the query
+-- that picks the target pane); nil = the same as $pid.
+fn start_term($pid, $tab_pid)
   $term_env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
-    FAKE_TERM_PID: to_string($pid), FAKE_TERM_LOG: $tmp .. "/typed.log"}
+    FAKE_TERM_PID: to_string($pid), FAKE_TERM_TAB_PID: $tab_pid == nil ? "" : to_string($tab_pid),
+    FAKE_TERM_LOG: $tmp .. "/typed.log"}
   return spawn([$mix, "--serve", $tmp .. "/fake-term.mix", "--name", "term"],
     {detach: true, env: $term_env, stdout: {file: $tmp .. "/term.log"}, stderr: "stdout"})
 end
@@ -88,7 +95,7 @@ try
     {detach: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
 
   -- A stray term (pid 4242) holds the name; the new boot term is pid 5151.
-  $term_pid = start_term(4242)
+  $term_pid = start_term(4242, nil)
   wait_term()
   $r = resume(5151)
   check($r.exit_code != 0, "the worker succeeded against a stray term: " .. $r.stdout)
@@ -97,8 +104,18 @@ try
   check(trim(read_file($tmp .. "/state.json.done")) == "", "a refused run marked a session done")
   stop_term()
 
+  -- The name check passes but the pane line the target comes from names
+  -- another process: pid and instance are bound in that one reply, so still
+  -- nothing is typed.
+  $term_pid = start_term(5151, 4242)
+  wait_term()
+  $r = resume(5151)
+  check($r.exit_code != 0 and contains($r.stdout, "NOT typing"), "the worker typed into a pane another process named: " .. $r.stdout)
+  check(read_file_or($tmp .. "/typed.log", "") == "", "keys reached a pane of another process")
+  stop_term()
+
   -- The expected process: the session is typed into boot tab 1's pane.
-  $term_pid = start_term(5151)
+  $term_pid = start_term(5151, nil)
   wait_term()
   $r = resume(5151)
   check($r.exit_code == 0, "the worker failed against the right term: " .. $r.stdout .. $r.stderr)

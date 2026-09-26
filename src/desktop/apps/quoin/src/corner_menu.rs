@@ -3,6 +3,7 @@ use crate::config::ShellConfig;
 use bevy::prelude::*;
 use cosmix_shell::chrome::corner_menu::{
     CornerMenuActionHook, CornerMenuRequest, MenuAction, MenuExtra, confirm_items, menu_items,
+    next_menu_serial,
 };
 use cosmix_shell::core::{Corner, OutputKey};
 use cosmix_shell::runtime::ShellFrameState;
@@ -51,6 +52,7 @@ fn open(world: &mut World, output: &OutputKey, corner: Corner) {
         output: output.clone(),
         corner,
         items,
+        serial: next_menu_serial(),
     });
 }
 
@@ -128,6 +130,7 @@ pub(crate) fn session_confirm_request(
         output,
         corner,
         items: confirm_items(question, label, MenuAction::Extra(extra)),
+        serial: next_menu_serial(),
     })
 }
 
@@ -144,6 +147,7 @@ fn confirm_request(world: &World, extra: &MenuExtra) -> Option<CornerMenuRequest
         output: anchor.output.clone(),
         corner: anchor.corner,
         items: confirm_items(question, &extra.label, MenuAction::Extra(confirmed)),
+        serial: next_menu_serial(),
     })
 }
 

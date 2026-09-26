@@ -39,8 +39,9 @@ struct ShellBusState {
     pending_panels: Vec<(InboundRequest, cosmix_shell::core::OutputKey)>,
     /// `shell.session.confirm` replies, held until the layer host has shown
     /// the confirm step (or dropped it): request, output, corner, reply body
-    /// on success, and the frame by which the host must have taken it.
-    pending_confirms: Vec<(InboundRequest, cosmix_shell::core::OutputKey, Corner, String, u64)>,
+    /// on success, the step's serial, and the frame by which the host must
+    /// have taken it.
+    pending_confirms: Vec<(InboundRequest, cosmix_shell::core::OutputKey, Corner, String, u64, u64)>,
     /// Local receipt ordering, not a broker incarnation token. Absence sweeps
     /// only affect reservations accepted strictly before their cutoff.
     /// CTK uses separate control/telemetry planes: this orders consumption in
@@ -271,20 +272,20 @@ fn reply_session_confirms(
     mut commands: Commands,
 ) {
     let frame = state.frame;
-    for (request, output, corner, body, deadline) in std::mem::take(&mut state.pending_confirms) {
+    for (request, output, corner, body, serial, deadline) in std::mem::take(&mut state.pending_confirms) {
         if state.live_generation != Some(request.connection_generation) {
             continue;
         }
-        let waiting = queued
-            .as_deref()
-            .is_some_and(|step| step.output == output && step.corner == corner);
+        // Matched by serial: a newer step queued on the same corner replaces
+        // this one, and its popup must not answer for it.
+        let waiting = queued.as_deref().is_some_and(|step| step.serial == serial);
         let (rc, reply) = if waiting && frame < deadline {
-            state.pending_confirms.push((request, output, corner, body, deadline));
+            state.pending_confirms.push((request, output, corner, body, serial, deadline));
             continue;
         } else if !waiting
-            && popup
-                .as_deref()
-                .is_some_and(|popup| popup.output == output && popup.edge == corner.summoned_edge())
+            && popup.as_deref().is_some_and(|popup| {
+                popup.serial == serial && popup.output == output && popup.edge == corner.summoned_edge()
+            })
         {
             let mut reply: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             reply["applied"] = json!(true);
@@ -297,7 +298,7 @@ fn reply_session_confirms(
             (10, json!({"error_code":"CONFIRM_NOT_SHOWN", "message":if waiting {
                 "the layer host did not take the confirm step"
             } else {
-                "the layer host did not show the confirm step (another output is selected, or no layer host runs here)"
+                "the layer host did not show the confirm step (a newer step replaced it, another output is selected, or no layer host runs here)"
             }}).to_string())
         };
         stash_or_respond(&bridge, &mut state, request, rc, reply, None, &mut |_| {});
@@ -747,7 +748,7 @@ fn service_bus(
                     // it): a reply here would claim a menu nobody has seen.
                     if state.pending_confirms.len() < MAX_PENDING_REPLIES {
                         let deadline = state.frame.saturating_add(CONFIRM_RECEIPT_FRAMES);
-                        state.pending_confirms.push((request, step.output.clone(), step.corner, body, deadline));
+                        state.pending_confirms.push((request, step.output.clone(), step.corner, body, step.serial, deadline));
                         commands.insert_resource(step);
                     } else {
                         stash_or_respond(&bridge, &mut state, request, 11,
@@ -1930,7 +1931,7 @@ mod tests {
             test_model().output().clone(), Edge::Left, "panel-token".into(),
         )]));
         app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
-            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
+            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(), serial: 0,
         });
         let reply = |request_id, body: &str| BusBridgeEvent::Reply {
             request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
@@ -2013,7 +2014,7 @@ mod tests {
             test_model().output().clone(), Edge::Left, "panel-token".into(),
         )]));
         app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
-            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
+            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(), serial: 0,
         });
         let reply = |request_id, body: &str| BusBridgeEvent::Reply {
             request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
@@ -3803,6 +3804,7 @@ mod tests {
             output: step.output.clone(),
             edge: Corner::BottomRight.summoned_edge(),
             surface: "menu".into(),
+            serial: step.serial,
         });
         app.update();
         let replies = peer.drain_responses();
@@ -3829,6 +3831,34 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_eq!(serde_json::from_str::<Value>(&replies[0].body).unwrap()["error_code"], "CONFIRM_NOT_SHOWN");
         assert!(!app.world().contains_resource::<CornerMenuRequest>(), "a refused step could still show");
+        // A newer request on the same corner replaces an older one before the
+        // host takes it: the host shows the newer step, so only the newer
+        // request reports applied and the older one is CONFIRM_NOT_SHOWN.
+        let mut older = local("shell.session.confirm");
+        older.body = json!({"action":"leave", "corner":"bottom-right"}).to_string();
+        peer.send(older);
+        app.update();
+        let first = app.world().resource::<CornerMenuRequest>().serial;
+        let mut newer = local("shell.session.confirm");
+        newer.body = json!({"action":"restart", "corner":"bottom-right"}).to_string();
+        peer.send(newer);
+        app.update();
+        let shown = app.world_mut().remove_resource::<CornerMenuRequest>().unwrap();
+        assert_ne!(shown.serial, first);
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: shown.output.clone(),
+            edge: Corner::BottomRight.summoned_edge(),
+            surface: "menu".into(),
+            serial: shown.serial,
+        });
+        app.update();
+        let mut replies = peer.drain_responses();
+        replies.sort_by_key(|reply| reply.rc);
+        assert_eq!(replies.len(), 2);
+        let applied: Value = serde_json::from_str(&replies[0].body).unwrap();
+        assert_eq!((replies[0].rc, applied["action"].clone(), applied["applied"].clone()), (0, json!("restart"), json!(true)));
+        assert_eq!(replies[1].rc, 10);
+        assert_eq!(serde_json::from_str::<Value>(&replies[1].body).unwrap()["error_code"], "CONFIRM_NOT_SHOWN");
         // Refusals: {error_code, message}, and no step opens.
         for args in [json!({}), json!({"action":"reboot"}), json!({"action":"leave", "corner":"middle"})] {
             app.world_mut().remove_resource::<CornerMenuRequest>();

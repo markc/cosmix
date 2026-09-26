@@ -38,6 +38,8 @@ $TERM = $cfg.term_service
 -- The term process keys may go to (--resume-fresh), or nil (--resume-only,
 -- where the user is at the keyboard and chose the terminal).
 $EXPECTED_PID = nil
+-- The state file in use, for recovery hints from helpers.
+$STATEFILE = ""
 
 fn fail($msg)
   print("session-resume: " .. $msg)
@@ -53,9 +55,11 @@ fn done_ids($statefile)
   return lines(trim(read_file($statefile .. ".done")))
 end
 
--- The pid of the term process answering on the Bus, from its term.panes
--- lines (term-core >= 0.8.1; they carry no free text, so no program running
--- in a pane can forge it), or nil.
+-- The pid the term answering on the Bus reports in its term.panes lines
+-- (term-core >= 0.8.1), or nil. Self-reported: a program in a pane cannot
+-- change it (pane lines carry no free text), but a process registering the
+-- name `term` itself could claim any pid; a broker-attested owner pid is
+-- future noded work.
 fn term_pid()
   $r = send $TERM "term.panes" body="{}" timeout=3
   if $rc != 0 then return nil end
@@ -93,6 +97,16 @@ fn pane_target($tab, $pane)
     if ($pane == nil and re_match($line, "(?:^| )active=true( |$)")) or ($pane != nil and $id == $pane) then
       $target = {pane: $id}
       $instance = $session.reply_int($line, "instance")
+      if $EXPECTED_PID != nil then
+        -- Bind the process and its instance in ONE reply: this line's pid
+        -- must be the expected one, and the instance sent with the keys is
+        -- this same line's, so term.type's own instance check refuses them
+        -- in any other process.
+        $pid = $session.reply_int($line, "pid")
+        if $pid != $EXPECTED_PID or $instance == nil then
+          fail("term.panes named pid " .. to_string($pid) .. " instance " .. to_string($instance) .. " for the pane, not the new boot term (pid " .. to_string($EXPECTED_PID) .. "); NOT typing. Recover with: " .. recovery($STATEFILE))
+        end
+      end
       if $instance != nil then $target.instance = $instance end
       return $target
     end
@@ -188,6 +202,8 @@ fn unit_prop($unit, $prop)
 end
 
 $a = args()
+-- Set here, at top level: a fn cannot assign a global.
+if len($a) >= 2 then $STATEFILE = $a[1] end
 if len($a) == 2 and $a[0] == "--resume-only" then
   $n = resume_sessions($a[1], false)
   print("resume done: " .. to_string($n) .. " session(s)")

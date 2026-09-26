@@ -118,6 +118,17 @@ pub struct CornerMenuRequest {
     pub output: OutputKey,
     pub corner: Corner,
     pub items: Vec<MenuItem>,
+    /// Which request this is ([`next_menu_serial`]): the layer host echoes it
+    /// in the popup it opens, so the asker can tell its own step was shown
+    /// and not a newer one on the same corner.
+    pub serial: u64,
+}
+
+/// A fresh [`CornerMenuRequest::serial`], unique in this process.
+pub fn next_menu_serial() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// App-owned Bus dispatch, called for a user-selected item that is not a mode
@@ -134,7 +145,10 @@ pub const QUESTION_LINE_CHARS: usize = 24;
 pub const QUESTION_MAX_LINES: usize = 3;
 /// The longest confirm question: config refuses longer ones, so a question
 /// always fits the rows reserved for it.
-pub const QUESTION_MAX_CHARS: usize = QUESTION_LINE_CHARS * QUESTION_MAX_LINES;
+pub const QUESTION_MAX_CHARS: usize = QUESTION_LINE_CHARS * QUESTION_MAX_LINES - LABEL_INDENT;
+
+/// Characters of indent before every row label (the checkmark column).
+const LABEL_INDENT: usize = 4;
 
 /// A confirm step's question: a disabled [`MenuAction::Inert`] row.
 fn is_question(item: &MenuItem) -> bool {
@@ -147,10 +161,8 @@ pub fn row_height(item: &MenuItem) -> f32 {
     if !is_question(item) {
         return ROW_HEIGHT;
     }
-    let lines = item
-        .label
-        .chars()
-        .count()
+    // The label renders after a four-space indent (spawn_menu).
+    let lines = (item.label.chars().count() + LABEL_INDENT)
         .div_ceil(QUESTION_LINE_CHARS)
         .clamp(1, QUESTION_MAX_LINES);
     ROW_HEIGHT * lines as f32
@@ -444,6 +456,7 @@ mod tests {
             output: OutputKey::new("test-output").unwrap(),
             corner: Corner::TopLeft,
             items,
+            serial: 0,
         };
         let rows = spawn_menu(&mut world, mount, &request, Vec2::new(1000.0, 800.0));
         assert!(world.get::<bevy::ui::InteractionDisabled>(rows[0]).is_some());
@@ -480,6 +493,7 @@ mod tests {
             output: OutputKey::new("test-output").unwrap(),
             corner: Corner::BottomLeft,
             items,
+            serial: 0,
         };
         let rows = spawn_menu(&mut world, mount, &request, size);
         assert_eq!(world.get::<Node>(rows[0]).unwrap().height, px(tall));
@@ -532,6 +546,7 @@ mod tests {
             output: OutputKey::new("test-output").unwrap(),
             corner: Corner::BottomRight,
             items: menu_items(PanelMode::Hidden, &[]),
+            serial: 0,
         };
         let rows = spawn_menu(&mut world, mount, &request, Vec2::new(1000.0, 800.0));
         for mode in [PanelMode::Hidden, PanelMode::Pinned, PanelMode::Docked] {

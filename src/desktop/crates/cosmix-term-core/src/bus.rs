@@ -738,10 +738,12 @@ fn handle(
                     id,
                     tabs.revision,
                     instance(),
-                    // This term PROCESS: a caller binding keys to one process
-                    // (the session-control resume worker) checks it against
-                    // the unit's MainPID. Pane lines carry no free text, so
-                    // nothing a program sets can forge it.
+                    // This term PROCESS, self-reported: a caller binding keys
+                    // to one process (the session-control resume worker)
+                    // checks it against the unit's MainPID. Pane lines carry
+                    // no free text, so a program in a pane cannot change it;
+                    // a process registering `term` itself could claim any pid
+                    // (a broker-attested owner pid is future noded work).
                     std::process::id()
                 )
             })

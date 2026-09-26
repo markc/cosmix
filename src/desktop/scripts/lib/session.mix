@@ -165,7 +165,8 @@ fn prepare_state_dir($dir, $owner)
   return unsafe_dir($dir, $owner)
 end
 
--- Write the state file (readable by the desktop user) and an empty .done
+-- Write the state file (mode 0640, group the desktop user's, since session
+-- ids and directories are private) and an empty .done
 -- beside it that the user owns, so the user-side resume can append to it;
 -- the directory stays root's, so the user can plant nothing in it. Refuses
 -- a name that already exists (a link included). nil on success, else the
@@ -177,8 +178,9 @@ fn write_state($state_dir, $state_file, $sessions, $ids, $owner)
     if exists($p, {follow_symlinks: false}) then return "already exists: " .. $p end
   end
   try
-    write_atomic($state_file, json_encode($sessions, true), {mode: 0o644})
-    write_atomic($state_file .. ".done", "", {mode: 0o644})
+    write_atomic($state_file, json_encode($sessions, true), {mode: 0o640})
+    chown($state_file, $owner, $ids.gid)
+    write_atomic($state_file .. ".done", "", {mode: 0o640})
     chown($state_file .. ".done", $ids.uid, $ids.gid)
   catch $e
     remove_state($state_file)
@@ -200,10 +202,11 @@ fn remove_state($state_file)
   end
 end
 
--- Remove state files (and their .done) older than $max_age seconds.
+-- Remove state files (and their .done) older than $max_age seconds, and the
+-- hidden temps an interrupted write_atomic can leave.
 fn prune_state($state_dir, $now, $max_age)
   $n = 0
-  for each $p in glob($state_dir .. "/sessions-*.json*")
+  for each $p in concat(glob($state_dir .. "/sessions-*.json*"), glob($state_dir .. "/.sessions-*.mixtmp-*"))
     $st = stat($p, {follow_symlinks: false})
     if $st.is_file and $now - $st.mtime > $max_age then
       try

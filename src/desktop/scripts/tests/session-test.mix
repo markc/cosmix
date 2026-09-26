@@ -123,14 +123,16 @@ try
   check($s.unsafe_dir($tmp .. "/state/open", $me) != nil, "a world-writable state dir was accepted")
   -- The normal write: state readable, .done present, both new files.
   check($s.write_state($safe, $safe .. "/sessions-3.json", [{id: "a"}], {uid: $me, gid: $me}, $me) == nil, "a safe state write failed")
-  check(band(stat($safe .. "/sessions-3.json").perm, 0o777) == 0o644 and exists($safe .. "/sessions-3.json.done"), "state file mode or .done wrong")
+  check(band(stat($safe .. "/sessions-3.json").perm, 0o777) == 0o640 and exists($safe .. "/sessions-3.json.done"), "state file mode or .done wrong")
   -- An aborted restart's leftovers go; old state is pruned, new state kept.
   $s.remove_state($safe .. "/sessions-3.json")
   check(not exists($safe .. "/sessions-3.json") and not exists($safe .. "/sessions-3.json.done"), "remove_state left files")
   write_file($safe .. "/sessions-old.json", "[]")
   $_touch = run_argv_must(["touch", "-d", "10 days ago", $safe .. "/sessions-old.json"])
   write_file($safe .. "/sessions-new.json", "[]")
-  check($s.prune_state($safe, time(), 7 * 86400) == 1 and exists($safe .. "/sessions-new.json") and not exists($safe .. "/sessions-old.json"), "prune wrong")
+  write_file($safe .. "/.sessions-9.json.mixtmp-x", "")
+  $_touch2 = run_argv_must(["touch", "-d", "10 days ago", $safe .. "/.sessions-9.json.mixtmp-x"])
+  check($s.prune_state($safe, time(), 7 * 86400) == 2 and not exists($safe .. "/.sessions-9.json.mixtmp-x") and exists($safe .. "/sessions-new.json") and not exists($safe .. "/sessions-old.json"), "prune wrong")
 
   -- ── worker unit name: a .service suffix is normalised away ──
   export COSMIX_SESSION_WORKER_UNIT = "cosmix-session-restart.service"

@@ -63,8 +63,8 @@ came from. So nothing that the desktop owns can carry the restart out.
    root-owned directory outside the user's home, checked level by level
    (no symlinks, root-owned, not writable by others) before anything is
    written, so no path the user controls can steer what root writes. The
-   state file is readable by the user, who owns only its empty `.done`
-   beside it. State older than 7 days is pruned on each restart. It then
+   state file is mode 0640, root and the user's group (session ids and
+   directories are private); the user owns only its empty `.done` beside it. State older than 7 days is pruned on each restart. It then
    starts the worker with `systemd-run --unit=cosmix-session-restart
    --collect` and replies. That unit name is the single name every restart
    uses, so a second restart while one runs is refused.
@@ -78,11 +78,18 @@ came from. So nothing that the desktop owns can carry the restart out.
    - runs `--resume-fresh STATE PID` as the desktop user, PID being the new
      boot term's MainPID.
 3. **`--resume-fresh`** waits for the terminal on the Bus and types only into
-   the term PROCESS whose pid is PID: it reads the pid from `term.panes`
-   (term-core 0.8.1 adds `pid=` to each pane line; pane lines carry no text a
-   program could set) before every keystroke batch. Any other process holding
-   the Bus name `term`, such as a terminal that outlived the restart, gets
-   nothing: the worker fails closed with the recovery command. For each session it
+   the term PROCESS whose pid is PID. Before every keystroke batch it reads
+   `term.panes` (term-core 0.8.1 adds `pid=` to each pane line), and the pane
+   it types into must come from a line naming PID; the `instance` sent with the
+   keys is that same line's, so `term.type`'s own instance check refuses the
+   keys in any other term process. A genuine term that outlived the restart
+   reports its own pid and gets nothing: the worker fails closed with the
+   recovery command.
+   The pid is SELF-REPORTED by whatever holds the Bus name `term`. A program
+   running in a pane cannot set it (pane lines carry no free text), but a
+   process that registers `term` itself could claim any pid. The real fix is
+   a broker-attested owner pid (noded recording the registering connection's
+   `SO_PEERCRED`), filed as a noded TODO. For each session it
    opens a pane: the boot tab's for the first session, a new tab for each
    later one. It then sends a `term.type` with `{pane, instance, text,
    request_id}` of
