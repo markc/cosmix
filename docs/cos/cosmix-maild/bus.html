@@ -526,7 +526,7 @@ queue update failure reuses the committed hold and finishes the queue update.</p
 and <code>failed</code> counts. Pass <code>next</code> as <code>cursor</code>, retaining the same account filter
 and apply mode. <code>done</code> means enumeration finished, not that every row passed.
 Rerun from cursor 0 after repairing failures. Up to 20 bounded diagnostics are
-returned. All successful rows return rc 0; any failed row returns rc 10 with
+returned. All successful rows return rc 0; any failed row returns rc 5 with
 <code>migration:</code> and the page report intact. Validation errors use
 <code>invalid_arguments:</code>. Row diagnostics distinguish <code>missing:</code>, <code>corrupt:</code>,
 <code>conflicting:</code> and <code>unreadable:</code>; other storage errors count as <code>failed</code>.</p>
@@ -535,6 +535,7 @@ MDS instance is opened and no blobd service or shared root is involved.</p>
 <p>The complete successful page shape is:</p>
 <pre><code class="language-json">{
   "apply": false,
+  "failed": false,
   "done": false,
   "next": 742,
   "accounts": {
@@ -567,7 +568,8 @@ by positive integer <code>account_id</code>. <code>limit</code> is an integer in
 otherwise it is null. Failed rows also advance the cursor. Use the returned
 cursor unchanged and keep the same filter and mode; begin apply at cursor 0
 after finishing dry-run, and restart at 0 to retry repaired failures.</p>
-<p>A page with failed rows retains all these fields, returns rc 10 and adds
+<p>A page with failed rows retains all these fields, returns warning rc 5
+(so Bus clients preserve the page value), sets <code>"failed": true</code> and adds
 <code>"error":"migration: some rows failed; legacy data retained"</code>.
 <code>errors</code> contains up to 20 objects of the form
 <code>{"cursor":742,"account_id":42,"error":"missing: legacy file"}</code>;

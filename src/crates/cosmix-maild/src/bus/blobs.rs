@@ -164,12 +164,12 @@ fn page(
     let failed = accounts
         .values()
         .any(|c| c.missing + c.corrupt + c.conflicting + c.failed > 0);
-    let mut reply = json!({"apply": request.apply, "done": done,
+    let mut reply = json!({"apply": request.apply, "done": done, "failed": failed,
         "next": if done { None } else { Some(cursor) }, "accounts": accounts, "errors": failures});
     if failed {
         reply["error"] = json!("migration: some rows failed; legacy data retained");
     }
-    Ok((if failed { 10 } else { 0 }, reply.to_string()))
+    Ok((if failed { 5 } else { 0 }, reply.to_string()))
 }
 
 fn verify(mut file: File, expected: &BlobHash, size: u64) -> anyhow::Result<()> {

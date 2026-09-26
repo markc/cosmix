@@ -104,7 +104,7 @@ Replies contain `done`, `next` (a numeric rowid cursor or null), and per-account
 and `failed` counts. Pass `next` as `cursor`, retaining the same account filter
 and apply mode. `done` means enumeration finished, not that every row passed.
 Rerun from cursor 0 after repairing failures. Up to 20 bounded diagnostics are
-returned. All successful rows return rc 0; any failed row returns rc 10 with
+returned. All successful rows return rc 0; any failed row returns rc 5 with
 `migration:` and the page report intact. Validation errors use
 `invalid_arguments:`. Row diagnostics distinguish `missing:`, `corrupt:`,
 `conflicting:` and `unreadable:`; other storage errors count as `failed`.
@@ -117,6 +117,7 @@ The complete successful page shape is:
 ```json
 {
   "apply": false,
+  "failed": false,
   "done": false,
   "next": 742,
   "accounts": {
@@ -152,7 +153,8 @@ otherwise it is null. Failed rows also advance the cursor. Use the returned
 cursor unchanged and keep the same filter and mode; begin apply at cursor 0
 after finishing dry-run, and restart at 0 to retry repaired failures.
 
-A page with failed rows retains all these fields, returns rc 10 and adds
+A page with failed rows retains all these fields, returns warning rc 5
+(so Bus clients preserve the page value), sets `"failed": true` and adds
 `"error":"migration: some rows failed; legacy data retained"`.
 `errors` contains up to 20 objects of the form
 `{"cursor":742,"account_id":42,"error":"missing: legacy file"}`;

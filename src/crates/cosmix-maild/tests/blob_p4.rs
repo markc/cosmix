@@ -23,6 +23,59 @@ struct Fixture {
 }
 
 struct LocalLane(Option<String>);
+// Exercise the actual typed Bus decoder, including warning-band preservation.
+async fn migrate_over_port(f: &Fixture, args: Value) -> (u8, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("port.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let state = f.state();
+    let db = state.db.clone();
+    let ms = state.mailstore.clone();
+    let worker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        socket.read_to_end(&mut bytes).await.unwrap();
+        let request = cosmix_bus::bus::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        let (rc, body) = cosmix_maild::bus::blobs::migrate(&db, &ms,
+            serde_json::from_str(&request.body).unwrap()).await;
+        let mut reply = cosmix_bus::bus::BusMessage::new();
+        reply.set("rc", &rc.to_string());
+        reply.body = body;
+        socket.write_all(&reply.to_bytes()).await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    let reply = cosmix_bus::call_port_typed(path.to_str().unwrap(), "maild.blob.migrate", args).await.unwrap();
+    worker.await.unwrap();
+    match reply {
+        cosmix_bus::PortReply::Ok { rc, value } => (rc, value),
+        other => panic!("page lost through typed Bus: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn failed_migration_page_keeps_cursor_and_counts_through_bus() {
+    let f = Fixture::new().await;
+    let state = f.state();
+    for bytes in [b"missing".as_slice(), b"good"] {
+        db::blob::store(&state.db.conn, &state.db.blob_dir, 1, bytes).await.unwrap();
+    }
+    std::fs::remove_file(cosmix_mds::blob::blob_path(&state.db.blob_dir,
+        &cosmix_mds::blob::hash_bytes(b"missing"))).unwrap();
+    let (rc, page) = migrate_over_port(&f, json!({"apply": true, "limit": 1})).await;
+    assert_eq!(rc, 5);
+    assert_eq!(page["failed"], true);
+    assert_eq!(page["done"], false);
+    assert_eq!(page["accounts"]["1"]["missing"], 1);
+    assert_eq!(page["errors"][0]["cursor"], page["next"]);
+    let (rc, last) = migrate_over_port(&f,
+        json!({"apply": true, "limit": 1, "cursor": page["next"]})).await;
+    assert_eq!(rc, 0);
+    assert_eq!(last["done"], true);
+    assert_eq!(last["failed"], false);
+    assert_eq!(last["accounts"]["1"]["migrated"], 1);
+}
+
 #[tokio::test]
 async fn broken_sibling_preserves_body_and_projects_undecodable_attachment() {
     let f = Fixture::new().await;
@@ -606,7 +659,7 @@ async fn migration_pages_and_refusals_keep_bad_rows_untouched() {
     let three = cosmix_mds::blob::hash_bytes(b"three");
     std::fs::remove_file(cosmix_mds::blob::blob_path(&state.db.blob_dir, &three)).unwrap();
     let (rc, failed) = migrate(&f, json!({"apply": true})).await;
-    assert_eq!(rc, 10);
+    assert_eq!(rc, 5);
     assert_eq!(failed["accounts"]["1"]["migrated"], 1);
     assert_eq!(failed["accounts"]["1"]["corrupt"], 1);
     assert_eq!(failed["accounts"]["1"]["missing"], 1);
@@ -651,7 +704,7 @@ async fn migration_retries_after_queue_failure_without_an_extra_hold() {
         )
         .unwrap();
     }
-    assert_eq!(migrate(&f, json!({"apply": true})).await.0, 10);
+    assert_eq!(migrate(&f, json!({"apply": true})).await.0, 5);
     assert_eq!(item_count(&f), 1);
     state
         .db
@@ -696,7 +749,7 @@ async fn migration_refuses_conflicting_uuid_alias_before_copy() {
         })
         .unwrap();
     let (rc, result) = migrate(&f, json!({"apply": true})).await;
-    assert_eq!(rc, 10);
+    assert_eq!(rc, 5);
     assert_eq!(result["accounts"]["1"]["conflicting"], 1);
     assert_eq!(item_count(&f), 0);
     assert!(
