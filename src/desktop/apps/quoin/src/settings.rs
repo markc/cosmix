@@ -734,6 +734,9 @@ fn plan_verb(
             let target = (panel.settled_thickness_px + delta)
                 .clamp(*range.start(), *range.end())
                 .min(panel.max_thickness_px);
+            // While the shown page declares an extent the model saves no less
+            // than it (what is shown is what is saved); report that size.
+            let target = panel.resize_floor_px.map_or(target, |floor| target.max(floor));
             if (target - panel.settled_thickness_px).abs() < f32::EPSILON {
                 return (
                     0,
@@ -1178,6 +1181,40 @@ mod tests {
                 thickness_px: 120.0
             }
         );
+    }
+
+    /// Review m1: a step below the shown page's authored extent would be
+    /// invisible yet saved. The stepper commits (and reports) the extent the
+    /// model will actually save instead.
+    #[test]
+    fn a_step_below_the_page_extent_saves_the_extent() {
+        let mut frame = frame_for("DP-1");
+        let left = &mut frame.panels[Edge::Left.index()];
+        left.settled_thickness_px = 422.0;
+        left.thickness_px = 440.0;
+        left.resize_floor_px = Some(440.0);
+        let (rc, body, command, _) = plan_verb(
+            &event_request("shell.settings.size", "size_left_minus"),
+            &frame,
+            Duration::ZERO,
+        );
+        assert_eq!(rc, 0, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["thickness_px"].as_f64(), Some(440.0), "{body}");
+        assert_eq!(
+            command.unwrap().kind,
+            ShellCommandKind::ResizeCommit { edge: Edge::Left, thickness_px: 440.0 }
+        );
+        // Already saved at the extent: a minus step is an honest no-op.
+        frame.panels[Edge::Left.index()].settled_thickness_px = 440.0;
+        let (rc, body, command, _) = plan_verb(
+            &event_request("shell.settings.size", "size_left_minus"),
+            &frame,
+            Duration::ZERO,
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert!(command.is_none(), "{body}");
+        assert!(body.contains("\"unchanged\":true"), "{body}");
     }
 
     #[test]

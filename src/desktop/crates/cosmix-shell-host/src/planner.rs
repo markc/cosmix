@@ -333,6 +333,7 @@ mod tests {
             thickness_px: 101.0,
             resize_active: false,
             settled_thickness_px: 101.0,
+            resize_floor_px: None,
             exclusive_zone_px: if mode == PanelMode::Docked {
                 101.0
             } else {

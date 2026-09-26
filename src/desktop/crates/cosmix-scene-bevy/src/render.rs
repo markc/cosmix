@@ -2006,6 +2006,39 @@ mod tests {
         remove_unseated_scenes(world);
     }
 
+    /// Review N3 (Opus vs GLM): registry removal lands the carousel through
+    /// `SubPanelRegistry::remove` (a direct carousel remove, not
+    /// `remove_shell_page`) and tears down content via
+    /// `remove_unseated_scenes` → `unmount_page_content`. That path must drop
+    /// the page's extent too, or a later page reusing the id inherits it.
+    #[test]
+    fn registry_removal_drops_the_page_extent() {
+        use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState, set_shell_pages};
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        let output = world.resource::<ShellFrameState>().0.geometry.output.clone();
+        let default = world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px;
+        load_mount_test_scene(world, "extent", Edge::Left, 300);
+        reconcile(world);
+        assert_eq!(world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px, 300.0);
+        world.write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::SubPanelRemove {
+                edge: Edge::Left,
+                name: "scene-extent".into(),
+                owner: "test".into(),
+                accepted_at: 1,
+            },
+        });
+        app.update();
+        let world = app.world_mut();
+        assert!(!world.resource::<SceneStore>().scenes.contains_key("extent"));
+        // A verb-only page reusing the id carries no extent.
+        set_shell_pages(world, Edge::Left, vec!["scene-extent".into()], Some("scene-extent"));
+        assert_eq!(world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px, default);
+    }
+
     #[test]
     fn sub_remove_scene_backed_unloads_content_once() {
         use cosmix_shell::runtime::{

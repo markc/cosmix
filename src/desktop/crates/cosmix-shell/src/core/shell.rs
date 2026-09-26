@@ -153,6 +153,16 @@ impl ShellModel {
         panel
     }
 
+    /// The smallest size a resize of `edge` may leave while its active page
+    /// declares an authored extent: that extent within the resize range and
+    /// the output budget. [`Self::resize_thickness`] raises any smaller input
+    /// to it; steppers read it to report the size they will actually save.
+    pub fn resize_floor(&self, edge: Edge) -> Option<f32> {
+        let range = super::resize_thickness_range(edge);
+        let minimum = self.active_page_minimum(edge)?;
+        Some(minimum.clamp(*range.start(), *range.end()).min(self.max_thickness(edge)))
+    }
+
     /// The thickness `edge`'s active page asks for: its authored extent within
     /// the resize range, over the remembered thickness when one exists. `None`
     /// without an authored extent.
@@ -333,10 +343,8 @@ impl ShellModel {
         // Below the shown page's authored extent a resize would be invisible
         // and still saved: clamp it, so what is shown is what is saved.
         let range = super::resize_thickness_range(edge);
-        let thickness = match self.active_page_minimum(edge) {
-            Some(minimum) if thickness.is_finite() => {
-                thickness.max(minimum.clamp(*range.start(), *range.end()).min(max))
-            }
+        let thickness = match self.resize_floor(edge) {
+            Some(floor) if thickness.is_finite() => thickness.max(floor),
             _ => thickness,
         };
         if thickness > max {
