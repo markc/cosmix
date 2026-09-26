@@ -2552,7 +2552,7 @@ fn xwayland_tagged_client_sees_only_human_seat() {
     assert_eq!(object, 1, "bind rejection is a wl_display error: {message}");
     assert_eq!(
         code,
-        smithay::reexports::wayland_server::protocol::wl_display::Error::InvalidObject as u32,
+        ::wayland_client::protocol::wl_display::Error::InvalidObject as u32,
         "{message}"
     );
     assert!(h.server.state.agent.seat.client_seats(&xclient).is_empty());
