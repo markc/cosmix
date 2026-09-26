@@ -117,7 +117,10 @@ queue update failure reuses the committed hold and finishes the queue update.
 
 Replies contain `done`, `next` (a numeric rowid cursor or null), and per-account
 `planned`, `migrated`, `already_migrated`, `missing`, `corrupt`, `conflicting`
-and `failed` counts. Pass `next` as `cursor`, retaining the same account filter
+and `failed` counts, plus `orphan` for rows whose account no longer exists.
+Orphans are skipped without copying blobs or creating holding items; they
+advance the cursor normally and do not mark the page failed.
+Pass `next` as `cursor`, retaining the same account filter
 and apply mode. `done` means enumeration finished, not that every row passed.
 Rerun from cursor 0 after repairing failures. Up to 20 bounded diagnostics are
 returned. All successful rows return rc 0; any failed row returns rc 5 with
@@ -139,6 +142,7 @@ The complete successful page shape is:
   "accounts": {
     "42": {
       "planned": 500,
+      "orphan": 0,
       "migrated": 0,
       "already_migrated": 0,
       "missing": 0,

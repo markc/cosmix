@@ -24,6 +24,28 @@ struct Fixture {
 
 struct LocalLane(Option<String>);
 #[tokio::test]
+async fn orphan_legacy_rows_advance_without_provisioning_or_copy() {
+    let f = Fixture::new().await;
+    let state = f.state();
+    db::blob::store(&state.db.conn, &state.db.blob_dir, 1, b"orphan").await.unwrap();
+    {
+        let conn = state.db.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF; UPDATE blobs SET account_id=999; PRAGMA foreign_keys=ON;").unwrap();
+    }
+    let before = item_count(&f);
+    for apply in [false, true] {
+        let (rc, page) = migrate(&f, json!({"apply": apply})).await;
+        assert_eq!(rc, 0);
+        assert_eq!(page["accounts"]["999"]["orphan"], 1);
+        assert_eq!(page["accounts"]["999"]["migrated"], 0);
+        assert_eq!(page["done"], true);
+        assert_eq!(page["next"], Value::Null);
+        assert_eq!(item_count(&f), before);
+        assert!(!state.mailstore.mds().blob_exists(&cosmix_mds::blob::hash_bytes(b"orphan")).unwrap());
+    }
+}
+
+#[tokio::test]
 async fn migration_page_budget_checks_next_row_and_allows_one_oversized_row() {
     let f = Fixture::new().await;
     let state = f.state();

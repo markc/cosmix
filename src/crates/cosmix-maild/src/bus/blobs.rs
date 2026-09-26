@@ -29,6 +29,7 @@ struct Request {
 
 #[derive(Default, Serialize)]
 struct Counts {
+    orphan: usize,
     planned: usize,
     migrated: usize,
     already_migrated: usize,
@@ -39,6 +40,7 @@ struct Counts {
 }
 
 struct Row {
+    account_exists: bool,
     cursor: i64,
     id: String,
     account: i32,
@@ -117,7 +119,8 @@ fn page(
             anyhow::ensure!(exists, "account not found");
         }
         let mut query = conn.prepare(
-            "SELECT rowid, id, account_id, hash, size FROM blobs \
+            "SELECT rowid, id, account_id, hash, size, \
+             EXISTS(SELECT 1 FROM accounts WHERE accounts.id = blobs.account_id) FROM blobs \
              WHERE rowid > ?1 AND (?2 IS NULL OR account_id = ?2) ORDER BY rowid LIMIT ?3",
         )?;
         query
@@ -125,6 +128,7 @@ fn page(
                 params![request.cursor, request.account_id, (limit + 1) as i64],
                 |r| {
                     Ok(Row {
+                        account_exists: r.get(5)?,
                         cursor: r.get(0)?,
                         id: r.get(1)?,
                         account: r.get(2)?,
@@ -145,7 +149,9 @@ fn page(
             break;
         }
         let counts = accounts.entry(row.account).or_default();
-        match migrate_row(db, ms, row, request.apply) {
+        if !row.account_exists {
+            counts.orphan += 1;
+        } else { match migrate_row(db, ms, row, request.apply) {
             Ok(true) => counts.already_migrated += 1,
             Ok(false) if request.apply => counts.migrated += 1,
             Ok(false) => counts.planned += 1,
@@ -166,6 +172,7 @@ fn page(
                         "error": message.chars().take(256).collect::<String>()}));
                 }
             }
+        }
         }
         bytes = bytes.saturating_add(row.size.max(0) as u64);
         consumed = index + 1;
