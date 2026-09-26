@@ -584,6 +584,16 @@ NAMESPACE CHILDREN SPECIAL-USE UNSELECT LITERAL+ UIDPLUS MOVE IDLE
 </tbody></table>
 <p>The retention defaults delete nothing: both age windows are zero, <code>dry_run</code> is true, and no accounts are armed.</p>
 <h2 id="storage-and-background-work">Storage and background work</h2>
+<p>JMAP uploads write only the MDS CAS and an account-scoped, expiring upload
+alias. Hash downloads require live mail ownership or a valid alias in the
+authenticated account; old uploads retain an account-scoped legacy fallback.
+Global CAS presence never grants download access. Legacy UUID downloads and
+imports remain supported, and legacy files and database rows are retained.</p>
+<p><code>maild.blob.migrate</code> performs bounded, resumable legacy migration inside the
+running daemon (dry-run by default). It preserves old upload UUIDs with durable
+holding items and backfills old outbound queue entries. Drive it over Bus after
+restart; there is no local migration CLI or second writer. See <a href="/cos/cosmix-maild/bus">bus.md</a>
+for cursors, per-account counts, refusal tokens and the retained-data contract.</p>
 <p>Mail metadata and operational state use SQLite. Mailbox content uses <code>cosmix-mds</code> through <code>SqliteMailStore</code>. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.</p>
 <p>Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.</p></div></div>
     </div>

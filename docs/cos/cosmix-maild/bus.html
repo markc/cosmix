@@ -464,6 +464,33 @@
 <tr><td><code>maild.accounts.unlock</code></td><td>Required <code>email</code></td><td>Restore the preserved password hash</td></tr>
 </tbody></table>
 <p>An unknown account and a wrong password both produce <code>valid: false</code> from <code>verify</code>. Lock and unlock are idempotent.</p>
+<h2 id="legacy-blob-migration">Legacy blob migration</h2>
+<p><code>maild.blob.migrate {apply?: false, account_id?, cursor?: 0, limit?: 500}</code>
+runs on the daemon's own store handle. It accepts at most 500 rows per call;
+pages also end after 64 MiB of declared source data (one large row can exceed
+that budget). Copy and verification stream through a fixed-size buffer.</p>
+<p>The default is read-only inspection: no set provisioning, CAS writes, aliases
+or queue changes. <code>apply: true</code> verifies each legacy file's hash and size,
+copies it into MDS, preserves its UUID alias and adds a non-expiring holding
+item in <code>__upload_staging__</code>. The membership's sole tag is
+<code>maild:legacy-blob:&lt;UUID&gt;</code>; alias expiry and temp-item fields are NULL. This
+marker and alias commit together. Repeating a page creates no extra holds.
+The holds intentionally survive upload expiry and mail retention until a
+later explicit legacy retirement; this verb deletes no legacy rows or files.</p>
+<p>Verified rows backfill <code>smtp_queue.blob_hash</code>; the old UUID is retained.
+Existing conflicting aliases or queue hashes are refused. A retry after a
+queue update failure reuses the committed hold and finishes the queue update.</p>
+<p>Replies contain <code>done</code>, <code>next</code> (a numeric rowid cursor or null), and per-account
+<code>planned</code>, <code>migrated</code>, <code>already_migrated</code>, <code>missing</code>, <code>corrupt</code>, <code>conflicting</code>
+and <code>failed</code> counts. Pass <code>next</code> as <code>cursor</code>, retaining the same account filter
+and apply mode. <code>done</code> means enumeration finished, not that every row passed.
+Rerun from cursor 0 after repairing failures. Up to 20 bounded diagnostics are
+returned. All successful rows return rc 0; any failed row returns rc 10 with
+<code>migration:</code> and the page report intact. Validation errors use
+<code>invalid_arguments:</code>. Row diagnostics distinguish <code>missing:</code>, <code>corrupt:</code>,
+<code>conflicting:</code> and <code>unreadable:</code>; other storage errors count as <code>failed</code>.</p>
+<p>This is a Bus maintenance operation, not a local CLI subcommand. No second
+MDS instance is opened and no blobd service or shared root is involved.</p>
 <h2 id="rules-and-bayesian-verbs">Rules and Bayesian verbs</h2>
 <table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
 <tr><td><code>maild.rules.reload</code></td><td>None</td><td>Reload the configured pack and return load metadata</td></tr>

@@ -197,6 +197,12 @@ authenticated account; old uploads retain an account-scoped legacy fallback.
 Global CAS presence never grants download access. Legacy UUID downloads and
 imports remain supported, and legacy files and database rows are retained.
 
+`maild.blob.migrate` performs bounded, resumable legacy migration inside the
+running daemon (dry-run by default). It preserves old upload UUIDs with durable
+holding items and backfills old outbound queue entries. Drive it over Bus after
+restart; there is no local migration CLI or second writer. See [bus.md](bus.md)
+for cursors, per-account counts, refusal tokens and the retained-data contract.
+
 Mail metadata and operational state use SQLite. Mailbox content uses `cosmix-mds` through `SqliteMailStore`. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.
 
 Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.

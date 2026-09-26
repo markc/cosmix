@@ -31,6 +31,39 @@ Success uses `rc = 0`. Caller, validation, and engine failures use `rc = 10` wit
 
 An unknown account and a wrong password both produce `valid: false` from `verify`. Lock and unlock are idempotent.
 
+## Legacy blob migration
+
+`maild.blob.migrate {apply?: false, account_id?, cursor?: 0, limit?: 500}`
+runs on the daemon's own store handle. It accepts at most 500 rows per call;
+pages also end after 64 MiB of declared source data (one large row can exceed
+that budget). Copy and verification stream through a fixed-size buffer.
+
+The default is read-only inspection: no set provisioning, CAS writes, aliases
+or queue changes. `apply: true` verifies each legacy file's hash and size,
+copies it into MDS, preserves its UUID alias and adds a non-expiring holding
+item in `__upload_staging__`. The membership's sole tag is
+`maild:legacy-blob:<UUID>`; alias expiry and temp-item fields are NULL. This
+marker and alias commit together. Repeating a page creates no extra holds.
+The holds intentionally survive upload expiry and mail retention until a
+later explicit legacy retirement; this verb deletes no legacy rows or files.
+
+Verified rows backfill `smtp_queue.blob_hash`; the old UUID is retained.
+Existing conflicting aliases or queue hashes are refused. A retry after a
+queue update failure reuses the committed hold and finishes the queue update.
+
+Replies contain `done`, `next` (a numeric rowid cursor or null), and per-account
+`planned`, `migrated`, `already_migrated`, `missing`, `corrupt`, `conflicting`
+and `failed` counts. Pass `next` as `cursor`, retaining the same account filter
+and apply mode. `done` means enumeration finished, not that every row passed.
+Rerun from cursor 0 after repairing failures. Up to 20 bounded diagnostics are
+returned. All successful rows return rc 0; any failed row returns rc 10 with
+`migration:` and the page report intact. Validation errors use
+`invalid_arguments:`. Row diagnostics distinguish `missing:`, `corrupt:`,
+`conflicting:` and `unreadable:`; other storage errors count as `failed`.
+
+This is a Bus maintenance operation, not a local CLI subcommand. No second
+MDS instance is opened and no blobd service or shared root is involved.
+
 ## Rules and Bayesian verbs
 
 | Verb | Arguments | Result |
@@ -145,4 +178,3 @@ Property changes are published without broker retention. `maild.props.watch` obt
 ## Availability
 
 Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.
-

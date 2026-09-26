@@ -15,6 +15,7 @@
 
 pub mod accounts;
 pub mod bayesian;
+pub mod blobs;
 pub mod dkim;
 pub mod props_publisher;
 pub mod retention;
@@ -353,6 +354,12 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new("maild.rules.reload", &[], "Reload mail rules", false),
         VerbDescriptor::new(
+            "maild.blob.migrate",
+            &["apply", "account_id", "cursor", "limit"],
+            "Migrate a bounded page of legacy blobs (dry-run by default)",
+            false,
+        ),
+        VerbDescriptor::new(
             "maild.rules.stats",
             &["top_n"],
             "Read mail rule statistics",
@@ -603,7 +610,9 @@ async fn dispatch_loop(
     };
 
     while let Some(cmd) = rx.recv().await {
-        let (rc, body) = if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
+        let (rc, body) = if cmd.command == "maild.blob.migrate" {
+            blobs::dispatch(&cmd, &db, &mailstore).await
+        } else if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
             rules::dispatch(
                 action,
                 &cmd,
