@@ -2365,7 +2365,12 @@ impl KeybindingHarness {
     }
 }
 
-fn seat_discovery_traffic(h: &mut KeybindingHarness, reverse: bool) -> (RegistryGlobals, u32, Vec<(u32, u16, Vec<u8>)>) {
+type WireEvents = Vec<(u32, u16, Vec<u8>)>;
+
+fn seat_discovery_traffic(
+    h: &mut KeybindingHarness,
+    reverse: bool,
+) -> (RegistryGlobals, u32, WireEvents) {
     let registry = h.allocate_object_id();
     let callback = h.allocate_object_id();
     send_display_request(&mut h.client, 1, registry);
@@ -22712,7 +22717,7 @@ pub(crate) struct RealSsdSubsurfaceSceneClient {
     next_sync: u32,
 }
 
-fn connect_ssd_scene_client(socket_name: &str) -> UnixStream {
+fn connect_ssd_scene_client(socket_name: &str) -> (UnixStream, WireEvents) {
     let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
         .expect("XDG_RUNTIME_DIR is required for the SSD scene oracle");
     let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(socket_name))
@@ -22731,14 +22736,14 @@ fn connect_ssd_scene_client(socket_name: &str) -> UnixStream {
         bind_global(&mut client, global, interface, version.min(maximum), id);
     }
     let pending = bind_named_seat(&mut client, &globals, "cosmix", 7, 9, 3, || {});
-    assert!(pending.iter().all(|(object, opcode, _)| *object == 1 && *opcode == 1),
-        "seat discovery before creating surfaces only receives delete_id: {pending:?}");
-    client
+    // The probe also drains earlier global-bind traffic, including wl_shm
+    // format events. Preserve it for the caller's setup/error checks.
+    (client, pending)
 }
 
 impl PendingSsdSubsurfaceSceneClient {
     pub(crate) fn connect(socket_name: &str) -> Self {
-        let mut client = connect_ssd_scene_client(socket_name);
+        let (mut client, mut ready) = connect_ssd_scene_client(socket_name);
         send_request(&mut client, 4, 0, &words(&[SSD_SCENE_PARENT_SURFACE]));
         send_request(&mut client, 4, 0, &words(&[SSD_SCENE_CHILD_SURFACE]));
         send_request(
@@ -22752,7 +22757,7 @@ impl PendingSsdSubsurfaceSceneClient {
             ]),
         );
         send_display_request(&mut client, 0, 13);
-        let ready = events_until_callback(&mut client, 13);
+        ready.extend(events_until_callback(&mut client, 13));
         assert!(
             ready
                 .iter()
@@ -41678,10 +41683,9 @@ impl ScreencopyWireHarness {
 
     fn new_first_light() -> (Self, crate::backend::render::tests::FirstLightCaptureDriver) {
         let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
-        assert!(
-            harness.registry_globals.all("wl_output").is_empty(),
-            "first-light KMS starts without an advertised output"
-        );
+        // KeybindingHarness constructs Winit first, then swaps backend data:
+        // its nested output global remains advertised outside the KMS registry.
+        let initial_outputs = harness.registry_globals.all("wl_output").to_vec();
         let key = kms_security_test_key(226, "Blocked-1");
         submit_kms_security_lifecycle(
             &mut harness,
@@ -41704,9 +41708,10 @@ impl ScreencopyWireHarness {
             state.backend.kms_output_is_ready(1, &key)
         });
         let announced = harness.sync();
-        // Retain every late announcement, just like the initial registry read.
-        // This fixture admits exactly one output; never replace an earlier one
-        // or hide a second announcement behind a first/last-wins lookup.
+        // Keep the nested output and every late announcement in the registry.
+        // Select the newly admitted first-light output explicitly, not whichever
+        // output a singleton or last-wins lookup happens to return.
+        let mut late_outputs = Vec::new();
         for event in &announced {
             if let Some(global) =
                 registry_global_from_events(std::slice::from_ref(event), 2, "wl_output")
@@ -41714,18 +41719,29 @@ impl ScreencopyWireHarness {
                 harness
                     .registry_globals
                     .record_announcement("wl_output".into(), global);
+                late_outputs.push(global);
             }
         }
         assert_eq!(
-            harness.registry_globals.all("wl_output").len(),
+            late_outputs.len(),
             1,
             "first-light KMS announces exactly one output"
         );
+        let (output_global, output_version) = late_outputs[0];
+        assert!(initial_outputs.iter().all(|(name, _)| *name != output_global));
 
         let feed = harness.take_renderer_feed();
         let driver = crate::backend::render::tests::first_light_capture_driver(feed);
         let manager = harness.bind_test_global("zwlr_screencopy_manager_v1", 3);
-        let output = harness.bind_test_global("wl_output", 4);
+        let output = harness.allocate_object_id();
+        bind_global(
+            &mut harness.client,
+            output_global,
+            "wl_output",
+            output_version.min(4),
+            output,
+        );
+        harness.dispatch_client();
         let shm = harness.bind_test_global("wl_shm", 1);
         let _ = harness.sync();
         (
