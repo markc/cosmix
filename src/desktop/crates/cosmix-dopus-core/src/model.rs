@@ -1697,12 +1697,14 @@ mod tests {
         pane.sort = SortColumn::Size;
         pane.root = vec![
             {
-                let mut entry = entry("/fixture/growing", true);
+                let mut entry = entry("growing", true);
+                entry.path = PathBuf::from("/fixture/growing");
                 entry.child_count = Some(2);
                 entry
             },
             {
-                let mut entry = entry("/fixture/steady", true);
+                let mut entry = entry("steady", true);
+                entry.path = PathBuf::from("/fixture/steady");
                 entry.child_count = Some(10);
                 entry
             },
@@ -1980,6 +1982,9 @@ mod tests {
         core.navigate(PaneId::Left, folder.clone());
         let new_generation = core.pane(PaneId::Left).generation;
         assert_ne!(child_generation, new_generation);
+        // Flush the navigate-emitted events so the assertions below see only
+        // what the late reply itself derives.
+        let _ = core.tick(now_instant());
 
         // The late children reply, addressed to the superseded generation,
         // must be rejected: not merged, not even touched.
@@ -2013,6 +2018,17 @@ mod tests {
     fn navigation_start_clears_selection_and_disables_actions() {
         let (_dir, mut core, _rx) = core_fixture();
         core.tick(now_instant());
+        // Land the startup listing so the pane is no longer `listing` —
+        // `has_selection` is gated on it (`action_selection_available`,
+        // browser.rs:236-240), and selection only ever happens on listed rows.
+        let generation = core.pane(PaneId::Left).generation;
+        core.on_event(CoreEvent::ListingArrived {
+            pane: PaneId::Left,
+            generation,
+            path: core.pane(PaneId::Left).path.clone(),
+            root: true,
+            result: Ok(vec![]),
+        });
 
         core.select_path(PaneId::Left, Some(PathBuf::from("/fixture/old")));
         assert!(core.availability().has_selection);
@@ -2164,6 +2180,7 @@ mod tests {
 
     fn confirm_token(core: &mut DopusCore) -> u64 {
         core.select_path(PaneId::Left, Some(PathBuf::from("/fixture/target")));
+        core.delete_selection();
         let events = core.tick(now_instant());
         events
             .iter()
