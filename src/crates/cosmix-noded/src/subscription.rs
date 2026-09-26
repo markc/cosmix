@@ -1283,8 +1283,8 @@ impl SubscriptionBroker {
         tokio::sync::RwLockReadGuard<'_, BrokerInner>,
         tokio::sync::RwLockReadGuard<'_, HashMap<String, TopicState>>,
     ) {
-        let inner = self.inner.read().await;
         let topics = self.topics.read().await;
+        let inner = self.inner.read().await;
         (inner, topics)
     }
 
