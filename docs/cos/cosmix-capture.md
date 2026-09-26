@@ -20,14 +20,27 @@ The service exposes four commands, with JSON object bodies:
 | `capture.stop` | `{}` | Stop the active job and finalise its MP4 |
 | `capture.status` | `{}` | Read state and completed file path |
 
-Replies contain `recording`, `phase`, `path`, `error`, `frames`, `pid`,
-`version`, `git_sha` and `build_time`. Phases are `idle`, `screenshot`,
-`starting`, `recording`, `finalising`, `complete` and `failed`.
+Replies contain `recording`, `phase`, `path`, `error`, `blob`, `blob_error`,
+`frames`, `pid`, `version`, `git_sha` and `build_time`. Phases are `idle`,
+`screenshot`, `starting`, `recording`, `finalising`, `complete` and `failed`.
 Only `complete` guarantees successful publication. A failed recording may
 still have a finalised usable MP4; `error` explains why recording stopped.
 The initial screenshot/start response acknowledges the job; poll status for
 completion. Stop is idempotent when no job is active. Concurrent jobs fail
 explicitly. Names are generated, and existing files are never overwritten.
+
+After a capture publishes its file, the same bytes are dual-written into the
+local node's blob store (`blobd`, over its byte lane with pin owner
+`capture`; mime `image/png` or `video/mp4`). The upload runs on the job's
+worker thread after publication, so status already shows the terminal phase
+with `blob: null` while it is in flight; the returned reference then appears
+additively as `blob` — `{"blob":"b3:<64 hex>","size":N,"mime":"…"}`. A
+failed upload never fails the capture: the phase stays `complete`, the file
+is where it always was, and `blob_error` says why the second copy did not
+land. One attempt, 30-second connect/read bounds, a 10-minute overall
+deadline. The file under `~/Videos/Cosmix` remains the source of truth; not
+done yet are the `captures` collection over the references and dropping the
+file write.
 
 Screenshots accept, for example,
 `{"output":"Output-1","region":{"x":100,"y":80,"width":640,"height":360}}`.

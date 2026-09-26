@@ -458,14 +458,26 @@ not a combined multi-monitor canvas. Keep the media directory outside Git.</p>
 <tr><td><code>capture.stop</code></td><td><code>{}</code></td><td>Stop the active job and finalise its MP4</td></tr>
 <tr><td><code>capture.status</code></td><td><code>{}</code></td><td>Read state and completed file path</td></tr>
 </tbody></table>
-<p>Replies contain <code>recording</code>, <code>phase</code>, <code>path</code>, <code>error</code>, <code>frames</code>, <code>pid</code>,
-<code>version</code>, <code>git_sha</code> and <code>build_time</code>. Phases are <code>idle</code>, <code>screenshot</code>,
-<code>starting</code>, <code>recording</code>, <code>finalising</code>, <code>complete</code> and <code>failed</code>.
+<p>Replies contain <code>recording</code>, <code>phase</code>, <code>path</code>, <code>error</code>, <code>blob</code>, <code>blob_error</code>,
+<code>frames</code>, <code>pid</code>, <code>version</code>, <code>git_sha</code> and <code>build_time</code>. Phases are <code>idle</code>,
+<code>screenshot</code>, <code>starting</code>, <code>recording</code>, <code>finalising</code>, <code>complete</code> and <code>failed</code>.
 Only <code>complete</code> guarantees successful publication. A failed recording may
 still have a finalised usable MP4; <code>error</code> explains why recording stopped.
 The initial screenshot/start response acknowledges the job; poll status for
 completion. Stop is idempotent when no job is active. Concurrent jobs fail
 explicitly. Names are generated, and existing files are never overwritten.</p>
+<p>After a capture publishes its file, the same bytes are dual-written into the
+local node's blob store (<code>blobd</code>, over its byte lane with pin owner
+<code>capture</code>; mime <code>image/png</code> or <code>video/mp4</code>). The upload runs on the job's
+worker thread after publication, so status already shows the terminal phase
+with <code>blob: null</code> while it is in flight; the returned reference then appears
+additively as <code>blob</code> — <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…"}</code>. A
+failed upload never fails the capture: the phase stays <code>complete</code>, the file
+is where it always was, and <code>blob_error</code> says why the second copy did not
+land. One attempt, 30-second connect/read bounds, a 10-minute overall
+deadline. The file under <code>~/Videos/Cosmix</code> remains the source of truth; not
+done yet are the <code>captures</code> collection over the references and dropping the
+file write.</p>
 <p>Screenshots accept, for example,
 <code>{"output":"Output-1","region":{"x":100,"y":80,"width":640,"height":360}}</code>.
 <code>output</code> overrides the startup output for that request only; omitted fields keep

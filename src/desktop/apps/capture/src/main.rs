@@ -1,3 +1,4 @@
+mod blob;
 mod encoder;
 mod stream;
 mod wayland;
@@ -27,6 +28,8 @@ struct Status {
     phase: &'static str,
     path: Option<PathBuf>,
     error: Option<String>,
+    blob: Option<Value>,
+    blob_error: Option<String>,
     frames: u64,
     fresh_frames: u64,
     acquired_frames: u64,
@@ -80,7 +83,7 @@ impl Status {
         } else {
             self.fresh_frames as f64 * 1000.0 / elapsed_ms as f64
         };
-        json!({"recording":matches!(self.phase,"starting"|"recording"),"phase":if self.phase.is_empty(){"idle"}else{self.phase},"path":self.path,"error":self.error,"frames":self.frames,"fresh_frames":self.fresh_frames,"acquired_frames":self.acquired_frames,"dropped_frames":self.dropped_frames,"repeated_presentations":self.repeated_frames,"duplicate_frames":self.frames.saturating_sub(self.fresh_frames),"elapsed_ms":elapsed_ms,"fresh_fps":fresh_fps,"capture_ms":self.capture_ms,"capture_wait_ms":self.capture_wait_ms,"capture_read_ms":self.capture_read_ms,"capture_normalise_ms":self.capture_normalise_ms,"encode_ms":self.encode_ms,"pid":std::process::id(),"version":build.version,"git_sha":build.git_sha,"build_time":build.build_time})
+        json!({"recording":matches!(self.phase,"starting"|"recording"),"phase":if self.phase.is_empty(){"idle"}else{self.phase},"path":self.path,"error":self.error,"blob":self.blob,"blob_error":self.blob_error,"frames":self.frames,"fresh_frames":self.fresh_frames,"acquired_frames":self.acquired_frames,"dropped_frames":self.dropped_frames,"repeated_presentations":self.repeated_frames,"duplicate_frames":self.frames.saturating_sub(self.fresh_frames),"elapsed_ms":elapsed_ms,"fresh_fps":fresh_fps,"capture_ms":self.capture_ms,"capture_wait_ms":self.capture_wait_ms,"capture_read_ms":self.capture_read_ms,"capture_normalise_ms":self.capture_normalise_ms,"encode_ms":self.encode_ms,"pid":std::process::id(),"version":build.version,"git_sha":build.git_sha,"build_time":build.build_time})
     }
 }
 struct Job {
@@ -159,6 +162,7 @@ fn publish(partial: &PathBuf, final_path: &PathBuf) -> Result<(), String> {
         .map_err(|e| format!("publish capture without overwrite: {e}"))?;
     fs::remove_file(partial).map_err(|e| e.to_string())
 }
+#[allow(clippy::too_many_arguments)]
 fn run_job(
     options: Options,
     video: bool,
@@ -167,7 +171,12 @@ fn run_job(
     partial: PathBuf,
     cancel: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
+    lane: blob::Lane,
 ) {
+    // Whether the finished file landed at `path` — publish succeeded,
+    // so the blob-store copy is owed even when encoding then reports
+    // a duration failure (the MP4 is still there and usable).
+    let mut published = false;
     let result = (|| -> Result<(), String> {
         let mut capture = wayland::Capture::connect(options.output.as_deref(), cancel.clone())?;
         capture.region = options.region;
@@ -196,6 +205,7 @@ fn run_job(
                 )
                 .map_err(|e| e.to_string())?;
             publish(&partial, &path)?;
+            published = true;
             status.lock().unwrap().frames = 1;
             return Ok(());
         }
@@ -289,6 +299,7 @@ fn run_job(
             return Err("recording stopped before first frame".into());
         }
         publish(&partial, &path)?;
+        published = true;
         if let Some(e) = failure {
             return Err(e);
         }
@@ -306,6 +317,21 @@ fn run_job(
         Err(error) => {
             state.phase = "failed";
             state.error = Some(error);
+        }
+    }
+    // Dual-write into the blob store: the file is the truth and is
+    // already published, so this copy is additive — its failure
+    // records `blob_error` and never demotes the terminal phase. The
+    // lock is dropped across the upload (a five-minute MP4 takes
+    // minutes): status meanwhile shows the terminal phase with
+    // `blob: null`, then the reference.
+    if published {
+        drop(state);
+        let outcome = lane.bind().and_then(|bind| blob::upload(&bind, &path));
+        let mut state = status.lock().unwrap();
+        match outcome {
+            Ok(reference) => state.blob = Some(reference),
+            Err(error) => state.blob_error = Some(error),
         }
     }
 }
@@ -402,19 +428,25 @@ async fn async_main() -> Result<(), String> {
     let Some(options) = options()? else {
         return Ok(());
     };
-    let client = SupervisedClient::connect_options(
-        "capture",
-        &cosmix_config::client_helpers::resolve_noded_url(),
-    )
-    .bounded_incoming(16)
-    .connect()
-    .await
-    .map_err(|e| e.to_string())?;
+    let client = Arc::new(
+        SupervisedClient::connect_options(
+            "capture",
+            &cosmix_config::client_helpers::resolve_noded_url(),
+        )
+        .bounded_incoming(16)
+        .connect()
+        .await
+        .map_err(|e| e.to_string())?,
+    );
     let mut incoming = client.incoming_bounded().ok_or("no incoming Bus queue")?;
     let status = Arc::new(Mutex::new(Status {
         vaapi_device: options.vaapi_device.clone(),
         ..Default::default()
     }));
+    // The worker thread dual-writes through this handle: the one
+    // lane-resolution props call parks the worker via the runtime
+    // handle, never the Bus loop below.
+    let lane = blob::Lane::new(client.clone(), tokio::runtime::Handle::current());
     let mut job: Option<Job> = None;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
@@ -438,10 +470,10 @@ async fn async_main() -> Result<(), String> {
                         let (path,partial) = reserve(&options,video)?;
                         *status.lock().unwrap() = Status {phase:if video {"starting"}else{"screenshot"},path:Some(path.clone()),vaapi_device:options.vaapi_device.clone(),..Default::default()};
                         let cancel = Arc::new(AtomicBool::new(false));
-                        let (mut opts,flag,state) = (options.clone(),cancel.clone(),status.clone());
+                        let (mut opts,flag,state,lane) = (options.clone(),cancel.clone(),status.clone(),lane.clone());
                         if output.is_some() { opts.output=output; }
                         opts.region=region;
-                        let thread = std::thread::Builder::new().name("cosmix-capture".into()).spawn(move ||run_job(opts,video,fps,path,partial,flag,state)).map_err(|e|e.to_string())?;
+                        let thread = std::thread::Builder::new().name("cosmix-capture".into()).spawn(move ||run_job(opts,video,fps,path,partial,flag,state,lane)).map_err(|e|e.to_string())?;
                         job = Some(Job {cancel,thread});
                     } else if command.command=="capture.stop" && let Some(job)=&job {
                         job.cancel.store(true,Ordering::Relaxed); status.lock().unwrap().stopping();
@@ -583,6 +615,36 @@ mod tests {
                 r#"{"region":{"x":0,"y":0,"width":1,"height":1}}"#
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn status_surfaces_the_blob_reference_additively() {
+        let plain = Status::default().value();
+        assert!(plain["blob"].is_null());
+        assert!(plain["blob_error"].is_null());
+        let id = format!("b3:{}", "0".repeat(64));
+        let reference = blob::parse_reference(
+            &json!({"blob":id,"size":9,"mime":"image/png","name":"a.png","origin":"alpha"})
+                .to_string(),
+        )
+        .unwrap();
+        let uploaded = Status {
+            blob: Some(reference),
+            ..Default::default()
+        }
+        .value();
+        assert_eq!(uploaded["blob"]["blob"], format!("b3:{}", "0".repeat(64)));
+        assert_eq!(uploaded["blob"]["mime"], "image/png");
+        assert!(uploaded["blob_error"].is_null());
+        let failed = Status {
+            blob_error: Some("lane answered 413 for http://10.42.0.5:4210/blob".into()),
+            ..Default::default()
+        }
+        .value();
+        assert!(failed["blob"].is_null());
+        assert_eq!(
+            failed["blob_error"],
+            "lane answered 413 for http://10.42.0.5:4210/blob"
         );
     }
     #[test]
