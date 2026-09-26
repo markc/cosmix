@@ -1330,6 +1330,21 @@ fn registry_late_announcements_append_without_hiding_ambiguity() {
 }
 
 #[test]
+fn seat_name_constants_match_shell_host_declarations() {
+    let shell_host = include_str!("../../../cosmix-shell-host/src/runner.rs");
+    for (constant, value) in [
+        ("HUMAN_SEAT_NAME", HUMAN_SEAT_NAME),
+        ("AGENT_SEAT_NAME", AGENT_SEAT_NAME),
+    ] {
+        let expected = format!("pub const {constant}: &str = {value:?};");
+        assert!(
+            shell_host.lines().any(|line| line == expected),
+            "the two crates' seat names must be edited together: shell-host must declare {expected}"
+        );
+    }
+}
+
+#[test]
 fn named_seat_requires_exactly_one_matching_name() {
     let seats = vec![(AGENT_SEAT_NAME.into(), (1, 9))];
     assert!(std::panic::catch_unwind(|| select_named_seat(&seats, HUMAN_SEAT_NAME)).is_err());

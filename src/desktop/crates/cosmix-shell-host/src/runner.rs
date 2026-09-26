@@ -991,7 +991,8 @@ fn release_pointer(pointer: impl PointerRelease) {
     }
 }
 
-// Keep in step with cosmix-comp/src/protocol/seat.rs; comp's shell dependency is optional.
+// Keep in step with cosmix-comp/src/protocol/seat.rs. Comp depends on cosmix-shell
+// only behind embedded-quoin; it does not depend on cosmix-shell-host.
 pub const HUMAN_SEAT_NAME: &str = "cosmix";
 pub const AGENT_SEAT_NAME: &str = "cosmix-agent";
 
