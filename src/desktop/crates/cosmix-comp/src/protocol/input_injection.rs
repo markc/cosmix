@@ -1,9 +1,9 @@
 //! `comp.input.*`: Bus-injected input, delivered through the real seat path.
 //!
-//! Ordinary injection enters [`WaylandState::handle_host_input`] like a
-//! device event. Targeted buttons use the same seat's motion/button path
-//! after focus arbitration, avoiding a second hit-test or unconditional
-//! raise. Nothing here talks to a client directly.
+//! Human injection enters [`WaylandState::handle_host_input`] like a device
+//! event. Agent injection uses independent Smithay handles without human
+//! focus arbitration, bindings or idle activity. Neither path writes wire
+//! keyboard events directly.
 
 use std::collections::VecDeque;
 
@@ -145,6 +145,7 @@ impl Default for InjectionState {
 }
 
 pub(super) struct SequenceRun {
+    seat: SeatKind,
     uses_agent: bool,
     steps: VecDeque<SequenceStep>,
     index: usize,
@@ -393,7 +394,7 @@ impl WaylandState {
             ControlReply::Body(body) | ControlReply::Refused { detail: body, .. } => {
                 body["seat"] = json!(seat.name());
             }
-            _ => {}
+            _ => return ControlReply::WithInputSeat { seat, reply: Box::new(reply) },
         }
         reply
     }
@@ -512,9 +513,10 @@ impl WaylandState {
                 (InjectedKind::PointerMove, false)
             }
             InputOp::PointerButton { button, action } => {
+                let expected = target_window.or_else(|| (seat == SeatKind::Agent).then(|| self.delivery_target_on(seat, false)).flatten());
                 for state in press_states(*action) {
-                    if seat == SeatKind::Agent && *state == HostButtonState::Pressed && target_window.is_some()
-                        && self.delivery_target_on(seat, false) != target_window {
+                    if seat == SeatKind::Agent && *state == HostButtonState::Pressed && expected.is_some()
+                        && self.delivery_target_on(seat, false) != expected {
                         return ControlReply::refused("target_changed", json!({}));
                     }
                     let input = HostInput::PointerButton {
@@ -845,6 +847,10 @@ impl WaylandState {
                 .current_focus()
                 .and_then(|target| target.owned_surface())
         }?;
+        if seat == SeatKind::Agent
+            && self.surfaces.get(&surface.id()).is_none_or(|record| !self.agent_tree_mapped(record)) {
+            return None;
+        }
         let root = canonical_root_surface(&self.popup_manager, &surface);
         self.surfaces
             .get(&root.id())
@@ -969,13 +975,19 @@ impl WaylandState {
         reply: tokio::sync::oneshot::Sender<ControlReply>,
         admitted: Instant,
     ) {
+        let (op, sequence_seat) = match op {
+            LongOp::SeatedSequence { seat, steps } => (LongOp::Sequence(steps), seat),
+            op => (op, crate::port::DEFAULT_INPUT_SEAT),
+        };
         match op {
+            LongOp::SeatedSequence { .. } => unreachable!("normalised above"),
             LongOp::Sequence(steps) => {
                 let id = self.injection.next_sequence;
                 self.injection.next_sequence = id.wrapping_add(1);
                 self.injection.sequences.insert(
                     id,
                     SequenceRun {
+                        seat: sequence_seat,
                         uses_agent: steps.iter().any(|step| matches!(step.op, InputOp::OnSeat { seat: SeatKind::Agent, .. })),
                         steps: steps.into(),
                         index: 0,
@@ -1068,6 +1080,7 @@ impl WaylandState {
                 let elapsed_ms =
                     u64::try_from(run.started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let _ = run.reply.send(ControlReply::Body(json!({
+                    "seat": run.seat.name(),
                     "steps": run.replies,
                     "elapsed_ms": elapsed_ms,
                 })));
@@ -1096,10 +1109,11 @@ impl WaylandState {
                     }
                 }
                 refusal => {
-                    let run = self.abort_sequence(id).expect("sequence run present");
+                    let Some(run) = self.abort_sequence(id) else { return };
                     let _ = run.reply.send(ControlReply::refused(
                         "step_failed",
                         json!({
+                            "seat": run.seat.name(),
                             "index": index,
                             "verb": step.verb,
                             "step": refusal.wire_json(),

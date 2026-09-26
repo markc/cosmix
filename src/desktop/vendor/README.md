@@ -9,6 +9,8 @@ Only comp's dev-dependency enables it; production builds have no constructor.
 `ClientDndGrabHandler::can_start_drag` is a default-true seat capability hook.
 Data-device StartDrag checks it before assigning the icon role or installing
 either grab; refusal cancels the source. Comp disables DnD on the agent seat.
+The `test-support` X11 keyboard-enter counter lets offline tests prove refusal
+precedes `KeyboardTarget::enter` and therefore any X11 focus request.
 
 ## iced_tiny_skia 0.14.1
 

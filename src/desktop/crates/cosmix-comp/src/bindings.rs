@@ -1506,6 +1506,7 @@ mod tests {
 
     #[test]
     fn binding_ids_are_unique() {
+        // Static binding-ID uniqueness, not a seat-owned input state slot.
         let table = BindingTable::phase1_defaults();
         let mut ids: Vec<_> = table.bindings.iter().map(|binding| binding.id).collect();
         ids.sort_unstable();

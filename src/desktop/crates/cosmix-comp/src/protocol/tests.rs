@@ -45518,6 +45518,31 @@ mod x11 {
         ));
     }
 
+    #[cfg(feature = "bus")]
+    #[test]
+    fn agent_x11_target_refuses_before_keyboard_enter_or_set_input_focus() {
+        use crate::port::{InputOp, KeySpec, PressAction};
+        let mut h = KeybindingHarness::new(true);
+        let (surface_id, _, window, object) = associate_normal_window(&mut h, 147);
+        commit_dmabuf(&mut h, surface_id, 32, 24);
+        let record = &h.server.state.surfaces[&object];
+        let (id, generation) = (record.id.0, record.generation);
+        let before = window.keyboard_enters_for_test();
+        let human = h.server.state.human.keyboard.current_focus();
+        let op = InputOp::OnSeat { seat: SeatKind::Agent, op: Box::new(InputOp::Targeted {
+            id, generation, raise: false, op: Box::new(InputOp::Key {
+                key: KeySpec::Evdev(30), action: PressAction::Both, modifiers: vec![],
+            }),
+        }) };
+        let body = h.server.state.service_input_op(&op).wire_json();
+        assert_eq!(body["error"], "x11_unsupported");
+        assert_eq!(body["hint"]["seat"], "human");
+        assert_eq!(window.keyboard_enters_for_test(), before,
+            "no KeyboardTarget::enter, hence no X11 SetInputFocus or WM_TAKE_FOCUS");
+        assert_eq!(h.server.state.human.keyboard.current_focus(), human);
+        assert!(h.server.state.agent.keyboard.current_focus().is_none());
+    }
+
     #[test]
     fn x11_keyboard_focus_marks_record_focused_and_falls_back_after_unmap() {
         let mut harness = KeybindingHarness::new(true);

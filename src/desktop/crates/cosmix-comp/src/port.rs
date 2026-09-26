@@ -401,6 +401,7 @@ pub(crate) enum LongOp {
         timeout: Duration,
     },
     Sequence(Vec<SequenceStep>),
+    SeatedSequence { seat: crate::protocol::SeatKind, steps: Vec<SequenceStep> },
     Wait(WaitSpec),
     /// Polite close now; if the same `{id, generation}` is still alive at
     /// the deadline, kill its client.
@@ -422,7 +423,7 @@ impl LongOp {
                     + crate::protocol::region_selection::REGION_CLEANUP_BUDGET
                     + Duration::from_secs(1)
             }
-            Self::Sequence(steps) => steps.iter().map(|step| step.delay).sum(),
+            Self::Sequence(steps) | Self::SeatedSequence { steps, .. } => steps.iter().map(|step| step.delay).sum(),
             Self::Wait(spec) => spec.timeout,
             Self::ForceClose { timeout, .. } => *timeout,
         }
@@ -443,6 +444,7 @@ pub(crate) struct PortLongRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ControlReply {
+    WithInputSeat { seat: crate::protocol::SeatKind, reply: Box<ControlReply> },
     PointerWatch {
         topic: String,
         lease_ms: u64,
@@ -532,6 +534,12 @@ impl ControlReply {
 
     pub(crate) fn into_wire(self) -> (u8, Arc<str>) {
         match self {
+            Self::WithInputSeat { seat, reply } => {
+                let (rc, body) = reply.into_wire();
+                let mut body: Value = serde_json::from_str(&body).expect("control replies are JSON");
+                body["seat"] = json!(seat.name());
+                (rc, Arc::from(body.to_string()))
+            }
             Self::PointerWatch { topic, lease_ms } => (
                 0,
                 Arc::from(json!({"version":1,"topic":topic,"lease_ms":lease_ms}).to_string()),
@@ -2709,7 +2717,9 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
         object.remove("seat");
         if seat == SeatKind::Agent && object.contains_key("raise")
             && bool_arg(object, "raise", false)? {
-            return Err(invalid_argument("raise", "false", "agent input never raises a window"));
+            return Err(ControlReply::refused("invalid_argument", json!({
+                "field":"raise", "seat":"agent", "message":"agent input never raises a window",
+            })));
         }
     }
     let op = parse_seated_input_op(verb, &args, seat)?;
@@ -2718,7 +2728,7 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
 }
 
 // Flip only in the release that also migrates the hub's human-input gates.
-const DEFAULT_INPUT_SEAT: crate::protocol::SeatKind = crate::protocol::SeatKind::Human;
+pub(crate) const DEFAULT_INPUT_SEAT: crate::protocol::SeatKind = crate::protocol::SeatKind::Human;
 
 fn parse_input_seat(value: Option<&Value>) -> Result<Option<crate::protocol::SeatKind>, ControlReply> {
     use crate::protocol::SeatKind;
@@ -3252,7 +3262,44 @@ fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
         }
         parsed.push(SequenceStep { verb, op, delay });
     }
-    Ok(LongOp::Sequence(parsed))
+    Ok(match seat {
+        Some(seat) => LongOp::SeatedSequence { seat, steps: parsed },
+        None => LongOp::Sequence(parsed),
+    })
+}
+
+#[cfg(test)]
+mod agent_seat_parse_tests {
+    use super::*;
+    use crate::protocol::SeatKind;
+
+    #[test]
+    fn seat_defaults_raise_policy_and_release_all_are_explicit() {
+        let window = json!({"id":1,"generation":2});
+        assert!(matches!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a"})).unwrap(), InputOp::Targeted { raise:true, .. }));
+        let InputOp::OnSeat { seat, op } = parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"agent"})).unwrap() else { panic!("agent wrapper") };
+        assert_eq!(seat, SeatKind::Agent);
+        assert!(matches!(*op, InputOp::Targeted { raise:false, .. }));
+        assert!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"agent","raise":true})).is_err());
+        for seat in [json!(null), json!(false), json!("other")] {
+            assert!(parse_input_op("comp.input.key", &json!({"key":"a","seat":seat})).is_err());
+        }
+        assert!(matches!(parse_input_op("comp.input.release_all", &json!({})).unwrap(), InputOp::OnSeat { seat:SeatKind::Agent, .. }));
+        assert_eq!(parse_input_op("comp.input.release_all", &json!({"seat":"human"})).unwrap(), InputOp::ReleaseAll);
+    }
+
+    #[test]
+    fn sequence_seat_is_inherited_and_each_step_can_override_it() {
+        let LongOp::SeatedSequence { seat, steps } = parse_sequence(&json!({"seat":"agent","steps":[
+            {"verb":"comp.input.key","args":{"text":"a"}},
+            {"verb":"comp.input.key","args":{"text":"b","seat":"human"}},
+            {"verb":"comp.input.release_all"}
+        ]})).unwrap() else { panic!("seated sequence") };
+        assert_eq!(seat, SeatKind::Agent);
+        assert!(matches!(steps[0].op, InputOp::OnSeat { seat:SeatKind::Agent, .. }));
+        assert_eq!(steps[1].op, InputOp::Text("b".into()));
+        assert!(matches!(steps[2].op, InputOp::OnSeat { seat:SeatKind::Agent, .. }));
+    }
 }
 
 /// `comp.window.stats {id, generation | source, registration?, samples?}`
@@ -5396,7 +5443,7 @@ mod tests {
         );
         assert_eq!(
             parse_input_op("comp.input.release_all", &json!({})),
-            Ok(InputOp::ReleaseAll)
+            Ok(InputOp::OnSeat { seat: crate::protocol::SeatKind::Agent, op: Box::new(InputOp::ReleaseAll) })
         );
     }
 

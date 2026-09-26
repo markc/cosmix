@@ -12,6 +12,8 @@ const KEY_M: u32 = 50;
 const KEY_O: u32 = 24;
 const KEY_LEFTSHIFT: u32 = 42;
 
+include!("agent_input_tests.rs");
+
 #[test]
 fn keyboard_without_an_owner_refuses_and_cleans_up_generated_holds() {
     let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
@@ -652,7 +654,7 @@ fn injected_move_and_click_reach_the_window_under_the_point() {
             .stats
             .input_mark(input_seq, injected_at_us),
         Some(input_injection::InputMark {
-        seat: crate::protocol::SeatKind::Human,
+            seat: crate::protocol::SeatKind::Human,
             input_seq,
             injected_at_us,
         })
@@ -694,6 +696,7 @@ fn require_hit_refuses_an_occluded_point_without_moving() {
         body,
         json!({
             "error": "occluded",
+            "seat": "human",
             "id": alpha_id,
             "under": {"id": beta_id, "generation": beta_generation},
         })
@@ -734,7 +737,7 @@ fn require_hit_refuses_an_occluded_point_without_moving() {
     assert_eq!(rc, 10);
     assert_eq!(
         body,
-        json!({"error": "unknown_output", "output": "o_nowhere"})
+        json!({"error": "unknown_output", "output": "o_nowhere", "seat":"human"})
     );
     let (width, height) = harness.server.state.backend.seat_extent();
     let (rc, body) = inject(
@@ -815,7 +818,7 @@ fn injected_binding_chord_is_consumed_by_the_binding() {
     assert_eq!(rc, 10);
     assert_eq!(
         body,
-        json!({"error": "unknown_key", "key": "NoSuchKeyName"})
+        json!({"error": "unknown_key", "key": "NoSuchKeyName", "seat":"human"})
     );
     assert!(keyboard_key_events(&harness.sync()).is_empty());
 }
@@ -963,7 +966,7 @@ fn text_types_through_the_keymap_and_refuses_unmappable_input_whole() {
     assert_eq!(rc, 10);
     assert_eq!(
         body,
-        json!({"error": "unmappable", "char": "\u{1F600}", "index": 2})
+        json!({"error": "unmappable", "char": "\u{1F600}", "index": 2, "seat":"human"})
     );
     assert!(
         keyboard_key_events(&harness.sync()).is_empty(),
