@@ -55,9 +55,6 @@ pub(crate) fn install(app: &mut App) {
 
 /// `dialog` in `shell.props.get` and `shell.panel.changed`: `null` while no
 /// dialog is loaded, else `{scene, visible, w, h, output}`.
-// Read by the props/panel.changed snapshots once Q1 threads `dialog`
-// through them (bus_service.rs, merged after Q1); tests use it until then.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn notice(dialog: Option<&QuoinDialog>) -> Value {
     dialog.and_then(QuoinDialog::notice).map_or(Value::Null, |notice| {
         json!({
@@ -67,6 +64,24 @@ pub(crate) fn notice(dialog: Option<&QuoinDialog>) -> Value {
             "h": notice.h,
             "output": notice.output,
         })
+    })
+}
+
+/// The same seat as a props-tree value, for the `dialog` leaf of
+/// `shell.props.get`.
+pub(crate) fn notice_prop(dialog: Option<&QuoinDialog>) -> cosmix_props_core::PropValue {
+    use cosmix_props_core::PropValue;
+    dialog.and_then(QuoinDialog::notice).map_or(PropValue::Null, |notice| {
+        PropValue::Object(
+            [
+                ("scene".to_owned(), PropValue::from(notice.scene)),
+                ("visible".to_owned(), PropValue::from(notice.visible)),
+                ("w".to_owned(), PropValue::from(f64::from(notice.w))),
+                ("h".to_owned(), PropValue::from(f64::from(notice.h))),
+                ("output".to_owned(), PropValue::from(notice.output)),
+            ]
+            .into(),
+        )
     })
 }
 
@@ -449,6 +464,11 @@ mod tests {
             notice(Some(world.resource::<QuoinDialog>())),
             props["props_get"]["dialog"],
             "hidden editor on DP-1"
+        );
+        assert_eq!(
+            Value::from(&notice_prop(Some(world.resource::<QuoinDialog>()))),
+            props["props_get"]["dialog"],
+            "props.get carries the same value"
         );
     }
 
