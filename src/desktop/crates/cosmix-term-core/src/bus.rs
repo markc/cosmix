@@ -611,10 +611,14 @@ fn handle(
         panic!("test verb: panic holding the tab-set lock");
     }
     match verb {
+        // `pid` lets a caller bind to one term PROCESS (the session-control
+        // resume worker checks it against the boot term unit's MainPID), which
+        // `instance`, reported by that same process, cannot prove.
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
-            "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)\ninstance={}",
+            "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)\ninstance={} pid={}",
             help(service),
-            instance()
+            instance(),
+            std::process::id()
         )),
         "term.session" => {
             let mut status = tabs.session_status();
@@ -721,7 +725,7 @@ fn handle(
             .map(|pane| {
                 let g = pane.geometry;
                 format!(
-                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={} instance={}",
+                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={} instance={} pid={}",
                     pane.id,
                     pane.active,
                     pane.cols,
@@ -733,7 +737,14 @@ fn handle(
                     g.h,
                     id,
                     tabs.revision,
-                    instance()
+                    instance(),
+                    // This term PROCESS, self-reported: a caller binding keys
+                    // to one process (the session-control resume worker)
+                    // checks it against the unit's MainPID. Pane lines carry
+                    // no free text, so a program in a pane cannot change it;
+                    // a process registering `term` itself could claim any pid
+                    // (a broker-attested owner pid is future noded work).
+                    std::process::id()
                 )
             })
             .collect::<Vec<_>>()
@@ -1179,6 +1190,7 @@ mod tests {
         // The instance this process reports is accepted.
         let listed = handle(&set, &cleanup, "term.panes", r#"{"tab":1}"#).unwrap();
         let reported = listed.rsplit_once(" instance=").unwrap().1;
+        let reported = reported.split_once(' ').map_or(reported, |(value, _)| value);
         assert_eq!(reported, instance().to_string());
         handle(
             &set,
@@ -1194,7 +1206,7 @@ mod tests {
         assert!(
             handle(&set, &cleanup, "INFO", "")
                 .unwrap()
-                .ends_with(&format!("\ninstance={}", instance()))
+                .ends_with(&format!("\ninstance={} pid={}", instance(), std::process::id()))
         );
         cleanup.submit(set.lock().unwrap().shutdown());
         drop(cleanup);
@@ -2138,7 +2150,12 @@ mod tests {
         assert_eq!(panes.lines().count(), 2);
         for line in panes.lines() {
             assert!(
-                line.ends_with(&format!(" tab=1 revision={} instance={}", revision(), instance())),
+                line.ends_with(&format!(
+                    " tab=1 revision={} instance={} pid={}",
+                    revision(),
+                    instance(),
+                    std::process::id()
+                )),
                 "{line}"
             );
         }

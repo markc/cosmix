@@ -14,6 +14,9 @@ pub struct PopupLayerIdentity {
     pub output: OutputKey,
     pub edge: Edge,
     pub surface: String,
+    /// The [`CornerMenuRequest`](cosmix_shell::chrome::corner_menu::CornerMenuRequest)
+    /// serial this popup shows: whoever queued a step can tell it was theirs.
+    pub serial: u64,
 }
 
 impl PanelLayerIdentities {

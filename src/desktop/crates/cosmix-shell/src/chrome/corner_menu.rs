@@ -11,6 +11,11 @@ pub struct MenuExtra {
     pub target: String,
     pub verb: String,
     pub args: Vec<String>,
+    /// A question to confirm first: choosing the extra opens a confirm step
+    /// ([`confirm_items`]) instead of calling the verb, so a misclick does
+    /// nothing. A human affordance of the menu only; the verb itself needs no
+    /// confirmation.
+    pub confirm: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +29,9 @@ pub enum MenuAction {
     /// it right after the mode items on every corner. Safe open toggles, so
     /// choosing it while the shipped editor is visible closes the editor.
     EditPanels,
+    /// A row that does nothing when chosen: a confirm step's question (shown
+    /// disabled) and its Cancel.
+    Inert,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +51,7 @@ impl MenuItem {
                 edge,
                 input: PanelInput::SetMode(mode),
             }),
-            MenuAction::Extra(_) | MenuAction::EditPanels => None,
+            MenuAction::Extra(_) | MenuAction::EditPanels | MenuAction::Inert => None,
         }
     }
 }
@@ -78,12 +86,57 @@ pub fn menu_items(mode: PanelMode, extras: &[MenuExtra]) -> Vec<MenuItem> {
     .collect()
 }
 
+/// Label of a confirm step's cancelling row.
+pub const CANCEL_LABEL: &str = "Cancel";
+
+/// A confirm step: the question (disabled), the confirming row, then Cancel.
+/// Choosing the confirming row performs `action`; Cancel, Escape or a click
+/// away does nothing.
+pub fn confirm_items(question: &str, confirm_label: &str, action: MenuAction) -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            label: question.into(),
+            checked: true,
+            action: MenuAction::Inert,
+        },
+        MenuItem {
+            label: confirm_label.into(),
+            checked: false,
+            action,
+        },
+        MenuItem {
+            label: CANCEL_LABEL.into(),
+            checked: false,
+            action: MenuAction::Inert,
+        },
+    ]
+}
+
 /// Snapshot supplied by the hook. Reopening reads the latest accepted config.
 #[derive(Resource, Clone)]
 pub struct CornerMenuRequest {
     pub output: OutputKey,
     pub corner: Corner,
     pub items: Vec<MenuItem>,
+    /// Which request this is ([`next_menu_serial`]): the layer host echoes it
+    /// in the popup it opens, so the asker can tell its own step was shown
+    /// and not a newer one on the same corner.
+    pub serial: u64,
+}
+
+/// Present while the layer host is opening the request with this serial:
+/// set when it takes the request and cleared once the popup exists (or the
+/// open failed). Replacing an open menu pumps an update in between, so an
+/// asker waiting on the step sees neither the request nor its popup then,
+/// and must read this instead of concluding the step was dropped.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CornerMenuOpening(pub u64);
+
+/// A fresh [`CornerMenuRequest::serial`], unique in this process.
+pub fn next_menu_serial() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// App-owned Bus dispatch, called for a user-selected item that is not a mode
@@ -94,10 +147,88 @@ pub struct CornerMenuActionHook(pub fn(&mut World, MenuAction));
 
 pub const ROW_HEIGHT: f32 = 32.0;
 pub const MENU_WIDTH: f32 = 220.0;
+/// Characters a confirm question wraps at in one row line (a conservative
+/// estimate for 14 px text in the menu width), and the most lines it may use.
+pub const QUESTION_LINE_CHARS: usize = 24;
+pub const QUESTION_MAX_LINES: usize = 3;
+/// The longest confirm question: config refuses longer ones, so a question
+/// always fits the rows reserved for it.
+pub const QUESTION_MAX_CHARS: usize = QUESTION_LINE_CHARS * QUESTION_MAX_LINES - LABEL_INDENT;
+
+/// Characters of indent before every row label (the checkmark column).
+const LABEL_INDENT: usize = 4;
+
+/// A confirm step's question: a disabled [`MenuAction::Inert`] row.
+fn is_question(item: &MenuItem) -> bool {
+    item.checked && item.action == MenuAction::Inert
+}
+
+/// A row's height: one line, or as many lines as a confirm question wraps to
+/// (at most [`QUESTION_MAX_LINES`]). Rendering and hit-testing both use it.
+pub fn row_height(item: &MenuItem) -> f32 {
+    if !is_question(item) {
+        return ROW_HEIGHT;
+    }
+    // The label renders after a four-space indent (spawn_menu).
+    let lines = (item.label.chars().count() + LABEL_INDENT)
+        .div_ceil(QUESTION_LINE_CHARS)
+        .clamp(1, QUESTION_MAX_LINES);
+    ROW_HEIGHT * lines as f32
+}
+
+pub fn menu_height(items: &[MenuItem]) -> f32 {
+    items.iter().map(row_height).sum()
+}
+
+/// Whether these items are a confirm step ([`confirm_items`]).
+pub fn is_confirm_step(items: &[MenuItem]) -> bool {
+    items.iter().any(is_question)
+}
+
+/// How long a confirm step ignores presses on its rows after opening: the
+/// second click of a double-click that chose the confirming entry would
+/// otherwise land on the action row the step puts under the pointer.
+pub const CONFIRM_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The input rules that keep a confirm step from accepting by accident: hover
+/// never selects a row (so a stray Enter or Space accepts nothing), only an
+/// arrow-key selection can be accepted from the keyboard, and a press counts
+/// only once [`CONFIRM_ARM_DELAY`] has passed since the step opened. An
+/// ordinary menu keeps its hover selection and immediate presses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuInputGuard {
+    pub confirm: bool,
+    pub opened_at: std::time::Duration,
+}
+
+impl MenuInputGuard {
+    pub fn new(items: &[MenuItem], opened_at: std::time::Duration) -> Self {
+        Self {
+            confirm: is_confirm_step(items),
+            opened_at,
+        }
+    }
+
+    /// Hover may move the selection.
+    pub fn hover_selects(&self) -> bool {
+        !self.confirm
+    }
+
+    /// A press at `now` may start choosing a row.
+    pub fn press_counts(&self, now: std::time::Duration) -> bool {
+        !self.confirm || now.saturating_sub(self.opened_at) >= CONFIRM_ARM_DELAY
+    }
+
+    /// Enter/Space may accept the current selection, which came from the
+    /// keyboard (`by_keyboard`) or from hover.
+    pub fn key_accepts(&self, by_keyboard: bool) -> bool {
+        !self.confirm || by_keyboard
+    }
+}
 
 /// Position rows inward from their owning corner. Label padding keeps text
 /// away from the compositor-owned hotspot.
-pub fn menu_origin(corner: Corner, size: Vec2, rows: usize) -> Vec2 {
+pub fn menu_origin(corner: Corner, size: Vec2, items: &[MenuItem]) -> Vec2 {
     let right = matches!(corner, Corner::TopRight | Corner::BottomRight);
     let bottom = matches!(corner, Corner::BottomLeft | Corner::BottomRight);
     Vec2::new(
@@ -107,17 +238,27 @@ pub fn menu_origin(corner: Corner, size: Vec2, rows: usize) -> Vec2 {
             0.0
         },
         if bottom {
-            (size.y - ROW_HEIGHT * rows as f32).max(0.0)
+            (size.y - menu_height(items)).max(0.0)
         } else {
             0.0
         },
     )
 }
 
-pub fn hit_row(position: Vec2, origin: Vec2, rows: usize) -> Option<usize> {
+pub fn hit_row(position: Vec2, origin: Vec2, items: &[MenuItem]) -> Option<usize> {
     let p = position - origin;
-    (p.x >= 0.0 && p.x < MENU_WIDTH && p.y >= 0.0 && p.y < ROW_HEIGHT * rows as f32)
-        .then(|| (p.y / ROW_HEIGHT) as usize)
+    if p.x < 0.0 || p.x >= MENU_WIDTH || p.y < 0.0 {
+        return None;
+    }
+    let mut top = 0.0;
+    for (index, item) in items.iter().enumerate() {
+        let bottom = top + row_height(item);
+        if p.y < bottom {
+            return Some(index);
+        }
+        top = bottom;
+    }
+    None
 }
 
 /// The transparent root catches click-away on this output. The native host
@@ -128,7 +269,7 @@ pub fn spawn_menu(
     request: &CornerMenuRequest,
     size: Vec2,
 ) -> Vec<Entity> {
-    let origin = menu_origin(request.corner, size, request.items.len());
+    let origin = menu_origin(request.corner, size, &request.items);
     let popup = world
         .spawn((
             Node {
@@ -151,8 +292,8 @@ pub fn spawn_menu(
                 .spawn((
                     Node {
                         width: percent(100),
-                        height: px(ROW_HEIGHT),
-                        min_height: px(ROW_HEIGHT),
+                        height: px(row_height(item)),
+                        min_height: px(row_height(item)),
                         align_items: AlignItems::Center,
                         padding: UiRect::horizontal(px(12)),
                         ..default()
@@ -163,11 +304,14 @@ pub fn spawn_menu(
             if item.checked {
                 world.entity_mut(row).insert(bevy::ui::InteractionDisabled);
             }
+            // Only a mode row's disabled state means "current"; a confirm
+            // step's question is disabled without a checkmark.
+            let current = item.checked && matches!(item.action, MenuAction::Mode(_));
             let label = world
                 .spawn((
                     Text::new(format!(
                         "{}{}",
-                        if item.checked { "✓  " } else { "    " },
+                        if current { "✓  " } else { "    " },
                         item.label
                     )),
                     TextFont::from_font_size(14.0),
@@ -179,6 +323,13 @@ pub fn spawn_menu(
                     }),
                 ))
                 .id();
+            if is_question(item) {
+                // Wraps inside the row, which row_height made tall enough.
+                world.entity_mut(label).insert(Node {
+                    width: percent(100),
+                    ..default()
+                });
+            }
             world.entity_mut(row).add_child(label);
             world.entity_mut(popup).add_child(row);
             row
@@ -254,6 +405,7 @@ mod tests {
                 target: "tools".into(),
                 verb: "tools.open".into(),
                 args: vec![],
+                confirm: None,
             };
             let items = menu_items(mode, std::slice::from_ref(&extra));
             assert_eq!(
@@ -287,6 +439,95 @@ mod tests {
         }
     }
     #[test]
+    fn confirm_step_is_question_action_cancel_and_only_the_action_acts() {
+        let extra = MenuExtra {
+            label: "Restart session".into(),
+            target: "desktop-session".into(),
+            verb: "desktop.session.restart".into(),
+            args: vec![],
+            confirm: None,
+        };
+        let items = confirm_items("Restart the session?", "Restart", MenuAction::Extra(extra.clone()));
+        assert_eq!(
+            items.iter().map(|i| (i.label.as_str(), i.checked)).collect::<Vec<_>>(),
+            [("Restart the session?", true), ("Restart", false), (CANCEL_LABEL, false)]
+        );
+        assert_eq!(items[1].action, MenuAction::Extra(extra));
+        for item in &items {
+            assert_eq!(item.command(Edge::Left), None, "a confirm row is never a mode change");
+        }
+        assert_eq!((&items[0].action, &items[2].action), (&MenuAction::Inert, &MenuAction::Inert));
+        // The question renders disabled but without a checkmark.
+        let mut world = World::new();
+        let mount = world.spawn(Node::default()).id();
+        let request = CornerMenuRequest {
+            output: OutputKey::new("test-output").unwrap(),
+            corner: Corner::TopLeft,
+            items,
+            serial: 0,
+        };
+        let rows = spawn_menu(&mut world, mount, &request, Vec2::new(1000.0, 800.0));
+        assert!(world.get::<bevy::ui::InteractionDisabled>(rows[0]).is_some());
+        let label = world.get::<Children>(rows[0]).unwrap()[0];
+        assert!(!world.get::<Text>(label).unwrap().0.starts_with('✓'));
+    }
+
+    /// Review 6: a long question gets as many row lines as it wraps to, and
+    /// hit-testing uses those real heights (not a fixed 32 px per row).
+    #[test]
+    fn a_long_question_is_a_taller_row_and_hit_testing_follows_it() {
+        let question = "Restart the session? Every window closes; agent sessions resume.";
+        assert!(question.chars().count() <= QUESTION_MAX_CHARS);
+        let items = confirm_items(question, "Restart", MenuAction::Inert);
+        let tall = row_height(&items[0]);
+        assert_eq!(tall, ROW_HEIGHT * 3.0);
+        assert_eq!(row_height(&items[1]), ROW_HEIGHT);
+        assert_eq!(menu_height(&items), tall + 2.0 * ROW_HEIGHT);
+        let short = confirm_items("Sure?", "Yes", MenuAction::Inert);
+        assert_eq!(row_height(&short[0]), ROW_HEIGHT);
+        let origin = Vec2::ZERO;
+        // Inside the tall question: still row 0, never the action row.
+        assert_eq!(hit_row(Vec2::new(20.0, tall - 1.0), origin, &items), Some(0));
+        assert_eq!(hit_row(Vec2::new(20.0, tall + 1.0), origin, &items), Some(1));
+        assert_eq!(hit_row(Vec2::new(20.0, tall + ROW_HEIGHT + 1.0), origin, &items), Some(2));
+        assert_eq!(hit_row(Vec2::new(20.0, menu_height(&items) + 1.0), origin, &items), None);
+        // A bottom corner anchors the whole (taller) menu above the edge.
+        let size = Vec2::new(1000.0, 800.0);
+        assert_eq!(menu_origin(Corner::BottomLeft, size, &items).y, 800.0 - menu_height(&items));
+        // The rendered rows use the same heights.
+        let mut world = World::new();
+        let mount = world.spawn(Node::default()).id();
+        let request = CornerMenuRequest {
+            output: OutputKey::new("test-output").unwrap(),
+            corner: Corner::BottomLeft,
+            items,
+            serial: 0,
+        };
+        let rows = spawn_menu(&mut world, mount, &request, size);
+        assert_eq!(world.get::<Node>(rows[0]).unwrap().height, px(tall));
+        assert_eq!(world.get::<Node>(rows[1]).unwrap().height, px(ROW_HEIGHT));
+    }
+
+    /// Reviews 3 and 4: in a confirm step hover never selects, only an
+    /// arrow-key selection accepts from the keyboard, and presses count only
+    /// after the arm delay. An ordinary menu is unchanged.
+    #[test]
+    fn a_confirm_step_guards_hover_keys_and_early_presses() {
+        use std::time::Duration;
+        let opened = Duration::from_secs(10);
+        let confirm = MenuInputGuard::new(&confirm_items("Sure?", "Yes", MenuAction::Inert), opened);
+        assert!(confirm.confirm);
+        assert!(!confirm.hover_selects());
+        assert!(!confirm.key_accepts(false), "Enter accepted a hover selection");
+        assert!(confirm.key_accepts(true));
+        assert!(!confirm.press_counts(opened + Duration::from_millis(200)), "a double-click's second press counted");
+        assert!(confirm.press_counts(opened + CONFIRM_ARM_DELAY));
+        let plain = MenuInputGuard::new(&menu_items(PanelMode::Hidden, &[]), opened);
+        assert!(!plain.confirm);
+        assert!(plain.hover_selects() && plain.key_accepts(false) && plain.press_counts(opened));
+    }
+
+    #[test]
     fn menu_choice_emits_setmode_command() {
         for edge in Edge::ALL {
             for current in [PanelMode::Hidden, PanelMode::Pinned, PanelMode::Docked] {
@@ -313,6 +554,7 @@ mod tests {
             output: OutputKey::new("test-output").unwrap(),
             corner: Corner::BottomRight,
             items: menu_items(PanelMode::Hidden, &[]),
+            serial: 0,
         };
         let rows = spawn_menu(&mut world, mount, &request, Vec2::new(1000.0, 800.0));
         for mode in [PanelMode::Hidden, PanelMode::Pinned, PanelMode::Docked] {
@@ -329,11 +571,11 @@ mod tests {
                 );
             }
         }
-        let origin = menu_origin(request.corner, Vec2::new(1000.0, 800.0), 3);
+        let origin = menu_origin(request.corner, Vec2::new(1000.0, 800.0), &request.items);
         assert_eq!(
-            hit_row(origin + Vec2::new(20.0, ROW_HEIGHT + 1.0), origin, 3),
+            hit_row(origin + Vec2::new(20.0, ROW_HEIGHT + 1.0), origin, &request.items),
             Some(1)
         );
-        assert_eq!(hit_row(origin - Vec2::ONE, origin, 3), None);
+        assert_eq!(hit_row(origin - Vec2::ONE, origin, &request.items), None);
     }
 }

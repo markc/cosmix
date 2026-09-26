@@ -1,0 +1,151 @@
+-- Deterministic tests for the session-control citizen's argument handling,
+-- session capture and command plans (lib/session.mix). Nothing here runs a
+-- systemctl, chvt or systemd-run: plans are only built and inspected.
+-- Run from the repo root: mix src/desktop/scripts/tests/session-test.mix
+$s = require("../lib/session.mix")
+fn check($condition, $message)
+  if not $condition then raise("SESSION_TEST", $message) end
+end
+fn refused($r, $code)
+  return $r.rc == 10 and $r.body.error_code == $code and type($r.body.message) == "string"
+end
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-session-test.XXXXXXXX"]))
+try
+  $cfg = {user: "alice", home: "/home/alice", desktop_unit: "cosmix-desktop.service",
+    boot_term_unit: "cosmix-boot-term.service", term_service: "term", leave_vt: "1",
+    worker_unit: "cosmix-session-restart", mix: "/opt/cosmix/bin/mix",
+    resume_script: "/opt/cosmix/share/desktop/session-resume.mix",
+    state_dir: "/home/alice/.cache/cosmix/session-resume", dry_run: false}
+
+  -- ── request(): empty bodies, the menu's {args}, dry_run, refusals ──
+  for each $empty in [nil, "", "   ", "{}", "{\"args\":[]}"]
+    $r = $s.request($empty, $cfg)
+    check($r.ok == true and $r.dry_run == false, "empty/args body refused: " .. json_encode($r))
+  end
+  check($s.request("{\"dry_run\":true}", $cfg).dry_run == true, "dry_run:true ignored")
+  check($s.request("{\"args\":[\"--dry-run\"]}", $cfg).dry_run == true, "args --dry-run ignored")
+  $forced = $cfg
+  $forced.dry_run = true
+  check($s.request("{\"dry_run\":false}", $forced).dry_run == true, "COSMIX_SESSION_DRY_RUN did not force a dry run")
+  check(refused($s.request("not json", $cfg), "INVALID_ARGUMENT"), "non-JSON body accepted")
+  check(refused($s.request("[1]", $cfg), "INVALID_ARGUMENT"), "non-object body accepted")
+  check(refused($s.request("{\"force\":true}", $cfg), "INVALID_ARGUMENT"), "unknown field accepted")
+  check(refused($s.request("{\"dry_run\":\"yes\"}", $cfg), "INVALID_ARGUMENT"), "string dry_run accepted")
+  check(refused($s.request("{\"args\":\"--dry-run\"}", $cfg), "INVALID_ARGUMENT"), "string args accepted")
+  check(refused($s.request("{\"args\":[3]}", $cfg), "INVALID_ARGUMENT"), "numeric arg accepted")
+  check(refused($s.request("{\"args\":[\"--now\"]}", $cfg), "INVALID_ARGUMENT"), "unknown arg accepted")
+
+  -- ── leave: chvt to a validated VT ──
+  $p = $s.plan_leave($cfg)
+  check($p.ok == true and json_encode($p.argv) == "[\"chvt\",\"1\"]", "leave argv wrong: " .. json_encode($p))
+  for each $bad in ["0", "64", "tty1", "", "1; reboot", "-1"]
+    $c = $cfg
+    $c.leave_vt = $bad
+    check(refused($s.plan_leave($c), "SESSION_CONFIG"), "bad VT accepted: " .. $bad)
+  end
+  $c = $cfg
+  $c.leave_vt = "07"
+  check($s.plan_leave($c).vt == "7", "VT not normalised")
+  $r = $s.leave_reply($p, true)
+  check($r.rc == 0 and $r.body.accepted == true and $r.body.action == "leave" and $r.body.vt == 1 and $r.body.dry_run == true and type($r.body.argv) == "list", "dry leave reply wrong: " .. json_encode($r))
+  check($s.leave_reply($p, false).body.argv == nil, "a real leave reply leaked its argv")
+
+  -- ── capture: live interactive sessions only, flags carried ──
+  mkdir($tmp .. "/sessions")
+  mkdir($tmp .. "/proc/101")
+  mkdir($tmp .. "/proc/102")
+  write_file($tmp .. "/proc/101/cmdline", "claude\0--dangerously-skip-permissions\0")
+  write_file($tmp .. "/proc/102/cmdline", "claude\0")
+  write_file($tmp .. "/sessions/101.json", json_encode({pid: 101, kind: "interactive", sessionId: "aaaa-1", cwd: "/home/alice/work"}))
+  write_file($tmp .. "/sessions/102.json", json_encode({pid: 102, kind: "interactive", sessionId: "bbbb-2", cwd: "/home/alice"}))
+  write_file($tmp .. "/sessions/103.json", json_encode({pid: 103, kind: "interactive", sessionId: "dead-3", cwd: "/home/alice"}))
+  write_file($tmp .. "/sessions/104.json", json_encode({pid: 102, kind: "print", sessionId: "print-4", cwd: "/home/alice"}))
+  write_file($tmp .. "/sessions/105.json", "{broken")
+  $got = $s.capture($tmp .. "/sessions", $tmp .. "/proc")
+  check(len($got) == 2, "capture count wrong: " .. json_encode($got))
+  check($got[0].id == "aaaa-1" and $got[0].flags == "--dangerously-skip-permissions", "flags not carried: " .. json_encode($got[0]))
+  check($got[1].id == "bbbb-2" and $got[1].flags == "", "plain session wrong: " .. json_encode($got[1]))
+  check(len($s.capture($tmp .. "/none", $tmp .. "/proc")) == 0, "a missing sessions dir was not empty")
+
+  -- ── restart plan: detached worker argv, state file, refusals ──
+  $p = $s.plan_restart($cfg, $got, 1234)
+  check($p.ok == true and $p.state_file == "/home/alice/.cache/cosmix/session-resume/sessions-1234.json", "state file wrong: " .. json_encode($p))
+  check($p.argv[0] == "systemd-run" and $p.argv[1] == "--unit=cosmix-session-restart" and contains($p.argv, "--collect"), "worker is not a transient unit: " .. json_encode($p.argv))
+  $tail = slice($p.argv, len($p.argv) - 5, len($p.argv))
+  check(json_encode($tail) == json_encode(["--", "/opt/cosmix/bin/mix", "/opt/cosmix/share/desktop/session-resume.mix", "--phase2", $p.state_file]), "worker command wrong: " .. json_encode($tail))
+  check(contains($p.argv, "COSMIX_SESSION_USER=alice") and contains($p.argv, "COSMIX_SESSION_HOME=/home/alice"), "worker env not handed over: " .. json_encode($p.argv))
+  $c = $cfg
+  $c.user = ""
+  check(refused($s.plan_restart($c, [], 1), "SESSION_CONFIG"), "restart without a user accepted")
+  $c = $cfg
+  $c.home = ""
+  check(refused($s.plan_restart($c, [], 1), "SESSION_CONFIG"), "restart without a home accepted")
+  $r = $s.restart_reply($p, true, "cosmix-session-restart")
+  check($r.rc == 0 and $r.body.action == "restart" and $r.body.dry_run == true and json_encode($r.body.sessions) == "[\"aaaa-1\",\"bbbb-2\"]" and type($r.body.argv) == "list", "dry restart reply wrong: " .. json_encode($r))
+  check($s.restart_reply($p, false, "u").body.argv == nil, "a real restart reply leaked its argv")
+  check(len($s.plan_restart($cfg, [], 5).sessions) == 0, "a restart with no sessions was refused")
+
+  -- ── resume line: typed bare, refused when it would need quoting ──
+  check($s.resume_line($got[0]) == "cd /home/alice/work && claude --dangerously-skip-permissions --resume aaaa-1\n", "resume line wrong: " .. $s.resume_line($got[0]))
+  check($s.resume_line($got[1]) == "cd /home/alice && claude --resume bbbb-2\n", "plain resume line wrong")
+  check($s.resume_line({id: "x-1", cwd: "/home/alice/my dir", flags: ""}) == nil, "a spaced directory was typed")
+  check($s.resume_line({id: "x-1", cwd: "/tmp/a;rm", flags: ""}) == nil, "a shell metacharacter was typed")
+  check($s.resume_line({id: "x 1", cwd: "/tmp", flags: ""}) == nil, "a spaced id was typed")
+
+  -- ── resume line: only the one known flag is carried ──
+  check($s.resume_line({id: "x-1", cwd: "/tmp", flags: "--model evil"}) == nil, "an unknown flag was typed")
+  check($s.resume_line({id: "x-1", cwd: "/tmp", flags: "--dangerously-skip-permissions --x"}) == nil, "a flag suffix was typed")
+
+  -- ── state directory: symlinks and foreign/open levels are refused ──
+  $me = uid()
+  $safe = $tmp .. "/state/ok"
+  check($s.prepare_state_dir($safe, $me) == nil, "a fresh private state dir was refused")
+  check(band(stat($safe).perm, 0o022) == 0, "the state dir is writable by others")
+  -- A planted directory symlink at any level: refused, and nothing is
+  -- written through it.
+  mkdir($tmp .. "/victim")
+  $_ln = run_argv_must(["ln", "-s", $tmp .. "/victim", $tmp .. "/state/link"])
+  $why = $s.prepare_state_dir($tmp .. "/state/link/sub", $me)
+  check($why != nil and contains($why, "symlink"), "a symlinked level was accepted: " .. to_string($why))
+  check(len(glob($tmp .. "/victim/*")) == 0, "something was created through the symlink")
+  $why = $s.write_state($tmp .. "/state/link", $tmp .. "/state/link/sessions-1.json", [], {uid: $me, gid: $me}, $me)
+  check($why != nil and contains($why, "symlink"), "state was written through a symlinked dir: " .. to_string($why))
+  check(len(glob($tmp .. "/victim/*")) == 0, "a state file landed in the symlink target")
+  -- A planted symlink AT the state file's name: refused, target untouched.
+  write_file($tmp .. "/victim/passwd", "original\n")
+  $_ln2 = run_argv_must(["ln", "-s", $tmp .. "/victim/passwd", $safe .. "/sessions-2.json"])
+  $why = $s.write_state($safe, $safe .. "/sessions-2.json", [{id: "a"}], {uid: $me, gid: $me}, $me)
+  check($why != nil and contains($why, "already exists"), "a symlinked state name was written: " .. to_string($why))
+  check(read_file($tmp .. "/victim/passwd") == "original\n", "the symlink target was overwritten")
+  -- A group/world-writable state dir is refused.
+  mkdir($tmp .. "/state/open")
+  chmod($tmp .. "/state/open", 0o777)
+  check($s.unsafe_dir($tmp .. "/state/open", $me) != nil, "a world-writable state dir was accepted")
+  -- The normal write: state readable, .done present, both new files.
+  check($s.write_state($safe, $safe .. "/sessions-3.json", [{id: "a"}], {uid: $me, gid: $me}, $me) == nil, "a safe state write failed")
+  check(band(stat($safe .. "/sessions-3.json").perm, 0o777) == 0o640 and exists($safe .. "/sessions-3.json.done"), "state file mode or .done wrong")
+  -- An aborted restart's leftovers go; old state is pruned, new state kept.
+  $s.remove_state($safe .. "/sessions-3.json")
+  check(not exists($safe .. "/sessions-3.json") and not exists($safe .. "/sessions-3.json.done"), "remove_state left files")
+  write_file($safe .. "/sessions-old.json", "[]")
+  $_touch = run_argv_must(["touch", "-d", "10 days ago", $safe .. "/sessions-old.json"])
+  write_file($safe .. "/sessions-new.json", "[]")
+  write_file($safe .. "/.sessions-9.json.mixtmp-x", "")
+  $_touch2 = run_argv_must(["touch", "-d", "10 days ago", $safe .. "/.sessions-9.json.mixtmp-x"])
+  check($s.prune_state($safe, time(), 7 * 86400) == 2 and not exists($safe .. "/.sessions-9.json.mixtmp-x") and exists($safe .. "/sessions-new.json") and not exists($safe .. "/sessions-old.json"), "prune wrong")
+
+  -- ── worker unit name: a .service suffix is normalised away ──
+  export COSMIX_SESSION_WORKER_UNIT = "cosmix-session-restart.service"
+  check($s.config().worker_unit == "cosmix-session-restart", "worker unit suffix not normalised")
+  export COSMIX_SESSION_WORKER_UNIT = ""
+
+  -- ── term reply parsing ──
+  check($s.reply_int("opened id=4 tab=4 pane=9", "pane") == 9, "reply_int pane")
+  check($s.reply_int("opened id=4 tab=4", "pane") == nil, "reply_int invented a pane")
+  check($s.reply_int("xpane=3 id=1", "pane") == nil, "reply_int matched inside a word")
+  print("PASS session-control: request/args handling, leave/restart plans, capture, resume lines")
+finally
+  if starts_with($tmp, "/tmp/cosmix-session-test.") then
+    $_rm = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end

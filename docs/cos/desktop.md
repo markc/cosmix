@@ -19,6 +19,9 @@ The initial [desktop Bus capability provider](desktop-bus.md) adds session
 discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
 It serves registered local callers and explicitly granted mesh clipboard
 callers through admitted noded connections.
+The [session-control citizen](session-control.md) restarts the session
+(resuming agent sessions into terminal panes) or leaves the seat for another
+VT, behind Quoin's Confirm/Cancel step for humans.
 
 ## What it is
 

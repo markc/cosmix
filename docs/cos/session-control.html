@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/term</title>
+    <title>CosMix — cos/session-control</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,266 +441,174 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/term.md"><div class="prose"><h1 id="term--the-lightweight-terminal">term — the lightweight terminal</h1>
-<p>CosMix Term (<code>apps/term</code>, binary <code>term</code>) is the tabbed Mix terminal on iced
-and wgpu. It is the lightweight frontend over <code>cosmix-term-core</code>, the same
-toolkit-free core as the Bevy frontend CosMix BTerm (<code>bterm</code>). The two share
-the PTY, the VT grid, the tab and pane model, the glyph raster and the Bus
-handlers. Only the window differs.</p>
-<p>It registers the Bus name <code>term</code> and serves the <code>term.*</code> verbs. bterm
-registers <code>bterm</code> and serves <code>bterm.*</code>, so both can run at once. <code>mix --gui</code>
-still prefers bterm until term reaches full verb parity (decisions D6 and
-D10). Set <code>COSMIX_TERM_BIN</code> to the <code>term</code> binary to launch this one.</p>
-<h2 id="tabs-and-panes">Tabs and panes</h2>
-<p>The tab strip across the top shows one button per tab and a <code>+</code> that opens a
-new one. Clicking a tab selects it. Each tab holds a tree of split panes, and
-clicking a pane focuses it. When a tab has more than one pane, the focused
-pane's border takes the design's focus-ring colour. Every other border,
-including a tab's only pane, takes the plain border colour.
-All strip and border colours come from the <code>cosmix-design</code> tokens.</p>
-<p>Each tab shows its focused pane's program-set OSC title, falling back to <code>mix</code>.
-A user-pinned title overrides OSC updates until cleared. The strip does not scroll or wrap. At the default window width, past about 17 tabs the <code>+</code>
-and the later tabs run off the right edge, although up to 32 terminals can be
-open. Ctrl+PageUp and Ctrl+PageDown still reach every tab.</p>
-<p>Every pane keeps a border of the same width whether or not it is focused, so
-moving focus never resizes a PTY. Split edges are placed on whole physical
-pixels, so a pane's grid is never drawn half a pixel off the display.</p>
-<p>Only the active tab's panes are drawn. A hidden tab keeps running and holds
-no grid buffers. When it is shown again every pane repaints in full.</p>
-<p>When a pane's shell exits, the pane closes. Closing the last pane of a tab
-closes the tab, and closing the last tab quits. A shell that exits on its own
-raises a desktop notification, as in bterm. Set <code>TERM_NOTIFY=0</code> to turn that
-off.</p>
-<h2 id="keys">Keys</h2>
-<p>Tab and pane chords need Ctrl and Shift, or Ctrl alone where shown.
-Any chord that also holds Alt or Super is left alone.</p>
-<table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
-<tr><td>Ctrl+Shift+T</td><td>new tab</td></tr>
-<tr><td>Ctrl+Shift+W</td><td>close the active tab</td></tr>
-<tr><td>Ctrl+PageDown / Ctrl+PageUp</td><td>next / previous tab</td></tr>
-<tr><td>Ctrl+Tab / Ctrl+Shift+Tab</td><td>next / previous pane in the current tab, in layout order, wrapping at either end</td></tr>
-<tr><td>Ctrl+Shift+E</td><td>split the focused pane side by side</td></tr>
-<tr><td>Ctrl+Shift+O</td><td>split the focused pane top and bottom</td></tr>
-<tr><td>Ctrl+Shift+X</td><td>close the focused pane</td></tr>
-<tr><td>Ctrl+Shift+arrows</td><td>focus the nearest pane in that direction</td></tr>
-<tr><td>Ctrl+Shift+Q</td><td>quit</td></tr>
+        <div id="content-doc" data-prerendered="cos/session-control.md"><div class="prose"><h1 id="session-control-restart-the-session-leave-the-seat">Session control: restart the session, leave the seat</h1>
+<p><code>src/desktop/scripts/session-control.mix</code> is the session-control citizen. It
+registers the Bus service <code>desktop-session</code> and answers two verbs:</p>
+<table><thead><tr><th>verb</th><th>what it does</th></tr></thead><tbody>
+<tr><td><code>desktop.session.restart</code></td><td>restarts the desktop unit (<code>cosmix-desktop.service</code>), then types a resume line into a terminal pane for each agent (Claude Code) session that was running</td></tr>
+<tr><td><code>desktop.session.leave</code></td><td>switches to another VT (<code>chvt 1</code> by default); the desktop keeps running on its own VT, so you can switch back to it</td></tr>
 </tbody></table>
-<p>Held, these chords do not repeat. A held Ctrl+Shift+T opens one tab, and
-the repeats are dropped rather than sent to the shell.</p>
-<p>Pane cycling changes only keyboard focus within the current tab, following
-the split tree's first pane before its second pane. Bare Tab still goes to
-the shell.</p>
-<p>Everything else goes to the focused pane's shell. That means printable text
-in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
-Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>
-<h2 id="selection-and-clipboard">Selection and clipboard</h2>
-<p>Drag with the left button to select; double-click selects a word and
-triple-click a logical line. A single click clears the selection. Ctrl+Shift+C
-copies to CLIPBOARD; Ctrl+Shift+V and Shift+Insert paste CLIPBOARD. Completed
-selections also populate PRIMARY, pasted with the middle button. Hold Shift
-before pressing a mouse button to override an application's mouse reporting.
-Copy/paste chords do not repeat; plain Ctrl+C still interrupts.</p>
-<p>Selections belong to each pane and follow their text through scrollback.
-Pasting returns to the live bottom and honours the application's bracketed
-paste mode. See <a href="/dev/term-clipboard">selection and clipboard details</a>
-for encoding, limits and Wayland requirements.</p>
-<h2 id="scrollback">Scrollback</h2>
-<table><thead><tr><th>Input</th><th>Action</th></tr></thead><tbody>
-<tr><td>Wheel up / down</td><td>scroll the pane under the pointer</td></tr>
-<tr><td>Shift+wheel</td><td>force local history instead of application mouse reporting</td></tr>
-<tr><td>Shift+PageUp / Shift+PageDown</td><td>scroll the focused pane by one page (rows minus one)</td></tr>
-<tr><td>Shift+Home / Shift+End</td><td>jump to the top / bottom of the focused pane's history</td></tr>
-</tbody></table>
-<p>Scrollback keys repeat when held and apply only on the primary screen. On the
-alternate screen, Shift+PageUp/PageDown/Home/End go to the application as
-PageUp/PageDown/Home/End. Plain PageUp and
-PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
-Accepted keyboard input, pasted or Bus <code>term.type</code> text (including control-lane
-typing), and mouse button or wheel reports return the viewport to the live bottom.
-Motion-only reports (including button drags), empty or rejected input, and
-automatic VT replies leave it alone. A live cursor is shown
-in a scrolled viewport only when its translated row remains on screen.</p>
-<p>Each wheel notch scrolls one line. Touchpad travel accumulates at one logical
-cell height per line, matching bterm. Applications that enable mouse reporting
-receive the wheel first; otherwise the alternate screen can translate it to cursor keys (for
-example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
-to change the font size. The <code>scrollback</code> setting controls history depth.</p>
-<p>Viewport changes mark only the affected pane dirty and arm the next redraw.
-Wheel scrolling, history keys and Bus <code>term.scroll</code> share this path: wakes
-coalesce without painting intermediate views, then the redraw repaints every
-row of the changed viewport, including when returning to the live bottom.
-Clean neighbouring panes keep their frames. The four-row tiny-skia bands use
-the viewport's translated cursor visibility, so an off-screen live cursor
-does not appear in history.</p>
-<h2 id="font-size">Font size</h2>
-<p>Font sizing follows foot. The window keeps its size and the grid gains or
-loses cells. Every pane is re-rasterised, and every shell is told its new
-size.</p>
-<table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
-<tr><td>Ctrl+plus, Ctrl+equal, Ctrl+keypad plus</td><td>one step larger</td></tr>
-<tr><td>Ctrl+minus, Ctrl+keypad minus</td><td>one step smaller</td></tr>
-<tr><td>Ctrl+0, Ctrl+keypad 0</td><td>back to the configured size</td></tr>
-<tr><td>Ctrl+wheel up / down</td><td>one step larger / smaller per notch</td></tr>
-</tbody></table>
-<p>A step is foot's half point, which is two thirds of a logical pixel. The
-size stays within the 6 to 48 pixel range that <code>font_px</code> accepts, and
-stepping stops at either end. These chords repeat when held. Touchpad
-scrolling counts 40 logical pixels of travel as one step.</p>
-<p>The zoomed size lasts for the life of the window. It applies to every tab and
-pane, including ones opened later. It survives moving the window to an output
-with a different scale. It is not written back to <code>term.conf.mix</code>, so a new
-window starts at the configured size.</p>
-<h2 id="configuration">Configuration</h2>
-<p><code>~/.config/cosmix/term.conf.mix</code> is shared with bterm. It sets <code>font_px</code>,
-<code>scrollback</code> and <code>cursor</code>. <code>TERM_FONT_PX</code> overrides <code>font_px</code> for one run,
-and <code>TERM_SPIKE_FONT</code> names a monospace font file.</p>
+<p>Both verbs are open to mesh callers and need no confirmation: agents drive
+them directly. The human confirm step belongs to Quoin: its "Restart session…"
+and "Leave seat…" corner-menu entries (<code>menu_items</code> with <code>confirm</code>) and the
+<code>shell.session.confirm {action}</code> verb that global chords bind to both open a
+Confirm/Cancel step first. See <a href="/cos/quoin">Quoin</a>.</p>
+<h2 id="requests-and-replies">Requests and replies</h2>
+<p>The body is empty, or a JSON object with optional fields:</p>
 <ul>
-<li><code>term --print-config</code> prints the resolved settings and exits.</li>
-<li><code>term --version</code> prints the version and build hash and does nothing else.</li>
+<li><code>args</code>: a list of strings. This is the shape a Quoin corner-menu extra sends
+(<code>{"args":[]}</code>). The only string accepted is <code>--dry-run</code>.</li>
+<li><code>dry_run</code>: <code>true</code> or <code>false</code>.</li>
 </ul>
-<h2 id="bus">Bus</h2>
-<p>term serves the core's <code>term.*</code> surface under the mesh-open law, like
-bterm. <code>send term HELP</code> lists the full surface. A verb and the matching chord
-make the same change, and the window follows a verb straight away. Every body
-is a JSON object, and <code>{}</code> means no arguments.</p>
-<table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
-<tr><td><code>term.tabs</code></td><td><code>{}</code></td><td>list tabs: id, active, title, cols, rows, child pid, revision, instance (this process's token)</td></tr>
-<tr><td><code>term.tab.new</code></td><td><code>{"cwd":"/absolute/directory","title":"build"}</code> (both optional)</td><td>open and select a tab; explicit cwd must exist, be searchable by the current user and never falls back; title pins the tab label</td></tr>
-<tr><td><code>term.tab.title</code></td><td><code>{"id":N,"title":"build"}</code></td><td>pin a label; empty string clears the pin and restores the focused pane's program-set OSC title (default <code>mix</code>)</td></tr>
-<tr><td><code>term.tab.move</code></td><td><code>{"id":N,"index":0}</code></td><td>reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane</td></tr>
-<tr><td><code>term.tab.select</code></td><td><code>{"id":N}</code></td><td>select tab N</td></tr>
-<tr><td><code>term.tab.close</code></td><td><code>{"id":N}</code></td><td>close tab N; closing the last tab quits</td></tr>
-<tr><td><code>term.panes</code></td><td><code>{"tab":N}</code> (optional)</td><td>list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision, instance, and <code>pid</code> (the term process itself; term-core 0.8.1: term 0.3.1, bterm 0.10.1). It is self-reported: pane lines carry no free text, so a program running in a pane cannot change it, but a process that registers the Bus name <code>term</code> itself can claim any pid (a broker-attested owner pid is future noded work). INFO ends with the same <code>instance=… pid=…</code></td></tr>
-<tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
-<tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
-<tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
-<tr><td><code>term.snapshot</code></td><td><code>{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}</code> (all optional)</td><td>read a pane anywhere; default is the focused pane in the selected/active tab; <code>contents</code> defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero)</td></tr>
-<tr><td><code>term.type</code></td><td><code>{"pane":N,"instance":I,"text":"..."}</code> (<code>pane</code> or <code>tab</code> <strong>required</strong>, <code>instance</code> optional)</td><td>type ASCII as keys without changing focus. <strong><code>pane</code> is the safe selector.</strong> <code>tab</code> means that tab's active pane <em>at delivery</em>, so it still follows focus inside the tab; with both, the pane must belong to the tab. Pane and tab ids are per-process counters from 1, so pass back the <code>instance</code> that <code>term.tabs</code>/<code>term.panes</code>/<code>INFO</code> reported: another term process refuses rather than typing into its own pane N. Neither selector, a disagreeing pair or a foreign instance is refused <code>{"error_code":"INVALID_ARGUMENT","message":…}</code> and never defaults to the focused pane (term-core 0.8.0: term 0.3.0, bterm 0.10.0) — keys that follow focus land wherever focus has moved (2026-09-25). These <code>INVALID_ARGUMENT</code> refusals are not recorded under a <code>request_id</code>, so retry the same id with the argument fixed; a <code>not-found</code> or non-ASCII refusal IS recorded and replays</td></tr>
-<tr><td><code>term.scroll</code></td><td><code>{"pane":N,"lines":3}</code> or <code>{"page":-1}</code> or <code>{"to":"top"}</code></td><td>move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed <code>lines</code>, signed <code>page</code>, or <code>to</code> (<code>top</code>/<code>bottom</code>)</td></tr>
-<tr><td><code>term.props.watch</code></td><td><code>{}</code></td><td>subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON <code>{topics,revision}</code>), then read state</td></tr>
-</tbody></table>
-<pre><code class="language-mix">send term term.tab.new
-send term term.pane.split dir=v
-send term term.panes
-send term term.tab.new cwd="/tmp" title="build"
-send term term.tab.title id=1 title="logs"
-send term term.tab.move id=1 index=0
-send term term.panes tab=1
-send term term.snapshot pane=1 contents=true scrollback_lines=100
-send term term.type pane=1 text="pwd\n"
-send term term.props.watch
+<p>A dry run replies with the plan (the argv it would run, the captured
+sessions, the state file) and runs nothing. <code>COSMIX_SESSION_DRY_RUN=1</code> in
+the citizen's environment makes every request a dry run.</p>
+<pre><code class="language-mix">send "desktop-session" desktop.session.restart body='{"dry_run":true}'
+send "desktop-session" desktop.session.leave
 </code></pre>
-<p>The same surface is served by bterm as <code>bterm.*</code>. Since term 0.2.8 the iced
-frontend also starts the shared native-session supervisor and serves the full
-target-bound lane: <code>term.list</code>, <code>term.session</code>, <code>term.tabs</code>, <code>term.panes</code>,
-<code>term.snapshot</code>, <code>term.type</code>, <code>term.execute</code>, <code>term.exec.result/cancel</code>,
-<code>term.task.submit/result/cancel</code>, <code>term.operation</code>, and <code>term.props.get/set</code>,
-along with target-bound tab/pane mutations. These requests use the allocated
-native-session route and its <code>target</code> identity, not the global targetless
-<code>term</code> service. The native route's <code>HELP</code> describes its arguments. Mesh callers
-need no additional authorisation; target identity, generation freshness and
-mutation-time rechecks still apply.</p>
-<p>The lane requires local noded 0.16.8 or later with native ingress enabled,
-<code>COSMIX_RUN=/run/cosmix</code> and a traversable socket directory (0755). If ingress
-is unavailable, graphics still start and the supervisor reports the reason
-once per cause transition rather than repeating it for each pane or reconnect
-retry. A later cause is logged even after a startup deadline was reported.
-Iced shows its window without waiting for noded: account lookup, connection,
-and the bounded first-pane readiness wait run on a startup worker. The first
-shell appears when that worker finishes, with a native grant if ready, or as
-a graphics-only shell otherwise. Before attach, mutating targetless verbs return
-non-zero rc with error <code>starting</code>; retry after attach with the same request ID
-(startup refusals are not cached). Watches registered during startup receive
-the first tab and pane's add/select events. First-pane spawn failure exits
-non-zero with an error after cleanup. Native work wakes the existing iced eventfd
-subscription. Both frontends release Control's cleanup sender on exit, reap
-the panes while the native actor can still acknowledge each revoke, then stop
-the actor. See
-<a href="/cos/term-native-control">native-session control</a> for discovery and request
-envelopes.</p>
-<p>Explicit stale tab/pane IDs return a <code>not-found</code>
-error, never the active pane. With both snapshot selectors, the pane must
-belong to the tab or the call returns <code>invalid-argument</code>. <code>contents:false</code>
-returns the usual metadata and diagnostic timings without the screen marker
-or text. Scrollback is prepended after the screen marker, oldest first;
-<code>rows</code> still describes the live screen. Reading never moves the scroll offset.
-Snapshot text represents empty grid cells as spaces, preserving column positions
-and trailing blank cells in both history and live-screen rows. Text is limited to
-512 KiB of encoded bytes (including allowance for JSON escaping), leaving
-metadata and transport headroom below the MCP 1 MiB and Bus 8 MiB limits.
-The budget keeps the newest complete rows: the live screen first, then as much
-recent history as fits. Retained rows are returned oldest first; the header reports
-<code>truncated=true</code> when the byte budget omits rows and <code>lines_returned=N</code>
-counts history and live-screen rows actually returned. A row larger than the
-budget returns no text rows. With <code>contents:false</code>, the count is zero and
-<code>truncated=false</code>. Capture copies bounded rows under the grid lock; text
-formatting runs after releasing the grid, terminal and tab-set locks.</p>
-<p>Pinned and OSC titles have control characters and Unicode line/paragraph
-separators stripped and are capped at 256 UTF-8 bytes on a character boundary.
-An empty sanitised pin clears it. Titles may contain spaces; tab-list readers
-should delimit the title at the final <code> cols=</code> field, rather than tokenising
-it on whitespace. Effective title changes advance the separate event revision
-via <code>tabs.changed</code> and <code>title.changed</code> with <code>kind=retitled</code>; they leave the
-tab-set and pane-layout revisions unchanged, so pane geometry stays valid.
-Completion notifications use the same sanitised, possibly program-set label.
-Explicit cwd paths follow symlinks and resolve <code>..</code> normally.</p>
-<p><code>term.scroll</code> (or <code>bterm.scroll</code> on bterm) returns JSON
-<code>{"pane":N,"display_offset":D,"history_lines":H}</code>. Positive lines/pages move
-up into history; negative values move down, clamped to available history.
-Each page is rows minus one, matching the keyboard chords. Integers must fit
-signed 64 bits; zero is a no-op. Stale pane IDs return <code>not-found</code>.
-Scrolling leaves snapshot content on the live screen and never sends PTY input.
-When watching, an offset change publishes <code>term.pane.changed</code> (or
-<code>bterm.pane.changed</code>) with <code>kind=scrolled</code>; a clamped no-op publishes nothing.
-Like other mutations it supports <code>request_id</code> replay and is refused on the
-strict diagnostic-only targetless lane.</p>
-<p>Existing replies keep their key=value format. New title replies are
-<code>retitled id=N tab=N pane=P revision=R</code>; move replies are
-<code>moved id=N index=I tab=N pane=P revision=R</code>. Tab creation still replies
-<code>opened id=N tab=N pane=P revision=R binding=...</code>. All mutations, including
-title/move and pane-selected typing, accept <code>request_id</code>; a retry with the
-same verb and arguments replays the original success or state refusal
-(<code>not-found</code>, non-ASCII text, the tab limit). <code>starting</code>, an oversized body
-and validation refusals (malformed JSON, unexpected/missing/mistyped
-arguments, any <code>invalid-argument</code>/<code>INVALID_ARGUMENT</code> reply) are NOT recorded,
-so the same ID may be retried with the request fixed. Different arguments
-with an ID whose first attempt was recorded are a conflict. The JSON envelope limit remains
-8192 bytes. Index must be an integer; invalid optional argument
-types are refused.</p>
-<p>Watch publishes <code>&lt;service&gt;.tabs.changed</code> (added, removed, moved, selected,
-retitled), <code>&lt;service&gt;.pane.changed</code> (added, removed, selected, resized) and
-<code>&lt;service&gt;.title.changed</code> (retitled). Each body is
-<code>{tab,pane,kind,revision}</code>; the embedded Bus command is the topic suffix.
-Events cover local UI actions and Bus mutations. OSC updates wake the core;
-multiple updates before it handles the wake may coalesce to the latest title.
-Pinned titles hide OSC updates until cleared. Unchanged values and replayed
-mutations produce no new events. There is no timer or caller identity lease.</p>
-<p>The watch revision is a separate monotonic event sequence, preserving the
-older layout revision in verb replies. Publishing uses a bounded 256-record
-queue and a serial, best-effort Bus sender. Subscribe before enabling watch,
-then read current state; on a revision gap or reconnect read state again.
-The watch response gives the current event revision. Events are not retained
-by noded; publication failures are logged at most once per 30 seconds and
-do not block terminal input. A dropped final event may remain undetectable
-until a later revision arrives; read state whenever freshness is required.</p>
-<p><code>term.panes</code> reports each pane's geometry in logical pixels, relative to the
-pane area below the tab strip, as bterm does. Geometry is from the last
-frontend layout: hidden tabs can report stale values after a window resize,
-or zeros after geometry invalidation. Select the tab and allow a frontend
-layout before relying on its geometry. Grid dimensions describe the current
-PTY grid and do not promise an up-to-date window layout.</p>
-<p><code>term.snapshot</code> always reads the live screen, even while a human views history.
-It does not move that viewport or consume pending repaint damage.</p>
-<p>With no broker, term prints that the Bus is unavailable and works as a
-plain terminal.</p>
-<h2 id="not-yet-in-this-frontend">Not yet in this frontend</h2>
 <ul>
-<li>The app-control port: <code>app.describe</code>, <code>app.quit</code> and <code>app.controls.*</code> are
-not served yet.</li>
-<li>The native-session lane, see <a href="/cos/term-native-session">term-native-session</a>.
-bterm is still its only client.</li>
-<li>A verb for the font size. Until one exists, font size is set from the
-keyboard or the wheel only.</li>
+<li><strong>restart</strong> replies at once:
+<code>{accepted:true, action:"restart", dry_run, unit, state_file, sessions}</code>.
+<code>sessions</code> lists the captured session ids; a dry run adds <code>argv</code>. The
+restart itself happens after the reply (see below).</li>
+<li><strong>leave</strong> replies <code>{accepted:true, action:"leave", dry_run, vt}</code> after
+<code>chvt</code> returns; a dry run adds <code>argv</code>.</li>
+<li><strong>Refusals</strong> are rc 10 <code>{error_code, message}</code>:
+<ul>
+<li><code>INVALID_ARGUMENT</code>: a malformed body, an unknown field, or an unknown arg.</li>
+<li><code>SESSION_CONFIG</code>: a missing <code>COSMIX_SESSION_USER</code>, an unknown user or
+home, or a bad <code>COSMIX_LEAVE_VT</code>.</li>
+<li><code>RESTART_IN_PROGRESS</code>: the restart unit is already running.</li>
+<li><code>STATE_DIR_UNSAFE</code>: a level of the state directory is a symlink, is not
+a directory, is owned by someone other than root, or is writable by
+others.</li>
+<li><code>STATE_WRITE</code>: the state file could not be written (a name already
+taken included).</li>
+<li><code>RESTART_START</code>: <code>systemd-run</code> failed; the state file is removed again.</li>
+<li><code>CHVT_FAILED</code>: <code>chvt</code> failed.</li>
+</ul>
+</li>
+</ul>
+<h2 id="how-a-restart-survives-itself">How a restart survives itself</h2>
+<p>A restart closes every desktop window, including the terminal the request
+came from. So nothing that the desktop owns can carry the restart out.</p>
+<ol>
+<li>The <strong>citizen</strong> runs as root from its own system unit. The unit is not
+<code>PartOf=</code> or <code>BindsTo=</code> the desktop, so the restart does not stop it. The
+citizen reads the desktop user's live interactive sessions from
+<code>~/.claude/sessions/&lt;pid&gt;.json</code> (live means <code>/proc/&lt;pid&gt;</code> exists). It
+writes them to <code>/var/lib/cosmix/session-resume/sessions-&lt;time&gt;.json</code>: a
+root-owned directory outside the user's home, checked level by level
+(no symlinks, root-owned, not writable by others) before anything is
+written, so no path the user controls can steer what root writes. The
+state file is mode 0640, root and the user's group (session ids and
+directories are private); the user owns only its empty <code>.done</code> beside it. State older than 7 days is pruned on each restart. It then
+starts the worker with <code>systemd-run --unit=cosmix-session-restart --collect</code> and replies. That unit name is the single name every restart
+uses, so a second restart while one runs is refused.</li>
+<li>The <strong>worker</strong> (<code>session-resume.mix --phase2</code>) runs in that transient
+unit, outside both the desktop's cgroup and the citizen's, so neither
+going down can stop it. It:
+<ul>
+<li>restarts the desktop unit;</li>
+<li>waits until the unit is <code>active</code> AND its boot terminal
+(<code>cosmix-boot-term.service</code>) is a NEW process. An old terminal still on
+the Bus would take the keys into whatever runs in its active tab;</li>
+<li>runs <code>--resume-fresh STATE PID</code> as the desktop user, PID being the new
+boot term's MainPID.</li>
+</ul>
+</li>
+<li><strong><code>--resume-fresh</code></strong> waits for the terminal on the Bus and types only into
+the term PROCESS whose pid is PID. Before every keystroke batch it reads
+<code>term.panes</code> (term-core 0.8.1 adds <code>pid=</code> to each pane line), and the pane
+it types into must come from a line naming PID; the <code>instance</code> sent with the
+keys is that same line's, so <code>term.type</code>'s own instance check refuses the
+keys in any other term process. A genuine term that outlived the restart
+reports its own pid and gets nothing: the worker fails closed with the
+recovery command.
+The pid is SELF-REPORTED by whatever holds the Bus name <code>term</code>. A program
+running in a pane cannot set it (pane lines carry no free text), but a
+process that registers <code>term</code> itself could claim any pid. The real fix is
+a broker-attested owner pid (noded recording the registering connection's
+<code>SO_PEERCRED</code>), filed as a noded TODO. For each session it
+opens a pane: the boot tab's for the first session, a new tab for each
+later one. It then sends a <code>term.type</code> with <code>{pane, instance, text, request_id}</code> of
+<code>cd &lt;cwd&gt; &amp;&amp; claude [--dangerously-skip-permissions] --resume &lt;id&gt;</code>.
+<ul>
+<li>Sessions resume by id, because <code>claude -c</code> reopens the most recent
+conversation of a directory, and two sessions in one directory would
+both reopen the same one.</li>
+<li>The <code>request_id</code>s are stable (keyed on the state file and the session)
+and every resumed id is appended to <code>&lt;state&gt;.done</code>. A rerun after a lost
+reply replays; it never types the same keys twice.</li>
+<li>A directory or id that would need shell quoting, or a <code>flags</code> value
+other than empty or <code>--dangerously-skip-permissions</code>, is not typed. The
+worker logs it for a by-hand resume.</li>
+</ul>
+</li>
+</ol>
+<p>The worker logs to <code>journalctl -u cosmix-session-restart</code>. Its first line
+names the recovery command:</p>
+<pre><code>mix /opt/cosmix/share/desktop/session-resume.mix --resume-only STATE
+</code></pre>
+<p>Run it as the desktop user. It skips <code>&lt;state&gt;.done</code> and opens a new tab for
+each remaining session.</p>
+<h2 id="chords">Chords</h2>
+<p>Global chords bind to Quoin's <code>shell.session.confirm {action}</code> (through
+inputd), never to the session verbs, so a keypress only ever opens the
+question. The chords are <strong>Ctrl+Alt+Backspace</strong> (restart) and
+<strong>Ctrl+Alt+End</strong> (leave).</p>
+<p><strong>Ctrl+Alt+Delete is deliberately NOT bound.</strong> It is the kernel's reboot key,
+and holding a VT does not stop it:</p>
+<ul>
+<li>seatd and logind put the desktop's VT in keyboard mode <code>K_OFF</code>.</li>
+<li>The kernel still handles <code>KT_SPEC</code> keys in that mode
+(<code>drivers/tty/vt/keyboard.c</code>, <code>kbd_keycode()</code>: the early return is
+<code>(raw_mode || kbd-&gt;kbdmode == VC_OFF) &amp;&amp; type != KT_SPEC &amp;&amp; type != KT_SHIFT</code>).</li>
+<li>Ctrl+Alt+Delete's Boot keysym is <code>KT_SPEC</code>: <code>ctrl_alt_del()</code> sends SIGINT
+to PID 1, which starts <code>ctrl-alt-del.target</code>, an alias of <code>reboot.target</code>.</li>
+</ul>
+<p>So Ctrl+Alt+Delete reboots the machine, while the desktop is running just as
+on a text console, whenever the kernel sees the keystroke. The kernel sees it
+unless inputd holds an exclusive grab on the keyboard and swallows the stroke
+as a bound row. A binding would make it safe only while inputd runs and grabs,
+which is why the leave chord is Ctrl+Alt+End instead. <code>ctrl-alt-del.target</code>
+is left as it is.</p>
+<h2 id="settings-environment">Settings (environment)</h2>
+<table><thead><tr><th>variable</th><th>default</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>COSMIX_SESSION_USER</code></td><td>(required for restart)</td><td>the desktop user whose sessions are resumed; never guessed</td></tr>
+<tr><td><code>COSMIX_SESSION_HOME</code></td><td>from <code>getent passwd</code></td><td>that user's home</td></tr>
+<tr><td><code>COSMIX_DESKTOP_UNIT</code></td><td><code>cosmix-desktop.service</code></td><td>the unit a restart restarts</td></tr>
+<tr><td><code>COSMIX_BOOT_TERM_UNIT</code></td><td><code>cosmix-boot-term.service</code></td><td>the boot terminal that must come back as a new process</td></tr>
+<tr><td><code>COSMIX_SESSION_TERM_SERVICE</code></td><td><code>term</code></td><td>the terminal's Bus service</td></tr>
+<tr><td><code>COSMIX_LEAVE_VT</code></td><td><code>1</code></td><td>the VT <code>leave</code> switches to (1–63)</td></tr>
+<tr><td><code>COSMIX_SESSION_WORKER_UNIT</code></td><td><code>cosmix-session-restart</code></td><td>the transient unit's name (a <code>.service</code> suffix is dropped)</td></tr>
+<tr><td><code>COSMIX_SESSION_STATE_DIR</code></td><td><code>/var/lib/cosmix/session-resume</code></td><td>where state files live (root-owned, checked before every write)</td></tr>
+<tr><td><code>COSMIX_SESSION_TERM_WAIT</code></td><td><code>90</code></td><td>seconds the worker waits for the new boot term on the Bus</td></tr>
+<tr><td><code>COSMIX_SESSION_DRY_RUN</code></td><td>unset</td><td><code>1</code>: every request is a dry run</td></tr>
+</tbody></table>
+<h2 id="install">Install</h2>
+<p>The citizen needs <code>lib/session.mix</code> and <code>session-resume.mix</code> beside it:</p>
+<pre><code>install -D -m 0644 src/desktop/scripts/session-control.mix /opt/cosmix/share/desktop/session-control.mix
+install -D -m 0644 src/desktop/scripts/session-resume.mix /opt/cosmix/share/desktop/session-resume.mix
+install -D -m 0644 src/desktop/scripts/lib/session.mix /opt/cosmix/share/desktop/lib/session.mix
+</code></pre>
+<p>Copy <code>src/desktop/scripts/cosmix-session-control.service</code> to
+<code>/etc/systemd/system/</code> and set <code>COSMIX_SESSION_USER</code>. Then run:</p>
+<pre><code>systemctl daemon-reload
+systemctl enable --now cosmix-session-control.service
+</code></pre>
+<p>Check it with a dry run before trusting it with the live desktop.</p>
+<h2 id="tests">Tests</h2>
+<p>The tests never restart or switch anything:</p>
+<ul>
+<li><code>mix src/desktop/scripts/tests/session-test.mix</code>: request handling, plans,
+session capture and resume lines, using pure functions against fixtures.</li>
+<li><code>COSMIX=$PWD mix src/desktop/scripts/tests/session-bus-test.mix</code>: the
+production citizen over a private broker in forced dry-run mode.</li>
+<li><code>COSMIX=$PWD mix src/desktop/scripts/tests/session-resume-test.mix</code>: the
+worker against a fake term over a private broker. A term with the wrong pid
+gets no keys and the worker fails closed; the right one gets the resume
+line.</li>
 </ul></div></div>
     </div>
 

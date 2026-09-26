@@ -457,7 +457,10 @@ configuration. Other broker clients are unaffected by this app-control gate.</p>
 <p>The initial <a href="/cos/desktop-bus">desktop Bus capability provider</a> adds session
 discovery, explicit text clipboard transfer and HTTP(S) opening through noded.
 It serves registered local callers and explicitly granted mesh clipboard
-callers through admitted noded connections.</p>
+callers through admitted noded connections.
+The <a href="/cos/session-control">session-control citizen</a> restarts the session
+(resuming agent sessions into terminal panes) or leaves the seat for another
+VT, behind Quoin's Confirm/Cancel step for humans.</p>
 <h2 id="what-it-is">What it is</h2>
 <table><thead><tr><th>Part</th><th>Crate</th><th>What it is</th></tr></thead><tbody>
 <tr><td>Compositor</td><td><code>cosmix-comp</code></td><td>Smithay protocol frontend with Bevy 0.19 / wgpu rendering. Runs nested inside an existing Wayland session (<code>--nested</code>) or on a KMS seat.</td></tr>

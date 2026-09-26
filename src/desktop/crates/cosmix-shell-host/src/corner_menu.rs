@@ -15,6 +15,13 @@ pub(super) struct NativeCornerMenu {
     rows: Vec<Entity>,
     selected: Option<usize>,
     pressed: Option<usize>,
+    /// A confirm step's accident guards (hover, keys, early presses).
+    guard: ui::MenuInputGuard,
+    /// When the menu opened, on a monotonic clock: the host is event-driven,
+    /// so `Time<Real>` may not have advanced since.
+    opened: std::time::Instant,
+    /// `selected` came from the arrow keys, not from hover.
+    key_selected: bool,
 }
 
 /// Default hook always supplies the three mode items and the built-in
@@ -28,6 +35,7 @@ pub fn open(world: &mut World, output: &OutputKey, corner: cosmix_shell::core::C
         output: output.clone(),
         corner,
         items,
+        serial: ui::next_menu_serial(),
     });
 }
 
@@ -55,12 +63,19 @@ impl RunnerState {
             return Ok(());
         };
         if self.selected_key.as_ref() != Some(&request.output) {
+            // Dropped: release any hold kept for it (a reopened step), and
+            // update so its asker learns promptly that nothing was shown.
+            stage_menu_hold(&mut self.app, &request.output, request.corner.summoned_edge(), false);
+            self.needs_update = true;
             return Ok(());
         }
         // A request arriving while a menu is open replaces it. The incumbent
         // must leave through the normal dismiss path — staging its hold
         // release — or its exclusive-keyboard layer and row entities leak.
         let replacing = self.menu.is_some();
+        // Dismissing the incumbent pumps an update before this request's
+        // popup exists: say which request is being opened meanwhile.
+        self.app.insert_resource(ui::CornerMenuOpening(request.serial));
         if replacing {
             self.dismiss_corner_menu(None);
         }
@@ -69,6 +84,7 @@ impl RunnerState {
             // for this request's edge (it may differ from the incumbent's).
             let edge = request.corner.summoned_edge();
             stage_menu_hold(&mut self.app, &request.output, edge, false);
+            self.app.world_mut().remove_resource::<ui::CornerMenuOpening>();
             return Ok(());
         };
         let size = Vec2::new(output.logical_size.width(), output.logical_size.height());
@@ -108,10 +124,15 @@ impl RunnerState {
             None,
             None,
         )
-        .map_err(|e| LayerHostError::new(e.to_string()))?;
+        .map_err(|e| {
+            self.app.world_mut().remove_resource::<ui::CornerMenuOpening>();
+            LayerHostError::new(e.to_string())
+        })?;
         self.app.insert_resource(crate::holders::PopupLayerIdentity {
             output: request.output.clone(), edge: request.corner.summoned_edge(), surface: identity,
+            serial: request.serial,
         });
+        self.app.world_mut().remove_resource::<ui::CornerMenuOpening>();
         self.app
             .world_mut()
             .get_mut::<Camera>(surface.camera)
@@ -126,19 +147,23 @@ impl RunnerState {
         self.touch_bridge.cancel(&mut self.app);
         let elapsed = self.app.world().resource::<Time<Real>>().elapsed();
         surface.apply_protocol_ops(&[ProtocolOp::CommitBufferless], elapsed);
-        // The incumbent's dismissal released the hold; the successor
-        // re-acquires after it so the FIFO drain ends held.
-        if replacing {
-            stage_menu_hold(
-                &mut self.app,
-                &request.output,
-                request.corner.summoned_edge(),
-                true,
-            );
-        }
+        // Every open menu holds its edge's reveal, whoever asked for it: a
+        // corner click (which also staged a hold at ingress; holding is
+        // idempotent), a confirm step reopened by a menu choice, or a Bus
+        // verb. After an incumbent's dismissal released its hold, this
+        // re-acquires it, so the FIFO drain ends held.
+        stage_menu_hold(
+            &mut self.app,
+            &request.output,
+            request.corner.summoned_edge(),
+            true,
+        );
         self.menu = Some(NativeCornerMenu {
             surface,
-            origin: ui::menu_origin(request.corner, size, request.items.len()),
+            origin: ui::menu_origin(request.corner, size, &request.items),
+            guard: ui::MenuInputGuard::new(&request.items, std::time::Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
             request,
             rows,
             selected: None,
@@ -168,7 +193,7 @@ impl RunnerState {
             let row = ui::hit_row(
                 Vec2::new(event.position.0 as f32, event.position.1 as f32),
                 menu.origin,
-                menu.rows.len(),
+                &menu.request.items,
             );
             let enabled = row.filter(|i| !menu.request.items[*i].checked);
             match event.kind {
@@ -177,8 +202,10 @@ impl RunnerState {
                         self.dismiss_corner_menu(None);
                         return true;
                     }
+                    // A confirm step ignores presses until armed: the
+                    // second click of a double-click is not a choice.
                     if button == BTN_LEFT {
-                        menu.pressed = enabled;
+                        menu.pressed = enabled.filter(|_| menu.guard.press_counts(menu.opened.elapsed()));
                     }
                 }
                 PointerEventKind::Release {
@@ -187,12 +214,17 @@ impl RunnerState {
                     self.dismiss_corner_menu(enabled);
                     return true;
                 }
-                PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. } => {
+                // A confirm step never selects on hover: a pointer resting on
+                // its action row must not let a stray Enter or Space accept.
+                PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. }
+                    if menu.guard.hover_selects() =>
+                {
                     menu.selected = enabled;
+                    menu.key_selected = false;
                     ui::highlight(self.app.world_mut(), &menu.rows, enabled);
                     self.needs_update = true;
                 }
-                PointerEventKind::Leave { .. } => {
+                PointerEventKind::Leave { .. } if menu.guard.hover_selects() => {
                     menu.selected = None;
                     ui::highlight(self.app.world_mut(), &menu.rows, None);
                     self.needs_update = true;
@@ -212,7 +244,7 @@ impl RunnerState {
             0xff1b => self.dismiss_corner_menu(None),
             0xff0d | 0x20 => {
                 let selected = menu.selected;
-                if selected.is_some() {
+                if selected.is_some() && menu.guard.key_accepts(menu.key_selected) {
                     self.dismiss_corner_menu(selected);
                 }
             }
@@ -233,6 +265,7 @@ impl RunnerState {
                     }
                 }
                 menu.selected = Some(index);
+                menu.key_selected = true;
                 ui::highlight(self.app.world_mut(), &menu.rows, menu.selected);
                 self.needs_update = true;
             }
@@ -259,7 +292,7 @@ impl RunnerState {
             menu.origin = ui::menu_origin(
                 menu.request.corner,
                 Vec2::new(configure.new_size.0 as f32, configure.new_size.1 as f32),
-                menu.rows.len(),
+                &menu.request.items,
             );
             let popup = self
                 .app
@@ -372,12 +405,21 @@ fn dismiss(app: &mut App, menu: &mut NativeCornerMenu, choice: Option<usize>) {
     if let Some(command) = item.as_ref().and_then(|i| i.command(edge)) {
         stage_shell_command(app, menu.request.output.clone(), command);
     }
-    stage_menu_hold(app, &menu.request.output, edge, false);
     if let Some(ui::MenuItem { action, .. }) = item
         && !matches!(action, MenuAction::Mode(_))
         && let Some(hook) = app.world().get_resource::<CornerMenuActionHook>().copied()
     {
         (hook.0)(app.world_mut(), action);
+    }
+    // A hook that reopened the menu on this same edge (a confirm step) keeps
+    // the reveal held: releasing here would drain before the step opens and a
+    // transient edge would conceal under it. Opening re-stages the hold.
+    let reopened = app
+        .world()
+        .get_resource::<CornerMenuRequest>()
+        .is_some_and(|next| next.output == menu.request.output && next.corner.summoned_edge() == edge);
+    if !reopened {
+        stage_menu_hold(app, &menu.request.output, edge, false);
     }
     menu.surface.close(app);
     app.update();
@@ -421,6 +463,7 @@ mod tests {
                 output,
                 corner: cosmix_shell::core::Corner::TopLeft,
                 items: ui::menu_items(PanelMode::Hidden, &[]),
+                serial: 0,
             };
             let mut menu = NativeCornerMenu {
                 surface,
@@ -429,6 +472,9 @@ mod tests {
                 rows: vec![],
                 selected: None,
                 pressed: None,
+                guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+                opened: std::time::Instant::now(),
+                key_selected: false,
             };
             dismiss(&mut app, &mut menu, choice);
             let panel = app
@@ -500,11 +546,15 @@ mod tests {
                 output,
                 corner: cosmix_shell::core::Corner::BottomRight,
                 items,
+                serial: 0,
             },
             origin: Vec2::ZERO,
             rows: vec![],
             selected: None,
             pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
         };
         dismiss(&mut app, &mut menu, Some(edit));
         assert_eq!(*CHOSEN.lock().unwrap(), [MenuAction::EditPanels]);
@@ -514,6 +564,80 @@ mod tests {
             PanelMode::Hidden
         );
         assert_eq!(menu.surface.phase, SurfacePhase::Closed);
+        menu.surface.retire(&mut app);
+    }
+
+    /// A choice whose hook reopens the menu on the same edge (a confirm step)
+    /// keeps the reveal held: the step opens over a still-revealed edge
+    /// instead of one the released hold let conceal.
+    #[test]
+    fn a_confirm_step_reopened_by_a_choice_keeps_the_reveal_held() {
+        fn reopen(world: &mut World, _: MenuAction) {
+            world.insert_resource(CornerMenuRequest {
+                output: OutputKey::new("test-output").unwrap(),
+                corner: cosmix_shell::core::Corner::TopLeft,
+                items: Vec::new(),
+                serial: 7,
+            });
+        }
+        let output = OutputKey::new("test-output").unwrap();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::MenuHold(true))
+            .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)));
+        app.insert_resource(CornerMenuActionHook(reopen));
+        let sequence = Arc::new(Mutex::new(Vec::new()));
+        let surface = PanelSurface::test_double(&mut app, SurfacePhase::Configured, sequence);
+        app.world_mut()
+            .entity_mut(surface.camera)
+            .insert(Camera::default());
+        let extra = ui::MenuExtra {
+            label: "Leave seat…".into(),
+            target: "desktop-session".into(),
+            verb: "desktop.session.leave".into(),
+            args: vec![],
+            confirm: Some("Leave?".into()),
+        };
+        let items = ui::menu_items(PanelMode::Hidden, std::slice::from_ref(&extra));
+        let choice = items.len() - 1;
+        let mut menu = NativeCornerMenu {
+            surface,
+            request: CornerMenuRequest {
+                output,
+                corner: cosmix_shell::core::Corner::TopLeft,
+                items,
+                serial: 6,
+            },
+            origin: Vec2::ZERO,
+            rows: vec![],
+            selected: None,
+            pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
+        };
+        dismiss(&mut app, &mut menu, Some(choice));
+        assert!(app.world().contains_resource::<CornerMenuRequest>(), "the hook reopened");
+        // Well past the grace: a released hold would have concealed it.
+        for _ in 0..3 {
+            app.update();
+        }
+        let panel = app.world().resource::<ShellFrameState>().0.panel(Edge::Left);
+        assert!(panel.transient_revealed, "the edge concealed under the confirm step");
         menu.surface.retire(&mut app);
     }
 
@@ -551,6 +675,7 @@ mod tests {
             output: output.clone(),
             corner: cosmix_shell::core::Corner::TopLeft,
             items: ui::menu_items(PanelMode::Hidden, &[]),
+            serial: 0,
         };
         app.insert_resource(request.clone());
         let mut menu = Some(NativeCornerMenu {
@@ -560,6 +685,9 @@ mod tests {
             rows: vec![],
             selected: None,
             pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
         });
         assert!(dismiss_menu(&mut app, &mut menu, None));
         assert!(menu.is_none());
@@ -609,11 +737,15 @@ mod tests {
                 output: output.clone(),
                 corner: cosmix_shell::core::Corner::TopLeft,
                 items: ui::menu_items(PanelMode::Hidden, &[]),
+                serial: 0,
             },
             origin: Vec2::ZERO,
             rows: vec![],
             selected: None,
             pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
         };
         // Replacement FIFO, as reconcile drives it: the ingress acquired
         // for the successor, the incumbent's dismissal releases (drained by

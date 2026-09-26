@@ -159,7 +159,7 @@ is a JSON object, and `{}` means no arguments.
 | `term.tab.move` | `{"id":N,"index":0}` | reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane |
 | `term.tab.select` | `{"id":N}` | select tab N |
 | `term.tab.close` | `{"id":N}` | close tab N; closing the last tab quits |
-| `term.panes` | `{"tab":N}` (optional) | list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision, instance |
+| `term.panes` | `{"tab":N}` (optional) | list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision, instance, and `pid` (the term process itself; term-core 0.8.1: term 0.3.1, bterm 0.10.1). It is self-reported: pane lines carry no free text, so a program running in a pane cannot change it, but a process that registers the Bus name `term` itself can claim any pid (a broker-attested owner pid is future noded work). INFO ends with the same `instance=… pid=…` |
 | `term.pane.split` | `{"dir":"v"}` or `{"dir":"h"}` | split the focused pane side by side (`v`) or top and bottom (`h`) |
 | `term.pane.select` | `{"id":N}` | focus pane N in the active tab |
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |

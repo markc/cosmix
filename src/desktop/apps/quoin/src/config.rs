@@ -4,8 +4,10 @@
 //! ingestion. Unknown keys, wrong types and duplicate names/chords are errors.
 //! `panels.{left,bottom,right,top}` are ordered string lists; position zero is
 //! primary. Content is supplied only by registered scenes.
-//! `menu_items.{edge}` contains `{label, target, verb, args}` Bus actions, with
-//! `args` an optional list of strings. These are additions to the mode menu.
+//! `menu_items.{edge}` contains `{label, target, verb, args, confirm}` Bus
+//! actions, with `args` an optional list of strings. These are additions to
+//! the mode menu. `confirm` is an optional question: choosing the item opens a
+//! Confirm/Cancel step first, so a misclick does nothing.
 //! `bindings.{edge}.{pin,dock,hide}` and `bindings.cycle_focus` are optional
 //! chords (`Super+Shift+Left`), or nil to disable. Defaults are unbound, avoiding
 //! unsolicited global grabs. A chord needs Ctrl, Alt or Super: a bare or
@@ -76,6 +78,8 @@ pub struct MenuItem {
     pub target: String,
     pub verb: String,
     pub args: Vec<String>,
+    /// A question asked in a confirm step before the verb is called.
+    pub confirm: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -254,7 +258,7 @@ impl ShellConfig {
                 };
                 for item in items.iter() {
                     let path = format!("menu_items.{name}");
-                    let item = fields(item, &["label", "target", "verb", "args"], &path)?;
+                    let item = fields(item, &["label", "target", "verb", "args", "confirm"], &path)?;
                     let required = |key| -> Result<String, String> {
                         string(
                             item.get(key)
@@ -273,11 +277,22 @@ impl ShellConfig {
                         .map(|value| strings(value, &format!("{path}.args")))
                         .transpose()?
                         .unwrap_or_default();
+                    let confirm = item
+                        .get("confirm")
+                        .map(|value| string(value, &format!("{path}.confirm")))
+                        .transpose()?;
+                    // The confirm step reserves at most a few row lines for
+                    // its question; a longer one would overflow them.
+                    let limit = cosmix_shell::chrome::corner_menu::QUESTION_MAX_CHARS;
+                    if confirm.as_ref().is_some_and(|question| question.chars().count() > limit) {
+                        return Err(format!("{path}.confirm: at most {limit} characters"));
+                    }
                     config.menu_items[edge.index()].push(MenuItem {
                         label,
                         target,
                         verb,
                         args,
+                        confirm,
                     });
                 }
             }
@@ -906,6 +921,9 @@ mod tests {
             r#"{panels: {left: [""]}}"#,
             r#"{carousel_motion: "sldie"}"#,
             r#"{menu_items: {left: [{label: "Missing action"}]}}"#,
+            r#"{menu_items: {left: [{label: "L", target: "t", verb: "t.v", confirm: ""}]}}"#,
+            r#"{menu_items: {left: [{label: "L", target: "t", verb: "t.v", confirm: true}]}}"#,
+            r#"{menu_items: {left: [{label: "L", target: "t", verb: "t.v", confirm: "Are you really, truly, completely and utterly sure you want to do this now?"}]}}"#,
             r#"{bindings: {left: {pni: "Super+Left"}}}"#,
             r#"{bindings: {cycle_focus: "Super+Escape"}}"#,
             r#"{bindings: {cycle_focus: "Shfit+Left"}}"#,
@@ -1010,7 +1028,16 @@ mod tests {
                 target: "tools".into(),
                 verb: "tools.open".into(),
                 args: vec!["main".into()],
+                confirm: None,
             }
+        );
+        let confirming = ShellConfig::parse(
+            r#"{menu_items: {top: [{label: "Restart session…", target: "desktop-session", verb: "desktop.session.restart", confirm: "Restart the session?"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            confirming.menu_items[Edge::Top.index()][0].confirm.as_deref(),
+            Some("Restart the session?")
         );
         assert_eq!(ShellConfig::parse("{}").unwrap(), ShellConfig::default());
     }
