@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-blobd"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -28,6 +28,7 @@ cosmix = [
     "dep:cosmix_bus",
     "dep:cosmix_client",
     "dep:cosmix_config",
+    "dep:cosmix_log",
     "dep:cosmix_props_core",
     "cosmix_props_core/bus",
     "dep:futures-util",
@@ -53,6 +54,9 @@ cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-bui
 cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true }
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
+# The subscriber main installs (journald-primary, RUST_LOG/EnvFilter) —
+# the dnsd/wgd logging-only shape, stats off.
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log", optional = true }
 cosmix_props_core = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", default-features = false, optional = true }
 # blob.fetch: the streaming HTTP client (bytes_stream) and its pump.
 futures-util = { workspace = true, optional = true }

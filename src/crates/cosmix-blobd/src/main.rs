@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use tracing::{error, info, warn};
 
 use cosmix_blobd::citizen::Citizen;
 use cosmix_blobd::core::config::Config;
@@ -24,6 +25,20 @@ fn main() -> anyhow::Result<()> {
     // --version/-V first, before the tokio runtime exists: a thread- or
     // fd-starved host must still get an answer, not a runtime-build panic.
     cosmix_buildinfo::exit_on_version!();
+    // Logging next, before anything else can fail quietly (the
+    // 2026-09-26 live-gate lesson: a silent daemon costs a full
+    // diagnosis run). The dnsd/wgd logging-only shape — journald-primary,
+    // RUST_LOG/EnvFilter honoured (the unit sets
+    // RUST_LOG=cosmix_blobd=info), stats off. The identity is the
+    // hyphenated package name; cosmix_log derives the EnvFilter target
+    // `cosmix_blobd` from it. The handle is bound for the whole of
+    // `main` (drop = final flush).
+    let _log_guard = cosmix_log::init(
+        &cosmix_log::LogOpts::default(),
+        &cosmix_log::StatsOpts::default(),
+        cosmix_log::LogDefaults::daemon("cosmix-blobd").with_stats(false),
+    )
+    .expect("logging init failed");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -57,7 +72,7 @@ async fn async_main() -> anyhow::Result<()> {
     let (origin, wg_ip) = match &node {
         Ok(Some(node)) => (node.node.clone(), node.wg_ip.clone()),
         Ok(None) | Err(_) => {
-            eprintln!("cosmix-blobd: node.conf.mix not found; origin falls back to \"localhost\"");
+            warn!("node.conf.mix not found; origin falls back to \"localhost\"");
             ("localhost".to_string(), String::new())
         }
     };
@@ -65,8 +80,8 @@ async fn async_main() -> anyhow::Result<()> {
     let store = match Store::open(&root, StoreOptions::from_config(&cfg, origin)) {
         Ok(store) => Arc::new(store),
         Err(StoreError::Locked(path)) => {
-            eprintln!(
-                "cosmix-blobd: another instance holds {}; one GC owner per root — exiting",
+            error!(
+                "another instance holds {}; one GC owner per root — exiting",
                 path.display()
             );
             std::process::exit(2);
@@ -75,8 +90,8 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let report = store.startup_report();
     if !report.orphans.is_empty() {
-        eprintln!(
-            "cosmix-blobd: startup reconcile found {} orphan CAS file(s); run blob.gc to sweep",
+        warn!(
+            "startup reconcile found {} orphan CAS file(s); run blob.gc to sweep",
             report.orphans.len()
         );
     }
@@ -92,8 +107,8 @@ async fn async_main() -> anyhow::Result<()> {
             let listener = match cosmix_blobd::lane::WgProvenBind::bind(bind, &wg_ip).await {
                 Ok(listener) => listener,
                 Err(LaneBindError::NotWg) => {
-                    eprintln!(
-                        "cosmix-blobd: lane_bind {bind} is not this node's WG address (wg_ip {:?}) — the lane serves only the mesh; refusing to start",
+                    error!(
+                        "lane_bind {bind} is not this node's WG address (wg_ip {:?}) — the lane serves only the mesh; refusing to start",
                         if wg_ip.is_empty() { "<absent>" } else { &wg_ip }
                     );
                     std::process::exit(2);
@@ -117,9 +132,10 @@ async fn async_main() -> anyhow::Result<()> {
                 )
                 .await
                 {
-                    eprintln!("cosmix-blobd: byte lane stopped: {error}");
+                    error!("byte lane stopped: {error}");
                 }
             });
+            info!("byte lane listening on {addr}");
             Some(addr)
         }
         None => None,

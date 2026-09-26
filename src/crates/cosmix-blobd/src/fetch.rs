@@ -50,6 +50,7 @@ use cosmix_mds::types::BlobHash;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tracing::{debug, warn};
 
 use crate::citizen::{BusEvent, TOPIC_PINNED, domain_event};
 use crate::core::reference;
@@ -263,8 +264,8 @@ impl PendingEvents {
         queue.push_back(event);
         drop(queue);
         if let Some(dropped) = dropped {
-            eprintln!(
-                "cosmix-blobd: fetch event backlog full ({}); dropping the oldest {} \
+            warn!(
+                "fetch event backlog full ({}); dropping the oldest {} \
                  (recovery: blob.stat present + the waiter's timeout)",
                 Self::CAP,
                 dropped.topic
@@ -303,31 +304,42 @@ impl Resolver for NodedResolver {
         instance: Option<&'a str>,
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let client = self
-                .client
-                .get()
-                .ok_or_else(|| "not connected to the broker".to_string())?;
             let to = resolver_to(node, instance);
-            let reply = tokio::time::timeout(
-                BUS_CALL_TIMEOUT,
-                client.call_typed(&to, RESOLVER_PROPS_VERB, json!({"path": "lane"})),
-            )
-            .await
-            .map_err(|_| format!("{RESOLVER_PROPS_VERB} on {to} timed out"))?
-            .map_err(|e| format!("{RESOLVER_PROPS_VERB} on {to}: {e}"))?;
-            match reply {
-                PortReply::Ok { value, .. } => {
-                    let bind = value
-                        .get("bind")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| format!("{to} props lane carries no bind"))?;
-                    Ok(format!("http://{bind}"))
+            debug!(to = %to, verb = RESOLVER_PROPS_VERB, "resolving remote lane");
+            let result = async {
+                let client = self
+                    .client
+                    .get()
+                    .ok_or_else(|| "not connected to the broker".to_string())?;
+                let reply = tokio::time::timeout(
+                    BUS_CALL_TIMEOUT,
+                    client.call_typed(&to, RESOLVER_PROPS_VERB, json!({"path": "lane"})),
+                )
+                .await
+                .map_err(|_| format!("{RESOLVER_PROPS_VERB} on {to} timed out"))?
+                .map_err(|e| format!("{RESOLVER_PROPS_VERB} on {to}: {e}"))?;
+                match reply {
+                    PortReply::Ok { value, .. } => {
+                        let bind = value
+                            .get("bind")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| format!("{to} props lane carries no bind"))?;
+                        Ok(format!("http://{bind}"))
+                    }
+                    // "Service 'blobd' not found" / "disconnected" / "Unknown
+                    // mesh node" / "Mesh bridge error" — all rc=10, all
+                    // first-try-unreachable for this source.
+                    PortReply::AppError { message, .. } => Err(message),
                 }
-                // "Service 'blobd' not found" / "disconnected" / "Unknown
-                // mesh node" / "Mesh bridge error" — all rc=10, all
-                // first-try-unreachable for this source.
-                PortReply::AppError { message, .. } => Err(message),
             }
+            .await;
+            match &result {
+                Ok(url) => debug!(to = %to, verb = RESOLVER_PROPS_VERB, rc = 0, url = %url, "lane resolved"),
+                Err(message) => {
+                    debug!(to = %to, verb = RESOLVER_PROPS_VERB, rc = 10, message = %message, "lane resolution failed")
+                }
+            }
+            result
         })
     }
 }
@@ -422,6 +434,13 @@ impl EventSink for BusSink {
     fn publish<'a>(&'a self, event: BusEvent) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let Some(client) = self.client.get() else {
+                // The 2026-09-26 silent failure: publishes going into a
+                // slot nothing was ever going to write. Say it now.
+                warn!(
+                    topic = event.topic,
+                    retain = false,
+                    "client slot is None at publish time; buffering for reconnect"
+                );
                 self.client.buffer(event);
                 return;
             };
@@ -448,13 +467,13 @@ async fn publish_event_via(client: &Arc<NodedClient>, event: &BusEvent) {
     )
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!(
-            "cosmix-blobd: fetch publish on {} failed (continuing): {error}",
+        Ok(Ok(())) => debug!(topic = event.topic, retain = false, "fetch published"),
+        Ok(Err(error)) => warn!(
+            "fetch publish on {} failed (continuing): {error}",
             event.topic
         ),
-        Err(_) => eprintln!(
-            "cosmix-blobd: fetch publish on {} timed out (continuing)",
+        Err(_) => warn!(
+            "fetch publish on {} timed out (continuing)",
             event.topic
         ),
     }
@@ -578,6 +597,7 @@ impl Fetcher {
     /// while `Inner` keeps another: that exact wiring bug left every
     /// publish buffered and every resolution "not connected" with no
     /// error anywhere (found live, 2026-09-26).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         config: FetchConfig,
@@ -644,9 +664,27 @@ impl Fetcher {
         target: Option<FetchTarget>,
         owner: String,
     ) -> SubmitOutcome {
+        let outcome = self.submit_inner(hash, target.as_ref(), &owner);
+        debug!(
+            blob = reference::blob_id(&hash),
+            origin = target.as_ref().map(|t| t.node.as_str()),
+            instance = target.as_ref().and_then(|t| t.instance.as_deref()),
+            owner = owner,
+            outcome = ?outcome,
+            "blob.fetch submitted"
+        );
+        outcome
+    }
+
+    fn submit_inner(
+        &self,
+        hash: BlobHash,
+        target: Option<&FetchTarget>,
+        owner: &str,
+    ) -> SubmitOutcome {
         let mut state = self.0.state.lock().unwrap();
         if let Some(entry) = state.entries.get_mut(&hash) {
-            entry.owners.push(owner);
+            entry.owners.push(owner.to_string());
             return SubmitOutcome::Joined {
                 queued: entry.queued,
             };
@@ -665,8 +703,8 @@ impl Fetcher {
         state.entries.insert(
             hash,
             Entry {
-                owners: vec![owner],
-                target,
+                owners: vec![owner.to_string()],
+                target: target.cloned(),
                 queued: !started,
                 permit,
             },
@@ -926,8 +964,16 @@ impl Inner {
             .clone();
         let response = match tokio::time::timeout(HEAD_TIMEOUT, http.get(&target).send()).await {
             Ok(Ok(response)) => response,
-            Ok(Err(error)) => return SourceOutcome::NetErr(format!("GET {target}: {error}")),
+            Ok(Err(error)) => {
+                debug!(url = %target, "lane GET failed: {error}");
+                return SourceOutcome::NetErr(format!("GET {target}: {error}"));
+            }
             Err(_) => {
+                debug!(
+                    url = %target,
+                    "lane GET sent no response head within {}s",
+                    HEAD_TIMEOUT.as_secs()
+                );
                 return SourceOutcome::NetErr(format!(
                     "GET {target}: no response head within {}s",
                     HEAD_TIMEOUT.as_secs()
@@ -936,11 +982,16 @@ impl Inner {
         };
         match response.status() {
             reqwest::StatusCode::OK => {}
-            reqwest::StatusCode::NOT_FOUND => return SourceOutcome::Lane404,
+            reqwest::StatusCode::NOT_FOUND => {
+                debug!(url = %target, status = 404, "lane GET");
+                return SourceOutcome::Lane404;
+            }
             status => {
+                debug!(url = %target, status = status.as_u16(), "lane GET");
                 return SourceOutcome::NetErr(format!("lane answered {status} for {target}"));
             }
         }
+        debug!(url = %target, status = 200, "lane GET serving body");
 
         // Quota before the first byte, reserved at admission (M3): the
         // declared Content-Length, or the whole remaining room when
@@ -989,15 +1040,19 @@ impl Inner {
             // put_reader_expect compared before committing, so a
             // success here is verified: the landed hash is the
             // requested one.
-            Ok((Ok((_landed, size)), reservation)) => SourceOutcome::Fetched {
-                size,
-                mime,
-                reservation,
-            },
+            Ok((Ok((_landed, size)), reservation)) => {
+                debug!(url = %target, size, "fetched bytes verified");
+                SourceOutcome::Fetched {
+                    size,
+                    mime,
+                    reservation,
+                }
+            }
             Ok((Err(cosmix_mds::Error::BlobCorrupt(message)), _reservation)) => {
                 // The body did not hash to the requested id. Nothing
                 // ever entered the CAS — mds removed the staging
                 // before any commit — so there is nothing to undo.
+                debug!(url = %target, "verify failed: {message}");
                 SourceOutcome::Verify(message)
             }
             Ok((Err(error), _reservation)) => {
@@ -1051,9 +1106,7 @@ impl Inner {
             ) {
                 Ok(pinned) => Ok(pinned),
                 Err(first) => {
-                    eprintln!(
-                        "cosmix-blobd: record_fetch for {id} failed ({first}); retrying once"
-                    );
+                    warn!("record_fetch for {id} failed ({first}); retrying once");
                     tokio::time::sleep(PIN_RETRY_DELAY).await;
                     self.store
                         .record_fetch(
@@ -1073,6 +1126,7 @@ impl Inner {
                 // R1: no owner fits its cap — the bytes landed but
                 // nobody holds them, which is a quota outcome, not ok.
                 Ok(pins) if pins.none_fit() => {
+                    debug!(blob = id, refused = ?pins.refused, "no owner cap fits; nothing pinned");
                     self.failed.fetch_add(1, Ordering::Relaxed);
                     events.push(domain_event(
                         TOPIC_FETCHED,
@@ -1086,6 +1140,13 @@ impl Inner {
                     ));
                 }
                 Ok(pins) => {
+                    debug!(
+                        blob = id,
+                        pinned = ?pins.pinned,
+                        held = ?pins.held,
+                        refused = ?pins.refused,
+                        "fetch pinned"
+                    );
                     for owner in &pins.pinned {
                         events.push(domain_event(
                             TOPIC_PINNED,
@@ -1109,6 +1170,7 @@ impl Inner {
                     events.push(domain_event(TOPIC_FETCHED, body));
                 }
                 Err(error) => {
+                    warn!("pin for {id} failed after the download landed: {error}");
                     self.failed.fetch_add(1, Ordering::Relaxed);
                     events.push(domain_event(
                         TOPIC_FETCHED,
@@ -1123,6 +1185,12 @@ impl Inner {
             }
             drop(reservation);
         } else {
+            debug!(
+                blob = id,
+                outcome = attempt.outcome.as_str(),
+                error = ?attempt.error,
+                "fetch failed"
+            );
             self.failed.fetch_add(1, Ordering::Relaxed);
             events.push(domain_event(
                 TOPIC_FETCHED,

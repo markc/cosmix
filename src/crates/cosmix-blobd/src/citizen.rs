@@ -20,6 +20,7 @@ use cosmix_mds::blob::{self, PutMode};
 use cosmix_mds::types::BlobHash;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
+use tracing::{debug, error, info, warn};
 
 use crate::core::reference::{self};
 use crate::core::store::{PutOptions, Store, StoreError};
@@ -693,15 +694,15 @@ pub async fn serve(citizen: Arc<Citizen>, verb_max_concurrent: usize) -> Result<
         match connection {
             Ok(Ok(client)) => {
                 let client = Arc::new(client);
-                eprintln!("cosmix-blobd: registered as '{service}'");
+                info!("registered as '{service}'");
                 run_connection(&citizen, &client, &permits).await;
                 client.close().await;
             }
             Ok(Err(error)) => {
-                eprintln!("cosmix-blobd: broker unavailable; retrying in 60s: {error}");
+                warn!("broker unavailable; retrying in 60s: {error}");
             }
             Err(_) => {
-                eprintln!("cosmix-blobd: broker connection timed out; retrying in 60s");
+                warn!("broker connection timed out; retrying in 60s");
             }
         }
         tokio::select! {
@@ -787,7 +788,7 @@ async fn serve_commands<S: ReplySink>(
                 tokio::task::spawn_blocking(move || citizen.dispatch(&dispatch_command))
                     .await
                     .unwrap_or_else(|panic| {
-                        eprintln!("cosmix-blobd: dispatch panicked: {panic}");
+                        error!("dispatch of {} panicked: {panic}", command.command);
                         (
                             10,
                             json!({"error": "internal dispatch failure"}).to_string(),
@@ -795,15 +796,20 @@ async fn serve_commands<S: ReplySink>(
                         )
                     });
             if let Err(error) = sink.respond(&command, rc, &body).await {
-                eprintln!("cosmix-blobd: Bus response failed; reply dropped: {error}");
+                warn!("Bus response for {} failed; reply dropped: {error}", command.command);
                 return;
             }
             for event in events {
-                if let Err(error) = sink.publish(&event).await {
-                    eprintln!(
-                        "cosmix-blobd: publish on {} failed (continuing): {error}",
-                        event.topic
-                    );
+                match sink.publish(&event).await {
+                    Ok(()) => {
+                        debug!(topic = event.topic, retain = false, "published");
+                    }
+                    Err(error) => {
+                        warn!(
+                            "publish on {} failed (continuing): {error}",
+                            event.topic
+                        );
+                    }
                 }
             }
         });

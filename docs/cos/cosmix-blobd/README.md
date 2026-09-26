@@ -51,6 +51,10 @@ Byte values accept plain integers or a binary suffix (`KiB`, `MiB`, `GiB`, `TiB`
 
 `lane_bind`'s port is **4210** by operator convention. No port-registry specification exists in `docs/spec/` today (the broker rides a Unix socket; the mesh listener defaults to 4200, MESH-013); this README is the record of the choice — 4210, the next number above the mesh default. The port is published as the `lane.port` prop (props-only, never the signed inventory); a future shared port-registry spec should adopt 4210 rather than renumber.
 
+## Logging
+
+Journald-primary through `cosmix_log::init` (the dnsd/wgd logging-only shape, stats off); `RUST_LOG` is honoured — the unit ships `RUST_LOG=cosmix_blobd=info`, and `RUST_LOG=cosmix_blobd=debug` follows each fetch submit, lane resolution, GET attempt, verify, pin and publish (a `warn` marks a publish into a broker-less client slot — the previously silent failure).
+
 ## Byte lane
 
 The lane is the HTTP listener that moves bytes: blobs never ride a Bus frame, so cross-node reads and user-side producers (capture, webd, Thunderbird) use it. It serves only the WireGuard address — **the bind proof is fail-closed**: `lane_bind`'s IP must equal this node's `wg_ip` from `node.conf.mix` (the same source noded's `bind_is_wg` uses), never unspecified, never loopback, never another interface; a mismatch (or an absent `wg_ip`) exits with status 2 before any socket is opened. The `RestrictAddressFamilies` in the unit already allows INET for it. `lane.bind`/`lane.port` props exist only once the socket is actually listening — main binds before the citizen is constructed.

@@ -1067,7 +1067,7 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-blobd"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1076,6 +1076,7 @@ dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-config",
+ "cosmix-lib-log",
  "cosmix-lib-props-core",
  "cosmix-mds",
  "futures-util",

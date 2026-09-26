@@ -37,6 +37,7 @@ use http_body_util::BodyExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::io::ReaderStream;
+use tracing::debug;
 
 use crate::core::mime;
 use crate::core::reference::Reference;
@@ -214,6 +215,7 @@ async fn get_blob(
     };
     let root = lane.store.blobs_root();
     if !matches!(blob::exists(&root, &hash), Ok(true)) {
+        debug!(blob = hex, method = %method, "lane request: not present");
         return lane_error(StatusCode::NOT_FOUND, "not_present");
     }
     let size = match blob::size(&root, &hash) {
@@ -259,6 +261,14 @@ async fn get_blob(
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, format!("\"{}\"", blob::hex(&hash)))
         .header(header::CACHE_CONTROL, "immutable");
+    debug!(
+        blob = hex,
+        method = %method,
+        status = status.as_u16(),
+        start,
+        len,
+        "lane request served"
+    );
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(
             header::CONTENT_RANGE,
@@ -479,6 +489,13 @@ impl Lane {
         let mime = string_header(headers, "x-cosmix-mime")
             .or_else(|| name.as_deref().map(mime::sniff).map(str::to_string))
             .unwrap_or_else(|| "application/octet-stream".to_string());
+        let expected_hex = expected.map(|h| blob::hex(&h));
+        debug!(
+            peer = %peer,
+            owner = owner,
+            expected = expected_hex,
+            "lane upload admitted"
+        );
 
         // Before the first byte: the hash is the identity. If the CAS
         // already holds verified bytes, pin them and answer 200 without
@@ -538,7 +555,7 @@ impl Lane {
         })
         .await;
 
-        match landed {
+        let response = match landed {
             Ok(Ok(UploadOutcome::Committed(outcome))) => {
                 let _ = pump.await;
                 reference_response(StatusCode::CREATED, &outcome.reference)
@@ -589,7 +606,13 @@ impl Lane {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("upload task failed: {join}"),
             ),
-        }
+        };
+        debug!(
+            expected = expected_hex,
+            status = response.status().as_u16(),
+            "lane upload finished"
+        );
+        response
     }
 
     /// Bookkeeping for the already-present PUT: attrs (kept if the
