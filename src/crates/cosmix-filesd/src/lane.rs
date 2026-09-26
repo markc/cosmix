@@ -491,7 +491,7 @@ mod tests {
         ] {
             // Deliberately independent of the sent name: reference must pass
             // the server's name through rather than reconstructing it locally.
-            let reply_name = expected.as_ref().map(|_| "server-chosen-name");
+            let reply_name = "server-chosen-name";
             let reply = json!({"blob": format!("b3:{}", content_hash(b"x")), "size": 1, "name": reply_name}).to_string();
             let (bind, worker) = serve_once("201 Created", reply.as_bytes(), reply.len());
             let (rc, value) = invoke(&dir.layer(true, vec![]), "fs.blob.ref",
