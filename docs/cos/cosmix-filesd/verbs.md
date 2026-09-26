@@ -233,6 +233,7 @@ All failures use rc 10 and `{"error":...}`:
 | `not_present:` | `blob is not on this node — blob.fetch it first` (GET 404) |
 | `verify_failed:` | Body length or BLAKE3 mismatch |
 | `invalid blob id` | Invalid materialise `blob` argument |
+| `missing or empty arg:` | A required string argument, such as `path`, is absent, empty or not a string |
 | `denied:`, `not found:`, `exists:`, `bad request:`, `i/o error:` | Filesystem-layer errors, passed through unchanged |
 
 A truncated HTTP body reported by ureq as a read error uses `lane:`. A short

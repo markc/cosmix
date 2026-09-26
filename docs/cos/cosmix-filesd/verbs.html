@@ -608,6 +608,7 @@ documented path-based check/use race posture is unchanged.</p>
 <tr><td><code>not_present:</code></td><td><code>blob is not on this node — blob.fetch it first</code> (GET 404)</td></tr>
 <tr><td><code>verify_failed:</code></td><td>Body length or BLAKE3 mismatch</td></tr>
 <tr><td><code>invalid blob id</code></td><td>Invalid materialise <code>blob</code> argument</td></tr>
+<tr><td><code>missing or empty arg:</code></td><td>A required string argument, such as <code>path</code>, is absent, empty or not a string</td></tr>
 <tr><td><code>denied:</code>, <code>not found:</code>, <code>exists:</code>, <code>bad request:</code>, <code>i/o error:</code></td><td>Filesystem-layer errors, passed through unchanged</td></tr>
 </tbody></table>
 <p>A truncated HTTP body reported by ureq as a read error uses <code>lane:</code>. A short
