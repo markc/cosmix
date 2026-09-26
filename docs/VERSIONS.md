@@ -56,7 +56,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-edit-client` | 0.2.0 |
 | `cosmix-edit-core` | 0.1.1 |
 | `cosmix-editd` | 0.2.0 |
-| `cosmix-filesd` | 0.8.2 |
+| `cosmix-filesd` | 0.9.0 |
 | `cosmix-indexd` | 0.9.2 |
 | `cosmix-input-core` | 0.1.4 |
 | `cosmix-input-schema` | 0.1.4 |
@@ -68,7 +68,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-lib-daemon` | 0.7.1 |
 | `cosmix-lib-davproto` | 0.1.2 |
 | `cosmix-lib-dns` | 0.3.0 |
-| `cosmix-lib-files` | 0.7.0 |
+| `cosmix-lib-files` | 0.8.0 |
 | `cosmix-lib-llm` | 0.2.0 |
 | `cosmix-lib-log-props` | 0.2.0 |
 | `cosmix-lib-mesh` | 0.6.0 |
