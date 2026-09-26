@@ -30,6 +30,11 @@ struct Status {
     error: Option<String>,
     blob: Option<Value>,
     blob_error: Option<String>,
+    /// True from publication until the dual-write lands `blob` or
+    /// `blob_error` — disambiguates `blob: null` on a terminal phase
+    /// (in flight) from a capture that never published (never
+    /// coming). Not in the JSON directly; `capture_value` surfaces it.
+    blob_pending: bool,
     frames: u64,
     fresh_frames: u64,
     acquired_frames: u64,
@@ -70,6 +75,7 @@ impl Status {
         if self.generation != generation {
             return false;
         }
+        self.blob_pending = false;
         match outcome {
             Ok(reference) => self.blob = Some(reference),
             Err(error) => self.blob_error = Some(error),
@@ -102,7 +108,7 @@ impl Status {
         } else {
             self.fresh_frames as f64 * 1000.0 / elapsed_ms as f64
         };
-        json!({"recording":matches!(self.phase,"starting"|"recording"),"phase":if self.phase.is_empty(){"idle"}else{self.phase},"path":self.path,"error":self.error,"blob":self.blob,"blob_error":self.blob_error,"frames":self.frames,"fresh_frames":self.fresh_frames,"acquired_frames":self.acquired_frames,"dropped_frames":self.dropped_frames,"repeated_presentations":self.repeated_frames,"duplicate_frames":self.frames.saturating_sub(self.fresh_frames),"elapsed_ms":elapsed_ms,"fresh_fps":fresh_fps,"capture_ms":self.capture_ms,"capture_wait_ms":self.capture_wait_ms,"capture_read_ms":self.capture_read_ms,"capture_normalise_ms":self.capture_normalise_ms,"encode_ms":self.encode_ms,"pid":std::process::id(),"version":build.version,"git_sha":build.git_sha,"build_time":build.build_time})
+        json!({"recording":matches!(self.phase,"starting"|"recording"),"phase":if self.phase.is_empty(){"idle"}else{self.phase},"path":self.path,"error":self.error,"blob":self.blob,"blob_error":self.blob_error,"blob_pending":self.blob_pending,"frames":self.frames,"fresh_frames":self.fresh_frames,"acquired_frames":self.acquired_frames,"dropped_frames":self.dropped_frames,"repeated_presentations":self.repeated_frames,"duplicate_frames":self.frames.saturating_sub(self.fresh_frames),"elapsed_ms":elapsed_ms,"fresh_fps":fresh_fps,"capture_ms":self.capture_ms,"capture_wait_ms":self.capture_wait_ms,"capture_read_ms":self.capture_read_ms,"capture_normalise_ms":self.capture_normalise_ms,"encode_ms":self.encode_ms,"pid":std::process::id(),"version":build.version,"git_sha":build.git_sha,"build_time":build.build_time})
     }
 }
 struct Job {
@@ -377,6 +383,7 @@ fn settle_job(
                 state.error = Some(error);
             }
         }
+        state.blob_pending = upload.is_some();
         settled.store(true, Ordering::Relaxed);
     }
     // Dual-write into the blob store: the file is the truth and is
@@ -825,6 +832,52 @@ mod tests {
         let state = status.lock().unwrap();
         assert!(state.blob.is_none());
         assert!(state.blob_error.is_none());
+    }
+
+    #[test]
+    fn blob_pending_marks_an_in_flight_dual_write() {
+        // Nothing published, nothing owed.
+        assert!(!Status::default().value()["blob_pending"]
+            .as_bool()
+            .unwrap());
+        // A capture that failed without publishing owes no upload.
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        settle_job(
+            &status,
+            1,
+            &settled,
+            None::<fn() -> Result<Value, String>>,
+            Err("compositor gone".into()),
+        );
+        assert!(!status.lock().unwrap().value()["blob_pending"]
+            .as_bool()
+            .unwrap());
+        // Published: pending from settle until the upload lands a field.
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        let in_flight = status.clone();
+        settle_job(
+            &status,
+            1,
+            &settled,
+            Some(move || {
+                assert!(in_flight.lock().unwrap().value()["blob_pending"]
+                    .as_bool()
+                    .unwrap());
+                Err("lane answered 413 for http://10.42.0.5:4210/blob".into())
+            }),
+            Ok(()),
+        );
+        let landed = status.lock().unwrap().value();
+        assert!(!landed["blob_pending"].as_bool().unwrap());
+        assert!(landed["blob_error"].is_string());
     }
 
     #[test]

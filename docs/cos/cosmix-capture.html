@@ -459,10 +459,15 @@ not a combined multi-monitor canvas. Keep the media directory outside Git.</p>
 <tr><td><code>capture.status</code></td><td><code>{}</code></td><td>Read state and completed file path</td></tr>
 </tbody></table>
 <p>Replies contain <code>recording</code>, <code>phase</code>, <code>path</code>, <code>error</code>, <code>blob</code>, <code>blob_error</code>,
-<code>frames</code>, <code>pid</code>, <code>version</code>, <code>git_sha</code> and <code>build_time</code>. Phases are <code>idle</code>,
+<code>blob_pending</code>, <code>frames</code>, <code>pid</code>, <code>version</code>, <code>git_sha</code> and <code>build_time</code>.
+Phases are <code>idle</code>,
 <code>screenshot</code>, <code>starting</code>, <code>recording</code>, <code>finalising</code>, <code>complete</code> and <code>failed</code>.
 Only <code>complete</code> guarantees successful publication. A failed recording may
 still have a finalised usable MP4; <code>error</code> explains why recording stopped.
+<code>blob_pending</code> is true from publication until the dual-write lands <code>blob</code>
+or <code>blob_error</code>, so <code>blob: null</code> with <code>blob_pending: true</code> means the store
+copy is in flight, while on a capture that never published it is false —
+no copy is coming.
 The initial screenshot/start response acknowledges the job; poll status for
 completion. Stop is idempotent when no job is active. One capture runs at a
 time and concurrent capture requests fail explicitly — but the job slot

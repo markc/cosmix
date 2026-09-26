@@ -21,10 +21,15 @@ The service exposes four commands, with JSON object bodies:
 | `capture.status` | `{}` | Read state and completed file path |
 
 Replies contain `recording`, `phase`, `path`, `error`, `blob`, `blob_error`,
-`frames`, `pid`, `version`, `git_sha` and `build_time`. Phases are `idle`,
+`blob_pending`, `frames`, `pid`, `version`, `git_sha` and `build_time`.
+Phases are `idle`,
 `screenshot`, `starting`, `recording`, `finalising`, `complete` and `failed`.
 Only `complete` guarantees successful publication. A failed recording may
 still have a finalised usable MP4; `error` explains why recording stopped.
+`blob_pending` is true from publication until the dual-write lands `blob`
+or `blob_error`, so `blob: null` with `blob_pending: true` means the store
+copy is in flight, while on a capture that never published it is false —
+no copy is coming.
 The initial screenshot/start response acknowledges the job; poll status for
 completion. Stop is idempotent when no job is active. One capture runs at a
 time and concurrent capture requests fail explicitly — but the job slot
