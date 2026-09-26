@@ -734,8 +734,13 @@ mod tests {
         };
         app.world_mut().write_message(cursor.clone());
         app.world_mut().write_message(WindowEvent::from(cursor));
-        app.update();
-        app.update();
+        // The test peer's outbound queue holds 16 messages and every update
+        // publishes; drain after each one so the click's call has room.
+        let mut calls = Vec::new();
+        for _ in 0..2 {
+            app.update();
+            calls.extend(peer.drain_calls());
+        }
         for state in [ButtonState::Pressed, ButtonState::Released] {
             let button = MouseButtonInput {
                 button: MouseButton::Left,
@@ -745,8 +750,8 @@ mod tests {
             app.world_mut().write_message(button);
             app.world_mut().write_message(WindowEvent::from(button));
             app.update();
+            calls.extend(peer.drain_calls());
         }
-        let calls = peer.drain_calls();
         let fired: Vec<_> = calls
             .iter()
             .filter(|call| call.to == "scene-editor" && call.command == "editor.view")
