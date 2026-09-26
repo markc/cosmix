@@ -666,9 +666,10 @@ for cursors, per-account counts, refusal tokens and the retained-data contract.<
 limit exceeds it. Larger admitted messages project <code>hasAttachment: null</code>
 and omit <code>attachments</code>; attachment inspection/export returns <code>too_large:</code>.
 Diagnostic blob inputs still use the configured <code>max_message_size</code>.</p>
-<p>Before parsing, a conservative case-insensitive raw scan permits at most
-2,000 <code>content-type:</code> occurrences and 32 <code>message/rfc822</code> occurrences.
-Quoted header text in message bodies counts too and can cause a false-positive
+<p>Before parsing, a linear header-aware scan permits at most 2,000 potential
+header blocks and 32 embedded-message media types (<code>message/rfc822</code> or
+<code>message/global</code>). It recognises whitespace in header names, folded values
+and comments. Quoted header text in message bodies counts too and can cause a false-positive
 <code>too_large:</code> refusal. Parse, walk and tree destruction use a dedicated 64 MiB
 thread stack. The walk permits depth 32, 1,000 parts, path length 64,
 64 MiB per decoded part, an aggregate 128 MiB decoded-byte budget, and at most
