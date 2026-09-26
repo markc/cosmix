@@ -17,8 +17,9 @@ required-features = ["cosmix"]
 
 [features]
 default = ["cosmix"]
-# The Bus citizen: registration, verbs, events, props, and the byte
-# lane. Off, the crate is the pure store core (tests run here).
+# The Bus citizen: registration, verbs, events, props, the byte lane
+# and the cross-node fetch machinery. Off, the crate is the pure store
+# core (tests run here).
 cosmix = [
     "dep:anyhow",
     "dep:axum",
@@ -29,7 +30,9 @@ cosmix = [
     "dep:cosmix_config",
     "dep:cosmix_props_core",
     "cosmix_props_core/bus",
+    "dep:futures-util",
     "dep:http-body-util",
+    "dep:reqwest",
     "dep:tokio",
     "dep:tokio-util",
 ]
@@ -51,7 +54,10 @@ cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional 
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true }
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
 cosmix_props_core = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", default-features = false, optional = true }
+# blob.fetch: the streaming HTTP client (bytes_stream) and its pump.
+futures-util = { workspace = true, optional = true }
 http-body-util = { version = "0.1", optional = true }
+reqwest = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 

@@ -114,6 +114,21 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     let instance = cfg.name.clone().unwrap_or_else(|| "default".to_string());
-    let citizen = Arc::new(Citizen::new(store, cfg.service_name(), instance, lane));
+    // The fetch machinery resolves remote lanes and publishes its
+    // completion events through blobd's own broker connection (the
+    // citizen keeps the slot current across reconnects).
+    let fetcher = Arc::new(cosmix_blobd::fetch::Fetcher::production(
+        Arc::clone(&store),
+        &cfg,
+        lane,
+        &instance,
+    ));
+    let citizen = Arc::new(Citizen::new(
+        store,
+        cfg.service_name(),
+        instance,
+        lane,
+        fetcher,
+    ));
     cosmix_blobd::citizen::serve(citizen).await
 }

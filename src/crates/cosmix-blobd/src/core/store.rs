@@ -38,6 +38,12 @@ pub const LOCK_FILE: &str = ".blobd.lock";
 /// never delete a fetch that has committed its bytes and not yet its
 /// pin.
 pub const DEFAULT_GC_GRACE_SECS: u64 = 60;
+/// Timestamp-granularity tolerance for "this stream created the CAS
+/// entry": some filesystems (OpenZFS rounds down; ext3 ticks at 1 s)
+/// stamp an mtime slightly *before* a wall-clock read taken earlier
+/// in the same write, so `mtime >= started` alone would misjudge a
+/// just-created entry as pre-existing.
+const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
 
 const BLOBD_APPLICATION_ID: i32 = 0x626C_6F62; // 'blob'
 const BLOBD_LATEST: u32 = 1;
@@ -94,6 +100,9 @@ pub enum StoreError {
     },
     /// Bad request (e.g. `mode: hardlink` without `immutable: true`).
     BadRequest(String),
+    /// The in-process `blob.fetch` queue is full (`fetch_queue_max`);
+    /// the verb replies rc 10 `busy`.
+    Busy,
 }
 
 impl std::fmt::Display for StoreError {
@@ -121,6 +130,10 @@ impl std::fmt::Display for StoreError {
                 write!(f, "quota: total would use {would_use} over the cap {limit}")
             }
             Self::BadRequest(s) => write!(f, "bad request: {s}"),
+            Self::Busy => write!(
+                f,
+                "busy: the fetch queue is full (fetch_queue_max); retry later"
+            ),
         }
     }
 }
@@ -203,13 +216,13 @@ pub struct StatInfo {
 }
 
 /// `blob.quota` reply data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QuotaReport {
     pub owners: BTreeMap<String, OwnerQuota>,
     pub total: OwnerQuota,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OwnerQuota {
     pub used: u64,
     pub limit: u64,
@@ -503,10 +516,85 @@ impl Store {
         })
     }
 
+    /// Post-fetch ingest bookkeeping: attributes with
+    /// `origin = source_node` (the node the bytes came from — a
+    /// fetched blob's reference should point at its origin, not claim
+    /// this node minted it) and one pin per joining owner. The bytes
+    /// must already be committed in the CAS. Returns the owners whose
+    /// pin row was added (an owner that already pinned the blob is
+    /// skipped, idempotently).
+    pub fn record_fetch(
+        &self,
+        hash: &BlobHash,
+        size: u64,
+        mime: &str,
+        source_node: &str,
+        owners: &[String],
+    ) -> Result<Vec<String>> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO blob_attrs (hash, mime, name_hint, origin, first_put) \
+             VALUES (?1, ?2, NULL, ?3, ?4)",
+            params![blob::hex(hash), mime, source_node, now_ms()],
+        )
+        .map_err(db_err)?;
+        let mut newly_pinned = Vec::new();
+        for owner in owners {
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO pins (hash, owner, created) VALUES (?1, ?2, ?3)",
+                    params![blob::hex(hash), owner, now_ms()],
+                )
+                .map_err(db_err)?
+                == 1;
+            if inserted {
+                bump_owner_used(&tx, owner, size)?;
+                newly_pinned.push(owner.clone());
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        drop(db);
+        if !newly_pinned.is_empty() {
+            self.bump_generation();
+        }
+        Ok(newly_pinned)
+    }
+
+    /// Remove a CAS entry a streamed upload or fetch just created when
+    /// the bytes landed under the *wrong* hash: only when the file's
+    /// mtime falls inside the request (content-addressed writes never
+    /// refresh an existing file's mtime, so a pre-existing entry is not
+    /// ours to delete) and nothing pins or describes it. Returns
+    /// whether the file was removed.
+    pub fn discard_recently_created(&self, hash: &BlobHash, started: SystemTime) -> bool {
+        let path = blob::blob_path(&self.blobs_root(), hash);
+        let created_here = match path.metadata().and_then(|md| md.modified()) {
+            Ok(modified) => {
+                modified
+                    >= started
+                        .checked_sub(MTIME_GRANULARITY)
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+            }
+            Err(_) => false,
+        };
+        if !created_here {
+            return false;
+        }
+        let anonymous = self
+            .stat(hash)
+            .map(|s| s.pins.is_empty() && s.first_put.is_none())
+            .unwrap_or(true);
+        anonymous && std::fs::remove_file(&path).is_ok()
+    }
+
     /// The largest upload `owner` may land right now: the tighter of
     /// the owner's remaining headroom and the total cap's. The lane
     /// checks a declared `Content-Length` against this before the
-    /// first byte and enforces it with a mid-stream counter.
+    /// first byte and enforces it with a mid-stream counter; `blob.fetch`
+    /// checks a lane response's `Content-Length` the same way.
     pub fn upload_cap(&self, owner: &str) -> Result<u64> {
         let owner_room = self
             .options

@@ -22,6 +22,7 @@ use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use axum::Router;
@@ -101,10 +102,34 @@ pub fn bind_is_wg(bind: &str, wg_ip: &str) -> bool {
 
 /// Shared lane state: the store and the upload-admission semaphore.
 /// Reads are unbounded (they cost one open file each); uploads hold a
-/// permit for their whole body.
+/// permit for their whole body. `gets` counts served `GET`s (the
+/// single-flight test asserts exactly one download per hash).
 pub struct Lane {
     store: Arc<Store>,
     uploads: Semaphore,
+    gets: AtomicU64,
+}
+
+impl Lane {
+    fn new(store: Arc<Store>, max_uploads: usize) -> Self {
+        Self {
+            store,
+            uploads: Semaphore::new(max_uploads),
+            gets: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The lane's route table, shared by [`serve_lane`] and the test
+/// constructor.
+fn lane_router(lane: Arc<Lane>) -> Router {
+    Router::new()
+        .route(
+            "/blob/{hex}",
+            get(get_blob).put(put_upload).post(post_upload),
+        )
+        .route("/blob", post(post_upload))
+        .with_state(lane)
 }
 
 /// Serve the byte lane on an already-bound `listener`. The WG bind
@@ -114,20 +139,10 @@ pub async fn serve_lane(
     store: Arc<Store>,
     max_uploads: usize,
 ) -> std::io::Result<()> {
-    let lane = Arc::new(Lane {
-        store,
-        uploads: Semaphore::new(max_uploads),
-    });
-    let app = Router::new()
-        .route(
-            "/blob/{hex}",
-            get(get_blob).put(put_upload).post(post_upload),
-        )
-        .route("/blob", post(post_upload))
-        .with_state(lane);
+    let lane = Arc::new(Lane::new(store, max_uploads));
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        lane_router(lane).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
 }
@@ -140,6 +155,9 @@ async fn get_blob(
     AxumPath(hex): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
+    if method == Method::GET {
+        lane.gets.fetch_add(1, Ordering::Relaxed);
+    }
     let Some(hash) = blob::from_hex(&hex) else {
         return lane_error(StatusCode::BAD_REQUEST, "invalid blob id");
     };
@@ -325,19 +343,32 @@ async fn post_upload(
 /// One frame crossing the pump channel. `Eof` is the explicit
 /// clean-end marker: a channel that closes without it (a cancelled or
 /// panicked pump) is a hard read error, never a silent truncation.
-enum Frame {
+/// Shared with `blob.fetch`, which pumps a lane response the same way
+/// the lane pumps a request body.
+pub(crate) enum Frame {
     Data(axum::body::Bytes),
     Eof,
     Abort(io::Error),
 }
 
 /// The blocking half of the pump: an `io::Read` view of the async
-/// request body, consumed by `blob::put_reader` on the blocking pool.
-struct ChannelReader {
+/// body, consumed by `blob::put_reader` on the blocking pool.
+pub(crate) struct ChannelReader {
     rx: mpsc::Receiver<Frame>,
     chunk: axum::body::Bytes,
     pos: usize,
     eof: bool,
+}
+
+impl ChannelReader {
+    pub(crate) fn new(rx: mpsc::Receiver<Frame>) -> Self {
+        Self {
+            rx,
+            chunk: axum::body::Bytes::new(),
+            pos: 0,
+            eof: false,
+        }
+    }
 }
 
 impl Read for ChannelReader {
@@ -579,12 +610,7 @@ fn stream_into_store(
     name: Option<String>,
     owner: String,
 ) -> Result<UploadOutcome, UploadError> {
-    let reader = ChannelReader {
-        rx,
-        chunk: axum::body::Bytes::new(),
-        pos: 0,
-        eof: false,
-    };
+    let reader = ChannelReader::new(rx);
     // put_reader hashes while staging and commits under the hash of the
     // bytes that actually arrived; on a read error it removes the
     // staged file and leaves no CAS entry.
@@ -594,24 +620,10 @@ fn stream_into_store(
         && expected != landed
     {
         // The landed bytes committed under their own (wrong) hash.
-        // Remove that entry only when this request created it (the CAS
-        // file's mtime falls inside the request — content-addressed
-        // writes never refresh an existing file's mtime) and nothing
-        // pins or describes it; a pre-existing entry is not ours to
-        // delete.
-        let path = blob::blob_path(&store.blobs_root(), &landed);
-        let created_here = fs_modified(&path)
-            .map(|modified| modified >= started)
-            .unwrap_or(false);
-        if created_here {
-            let anonymous = store
-                .stat(&landed)
-                .map(|s| s.pins.is_empty() && s.first_put.is_none())
-                .unwrap_or(true);
-            if anonymous {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+        // Remove that entry only when this request created it and
+        // nothing pins or describes it; a pre-existing entry is not
+        // ours to delete.
+        store.discard_recently_created(&landed, started);
         return Ok(UploadOutcome::Mismatch {
             expected,
             landed,
@@ -623,10 +635,6 @@ fn stream_into_store(
         .record_upload(&landed, size, &mime, name.as_deref(), &owner)
         .map_err(UploadError::Store)?;
     Ok(UploadOutcome::Committed(outcome))
-}
-
-fn fs_modified(path: &Path) -> io::Result<SystemTime> {
-    std::fs::metadata(path).and_then(|md| md.modified())
 }
 
 // ---- Headers and responses ----
@@ -677,33 +685,21 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
         .expect("static response parts")
 }
 
+/// TESTS ONLY, shared with `blob.fetch`'s tests: a lane bound to
+/// loopback, its store options, and deterministic pseudo-random bytes.
+/// In production a lane is constructed only by main, and only after
+/// `bind_is_wg` has proved the bind is this node's own WG address —
+/// fail closed, exit 2 before any socket; loopback is never a legal
+/// production bind. The proof itself is a pure function with its own
+/// unit test below (the arm-6 shape).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::core::store::StoreOptions;
     use std::collections::BTreeMap;
-    // `Read` arrives via `use super::*`; `BufRead` and `Write` are
-    // test-local.
-    use std::io::{BufRead, BufReader, Write as _};
-    use std::net::TcpStream;
     use tempfile::TempDir;
 
-    /// TESTS ONLY: a lane bound to loopback. In production a lane is
-    /// constructed only by main, and only after `bind_is_wg` has proved
-    /// the bind is this node's own WG address — fail closed, exit 2
-    /// before any socket; loopback is never a legal production bind.
-    /// The proof itself is a pure function with its own unit test
-    /// below (the arm-6 shape).
-    async fn test_lane(options: StoreOptions) -> (TempDir, Arc<Store>, SocketAddr) {
-        let dir = TempDir::new().unwrap();
-        let store = Arc::new(Store::open(dir.path(), options).unwrap());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_lane(listener, Arc::clone(&store), 4));
-        (dir, store, addr)
-    }
-
-    fn options() -> StoreOptions {
+    pub(crate) fn options() -> StoreOptions {
         StoreOptions {
             origin: "testnode".into(),
             quota_total_bytes: crate::core::DEFAULT_QUOTA_TOTAL_BYTES,
@@ -715,7 +711,7 @@ mod tests {
     /// Deterministic pseudo-random bytes (xorshift64*): incompressible
     /// enough that no accidental dedup hides a wrong-range read, and
     /// reproducible across runs.
-    fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+    pub(crate) fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
         let mut out = Vec::with_capacity(len);
         let mut state = seed | 1;
         while out.len() < len {
@@ -727,6 +723,38 @@ mod tests {
         out.truncate(len);
         out
     }
+
+    /// A loopback lane without the counter handle.
+    pub(crate) async fn test_lane(options: StoreOptions) -> (TempDir, Arc<Store>, SocketAddr) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path(), options).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let lane = Arc::new(Lane::new(Arc::clone(&store), 4));
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(
+                listener,
+                lane_router(lane).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                eprintln!("test lane stopped: {error}");
+            }
+        });
+        (dir, store, addr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{options, pseudo_random, test_lane};
+    use super::*;
+    use crate::core::store::StoreOptions;
+    use std::collections::BTreeMap;
+    // `Read` arrives via `use super::*`; `BufRead` and `Write` are
+    // test-local.
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::TcpStream;
 
     /// A whole HTTP/1.1 exchange over a raw socket: the lane only ever
     /// answers with Content-Length bodies, so the response is read

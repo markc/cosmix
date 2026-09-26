@@ -17,6 +17,12 @@ pub struct PropsInput {
     pub quota_total_used: u64,
     pub quota_total_limit: u64,
     pub generation: u64,
+    /// `blob.fetch` gauges and counters: downloads moving, waiting in
+    /// the in-process queue, and lifetime completed/failed totals.
+    pub fetch_in_flight: u64,
+    pub fetch_queued: u64,
+    pub fetch_completed: u64,
+    pub fetch_failed: u64,
 }
 
 /// `blob.props.*` tree: config surface, live counts, quota totals and
@@ -27,7 +33,7 @@ pub struct BlobProps {
 
 impl BlobProps {
     pub fn new(input: &PropsInput) -> Self {
-        let mut leaves = Vec::with_capacity(10);
+        let mut leaves = Vec::with_capacity(14);
         push(&mut leaves, "lane.bind", input.lane_bind.clone().into());
         push(&mut leaves, "lane.port", u64::from(input.lane_port).into());
         push(&mut leaves, "root", input.root.clone().into());
@@ -49,6 +55,18 @@ impl BlobProps {
             "lifecycle.generation",
             (input.generation).into(),
         );
+        push(
+            &mut leaves,
+            "fetch.in_flight",
+            (input.fetch_in_flight).into(),
+        );
+        push(&mut leaves, "fetch.queued", (input.fetch_queued).into());
+        push(
+            &mut leaves,
+            "fetch.completed",
+            (input.fetch_completed).into(),
+        );
+        push(&mut leaves, "fetch.failed", (input.fetch_failed).into());
         Self { leaves }
     }
 }
@@ -115,6 +133,26 @@ impl PropTree for BlobProps {
                 PropType::Number,
                 "Monotonic mutation counter for this daemon process.",
             ),
+            "in_flight" => PropDescribe::leaf(
+                path.clone(),
+                PropType::Number,
+                "blob.fetch downloads currently moving (running tasks, queued ones excluded).",
+            ),
+            "queued" => PropDescribe::leaf(
+                path.clone(),
+                PropType::Number,
+                "blob.fetch requests waiting for a concurrency slot (bounded by fetch_queue_max).",
+            ),
+            "completed" => PropDescribe::leaf(
+                path.clone(),
+                PropType::Number,
+                "blob.fetch completions (any outcome) since process start.",
+            ),
+            "failed" => PropDescribe::leaf(
+                path.clone(),
+                PropType::Number,
+                "blob.fetch failures (any non-ok outcome) since process start.",
+            ),
             _ => return None,
         };
         // Transient means excluded from props.changed: only the
@@ -128,6 +166,36 @@ fn push(leaves: &mut Vec<(PropPath, PropValue)>, path: &str, value: PropValue) {
     if let Ok(path) = PropPath::new(path) {
         leaves.push((path, value));
     }
+}
+
+/// Diff two props snapshots into `blob.props.changed` events
+/// (transient leaves excluded). Shared by the verb dispatch path
+/// (around a synchronous mutation) and the fetch completion path
+/// (around a background download landing).
+pub fn props_diff_events(before: &PropsInput, after: &PropsInput) -> Vec<crate::citizen::BusEvent> {
+    let old_tree = BlobProps::new(before);
+    let new_tree = BlobProps::new(after);
+    let old = old_tree.snapshot();
+    let new = new_tree.snapshot();
+    let mut events = Vec::new();
+    for (path, old_value, new_value) in cosmix_props_core::diff(&old, &new) {
+        let described = new_tree
+            .describe(&path)
+            .or_else(|| old_tree.describe(&path));
+        if described.is_none_or(|d| d.transient) {
+            continue;
+        }
+        events.push(crate::citizen::BusEvent {
+            topic: crate::citizen::TOPIC_PROPS_CHANGED,
+            message: cosmix_props_core::publish::build_props_changed_message(
+                &path,
+                &old_value,
+                &new_value,
+                "blob.verb",
+            ),
+        });
+    }
+    events
 }
 
 #[cfg(test)]
@@ -146,6 +214,10 @@ mod tests {
             quota_total_used: 1024,
             quota_total_limit: 2048,
             generation: 9,
+            fetch_in_flight: 1,
+            fetch_queued: 2,
+            fetch_completed: 7,
+            fetch_failed: 1,
         }
     }
 
@@ -161,6 +233,10 @@ mod tests {
         assert_eq!(snapshot["quota"]["total"]["used"], 1024);
         assert_eq!(snapshot["quota"]["total"]["limit"], 2048);
         assert_eq!(snapshot["lifecycle"]["generation"], 9);
+        assert_eq!(snapshot["fetch"]["in_flight"], 1);
+        assert_eq!(snapshot["fetch"]["queued"], 2);
+        assert_eq!(snapshot["fetch"]["completed"], 7);
+        assert_eq!(snapshot["fetch"]["failed"], 1);
     }
 
     #[test]

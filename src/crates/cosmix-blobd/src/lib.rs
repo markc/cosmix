@@ -15,6 +15,8 @@ pub mod core;
 #[cfg(feature = "cosmix")]
 pub mod citizen;
 #[cfg(feature = "cosmix")]
+pub mod fetch;
+#[cfg(feature = "cosmix")]
 pub mod lane;
 #[cfg(feature = "cosmix")]
 pub mod props;

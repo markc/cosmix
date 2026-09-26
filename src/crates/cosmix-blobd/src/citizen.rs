@@ -18,12 +18,12 @@ use cosmix_bus::bus::BusMessage;
 use cosmix_client::{IncomingCommand, NodedClient};
 use cosmix_mds::blob::{self, PutMode};
 use cosmix_mds::types::BlobHash;
-use cosmix_props_core::PropTree;
 use serde_json::{Value, json};
 
 use crate::core::reference::{self};
 use crate::core::store::{PutOptions, Store, StoreError};
-use crate::props::{BlobProps, PropsInput};
+use crate::fetch::{FetchTarget, Fetcher, SubmitOutcome, TOPIC_FETCHED};
+use crate::props::{BlobProps, PropsInput, props_diff_events};
 
 pub const DEFAULT_SERVICE: &str = "blobd";
 pub const TOPIC_PINNED: &str = "blob.pinned";
@@ -34,18 +34,21 @@ pub const TOPIC_PROPS_CHANGED: &str = "blob.props.changed";
 const BROKER_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const OP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One `retain: false` publication queued by a dispatch.
+/// One `retain: false` publication queued by a dispatch or a fetch
+/// completion.
 pub struct BusEvent {
-    topic: &'static str,
-    message: BusMessage,
+    pub(crate) topic: &'static str,
+    pub(crate) message: BusMessage,
 }
 
-/// The dispatching citizen: a store plus its instance identity.
+/// The dispatching citizen: a store plus its instance identity and
+/// the fetch machinery.
 pub struct Citizen {
     store: Arc<Store>,
     service: String,
     instance: String,
     lane_bind: Option<SocketAddr>,
+    fetcher: Arc<Fetcher>,
 }
 
 impl Citizen {
@@ -54,12 +57,14 @@ impl Citizen {
         service: String,
         instance: String,
         lane_bind: Option<SocketAddr>,
+        fetcher: Arc<Fetcher>,
     ) -> Self {
         Self {
             store,
             service,
             instance,
             lane_bind,
+            fetcher,
         }
     }
 
@@ -93,9 +98,7 @@ impl Citizen {
             "blob.quota" => self.verb_quota(args.as_ref()),
             "blob.gc" => self.verb_gc(args.as_ref()),
             "blob.info" => Ok(self.verb_info()),
-            "blob.fetch" => Err(StoreError::BadRequest(
-                "not_implemented: blob.fetch arrives in a later slice (P1 slice 4)".into(),
-            )),
+            "blob.fetch" => self.verb_fetch(command, args.as_ref()),
             other => Err(StoreError::BadRequest(format!(
                 "unknown blob verb: {other}"
             ))),
@@ -321,6 +324,100 @@ impl Citizen {
         Ok((0, body.to_string(), events))
     }
 
+    /// `blob.fetch {blob, from?, owner?}`: **replies immediately**,
+    /// never a deferred reply (the 30 s mesh response timeout cannot
+    /// carry a multi-GiB pull). Completion is the `blob.fetched`
+    /// event plus the `blob.stat` transition. `blob` is a `b3:` id or
+    /// a full reference (the reference's `origin` — and an `instance`
+    /// member, if present — drive first-try resolution; `from`
+    /// overrides the node).
+    fn verb_fetch(
+        &self,
+        command: &IncomingCommand,
+        args: Option<&Value>,
+    ) -> Result<(u8, String, Vec<BusEvent>), StoreError> {
+        let args =
+            args.ok_or_else(|| StoreError::BadRequest("blob.fetch requires a JSON body".into()))?;
+        let (hash, mut origin, mut instance) = match args.get("blob") {
+            Some(Value::String(id)) => (parse_id(id)?, None, None),
+            Some(value @ Value::Object(_)) => {
+                let id = value.get("blob").and_then(Value::as_str).ok_or_else(|| {
+                    StoreError::BadRequest("blob.fetch: a reference object needs a blob id".into())
+                })?;
+                let hash = parse_id(id)?;
+                let origin = value
+                    .get("origin")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let instance = value
+                    .get("instance")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                (hash, origin, instance)
+            }
+            _ => {
+                return Err(StoreError::BadRequest(
+                    "blob.fetch requires a blob id or a reference object".into(),
+                ));
+            }
+        };
+        if let Some(from) = args.get("from").and_then(Value::as_str) {
+            origin = Some(from.to_string());
+        }
+        if let Some(name) = args.get("instance").and_then(Value::as_str) {
+            instance = Some(name.to_string());
+        }
+        let owner = owner_from(command, args);
+        let id = reference::blob_id(&hash);
+
+        // If the CAS already has it, pin to the caller and done — the
+        // reply is the completion.
+        if matches!(blob::exists(&self.store.blobs_root(), &hash), Ok(true)) {
+            let before = self.props_input()?;
+            let changed = self.store.pin(&hash, &owner)?;
+            let mut events = Vec::new();
+            if changed {
+                events.push(domain_event(
+                    TOPIC_PINNED,
+                    json!({"blob": id, "owner": owner}),
+                ));
+            }
+            self.append_props_events(before, &mut events);
+            let body = json!({
+                "accepted": true,
+                "blob": id,
+                "origin": origin,
+                "in_flight": false,
+                "present": true,
+            });
+            return Ok((0, body.to_string(), events));
+        }
+
+        let target = origin.as_ref().map(|node| FetchTarget {
+            node: node.clone(),
+            instance: instance.clone(),
+        });
+        let before = self.props_input()?;
+        let outcome = self.fetcher.submit(hash, target, owner);
+        if outcome == SubmitOutcome::Busy {
+            return Err(StoreError::Busy);
+        }
+        // in_flight: true when this call joined an existing fetch or
+        // queued behind the concurrency bound; false when it started
+        // the download itself.
+        let in_flight = outcome == SubmitOutcome::Joined;
+        let mut events = Vec::new();
+        self.append_props_events(before, &mut events);
+        let body = json!({
+            "accepted": true,
+            "blob": id,
+            "origin": origin,
+            "in_flight": in_flight,
+            "present": false,
+        });
+        Ok((0, body.to_string(), events))
+    }
+
     fn verb_info(&self) -> (u8, String, Vec<BusEvent>) {
         let build = cosmix_buildinfo::build_info!();
         let counts = self
@@ -349,6 +446,7 @@ impl Citizen {
     fn props_input(&self) -> Result<PropsInput, StoreError> {
         let (counts_blobs, counts_pins) = self.store.counts()?;
         let quota = self.store.quota_report(None)?;
+        let gauges = self.fetcher.gauges();
         Ok(PropsInput {
             lane_bind: self
                 .lane_bind
@@ -363,6 +461,10 @@ impl Citizen {
             quota_total_used: quota.total.used,
             quota_total_limit: quota.total.limit,
             generation: self.store.generation(),
+            fetch_in_flight: gauges.in_flight,
+            fetch_queued: gauges.queued,
+            fetch_completed: gauges.completed,
+            fetch_failed: gauges.failed,
         })
     }
 
@@ -372,7 +474,12 @@ impl Citizen {
                 0,
                 json!({
                     "topic": TOPIC_PROPS_CHANGED,
-                    "domain_topics": [TOPIC_PINNED, TOPIC_UNPINNED, TOPIC_SWEPT],
+                    "domain_topics": [
+                        TOPIC_PINNED,
+                        TOPIC_UNPINNED,
+                        TOPIC_SWEPT,
+                        TOPIC_FETCHED,
+                    ],
                     "generation": self.store.generation(),
                     "bootstrap": "subscribe on this connection, then read blob.props.get",
                 })
@@ -391,33 +498,13 @@ impl Citizen {
     }
 
     /// Diff the props tree around a mutation into `blob.props.changed`
-    /// events (transient leaves excluded by describe()).
+    /// events (transient leaves excluded by the shared differ).
     fn append_props_events(&self, before: PropsInput, events: &mut Vec<BusEvent>) {
         let after = match self.props_input() {
             Ok(input) => input,
             Err(_) => return,
         };
-        let old_tree = BlobProps::new(&before);
-        let new_tree = BlobProps::new(&after);
-        let old = old_tree.snapshot();
-        let new = new_tree.snapshot();
-        for (path, old_value, new_value) in cosmix_props_core::diff(&old, &new) {
-            let described = new_tree
-                .describe(&path)
-                .or_else(|| old_tree.describe(&path));
-            if described.is_none_or(|d| d.transient) {
-                continue;
-            }
-            events.push(BusEvent {
-                topic: TOPIC_PROPS_CHANGED,
-                message: cosmix_props_core::publish::build_props_changed_message(
-                    &path,
-                    &old_value,
-                    &new_value,
-                    "blob.verb",
-                ),
-            });
-        }
+        events.extend(props_diff_events(&before, &after));
     }
 }
 
@@ -454,7 +541,7 @@ fn error_body(e: &StoreError) -> String {
     json!({"error": e.to_string()}).to_string()
 }
 
-fn domain_event(topic: &'static str, body: Value) -> BusEvent {
+pub(crate) fn domain_event(topic: &'static str, body: Value) -> BusEvent {
     let mut message = BusMessage::new();
     message.set("command", topic);
     message.body = body.to_string();
@@ -499,6 +586,9 @@ fn clone_command(command: &IncomingCommand) -> IncomingCommand {
 /// Run the reconnecting citizen loop. Does not return during normal
 /// operation; returns on SIGINT/SIGTERM.
 pub async fn serve(citizen: Arc<Citizen>) -> Result<()> {
+    // The fetch dispatcher: one task per admitted download, living
+    // across broker reconnects.
+    citizen.fetcher.spawn_dispatcher().await;
     let build = cosmix_buildinfo::build_info!();
     let provenance = cosmix_bus::RegisterProvenance::from_parts(
         build.pkg,
@@ -541,6 +631,14 @@ pub async fn serve(citizen: Arc<Citizen>) -> Result<()> {
 }
 
 async fn run_connection(citizen: &Arc<Citizen>, client: &Arc<NodedClient>) {
+    // The fetch machinery resolves and publishes through the live
+    // connection; cleared when it ends, whenever it ends.
+    citizen.fetcher.set_client(Some(Arc::clone(client)));
+    run_connection_inner(citizen, client).await;
+    citizen.fetcher.set_client(None);
+}
+
+async fn run_connection_inner(citizen: &Arc<Citizen>, client: &Arc<NodedClient>) {
     let Some(mut incoming) = client.incoming_async().await else {
         return;
     };
@@ -624,6 +722,8 @@ async fn shutdown_signal() -> Result<()> {
 mod tests {
     use super::*;
     use crate::core::store::{StartupReport, StoreOptions};
+    use crate::fetch::test_support::{NullPeers, NullResolver, TestSink};
+    use crate::fetch::{FetchConfig, Fetcher};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -639,13 +739,24 @@ mod tests {
             },
         )
         .unwrap();
+        let store = Arc::new(store);
+        let fetcher = Fetcher::new(
+            Arc::clone(&store),
+            FetchConfig::default(),
+            Some("10.42.0.5:4210".parse().unwrap()),
+            "default".into(),
+            Arc::new(NullResolver),
+            Arc::new(NullPeers),
+            Arc::new(TestSink::default()),
+        );
         (
             dir,
             Citizen::new(
-                Arc::new(store),
+                store,
                 "blobd".into(),
                 "default".into(),
                 Some("10.42.0.5:4210".parse().unwrap()),
+                Arc::new(fetcher),
             ),
         )
     }
@@ -747,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn stat_path_url_error_and_fetch_reserved() {
+    fn stat_path_url_error_and_fetch_present() {
         let (dir, c) = citizen();
         let src = dir.path().join("u.bin");
         std::fs::write(&src, b"url me").unwrap();
@@ -774,9 +885,28 @@ mod tests {
         assert_eq!(rc, 10);
         assert!(body.contains("not_present"));
 
-        let (rc, body, _) = c.dispatch(&command("blob.fetch", "t", json!({"blob": id})));
-        assert_eq!(rc, 10);
-        assert!(body.contains("not_implemented"), "{body}");
+        // fetch of a present blob: the immediate reply is the
+        // completion — pinned to the caller, no fetch started.
+        let (rc, body, events) = c.dispatch(&command("blob.fetch", "maild", json!({"blob": id})));
+        assert_eq!(rc, 0, "{body}");
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["accepted"], true);
+        assert_eq!(reply["present"], true);
+        assert_eq!(reply["in_flight"], false);
+        assert_eq!(reply["origin"], Value::Null);
+        assert_eq!(events[0].topic, TOPIC_PINNED);
+        let pinned: Value = serde_json::from_str(&events[0].message.body).unwrap();
+        assert_eq!(pinned["owner"], "maild");
+        let stat = c
+            .dispatch(&command("blob.stat", "maild", json!({"blob": id})))
+            .1;
+        assert!(
+            serde_json::from_str::<Value>(&stat).unwrap()["pins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o == "maild")
+        );
 
         let (rc, body, _) = c.dispatch(&command("blob.warp", "t", json!({})));
         assert_eq!(rc, 10);
@@ -785,6 +915,38 @@ mod tests {
         let (rc, body, _) = c.dispatch(&command("blob.stat", "t", json!({"blob": "nope"})));
         assert_eq!(rc, 10);
         assert!(body.contains("invalid blob id"));
+    }
+
+    #[test]
+    fn fetch_arg_shapes() {
+        let (dir, c) = citizen();
+        // A reference object drives origin/instance; bad shapes refuse.
+        let (rc, _, _) = c.dispatch(&command("blob.fetch", "t", json!({"blob": 7})));
+        assert_eq!(rc, 10);
+        let (rc, _, _) = c.dispatch(&command("blob.fetch", "t", json!({})));
+        assert_eq!(rc, 10);
+        let (rc, body, _) = c.dispatch(&command(
+            "blob.fetch",
+            "t",
+            json!({"blob": {"blob": "b3:tooshort"}}),
+        ));
+        assert_eq!(rc, 10, "{body}");
+        assert!(body.contains("invalid blob id"));
+        // A valid id for bytes we do not hold is accepted (the fetch
+        // itself goes nowhere in this runtime-less test — the reply
+        // shape is what is asserted).
+        let absent = "b3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let (rc, body, _) = c.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": {"blob": absent, "size": 5, "mime": "text/plain", "origin": "alpha"}}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["accepted"], true);
+        assert_eq!(reply["present"], false);
+        assert_eq!(reply["origin"], "alpha");
+        let _ = dir;
     }
 
     #[test]
