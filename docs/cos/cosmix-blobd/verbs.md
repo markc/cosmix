@@ -18,7 +18,7 @@ Success uses result code `0`. Errors use result code `10` and a body shaped as:
 
 Error tokens worth matching on: `not_present` (blob not held), `invalid blob id` (malformed `b3:` reference), `quota:` (an owner or total cap refusal — the message carries the numbers), `busy` (the `blob.fetch` queue is full — retry later), `vanished:` (the bytes disappeared while the pin was landing — a `blob.gc` race; retry the put).
 
-Verbs dispatch concurrently, bounded by `verb_max_concurrent` (default 8): a slow `blob.put` or `blob.gc` holds one slot, not the connection — other verbs (including `blob.fetch`'s immediate reply) keep answering. Beyond the bound a verb queues; its reply is late, never lost. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.
+Verbs dispatch concurrently. The data-scaled verbs — `blob.put`, `blob.gc`, `blob.list`, `blob.pin`, `blob.unpin` — are bounded by `verb_max_concurrent` (default 8): each holds one slot, not the connection, and beyond the bound it queues; its reply is late, never lost. Every other verb (`blob.fetch`'s immediate reply, `stat`, `has`, `path`, `url`, `info`, `quota`, `props.*`) takes no slot, so eight slow verbs never starve them. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.
 
 A blob reference is `{"blob":"b3:<64 hex>","size":N,"mime":"…","name":"…"?, "origin":"<node name>"}` (`name` present only when the ingester knew one; `origin` is a node name, never an IP).
 
@@ -78,7 +78,7 @@ Bulk presence check. The response contains `present` and `missing` arrays of blo
 | `blob` | Blob id |
 | `owner` | Pin owner (defaults to the calling service) |
 
-Owner-tagged pins (`maild:acct7`, `capture:session-12`, `filesd:notes` style). Both are idempotent; the response contains `pinned`, whether a pin row actually changed. Pinning requires the bytes to be present; unpinning never does. Emit `blob.pinned` / `blob.unpinned` on a transition.
+Owner-tagged pins (`maild:acct7`, `capture:session-12`, `filesd:notes` style). Both are idempotent; the response contains `pinned`, whether a pin row actually changed. Pinning requires the bytes to be present; unpinning never does. Emit `blob.pinned` / `blob.unpinned` on a transition. Every producer of these two events — `blob.put`, `blob.pin`/`blob.unpin`, a `blob.fetch` completion — publishes the same body, `{blob, owner}`; the topic is the event type.
 
 ### `blob.list`
 
@@ -104,7 +104,7 @@ The response contains `owners` (`<owner>: {used, limit, reserved}`) and `total: 
 |---|---|
 | `dry_run` | `false` |
 
-Candidates are CAS files with mds refcount 0 (no row counts as 0), no pin, and an mtime older than the 60-second grace window. A dry run lists; a live run unlinks, drops attributes, adjusts quota and emits `blob.swept {count}`. The response contains `dry_run`, `count`, `bytes_freed`, the swept blob ids, and `skipped` (`referenced`, `pinned`, `young`).
+Candidates are CAS files with mds refcount 0 (no row counts as 0), no pin, and an mtime older than the 60-second grace window. A dry run lists; a live run unlinks, drops attributes, adjusts quota and emits `blob.swept {count}`. One sweep at a time: a `blob.gc` arriving while another runs answers rc 10 `busy` at once. The response contains `dry_run`, `count`, `bytes_freed`, the swept blob ids, and `skipped` (`referenced`, `pinned`, `young`).
 
 ### `blob.info`
 
@@ -121,11 +121,14 @@ Cross-node pull over the origin's byte lane. **Replies immediately** — never a
 | `instance` | Optional | Remote instance name; the target service becomes `blobd-<name>` |
 | `owner` | The calling service (`from`) | Pin owner for this caller |
 
-The reply is `{accepted:true, blob, origin, in_flight, present}`:
+The reply is `{accepted:true, blob, origin, in_flight, queued, present}`:
 
-- `present:true` — the CAS already had it; the caller's pin landed and this reply is the completion.
-- `present:false, in_flight:false` — this call started the download.
+- `present:true` — the CAS already had it; the caller's pin landed and this reply is the completion (`in_flight` and `queued` are false).
+- `present:false, in_flight:false` — this call admitted a new fetch.
 - `present:false, in_flight:true` — a fetch for this hash was already in the system (running or queued) and this call joined it: **single-flight per hash**, one download, the joiner's pin lands on completion.
+- `queued` — orthogonal to `in_flight`: true when the fetch this call admitted or joined is waiting for one of the `fetch_max_concurrent` slots, false when its download holds one. A new fetch takes its slot at admission, so `in_flight:false, queued:false` means the download is running, not waiting.
+
+The immediate reply and `blob.fetched` are **not ordered** relative to each other — a fast fetch can complete before its reply arrives. Subscribe to `blob.fetched` before sending the fetch (`blob_fetch_wait` in `mix/blob.mix` does).
 
 Completion is the `blob.fetched` event (`retain: false`, so a late subscriber sees nothing) plus the `blob.stat` transition `present:false → true`:
 
@@ -133,7 +136,7 @@ Completion is the `blob.fetched` event (`retain: false`, so a late subscriber se
 {"blob":"b3:…","outcome":"ok","origin_used":"alpha","size":184320}
 ```
 
-`outcome` ∈ `ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io` (`origin_used` is null and `error` carries the reason on every non-`ok` outcome). Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a `blob.has` fan-out over `noded.peers`; `verify_failed` is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's [Fetching] section.
+`outcome` ∈ `ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io` (`origin_used` is null and `error` carries the reason on every non-`ok` outcome). Quota is settled **per owner** when the pins land: an owner (submitter or joiner) whose cap refuses the pin is listed in `refused: [owner…]` and gets no pin, while the owners that fit are pinned and the outcome stays `ok`; when no owner fits, the outcome is `quota` (with `refused`). A download that outlives `fetch_deadline_secs` is `origin_unreachable` with an `error` naming the deadline. Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a `blob.has` fan-out over `noded.peers`; `verify_failed` is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's [Fetching] section.
 
 `blob.fetched` is **best-effort across a broker reconnect**: events published while blobd has no broker connection are buffered (bounded, 256 — the oldest drop beyond it) and replayed on the next connection, oldest first. Recovery when an event may have been missed: `blob.stat` showing `present:true`, and `blob_fetch_wait`'s own timeout — never polling, never a retained event.
 

@@ -18,10 +18,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use cosmix_mds::Mds;
@@ -107,9 +107,10 @@ pub enum StoreError {
     },
     /// Bad request (e.g. `mode: hardlink` without `immutable: true`).
     BadRequest(String),
-    /// The in-process `blob.fetch` queue is full (`fetch_queue_max`);
-    /// the verb replies rc 10 `busy`.
-    Busy,
+    /// A bounded resource is taken; the verb replies rc 10 `busy:
+    /// <why>` — the `blob.fetch` queue is full (`fetch_queue_max`), or
+    /// another `blob.gc` is already sweeping (one GC owner, M2b).
+    Busy(&'static str),
 }
 
 impl std::fmt::Display for StoreError {
@@ -141,10 +142,7 @@ impl std::fmt::Display for StoreError {
                 write!(f, "quota: total would use {would_use} over the cap {limit}")
             }
             Self::BadRequest(s) => write!(f, "bad request: {s}"),
-            Self::Busy => write!(
-                f,
-                "busy: the fetch queue is full (fetch_queue_max); retry later"
-            ),
+            Self::Busy(why) => write!(f, "busy: {why}; retry later"),
         }
     }
 }
@@ -297,6 +295,24 @@ pub struct GcSweep {
     pub skipped_young: u64,
 }
 
+/// [`Store::record_fetch`]'s per-owner outcome (R1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchPins {
+    /// Owners whose pin row this call added.
+    pub pinned: Vec<String>,
+    /// Owners that already held a pin (idempotent, nothing written).
+    pub held: Vec<String>,
+    /// Owners the owner or total cap refused; nothing written for them.
+    pub refused: Vec<String>,
+}
+
+impl FetchPins {
+    /// No owner holds the bytes: every one was refused.
+    pub fn none_fit(&self) -> bool {
+        self.pinned.is_empty() && self.held.is_empty() && !self.refused.is_empty()
+    }
+}
+
 /// Arguments to [`Store::put`].
 #[derive(Debug, Clone)]
 pub struct PutOptions<'a> {
@@ -356,18 +372,28 @@ pub struct Store {
     /// completion must publish outcome io, never a pinless ok.
     #[cfg(test)]
     pub(crate) fail_record_fetch: AtomicBool,
+    /// Held for a sweep's whole duration (M2b); `try_lock` is the
+    /// one-GC-owner admission.
+    gc_running: Mutex<()>,
+    /// TEST ONLY (M2b): a pause at the top of a sweep, so a second
+    /// `blob.gc` can race a running one deterministically.
+    #[cfg(test)]
+    pub(crate) gc_hold: Mutex<Option<Duration>>,
 }
 
 impl Store {
-    /// Open (or create) the store at `root`: mds root, exclusive
-    /// `flock`, `blobd.sqlite` migrations, then startup housekeeping
+    /// Open (or create) the store at `root`: exclusive `flock`, mds
+    /// root, `blobd.sqlite` migrations, then startup housekeeping
     /// (`.tmp` sweep + orphan reconcile).
     pub fn open(root: impl Into<PathBuf>, options: StoreOptions) -> Result<Self> {
         let root = root.into();
-        let mds = SqliteCasMds::open(&root)?;
 
         // One GC owner per root. flock locks are per open file
         // description, so a second open — even in-process — conflicts.
+        // Taken before anything else touches the root (m2): mds's open
+        // creates directories and may migrate `blobs.sqlite`, and a
+        // second instance must exit 2 without having done either.
+        fs::create_dir_all(&root)?;
         let lock_path = root.join(LOCK_FILE);
         let lock_file = OpenOptions::new()
             .create(true)
@@ -385,6 +411,7 @@ impl Store {
             return Err(StoreError::Io(err));
         }
 
+        let mds = SqliteCasMds::open(&root)?;
         let db = open_blobd_db(&root)?;
         let index = open_index_conn(&root)?;
 
@@ -408,6 +435,9 @@ impl Store {
             generation: AtomicU64::new(0),
             #[cfg(test)]
             fail_record_fetch: AtomicBool::new(false),
+            gc_running: Mutex::new(()),
+            #[cfg(test)]
+            gc_hold: Mutex::new(None),
         };
         store.startup_housekeeping()?;
         Ok(store)
@@ -645,8 +675,14 @@ impl Store {
     /// this node minted it) and one pin per joining owner. The bytes
     /// must already be committed in the CAS; the existence re-check
     /// under the db lock refuses `Vanished` if a concurrent `blob.gc`
-    /// swept them (M1). Returns the owners whose pin row was added (an
-    /// owner that already pinned the blob is skipped, idempotently).
+    /// swept them (M1).
+    ///
+    /// Quota is per owner (R1): an owner whose cap (or the total cap)
+    /// refuses the pin lands in [`FetchPins::refused`] with nothing
+    /// written for it, and the owners that fit still pin and commit —
+    /// one over-cap joiner never rolls back everyone else's pin. An
+    /// owner that already pinned the blob is skipped, idempotently,
+    /// and counts as held.
     pub fn record_fetch(
         &self,
         hash: &BlobHash,
@@ -654,7 +690,7 @@ impl Store {
         mime: &str,
         source_node: &str,
         owners: &[String],
-    ) -> Result<Vec<String>> {
+    ) -> Result<FetchPins> {
         #[cfg(test)]
         if self.fail_record_fetch.load(Ordering::Relaxed) {
             return Err(StoreError::Db(
@@ -674,26 +710,32 @@ impl Store {
             params![blob::hex(hash), mime, source_node, now_ms()],
         )
         .map_err(db_err)?;
-        let mut newly_pinned = Vec::new();
+        let mut pins = FetchPins::default();
         for owner in owners {
-            let inserted = pin_with_cap(
+            match pin_with_cap(
                 &tx,
                 &blob::hex(hash),
                 owner,
                 size,
                 self.options.owner_limit(owner),
                 self.options.quota_total_bytes,
-            )?;
-            if inserted {
-                newly_pinned.push(owner.clone());
+            ) {
+                Ok(true) => pins.pinned.push(owner.clone()),
+                Ok(false) => pins.held.push(owner.clone()),
+                // A refusal writes nothing; the transaction stays good
+                // for the owners that fit.
+                Err(StoreError::QuotaOwner { .. } | StoreError::QuotaTotal { .. }) => {
+                    pins.refused.push(owner.clone())
+                }
+                Err(error) => return Err(error),
             }
         }
         tx.commit().map_err(db_err)?;
         drop(db);
-        if !newly_pinned.is_empty() {
+        if !pins.pinned.is_empty() {
             self.bump_generation();
         }
-        Ok(newly_pinned)
+        Ok(pins)
     }
 
     // ---- Reads ----
@@ -1117,7 +1159,25 @@ impl Store {
     /// mutex, so either the pin lands first and the candidate is
     /// skipped, or the sweep wins and the pin is refused `Vanished` —
     /// never an acknowledged pin whose bytes were just unlinked.
+    ///
+    /// One sweep at a time (M2b): a second concurrent call answers
+    /// `Busy` at once instead of queueing a duplicate scan behind the
+    /// first.
     pub fn gc(&self, dry_run: bool) -> Result<GcSweep> {
+        let _sweeping = match self.gc_running.try_lock() {
+            Ok(guard) => guard,
+            // A sweep that panicked holds no state worth refusing on.
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(StoreError::Busy(
+                    "a blob.gc is already running (one GC owner)",
+                ));
+            }
+        };
+        #[cfg(test)]
+        if let Some(hold) = *self.gc_hold.lock().unwrap() {
+            std::thread::sleep(hold);
+        }
         let grace = Duration::from_secs(DEFAULT_GC_GRACE_SECS);
         let mut report = GcSweep::default();
         for file in self.cas_scan()? {
@@ -1348,9 +1408,11 @@ fn pin_with_cap(
         });
     }
     let total_used: i64 = tx
-        .query_row("SELECT COALESCE(SUM(used_bytes), 0) FROM quota", params![], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COALESCE(SUM(used_bytes), 0) FROM quota",
+            params![],
+            |r| r.get(0),
+        )
         .map_err(db_err)?;
     let total_would = total_used as u64 + size;
     if total_would > total_limit {
@@ -1851,6 +1913,35 @@ mod tests {
     }
 
     #[test]
+    fn record_fetch_refuses_over_cap_owners_alone() {
+        // R1: the owners that fit pin and commit; the over-cap one is
+        // refused with nothing written; all refused = none_fit.
+        let dir = TempDir::new().unwrap();
+        let options = StoreOptions {
+            owner_limits: BTreeMap::from([("tiny".to_string(), 10)]),
+            ..options()
+        };
+        let store = Store::open(dir.path(), options).unwrap();
+        let hash = blob::put(&store.blobs_root(), &[7u8; 50]).unwrap();
+        let owners = ["maild".to_string(), "tiny".to_string()];
+        let pins = store
+            .record_fetch(&hash, 50, "application/octet-stream", "A", &owners)
+            .unwrap();
+        assert_eq!(pins.pinned, vec!["maild".to_string()]);
+        assert_eq!(pins.refused, vec!["tiny".to_string()]);
+        assert!(!pins.none_fit());
+        assert_eq!(store.pin_owners(&hash).unwrap(), vec!["maild".to_string()]);
+        let report = store.quota_report(None).unwrap();
+        assert_eq!(report.owners["maild"].used, 50);
+        assert!(report.owners.get("tiny").is_none_or(|q| q.used == 0));
+
+        let alone = store
+            .record_fetch(&hash, 50, "application/octet-stream", "A", &owners[1..])
+            .unwrap();
+        assert!(alone.none_fit(), "{alone:?}");
+    }
+
+    #[test]
     fn gc_never_sweeps_bytes_a_concurrent_pin_just_acked() {
         // The M1 race, hammered: an unpinned blob older than the grace
         // window; a lane-style idempotent re-put (record_upload) runs
@@ -1863,9 +1954,7 @@ mod tests {
         for _ in 0..25 {
             let (dir, store) = store();
             let src = write_src(&dir, "race.bin", b"race me");
-            let out = store
-                .put(&src, &PutOptions::new("first"))
-                .unwrap();
+            let out = store.put(&src, &PutOptions::new("first")).unwrap();
             store.unpin(&out.reference.hash, "first").unwrap();
             age_file(&store.path(&out.reference.hash).unwrap());
             let store = Arc::new(store);
@@ -1919,11 +2008,17 @@ mod tests {
 
         let again = store.put(&src, &PutOptions::new("maild")).unwrap();
         assert_eq!(again.reference.hash, out.reference.hash);
-        assert!(again.newly_pinned, "the unpin removed the row; the re-put re-pins");
+        assert!(
+            again.newly_pinned,
+            "the unpin removed the row; the re-put re-pins"
+        );
         store.unpin(&out.reference.hash, "maild").unwrap();
 
         let after = store.gc(true).unwrap();
-        assert!(after.swept.is_empty(), "the re-put refreshed the grace window");
+        assert!(
+            after.swept.is_empty(),
+            "the re-put refreshed the grace window"
+        );
         assert_eq!(after.skipped_young, 1);
     }
 
@@ -1945,15 +2040,11 @@ mod tests {
         .unwrap();
 
         // A declared 700 KiB holds 700 KiB of the owner's 1 MiB…
-        let r1 = store
-            .reserve_upload("race", Some(700 * 1024))
-            .unwrap();
+        let r1 = store.reserve_upload("race", Some(700 * 1024)).unwrap();
         assert_eq!(r1.cap(), 700 * 1024);
         // …so a second 700 KiB admission against the same cap is
         // refused — the old check-then-act would have granted both.
-        let err = store
-            .reserve_upload("race", Some(700 * 1024))
-            .unwrap_err();
+        let err = store.reserve_upload("race", Some(700 * 1024)).unwrap_err();
         assert!(
             matches!(err, StoreError::QuotaOwner { ref owner, would_use, limit } if owner == "race" && would_use == 1400 * 1024 && limit == 1024 * 1024),
             "got {err:?}"
@@ -1968,9 +2059,7 @@ mod tests {
         // Release on drop, then the same admission succeeds.
         drop(r1);
         assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
-        let _again = store
-            .reserve_upload("race", Some(700 * 1024))
-            .unwrap();
+        let _again = store.reserve_upload("race", Some(700 * 1024)).unwrap();
 
         // An absent length reserves the owner's whole remaining room:
         // the mid-stream counter enforces it from the first byte.
@@ -2032,7 +2121,10 @@ mod tests {
         let top = shard.parent().unwrap();
         assert_grouped(top);
         assert_grouped(shard);
-        assert_eq!(fs::metadata(&cas).unwrap().gid(), group_gid(&group).unwrap());
+        assert_eq!(
+            fs::metadata(&cas).unwrap().gid(),
+            group_gid(&group).unwrap()
+        );
         // The setgid bit is on the shard dirs themselves.
         assert!(fs::metadata(top).unwrap().mode() & 0o2000 != 0);
         assert!(fs::metadata(shard).unwrap().mode() & 0o2000 != 0);
@@ -2064,10 +2156,7 @@ mod tests {
             dir.path(),
             StoreOptions {
                 origin: "testnode".into(),
-                owner_limits: BTreeMap::from([(
-                    ("tightside").to_string(),
-                    16u64,
-                )]),
+                owner_limits: BTreeMap::from([(("tightside").to_string(), 16u64)]),
                 ..options()
             },
         )
@@ -2083,7 +2172,10 @@ mod tests {
             "got {err:?}"
         );
         assert!(store.pin_owners(&out.reference.hash).unwrap() == vec!["roomy".to_string()]);
-        assert_eq!(store.quota_report(None).unwrap().owners["tightside"].used, 0);
+        assert_eq!(
+            store.quota_report(None).unwrap().owners["tightside"].used,
+            0
+        );
     }
 
     #[test]
@@ -2116,6 +2208,43 @@ mod tests {
         // Dropping the holder releases it (fd closed).
         drop(store);
         assert!(Store::open(dir.path(), options()).is_ok());
+    }
+
+    #[test]
+    fn second_open_touches_nothing_under_the_root() {
+        // m2: the flock comes before mds's open, so a refused second
+        // instance creates, migrates and rewrites nothing. Removing a
+        // directory mds's open would recreate makes the check sharp:
+        // opening mds first brings `containers/` back.
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, (SystemTime, u64)> {
+            let mut out = BTreeMap::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in fs::read_dir(&dir).unwrap() {
+                    let p = entry.unwrap().path();
+                    let md = fs::symlink_metadata(&p).unwrap();
+                    if md.is_dir() {
+                        stack.push(p.clone());
+                    }
+                    out.insert(p, (md.modified().unwrap(), md.len()));
+                }
+            }
+            out
+        }
+        let (dir, _store) = store();
+        fs::remove_dir(dir.path().join("containers")).unwrap();
+        let before = snapshot(dir.path());
+        std::thread::sleep(Duration::from_millis(20));
+        let err = match Store::open(dir.path(), options()) {
+            Err(err) => err,
+            Ok(_) => panic!("second open of a locked root must fail"),
+        };
+        assert!(matches!(err, StoreError::Locked(_)), "got {err:?}");
+        assert_eq!(
+            snapshot(dir.path()),
+            before,
+            "the refused open touched the root"
+        );
     }
 
     #[test]

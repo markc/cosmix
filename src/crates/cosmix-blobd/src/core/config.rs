@@ -5,7 +5,8 @@
 //! read from the raw text, not the flat map, so they cannot collide.
 //!
 //! Keys: `root`, `name`, `lane_bind`, `lane_max_uploads`,
-//! `fetch_max_concurrent`, `fetch_queue_max`, `verb_max_concurrent`,
+//! `fetch_max_concurrent`, `fetch_queue_max`, `fetch_deadline_secs`,
+//! `verb_max_concurrent`, `cas_group`, `lane_upload_deadline_secs`,
 //! `quota_total_bytes`, `quota_owner_default_bytes`,
 //! `quota_owner: <owner>=<bytes>` (repeatable). The byte values accept
 //! plain integers or a `KiB` family suffix.
@@ -32,7 +33,8 @@ pub const DEFAULT_FETCH_QUEUE_MAX: usize = 32;
 /// `blob.put`, a CAS-walking `blob.gc`) holds one permit, not the
 /// connection: beyond the bound a verb waits (its reply is late,
 /// never lost) instead of blocking every other verb past the 30 s
-/// mesh timeout (M2).
+/// mesh timeout (M2). Only the data-scaled verbs take a permit; quick
+/// lookups dispatch without one (M2a).
 pub const DEFAULT_VERB_MAX_CONCURRENT: usize = 8;
 /// Default CAS shared-read group (SPEC 10a §3.3): blobd chgrps its
 /// state root and CAS root to this group with the setgid bit at open,
@@ -45,6 +47,11 @@ pub const DEFAULT_CAS_GROUP: &str = "cosmix-blob";
 /// idle timeout bounds inter-frame gaps only, so the total deadline is
 /// what bounds a drip-feed client.
 pub const DEFAULT_LANE_UPLOAD_DEADLINE_SECS: u64 = 3600;
+/// Default total per-download deadline for `blob.fetch` (m6): the
+/// lane's upload bound, mirrored on the pulling side. A drip-feeding
+/// source holds a fetch slot and quota reservation for at most this
+/// long; expiry aborts the download (staging deleted).
+pub const DEFAULT_FETCH_DEADLINE_SECS: u64 = 3600;
 
 /// Parsed configuration with defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +84,10 @@ pub struct Config {
     /// Total per-upload deadline on the lane; expiry aborts the
     /// upload (staging deleted) with `408` (F8).
     pub lane_upload_deadline_secs: u64,
+    /// Total per-download deadline for `blob.fetch`; expiry aborts the
+    /// download (staging deleted) — outcome `origin_unreachable`
+    /// naming the deadline if no other source serves (m6).
+    pub fetch_deadline_secs: u64,
     pub quota_total_bytes: u64,
     pub quota_owner_default_bytes: u64,
     /// Per-owner caps from repeated `quota_owner: <owner>=<bytes>`
@@ -96,6 +107,7 @@ impl Default for Config {
             verb_max_concurrent: DEFAULT_VERB_MAX_CONCURRENT,
             cas_group: DEFAULT_CAS_GROUP.to_string(),
             lane_upload_deadline_secs: DEFAULT_LANE_UPLOAD_DEADLINE_SECS,
+            fetch_deadline_secs: DEFAULT_FETCH_DEADLINE_SECS,
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
             owner_limits: BTreeMap::new(),
@@ -213,6 +225,19 @@ impl Config {
                     }
                     cfg.lane_upload_deadline_secs = n;
                 }
+                "fetch_deadline_secs" => {
+                    let n: u64 = v
+                        .parse()
+                        .map_err(|e| format!("fetch_deadline_secs: bad seconds {v:?}: {e}"))?;
+                    if n == 0 {
+                        return Err(
+                            "fetch_deadline_secs: must be at least 1 (0 would abort every \
+                             download at once; the idle timeout already covers dead peers)"
+                                .into(),
+                        );
+                    }
+                    cfg.fetch_deadline_secs = n;
+                }
                 "quota_total_bytes" => {
                     cfg.quota_total_bytes = parse_bytes(v)
                         .ok_or_else(|| format!("quota_total_bytes: bad byte size {v:?}"))?;
@@ -257,9 +282,41 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
 /// Alias documenting quota fields in store types.
 pub type ByteSize = u64;
 
+/// The documented default root, used when neither `root:` nor the
+/// unit's `$STATE_DIRECTORY` names one.
+pub const DEFAULT_ROOT: &str = "/var/lib/cosmix/blobd";
+
+/// The root when the config sets none (m10): systemd's
+/// `$STATE_DIRECTORY` (the unit's `StateDirectory`, a named instance's
+/// drop-in included; the first entry when it lists several), else
+/// [`DEFAULT_ROOT`]. Never the XDG resolver — under the unit's
+/// `HOME=%S/cosmix/blobd` redirect a non-root uid resolves that
+/// somewhere under the state dir, not to it.
+pub fn default_root(state_directory: Option<&str>) -> PathBuf {
+    state_directory
+        .and_then(|dirs| dirs.split(':').next())
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_root_is_the_state_directory_else_the_documented_path() {
+        assert_eq!(
+            default_root(Some("/var/lib/cosmix/blobd-two")),
+            PathBuf::from("/var/lib/cosmix/blobd-two")
+        );
+        assert_eq!(
+            default_root(Some("/var/lib/cosmix/blobd:/var/lib/other")),
+            PathBuf::from("/var/lib/cosmix/blobd")
+        );
+        assert_eq!(default_root(Some("")), PathBuf::from(DEFAULT_ROOT));
+        assert_eq!(default_root(None), PathBuf::from(DEFAULT_ROOT));
+    }
 
     #[test]
     fn empty_text_yields_defaults() {
@@ -323,6 +380,17 @@ mod tests {
         assert!(Config::parse("cas_group:\n").is_err());
         assert!(Config::parse("lane_upload_deadline_secs: 0\n").is_err());
         assert!(Config::parse("lane_upload_deadline_secs: soon\n").is_err());
+        assert_eq!(
+            Config::default().fetch_deadline_secs,
+            DEFAULT_FETCH_DEADLINE_SECS
+        );
+        assert_eq!(
+            Config::parse("fetch_deadline_secs: 90\n")
+                .unwrap()
+                .fetch_deadline_secs,
+            90
+        );
+        assert!(Config::parse("fetch_deadline_secs: 0\n").is_err());
         assert!(Config::parse("quota_total_bytes: lots\n").is_err());
         assert!(Config::parse("quota_owner: noequals\n").is_err());
         assert!(Config::parse("quota_owner: =5MiB\n").is_err());

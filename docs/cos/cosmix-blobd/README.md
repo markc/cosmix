@@ -31,14 +31,15 @@ quota_owner: capture=2GiB
 
 | Key | Default | Meaning |
 |---|---|---|
-| `root` | `/var/lib/cosmix/blobd` (the unit's `StateDirectory`) | mds root this instance owns |
+| `root` | The unit's `StateDirectory` (`$STATE_DIRECTORY`, which systemd sets), else `/var/lib/cosmix/blobd` | mds root this instance owns |
 | `name` | unset (service `blobd`) | Instance name; Bus service becomes `blobd-<name>` |
 | `lane_bind` | unset (no lane) | Byte-lane bind `<ip>:<port>`; the IP must be this node's `wg_ip` (see [Byte lane](#byte-lane)) |
 | `lane_max_uploads` | `4` | Concurrent lane uploads admitted; beyond it the lane answers `503` — no queueing |
 | `lane_upload_deadline_secs` | `3600` | Total per-upload deadline; a drip-feed body is aborted (staging deleted) with `408` when it passes — the 30 s idle timeout bounds inter-frame gaps only |
 | `fetch_max_concurrent` | `2` | Concurrent `blob.fetch` downloads; beyond it a fetch queues (see [Fetching](#fetching)) |
 | `fetch_queue_max` | `32` | In-process fetch queue depth; beyond it the verb replies rc 10 `busy` |
-| `verb_max_concurrent` | `8` | Concurrent verb dispatches; beyond it a verb queues (its reply is late, never lost) instead of blocking every other verb |
+| `fetch_deadline_secs` | `3600` | Total per-download deadline for `blob.fetch`; a drip-feed body is aborted (staging deleted, slot and reservation released) when it passes — outcome `origin_unreachable` naming the deadline if nothing else serves |
+| `verb_max_concurrent` | `8` | Concurrent data-scaled verb dispatches (`blob.put`, `blob.gc`, `blob.list`, `blob.pin`/`unpin`); beyond it such a verb queues (its reply is late, never lost). Quick verbs take no slot |
 | `cas_group` | `cosmix-blob` | Shared-read group the state root and CAS root are chgrped to at open, with the setgid bit (mode 2750), so `blob.path` targets are traversable by members (see [Permissions](#permissions)) |
 | `quota_total_bytes` | `50GiB` | Total cap on accounted (pinned) bytes |
 | `quota_owner_default_bytes` | `10GiB` | Per-owner cap unless overridden |
@@ -88,9 +89,9 @@ A `blob.fetch` interrupted by a restart leaves at most staging residue under `bl
 
 ## Fetching
 
-`blob.fetch` pulls bytes from another node over its byte lane. The verb **replies immediately** — never a deferred reply, because the mesh response timeout is 30 s and a multi-GiB pull outlives it: `{accepted:true, blob, origin, in_flight, present}`. If the CAS already holds the blob it is pinned to the caller (`present:true`) and the reply is the completion. Otherwise completion is the `blob.fetched` event (`retain: false`) plus the `blob.stat` transition `present:false → true`.
+`blob.fetch` pulls bytes from another node over its byte lane. The verb **replies immediately** — never a deferred reply, because the mesh response timeout is 30 s and a multi-GiB pull outlives it: `{accepted:true, blob, origin, in_flight, queued, present}`. If the CAS already holds the blob it is pinned to the caller (`present:true`) and the reply is the completion. Otherwise completion is the `blob.fetched` event (`retain: false`) plus the `blob.stat` transition `present:false → true`.
 
-**Single-flight per hash.** A second `blob.fetch` for an in-flight hash joins it (`in_flight:true`), adds its pin on completion, and never starts a second download. `in_flight` is `true` when this call joined an existing fetch or queued behind the concurrency bound; `false` when it started the download itself.
+**Single-flight per hash.** A second `blob.fetch` for an in-flight hash joins it (`in_flight:true`), adds its pin on completion, and never starts a second download. `in_flight` is `true` exactly when this call joined an existing fetch; `queued` is `true` when the fetch it admitted or joined is waiting for a concurrency slot. A new fetch takes its slot at admission, so `queued:false` on a new fetch means its download is running.
 
 **Resolution order.** The first try is `from` if given, else the reference's `origin` (a node name — or `blobd-<name>` when the reference carries an `instance` member). The node's lane URL is resolved with a mesh-open `blob.props.get {path:"lane"}` on the remote's `blobd` service (addressed `blobd[.<instance>].<node>` through the local noded), so the port is never a constant. The origin is advisory, first try only: on `Service 'blobd' not found` / `disconnected` (both rc=10, discriminated by message text), any other unreachable-source error, or a lane 404, the fetch fans `blob.has {blobs:[hash]}` out over `noded.peers` — all peers, one round, bounded concurrency 4 — and pulls from the first `present`, resolving that peer's lane the same way. Nothing found → `not_found_anywhere`.
 
@@ -107,7 +108,7 @@ A `blob.fetch` interrupted by a restart leaves at most staging residue under `bl
 | `quota` | The owner or total cap would be exceeded (declared `Content-Length` or the mid-stream counter); terminal |
 | `io` | A holder was reached but the transfer or the local ingest failed |
 
-**Bounds.** At most `fetch_max_concurrent` (default 2) downloads run; beyond that the verb still replies `accepted` and the fetch queues in-process up to `fetch_queue_max` (default 32) — above that the verb replies rc 10 `busy`; never an unbounded queue. A stalled body aborts after a 30 s idle read timeout (staging deleted). The `fetch.in_flight`, `fetch.queued`, `fetch.completed` and `fetch.failed` props expose the live gauges and lifetime counters.
+**Bounds.** At most `fetch_max_concurrent` (default 2) downloads run; beyond that the verb still replies `accepted` and the fetch queues in-process up to `fetch_queue_max` (default 32) — above that the verb replies rc 10 `busy`; never an unbounded queue. A peer that accepts the connection but never sends a response head gives up the slot after 30 s (`origin_unreachable` if nothing else serves); a stalled body aborts after the same 30 s idle read timeout (staging deleted). Two bounds cover the body, as on the lane: the 30 s idle timeout bounds gaps between frames, and `fetch_deadline_secs` (default 3600) bounds the whole download — a source drip-feeding a byte every few seconds is aborted when it passes (staging deleted, slot and reservation released; `origin_unreachable` naming the deadline if nothing else serves). The `fetch.in_flight`, `fetch.queued`, `fetch.completed` and `fetch.failed` props expose the live gauges and lifetime counters.
 
 ## Storage layout
 
@@ -132,7 +133,7 @@ Quotas are correctness, not authorisation: an upload (a `blob.put`, a lane body,
 
 ## Permissions
 
-Registry UID 521 (`cosmix-blobd`), shared-credential group 522 (`cosmix-blob`, SPEC 10a v1.4.7). `blob.put {path}` is daemon-local ingest: processes that share the `cosmix-blob` group (maild, filesd). At open blobd chgrps its state root and CAS root to `cosmix-blob` (`cas_group`, default `cosmix-blob`) and sets the setgid bit — mode 2750 — so every shard directory mds creates and every CAS file inherits the group; same-node readers of `blob.path` traverse the tree as group members (the unit's `SupplementaryGroups=cosmix-blob` is what allows the chown; the `StateDirectoryMode=0750` tree alone would be group `cosmix-blobd` and untraversable). An absent group or a refused chown is logged and skipped — a private CAS still serves verbs, it just has no same-node zero-copy readers. User-side and remote producers (capture, webd, Thunderbird) push bytes through the byte lane — no cross-user path read exists or is needed. Under the 2026-09-15 full-mesh-access law the verbs are mesh-open with no authorisation gates; `blob.put`'s path argument is on record as the first verb to jail if a lock is ever opted in.
+Registry UID 521 (`cosmix-blobd`), shared-credential group 522 (`cosmix-blob`, SPEC 10a v1.4.7). `blob.put {path}` is daemon-local ingest: processes that share the `cosmix-blob` group (maild, filesd). At open blobd chgrps its state root and CAS root to `cosmix-blob` (`cas_group`, default `cosmix-blob`) and sets the setgid bit — mode 2750 — so every shard directory mds creates and every CAS file inherits the group; same-node readers of `blob.path` traverse the tree as group members (the unit's `SupplementaryGroups=cosmix-blob` is what allows the chown; the `StateDirectoryMode=0750` tree alone would be group `cosmix-blobd` and untraversable). An absent group or a refused chown is logged and skipped — a private CAS still serves verbs, it just has no same-node zero-copy readers. `blob.put` `mode: hardlink` is the exception: a hard-linked CAS entry keeps the producer's owner, group and mode, so `blob.path` readers see it only if the producer's file was readable by `cosmix-blob`; `copy`/`reflink` entries always inherit the CAS group. User-side and remote producers (capture, webd, Thunderbird) push bytes through the byte lane — no cross-user path read exists or is needed. Under the 2026-09-15 full-mesh-access law the verbs are mesh-open with no authorisation gates; `blob.put`'s path argument is on record as the first verb to jail if a lock is ever opted in.
 
 ## Events
 
@@ -140,7 +141,7 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 
 - `blob.pinned {blob, owner}`
 - `blob.unpinned {blob, owner}`
-- `blob.fetched {blob, outcome, origin_used, size?, error?}` — the `blob.fetch` completion; `outcome` is the taxonomy above, `origin_used` the node the bytes came from (null on failure)
+- `blob.fetched {blob, outcome, origin_used, size?, error?, refused?}` — the `blob.fetch` completion; `outcome` is the taxonomy above, `origin_used` the node the bytes came from (null on failure), `refused` the owners whose cap refused their pin (the others are pinned; all refused is outcome `quota`)
 - `blob.swept {count}`
 - `blob.props.changed` (SPEC-07 shape; `lifecycle.generation` is transient)
 
@@ -150,19 +151,21 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 
 ```mix
 $b = require("/path/to/cosmix-blobd/mix/blob.mix")
-$r = $b.blob_put("/tmp/shot.png", {owner: "capture"})
+$r = $b.blob_put("/var/lib/cosmix/capture/shot.png", {owner: "capture"})
 if not $r.ok then die $r.result end
 print($r.result.blob)          -- "b3:…"
 ```
 
+**Paths the daemon can see.** `blob.put` opens the path as the `cosmix-blobd` user inside its unit's sandbox, not the caller's view of the filesystem. `PrivateTmp=yes` gives the daemon its own `/tmp` and `/var/tmp`, so a file the caller wrote to `/tmp` is not there; `ProtectHome=yes` hides `/home`, `/root` and `/run/user`. The file must also be readable by `cosmix-blobd` — in practice group `cosmix-blob`. Stage under a state directory (`/var/lib/<service>/`) or `/srv/`.
+
 Every Bus-touching function answers the same map — `{ok, rc, result}` — and never raises on a Bus failure: `ok` is true exactly when `rc` sits in send's success bands (`0`, or `1..9` delivered-with-warning); blobd absent comes back `ok:false, rc:10, result:"Service 'blobd' not found"`; a broker-less host `rc:-3`; a lost broker `rc:-1`. The functions mirror the verbs one for one — `blob_put(path[, opts])`, `blob_stat`, `blob_path`, `blob_url`, `blob_has(list)`, `blob_pin`/`blob_unpin(ref, owner)`, `blob_list`, `blob_quota`, `blob_gc(dry_run)` — plus the pure helpers `blob_ref(hash[, size, mime])` and `blob_hash(ref)`. Every wrapper takes a trailing opts map; `service` addresses a named instance (`{service: "blobd-two"}` for a `--name two` instance), and `blob_put`'s opts carry `mime`, `name`, `owner`, `mode` and `immutable`.
 
-`blob_fetch(ref[, opts])` returns the immediate `{accepted, …}` reply. `blob_fetch_wait(ref, timeout_s[, opts])` subscribes to `blob.fetched` **before** sending the fetch (the event is `retain: false` — a subscriber that arrives later never sees it), waits on the delivery — the `sleep` tick inside the wait is only the yield that lets the event pump dispatch; no `blob.stat` traffic — and answers the local CAS path on `ok` (plus the event under `event`), `rc:-2` on timeout and `rc:10` for a failed outcome (`verify_failed`, `quota`, …). Two Mix scoping facts shape its contract, stated here because they are the language's, not blobd's:
+`blob_fetch(ref[, opts])` returns the immediate `{accepted, …}` reply. `blob_fetch_wait(ref, timeout_s[, opts])` subscribes to `blob.fetched` **before** sending the fetch (the event is `retain: false` — a subscriber that arrives later never sees it), waits on the delivery — the `sleep` tick inside the wait is only the yield that lets the event pump dispatch; no `blob.stat` traffic — and answers the local CAS path on `ok` (plus the event under `event`), `rc:-2` on timeout and `rc:10` for a failed outcome (`verify_failed`, `quota`, …) or when an `ok` event's `refused` names this caller (`result:"quota: <owner> refused"`; the caller is `opts.owner`, else a citizen's `serve_name()` — a plain script with neither checks `event.refused` itself). Two Mix scoping facts shape its contract, stated here because they are the language's, not blobd's:
 
-- An `on` handler body writes the **calling script's** globals, and a handler cannot create one — so the event channel is a top-level global the caller owns. A script using `blob_fetch_wait` declares `$blobd_fetched = []` at its top level before the first call; the wait refuses cleanly (a `result` naming the line) when it is missing.
+- An `on` handler body runs against the **calling script's** scope with no module environment, and a handler cannot create a global — so the event channel is a top-level global the caller owns; it cannot live in the module (module vars also reach module functions by value per call, so the wait would never see a push). A script using `blob_fetch_wait` declares `$blobd_fetched = []` at its top level before the first call; the wait refuses cleanly (a `result` naming the line) when it is missing. A Mix `wait_event(topic, timeout)` would retire both the channel and the wait's 50 ms yield tick.
 - A plain (non-`--serve`) script that has registered a handler does not exit when its body ends — the event pump keeps it alive. End a one-shot with `quit()` (the ephemeral-citizen retirement); a serve citizen ignores this.
 
-`mix lint --allow-global blobd_fetched mix/blob.mix` is clean — the one declared global is the channel above. A self-test of the pure helpers runs with `BLOBD_MIX_SELFTEST=1 mix mix/blob.mix`; the Bus wrappers are exercised live by the hub's `blobd_gate.mix`.
+The lint contract is `mix lint --allow-global blobd_fetched mix/blob.mix` — the flag declares the one caller-provided global, the channel above (Mix lint has no in-file pragma for a caller-provided global yet). A self-test of the pure helpers runs with `BLOBD_MIX_SELFTEST=1 mix mix/blob.mix`; the Bus wrappers are exercised live by the hub's `blobd_gate.mix`.
 
 ## Bus interface
 

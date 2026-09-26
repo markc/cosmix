@@ -149,19 +149,50 @@ fn lane_router(lane: Arc<Lane>) -> Router {
         .with_state(lane)
 }
 
-/// Serve the byte lane on an already-bound `listener`. The WG bind
-/// proof is the caller's (main's) job — see [`bind_is_wg`].
+/// A lane listener whose bind address [`bind_is_wg`] has proved is this
+/// node's own WG address (m9). The only public constructor runs the
+/// proof before opening the socket, so [`serve_lane`] — which takes
+/// nothing else — cannot be handed an unproven listener.
+pub struct WgProvenBind {
+    listener: TcpListener,
+}
+
+/// Why [`WgProvenBind::bind`] refused.
+#[derive(Debug)]
+pub enum LaneBindError {
+    /// The bind is not this node's WG address; no socket was opened.
+    NotWg,
+    /// The proof passed but the socket would not bind.
+    Io(io::Error),
+}
+
+impl WgProvenBind {
+    /// Prove `bind` against `wg_ip` (fail closed), then bind it.
+    pub async fn bind(bind: SocketAddr, wg_ip: &str) -> Result<Self, LaneBindError> {
+        if !bind_is_wg(&bind.to_string(), wg_ip) {
+            return Err(LaneBindError::NotWg);
+        }
+        let listener = TcpListener::bind(bind).await.map_err(LaneBindError::Io)?;
+        Ok(Self { listener })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+}
+
+/// Serve the byte lane on a WG-proven listener — see [`WgProvenBind`].
 /// `upload_deadline` (`lane_upload_deadline_secs`) bounds each
 /// upload's total duration (F8).
 pub async fn serve_lane(
-    listener: TcpListener,
+    bind: WgProvenBind,
     store: Arc<Store>,
     max_uploads: usize,
     upload_deadline: Duration,
 ) -> std::io::Result<()> {
     let lane = Arc::new(Lane::new(store, max_uploads, upload_deadline));
     axum::serve(
-        listener,
+        bind.listener,
         lane_router(lane).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
@@ -457,6 +488,17 @@ impl Lane {
         {
             return match self.finish_present(&expected, &mime, name.as_deref(), &owner) {
                 Ok(outcome) => reference_response(StatusCode::OK, &outcome.reference),
+                // The pin pays its cap (F6): the quota band, as at
+                // admission.
+                Err(e @ (StoreError::QuotaOwner { .. } | StoreError::QuotaTotal { .. })) => {
+                    lane_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string())
+                }
+                // A blob.gc swept the bytes between the check and the
+                // pin: nothing is pinned, and a retry uploads them.
+                Err(e @ StoreError::Vanished(_)) => lane_error(
+                    StatusCode::CONFLICT,
+                    &format!("{e} — retry the upload with its body"),
+                ),
                 Err(e) => lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             };
         }
@@ -521,7 +563,9 @@ impl Lane {
                     _ => None,
                 };
                 match abort {
-                    Some(LaneAbort::Cap) => lane_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string()),
+                    Some(LaneAbort::Cap) => {
+                        lane_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string())
+                    }
                     Some(LaneAbort::Idle) | Some(LaneAbort::Deadline) => {
                         lane_error(StatusCode::REQUEST_TIMEOUT, &e.to_string())
                     }
@@ -550,8 +594,8 @@ impl Lane {
 
     /// Bookkeeping for the already-present PUT: attrs (kept if the
     /// blob already has them) plus the lane-owner pin. The bytes are on
-    /// disk already, so — like `blob.pin` — no quota check applies: the
-    /// pin only accounts for what exists.
+    /// disk already, but — like `blob.pin` — the pin still pays the
+    /// owner's cap (F6): an over-cap owner is refused (413).
     fn finish_present(
         &self,
         hash: &BlobHash,
@@ -572,7 +616,12 @@ impl Lane {
 /// closed channel signals the reader explicitly (`Eof` or `Abort`);
 /// on a cap, idle or deadline abort the CAS writer's error path
 /// deletes the staging file before the handler answers.
-async fn pump_body(mut body: Body, tx: mpsc::Sender<Frame>, cap: u64, deadline: tokio::time::Instant) {
+async fn pump_body(
+    mut body: Body,
+    tx: mpsc::Sender<Frame>,
+    cap: u64,
+    deadline: tokio::time::Instant,
+) {
     let mut count: u64 = 0;
     loop {
         let frame = match tokio::time::timeout_at(
@@ -582,7 +631,9 @@ async fn pump_body(mut body: Body, tx: mpsc::Sender<Frame>, cap: u64, deadline: 
         .await
         {
             Err(_) => {
-                let _ = tx.send(Frame::Abort(abort_error(LaneAbort::Deadline))).await;
+                let _ = tx
+                    .send(Frame::Abort(abort_error(LaneAbort::Deadline)))
+                    .await;
                 return;
             }
             Ok(Err(_)) => {
@@ -624,7 +675,9 @@ enum UploadOutcome {
     /// `put_reader_expect` rejected it before anything committed, so
     /// the CAS holds no entry for either hash and staging is empty;
     /// the message names both hashes.
-    Mismatch { message: String },
+    Mismatch {
+        message: String,
+    },
 }
 
 enum UploadError {
@@ -655,7 +708,7 @@ fn stream_into_store(
         Some(expected) => match blob::put_reader_expect(&store.blobs_root(), reader, &expected) {
             Ok(landed) => landed,
             Err(cosmix_mds::Error::BlobCorrupt(message)) => {
-                return Ok(UploadOutcome::Mismatch { message })
+                return Ok(UploadOutcome::Mismatch { message });
             }
             Err(other) => return Err(UploadError::Io(other)),
         },
@@ -1119,9 +1172,9 @@ mod tests {
         let b = upload(0xB0B);
         let (sa, sb) = (a.join().unwrap(), b.join().unwrap());
         assert!(
-            [(sa, sb)].iter().any(|(x, y)| {
-                (*x == 201 && *y == 413) || (*x == 413 && *y == 201)
-            }),
+            [(sa, sb)]
+                .iter()
+                .any(|(x, y)| { (*x == 201 && *y == 413) || (*x == 413 && *y == 201) }),
             "exactly one 201 and one 413, got {sa}/{sb}"
         );
 
@@ -1289,7 +1342,64 @@ mod tests {
         assert!(!bind_is_wg("10.42.0.5:4210", "wg.invalid"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wg_proven_bind_refuses_before_binding_and_serves_once_proven() {
+        // m9: serve_lane takes only a WgProvenBind, and its public
+        // constructor is the proof. A non-WG bind is refused without a
+        // socket; a proven one binds and serves.
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy = taken.local_addr().unwrap();
+        // The port is already bound, so an attempt to bind would be
+        // Io — NotWg proves the proof ran first.
+        assert!(matches!(
+            WgProvenBind::bind(busy, "192.0.2.5").await,
+            Err(LaneBindError::NotWg)
+        ));
+        assert!(matches!(
+            WgProvenBind::bind("0.0.0.0:0".parse().unwrap(), "0.0.0.0").await,
+            Err(LaneBindError::NotWg)
+        ));
+        drop(taken);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let proven = WgProvenBind::bind("127.0.0.1:0".parse().unwrap(), "127.0.0.1")
+            .await
+            .unwrap();
+        let addr = proven.local_addr().unwrap();
+        tokio::spawn(serve_lane(proven, store, 1, Duration::from_secs(60)));
+        let missing = format!("/blob/{}", blob::hex(&blob::hash_bytes(b"absent")));
+        let (status, _, _) =
+            tokio::task::spawn_blocking(move || request(addr, "GET", &missing, &[], b""))
+                .await
+                .unwrap();
+        assert_eq!(status, 404);
+    }
+
     // ---- HEAD mirrors GET; 404 and 416 shapes ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn present_hash_put_by_an_over_cap_owner_is_413() {
+        // F6 on the already-present path: the pin pays its cap, and the
+        // refusal is the quota band (413), not a 500.
+        let options = StoreOptions {
+            owner_limits: BTreeMap::from([("tiny".to_string(), 10)]),
+            ..options()
+        };
+        let (_dir, store, addr) = test_lane(options).await;
+        let bytes = pseudo_random(100, 0x7C4F);
+        let hash = blob::put(&store.blobs_root(), &bytes).unwrap();
+        let (status, _, body) = request(
+            addr,
+            "PUT",
+            &format!("/blob/{}", blob::hex(&hash)),
+            &[("X-Cosmix-Owner", "tiny")],
+            b"",
+        );
+        assert_eq!(status, 413, "{}", String::from_utf8_lossy(&body));
+        assert!(String::from_utf8_lossy(&body).contains("quota"));
+        assert!(store.stat(&hash).unwrap().pins.is_empty());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn head_mirrors_get_and_error_shapes() {

@@ -6,6 +6,7 @@ use clap::Parser;
 use cosmix_blobd::citizen::Citizen;
 use cosmix_blobd::core::config::Config;
 use cosmix_blobd::core::store::{Store, StoreError, StoreOptions};
+use cosmix_blobd::lane::LaneBindError;
 
 #[derive(Parser)]
 #[command(
@@ -41,10 +42,12 @@ async fn async_main() -> anyhow::Result<()> {
         None => Config::default(),
     };
 
-    // Default root: the unit's StateDirectory via the shared FHS/XDG
-    // resolver (/var/lib/cosmix/blobd on a system install).
+    // Default root: the unit's StateDirectory as systemd hands it over
+    // ($STATE_DIRECTORY), else /var/lib/cosmix/blobd. Not the XDG
+    // resolver: under the unit's HOME redirect a non-root uid resolves
+    // that inside the state dir, not to it.
     let root = cfg.root.clone().unwrap_or_else(|| {
-        cosmix_config::paths::cosmix_path(cosmix_config::paths::CosmixDir::Var).join("blobd")
+        cosmix_blobd::core::config::default_root(std::env::var("STATE_DIRECTORY").ok().as_deref())
     });
 
     // `origin` is the node name from node.conf.mix — props-legible,
@@ -85,28 +88,34 @@ async fn async_main() -> anyhow::Result<()> {
     // constructed, so lane.bind/lane.port props only exist once the
     // socket is actually listening.
     let lane = match cfg.lane_bind {
-        Some(bind) if !cosmix_blobd::lane::bind_is_wg(&bind.to_string(), &wg_ip) => {
-            eprintln!(
-                "cosmix-blobd: lane_bind {bind} is not this node's WG address (wg_ip {:?}) — the lane serves only the mesh; refusing to start",
-                if wg_ip.is_empty() { "<absent>" } else { &wg_ip }
-            );
-            std::process::exit(2);
-        }
         Some(bind) => {
-            let listener = tokio::net::TcpListener::bind(bind)
-                .await
-                .map_err(|e| anyhow::anyhow!("bind byte lane {bind}: {e}"))?;
+            let listener = match cosmix_blobd::lane::WgProvenBind::bind(bind, &wg_ip).await {
+                Ok(listener) => listener,
+                Err(LaneBindError::NotWg) => {
+                    eprintln!(
+                        "cosmix-blobd: lane_bind {bind} is not this node's WG address (wg_ip {:?}) — the lane serves only the mesh; refusing to start",
+                        if wg_ip.is_empty() { "<absent>" } else { &wg_ip }
+                    );
+                    std::process::exit(2);
+                }
+                Err(LaneBindError::Io(e)) => {
+                    return Err(anyhow::anyhow!("bind byte lane {bind}: {e}"));
+                }
+            };
             let addr = listener
                 .local_addr()
                 .map_err(|e| anyhow::anyhow!("byte lane local_addr: {e}"))?;
             let lane_store = Arc::clone(&store);
             let max_uploads = cfg.lane_max_uploads;
-            let upload_deadline =
-                std::time::Duration::from_secs(cfg.lane_upload_deadline_secs);
+            let upload_deadline = std::time::Duration::from_secs(cfg.lane_upload_deadline_secs);
             tokio::spawn(async move {
-                if let Err(error) =
-                    cosmix_blobd::lane::serve_lane(listener, lane_store, max_uploads, upload_deadline)
-                        .await
+                if let Err(error) = cosmix_blobd::lane::serve_lane(
+                    listener,
+                    lane_store,
+                    max_uploads,
+                    upload_deadline,
+                )
+                .await
                 {
                     eprintln!("cosmix-blobd: byte lane stopped: {error}");
                 }

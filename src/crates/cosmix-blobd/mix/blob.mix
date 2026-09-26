@@ -8,8 +8,15 @@
 --
 -- Load beside the daemon:
 --   $b = require("…/cosmix-blobd/mix/blob.mix")
---   $r = $b.blob_put("/tmp/shot.png", {owner: "capture"})
+--   $r = $b.blob_put("/var/lib/cosmix/capture/shot.png", {owner: "capture"})
 --   if not $r.ok then die $r.result end
+--
+-- Paths the daemon can see: blob.put reads the path as the cosmix-blobd
+-- user inside its unit's sandbox. PrivateTmp=yes gives it its own /tmp
+-- and /var/tmp (a caller's /tmp file is not there), ProtectHome=yes
+-- hides /home, /root and /run/user, and the file must be readable by
+-- cosmix-blobd — in practice group cosmix-blob. Stage under a state
+-- directory such as /var/lib/<service>/ or /srv/.
 --
 -- A named instance (`cosmix-blobd --name two`, service `blobd-two`) is
 -- reached by passing {service: "blobd-two"} — every wrapper takes it.
@@ -19,11 +26,21 @@
 -- subscribed BEFORE the fetch was sent; blob_fetch_wait subscribes first,
 -- sends second, and then waits on the delivery (a `sleep` tick is only the
 -- yield that lets the event pump dispatch — no blob.stat traffic, the
--- no-poll law). Mix handler bodies write the CALLING script's globals,
--- not module state, so the channel is a top-level global the caller owns:
+-- no-poll law). The channel is a top-level global the CALLER owns, and it
+-- cannot be this module's: an `on` handler body runs against the calling
+-- script's scope with no module environment (so it can neither see nor
+-- write a module var), and module vars reach module functions by value
+-- per call (so the wait could never see a push). The one global this
+-- library reads is therefore:
 --
 --   $blobd_fetched = []          -- top level, before the first wait
 --   $w = $b.blob_fetch_wait($r.result, 60)
+--
+-- Lint contract: `mix lint --allow-global blobd_fetched mix/blob.mix` —
+-- the flag declares the one caller-provided global. Mix lint has no
+-- in-file pragma for a caller-provided global yet. The 50 ms wait tick
+-- goes once Mix has wait_event(topic, timeout) — a blocking receive
+-- needs neither the handler nor the channel.
 --
 -- And because the wait registers an `on blob.fetched` handler, a ONE-SHOT
 -- script ends with quit() (the ephemeral-citizen retirement) or the event
@@ -152,7 +169,7 @@ end
 -- ── fetch ──────────────────────────────────────────────────────────────
 
 -- blob.fetch: the immediate reply {accepted, blob, origin, in_flight,
--- present} — completion is the blob.fetched event (see blob_fetch_wait).
+-- queued, present} — completion is the blob.fetched event (see blob_fetch_wait).
 -- $opts: from (node name), instance (remote blobd-<name>), owner, service.
 fn blob_fetch($ref, $opts)
   $r = send _svc($opts) blob.fetch blob=$ref from=_opt($opts, "from") instance=_opt($opts, "instance") owner=_opt($opts, "owner")
@@ -253,6 +270,14 @@ fn _fetch_wait_path($id, $opts, $event)
     if $event.error != nil then $why = $why .. ": " .. $event.error end
     return {ok: false, rc: 10, result: $why, event: $event}
   end
+  -- An ok fetch can still refuse THIS caller's pin (its cap): blobd pins
+  -- to opts.owner, else the sending service — serve_name() for a
+  -- citizen. A plain script with no owner has no name to match; it
+  -- reads event.refused itself.
+  $me = _opt($opts, "owner") ?? serve_name()
+  if $event != nil and $event.refused != nil and $me != nil and contains($event.refused, $me) then
+    return {ok: false, rc: 10, result: "quota: " .. $me .. " refused", event: $event}
+  end
   $r = send _svc($opts) blob.path blob=$id
   if $rc >= 10 or $rc < 0 then
     return _done($rc, $r)
@@ -284,5 +309,14 @@ if env("BLOBD_MIX_SELFTEST") != "" then
   _t(_opt({service: "blobd-two"}, "service") == "blobd-two", "opt reads member")
   _t(_svc({service: "blobd-two"}) == "blobd-two", "svc override")
   _t(_svc(nil) == "blobd", "svc default")
+  -- Both refusals answer before any Bus traffic: a missing id, then a
+  -- missing caller-owned channel (this script declares none).
+  $w = blob_fetch_wait(nil, 1, nil)
+  _t($w.rc == 10 and not $w.ok, "fetch_wait refuses a missing id")
+  $refusal = {blob: $h, outcome: "ok", refused: ["capture"]}
+  $w = _fetch_wait_path($h, {owner: "capture"}, $refusal)
+  _t($w.rc == 10 and $w.result == "quota: capture refused", "refused owner is not ok")
+  $w = blob_fetch_wait($h, 1, nil)
+  _t($w.rc == 10 and contains($w.result, 'blobd_fetched = []'), "fetch_wait refuses a missing channel")
   print("blob.mix self-test: ok")
 end

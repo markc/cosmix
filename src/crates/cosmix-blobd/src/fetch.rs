@@ -26,7 +26,8 @@
 //! run; beyond that the verb still replies `accepted` and the fetch
 //! queues in-process up to `fetch_queue_max` (default 32) — above
 //! that the verb replies rc 10 `busy`. Never an unbounded queue. A
-//! stalled body aborts after a 30 s idle read timeout. The resolver
+//! peer that never sends a response head, or a stalled body, aborts
+//! after the same 30 s idle bound. The resolver
 //! and peer roster sit behind small traits so tests inject them and
 //! production wires noded; no unit test touches the Bus.
 
@@ -48,7 +49,7 @@ use cosmix_mds::blob;
 use cosmix_mds::types::BlobHash;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::citizen::{BusEvent, TOPIC_PINNED, domain_event};
 use crate::core::reference;
@@ -69,6 +70,15 @@ const PUMP_FRAMES: usize = 4;
 /// TCP connect timeout for a lane GET — an unresponsive peer must not
 /// hold a fetch slot for the mesh timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the response head (m6): a peer that accepts the
+/// connection and never answers must not hold a fetch slot either.
+/// The idle bound, applied to the headers; short under test so the
+/// hung-peer case runs in seconds.
+const HEAD_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    IDLE_TIMEOUT
+};
 /// `blob.has` fan-out concurrency bound (one round over the roster).
 const FANOUT_CONCURRENCY: usize = 4;
 /// Timeout around props/has Bus calls: above the 30 s mesh response
@@ -459,6 +469,9 @@ pub struct FetchConfig {
     pub max_concurrent: usize,
     /// Queue depth; a fetch beyond it is refused rc 10 `busy`.
     pub queue_max: usize,
+    /// Total bound on one download's body (`fetch_deadline_secs`, m6);
+    /// the idle timeout bounds only the gaps between frames.
+    pub deadline: Duration,
 }
 
 impl Default for FetchConfig {
@@ -466,6 +479,7 @@ impl Default for FetchConfig {
         Self {
             max_concurrent: crate::core::config::DEFAULT_FETCH_MAX_CONCURRENT,
             queue_max: crate::core::config::DEFAULT_FETCH_QUEUE_MAX,
+            deadline: Duration::from_secs(crate::core::config::DEFAULT_FETCH_DEADLINE_SECS),
         }
     }
 }
@@ -475,19 +489,25 @@ impl FetchConfig {
         Self {
             max_concurrent: cfg.fetch_max_concurrent,
             queue_max: cfg.fetch_queue_max,
+            deadline: Duration::from_secs(cfg.fetch_deadline_secs),
         }
     }
 }
 
-/// What [`Fetcher::submit`] decided — the verb reply's `in_flight`.
+/// What [`Fetcher::submit`] decided — the verb reply's `in_flight`
+/// and `queued`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitOutcome {
-    /// This call started the download (a slot was free).
+    /// This call started the download: it took a concurrency slot at
+    /// submit, so the download is not waiting on anything.
     Started,
+    /// This call admitted a new fetch, but every slot is held: it
+    /// waits in the (bounded) queue.
+    Queued,
     /// A fetch for this hash was already in the system; the caller
-    /// joined it (its pin lands on completion) or this call queued
-    /// behind the concurrency bound.
-    Joined,
+    /// joined it (its pin lands on completion). `queued` is whether
+    /// that fetch is still waiting for a slot.
+    Joined { queued: bool },
     /// The queue is full; rc 10 `busy`.
     Busy,
 }
@@ -507,15 +527,18 @@ struct Entry {
     target: Option<FetchTarget>,
     /// True until the task holds a concurrency slot.
     queued: bool,
+    /// The slot taken at submit (m5), handed to the task; `None` for a
+    /// queued entry, whose task acquires one when it frees up.
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Default)]
 struct FetchState {
     entries: HashMap<BlobHash, Entry>,
-    /// Admitted entries — the `fetch.in_flight` gauge. Counted at
-    /// submit under the same lock that decides admission, so the
-    /// verb's queued/started reply is exact, not a race against task
-    /// startup.
+    /// Fetches holding a slot — the `fetch.in_flight` gauge. Raised
+    /// only once a permit is held and lowered under this lock just
+    /// before the permit drops, so it never exceeds
+    /// `fetch_max_concurrent`.
     running: usize,
 }
 
@@ -532,7 +555,7 @@ struct Inner {
     /// outside any runtime). `Client` is a cheap `Arc` clone.
     http: OnceLock<reqwest::Client>,
     state: Mutex<FetchState>,
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
     jobs_tx: mpsc::UnboundedSender<BlobHash>,
     jobs_rx: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<BlobHash>>>,
     config: FetchConfig,
@@ -568,7 +591,7 @@ impl Fetcher {
             client: ClientSlot::default(),
             http: OnceLock::new(),
             state: Mutex::new(FetchState::default()),
-            slots: Semaphore::new(config.max_concurrent),
+            slots: Arc::new(Semaphore::new(config.max_concurrent)),
             jobs_tx,
             jobs_rx: tokio::sync::Mutex::new(Some(jobs_rx)),
             config,
@@ -600,9 +623,11 @@ impl Fetcher {
 
     /// Submit a fetch. Synchronous and quick (a map insert and a
     /// channel send) — the verb reply is immediate by construction.
-    /// Admission is decided under the state lock: a slot free → this
-    /// call started the download; the concurrency bound met → it
-    /// queues (bounded); the queue full → `Busy`.
+    /// Admission is decided under the state lock by taking the slot
+    /// itself (m5), never by reading a counter: a permit acquired →
+    /// this call started the download and the task inherits the
+    /// permit; none free → it queues (bounded); the queue full →
+    /// `Busy`.
     pub fn submit(
         &self,
         hash: BlobHash,
@@ -612,16 +637,19 @@ impl Fetcher {
         let mut state = self.0.state.lock().unwrap();
         if let Some(entry) = state.entries.get_mut(&hash) {
             entry.owners.push(owner);
-            return SubmitOutcome::Joined;
+            return SubmitOutcome::Joined {
+                queued: entry.queued,
+            };
         }
-        let slot_free = state.running < self.0.config.max_concurrent;
-        if !slot_free {
+        let permit = Arc::clone(&self.0.slots).try_acquire_owned().ok();
+        let started = permit.is_some();
+        if !started {
             let queued_count = state.entries.values().filter(|e| e.queued).count();
             if queued_count >= self.0.config.queue_max {
                 return SubmitOutcome::Busy;
             }
         }
-        if slot_free {
+        if started {
             state.running += 1;
         }
         state.entries.insert(
@@ -629,15 +657,16 @@ impl Fetcher {
             Entry {
                 owners: vec![owner],
                 target,
-                queued: !slot_free,
+                queued: !started,
+                permit,
             },
         );
         drop(state);
         let _ = self.0.jobs_tx.send(hash);
-        if slot_free {
+        if started {
             SubmitOutcome::Started
         } else {
-            SubmitOutcome::Joined
+            SubmitOutcome::Queued
         }
     }
 
@@ -683,39 +712,60 @@ impl Inner {
     /// events. Runs as its own task; the entry exists for its whole
     /// lifetime (single-flight), removed only here.
     async fn run_fetch(self: Arc<Self>, hash: BlobHash) {
-        // A queued fetch waits here; the permit is held for the whole
-        // download.
-        let _permit = self.slots.acquire().await;
-        let (target, owner, was_queued) = {
+        // The slot is held for the whole download: a started fetch
+        // inherits the permit submit took; a queued one waits for one
+        // here.
+        let submitted = self
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&hash)
+            .map(|entry| entry.permit.take());
+        let permit = match submitted {
+            None => return, // defensive: jobs and entries are 1:1
+            Some(Some(permit)) => permit,
+            Some(None) => match Arc::clone(&self.slots).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return, // the semaphore is never closed
+            },
+        };
+        let (target, owner) = {
             let mut state = self.state.lock().unwrap();
             let Some(entry) = state.entries.get_mut(&hash) else {
-                return; // defensive: jobs and entries are 1:1
+                return;
             };
-            // Admission already counted a submit-time slot; a queued
-            // entry is promoted when its permit actually frees up.
-            let was_queued = entry.queued;
+            // A queued entry is promoted only now it holds a permit;
+            // a started one was counted at submit.
+            let promoted = entry.queued;
             entry.queued = false;
-            (entry.target.clone(), entry.owners[0].clone(), was_queued)
+            let picked = (entry.target.clone(), entry.owners[0].clone());
+            if promoted {
+                state.running += 1;
+            }
+            picked
         };
-        if was_queued {
-            self.state.lock().unwrap().running += 1;
-        }
 
         let attempt = self.execute(hash, target, owner).await;
 
         // Completion: take the entry (its owners froze at this point —
-        // later fetches for the same hash start fresh).
+        // later fetches for the same hash start fresh) and release the
+        // slot. The gauge and the permit drop together under the state
+        // lock (m5): a submit can never see a free count while the
+        // permit is still held, so `Started` is always true and
+        // `running` never exceeds `fetch_max_concurrent`. The download
+        // is over; `complete()` pins and publishes outside the bound,
+        // and its props diff sees the gauge already lowered.
         let owners = {
             let mut state = self.state.lock().unwrap();
-            match state.entries.remove(&hash) {
-                Some(entry) => {
-                    if !entry.queued {
-                        state.running = state.running.saturating_sub(1);
-                    }
-                    entry.owners
-                }
-                None => Vec::new(),
-            }
+            let owners = state
+                .entries
+                .remove(&hash)
+                .map(|entry| entry.owners)
+                .unwrap_or_default();
+            state.running = state.running.saturating_sub(1);
+            drop(permit);
+            owners
         };
 
         self.complete(hash, attempt, owners).await;
@@ -733,16 +783,12 @@ impl Inner {
         // concurrent put or fetch): nothing to move.
         if matches!(blob::exists(&self.store.blobs_root(), &hash), Ok(true)) {
             let size = blob::size(&self.store.blobs_root(), &hash).unwrap_or(0);
-            return Attempt::ok(
-                None,
-                size,
-                "application/octet-stream".to_string(),
-                None,
-            );
+            return Attempt::ok(None, size, "application/octet-stream".to_string(), None);
         }
 
         let mut answered_no = false; // a reachable source said "not present"
         let mut holder_failed = None; // a holder was reached but the transfer failed
+        let mut too_slow = None; // a source outlived fetch_deadline_secs (m6)
 
         if let Some(target) = target
             && let Ok(url) = self
@@ -764,6 +810,7 @@ impl Inner {
                 // demonstrably holds the bytes; that is an `io`
                 // outcome if nothing else serves them.
                 SourceOutcome::StreamErr(error) => holder_failed = Some(error),
+                SourceOutcome::Deadline(error) => too_slow = Some(error),
                 SourceOutcome::NetErr(_) => {}
             }
         }
@@ -803,9 +850,7 @@ impl Inner {
                         size,
                         mime,
                         reservation,
-                    } => {
-                        return Attempt::ok(Some(peer.clone()), size, mime, Some(reservation))
-                    }
+                    } => return Attempt::ok(Some(peer.clone()), size, mime, Some(reservation)),
                     terminal @ (SourceOutcome::Verify { .. }
                     | SourceOutcome::Quota(_)
                     | SourceOutcome::Local(_)) => return Attempt::terminal(terminal),
@@ -817,13 +862,19 @@ impl Inner {
                     SourceOutcome::StreamErr(error) | SourceOutcome::NetErr(error) => {
                         holder_failed = Some(error)
                     }
+                    SourceOutcome::Deadline(error) => too_slow = Some(error),
                 },
                 Err(_) => continue,
             }
         }
 
-        // Exhausted. Classify.
-        if let Some(error) = holder_failed {
+        // Exhausted. Classify. A source that only failed by outliving
+        // the deadline never served in time: unreachable, not io (m6).
+        if let Some(error) = too_slow
+            && holder_failed.is_none()
+        {
+            Attempt::failed(FetchOutcome::OriginUnreachable, error)
+        } else if let Some(error) = holder_failed {
             Attempt::failed(
                 FetchOutcome::Io,
                 format!("a holder was reached but the transfer failed: {error}"),
@@ -863,9 +914,15 @@ impl Inner {
                     .expect("build the fetch HTTP client")
             })
             .clone();
-        let response = match http.get(&target).send().await {
-            Ok(response) => response,
-            Err(error) => return SourceOutcome::NetErr(format!("GET {target}: {error}")),
+        let response = match tokio::time::timeout(HEAD_TIMEOUT, http.get(&target).send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return SourceOutcome::NetErr(format!("GET {target}: {error}")),
+            Err(_) => {
+                return SourceOutcome::NetErr(format!(
+                    "GET {target}: no response head within {}s",
+                    HEAD_TIMEOUT.as_secs()
+                ));
+            }
         };
         match response.status() {
             reqwest::StatusCode::OK => {}
@@ -883,10 +940,10 @@ impl Inner {
         let reservation = match self.store.reserve_upload(owner, response.content_length()) {
             Ok(reservation) => reservation,
             Err(e @ crate::core::store::StoreError::QuotaOwner { .. }) => {
-                return SourceOutcome::Quota(e.to_string())
+                return SourceOutcome::Quota(e.to_string());
             }
             Err(e @ crate::core::store::StoreError::QuotaTotal { .. }) => {
-                return SourceOutcome::Quota(e.to_string())
+                return SourceOutcome::Quota(e.to_string());
             }
             Err(e) => return SourceOutcome::Local(e.to_string()),
         };
@@ -900,15 +957,19 @@ impl Inner {
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
         let (tx, rx) = mpsc::channel::<Frame>(PUMP_FRAMES);
-        let pump = tokio::spawn(pump_response(response, tx, cap));
+        let deadline = tokio::time::Instant::now() + self.config.deadline;
+        let pump = tokio::spawn(pump_response(response, tx, cap, deadline));
         let reader_store = Arc::clone(&self.store);
         let expected = *hash;
         // The reservation rides inside the write task (its release
         // must outlast the stream) and comes back out on success, so
         // it can outlive this frame and settle after the pin lands.
         let landed = tokio::task::spawn_blocking(move || {
-            let landed =
-                blob::put_reader_expect(&reader_store.blobs_root(), ChannelReader::new(rx), &expected);
+            let landed = blob::put_reader_expect(
+                &reader_store.blobs_root(),
+                ChannelReader::new(rx),
+                &expected,
+            );
             (landed, reservation)
         })
         .await;
@@ -938,6 +999,11 @@ impl Inner {
                     Some(FetchAbort::Cap) => SourceOutcome::Quota(
                         "quota: the body passed the remaining cap mid-stream".to_string(),
                     ),
+                    Some(FetchAbort::Deadline) => SourceOutcome::Deadline(format!(
+                        "GET {target}: the body passed its total deadline of {}s \
+                         (fetch_deadline_secs)",
+                        self.config.deadline.as_secs()
+                    )),
                     _ => SourceOutcome::StreamErr(error.to_string()),
                 }
             }
@@ -994,8 +1060,23 @@ impl Inner {
                 }
             };
             match pin_result {
-                Ok(newly_pinned) => {
-                    for owner in &newly_pinned {
+                // R1: no owner fits its cap — the bytes landed but
+                // nobody holds them, which is a quota outcome, not ok.
+                Ok(pins) if pins.none_fit() => {
+                    self.failed.fetch_add(1, Ordering::Relaxed);
+                    events.push(domain_event(
+                        TOPIC_FETCHED,
+                        json!({
+                            "blob": id,
+                            "outcome": FetchOutcome::Quota.as_str(),
+                            "origin_used": Value::Null,
+                            "error": "no owner's cap fits the fetched blob; nothing pinned",
+                            "refused": pins.refused,
+                        }),
+                    ));
+                }
+                Ok(pins) => {
+                    for owner in &pins.pinned {
                         events.push(domain_event(
                             TOPIC_PINNED,
                             json!({"blob": id, "owner": owner}),
@@ -1004,15 +1085,18 @@ impl Inner {
                     self.completed.fetch_add(1, Ordering::Relaxed);
                     let after = self.props_input();
                     events.extend(props_diff_events(&before, &after));
-                    events.push(domain_event(
-                        TOPIC_FETCHED,
-                        json!({
-                            "blob": id,
-                            "outcome": attempt.outcome.as_str(),
-                            "origin_used": attempt.origin_used,
-                            "size": attempt.size,
-                        }),
-                    ));
+                    let mut body = json!({
+                        "blob": id,
+                        "outcome": attempt.outcome.as_str(),
+                        "origin_used": attempt.origin_used,
+                        "size": attempt.size,
+                    });
+                    // R1: over-cap joiners are named; the owners that
+                    // fit are pinned and the outcome stays ok for them.
+                    if !pins.refused.is_empty() {
+                        body["refused"] = json!(pins.refused);
+                    }
+                    events.push(domain_event(TOPIC_FETCHED, body));
                 }
                 Err(error) => {
                     self.failed.fetch_add(1, Ordering::Relaxed);
@@ -1161,6 +1245,10 @@ enum SourceOutcome {
     /// The body started and failed mid-stream — the source
     /// demonstrably holds the bytes.
     StreamErr(String),
+    /// The body outlived `fetch_deadline_secs` (m6): the source is too
+    /// slow to count as serving. Try the next source; with none, the
+    /// outcome is `origin_unreachable` naming the deadline.
+    Deadline(String),
     /// Local store failure; terminal.
     Local(String),
 }
@@ -1173,6 +1261,8 @@ enum SourceOutcome {
 enum FetchAbort {
     Cap,
     Idle,
+    /// The download's total deadline (`fetch_deadline_secs`) passed.
+    Deadline,
 }
 
 impl std::fmt::Display for FetchAbort {
@@ -1180,6 +1270,10 @@ impl std::fmt::Display for FetchAbort {
         match self {
             Self::Cap => write!(f, "quota: the body passed the remaining cap mid-stream"),
             Self::Idle => write!(f, "lane read idle for over 30s"),
+            Self::Deadline => write!(
+                f,
+                "download passed its total deadline (fetch_deadline_secs)"
+            ),
         }
     }
 }
@@ -1194,17 +1288,26 @@ fn abort_kind(error: &cosmix_mds::Error) -> Option<FetchAbort> {
 }
 
 /// Pump the lane response into the channel the blocking CAS writer
-/// reads, enforcing the mid-stream cap and the idle timeout (the
-/// lane's own upload pump, mirrored).
-async fn pump_response(response: reqwest::Response, tx: mpsc::Sender<Frame>, cap: u64) {
+/// reads, enforcing the mid-stream cap, the idle timeout and the total
+/// `deadline` (the lane's own upload pump, mirrored).
+async fn pump_response(
+    response: reqwest::Response,
+    tx: mpsc::Sender<Frame>,
+    cap: u64,
+    deadline: tokio::time::Instant,
+) {
     let mut count: u64 = 0;
     let mut stream = response.bytes_stream();
     loop {
-        let item = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+        let wake = deadline.min(tokio::time::Instant::now() + IDLE_TIMEOUT);
+        let item = match tokio::time::timeout_at(wake, stream.next()).await {
             Err(_) => {
-                let _ = tx
-                    .send(Frame::Abort(io::Error::other(FetchAbort::Idle)))
-                    .await;
+                let abort = if tokio::time::Instant::now() >= deadline {
+                    FetchAbort::Deadline
+                } else {
+                    FetchAbort::Idle
+                };
+                let _ = tx.send(Frame::Abort(io::Error::other(abort))).await;
                 return;
             }
             Ok(None) => {
@@ -1721,6 +1824,73 @@ mod tests {
         assert_eq!(fetcher.gauges().completed, 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_over_cap_joiner_is_refused_alone_the_submitter_pins() {
+        // R1: the submitter fits its cap, a joiner does not. The joiner
+        // is named in `refused`; the submitter's pin lands and the
+        // outcome stays ok — one over-cap owner never rolls back the
+        // others' pins.
+        let bytes = pseudo_random(4096, 0x0C4B);
+        let hash = blob::hash_bytes(&bytes);
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_head(&mut stream).await;
+                let (body, mut released) = (bytes.clone(), release_rx.clone());
+                tokio::spawn(async move {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body[..1]).await;
+                    while !*released.borrow_and_update() {
+                        if released.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = stream.write_all(&body[1..]).await;
+                });
+            }
+        });
+
+        let dir_b = TempDir::new().unwrap();
+        let options = StoreOptions {
+            owner_limits: BTreeMap::from([("tiny".to_string(), 1024)]),
+            ..options_for("B")
+        };
+        let store_b = Arc::new(Store::open(dir_b.path(), options).unwrap());
+        let resolver = MapResolver::default().map("A", format!("http://{addr}"));
+        let (citizen, _fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, ListPeers::default()).await;
+        let id = reference::blob_id(&hash);
+        for owner in ["maild", "tiny"] {
+            let (rc, body, _) = citizen.dispatch(&command(
+                "blob.fetch",
+                owner,
+                json!({"blob": id, "from": "A"}),
+            ));
+            assert_eq!(rc, 0, "{body}");
+        }
+        release_tx.send(true).unwrap();
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("blob.fetched");
+        assert_eq!(event["outcome"], "ok", "{event}");
+        assert_eq!(event["refused"], json!(["tiny"]), "{event}");
+        assert_eq!(store_b.stat(&hash).unwrap().pins, vec!["maild".to_string()]);
+        let pinned = sink.bodies(crate::citizen::TOPIC_PINNED);
+        assert_eq!(pinned, vec![json!({"blob": id, "owner": "maild"})]);
+    }
+
     // ---- Origin unreachable → fan-out finds it on C ----
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1937,7 +2107,15 @@ mod tests {
         assert!(blob::exists(&store_b.blobs_root(), &hash).unwrap());
         assert!(store_b.stat(&hash).unwrap().pins.is_empty());
         let gauges = fetcher.gauges();
-        assert_eq!((gauges.in_flight, gauges.queued, gauges.completed, gauges.failed), (0, 0, 0, 1));
+        assert_eq!(
+            (
+                gauges.in_flight,
+                gauges.queued,
+                gauges.completed,
+                gauges.failed
+            ),
+            (0, 0, 0, 1)
+        );
 
         // Recovery: with the injection off, a re-fetch finds the bytes
         // present and pins them — the reply is the completion.
@@ -1961,15 +2139,15 @@ mod tests {
         let drained = pending.drain();
         // The oldest 44 dropped; replay order is still publication order.
         assert_eq!(
-            drained.first().and_then(|e| {
-                serde_json::from_str::<Value>(&e.message.body).ok()
-            }),
+            drained
+                .first()
+                .and_then(|e| { serde_json::from_str::<Value>(&e.message.body).ok() }),
             Some(json!({"i": 44}))
         );
         assert_eq!(
-            drained.last().and_then(|e| {
-                serde_json::from_str::<Value>(&e.message.body).ok()
-            }),
+            drained
+                .last()
+                .and_then(|e| { serde_json::from_str::<Value>(&e.message.body).ok() }),
             Some(json!({"i": 299}))
         );
         assert!(pending.drain().is_empty(), "drain empties the backlog");
@@ -1984,8 +2162,10 @@ mod tests {
         // delivery is the hub gate's arms 1/2/3/9.
         let slot = ClientSlot::default();
         let sink = BusSink::new(slot.clone());
-        sink.publish(domain_event(TOPIC_FETCHED, json!({"i": 1}))).await;
-        sink.publish(domain_event(TOPIC_FETCHED, json!({"i": 2}))).await;
+        sink.publish(domain_event(TOPIC_FETCHED, json!({"i": 1})))
+            .await;
+        sink.publish(domain_event(TOPIC_FETCHED, json!({"i": 2})))
+            .await;
         assert_eq!(slot.pending_len(), 2);
         let backlog = slot.drain_pending_for_test();
         assert_eq!(backlog.len(), 2);
@@ -2092,6 +2272,7 @@ mod tests {
         let config = FetchConfig {
             max_concurrent: 2,
             queue_max: 1,
+            ..FetchConfig::default()
         };
         let fetcher = Fetcher::new(
             Arc::clone(&store_b),
@@ -2130,12 +2311,12 @@ mod tests {
                     );
                 }
                 0x33 => {
-                    // Queued behind the two running downloads.
+                    // Queued behind the two running downloads: a new
+                    // fetch (not a join), waiting for a slot.
                     assert_eq!(rc, 0, "{body}");
-                    assert_eq!(
-                        serde_json::from_str::<Value>(&body).unwrap()["in_flight"],
-                        true
-                    );
+                    let reply: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(reply["in_flight"], false, "{body}");
+                    assert_eq!(reply["queued"], true, "{body}");
                 }
                 _ => {
                     // The queue (depth 1) is full: busy, rc 10.
@@ -2170,5 +2351,282 @@ mod tests {
             ),
             (0, 0, 0, 3)
         );
+    }
+
+    /// Blocks every publish until `gate` opens, counting the callers
+    /// parked in it — each `complete()` parks on its first event.
+    struct GatedSink {
+        inner: TestSink,
+        gate: tokio::sync::watch::Receiver<bool>,
+        parked: Arc<AtomicU64>,
+    }
+
+    impl EventSink for GatedSink {
+        fn publish<'a>(&'a self, event: BusEvent) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.parked.fetch_add(1, Ordering::SeqCst);
+                let mut gate = self.gate.clone();
+                while !*gate.borrow_and_update() {
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+                self.parked.fetch_sub(1, Ordering::SeqCst);
+                self.inner.publish(event).await;
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slot_is_taken_at_submit_and_freed_before_completion() {
+        // m5, fetch_max_concurrent 1: the second new fetch replies
+        // queued (not a false "started"), the gauge never exceeds the
+        // bound, and a finished download frees its slot before
+        // complete() publishes — with every publish parked, the queued
+        // fetch still gets the slot and runs its download.
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_head(&mut stream).await;
+                let mut released = release_rx.clone();
+                tokio::spawn(async move {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                                Content-Length: 4\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(b"1").await;
+                    while !*released.borrow_and_update() {
+                        if released.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = stream.write_all(b"234").await;
+                });
+            }
+        });
+
+        let (_dir_b, store_b) = bare_store("B");
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let sink = TestSink::default();
+        let parked = Arc::new(AtomicU64::new(0));
+        let fetcher = Fetcher::new(
+            Arc::clone(&store_b),
+            FetchConfig {
+                max_concurrent: 1,
+                queue_max: 4,
+                ..FetchConfig::default()
+            },
+            None,
+            "default".into(),
+            Arc::new(MapResolver::default().map("A", format!("http://{addr}"))),
+            Arc::new(ListPeers::default()),
+            Arc::new(GatedSink {
+                inner: sink.clone(),
+                gate: gate_rx,
+                parked: Arc::clone(&parked),
+            }),
+        );
+        let citizen = Citizen::new(
+            Arc::clone(&store_b),
+            "blobd".into(),
+            "default".into(),
+            None,
+            Arc::new(fetcher.clone()),
+        );
+        fetcher.spawn_dispatcher().await;
+
+        let peak = Arc::new(AtomicU64::new(0));
+        let sampler = {
+            let (fetcher, peak) = (fetcher.clone(), Arc::clone(&peak));
+            tokio::spawn(async move {
+                loop {
+                    peak.fetch_max(fetcher.gauges().in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        let ids: Vec<String> = [0x51, 0x52]
+            .iter()
+            .map(|seed| reference::blob_id(&blob::hash_bytes(&pseudo_random(64, *seed))))
+            .collect();
+        let fetch = |id: &str| {
+            let (rc, body, _) = citizen.dispatch(&command(
+                "blob.fetch",
+                "maild",
+                json!({"blob": id, "from": "A"}),
+            ));
+            assert_eq!(rc, 0, "{body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        let first = fetch(&ids[0]);
+        assert_eq!(
+            (&first["in_flight"], &first["queued"]),
+            (&json!(false), &json!(false))
+        );
+        let second = fetch(&ids[1]);
+        assert_eq!(
+            (&second["in_flight"], &second["queued"]),
+            (&json!(false), &json!(true))
+        );
+        // A joiner of the queued fetch: in_flight (joined) and queued.
+        let joiner = fetch(&ids[1]);
+        assert_eq!(
+            (&joiner["in_flight"], &joiner["queued"]),
+            (&json!(true), &json!(true))
+        );
+        let gauges = fetcher.gauges();
+        assert_eq!((gauges.in_flight, gauges.queued), (1, 1));
+
+        // Release the bytes with every publish parked: both downloads
+        // must finish and park in complete(). The second can only run
+        // if the first freed its slot before completing.
+        release_tx.send(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while parked.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued fetch never got the slot the finished one held"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        gate_tx.send(true).unwrap();
+        for id in &ids {
+            sink.wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("blob.fetched for an admitted hash");
+        }
+        sampler.abort();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "in_flight exceeded fetch_max_concurrent"
+        );
+        let gauges = fetcher.gauges();
+        assert_eq!((gauges.in_flight, gauges.queued), (0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_that_never_answers_frees_the_slot_origin_unreachable() {
+        // m6: the origin accepts the connection, reads the request and
+        // never sends a response head. Only connect_timeout used to be
+        // set, so this held a slot until the kernel gave up; now the
+        // head bound (2 s under test) ends it and, with no peer to fall
+        // back on, the outcome is origin_unreachable.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_head(&mut stream).await;
+                held.push(stream);
+            }
+        });
+
+        let (_dir_b, store_b) = bare_store("B");
+        let resolver = MapResolver::default().map("A", format!("http://{addr}"));
+        let (citizen, fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, ListPeers::default()).await;
+        let id = reference::blob_id(&blob::hash_bytes(&pseudo_random(64, 0x61)));
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": id, "from": "A"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                HEAD_TIMEOUT + Duration::from_secs(8),
+            )
+            .await
+            .expect("a hung origin must end within the head timeout");
+        assert_eq!(event["outcome"], "origin_unreachable", "{event}");
+        let gauges = fetcher.gauges();
+        assert_eq!((gauges.in_flight, gauges.failed), (0, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drip_feed_origin_passes_the_total_deadline() {
+        // m6 residual, the lane's F8 test mirrored: one byte every
+        // 200 ms never trips the 30 s idle timeout, so only the total
+        // deadline (1 s here) ends it — origin_unreachable naming the
+        // deadline, slot freed, staging cleaned, reservation released.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_head(&mut stream).await;
+                tokio::spawn(async move {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                                Content-Length: 64\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    for _ in 0..64 {
+                        if stream.write_all(b"x").await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                });
+            }
+        });
+
+        let (_dir_b, store_b) = bare_store("B");
+        let sink = TestSink::default();
+        let fetcher = Fetcher::new(
+            Arc::clone(&store_b),
+            FetchConfig {
+                deadline: Duration::from_secs(1),
+                ..FetchConfig::default()
+            },
+            None,
+            "default".into(),
+            Arc::new(MapResolver::default().map("A", format!("http://{addr}"))),
+            Arc::new(ListPeers::default()),
+            Arc::new(sink.clone()),
+        );
+        fetcher.spawn_dispatcher().await;
+        let hash = blob::hash_bytes(&pseudo_random(64, 0xD41F));
+        let id = reference::blob_id(&hash);
+        let started = std::time::Instant::now();
+        fetcher.submit(
+            hash,
+            Some(FetchTarget {
+                node: "A".into(),
+                instance: None,
+            }),
+            "maild".into(),
+        );
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the deadline must end a drip-feed download");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(event["outcome"], "origin_unreachable", "{event}");
+        assert!(
+            event["error"]
+                .as_str()
+                .unwrap()
+                .contains("fetch_deadline_secs"),
+            "{event}"
+        );
+        assert!(tmp_is_empty(&store_b));
+        assert!(!blob::exists(&store_b.blobs_root(), &hash).unwrap());
+        assert_eq!(fetcher.gauges().in_flight, 0);
+        assert_eq!(store_b.quota_report(None).unwrap().total.reserved, 0);
     }
 }

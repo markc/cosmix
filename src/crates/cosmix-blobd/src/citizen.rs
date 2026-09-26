@@ -242,14 +242,13 @@ impl Citizen {
         };
         let mut events = Vec::new();
         if changed {
-            let (topic, event) = if pin {
-                (TOPIC_PINNED, "blob.pinned")
-            } else {
-                (TOPIC_UNPINNED, "blob.unpinned")
-            };
+            // One body shape for every blob.pinned/blob.unpinned
+            // producer (put, pin, fetch): {blob, owner} — the topic is
+            // the type (n1).
+            let topic = if pin { TOPIC_PINNED } else { TOPIC_UNPINNED };
             events.push(domain_event(
                 topic,
-                json!({"event": event, "blob": reference::blob_id(&hash), "owner": owner}),
+                json!({"blob": reference::blob_id(&hash), "owner": owner}),
             ));
         }
         self.append_props_events(before, &mut events);
@@ -410,6 +409,7 @@ impl Citizen {
                 "blob": id,
                 "origin": origin,
                 "in_flight": false,
+                "queued": false,
                 "present": true,
             });
             return Ok((0, body.to_string(), events));
@@ -422,12 +422,18 @@ impl Citizen {
         let before = self.props_input()?;
         let outcome = self.fetcher.submit(hash, target, owner);
         if outcome == SubmitOutcome::Busy {
-            return Err(StoreError::Busy);
+            return Err(StoreError::Busy(
+                "the fetch queue is full (fetch_queue_max)",
+            ));
         }
-        // in_flight: true when this call joined an existing fetch or
-        // queued behind the concurrency bound; false when it started
-        // the download itself.
-        let in_flight = outcome == SubmitOutcome::Joined;
+        // in_flight: this call joined an existing fetch rather than
+        // admitting a new one. queued: the fetch this call rides —
+        // new or joined — is waiting for a concurrency slot.
+        let in_flight = matches!(outcome, SubmitOutcome::Joined { .. });
+        let queued = matches!(
+            outcome,
+            SubmitOutcome::Queued | SubmitOutcome::Joined { queued: true }
+        );
         let mut events = Vec::new();
         self.append_props_events(before, &mut events);
         let body = json!({
@@ -435,6 +441,7 @@ impl Citizen {
             "blob": id,
             "origin": origin,
             "in_flight": in_flight,
+            "queued": queued,
             "present": false,
         });
         Ok((0, body.to_string(), events))
@@ -704,7 +711,11 @@ pub async fn serve(citizen: Arc<Citizen>, verb_max_concurrent: usize) -> Result<
     }
 }
 
-async fn run_connection(citizen: &Arc<Citizen>, client: &Arc<NodedClient>, permits: &Arc<Semaphore>) {
+async fn run_connection(
+    citizen: &Arc<Citizen>,
+    client: &Arc<NodedClient>,
+    permits: &Arc<Semaphore>,
+) {
     // The fetch machinery resolves and publishes through the live
     // connection; cleared when it ends, whenever it ends.
     citizen.fetcher.set_client(Some(Arc::clone(client)));
@@ -729,8 +740,22 @@ async fn run_connection_inner(
     .await;
 }
 
-/// Dispatch every incoming command as its own task, bounded by
-/// `permits` (M2): the loop is only `recv` → spawn, so one slow verb
+/// Whether `verb` takes a `verb_max_concurrent` permit (M2a): the
+/// verbs whose cost scales with data — a hash+copy `blob.put`, a CAS
+/// walk `blob.gc`, an inventory `blob.list`, the quota-checked pin
+/// writes. Everything else (`blob.fetch`'s early reply, `stat`,
+/// `has`, `path`, `url`, `info`, `quota`, `props.*`) is a
+/// sub-millisecond lookup or already async, and dispatches without
+/// one.
+fn takes_verb_permit(verb: &str) -> bool {
+    matches!(
+        verb,
+        "blob.put" | "blob.gc" | "blob.list" | "blob.pin" | "blob.unpin"
+    )
+}
+
+/// Dispatch every incoming command as its own task, the slow verbs
+/// bounded by `permits` (M2): the loop is only `recv` → spawn, so one slow verb
 /// never holds the queue — `blob.fetch`'s early reply and every other
 /// verb keep answering while a multi-GiB `blob.put` or a CAS walk
 /// runs. Responding and publishing happen inside the task; no verb
@@ -749,9 +774,14 @@ async fn serve_commands<S: ReplySink>(
         let sink = Arc::clone(&sink);
         let permits = Arc::clone(&permits);
         tasks.spawn(async move {
-            // Beyond verb_max_concurrent the command waits here: its
-            // reply is late, never lost.
-            let _permit = permits.acquire_owned().await;
+            // Beyond verb_max_concurrent a slow verb waits here: its
+            // reply is late, never lost. Quick verbs take no permit,
+            // so eight slow ones can never starve them (M2a).
+            let _permit = if takes_verb_permit(&command.command) {
+                permits.acquire_owned().await.ok()
+            } else {
+                None
+            };
             let dispatch_command = clone_command(&command);
             let (rc, body, events) =
                 tokio::task::spawn_blocking(move || citizen.dispatch(&dispatch_command))
@@ -1120,6 +1150,37 @@ mod tests {
     }
 
     #[test]
+    fn pin_events_share_one_body_shape_across_producers() {
+        // n1: blob.put, blob.pin and blob.unpin publish exactly
+        // {blob, owner} — no `event` key; the topic is the type.
+        // (blob.fetch's completion pin builds the same literal.)
+        let (dir, c) = citizen();
+        let src = dir.path().join("shape.bin");
+        std::fs::write(&src, b"shape").unwrap();
+        let (_, body, put_events) = c.dispatch(&command("blob.put", "maild", json!({"path": src})));
+        let id = serde_json::from_str::<Value>(&body).unwrap()["blob"].clone();
+        let (_, _, pin_events) = c.dispatch(&command(
+            "blob.pin",
+            "t",
+            json!({"blob": id, "owner": "filesd"}),
+        ));
+        let (_, _, unpin_events) = c.dispatch(&command(
+            "blob.unpin",
+            "t",
+            json!({"blob": id, "owner": "filesd"}),
+        ));
+        for (events, topic, owner) in [
+            (&put_events, TOPIC_PINNED, "maild"),
+            (&pin_events, TOPIC_PINNED, "filesd"),
+            (&unpin_events, TOPIC_UNPINNED, "filesd"),
+        ] {
+            assert_eq!(events[0].topic, topic);
+            let parsed: Value = serde_json::from_str(&events[0].message.body).unwrap();
+            assert_eq!(parsed, json!({"blob": id, "owner": owner}), "{topic}");
+        }
+    }
+
+    #[test]
     fn startup_report_shape() {
         // Sanity on the report the daemon logs at open.
         let report = StartupReport {
@@ -1202,5 +1263,68 @@ mod tests {
             "blob.put genuinely held its 2 s (measured {:?}) — the slow verb was not running",
             put_at.duration_since(start)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eight_slow_verbs_holding_every_permit_do_not_starve_blob_info() {
+        // M2a: verb_max_concurrent 8, eight 2 s blob.puts hold every
+        // permit; blob.info takes none and still answers in 200 ms.
+        let (dir, mut c) = citizen();
+        c.slow_verbs
+            .insert("blob.put".into(), Duration::from_secs(2));
+        let citizen = Arc::new(c);
+        let sink = Arc::new(RecordSink::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let start = Instant::now();
+        for i in 0..8 {
+            tx.send(command(
+                "blob.put",
+                "maild",
+                json!({"path": dir.path().join(format!("slow{i}.bin"))}),
+            ))
+            .unwrap();
+        }
+        tx.send(command("blob.info", "maild", json!({}))).unwrap();
+        drop(tx);
+        serve_commands(
+            Arc::clone(&citizen),
+            Arc::clone(&sink),
+            rx,
+            Arc::new(Semaphore::new(8)),
+        )
+        .await;
+        let replies = sink.0.lock().unwrap().clone();
+        assert_eq!(replies.len(), 9, "every command answered");
+        let (_, info_at) = replies
+            .iter()
+            .find(|(verb, _)| verb == "blob.info")
+            .expect("blob.info replied");
+        assert!(
+            info_at.duration_since(start) < Duration::from_millis(200),
+            "blob.info answered in {:?} behind eight permit-holding puts",
+            info_at.duration_since(start)
+        );
+        assert!(takes_verb_permit("blob.gc") && !takes_verb_permit("blob.fetch"));
+    }
+
+    #[test]
+    fn a_second_concurrent_gc_answers_busy() {
+        // M2b: one GC owner. The first sweep is held open; a second
+        // blob.gc racing it answers rc 10 busy at once.
+        let (_dir, c) = citizen();
+        *c.store.gc_hold.lock().unwrap() = Some(Duration::from_millis(500));
+        let replies = std::thread::scope(|s| {
+            let first = s.spawn(|| c.dispatch(&command("blob.gc", "t", json!({"dry_run": true}))));
+            std::thread::sleep(Duration::from_millis(100));
+            let second = c.dispatch(&command("blob.gc", "t", json!({"dry_run": true})));
+            (first.join().unwrap(), second)
+        });
+        let ((rc_first, body_first, _), (rc_second, body_second, _)) = replies;
+        assert_eq!(rc_first, 0, "{body_first}");
+        assert_eq!(rc_second, 10, "{body_second}");
+        assert!(body_second.contains("busy"), "{body_second}");
+        // The lock releases with the sweep: the next gc runs.
+        *c.store.gc_hold.lock().unwrap() = None;
+        assert_eq!(c.dispatch(&command("blob.gc", "t", json!({}))).0, 0);
     }
 }

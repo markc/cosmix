@@ -454,7 +454,7 @@
 <pre><code class="language-json">{"error":"message"}
 </code></pre>
 <p>Error tokens worth matching on: <code>not_present</code> (blob not held), <code>invalid blob id</code> (malformed <code>b3:</code> reference), <code>quota:</code> (an owner or total cap refusal — the message carries the numbers), <code>busy</code> (the <code>blob.fetch</code> queue is full — retry later), <code>vanished:</code> (the bytes disappeared while the pin was landing — a <code>blob.gc</code> race; retry the put).</p>
-<p>Verbs dispatch concurrently, bounded by <code>verb_max_concurrent</code> (default 8): a slow <code>blob.put</code> or <code>blob.gc</code> holds one slot, not the connection — other verbs (including <code>blob.fetch</code>'s immediate reply) keep answering. Beyond the bound a verb queues; its reply is late, never lost. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.</p>
+<p>Verbs dispatch concurrently. The data-scaled verbs — <code>blob.put</code>, <code>blob.gc</code>, <code>blob.list</code>, <code>blob.pin</code>, <code>blob.unpin</code> — are bounded by <code>verb_max_concurrent</code> (default 8): each holds one slot, not the connection, and beyond the bound it queues; its reply is late, never lost. Every other verb (<code>blob.fetch</code>'s immediate reply, <code>stat</code>, <code>has</code>, <code>path</code>, <code>url</code>, <code>info</code>, <code>quota</code>, <code>props.*</code>) takes no slot, so eight slow verbs never starve them. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.</p>
 <p>A blob reference is <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…","name":"…"?, "origin":"&lt;node name&gt;"}</code> (<code>name</code> present only when the ingester knew one; <code>origin</code> is a node name, never an IP).</p>
 <h2 id="verbs">Verbs</h2>
 <h3 id="blobput"><code>blob.put</code></h3>
@@ -493,7 +493,7 @@
 <tr><td><code>blob</code></td><td>Blob id</td></tr>
 <tr><td><code>owner</code></td><td>Pin owner (defaults to the calling service)</td></tr>
 </tbody></table>
-<p>Owner-tagged pins (<code>maild:acct7</code>, <code>capture:session-12</code>, <code>filesd:notes</code> style). Both are idempotent; the response contains <code>pinned</code>, whether a pin row actually changed. Pinning requires the bytes to be present; unpinning never does. Emit <code>blob.pinned</code> / <code>blob.unpinned</code> on a transition.</p>
+<p>Owner-tagged pins (<code>maild:acct7</code>, <code>capture:session-12</code>, <code>filesd:notes</code> style). Both are idempotent; the response contains <code>pinned</code>, whether a pin row actually changed. Pinning requires the bytes to be present; unpinning never does. Emit <code>blob.pinned</code> / <code>blob.unpinned</code> on a transition. Every producer of these two events — <code>blob.put</code>, <code>blob.pin</code>/<code>blob.unpin</code>, a <code>blob.fetch</code> completion — publishes the same body, <code>{blob, owner}</code>; the topic is the event type.</p>
 <h3 id="bloblist"><code>blob.list</code></h3>
 <table><thead><tr><th>Argument</th><th style="text-align: right">Default</th><th>Constraints</th></tr></thead><tbody>
 <tr><td><code>owner</code></td><td style="text-align: right">unset</td><td>Restrict to this owner's pins</td></tr>
@@ -510,7 +510,7 @@
 <table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>dry_run</code></td><td><code>false</code></td></tr>
 </tbody></table>
-<p>Candidates are CAS files with mds refcount 0 (no row counts as 0), no pin, and an mtime older than the 60-second grace window. A dry run lists; a live run unlinks, drops attributes, adjusts quota and emits <code>blob.swept {count}</code>. The response contains <code>dry_run</code>, <code>count</code>, <code>bytes_freed</code>, the swept blob ids, and <code>skipped</code> (<code>referenced</code>, <code>pinned</code>, <code>young</code>).</p>
+<p>Candidates are CAS files with mds refcount 0 (no row counts as 0), no pin, and an mtime older than the 60-second grace window. A dry run lists; a live run unlinks, drops attributes, adjusts quota and emits <code>blob.swept {count}</code>. One sweep at a time: a <code>blob.gc</code> arriving while another runs answers rc 10 <code>busy</code> at once. The response contains <code>dry_run</code>, <code>count</code>, <code>bytes_freed</code>, the swept blob ids, and <code>skipped</code> (<code>referenced</code>, <code>pinned</code>, <code>young</code>).</p>
 <h3 id="blobinfo"><code>blob.info</code></h3>
 <p>No arguments. Version, git sha, build time, <code>root</code>, <code>instance</code>, <code>lane_bind</code> and <code>counts</code> (<code>blobs</code>, <code>pins</code>).</p>
 <h3 id="blobfetch"><code>blob.fetch</code></h3>
@@ -521,16 +521,18 @@
 <tr><td><code>instance</code></td><td>Optional</td><td>Remote instance name; the target service becomes <code>blobd-&lt;name&gt;</code></td></tr>
 <tr><td><code>owner</code></td><td>The calling service (<code>from</code>)</td><td>Pin owner for this caller</td></tr>
 </tbody></table>
-<p>The reply is <code>{accepted:true, blob, origin, in_flight, present}</code>:</p>
+<p>The reply is <code>{accepted:true, blob, origin, in_flight, queued, present}</code>:</p>
 <ul>
-<li><code>present:true</code> — the CAS already had it; the caller's pin landed and this reply is the completion.</li>
-<li><code>present:false, in_flight:false</code> — this call started the download.</li>
+<li><code>present:true</code> — the CAS already had it; the caller's pin landed and this reply is the completion (<code>in_flight</code> and <code>queued</code> are false).</li>
+<li><code>present:false, in_flight:false</code> — this call admitted a new fetch.</li>
 <li><code>present:false, in_flight:true</code> — a fetch for this hash was already in the system (running or queued) and this call joined it: <strong>single-flight per hash</strong>, one download, the joiner's pin lands on completion.</li>
+<li><code>queued</code> — orthogonal to <code>in_flight</code>: true when the fetch this call admitted or joined is waiting for one of the <code>fetch_max_concurrent</code> slots, false when its download holds one. A new fetch takes its slot at admission, so <code>in_flight:false, queued:false</code> means the download is running, not waiting.</li>
 </ul>
+<p>The immediate reply and <code>blob.fetched</code> are <strong>not ordered</strong> relative to each other — a fast fetch can complete before its reply arrives. Subscribe to <code>blob.fetched</code> before sending the fetch (<code>blob_fetch_wait</code> in <code>mix/blob.mix</code> does).</p>
 <p>Completion is the <code>blob.fetched</code> event (<code>retain: false</code>, so a late subscriber sees nothing) plus the <code>blob.stat</code> transition <code>present:false → true</code>:</p>
 <pre><code class="language-json">{"blob":"b3:…","outcome":"ok","origin_used":"alpha","size":184320}
 </code></pre>
-<p><code>outcome</code> ∈ <code>ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io</code> (<code>origin_used</code> is null and <code>error</code> carries the reason on every non-<code>ok</code> outcome). Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a <code>blob.has</code> fan-out over <code>noded.peers</code>; <code>verify_failed</code> is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's <a href="../cosmix-blobd/#fetching">Fetching</a> section.</p>
+<p><code>outcome</code> ∈ <code>ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io</code> (<code>origin_used</code> is null and <code>error</code> carries the reason on every non-<code>ok</code> outcome). Quota is settled <strong>per owner</strong> when the pins land: an owner (submitter or joiner) whose cap refuses the pin is listed in <code>refused: [owner…]</code> and gets no pin, while the owners that fit are pinned and the outcome stays <code>ok</code>; when no owner fits, the outcome is <code>quota</code> (with <code>refused</code>). A download that outlives <code>fetch_deadline_secs</code> is <code>origin_unreachable</code> with an <code>error</code> naming the deadline. Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a <code>blob.has</code> fan-out over <code>noded.peers</code>; <code>verify_failed</code> is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's <a href="../cosmix-blobd/#fetching">Fetching</a> section.</p>
 <p><code>blob.fetched</code> is <strong>best-effort across a broker reconnect</strong>: events published while blobd has no broker connection are buffered (bounded, 256 — the oldest drop beyond it) and replayed on the next connection, oldest first. Recovery when an event may have been missed: <code>blob.stat</code> showing <code>present:true</code>, and <code>blob_fetch_wait</code>'s own timeout — never polling, never a retained event.</p></div></div>
     </div>
 

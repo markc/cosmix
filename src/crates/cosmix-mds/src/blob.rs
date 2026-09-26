@@ -83,7 +83,11 @@ pub enum PutMode {
     /// Only for publishers that promise the source path immutable
     /// from the call onward (the blob store's own staging); never for
     /// a mutable path such as a filesd place, whose contract is
-    /// "someone else may rewrite this path".
+    /// "someone else may rewrite this path". The CAS entry is the
+    /// source inode, so it keeps the producer's owner, group and mode —
+    /// shared-group readers (blobd's `cosmix-blob`) see it only if the
+    /// producer's file was group-readable; `Copy`/`Reflink` entries
+    /// always inherit the CAS directory's group.
     HardLink,
 }
 
@@ -199,7 +203,20 @@ pub fn put(blobs_root: &Path, bytes: &[u8]) -> Result<BlobHash> {
 /// same-hash race), fsync the parent directory, and unlink the temp
 /// file. The single home of the protocol — `put_reader` and
 /// `put_path` both land here.
+///
+/// Every error path removes the staged file (m1): the streaming
+/// callers hand `tmp_path` over with no guard of their own, so a
+/// failed fsync or shard `create_dir_all` here would otherwise leave
+/// a `.tmp` corpse until the next restart sweep.
 fn commit_staged(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> Result<()> {
+    let committed = commit_staged_inner(blobs_root, tmp_path, hash);
+    if committed.is_err() {
+        let _ = fs::remove_file(tmp_path);
+    }
+    committed
+}
+
+fn commit_staged_inner(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> Result<()> {
     // 2. fsync temp. Opened read-only: fsync flushes the inode, not
     // the fd's write mode.
     File::open(tmp_path)?.sync_all()?;
@@ -214,10 +231,7 @@ fn commit_staged(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> Result<
             // Race: another writer placed the same hash. Both inputs
             // are identical (CAS), so dropping ours is safe.
         }
-        Err(e) => {
-            let _ = fs::remove_file(tmp_path);
-            return Err(Error::Io(e));
-        }
+        Err(e) => return Err(Error::Io(e)),
     }
 
     // 4. fsync the parent directory so the link survives a crash.
@@ -657,7 +671,10 @@ mod tests {
         assert!(matches!(err, Error::BlobCorrupt(_)), "got {err:?}");
         let msg = err.to_string();
         assert!(msg.contains(&hex(&landed)), "message names landed: {msg}");
-        assert!(msg.contains(&hex(&expected)), "message names expected: {msg}");
+        assert!(
+            msg.contains(&hex(&expected)),
+            "message names expected: {msg}"
+        );
 
         // No CAS file under either hash, nothing staging.
         assert!(!blob_path(d.path(), &expected).exists());
@@ -784,12 +801,7 @@ mod tests {
 
     fn mtime_age(path: &Path) -> std::time::Duration {
         std::time::SystemTime::now()
-            .duration_since(
-                std::fs::metadata(path)
-                    .unwrap()
-                    .modified()
-                    .unwrap(),
-            )
+            .duration_since(std::fs::metadata(path).unwrap().modified().unwrap())
             .unwrap()
     }
 
@@ -856,6 +868,28 @@ mod tests {
         let tmp: Vec<_> = std::fs::read_dir(d.path().join(".tmp")).unwrap().collect();
         assert!(tmp.is_empty(), "tmp leftovers: {tmp:?}");
         assert!(!blob_path(d.path(), &hash_bytes(bytes)).exists());
+    }
+
+    #[test]
+    fn streaming_commit_failures_leave_no_tmp_residue() {
+        // m1: put_reader and put_reader_expect hand the staged file to
+        // commit_staged with no guard of their own; the same squatted
+        // shard dir must not strand a .tmp entry on either path.
+        let d = root();
+        let bytes = b"doomed stream";
+        let hb = hash_bytes(bytes);
+        std::fs::write(d.path().join(&hex(&hb)[0..2]), b"not a directory").unwrap();
+
+        assert!(matches!(
+            put_reader(d.path(), &bytes[..]),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            put_reader_expect(d.path(), &bytes[..], &hb),
+            Err(Error::Io(_))
+        ));
+        let tmp: Vec<_> = std::fs::read_dir(d.path().join(".tmp")).unwrap().collect();
+        assert!(tmp.is_empty(), "tmp leftovers: {tmp:?}");
     }
 
     #[test]
