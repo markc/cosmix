@@ -13018,6 +13018,28 @@ fn map_test_popup_with_parent_on_seat(
     parent_xdg_surface: u32,
     grab: Option<(u32, u32)>,
 ) -> (ObjectId, u32) {
+    let (surface, xdg_surface, popup, serial) = configure_test_popup_with_parent_on_seat(harness, parent_xdg_surface, grab);
+    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial]));
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    harness.dispatch_client();
+    let object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == surface)
+        .cloned()
+        .expect("mapped popup remains tracked");
+    (object, popup)
+}
+
+fn configure_test_popup_with_parent_on_seat(
+    harness: &mut KeybindingHarness,
+    parent_xdg_surface: u32,
+    grab: Option<(u32, u32)>,
+) -> (u32, u32, u32, u32) {
     let positioner = harness.allocate_object_id();
     let surface = harness.allocate_object_id();
     let xdg_surface = harness.allocate_object_id();
@@ -13066,20 +13088,7 @@ fn map_test_popup_with_parent_on_seat(
                 .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("popup serial")))
         })
         .expect("popup receives an initial configure");
-    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial]));
-    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
-    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
-    send_request(&mut harness.client, surface, 6, &[]);
-    harness.dispatch_client();
-    let object = harness
-        .server
-        .state
-        .surfaces
-        .keys()
-        .find(|object| object.protocol_id() == surface)
-        .cloned()
-        .expect("mapped popup remains tracked");
-    (object, popup)
+    (surface, xdg_surface, popup, serial)
 }
 
 fn map_test_undecorated_toplevel(harness: &mut KeybindingHarness) -> ObjectId {

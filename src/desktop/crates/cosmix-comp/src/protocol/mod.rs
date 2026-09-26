@@ -9220,8 +9220,12 @@ impl WaylandState {
         }
         // Grab teardown can invoke focus_changed. Preserve a fresh action
         // forwarded while the preceding menu was being dismissed.
-        self.agent.last_keyboard_action = keyboard_action;
-        self.agent.last_pointer_action = pointer_action;
+        // A fresh action on a surviving root must survive menu switching; an
+        // action naming an unmapped/destroyed root is no longer provenance.
+        let live_root = |action: &(Serial, WlSurface)| self.surfaces.get(&action.1.id())
+            .is_some_and(|record| record.mapped);
+        self.agent.last_keyboard_action = keyboard_action.filter(live_root);
+        self.agent.last_pointer_action = pointer_action.filter(live_root);
     }
 
     fn with_client_state<T>(

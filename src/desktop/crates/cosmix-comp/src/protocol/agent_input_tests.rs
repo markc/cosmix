@@ -541,6 +541,8 @@ fn agent_menu_root_unmap_retires_grabs_and_allows_other_window_keys() {
     let serial = h.server.state.agent.last_keyboard_action.as_ref().unwrap().0;
     map_test_popup_on_seat(&mut h, Some((seat, serial.into())));
     assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(agent_key(PressAction::Press, KEY_LEFTSHIFT))).0, 0);
+    let root = h.server.state.surfaces[&alpha].role.wl_surface().clone();
+    h.server.state.agent.last_pointer_action = Some((serial, root));
     send_request(&mut h.client, alpha.protocol_id(), 1, &words(&[0, 0, 0]));
     send_request(&mut h.client, alpha.protocol_id(), 6, &[]);
     let _ = h.sync();
@@ -550,9 +552,33 @@ fn agent_menu_root_unmap_retires_grabs_and_allows_other_window_keys() {
     assert!(!h.server.state.agent.keyboard.is_grabbed());
     assert!(!h.server.state.agent.pointer.is_grabbed());
     assert!(h.server.state.agent.keyboard.pressed_keys().is_empty());
+    assert!(h.server.state.agent.last_pointer_action.is_none());
+    assert!(h.server.state.agent.last_keyboard_action.is_none());
     let key = agent_target(&h, &beta, agent_key(PressAction::Both, KEY_B));
     let (rc, body) = inject(&mut h, &ingress, &runtime, key);
     assert_eq!(rc, 0, "{body}");
+}
+
+#[test]
+fn agent_key_before_popup_first_buffer_refuses_the_actual_unmapped_destination() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    let (seat, keyboard, _) = bind_agent_devices(&mut h);
+    let open = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A));
+    assert_eq!(inject(&mut h, &ingress, &runtime, open).0, 0);
+    let serial = h.server.state.agent.last_keyboard_action.as_ref().unwrap().0;
+    let (surface, _, _, _) = configure_test_popup_with_parent_on_seat(
+        &mut h, TEST_XDG_SURFACE_ID, Some((seat, serial.into())),
+    );
+    let record = h.server.state.surfaces.values().find(|record| record.role.wl_surface().id().protocol_id() == surface).unwrap();
+    assert!(!record.mapped);
+    assert_eq!(record.content_seq, 0);
+    assert!(h.server.state.agent.keyboard.is_grabbed());
+    let _ = h.sync();
+    let (rc, reply) = inject(&mut h, &ingress, &runtime, on_agent(agent_key(PressAction::Both, KEY_B)));
+    assert_eq!(rc, 10, "{reply}");
+    assert_eq!(reply["error"], "unmapped");
+    assert!(device_key_events(&h.sync(), keyboard).is_empty());
+    assert!(h.server.state.agent.held.is_empty());
 }
 
 #[test]

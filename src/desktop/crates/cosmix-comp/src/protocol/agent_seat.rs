@@ -332,14 +332,10 @@ impl WaylandState {
         let grab = self.agent.popup_grab.as_ref().filter(|grab| !grab.has_ended())?;
         let surface = grab.current_grab()?.owned_surface()?;
         self.popup_manager.find_popup(&surface)?;
-        if !self.agent_popup_surface_mapped(&surface) { return None; }
+        // The grab will deliver here even before the popup's first buffer.
+        // Return its actual destination so preflight refuses unmapped, rather
+        // than validating the root and then letting the grab refocus elsewhere.
         Some(surface)
-    }
-
-    fn agent_popup_surface_mapped(&self, surface: &WlSurface) -> bool {
-        let root = canonical_root_surface(&self.popup_manager, surface);
-        [&root, surface].into_iter().all(|surface| self.surfaces.get(&surface.id())
-            .is_some_and(|record| self.agent_tree_mapped(record)))
     }
 
     /// PopupKeyboardGrab refocuses on input. Validate that same destination
