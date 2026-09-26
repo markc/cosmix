@@ -360,7 +360,22 @@ impl WaylandState {
     /// `comp.input.*` (one verb). Target candidacy is checked before focus;
     /// a refused target injects no key or button.
     pub(crate) fn service_input_op(&mut self, op: &InputOp) -> ControlReply {
-        self.service_input_payload(op, None)
+        let (seat, op) = match op {
+            InputOp::OnSeat { seat, op } => (*seat, op.as_ref()),
+            _ => (SeatKind::Human, op),
+        };
+        let mut reply = if seat == SeatKind::Agent {
+            ControlReply::refused("agent_delivery_unavailable", json!({}))
+        } else {
+            self.service_input_payload(op, None)
+        };
+        match &mut reply {
+            ControlReply::Body(body) | ControlReply::Refused { detail: body, .. } => {
+                body["seat"] = json!(seat.name());
+            }
+            _ => {}
+        }
+        reply
     }
 
     fn service_targeted_input(
@@ -444,6 +459,7 @@ impl WaylandState {
         let mut key_result = (None, 0, None);
         let mut button_delivery = None;
         let (kind, keyboard) = match op {
+            InputOp::OnSeat { .. } => return self.service_input_op(op),
             InputOp::Targeted {
                 id,
                 generation,

@@ -16555,7 +16555,8 @@ pub(crate) mod workspaces;
 mod xwayland;
 
 use focus::{SeatFocusTarget, focus_targets_surface};
-use seat::{AGENT_SEAT_NAME, CompSeat, HUMAN_SEAT_NAME, SeatKind};
+use seat::{AGENT_SEAT_NAME, CompSeat, HUMAN_SEAT_NAME};
+pub(crate) use seat::SeatKind;
 
 struct WaylandClientState {
     compositor_state: CompositorClientState,

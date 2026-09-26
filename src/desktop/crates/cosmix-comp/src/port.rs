@@ -331,6 +331,7 @@ pub(crate) enum KeySpec {
 /// One `comp.input.*` operation, parsed and bounded on the worker.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InputOp {
+    OnSeat { seat: crate::protocol::SeatKind, op: Box<InputOp> },
     /// Focus and inject in one compositor-thread dispatch.
     Targeted {
         id: u64,
@@ -368,6 +369,7 @@ impl InputOp {
     /// is held, which earlier (capped) verbs bounded.
     pub(crate) fn event_bound(&self) -> usize {
         match self {
+            Self::OnSeat { op, .. } => op.event_bound(),
             Self::Targeted { op, .. } => op.event_bound() + usize::from(matches!(op.as_ref(), Self::PointerButton { .. })),
             Self::PointerMove { .. } | Self::PointerScroll { .. } | Self::ReleaseAll => 1,
             Self::PointerButton { .. } => 2,
@@ -2696,6 +2698,39 @@ fn modifier_spec(value: &Value) -> Result<KeySpec, ControlReply> {
 /// Parse one `comp.input.*` verb's arguments. Shared by the direct verbs
 /// and `comp.input.sequence` steps, so a step is exactly the verb.
 pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, ControlReply> {
+    use crate::protocol::SeatKind;
+    let seat = parse_input_seat(args.get("seat"))?.unwrap_or(if verb == "comp.input.release_all" {
+        SeatKind::Agent
+    } else {
+        DEFAULT_INPUT_SEAT
+    });
+    let mut args = args.clone();
+    if let Some(object) = args.as_object_mut() {
+        object.remove("seat");
+        if seat == SeatKind::Agent && object.contains_key("raise")
+            && bool_arg(object, "raise", false)? {
+            return Err(invalid_argument("raise", "false", "agent input never raises a window"));
+        }
+    }
+    let op = parse_seated_input_op(verb, &args, seat)?;
+    // Keep the internal human operation shape stable for existing call sites.
+    Ok(if seat == SeatKind::Human { op } else { InputOp::OnSeat { seat, op: Box::new(op) } })
+}
+
+// Flip only in the release that also migrates the hub's human-input gates.
+const DEFAULT_INPUT_SEAT: crate::protocol::SeatKind = crate::protocol::SeatKind::Human;
+
+fn parse_input_seat(value: Option<&Value>) -> Result<Option<crate::protocol::SeatKind>, ControlReply> {
+    use crate::protocol::SeatKind;
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) if value == "human" => Ok(Some(SeatKind::Human)),
+        Some(Value::String(value)) if value == "agent" => Ok(Some(SeatKind::Agent)),
+        _ => Err(invalid_argument("seat", "string", "agent|human")),
+    }
+}
+
+fn parse_seated_input_op(verb: &str, args: &Value, seat: crate::protocol::SeatKind) -> Result<InputOp, ControlReply> {
     let op = parse_input_payload(verb, args)?;
     if !matches!(verb, "comp.input.key" | "comp.input.pointer.button") {
         return Ok(op);
@@ -2725,7 +2760,7 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
     Ok(InputOp::Targeted {
         id,
         generation,
-        raise: bool_arg(object, "raise", true)?,
+        raise: bool_arg(object, "raise", seat == crate::protocol::SeatKind::Human)?,
         op: Box::new(op),
     })
 }
@@ -3131,8 +3166,9 @@ fn parse_region_select(args: &Value) -> Result<LongOp, ControlReply> {
 /// delays together are capped at 60 s.
 fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
     let empty = serde_json::Map::new();
-    const ALLOWED: &[&str] = &["steps", "interval_ms"];
+    const ALLOWED: &[&str] = &["steps", "interval_ms", "seat"];
     let object = args_object(args, &empty, ALLOWED)?;
+    let seat = parse_input_seat(object.get("seat"))?;
     let interval = delay_arg(present(object, "interval_ms"), "interval_ms")?.unwrap_or_default();
     let steps = match present(object, "steps") {
         Some(Value::Array(steps)) if !steps.is_empty() && steps.len() <= SEQUENCE_MAX_STEPS => {
@@ -3171,8 +3207,15 @@ fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
                     "comp.input.pointer.move|pointer.button|pointer.scroll|key|release_all",
                 )
             })?;
+        let mut args = step.get("args").cloned().unwrap_or(Value::Null);
+        if let Some(seat) = seat {
+            if args.is_null() { args = json!({}); }
+            if let Some(object) = args.as_object_mut() {
+                object.entry("seat").or_insert_with(|| json!(seat.name()));
+            }
+        }
         let op =
-            parse_input_op(verb, step.get("args").unwrap_or(&Value::Null)).map_err(|reply| {
+            parse_input_op(verb, &args).map_err(|reply| {
                 match reply {
                     ControlReply::Validation(SetValidationError::InvalidValue {
                         path,

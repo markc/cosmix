@@ -7,9 +7,15 @@ pub const HUMAN_SEAT_NAME: &str = "cosmix";
 pub const AGENT_SEAT_NAME: &str = "cosmix-agent";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SeatKind {
+pub(crate) enum SeatKind {
     Human,
     Agent,
+}
+
+impl SeatKind {
+    pub(crate) fn name(self) -> &'static str {
+        match self { Self::Human => "human", Self::Agent => "agent" }
+    }
 }
 
 /// A rigid pose in scene coordinates. Orientation is an xyzw quaternion.
