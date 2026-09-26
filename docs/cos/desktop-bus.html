@@ -442,11 +442,15 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/desktop-bus.md"><div class="prose"><h1 id="desktop-bus-capabilities">Desktop Bus capabilities</h1>
-<p>Status: API 1, implementation 0.3.6. Every verb is open to mesh callers by
+<p>Status: API 1, implementation 0.3.7. Every verb is open to mesh callers by
 default. Explicit grants apply only under the opt-in lock described below.
 Cross-node calls use native ABP between noded instances, requiring noded
 0.15.0 or newer at both ends. Automatic clipboard synchronisation is not
 implemented.</p>
+<p>Clipboard helpers pin <code>wl-copy</code> and <code>wl-paste</code> to the compositor's human
+seat. On a foreign compositor, only wl-clipboard's exact missing-seat error
+permits one retry using its default seat. The service logs the selected path
+and outcome without logging clipboard text.</p>
 <p>The implementation version is the <code>-- version:</code> header of
 <code>src/desktop/scripts/desktop-session.mix</code>, which is what
 <code>mix desktop-session.mix --version</code> prints and what <code>desktop.capabilities</code>

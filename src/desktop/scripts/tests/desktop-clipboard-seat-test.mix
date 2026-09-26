@@ -1,0 +1,19 @@
+-- Pure clipboard seat routing checks; never reads or changes a clipboard.
+$d = require("../lib/desktop.mix")
+fn check($condition, $message)
+  if not $condition then raise("CLIPBOARD_SEAT_TEST", $message) end
+end
+for each $action in ["read", "write", "clipboard_pick", "clipboard_rotate"]
+  $plan = {action:$action, argv:$d.clipboard_argv("clipboard-helper",["--type","text"]), options:{stdin:"payload"}}
+  check(len($plan.argv) == 5 and $plan.argv[1] == "--seat","missing seat pin")
+  $missing = {ok:false, timed_out:false, stderr_truncated:false, stderr:"No such seat: " .. $plan.argv[2] .. "\n"}
+  $retry = $d.clipboard_fallback($plan,$missing)
+  check(deep_eq($retry.argv,["clipboard-helper","--type","text"]),"fallback arguments changed")
+  check(deep_eq($retry.options,$plan.options),"fallback lost stdin or limits")
+  check($d.clipboard_fallback($retry,$missing) == nil,"second retry permitted")
+  for each $result in [{ok:true,stderr:$missing.stderr}, {ok:false,timed_out:true,stderr:$missing.stderr}, {ok:false,stderr_truncated:true,stderr:$missing.stderr}, {ok:false,stderr:"This seat has no keyboard"}, {ok:false,stderr:"No such seat: another"}, {ok:false,stderr:"No such seat: " .. $plan.argv[2] .. "\nadditional error"}]
+    check($d.clipboard_fallback($plan,$result) == nil,"unrelated or ambiguous outcome retried")
+  end
+end
+check($d.clipboard_fallback({action:"open"},{ok:false,stderr:"No such seat: anything"}) == nil,"open retried")
+print("PASS clipboard seat pin, exact missing-seat fallback, preserved payload/limits, and single retry")

@@ -3725,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wl-dnd"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "getrandom 0.4.3",
  "libc",

@@ -133,7 +133,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-trayd` | 0.6.3 |
 | `cosmix-wallpaper` | 0.2.1 |
 | `cosmix-wgpu-dmabuf` | 0.16.2 |
-| `cosmix-wl-dnd` | 0.4.2 |
+| `cosmix-wl-dnd` | 0.4.3 |
 | `ctk` | 0.58.1 |
 | `spike-wl-dnd` | 0.1.1 |
 | `term-native-test-broker` | 0.0.0 |

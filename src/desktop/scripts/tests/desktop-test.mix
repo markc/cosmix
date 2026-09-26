@@ -102,7 +102,14 @@ try
   for each $text in ["", "  café\n\n", repeat("é",32768)]
     $plan = $d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100)
     check($plan.action == "write" and $plan.options.stdin == $text,"text modified")
-    check(len($plan.argv) == 3 and $plan.options.stdout == "null" and $plan.options.stderr == "null","text leaked to argv/output")
+    check(len($plan.argv) == 5 and $plan.argv[1] == "--seat" and $plan.options.stdout == "null" and $plan.options.stderr == "capture","seat pin or output routing wrong")
+    $missing_seat = {ok:false, timed_out:false, stderr_truncated:false, stderr:"No such seat: " .. $plan.argv[2] .. "\n"}
+    $retry = $d.clipboard_fallback($plan,$missing_seat)
+    check(deep_eq($retry.argv,[$ctx.copy,"--type","text/plain;charset=utf-8"]) and $retry.options.stdin == $text,"foreign compositor retry changed payload")
+    check($d.clipboard_fallback($retry,$missing_seat) == nil,"fallback can retry more than once")
+    check($d.clipboard_fallback($plan,{ok:false,stderr:"This seat has no keyboard"}) == nil,"unrelated failure retries")
+    check($d.clipboard_fallback($plan,{ok:false,timed_out:true,stderr:$missing_seat.stderr}) == nil,"timeout retries")
+    check($d.clipboard_fallback($plan,{ok:true,stderr:$missing_seat.stderr}) == nil,"success retries")
   end
   for each $text in [repeat("é",32769),json_parse("\"\\u0000\""),{},42]
     check($d.prepare($ctx,"desktop.clipboard.write",$headers,{instance:$ctx.instance,text:$text},100).rc == 10,"invalid text accepted")

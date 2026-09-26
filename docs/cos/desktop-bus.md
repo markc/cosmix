@@ -1,10 +1,15 @@
 # Desktop Bus capabilities
 
-Status: API 1, implementation 0.3.6. Every verb is open to mesh callers by
+Status: API 1, implementation 0.3.7. Every verb is open to mesh callers by
 default. Explicit grants apply only under the opt-in lock described below.
 Cross-node calls use native ABP between noded instances, requiring noded
 0.15.0 or newer at both ends. Automatic clipboard synchronisation is not
 implemented.
+
+Clipboard helpers pin `wl-copy` and `wl-paste` to the compositor's human
+seat. On a foreign compositor, only wl-clipboard's exact missing-seat error
+permits one retry using its default seat. The service logs the selected path
+and outcome without logging clipboard text.
 
 The implementation version is the `-- version:` header of
 `src/desktop/scripts/desktop-session.mix`, which is what
