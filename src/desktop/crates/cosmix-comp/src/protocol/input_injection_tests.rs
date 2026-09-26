@@ -13,6 +13,7 @@ const KEY_O: u32 = 24;
 const KEY_LEFTSHIFT: u32 = 42;
 
 include!("agent_input_tests.rs");
+include!("selection_relay_tests.rs");
 
 #[test]
 fn keyboard_without_an_owner_refuses_and_cleans_up_generated_holds() {

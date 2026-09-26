@@ -59,8 +59,11 @@ where
         }
     }
 
-    fn destroyed(_state: &mut D, _client: ClientId, _resource: &PrimarySource, data: &PrimarySourceUserData) {
+    fn destroyed(state: &mut D, _client: ClientId, resource: &PrimarySource, data: &PrimarySourceUserData) {
         data.alive_tracker.destroy_notify();
+        state.selection_source_destroyed(super::super::SelectionSource {
+            provider: super::super::source::SelectionSourceProvider::Primary(resource.clone()),
+        });
     }
 }
 

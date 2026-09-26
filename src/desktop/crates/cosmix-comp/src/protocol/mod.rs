@@ -3353,6 +3353,7 @@ impl ProtocolServer {
             wlr_data_control_state,
             ext_data_control_state,
             seat_state,
+            selection_relay: Default::default(),
             human: CompSeat {
                 kind: SeatKind::Human,
                 #[cfg(feature = "bus")]
@@ -6293,6 +6294,7 @@ struct WaylandState {
     wlr_data_control_state: WlrDataControlState,
     ext_data_control_state: ExtDataControlState,
     seat_state: SeatState<Self>,
+    selection_relay: selection_relay::SelectionRelay,
     human: CompSeat,
     agent: CompSeat,
     #[cfg(feature = "bus")]
@@ -16598,6 +16600,7 @@ pub(crate) mod presentation_stats;
 #[cfg(feature = "bus")]
 pub(crate) mod region_selection;
 mod release_use;
+mod selection_relay;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;

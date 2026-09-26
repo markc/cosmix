@@ -11,6 +11,9 @@ Data-device StartDrag checks it before assigning the icon role or installing
 either grab; refusal cancels the source. Comp disables DnD on the agent seat.
 The `test-support` X11 keyboard-enter counter lets offline tests prove refusal
 precedes `KeyboardTarget::enter` and therefore any X11 focus request.
+`SelectionHandler::selection_source_destroyed` is a default no-op hook called
+by clipboard, primary, wlr-data-control and ext-data-control source destruction.
+Comp uses it to invalidate cross-seat selection mirrors without polling.
 
 ## iced_tiny_skia 0.14.1
 

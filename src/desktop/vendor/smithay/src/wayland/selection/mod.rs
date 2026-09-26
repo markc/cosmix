@@ -36,6 +36,11 @@ pub trait SelectionHandler: Sized + SeatHandler {
     #[allow(unused_variables)]
     fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, seat: Seat<Self>) {}
 
+    /// A source was destroyed/disconnected; mirrors can invalidate their offers
+    /// immediately, without polling. Reported for all selection protocols.
+    #[allow(unused_variables)]
+    fn selection_source_destroyed(&mut self, source: SelectionSource) {}
+
     /// A client requested to read the server-set selection.
     ///
     /// * `mime_type` - the requested mime type

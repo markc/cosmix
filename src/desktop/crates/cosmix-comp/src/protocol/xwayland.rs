@@ -31,12 +31,6 @@
 use super::*;
 use smithay::{
     reexports::calloop::RegistrationToken,
-    wayland::selection::data_device::{
-        request_data_device_client_selection, set_data_device_selection,
-    },
-    wayland::selection::primary_selection::{
-        request_primary_client_selection, set_primary_selection,
-    },
     wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     xwayland::{
         X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler,
@@ -285,10 +279,6 @@ pub(super) struct XwaylandRuntime {
     /// `send_selection`. X-2's clipboard bridge must revisit this drain
     /// before relaxing either refusal.
     pub(super) draining_wms: Vec<X11Wm>,
-    /// Set only while comp is installing an X-originated selection on the
-    /// Wayland side, to stop the resulting `new_selection` echo bridging it
-    /// back to X — which would release comp's own X ownership.
-    pub(super) bridging_selection_from_x11: bool,
     /// Keyboard refocus debt: the XID's window held the keyboard when a
     /// surface swap withdrew the displaced record, and the replacement is
     /// not presentable yet. Paid (focus handed back) the moment the XID's
@@ -341,7 +331,6 @@ impl XwaylandRuntime {
             xids_by_object: HashMap::new(),
             override_redirect_windows: HashSet::new(),
             draining_wms: Vec::new(),
-            bridging_selection_from_x11: false,
             refocus: None,
             shutting_down: false,
         }
@@ -2898,10 +2887,8 @@ impl WaylandState {
 
     /// Mirror a Wayland client's selection onto the X side.
     ///
-    /// `mime_types` is `None` when the selection was cleared or when comp
-    /// itself is the source — the latter is the loop guard: comp installs
-    /// itself as the source when bridging an X selection to Wayland, and
-    /// echoing that back would hand ownership between the two sides forever.
+    /// Called only by the selection relay for a real Wayland source or clear.
+    /// X11 mirrors use compositor setters, which do not call `new_selection`.
     pub(super) fn bridge_selection_to_x11(
         &mut self,
         target: SelectionTarget,
@@ -2910,15 +2897,6 @@ impl WaylandState {
         let XwaylandLifecycle::Ready { wm, .. } = &mut self.xwayland.lifecycle else {
             return;
         };
-        if self.xwayland.bridging_selection_from_x11 {
-            // Re-entrant: this call is the echo of comp installing an X-owned
-            // selection on the Wayland side. Bridging it back would hand
-            // ownership between the two sides forever, and — because the echo
-            // carries no client source — the `None` arm would RELEASE comp's X
-            // ownership a second after taking it.
-            tracing::trace!(?target, "ignoring the echo of an X-originated selection");
-            return;
-        }
         let owned = mime_types.map(<[String]>::to_vec);
         tracing::debug!(
             ?target,
@@ -2980,34 +2958,7 @@ impl WaylandState {
         mime_type: String,
         fd: std::os::fd::OwnedFd,
     ) {
-        // The two helpers carry DIFFERENT error types, so each arm reports its
-        // own. Both failures mean the same thing to a user — "nobody is
-        // offering that" — and neither is worth reddening a gate: "no
-        // selection" and "that mime type is not on offer" are ordinary answers
-        // to an X client asking for something no Wayland client has.
-        let seat = self.human.seat.clone();
-        match selection {
-            SelectionTarget::Clipboard => {
-                if let Err(error) =
-                    request_data_device_client_selection(&seat, mime_type.clone(), fd)
-                {
-                    tracing::debug!(
-                        mime_type,
-                        %error,
-                        "X11 clipboard paste found no matching Wayland selection"
-                    );
-                }
-            }
-            SelectionTarget::Primary => {
-                if let Err(error) = request_primary_client_selection(&seat, mime_type.clone(), fd) {
-                    tracing::debug!(
-                        mime_type,
-                        %error,
-                        "X11 primary paste found no matching Wayland selection"
-                    );
-                }
-            }
-        }
+        self.relay_to_x11(selection, mime_type, fd);
     }
 
     /// An X client took ownership: advertise it to Wayland clients.
@@ -3021,27 +2972,14 @@ impl WaylandState {
         mime_types: Vec<String>,
     ) {
         tracing::debug!(?selection, ?mime_types, "X11 selection offered to Wayland");
-        let seat = self.human.seat.clone();
-        // Installing this fires `SelectionHandler::new_selection` synchronously,
-        // which would bridge straight back to X. The flag is the loop breaker;
-        // see `bridge_selection_to_x11` for what the echo would otherwise do.
-        self.xwayland.bridging_selection_from_x11 = true;
-        match selection {
-            SelectionTarget::Clipboard => {
-                set_data_device_selection(&self.display_handle, &seat, mime_types, ());
-            }
-            SelectionTarget::Primary => {
-                set_primary_selection(&self.display_handle, &seat, mime_types, ());
-            }
-        }
-        self.xwayland.bridging_selection_from_x11 = false;
+        // Compositor setters do not call new_selection. Explicit X11 provenance
+        // advertises both seats without echoing ownership back into XWM.
+        self.relay_from_x11(selection, mime_types);
     }
 
     pub(super) fn x11_cleared_selection(&mut self, selection: SelectionTarget) {
-        // An X client dropped its selection. Nothing to mirror: the Wayland
-        // side keeps whatever it had, exactly as it would if no X client had
-        // ever owned one.
         tracing::debug!(?selection, "X11 selection cleared");
+        self.clear_x11_relay(selection);
     }
 
     pub(super) fn x11_randr_primary_output_change(&mut self, output_name: Option<String>) {

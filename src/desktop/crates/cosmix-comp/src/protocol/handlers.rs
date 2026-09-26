@@ -2269,7 +2269,7 @@ impl ForeignToplevelListHandler for WaylandState {
 }
 
 impl SelectionHandler for WaylandState {
-    type SelectionUserData = ();
+    type SelectionUserData = super::selection_relay::SelectionProvenance;
 
     fn new_selection(
         &mut self,
@@ -2277,53 +2277,23 @@ impl SelectionHandler for WaylandState {
         source: Option<SelectionSource>,
         seat: Seat<Self>,
     ) {
-        if seat != self.human.seat {
-            tracing::debug!("ignored non-human selection bridge update");
-            return;
-        }
-        tracing::debug!(
-            ?target,
-            mime_types = ?source.as_ref().map(SelectionSource::mime_types),
-            "nested client selection changed"
-        );
-        // Client-to-client transfers remain entirely fd-driven inside
-        // Smithay: the source receives wl_data_source.send with the receiver's
-        // pipe fd and writes directly, so the protocol thread never copies or
-        // blocks on clipboard payload bytes. Host clipboard bridging is a
-        // later phase concern.
-        //
-        // X-2b: mirror a WAYLAND client's selection onto the X side so an X
-        // client can paste it. Only a real client source is mirrored — a
-        // `None` source, or one comp itself installed while bridging an X
-        // selection the other way, must not be echoed back, or the two sides
-        // would hand ownership to each other in a loop.
-        #[cfg(feature = "xwayland")]
-        {
-            let offered = source.as_ref().map(SelectionSource::mime_types);
-            self.bridge_selection_to_x11(target, offered.as_deref());
-        }
+        self.relay_client_selection(target, source, seat);
     }
 
-    /// An X client is pasting a selection comp advertised on Wayland'\''s behalf.
-    ///
-    /// Reached only for a selection whose source is the COMPOSITOR — which, in
-    /// this compositor, means one bridged from X by `x11_new_selection`. So the
-    /// answer is to ask the X side for the bytes.
-    #[cfg_attr(not(feature = "xwayland"), allow(unused_variables))]
+    fn selection_source_destroyed(&mut self, source: SelectionSource) {
+        self.relay_source_destroyed(source);
+    }
+
+    /// Resolve every compositor offer through explicit source provenance.
     fn send_selection(
         &mut self,
         target: SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
-        seat: Seat<Self>,
-        _user_data: &(),
+        _seat: Seat<Self>,
+        user_data: &Self::SelectionUserData,
     ) {
-        if seat != self.human.seat {
-            tracing::debug!("ignored non-human compositor selection transfer");
-            return;
-        }
-        #[cfg(feature = "xwayland")]
-        self.serve_x11_selection(target, mime_type, fd);
+        self.send_relay_selection(target, mime_type, fd, user_data);
     }
 }
 
