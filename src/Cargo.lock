@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-maild"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "arc-swap",

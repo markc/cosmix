@@ -68,7 +68,7 @@ use crate::mailstore::{
 /// post-migration form. The companion `blob_download` handler
 /// accepts both the legacy UUID form (for emails uploaded via
 /// `db::blob`) and the CAS hex form, gating the CAS branch on
-/// per-account ownership via `db::blob`.
+/// per-account live MDS ownership, with a legacy upload fallback.
 ///
 /// `receivedAt` and `date` project as JMAP `UTCDate` strings (RFC
 /// 8620 §1.4 / RFC 3339, `Z`-suffixed) rather than raw integers.

@@ -191,6 +191,12 @@ The retention defaults delete nothing: both age windows are zero, `dry_run` is t
 
 ## Storage and background work
 
+JMAP uploads write only the MDS CAS and an account-scoped, expiring upload
+alias. Hash downloads require live mail ownership or a valid alias in the
+authenticated account; old uploads retain an account-scoped legacy fallback.
+Global CAS presence never grants download access. Legacy UUID downloads and
+imports remain supported, and legacy files and database rows are retained.
+
 Mail metadata and operational state use SQLite. Mailbox content uses `cosmix-mds` through `SqliteMailStore`. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.
 
 Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.

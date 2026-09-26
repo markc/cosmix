@@ -458,19 +458,13 @@ pub async fn blob_download(
         };
     }
 
-    let Some(hash) = cosmix_mds::blob::from_hex(&blob_id) else {
+    let Some(hash) = crate::mailstore::parse_hash(&blob_id) else {
         return (StatusCode::BAD_REQUEST, "invalid blob id").into_response();
     };
 
-    // Account ownership gate. CAS hashes are deduplicated across
-    // accounts in the mds blob store, so a global `mds.get_blob(&hash)`
-    // would let any authenticated user retrieve bytes by hash
-    // regardless of mailbox membership. We require a `blobs` row
-    // binding `(account_id, hash)` — written when this account either
-    // uploaded the bytes (`/upload`) or received them via SMTP. A
-    // missing row returns 404 (not 403) to avoid confirming that the
-    // hash exists somewhere on the server.
-    match db::blob::hash_owned_by_account(&state.db.conn, account_id, &blob_id).await {
+    // Prefer live mail / upload ownership in MDS. Old uploads retain an
+    // account-scoped legacy fallback until the legacy store is retired.
+    match hash_owned_by_account(&state.db, &state.mailstore, account_id, hash).await {
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "blob not found").into_response(),
         Err(e) => {
@@ -506,6 +500,19 @@ pub async fn blob_download(
     }
 }
 
+async fn hash_owned_by_account(
+    db: &Db,
+    mailstore: &Arc<SqliteMailStore>,
+    account: i32,
+    hash: cosmix_mds::BlobHash,
+) -> Result<bool> {
+    let ms = mailstore.clone();
+    if tokio::task::spawn_blocking(move || ms.owns_blob_hash(account, &hash)).await?? {
+        return Ok(true);
+    }
+    db::blob::hash_owned_by_account(&db.conn, account, &cosmix_mds::blob::hex(&hash)).await
+}
+
 /// POST /jmap/upload/{account_id} — Upload a blob.
 ///
 /// Migrated to MailStore CAS in Task 3.3a:
@@ -516,13 +523,8 @@ pub async fn blob_download(
 ///      `__upload_staging__` container with `expires_at = now + 1h`
 ///      (per `mailstore::expiry` v1.1 §1).
 ///
-/// Migration-window dual-write: a `db::blob` row is also inserted so
-/// the legacy `blob_download` CAS-hex gate (`hash_owned_by_account`)
-/// keeps working unchanged. Per
-/// `_doc/planned/jmap-mds-migration.md` §3.3a option (a), this is
-/// the lower-risk path while the legacy `/download` UUID branch is
-/// still serving traffic. The dual-write retires when the gate
-/// migrates to an mds-side ownership oracle.
+/// Uploads no longer write the legacy store. Downloads authorise hashes
+/// through live account-owned MDS items or valid upload aliases.
 pub async fn blob_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -538,11 +540,10 @@ pub async fn blob_upload(
     };
 
     let size = body.len();
-    let bytes = body.to_vec();
 
     // Step 1: write to MDS CAS (idempotent on hash). Sync API; spawn_blocking.
     let mds = state.mailstore.mds().clone();
-    let bytes_for_mds = bytes.clone();
+    let bytes_for_mds = body.to_vec();
     let blob_hash = match tokio::task::spawn_blocking(move || mds.put_blob(&bytes_for_mds)).await {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
@@ -593,24 +594,6 @@ pub async fn blob_upload(
                 .into_response();
         }
     };
-
-    // Step 3: dual-write a `db::blob` row binding `(account_id,
-    // hash)` so the legacy `/download` CAS-hex gate
-    // (`db::blob::hash_owned_by_account`) keeps resolving for blobs
-    // uploaded via this path. The UUID returned by `db::blob::store`
-    // is intentionally discarded — it is not exposed to the client;
-    // only the new MailStore `BlobId` is returned. This dual-write
-    // retires when the `/download` gate migrates to an mds-side
-    // ownership oracle (`_doc/planned/jmap-mds-migration.md` §3.3a
-    // option (b)).
-    if let Err(e) = db::blob::store(&state.db.conn, &state.db.blob_dir, account_id, &bytes).await {
-        tracing::error!(error = %e, "blob upload: db::blob dual-write failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "upload failed"})),
-        )
-            .into_response();
-    }
 
     let resp = serde_json::json!({
         "accountId": account_id.to_string(),
