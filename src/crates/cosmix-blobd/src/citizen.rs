@@ -19,6 +19,7 @@ use cosmix_client::{IncomingCommand, NodedClient};
 use cosmix_mds::blob::{self, PutMode};
 use cosmix_mds::types::BlobHash;
 use serde_json::{Value, json};
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::core::reference::{self};
 use crate::core::store::{PutOptions, Store, StoreError};
@@ -49,6 +50,12 @@ pub struct Citizen {
     instance: String,
     lane_bind: Option<SocketAddr>,
     fetcher: Arc<Fetcher>,
+    /// TEST ONLY (M2): per-verb artificial dispatch latency, slept at
+    /// the top of `dispatch` (on the blocking pool) so the connection
+    /// loop's concurrency test can hold one verb without a multi-GiB
+    /// blob.
+    #[cfg(test)]
+    pub(crate) slow_verbs: BTreeMap<String, Duration>,
 }
 
 impl Citizen {
@@ -65,6 +72,8 @@ impl Citizen {
             instance,
             lane_bind,
             fetcher,
+            #[cfg(test)]
+            slow_verbs: BTreeMap::new(),
         }
     }
 
@@ -72,6 +81,10 @@ impl Citizen {
     /// Store work is blocking file/SQLite IO, so the connection loop
     /// runs this on the blocking pool.
     pub fn dispatch(&self, command: &IncomingCommand) -> (u8, String, Vec<BusEvent>) {
+        #[cfg(test)]
+        if let Some(delay) = self.slow_verbs.get(&command.command) {
+            std::thread::sleep(*delay);
+        }
         self.dispatch_inner(command)
             .unwrap_or_else(|e| (10, error_body(&e), Vec::new()))
     }
@@ -583,9 +596,60 @@ fn clone_command(command: &IncomingCommand) -> IncomingCommand {
 
 // ---- Connection lifetime ----
 
+/// Where a dispatched command's reply and its events go. Production
+/// wraps the live [`NodedClient`]; the M2 test records reply
+/// timestamps. Splitting this from the client is what makes the
+/// connection loop's concurrency testable without a broker.
+/// `BoxFuture` (the crate's shared `Send` boxed future), the same
+/// idiom the fetch traits use.
+trait ReplySink: Send + Sync + 'static {
+    /// One Bus reply. An Err means the reply channel is gone; the task
+    /// drops the reply (the incoming channel closing is what triggers
+    /// the reconnect).
+    fn respond<'a>(
+        &'a self,
+        command: &'a IncomingCommand,
+        rc: u8,
+        body: &'a str,
+    ) -> crate::fetch::BoxFuture<'a, Result<()>>;
+    /// One `retain: false` event publication. An Err is the caller's
+    /// to log; publishing stays best-effort.
+    fn publish<'a>(&'a self, event: &'a BusEvent) -> crate::fetch::BoxFuture<'a, Result<()>>;
+}
+
+struct ClientSink(Arc<NodedClient>);
+
+impl ReplySink for ClientSink {
+    fn respond<'a>(
+        &'a self,
+        command: &'a IncomingCommand,
+        rc: u8,
+        body: &'a str,
+    ) -> crate::fetch::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.0
+                .respond_parts(
+                    &command.from,
+                    &command.command,
+                    command.id.as_deref(),
+                    rc,
+                    body,
+                )
+                .await
+        })
+    }
+
+    fn publish<'a>(&'a self, event: &'a BusEvent) -> crate::fetch::BoxFuture<'a, Result<()>> {
+        Box::pin(async move { publish_event(&self.0, event).await })
+    }
+}
+
 /// Run the reconnecting citizen loop. Does not return during normal
-/// operation; returns on SIGINT/SIGTERM.
-pub async fn serve(citizen: Arc<Citizen>) -> Result<()> {
+/// operation; returns on SIGINT/SIGTERM. `verb_max_concurrent` bounds
+/// how many dispatches run at once; a slow verb (a multi-GiB
+/// `blob.put`, a CAS-walking `blob.gc`) holds one permit, not the
+/// connection (M2).
+pub async fn serve(citizen: Arc<Citizen>, verb_max_concurrent: usize) -> Result<()> {
     // The fetch dispatcher: one task per admitted download, living
     // across broker reconnects.
     citizen.fetcher.spawn_dispatcher().await;
@@ -599,6 +663,7 @@ pub async fn serve(citizen: Arc<Citizen>) -> Result<()> {
         cosmix_buildinfo::now_rfc3339(),
     );
     let service = citizen.service.clone();
+    let permits = Arc::new(Semaphore::new(verb_max_concurrent.max(1)));
 
     loop {
         let connection = tokio::time::timeout(
@@ -613,7 +678,7 @@ pub async fn serve(citizen: Arc<Citizen>) -> Result<()> {
             Ok(Ok(client)) => {
                 let client = Arc::new(client);
                 eprintln!("cosmix-blobd: registered as '{service}'");
-                run_connection(&citizen, &client).await;
+                run_connection(&citizen, &client, &permits).await;
                 client.close().await;
             }
             Ok(Err(error)) => {
@@ -630,58 +695,86 @@ pub async fn serve(citizen: Arc<Citizen>) -> Result<()> {
     }
 }
 
-async fn run_connection(citizen: &Arc<Citizen>, client: &Arc<NodedClient>) {
+async fn run_connection(citizen: &Arc<Citizen>, client: &Arc<NodedClient>, permits: &Arc<Semaphore>) {
     // The fetch machinery resolves and publishes through the live
     // connection; cleared when it ends, whenever it ends.
     citizen.fetcher.set_client(Some(Arc::clone(client)));
-    run_connection_inner(citizen, client).await;
+    run_connection_inner(citizen, client, permits).await;
     citizen.fetcher.set_client(None);
 }
 
-async fn run_connection_inner(citizen: &Arc<Citizen>, client: &Arc<NodedClient>) {
-    let Some(mut incoming) = client.incoming_async().await else {
+async fn run_connection_inner(
+    citizen: &Arc<Citizen>,
+    client: &Arc<NodedClient>,
+    permits: &Arc<Semaphore>,
+) {
+    let Some(incoming) = client.incoming_async().await else {
         return;
     };
-    loop {
-        let Some(command) = incoming.recv().await else {
-            return;
-        };
-        let (rc, body, events) = {
-            let citizen = Arc::clone(citizen);
-            let command = clone_command(&command);
-            tokio::task::spawn_blocking(move || citizen.dispatch(&command))
-                .await
-                .unwrap_or_else(|panic| {
-                    eprintln!("cosmix-blobd: dispatch panicked: {panic}");
-                    (
-                        10,
-                        json!({"error": "internal dispatch failure"}).to_string(),
-                        Vec::new(),
-                    )
-                })
-        };
-        let respond = client
-            .respond_parts(
-                &command.from,
-                &command.command,
-                command.id.as_deref(),
-                rc,
-                &body,
-            )
-            .await;
-        if let Err(error) = respond {
-            eprintln!("cosmix-blobd: Bus response failed; reconnecting: {error}");
-            return;
-        }
-        for event in events {
-            if let Err(error) = publish_event(client, &event).await {
-                eprintln!(
-                    "cosmix-blobd: publish on {} failed (continuing): {error}",
-                    event.topic
-                );
+    serve_commands(
+        Arc::clone(citizen),
+        Arc::new(ClientSink(Arc::clone(client))),
+        incoming,
+        Arc::clone(permits),
+    )
+    .await;
+}
+
+/// Dispatch every incoming command as its own task, bounded by
+/// `permits` (M2): the loop is only `recv` → spawn, so one slow verb
+/// never holds the queue — `blob.fetch`'s early reply and every other
+/// verb keep answering while a multi-GiB `blob.put` or a CAS walk
+/// runs. Responding and publishing happen inside the task; no verb
+/// needs cross-verb ordering (the store serialises what must be
+/// serialised under its own locks). Returns when the incoming channel
+/// closes, after draining the in-flight dispatches.
+async fn serve_commands<S: ReplySink>(
+    citizen: Arc<Citizen>,
+    sink: Arc<S>,
+    mut incoming: mpsc::UnboundedReceiver<IncomingCommand>,
+    permits: Arc<Semaphore>,
+) {
+    let mut tasks = tokio::task::JoinSet::new();
+    while let Some(command) = incoming.recv().await {
+        let citizen = Arc::clone(&citizen);
+        let sink = Arc::clone(&sink);
+        let permits = Arc::clone(&permits);
+        tasks.spawn(async move {
+            // Beyond verb_max_concurrent the command waits here: its
+            // reply is late, never lost.
+            let _permit = permits.acquire_owned().await;
+            let dispatch_command = clone_command(&command);
+            let (rc, body, events) =
+                tokio::task::spawn_blocking(move || citizen.dispatch(&dispatch_command))
+                    .await
+                    .unwrap_or_else(|panic| {
+                        eprintln!("cosmix-blobd: dispatch panicked: {panic}");
+                        (
+                            10,
+                            json!({"error": "internal dispatch failure"}).to_string(),
+                            Vec::new(),
+                        )
+                    });
+            if let Err(error) = sink.respond(&command, rc, &body).await {
+                eprintln!("cosmix-blobd: Bus response failed; reply dropped: {error}");
+                return;
             }
-        }
+            for event in events {
+                if let Err(error) = sink.publish(&event).await {
+                    eprintln!(
+                        "cosmix-blobd: publish on {} failed (continuing): {error}",
+                        event.topic
+                    );
+                }
+            }
+        });
+        // Reap what has finished so the set does not grow without
+        // bound over a long-lived connection.
+        while tasks.try_join_next().is_some() {}
     }
+    // The channel closed: let the in-flight dispatches answer before
+    // the connection is torn down.
+    while tasks.join_next().await.is_some() {}
 }
 
 async fn publish_event(client: &Arc<NodedClient>, event: &BusEvent) -> Result<()> {
@@ -725,6 +818,7 @@ mod tests {
     use crate::fetch::test_support::{NullPeers, NullResolver, TestSink};
     use crate::fetch::{FetchConfig, Fetcher};
     use serde_json::json;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     fn citizen() -> (TempDir, Citizen) {
@@ -1024,5 +1118,79 @@ mod tests {
         };
         assert_eq!(report.tmp_removed, 2);
         assert_eq!(report.orphans.len(), 1);
+    }
+
+    // ---- M2: one slow verb never blocks another ----
+
+    /// Records each reply with the instant it landed.
+    #[derive(Default)]
+    struct RecordSink(std::sync::Mutex<Vec<(String, Instant)>>);
+
+    impl ReplySink for RecordSink {
+        fn respond<'a>(
+            &'a self,
+            command: &'a IncomingCommand,
+            _rc: u8,
+            _body: &'a str,
+        ) -> crate::fetch::BoxFuture<'a, Result<()>> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((command.command.clone(), Instant::now()));
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn publish<'a>(&'a self, _event: &'a BusEvent) -> crate::fetch::BoxFuture<'a, Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_verb_does_not_delay_a_concurrent_blob_info() {
+        let (dir, mut c) = citizen();
+        // A 2 s blob.put (the slow-verb hook stands in for a multi-GiB
+        // hash+copy+re-hash) dispatched first; blob.info arriving right
+        // behind it must still answer within 200 ms.
+        c.slow_verbs
+            .insert("blob.put".into(), Duration::from_secs(2));
+        let citizen = Arc::new(c);
+        let sink = Arc::new(RecordSink::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let start = Instant::now();
+        tx.send(command(
+            "blob.put",
+            "maild",
+            json!({"path": dir.path().join("slow.bin")}),
+        ))
+        .unwrap();
+        tx.send(command("blob.info", "maild", json!({}))).unwrap();
+        drop(tx);
+        serve_commands(
+            Arc::clone(&citizen),
+            Arc::clone(&sink),
+            rx,
+            Arc::new(Semaphore::new(8)),
+        )
+        .await;
+        let replies = sink.0.lock().unwrap().clone();
+        assert_eq!(replies.len(), 2, "both commands answered");
+        let (_, info_at) = replies
+            .iter()
+            .find(|(verb, _)| verb == "blob.info")
+            .expect("blob.info replied");
+        let (_, put_at) = replies
+            .iter()
+            .find(|(verb, _)| verb == "blob.put")
+            .expect("blob.put replied");
+        assert!(
+            info_at.duration_since(start) < Duration::from_millis(200),
+            "blob.info answered in {:?} while blob.put was still running",
+            info_at.duration_since(start)
+        );
+        assert!(
+            put_at.duration_since(*info_at) >= Duration::from_secs(2),
+            "blob.put overlapped blob.info by {:?} — the slow verb was not held",
+            put_at.duration_since(*info_at)
+        );
     }
 }

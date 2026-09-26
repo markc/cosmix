@@ -468,6 +468,7 @@ quota_owner: capture=2GiB
 <tr><td><code>lane_max_uploads</code></td><td><code>4</code></td><td>Concurrent lane uploads admitted; beyond it the lane answers <code>503</code> — no queueing</td></tr>
 <tr><td><code>fetch_max_concurrent</code></td><td><code>2</code></td><td>Concurrent <code>blob.fetch</code> downloads; beyond it a fetch queues (see <a href="/cos/cosmix-blobd/#fetching">Fetching</a>)</td></tr>
 <tr><td><code>fetch_queue_max</code></td><td><code>32</code></td><td>In-process fetch queue depth; beyond it the verb replies rc 10 <code>busy</code></td></tr>
+<tr><td><code>verb_max_concurrent</code></td><td><code>8</code></td><td>Concurrent verb dispatches; beyond it a verb queues (its reply is late, never lost) instead of blocking every other verb</td></tr>
 <tr><td><code>quota_total_bytes</code></td><td><code>50GiB</code></td><td>Total cap on accounted (pinned) bytes</td></tr>
 <tr><td><code>quota_owner_default_bytes</code></td><td><code>10GiB</code></td><td>Per-owner cap unless overridden</td></tr>
 <tr><td><code>quota_owner: &lt;owner&gt;=&lt;bytes&gt;</code></td><td>none (repeatable)</td><td>Per-owner cap; later lines for the same owner win</td></tr>

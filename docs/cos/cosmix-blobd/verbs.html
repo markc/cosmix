@@ -454,6 +454,7 @@
 <pre><code class="language-json">{"error":"message"}
 </code></pre>
 <p>Error tokens worth matching on: <code>not_present</code> (blob not held), <code>invalid blob id</code> (malformed <code>b3:</code> reference), <code>quota:</code> (an owner or total cap refusal — the message carries the numbers), <code>busy</code> (the <code>blob.fetch</code> queue is full — retry later).</p>
+<p>Verbs dispatch concurrently, bounded by <code>verb_max_concurrent</code> (default 8): a slow <code>blob.put</code> or <code>blob.gc</code> holds one slot, not the connection — other verbs (including <code>blob.fetch</code>'s immediate reply) keep answering. Beyond the bound a verb queues; its reply is late, never lost. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.</p>
 <p>A blob reference is <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…","name":"…"?, "origin":"&lt;node name&gt;"}</code> (<code>name</code> present only when the ingester knew one; <code>origin</code> is a node name, never an IP).</p>
 <h2 id="verbs">Verbs</h2>
 <h3 id="blobput"><code>blob.put</code></h3>

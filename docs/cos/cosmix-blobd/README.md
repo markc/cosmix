@@ -37,6 +37,7 @@ quota_owner: capture=2GiB
 | `lane_max_uploads` | `4` | Concurrent lane uploads admitted; beyond it the lane answers `503` — no queueing |
 | `fetch_max_concurrent` | `2` | Concurrent `blob.fetch` downloads; beyond it a fetch queues (see [Fetching](#fetching)) |
 | `fetch_queue_max` | `32` | In-process fetch queue depth; beyond it the verb replies rc 10 `busy` |
+| `verb_max_concurrent` | `8` | Concurrent verb dispatches; beyond it a verb queues (its reply is late, never lost) instead of blocking every other verb |
 | `quota_total_bytes` | `50GiB` | Total cap on accounted (pinned) bytes |
 | `quota_owner_default_bytes` | `10GiB` | Per-owner cap unless overridden |
 | `quota_owner: <owner>=<bytes>` | none (repeatable) | Per-owner cap; later lines for the same owner win |

@@ -130,5 +130,5 @@ async fn async_main() -> anyhow::Result<()> {
         lane,
         fetcher,
     ));
-    cosmix_blobd::citizen::serve(citizen).await
+    cosmix_blobd::citizen::serve(citizen, cfg.verb_max_concurrent).await
 }

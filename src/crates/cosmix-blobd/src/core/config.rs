@@ -5,10 +5,10 @@
 //! read from the raw text, not the flat map, so they cannot collide.
 //!
 //! Keys: `root`, `name`, `lane_bind`, `lane_max_uploads`,
-//! `fetch_max_concurrent`, `fetch_queue_max`, `quota_total_bytes`,
-//! `quota_owner_default_bytes`, `quota_owner: <owner>=<bytes>`
-//! (repeatable). The byte values accept plain integers or a `KiB`
-//! family suffix.
+//! `fetch_max_concurrent`, `fetch_queue_max`, `verb_max_concurrent`,
+//! `quota_total_bytes`, `quota_owner_default_bytes`,
+//! `quota_owner: <owner>=<bytes>` (repeatable). The byte values accept
+//! plain integers or a `KiB` family suffix.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -28,6 +28,12 @@ pub const DEFAULT_FETCH_MAX_CONCURRENT: usize = 2;
 /// Default in-process fetch queue depth: 32. A fetch arriving beyond
 /// it is refused rc 10 `busy` — never an unbounded queue.
 pub const DEFAULT_FETCH_QUEUE_MAX: usize = 32;
+/// Default concurrent verb dispatches: 8. A slow verb (a multi-GiB
+/// `blob.put`, a CAS-walking `blob.gc`) holds one permit, not the
+/// connection: beyond the bound a verb waits (its reply is late,
+/// never lost) instead of blocking every other verb past the 30 s
+/// mesh timeout (M2).
+pub const DEFAULT_VERB_MAX_CONCURRENT: usize = 8;
 
 /// Parsed configuration with defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +56,9 @@ pub struct Config {
     /// In-process fetch queue depth; a fetch beyond it is refused
     /// rc 10 `busy`.
     pub fetch_queue_max: usize,
+    /// Concurrent verb dispatches; beyond it a verb queues (bounded,
+    /// in-process) rather than blocking every other verb.
+    pub verb_max_concurrent: usize,
     pub quota_total_bytes: u64,
     pub quota_owner_default_bytes: u64,
     /// Per-owner caps from repeated `quota_owner: <owner>=<bytes>`
@@ -66,6 +75,7 @@ impl Default for Config {
             lane_max_uploads: DEFAULT_LANE_MAX_UPLOADS,
             fetch_max_concurrent: DEFAULT_FETCH_MAX_CONCURRENT,
             fetch_queue_max: DEFAULT_FETCH_QUEUE_MAX,
+            verb_max_concurrent: DEFAULT_VERB_MAX_CONCURRENT,
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
             owner_limits: BTreeMap::new(),
@@ -152,6 +162,18 @@ impl Config {
                     }
                     cfg.fetch_queue_max = n;
                 }
+                "verb_max_concurrent" => {
+                    let n: usize = v
+                        .parse()
+                        .map_err(|e| format!("verb_max_concurrent: bad count {v:?}: {e}"))?;
+                    if n == 0 {
+                        return Err(
+                            "verb_max_concurrent: must be at least 1 (0 would stall every verb)"
+                                .into(),
+                        );
+                    }
+                    cfg.verb_max_concurrent = n;
+                }
                 "quota_total_bytes" => {
                     cfg.quota_total_bytes = parse_bytes(v)
                         .ok_or_else(|| format!("quota_total_bytes: bad byte size {v:?}"))?;
@@ -214,7 +236,7 @@ mod tests {
         let cfg = Config::parse(
             "# comment\nroot: /var/lib/cosmix/blobd-two\nname: two\n\
              lane_bind: 10.42.0.5:4210\nlane_max_uploads: 8\nfetch_max_concurrent: 3\n\
-             fetch_queue_max: 8\nquota_total_bytes: 100GiB\n\
+             fetch_queue_max: 8\nverb_max_concurrent: 2\nquota_total_bytes: 100GiB\n\
              quota_owner_default_bytes: 512MiB\nquota_owner: maild=1GiB\n\
              quota_owner: capture=2 GiB\nignored_key: whatever\n",
         )
@@ -229,6 +251,7 @@ mod tests {
         assert_eq!(cfg.lane_max_uploads, 8);
         assert_eq!(cfg.fetch_max_concurrent, 3);
         assert_eq!(cfg.fetch_queue_max, 8);
+        assert_eq!(cfg.verb_max_concurrent, 2);
         assert_eq!(cfg.quota_total_bytes, 100 * 1024 * 1024 * 1024);
         assert_eq!(cfg.quota_owner_default_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.owner_limits["maild"], 1024 * 1024 * 1024);
@@ -251,6 +274,8 @@ mod tests {
         assert!(Config::parse("fetch_max_concurrent: few\n").is_err());
         assert!(Config::parse("fetch_queue_max: 0\n").is_err());
         assert!(Config::parse("fetch_queue_max: lots\n").is_err());
+        assert!(Config::parse("verb_max_concurrent: 0\n").is_err());
+        assert!(Config::parse("verb_max_concurrent: few\n").is_err());
         assert!(Config::parse("quota_total_bytes: lots\n").is_err());
         assert!(Config::parse("quota_owner: noequals\n").is_err());
         assert!(Config::parse("quota_owner: =5MiB\n").is_err());
