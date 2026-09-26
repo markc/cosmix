@@ -539,14 +539,17 @@ current output.</li>
 <table><thead><tr><th>Verb</th><th>Args</th><th>Reply</th></tr></thead><tbody>
 <tr><td><code>shell.dialog.show</code></td><td><code>{scene}</code></td><td><code>{scene,visible:true,applied}</code>; maps and takes the keyboard</td></tr>
 <tr><td><code>shell.dialog.hide</code></td><td><code>{scene}</code></td><td><code>{scene,visible:false,applied}</code>; unmaps and keeps scene state</td></tr>
-<tr><td><code>shell.scene.layout</code></td><td><code>{scene,node?}</code></td><td><code>{scene,revision,applied_revision,visible,surface:{kind:"panel"|"dialog",edge?,output,x,y,w,h},nodes:{&lt;id&gt;:{x,y,w,h,hidden}},instances:{&lt;list&gt;:{&lt;item&gt;:{x,y,w,h}}}}</code></td></tr>
+<tr><td><code>shell.scene.layout</code></td><td><code>{scene,node?}</code></td><td><code>{scene,revision,applied_revision,visible,surface:{kind:"panel"|"dialog",edge?,output,x,y,w,h},nodes:{&lt;id&gt;:{x,y,w,h,hidden}},instances:{&lt;list&gt;:{&lt;item&gt;:{x,y,w,h}}},chrome:{close?:{x,y,w,h}}}</code></td></tr>
 </tbody></table>
 <p><code>applied</code> is false when the dialog was already in the requested state.
 Refusals are <code>NOT_FOUND</code> (no such scene) and <code>NOT_DIALOG</code> (an edge page).
 <code>shell.scene.layout</code> reads the applied revision's computed layout in logical
 px. The surface rect is in output coordinates and node rects are relative to
 the surface. While unmapped it reports <code>visible:false</code> and empty <code>nodes</code>. It
-is how gates and agents click a node: take the centre of its rect.</p>
+is how gates and agents click a node: take the centre of its rect.
+<code>chrome.close</code> is the dialog's × frame control, measured the same way and in
+the same surface coordinates, present only while a <code>chrome:true</code> dialog is
+mapped (<code>chrome</code> is <code>{}</code> otherwise). Clicking its centre hides the dialog.</p>
 <p>Every change of <code>dialog.visible</code> or <code>dialog.scene</code> publishes
 <code>shell.panel.changed</code> with a strictly greater revision; the snapshot's
 <code>dialog</code> is <code>{scene,visible,w,h,output}</code> or null. Page order is written with

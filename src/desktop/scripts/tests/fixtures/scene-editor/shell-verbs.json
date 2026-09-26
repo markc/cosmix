@@ -40,9 +40,11 @@
         "btn_recommended": {"x": 12.0, "y": 556.0, "w": 158.0, "h": 32.0, "hidden": false},
         "installed": {"x": 12.0, "y": 80.0, "w": 856.0, "h": 460.0, "hidden": true}
       },
-      "instances": {"templates": {"t_panel": {"x": 12.0, "y": 110.0, "w": 422.0, "h": 52.0}}}
+      "instances": {"templates": {"t_panel": {"x": 12.0, "y": 110.0, "w": 422.0, "h": 52.0}}},
+      "chrome": {"close": {"x": 841.0, "y": 5.0, "w": 28.0, "h": 24.0}}
     },
-    "reply_unmapped": {"scene": "editor", "revision": 9, "applied_revision": 9, "visible": false, "surface": {"kind": "dialog", "edge": null, "output": "DP-1", "x": 520.0, "y": 230.0, "w": 880.0, "h": 620.0}, "nodes": {}, "instances": {}},
+    "_chrome": "Frame controls measured from the engine like node rects (surface coords). `chrome.close` is the dialog's × while mapped with chrome:true; {} otherwise (unmapped, chrome:false, or an edge scene).",
+    "reply_unmapped": {"scene": "editor", "revision": 9, "applied_revision": 9, "visible": false, "surface": {"kind": "dialog", "edge": null, "output": "DP-1", "x": 520.0, "y": 230.0, "w": 880.0, "h": 620.0}, "nodes": {}, "instances": {}, "chrome": {}},
     "refusals": {
       "NOT_FOUND": {"error_code": "NOT_FOUND", "message": "no scene named editor is loaded", "scene": "editor"},
       "UNIMPLEMENTED": {"error_code": "UNIMPLEMENTED", "message": "shell.scene.layout arrives in Stage Q2 of the Scene Editor plan"}
