@@ -265,6 +265,8 @@ enum RangeParse {
 /// `Ignore` (RFC 9110: an unsatisfiable-or-invalid list is ignored
 /// unless *all* valid specs are unsatisfiable — a lone spec that parses
 /// but starts at/after EOF, or a zero suffix, is `Unsatisfiable`).
+/// Numbers too large for u64 are `Ignore`, never a panic — the header
+/// is remote-controlled input (F1).
 fn parse_range(spec: &str, size: u64) -> RangeParse {
     let Some(spec) = spec.trim().strip_prefix("bytes=") else {
         return RangeParse::Ignore;
@@ -278,7 +280,9 @@ fn parse_range(spec: &str, size: u64) -> RangeParse {
         if !is_digits(suffix) {
             return RangeParse::Ignore;
         }
-        let n: u64 = suffix.parse().expect("digits");
+        let Some(n) = suffix.parse::<u64>().ok() else {
+            return RangeParse::Ignore;
+        };
         if n == 0 || size == 0 {
             return RangeParse::Unsatisfiable;
         }
@@ -291,7 +295,9 @@ fn parse_range(spec: &str, size: u64) -> RangeParse {
     if !is_digits(first) {
         return RangeParse::Ignore;
     }
-    let start: u64 = first.parse().expect("digits");
+    let Some(start) = first.parse::<u64>().ok() else {
+        return RangeParse::Ignore;
+    };
     // An absent last-byte-pos runs to EOF; a present one is clamped to
     // it (RFC 9110 §14.1.1) — saturating, because size 0 is decided by
     // the start check below.
@@ -301,7 +307,9 @@ fn parse_range(spec: &str, size: u64) -> RangeParse {
         if !is_digits(last) {
             return RangeParse::Ignore;
         }
-        let end: u64 = last.parse().expect("digits");
+        let Some(end) = last.parse::<u64>().ok() else {
+            return RangeParse::Ignore;
+        };
         if end < start {
             return RangeParse::Ignore;
         }
@@ -1265,5 +1273,17 @@ mod tests {
         assert_eq!(status, 206);
         assert_eq!(header_value(&headers, "content-range"), "bytes 0-8191/8192");
         assert_eq!(body.len(), 8192);
+
+        // Numbers past u64 (F1): every position overflows — the header
+        // is ignored, never a panic on remote input.
+        for spec in [
+            "bytes=-99999999999999999999999999",
+            "bytes=99999999999999999999999999-",
+            "bytes=0-99999999999999999999999999",
+        ] {
+            let (status, _, body) = request(addr, "GET", &path, &[("Range", spec)], b"");
+            assert_eq!(status, 200, "{spec} must be ignored");
+            assert_eq!(body.len(), 8192, "{spec} serves the whole blob");
+        }
     }
 }
