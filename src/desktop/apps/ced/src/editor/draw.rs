@@ -723,8 +723,9 @@ mod tests {
             assert!(t.own.is_within(&t.clip), "{t:?}: the clip holds the text's own box");
         }
         // A full redraw (scroll, resize): only boxes that cross their layer
-        // edge — the partial last row, the long lines — take the mask.
-        let crossing = texts.iter().filter(|t| !t.own.is_within(&t.layer)).count();
+        // edge — the partial last row, the long lines — take the mask (a box
+        // wholly outside its layer is culled).
+        let crossing = texts.iter().filter(|t| t.own.intersects(&t.layer) && !t.own.is_within(&t.layer)).count();
         assert!(crossing > 0 && crossing * 5 < texts.len(), "{crossing} of {} boxes cross their layer", texts.len());
         assert_eq!(masks(texts, &WINDOW), crossing, "a full redraw masks only the crossing boxes");
         // One row redrawn (a caret moving on row 6): its own damage, from
