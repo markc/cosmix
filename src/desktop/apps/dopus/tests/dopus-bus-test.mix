@@ -8,7 +8,8 @@
 -- selection.*) moves only the active pane while dopus.state shows both;
 -- refusals stay honest (file.* FORBIDDEN — the Bus never opens files,
 -- unknown action INVALID_ARGUMENT, unknown verb UNKNOWN_VERB, theme.set
--- UNAVAILABLE headless). dopus.quit answers rc 0 BEFORE the process exits
+-- AND the theme.* actions UNAVAILABLE headless). dopus.quit answers rc 0
+-- BEFORE the process exits
 -- (reply-then-exit: the client's send would time out otherwise).
 --
 -- NOT reachable over the Bus, so not drivable here: the listing's directory
@@ -204,7 +205,16 @@ try
   pane_is(0, $gamma, "tilde expand")
   ok('dopus.open paths=[$a.l, $a.r]', {l: $alpha, r: $beta})
 
-  -- 9. selection acts on the ACTIVE pane (both panes have rows)
+  -- 9. selection acts on the ACTIVE pane (both panes have rows). Listings
+  -- are async: wait (bounded ~5 s) until BOTH panes report rows, or
+  -- selection.next races an empty listing and "selects" nothing.
+  $listed = false
+  for each $i in range(1, 25)
+    $st = ok('dopus.state', {})
+    if $st.panes[0].rows > 0 and $st.panes[1].rows > 0 then $listed = true; break end
+    sleep(0.2)
+  end
+  check($listed, "listings never landed in 5 s: " .. json_encode($st))
   act("selection.next")
   $active = if pane(0).active then pane(0) else pane(1) end
   check($active.selected != nil, "selection.next selected nothing: " .. json_encode($active))
@@ -218,6 +228,10 @@ try
   refused('dopus.action id="no.such-action"', {}, "INVALID_ARGUMENT")
   refused('dopus.frobnicate', {}, "UNKNOWN_VERB")
   refused('dopus.theme.set mode="dark"', {}, "UNAVAILABLE")
+  -- The theme.* actions share theme.set's posture: UNAVAILABLE (the
+  -- vocabulary exists; headless has no painter), never FORBIDDEN.
+  refused('dopus.action id="theme.mode-toggle"', {}, "UNAVAILABLE")
+  refused('dopus.action id="theme.scheme-ocean"', {}, "UNAVAILABLE")
   -- A second registration under the same name must fail (single instance):
   $dupe = run_argv([$dopus, "--headless", "--service", "dopus-test", "--noded-url", $url],
     {clear_env: true, env: $env, timeout: 20})
@@ -235,17 +249,28 @@ try
   end
   check($exited, "dopus still running 10 s after dopus.quit")
   $dopus_pid = nil
-  print("PASS dopus headless e2e: boot twin-pane state, dopus.open pane routing + extras ignored + tilde, F6, active-pane sort (law 5 toggle)/hidden/nav/selection, refusals (file.*, unknown action/verb, theme.set), single instance, reply-then-exit quit")
+  print("PASS dopus headless e2e: boot twin-pane state, dopus.open pane routing + extras ignored + tilde, F6, active-pane sort (law 5 toggle)/hidden/nav/selection, refusals (file.*, unknown action/verb, theme.set + theme.*), single instance, reply-then-exit quit")
 catch $err
   for each $log in glob($tmp .. "/*.log")
     print("--- " .. $log .. "\n" .. read_file($log))
   end
   raise("DOPUS_BUS_TEST", to_string($err))
 finally
+  -- Cleanup raises NOTHING (run_argv, never run_argv_must): a cleanup
+  -- failure must never mask the original error raised in the try body.
   for each $child in [$dopus_pid, $noded_pid]
-    if $child != nil then $_kill = run_argv(["kill", "--", to_string($child)], {timeout: 10}) end
+    if $child != nil then
+      $_kill = run_argv(["kill", "--", to_string($child)], {timeout: 10})
+      -- Bounded exit wait before rm -rf: kill(1) returns before the
+      -- process dies, and rm must not race a child still writing into $tmp.
+      for each $i in range(1, 50)
+        if not process_alive($child) then break end
+        sleep(0.1)
+      end
+    end
   end
   if starts_with($tmp, "/tmp/cosmix-dopus-bus-test.") then
-    $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
+    $_remove = run_argv(["rm", "-rf", "--", $tmp], {timeout: 30})
+    if not $_remove.ok then print("CLEANUP FAILED (original error above): rm -rf " .. $tmp) end
   end
 end

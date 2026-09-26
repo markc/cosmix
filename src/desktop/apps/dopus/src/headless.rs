@@ -142,6 +142,10 @@ pub fn run(
                 match served {
                     Served::Reply { id, rc, body } => bus.respond(id, rc, body),
                     Served::ThemeSet { .. } => unreachable!("theme.set was refused above"),
+                    // Headless never sees a theme action: serve_command
+                    // refuses Applied::Theme UNAVAILABLE before this point
+                    // (same posture as the theme.set pre-refusal above).
+                    Served::ThemeAction { .. } => unreachable!("theme actions are refused for headless"),
                     Served::Quit { id } => {
                         bus.respond(
                             id,

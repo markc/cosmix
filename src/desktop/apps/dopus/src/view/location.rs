@@ -6,13 +6,15 @@
 //! cancel.
 //!
 //! Focus: while an editor is up the app flips the key router's
-//! `focus_editable`, so every chord (all `allow_in_editable: false`) falls
-//! through to the editor — cosmix-actions' [`FocusContext`](cosmix_actions::FocusContext)
-//! contract. Enter and Escape are not keymap bindings, so [`Capture`] turns
-//! them into messages before they reach the field; the router never sees
-//! them (no new keymap ids — a `location.focus` id plus a Ctrl+L chord
-//! would need a cosmix-actions keymap addition: reported, not invented
-//! locally).
+//! `focus_editable`, so the chords fall through to the editor —
+//! cosmix-actions' [`FocusContext`](cosmix_actions::FocusContext) contract.
+//! Enter IS a keymap binding (it is file.open in the packaged keymap), but
+//! every default is `allow_in_editable: false`, so the router suppresses it
+//! while an editor holds focus and the keystroke reaches the field.
+//! [`Capture`] is still load-bearing for Escape — no keymap entry owns it —
+//! and turns Enter into a message before the field sees it (no new keymap
+//! ids — a `location.focus` id plus a Ctrl+L chord would need a
+//! cosmix-actions keymap addition: reported, not invented locally).
 
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, renderer};

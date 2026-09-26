@@ -189,8 +189,11 @@ fn sort_header<'a>(look: Look, pane: &'a PaneModel, pane_id: PaneId) -> Element<
 struct DividerState {
     /// A press is down (the pointer may leave the 6 px handle while dragging).
     dragging: bool,
-    /// The last completed press: a second within [`DOUBLE_CLICK`] resets the
-    /// split to exactly 0.5.
+    /// The current drag has moved the split: a release after movement is a
+    /// drag, not a click — the double-click window runs click-to-click only.
+    moved: bool,
+    /// The last completed click (a release that did NOT drag): a second
+    /// within [`DOUBLE_CLICK`] resets the split to exactly 0.5.
     last_click: Option<Instant>,
 }
 
@@ -217,9 +220,12 @@ impl Divider {
     }
 
     /// The ratio under an absolute cursor x, clamped to the drag contract.
+    /// The denominator is the panes row MINUS the divider — the exact space
+    /// the two FillPortion panes share in `view::root` — so the grip's
+    /// centre tracks the cursor at the clamp extremes too.
     fn ratio_at(x: f32, viewport: &Rectangle) -> f32 {
         let left = viewport.x + crate::view::places::PLACES_W;
-        let width = (viewport.width - crate::view::places::PLACES_W).max(1.0);
+        let width = (viewport.width - crate::view::places::PLACES_W - DIVIDER_W).max(1.0);
         ((x - left) / width).clamp(SPLIT_MIN, SPLIT_MAX)
     }
 }
@@ -254,22 +260,36 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(clip) => {
                 if st.last_click.is_some_and(|when| when.elapsed() < DOUBLE_CLICK) {
-                    // Double-click: exactly half; the stale press does not
-                    // start a drag.
+                    // Double-click: exactly half; this press does not start
+                    // a drag.
                     st.last_click = None;
                     shell.publish(Msg::Split(0.5));
                 } else {
-                    st.last_click = Some(Instant::now());
                     st.dragging = true;
+                    st.moved = false;
                 }
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                // The double-click window runs click-to-click: only a
+                // release that did NOT drag stamps it, so a drag-and-repress
+                // gesture cannot snap the split to 0.5.
+                if st.dragging && !st.moved {
+                    st.last_click = Some(Instant::now());
+                }
                 st.dragging = false;
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if st.dragging => {
+                st.moved = true;
                 shell.publish(Msg::Split(Self::ratio_at(position.x, viewport)));
                 shell.capture_event();
+            }
+            // A release outside the window never arrives, and iced's
+            // CursorMoved carries no button state, so a held drag cannot be
+            // detected as orphaned per-event: losing focus or a resize ends
+            // the drag instead (the split keeps its last published ratio).
+            Event::Window(iced::window::Event::Unfocused | iced::window::Event::Resized(_)) => {
+                st.dragging = false;
             }
             _ => {}
         }
@@ -305,13 +325,21 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        mouse::Interaction::ResizingHorizontally
+        // The col-resize cursor is the handle's, not the window's: only over
+        // the handle itself, or while a drag carries it elsewhere (the
+        // cosmix-iced-widgets fader.rs shape).
+        let st = tree.state.downcast_ref::<DividerState>();
+        if st.dragging || cursor.is_over(layout.bounds()) {
+            mouse::Interaction::ResizingHorizontally
+        } else {
+            mouse::Interaction::None
+        }
     }
 }
 

@@ -19,7 +19,12 @@ pub fn load(dir: Option<&Path>) -> (DOpusConfig, Option<ConfigFile>) {
             if let Err(error) = std::fs::create_dir_all(dir) {
                 eprintln!("cosmix-dopus: cannot create config dir {}: {error}", dir.display());
             }
-            let (config, file) = ConfigFile::load(dir);
+            let (mut config, file) = ConfigFile::load(dir);
+            // A stale or hand-edited ratio clamps at load to the divider
+            // drag contract: the view clamps at render too, but the app
+            // caches the raw value at boot and `dopus.state` reports it.
+            config.split_ratio =
+                config.split_ratio.clamp(crate::view::panes::SPLIT_MIN, crate::view::panes::SPLIT_MAX);
             (config, Some(file))
         }
         None => (DOpusConfig::default(), None),
@@ -50,5 +55,17 @@ mod tests {
         let file = file.unwrap();
         assert!(file.allow_save);
         assert!(file.path.ends_with("config.conf.mix"));
+    }
+
+    #[test]
+    fn boot_split_ratio_clamps_to_the_drag_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.conf.mix");
+        std::fs::write(&path, b"schema_version: 1\nsplit_ratio: 5.0\n").unwrap();
+        let (config, _) = load(Some(dir.path()));
+        assert_eq!(config.split_ratio, crate::view::panes::SPLIT_MAX);
+        std::fs::write(&path, b"schema_version: 1\nsplit_ratio: 0.01\n").unwrap();
+        let (config, _) = load(Some(dir.path()));
+        assert_eq!(config.split_ratio, crate::view::panes::SPLIT_MIN);
     }
 }

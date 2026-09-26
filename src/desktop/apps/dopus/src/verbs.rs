@@ -13,6 +13,8 @@
 //! mutates the filesystem through a file manager. `dopus.open` navigates the
 //! two panes (P1 accepted and ignored the paths).
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 pub const SERVICE: &str = "dopus";
@@ -220,6 +222,10 @@ pub enum Served {
     /// Apply the theme selection, then reply to `id` with the resolved
     /// `(scheme, mode)` names.
     ThemeSet { id: u64, scheme: Option<String>, mode: Option<String> },
+    /// Perform the theme selection of a `dopus.action theme.*` call: the
+    /// windowed twin of [`Served::ThemeSet`] (mode-toggle resolves against
+    /// the live selection; headless refuses UNAVAILABLE).
+    ThemeAction { id: u64, action: ThemeAction },
     /// Reply to `id`, then quit.
     Quit { id: u64 },
 }
@@ -285,10 +291,33 @@ pub fn scheme_action(action: ActionId) -> Option<&'static str> {
     })
 }
 
+/// The theme selection one of the `theme.*` actions performs. The windowed
+/// app resolves it against its live theme (the same performer the
+/// `dopus.theme.set` verb uses); headless refuses it — a theme with nothing
+/// to paint is a lie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThemeAction {
+    /// A `theme.scheme-*` action: the scheme by its `dopus.theme.set` name.
+    Scheme(String),
+    /// `theme.mode-toggle`: light/dark, resolved against the live selection.
+    ModeToggle,
+}
+
+/// The theme selection a `theme.*` action performs, if it is one.
+fn theme_action(action: ActionId) -> Option<ThemeAction> {
+    if action == cosmix_actions::theme::MODE_TOGGLE {
+        return Some(ThemeAction::ModeToggle);
+    }
+    scheme_action(action).map(|name| ThemeAction::Scheme(name.to_owned()))
+}
+
 /// What applying one action does. The Bus layer and the keyboard layer share
 /// this: a `dopus.action` call is a keystroke a remote caller pressed.
 pub enum Applied {
     Done,
+    /// A `theme.*` action: the windowed app performs the selection
+    /// ([`Served::ThemeAction`]); headless refuses it.
+    Theme(ThemeAction),
     Quit,
 }
 
@@ -366,6 +395,12 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
     if action == filemgr::APP_QUIT {
         return Ok(Applied::Quit);
     }
+    if let Some(theme) = theme_action(action) {
+        // The module header and `dopus.actions.list` promise these; the
+        // windowed app performs the selection (what `dopus.theme.set`
+        // takes), headless refuses it — no painter, no theme.
+        return Ok(Applied::Theme(theme));
+    }
     // The fallthrough serves two different callers' mistakes: a KNOWN
     // action that is keyboard-only until P3 (file.*/place.* — FORBIDDEN,
     // filemgr's posture) and an id nothing defines (INVALID_ARGUMENT —
@@ -408,10 +443,24 @@ pub fn action_table(keymap: &cosmix_actions::Keymap) -> Vec<ActionRow> {
         .collect()
 }
 
+/// A FILE path navigated as a pane directory lands on its PARENT —
+/// `/etc/passwd` opens `/etc`, not a permanent error status plus a persisted
+/// file path the pane can never list. Selecting the file itself is P3.
+pub fn navigable(path: PathBuf) -> PathBuf {
+    if path.exists() && !path.is_dir() {
+        return path.parent().map(Path::to_path_buf).unwrap_or(path);
+    }
+    path
+}
+
 /// Apply forwarded `dopus.open` PATHs to the panes: the first navigates the
 /// left pane, the second the right, extras are logged and ignored (the
 /// P2 open contract — the same path the windowed startup and the Bus verb
-/// take, so the two surfaces cannot drift).
+/// take, so the two surfaces cannot drift). Relative paths resolve against
+/// THIS process's cwd here — the chokepoint every Bus/open entry funnels
+/// through, so the verb, argv and forward cannot drift (main.rs absolutises
+/// its argv too; a harmless double). A file path lands on its parent
+/// ([`navigable`]).
 pub fn apply_open_paths(core: &mut DopusCore, paths: &[String]) {
     for (index, raw) in paths.iter().enumerate() {
         let pane = match index {
@@ -422,7 +471,16 @@ pub fn apply_open_paths(core: &mut DopusCore, paths: &[String]) {
                 continue;
             }
         };
-        core.navigate(pane, crate::dirs::expand_tilde(raw));
+        let expanded = crate::dirs::expand_tilde(raw);
+        let absolute = if expanded.is_relative() {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(expanded),
+                Err(_) => expanded,
+            }
+        } else {
+            expanded
+        };
+        core.navigate(pane, navigable(absolute));
     }
 }
 
@@ -511,6 +569,18 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                         command.id,
                         &ActionReply { id: req.id, ok: true, result: None },
                     )],
+                    // The theme.* actions: UNAVAILABLE on headless (the
+                    // theme.set pre-refusal's wording — the vocabulary is
+                    // real, the painter is not), performed windowed.
+                    Ok(Applied::Theme(_)) if meta.headless => vec![Served::refusal(
+                        command.id,
+                        Refusal {
+                            error_code: code::UNAVAILABLE.to_owned(),
+                            message: "theme selection needs the windowed app (headless paints nothing)".to_owned(),
+                            reason: Some("headless".to_owned()),
+                        },
+                    )],
+                    Ok(Applied::Theme(theme)) => vec![Served::ThemeAction { id: command.id, action: theme }],
                     Ok(Applied::Quit) => vec![
                         Served::reply_json(command.id, &QuitReply { quitting: true }),
                         Served::Quit { id: command.id },

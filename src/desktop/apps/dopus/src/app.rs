@@ -357,6 +357,9 @@ impl Dopus {
             Msg::PaneRows(pane, msg) => self.on_rows(pane, msg),
             Msg::Pane(pane, op) => self.on_pane_op(pane, op),
             Msg::Go(pane, path) => {
+                // Clicking away ends a location edit (same path as
+                // LocationCancel) before the navigation lands.
+                self.stop_editing();
                 self.core.navigate(pane, path);
                 Task::none()
             }
@@ -370,9 +373,16 @@ impl Dopus {
             Msg::LocationSubmit(pane) => {
                 let text = self.editing.as_ref().map(|(_, text)| text.clone()).unwrap_or_default();
                 self.stop_editing();
-                // Leading `~` expands to home; the core re-lists and
+                // An empty submit is a cancel: the bar was cleared, not
+                // aimed anywhere — navigating to "" would be a permanent
+                // error status.
+                if text.is_empty() {
+                    return Task::none();
+                }
+                // Leading `~` expands to home; a file path lands on its
+                // parent (verbs::navigable); the core re-lists and
                 // status-lines a path it cannot read.
-                self.core.navigate(pane, crate::dirs::expand_tilde(&text));
+                self.core.navigate(pane, verbs::navigable(crate::dirs::expand_tilde(&text)));
                 Task::none()
             }
             Msg::LocationCancel => {
@@ -426,7 +436,12 @@ impl Dopus {
         match msg {
             // Any press lands in the listing: clicking a pane makes it the
             // active one (the divider/keyboard follow the same core state).
-            rows::RowsMsg::Press => self.core.set_active_pane(pane),
+            // A click away from a location bar also ends its edit (the
+            // editor's own clicks swap panes cleanly before this).
+            rows::RowsMsg::Press => {
+                self.stop_editing();
+                self.core.set_active_pane(pane);
+            }
             rows::RowsMsg::Select(path) => self.core.select_path(pane, Some(path)),
             rows::RowsMsg::Toggle(path) => self.core.toggle_expand(pane, &path),
         }
@@ -534,27 +549,24 @@ impl Dopus {
             match served {
                 Served::Reply { id, rc, body } => handle.respond(id, rc, body),
                 Served::ThemeSet { id, scheme, mode } => {
-                    match self.select_theme(scheme.as_deref(), mode.as_deref()) {
-                        Ok(()) => handle.respond(
-                            id,
-                            0,
-                            serde_json::to_string(&verbs::ThemeSetReply {
-                                scheme: self.theme.scheme.name().to_owned(),
-                                mode: self.theme.mode.name().to_owned(),
-                            })
-                            .unwrap_or_default(),
-                        ),
-                        Err(message) => handle.respond(
-                            id,
-                            10,
-                            serde_json::to_string(&verbs::Refusal {
-                                error_code: verbs::code::INVALID_ARGUMENT.to_owned(),
-                                message,
-                                reason: None,
-                            })
-                            .unwrap_or_default(),
-                        ),
-                    }
+                    let result = self.select_theme(scheme.as_deref(), mode.as_deref());
+                    self.theme_reply(id, result);
+                }
+                Served::ThemeAction { id, action } => {
+                    // The same performer the `dopus.theme.set` verb uses;
+                    // mode-toggle resolves against the live selection first
+                    // (the keyboard path's rule).
+                    let result = match action {
+                        verbs::ThemeAction::Scheme(name) => self.select_theme(Some(&name), None),
+                        verbs::ThemeAction::ModeToggle => {
+                            let mode = match self.theme_override.map(|(_, m)| m).unwrap_or(self.theme.mode) {
+                                Mode::Dark => Mode::Light,
+                                _ => Mode::Dark,
+                            };
+                            self.select_theme(None, Some(mode.name()))
+                        }
+                    };
+                    self.theme_reply(id, result);
                 }
                 Served::Quit { id } => {
                     handle.respond(
@@ -562,11 +574,45 @@ impl Dopus {
                         0,
                         serde_json::to_string(&verbs::QuitReply { quitting: true }).unwrap_or_default(),
                     );
+                    // Quit terminates the batch: the whole Vec is processed
+                    // IN ORDER and everything after the FIRST Quit is
+                    // dropped — nothing past a quitting process's last
+                    // reply is answerable (serve_command never appends
+                    // after Quit today; a future verb doing so loses only
+                    // what could not have been answered anyway).
                     return self.quit();
                 }
             }
         }
         Task::none()
+    }
+
+    /// The theme performer's reply, shared by the `dopus.theme.set` verb and
+    /// the `dopus.action theme.*` actions: the resolved `(scheme, mode)`
+    /// names, or the INVALID_ARGUMENT refusal `select_theme` produced.
+    fn theme_reply(&mut self, id: u64, result: Result<(), String>) {
+        let Some(bus) = &self.bus else { return };
+        match result {
+            Ok(()) => bus.respond(
+                id,
+                0,
+                serde_json::to_string(&verbs::ThemeSetReply {
+                    scheme: self.theme.scheme.name().to_owned(),
+                    mode: self.theme.mode.name().to_owned(),
+                })
+                .unwrap_or_default(),
+            ),
+            Err(message) => bus.respond(
+                id,
+                10,
+                serde_json::to_string(&verbs::Refusal {
+                    error_code: verbs::code::INVALID_ARGUMENT.to_owned(),
+                    message,
+                    reason: None,
+                })
+                .unwrap_or_default(),
+            ),
+        }
     }
 
     /// The keyboard/menu path: `theme.*` here, everything else through the
@@ -591,6 +637,22 @@ impl Dopus {
             }
             match verbs::apply_action(*action, &mut self.core) {
                 Ok(verbs::Applied::Done) => {}
+                // Unreachable from this path (the theme pre-filter above
+                // consumed every theme id) but the shared layer must stay
+                // exhaustive: perform the selection the same way the Bus
+                // arm does.
+                Ok(verbs::Applied::Theme(action)) => {
+                    let _ = match action {
+                        verbs::ThemeAction::Scheme(name) => self.select_theme(Some(&name), None),
+                        verbs::ThemeAction::ModeToggle => {
+                            let mode = match self.theme_override.map(|(_, m)| m).unwrap_or(self.theme.mode) {
+                                Mode::Dark => Mode::Light,
+                                _ => Mode::Dark,
+                            };
+                            self.select_theme(None, Some(mode.name()))
+                        }
+                    };
+                }
                 Ok(verbs::Applied::Quit) => quit = true,
                 Err(refusal) => self.status = Some(refusal.message),
             }
