@@ -77,8 +77,8 @@ The principal identifier wrappers are `SetId`, `ContainerId`, `ItemId`, and `Blo
 `blob::put_path` ingests a local file under a `PutMode`:
 
 - `Copy` — plain userspace copy.
-- `Reflink` — kernel-side copy (`FICLONE`, then `copy_file_range`) that falls through to a full copy on `EOPNOTSUPP`, `EXDEV`, `EINVAL`, or `ENOSYS`; it never fails merely because the filesystem lacks reflink support.
-- `HardLink` — links the source inode into the CAS; only callers that promise the source path immutable from the call onward may use it. A mutable path such as a filesd place must use `Copy` or `Reflink`.
+- `Reflink` — kernel-side copy (`FICLONE`, then `copy_file_range`) that falls through to a full copy on **any** kernel-path error, never merely because the filesystem lacks reflink support: no errno allowlist anticipates every refusal (OpenZFS with block cloning disabled answers `FICLONE` with `EPERM`, and a container's seccomp profile can refuse the ioctl outright — both caught on the build cluster, 2026-09-26). The userspace copy that follows either succeeds or surfaces the real error itself.
+- `HardLink` — links the source inode into the CAS; only callers that promise the source path immutable from the call onward may use it. A mutable path such as a filesd place must use `Copy` or `Reflink`. The staged link is touched to now before it commits (the inode is shared, so the source's mtime moves with it — an mtime is not content).
 
 Every mode re-hashes the staged bytes against the ingest-time hash before they are linked in, so a source rewritten mid-copy cannot enter the store under a stale hash. `SqliteCasMds::blobs_root` is public, so an out-of-process CAS owner reaches `blob::put_path` and `blob::open` with the same root the store itself uses.
 
