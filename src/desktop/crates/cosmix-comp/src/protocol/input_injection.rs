@@ -143,6 +143,7 @@ impl Default for InjectionState {
 }
 
 pub(super) struct SequenceRun {
+    uses_agent: bool,
     steps: VecDeque<SequenceStep>,
     index: usize,
     /// The front step's delay has elapsed.
@@ -306,6 +307,10 @@ impl WaylandState {
         }
         let pointer = self.human.pointer.clone();
         self.human.delivery.button_delivery = self.delivery_target(false);
+        if state == HostButtonState::Pressed
+            && self.human.delivery.button_delivery != Some((id, generation)) {
+            return;
+        }
         pointer.button(
             self,
             &ButtonEvent {
@@ -502,6 +507,10 @@ impl WaylandState {
             }
             InputOp::PointerButton { button, action } => {
                 for state in press_states(*action) {
+                    if seat == SeatKind::Agent && *state == HostButtonState::Pressed && target_window.is_some()
+                        && self.delivery_target_on(seat, false) != target_window {
+                        return ControlReply::refused("target_changed", json!({}));
+                    }
                     let input = HostInput::PointerButton {
                         button: *button,
                         state: *state,
@@ -589,7 +598,8 @@ impl WaylandState {
                         events.push((*modifier, HostButtonState::Released, false));
                     }
                 }
-                key_result = self.inject_keys(seat, events, target_window, time);
+                let delivery = target_window.or_else(|| (seat == SeatKind::Agent).then(|| self.delivery_target_on(seat, true)).flatten());
+                key_result = self.inject_keys(seat, events, delivery, time);
                 (InjectedKind::Key, true)
             }
             InputOp::Text(text) => {
@@ -628,7 +638,8 @@ impl WaylandState {
                         events.push((shift, HostButtonState::Released, false));
                     }
                 }
-                key_result = self.inject_keys(seat, events, target_window, time);
+                let delivery = target_window.or_else(|| (seat == SeatKind::Agent).then(|| self.delivery_target_on(seat, true)).flatten());
+                key_result = self.inject_keys(seat, events, delivery, time);
                 (InjectedKind::Text, true)
             }
             InputOp::ReleaseAll => {
@@ -830,6 +841,7 @@ impl WaylandState {
         let root = canonical_root_surface(&self.popup_manager, &surface);
         self.surfaces
             .get(&root.id())
+            .filter(|record| seat == SeatKind::Human || record.mapped)
             .map(|record| (record.id.0, record.generation))
     }
 
@@ -957,6 +969,7 @@ impl WaylandState {
                 self.injection.sequences.insert(
                     id,
                     SequenceRun {
+                        uses_agent: steps.iter().any(|step| matches!(step.op, InputOp::OnSeat { seat: SeatKind::Agent, .. })),
                         steps: steps.into(),
                         index: 0,
                         delay_elapsed: false,
@@ -988,6 +1001,17 @@ impl WaylandState {
             self.release_holds(seat, orphaned, monotonic_millis());
         }
         Some(run)
+    }
+
+    pub(super) fn cancel_agent_sequences(&mut self) {
+        let runs = self.injection.sequences.iter().filter_map(|(&id, run)| run.uses_agent.then_some(id)).collect::<Vec<_>>();
+        for id in runs {
+            if let Some(run) = self.abort_sequence(id) {
+                let _ = run.reply.send(ControlReply::refused("input_cleared", json!({
+                    "seat":"agent", "completed":run.replies, "released":true,
+                })));
+            }
+        }
     }
 
     fn arm_sequence_timer(&mut self, id: u64, delay: Duration, elapses_delay: bool) {

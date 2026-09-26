@@ -8187,7 +8187,7 @@ impl WaylandState {
     }
 
     fn teardown_input_for_session_lock(&mut self) {
-        self.clear_agent_input_for_lock();
+        self.clear_agent_input();
         #[cfg(feature = "bus")]
         self.finish_region_selection(crate::port::ControlReply::Locked);
         #[cfg(feature = "bus")]
@@ -9091,6 +9091,7 @@ impl WaylandState {
                 self.release_pressed_keys();
             }
             HostInput::KeyboardFocusLostKeepingKeys => {
+                self.clear_agent_input();
                 self.cancel_chrome_pointer_grab(true);
                 self.update_chrome_hover(None);
                 self.set_chrome_cursor_override(None);
@@ -9130,7 +9131,9 @@ impl WaylandState {
         }
     }
 
-    fn clear_agent_input_for_lock(&mut self) {
+    fn clear_agent_input(&mut self) {
+        #[cfg(feature = "bus")]
+        self.cancel_agent_sequences();
         self.agent.last_keyboard_action = None;
         let keyboard = self.agent.keyboard.clone();
         let pointer = self.agent.pointer.clone();
@@ -9152,7 +9155,11 @@ impl WaylandState {
             });
         }
         #[cfg(feature = "bus")]
-        { self.agent.held = Default::default(); }
+        {
+            self.agent.held = Default::default();
+            self.agent.delivery = Default::default();
+            self.agent.pointer_position = None;
+        }
         keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         pointer.motion(self, None, &MotionEvent {
             location: pointer.current_location(),
@@ -10815,6 +10822,8 @@ impl WaylandState {
                 self.clear_focus_for_surface(&surface);
             }
         }
+        #[cfg(feature = "bus")]
+        self.reconcile_agent_focus();
     }
 
     fn commit_subsurface_stack(&mut self, parent: &WlSurface) -> bool {
@@ -12550,6 +12559,7 @@ impl WaylandState {
     /// loss: a pause-specific variant would be the first place the two disagree
     /// about what a stuck modifier means.
     fn release_pressed_keys(&mut self) {
+        self.clear_agent_input();
         let keyboard = self.human.keyboard.clone();
         let pressed_keys = keyboard.pressed_keys();
         if !pressed_keys.is_empty() {
@@ -12566,6 +12576,7 @@ impl WaylandState {
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     fn reconcile_all_input_authority_loss(&mut self) {
+        self.clear_agent_input();
         #[cfg(feature = "bus")]
         self.abandon_region_input();
         self.cancel_chrome_pointer_grab(true);
@@ -12731,6 +12742,7 @@ impl WaylandState {
                 }
             }
             BindingAction::SwitchVt(vt) => {
+                self.clear_agent_input();
                 debug_assert!(!action.needs_ecs());
                 if let Some(request) = self.vt_switch_requested.as_ref() {
                     request(vt);

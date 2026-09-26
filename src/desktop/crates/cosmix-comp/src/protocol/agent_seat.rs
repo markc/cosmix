@@ -131,7 +131,7 @@ impl WaylandState {
         ))
     }
 
-    fn agent_tree_mapped(&self, mut record: &SurfaceRecord) -> bool {
+    fn agent_tree_mapped<'a>(&'a self, mut record: &'a SurfaceRecord) -> bool {
         loop {
             if !record.mapped || matches!(record.role, SurfaceRole::Dormant(_)) { return false; }
             if matches!(record.role, SurfaceRole::Subsurface { .. }) && !record.parent_association_committed { return false; }
@@ -139,6 +139,16 @@ impl WaylandState {
             let Some(parent) = self.surface_objects.get(&parent).and_then(|object| self.surfaces.get(object)) else { return false };
             record = parent;
         }
+    }
+
+    pub(super) fn reconcile_agent_focus(&mut self) {
+        let invalid = [
+            self.agent.keyboard.current_focus().and_then(|target| target.owned_surface()),
+            self.agent.pointer.current_focus().and_then(|target| target.owned_surface()),
+        ].into_iter().flatten().any(|surface| {
+            self.surfaces.get(&surface.id()).is_none_or(|record| !self.agent_tree_mapped(record))
+        });
+        if invalid { self.clear_agent_input(); }
     }
 
     fn agent_motion(&mut self, focus: Option<(SeatFocusTarget, Point<f64, Logical>)>, position: (f64, f64), time: u32) {
