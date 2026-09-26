@@ -548,11 +548,22 @@ impl Dopus {
                     }
                 }
                 CoreEvent::OpenFile(path) => {
-                    if let Err(error) = std::process::Command::new("xdg-open").arg(&path).spawn() {
-                        self.status = Some(format!(
-                            "Opening {}: {error}",
-                            cosmix_dopus_core::sanitise_display_path(&path)
-                        ));
+                    match std::process::Command::new("xdg-open").arg(&path).spawn() {
+                        Ok(mut child) => {
+                            // Reap off the UI thread: an unreaped Child stays
+                            // a zombie until dopus exits. One detached wait
+                            // per open; the UI stays fire-and-forget.
+                            std::thread::Builder::new()
+                                .name("dopus-xdg-open-reap".to_owned())
+                                .spawn(move || drop(child.wait()))
+                                .expect("spawning the xdg-open reaper");
+                        }
+                        Err(error) => {
+                            self.status = Some(format!(
+                                "Opening {}: {error}",
+                                cosmix_dopus_core::sanitise_display_path(&path)
+                            ));
+                        }
                     }
                 }
                 CoreEvent::Status { text, .. } => self.status = Some(text),
@@ -598,10 +609,24 @@ impl Dopus {
             }
             DialogMsg::Submit => self.submit_prompt(),
             DialogMsg::Dismiss => {
-                let Some(dialogs::Dialog::Prompt { token, .. }) = &self.dialog else { return Task::none() };
-                let token = *token;
-                self.core.prompt_text(token, None);
-                self.advance_dialog()
+                // A scrim press lands on BOTH dialog kinds (dialogs.rs's
+                // frame wraps them alike): fail-closed each way — a
+                // dismissed confirm is No (the dialogs.rs law), a dismissed
+                // prompt is `prompt_text(token, None)`. Nothing runs either
+                // way.
+                match &self.dialog {
+                    Some(dialogs::Dialog::Confirm { token, .. }) => {
+                        let token = *token;
+                        self.core.confirm(token, ConfirmAnswer::No);
+                        self.advance_dialog()
+                    }
+                    Some(dialogs::Dialog::Prompt { token, .. }) => {
+                        let token = *token;
+                        self.core.prompt_text(token, None);
+                        self.advance_dialog()
+                    }
+                    None => Task::none(),
+                }
             }
         }
     }

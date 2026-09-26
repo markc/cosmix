@@ -78,6 +78,10 @@ pub struct Router {
     /// The modal scope name while a dialog owns the keyboard
     /// ([`MODAL_SCOPE`]); `None` otherwise.
     pub modal: Option<&'static str>,
+    /// An IME composition is in flight (a non-empty preedit): the modal
+    /// capture must leave Enter to the field — the keystroke COMMITS the
+    /// composition, it does not confirm the dialog.
+    pub composing: bool,
 }
 
 pub type SharedRouter = Arc<Mutex<Router>>;
@@ -95,6 +99,7 @@ pub fn initial(custom_path: Option<&Path>) -> Result<SharedRouter, String> {
         state: ResolveState::default(),
         focus_editable: false,
         modal: None,
+        composing: false,
     })))
 }
 
@@ -132,10 +137,37 @@ pub fn set_modal(shared: &SharedRouter, open: bool) {
 /// flag from [`Router::focus_editable`].
 fn focus_context(router: &Router) -> FocusContext {
     match router.modal {
-        // MODAL_SCOPE is a checked-in constant, so the validator never
-        // refuses it here.
-        Some(scope) => FocusContext::modal(scope).unwrap_or_else(|_| FocusContext::global()),
+        // MODAL_SCOPE is a checked-in constant (the one-line test pins the
+        // validator's Ok), so this cannot fail.
+        Some(scope) => FocusContext::modal(scope).expect("dopus.dialog is a valid modal scope"),
         None => FocusContext::global().with_editable(router.focus_editable),
+    }
+}
+
+/// Fold an IME event into the router's composition flag (iced 0.14's
+/// `Event::InputMethod(input_method::Event)`; ced's editor/widget.rs:440 is
+/// the precedent): a non-empty preedit opens the composition, an empty one
+/// clears the preedit, and `Commit`/`Closed` end it outright. `Opened` only
+/// enables the input method — no composition is in flight yet.
+fn note_ime(shared: &SharedRouter, event: &iced::advanced::input_method::Event) {
+    use iced::advanced::input_method;
+    let next = match event {
+        input_method::Event::Preedit(text, _) => !text.is_empty(),
+        input_method::Event::Commit(_) | input_method::Event::Closed | input_method::Event::Opened => false,
+    };
+    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    router.composing = next;
+}
+
+/// The modal key a captured stroke maps to, if any. Enter confirms only
+/// OUTSIDE a composition — a composing Enter commits into the focused
+/// field (the IME guard) — while Escape may still dismiss (cancelling the
+/// composition is the field's business, as in ced's editor).
+fn modal_key(key: &Key, composing: bool) -> Option<ModalKey> {
+    match key {
+        Key::Named(Named::Enter) if !composing => Some(ModalKey::Confirm),
+        Key::Named(Named::Escape) => Some(ModalKey::Dismiss),
+        _ => None,
     }
 }
 
@@ -311,6 +343,12 @@ impl<'a, Message, Theme, Renderer> KeyRouter<'a, Message, Theme, Renderer> {
         self.on_modal_key = Some(Box::new(f));
         self
     }
+
+    /// Whether an IME composition is in flight ([`Router::composing`], fed
+    /// by [`note_ime`]).
+    fn composing(&self) -> bool {
+        self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).composing
+    }
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for KeyRouter<'_, Message, Theme, Renderer>
@@ -357,20 +395,27 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // Track IME composition BEFORE the modal capture: a live preedit
+        // turns the next Enter into a commit for the focused field, and the
+        // capture must know it. The event itself still reaches the children
+        // (the field owns the composition).
+        if let Event::InputMethod(ime) = event {
+            note_ime(&self.shared, ime);
+        }
         // A dialog owns Enter and Escape outright (location.rs's `Capture`
         // rule, dialog-wide): publish them before any child — the prompt's
         // text field included — can react, and let every other keystroke
-        // through to whoever holds focus.
+        // through to whoever holds focus. OS repeats never capture: a held
+        // Enter must not confirm the dialog (cosmix-actions'
+        // RepeatPolicy::Ignore names dialogs for exactly this; the capture
+        // bypasses the resolver, so the check lives here).
         if self.modal
-            && let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
+            && let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, repeat, .. }) = event
+            && !repeat
             && !modifiers.control()
             && !modifiers.alt()
             && !modifiers.logo()
-            && let Some(modal_key) = match key {
-                Key::Named(Named::Enter) => Some(ModalKey::Confirm),
-                Key::Named(Named::Escape) => Some(ModalKey::Dismiss),
-                _ => None,
-            }
+            && let Some(modal_key) = modal_key(key, self.composing())
             && let Some(on_modal_key) = &self.on_modal_key
         {
             shell.publish(on_modal_key(modal_key));
@@ -566,6 +611,29 @@ mod tests {
             let resolved = resolve(input, &context, &router.keymap, &mut state, tick());
             assert!(resolved.actions.is_empty(), "{text} fired under a modal");
         }
+    }
+
+    #[test]
+    fn the_modal_scope_is_a_valid_scope_name() {
+        // focus_context() expects on this: the checked-in constant must
+        // stay inside the validator's grammar forever.
+        assert!(FocusContext::modal(MODAL_SCOPE).is_ok());
+    }
+
+    #[test]
+    fn enter_confirms_only_outside_a_composition() {
+        assert_eq!(modal_key(&Key::Named(Named::Enter), false), Some(ModalKey::Confirm));
+        assert_eq!(
+            modal_key(&Key::Named(Named::Enter), true),
+            None,
+            "a composing Enter commits into the field, never the dialog"
+        );
+        assert_eq!(
+            modal_key(&Key::Named(Named::Escape), true),
+            Some(ModalKey::Dismiss),
+            "Escape may still dismiss; composition cancel is the field's business"
+        );
+        assert_eq!(modal_key(&Key::Character("x".into()), false), None);
     }
 
     #[test]

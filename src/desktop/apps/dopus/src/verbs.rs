@@ -255,7 +255,7 @@ impl Served {
 /// The action table: `(action, label)`. `app.quit` is served; the `file.*`
 /// operations are keyboard-only (the Bus arm refuses every `file.*` — see
 /// the module header), so they appear here for the keyboard path and
-/// `dopus.actions.list` only; their `enabled` flag is per-frame from the
+/// `dopus.actions.list` only; their `enabled` flag is per-call from the
 /// core's availability ([`apply_availability`]).
 pub const ACTIONS: &[(ActionId, &str)] = &[
     (filemgr::FILE_OPEN, "Open the selection"),
@@ -343,6 +343,20 @@ fn gated(message: &str) -> Refusal {
     }
 }
 
+/// Whether the core already holds a NewFolder or Rename reservation (its
+/// `begin_*` verbs return silently then — browser.rs's single name edit).
+/// Both callers refuse up front instead: [`gated`] forbids propagating a
+/// silent nothing as `Ok(Done)` (the 200 ms flush window would surface it
+/// as a hollow success).
+fn name_edit_pending(core: &DopusCore) -> bool {
+    core.outstanding_reservations().iter().any(|(_, kind)| {
+        matches!(
+            kind,
+            cosmix_dopus_core::ReservationKind::NewFolder | cosmix_dopus_core::ReservationKind::Rename
+        )
+    })
+}
+
 /// Apply one action to the core. Everything pane-targeted acts on the ACTIVE
 /// pane (the keyboard and the Bus are one keystroke each); the pane headers
 /// activate their pane first (the app calls `set_active_pane` before these).
@@ -373,6 +387,9 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
         if availability.operation_running {
             return Err(busy());
         }
+        if name_edit_pending(core) {
+            return Err(gated("A name edit is already pending"));
+        }
         core.begin_new_folder();
         return done;
     }
@@ -382,6 +399,9 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
         }
         if availability.operation_running {
             return Err(busy());
+        }
+        if name_edit_pending(core) {
+            return Err(gated("A name edit is already pending"));
         }
         core.begin_rename();
         return done;
@@ -511,8 +531,9 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
 /// (P3): a `file.*` row the current state cannot take reads as disabled —
 /// no selection, or an operation holding the single-flight slot — and the
 /// keyboard path agrees ([`apply_action`] refuses with the same verdict).
-/// Everything non-file stays enabled. Applied per frame by the windowed
-/// app and per call by `dopus.actions.list` ([`serve_command`]).
+/// Everything non-file stays enabled. Applied per `dopus.actions.list`
+/// call from [`serve_command`]; the windowed action table is built once at
+/// boot and renders nothing yet.
 pub fn apply_availability(actions: &mut [ActionRow], availability: &cosmix_dopus_core::AvailabilitySnapshot) {
     for row in actions {
         let selection = availability.has_selection;

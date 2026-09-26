@@ -143,7 +143,8 @@ try
     "dopus.ping: " .. json_encode($pong))
   $desc = ok('dopus.describe', {})
   check($desc.contract == "ctk-app-control.v0" and $desc.app == "dopus" and $desc.engine == "iced"
-    and contains(join($desc.verbs, " "), "dopus.state"), "dopus.describe: " .. json_encode($desc))
+    and contains(join($desc.verbs, " "), "dopus.state") and contains($desc.description, "P3"),
+    "dopus.describe: " .. json_encode($desc))
 
   -- 1. boot: two panes, both at home, pane 0 active, name ascending
   $info = ok('dopus.info', {})
@@ -229,6 +230,47 @@ try
   $active = if pane(0).active then pane(0) else pane(1) end
   check($active.selected != nil, "selection.first selected nothing: " .. json_encode($active))
 
+  -- 9b. the availability flags are not vacuous: exercise BOTH states
+  -- through real core transitions. Availability is ACTIVE-pane scoped, and
+  -- §9/F6 left pane 1 active with its §9 selection — flip to pane 0 first,
+  -- then navigate it to gamma (EMPTY — selection clears on nav): nothing
+  -- to act on, every selection-taking file.* row reads disabled;
+  -- file.new-folder stays ENABLED (it needs only the idle single-flight
+  -- slot — a new folder is exactly what an empty dir is for). Back on
+  -- alpha with a fresh selection, all six read enabled.
+  act("nav.switch-pane")
+  ok('dopus.open paths=[$a.g]', {g: $gamma})
+  $acts = ok('dopus.actions.list', {})
+  $disabled = 0
+  for each $row in $acts.actions
+    if starts_with($row.id, "file.") then
+      if $row.id == "file.new-folder" then
+        check($row.enabled, "new-folder must stay enabled in an empty dir: " .. json_encode($row))
+      else
+        check(not $row.enabled, $row.id .. " must be disabled without a selection: " .. json_encode($row))
+        $disabled = $disabled + 1
+      end
+    end
+  end
+  check($disabled == 5, "expected 5 disabled file rows in an empty dir, got " .. to_string($disabled))
+  ok('dopus.open paths=[$a.l]', {l: $alpha})
+  $relisted = false
+  for each $i in range(1, 25)
+    if pane(0).rows > 0 then $relisted = true; break end
+    sleep(0.2)
+  end
+  check($relisted, "alpha listing never came back in 5 s: " .. json_encode(pane(0)))
+  act("selection.next")
+  $acts = ok('dopus.actions.list', {})
+  $enabled = 0
+  for each $row in $acts.actions
+    if starts_with($row.id, "file.") then
+      check($row.enabled, $row.id .. " must be enabled with a selection: " .. json_encode($row))
+      $enabled = $enabled + 1
+    end
+  end
+  check($enabled == 6, "expected 6 enabled file rows with a selection, got " .. to_string($enabled))
+
   -- 10. refusals stay honest
   refused('dopus.action id="no.such-action"', {}, "INVALID_ARGUMENT")
   refused('dopus.frobnicate', {}, "UNKNOWN_VERB")
@@ -247,7 +289,9 @@ try
   -- Bus. The file operations are keyboard + dialog only in the windowed
   -- app; the Bus never mutates the filesystem, permanently — listed in
   -- dopus.actions.list for the keyboard path is NOT served on the wire.
-  refused('dopus.action id="file.open"', {}, "FORBIDDEN")
+  -- The wording is part of the posture: the refusal names the law itself.
+  $forbidden = refused('dopus.action id="file.open"', {}, "FORBIDDEN")
+  check(contains($forbidden.message, "never mutates"), "FORBIDDEN wording: " .. json_encode($forbidden))
   refused('dopus.action id="file.new-folder"', {}, "FORBIDDEN")
   refused('dopus.action id="file.rename"', {}, "FORBIDDEN")
   refused('dopus.action id="file.copy-other-pane"', {}, "FORBIDDEN")
@@ -291,7 +335,7 @@ try
   end
   check($exited, "dopus still running 10 s after dopus.quit")
   $dopus_pid = nil
-  print("PASS dopus headless e2e: boot twin-pane state, dopus.open pane routing + extras ignored + tilde, F6, active-pane sort (law 5 toggle)/hidden/nav/selection, refusals (unknown action/verb, theme.set + theme.*), P3 posture (all six file.* FORBIDDEN, state shape unchanged, actions.list availability flags), single instance, reply-then-exit quit")
+  print("PASS dopus headless e2e: boot twin-pane state, dopus.open pane routing + extras ignored + tilde, F6, active-pane sort (law 5 toggle)/hidden/nav/selection, refusals (unknown action/verb, theme.set + theme.*), P3 posture (all six file.* FORBIDDEN, state shape unchanged, actions.list availability both ways: empty-dir disabled, selected enabled), single instance, reply-then-exit quit")
 catch $err
   for each $log in glob($tmp .. "/*.log")
     print("--- " .. $log .. "\n" .. read_file($log))
