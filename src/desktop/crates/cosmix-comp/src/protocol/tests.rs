@@ -1178,6 +1178,10 @@ struct RegistryGlobals {
 }
 
 impl RegistryGlobals {
+    fn record_announcement(&mut self, interface: String, global: (u32, u32)) {
+        self.by_interface.entry(interface).or_default().push(global);
+    }
+
     fn all(&self, interface: &str) -> &[(u32, u32)] {
         self.by_interface.get(interface).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -1235,7 +1239,7 @@ fn registry_globals_for(
                 .try_into()
                 .expect("global version"),
         );
-        globals.by_interface.entry(interface).or_default().push((name, version));
+        globals.record_announcement(interface, (name, version));
     }
     panic!("registry callback {callback_id} did not complete");
 }
@@ -1295,6 +1299,19 @@ fn registry_singleton_rejects_duplicate_interfaces() {
     globals.by_interface.insert("wl_seat".into(), vec![(1, 9), (2, 9)]);
     assert_eq!(globals.all("wl_seat"), &[(1, 9), (2, 9)]);
     assert!(std::panic::catch_unwind(|| globals["wl_seat"]).is_err());
+}
+
+#[test]
+fn registry_late_announcements_append_without_hiding_ambiguity() {
+    let mut globals = RegistryGlobals::default();
+    globals.record_announcement("wl_compositor".into(), (1, 5));
+    assert_eq!(globals.get("wl_output"), None);
+    globals.record_announcement("wl_output".into(), (2, 4));
+    assert_eq!(globals.get("wl_output"), Some(&(2, 4)));
+    globals.record_announcement("wl_output".into(), (3, 4));
+    assert_eq!(globals.all("wl_output"), &[(2, 4), (3, 4)]);
+    assert!(std::panic::catch_unwind(|| globals["wl_output"]).is_err());
+    assert_eq!(globals["wl_compositor"], (1, 5));
 }
 
 #[test]
@@ -41661,6 +41678,10 @@ impl ScreencopyWireHarness {
 
     fn new_first_light() -> (Self, crate::backend::render::tests::FirstLightCaptureDriver) {
         let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+        assert!(
+            harness.registry_globals.all("wl_output").is_empty(),
+            "first-light KMS starts without an advertised output"
+        );
         let key = kms_security_test_key(226, "Blocked-1");
         submit_kms_security_lifecycle(
             &mut harness,
@@ -41683,11 +41704,23 @@ impl ScreencopyWireHarness {
             state.backend.kms_output_is_ready(1, &key)
         });
         let announced = harness.sync();
-        let output_global = registry_global_from_events(&announced, 2, "wl_output")
-            .expect("first-light KMS output is announced");
-        harness
-            .registry_globals
-            .insert("wl_output".into(), output_global);
+        // Retain every late announcement, just like the initial registry read.
+        // This fixture admits exactly one output; never replace an earlier one
+        // or hide a second announcement behind a first/last-wins lookup.
+        for event in &announced {
+            if let Some(global) =
+                registry_global_from_events(std::slice::from_ref(event), 2, "wl_output")
+            {
+                harness
+                    .registry_globals
+                    .record_announcement("wl_output".into(), global);
+            }
+        }
+        assert_eq!(
+            harness.registry_globals.all("wl_output").len(),
+            1,
+            "first-light KMS announces exactly one output"
+        );
 
         let feed = harness.take_renderer_feed();
         let driver = crate::backend::render::tests::first_light_capture_driver(feed);

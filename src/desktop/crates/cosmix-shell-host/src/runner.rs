@@ -2824,20 +2824,14 @@ impl SeatHandler for RunnerState {
         capability: Capability,
     ) {
         match capability {
-            Capability::Pointer => {
-                if !self.pointer_seats.contains(&seat) {
-                    self.pointer_seats.push(seat);
-                }
+            Capability::Pointer if !self.pointer_seats.contains(&seat) => {
+                self.pointer_seats.push(seat);
             }
-            Capability::Keyboard => {
-                if !self.keyboard_seats.contains(&seat) {
-                    self.keyboard_seats.push(seat);
-                }
+            Capability::Keyboard if !self.keyboard_seats.contains(&seat) => {
+                self.keyboard_seats.push(seat);
             }
-            Capability::Touch => {
-                if !self.touch_seats.contains(&seat) {
-                    self.touch_seats.push(seat);
-                }
+            Capability::Touch if !self.touch_seats.contains(&seat) => {
+                self.touch_seats.push(seat);
             }
             _ => {}
         }
