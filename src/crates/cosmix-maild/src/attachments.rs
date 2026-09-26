@@ -259,6 +259,8 @@ fn inspect_inner(data: &[u8], selected: Option<&str>, body_values: bool) -> Resu
         .ok_or_else(|| Error::Unreadable("cannot parse message".into()))?;
     let mut walker = Walker {
         count: 0,
+        decoded_bytes: 0,
+        reparse_depth: 0,
         selected,
         body_values,
         result: Inspection {
@@ -275,12 +277,22 @@ fn inspect_inner(data: &[u8], selected: Option<&str>, body_values: bool) -> Resu
 
 struct Walker<'a> {
     count: usize,
+    decoded_bytes: usize,
+    reparse_depth: usize,
     selected: Option<&'a str>,
     body_values: bool,
     result: Inspection,
 }
 
 impl Walker<'_> {
+    fn charge(&mut self, bytes: usize) -> Result<(), Error> {
+        self.decoded_bytes = self.decoded_bytes.saturating_add(bytes);
+        if self.decoded_bytes > 2 * MAX_MESSAGE {
+            return Err(Error::TooLarge("MIME decoded-byte budget (128 MiB)"));
+        }
+        Ok(())
+    }
+
     fn visit(
         &mut self,
         message: &Message<'_>,
@@ -311,6 +323,7 @@ impl Walker<'_> {
                 Err(Error::Unreadable(_)) => { undecodable = true; None }
                 Err(e) => return Err(e),
             };
+            if let Some(bytes) = &bytes { self.charge(bytes.len())?; }
             let text = !embedded
                 && !attachment
                 && !attached_parent
@@ -382,15 +395,27 @@ impl Walker<'_> {
                     )?;
                 }
             }
-            PartType::Message(inner) => self.visit(
+            PartType::Message(inner) => {
+                // Account for the parser's owned decoded embedded buffer too.
+                if matches!(inner.raw_message, std::borrow::Cow::Owned(_)) {
+                    self.charge(inner.raw_message.len())?;
+                }
+                self.visit(
                 inner,
                 0,
                 format!("{path}.1"),
                 true,
                 attached_parent || attachment,
-            )?,
+                )?;
+            }
             _ if part.is_content_type("message", "rfc822") => {
+                if self.reparse_depth >= 2 {
+                    return Err(Error::TooLarge("MIME encoded re-parse limit (2)"));
+                }
                 let bytes = decoded(message, part)?;
+                self.charge(bytes.len())?;
+                structure_preflight(&bytes)?;
+                self.reparse_depth += 1;
                 let inner = MessageParser::default()
                     .parse(&bytes)
                     .ok_or_else(|| Error::Unreadable("cannot parse embedded message".into()))?;
@@ -401,6 +426,7 @@ impl Walker<'_> {
                     true,
                     attached_parent || attachment,
                 )?;
+                self.reparse_depth -= 1;
             }
             _ => (),
         }
@@ -411,6 +437,28 @@ impl Walker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_printable_nesting_has_one_global_decoded_budget() {
+        let mut raw = format!("Content-Type: text/plain\r\n\r\n{}", "x".repeat(22 * 1024 * 1024));
+        for _ in 0..6 {
+            raw = format!("Content-Type: message/rfc822\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n{raw}");
+        }
+        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME decoded-byte budget (128 MiB)"));
+    }
+
+    #[test]
+    fn encoded_reparse_depth_is_bounded() {
+        use base64::Engine;
+        let mut raw = "Content-Type: text/plain\r\n\r\nx".to_owned();
+        for _ in 0..16 {
+            raw = format!("Content-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+                base64::engine::general_purpose::STANDARD.encode(raw));
+        }
+        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME encoded re-parse limit (2)"));
+    }
 
     #[test]
     fn preflight_refuses_unencoded_nesting_before_parse_and_walker_bounds_multipart() {
