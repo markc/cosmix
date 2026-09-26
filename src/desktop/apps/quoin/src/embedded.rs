@@ -158,7 +158,10 @@ impl EmbeddedQuoinPlugin {
                 .in_set(ShellRuntimeSet::Input)
                 .before(crate::bus_service::ShellBusDispatch),
         )
-            .add_systems(Update, present.in_set(ShellRuntimeSet::Host))
+            .add_systems(
+                Update,
+                (present, present_dialog).chain().in_set(ShellRuntimeSet::Host),
+            )
             .add_observer(grip_start)
             .add_observer(grip_move)
             .add_observer(grip_end)
@@ -411,6 +414,59 @@ fn present(
         }
     }
 }
+
+/// The dialog (scene-editor plan §4.3 Q2) in comp's renderer: the chrome
+/// root, centred in the canvas the docked panels leave, above every panel
+/// band, and an input region like a panel's. `origin` tells
+/// `shell.scene.layout` where it is.
+fn present_dialog(
+    mut commands: Commands,
+    output: Res<EmbeddedOutput>,
+    frame: Res<ShellFrameState>,
+    mut dialog: ResMut<cosmix_shell::chrome::dialog::QuoinDialog>,
+    mut regions: ResMut<EmbeddedPanelRegions>,
+    mut nodes: Query<(&mut Node, Option<&UiTargetCamera>)>,
+) {
+    let placed = match (output.active, output.camera, dialog.root, dialog.size()) {
+        (true, Some(camera), Some(root), Some(size)) if dialog.wants_surface() => {
+            let canvas = panel_layout(&frame.0).canvas;
+            let origin = (Vec2::new(canvas.x, canvas.y)
+                + (Vec2::new(canvas.width, canvas.height) - size) / 2.0)
+                .round();
+            if let Ok((mut node, target)) = nodes.get_mut(root) {
+                let desired = (
+                    PositionType::Absolute,
+                    px(origin.x),
+                    px(origin.y),
+                    px(size.x),
+                    px(size.y),
+                );
+                if (node.position_type, node.left, node.top, node.width, node.height) != desired {
+                    (node.position_type, node.left, node.top, node.width, node.height) = desired;
+                }
+                if target.is_none_or(|target| target.0 != camera) {
+                    commands
+                        .entity(root)
+                        .insert((UiTargetCamera(camera), GlobalZIndex(DIALOG_Z_INDEX)));
+                }
+            }
+            regions.0.push(PanelRect {
+                x: origin.x,
+                y: origin.y,
+                width: size.x,
+                height: size.y,
+            });
+            Some(origin)
+        }
+        _ => None,
+    };
+    if dialog.origin != placed {
+        dialog.origin = placed;
+    }
+}
+
+/// Above the highest panel band (`panel_z_index` tops out below 200).
+const DIALOG_Z_INDEX: i32 = 300;
 
 #[cfg(test)]
 mod tests {

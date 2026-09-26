@@ -47,19 +47,16 @@ use winit::keyboard::PhysicalKey;
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use xkbcommon::xkb;
 
-/// What an input target is (scene-editor plan §4.3 Q2, frozen in Stage S).
+/// What an input target is (scene-editor plan §4.3 Q2).
 ///
-/// `SurfaceTarget` below is still edge-typed: every consumer reads `edge`
-/// as panel semantics (keyboard enter → `PanelInput`, pointer-leave, resize
-/// grips, reveal/hold/hide, and the edge/thickness coordinate mapping in
-/// `output_logical_position`). Q2 replaces its `edge`, `thickness` and
-/// `committed_margin` fields with `kind: SurfaceKind`, so the dialog can join
-/// `surface_targets()` without driving a panel. Every edge-semantic consumer
-/// matches on the kind and skips `Dialog`; dialog coordinates map through its
-/// committed `origin` (the output position of the centred surface). A
-/// missed arm is then a compile error, not a silent edge reveal.
-#[allow(dead_code)] // Stage S freeze; Q2 is the first user.
-#[derive(Clone, Debug, PartialEq)]
+/// Only a `Panel` carries panel semantics: keyboard enter → the focused
+/// edge, pointer enter/leave → `PanelInput`, resize grips, reveal, hold and
+/// hide. Every edge-semantic consumer matches on the kind and skips
+/// `Dialog`, so a missed arm is a compile error, not a silent edge reveal.
+/// Pointer, keyboard focus and confinement still resolve a dialog's own
+/// window; its coordinates map through the committed `origin` (the output
+/// position of the centred surface).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SurfaceKind {
     Panel {
         edge: Edge,
@@ -71,14 +68,22 @@ pub(crate) enum SurfaceKind {
     },
 }
 
+impl SurfaceKind {
+    /// The panel edge, or `None` for a surface with no panel semantics.
+    pub(crate) const fn edge(self) -> Option<Edge> {
+        match self {
+            Self::Panel { edge, .. } => Some(edge),
+            Self::Dialog { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SurfaceTarget {
     pub surface: wl_surface::WlSurface,
     pub window: Entity,
-    pub edge: Edge,
     pub output_size: Vec2,
-    pub thickness: f32,
-    pub committed_margin: i32,
+    pub kind: SurfaceKind,
 }
 
 #[derive(Clone, Debug)]
@@ -179,7 +184,10 @@ impl KeyboardBridge {
                 surface: Some(target.surface.clone()),
                 window: target.window,
             },
-            target.edge,
+            // A dialog holds the keyboard as no panel: the model hears
+            // that no edge is focused, so Escape and the focus cycle
+            // address no panel while the dialog has the keys.
+            target.kind.edge(),
             raw,
             keysyms,
         )
@@ -189,7 +197,7 @@ impl KeyboardBridge {
         &mut self,
         app: &mut App,
         focus: KeyboardFocus,
-        edge: Edge,
+        edge: Option<Edge>,
         raw: &[u32],
         keysyms: &[Keysym],
     ) -> bool {
@@ -201,7 +209,7 @@ impl KeyboardBridge {
         if let Some(mut keyboard) = app.world_mut().get_resource_mut::<KeyboardWindow>() {
             keyboard.0 = Some(window);
         }
-        stage_keyboard_focus(app, Some(edge));
+        stage_keyboard_focus(app, edge);
         set_window_focused(app, window, true);
         emit_window(
             app,
@@ -591,7 +599,8 @@ fn emit_touch(app: &mut App, id: i32, contact: &TouchContact, phase: TouchPhase)
 struct Focus {
     surface_id: u32,
     window: Entity,
-    edge: Edge,
+    /// `None` on a dialog: its enter and leave drive no panel.
+    edge: Option<Edge>,
     position: Vec2,
     output_position: Vec2,
 }
@@ -1080,7 +1089,7 @@ impl PointerBridge {
                         (
                             target.surface.id().protocol_id(),
                             target.window,
-                            target.edge,
+                            target.kind.edge(),
                         ),
                         (position, output_position(target, position)),
                     );
@@ -1130,22 +1139,24 @@ impl PointerBridge {
                     if let PointerEventKind::Press { button, .. } = event.kind
                         && translate_button(button) == Some(MouseButton::Left)
                         && self.pressed.is_empty()
-                        && grip_contains(app, target.edge, target.window, raw)
+                        // A dialog has no resize grip: only a panel resizes.
+                        && let Some(edge) = target.kind.edge()
+                        && grip_contains(app, edge, target.window, raw)
                         && let Some(frame) = app
                             .world()
                             .get_resource::<cosmix_shell::runtime::ShellFrameState>()
-                        && frame.0.panel(target.edge).mapped
-                        && let Some(extent) = configured_extent(app, target.window, target.edge)
+                        && frame.0.panel(edge).mapped
+                        && let Some(extent) = configured_extent(app, target.window, edge)
                     {
                         self.resize = Some(ResizeSession {
-                            edge: target.edge,
+                            edge,
                             button: MouseButton::Left,
                             press_origin: raw,
-                            starting_thickness: frame.0.panel(target.edge).thickness_px,
+                            starting_thickness: frame.0.panel(edge).thickness_px,
                             starting_extent: extent,
                             left_surface: false,
                         });
-                        semantic(app, output, target.edge, PanelInput::ResizeStarted);
+                        semantic(app, output, edge, PanelInput::ResizeStarted);
                         handled = true;
                         continue;
                     }
@@ -1160,7 +1171,7 @@ impl PointerBridge {
                             tracing::debug!(
                                 event = "quoin_item_press_feed",
                                 window = ?target.window,
-                                edge = ?target.edge,
+                                kind = ?target.kind,
                                 raw = ?raw,
                                 position = ?position
                             );
@@ -1229,7 +1240,7 @@ impl PointerBridge {
         &mut self,
         app: &mut App,
         output: &OutputKey,
-        target: (u32, Entity, Edge),
+        target: (u32, Entity, Option<Edge>),
         positions: (Vec2, Vec2),
     ) {
         let (surface_id, window, edge) = target;
@@ -1244,7 +1255,9 @@ impl PointerBridge {
                 delta: None,
             },
         );
-        semantic(app, output, edge, PanelInput::PointerEntered);
+        if let Some(edge) = edge {
+            semantic(app, output, edge, PanelInput::PointerEntered);
+        }
         self.last_output_position = Some(output_position);
         self.focus = Some(Focus {
             surface_id,
@@ -1386,7 +1399,9 @@ impl PointerBridge {
                 window: focus.window,
             },
         );
-        semantic(app, output, focus.edge, PanelInput::PointerLeft);
+        if let Some(edge) = focus.edge {
+            semantic(app, output, edge, PanelInput::PointerLeft);
+        }
     }
 
     fn axis(
@@ -1514,13 +1529,20 @@ fn semantic(app: &mut App, output: &OutputKey, edge: Edge, input: PanelInput) {
 }
 
 fn output_position(target: &SurfaceTarget, local: Vec2) -> Vec2 {
-    output_logical_position(
-        target.edge,
-        local,
-        target.output_size,
-        target.thickness,
-        target.committed_margin,
-    )
+    kind_output_position(target.kind, target.output_size, local)
+}
+
+/// A panel maps through its edge, thickness and margin; a dialog through
+/// the committed origin of its centred surface.
+fn kind_output_position(kind: SurfaceKind, output_size: Vec2, local: Vec2) -> Vec2 {
+    match kind {
+        SurfaceKind::Panel {
+            edge,
+            thickness,
+            committed_margin,
+        } => output_logical_position(edge, local, output_size, thickness, committed_margin),
+        SurfaceKind::Dialog { origin } => origin + local,
+    }
 }
 
 fn translate_button(button: u32) -> Option<MouseButton> {
@@ -1881,7 +1903,7 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            (1, window, Edge::Left),
+            (1, window, Some(Edge::Left)),
             (Vec2::ZERO, Vec2::ZERO),
         );
         bridge.resize = Some(resize_session(Edge::Left));
@@ -1920,7 +1942,7 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            (1, window, Edge::Right),
+            (1, window, Some(Edge::Right)),
             (Vec2::ZERO, Vec2::ZERO),
         );
         bridge.resize = Some(resize_session(Edge::Right));
@@ -2118,7 +2140,7 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            (7, window, Edge::Left),
+            (7, window, Some(Edge::Left)),
             (Vec2::new(20.0, 10.0), Vec2::new(20.0, 10.0)),
         );
         bridge.motion(&mut app, window, Vec2::new(24.0, 13.0));
@@ -2152,7 +2174,7 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            (7, window, Edge::Top),
+            (7, window, Some(Edge::Top)),
             (Vec2::new(20.0, 10.0), Vec2::new(20.0, 10.0)),
         );
         bridge.axis(
@@ -2212,7 +2234,7 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            (7, window, Edge::Right),
+            (7, window, Some(Edge::Right)),
             (Vec2::new(10.0, 20.0), Vec2::new(10.0, 20.0)),
         );
         bridge.pressed.push(MouseButton::Left);
@@ -2266,7 +2288,7 @@ mod tests {
         bridge.enter(
             &mut app,
             &output,
-            (7, window, Edge::Left),
+            (7, window, Some(Edge::Left)),
             (Vec2::new(12.0, 8.0), Vec2::new(12.0, 8.0)),
         );
         app.world_mut()
@@ -2587,7 +2609,7 @@ mod tests {
                 surface: None,
                 window,
             },
-            Edge::Left,
+            Some(Edge::Left),
             &[125, 15, 1],
             &[Keysym::Super_L, Keysym::Tab, Keysym::Escape],
         ));
@@ -2908,5 +2930,152 @@ mod tests {
         );
         assert_eq!(translate_button(u32::MAX), None);
         assert_eq!(translate_button(BTN_LEFT), Some(MouseButton::Left));
+    }
+
+    fn staged(app: &App) -> Vec<ShellCommandKind> {
+        app.world()
+            .resource::<StagedShellCommands>()
+            .0
+            .iter()
+            .map(|(_, kind)| kind.clone())
+            .collect()
+    }
+
+    fn with_frame(app: &mut App) {
+        let model = ShellModel::new(
+            OutputKey::new("DP-1").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        app.insert_resource(ShellFrameState(cosmix_shell::runtime::ShellFrame::from_model(
+            &model,
+        )))
+        .init_resource::<StagedShellCommands>();
+    }
+
+    /// Scene-editor plan §4.3 Q2: a keyboard enter on the dialog makes its
+    /// window the keyboard window, so confinement keeps a dialog field
+    /// focused and clears a panel's; and it tells the model no panel holds
+    /// the keys, so no edge is focused, revealed or held by it.
+    #[test]
+    fn dialog_keyboard_enter_resolves_its_window_and_focuses_no_panel() {
+        run_within(Duration::from_secs(10), || {
+            let (mut app, dialog) = dispatch_app();
+            with_frame(&mut app);
+            let panel = app.world_mut().spawn(Window::default()).id();
+            let dialog_field = field_in_window(&mut app, dialog);
+            let panel_field = field_in_window(&mut app, panel);
+            app.finish();
+            app.cleanup();
+            let mut bridge = KeyboardBridge::default();
+            let kind = SurfaceKind::Dialog {
+                origin: Vec2::new(60.0, 90.0),
+            };
+            assert!(bridge.enter_focus(
+                &mut app,
+                KeyboardFocus {
+                    surface: None,
+                    window: dialog,
+                },
+                kind.edge(),
+                &[],
+                &[],
+            ));
+            assert_eq!(app.world().resource::<KeyboardWindow>().0, Some(dialog));
+            let staged = staged(&app);
+            assert!(
+                matches!(
+                    staged.as_slice(),
+                    [ShellCommandKind::Keyboard(KeyboardCommand::FocusObserved(None))]
+                ),
+                "a dialog enter reports no focused edge and nothing else: {staged:?}"
+            );
+
+            // A panel field keeps no focus while the dialog has the keys.
+            app.insert_resource(InputFocus::from_entity(panel_field));
+            app.update();
+            emit_keyboard(
+                &mut app,
+                dialog,
+                &map_key(30, Keysym::a, Some("a".to_owned())),
+                ButtonState::Pressed,
+                false,
+            );
+            app.update();
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
+            assert!(app.world().resource::<FocusedKeys>().0.is_empty());
+
+            // A dialog field does, and receives the typed key.
+            app.insert_resource(InputFocus::from_entity(dialog_field));
+            app.update();
+            emit_keyboard(
+                &mut app,
+                dialog,
+                &map_key(30, Keysym::a, Some("a".to_owned())),
+                ButtonState::Pressed,
+                false,
+            );
+            app.update();
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(dialog_field));
+            assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
+        });
+    }
+
+    /// Pointer enter and leave on a dialog feed Bevy the cursor (so its
+    /// widgets hover and click) but stage no `PanelInput`; the panel control
+    /// arm stages both.
+    #[test]
+    fn dialog_pointer_enter_and_leave_drive_no_panel() {
+        for (edge, expected) in [
+            (None, 0),
+            (Some(Edge::Left), 2),
+        ] {
+            let (mut app, window, output) = pointer_app();
+            let mut bridge = PointerBridge::default();
+            bridge.enter(
+                &mut app,
+                &output,
+                (1, window, edge),
+                (Vec2::new(10.0, 10.0), Vec2::new(70.0, 100.0)),
+            );
+            bridge.leave(&mut app, &output);
+            let panel_inputs = staged(&app)
+                .into_iter()
+                .filter(|kind| matches!(kind, ShellCommandKind::Panel { .. }))
+                .count();
+            assert_eq!(panel_inputs, expected, "{edge:?}");
+            let cursor = app
+                .world_mut()
+                .resource_mut::<Messages<CursorEntered>>()
+                .drain()
+                .count();
+            assert_eq!(cursor, 1, "{edge:?}: the window still sees the cursor");
+        }
+    }
+
+    #[test]
+    fn dialog_coordinates_map_through_the_committed_origin() {
+        let output = Vec2::new(1920.0, 1080.0);
+        let dialog = SurfaceKind::Dialog {
+            origin: Vec2::new(520.0, 204.0),
+        };
+        assert_eq!(dialog.edge(), None);
+        assert_eq!(
+            kind_output_position(dialog, output, Vec2::new(440.0, 310.0)),
+            Vec2::new(960.0, 514.0)
+        );
+        let panel = SurfaceKind::Panel {
+            edge: Edge::Bottom,
+            thickness: 52.0,
+            committed_margin: 0,
+        };
+        assert_eq!(panel.edge(), Some(Edge::Bottom));
+        assert_eq!(
+            kind_output_position(panel, output, Vec2::new(10.0, 2.0)),
+            output_logical_position(Edge::Bottom, Vec2::new(10.0, 2.0), output, 52.0, 0)
+        );
     }
 }

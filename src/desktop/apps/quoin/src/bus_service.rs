@@ -287,6 +287,7 @@ struct SceneBus<'w> {
     config: ResMut<'w, crate::config::ShellConfig>,
     schemes: MessageWriter<'w, cosmix_shell::chrome::QuoinSchemeSelected>,
     settings: Option<ResMut<'w, crate::settings::SettingsScene>>,
+    dialog: Option<ResMut<'w, crate::dialog_bus::DialogRequests>>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -593,9 +594,15 @@ fn service_bus(
                 (rc, body, None)
             } else if crate::dialog_bus::handles(&request.command) {
                 // Scene Editor plan §4.3 Q2: dialog and layout verbs live in
-                // dialog_bus.rs (Stage S routes them; Q2 implements them).
-                let (rc, body) = crate::dialog_bus::dispatch(&request.command);
-                (rc, body, None)
+                // dialog_bus.rs, answered with world access in Presentation.
+                // Fixtures that install the Bus service alone have no queue.
+                let Some(queue) = content.dialog.as_deref_mut() else {
+                    let body = json!({"error_code":"UNIMPLEMENTED", "message":"dialog verbs are not installed in this host"});
+                    stash_or_respond(&bridge, &mut state, request, 10, body.to_string(), None, &mut dispatch);
+                    continue;
+                };
+                queue.defer(request);
+                continue;
             } else if request.command == "shell.panel.order" {
                 // Scene Editor plan §4.3 Q1: frozen request/reply in
                 // tests/fixtures/scene-editor/shell-verbs.json; Q1 implements.
