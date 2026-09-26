@@ -658,6 +658,7 @@ mod tests {
         let metrics = Metrics { cell_w: 10.0, line_h: 20.0 };
         let mut st = State::default();
         st.metrics = Some(metrics);
+        st.scroll.first_line = 1;
         let g = Geometry::new(Rectangle { x: 100.0, y: 50.0, width: 800.0, height: 405.0 }, metrics, text.line_count(), true);
         let mut r = Rec::default();
         draw(&ed, &st, &g, &mut r, mouse::Cursor::Unavailable);
