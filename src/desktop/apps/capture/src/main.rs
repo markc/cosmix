@@ -1,3 +1,4 @@
+mod blob;
 mod encoder;
 mod stream;
 mod wayland;
@@ -27,6 +28,13 @@ struct Status {
     phase: &'static str,
     path: Option<PathBuf>,
     error: Option<String>,
+    blob: Option<Value>,
+    blob_error: Option<String>,
+    /// True from publication until the dual-write lands `blob` or
+    /// `blob_error` — disambiguates `blob: null` on a terminal phase
+    /// (in flight) from a capture that never published (never
+    /// coming). Not in the JSON directly; `capture_value` surfaces it.
+    blob_pending: bool,
     frames: u64,
     fresh_frames: u64,
     acquired_frames: u64,
@@ -40,6 +48,11 @@ struct Status {
     encode_ms: u64,
     started: Option<Instant>,
     elapsed_ms: u64,
+    /// Which job owns this status. A new capture resets the status
+    /// under a fresh generation; a still-running dual-write from an
+    /// older job lands only on a matching generation, so a stale
+    /// upload never writes into the new job's status.
+    generation: u64,
 }
 impl Status {
     fn observe_capture(&mut self, timing: wayland::FrameTiming) {
@@ -53,6 +66,21 @@ impl Status {
         if matches!(self.phase, "starting" | "recording" | "screenshot") {
             self.phase = "finalising";
         }
+    }
+    /// Land a finished dual-write. A newer job has since reset the
+    /// status under its own generation, so a stale uploader's result
+    /// is refused, not written into the new job's status; the caller
+    /// logs the drop. Returns whether the result landed.
+    fn land_upload(&mut self, generation: u64, outcome: Result<Value, String>) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.blob_pending = false;
+        match outcome {
+            Ok(reference) => self.blob = Some(reference),
+            Err(error) => self.blob_error = Some(error),
+        }
+        true
     }
     fn value(&self) -> Value {
         let mut value = self.capture_value();
@@ -80,12 +108,25 @@ impl Status {
         } else {
             self.fresh_frames as f64 * 1000.0 / elapsed_ms as f64
         };
-        json!({"recording":matches!(self.phase,"starting"|"recording"),"phase":if self.phase.is_empty(){"idle"}else{self.phase},"path":self.path,"error":self.error,"frames":self.frames,"fresh_frames":self.fresh_frames,"acquired_frames":self.acquired_frames,"dropped_frames":self.dropped_frames,"repeated_presentations":self.repeated_frames,"duplicate_frames":self.frames.saturating_sub(self.fresh_frames),"elapsed_ms":elapsed_ms,"fresh_fps":fresh_fps,"capture_ms":self.capture_ms,"capture_wait_ms":self.capture_wait_ms,"capture_read_ms":self.capture_read_ms,"capture_normalise_ms":self.capture_normalise_ms,"encode_ms":self.encode_ms,"pid":std::process::id(),"version":build.version,"git_sha":build.git_sha,"build_time":build.build_time})
+        json!({"recording":matches!(self.phase,"starting"|"recording"),"phase":if self.phase.is_empty(){"idle"}else{self.phase},"path":self.path,"error":self.error,"blob":self.blob,"blob_error":self.blob_error,"blob_pending":self.blob_pending,"frames":self.frames,"fresh_frames":self.fresh_frames,"acquired_frames":self.acquired_frames,"dropped_frames":self.dropped_frames,"repeated_presentations":self.repeated_frames,"duplicate_frames":self.frames.saturating_sub(self.fresh_frames),"elapsed_ms":elapsed_ms,"fresh_fps":fresh_fps,"capture_ms":self.capture_ms,"capture_wait_ms":self.capture_wait_ms,"capture_read_ms":self.capture_read_ms,"capture_normalise_ms":self.capture_normalise_ms,"encode_ms":self.encode_ms,"pid":std::process::id(),"version":build.version,"git_sha":build.git_sha,"build_time":build.build_time})
     }
 }
 struct Job {
     cancel: Arc<AtomicBool>,
+    /// Set by the worker once the terminal phase is written: the
+    /// capture itself is over and only the detached dual-write may
+    /// still run, so admission no longer belongs to this job.
+    settled: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+}
+
+/// Admission view of the job slot: empty, or held by a worker that
+/// already wrote its terminal phase. A settled worker only has the
+/// detached dual-write left, so the next capture may start while that
+/// upload is still in flight.
+fn slot_free(job: &Option<Job>) -> bool {
+    job.as_ref()
+        .is_none_or(|job| job.settled.load(Ordering::Relaxed))
 }
 fn options() -> Result<Option<Options>, String> {
     let mut output = None;
@@ -159,6 +200,7 @@ fn publish(partial: &PathBuf, final_path: &PathBuf) -> Result<(), String> {
         .map_err(|e| format!("publish capture without overwrite: {e}"))?;
     fs::remove_file(partial).map_err(|e| e.to_string())
 }
+#[allow(clippy::too_many_arguments)]
 fn run_job(
     options: Options,
     video: bool,
@@ -167,7 +209,15 @@ fn run_job(
     partial: PathBuf,
     cancel: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
+    generation: u64,
+    settled: Arc<AtomicBool>,
+    lane: blob::Lane,
+    shutdown: Arc<AtomicBool>,
 ) {
+    // Whether the finished file landed at `path` — publish succeeded,
+    // so the blob-store copy is owed even when encoding then reports
+    // a duration failure (the MP4 is still there and usable).
+    let mut published = false;
     let result = (|| -> Result<(), String> {
         let mut capture = wayland::Capture::connect(options.output.as_deref(), cancel.clone())?;
         capture.region = options.region;
@@ -196,6 +246,7 @@ fn run_job(
                 )
                 .map_err(|e| e.to_string())?;
             publish(&partial, &path)?;
+            published = true;
             status.lock().unwrap().frames = 1;
             return Ok(());
         }
@@ -289,26 +340,109 @@ fn run_job(
             return Err("recording stopped before first frame".into());
         }
         publish(&partial, &path)?;
+        published = true;
         if let Some(e) = failure {
             return Err(e);
         }
         Ok(())
     })();
-    let mut state = status.lock().unwrap();
-    if let Some(started) = state.started.take() {
-        state.elapsed_ms = started.elapsed().as_millis() as u64;
-    }
-    match result {
-        Ok(()) => {
-            state.phase = "complete";
-            state.error = None;
+    let upload = (published && !shutdown.load(Ordering::Relaxed)).then(|| {
+        let exit = shutdown.clone();
+        move || {
+            lane.bind()
+                .and_then(|bind| blob::upload(&bind, &path, exit))
         }
-        Err(error) => {
-            state.phase = "failed";
-            state.error = Some(error);
+    });
+    settle_job(&status, generation, &settled, upload, result);
+}
+
+/// run_job's terminal wiring, split off so the dual-write rules are
+/// testable without Wayland or a Bus: write the terminal phase, mark
+/// the job settled — admission may start the next capture while the
+/// dual-write still runs — then upload with the status lock dropped.
+/// The result lands only on a matching generation, so a stale upload
+/// never writes into a newer job's status. `upload` is None when
+/// nothing was published or process shutdown is abandoning the copy
+/// (`capture.stop` deliberately does not count: a stopped recording
+/// still owes its dual-write).
+fn settle_job(
+    status: &Arc<Mutex<Status>>,
+    generation: u64,
+    settled: &AtomicBool,
+    upload: Option<impl FnOnce() -> Result<Value, String>>,
+    result: Result<(), String>,
+) {
+    {
+        let mut state = status.lock().unwrap();
+        if let Some(started) = state.started.take() {
+            state.elapsed_ms = started.elapsed().as_millis() as u64;
+        }
+        match result {
+            Ok(()) => {
+                state.phase = "complete";
+                state.error = None;
+            }
+            Err(error) => {
+                state.phase = "failed";
+                state.error = Some(error);
+            }
+        }
+        state.blob_pending = upload.is_some();
+        settled.store(true, Ordering::Relaxed);
+    }
+    // Dual-write into the blob store: the file is the truth and is
+    // already published, so this copy is additive — its failure
+    // records `blob_error` and never demotes the terminal phase. The
+    // lock is dropped across the upload (a five-minute MP4 takes
+    // minutes): status meanwhile shows the terminal phase with
+    // `blob: null`, then the reference. The upload runs under
+    // `catch_unwind`: a panic in the tail (0.2.3: a timed future built
+    // outside the runtime context) must land `blob_error` and clear
+    // `blob_pending` — never strand `blob_pending: true` on a dead
+    // worker.
+    if let Some(upload) = upload {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(upload))
+            .unwrap_or_else(|payload| Err(upload_panic_message(&payload)));
+        let mut state = status.lock().unwrap();
+        if !state.land_upload(generation, outcome) {
+            eprintln!(
+                "capture: dual-write from job {generation} dropped — a newer job owns the status"
+            );
         }
     }
 }
+
+/// A panicked upload's landing text: the payload's text when it is a
+/// `&str`/`String` (what `panic!("…")` produces), otherwise the bare
+/// prefix — the payload type is all a non-string panic offers.
+fn upload_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        format!("upload panicked: {text}")
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        format!("upload panicked: {text}")
+    } else {
+        "upload panicked".to_string()
+    }
+}
+
+/// Stop the active job for process shutdown and wait for its worker
+/// without ever joining inside the runtime: on this current-thread
+/// runtime only the main thread drives the IO and timers the worker's
+/// `block_on` parks on, so a synchronous join deadlocks (worker waits
+/// for the timer that only main's loop would fire; main waits for the
+/// join). The blocking pool owns the join, bounded — a worker that
+/// will not stop in `bound` is abandoned, not waited out. Returns
+/// whether the worker finished within the bound.
+async fn reap(job: Job, shutdown: &AtomicBool, bound: Duration) -> bool {
+    job.cancel.store(true, Ordering::Relaxed);
+    shutdown.store(true, Ordering::Relaxed);
+    let thread = job.thread;
+    let joined = tokio::task::spawn_blocking(move || thread.join().is_ok());
+    tokio::time::timeout(bound, joined)
+        .await
+        .is_ok_and(|joined| joined.is_ok())
+}
+
 fn recording_target(elapsed: Duration, fps: u32) -> u64 {
     ((elapsed.as_secs_f64() * fps as f64).floor() as u64)
         .saturating_add(1)
@@ -391,31 +525,47 @@ fn main() -> Result<(), String> {
     // `leading`: capture's option values are free strings with no `--`
     // escape (`--output --version` names an output), so only argv[1] asks.
     cosmix_buildinfo::exit_on_version!(leading);
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("build the tokio runtime")
-        .block_on(async_main())
+        .expect("build the tokio runtime");
+    let result = runtime.block_on(async_main());
+    // A dropped runtime waits out its blocking pool without a bound, so
+    // the worker join `reap` abandoned would hold exit for the worker's
+    // own socket bound (up to 30 s). Bound the wait: the shutdown flag
+    // has already told every worker and uploader it is abandoned.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 async fn async_main() -> Result<(), String> {
     let Some(options) = options()? else {
         return Ok(());
     };
-    let client = SupervisedClient::connect_options(
-        "capture",
-        &cosmix_config::client_helpers::resolve_noded_url(),
-    )
-    .bounded_incoming(16)
-    .connect()
-    .await
-    .map_err(|e| e.to_string())?;
+    let client = Arc::new(
+        SupervisedClient::connect_options(
+            "capture",
+            &cosmix_config::client_helpers::resolve_noded_url(),
+        )
+        .bounded_incoming(16)
+        .connect()
+        .await
+        .map_err(|e| e.to_string())?,
+    );
     let mut incoming = client.incoming_bounded().ok_or("no incoming Bus queue")?;
     let status = Arc::new(Mutex::new(Status {
         vaapi_device: options.vaapi_device.clone(),
         ..Default::default()
     }));
+    // The worker thread dual-writes through this handle: the one
+    // lane-resolution props call parks the worker via the runtime
+    // handle, never the Bus loop below.
+    let lane = blob::Lane::new(client.clone(), tokio::runtime::Handle::current());
     let mut job: Option<Job> = None;
+    // Set only on the process-exit paths (SIGTERM, SIGINT, Bus loss)
+    // — never by `capture.stop`, whose recordings still owe their
+    // dual-write. Abandons lane resolution and an in-flight upload.
+    let shutdown = Arc::new(AtomicBool::new(false));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -430,19 +580,27 @@ async fn async_main() -> Result<(), String> {
                     BoundedIncomingEvent::Command(command) => command,
                     BoundedIncomingEvent::Overflow { .. } => continue,
                 };
-                if job.as_ref().is_some_and(|j|j.thread.is_finished()) { let _ = job.take().unwrap().thread.join(); }
+                if job.is_some() && slot_free(&job) {
+                    // Settled: terminal phase written, only the detached
+                    // dual-write may still run. Free admission and drop the
+                    // handle — the uploader finishes on its own and its
+                    // result lands on a matching generation only.
+                    drop(job.take());
+                }
                 let result = (|| -> Result<Value,String> {
                     let start = request(&command.command,&command.body)?;
                     if let Some(JobRequest {video,fps,output,region}) = start {
                         if job.is_some() { return Err("capture job already active".into()); }
                         let (path,partial) = reserve(&options,video)?;
-                        *status.lock().unwrap() = Status {phase:if video {"starting"}else{"screenshot"},path:Some(path.clone()),vaapi_device:options.vaapi_device.clone(),..Default::default()};
+                        let generation = status.lock().unwrap().generation+1;
+                        *status.lock().unwrap() = Status {phase:if video {"starting"}else{"screenshot"},path:Some(path.clone()),vaapi_device:options.vaapi_device.clone(),generation,..Default::default()};
                         let cancel = Arc::new(AtomicBool::new(false));
-                        let (mut opts,flag,state) = (options.clone(),cancel.clone(),status.clone());
+                        let settled = Arc::new(AtomicBool::new(false));
+                        let (mut opts,flag,state,done,job_lane,exit) = (options.clone(),cancel.clone(),status.clone(),settled.clone(),lane.clone(),shutdown.clone());
                         if output.is_some() { opts.output=output; }
                         opts.region=region;
-                        let thread = std::thread::Builder::new().name("cosmix-capture".into()).spawn(move ||run_job(opts,video,fps,path,partial,flag,state)).map_err(|e|e.to_string())?;
-                        job = Some(Job {cancel,thread});
+                        let thread = std::thread::Builder::new().name("cosmix-capture".into()).spawn(move ||run_job(opts,video,fps,path,partial,flag,state,generation,done,job_lane,exit)).map_err(|e|e.to_string())?;
+                        job = Some(Job {cancel,settled,thread});
                     } else if command.command=="capture.stop" && let Some(job)=&job {
                         job.cancel.store(true,Ordering::Relaxed); status.lock().unwrap().stopping();
                     }
@@ -453,9 +611,14 @@ async fn async_main() -> Result<(), String> {
             }
         }
     }
+    // Both exit paths — signal and Bus loss — land here; neither may
+    // join the worker synchronously inside the runtime (see `reap`).
+    // The flag is set even with no live job: a dual-write detached
+    // from a settled job still runs on its own thread and must see the
+    // exit as promptly as a reap-owned worker does.
+    shutdown.store(true, Ordering::Relaxed);
     if let Some(job) = job {
-        job.cancel.store(true, Ordering::Relaxed);
-        let _ = job.thread.join();
+        let _ = reap(job, &shutdown, Duration::from_secs(5)).await;
     }
     client.close().await;
     Ok(())
@@ -586,6 +749,36 @@ mod tests {
         );
     }
     #[test]
+    fn status_surfaces_the_blob_reference_additively() {
+        let plain = Status::default().value();
+        assert!(plain["blob"].is_null());
+        assert!(plain["blob_error"].is_null());
+        let id = format!("b3:{}", "0".repeat(64));
+        let reference = blob::parse_reference(
+            &json!({"blob":id,"size":9,"mime":"image/png","name":"a.png","origin":"alpha"})
+                .to_string(),
+        )
+        .unwrap();
+        let uploaded = Status {
+            blob: Some(reference),
+            ..Default::default()
+        }
+        .value();
+        assert_eq!(uploaded["blob"]["blob"], format!("b3:{}", "0".repeat(64)));
+        assert_eq!(uploaded["blob"]["mime"], "image/png");
+        assert!(uploaded["blob_error"].is_null());
+        let failed = Status {
+            blob_error: Some("lane answered 413 for http://10.42.0.5:4210/blob".into()),
+            ..Default::default()
+        }
+        .value();
+        assert!(failed["blob"].is_null());
+        assert_eq!(
+            failed["blob_error"],
+            "lane answered 413 for http://10.42.0.5:4210/blob"
+        );
+    }
+    #[test]
     fn publication_never_clobbers_existing_media() {
         let dir = tempfile::tempdir().unwrap();
         let partial = dir.path().join("a.partial.png");
@@ -594,5 +787,253 @@ mod tests {
         fs::write(&final_path, b"keep").unwrap();
         assert!(publish(&partial, &final_path).is_err());
         assert_eq!(fs::read(final_path).unwrap(), b"keep");
+    }
+
+    fn parked_job(park: impl FnOnce() + Send + 'static) -> Job {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let settled = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn(park);
+        Job {
+            cancel,
+            settled,
+            thread,
+        }
+    }
+
+    fn reference() -> Value {
+        json!({"blob": format!("b3:{}", "0".repeat(64)), "size": 9, "mime": "image/png"})
+    }
+
+    #[test]
+    fn settle_lands_the_reference_on_a_published_capture() {
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        let expected = reference();
+        settle_job(&status, 1, &settled, Some(move || Ok(expected)), Ok(()));
+        let state = status.lock().unwrap();
+        assert_eq!(state.phase, "complete");
+        assert!(state.error.is_none());
+        assert_eq!(state.blob, Some(reference()));
+        assert!(settled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_published_duration_failure_still_uploads() {
+        // The MP4 landed at `path`, so the store copy is owed even
+        // though encoding then reported the shortfall.
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        let expected = reference();
+        settle_job(
+            &status,
+            1,
+            &settled,
+            Some(move || Ok(expected)),
+            Err("encoder fell behind: 299 frames".into()),
+        );
+        let state = status.lock().unwrap();
+        assert_eq!(state.phase, "failed");
+        assert_eq!(
+            state.error.as_deref(),
+            Some("encoder fell behind: 299 frames")
+        );
+        assert_eq!(state.blob, Some(reference()));
+    }
+
+    #[test]
+    fn a_failed_dual_write_records_blob_error_not_a_failed_capture() {
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        settle_job(
+            &status,
+            1,
+            &settled,
+            Some(|| Err("blob.props.get on blobd timed out".into())),
+            Ok(()),
+        );
+        let state = status.lock().unwrap();
+        assert_eq!(state.phase, "complete");
+        assert!(state.error.is_none());
+        assert!(state.blob.is_none());
+        assert_eq!(
+            state.blob_error.as_deref(),
+            Some("blob.props.get on blobd timed out")
+        );
+    }
+
+    #[test]
+    fn a_stale_upload_never_lands_in_a_newer_jobs_status() {
+        let status = Arc::new(Mutex::new(Status {
+            generation: 2,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        let expected = reference();
+        settle_job(&status, 1, &settled, Some(move || Ok(expected)), Ok(()));
+        let state = status.lock().unwrap();
+        assert!(state.blob.is_none());
+        assert!(state.blob_error.is_none());
+    }
+
+    #[test]
+    fn blob_pending_marks_an_in_flight_dual_write() {
+        // Nothing published, nothing owed.
+        assert!(!Status::default().value()["blob_pending"].as_bool().unwrap());
+        // A capture that failed without publishing owes no upload.
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        settle_job(
+            &status,
+            1,
+            &settled,
+            None::<fn() -> Result<Value, String>>,
+            Err("compositor gone".into()),
+        );
+        assert!(
+            !status.lock().unwrap().value()["blob_pending"]
+                .as_bool()
+                .unwrap()
+        );
+        // Published: pending from settle until the upload lands a field.
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        let in_flight = status.clone();
+        settle_job(
+            &status,
+            1,
+            &settled,
+            Some(move || {
+                assert!(
+                    in_flight.lock().unwrap().value()["blob_pending"]
+                        .as_bool()
+                        .unwrap()
+                );
+                Err("lane answered 413 for http://10.42.0.5:4210/blob".into())
+            }),
+            Ok(()),
+        );
+        let landed = status.lock().unwrap().value();
+        assert!(!landed["blob_pending"].as_bool().unwrap());
+        assert!(landed["blob_error"].is_string());
+    }
+
+    #[test]
+    fn a_panicking_upload_lands_blob_error_and_clears_pending() {
+        // 0.2.3's live failure shape: the worker panicked inside the
+        // upload tail and the thread died after `blob_pending = true`
+        // but before any landing — status read `blob_pending: true,
+        // blob: null, blob_error: null` forever. A panic now lands as
+        // `blob_error`, generation-guarded like any other failure.
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        settle_job(
+            &status,
+            1,
+            &settled,
+            Some(|| panic!("there is no reactor running")),
+            Ok(()),
+        );
+        let state = status.lock().unwrap();
+        assert_eq!(state.phase, "complete");
+        assert!(state.error.is_none());
+        assert!(state.blob.is_none());
+        assert_eq!(
+            state.blob_error.as_deref(),
+            Some("upload panicked: there is no reactor running")
+        );
+        assert!(!state.blob_pending, "a panic must not strand pending");
+    }
+
+    #[test]
+    fn admission_frees_at_the_terminal_phase_while_the_upload_runs() {
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let flag = settled.clone();
+        let state = status.clone();
+        let thread = std::thread::spawn(move || {
+            settle_job(
+                &state,
+                1,
+                &flag,
+                Some(|| {
+                    let _ = parked.recv();
+                    Ok(reference())
+                }),
+                Ok(()),
+            );
+        });
+        let mut slot = Some(Job {
+            cancel: Arc::new(AtomicBool::new(false)),
+            settled,
+            thread,
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !slot_free(&slot) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(slot_free(&slot), "slot frees at the terminal phase");
+        assert!(
+            !slot.as_ref().unwrap().thread.is_finished(),
+            "the dual-write is still in flight"
+        );
+        // The next capture takes the slot and resets the status under
+        // its own generation; the parked uploader then finishes stale.
+        let taken = slot.take().unwrap();
+        status.lock().unwrap().generation = 2;
+        drop(release);
+        let Job { thread, .. } = taken;
+        thread.join().unwrap();
+        let state = status.lock().unwrap();
+        assert!(state.blob.is_none(), "stale result dropped, not landed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaps_a_worker_that_honours_the_flag() {
+        // A worker mid-upload ignores `cancel` (a stopped recording
+        // still uploads) and exits on `shutdown` — the reap case.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let job = parked_job(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        assert!(
+            reap(job, &shutdown, Duration::from_secs(5)).await,
+            "worker honours shutdown, must join within the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_stuck_worker_within_the_bound() {
+        // A worker parked past the bound is abandoned, not waited out;
+        // it exits shortly after so the blocking pool drains too.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let job = parked_job(|| std::thread::sleep(Duration::from_secs(2)));
+        let started = Instant::now();
+        assert!(!reap(job, &shutdown, Duration::from_millis(150)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

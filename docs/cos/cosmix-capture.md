@@ -20,14 +20,63 @@ The service exposes four commands, with JSON object bodies:
 | `capture.stop` | `{}` | Stop the active job and finalise its MP4 |
 | `capture.status` | `{}` | Read state and completed file path |
 
-Replies contain `recording`, `phase`, `path`, `error`, `frames`, `pid`,
-`version`, `git_sha` and `build_time`. Phases are `idle`, `screenshot`,
-`starting`, `recording`, `finalising`, `complete` and `failed`.
+Replies contain `recording`, `phase`, `path`, `error`, `blob`, `blob_error`,
+`blob_pending`, `frames`, `pid`, `version`, `git_sha` and `build_time`.
+Phases are `idle`,
+`screenshot`, `starting`, `recording`, `finalising`, `complete` and `failed`.
 Only `complete` guarantees successful publication. A failed recording may
 still have a finalised usable MP4; `error` explains why recording stopped.
+`blob_pending` is true from publication until the dual-write lands `blob`
+or `blob_error`, so `blob: null` with `blob_pending: true` means the store
+copy is in flight, while on a capture that never published it is false —
+no copy is coming.
 The initial screenshot/start response acknowledges the job; poll status for
-completion. Stop is idempotent when no job is active. Concurrent jobs fail
-explicitly. Names are generated, and existing files are never overwritten.
+completion. Stop is idempotent when no job is active. One capture runs at a
+time and concurrent capture requests fail explicitly — but the job slot
+frees at the terminal phase, so a screenshot or recording can start while a
+previous capture's blob upload is still in flight. Names are generated, and
+existing files are never overwritten.
+
+After a capture publishes its file, the same bytes are dual-written into the
+local node's blob store (`blobd`, over its byte lane with pin owner
+`capture`; mime `image/png` or `video/mp4`). The upload runs detached after
+the terminal phase, so status already shows `complete`/`failed` with
+`blob: null` while it is in flight; the returned reference then appears
+additively as `blob` — `{"blob":"b3:<64 hex>","size":N,"mime":"…",
+"name":"cosmix-<pid>-<ns>.png","origin":"<node>"}`; `name` and `origin`
+ride along with whatever the lane recorded (null when it recorded
+none). Each
+job owns the status by a generation: if a newer capture starts before an
+older job's upload finishes, the stale upload's result is dropped (and
+logged), never written into the new job's status. A
+failed upload never fails the capture: the phase stays `complete`, the file
+is where it always was, and `blob_error` says why the second copy did not
+land. An upload that panics lands `blob_error` too, clearing `blob_pending`.
+A refused upload names the lane's status in `blob_error` and, when the
+refusal's reply body is readable, a bounded prefix of it — blobd's
+`{"error":"quota: capture"}` is what an operator needs. One caveat inherent
+to the HTTP client: a refusal sent before the request body is read breaks
+the write mid-stream and no response can be read after that, so a truly
+early 413 surfaces as a transport error rather than a status error — named
+`lane closed during upload (refused? check blobd quota)` so the close reads
+as the refusal it usually is. Lane
+resolution reads blobd's `blob.props.get` lane property (bounded to 35 s);
+an empty `bind` — blobd publishing before its lane listens — is refused as
+`blobd lane not listening` rather than tried as a URL. One attempt,
+30-second connect/read/write bounds on the lane socket (including the
+201 reply read), and a 10-minute whole-upload deadline enforced
+between body chunks — the deadline bounds the body write; once the
+body is fully handed to the kernel, the wait for the lane's reply is
+bounded by the 30-second socket read bound, not the deadline. Process
+shutdown — SIGTERM, SIGINT or Bus
+loss — abandons lane
+resolution and an in-flight upload instead of waiting them out, so capture
+exits within about a second of SIGTERM; a worker parked on a stalled lane
+is abandoned within one socket write, at most the 30 s socket bound. The file under
+`~/Videos/Cosmix`
+remains the source of truth; not
+done yet are the `captures` collection over the references and dropping the
+file write.
 
 Screenshots accept, for example,
 `{"output":"Output-1","region":{"x":100,"y":80,"width":640,"height":360}}`.
