@@ -4991,6 +4991,62 @@ fn surface_is_presentable(record: &SurfaceRecord) -> bool {
     record.mapped && !matches!(record.role, SurfaceRole::Dormant(_))
 }
 
+/// One layer's exclusive zone taken out of the remaining zone, exactly as
+/// smithay's `LayerMap::arrange` takes it (vendor/smithay
+/// `desktop/wayland/layer.rs`): comp recomputes the zone with this when a
+/// stalled owner's reservations must count as zero.
+#[cfg(feature = "bus")]
+fn reserve_exclusive_zone(
+    mut zone: Rectangle<i32, Logical>,
+    anchor: Anchor,
+    margin: smithay::wayland::shell::wlr_layer::Margins,
+    amount: u32,
+) -> Rectangle<i32, Logical> {
+    let amount = amount as i32;
+    match anchor {
+        x if x.contains(Anchor::TOP) && x.contains(Anchor::BOTTOM) => {
+            zone.size.w -= amount;
+            if x.contains(Anchor::LEFT) {
+                zone.loc.x += amount + margin.left;
+                zone.size.w -= margin.left;
+            }
+            if x.contains(Anchor::RIGHT) {
+                zone.size.w -= margin.right;
+            }
+        }
+        x if x.contains(Anchor::LEFT) && x.contains(Anchor::RIGHT) => {
+            zone.size.h -= amount;
+            if x.contains(Anchor::TOP) {
+                zone.loc.y += amount + margin.top;
+                zone.size.h -= margin.top;
+            }
+            if x.contains(Anchor::BOTTOM) {
+                zone.size.h -= margin.bottom;
+            }
+        }
+        x if x == Anchor::all() => {
+            zone.size.w = 0;
+            zone.size.h = 0;
+        }
+        x if x.contains(Anchor::LEFT) && !x.contains(Anchor::RIGHT) => {
+            zone.loc.x += amount + margin.left;
+            zone.size.w -= amount + margin.left;
+        }
+        x if x.contains(Anchor::TOP) && !x.contains(Anchor::BOTTOM) => {
+            zone.loc.y += amount + margin.top;
+            zone.size.h -= amount + margin.top;
+        }
+        x if x.contains(Anchor::RIGHT) && !x.contains(Anchor::LEFT) => {
+            zone.size.w -= amount + margin.right;
+        }
+        x if x.contains(Anchor::BOTTOM) && !x.contains(Anchor::TOP) => {
+            zone.size.h -= amount + margin.bottom;
+        }
+        _ => {}
+    }
+    zone
+}
+
 /// A committed buffer may map the surface unless it belongs to an X11 window
 /// that is not yet association+map eligible: the backing is retained for the
 /// map grant to republish, but nothing is presented early.
@@ -14114,17 +14170,76 @@ impl WaylandState {
         let Some(output) = self.backend.default_output() else {
             return self.logical_output_rect();
         };
-        let layer_map = layer_map_for_output(&output);
-        if layer_map.layers().next().is_none() {
+        let Some(zone) = self.layer_non_exclusive_zone(&output) else {
             return self.logical_output_rect();
-        }
-        let zone = layer_map.non_exclusive_zone();
+        };
         let origin = output.current_location();
         LogicalOutputRect {
             x: (origin.x + zone.loc.x) as f32,
             y: (origin.y + zone.loc.y) as f32,
             width: zone.size.w.max(0) as f32,
             height: zone.size.h.max(0) as f32,
+        }
+    }
+
+    /// The output's non-exclusive zone as windows see it; `None` with no
+    /// layers. Shell design §7: a stalled owner keeps no space reserved, so
+    /// while one of its layers reserves an exclusive zone here the zone is
+    /// recomputed without it, in the layer map's own arrangement order.
+    /// Otherwise it is the layer map's zone. The layers themselves keep their
+    /// arranged geometry: only the space windows are offered changes.
+    fn layer_non_exclusive_zone(&self, output: &Output) -> Option<Rectangle<i32, Logical>> {
+        let layer_map = layer_map_for_output(output);
+        layer_map.layers().next()?;
+        #[cfg(feature = "bus")]
+        if !self.observations.stalled_owners.is_empty() {
+            let stalled = |layer: &DesktopLayerSurface| {
+                port_observation::layer_owner_stalled(
+                    self,
+                    layer.wl_surface().client().map(|client| client.id()),
+                )
+            };
+            let reserves = |layer: &DesktopLayerSurface| {
+                matches!(layer.cached_state().exclusive_zone, ExclusiveZone::Exclusive(_))
+            };
+            if layer_map.layers().any(|layer| stalled(layer) && reserves(layer)) {
+                let size = output
+                    .current_mode()
+                    .map(|mode| {
+                        let size = mode
+                            .size
+                            .to_f64()
+                            .to_logical(output.current_scale().fractional_scale())
+                            .to_i32_round();
+                        output.current_transform().transform_size(size)
+                    })
+                    .unwrap_or_else(|| (0, 0).into());
+                let mut zone = Rectangle::from_size(size);
+                for layer in layer_map.layers().filter(|layer| !stalled(layer)) {
+                    let state = layer.cached_state();
+                    if let ExclusiveZone::Exclusive(amount) = state.exclusive_zone {
+                        zone = reserve_exclusive_zone(zone, state.anchor, state.margin, amount);
+                    }
+                }
+                return Some(zone);
+            }
+        }
+        Some(layer_map.non_exclusive_zone())
+    }
+
+    /// Shell design §7: the stalled layer owners changed. Their exclusive
+    /// zones stop (or start again) counting, so maximised and fullscreen
+    /// windows follow the space that frees or reclaims. Driven by the stall
+    /// verdict and its recovery (an answered probe, a report, a new
+    /// incarnation), never by a timer of its own.
+    #[cfg(feature = "bus")]
+    pub(super) fn set_stalled_layer_owners(&mut self, owners: Vec<ClientId>) {
+        let usable_before = self.usable_output_rect();
+        self.mark_all_outputs_before_change("layer.stalled");
+        self.observations.stalled_owners = owners;
+        if self.usable_output_rect() != usable_before {
+            self.reconfigure_window_states_for_output();
+            self.invalidate_pointer_hit_test_geometry();
         }
     }
 
@@ -14161,11 +14276,9 @@ impl WaylandState {
                 )?
             }
         };
-        let layer_map = layer_map_for_output(output);
-        if layer_map.layers().next().is_none() {
+        let Some(zone) = self.layer_non_exclusive_zone(output) else {
             return Some(own_rect);
-        }
-        let zone = layer_map.non_exclusive_zone();
+        };
         let origin = output.current_location();
         port_snapshot::exact_logical_output_rect(
             origin.x.checked_add(zone.loc.x)?,

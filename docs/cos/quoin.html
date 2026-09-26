@@ -1068,8 +1068,8 @@ Nothing polls. Pinned and
 docked panels have no holders. The embedded host has no Wayland panel layers
 and does not install this standalone transport adapter.</p>
 <p>A slow, stopped or crashed Quoin cannot keep a panel shown, hold the keyboard
-or leave holds behind; stale docked reservations are the part of shell design
-§7 not yet covered. Comp identifies Quoin by the Wayland client of its layers,
+or leave holds behind, and cannot keep screen space reserved (shell design §7).
+Comp identifies Quoin by the Wayland client of its layers,
 never by a namespace token (Quoin adds 128 random bits to each token so it
 cannot be guessed), and an edge is adopted only for a token Quoin itself
 reported; another live client's layer under a copied token is refused
@@ -1081,7 +1081,14 @@ panel — by re-sending an unchanged layer configure that a live Quoin
 acknowledges within a second, as SCTK does on its own. A Quoin that does not
 answer is taken to be stopped: its menu and focus holds drop, its Exclusive
 menu loses the keyboard, and its panel and menu are hidden and excluded from
-input; nothing of any other client is touched. A conceal Quoin applies (the
+input; nothing of any other client is touched. While it is stopped its layers
+reserve no space: their exclusive zones count as zero, so maximised
+windows grow into what a docked panel held (the panel itself stays
+drawn), and the reservation returns when Quoin is heard from again (an
+acknowledged configure, a report, or a new connection). Stopped-ness is only
+ever learned from those checks, so a Quoin whose every edge is docked or
+pinned — nothing showing that comp conceals, no menu — is not probed and keeps
+its reservation. A conceal Quoin applies (the
 layer unmapped) owes nothing, so a panel shown again at once stays. When
 Quoin's Wayland connection dies comp drops everything it held; when its Bus
 connection goes (comp watches noded's registry), or a report arrives from a

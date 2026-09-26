@@ -3396,7 +3396,9 @@ fn apply_panel_enforcement(state: &mut WaylandState) -> bool {
     let stalled_changed = stalled != state.observations.stalled_owners;
     if stalled_changed {
         tracing::info!(owners = stalled.len(), "stalled panel owners changed");
-        state.observations.stalled_owners = stalled;
+        // Its docked reservations stop counting too (and count again on
+        // recovery): windows reflow into the space.
+        state.set_stalled_layer_owners(stalled);
         state.arbitrate_keyboard_focus(None, false, false);
     }
     let enforced: BTreeSet<SurfaceId> = state

@@ -36293,6 +36293,164 @@ fn enforcement_hides_and_excludes_only_the_stalled_panel_layers() {
     assert!(harness.server.state.observations.enforced_surfaces.is_empty());
 }
 
+/// Shell design §7, second half: a stalled Quoin keeps no space reserved.
+/// Quoin docks a bottom panel with an exclusive zone; a foreign dock on the
+/// right reserves its own. When a probe goes unanswered, Quoin's reservation
+/// counts as zero and the maximised window grows into the freed space, while
+/// the foreign (healthy) owner's reservation stands and Quoin's docked panel
+/// stays drawn. Quoin's next report restores its reservation.
+#[cfg(feature = "bus")]
+#[test]
+fn stalled_owner_docked_reservation_lapses_and_recovers() {
+    const TOP_LEFT: u32 = 1 | 4;
+    const RIGHT_EDGE: u32 = 1 | 2 | 8;
+    const BOTTOM_EDGE: u32 = 2 | 4 | 8;
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let _ = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (20, 0),
+            anchor: RIGHT_EDGE,
+            exclusive_zone: 20,
+            ..TestLayerSpec::default()
+        },
+        "foreign-dock",
+    );
+    let _ = harness.sync();
+    let mut quoin = connect_other_layer_client(&mut harness);
+    swap_test_client(&mut harness, &mut quoin);
+    let _ = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec { anchor: TOP_LEFT, ..TestLayerSpec::default() },
+        "quoin.panel.15",
+    );
+    let _ = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (0, 30),
+            anchor: BOTTOM_EDGE,
+            exclusive_zone: 30,
+            ..TestLayerSpec::default()
+        },
+        "quoin.dock.bottom",
+    );
+    let _ = harness.sync();
+    swap_test_client(&mut harness, &mut quoin);
+    let output = harness.server.state.backend.default_output().unwrap();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    let (width, height) = (width as f32, height as f32);
+    let usable = |harness: &KeybindingHarness| {
+        let rect = harness.server.state.usable_output_rect();
+        (rect.width, rect.height)
+    };
+    let port_usable = |harness: &KeybindingHarness| {
+        let rect = harness
+            .server
+            .state
+            .port_usable_output_rect_for(&output)
+            .expect("the output projects a usable rect");
+        (rect.width, rect.height)
+    };
+    // Healthy: both reservations count.
+    assert_eq!(usable(&harness), (width - 20.0, height - 30.0));
+    let maximize = request_test_maximized(&mut harness, true);
+    let docked = configured_toplevel_size(&maximize);
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&maximize));
+    let docked_port = port_usable(&harness);
+
+    // Quoin stalls, exactly as the SIGSTOP gate drives it.
+    let away = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    route_pointer_to(&mut harness, away.0, away.1);
+    let _ = harness.sync();
+    let key = (output.name(), "left".to_owned());
+    let mode = json!({"output":output.name(),"edge":"left","surface":"quoin.panel.15","mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode.clone()).0, 0);
+    let cycle = |harness: &mut KeybindingHarness, at: (f64, f64)| {
+        route_pointer_to(harness, at.0, at.1);
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    };
+    cycle(&mut harness, (20.0, 12.0));
+    cycle(&mut harness, away);
+    pump_until(&mut harness, "the owner is marked stalled", |harness| {
+        harness.server.state.observations.panel_holders[&key].stalled
+    });
+    assert_eq!(
+        usable(&harness),
+        (width - 20.0, height),
+        "the stalled owner's reservation is zero; the healthy owner's stands"
+    );
+    assert_eq!(port_usable(&harness), (docked_port.0, docked_port.1 + 30.0));
+    let lapsed = harness.sync();
+    let grown = configured_toplevel_size(&lapsed);
+    assert_eq!(
+        (grown.0, grown.1 - docked.1),
+        (docked.0, 30),
+        "the maximised window reflows into the freed space: {lapsed:?}"
+    );
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&lapsed));
+    let dock = layer_by_namespace(&harness, "quoin.dock.bottom");
+    assert!(dock.mapped && dock.layout.visible, "the docked panel itself stays drawn");
+
+    // Recovery: Quoin's next report clears the stall and the space returns.
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    assert!(!harness.server.state.observations.panel_holders[&key].stalled);
+    assert_eq!(usable(&harness), (width - 20.0, height - 30.0));
+    assert_eq!(port_usable(&harness), docked_port);
+    let recovered = harness.sync();
+    assert_eq!(
+        configured_toplevel_size(&recovered),
+        docked,
+        "the maximised window gives the space back: {recovered:?}"
+    );
+}
+
+/// The zone comp recomputes without a stalled owner mirrors smithay's own
+/// arrangement: with every owner healthy, taking each layer's exclusive zone
+/// out in the layer map's order lands on the layer map's zone, for every
+/// anchoring the arrangement distinguishes, margins included.
+#[cfg(feature = "bus")]
+#[test]
+fn recomputed_exclusive_zone_matches_the_layer_map() {
+    const TOP: u32 = 1;
+    const BOTTOM: u32 = 2;
+    const LEFT: u32 = 4;
+    const RIGHT: u32 = 8;
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let specs = [
+        (TOP | LEFT | RIGHT, (0, 12), 12, (2, 0, 0, 0)),
+        (TOP | BOTTOM | LEFT, (10, 0), 10, (0, 0, 0, 3)),
+        (TOP | BOTTOM | RIGHT, (9, 0), 9, (0, 4, 0, 0)),
+        (BOTTOM | LEFT | RIGHT, (0, 7), 7, (0, 0, 5, 0)),
+        (TOP | LEFT, (16, 16), 6, (1, 0, 0, 1)),
+        (BOTTOM | RIGHT, (16, 16), 5, (0, 2, 2, 0)),
+    ];
+    for (index, (anchor, size, exclusive_zone, margin)) in specs.into_iter().enumerate() {
+        let _ = map_named_test_layer_surface(
+            &mut harness,
+            0,
+            TestLayerSpec { size, anchor, exclusive_zone, margin, ..TestLayerSpec::default() },
+            &format!("mirror.{index}"),
+        );
+    }
+    let _ = harness.sync();
+    let output = harness.server.state.backend.default_output().unwrap();
+    let layer_map = layer_map_for_output(&output);
+    let (width, height) = harness.server.state.backend.seat_extent();
+    let mut zone = Rectangle::from_size((width as i32, height as i32).into());
+    for layer in layer_map.layers() {
+        let state = layer.cached_state();
+        if let ExclusiveZone::Exclusive(amount) = state.exclusive_zone {
+            zone = reserve_exclusive_zone(zone, state.anchor, state.margin, amount);
+        }
+    }
+    assert_ne!(zone, Rectangle::from_size((width as i32, height as i32).into()));
+    assert_eq!(zone, layer_map.non_exclusive_zone());
+}
+
 /// Namespace tokens are unauthenticated. Once Quoin's client owns an edge, a
 /// layer another client creates under a copy of its token is neither bound,
 /// held nor enforced, even when it is the only layer the token names.
