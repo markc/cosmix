@@ -459,12 +459,15 @@ impl WaylandState {
         self.service_input_payload(SeatKind::Human, op, Some((id, generation)))
     }
 
-    fn service_input_payload(
+    pub(super) fn service_input_payload(
         &mut self,
         seat: SeatKind,
         op: &InputOp,
         target_window: Option<(u64, u64)>,
     ) -> ControlReply {
+        if seat == SeatKind::Agent && let Err(reply) = self.agent_preflight(op) {
+            return reply;
+        }
         let injected_at_us = monotonic_micros();
         let time = (injected_at_us / 1_000) as u32;
         let mut key_result = (None, 0, None);
@@ -478,11 +481,15 @@ impl WaylandState {
                 op,
             } => {
                 if seat == SeatKind::Agent {
-                    return ControlReply::refused("agent_target_unavailable", json!({}));
+                    return self.service_agent_targeted_input(*id, *generation, *raise, op);
                 }
                 return self.service_targeted_input(*id, *generation, *raise, op);
             }
             InputOp::PointerMove { target, corners } => {
+                if seat == SeatKind::Agent {
+                    if let Err(reply) = self.move_agent_pointer(target, time) { return reply; }
+                    self.injection.events = self.injection.events.wrapping_add(1);
+                } else {
                 let input = match self.pointer_move_input(target, time) {
                     Ok(input) => input,
                     Err(reply) => return reply,
@@ -490,6 +497,7 @@ impl WaylandState {
                 self.injection.suppress_corners = !corners;
                 self.inject(seat, input);
                 self.injection.suppress_corners = false;
+                }
                 (InjectedKind::PointerMove, false)
             }
             InputOp::PointerButton { button, action } => {
@@ -695,7 +703,7 @@ impl WaylandState {
         }
     }
 
-    fn pointer_move_input(
+    pub(super) fn pointer_move_input(
         &self,
         target: &PointerMoveTarget,
         time: u32,

@@ -2,8 +2,193 @@
 //! host input arbitration, compositor bindings, constraints or chrome.
 
 use super::*;
+use crate::port::{ControlReply, InputOp, PointerMoveTarget, PressAction};
+use serde_json::json;
 
 impl WaylandState {
+    fn agent_refusal(reason: &'static str) -> ControlReply {
+        let mut detail = json!({});
+        if matches!(reason, "agent_seat_unbound" | "x11_unsupported" | "chrome_target") {
+            detail["hint"] = json!({"seat":"human"});
+        }
+        if reason == "agent_seat_unbound" {
+            detail["message"] = json!("target client is currently unbound on the agent seat");
+        }
+        ControlReply::refused(reason, detail)
+    }
+
+    fn validate_agent_surface(&self, surface: &WlSurface, keyboard: bool) -> Result<(), ControlReply> {
+        if self.session_lock_active() { return Err(Self::agent_refusal("session_lock")); }
+        let root = canonical_root_surface(&self.popup_manager, surface);
+        let record = self.surfaces.get(&root.id()).ok_or_else(|| Self::agent_refusal("unmapped"))?;
+        #[cfg(feature = "xwayland")]
+        if matches!(record.role, SurfaceRole::X11(_)) {
+            return Err(Self::agent_refusal("x11_unsupported"));
+        }
+        if !record.mapped { return Err(Self::agent_refusal("unmapped")); }
+        if !self.surface_is_input_presentable(record) { return Err(Self::agent_refusal("not_presentable")); }
+        let client = surface.client().ok_or_else(|| Self::agent_refusal("unmapped"))?;
+        let bound = if keyboard {
+            self.agent.keyboard.client_keyboards(&client).next().is_some()
+        } else {
+            self.agent.pointer.client_pointers(&client).next().is_some()
+        };
+        if !bound { return Err(Self::agent_refusal("agent_seat_unbound")); }
+        Ok(())
+    }
+
+    pub(super) fn agent_preflight(&self, op: &InputOp) -> Result<(), ControlReply> {
+        if self.session_lock_active() { return Err(Self::agent_refusal("session_lock")); }
+        if matches!(op, InputOp::Key { .. } | InputOp::Text(_))
+            && self.agent.keyboard.with_grab(|_, grab| !grab.is::<PopupKeyboardGrab<WaylandState>>()).unwrap_or(false) {
+            return Err(Self::agent_refusal("keyboard_grab"));
+        }
+        match op {
+            InputOp::Key { action: PressAction::Release, .. } | InputOp::ReleaseAll => Ok(()),
+            InputOp::Key { .. } | InputOp::Text(_) => {
+                let surface = self.agent.keyboard.current_focus().and_then(|target| target.owned_surface())
+                    .ok_or_else(|| Self::agent_refusal("no_keyboard_target"))?;
+                self.validate_agent_surface(&surface, true)
+            }
+            InputOp::PointerButton { action: PressAction::Release, .. } => Ok(()),
+            InputOp::PointerButton { .. } | InputOp::PointerScroll { .. } => {
+                if let Some(surface) = self.agent.pointer.current_focus().and_then(|target| target.owned_surface()) {
+                    self.validate_agent_surface(&surface, false)
+                } else if self.agent_popup_pointer_grab() {
+                    // A press outside a popup is delivered to its grab to dismiss it.
+                    Ok(())
+                } else { Err(Self::agent_refusal("no_pointer_target")) }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn agent_popup_pointer_grab(&self) -> bool {
+        self.agent.pointer.with_grab(|_, grab| grab.is::<PopupPointerGrab<WaylandState>>()).unwrap_or(false)
+    }
+
+    pub(super) fn service_agent_targeted_input(&mut self, id: u64, generation: u64, raise: bool, op: &InputOp) -> ControlReply {
+        if raise { return Self::agent_refusal("invalid_argument"); }
+        if self.session_lock_active() { return Self::agent_refusal("session_lock"); }
+        let object = match self.resolve_window_target(id, Some(generation)) {
+            Ok(object) => object,
+            Err(error) => return ControlReply::WindowTarget { id, error },
+        };
+        let surface = self.surfaces[&object].role.wl_surface().clone();
+        let keyboard_op = matches!(op, InputOp::Key { .. } | InputOp::Text(_));
+        if let Err(reply) = self.validate_agent_surface(&surface, keyboard_op) { return reply; }
+        let keyboard_grab = self.agent.keyboard.is_grabbed();
+        let matching_popup = self.agent.keyboard.with_grab(|_, grab| grab.is::<PopupKeyboardGrab<WaylandState>>()).unwrap_or(false)
+            && self.delivery_target_on(SeatKind::Agent, true) == Some((id, generation));
+        if keyboard_grab && !matching_popup { return Self::agent_refusal("keyboard_grab"); }
+        if self.agent.pointer.is_grabbed()
+            && self.delivery_target_on(SeatKind::Agent, false) != Some((id, generation)) {
+            return Self::agent_refusal("pointer_grab");
+        }
+        let release = matches!(op, InputOp::Key { action: PressAction::Release, .. }
+            | InputOp::PointerButton { action: PressAction::Release, .. });
+        if !release {
+            // Resolve every pointer check before mutating either device focus.
+            let pointer_target = if keyboard_op { None } else {
+                let record = &self.surfaces[&object];
+                let position = self.agent.pointer_position.filter(|_| self.delivery_target_on(SeatKind::Agent, false) == Some((id, generation)))
+                    .unwrap_or((f64::from(record.layout.x + record.layout.width / 2.0),
+                                f64::from(record.layout.y + record.layout.height / 2.0)));
+                let Some((hit, origin)) = self.agent_hit(Some(&object), position.0, position.1) else {
+                    return Self::agent_refusal("chrome_target");
+                };
+                if let Err(reply) = self.validate_agent_surface(&hit, false) { return reply; }
+                Some((hit, origin, position))
+            };
+            if !matching_popup {
+                let keyboard = self.agent.keyboard.clone();
+                keyboard.set_focus(self, Some(SeatFocusTarget::Wayland(surface)), SERIAL_COUNTER.next_serial());
+            }
+            if let Some((surface, origin, position)) = pointer_target {
+                self.agent_motion(Some((SeatFocusTarget::Wayland(surface), origin)), position, monotonic_millis());
+            }
+        }
+        self.service_input_payload(SeatKind::Agent, op, Some((id, generation)))
+    }
+
+    /// Root-local means the root wl_surface's (0,0), including its committed
+    /// window-geometry offset. Descendant layouts already contain subsurface
+    /// and popup offsets. Use committed input regions and compositor tree order;
+    /// ignore visibility/workspace only when a particular root was requested.
+    fn agent_hit(&self, root: Option<&ObjectId>, x: f64, y: f64) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.surfaces.values().filter(|record| {
+            self.agent_tree_mapped(record) && self.surface_is_input_presentable(record)
+                && root.map_or(record.layout.visible, |root| canonical_root_surface(&self.popup_manager, record.role.wl_surface()).id() == *root)
+                && x >= f64::from(record.layout.x) && y >= f64::from(record.layout.y)
+                && x < f64::from(record.layout.x + record.layout.width)
+                && y < f64::from(record.layout.y + record.layout.height)
+                && record.committed_input_region.as_ref().is_none_or(|region| region.contains((
+                    (x - f64::from(record.layout.x)).floor() as i32,
+                    (y - f64::from(record.layout.y)).floor() as i32,
+                )))
+        }).max_by(|left, right| surface_stack_cmp(left, right)).map(|record| (
+            record.role.wl_surface().clone(), (f64::from(record.layout.x), f64::from(record.layout.y)).into(),
+        ))
+    }
+
+    fn agent_tree_mapped(&self, mut record: &SurfaceRecord) -> bool {
+        loop {
+            if !record.mapped || matches!(record.role, SurfaceRole::Dormant(_)) { return false; }
+            if matches!(record.role, SurfaceRole::Subsurface { .. }) && !record.parent_association_committed { return false; }
+            let Some(parent) = record.layout.parent else { return true };
+            let Some(parent) = self.surface_objects.get(&parent).and_then(|object| self.surfaces.get(object)) else { return false };
+            record = parent;
+        }
+    }
+
+    fn agent_motion(&mut self, focus: Option<(SeatFocusTarget, Point<f64, Logical>)>, position: (f64, f64), time: u32) {
+        self.agent.pointer_position = Some(position);
+        let pointer = self.agent.pointer.clone();
+        pointer.motion(self, focus, &MotionEvent { location: position.into(), serial: SERIAL_COUNTER.next_serial(), time });
+        pointer.frame(self);
+    }
+
+    pub(super) fn move_agent_pointer(&mut self, target: &PointerMoveTarget, time: u32) -> Result<(), ControlReply> {
+        let (root, x, y) = match target {
+            PointerMoveTarget::Window { id, generation, x, y, .. } => {
+                let object = self.resolve_window_target(*id, Some(*generation))
+                    .map_err(|error| ControlReply::WindowTarget { id: *id, error })?;
+                let record = &self.surfaces[&object];
+                self.validate_agent_surface(record.role.wl_surface(), false)?;
+                let position = (f64::from(record.layout.x) + x, f64::from(record.layout.y) + y);
+                (Some(object), position.0, position.1)
+            }
+            PointerMoveTarget::Relative { dx, dy } => {
+                let (x, y) = self.agent.pointer_position.ok_or_else(|| Self::agent_refusal("no_pointer_target"))?;
+                (None, x + dx, y + dy)
+            }
+            PointerMoveTarget::Output { .. } => {
+                let HostInput::PointerMotionAbsolute { x, y, .. } = self.pointer_move_input(target, time)? else { unreachable!() };
+                (None, x, y)
+            }
+        };
+        if self.agent.pointer.is_grabbed() && !self.agent_popup_pointer_grab() {
+            if !self.agent.pointer.with_grab(|_, grab| grab.is::<smithay::input::pointer::ClickGrab<WaylandState>>()).unwrap_or(false) {
+                return Err(Self::agent_refusal("pointer_grab"));
+            }
+            // The ordinary implicit button grab may continue within its root.
+            let start = self.agent.pointer.grab_start_data().and_then(|start| start.focus)
+                .and_then(|(focus, _)| focus.owned_surface());
+            if start.is_none_or(|surface| root.as_ref().is_some_and(|root|
+                canonical_root_surface(&self.popup_manager, &surface).id() != *root)) {
+                return Err(Self::agent_refusal("pointer_grab"));
+            }
+        }
+        if root.is_none() && matches!(self.pointer_target_at(x, y), Some(PointerTarget::Chrome { .. })) {
+            return Err(Self::agent_refusal("chrome_target"));
+        }
+        let hit = self.agent_hit(root.as_ref(), x, y);
+        if root.is_some() && hit.is_none() { return Err(Self::agent_refusal("chrome_target")); }
+        if let Some((surface, _)) = &hit { self.validate_agent_surface(surface, false)?; }
+        self.agent_motion(hit.map(|(surface, origin)| (SeatFocusTarget::Wayland(surface), origin)), (x, y), time);
+        Ok(())
+    }
+
     pub(super) fn deliver_agent_input(&mut self, input: HostInput) {
         match input {
             HostInput::Key { keycode, state, time } => {
