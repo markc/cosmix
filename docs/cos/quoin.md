@@ -810,8 +810,12 @@ timing window. It is not an exactly-once guarantee across a connection reset or
 publisher sequence restart; a publisher restart requires a fresh host/connection.
 High-water rejections emit `quoin_corner_sequence_rejected` WARNs at counts
 1, 2, 4, 8, … with the received sequence, canonical sequence and high-water mark.
-These include legitimate duplicates (including the first legacy/v2 pair);
-persistent low sequences can indicate a compositor restart. Legacy clicks ignored
+These include redelivered duplicates. The v2 half of a legacy-first pair is
+dropped silently, neither counted nor logged: the click already acted through
+its legacy record. The common case is the first click after connect, when it is
+an unmodified LMB, but any legacy-first pair accepted before v2 is observed
+qualifies, including one that follows a gap. Persistent low sequences can indicate a compositor
+restart. Legacy clicks ignored
 after v2 discovery do not increment this separate counter. The counter resets
 with connection preference state. Automatic publisher-restart recovery is not
 implemented: `info.instance` identifies the compositor process, but is absent
