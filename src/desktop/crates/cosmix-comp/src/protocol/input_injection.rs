@@ -1179,7 +1179,7 @@ impl WaylandState {
                 return;
             }
             if self.injection.events.wrapping_sub(events_at_start) >= SEQUENCE_YIELD_EVENTS
-                || steps_this_turn >= SEQUENCE_YIELD_EVENTS
+                || (run.uses_agent && steps_this_turn >= SEQUENCE_YIELD_EVENTS)
             {
                 if run.uses_agent {
                     self.queue_agent_sequence(id);

@@ -1,6 +1,22 @@
 // Included by input_injection_tests.rs: real queued Bus controls and wire devices.
 
 #[test]
+fn human_sequence_scheduler_yields_on_events_not_agent_step_scans() {
+    let (mut h, _, runtime, _, _, _) = two_windows();
+    // White-box scheduler boundary: the public parser caps runs at 256 steps.
+    // Go one beyond that with zero-event cleanup to distinguish the historical
+    // human event budget from the agent coalescing scan budget.
+    let steps = (0..257).map(|_| step("comp.input.release_all", InputOp::ReleaseAll, 0)).collect();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let events = h.server.state.injection.events;
+    h.server.state.start_long_op(crate::port::LongOp::Sequence(steps), sender, Instant::now());
+    assert_eq!(h.server.state.injection.events, events);
+    assert!(h.server.state.injection.sequences.is_empty(), "human cleanup must not arm an agent step-count yield");
+    let reply = runtime.block_on(receiver).unwrap().wire_json();
+    assert_eq!(reply["steps"].as_array().unwrap().len(), 257);
+}
+
+#[test]
 fn snapshot_after_parked_agent_motion_waits_for_its_delivery() {
     let (mut h, ingress, runtime, _, alpha, _) = two_windows();
     bind_agent_devices(&mut h);
