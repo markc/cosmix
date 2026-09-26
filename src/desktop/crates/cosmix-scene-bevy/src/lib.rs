@@ -298,7 +298,7 @@ impl SceneStore {
                     && cosmix_scene::resolve(&document).is_ok_and(|tree| render::is_dialog(&tree));
                 if let Some(entry) = self.scenes.get(&document.name)
                     && entry.model_generation.is_some()
-                    && !(preempting && !entry.is_model_authority(mount.as_deref()))
+                    && (!preempting || entry.is_model_authority(mount.as_deref()))
                     && (managed_generation.is_none() || !entry.is_model_authority(mount.as_deref()))
                 {
                     return Err(model_authority_refusal(&document.name));
