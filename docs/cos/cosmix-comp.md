@@ -957,6 +957,10 @@ rounds half away from zero on both sides of the origin.
 keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
 hidden from Xwayland. Every `comp.input.*` verb accepts `seat:"human"` or
 `seat:"agent"`; there are no caller authorisation gates on either choice.
+Clipboard and primary selections now relay between the two seats with source
+provenance. Consecutive compatible agent motions coalesce, and agent delivery
+runs in bounded batches after ready human input. Full-click menu switching
+preserves the next menu's press serial; unmapping a menu's root retires its grabs.
 
 The default is still **human** (`cosmix`). It changes to agent only in the
 release that also migrates the hub's human-input gates. The deliberate exception
@@ -972,13 +976,30 @@ Without a sequence-level seat, each verb uses its own default.
 | Idle | Human activity resumes idle notifications on both seats | Neither seat's idle notification is reset; no user-activity observation |
 | Session lock | Untargeted input retains the lock-screen path | All verbs refuse with `session_lock` |
 | Pointer | Device path, including chrome, corners and constraints | Client surfaces only; independent position; human cursor image/position unchanged |
-| Clipboard | Existing human clipboard/XWM bridge | Still per-seat; the cross-seat relay is not implemented yet |
+| Clipboard and primary | Shared selection, including the XWM bridge | Shared selection, with the source seat and generation tracked explicitly |
 
 Successful agent delivery updates `input.seats.agent.last_input_us` and
 `input.last_origin:"agent"`. Human delivery updates the human leaves and reports
 `last_origin:"human"`. The existing focus/pointer leaves retain their human
 meaning. Human Bus injection still follows `inject → handle_host_input →
 notify_idle_activity(Human)`; agent delivery uses the agent Smithay handles.
+
+Clipboard and primary are separate logical selections, each offered on both
+seats. A client setting either selection replaces the other seat's mirror;
+clearing it or destroying/disconnecting its current source clears both offers.
+Destroying a replaced source leaves the newer selection intact. Data-control
+history clients on either seat see each replacement once. Mirrors use
+compositor selection setters, which do not invoke the source-change callback,
+so they cannot echo ownership back and forth.
+
+Each mirror records a source seat (or X11) and a selection generation. Reading
+a replaced mirror closes the transfer fd without serving newer clipboard data.
+For a current Wayland source, the relay passes the recipient's fd to that
+source; clipboard bytes do not pass through comp. X11 offers carry X11
+provenance on both seats. An X11 paste of an agent-sourced selection routes
+explicitly through the relay to the agent source, never through a presumed
+human source. Clipboard sharing is independent of input reachability: agent
+key and pointer delivery to X11 still returns `x11_unsupported`.
 
 | Verb | Arguments, in addition to `seat?` |
 | --- | --- |
@@ -1102,7 +1123,11 @@ popup grab consumes it. Human clicks outside do not dismiss agent popups.
 `release_all` with no seat or with `seat:"agent"` dismisses the agent popup chain
 and removes its keyboard/pointer grabs; `seat:"human"` leaves it alone.
 The agent half of bare cleanup does not record agent input activity or change
-`input.last_origin`. Naturally ended popup chains are retired from seat state.
+`input.last_origin`. Naturally ended popup chains retire their handles while
+preserving a newer press that may open the next menu. Explicit dismissal clears
+both device action slots. A chain whose popup or root has unmapped is also
+retired; a newly created popup may still complete its initial configure/map
+handshake, provided its root remains mapped.
 Explicit agent key/button releases bypass target candidacy and focus mutation,
 so a hold can be retired after its old target unmaps; session lock still refuses.
 
@@ -1115,6 +1140,30 @@ On a failed step, it returns `step_failed` with `index`, `verb`, `step`,
 `completed` and `released:true`, and gives up its holds on **both** seats.
 Other owners' holds remain. Caller cancellation also releases the run's holds.
 Eight sequence permits are available; admission beyond that returns `busy`.
+
+Within a dispatch batch, only consecutive agent motions to the same live client
+surface and with the same coordinate contract coalesce. Window motions must
+name the same window generation; output motions must use the same output
+selector; consecutive relative deltas are summed. Grabs, surface transitions,
+sequence delays and intervening controls (including keys, buttons and scroll)
+are delivery boundaries. Human motions retain their existing path and cannot
+merge with agent motions. Separate sequence runs are also boundaries.
+
+Each coalesced request is answered **after** the final motion is delivered.
+Its reply reports that final position, target, timestamp and shared `input_seq`,
+with `coalesced:N` giving the number of requests represented by that delivery.
+Intermediate coordinates are not reported as delivered. Sequence replies keep
+one entry per requested step, sharing those delivery fields for a coalesced run.
+
+Ready human `HostInput` drains before Bus delivery. Each dispatch services at
+most eight standalone agent verbs and one ready agent sequence burst; ordered
+controls left over remain queued. Sequences yield at the existing 256-event
+boundary between atomic operations, and also after visiting 256 steps so
+coalescing cannot create an unbounded scan. Ready agent sequences rotate in
+queue order. Queued agent work wakes the event loop directly: continuously
+arriving human input cannot postpone it indefinitely, and no polling timer is
+used for agent continuation. Explicitly requested delays still use one-shot
+timers. Resolve, focus and each individual input operation remain atomic.
 
 Lock entry, VT switching, session pause and input-authority loss clear agent
 holds, grabs and focus and cancel sequences using the agent seat with
