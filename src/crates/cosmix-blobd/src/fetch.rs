@@ -649,7 +649,12 @@ impl Inner {
         // concurrent put or fetch): nothing to move.
         if matches!(blob::exists(&self.store.blobs_root(), &hash), Ok(true)) {
             let size = blob::size(&self.store.blobs_root(), &hash).unwrap_or(0);
-            return Attempt::ok(None, size, "application/octet-stream".to_string());
+            return Attempt::ok(
+                None,
+                size,
+                "application/octet-stream".to_string(),
+                None,
+            );
         }
 
         let mut answered_no = false; // a reachable source said "not present"
@@ -662,9 +667,11 @@ impl Inner {
                 .await
         {
             match self.try_source(&url, &hash, &owner).await {
-                SourceOutcome::Fetched { size, mime } => {
-                    return Attempt::ok(Some(target.node), size, mime);
-                }
+                SourceOutcome::Fetched {
+                    size,
+                    mime,
+                    reservation,
+                } => return Attempt::ok(Some(target.node), size, mime, Some(reservation)),
                 terminal @ (SourceOutcome::Verify { .. }
                 | SourceOutcome::Quota(_)
                 | SourceOutcome::Local(_)) => return Attempt::terminal(terminal),
@@ -708,8 +715,12 @@ impl Inner {
         for peer in &holders {
             match self.resolver.lane_url(peer, None).await {
                 Ok(url) => match self.try_source(&url, &hash, &owner).await {
-                    SourceOutcome::Fetched { size, mime } => {
-                        return Attempt::ok(Some(peer.clone()), size, mime);
+                    SourceOutcome::Fetched {
+                        size,
+                        mime,
+                        reservation,
+                    } => {
+                        return Attempt::ok(Some(peer.clone()), size, mime, Some(reservation))
                     }
                     terminal @ (SourceOutcome::Verify { .. }
                     | SourceOutcome::Quota(_)
@@ -780,19 +791,22 @@ impl Inner {
             }
         }
 
-        // Quota before the first byte; a lying (or absent) length meets
-        // the same limit as the mid-stream counter below.
-        let cap = match self.store.upload_cap(owner) {
-            Ok(cap) => cap,
-            Err(error) => return SourceOutcome::Local(error.to_string()),
+        // Quota before the first byte, reserved at admission (M3): the
+        // declared Content-Length, or the whole remaining room when
+        // absent — concurrent downloads for one owner can no longer
+        // each spend the same headroom. The reservation travels with
+        // the attempt and releases when the pin settles.
+        let reservation = match self.store.reserve_upload(owner, response.content_length()) {
+            Ok(reservation) => reservation,
+            Err(e @ crate::core::store::StoreError::QuotaOwner { .. }) => {
+                return SourceOutcome::Quota(e.to_string())
+            }
+            Err(e @ crate::core::store::StoreError::QuotaTotal { .. }) => {
+                return SourceOutcome::Quota(e.to_string())
+            }
+            Err(e) => return SourceOutcome::Local(e.to_string()),
         };
-        if let Some(len) = response.content_length()
-            && len > cap
-        {
-            return SourceOutcome::Quota(format!(
-                "quota: body of {len} bytes exceeds the remaining cap of {cap}"
-            ));
-        }
+        let cap = reservation.cap();
         let mime = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -805,8 +819,13 @@ impl Inner {
         let pump = tokio::spawn(pump_response(response, tx, cap));
         let reader_store = Arc::clone(&self.store);
         let expected = *hash;
+        // The reservation rides inside the write task (its release
+        // must outlast the stream) and comes back out on success, so
+        // it can outlive this frame and settle after the pin lands.
         let landed = tokio::task::spawn_blocking(move || {
-            blob::put_reader_expect(&reader_store.blobs_root(), ChannelReader::new(rx), &expected)
+            let landed =
+                blob::put_reader_expect(&reader_store.blobs_root(), ChannelReader::new(rx), &expected);
+            (landed, reservation)
         })
         .await;
         let _ = pump.await;
@@ -815,14 +834,18 @@ impl Inner {
             // put_reader_expect compared before committing, so a
             // success here is verified: the landed hash is the
             // requested one.
-            Ok(Ok((_landed, size))) => SourceOutcome::Fetched { size, mime },
-            Ok(Err(cosmix_mds::Error::BlobCorrupt(message))) => {
+            Ok((Ok((_landed, size)), reservation)) => SourceOutcome::Fetched {
+                size,
+                mime,
+                reservation,
+            },
+            Ok((Err(cosmix_mds::Error::BlobCorrupt(message)), _reservation)) => {
                 // The body did not hash to the requested id. Nothing
                 // ever entered the CAS — mds removed the staging
                 // before any commit — so there is nothing to undo.
                 SourceOutcome::Verify(message)
             }
-            Ok(Err(error)) => {
+            Ok((Err(error), _reservation)) => {
                 // The abort reason rode inside the io::Error that
                 // stopped the stream; put_reader_expect has already
                 // deleted the staging file by the time it surfaces
@@ -841,10 +864,14 @@ impl Inner {
     /// Ingest on success, counters, and the completion events: one
     /// `blob.pinned` per newly pinned owner, the props diff, then
     /// `blob.fetched` last — it is the completion signal.
-    async fn complete(self: &Arc<Self>, hash: BlobHash, attempt: Attempt, owners: Vec<String>) {
+    async fn complete(self: &Arc<Self>, hash: BlobHash, mut attempt: Attempt, owners: Vec<String>) {
         let id = reference::blob_id(&hash);
         let mut events = Vec::new();
         if attempt.outcome == FetchOutcome::Ok {
+            // Settle the admission's quota reservation after the pins
+            // account the real size (M3); on every other path it has
+            // already dropped with the attempt's failure.
+            let reservation = attempt.reservation.take();
             let before = self.props_input();
             let newly_pinned = self
                 .store
@@ -859,6 +886,7 @@ impl Inner {
                     &owners,
                 )
                 .unwrap_or_default();
+            drop(reservation);
             for owner in &newly_pinned {
                 events.push(domain_event(
                     TOPIC_PINNED,
@@ -938,16 +966,26 @@ struct Attempt {
     size: Option<u64>,
     mime: Option<String>,
     error: Option<String>,
+    /// The download's quota reservation (M3), held from admission
+    /// until the pins account the real size; `None` when the bytes
+    /// were already present.
+    reservation: Option<crate::core::store::Reservation>,
 }
 
 impl Attempt {
-    fn ok(origin_used: Option<String>, size: u64, mime: String) -> Self {
+    fn ok(
+        origin_used: Option<String>,
+        size: u64,
+        mime: String,
+        reservation: Option<crate::core::store::Reservation>,
+    ) -> Self {
         Self {
             outcome: FetchOutcome::Ok,
             origin_used,
             size: Some(size),
             mime: Some(mime),
             error: None,
+            reservation,
         }
     }
 
@@ -968,6 +1006,7 @@ impl Attempt {
             size: None,
             mime: None,
             error: Some(error),
+            reservation: None,
         }
     }
 }
@@ -978,6 +1017,10 @@ enum SourceOutcome {
     Fetched {
         size: u64,
         mime: String,
+        /// The admission's quota reservation (M3), carried to
+        /// `complete` so it releases only after the pins account the
+        /// real size.
+        reservation: crate::core::store::Reservation,
     },
     /// Bytes did not hash to the requested id; terminal, never
     /// retried. mds's `put_reader_expect` rejected them before any

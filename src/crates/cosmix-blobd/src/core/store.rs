@@ -16,7 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -228,6 +228,48 @@ pub struct QuotaReport {
 pub struct OwnerQuota {
     pub used: u64,
     pub limit: u64,
+    /// Bytes admitted to in-flight uploads but not yet pinned (M3's
+    /// reservation table) — visible beside `used` so an operator can
+    /// see why a fresh upload is refused while `used` looks low.
+    pub reserved: u64,
+}
+
+/// One in-flight upload's quota hold (M3): the bytes admitted when the
+/// upload started, released exactly once when this guard drops —
+/// abort, error, panic or the pin's accounting, all run `Drop` — so a
+/// reservation can never leak. The uploading path keeps the guard
+/// alive until `record_upload`/`record_fetch` has settled the real
+/// size.
+#[derive(Debug)]
+pub struct Reservation {
+    reserved: Arc<Mutex<BTreeMap<String, u64>>>,
+    owner: String,
+    amount: u64,
+}
+
+impl Reservation {
+    /// The mid-stream byte bound this reservation grants: the declared
+    /// `Content-Length`, or the owner's whole remaining room when the
+    /// length was unknown.
+    pub fn cap(&self) -> u64 {
+        self.amount
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut reserved = self.reserved.lock().unwrap();
+        let left = reserved
+            .get(&self.owner)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(self.amount);
+        if left == 0 {
+            reserved.remove(&self.owner);
+        } else {
+            reserved.insert(self.owner.clone(), left);
+        }
+    }
 }
 
 /// `blob.gc` outcome. `swept` holds blob ids in hash order.
@@ -285,6 +327,10 @@ pub struct Store {
     /// Read connection to mds's `blobs.sqlite` for the public row API.
     /// blobd never writes here (D4: mds's schema is mds's).
     index: Mutex<Connection>,
+    /// In-flight upload reservations (M3): owner → bytes admitted but
+    /// not yet pinned. Lock order is always reserved → db — a path
+    /// holding the db mutex never takes this one.
+    reserved: Arc<Mutex<BTreeMap<String, u64>>>,
     /// Holds the root `flock` for the store's lifetime. Never read:
     /// closing it on drop is what releases the lock.
     _lock_file: File,
@@ -328,6 +374,7 @@ impl Store {
             mds,
             db: Mutex::new(db),
             index: Mutex::new(index),
+            reserved: Arc::new(Mutex::new(BTreeMap::new())),
             _lock_file: lock_file,
             options,
             startup: StartupReport::default(),
@@ -403,10 +450,68 @@ impl Store {
 
     // ---- Ingest ----
 
+    /// Atomically check the caps and reserve room for one upload
+    /// (M3). `declared` is the `Content-Length` when the client sent
+    /// one; when absent the owner's whole remaining room is reserved
+    /// (the mid-stream counter then aborts at that bound). The check
+    /// counts used bytes and every in-flight reservation under the
+    /// reserved→db lock order, so N concurrent uploads for one owner
+    /// can no longer each spend the full headroom — the old
+    /// check-then-act read the cap once and never reserved.
+    pub fn reserve_upload(&self, owner: &str, declared: Option<u64>) -> Result<Reservation> {
+        let mut reserved = self.reserved.lock().unwrap();
+        let owner_reserved = reserved.get(owner).copied().unwrap_or(0);
+        let total_reserved: u64 = reserved.values().copied().sum();
+        let owner_used = self.owner_used(owner)?;
+        let total_used = self.total_used()?;
+        // Owner cap first — the order Store::put has always checked.
+        if let Some(amount) = declared {
+            let limit = self.options.owner_limit(owner);
+            let would_use = owner_used
+                .saturating_add(owner_reserved)
+                .saturating_add(amount);
+            if would_use > limit {
+                return Err(StoreError::QuotaOwner {
+                    owner: owner.to_string(),
+                    would_use,
+                    limit,
+                });
+            }
+            let total_would = total_used
+                .saturating_add(total_reserved)
+                .saturating_add(amount);
+            if total_would > self.options.quota_total_bytes {
+                return Err(StoreError::QuotaTotal {
+                    would_use: total_would,
+                    limit: self.options.quota_total_bytes,
+                });
+            }
+        }
+        let amount = declared.unwrap_or_else(|| {
+            let owner_room = self
+                .options
+                .owner_limit(owner)
+                .saturating_sub(owner_used.saturating_add(owner_reserved));
+            let total_room = self
+                .options
+                .quota_total_bytes
+                .saturating_sub(total_used.saturating_add(total_reserved));
+            owner_room.min(total_room)
+        });
+        *reserved.entry(owner.to_string()).or_insert(0) += amount;
+        Ok(Reservation {
+            reserved: Arc::clone(&self.reserved),
+            owner: owner.to_string(),
+            amount,
+        })
+    }
+
     /// Daemon-local ingest via `mds::put_blob_path`. The quota check
-    /// runs before the copy (size from `stat`); accounting lands with
-    /// the pin after the CAS commit. Idempotent: a re-put returns the
-    /// same reference and pins nothing new.
+    /// reserves at admission (M3) — concurrent puts cannot overshoot a
+    /// cap — and accounting settles to the real size when the pin
+    /// lands (the reservation releases as this frame unwinds).
+    /// Idempotent: a re-put returns the same reference and pins
+    /// nothing new.
     pub fn put(&self, src: &Path, opts: &PutOptions<'_>) -> Result<PutOutcome> {
         if opts.mode == PutMode::HardLink && !opts.immutable {
             return Err(StoreError::BadRequest(
@@ -423,26 +528,10 @@ impl Store {
             )));
         }
 
-        // Quota before the copy: owner cap, then total cap.
+        // Quota reserved for the copy's duration; the mid-copy race
+        // that read the cap once is closed.
         let size = md.len();
-        let owner_used = self.owner_used(opts.owner)?;
-        let owner_limit = self.options.owner_limit(opts.owner);
-        let would_use = owner_used.saturating_add(size);
-        if would_use > owner_limit {
-            return Err(StoreError::QuotaOwner {
-                owner: opts.owner.to_string(),
-                would_use,
-                limit: owner_limit,
-            });
-        }
-        let total_used = self.total_used()?;
-        let total_would = total_used.saturating_add(size);
-        if total_would > self.options.quota_total_bytes {
-            return Err(StoreError::QuotaTotal {
-                would_use: total_would,
-                limit: self.options.quota_total_bytes,
-            });
-        }
+        let _reservation = self.reserve_upload(opts.owner, Some(size))?;
 
         let hash = self.mds.put_blob_path(src, opts.mode)?;
         let size = blob::size(&self.blobs_root(), &hash)?;
@@ -572,23 +661,6 @@ impl Store {
             self.bump_generation();
         }
         Ok(newly_pinned)
-    }
-
-    /// The largest upload `owner` may land right now: the tighter of
-    /// the owner's remaining headroom and the total cap's. The lane
-    /// checks a declared `Content-Length` against this before the
-    /// first byte and enforces it with a mid-stream counter; `blob.fetch`
-    /// checks a lane response's `Content-Length` the same way.
-    pub fn upload_cap(&self, owner: &str) -> Result<u64> {
-        let owner_room = self
-            .options
-            .owner_limit(owner)
-            .saturating_sub(self.owner_used(owner)?);
-        let total_room = self
-            .options
-            .quota_total_bytes
-            .saturating_sub(self.total_used()?);
-        Ok(owner_room.min(total_room))
     }
 
     // ---- Reads ----
@@ -880,6 +952,10 @@ impl Store {
     // ---- Quota ----
 
     pub fn quota_report(&self, owner: Option<&str>) -> Result<QuotaReport> {
+        // The reservation snapshot first, never nested with the db
+        // lock (lock order is reserved → db everywhere else).
+        let reserved_map: BTreeMap<String, u64> = self.reserved.lock().unwrap().clone();
+        let total_reserved: u64 = reserved_map.values().copied().sum();
         let db = self.db.lock().unwrap();
         let mut owners = BTreeMap::new();
         match owner {
@@ -898,6 +974,7 @@ impl Store {
                     OwnerQuota {
                         used: used as u64,
                         limit: self.options.owner_limit(one),
+                        reserved: reserved_map.get(one).copied().unwrap_or(0),
                     },
                 );
             }
@@ -917,6 +994,7 @@ impl Store {
                         OwnerQuota {
                             used: used as u64,
                             limit: self.options.owner_limit(&o),
+                            reserved: reserved_map.get(&o).copied().unwrap_or(0),
                         },
                     );
                 }
@@ -924,6 +1002,7 @@ impl Store {
                     owners.entry(o.clone()).or_insert(OwnerQuota {
                         used: 0,
                         limit: *limit,
+                        reserved: reserved_map.get(o).copied().unwrap_or(0),
                     });
                 }
             }
@@ -940,6 +1019,7 @@ impl Store {
             total: OwnerQuota {
                 used: total_used as u64,
                 limit: self.options.quota_total_bytes,
+                reserved: total_reserved,
             },
         })
     }
@@ -1651,6 +1731,56 @@ mod tests {
         let after = store.gc(true).unwrap();
         assert!(after.swept.is_empty(), "the re-put refreshed the grace window");
         assert_eq!(after.skipped_young, 1);
+    }
+
+    // ---- M3: concurrent uploads cannot overshoot a cap ----
+
+    #[test]
+    fn reservations_bound_concurrent_admissions_and_report() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                origin: "testnode".into(),
+                quota_total_bytes: 2 * 1024 * 1024,
+                quota_owner_default_bytes: 2 * 1024 * 1024,
+                owner_limits: BTreeMap::from([(("race").to_string(), 1024 * 1024)]),
+            },
+        )
+        .unwrap();
+
+        // A declared 700 KiB holds 700 KiB of the owner's 1 MiB…
+        let r1 = store
+            .reserve_upload("race", Some(700 * 1024))
+            .unwrap();
+        assert_eq!(r1.cap(), 700 * 1024);
+        // …so a second 700 KiB admission against the same cap is
+        // refused — the old check-then-act would have granted both.
+        let err = store
+            .reserve_upload("race", Some(700 * 1024))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::QuotaOwner { ref owner, would_use, limit } if owner == "race" && would_use == 1400 * 1024 && limit == 1024 * 1024),
+            "got {err:?}"
+        );
+
+        // blob.quota reports the hold beside used.
+        let report = store.quota_report(None).unwrap();
+        assert_eq!(report.owners["race"].used, 0);
+        assert_eq!(report.owners["race"].reserved, 700 * 1024);
+        assert_eq!(report.total.reserved, 700 * 1024);
+
+        // Release on drop, then the same admission succeeds.
+        drop(r1);
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
+        let _again = store
+            .reserve_upload("race", Some(700 * 1024))
+            .unwrap();
+
+        // An absent length reserves the owner's whole remaining room:
+        // the mid-stream counter enforces it from the first byte.
+        let r2 = store.reserve_upload("race", None).unwrap();
+        assert_eq!(r2.cap(), 324 * 1024);
     }
 
     #[test]

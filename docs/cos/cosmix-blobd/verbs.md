@@ -96,7 +96,7 @@ Inventory of blobs blobd knows (attributes or pins — an orphan file with neith
 |---|---|
 | `owner` | unset (all owners) |
 
-The response contains `owners` (`<owner>: {used, limit}`) and `total: {used, limit}`. `used` sums distinct pinned blob sizes per owner.
+The response contains `owners` (`<owner>: {used, limit, reserved}`) and `total: {used, limit, reserved}`. `used` sums distinct pinned blob sizes per owner; `reserved` is the in-flight upload headroom — bytes admitted to running uploads (lane `POST`/`PUT` bodies, `blob.fetch` downloads) whose pins have not landed yet. A fresh upload is refused against `used + reserved`, so concurrent uploads cannot each spend the same cap room, and the reservation releases when the pin settles or the upload aborts.
 
 ### `blob.gc`
 

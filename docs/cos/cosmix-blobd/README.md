@@ -78,7 +78,7 @@ Every successful upload records attributes (`origin` = this node) and a pin, so 
 
 ### Caps and bounds
 
-The total cap and the lane owner's remaining quota are enforced **mid-stream** by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers `413`; a declared `Content-Length` over the cap is refused `413` before any byte is read. An idle request body (no data for 30 s) aborts with `408`. At most `lane_max_uploads` (default 4) uploads run concurrently; beyond that the lane answers `503` immediately — there is no queue (the no-poll/no-flood law).
+The total cap and the lane owner's remaining quota are enforced **mid-stream** by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers `413`; a declared `Content-Length` over the cap is refused `413` before any byte is read. Quota is reserved at admission (the declared length, or the whole remaining room when absent), so concurrent uploads cannot each spend the same cap room — the mid-stream counter enforces the reservation. An idle request body (no data for 30 s) aborts with `408`. At most `lane_max_uploads` (default 4) uploads run concurrently; beyond that the lane answers `503` immediately — there is no queue (the no-poll/no-flood law).
 
 Uploads are **restart-only** in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction.
 
@@ -126,7 +126,7 @@ At startup blobd removes everything under `blobs/.tmp` (nothing in-flight can su
 
 `blob.gc` sweeps CAS files whose mds refcount is 0 (no row counts as 0 — every blobd put is rowless until a set references it), that carry no pin, and whose mtime is older than the 60-second grace window (`DEFAULT_GC_QUIESCENCE`). A dry run lists candidates; a live run unlinks, drops attributes and adjusts quota accounting. Pinned blobs are never candidates.
 
-Quotas are correctness, not authorisation: `blob.put` checks the owner cap and the total cap **before** the copy (size from `stat`), and accounts when the pin lands. `used` is the sum of distinct pinned blob sizes per owner; unpinning releases it. Idempotent re-puts of an already-pinned blob are refused at the cap like any other put (the quota check runs before the hash is known).
+Quotas are correctness, not authorisation: an upload (a `blob.put`, a lane body, a `blob.fetch` download) **reserves** the owner cap and the total cap at admission — the declared `Content-Length`, or the owner's whole remaining room when the length is unknown — so concurrent uploads cannot each spend the same headroom; the accounting settles to the real size when the pin lands, and an abort releases the reservation. `used` is the sum of distinct pinned blob sizes per owner; `blob.quota` reports `reserved` (the in-flight headroom) beside it; unpinning releases it. Idempotent re-puts of an already-pinned blob are refused at the cap like any other put (the quota check runs before the hash is known).
 
 ## Permissions
 

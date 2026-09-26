@@ -450,28 +450,25 @@ impl Lane {
             }
         };
 
-        // Caps: the tighter of the owner's remaining quota and the
-        // total cap. A declared Content-Length is checked before any
-        // byte is read; a lying (or absent) one meets the same limit
-        // as a mid-stream byte counter.
-        let cap = match self.store.upload_cap(&owner) {
-            Ok(cap) => cap,
+        // Caps: quota is reserved at admission (M3) — the declared
+        // Content-Length, or the owner's whole remaining room when
+        // absent — so concurrent uploads cannot each spend the same
+        // headroom. The reservation's bound is the mid-stream counter;
+        // it releases when the pin lands (or the upload aborts).
+        let reservation = match self.store.reserve_upload(&owner, content_length(headers)) {
+            Ok(reservation) => reservation,
+            Err(e @ (StoreError::QuotaOwner { .. } | StoreError::QuotaTotal { .. })) => {
+                return lane_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string());
+            }
             Err(e) => return lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
-        if let Some(len) = content_length(headers)
-            && len > cap
-        {
-            return lane_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &format!("quota: body of {len} bytes exceeds the remaining cap of {cap}"),
-            );
-        }
+        let cap = reservation.cap();
 
         let (tx, rx) = mpsc::channel::<Frame>(PUMP_FRAMES);
         let pump = tokio::spawn(pump_body(body, tx, cap));
         let store = Arc::clone(&self.store);
         let landed = tokio::task::spawn_blocking(move || {
-            stream_into_store(&store, rx, expected, mime, name, owner)
+            stream_into_store(&store, rx, expected, mime, name, owner, reservation)
         })
         .await;
 
@@ -598,7 +595,9 @@ enum UploadError {
 /// a body that does not hash to the claimed id never enters the CAS
 /// under either hash and comes back as [`UploadOutcome::Mismatch`]. A
 /// POST is server-hashed: `blob::put_reader`, the landed hash is the
-/// truth.
+/// truth. The reservation is held to the end of this frame — after
+/// `record_upload` settles the real size — so the admission headroom
+/// never double-counts and never leaks (M3).
 fn stream_into_store(
     store: &Arc<Store>,
     rx: mpsc::Receiver<Frame>,
@@ -606,6 +605,7 @@ fn stream_into_store(
     mime: String,
     name: Option<String>,
     owner: String,
+    reservation: crate::core::store::Reservation,
 ) -> Result<UploadOutcome, UploadError> {
     let reader = ChannelReader::new(rx);
     let (landed, size) = match expected {
@@ -622,6 +622,9 @@ fn stream_into_store(
     let outcome = store
         .record_upload(&landed, size, &mime, name.as_deref(), &owner)
         .map_err(UploadError::Store)?;
+    // Settle: the pin now accounts the real size; the admission's
+    // headroom releases (on the error paths above, the `?` dropped it).
+    drop(reservation);
     Ok(UploadOutcome::Committed(outcome))
 }
 
@@ -1007,6 +1010,70 @@ mod tests {
         assert_eq!(report.owners["capped"].used, 0);
         assert_eq!(report.total.used, 0);
         assert!(store.list(None, 10, None).unwrap().is_empty());
+    }
+
+    // ---- M3: concurrent uploads cannot overshoot the owner cap ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_concurrent_uploads_get_one_201_and_one_413() {
+        // Two 700 KiB uploads against a 1 MiB owner cap, both in
+        // flight at once: the admission reservation must refuse one
+        // (413) before any byte — the old check-then-act read the cap
+        // once and granted both.
+        let capped = StoreOptions {
+            owner_limits: BTreeMap::from([(("race").to_string(), 1024 * 1024)]),
+            ..options()
+        };
+        let (_dir, store, addr) = test_lane(capped).await;
+
+        // Slow distinct uploads (11 × 64 KiB chunks with a pause), so
+        // both are admitted while the other is mid-body. The response
+        // is read on its own thread: the refused upload's writes fail
+        // with EPIPE once the lane answers 413 and stops reading —
+        // the status is what matters, and it is consumed as it
+        // arrives.
+        let upload = |seed: u64| {
+            std::thread::spawn(move || {
+                let bytes = pseudo_random(700 * 1024, seed);
+                let mut stream = TcpStream::connect(addr).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut response_stream = stream.try_clone().unwrap();
+                let reader =
+                    std::thread::spawn(move || read_response(&mut response_stream, false).0);
+                let head = format!(
+                    "POST /blob HTTP/1.1\r\nHost: blobd.test\r\nX-Cosmix-Owner: race\r\n\
+                     Content-Length: {}\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                for chunk in bytes.chunks(64 * 1024) {
+                    if stream.write_all(chunk).is_err() {
+                        break; // the refusal closed its end; the 413 is out
+                    }
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                reader.join().unwrap()
+            })
+        };
+        let a = upload(0xA11CE);
+        let b = upload(0xB0B);
+        let (sa, sb) = (a.join().unwrap(), b.join().unwrap());
+        assert!(
+            [(sa, sb)].iter().any(|(x, y)| {
+                (*x == 201 && *y == 413) || (*x == 413 && *y == 201)
+            }),
+            "exactly one 201 and one 413, got {sa}/{sb}"
+        );
+
+        // The cap held: exactly one 700 KiB blob accounted, nothing
+        // staging, and the refused one left no bytes.
+        let report = store.quota_report(None).unwrap();
+        assert_eq!(report.owners["race"].used, 700 * 1024);
+        assert_eq!(report.total.used, 700 * 1024);
+        assert_eq!(report.total.reserved, 0, "the reservation settled");
+        assert!(tmp_is_empty(&store));
     }
 
     // ---- Lane idempotence: PUT of a hash the CAS already holds ----

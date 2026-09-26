@@ -299,11 +299,20 @@ impl Citizen {
         let owners: serde_json::Map<String, Value> = report
             .owners
             .iter()
-            .map(|(name, q)| (name.clone(), json!({"used": q.used, "limit": q.limit})))
+            .map(|(name, q)| {
+                (
+                    name.clone(),
+                    json!({"used": q.used, "limit": q.limit, "reserved": q.reserved}),
+                )
+            })
             .collect();
         let body = json!({
             "owners": owners,
-            "total": {"used": report.total.used, "limit": report.total.limit},
+            "total": {
+                "used": report.total.used,
+                "limit": report.total.limit,
+                "reserved": report.total.reserved,
+            },
         });
         Ok((0, body.to_string(), Vec::new()))
     }

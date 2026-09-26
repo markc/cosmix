@@ -505,7 +505,7 @@
 <table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>owner</code></td><td>unset (all owners)</td></tr>
 </tbody></table>
-<p>The response contains <code>owners</code> (<code>&lt;owner&gt;: {used, limit}</code>) and <code>total: {used, limit}</code>. <code>used</code> sums distinct pinned blob sizes per owner.</p>
+<p>The response contains <code>owners</code> (<code>&lt;owner&gt;: {used, limit, reserved}</code>) and <code>total: {used, limit, reserved}</code>. <code>used</code> sums distinct pinned blob sizes per owner; <code>reserved</code> is the in-flight upload headroom — bytes admitted to running uploads (lane <code>POST</code>/<code>PUT</code> bodies, <code>blob.fetch</code> downloads) whose pins have not landed yet. A fresh upload is refused against <code>used + reserved</code>, so concurrent uploads cannot each spend the same cap room, and the reservation releases when the pin settles or the upload aborts.</p>
 <h3 id="blobgc"><code>blob.gc</code></h3>
 <table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>dry_run</code></td><td><code>false</code></td></tr>
