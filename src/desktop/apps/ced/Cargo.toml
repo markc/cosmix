@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-ced"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -36,6 +36,10 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync", "ti
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
+# Scene Editor plan §4.4: in-process lint of `scene` buffers (the registry
+# Quoin validates with) and sha256 digest gating of external diagnostics.
+cosmix-scene = { path = "../../crates/cosmix-scene" }
+sha2 = "0.10"
 rand = "0.8"
 anyhow = "1"
 tracing = "0.1"

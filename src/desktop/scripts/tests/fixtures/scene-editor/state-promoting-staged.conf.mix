@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "enabled": [
+    "panel",
+    "launcher",
+    "launcher-sandbox"
+  ],
+  "origins": {
+    "panel": "panel",
+    "launcher": "launcher",
+    "launcher-sandbox": "launcher",
+    "editor": "editor"
+  },
+  "recovery": {},
+  "forks": {
+    "launcher-sandbox": {
+      "from": "launcher",
+      "panel": nil
+    }
+  },
+  "promoting": {
+    "from": "launcher-sandbox",
+    "to": "launcher",
+    "stage": ".stage-5c1d2e3f-0a4b-4c6d-8e9f-a0b1c2d3e4f5",
+    "backup": ".recovery/launcher-6b1e40d7-2f3a-4b5c-9d6e-7f8091a2b3c4",
+    "phase": "staged"
+  }
+}

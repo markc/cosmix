@@ -1,0 +1,23 @@
+{
+  "_contract": "Scene Editor plan §4.1 rules 2 and 12, frozen in Stage S. The loader's injected io map (src/desktop/scripts/lib/scenes-io.mix; tests replace this map, never the state machine). Stage L implements; the fake io in scenes-test.mix records every argument, including the lint mode.",
+  "check": {
+    "signature": "check($path, {lint: \"deny\" | \"report\"}) -> {ok: bool, problems: [problem]}",
+    "deny": "mix --check, then mix lint --json --deny-warnings; any error or warning refuses with SCENES_BEHAVIOUR_INVALID whose context carries the lint JSON (lines and columns). Used for every user installation.",
+    "report": "mix --check is a hard gate (refuses SCENES_BEHAVIOUR_INVALID); mix lint --json findings never refuse and come back as problems. Used only for the reserved editor entry while its dir is the shipped template.",
+    "problem": {"file": "/opt/cosmix/share/scenes/editor/behaviour.mix", "digest": "<sha256 of the file bytes checked>", "line": 40, "col": 3, "severity": "warning", "code": "MIX-W2001", "message": "unused variable $x"},
+    "example_report": {"ok": true, "problems": [{"file": "/opt/cosmix/share/scenes/editor/behaviour.mix", "digest": "7d1f9c4e0a6b2d83c5e1f04a9b7c6d2e3f8a0b1c4d5e6f708192a3b4c5d6e7f8", "line": 40, "col": 3, "severity": "warning", "code": "MIX-W2001", "message": "unused variable $x"}]}
+  },
+  "launch": {
+    "signature": "launch($dir, $name, $generation, $host, $me) -> pid",
+    "contract": "spawn [mix, --serve, $dir/behaviour.mix, --name, scene-<name>] with cwd = $dir and env SCENE_NAME, SCENE_HOST, SCENES_SERVICE, SCENE_GENERATION, SCENE_DIR = $dir; die_with_parent, exit_event, tag {name, generation}. For the reserved editor, $dir is the shipped template directory or $ROOT/editor. A behaviour loads helpers beside it with require($SCENE_DIR .. \"/lib.mix\")."
+  },
+  "persist": {
+    "contract": "persist($s) refuses with SCENES_STATE_UNREADABLE and writes nothing while $s.state_ok is false. $s.state_ok is set only by the outcome of read_state, never derived from $s.diagnostic."
+  },
+  "state_records": {
+    "paths": "stage and backup in promoting/resetting records are relative to the scene root (\".stage-<uuid>\", \".recovery/<name>-<uuid>\").",
+    "promoting": {"from": "launcher-sandbox", "to": "launcher", "stage": ".stage-<uuid>", "backup": ".recovery/launcher-<uuid>", "phase": "staged | swapped | placed", "error": "optional {error_code, message} after a failed recovery"},
+    "resetting": {"name": "panel", "stage": ".stage-<uuid>", "backup": ".recovery/panel-<uuid>", "phase": "staged | swapped | placed", "error": "optional"},
+    "forks": {"<as>": {"from": "<original name>", "panel": "<original authored window.panel, or nil>"}}
+  }
+}

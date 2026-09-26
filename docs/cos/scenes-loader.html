@@ -492,6 +492,9 @@ children inherit the session and existing <code>COMP_SERVICE</code>, <code>APPS_
 <code>TRAY_SERVICE</code>, <code>NOTIFY_SERVICE</code> and other overrides. They additionally receive
 <code>SCENE_NAME</code>, <code>SCENE_HOST</code>, <code>SCENES_SERVICE</code>, <code>SCENE_GENERATION</code>, and <code>SCENE_DIR</code>;
 their working directory is their scene directory. Each runs as <code>scene-&lt;name&gt;</code>.
+<code>SCENE_DIR</code> is the directory the behaviour runs from. For the Scene Editor's
+reserved entry that is either the shipped template or the user copy, so
+helpers kept beside a template load with <code>require($SCENE_DIR .. "/lib.mix")</code>.
 <code>SCENES_LIB</code> defaults to the shipped catalogue's <code>lib</code> directory, matching the
 shared behaviour helpers, and can be overridden explicitly. Generations are
 positive exact integers, allocated from an atomically persisted <code>.generation</code>

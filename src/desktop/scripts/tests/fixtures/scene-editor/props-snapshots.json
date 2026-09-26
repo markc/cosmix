@@ -1,0 +1,42 @@
+{
+  "_contract": "Scene Editor plan §4.3: shell.props.get and shell.panel.changed gain `dialog` (null until a dialog scene is loaded; always null before Stage Q2) and per-panel `declared` (the conf.mix order). Every change of dialog.visible or dialog.scene publishes panel.changed with a strictly greater revision; only an unchanged snapshot publishes nothing. The panel_changed_* examples elide `panels` as {} for brevity; the real notices carry every panel exactly as props_get does.",
+  "props_get": {
+    "generation": 3,
+    "revision": 41,
+    "dialog": {"scene": "editor", "visible": false, "w": 880.0, "h": 620.0, "output": "DP-1"},
+    "panels": {
+      "bottom": {"visible": true, "pinned": false, "mode": "docked", "page": "scene-panel", "pages": ["scene-panel"], "declared": ["scene-panel"], "width_px": 52.0, "output": "DP-1"},
+      "left": {"visible": false, "pinned": false, "mode": "hidden", "page": "scene-launcher", "pages": ["scene-launcher"], "declared": ["scene-launcher"], "width_px": 440.0, "output": "DP-1"},
+      "right": {"visible": false, "pinned": false, "mode": "hidden", "page": "settings.appearance", "pages": ["settings.appearance", "scene-notes"], "declared": ["settings.appearance", "scene-calendar", "scene-notes"], "width_px": 380.0, "output": "DP-1"},
+      "top": {"visible": false, "pinned": false, "mode": "hidden", "page": null, "pages": [], "declared": [], "width_px": 0.0, "output": "DP-1"}
+    }
+  },
+  "panel_changed_show": {
+    "_topic": "<host>.panel.changed, command shell.panel.changed",
+    "generation": 3,
+    "revision": 42,
+    "dialog": {"scene": "editor", "visible": true, "w": 880.0, "h": 620.0, "output": "DP-1"},
+    "panels": {}
+  },
+  "panel_changed_hide": {
+    "_topic": "<host>.panel.changed after × or Escape: same generation, revision advanced",
+    "generation": 3,
+    "revision": 43,
+    "dialog": {"scene": "editor", "visible": false, "w": 880.0, "h": 620.0, "output": "DP-1"},
+    "panels": {}
+  },
+  "panel_changed_preempted": {
+    "_topic": "another owner took the seat: the loader records visible:false and, if shell.scenes.list no longer lists editor, mounted:false",
+    "generation": 3,
+    "revision": 44,
+    "dialog": {"scene": "other-dialog", "visible": true, "w": 400.0, "h": 300.0, "output": "DP-1"},
+    "panels": {}
+  },
+  "panel_changed_no_dialog": {
+    "_topic": "Stage Q1 and later with no dialog loaded; `panels` elided",
+    "generation": 3,
+    "revision": 45,
+    "dialog": null,
+    "panels": {}
+  }
+}

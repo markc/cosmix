@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "enabled": [
+    "panel"
+  ],
+  "origins": {
+    "panel": "panel"
+  },
+  "recovery": {},
+  "resetting": {
+    "name": "panel",
+    "stage": ".stage-0e1f2a3b-4c5d-4e6f-8a9b-c0d1e2f3a4b5",
+    "backup": ".recovery/panel-7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d",
+    "phase": "swapped"
+  }
+}

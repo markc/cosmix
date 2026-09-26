@@ -2,3 +2,7 @@ schema: 1
 name: "panel"
 title: "Panel"
 behaviour: "behaviour.mix"
+description: "Bottom panel: launcher, workspaces, tasks, tray, clock"
+recommended: true
+order: 10
+requires: ["comp", "apps"]

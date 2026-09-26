@@ -2,3 +2,7 @@ schema: 1
 name: "calendar"
 title: "Calendar"
 behaviour: "behaviour.mix"
+description: "Month calendar with today marked"
+recommended: true
+order: 30
+requires: []

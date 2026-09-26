@@ -1,0 +1,74 @@
+-- version: 0.1.0
+-- Scene Editor behaviour (scene-editor plan §4.6). Stage S stub: it readies
+-- with the loader and publishes the document's default model, and answers
+-- every node verb with UNIMPLEMENTED. Stage E replaces the handlers.
+-- Helpers come from $SCENE_DIR/lib.mix (beside this file, so a user copy of
+-- the editor edits its own logic); only runtime.mix comes from the shared lib.
+$LIB = env("SCENES_LIB", env("XDG_DATA_HOME", env("HOME") .. "/.local/share") .. "/cosmix/scenes/lib")
+$DIR = env("SCENE_DIR", cwd())
+$r = require($LIB .. "/runtime.mix")
+$e = require($DIR .. "/lib.mix")
+$ctx = $r.scene_context("editor")
+$state = {ready: false, model: $e.header_model($DIR)}
+
+fn refresh()
+  if not $state.ready then return $r.failure("scene_not_ready", "Waiting for loader readiness") end
+  return $r.publish_model($ctx, $state.model)
+end
+
+on editor.view
+  $r.respond($e.unimplemented("editor.view"))
+end
+on editor.template.select
+  $r.respond($e.unimplemented("editor.template.select"))
+end
+on editor.template.install
+  $r.respond($e.unimplemented("editor.template.install"))
+end
+on editor.recommended
+  $r.respond($e.unimplemented("editor.recommended"))
+end
+on editor.scene.select
+  $r.respond($e.unimplemented("editor.scene.select"))
+end
+on editor.scene.action
+  $r.respond($e.unimplemented("editor.scene.action"))
+end
+on editor.scene.remove
+  $r.respond($e.unimplemented("editor.scene.remove"))
+end
+on editor.scene.edit
+  $r.respond($e.unimplemented("editor.scene.edit"))
+end
+on editor.scene.fork
+  $r.respond($e.unimplemented("editor.scene.fork"))
+end
+on editor.scene.promote
+  $r.respond($e.unimplemented("editor.scene.promote"))
+end
+on editor.scene.move
+  $r.respond($e.unimplemented("editor.scene.move"))
+end
+on editor.edge.mode
+  $r.respond($e.unimplemented("editor.edge.mode"))
+end
+on editor.edge.size
+  $r.respond($e.unimplemented("editor.edge.size"))
+end
+on editor.edge.page
+  $r.respond($e.unimplemented("editor.edge.page"))
+end
+on editor.edge.order
+  $r.respond($e.unimplemented("editor.edge.order"))
+end
+on bus.connected
+  if len(keys($event.headers)) != 0 then return end
+  $state.ready = false
+  $ready = $r.ready($ctx)
+  $state.ready = $ready.ok
+  if $state.ready then refresh() end
+end
+$ready = $r.ready($ctx)
+if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
+$state.ready = true
+refresh()

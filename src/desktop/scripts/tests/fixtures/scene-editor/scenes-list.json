@@ -1,0 +1,103 @@
+{
+  "needs_setup": false,
+  "root": "/home/user/.config/cosmix/scenes",
+  "templates_root": "/opt/cosmix/share/scenes",
+  "state_ok": true,
+  "revision": 42,
+  "diagnostic": null,
+  "editor": {
+    "user_copy": true,
+    "user_dirty": false,
+    "mounted": true,
+    "visible": false,
+    "source": "shipped",
+    "safe": false,
+    "fallback": {"error_code": "SCENES_CITIZEN", "message": "document citizen must address its behaviour", "file": "/home/user/.config/cosmix/scenes/editor/scene.mix"},
+    "behaviour": "running",
+    "view": "installed",
+    "scene": "panel",
+    "first_run": false,
+    "request_seq": 3,
+    "problems": [
+      {"file": "/opt/cosmix/share/scenes/editor/behaviour.mix", "digest": "7d1f9c4e0a6b2d83c5e1f04a9b7c6d2e3f8a0b1c4d5e6f708192a3b4c5d6e7f8", "line": 40, "col": 3, "severity": "warning", "code": "MIX-W2001", "message": "unused variable $x"}
+    ]
+  },
+  "scenes": [
+    {
+      "name": "panel", "installed": true, "enabled": true, "mounted": true, "revision": 18, "generation": 7,
+      "behaviour": "running", "ready": true, "template": "panel",
+      "diagnostic": {"error_code": "SCENES_UPSTREAM", "message": "scene host refused request", "context": {"target": "shell", "verb": "shell.scene.load", "rc": 10, "upstream": {"diagnostics": [{"line": 12, "code": "binding-policy", "severity": "Error", "message": "${env.HOME} is not a model path"}]}}, "file": "/home/user/.config/cosmix/scenes/panel/scene.mix", "attempted_digest": "0f6a0c8f1d2b3e4a5968778695a4b3c2d1e0f1a2b3c4d5e6f708192a3b4c5d6e", "last_good_revision": 18},
+      "diagnostics": [],
+      "exit": null,
+      "attempted_digest": "0f6a0c8f1d2b3e4a5968778695a4b3c2d1e0f1a2b3c4d5e6f708192a3b4c5d6e",
+      "accepted_digest": "a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819",
+      "journal": "journalctl -u cosmix-desk-scenes.service",
+      "open": false, "pending": false,
+      "title": "Panel", "edge": "bottom", "page": "scene-panel", "kind": "edge",
+      "files": {
+        "scene": "/home/user/.config/cosmix/scenes/panel/scene.mix",
+        "behaviour": "/home/user/.config/cosmix/scenes/panel/behaviour.mix",
+        "metadata": "/home/user/.config/cosmix/scenes/panel/template.conf.mix"
+      },
+      "digests": {
+        "scene": "0f6a0c8f1d2b3e4a5968778695a4b3c2d1e0f1a2b3c4d5e6f708192a3b4c5d6e",
+        "behaviour": "5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4",
+        "metadata": "c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3"
+      },
+      "forked_from": null,
+      "problems": [
+        {"file": "/home/user/.config/cosmix/scenes/panel/scene.mix", "digest": "0f6a0c8f1d2b3e4a5968778695a4b3c2d1e0f1a2b3c4d5e6f708192a3b4c5d6e", "line": 12, "severity": "error", "code": "binding-policy", "message": "${env.HOME} is not a model path"}
+      ]
+    },
+    {
+      "name": "launcher-sandbox", "installed": true, "enabled": true, "mounted": false, "revision": 0, "generation": 0,
+      "behaviour": "disabled", "ready": false, "template": "launcher",
+      "diagnostic": {"error_code": "SCENES_REMOUNT_FAILED", "message": "address change failed and the rollback load failed too", "context": {"new": {"error_code": "SUBPANEL_COLLISION", "message": "page is held by another owner"}, "rollback": {"error_code": "SCENES_TRANSPORT", "message": "scene host request failed"}}},
+      "diagnostics": [],
+      "exit": null,
+      "attempted_digest": "9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+      "accepted_digest": "8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a",
+      "journal": "journalctl -u cosmix-desk-scenes.service",
+      "open": false, "pending": false,
+      "title": "Applications", "edge": "left", "page": "scene-launcher-sandbox", "kind": "edge",
+      "files": {
+        "scene": "/home/user/.config/cosmix/scenes/launcher-sandbox/scene.mix",
+        "behaviour": "/home/user/.config/cosmix/scenes/launcher-sandbox/behaviour.mix",
+        "metadata": "/home/user/.config/cosmix/scenes/launcher-sandbox/template.conf.mix"
+      },
+      "digests": {
+        "scene": "9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+        "behaviour": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+        "metadata": "2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e"
+      },
+      "forked_from": "launcher",
+      "problems": [
+        {"file": "/home/user/.config/cosmix/scenes/launcher-sandbox/scene.mix", "digest": "9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b", "line": 1, "severity": "error", "code": "SCENES_REMOUNT_FAILED", "message": "address change failed and the rollback load failed too"}
+      ]
+    },
+    {
+      "name": "notes", "installed": true, "enabled": true, "mounted": true, "revision": 3, "generation": 12,
+      "behaviour": "running", "ready": true, "template": "notes",
+      "diagnostic": {"error_code": "SCENES_RECOVERY", "message": "promote record could not be finished", "context": {"record": "promoting", "to": true, "stage": false, "backup": false}},
+      "diagnostics": [],
+      "exit": null,
+      "attempted_digest": "3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+      "accepted_digest": "3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+      "journal": "journalctl -u cosmix-desk-scenes.service",
+      "open": false, "pending": false,
+      "title": "Notifications", "edge": "right", "page": "scene-notes", "kind": "edge",
+      "files": {
+        "scene": "/home/user/.config/cosmix/scenes/notes/scene.mix",
+        "behaviour": "/home/user/.config/cosmix/scenes/notes/behaviour.mix",
+        "metadata": "/home/user/.config/cosmix/scenes/notes/template.conf.mix"
+      },
+      "digests": {
+        "scene": "3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+        "behaviour": "4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a",
+        "metadata": "5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b"
+      },
+      "forked_from": null,
+      "problems": []
+    }
+  ]
+}

@@ -47,6 +47,30 @@ use winit::keyboard::PhysicalKey;
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use xkbcommon::xkb;
 
+/// What an input target is (scene-editor plan §4.3 Q2, frozen in Stage S).
+///
+/// `SurfaceTarget` below is still edge-typed: every consumer reads `edge`
+/// as panel semantics (keyboard enter → `PanelInput`, pointer-leave, resize
+/// grips, reveal/hold/hide, and the edge/thickness coordinate mapping in
+/// `output_logical_position`). Q2 replaces its `edge`, `thickness` and
+/// `committed_margin` fields with `kind: SurfaceKind`, so the dialog can join
+/// `surface_targets()` without driving a panel. Every edge-semantic consumer
+/// matches on the kind and skips `Dialog`; dialog coordinates map through its
+/// committed `origin` (the output position of the centred surface). A
+/// missed arm is then a compile error, not a silent edge reveal.
+#[allow(dead_code)] // Stage S freeze; Q2 is the first user.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SurfaceKind {
+    Panel {
+        edge: Edge,
+        thickness: f32,
+        committed_margin: i32,
+    },
+    Dialog {
+        origin: Vec2,
+    },
+}
+
 #[derive(Clone)]
 pub(crate) struct SurfaceTarget {
     pub surface: wl_surface::WlSurface,

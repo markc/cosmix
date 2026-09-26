@@ -1,0 +1,91 @@
+-- version: 0.1.0
+-- Scene Editor Mix gates (scene-editor plan §7): lint every loader/editor
+-- script, then run the deterministic tests with TZ=UTC, then the e2e. Stops
+-- at the first failure and prints each step's result. Run from anywhere:
+--   mix src/desktop/scripts/tests/scene-editor-gates.mix [--allow-pending]
+-- A file a later stage has not written yet is PENDING <stage>: a failure
+-- unless --allow-pending (Stage S, and stages running before that owner
+-- merges). scenes-mesh-test.mix needs a live integrated stack and runs only
+-- when SCENES_LOCAL_TARGET and SCENES_REMOTE_TARGET are both set; otherwise
+-- it is reported SKIPPED, never PASS.
+$here = dirname(realpath($0))
+$root = realpath($here .. "/../../../..")
+$scripts = $root .. "/src/desktop/scripts"
+$allow_pending = contains(args(), "--allow-pending")
+$mix = realpath("/proc/self/exe")
+$results = []
+$failed = false
+
+fn note($step, $outcome)
+  print(rpad($outcome, 9) .. " " .. $step)
+  return {step: $step, outcome: $outcome}
+end
+
+-- {path, owner stage} in gate order.
+$lints = [
+  [$scripts .. "/scenes.mix", "S"],
+  [$scripts .. "/lib/scenes.mix", "S"],
+  [$scripts .. "/lib/scenes-io.mix", "S"],
+  [$scripts .. "/scenes-cli.mix", "L"],
+  [$root .. "/share/scenes/editor/behaviour.mix", "S"],
+  [$root .. "/share/scenes/editor/lib.mix", "S"],
+  [$here .. "/scene-editor-fixtures-test.mix", "S"]
+]
+$tests = [
+  [$here .. "/scene-editor-fixtures-test.mix", "S"],
+  [$here .. "/scenes-test.mix", "S"],
+  [$here .. "/scene-template-test.mix", "S"],
+  [$here .. "/scene-editor-test.mix", "E"],
+  [$here .. "/scene-editor-e2e.mix", "L"]
+]
+
+for each $entry in $lints
+  if $failed then break end
+  $path = $entry[0]
+  if not is_file($path) then
+    push($results, note("lint " .. $path, "PENDING " .. $entry[1]))
+    if not $allow_pending then $failed = true end
+  else
+    $r = run_argv([$mix, "lint", "--deny-warnings", $path], {timeout: 60, max_output: 65536})
+    push($results, note("lint " .. $path, $r.ok ? "PASS" : "FAIL"))
+    if not $r.ok then
+      print($r.stdout .. $r.stderr)
+      $failed = true
+    end
+  end
+end
+
+for each $entry in $tests
+  if $failed then break end
+  $path = $entry[0]
+  if not is_file($path) then
+    push($results, note("run " .. $path, "PENDING " .. $entry[1]))
+    if not $allow_pending then $failed = true end
+  else
+    $r = run_argv([$mix, $path], {timeout: 590, max_output: 1048576, env: {TZ: "UTC"}})
+    push($results, note("run " .. $path, $r.ok ? "PASS" : "FAIL"))
+    if not $r.ok then
+      print($r.stdout .. $r.stderr)
+      $failed = true
+    end
+  end
+end
+
+if not $failed then
+  if env("SCENES_LOCAL_TARGET") != "" and env("SCENES_REMOTE_TARGET") != "" then
+    $r = run_argv([$mix, $here .. "/scenes-mesh-test.mix"], {timeout: 120, max_output: 65536})
+    push($results, note("run scenes-mesh-test.mix", $r.ok ? "PASS" : "FAIL"))
+    if not $r.ok then
+      print($r.stdout .. $r.stderr)
+      $failed = true
+    end
+  else
+    push($results, note("run scenes-mesh-test.mix (needs SCENES_LOCAL_TARGET + SCENES_REMOTE_TARGET)", "SKIPPED"))
+  end
+end
+
+if $failed then
+  print("scene-editor gates: FAIL")
+  exit(1)
+end
+print("scene-editor gates: PASS (" .. to_string(len($results)) .. " steps)")

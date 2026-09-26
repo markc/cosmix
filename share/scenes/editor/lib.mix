@@ -1,0 +1,32 @@
+-- Scene Editor helpers (scene-editor plan §4.6). They live beside the
+-- template, not in the shared lib/, so a user copy of the editor can edit its
+-- own logic. The behaviour loads them with require($SCENE_DIR .. "/lib.mix").
+--
+-- Stage S skeleton: the model builder, click planning and the ced
+-- diagnostics diff arrive in Stage E. What is frozen here is the verb set the
+-- template's nodes name and the model's default shape (the scene's header).
+
+-- Every directed verb a node of scene.mix names (§4.6 "Clicks → behaviour
+-- verbs"). The behaviour answers each; Stage E implements them.
+fn verbs()
+  return ["editor.view", "editor.template.select", "editor.template.install",
+    "editor.recommended", "editor.scene.select", "editor.scene.action",
+    "editor.scene.remove", "editor.scene.edit", "editor.scene.fork",
+    "editor.scene.promote", "editor.scene.move", "editor.edge.mode",
+    "editor.edge.size", "editor.edge.page", "editor.edge.order"]
+end
+
+-- The default model is the scene document's own `model:` header, so the
+-- document and the behaviour cannot disagree about its shape.
+fn header_model($dir)
+  for each $line in read_lines($dir .. "/scene.mix")
+    if starts_with($line, "model: ") then return json_parse(substr($line, 7)) end
+    if $line == "```mix" then break end
+  end
+  raise("EDITOR_MODEL", "scene.mix has no model header", {dir: $dir})
+end
+
+fn unimplemented($verb)
+  return {ok: false, rc: 10, value: {error_code: "UNIMPLEMENTED",
+    message: $verb .. " arrives in Stage E of the Scene Editor plan"}}
+end

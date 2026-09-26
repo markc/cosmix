@@ -1,0 +1,1 @@
+{"tab": 3, "path": "/home/user/.config/cosmix/scenes/panel/scene.mix", "problems": [{"line": 12, "col": 1, "severity": "error", "code": "binding-policy", "message": "${env.HOME} is not a model path", "source": "lint"}, {"line": 12, "col": 1, "severity": "error", "code": "binding-policy", "message": "${env.HOME} is not a model path", "source": "scenes"}]}

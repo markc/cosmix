@@ -2,3 +2,7 @@ schema: 1
 name: "quoin-settings"
 title: "Appearance"
 behaviour: "behaviour.mix"
+description: "Colour scheme, carousel motion and panel sizes"
+recommended: true
+order: 50
+requires: []

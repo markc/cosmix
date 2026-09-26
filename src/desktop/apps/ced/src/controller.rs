@@ -1941,6 +1941,12 @@ impl Controller {
                 fx.push(Effect::SaveSession);
                 fx.push(Effect::Quit);
             }
+            "ced.diagnostics" | "ced.problems" => refuse(
+                fx,
+                code::UNIMPLEMENTED,
+                format!("{} arrives in Stage C of the Scene Editor plan", cmd.verb),
+                None,
+            ),
             "INFO" | "HELP" => {
                 let verbs: Vec<&str> = verbs::VERBS.iter().map(|(v, _)| *v).collect();
                 reply(fx, json!({"service": verbs::SERVICE, "schema": verbs::SCHEMA, "verbs": verbs}).to_string());
@@ -2548,5 +2554,15 @@ mod tests {
         assert_eq!(rc, 0);
         assert_eq!((v["frames"].as_u64(), v["view_us"]["p99"].as_u64(), v["next_frame_us"]["max"].as_u64()), (Some(100), Some(99), Some(1000)));
         assert!(c.edit_info().is_none());
+    }
+
+    #[test]
+    fn scene_editor_verbs_are_registered_and_unimplemented_until_stage_c() {
+        let mut c = ctl();
+        for verb in ["ced.diagnostics", "ced.problems"] {
+            assert!(verbs::VERBS.iter().any(|(v, _)| *v == verb), "{verb} in the manifest");
+            let (rc, v) = response(&c.on_bus_command(cmd(verb, json!({}))));
+            assert_eq!((rc, v["error_code"].as_str()), (10, Some(verbs::code::UNIMPLEMENTED)), "{verb}: {v}");
+        }
     }
 }

@@ -1,0 +1,39 @@
+{
+  "view": "installed",
+  "first_run": false,
+  "safe": false,
+  "source": "user",
+  "banner": {"shown": true, "text": "Your editor copy failed to load (SCENES_CITIZEN); showing the shipped editor", "color": "#fcfcfc", "background": "#da445333"},
+  "tabs": {
+    "gallery": {"background": "#ffffff0f"},
+    "installed": {"background": "#3daee9"},
+    "arrange": {"background": "#ffffff0f"}
+  },
+  "templates": [
+    {"id": "t_panel", "cells": ["Panel", "Bottom panel: launcher, workspaces, tasks, tray, clock", "bottom", "installed"], "template": "panel", "recommended": true, "background": "#00000000"}
+  ],
+  "tpl": {"shown": false, "title": "", "desc": "", "needs": "", "installed": "", "can_install": false},
+  "recommended": {"label": "Recommended set", "background": "#ffffff0f", "shown": true},
+  "scenes": [
+    {"id": "s_panel", "cells": ["●", "Panel", "panel", "diagnostic", "bottom"], "name": "panel", "dot": "#f67400", "background": "#3daee933"},
+    {"id": "s_launcher", "cells": ["●", "Applications", "launcher", "running", "left"], "name": "launcher", "dot": "#27ae60", "background": "#00000000"},
+    {"id": "s_notes", "cells": ["●", "Notifications", "notes", "crash_loop", "right"], "name": "notes", "dot": "#da4453", "background": "#00000000"},
+    {"id": "s_calendar", "cells": ["●", "Calendar", "calendar", "disabled", "right"], "name": "calendar", "dot": "#6e7680", "background": "#00000000"}
+  ],
+  "selected": {
+    "shown": true, "name": "panel", "title": "Panel", "status": "mounted · last edit refused · bottom edge · template panel",
+    "status_color": "#f67400",
+    "problems": [
+      {"id": "p_0", "cells": ["scene.mix:12  binding-policy  ${env.HOME} is not a model path"], "color": "#da4453"},
+      {"id": "p_1", "cells": ["behaviour.mix:40  MIX-W2001  unused variable $x"], "color": "#f67400"}
+    ],
+    "enabled_label": "Disable", "has_behaviour": true, "is_fork": false, "remove_label": "Remove"
+  },
+  "edges": {
+    "top": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "—", "pages": []},
+    "bottom": {"mode": "docked", "modes": {"hidden": "#ffffff0f", "pinned": "#ffffff0f", "docked": "#3daee9"}, "size": "52 px", "pages": [{"id": "g_scene-panel", "cells": ["panel"], "page": "scene-panel", "background": "#ffffff0f"}]},
+    "left": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "440 px", "pages": [{"id": "g_scene-launcher", "cells": ["launcher"], "page": "scene-launcher", "background": "#ffffff0f"}]},
+    "right": {"mode": "hidden", "modes": {"hidden": "#3daee9", "pinned": "#ffffff0f", "docked": "#ffffff0f"}, "size": "380 px", "pages": [{"id": "g_scene-notes", "cells": ["notes"], "page": "scene-notes", "background": "#ffffff0f"}]}
+  },
+  "status": "4 scenes · 1 refused edit · loader revision 42"
+}

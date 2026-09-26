@@ -5,6 +5,7 @@ mod bus_service;
 pub mod config;
 mod corner_menu;
 mod desktop_font;
+mod dialog_bus;
 pub mod embedded;
 #[cfg(test)]
 mod font_tests;

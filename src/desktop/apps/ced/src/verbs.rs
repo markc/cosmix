@@ -30,6 +30,8 @@ pub const VERBS: &[(&str, bool)] = &[
     ("ced.wait", true),
     ("ced.layout", true),
     ("ced.stats", true),
+    ("ced.diagnostics", false),
+    ("ced.problems", true),
     ("app.describe", true),
     ("app.quit", false),
 ];
@@ -42,6 +44,10 @@ pub mod code {
     pub const UNAVAILABLE: &str = "UNAVAILABLE";
     pub const INTERNAL: &str = "INTERNAL";
     pub const UNKNOWN_VERB: &str = "UNKNOWN_VERB";
+    /// A verb in the manifest whose implementation has not landed yet
+    /// (Scene Editor plan Stage S registers `ced.diagnostics`/`ced.problems`;
+    /// Stage C implements them).
+    pub const UNIMPLEMENTED: &str = "UNIMPLEMENTED";
 }
 
 /// Every refusal body (decision 10 shape).
@@ -359,6 +365,88 @@ pub struct StatsReply {
     pub conflicts: u64,
     pub retries: u64,
     pub uncertain: u64,
+}
+
+// ── external diagnostics (Scene Editor plan §4.4, frozen in its Stage S) ────
+//
+// `ced.diagnostics` stores a set per `(path, source)` (LRU of
+// [`DIAG_STORE_PATHS`] paths) and applies it with
+// `cosmix_edit_client::diag::Diagnostics::accept_items` to every tab showing
+// `path`: when the verb arrives, when a tab for the path opens, after a tab
+// Resyncs, and when a tab's `dirty` goes false. Each application checks
+// `digest` (lower-hex sha256 of the file bytes the diagnostics describe): a
+// tab whose text does not hash to it shows nothing (`stale:true`) and the
+// set stays stored; otherwise the set is tagged at the tab's current gen and
+// follows covered-range invalidation. An empty list clears that source.
+// Refusals: INVALID_ARGUMENT (relative path, bad or reserved source, too
+// many diagnostics or too large a body).
+
+/// At most this many diagnostics in one `ced.diagnostics` request.
+pub const MAX_EXTERNAL_DIAGNOSTICS: usize = 500;
+/// At most this many body bytes in one `ced.diagnostics` request.
+pub const MAX_DIAGNOSTICS_BODY: usize = 64 * 1024;
+/// Paths whose external sets ced keeps (least recently used dropped first).
+pub const DIAG_STORE_PATHS: usize = 64;
+/// The frontend's own lint source; external callers may not use it.
+pub const LINT_SOURCE: &str = "lint";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagSeverity {
+    Error,
+    Warning,
+    Note,
+}
+
+/// One external diagnostic: 1-based `line`, optional 1-based `col`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalDiagnostic {
+    pub line: usize,
+    #[serde(default)]
+    pub col: Option<usize>,
+    pub severity: DiagSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+/// `source` matches `^[a-z][a-z0-9-]{0,31}$` and is not [`LINT_SOURCE`];
+/// `path` is absolute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsReq {
+    pub path: String,
+    pub source: String,
+    #[serde(default)]
+    pub digest: Option<String>,
+    pub diagnostics: Vec<ExternalDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsReply {
+    pub path: String,
+    /// Tabs currently showing `path` (empty when none is open).
+    pub tabs: Vec<u64>,
+    /// Diagnostics now shown across those tabs.
+    pub shown: usize,
+    /// True when a tab's text did not hash to `digest`.
+    pub stale: bool,
+}
+
+/// One Problems-panel row: what ced shows, whatever its source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProblemRow {
+    pub line: usize,
+    pub col: usize,
+    pub severity: DiagSeverity,
+    pub code: String,
+    pub message: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProblemsReply {
+    pub tab: u64,
+    pub path: Option<String>,
+    pub problems: Vec<ProblemRow>,
 }
 
 // ── app control (ctk-app-control.v0, ctk/src/app_control.rs:733-762) ─────────

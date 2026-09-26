@@ -17,6 +17,12 @@ pub struct MenuExtra {
 pub enum MenuAction {
     Mode(PanelMode),
     Extra(MenuExtra),
+    /// Built-in "Edit panels…" (scene-editor plan §4.3 Q1): frame, not
+    /// content, so it is never a `conf.mix` extra. It sends
+    /// `scenes.editor.open` with body exactly `{"safe":true}` to
+    /// `env("SCENES_SERVICE","scenes")`; the menu lists it after the mode
+    /// items on every corner. Declared in Stage S; Q1 wires it.
+    EditPanels,
 }
 
 #[derive(Clone, Debug)]
@@ -36,7 +42,7 @@ impl MenuItem {
                 edge,
                 input: PanelInput::SetMode(mode),
             }),
-            MenuAction::Extra(_) => None,
+            MenuAction::Extra(_) | MenuAction::EditPanels => None,
         }
     }
 }

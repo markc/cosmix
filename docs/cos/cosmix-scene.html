@@ -446,9 +446,21 @@
 <p><code>cosmix-scene</code> parses a bounded Mix Scenes v0 document into a renderer-neutral
 tree. A document is a Bus envelope with required <code>scene: 1</code>, <code>name</code> and
 <code>citizen</code> headers. <code>window</code>, <code>subscribe</code>, <code>targets</code> and <code>model</code> are optional
-single-line JSON headers. <code>window.kind</code> is <code>edge</code> in v0; the envelope is the
-mount request and a window-family node is optional. If both exist, their kinds
-must agree.</p>
+single-line JSON headers. The envelope is the mount request and a
+window-family node is optional. If both exist, they must agree.</p>
+<p><code>window.kind</code> is <code>edge</code> or <code>dialog</code> (0.6). Absent on the header, it means
+<code>edge</code>. An edge window takes an <code>edge</code> (<code>right</code> by default), optional <code>w</code>/<code>h</code>
+and <code>title</code>. A <code>dialog</code> is a centred window, not a page on an edge. It needs
+numeric <code>w</code> and <code>h</code> in 240..=2048 logical px and takes no <code>edge</code> or <code>panel</code>,
+which lint reports as <code>window-dialog-edge</code>. <code>chrome</code> defaults to true for
+both kinds. From 0.6 the header is validated on its own, not only against a
+window node: an unknown <code>kind</code> is <code>window-kind</code>, a bad <code>edge</code> is
+<code>enum-value</code>, and a non-numeric or negative <code>w</code>/<code>h</code> or a non-string <code>title</code>
+is <code>port-type</code>. Earlier versions accepted a header-only kind they could not
+honour and mounted it on the right edge, so citizens that author a dialog
+check <code>shell.scene.describe {family:"window"}</code> for the <code>dialog</code> enum value
+first. In v1 only the Scene Editor mounts as a dialog: the scenes loader
+refuses <code>kind:"dialog"</code> for every other scene.</p>
 <p>The body contains exactly one fenced <code>mix</code> strict-data map. Nodes have the
 shape <code>id: { widget: family, ...ports }</code>. The ten families are <code>window</code>,
 <code>column</code>, <code>row</code>, <code>text</code>, <code>field</code>, <code>button</code>, <code>toggle</code>, <code>list</code>, <code>image</code> and

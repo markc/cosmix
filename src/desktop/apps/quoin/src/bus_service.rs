@@ -591,6 +591,20 @@ fn service_bus(
                     }
                 };
                 (rc, body, None)
+            } else if crate::dialog_bus::handles(&request.command) {
+                // Scene Editor plan §4.3 Q2: dialog and layout verbs live in
+                // dialog_bus.rs (Stage S routes them; Q2 implements them).
+                let (rc, body) = crate::dialog_bus::dispatch(&request.command);
+                (rc, body, None)
+            } else if request.command == "shell.panel.order" {
+                // Scene Editor plan §4.3 Q1: frozen request/reply in
+                // tests/fixtures/scene-editor/shell-verbs.json; Q1 implements.
+                (
+                    10,
+                    json!({"error_code":"UNIMPLEMENTED", "message":"shell.panel.order arrives in Stage Q1 of the Scene Editor plan"})
+                        .to_string(),
+                    None,
+                )
             } else if request.command == "shell.scenes.list" {
                 (
                     0,

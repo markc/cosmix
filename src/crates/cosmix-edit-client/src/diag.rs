@@ -36,6 +36,27 @@ pub struct Diagnostic {
     pub code: String,
     pub message: String,
     pub hint: Option<String>,
+    /// Which set it belongs to: [`LINT_SOURCE`] for the frontend lint,
+    /// otherwise the external source that sent it (e.g. `scenes`). The
+    /// Problems panel labels rows with it.
+    pub source: String,
+}
+
+/// The frontend's own lint set (`mix lint --json`, or in-process scene lint).
+pub const LINT_SOURCE: &str = "lint";
+
+/// An already-parsed diagnostic for [`Diagnostics::accept_items`]: in-process
+/// scene lint, or an external set from `ced.diagnostics`. 1-based `line`;
+/// `column` 1-based or `None` (the squiggle then covers the line past its
+/// indentation, as for lint results without a column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagItem {
+    pub line: usize,
+    pub column: Option<usize>,
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +120,7 @@ impl Diagnostics {
             };
             let line = raw.line.unwrap_or(1).max(1);
             let Some((covered, range)) = locate(text_at_tag, line, raw.column) else { continue };
-            next.items.push(Diagnostic { range, line, severity, code: raw.code, message: raw.message, hint: raw.hint });
+            next.items.push(Diagnostic { range, line, severity, code: raw.code, message: raw.message, hint: raw.hint, source: LINT_SOURCE.into() });
             next.covered.push(covered);
         }
         for d in deltas_since {
@@ -107,6 +128,37 @@ impl Diagnostics {
         }
         *self = next;
         Ok(())
+    }
+
+    /// Replace **only `source`'s** set with `items` for `tag` (Scene Editor
+    /// plan §4.4.1, frozen in its Stage S; Stage C implements it).
+    ///
+    /// Same stale-tag rule and covered-range invalidation as [`accept`]: a
+    /// result for another epoch, buffer, language or `cfg`, or for a gen
+    /// ahead of `current`, is `StaleTag`; items are located in
+    /// `text_at_tag` and then mapped through `deltas_since`. Other sources'
+    /// sets are untouched; an empty `items` clears `source`'s set. Every
+    /// stored [`Diagnostic`] carries `source`. [`items`] returns the union of
+    /// all sets; `apply_delta` maps every set and `Resync` clears every set
+    /// (the caller re-applies stored external sets after a Resync).
+    ///
+    /// Until Stage C, [`accept`] still replaces the whole union with the lint
+    /// set; this signature is what the in-process scene lint and
+    /// `ced.diagnostics` code against.
+    ///
+    /// [`accept`]: Self::accept
+    /// [`items`]: Self::items
+    pub fn accept_items(
+        &mut self,
+        source: &str,
+        current: &ResultTag,
+        tag: ResultTag,
+        text_at_tag: &str,
+        items: &[DiagItem],
+        deltas_since: &[ViewDelta],
+    ) -> Result<(), DiagError> {
+        let _ = (source, current, tag, text_at_tag, items, deltas_since);
+        todo!("Scene Editor Stage C: source-tagged diagnostic sets")
     }
 
     /// Drop diagnostics whose covered line the delta touched; map the rest.
