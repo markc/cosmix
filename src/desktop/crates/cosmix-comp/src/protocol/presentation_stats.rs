@@ -94,6 +94,7 @@ impl Ring {
 /// An injected input that a later presentation answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InputMark {
+    /// Input correlation belongs to the driven seat, not the human focus owner.
     pub(crate) seat: super::SeatKind,
     pub(crate) input_seq: u64,
     pub(crate) injected_at_us: u64,

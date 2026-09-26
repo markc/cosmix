@@ -39,6 +39,8 @@ pub(super) struct CompSeat {
     pub seat: Seat<WaylandState>,
     pub keyboard: KeyboardHandle<WaylandState>,
     pub pointer: PointerHandle<WaylandState>,
+    /// Per-seat popup serial provenance; agent keys never overwrite the human
+    /// binding path's action, even when both keyboards focus the same client.
     pub last_keyboard_action: Option<(Serial, WlSurface)>,
     /// One recent press per device survives a synthetic release for popup requests.
     pub last_pointer_action: Option<(Serial, WlSurface)>,
