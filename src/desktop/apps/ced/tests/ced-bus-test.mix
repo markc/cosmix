@@ -6,7 +6,9 @@
 -- lane refuses nothing_to_undo); an overlap race converges; editd SIGKILL +
 -- restart reattaches the tab to the restored buffer with no detached copy,
 -- twice (the second across the restore's new generation); file.save writes
--- the bytes and removes the recovery files. Headless truthfulness: ced.layout
+-- the bytes and removes the recovery files; ced.diagnostics shows a set whose
+-- digest is the saved file's in ced.problems, hides a stale one, refuses the
+-- reserved lint source and clears on []. Headless truthfulness: ced.layout
 -- and window-only ced.action refuse UNAVAILABLE; ced.wait times out and
 -- refuses bad arguments. Nothing here can reach the host Bus: private TCP
 -- port, private unix socket, admission off, HOME and state dirs in the temp
@@ -311,6 +313,26 @@ try
   check(eok('edit.recovery.flush', {}).synced, "flush after save")
   check(length(glob($recdir .. "/" .. $rid .. ".*")) == 0, "file.save left recovery files: " .. json_encode(glob($recdir .. "/" .. $rid .. ".*")))
 
+  -- 9. external diagnostics (Scene Editor plan §4.4): a set whose digest is
+  -- the saved file's is shown; another digest is stored but stale; the lint
+  -- source is reserved; an empty list clears.
+  $digest = hash_file($file, "sha256")
+  $ds = [{line: 1, severity: "error", code: "binding-policy", message: "e2e"}, {line: 2, col: 3, severity: "warning", code: "w", message: "e2e"}]
+  $dg = cok('ced.diagnostics path=$a.p source="scenes" digest=$a.d diagnostics=$a.ds', {p: $file, d: $digest, ds: $ds})
+  check(length($dg.tabs) == 1 and $dg.tabs[0] == $t and $dg.shown == 2 and not $dg.stale, "ced.diagnostics: " .. json_encode($dg))
+  $pr = cok('ced.problems tab=$a.t', {t: $t})
+  check($pr.path == $file and length($pr.problems) == 2, "ced.problems: " .. json_encode($pr))
+  check($pr.problems[0].source == "scenes" and $pr.problems[0].line == 1 and $pr.problems[0].code == "binding-policy", "ced.problems row: " .. json_encode($pr))
+  check($pr.problems[1].line == 2 and $pr.problems[1].col == 3 and $pr.problems[1].severity == "warning", "ced.problems col: " .. json_encode($pr))
+  $dg = cok('ced.diagnostics path=$a.p source="scenes" digest=$a.d diagnostics=$a.ds', {p: $file, d: hash_sha256("other"), ds: $ds})
+  check($dg.stale and $dg.shown == 0, "stale digest: " .. json_encode($dg))
+  check(length(cok('ced.problems tab=$a.t', {t: $t}).problems) == 0, "a stale set is not shown")
+  cd_refused('ced.diagnostics path=$a.p source="lint" diagnostics=[]', {p: $file}, "INVALID_ARGUMENT", "bad_source")
+  cd_refused('ced.diagnostics path="doc.txt" source="scenes" diagnostics=[]', {}, "INVALID_ARGUMENT", "bad_path")
+  cok('ced.diagnostics path=$a.p source="scenes" digest=$a.d diagnostics=$a.ds', {p: $file, d: $digest, ds: $ds})
+  $dg = cok('ced.diagnostics path=$a.p source="scenes" diagnostics=[]', {p: $file})
+  check($dg.shown == 0 and length(cok('ced.problems tab=$a.t', {t: $t}).problems) == 0, "an empty list clears: " .. json_encode($dg))
+
   -- app.quit: ced detaches (the buffer stays in editd) and writes session.json
   check(cok('app.quit', {}).quitting, "app.quit")
   $quit = false
@@ -325,7 +347,7 @@ try
   $sj = json_parse(read_file($session))
   check(length($sj.tabs) == 1 and $sj.tabs[0].path == $file, "session.json tabs: " .. json_encode($sj))
   check(length(filter(eok('edit.list', {}).buffers, fn($x) = $x.buffer == $b7)) == 1, "quitting ced closed the buffer")
-  print("PASS ced headless e2e: open/live, agent edit + last_remote, interleaved convergence, per-lane undo (" .. $lane .. "), overlap race, headless refusals + ced.wait timeout, SIGKILL restore reattach x2 across a generation switch, file.save cleans recovery files, app.quit + session")
+  print("PASS ced headless e2e: open/live, agent edit + last_remote, interleaved convergence, per-lane undo (" .. $lane .. "), overlap race, headless refusals + ced.wait timeout, SIGKILL restore reattach x2 across a generation switch, file.save cleans recovery files, ced.diagnostics/ced.problems digest gating, app.quit + session")
 catch $err
   for each $log in glob($tmp .. "/*.log")
     print("--- " .. $log .. "\n" .. read_file($log))
