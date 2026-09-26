@@ -2,6 +2,11 @@
 
 use super::{KeyboardHandle, PointerHandle, Seat, WaylandState};
 
+// Keep in step with cosmix-shell-host/src/runner.rs; no unconditional shared desktop crate.
+pub const HUMAN_SEAT_NAME: &str = "cosmix";
+#[allow(dead_code)] // The agent global arrives in the next chunk.
+pub const AGENT_SEAT_NAME: &str = "cosmix-agent";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SeatKind {
     Human,
@@ -18,6 +23,7 @@ pub(super) struct RigidPose {
 }
 
 /// The observer belongs to the seat, independently of its input devices.
+/// D1, TODO-comp: a seat owns its camera pose and optional hand/controller poses.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct SeatPose {
     pub camera: RigidPose,

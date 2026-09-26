@@ -3197,7 +3197,7 @@ impl ProtocolServer {
             |_client| true,
         );
         let mut seat_state = SeatState::new();
-        let mut seat = seat_state.new_wl_seat(&display_handle, "cosmix");
+        let mut seat = seat_state.new_wl_seat(&display_handle, HUMAN_SEAT_NAME);
         let keyboard = seat
             .add_keyboard(Default::default(), 500, 30)
             .map_err(|error| error.to_string())?;
@@ -16473,7 +16473,7 @@ pub(crate) mod workspaces;
 mod xwayland;
 
 use focus::{SeatFocusTarget, focus_targets_surface};
-use seat::{CompSeat, SeatKind};
+use seat::{CompSeat, HUMAN_SEAT_NAME, SeatKind};
 
 struct WaylandClientState {
     compositor_state: CompositorClientState,

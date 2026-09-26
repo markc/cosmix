@@ -991,6 +991,22 @@ fn release_pointer(pointer: impl PointerRelease) {
     }
 }
 
+// Keep in step with cosmix-comp/src/protocol/seat.rs; comp's shell dependency is optional.
+pub const HUMAN_SEAT_NAME: &str = "cosmix";
+pub const AGENT_SEAT_NAME: &str = "cosmix-agent";
+
+fn first_seat_bind_failure<T: Clone + PartialEq>(
+    failures: &mut Vec<(T, Capability)>,
+    seat: &T,
+    capability: Capability,
+) -> bool {
+    if failures.iter().any(|(failed, kind)| failed == seat && *kind == capability) {
+        return false;
+    }
+    failures.push((seat.clone(), capability));
+    true
+}
+
 /// Prefer the compositor's human seat. Unknown names wait for discovery;
 /// an agent seat is never a fallback. Keep an existing ordinary fallback
 /// stable until the preferred seat becomes available.
@@ -999,12 +1015,12 @@ fn preferred_seat<T: Clone + PartialEq>(
     active: Option<&T>,
 ) -> Option<T> {
     candidates.iter()
-        .find(|(_, name)| name.as_deref() == Some("cosmix"))
+        .find(|(_, name)| name.as_deref() == Some(HUMAN_SEAT_NAME))
         .or_else(|| candidates.iter().find(|(seat, name)| {
-            Some(seat) == active && name.as_deref().is_some_and(|name| name != "cosmix-agent")
+            Some(seat) == active && name.as_deref().is_some_and(|name| name != AGENT_SEAT_NAME)
         }))
         .or_else(|| candidates.iter().find(|(_, name)| {
-            name.as_deref().is_some_and(|name| name != "cosmix-agent")
+            name.as_deref().is_some_and(|name| name != AGENT_SEAT_NAME)
         }))
         .map(|(seat, _)| seat.clone())
 }
@@ -1435,6 +1451,7 @@ struct RunnerState {
     max_texture_dimension_2d: u32,
     pointer_bridge: PointerBridge,
     pointer_seats: Vec<wl_seat::WlSeat>,
+    seat_bind_failures: Vec<(wl_seat::WlSeat, Capability)>,
     active_pointer_seat: Option<wl_seat::WlSeat>,
     active_pointer: Option<wl_pointer::WlPointer>,
     keyboard_bridge: KeyboardBridge,
@@ -1726,6 +1743,7 @@ fn run_layer_host(
         max_texture_dimension_2d: 0,
         pointer_bridge: PointerBridge::default(),
         pointer_seats: Vec::new(),
+        seat_bind_failures: Vec::new(),
         active_pointer_seat: None,
         active_pointer: None,
         keyboard_bridge: KeyboardBridge::default(),
@@ -2861,6 +2879,7 @@ impl SeatHandler for RunnerState {
         self.remove_pointer_seat(qh, &seat);
         self.remove_keyboard_seat(qh, &seat);
         self.remove_touch_seat(qh, &seat);
+        self.seat_bind_failures.retain(|(failed, _)| failed != &seat);
     }
 }
 
@@ -3236,9 +3255,12 @@ impl RunnerState {
         change_seat_binding(active.as_ref(), desired, |change| match change {
             SeatBindingChange::Release => self.clear_pointer_seat(),
             SeatBindingChange::Bind(seat) => {
-                if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
-                    self.active_pointer_seat = Some(seat);
-                    self.active_pointer = Some(pointer);
+                match self.seat_state.get_pointer(qh, &seat) {
+                    Ok(pointer) => {
+                        self.active_pointer_seat = Some(seat);
+                        self.active_pointer = Some(pointer);
+                    }
+                    Err(error) => self.warn_seat_bind_failure(&seat, Capability::Pointer, &error),
                 }
             }
         });
@@ -3271,13 +3293,16 @@ impl RunnerState {
         change_seat_binding(active.as_ref(), desired, |change| match change {
             SeatBindingChange::Release => self.clear_keyboard_seat(),
             SeatBindingChange::Bind(seat) => {
-                if let Ok(keyboard) = bind_keyboard_with_text_input(
+                match bind_keyboard_with_text_input(
                     &seat,
                     |seat| self.seat_state.get_keyboard(qh, seat, None),
                     |seat| self.text_input.attach(seat, qh),
                 ) {
-                    self.active_keyboard_seat = Some(seat);
-                    self.active_keyboard = Some(keyboard);
+                    Ok(keyboard) => {
+                        self.active_keyboard_seat = Some(seat);
+                        self.active_keyboard = Some(keyboard);
+                    }
+                    Err(error) => self.warn_seat_bind_failure(&seat, Capability::Keyboard, &error),
                 }
             }
         });
@@ -3312,9 +3337,12 @@ impl RunnerState {
         change_seat_binding(active.as_ref(), desired, |change| match change {
             SeatBindingChange::Release => self.clear_touch_seat(),
             SeatBindingChange::Bind(seat) => {
-                if let Ok(touch) = self.seat_state.get_touch(qh, &seat) {
-                    self.active_touch_seat = Some(seat);
-                    self.active_touch = Some(touch);
+                match self.seat_state.get_touch(qh, &seat) {
+                    Ok(touch) => {
+                        self.active_touch_seat = Some(seat);
+                        self.active_touch = Some(touch);
+                    }
+                    Err(error) => self.warn_seat_bind_failure(&seat, Capability::Touch, &error),
                 }
             }
         });
@@ -3327,6 +3355,19 @@ impl RunnerState {
         }
         self.clear_touch_seat();
         self.promote_touch(qh);
+    }
+
+    fn warn_seat_bind_failure(
+        &mut self,
+        seat: &wl_seat::WlSeat,
+        capability: Capability,
+        error: &impl std::fmt::Display,
+    ) {
+        // Keep preference stable: no fallback attempt in this pass. A later
+        // dispatch may retry, but reports this seat/capability failure only once.
+        if first_seat_bind_failure(&mut self.seat_bind_failures, seat, capability) {
+            tracing::warn!(seat = ?seat.id(), %capability, %error, "failed to bind preferred seat device");
+        }
     }
 
     fn clear_touch_seat(&mut self) {
@@ -3559,10 +3600,30 @@ mod tests {
     use crate::surface::frame_request_overdue;
 
     #[test]
+    fn seat_bind_failure_warns_once_per_seat_and_capability() {
+        let mut failures = Vec::new();
+        for capability in [Capability::Pointer, Capability::Keyboard, Capability::Touch] {
+            assert!(first_seat_bind_failure(&mut failures, &1, capability));
+            assert!(!first_seat_bind_failure(&mut failures, &1, capability));
+            assert!(first_seat_bind_failure(&mut failures, &2, capability));
+            assert!(!first_seat_bind_failure(&mut failures, &2, capability));
+        }
+        assert_eq!(failures.len(), 6);
+    }
+
+    #[test]
+    fn agent_seat_name_is_excluded_before_human_name_arrives() {
+        // Contract paired with comp's production_seat_remains_single_named_human_without_touch.
+        let candidates = vec![(1, Some(AGENT_SEAT_NAME.into())), (2, None)];
+        assert_eq!(preferred_seat(&candidates, None), None);
+        assert_eq!(preferred_seat(&candidates, Some(&1)), None);
+    }
+
+    #[test]
     fn human_seat_wins_in_both_discovery_orders() {
         for candidates in [
-            vec![(1, Some("cosmix-agent".into())), (2, Some("cosmix".into()))],
-            vec![(2, Some("cosmix".into())), (1, Some("cosmix-agent".into()))],
+            vec![(1, Some(AGENT_SEAT_NAME.into())), (2, Some(HUMAN_SEAT_NAME.into()))],
+            vec![(2, Some(HUMAN_SEAT_NAME.into())), (1, Some(AGENT_SEAT_NAME.into()))],
         ] {
             assert_eq!(preferred_seat(&candidates, None), Some(2));
             assert_eq!(preferred_seat(&candidates, Some(&1)), Some(2));
@@ -3575,13 +3636,13 @@ mod tests {
         assert_eq!(preferred_seat(&candidates, None), None);
         candidates[0].1 = Some("seat0".into());
         assert_eq!(preferred_seat(&candidates, None), Some(1));
-        candidates[1].1 = Some("cosmix".into());
+        candidates[1].1 = Some(HUMAN_SEAT_NAME.into());
         assert_eq!(preferred_seat(&candidates, Some(&1)), Some(2));
     }
 
     #[test]
     fn agent_seat_is_never_a_fallback_after_human_removal() {
-        let candidates = vec![(1, Some("cosmix-agent".into()))];
+        let candidates = vec![(1, Some(AGENT_SEAT_NAME.into()))];
         assert_eq!(preferred_seat(&candidates, Some(&2)), None);
         assert_eq!(preferred_seat(&candidates, Some(&1)), None);
     }
@@ -3590,13 +3651,13 @@ mod tests {
     fn ordinary_seat_fallback_stays_stable_until_human_arrives() {
         let mut candidates = vec![(1, Some("seat0".into())), (2, Some("seat1".into()))];
         assert_eq!(preferred_seat(&candidates, Some(&2)), Some(2));
-        candidates.push((3, Some("cosmix".into())));
+        candidates.push((3, Some(HUMAN_SEAT_NAME.into())));
         assert_eq!(preferred_seat(&candidates, Some(&2)), Some(3));
     }
 
     #[test]
     fn seat_switch_releases_once_before_binding_replacement() {
-        let candidates = vec![(1, Some("seat0".into())), (2, Some("cosmix".into()))];
+        let candidates = vec![(1, Some("seat0".into())), (2, Some(HUMAN_SEAT_NAME.into()))];
         let mut active = Some(1);
         let mut operations = Vec::new();
         // This is the shared transition boundary used by pointer, keyboard
@@ -3621,7 +3682,7 @@ mod tests {
 
     #[test]
     fn seat_removal_cleans_up_once_without_binding_agent() {
-        let candidates = vec![(1, Some("cosmix-agent".into()))];
+        let candidates = vec![(1, Some(AGENT_SEAT_NAME.into()))];
         let mut active = Some(2);
         let mut releases = 0;
         for _ in 0..2 {
@@ -3640,7 +3701,7 @@ mod tests {
 
     #[test]
     fn keyboard_and_text_input_bind_to_selected_human_seat() {
-        let candidates = vec![(1, Some("cosmix-agent".into())), (2, Some("cosmix".into()))];
+        let candidates = vec![(1, Some(AGENT_SEAT_NAME.into())), (2, Some(HUMAN_SEAT_NAME.into()))];
         let chosen = preferred_seat(&candidates, None).unwrap();
         let mut attached = None;
         let keyboard = bind_keyboard_with_text_input(
