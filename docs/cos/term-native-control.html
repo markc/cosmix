@@ -462,14 +462,28 @@ local caller with no grant: <code>term.tabs</code>, <code>term.tab.new/select/cl
 plus <code>INFO</code>/<code>HELP</code> (term 0.8.5, per the 2026-09-15 full-mesh-access law) — each
 in the holding frontend's own namespace.
 These verbs act on the active tab/pane of the instance holding the name at
-delivery time; they carry no target binding. <code>term.type</code> revokes any
+delivery time; they carry no target binding. The exception is <code>term.type</code>,
+which requires a <code>pane</code> or <code>tab</code> selector and refuses a body with neither
+(<code>INVALID_ARGUMENT</code>) rather than typing into whatever pane holds focus.
+<code>pane</code> is the safe selector; <code>tab</code> resolves to that tab's active pane at
+delivery, so it still follows focus inside the tab. An optional <code>instance</code>
+(from <code>term.tabs</code>/<code>term.panes</code>/<code>INFO</code>) makes another term process refuse
+instead of typing into its own pane of the same id.
+<code>term.type</code> revokes any
 delegated control writer exactly as real keys do. Any mutating verb's body
 (<code>tab.*</code>, <code>pane.*</code>, <code>type</code>) may add <code>"request_id":"&lt;string&gt;"</code>: a resend of
 the same request (same verb and arguments; JSON key order is free) replays
 the recorded reply instead of re-executing the verb (last 128 remembered) —
-use it on every mutation that might be resent after a lost reply. A reused
-id with a different verb or arguments is refused as a conflict, never
-answered with another request's reply; the replay is the recorded outcome
+use it on every mutation that might be resent after a lost reply. Not
+recorded, so the same id may be retried with the request fixed: <code>starting</code>,
+an oversized body, and every validation refusal (malformed JSON,
+unexpected/missing/mistyped arguments, any <code>invalid-argument</code> or
+<code>INVALID_ARGUMENT</code> reply — e.g. <code>term.type</code> without <code>pane</code>/<code>tab</code>, a pane/tab
+disagreement, a foreign <code>instance</code>). Successes and state refusals such as
+<code>not-found</code>, non-ASCII text and the tab limit ARE recorded and replayed. A
+reused id whose first attempt was recorded, sent with a different verb or
+arguments, is refused as a conflict, never answered with another request's
+reply; the replay is the recorded outcome
 of the original attempt, so retrying after changing state needs a fresh id.
 Reads never consult the cache and always answer current state. Replies echo
 the identity the targetless verb acted on as trailing <code>key=value</code> tokens —

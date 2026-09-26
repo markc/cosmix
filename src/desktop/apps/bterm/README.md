@@ -57,7 +57,11 @@ the end. Closing the last tab quits after bounded terminal shutdown.
 The diagnostic `bterm` Bus service accepts JSON objects, including `{"id":42}` for
 `bterm.tab.select` and `bterm.tab.close`. `bterm.tab.new` opens and activates a tab;
 `bterm.tabs` lists stable IDs, selection, titles, dimensions and child PIDs.
-`bterm.snapshot` and `bterm.type` target the active pane. `bterm.panes` lists the
+`bterm.snapshot` targets the active pane by default; `bterm.type` requires a
+`pane` or `tab` and never defaults to focus: `pane` is the safe selector, `tab`
+means that tab's active pane at delivery (it still follows focus inside the tab),
+and an optional `instance` from `bterm.tabs`/`bterm.panes` refuses a different
+process. `bterm.panes` lists the
 active tab's pane IDs, active flags, cached dimensions/PIDs and logical x/y/w/h
 (zero geometry until layout). `bterm.pane.split` accepts
 `{"dir":"h"}` (also horizontal, v, vertical); `bterm.pane.select` accepts `{"id":42}` belonging
@@ -79,7 +83,7 @@ stay the canonical `term.*` on the broker-allocated Unix identity, identical in
 both frontends (see [Term native control](../../../../docs/cos/term-native-control.md)).
 
 No-argument verbs require `{}` (an empty body is also accepted).
-`bterm.type` requires `{"text":"echo hello\n"}`; the JSON envelope and escaping
+`bterm.type` requires `{"pane":1,"text":"echo hello\n"}` (or `"tab"` in place of `"pane"`); the JSON envelope and escaping
 count towards the 8192-byte request cap. Invalid JSON, non-object bodies,
 unexpected fields and missing or wrongly typed arguments are rejected before
 mutation. IDs are non-negative u64 integers. This breaks raw-body callers as

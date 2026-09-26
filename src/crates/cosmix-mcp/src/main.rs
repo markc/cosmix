@@ -20,6 +20,9 @@ struct CosmixMcp {
     noded: OnceCell<Arc<cosmix_client::NodedClient>>,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
     metrics: Arc<Metrics>,
+    /// The frontend and instance the last successful term_list read: the
+    /// default target for a term_type that names neither.
+    term_pin: std::sync::Mutex<Option<TermPin>>,
 }
 
 // ---- Observability: per-tool-call metrics + arg redaction ----
@@ -322,6 +325,19 @@ impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
 struct TermTypeParams {
     /// Diagnostic synthetic input; max 8192 UTF-8 bytes including JSON envelope on the wire.
     text: String,
+    /// Pane id to type into (from term_list). Pane or tab is REQUIRED; pane
+    /// is the SAFE selector.
+    pane: Option<u64>,
+    /// Tab id: types into that tab's active pane AT DELIVERY, so it still
+    /// follows focus within the tab — prefer pane. With both, the pane must
+    /// belong to the tab.
+    tab: Option<u64>,
+    /// The `service` term_list answered from (bterm or term). Pass it back:
+    /// the call then goes to exactly that frontend, with no fallback probe.
+    service: Option<String>,
+    /// The `instance` term_list returned. Pass it back: a different term
+    /// process refuses instead of typing into its own pane of the same id.
+    instance: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -465,6 +481,96 @@ fn term_tab_request(p: TermTabParams) -> Result<(&'static str, serde_json::Value
         }
         _ => Err("op must be new|select|close".into()),
     }
+}
+
+/// The body for a type request. Decision 8 (2026-09-25): typing names its
+/// target; the old active-pane default sent an agent's keys into whatever
+/// pane held focus.
+/// A term_list read: the frontend it answered from and that process's
+/// instance token (`None` from a frontend older than term-core 0.8.0).
+type TermPin = (&'static str, Option<u64>);
+
+/// Decision 10's house shape, for this tool's new refusals.
+fn term_invalid(message: &str) -> String {
+    serde_json::json!({"error_code": "INVALID_ARGUMENT", "message": message}).to_string()
+}
+
+/// Pane and tab ids are per-process counters from 1, so a type ALWAYS goes
+/// to a pinned frontend and never through the resolve-and-fall-back probe:
+/// the `service` the caller passes back, else the one the last term_list in
+/// this process read (`remembered`), else a refusal. `instance` (explicit,
+/// else remembered for that same service) is forwarded, so a terminal that
+/// restarted since the listing refuses rather than types.
+fn term_type_request(
+    p: TermTypeParams,
+    remembered: Option<TermPin>,
+) -> Result<(&'static str, serde_json::Value), String> {
+    if p.pane.is_none() && p.tab.is_none() {
+        return Err("pane or tab is required".into());
+    }
+    if p.pane == Some(0) || p.tab == Some(0) {
+        return Err("pane and tab ids start at 1".into());
+    }
+    let service = match p.service.as_deref() {
+        None => remembered
+            .map(|(service, _)| service)
+            .ok_or_else(|| term_invalid("call term_list first: term_type types only into a terminal term_list has read"))?,
+        Some(name) => TERM_SERVICES
+            .into_iter()
+            .find(|known| *known == name)
+            .ok_or_else(|| format!("service must be one of {}", TERM_SERVICES.join(", ")))?,
+    };
+    let instance = p.instance.or_else(|| {
+        remembered
+            .filter(|(pinned, _)| *pinned == service)
+            .and_then(|(_, instance)| instance)
+    });
+    let mut body = serde_json::json!({"text": p.text});
+    if let Some(pane) = p.pane {
+        body["pane"] = pane.into();
+    }
+    if let Some(tab) = p.tab {
+        body["tab"] = tab.into();
+    }
+    if let Some(instance) = instance {
+        body["instance"] = instance.into();
+    }
+    Ok((service, body))
+}
+
+/// A term-core instance refusal means the process term_list read is gone:
+/// say that, in the house shape, instead of the frontend's own wording.
+fn term_type_outcome(reply: String) -> String {
+    if reply.starts_with("ERROR:") && reply.contains("is not this term process") {
+        format!(
+            "ERROR: {}",
+            term_invalid("terminal restarted since term_list; call term_list again")
+        )
+    } else {
+        reply
+    }
+}
+
+/// The one instance token a term_list read came from, or null for a
+/// frontend too old to report one. Tabs and panes are two sequential reads;
+/// if they came from different processes the listing is refused rather than
+/// handing out ids that belong to two namespaces.
+fn term_listing_instance(
+    tabs: &serde_json::Value,
+    panes: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut seen = serde_json::Value::Null;
+    for row in tabs.as_array().into_iter().chain(panes.as_array()).flatten() {
+        let instance = &row["instance"];
+        if instance.is_null() {
+            continue;
+        }
+        if !seen.is_null() && seen != *instance {
+            return Err("the term process changed between the tab and pane reads; call term_list again".into());
+        }
+        seen = instance.clone();
+    }
+    Ok(seen)
 }
 
 /// The verb SUFFIX (namespace-free) and body for a pane operation.
@@ -848,6 +954,8 @@ impl CosmixMcp {
 
     /// Read-only tab and active-tab pane listing (ids, active flags, dimensions, pids,
     /// geometry) from the live CosMix terminal over ABP (`bterm`, else `term`).
+    /// Also returns the `service` it read and that process's `instance`: pass both
+    /// to term_type, because pane ids are per-process and restart at 1.
     /// Sequential reads are not atomic.
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
@@ -858,7 +966,11 @@ impl CosmixMcp {
             let noded = self.noded().await?;
             let tabs = term_reply(noded.call(service, &term_verb(service, "tabs")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
             let panes = term_reply(noded.call(service, &term_verb(service, "panes")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
-            term_reply(serde_json::json!({"tabs": term_listing(&tabs, true)?, "panes": term_listing(&panes, false)?}))
+            let (tabs, panes) = (term_listing(&tabs, true)?, term_listing(&panes, false)?);
+            let instance = term_listing_instance(&tabs, &panes)?;
+            let reply = term_reply(serde_json::json!({"service": service, "instance": instance, "tabs": tabs, "panes": panes}))?;
+            *self.term_pin.lock().unwrap_or_else(|p| p.into_inner()) = Some((service, instance.as_u64()));
+            Ok(reply)
         }.await;
         result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
     }
@@ -876,11 +988,23 @@ impl CosmixMcp {
     /// authenticated input API. The term service is a self-asserted diagnostic surface
     /// pending authenticated per-instance identity (P0-I). Text uses the keyboard
     /// encoder; newline is Enter. JSON request is limited to 8192 bytes.
+    /// REQUIRES pane or tab, and never defaults to whichever pane holds focus.
+    /// pane is the safe selector; tab means that tab's active pane at delivery, so
+    /// it still follows focus inside the tab. Pass back the `service` and `instance`
+    /// term_list returned: the call then goes to exactly that frontend, and a
+    /// different term process refuses instead of typing into its own pane N.
+    /// Omitted, they default to the last term_list in this MCP process; with no
+    /// term_list yet the call is refused (never probed and never falls back).
     #[tool]
     async fn term_type(&self, Parameters(p): Parameters<TermTypeParams>) -> String {
         // VERIFY: MCP Term tool is a thin structured-argument ABP translation.
-        self.term_request("type", serde_json::json!({"text": p.text}))
-            .await
+        let remembered = *self.term_pin.lock().unwrap_or_else(|p| p.into_inner());
+        match term_type_request(p, remembered) {
+            Ok((service, args)) => {
+                term_type_outcome(self.term_request_to(Some(service), "type", args).await)
+            }
+            Err(e) => format!("ERROR: {e}"),
+        }
     }
 
     /// Create, select or close a tab in the live CosMix terminal over ABP; select/close require id.
@@ -910,11 +1034,26 @@ impl CosmixMcp {
     /// terminal frontend is live. The namespace comes from the resolved
     /// service, never from the caller.
     async fn term_request(&self, verb_suffix: &str, args: serde_json::Value) -> String {
+        self.term_request_to(None, verb_suffix, args).await
+    }
+
+    /// [`Self::term_request`], optionally pinned: `Some(service)` calls exactly
+    /// that frontend and skips the resolve/fallback probe entirely, so a reply
+    /// can never come from a different process than the caller listed.
+    async fn term_request_to(
+        &self,
+        pinned: Option<&'static str>,
+        verb_suffix: &str,
+        args: serde_json::Value,
+    ) -> String {
         if args.to_string().len() > 8192 {
             return "ERROR: request exceeds 8192 bytes".into();
         }
         let result: Result<String, String> = async {
-            let service = self.term_service().await?;
+            let service = match pinned {
+                Some(service) => service,
+                None => self.term_service().await?,
+            };
             let noded = self.noded().await?;
             term_reply(
                 noded
@@ -2818,6 +2957,7 @@ async fn async_main() {
         noded: OnceCell::new(),
         tool_router: CosmixMcp::tool_router(),
         metrics: Arc::new(Metrics::new()),
+        term_pin: std::sync::Mutex::new(None),
     };
     let service = match server.serve(rmcp::transport::io::stdio()).await {
         Ok(s) => s,
@@ -2832,9 +2972,138 @@ async fn async_main() {
 
 #[cfg(test)]
 mod tests {
+    fn bare_type() -> super::TermTypeParams {
+        super::TermTypeParams {
+            text: "x".into(),
+            pane: Some(3),
+            tab: None,
+            service: None,
+            instance: None,
+        }
+    }
+
+    /// Unpinned term_type, case 1: no term_list yet is refused in the house
+    /// shape — never probed, never a fallback to whichever frontend answers.
+    #[test]
+    fn term_type_without_term_list_is_refused() {
+        let refusal: serde_json::Value =
+            serde_json::from_str(&super::term_type_request(bare_type(), None).unwrap_err()).unwrap();
+        assert_eq!(refusal["error_code"], "INVALID_ARGUMENT");
+        assert!(refusal["message"].as_str().unwrap().contains("call term_list first"));
+    }
+
+    /// Case 2: the remembered pair is the default — its service AND instance.
+    #[test]
+    fn term_type_defaults_to_the_remembered_term_list_pair() {
+        use super::*;
+        let remembered: Option<TermPin> = Some(("term", Some(77)));
+        assert_eq!(
+            term_type_request(bare_type(), remembered).unwrap(),
+            ("term", serde_json::json!({"text":"x","pane":3,"instance":77}))
+        );
+        // An explicit OTHER service does not inherit the remembered instance.
+        assert_eq!(
+            term_type_request(TermTypeParams { service: Some("bterm".into()), ..bare_type() }, remembered)
+                .unwrap(),
+            ("bterm", serde_json::json!({"text":"x","pane":3}))
+        );
+    }
+
+    /// Case 3: the frontend refusing that instance (it restarted since the
+    /// listing) comes back as INVALID_ARGUMENT naming the cause.
+    #[test]
+    fn term_type_reports_a_restart_since_term_list() {
+        use super::*;
+        let restarted = term_type_outcome(
+            r#"ERROR: {"error_code":"INVALID_ARGUMENT","message":"instance 77 is not this term process (instance=5); re-read term.panes"}"#.into(),
+        );
+        let refusal: serde_json::Value =
+            serde_json::from_str(restarted.strip_prefix("ERROR: ").unwrap()).unwrap();
+        assert_eq!(refusal["error_code"], "INVALID_ARGUMENT");
+        assert_eq!(refusal["message"], "terminal restarted since term_list; call term_list again");
+        for other in ["DIAGNOSTIC synthetic keys queued tab=1 pane=3", "ERROR: not-found: pane id=3"] {
+            assert_eq!(term_type_outcome(other.into()), other);
+        }
+    }
+
     #[test]
     fn term_translations_and_listing() {
         use super::*;
+        // An old frontend listed: no instance to forward, service still pinned.
+        let old: Option<TermPin> = Some(("bterm", None));
+        let typed = |pane, tab| {
+            term_type_request(
+                TermTypeParams {
+                    text: "hi\n".into(),
+                    pane,
+                    tab,
+                    service: None,
+                    instance: None,
+                },
+                old,
+            )
+        };
+        assert_eq!(typed(None, None).unwrap_err(), "pane or tab is required");
+        assert_eq!(typed(Some(3), None).unwrap(), ("bterm", serde_json::json!({"text":"hi\n","pane":3})));
+        assert_eq!(typed(None, Some(2)).unwrap(), ("bterm", serde_json::json!({"text":"hi\n","tab":2})));
+        assert_eq!(
+            typed(Some(3), Some(2)).unwrap(),
+            ("bterm", serde_json::json!({"text":"hi\n","pane":3,"tab":2}))
+        );
+        // Ids start at 1: zero is refused locally, before any Bus call.
+        for (pane, tab) in [(Some(0), None), (None, Some(0)), (Some(3), Some(0))] {
+            assert_eq!(typed(pane, tab).unwrap_err(), "pane and tab ids start at 1");
+        }
+        // Pinning: the service term_list answered from is called exactly, and
+        // the instance rides along so a different process refuses.
+        for service in TERM_SERVICES {
+            assert_eq!(
+                term_type_request(
+                    TermTypeParams {
+                        text: "x".into(),
+                        pane: Some(3),
+                        tab: None,
+                        service: Some(service.into()),
+                        instance: Some(42),
+                    },
+                    None
+                )
+                .unwrap(),
+                (service, serde_json::json!({"text":"x","pane":3,"instance":42}))
+            );
+        }
+        assert!(
+            term_type_request(
+                TermTypeParams {
+                    text: "x".into(),
+                    pane: Some(3),
+                    tab: None,
+                    service: Some("webd".into()),
+                    instance: None,
+                },
+                None
+            )
+            .is_err()
+        );
+        // term_list's instance: one token, null for an old frontend, and a
+        // refusal when the two reads came from different processes.
+        let rows = |instances: &[Option<u64>]| {
+            serde_json::Value::Array(
+                instances
+                    .iter()
+                    .map(|i| match i {
+                        Some(i) => serde_json::json!({"id":1,"instance":i}),
+                        None => serde_json::json!({"id":1}),
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            term_listing_instance(&rows(&[Some(9)]), &rows(&[Some(9), Some(9)])).unwrap(),
+            9
+        );
+        assert!(term_listing_instance(&rows(&[None]), &rows(&[None])).unwrap().is_null());
+        assert!(term_listing_instance(&rows(&[Some(9)]), &rows(&[Some(8)])).is_err());
         for (op, verb) in [
             ("new", "tab.new"),
             ("select", "tab.select"),
@@ -2922,6 +3191,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(panes[0]["y"], 1.5);
+        // term-core 0.8.0 appends the instance token; it survives exactly.
+        let token = (1_u64 << 53) - 1;
+        let tabs = term_listing(
+            &format!("id=1 active=true title=a b cols=80 rows=24 child_pid=1 revision=2 instance={token}"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(tabs[0]["instance"], token);
+        assert_eq!(tabs[0]["title"], "a b");
         assert!(term_listing("bad", true).is_err());
         assert_eq!(
             term_reply(serde_json::json!("screen\ntext")).unwrap(),

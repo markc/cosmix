@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — unless explicit pane/tab selectors are supplied, they act on the active tab/pane of the instance holding this name at delivery time; both iced term and Bevy bterm also start target-bound control (instance/incarnation/pane_generation) on the allocated native-session route: list/session/tabs/panes/snapshot/type, execute, exec.result/cancel, task.submit/result/cancel, operation, props.get/set and tab/pane mutations. Use the allocated route HELP for target envelopes. These are not targetless verbs on this global name. Requires local noded >= 0.16.8 native ingress, COSMIX_RUN=/run/cosmix and socket directory 0755; unavailable ingress leaves graphics working. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {cwd?:<absolute existing directory>, title?:<string>}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {tab?:<integer>}: list selected tab (default active tab) pane ids, focus, dimensions, child pids and logical geometry (last layout only; hidden tabs may be stale or zero)\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {pane?:<integer>, tab?:<integer>, contents?:<boolean=true>, scrollback_lines?:<integer=0, max 10000>}: read-only selected live screen (offset zero, default active); buffered history above the live screen is capped at available lines; text has a 512 KiB encoded-byte budget, returns complete oldest-first rows with truncated and lines_returned; formatting happens after releasing capture locks; pane+tab must agree; contents=false omits text but keeps dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.scroll {pane?:<integer>, lines?:<signed integer>, page?:<signed integer>, to?:top|bottom}: exactly one of lines/page/to; positive lines or pages move up into history; pages overlap by one row; viewport only, snapshots stay live; returns JSON {pane,display_offset,history_lines}; stale pane is not-found; changed offsets publish pane.changed kind=scrolled when watching\nterm.type {pane?:<integer>, \"text\":\"<string>\"}: ASCII synthetic keys to the selected pane without changing focus (default active pane) through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nterm.tab.title {id:<integer>, title:<string>}: pin a user title (controls stripped, max 256 UTF-8 bytes); empty after sanitising clears the pin and restores the active pane OSC title\nterm.tab.move {id:<integer>, index:<integer>}: reorder tab, clamping index to 0..len-1; focus is preserved\nterm.props.watch {}: first subscribe through noded topic.subscribe to term.tabs.changed, term.pane.changed and term.title.changed; then call this verb to enable caller-free publishing and return JSON {topics,revision}; then read current state. Bodies are {tab,pane,kind,revision}; revision is a separate monotonic event sequence, not the legacy layout revision. Bounded best-effort delivery; on a gap or reconnect read current state.\nBefore the first tab attaches, mutating verbs return non-zero rc with error starting. Retry after attach, including with the same request_id; starting refusals are not cached.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type, scroll) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
+pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — unless explicit pane/tab selectors are supplied, they act on the active tab/pane of the instance holding this name at delivery time (term.type excepted: it requires pane or tab); both iced term and Bevy bterm also start target-bound control (instance/incarnation/pane_generation) on the allocated native-session route: list/session/tabs/panes/snapshot/type, execute, exec.result/cancel, task.submit/result/cancel, operation, props.get/set and tab/pane mutations. Use the allocated route HELP for target envelopes. These are not targetless verbs on this global name. Requires local noded >= 0.16.8 native ingress, COSMIX_RUN=/run/cosmix and socket directory 0755; unavailable ingress leaves graphics working. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid, revision, instance (this process's token)\nterm.tab.new {cwd?:<absolute existing directory>, title?:<string>}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {tab?:<integer>}: list selected tab (default active tab) pane ids, focus, dimensions, child pids, logical geometry, tab, revision and instance (last layout only; hidden tabs may be stale or zero)\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {pane?:<integer>, tab?:<integer>, contents?:<boolean=true>, scrollback_lines?:<integer=0, max 10000>}: read-only selected live screen (offset zero, default active); buffered history above the live screen is capped at available lines; text has a 512 KiB encoded-byte budget, returns complete oldest-first rows with truncated and lines_returned; formatting happens after releasing capture locks; pane+tab must agree; contents=false omits text but keeps dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.scroll {pane?:<integer>, lines?:<signed integer>, page?:<signed integer>, to?:top|bottom}: exactly one of lines/page/to; positive lines or pages move up into history; pages overlap by one row; viewport only, snapshots stay live; returns JSON {pane,display_offset,history_lines}; stale pane is not-found; changed offsets publish pane.changed kind=scrolled when watching\nterm.type {pane:<integer> | tab:<integer>, instance?:<integer>, \"text\":\"<string>\"}: ASCII synthetic keys without changing focus; pane or tab is REQUIRED, neither is refused {error_code:INVALID_ARGUMENT} and never defaults to the active pane. pane is the SAFE selector; tab means that tab's active pane AT DELIVERY, so it still follows focus within the tab; both must agree. Pane/tab ids are per-process counters, so pass back the instance that term.tabs/term.panes/INFO reported: a different process refuses INVALID_ARGUMENT instead of typing into its own pane of that id. Keys go through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nterm.tab.title {id:<integer>, title:<string>}: pin a user title (controls stripped, max 256 UTF-8 bytes); empty after sanitising clears the pin and restores the active pane OSC title\nterm.tab.move {id:<integer>, index:<integer>}: reorder tab, clamping index to 0..len-1; focus is preserved\nterm.props.watch {}: first subscribe through noded topic.subscribe to term.tabs.changed, term.pane.changed and term.title.changed; then call this verb to enable caller-free publishing and return JSON {topics,revision}; then read current state. Bodies are {tab,pane,kind,revision}; revision is a separate monotonic event sequence, not the legacy layout revision. Bounded best-effort delivery; on a gap or reconnect read current state.\nBefore the first tab attaches, mutating verbs return non-zero rc with error starting. Retry after attach, including with the same request_id; starting refusals are not cached.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type, scroll) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. NOT recorded (the same id may be retried with the request fixed): starting, an oversized body, and every validation refusal — malformed JSON, unexpected/missing/mistyped arguments and any invalid-argument or INVALID_ARGUMENT reply (e.g. term.type without pane/tab, a pane/tab disagreement, a foreign instance). Recorded and replayed: successes and state refusals such as not-found, non-ASCII text and the tab limit. A reused id whose first attempt WAS recorded, sent with a different verb or arguments, is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
 /// The one spelling the handlers in this crate are written in.
 ///
 /// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global Bus
@@ -526,16 +526,52 @@ fn dispatch(
             return reply;
         }
     }
+    // A body its own verb refuses performed no mutation either; caching that
+    // refusal would turn the obvious retry (same id, argument fixed — e.g. a
+    // term.type that forgot its pane) into a conflict.
+    let valid = parsed.is_some() && parse_args(verb, body).is_ok();
     let result = handle(service, set, cleanup, verb, body);
     // Startup refusals performed no mutation: the same request may be retried.
-    if result.as_ref().is_err_and(|error| error == "starting") {
+    if result
+        .as_ref()
+        .is_err_and(|error| error == "starting" || is_invalid_argument(error))
+    {
         return result;
     }
-    if let Some(args) = parsed {
+    if let Some(args) = parsed.filter(|_| valid) {
         let id = args["request_id"].as_str().expect("filtered as string");
         replies.put(id.to_owned(), verb, args, result.clone());
     }
     result
+}
+
+/// This process's instance token: random per process, fixed for its life.
+/// Pane and tab ids are per-process counters from 1, so `pane=3` names a
+/// different pane in every term process; echoing this token on INFO,
+/// term.tabs and term.panes and accepting it back on term.type lets a caller
+/// refuse to type into a process it never listed. Kept below 2^53 so JSON
+/// clients that read numbers as doubles round-trip it exactly.
+pub fn instance() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static INSTANCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INSTANCE.get_or_init(|| {
+        // RandomState is seeded from the OS random source once per process.
+        let mut hasher = std::hash::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        (hasher.finish() & ((1 << 53) - 1)).max(1)
+    })
+}
+
+/// Decision 10's house shape for new refusals. Older global-lane refusals
+/// stay plain text until migrated on their own.
+fn invalid_argument(message: &str) -> String {
+    serde_json::json!({"error_code": "INVALID_ARGUMENT", "message": message}).to_string()
+}
+
+fn is_invalid_argument(error: &str) -> bool {
+    error.starts_with("invalid-argument")
+        || serde_json::from_str::<serde_json::Value>(error)
+            .is_ok_and(|value| value["error_code"] == "INVALID_ARGUMENT")
 }
 
 /// The global, self-asserted TCP name is never an authority boundary.
@@ -576,8 +612,9 @@ fn handle(
     }
     match verb {
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
-            "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)",
-            help(service)
+            "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)\ninstance={}",
+            help(service),
+            instance()
         )),
         "term.session" => {
             let mut status = tabs.session_status();
@@ -591,8 +628,15 @@ fn handle(
             .iter()
             .map(|tab| {
                 format!(
-                    "id={} active={} title={} cols={} rows={} child_pid={} revision={}",
-                    tab.id, tab.active, tab.title, tab.cols, tab.rows, tab.child_pid, tabs.revision
+                    "id={} active={} title={} cols={} rows={} child_pid={} revision={} instance={}",
+                    tab.id,
+                    tab.active,
+                    tab.title,
+                    tab.cols,
+                    tab.rows,
+                    tab.child_pid,
+                    tabs.revision,
+                    instance()
                 )
             })
             .collect::<Vec<_>>()
@@ -677,7 +721,7 @@ fn handle(
             .map(|pane| {
                 let g = pane.geometry;
                 format!(
-                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={}",
+                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={} instance={}",
                     pane.id,
                     pane.active,
                     pane.cols,
@@ -688,7 +732,8 @@ fn handle(
                     g.w,
                     g.h,
                     id,
-                    tabs.revision
+                    tabs.revision,
+                    instance()
                 )
             })
             .collect::<Vec<_>>()
@@ -768,7 +813,21 @@ fn handle(
         }
         // VERIFY: active-pane snapshot/type — selection stays under the set lock.
         "term.snapshot" | "term.type" => {
-            let (tab, pane) = tabs.resolve(args["pane"].as_u64(), args["tab"].as_u64())?;
+            if verb == "term.type"
+                && let Some(wanted) = args["instance"].as_u64()
+                && wanted != instance()
+            {
+                return Err(invalid_argument(&format!(
+                    "instance {wanted} is not this term process (instance={}); re-read term.panes",
+                    instance()
+                )));
+            }
+            let (tab, pane) = tabs
+                .resolve(args["pane"].as_u64(), args["tab"].as_u64())
+                .map_err(|error| match error.strip_prefix("invalid-argument: ") {
+                    Some(message) if verb == "term.type" => invalid_argument(message),
+                    _ => error,
+                })?;
             let active = tabs
                 .pane_by_id(pane)
                 .expect("resolved pane exists under set lock");
@@ -850,7 +909,7 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     let object = args.as_object().ok_or("body must be a JSON object")?;
     let extra: &[&str] = match verb {
         "term.snapshot" => &["pane", "tab", "contents", "scrollback_lines"],
-        "term.type" => &["pane"],
+        "term.type" => &["pane", "tab", "instance"],
         "term.scroll" => &["pane", "lines", "page", "to"],
         "term.panes" => &["tab"],
         "term.tab.new" => &["cwd", "title"],
@@ -869,6 +928,16 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
         args["request_id"]
             .as_str()
             .ok_or("request_id must be a string")?;
+    }
+    // A targetless term.type once followed focus: on 2026-09-25 an agent's
+    // keystrokes landed in a Claude prompt when the active pane moved
+    // under it. Typing therefore names its pane (or a tab, meaning that
+    // tab's active pane); the active-pane default is gone.
+    if verb == "term.type" && !object.contains_key("pane") && !object.contains_key("tab") {
+        return Err(invalid_argument("term.type requires pane or tab"));
+    }
+    if object.contains_key("instance") && args["instance"].as_u64().is_none() {
+        return Err(invalid_argument("instance must be a non-negative integer (u64)"));
     }
     if verb == "term.scroll" {
         if ["lines", "page", "to"].iter().filter(|key| object.contains_key(**key)).count() != 1 {
@@ -1084,6 +1153,49 @@ mod tests {
         assert_eq!(target.lock().unwrap().display_offset(), 0);
         assert_eq!(focused.lock().unwrap().display_offset(), 2);
         assert_eq!(identity(&set.lock().unwrap()), focus);
+        // tab= on a NON-active tab lands in THAT tab's active pane, never in
+        // the focused tab's pane.
+        let focused_input = focused.lock().unwrap().listener.test_input_receiver();
+        handle(&set, &cleanup, "term.type", r#"{"tab":1,"text":"t"}"#).unwrap();
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            rio_vt::event::Msg::Input(bytes) if bytes.as_ref() == b"t"
+        ));
+        assert!(focused_input.try_recv().is_err(), "keys leaked into the focused tab");
+        assert_eq!(identity(&set.lock().unwrap()), focus);
+        // pane and tab that disagree, and a foreign instance, are refused in
+        // decision 10's shape and write nothing.
+        for body in [
+            r#"{"pane":1,"tab":2,"text":"no"}"#.to_string(),
+            format!(r#"{{"pane":1,"instance":{},"text":"no"}}"#, instance() ^ 1),
+        ] {
+            let refusal: serde_json::Value =
+                serde_json::from_str(&handle(&set, &cleanup, "term.type", &body).unwrap_err())
+                    .unwrap();
+            assert_eq!(refusal["error_code"], "INVALID_ARGUMENT", "{body}");
+        }
+        assert!(input.try_recv().is_err(), "a refused type wrote keys");
+        assert!(focused_input.try_recv().is_err(), "a refused type wrote keys");
+        // The instance this process reports is accepted.
+        let listed = handle(&set, &cleanup, "term.panes", r#"{"tab":1}"#).unwrap();
+        let reported = listed.rsplit_once(" instance=").unwrap().1;
+        assert_eq!(reported, instance().to_string());
+        handle(
+            &set,
+            &cleanup,
+            "term.type",
+            &format!(r#"{{"pane":1,"instance":{reported},"text":"i"}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            rio_vt::event::Msg::Input(bytes) if bytes.as_ref() == b"i"
+        ));
+        assert!(
+            handle(&set, &cleanup, "INFO", "")
+                .unwrap()
+                .ends_with(&format!("\ninstance={}", instance()))
+        );
         cleanup.submit(set.lock().unwrap().shutdown());
         drop(cleanup);
         worker.join().unwrap();
@@ -1421,7 +1533,7 @@ mod tests {
             ("term.pane.split", serde_json::json!({"dir":"h"})),
             ("term.pane.select", serde_json::json!({"id":1})),
             ("term.pane.close", serde_json::json!({})),
-            ("term.type", serde_json::json!({"text":"hello"})),
+            ("term.type", serde_json::json!({"pane":1,"text":"hello"})),
             ("term.scroll", serde_json::json!({"lines":1})),
             ("term.tab.title", serde_json::json!({"id":1,"title":"test"})),
             ("term.tab.move", serde_json::json!({"id":1,"index":0})),
@@ -1714,7 +1826,7 @@ mod tests {
             let keys: Vec<_> = line.iter().map(|(key, _)| *key).collect();
             assert_eq!(
                 keys,
-                ["id", "active", "title", "cols", "rows", "child_pid", "revision"],
+                ["id", "active", "title", "cols", "rows", "child_pid", "revision", "instance"],
                 "{tabs}"
             );
             assert_eq!(line[0], ("id", id));
@@ -2026,7 +2138,7 @@ mod tests {
         assert_eq!(panes.lines().count(), 2);
         for line in panes.lines() {
             assert!(
-                line.ends_with(&format!(" tab=1 revision={}", revision())),
+                line.ends_with(&format!(" tab=1 revision={} instance={}", revision(), instance())),
                 "{line}"
             );
         }
@@ -2036,7 +2148,7 @@ mod tests {
                 .starts_with(&format!("tab=1 pane=2 revision={} cols=", revision()))
         );
         assert!(
-            handle(&set, &cleanup, "term.type", r#"{"text":""}"#)
+            handle(&set, &cleanup, "term.type", r#"{"tab":1,"text":""}"#)
                 .unwrap()
                 .ends_with(&format!(" tab=1 pane=2 revision={}", revision()))
         );
@@ -2055,7 +2167,12 @@ mod tests {
         let original_terminal = set.lock().unwrap().pane_by_id(original).unwrap();
         // Holding the inactive terminal must not block snapshot or synthetic input.
         let held = original_terminal.lock().unwrap();
-        assert!(handle(&set, &cleanup, "term.type", r#"{"text":""}"#).is_ok());
+        assert!(handle(&set, &cleanup, "term.type", r#"{"pane":2,"text":""}"#).is_ok());
+        // A targetless type is refused on the live path, not sent to focus.
+        assert_eq!(
+            handle(&set, &cleanup, "term.type", r#"{"text":""}"#).unwrap_err(),
+            invalid_argument("term.type requires pane or tab")
+        );
         assert!(handle(&set, &cleanup, "term.snapshot", "").is_ok());
         drop(held);
         assert!(handle(&set, &cleanup, "term.pane.select", r#"{"id":999}"#).is_err());
@@ -2229,10 +2346,21 @@ mod tests {
                 &cleanup,
                 &mut replies,
                 "term.type",
-                r#"{"text":"","request_id":"r4"}"#,
+                r#"{"tab":1,"text":"","request_id":"r4"}"#,
             )
             .is_ok()
         );
+        // A validation refusal is not cached either: the obvious retry — same
+        // id, pane added — executes instead of conflicting.
+        for (body, ok) in [
+            (r#"{"text":"","request_id":"r5"}"#, false),
+            (r#"{"tab":1,"text":"","request_id":"r5"}"#, true),
+            (r#"{"tab":1,"text":"","request_id":"r5"}"#, true),
+        ] {
+            let reply = dispatch(true, &set, &cleanup, &mut replies, "term.type", body);
+            assert_eq!(reply.is_ok(), ok, "{body}: {reply:?}");
+        }
+        assert!(replies.map.contains_key("r5"), "the successful type is still cached");
         // tab.new says whether the new pane got a native binding; this set
         // was built without a native session, so it cannot have one.
         let opened = dispatch(true, &set, &cleanup, &mut replies, "term.tab.new", "").unwrap();
@@ -2328,19 +2456,49 @@ mod tests {
         assert!(parse_args("term.tab.new", r#"{"request_id":null}"#).is_err());
         let text = "echo hello\n\t\u{3}";
         assert_eq!(
-            parse_args("term.type", &serde_json::json!({"text":text}).to_string()).unwrap()["text"],
+            parse_args("term.type", &serde_json::json!({"pane":1,"text":text}).to_string()).unwrap()["text"],
             text
         );
         for body in ["", "raw", "{}", r#"{"text":42}"#, r#"{"text":null}"#] {
             assert!(parse_args("term.type", body).is_err());
         }
-        let boundary = serde_json::json!({"text":"a".repeat(8181)}).to_string();
+        // Decision 8 (2026-09-25): no pane and no tab is refused, never
+        // defaulted to whichever pane happens to hold focus.
+        for body in [r#"{"text":"x"}"#, r#"{"text":"","request_id":"r1"}"#] {
+            assert_eq!(
+                parse_args("term.type", body).unwrap_err(),
+                invalid_argument("term.type requires pane or tab"),
+                "{body}"
+            );
+        }
+        for body in [r#"{"pane":1,"text":""}"#, r#"{"tab":1,"text":""}"#, r#"{"pane":1,"tab":1,"text":""}"#] {
+            assert!(parse_args("term.type", body).is_ok(), "{body}");
+        }
+        for body in [r#"{"tab":null,"text":""}"#, r#"{"tab":-1,"text":""}"#] {
+            assert!(parse_args("term.type", body).is_err(), "{body}");
+        }
+        // Decision 10: the new refusals are the JSON house shape.
+        let refusal: serde_json::Value =
+            serde_json::from_str(&parse_args("term.type", r#"{"text":""}"#).unwrap_err()).unwrap();
+        assert_eq!(refusal["error_code"], "INVALID_ARGUMENT");
+        assert_eq!(refusal["message"], "term.type requires pane or tab");
+        assert!(parse_args("term.type", r#"{"pane":1,"instance":7,"text":""}"#).is_ok());
+        for instance in ["\"7\"", "-1", "null", "1.5"] {
+            let body = format!(r#"{{"pane":1,"instance":{instance},"text":""}}"#);
+            assert!(
+                is_invalid_argument(&parse_args("term.type", &body).unwrap_err()),
+                "{body}"
+            );
+        }
+        // instance belongs to term.type only.
+        assert!(parse_args("term.snapshot", r#"{"instance":7}"#).is_err());
+        let boundary = serde_json::json!({"pane":1,"text":"a".repeat(8172)}).to_string();
         assert_eq!(boundary.len(), 8192);
         assert!(parse_args("term.type", &boundary).is_ok());
         assert!(
             parse_args(
                 "term.type",
-                &serde_json::json!({"text":"a".repeat(8193)}).to_string()
+                &serde_json::json!({"pane":1,"text":"a".repeat(8193)}).to_string()
             )
             .is_err()
         );

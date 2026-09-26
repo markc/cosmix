@@ -153,18 +153,18 @@ is a JSON object, and `{}` means no arguments.
 
 | Verb | Body | Effect |
 |---|---|---|
-| `term.tabs` | `{}` | list tabs: id, active, title, cols, rows, child pid, revision |
+| `term.tabs` | `{}` | list tabs: id, active, title, cols, rows, child pid, revision, instance (this process's token) |
 | `term.tab.new` | `{"cwd":"/absolute/directory","title":"build"}` (both optional) | open and select a tab; explicit cwd must exist, be searchable by the current user and never falls back; title pins the tab label |
 | `term.tab.title` | `{"id":N,"title":"build"}` | pin a label; empty string clears the pin and restores the focused pane's program-set OSC title (default `mix`) |
 | `term.tab.move` | `{"id":N,"index":0}` | reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane |
 | `term.tab.select` | `{"id":N}` | select tab N |
 | `term.tab.close` | `{"id":N}` | close tab N; closing the last tab quits |
-| `term.panes` | `{"tab":N}` (optional) | list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision |
+| `term.panes` | `{"tab":N}` (optional) | list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision, instance |
 | `term.pane.split` | `{"dir":"v"}` or `{"dir":"h"}` | split the focused pane side by side (`v`) or top and bottom (`h`) |
 | `term.pane.select` | `{"id":N}` | focus pane N in the active tab |
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |
 | `term.snapshot` | `{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}` (all optional) | read a pane anywhere; default is the focused pane in the selected/active tab; `contents` defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero) |
-| `term.type` | `{"pane":N,"text":"..."}` (`pane` optional) | type ASCII as keys into that pane, default focused pane; does not change focus |
+| `term.type` | `{"pane":N,"instance":I,"text":"..."}` (`pane` or `tab` **required**, `instance` optional) | type ASCII as keys without changing focus. **`pane` is the safe selector.** `tab` means that tab's active pane *at delivery*, so it still follows focus inside the tab; with both, the pane must belong to the tab. Pane and tab ids are per-process counters from 1, so pass back the `instance` that `term.tabs`/`term.panes`/`INFO` reported: another term process refuses rather than typing into its own pane N. Neither selector, a disagreeing pair or a foreign instance is refused `{"error_code":"INVALID_ARGUMENT","message":…}` and never defaults to the focused pane (term-core 0.8.0: term 0.3.0, bterm 0.10.0) — keys that follow focus land wherever focus has moved (2026-09-25). These `INVALID_ARGUMENT` refusals are not recorded under a `request_id`, so retry the same id with the argument fixed; a `not-found` or non-ASCII refusal IS recorded and replays |
 | `term.scroll` | `{"pane":N,"lines":3}` or `{"page":-1}` or `{"to":"top"}` | move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed `lines`, signed `page`, or `to` (`top`/`bottom`) |
 | `term.props.watch` | `{}` | subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON `{topics,revision}`), then read state |
 
@@ -255,8 +255,12 @@ Existing replies keep their key=value format. New title replies are
 `moved id=N index=I tab=N pane=P revision=R`. Tab creation still replies
 `opened id=N tab=N pane=P revision=R binding=...`. All mutations, including
 title/move and pane-selected typing, accept `request_id`; a retry with the
-same verb and arguments replays the original success or refusal. Different
-arguments with the same ID are a conflict. The JSON envelope limit remains
+same verb and arguments replays the original success or state refusal
+(`not-found`, non-ASCII text, the tab limit). `starting`, an oversized body
+and validation refusals (malformed JSON, unexpected/missing/mistyped
+arguments, any `invalid-argument`/`INVALID_ARGUMENT` reply) are NOT recorded,
+so the same ID may be retried with the request fixed. Different arguments
+with an ID whose first attempt was recorded are a conflict. The JSON envelope limit remains
 8192 bytes. Index must be an integer; invalid optional argument
 types are refused.
 
