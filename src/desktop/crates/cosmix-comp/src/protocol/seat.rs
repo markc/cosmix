@@ -43,8 +43,8 @@ pub(super) struct CompSeat {
     /// One recent press per device survives a synthetic release for popup requests.
     pub last_pointer_action: Option<(Serial, WlSurface)>,
     pub popup_grab: Option<smithay::desktop::PopupGrab<WaylandState>>,
-    /// Surviving canonical parent used when an agent popup loses its surface.
-    pub keyboard_root: Option<WlSurface>,
+    /// Nearest-first ancestry retained while the focused surface still exists.
+    pub keyboard_ancestors: Vec<WlSurface>,
     #[cfg(feature = "bus")]
     pub last_input_us: Option<u64>,
     /// Agent pointer coordinates become known only when its delivery path moves it.

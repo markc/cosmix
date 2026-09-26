@@ -1101,6 +1101,8 @@ press replaces it; relevant focus changes and cleanup invalidate it; a successfu
 popup grab consumes it. Human clicks outside do not dismiss agent popups.
 `release_all` with no seat or with `seat:"agent"` dismisses the agent popup chain
 and removes its keyboard/pointer grabs; `seat:"human"` leaves it alone.
+The agent half of bare cleanup does not record agent input activity or change
+`input.last_origin`. Naturally ended popup chains are retired from seat state.
 Explicit agent key/button releases bypass target candidacy and focus mutation,
 so a hold can be retired after its old target unmaps; session lock still refuses.
 
@@ -1118,7 +1120,9 @@ Lock entry, VT switching, session pause and input-authority loss clear agent
 holds, grabs and focus and cancel sequences using the agent seat with
 `input_cleared`. Surface loss is reconciled per device without cancelling sequences:
 a dead pointer target loses pointer focus and pointer holds; a dead keyboard
-target returns to its surviving canonical parent, or loses keyboard focus and
+target keeps an active popup keyboard grab, which delivers the next key to its
+topmost live menu. Without that grab it returns to its nearest live ancestor,
+or loses keyboard focus and
 key holds if no parent survives. This does not arbitrate human focus. Unlock reconciliation samples human
 pressed state only. Agent cleanup does not reset idle notifications.
 Human region selection and nested keyboard-focus loss do not clear agent state.

@@ -1463,6 +1463,8 @@ press replaces it; relevant focus changes and cleanup invalidate it; a successfu
 popup grab consumes it. Human clicks outside do not dismiss agent popups.
 <code>release_all</code> with no seat or with <code>seat:"agent"</code> dismisses the agent popup chain
 and removes its keyboard/pointer grabs; <code>seat:"human"</code> leaves it alone.
+The agent half of bare cleanup does not record agent input activity or change
+<code>input.last_origin</code>. Naturally ended popup chains are retired from seat state.
 Explicit agent key/button releases bypass target candidacy and focus mutation,
 so a hold can be retired after its old target unmaps; session lock still refuses.</p>
 <p>A sequence has at most 256 steps and 4096 generated events in total. Delays
@@ -1478,7 +1480,9 @@ Eight sequence permits are available; admission beyond that returns <code>busy</
 holds, grabs and focus and cancel sequences using the agent seat with
 <code>input_cleared</code>. Surface loss is reconciled per device without cancelling sequences:
 a dead pointer target loses pointer focus and pointer holds; a dead keyboard
-target returns to its surviving canonical parent, or loses keyboard focus and
+target keeps an active popup keyboard grab, which delivers the next key to its
+topmost live menu. Without that grab it returns to its nearest live ancestor,
+or loses keyboard focus and
 key holds if no parent survives. This does not arbitrate human focus. Unlock reconciliation samples human
 pressed state only. Agent cleanup does not reset idle notifications.
 Human region selection and nested keyboard-focus loss do not clear agent state.</p>

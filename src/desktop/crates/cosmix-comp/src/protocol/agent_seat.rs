@@ -106,11 +106,7 @@ impl WaylandState {
             }
             | InputOp::ReleaseAll => Ok(()),
             InputOp::Key { .. } | InputOp::Text(_) => {
-                let surface = self
-                    .agent
-                    .keyboard
-                    .current_focus()
-                    .and_then(|target| target.owned_surface())
+                let surface = self.agent_keyboard_delivery_surface()
                     .ok_or_else(|| Self::agent_refusal("no_keyboard_target"))?;
                 self.validate_agent_surface(&surface, true)
             }
@@ -295,6 +291,7 @@ impl WaylandState {
     }
 
     pub(super) fn reconcile_agent_focus(&mut self) {
+        self.prune_agent_popup_grab();
         let invalid = |surface: &WlSurface| {
             self.surfaces
                 .get(&surface.id())
@@ -304,7 +301,7 @@ impl WaylandState {
             .and_then(|target| target.owned_surface()).as_ref().is_some_and(invalid);
         let pointer_dead = self.agent.pointer.current_focus()
             .and_then(|target| target.owned_surface()).as_ref().is_some_and(invalid);
-        let parent = self.agent.keyboard_root.clone().filter(|surface| !invalid(surface));
+        let parent = self.agent.keyboard_ancestors.iter().find(|surface| !invalid(surface)).cloned();
         if pointer_dead {
             self.agent.last_pointer_action = None;
             let pointer = self.agent.pointer.clone();
@@ -317,11 +314,40 @@ impl WaylandState {
             });
             pointer.frame(self);
         }
-        if keyboard_dead {
+        if keyboard_dead && self.agent_grabbed_keyboard_surface().is_none() {
             let keyboard = self.agent.keyboard.clone();
             keyboard.unset_grab(self);
             if parent.is_none() { self.release_agent_device_holds(true); }
             keyboard.set_focus(self, parent.map(SeatFocusTarget::Wayland), SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    fn agent_grabbed_keyboard_surface(&self) -> Option<WlSurface> {
+        if !self.agent.keyboard.with_grab(|_, grab| grab.is::<PopupKeyboardGrab<WaylandState>>()).unwrap_or(false) {
+            return None;
+        }
+        let grab = self.agent.popup_grab.as_ref().filter(|grab| !grab.has_ended())?;
+        let surface = grab.current_grab()?.owned_surface()?;
+        self.popup_manager.find_popup(&surface)?;
+        Some(surface)
+    }
+
+    /// PopupKeyboardGrab refocuses on input. Validate that same destination
+    /// before injection, even if its old submenu focus has already disappeared.
+    pub(super) fn agent_keyboard_delivery_surface(&self) -> Option<WlSurface> {
+        self.agent_grabbed_keyboard_surface().or_else(|| {
+            self.agent.keyboard.current_focus().and_then(|target| target.owned_surface())
+        })
+    }
+
+    fn prune_agent_popup_grab(&mut self) {
+        if self.agent.popup_grab.as_ref().is_some_and(|grab| {
+            grab.has_ended() || grab.current_grab().and_then(|focus| focus.owned_surface())
+                .is_none_or(|surface| self.popup_manager.find_popup(&surface).is_none())
+        }) {
+            // Smithay can retain dismissed resources until client destruction;
+            // current_grab already falls back to the root when no popup remains.
+            self.agent.popup_grab = None;
         }
     }
 
@@ -541,5 +567,6 @@ impl WaylandState {
             // Resolved client-only motion is added by the targeting layer.
             _ => {}
         }
+        self.prune_agent_popup_grab();
     }
 }

@@ -3362,7 +3362,7 @@ impl ProtocolServer {
                 last_keyboard_action: None,
                 last_pointer_action: None,
                 popup_grab: None,
-                keyboard_root: None,
+                keyboard_ancestors: Vec::new(),
                 #[cfg(feature = "bus")]
                 held: Default::default(),
                 #[cfg(feature = "bus")]
@@ -3384,7 +3384,7 @@ impl ProtocolServer {
                 last_keyboard_action: None,
                 last_pointer_action: None,
                 popup_grab: None,
-                keyboard_root: None,
+                keyboard_ancestors: Vec::new(),
                 #[cfg(feature = "bus")]
                 held: Default::default(),
                 #[cfg(feature = "bus")]

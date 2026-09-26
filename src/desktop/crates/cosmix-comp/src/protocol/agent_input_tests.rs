@@ -316,6 +316,22 @@ fn agent_unbound_client_and_session_lock_refuse_before_focus() {
 }
 
 #[test]
+fn bare_release_all_does_not_report_agent_cleanup_as_input() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    let press = agent_target(&h, &alpha, agent_key(PressAction::Press, KEY_LEFTSHIFT));
+    assert_eq!(inject(&mut h, &ingress, &runtime, press).0, 0);
+    assert_eq!(inject(&mut h, &ingress, &runtime, agent_key(PressAction::Both, KEY_A)).0, 0);
+    let origin = h.server.state.last_input_origin;
+    let agent_time = h.server.state.agent.last_input_us;
+    assert_eq!(origin, Some(SeatKind::Human));
+    assert_eq!(inject(&mut h, &ingress, &runtime, InputOp::ReleaseAll).0, 0);
+    assert!(h.server.state.agent.keyboard.pressed_keys().is_empty());
+    assert_eq!(h.server.state.last_input_origin, origin);
+    assert_eq!(h.server.state.agent.last_input_us, agent_time);
+}
+
+#[test]
 fn agent_release_all_preserves_human_holds_and_origin_tracks_delivery() {
     let (mut h, ingress, runtime, _, alpha, _) = two_windows();
     bind_agent_devices(&mut h);
@@ -416,6 +432,7 @@ fn agent_click_popup_survives_human_focus_and_outside_click_dismisses() {
             .iter()
             .any(|(object, opcode, _)| *object == popup && *opcode == 1)
     );
+    assert!(h.server.state.agent.popup_grab.is_none(), "outside dismissal retires stored chain");
 }
 
 #[test]
@@ -483,6 +500,51 @@ fn agent_live_surface_unmap_clears_click_grab_without_disturbing_keyboard_or_seq
     assert!(h.server.state.agent.keyboard.modifier_state().shift);
     assert_eq!(h.server.state.agent.held.owners_of(key_hold), 1);
     assert_eq!(h.server.state.injection.sequences.len(), 1);
+}
+
+#[test]
+fn agent_submenu_destruction_keeps_keys_on_the_live_parent_menu() {
+    for keep_keyboard_grab in [true, false] {
+        let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+        let (seat, keyboard, _) = bind_agent_devices(&mut h);
+        let open = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A));
+        assert_eq!(inject(&mut h, &ingress, &runtime, open).0, 0);
+        let serial = h.server.state.agent.last_keyboard_action.as_ref().unwrap().0;
+        let (parent_surface, parent_popup) = map_test_popup_on_seat(&mut h, Some((seat, serial.into())));
+        assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(agent_key(PressAction::Both, KEY_A))).0, 0);
+        let serial = h.server.state.agent.last_keyboard_action.as_ref().unwrap().0;
+        let (child_surface, child_popup) = map_test_popup_with_parent_on_seat(
+            &mut h, parent_popup - 1, Some((seat, serial.into())),
+        );
+        assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(agent_key(PressAction::Both, KEY_B))).0, 0);
+        assert_eq!(h.server.state.agent.keyboard.current_focus().and_then(|focus| focus.owned_surface()).map(|surface| surface.id()), Some(child_surface.clone()));
+        if !keep_keyboard_grab {
+            h.server.state.agent.keyboard.clone().unset_grab(&mut h.server.state);
+        }
+        let _ = h.sync();
+        send_request(&mut h.client, child_popup, 0, &[]);
+        send_request(&mut h.client, child_popup - 1, 0, &[]);
+        send_request(&mut h.client, child_surface.protocol_id(), 0, &[]);
+        let mut traffic = h.sync();
+        assert!(h.server.state.agent.popup_grab.is_some(), "parent chain remains open");
+        assert_eq!(h.server.state.agent.keyboard.with_grab(|_, grab|
+            grab.is::<PopupKeyboardGrab<WaylandState>>()
+        ).unwrap_or(false), keep_keyboard_grab);
+        let (rc, body) = inject(&mut h, &ingress, &runtime, on_agent(agent_key(PressAction::Both, KEY_A)));
+        assert_eq!(rc, 0, "{body}");
+        traffic.extend(h.sync());
+        assert!(traffic.iter().any(|(object, opcode, body)|
+            *object == keyboard && *opcode == 1 && word(body, 1) == parent_surface.protocol_id()
+        ), "keyboard enters the surviving parent popup");
+        assert_eq!(device_key_events(&traffic, keyboard), [(KEY_A, 1), (KEY_A, 0)]);
+        assert_eq!(h.server.state.agent.keyboard.current_focus().and_then(|focus| focus.owned_surface()).map(|surface| surface.id()), Some(parent_surface.clone()));
+
+        send_request(&mut h.client, parent_popup, 0, &[]);
+        send_request(&mut h.client, parent_popup - 1, 0, &[]);
+        send_request(&mut h.client, parent_surface.protocol_id(), 0, &[]);
+        let _ = h.sync();
+        assert!(h.server.state.agent.popup_grab.is_none(), "destroying the last popup retires stored chain");
+    }
 }
 
 #[test]

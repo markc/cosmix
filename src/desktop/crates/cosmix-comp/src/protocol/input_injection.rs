@@ -373,7 +373,9 @@ impl WaylandState {
     pub(crate) fn service_input_op(&mut self, op: &InputOp) -> ControlReply {
         if matches!(op, InputOp::ReleaseAll) {
             // Legacy safety-net cleanup spans both seats, but only injected holds.
+            let reconciling = std::mem::replace(&mut self.injection.reconciling, true);
             self.release_injected(SeatKind::Agent, monotonic_millis());
+            self.injection.reconciling = reconciling;
             let mut reply = self.service_input_payload(SeatKind::Human, op, None);
             if let ControlReply::Body(body) = &mut reply { body["seat"] = json!("both"); }
             return reply;
@@ -857,9 +859,11 @@ impl WaylandState {
 
     pub(super) fn delivery_target_on(&self, seat: SeatKind, keyboard: bool) -> Option<(u64, u64)> {
         let surface = if keyboard {
-            self.comp_seat(seat).keyboard
-                .current_focus()
-                .and_then(|target| target.owned_surface())
+            if seat == SeatKind::Agent {
+                self.agent_keyboard_delivery_surface()
+            } else {
+                self.human.keyboard.current_focus().and_then(|target| target.owned_surface())
+            }
         } else {
             self.comp_seat(seat).pointer
                 .current_focus()

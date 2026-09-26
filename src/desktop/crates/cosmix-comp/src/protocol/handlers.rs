@@ -2143,7 +2143,19 @@ impl SeatHandler for WaylandState {
         if seat != &self.human.seat {
             if seat == &self.agent.seat {
                 invalidate_keyboard_action(&mut self.agent.last_keyboard_action);
-                self.agent.keyboard_root = focused_root;
+                let mut ancestors = Vec::new();
+                let mut parent = focused_surface.as_ref()
+                    .and_then(|surface| self.surfaces.get(&surface.id()))
+                    .and_then(|record| record.layout.parent);
+                while let Some(id) = parent {
+                    let Some(record) = self.surface_objects.get(&id)
+                        .and_then(|object| self.surfaces.get(object)) else { break };
+                    let surface = record.role.wl_surface().clone();
+                    if ancestors.contains(&surface) { break; }
+                    ancestors.push(surface);
+                    parent = record.layout.parent;
+                }
+                self.agent.keyboard_ancestors = ancestors;
             }
             return;
         }

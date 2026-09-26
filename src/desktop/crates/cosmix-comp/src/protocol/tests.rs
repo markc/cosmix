@@ -13007,6 +13007,14 @@ fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> 
 }
 
 fn map_test_popup_on_seat(harness: &mut KeybindingHarness, grab: Option<(u32, u32)>) -> (ObjectId, u32) {
+    map_test_popup_with_parent_on_seat(harness, TEST_XDG_SURFACE_ID, grab)
+}
+
+fn map_test_popup_with_parent_on_seat(
+    harness: &mut KeybindingHarness,
+    parent_xdg_surface: u32,
+    grab: Option<(u32, u32)>,
+) -> (ObjectId, u32) {
     let positioner = harness.allocate_object_id();
     let surface = harness.allocate_object_id();
     let xdg_surface = harness.allocate_object_id();
@@ -13035,7 +13043,7 @@ fn map_test_popup_on_seat(harness: &mut KeybindingHarness, grab: Option<(u32, u3
         &mut harness.client,
         xdg_surface,
         2,
-        &words(&[popup, TEST_XDG_SURFACE_ID, positioner]),
+        &words(&[popup, parent_xdg_surface, positioner]),
     );
     if let Some((seat, serial)) = grab {
         send_request(
