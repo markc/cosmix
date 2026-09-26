@@ -144,6 +144,8 @@ Filesystem paths begin with a configured place ID. Place writability and allow o
 | `fs.mkdir` | Required `path`; optional `parents` (`false`) |
 | `fs.touch` | Required `path` |
 | `fs.write` | Required `path`; optional `content` (empty string), `overwrite` (`false`) |
+| `fs.blob.ref` | Required `path`; optional `name` (source filename), `mime` (source extension) |
+| `fs.blob.materialise` | Required `blob`, `path`; optional `overwrite` (`false`) |
 | `fs.copy` | Required `from` and `to`; optional `overwrite` (`false`) |
 | `fs.move` | Required `from` and `to`; optional `overwrite` (`false`) |
 | `fs.trash` | Required `path` |
@@ -151,6 +153,96 @@ Filesystem paths begin with a configured place ID. Place writability and allow o
 | `fs.trash.restore` | Required `token` |
 
 Write operations fail for a read-only place.
+
+### Binary blob bridge
+
+Both blob verbs have `read_only=false` and have no unprefixed aliases.
+Filesystem dispatch runs concurrently with 64 permits; saturation waits for a
+permit. Lane discovery times out after 10 seconds. Transfers remain synchronous:
+size `timeout=` on Mix `send` for the file. Cross-node calls are capped by the
+30-second mesh response budget, so drive large transfers from the node owning
+the place. A transfer can finish and pin/land after the caller times out;
+retrying materialise then answers `exists:` if the earlier transfer landed.
+`fs.blob.ref` changes blobd's pin state but only needs **read** access to its
+source place; a read-only place is a valid source. `fs.blob.materialise` needs
+a writable destination place. The existing delegation gate applies to both.
+
+`fs.blob.ref {path, name?, mime?}` opens a plain, single-link regular file under
+the place jail and streams it to `POST /blob` on the configured `blob_service`'s
+byte lane. Place roots, directories, symlink files, hardlinks, special files and
+policy-prefix paths are refused. The body uses an explicit `Content-Length`;
+the pin owner is the filesd `bus_service`. The MIME default is the same extension
+table as `fs.read_blob`. A 201 response returns the validated blob reference
+with `path` added; optional reference attributes (including a named store's
+`instance`) are preserved. File bytes are never carried in a Bus frame.
+
+Filename hints (including an explicit `name`) percent-encode UTF-8 bytes outside
+printable non-space ASCII, plus `%`, for the HTTP header. blobd currently stores
+the encoded name verbatim, so `Résumé.pdf` returns as `R%C3%A9sum%C3%A9.pdf`.
+An encoded name longer than 128 bytes is omitted; the reference name is null.
+
+A source shrinking during the upload aborts immediately with
+`lane: source shrank during upload`. Filesd checks the same open descriptor's
+length and mtime after sending; a change reports `lane: source changed during
+upload (blob may already be pinned)`. This detects ordinary concurrent edits,
+not edits that deliberately restore both length and mtime.
+
+After discovering the lane, ref preflights `blob.quota {owner: bus_service}`
+under the same 10-second timeout. File length must fit both owner and total
+headroom after used and reserved bytes. This is advisory: the lane remains
+authoritative. A timeout, lookup error or malformed quota reply logs one line
+and skips the preflight, allowing the upload to proceed. Only a well-formed
+reply showing insufficient room refuses the upload with `quota:`.
+A concurrent quota refusal may close a large upload before
+ureq reads the 413, yielding `lane:` with a quota hint rather than `quota:`.
+
+`fs.blob.materialise {blob, path, overwrite?}` accepts `b3:<64 lowercase hex>`,
+bare lowercase hex, or a reference map containing `blob`. It streams
+`GET /blob/<hex>` from that local store. A missing blob must first be fetched
+with `blob.fetch`; materialise does not initiate a cross-node fetch.
+
+The destination uses the write jail and rejects symlink or non-regular targets
+on overwrite. In unrestricted places a hard-linked target is replaced by
+rename, leaving its other links unchanged, like `fs.write`; policy-scoped
+places still reject hard-linked targets in the resolver.
+Missing parent directories are created only after a successful GET response,
+immediately before landing; a 404 or connection failure creates none. Bytes stream into
+a unique sibling temporary file, with length and BLAKE3 verification before
+publication. An overwrite preserves mode bits and uses fsync then rename;
+`overwrite=false` uses Linux `renameat2(RENAME_NOREPLACE)` to publish in one
+step and refuse a destination created during the download. Unsupported
+rename flags fall back to link/unlink (a crash between those steps can leave
+two names). Where links are unsupported, the last tier is best-effort
+check-then-rename and cannot exclude a concurrent target creation. New files
+use mode 0666 filtered by the process umask, like `fs.write`. Ownership is not
+preserved. Staging is removed on errors; the old target survives failed reads
+or verification. Directory fsync is best-effort after publication.
+
+Success is `{"ok":true,"path":...,"blob":"b3:...","size":N}`. The HTTP
+client has 30-second connect/read/write bounds, refuses redirects and encoded
+responses, and requires `Content-Length` on GET. The reader-driven landing
+primitive checks short and long inputs. ureq 2 exposes only the declared HTTP
+body, so trailing wire bytes beyond `Content-Length` are not visible to it;
+the framed body must still match the requested hash. The existing resolver's
+documented path-based check/use race posture is unchanged.
+
+All failures use rc 10 and `{"error":...}`:
+
+| Leading text | Meaning |
+|---|---|
+| `lane_unavailable:` | Lane props failed, timed out, or supplied an empty/invalid bind |
+| `quota:` | HTTP 413, including a bounded prefix of blobd's error body |
+| `lane:` | Other HTTP/transport errors, invalid references or response framing; a mid-upload close includes `lane closed during upload` and a quota hint |
+| `not_present:` | `blob is not on this node — blob.fetch it first` (GET 404) |
+| `verify_failed:` | Body length or BLAKE3 mismatch |
+| `invalid blob id` | Invalid materialise `blob` argument |
+| `missing or empty arg:` | A required string argument, such as `path`, is absent, empty or not a string |
+| `denied:`, `not found:`, `exists:`, `bad request:`, `i/o error:` | Filesystem-layer errors, passed through unchanged |
+
+A truncated HTTP body reported by ureq as a read error uses `lane:`. A short
+reader ending cleanly uses `verify_failed:`. A failed body read or verification may have created
+parent directories; a failed upload response does not undo a pin already
+committed by blobd.
 
 ### Irreversible operations
 

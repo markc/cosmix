@@ -114,6 +114,8 @@ Filesystem mode registers these commands:
 - `fs.stat`
 - `fs.tree`
 - `fs.read_blob`
+- `fs.blob.ref`
+- `fs.blob.materialise`
 - `fs.search`
 - `fs.mkdir`
 - `fs.touch`
@@ -129,6 +131,23 @@ Filesystem mode registers these commands:
 Successful commands return Bus result code `0` with a JSON body. Handler, validation, authorisation, and filesystem errors return code `10` with an `error` field.
 
 See [verbs.md](verbs.md) for arguments, defaults, limits, and response shapes.
+
+The binary bridge uses the configured `blob_service` (default `blobd`), resolving
+its byte-lane bind anew on each call. Both verbs are marked mutating and require
+their `fs.` prefix:
+
+| Verb | Arguments and defaults | Result / error tokens |
+|---|---|---|
+| `fs.blob.ref` | `path`; `name` defaults to filename, `mime` to source extension | Streams a plain file via POST, pins to `bus_service`, returns reference plus `path`; `lane_unavailable:`, `quota:`, `lane:` |
+| `fs.blob.materialise` | `blob` (reference, b3 id or bare hash), `path`; `overwrite=false` | GET, BLAKE3 verification, atomic landing; `invalid blob id`, `lane_unavailable:`, `not_present:`, `verify_failed:`, `lane:` |
+
+Both pass filesystem errors through unchanged (`denied:`, `not found:`,
+`exists:`, `bad request:`, `i/o error:`). Ref can read a read-only place;
+materialise requires a writable place and creates missing parents like
+`fs.write`. No blob bytes cross Bus. Materialise requires the blob to be on
+this node already; use `blob.fetch` first otherwise. See the
+[binary bridge contract](verbs.md#binary-blob-bridge) for staging, permissions,
+transport bounds and framing limitations.
 
 ## Properties
 

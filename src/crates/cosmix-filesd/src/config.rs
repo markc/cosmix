@@ -27,6 +27,7 @@ pub fn mode_of(file: &HashMap<String, String>) -> &str {
 #[derive(Debug, Clone)]
 pub struct FsConfig {
     pub bus_service: String,
+    pub blob_service: String,
     pub places: Vec<Place>,
     pub trash_root: PathBuf,
     pub delegated_peers: Vec<String>,
@@ -144,6 +145,13 @@ pub fn resolve_fs(text: &str, bus_service: Option<String>) -> Result<FsConfig, S
     let bus_service = bus_service
         .or_else(|| f.get("bus_service").cloned())
         .unwrap_or_else(|| "filesd-fs".to_string());
+    let blob_service = f.get("blob_service").cloned().unwrap_or_else(|| "blobd".into());
+    let valid_blob_service = (2..=31).contains(&blob_service.len())
+        && blob_service.as_bytes()[0].is_ascii_lowercase()
+        && blob_service.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid_blob_service {
+        return Err("config: invalid 'blob_service' (expected ^[a-z][a-z0-9-]{1,30}$)".into());
+    }
     let trash_root = f
         .get("trash_root")
         .map(PathBuf::from)
@@ -160,6 +168,7 @@ pub fn resolve_fs(text: &str, bus_service: Option<String>) -> Result<FsConfig, S
     };
     Ok(FsConfig {
         bus_service,
+        blob_service,
         places,
         trash_root,
         delegated_peers,
@@ -296,6 +305,9 @@ mod tests {
         assert_eq!(mode_of(&f), "fs");
         let cfg = resolve_fs(text, None).unwrap();
         assert_eq!(cfg.bus_service, "filesd-fs");
+        assert_eq!(cfg.blob_service, "blobd");
+        let named = format!("{text}blob_service: blobd-two\n");
+        assert_eq!(resolve_fs(&named, None).unwrap().blob_service, "blobd-two");
         assert_eq!(cfg.trash_root, PathBuf::from("/srv/fm/.Trash"));
         assert_eq!(cfg.places.len(), 2);
         assert_eq!(cfg.places[0].id, "home");
@@ -314,6 +326,19 @@ mod tests {
     fn fs_mode_default_mode_is_corpus() {
         let f = parse("root: /r\ncorpus_id: n\ndb: /d\n");
         assert_eq!(mode_of(&f), "corpus");
+    }
+
+    #[test]
+    fn fs_blob_service_must_be_a_local_service_name() {
+        let base = "mode: fs\ntrash_root: /t\nplace: home | Home | /srv/home\n";
+        for name in ["", "x", "Blobd", "1blob", "blobd.two", "blobd two", "blobd_two", "éé"] {
+            assert!(resolve_fs(&format!("{base}blob_service: {name}\n"), None)
+                .unwrap_err().contains("blob_service"), "{name:?}");
+        }
+        assert!(resolve_fs(&format!("{base}blob_service: {}\n", "a".repeat(32)), None).is_err());
+        for name in ["ab".to_string(), "blobd-two".to_string(), "a".repeat(31)] {
+            assert_eq!(resolve_fs(&format!("{base}blob_service: {name}\n"), None).unwrap().blob_service, name);
+        }
     }
 
     #[test]

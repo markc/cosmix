@@ -17,6 +17,12 @@ pub enum FilesError {
     /// Filesystem error.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    /// A streaming input failed, distinct from a local filesystem failure.
+    #[error("reader: {0}")]
+    SourceRead(std::io::Error),
+    /// A streamed blob failed its length or BLAKE3 check.
+    #[error("verify_failed: {0}")]
+    VerifyFailed(String),
     /// The canonical header reader rejected the input.
     #[error("header parse error: {0}")]
     Parse(String),

@@ -15,6 +15,7 @@
 
 mod config;
 mod delegation;
+mod lane;
 mod props;
 
 use std::collections::BTreeSet;
@@ -1017,6 +1018,7 @@ async fn serve_bus(client: Arc<NodedClient>, tx: &mpsc::Sender<WriterCmd>) {
 async fn serve_fs(cfg: config::FsConfig) -> anyhow::Result<()> {
     let config::FsConfig {
         bus_service,
+        blob_service,
         places,
         trash_root,
         delegated_peers,
@@ -1025,7 +1027,7 @@ async fn serve_fs(cfg: config::FsConfig) -> anyhow::Result<()> {
     let peers = Arc::new(delegated_peers);
     eprintln!("cosmix-filesd: serving file-manager fs layer (Bus service '{bus_service}')");
     tokio::select! {
-        r = run_bus_loop_fs(fs, peers, bus_service) => r,
+        r = run_bus_loop_fs(fs, peers, bus_service, blob_service) => r,
         _ = shutdown() => { eprintln!("cosmix-filesd: shutdown"); Ok(()) }
     }
 }
@@ -1111,6 +1113,18 @@ fn fs_verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
     vec![
         VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
         VerbDescriptor::new("fs.places", &[], "List configured places", true),
+        VerbDescriptor::new(
+            "fs.blob.ref",
+            &["path", "name", "mime"],
+            "Stream a place file into blobd and pin it",
+            false,
+        ),
+        VerbDescriptor::new(
+            "fs.blob.materialise",
+            &["blob", "path", "overwrite"],
+            "Verify and land a local blob in a writable place",
+            false,
+        ),
         VerbDescriptor::new("places", &[], "Alias for fs.places", true),
         VerbDescriptor::new(
             "fs.list",
@@ -1244,6 +1258,7 @@ async fn run_bus_loop_fs(
     fs: Arc<cosmix_files::fsops::FsLayer>,
     peers: Arc<Vec<String>>,
     service: String,
+    blob_service: String,
 ) -> anyhow::Result<()> {
     let bi = cosmix_buildinfo::build_info!();
     let prov = cosmix_bus::RegisterProvenance::from_parts(
@@ -1261,7 +1276,13 @@ async fn run_bus_loop_fs(
         {
             Ok(client) => {
                 backoff = Duration::from_secs(1);
-                serve_bus_fs(Arc::new(client.with_verbs(fs_verb_manifest())), &fs, &peers).await; // returns on disconnect
+                serve_bus_fs(
+                    Arc::new(client.with_verbs(fs_verb_manifest())),
+                    &fs,
+                    &peers,
+                    &service,
+                    &blob_service,
+                ).await; // returns on disconnect
             }
             Err(e) => eprintln!("cosmix-filesd: broker unavailable; retry in {backoff:?}: {e}"),
         }
@@ -1274,16 +1295,44 @@ async fn serve_bus_fs(
     client: Arc<NodedClient>,
     fs: &Arc<cosmix_files::fsops::FsLayer>,
     peers: &Arc<Vec<String>>,
+    service: &str,
+    blob_service: &str,
 ) {
-    let Some(mut rx) = client.incoming_async().await else {
+    let Some(rx) = client.incoming_async().await else {
         return;
     };
+    run_fs_commands(rx, |cmd| {
+        let client = client.clone();
+        let fs = fs.clone();
+        let peers = peers.clone();
+        let service = service.to_string();
+        let blob_service = blob_service.to_string();
+        async move {
+            let (from, command, id) = (cmd.from.clone(), cmd.command.clone(), cmd.id.clone());
+            let (rc, body) = dispatch_fs(cmd, fs, peers, &service, &blob_service, &client).await;
+            let _ = client.respond_parts(&from, &command, id.as_deref(), rc, &body).await;
+        }
+    }).await;
+}
+
+/// The production receive/dispatch/respond loop. Admission waits rather than
+/// rejecting or creating an unbounded task queue; each task owns its response.
+async fn run_fs_commands<D, F>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<IncomingCommand>,
+    mut dispatch_and_respond: D,
+)
+where
+    D: FnMut(IncomingCommand) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let slots = Arc::new(tokio::sync::Semaphore::new(64));
     while let Some(cmd) = rx.recv().await {
-        let (from, command, id) = (cmd.from.clone(), cmd.command.clone(), cmd.id.clone());
-        let (rc, body) = dispatch_fs(cmd, fs.clone(), peers.clone()).await;
-        let _ = client
-            .respond_parts(&from, &command, id.as_deref(), rc, &body)
-            .await;
+        let permit = slots.clone().acquire_owned().await.expect("fs semaphore is never closed");
+        let work = dispatch_and_respond(cmd);
+        tokio::spawn(async move {
+            let _permit = permit;
+            work.await;
+        });
     }
 }
 
@@ -1293,6 +1342,34 @@ async fn dispatch_fs(
     cmd: IncomingCommand,
     fs: Arc<cosmix_files::fsops::FsLayer>,
     peers: Arc<Vec<String>>,
+    service: &str,
+    blob_service: &str,
+    client: &NodedClient,
+) -> (u8, String) {
+    dispatch_fs_with_quota(cmd, fs, peers, service, lane::bind(client, blob_service), lane::quota(client, blob_service, service)).await
+}
+
+#[cfg(test)]
+async fn dispatch_fs_with_bind(
+    cmd: IncomingCommand,
+    fs: Arc<cosmix_files::fsops::FsLayer>,
+    peers: Arc<Vec<String>>,
+    service: &str,
+    bind: impl std::future::Future<Output = Result<String, String>>,
+) -> (u8, String) {
+    dispatch_fs_with_quota(cmd, fs, peers, service, bind,
+        async { panic!("this dispatch must not request quota") }).await
+}
+
+/// The resolver future is lazy: only the exact, prefixed blob verbs poll it.
+/// Keeping that boundary injectable lets tests prove other verbs never call Bus.
+async fn dispatch_fs_with_quota(
+    cmd: IncomingCommand,
+    fs: Arc<cosmix_files::fsops::FsLayer>,
+    peers: Arc<Vec<String>>,
+    service: &str,
+    bind: impl std::future::Future<Output = Result<String, String>>,
+    quota: impl std::future::Future<Output = Result<serde_json::Value, String>>,
 ) -> (u8, String) {
     let (deleg, args) = match gate(&cmd, &peers) {
         Ok(v) => v,
@@ -1303,7 +1380,31 @@ async fn dispatch_fs(
         .strip_prefix("fs.")
         .unwrap_or(&cmd.command)
         .to_string();
-    let (rc, body) = tokio::task::spawn_blocking(move || fs_verb(&fs, &verb, &args))
+    let blob_verb = matches!(cmd.command.as_str(), "fs.blob.ref" | "fs.blob.materialise");
+    let bind = if blob_verb {
+        let mut result = bind.await;
+        if result.is_ok() && cmd.command == "fs.blob.ref" {
+            let source_fs = fs.clone();
+            let source_args = args.clone();
+            let length = tokio::task::spawn_blocking(move || lane::source_length(&source_fs, &source_args))
+                .await.unwrap_or_else(|_| Err("internal error checking source".into()));
+            match length {
+                Ok(length) => match quota.await.and_then(|value| lane::check_quota(&value, service, length)) {
+                    Ok(Some(refusal)) => result = Err(refusal),
+                    Ok(None) => {}
+                    Err(reason) => eprintln!("cosmix-filesd: skipping advisory quota preflight: {reason}"),
+                },
+                Err(error) => result = Err(error),
+            }
+        }
+        Some(result)
+    } else { None };
+    let service = service.to_string();
+    let command = cmd.command.clone();
+    let (rc, body) = tokio::task::spawn_blocking(move || match bind {
+        Some(bind) => lane::verb(&fs, &command, &args, &bind, &service),
+        None => fs_verb(&fs, &verb, &args),
+    })
         .await
         .unwrap_or_else(|_| (10, jerr("internal error handling command")));
     if let Some(d) = &deleg {
@@ -2235,6 +2336,151 @@ mod tests {
     }
 
     // ── fs-mode verb table ──────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn slow_fs_dispatch_does_not_block_places() {
+        let (fs, dir) = fs_layer(true);
+        let fs = Arc::new(fs);
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, mut replies_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_task = tokio::spawn(run_fs_commands(rx, move |command| {
+            let fs = fs.clone();
+            let replies = replies.clone();
+            let started = if command.command == "fs.slow" { started_tx.take() } else { None };
+            async move {
+                let name = command.command.clone();
+                let (rc, _) = if let Some(started) = started {
+                    tokio::task::spawn_blocking(move || {
+                        started.send(()).unwrap();
+                        std::thread::sleep(Duration::from_secs(2));
+                        fs_verb(&fs, "places", &json!({}))
+                    }).await.unwrap()
+                } else {
+                    dispatch_fs_with_bind(command, fs, Arc::new(vec![]),
+                        "filesd-fs", async { panic!("places must not resolve the lane") }).await
+                };
+                replies.send((name, rc)).unwrap();
+            }
+        }));
+        commands.send(cmd("fs.slow", json!({}))).unwrap();
+        started_rx.await.unwrap(); // a handshake, never a scheduling sleep
+        commands.send(cmd("fs.places", json!({}))).unwrap();
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies_rx.recv())
+            .await.expect("places queued behind a slow dispatch").unwrap();
+        assert_eq!(reply, ("fs.places".to_string(), 0));
+        assert_eq!(replies_rx.recv().await.unwrap(), ("fs.slow".to_string(), 0));
+        drop(commands);
+        loop_task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn blob_manifest_is_mutating_and_has_no_bare_aliases() {
+        let manifest = fs_verb_manifest();
+        for (name, args) in [
+            ("fs.blob.ref", vec!["path", "name", "mime"]),
+            ("fs.blob.materialise", vec!["blob", "path", "overwrite"]),
+        ] {
+            let entry = manifest.iter().find(|v| v.name == name).unwrap();
+            assert!(!entry.read_only);
+            assert_eq!(entry.args, args);
+        }
+        assert!(!manifest.iter().any(|v| v.name.starts_with("blob.")));
+    }
+
+    #[tokio::test]
+    async fn bare_blob_verbs_do_not_resolve_the_lane() {
+        let (fs, dir) = fs_layer(true);
+        for verb in ["blob.ref", "blob.materialise"] {
+            let (rc, body) = dispatch_fs_with_bind(
+                cmd(verb, json!({})), Arc::new(fs.clone()), Arc::new(vec![]), "filesd-fs",
+                async { panic!("bare blob verbs must not resolve the lane") },
+            ).await;
+            assert_eq!(rc, 10);
+            assert!(body.contains("unknown verb"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blob_dispatch_resolves_per_call_and_reports_unavailable() {
+        let (fs, dir) = fs_layer(true);
+        std::fs::write(dir.join("home/file"), b"x").unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let (rc, body) = dispatch_fs_with_bind(
+                cmd("fs.blob.ref", json!({"path": "home/file"})),
+                Arc::new(fs.clone()), Arc::new(vec![]), "filesd-fs",
+                async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err("lane_unavailable: test lane is down".into())
+                },
+            ).await;
+            assert_eq!(rc, 10);
+            assert!(body.contains("lane_unavailable:"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ref_quota_failure_or_malformed_reply_still_uploads() {
+        use std::io::{BufRead, Read, Write};
+        let (fs, dir) = fs_layer(true);
+        std::fs::write(dir.join("home/file"), b"hello").unwrap();
+        for quota in [Err("blob.quota timed out".to_string()),
+            Err("blob.quota AppError".to_string()), Ok(json!({})),
+            Ok(json!({"owners": {"filesd-fs": {"limit": 0, "used": 0, "reserved": 0}}}))] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let bind = listener.local_addr().unwrap().to_string();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    head.push_str(&line);
+                    if line == "\r\n" { break; }
+                }
+                assert!(head.starts_with("POST /blob HTTP/1.1\r\n"));
+                let mut body = [0; 5];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"hello");
+                let reply = json!({"blob": format!("b3:{}", "a".repeat(64)), "size": 5}).to_string();
+                write!(reader.get_mut(), "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            });
+            let (rc, body) = dispatch_fs_with_quota(
+                cmd("fs.blob.ref", json!({"path": "home/file"})), Arc::new(fs.clone()),
+                Arc::new(vec![]), "filesd-fs", async { Ok(bind) }, async { quota }).await;
+            assert_eq!(rc, 0, "{body}");
+            worker.join().unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ref_quota_preflight_refuses_before_http() {
+        let (fs, dir) = fs_layer(true);
+        std::fs::write(dir.join("home/file"), b"hello").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        let (rc, body) = dispatch_fs_with_quota(
+            cmd("fs.blob.ref", json!({"path": "home/file"})), Arc::new(fs), Arc::new(vec![]),
+            "filesd-fs", async { Ok(bind) }, async {
+                Ok(json!({"owners": {"filesd-fs": {"limit": 4, "used": 0, "reserved": 0}},
+                    "total": {"limit": 100, "used": 0, "reserved": 0}}))
+            }).await;
+        assert_eq!(rc, 10);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"],
+            "quota: 5 B exceeds remaining 4 B for filesd-fs");
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn fs_layer(writable: bool) -> (cosmix_files::fsops::FsLayer, PathBuf) {
         use cosmix_files::fsops::{FsLayer, Place};
         let dir = scratch();
@@ -2323,11 +2569,15 @@ mod tests {
         let peers = Arc::new(vec!["webd".to_string()]);
         // A delegated peer with a valid admin envelope is authorized.
         let good = dcmd("webd", "fs.places", good_envelope(), json!({}));
-        let (rc, _) = dispatch_fs(good, fs.clone(), peers.clone()).await;
+        let (rc, _) = dispatch_fs_with_bind(good, fs.clone(), peers.clone(), "filesd-fs", async {
+            panic!("non-blob verb must not resolve the lane")
+        }).await;
         assert_eq!(rc, 0);
         // from=webd but no envelope → defence-in-depth refusal (the shared gate).
         let bare = cmd_from("webd", "fs.places", Value::Null);
-        let (rc, body) = dispatch_fs(bare, fs.clone(), peers.clone()).await;
+        let (rc, body) = dispatch_fs_with_bind(bare, fs.clone(), peers.clone(), "filesd-fs", async {
+            panic!("refused call must not resolve the lane")
+        }).await;
         assert_eq!(rc, 10);
         assert!(
             body.contains("must present a $cosmix_delegation envelope"),
