@@ -1188,6 +1188,7 @@ mod tests {
         // The instance this process reports is accepted.
         let listed = handle(&set, &cleanup, "term.panes", r#"{"tab":1}"#).unwrap();
         let reported = listed.rsplit_once(" instance=").unwrap().1;
+        let reported = reported.split_once(' ').map_or(reported, |(value, _)| value);
         assert_eq!(reported, instance().to_string());
         handle(
             &set,
