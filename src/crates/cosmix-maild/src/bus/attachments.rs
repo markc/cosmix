@@ -144,6 +144,7 @@ async fn execute(
         );
     }
     let (bytes, mime, name) = if let Some(path) = &part {
+        drop(bytes); // retain only the selected decoded part across lane I/O
         let structure = structure.ok_or("unreadable: missing MIME structure")?;
         let p = structure
             .parts
