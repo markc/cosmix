@@ -210,6 +210,7 @@ pub(crate) fn respond(world: &mut World, command: &str, args: &Value) -> (u8, St
                     shift_rects(&mut body, offset);
                 }
             }
+            body["chrome"] = frame_controls(world, kind == Some(true) && visible);
             (0, body.to_string())
         }
         _ => refusal("UNKNOWN_COMMAND", format!("{command} is not a dialog verb"), None),
@@ -230,6 +231,31 @@ fn dialog_root_origin(world: &World) -> Vec2 {
             Some(transform.transform_point2(node.border_box().min) * node.inverse_scale_factor)
         })
         .unwrap_or(Vec2::ZERO)
+}
+
+/// Quoin's own frame controls on a mapped dialog, measured from the engine
+/// like node rects and in the same surface coordinates: `{close:{x,y,w,h}}`
+/// for the ×, or `{}` when there is none (unmapped, `chrome:false`, or an
+/// edge scene).
+fn frame_controls(world: &World, mapped_dialog: bool) -> Value {
+    let dialog = world.resource::<QuoinDialog>();
+    let chromed = mapped_dialog && dialog.seat.as_ref().is_some_and(|seat| seat.chrome);
+    let close = dialog
+        .root
+        .filter(|_| chromed)
+        .and_then(|root| world.get::<cosmix_shell::chrome::dialog::QuoinDialogParts>(root))
+        .and_then(|parts| {
+            let node = world.get::<bevy::ui::ComputedNode>(parts.close)?;
+            let transform = world.get::<bevy::ui::UiGlobalTransform>(parts.close)?;
+            let border = node.border_box();
+            let min = transform.transform_point2(border.min) * node.inverse_scale_factor;
+            let max = transform.transform_point2(border.max) * node.inverse_scale_factor;
+            Some((min - dialog_root_origin(world), max - min))
+        });
+    match close {
+        Some((at, size)) => json!({"close": {"x": at.x, "y": at.y, "w": size.x, "h": size.y}}),
+        None => json!({}),
+    }
 }
 
 /// In comp's renderer every panel shares the output camera; a layer-host

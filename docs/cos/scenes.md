@@ -105,7 +105,7 @@ documents from every other scene.
 | --- | --- | --- |
 | `shell.dialog.show` | `{scene}` | `{scene,visible:true,applied}`; maps and takes the keyboard |
 | `shell.dialog.hide` | `{scene}` | `{scene,visible:false,applied}`; unmaps and keeps scene state |
-| `shell.scene.layout` | `{scene,node?}` | `{scene,revision,applied_revision,visible,surface:{kind:"panel"\|"dialog",edge?,output,x,y,w,h},nodes:{<id>:{x,y,w,h,hidden}},instances:{<list>:{<item>:{x,y,w,h}}}}` |
+| `shell.scene.layout` | `{scene,node?}` | `{scene,revision,applied_revision,visible,surface:{kind:"panel"\|"dialog",edge?,output,x,y,w,h},nodes:{<id>:{x,y,w,h,hidden}},instances:{<list>:{<item>:{x,y,w,h}}},chrome:{close?:{x,y,w,h}}}` |
 
 `applied` is false when the dialog was already in the requested state.
 Refusals are `NOT_FOUND` (no such scene) and `NOT_DIALOG` (an edge page).
@@ -113,6 +113,9 @@ Refusals are `NOT_FOUND` (no such scene) and `NOT_DIALOG` (an edge page).
 px. The surface rect is in output coordinates and node rects are relative to
 the surface. While unmapped it reports `visible:false` and empty `nodes`. It
 is how gates and agents click a node: take the centre of its rect.
+`chrome.close` is the dialog's × frame control, measured the same way and in
+the same surface coordinates, present only while a `chrome:true` dialog is
+mapped (`chrome` is `{}` otherwise). Clicking its centre hides the dialog.
 
 Every change of `dialog.visible` or `dialog.scene` publishes
 `shell.panel.changed` with a strictly greater revision; the snapshot's

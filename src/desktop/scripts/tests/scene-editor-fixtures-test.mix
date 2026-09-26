@@ -62,6 +62,11 @@ for each $verb in ["shell.panel.order", "shell.dialog.show", "shell.dialog.hide"
   check(has_key($shell[$verb].refusals, "UNIMPLEMENTED"), $verb .. ": the Stage S stub refusal needs a fixture")
 end
 check($shell["shell.scene.load"].request.preempt_dialog == true, "load envelope carries preempt_dialog")
+$close = $shell["shell.scene.layout"].reply.chrome.close
+for each $key in ["x", "y", "w", "h"]
+  check(has_key($close, $key), "layout reply chrome.close." .. $key)
+end
+check(length(keys($shell["shell.scene.layout"].reply_unmapped.chrome)) == 0, "unmapped layout has no frame controls")
 check(has_key($shell["shell.scene.load"].refusals, "DIALOG_BUSY"), "DIALOG_BUSY fixture")
 check($shell["shell.scene.load"].preemption_notice.body.reason == "preempted", "pre-emption notice")
 

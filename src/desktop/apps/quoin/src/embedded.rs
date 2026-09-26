@@ -777,6 +777,46 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&fired[0].body).unwrap();
         assert_eq!(body["node"], "go");
         assert_eq!(body["kind"], "click");
+
+        // The × frame control: measured by the engine into the same surface
+        // coordinates, in the title band at the right end; its centre hides
+        // the dialog with no behaviour involved.
+        let close = layout["chrome"]["close"].clone();
+        let at = |key: &str| close[key].as_f64().unwrap() as f32;
+        assert_eq!((at("w"), at("h")), (28.0, 24.0), "{close}");
+        assert!(at("y") >= 0.0 && at("y") + at("h") <= 33.0, "in the title band: {close}");
+        assert!(at("x") + at("w") <= 400.0 && at("x") > 300.0, "at the right end: {close}");
+        let centre = origin + Vec2::new(at("x") + at("w") / 2.0, at("y") + at("h") / 2.0);
+        let cursor = CursorMoved {
+            window,
+            position: centre,
+            delta: None,
+        };
+        app.world_mut().write_message(cursor.clone());
+        app.world_mut().write_message(WindowEvent::from(cursor));
+        app.update();
+        app.update();
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            let button = MouseButtonInput {
+                button: MouseButton::Left,
+                state,
+                window,
+            };
+            app.world_mut().write_message(button);
+            app.world_mut().write_message(WindowEvent::from(button));
+            app.update();
+        }
+        assert!(
+            !app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>().visible,
+            "× hides the dialog"
+        );
+        let (_, hidden) = crate::dialog_bus::respond(
+            app.world_mut(),
+            "shell.scene.layout",
+            &serde_json::json!({"scene":"editor"}),
+        );
+        let hidden: serde_json::Value = serde_json::from_str(&hidden).unwrap();
+        assert_eq!((hidden["visible"].as_bool(), &hidden["chrome"]), (Some(false), &serde_json::json!({})));
     }
 
     /// A legacy v2 state file as today's Quoin writes it, for the migration
