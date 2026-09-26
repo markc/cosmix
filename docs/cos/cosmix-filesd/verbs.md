@@ -176,6 +176,11 @@ table as `fs.read_blob`. A 201 response returns the validated blob reference
 with `path` added; optional reference attributes (including a named store's
 `instance`) are preserved. File bytes are never carried in a Bus frame.
 
+Filename hints (including an explicit `name`) percent-encode UTF-8 bytes outside
+printable non-space ASCII, plus `%`, for the HTTP header. blobd currently stores
+the encoded name verbatim, so `Résumé.pdf` returns as `R%C3%A9sum%C3%A9.pdf`.
+An encoded name longer than 128 bytes is omitted; the reference name is null.
+
 `fs.blob.materialise {blob, path, overwrite?}` accepts `b3:<64 lowercase hex>`,
 bare lowercase hex, or a reference map containing `blob`. It streams
 `GET /blob/<hex>` from that local store. A missing blob must first be fetched

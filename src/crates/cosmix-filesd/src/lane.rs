@@ -90,6 +90,20 @@ fn blob_hex(value: &Value) -> Result<&str, String> {
     Ok(hex)
 }
 
+/// Printable ASCII except '%' stays unchanged. blobd stores this verbatim.
+fn encoded_name(name: &str) -> Option<String> {
+    let mut encoded = String::new();
+    for byte in name.bytes() {
+        if (0x21..=0x7e).contains(&byte) && byte != b'%' {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+        if encoded.len() > 128 { return None; }
+    }
+    Some(encoded)
+}
+
 fn parse_reference(body: &str) -> Result<Value, String> {
     let value: Value = serde_json::from_str(body)
         .map_err(|e| format!("lane: reference is not JSON: {e}"))?;
@@ -109,12 +123,14 @@ pub fn reference(fs: &FsLayer, a: &Value, bind: Result<&str, &str>, owner: &str)
     let (file, name, mime) = fs.open_blob(path).map_err(super::estr)?;
     let length = file.metadata().map_err(|e| super::estr(e.into()))?.len();
     let bind = checked_bind(bind.map_err(str::to_string)?)?;
-    let response = agent().post(&format!("http://{bind}/blob"))
+    let mut request = agent().post(&format!("http://{bind}/blob"))
         .set("Content-Length", &length.to_string())
         .set("X-Cosmix-Owner", owner)
-        .set("X-Cosmix-Name", a["name"].as_str().unwrap_or(&name))
-        .set("X-Cosmix-Mime", a["mime"].as_str().unwrap_or(mime))
-        .send(file.take(length))
+        .set("X-Cosmix-Mime", a["mime"].as_str().unwrap_or(mime));
+    if let Some(name) = encoded_name(a["name"].as_str().unwrap_or(&name)) {
+        request = request.set("X-Cosmix-Name", &name);
+    }
+    let response = request.send(file.take(length))
         .map_err(|e| http_error(e, true))?;
     if response.status() != 201 {
         return Err(format!("lane: expected HTTP 201, got {}", response.status()));
@@ -298,6 +314,29 @@ mod tests {
         let head = worker.join().unwrap().0.to_ascii_lowercase();
         assert!(head.contains("x-cosmix-name: x.png"));
         assert!(head.contains("x-cosmix-mime: image/png"));
+    }
+
+    #[test]
+    fn reference_encodes_names_and_omits_oversized_header() {
+        let dir = Scratch::new();
+        fs::write(dir.0.join("Résumé.pdf"), b"x").unwrap();
+        for (name, expected) in [
+            (None, Some("R%C3%A9sum%C3%A9.pdf".to_string())),
+            (Some("a\nb% c".to_string()), Some("a%0Ab%25%20c".to_string())),
+            (Some("a".repeat(200)), None),
+        ] {
+            let reply = json!({"blob": format!("b3:{}", content_hash(b"x")), "size": 1, "name": expected}).to_string();
+            let (bind, worker) = serve_once("201 Created", reply.as_bytes(), reply.len());
+            let (rc, value) = invoke(&dir.layer(true, vec![]), "fs.blob.ref",
+                json!({"path": "home/Résumé.pdf", "name": name}), &bind);
+            assert_eq!(rc, 0, "{value}");
+            let head = worker.join().unwrap().0;
+            let header = head.lines().filter_map(|s| s.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case("x-cosmix-name"))
+                .map(|(_, value)| value.trim().to_string());
+            assert_eq!(header, expected);
+            assert_eq!(value["name"], json!(expected));
+        }
     }
 
     #[test]
