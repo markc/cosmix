@@ -218,7 +218,7 @@ pub fn materialise(fs: &FsLayer, a: &Value, bind: Result<&str, &str>) -> Result<
     let hex = blob_hex(&a["blob"])?;
     let path = super::req(a, "path")?;
     let overwrite = a["overwrite"].as_bool().unwrap_or(false);
-    fs.blob_target(path, overwrite).map_err(super::estr)?;
+    fs.blob_target(path, overwrite, false).map_err(super::estr)?;
     let bind = checked_bind(bind.map_err(str::to_string)?)?;
     let response = agent().get(&format!("http://{bind}/blob/{hex}"))
         .call().map_err(|e| http_error(e, false))?;
@@ -234,7 +234,7 @@ pub fn materialise(fs: &FsLayer, a: &Value, bind: Result<&str, &str>) -> Result<
     }
     let length = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok())
         .ok_or("lane: missing or invalid Content-Length")?;
-    let target = fs.blob_target(path, overwrite).map_err(super::estr)?;
+    let target = fs.blob_target(path, overwrite, true).map_err(super::estr)?;
     // ureq exposes exactly the HTTP Content-Length body. Extra wire bytes after
     // that frame are not exposed; land_verified also checks length for any Read.
     let size = atomic::land_verified(&target, response.into_reader(), length, hex, overwrite)
@@ -560,6 +560,16 @@ mod tests {
             assert!(!dir.0.join("out").exists());
             dir.no_temp();
         }
+    }
+
+    #[test]
+    fn materialise_404_does_not_create_parents() {
+        let dir = Scratch::new();
+        let (bind, worker) = serve_once("404 Not Found", b"{}", 2);
+        assert_error(invoke(&dir.layer(true, vec![]), "fs.blob.materialise",
+            json!({"blob": content_hash(b"absent"), "path": "home/a/b/c/out"}), &bind), "not_present:");
+        worker.join().unwrap();
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
     }
 
     #[test]

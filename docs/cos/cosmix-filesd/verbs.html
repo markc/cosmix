@@ -578,7 +578,8 @@ bare lowercase hex, or a reference map containing <code>blob</code>. It streams
 <code>GET /blob/&lt;hex&gt;</code> from that local store. A missing blob must first be fetched
 with <code>blob.fetch</code>; materialise does not initiate a cross-node fetch.</p>
 <p>The destination uses the write jail and rejects existing non-plain targets.
-Missing parent directories are created, matching <code>fs.write</code>. Bytes stream into
+Missing parent directories are created only after a successful GET response,
+immediately before landing; a 404 or connection failure creates none. Bytes stream into
 a unique sibling temporary file, with length and BLAKE3 verification before
 publication. An overwrite preserves mode bits and uses fsync then rename;
 <code>overwrite=false</code> uses Linux <code>renameat2(RENAME_NOREPLACE)</code> to publish in one
@@ -607,7 +608,7 @@ documented path-based check/use race posture is unchanged.</p>
 <tr><td><code>denied:</code>, <code>not found:</code>, <code>exists:</code>, <code>bad request:</code>, <code>i/o error:</code></td><td>Filesystem-layer errors, passed through unchanged</td></tr>
 </tbody></table>
 <p>A truncated HTTP body reported by ureq as a read error uses <code>lane:</code>. A short
-reader ending cleanly uses <code>verify_failed:</code>. A failed call may have created
+reader ending cleanly uses <code>verify_failed:</code>. A failed body read or verification may have created
 parent directories; a failed upload response does not undo a pin already
 committed by blobd.</p>
 <h3 id="irreversible-operations">Irreversible operations</h3>

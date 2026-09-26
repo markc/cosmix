@@ -199,7 +199,8 @@ bare lowercase hex, or a reference map containing `blob`. It streams
 with `blob.fetch`; materialise does not initiate a cross-node fetch.
 
 The destination uses the write jail and rejects existing non-plain targets.
-Missing parent directories are created, matching `fs.write`. Bytes stream into
+Missing parent directories are created only after a successful GET response,
+immediately before landing; a 404 or connection failure creates none. Bytes stream into
 a unique sibling temporary file, with length and BLAKE3 verification before
 publication. An overwrite preserves mode bits and uses fsync then rename;
 `overwrite=false` uses Linux `renameat2(RENAME_NOREPLACE)` to publish in one
@@ -232,7 +233,7 @@ All failures use rc 10 and `{"error":...}`:
 | `denied:`, `not found:`, `exists:`, `bad request:`, `i/o error:` | Filesystem-layer errors, passed through unchanged |
 
 A truncated HTTP body reported by ureq as a read error uses `lane:`. A short
-reader ending cleanly uses `verify_failed:`. A failed call may have created
+reader ending cleanly uses `verify_failed:`. A failed body read or verification may have created
 parent directories; a failed upload response does not undo a pin already
 committed by blobd.
 

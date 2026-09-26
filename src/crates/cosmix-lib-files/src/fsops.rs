@@ -431,10 +431,9 @@ impl FsLayer {
         Ok((file, file_name(place_rel).to_string(), mime_for(file_name(place_rel))))
     }
 
-    /// Vet a materialisation target before fetching bytes. Like `write`, creates
-    /// missing parents; unlike unrestricted `write`, refuses symlink/special
-    /// targets. Call again after connecting to the lane to refresh the jail check.
-    pub fn blob_target(&self, place_rel: &str, overwrite: bool) -> Result<PathBuf> {
+    /// Vet a materialisation target. The first pass is check-only; set
+    /// `create_parents` only after GET succeeds, immediately before landing.
+    pub fn blob_target(&self, place_rel: &str, overwrite: bool, create_parents: bool) -> Result<PathBuf> {
         let (_place, full) = self.resolve(place_rel, true)?;
         match fs::symlink_metadata(&full) {
             Ok(_) if !overwrite => return Err(FilesError::Exists(format!(
@@ -444,7 +443,7 @@ impl FsLayer {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        ensure_parent(&full)?;
+        if create_parents { ensure_parent(&full)?; }
         Ok(full)
     }
 
