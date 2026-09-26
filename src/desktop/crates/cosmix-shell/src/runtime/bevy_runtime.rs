@@ -1193,10 +1193,13 @@ mod tests {
             Some("launcher"),
         );
         set_page_minimum_thickness(world, Edge::Left, "launcher", Some(310.0));
-        let left = |world: &World| world.resource::<ShellFrameState>().0.panel(Edge::Left);
-        assert_eq!(left(world).thickness_px, 310.0);
+        // (presented thickness, settled thickness) of the left edge.
+        let left = |world: &World| {
+            let panel = world.resource::<ShellFrameState>().0.panel(Edge::Left);
+            (panel.thickness_px, panel.settled_thickness_px)
+        };
         // Persistence reads the settled value: the request is never saved.
-        assert_eq!(left(world).settled_thickness_px, 230.0);
+        assert_eq!(left(world), (310.0, 230.0));
         // A smaller request never shrinks the remembered thickness.
         set_page_minimum_thickness(world, Edge::Left, "notes", Some(150.0));
         set_shell_pages(
@@ -1205,7 +1208,7 @@ mod tests {
             vec!["launcher".into(), "notes".into()],
             Some("notes"),
         );
-        assert_eq!(left(world).thickness_px, 230.0);
+        assert_eq!(left(world).0, 230.0);
         set_shell_pages(
             world,
             Edge::Left,
@@ -1229,12 +1232,12 @@ mod tests {
                 vec!["launcher".into(), "notes".into()],
                 Some("launcher"),
             );
-            assert_eq!(left(world).thickness_px, 310.0, "{output}");
+            assert_eq!(left(world).0, 310.0, "{output}");
         }
         // Removing the page takes its extent with it.
         remove_shell_page(world, Edge::Left, "launcher");
         set_shell_pages(world, Edge::Left, vec!["launcher".into()], Some("launcher"));
-        assert!(left(world).thickness_px < 310.0);
+        assert!(left(world).0 < 310.0);
     }
 
     #[test]

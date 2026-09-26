@@ -1789,10 +1789,16 @@ mod tests {
             set_page_thickness(world, edge, 20.0);
             load_mount_test_scene(world, "wide", edge, 40);
             reconcile(world);
-            let panel = |world: &World| world.resource::<ShellFrameState>().0.panel(edge);
-            assert_eq!(panel(world).active_page_id.as_deref(), Some("scene-wide"));
-            assert_eq!(panel(world).thickness_px, 40.0, "{edge:?}");
-            assert_eq!(panel(world).settled_thickness_px, 20.0, "{edge:?}");
+            // (presented thickness, settled thickness) of the edge.
+            let panel = |world: &World| {
+                let panel = world.resource::<ShellFrameState>().0.panel(edge);
+                (panel.thickness_px, panel.settled_thickness_px)
+            };
+            assert_eq!(
+                world.resource::<ShellFrameState>().0.panel(edge).active_page_id.as_deref(),
+                Some("scene-wide")
+            );
+            assert_eq!(panel(world), (40.0, 20.0), "{edge:?}");
             // A page asking for less than the saved width gets the saved one.
             load_mount_test_scene(world, "narrow", edge, 10);
             reconcile(world);
@@ -1802,7 +1808,7 @@ mod tests {
                 vec!["scene-wide".into(), "scene-narrow".into()],
                 Some("scene-narrow"),
             );
-            assert_eq!(panel(world).thickness_px, 20.0, "{edge:?}");
+            assert_eq!(panel(world).0, 20.0, "{edge:?}");
             // Back on the wide page it grows again; the saved value never moved.
             set_shell_pages(
                 world,
@@ -1810,8 +1816,7 @@ mod tests {
                 vec!["scene-wide".into(), "scene-narrow".into()],
                 Some("scene-wide"),
             );
-            assert_eq!(panel(world).thickness_px, 40.0, "{edge:?}");
-            assert_eq!(panel(world).settled_thickness_px, 20.0, "{edge:?}");
+            assert_eq!(panel(world), (40.0, 20.0), "{edge:?}");
         }
     }
 
