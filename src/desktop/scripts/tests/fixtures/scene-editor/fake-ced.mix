@@ -1,0 +1,51 @@
+-- A ced-shaped citizen for scene-editor-e2e.mix (Scene Editor plan §7,
+-- Stage T): ced.open adds each path as a tab, ced.tabs lists them, and
+-- ced.diagnostics is accepted as ced would for an open path. Every request
+-- is appended as one JSON line to FAKE_CED_LOG ({verb, args}), so the test
+-- reads what the editor behaviour sent without a Bus round trip.
+-- Serve it as `ced`: mix --serve fake-ced.mix --name ced
+$LOG = env("FAKE_CED_LOG", "")
+$st = {tabs:[], next:1}
+
+fn note($verb, $a)
+  if $LOG != "" then append_file($LOG, json_encode({verb:$verb, args:$a}) .. "\n") end
+end
+
+fn req()
+  return type($event.args) == "map" ? $event.args : {}
+end
+
+fn tab_of($path)
+  for each $t in $st.tabs
+    if $t.path == $path then return $t.tab end
+  end
+  return nil
+end
+
+on ced.open
+  $a = req()
+  note("ced.open", $a)
+  $opened = []
+  for each $path in $a.paths ?? []
+    $tab = tab_of($path)
+    if $tab == nil then
+      $tab = $st.next
+      $st.next = $st.next + 1
+      $st.tabs = concat($st.tabs, [{tab:$tab, path:$path}])
+    end
+    push($opened, $tab)
+  end
+  reply(0, json_encode({tabs:$opened}))
+end
+
+on ced.tabs
+  note("ced.tabs", req())
+  reply(0, json_encode({active:length($st.tabs) > 0 ? $st.tabs[length($st.tabs) - 1].tab : nil, tabs:$st.tabs}))
+end
+
+on ced.diagnostics
+  $a = req()
+  note("ced.diagnostics", $a)
+  $tab = tab_of($a.path ?? "")
+  reply(0, json_encode({path:$a.path, tabs:$tab == nil ? [] : [$tab], shown:length($a.diagnostics ?? []), stale:false}))
+end
