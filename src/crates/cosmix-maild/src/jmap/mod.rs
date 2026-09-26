@@ -348,19 +348,16 @@ async fn dispatch(
 
 /// GET /jmap/blob/{blob_id} — Download a blob.
 ///
-/// `blob_id` can be either:
+/// `blob_id` can be:
+///   - an `mp1_` part identifier bound to an account-owned item and message hash,
 ///   - a legacy per-account UUID (issued by `db::blob::store` when
 ///     pre-migration uploads / inbound delivery created the row), or
 ///   - a 64-character lowercase-hex CAS `BlobHash` (the post-
 ///     migration form returned by `Email/get` — see
 ///     `jmap/email.rs:record_to_jmap`).
 ///
-/// The handler tries UUID first; on parse failure it falls back to
-/// `cosmix_mds::blob::from_hex` for the CAS form. This dual-path
-/// matching is the bridge while the upload path migrates off
-/// `db::blob` (Task 3.3a, `_doc/planned/jmap-mds-migration.md`);
-/// once that lands, both upload and download share the mds CAS
-/// surface and the legacy UUID branch can be retired.
+/// Part IDs are resolved before UUIDs and raw hashes. Legacy aliases remain
+/// account-scoped during migration; global CAS existence never authorises a read.
 pub async fn blob_download(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -369,6 +366,45 @@ pub async fn blob_download(
     let Some(account_id) = auth::authenticate(&state.db, &headers).await else {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     };
+
+    if blob_id.starts_with("mp1_") {
+        let Some(id) = crate::attachments::PartBlobId::parse(&blob_id) else {
+            return (StatusCode::BAD_REQUEST, "invalid blob id").into_response();
+        };
+        let ms = state.mailstore.clone();
+        return match tokio::task::spawn_blocking(move || {
+            crate::attachments::download(&ms, account_id, &id)
+        })
+        .await
+        {
+            Ok(Ok((part, bytes))) => {
+                let content_type =
+                    axum::http::HeaderValue::from_str(&part.mime).unwrap_or_else(|_| {
+                        axum::http::HeaderValue::from_static("application/octet-stream")
+                    });
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, content_type)],
+                    bytes,
+                )
+                    .into_response()
+            }
+            Ok(Err(crate::attachments::Error::NotFound)) => {
+                (StatusCode::NOT_FOUND, "blob not found").into_response()
+            }
+            Ok(Err(e @ crate::attachments::Error::TooLarge(_))) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response()
+            }
+            Ok(Err(e @ crate::attachments::Error::Unreadable(_))) => {
+                tracing::warn!(error = %e, "part download failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "unreadable: message").into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "part download worker failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        };
+    }
 
     if let Ok(id) = blob_id.parse::<uuid::Uuid>() {
         // UUID can be either a post-Task-3.3a JMAP `BlobId` alias

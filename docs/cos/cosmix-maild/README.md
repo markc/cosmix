@@ -66,6 +66,14 @@ report a false negative or a partial attachment list. Property filtering still
 applies. Downloadable parts preserve transfer-decoded octets, including original
 text charset bytes; body display values may be charset-converted to UTF-8.
 
+`GET /jmap/blob/{blobId}` accepts these part IDs alongside upload UUIDs and
+whole-message hashes. Authentication and account ownership precede file reads.
+A foreign item, missing item, stale message hash or absent part returns the
+same HTTP 404 `blob not found`. Malformed IDs return HTTP 400 `invalid blob id`;
+an inspection limit returns HTTP 413 `too_large: …`; unreadable or corrupt
+owned messages return HTTP 500 `unreadable: message`. No part bytes are stored
+as new CAS blobs by inspection or download.
+
 ### SMTP
 
 `smtp_inbound` enables inbound SMTP. `smtp_smtps` enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.

@@ -24,6 +24,119 @@ struct Fixture {
 
 const MIME: &[u8] = b"Subject: parts\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: multipart/alternative; boundary=y\r\n\r\n--y\r\nContent-Type: text/plain\r\n\r\nhello\r\n--y\r\nContent-Type: text/html\r\n\r\n<b>hello</b>\r\n--y--\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename*=utf-8''caf%C3%A9.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n";
 
+#[tokio::test]
+async fn part_downloads_bind_account_item_hash_and_path() {
+    let f = Fixture::new().await;
+    let item = f.deliver(MIME);
+    let email = get_email(&f, item, Value::Null).await;
+    let id = email["attachments"][0]["blobId"].as_str().unwrap();
+    assert_eq!(f.download(1, id).await, (StatusCode::OK, vec![0, 255]));
+    let absent = (StatusCode::NOT_FOUND, b"blob not found".to_vec());
+    assert_eq!(f.download(2, id).await, absent);
+    let original = cosmix_maild::attachments::PartBlobId::parse(id).unwrap();
+    let mut stale = original.clone();
+    stale.message_hash = cosmix_mds::BlobHash([0; 32]);
+    assert_eq!(f.download(1, &stale.to_string()).await, absent);
+    let mut missing_item = original.clone();
+    missing_item.item = cosmix_mds::ItemId(uuid::Uuid::nil());
+    assert_eq!(f.download(1, &missing_item.to_string()).await, absent);
+    let mut missing_part = original;
+    missing_part.part = "1.999".into();
+    assert_eq!(f.download(1, &missing_part.to_string()).await, absent);
+    for bad in [
+        "mp1_é",
+        "mp1_",
+        &format!("{id}_0"),
+        &id.replace("_1_2", "_1_02"),
+    ] {
+        assert_eq!(f.download(1, bad).await.0, StatusCode::BAD_REQUEST);
+    }
+    let unauth = jmap::blob_download(State(f.state()), HeaderMap::new(), Path(id.to_owned()))
+        .await
+        .into_response();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    // A whole-message blob still follows the existing CAS route.
+    assert_eq!(
+        f.download(1, email["blobId"].as_str().unwrap()).await,
+        (StatusCode::OK, MIME.to_vec())
+    );
+    // Every projected text/html body ID is downloadable too.
+    for kind in ["textBody", "htmlBody"] {
+        let response = f
+            .download(1, email[kind][0]["blobId"].as_str().unwrap())
+            .await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert!(String::from_utf8(response.1).unwrap().contains("hello"));
+    }
+}
+
+#[tokio::test]
+async fn part_downloads_preserve_charset_octets_and_embedded_bytes() {
+    let f = Fixture::new().await;
+    let raw = b"Content-Type: text/plain; charset=iso-8859-1\r\nContent-Disposition: attachment; filename=cafe.txt\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ncaf=E9";
+    let item = f.deliver(raw);
+    let email = get_email(&f, item, Value::Null).await;
+    let id = email["attachments"][0]["blobId"].as_str().unwrap();
+    let response = jmap::blob_download(State(f.state()), Fixture::headers(1), Path(id.into()))
+        .await
+        .into_response();
+    assert_eq!(response.headers()["content-type"], "text/plain");
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 100)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"caf\xe9"
+    );
+
+    let inner = b"Subject: inner\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=";
+    let raw = format!(
+        "Content-Type: message/rfc822\r\nContent-Disposition: attachment; filename=mail.eml\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+        base64::engine::general_purpose::STANDARD.encode(inner)
+    );
+    let item = f.deliver(raw.as_bytes());
+    let email = get_email(&f, item, Value::Null).await;
+    let id = email["attachments"][0]["blobId"].as_str().unwrap();
+    assert_eq!(email["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(f.download(1, id).await, (StatusCode::OK, inner.to_vec()));
+    let mut nested = cosmix_maild::attachments::PartBlobId::parse(id).unwrap();
+    nested.part = "1.1".into();
+    assert_eq!(
+        f.download(1, &nested.to_string()).await,
+        (StatusCode::OK, vec![0, 255])
+    );
+}
+
+#[tokio::test]
+async fn part_download_reports_caps_and_unreadable_storage() {
+    let f = Fixture::new().await;
+    let item = f.deliver(MIME);
+    let email = get_email(&f, item, Value::Null).await;
+    let id = email["attachments"][0]["blobId"].as_str().unwrap();
+    let state = f.state();
+    let hash = state.mailstore.get_email(1, item).unwrap().blob_hash;
+    let path = cosmix_mds::blob::blob_path(&state.mailstore.mds().blobs_root(), &hash);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(cosmix_maild::attachments::MAX_MESSAGE as u64 + 1)
+        .unwrap();
+    let (status, body) = f.download(1, id).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(body.starts_with(b"too_large:"));
+    // Foreign-account requests never expose the read failure or cap.
+    assert_eq!(f.download(2, id).await.0, StatusCode::NOT_FOUND);
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(
+        f.download(1, id).await,
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"unreadable: message".to_vec()
+        )
+    );
+}
+
 async fn get_email(f: &Fixture, id: cosmix_mds::ItemId, properties: Value) -> Value {
     let state = f.state();
     let result = jmap::email::get(

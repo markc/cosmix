@@ -494,6 +494,13 @@ be inspected. Unreadable, corrupt or over-limit messages return
 report a false negative or a partial attachment list. Property filtering still
 applies. Downloadable parts preserve transfer-decoded octets, including original
 text charset bytes; body display values may be charset-converted to UTF-8.</p>
+<p><code>GET /jmap/blob/{blobId}</code> accepts these part IDs alongside upload UUIDs and
+whole-message hashes. Authentication and account ownership precede file reads.
+A foreign item, missing item, stale message hash or absent part returns the
+same HTTP 404 <code>blob not found</code>. Malformed IDs return HTTP 400 <code>invalid blob id</code>;
+an inspection limit returns HTTP 413 <code>too_large: …</code>; unreadable or corrupt
+owned messages return HTTP 500 <code>unreadable: message</code>. No part bytes are stored
+as new CAS blobs by inspection or download.</p>
 <h3 id="smtp">SMTP</h3>
 <p><code>smtp_inbound</code> enables inbound SMTP. <code>smtp_smtps</code> enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.</p>
 <p>Inbound delivery resolves local accounts and aliases, applies mail-auth checks, the rules engine, Bayesian classification, optional Mix routing, and retention-related metadata before committing mail to the mailbox store. Remote submissions enter the retry queue and outbound delivery path.</p>
