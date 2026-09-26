@@ -479,7 +479,9 @@ local node's blob store (<code>blobd</code>, over its byte lane with pin owner
 <code>capture</code>; mime <code>image/png</code> or <code>video/mp4</code>). The upload runs detached after
 the terminal phase, so status already shows <code>complete</code>/<code>failed</code> with
 <code>blob: null</code> while it is in flight; the returned reference then appears
-additively as <code>blob</code> — <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…"}</code>. Each
+additively as <code>blob</code> — <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…", "name":"cosmix-&lt;pid&gt;-&lt;ns&gt;.png","origin":"&lt;node&gt;"}</code>; <code>name</code> and <code>origin</code>
+ride along with whatever the lane recorded (null when it recorded
+none). Each
 job owns the status by a generation: if a newer capture starts before an
 older job's upload finishes, the stale upload's result is dropped (and
 logged), never written into the new job's status. A
@@ -493,9 +495,10 @@ the write mid-stream and no response can be read after that, so a truly
 early 413 surfaces as a transport error rather than a status error. Lane
 resolution reads blobd's <code>blob.props.get</code> lane property (bounded to 35 s);
 an empty <code>bind</code> — blobd publishing before its lane listens — is refused as
-<code>blobd lane not listening</code> rather than tried as a URL. One attempt, 30-second connect/read/write bounds on the lane socket
-(including the 201 reply read), and a 10-minute whole-upload deadline
-enforced between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
+<code>blobd lane not listening</code> rather than tried as a URL. One attempt,
+30-second connect/read/write bounds on the lane socket (including the
+201 reply read), and a 10-minute whole-upload deadline enforced
+between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
 loss — abandons lane
 resolution and an in-flight upload instead of waiting them out, so capture
 never lingers on a stalled lane at exit. The file under <code>~/Videos/Cosmix</code>

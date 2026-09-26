@@ -42,7 +42,10 @@ local node's blob store (`blobd`, over its byte lane with pin owner
 `capture`; mime `image/png` or `video/mp4`). The upload runs detached after
 the terminal phase, so status already shows `complete`/`failed` with
 `blob: null` while it is in flight; the returned reference then appears
-additively as `blob` — `{"blob":"b3:<64 hex>","size":N,"mime":"…"}`. Each
+additively as `blob` — `{"blob":"b3:<64 hex>","size":N,"mime":"…",
+"name":"cosmix-<pid>-<ns>.png","origin":"<node>"}`; `name` and `origin`
+ride along with whatever the lane recorded (null when it recorded
+none). Each
 job owns the status by a generation: if a newer capture starts before an
 older job's upload finishes, the stale upload's result is dropped (and
 logged), never written into the new job's status. A
@@ -56,9 +59,10 @@ the write mid-stream and no response can be read after that, so a truly
 early 413 surfaces as a transport error rather than a status error. Lane
 resolution reads blobd's `blob.props.get` lane property (bounded to 35 s);
 an empty `bind` — blobd publishing before its lane listens — is refused as
-`blobd lane not listening` rather than tried as a URL. One attempt, 30-second connect/read/write bounds on the lane socket
-(including the 201 reply read), and a 10-minute whole-upload deadline
-enforced between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
+`blobd lane not listening` rather than tried as a URL. One attempt,
+30-second connect/read/write bounds on the lane socket (including the
+201 reply read), and a 10-minute whole-upload deadline enforced
+between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
 loss — abandons lane
 resolution and an in-flight upload instead of waiting them out, so capture
 never lingers on a stalled lane at exit. The file under `~/Videos/Cosmix`
