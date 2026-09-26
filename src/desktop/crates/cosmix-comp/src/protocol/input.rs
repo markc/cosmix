@@ -148,6 +148,16 @@ pub(crate) struct InputIngressState {
 }
 
 impl InputIngressState {
+    #[cfg(feature = "bus")]
+    pub(super) fn physically_holds_key(&self, key: smithay::input::keyboard::Keycode) -> bool {
+        self.devices.values().any(|device| device.keys.contains(&key))
+    }
+
+    #[cfg(feature = "bus")]
+    pub(super) fn physically_holds_button(&self, button: u32) -> bool {
+        self.devices.values().any(|device| device.buttons.contains(&button))
+    }
+
     fn added(&mut self, device: &impl Device) {
         let id = device.id();
         if let Some(_existing) = self.devices.get_mut(&id) {

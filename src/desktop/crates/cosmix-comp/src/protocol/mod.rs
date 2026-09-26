@@ -3362,6 +3362,8 @@ impl ProtocolServer {
                 last_keyboard_action: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
+                #[cfg(feature = "bus")]
+                delivery: Default::default(),
                 seat,
                 keyboard,
                 pointer,
@@ -3379,6 +3381,8 @@ impl ProtocolServer {
                 last_keyboard_action: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
+                #[cfg(feature = "bus")]
+                delivery: Default::default(),
                 seat: agent_seat,
                 keyboard: agent_keyboard,
                 pointer: agent_pointer,
@@ -11993,7 +11997,7 @@ impl WaylandState {
             return;
         }
         #[cfg(feature = "bus")]
-        if let Some((id, generation)) = self.injection.targeted_button {
+        if let Some((id, generation)) = self.human.delivery.targeted_button {
             // All modal, quarantine and delivery gates have already run in
             // handle_host_input. Only device hit-testing/raising is replaced.
             self.targeted_pointer_button(id, generation, button, state, time);
@@ -12452,12 +12456,12 @@ impl WaylandState {
                     #[cfg(feature = "bus")]
                     {
                         let forwarded = matches!(&disposition, KeyDisposition::Forward);
-                        state.injection.key_handled = !forwarded
+                        state.human.delivery.key_handled = !forwarded
                             || state.human.keyboard.current_focus().is_some()
                             // Bare modifiers are prefixes for a later binding,
                             // even when there is no focused client yet.
                             || keysym.is_some_and(|sym| sym.is_modifier_key());
-                        state.injection.key_delivery = if forwarded {
+                        state.human.delivery.key_delivery = if forwarded {
                             state.delivery_target(true)
                         } else {
                             None
@@ -16541,6 +16545,8 @@ mod handlers;
 mod input;
 #[cfg(feature = "bus")]
 mod input_injection;
+#[cfg(feature = "bus")]
+mod agent_seat;
 mod occlusion;
 pub(crate) mod presentation;
 pub(crate) mod presentation_stats;

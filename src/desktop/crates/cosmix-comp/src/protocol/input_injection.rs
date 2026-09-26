@@ -98,7 +98,8 @@ impl Holds {
     }
 }
 
-pub(crate) struct InjectionState {
+#[derive(Default)]
+pub(super) struct DeliveryScratch {
     /// Result of the last event through the shared seat path. Modal owners
     /// consume events without a client target; the keyboard filter refines it.
     pub(super) key_handled: bool,
@@ -106,6 +107,9 @@ pub(crate) struct InjectionState {
     /// Preserve the explicit button focus/raise policy after the host gates.
     pub(super) targeted_button: Option<(u64, u64)>,
     pub(super) button_delivery: Option<(u64, u64)>,
+}
+
+pub(crate) struct InjectionState {
     next_seq: u64,
     /// The sequence whose step is running (the owner of what it presses).
     current_run: Option<u64>,
@@ -125,10 +129,6 @@ pub(crate) struct InjectionState {
 impl Default for InjectionState {
     fn default() -> Self {
         Self {
-            key_handled: false,
-            key_delivery: None,
-            targeted_button: None,
-            button_delivery: None,
             next_seq: 0,
             current_run: None,
             events: 0,
@@ -221,8 +221,8 @@ fn press_states(action: PressAction) -> &'static [HostButtonState] {
 }
 
 impl WaylandState {
-    fn keymap_index(&mut self) -> KeymapIndex {
-        let keyboard = self.human.keyboard.clone();
+    fn keymap_index(&mut self, seat: SeatKind) -> KeymapIndex {
+        let keyboard = self.comp_seat(seat).keyboard.clone();
         keyboard.with_xkb_state(self, |context| {
             let xkb = context
                 .xkb()
@@ -243,17 +243,30 @@ impl WaylandState {
         }
     }
 
-    fn inject(&mut self, input: HostInput) {
+    fn inject(&mut self, seat: SeatKind, input: HostInput) {
         let owner = self.injection.current_run;
-        self.human.held.note(owner, &input);
+        self.comp_seat_mut(seat).held.note(owner, &input);
+        // Injection cannot release (or duplicate) a physical device's hold.
+        if seat == SeatKind::Human && match &input {
+            HostInput::Key { keycode, .. } => self.input_ingress.physically_holds_key(*keycode)
+                || self.injection.host_held_keys.contains(&keycode.raw()),
+            HostInput::PointerButton { button, .. } => self.input_ingress.physically_holds_button(*button)
+                || self.injection.host_held_buttons.contains(button),
+            _ => false,
+        } {
+            return;
+        }
         self.injection.events = self.injection.events.wrapping_add(1);
-        self.handle_host_input(input);
+        match seat {
+            SeatKind::Human => self.handle_host_input(input),
+            SeatKind::Agent => self.deliver_agent_input(input),
+        }
     }
 
-    fn inject_key(&mut self, keycode: Keycode, state: HostButtonState, time: u32) {
-        self.injection.key_handled = true;
-        self.injection.key_delivery = None;
-        self.inject(HostInput::Key {
+    fn inject_key(&mut self, seat: SeatKind, keycode: Keycode, state: HostButtonState, time: u32) {
+        self.comp_seat_mut(seat).delivery.key_handled = true;
+        self.comp_seat_mut(seat).delivery.key_delivery = None;
+        self.inject(seat, HostInput::Key {
             keycode,
             state,
             time,
@@ -292,7 +305,7 @@ impl WaylandState {
             self.record_pointer_focus_local_position(focus.as_ref(), location);
         }
         let pointer = self.human.pointer.clone();
-        self.injection.button_delivery = self.delivery_target(false);
+        self.human.delivery.button_delivery = self.delivery_target(false);
         pointer.button(
             self,
             &ButtonEvent {
@@ -309,6 +322,7 @@ impl WaylandState {
     /// reconcile XKB and binding/hold bookkeeping after focus changes.
     fn inject_keys(
         &mut self,
+        seat: SeatKind,
         events: Vec<(Keycode, HostButtonState, bool)>,
         target: Option<(u64, u64)>,
         time: u32,
@@ -321,21 +335,21 @@ impl WaylandState {
         for (keycode, state, required) in events {
             if state == HostButtonState::Pressed
                 && target.is_some()
-                && self.delivery_target(true) != target
+                && self.delivery_target_on(seat, true) != target
             {
                 failure = Some("target_changed");
                 break;
             }
             let was_held = self
-                .human
+                .comp_seat(seat)
                 .held
                 .owners
                 .contains_key(&Hold::Key(keycode.raw()));
-            self.inject_key(keycode, state, time);
+            self.inject_key(seat, keycode, state, time);
             completed += 1;
             if required && (state == HostButtonState::Pressed || !payload_seen) {
-                if self.injection.key_delivery.is_some() {
-                    delivery = self.injection.key_delivery;
+                if self.comp_seat_mut(seat).delivery.key_delivery.is_some() {
+                    delivery = self.comp_seat_mut(seat).delivery.key_delivery;
                 }
                 payload_seen = true;
             }
@@ -343,7 +357,7 @@ impl WaylandState {
                 if !was_held {
                     pressed_here.insert(keycode.raw());
                 }
-                if required && !was_held && !self.injection.key_handled {
+                if required && !was_held && !self.comp_seat_mut(seat).delivery.key_handled {
                     failure = Some("no_keyboard_target");
                     break;
                 }
@@ -352,7 +366,7 @@ impl WaylandState {
             }
         }
         if failure.is_some() {
-            self.release_holds(pressed_here.into_iter().map(Hold::Key).collect(), time);
+            self.release_holds(seat, pressed_here.into_iter().map(Hold::Key).collect(), time);
         }
         (failure, completed, delivery)
     }
@@ -364,11 +378,7 @@ impl WaylandState {
             InputOp::OnSeat { seat, op } => (*seat, op.as_ref()),
             _ => (SeatKind::Human, op),
         };
-        let mut reply = if seat == SeatKind::Agent {
-            ControlReply::refused("agent_delivery_unavailable", json!({}))
-        } else {
-            self.service_input_payload(op, None)
-        };
+        let mut reply = self.service_input_payload(seat, op, None);
         match &mut reply {
             ControlReply::Body(body) | ControlReply::Refused { detail: body, .. } => {
                 body["seat"] = json!(seat.name());
@@ -407,7 +417,7 @@ impl WaylandState {
         ) {
             // A release reconciles the seat that owns the hold, even when
             // its original window can no longer take focus. Never refocus it.
-            return self.service_input_payload(op, Some((id, generation)));
+            return self.service_input_payload(SeatKind::Human, op, Some((id, generation)));
         }
         let record = &self.surfaces[&object];
         let reason = if self.region_selection_active() {
@@ -446,11 +456,12 @@ impl WaylandState {
             return refusal("focus_refused");
         }
         // There is no event-loop yield between the fence, focus and injection.
-        self.service_input_payload(op, Some((id, generation)))
+        self.service_input_payload(SeatKind::Human, op, Some((id, generation)))
     }
 
     fn service_input_payload(
         &mut self,
+        seat: SeatKind,
         op: &InputOp,
         target_window: Option<(u64, u64)>,
     ) -> ControlReply {
@@ -466,6 +477,9 @@ impl WaylandState {
                 raise,
                 op,
             } => {
+                if seat == SeatKind::Agent {
+                    return ControlReply::refused("agent_target_unavailable", json!({}));
+                }
                 return self.service_targeted_input(*id, *generation, *raise, op);
             }
             InputOp::PointerMove { target, corners } => {
@@ -474,7 +488,7 @@ impl WaylandState {
                     Err(reply) => return reply,
                 };
                 self.injection.suppress_corners = !corners;
-                self.inject(input);
+                self.inject(seat, input);
                 self.injection.suppress_corners = false;
                 (InjectedKind::PointerMove, false)
             }
@@ -489,16 +503,16 @@ impl WaylandState {
                         // The focus verb has already applied the requested
                         // raise policy. A device click would hit-test again
                         // and unconditionally raise, defeating raise:false.
-                        self.injection.targeted_button = target_window;
-                        self.injection.button_delivery = None;
-                        self.inject(input);
-                        button_delivery = self.injection.button_delivery;
-                        self.injection.targeted_button = None;
+                        self.comp_seat_mut(seat).delivery.targeted_button = target_window;
+                        self.comp_seat_mut(seat).delivery.button_delivery = None;
+                        self.inject(seat, input);
+                        button_delivery = self.comp_seat_mut(seat).delivery.button_delivery;
+                        self.comp_seat_mut(seat).delivery.targeted_button = None;
                     } else {
-                        self.inject(input);
+                        self.inject(seat, input);
                     }
                 }
-                if target_window.is_some() && button_delivery.is_some() {
+                if seat == SeatKind::Human && target_window.is_some() && button_delivery.is_some() {
                     self.retarget_pointer_after_visibility_change();
                 }
                 (InjectedKind::PointerButton, false)
@@ -512,7 +526,7 @@ impl WaylandState {
                 let axis = |amount: Option<f64>, v120: Option<i32>| {
                     amount.map(|amount| HostAxis { amount, v120 })
                 };
-                self.inject(HostInput::PointerAxis {
+                self.inject(seat, HostInput::PointerAxis {
                     horizontal: axis(*dx, v120.0),
                     vertical: axis(*dy, v120.1),
                     source: match source {
@@ -533,7 +547,7 @@ impl WaylandState {
                 action,
                 modifiers,
             } => {
-                let index = self.keymap_index();
+                let index = self.keymap_index(seat);
                 let Some((keycode, shifted)) = self.resolve_key(&index, key) else {
                     return unknown_key(key);
                 };
@@ -567,16 +581,16 @@ impl WaylandState {
                         events.push((*modifier, HostButtonState::Released, false));
                     }
                 }
-                key_result = self.inject_keys(events, target_window, time);
+                key_result = self.inject_keys(seat, events, target_window, time);
                 (InjectedKind::Key, true)
             }
             InputOp::Text(text) => {
                 // An input method holding the keyboard would compose the
                 // keys into something else; typed text must arrive as sent.
-                if self.human.seat.input_method().keyboard_grabbed() {
+                if self.comp_seat(seat).seat.input_method().keyboard_grabbed() {
                     return ControlReply::refused("ime_active", json!({}));
                 }
-                let index = self.keymap_index();
+                let index = self.keymap_index(seat);
                 let shift = self.resolve_key(&index, &KeySpec::Name("Shift_L".into()));
                 let mut keys = Vec::with_capacity(text.len());
                 for (position, character) in text.chars().enumerate() {
@@ -606,11 +620,11 @@ impl WaylandState {
                         events.push((shift, HostButtonState::Released, false));
                     }
                 }
-                key_result = self.inject_keys(events, target_window, time);
+                key_result = self.inject_keys(seat, events, target_window, time);
                 (InjectedKind::Text, true)
             }
             InputOp::ReleaseAll => {
-                self.release_injected(time);
+                self.release_injected(seat, time);
                 (InjectedKind::ReleaseAll, false)
             }
         };
@@ -623,7 +637,7 @@ impl WaylandState {
         } else if target_window.is_some() {
             button_delivery
         } else {
-            button_delivery.or_else(|| self.delivery_target(false))
+            button_delivery.or_else(|| self.delivery_target_on(seat, false))
         };
         self.note_injected_input(
             target.map(|(id, _)| SurfaceId(id)),
@@ -635,7 +649,7 @@ impl WaylandState {
         crate::frame_trace::event("comp_input_injected", || {
             (input_seq, kind as u64, target.map_or(0, |(id, _)| id))
         });
-        let pointer = self.pointer_output_position();
+        let pointer = self.pointer_output_position_on(seat);
         let body = json!({
             "input_seq": input_seq,
             "injected_at_us": injected_at_us,
@@ -652,27 +666,27 @@ impl WaylandState {
     }
 
     /// `release_all`: release everything injection holds, and only that.
-    fn release_injected(&mut self, time: u32) {
-        let holds = std::mem::take(&mut self.human.held);
-        self.release_holds(holds.owners.into_keys().collect(), time);
+    fn release_injected(&mut self, seat: SeatKind, time: u32) {
+        let holds = std::mem::take(&mut self.comp_seat_mut(seat).held);
+        self.release_holds(seat, holds.owners.into_keys().collect(), time);
     }
 
     /// Release the given holds the seat still has pressed: keys (newest
     /// code first), then buttons.
-    fn release_holds(&mut self, holds: Vec<Hold>, time: u32) {
-        let pressed = self.human.keyboard.pressed_keys();
+    fn release_holds(&mut self, seat: SeatKind, holds: Vec<Hold>, time: u32) {
+        let pressed = self.comp_seat(seat).keyboard.pressed_keys();
         for hold in holds.iter().rev() {
             let Hold::Key(raw) = *hold else { continue };
             let keycode = Keycode::new(raw);
             if pressed.contains(&keycode) {
-                self.inject_key(keycode, HostButtonState::Released, time);
+                self.inject_key(seat, keycode, HostButtonState::Released, time);
             }
         }
-        let pressed = self.human.pointer.current_pressed();
+        let pressed = self.comp_seat(seat).pointer.current_pressed();
         for hold in holds {
             let Hold::Button(button) = hold else { continue };
             if pressed.contains(&button) {
-                self.inject(HostInput::PointerButton {
+                self.inject(seat, HostInput::PointerButton {
                     button,
                     state: HostButtonState::Released,
                     time,
@@ -792,12 +806,16 @@ impl WaylandState {
     /// `{id, generation}` of the root of whatever the seat now delivers to:
     /// keyboard focus for key verbs, pointer focus otherwise.
     pub(super) fn delivery_target(&self, keyboard: bool) -> Option<(u64, u64)> {
+        self.delivery_target_on(SeatKind::Human, keyboard)
+    }
+
+    pub(super) fn delivery_target_on(&self, seat: SeatKind, keyboard: bool) -> Option<(u64, u64)> {
         let surface = if keyboard {
-            self.human.keyboard
+            self.comp_seat(seat).keyboard
                 .current_focus()
                 .and_then(|target| target.owned_surface())
         } else {
-            self.human.pointer
+            self.comp_seat(seat).pointer
                 .current_focus()
                 .and_then(|target| target.owned_surface())
         }?;
@@ -808,8 +826,11 @@ impl WaylandState {
     }
 
     /// The cursor as `(output key, output-local x, y)`.
-    fn pointer_output_position(&self) -> Option<(String, f64, f64)> {
-        let (x, y) = self.cursor_position;
+    fn pointer_output_position_on(&self, seat: SeatKind) -> Option<(String, f64, f64)> {
+        let (x, y) = match seat {
+            SeatKind::Human => self.cursor_position,
+            SeatKind::Agent => self.agent.pointer_position?,
+        };
         project_outputs(self)?
             .rows
             .into_iter()
@@ -954,8 +975,10 @@ impl WaylandState {
     /// owner (another run, a single verb) still holds.
     fn abort_sequence(&mut self, id: u64) -> Option<SequenceRun> {
         let run = self.injection.sequences.remove(&id)?;
-        let orphaned = self.human.held.drop_owner(Some(id));
-        self.release_holds(orphaned, monotonic_millis());
+        for seat in [SeatKind::Human, SeatKind::Agent] {
+            let orphaned = self.comp_seat_mut(seat).held.drop_owner(Some(id));
+            self.release_holds(seat, orphaned, monotonic_millis());
+        }
         Some(run)
     }
 

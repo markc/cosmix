@@ -49,6 +49,19 @@ pub(super) struct CompSeat {
     /// in its Smithay keyboard/pointer handles.
     #[cfg(feature = "bus")]
     pub held: super::input_injection::Holds,
+    #[cfg(feature = "bus")]
+    pub delivery: super::input_injection::DeliveryScratch,
     #[allow(dead_code)]
     pub pose: Option<SeatPose>,
+}
+
+#[cfg(feature = "bus")]
+impl WaylandState {
+    pub(super) fn comp_seat(&self, kind: SeatKind) -> &CompSeat {
+        match kind { SeatKind::Human => &self.human, SeatKind::Agent => &self.agent }
+    }
+
+    pub(super) fn comp_seat_mut(&mut self, kind: SeatKind) -> &mut CompSeat {
+        match kind { SeatKind::Human => &mut self.human, SeatKind::Agent => &mut self.agent }
+    }
 }
