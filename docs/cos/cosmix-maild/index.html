@@ -667,12 +667,13 @@ limit exceeds it. Larger admitted messages project <code>hasAttachment: null</co
 and omit <code>attachments</code>; attachment inspection/export returns <code>too_large:</code>.
 Diagnostic blob inputs still use the configured <code>max_message_size</code>.</p>
 <p>Before parsing, a linear header-aware scan permits at most 2,000 potential
-header blocks and 32 potential embedded messages (conservatively all <code>message/*</code>
+header blocks and 1,000 potential embedded messages (conservatively all <code>message/*</code>
 types). It removes whitespace in header names, conservatively accepts folded
-names, and recognises folded values and comments. After <code>multipart/digest</code>,
-every subsequent blank or boundary separator counts as a potential implicit
-message, even after the digest ends. Quoted header text in message bodies
-counts too and can cause a false-positive
+names, and recognises folded values and comments. These are count bounds, not
+depth bounds: sibling attached messages and digest children do not add nesting
+depth, and digest body blank lines do not count as messages. Each nesting level
+needs a header block, bounding parser recursion before the walker checks true
+depth. Quoted header text in message bodies counts too and can cause a false-positive
 <code>too_large:</code> refusal. Parse, walk and tree destruction use a dedicated 64 MiB
 thread stack. The walk permits depth 32, 1,000 parts, path length 64,
 64 MiB per decoded part, an aggregate 128 MiB decoded-byte budget, and at most

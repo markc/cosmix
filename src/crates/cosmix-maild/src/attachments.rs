@@ -247,23 +247,18 @@ pub fn inspect(
 // header-shaped lines elsewhere too: quoted body text may over-count. Unfold
 // values without allocating; the media lexer below deliberately accepts a
 // superset of the dependency's tokens, never fewer accepted message types.
+// Bound counts here, not sibling count as depth: each nesting level needs a
+// header block (message/* or multipart/digest for implicit children), so depth
+// is bounded by blocks, capped before parse at 2 * MAX_PARTS. Header-less
+// digest children are siblings, not additional levels (message.rs:64-65,214-236).
+// The 64 MiB worker stack handles this bounded parse/drop; the walker then
+// enforces true depth 32. Blank lines alone do not add nesting levels.
 fn structure_preflight(data: &[u8]) -> Result<(), Error> {
     let mut lines = data.split_inclusive(|b| *b == b'\n').peekable();
     let (mut blocks, mut messages) = (0, 0);
     let mut starts_block = true;
-    // mail-parser 0.11.5 parsers/message.rs:49,64-65 defaults digest children
-    // to Message; :214-236 nests them. Conservatively charge every subsequent
-    // blank/boundary separator, including empty headers, even after the digest
-    // ends. This needs no boundary storage and cannot miss implicit children.
-    let mut digest_seen = false;
     while let Some(line) = lines.next() {
         if line.trim_ascii().is_empty() || line.starts_with(b"--") {
-            if digest_seen {
-                messages += 1;
-                if messages > MAX_DEPTH {
-                    return Err(Error::TooLarge("MIME pre-parse structure limit"));
-                }
-            }
             starts_block = true;
             continue;
         }
@@ -285,12 +280,11 @@ fn structure_preflight(data: &[u8]) -> Result<(), Error> {
                 media.feed(lines.next().unwrap());
             }
             media.finish_token();
-            digest_seen |= media.multipart && media.digest;
             // message.rs:59-60 nests rfc822 AND global. Count every message/*
             // conservatively, including unknown subtypes, before any parsing.
             if media.message && media.subtype {
                 messages += 1;
-                if messages > MAX_DEPTH {
+                if messages > MAX_PARTS {
                     return Err(Error::TooLarge("MIME pre-parse structure limit"));
                 }
             }
@@ -337,12 +331,10 @@ fn content_type_value<'a>(
 
 #[derive(Default)]
 struct PreflightMedia {
-    token: [u8; 9],
+    token: [u8; 7],
     length: usize,
     subtype: bool,
     message: bool,
-    multipart: bool,
-    digest: bool,
     comments: usize,
     escaped: bool,
     done: bool,
@@ -351,11 +343,8 @@ struct PreflightMedia {
 impl PreflightMedia {
     fn finish_token(&mut self) {
         let token = self.token.get(..self.length).unwrap_or_default();
-        if self.subtype {
-            self.digest |= token == b"digest";
-        } else {
+        if !self.subtype {
             self.message |= token == b"message";
-            self.multipart |= token == b"multipart";
         }
         self.length = 0;
     }
@@ -649,8 +638,7 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(200),
             "preflight must refuse plain 5000-level nesting cheaply in either profile"
         );
-        // Forty rfc822 wrappers exceed the preflight cap of 32. Multipart
-        // nesting exercises depth 40 BELOW both occurrence-count caps instead.
+        // Multipart nesting exercises true depth below both count caps.
         let mut raw = "Content-Type: text/plain\r\n\r\nx".to_owned();
         for n in 0..40 {
             raw = format!(
@@ -688,7 +676,7 @@ mod tests {
                 Some("rfc822" | "global")
             ));
             // Small cases prove media recognition, not merely the block cap.
-            for depth in [MAX_DEPTH + 1, 5000] {
+            for depth in [MAX_PARTS + 1, 5000] {
                 let raw = format!("{}Content-Type: text/plain\r\n\r\nx", header.repeat(depth));
                 assert_eq!(
                     inspect(raw.as_bytes(), None, false).unwrap_err(),
@@ -747,7 +735,7 @@ mod tests {
             // Keep it scanner-only: over-counting is the conservative side.
             "cOnTeNt - TyPe\t: (a (nested\\) comment)) MeSsAgE / (b) RfC822\n\n",
         ] {
-            for depth in [MAX_DEPTH + 1, 5000] {
+            for depth in [MAX_PARTS + 1, 5000] {
                 let raw = format!("{}Subject: leaf\r\n\r\nx", header.repeat(depth));
                 assert_eq!(
                     inspect(raw.as_bytes(), None, false).unwrap_err(),
@@ -758,24 +746,62 @@ mod tests {
     }
 
     #[test]
-    fn preflight_bounds_implicit_digest_messages() {
-        let raw = format!(
-            "Content-Type: multipart/digest; boundary=d\r\n\r\n{}--d--\r\n",
-            "--d\r\n\r\nSubject: implicit message\r\n\r\nbody\r\n".repeat(40)
-        );
+    fn forty_sibling_messages_and_digest_body_blanks_are_not_depth() {
+        for (subtype, explicit) in [("digest", false), ("digest", true), ("mixed", true)] {
+            let mut raw = format!("Content-Type: multipart/{subtype}; boundary=d\r\n\r\n");
+            for n in 1..=40 {
+                raw.push_str("--d\r\n");
+                if explicit {
+                    raw.push_str(&format!("Content-Type: message/rfc822\r\nContent-Disposition: attachment; filename={n}.eml\r\n"));
+                }
+                raw.push_str(&format!(
+                    "\r\nSubject: sibling {n}\r\nContent-Type: text/plain\r\n\r\nbody\r\n"
+                ));
+                raw.push_str(&"\r\n".repeat(100));
+            }
+            raw.push_str("--d--\r\n");
+            structure_preflight(raw.as_bytes()).unwrap();
+            let result = inspect(raw.as_bytes(), None, false).unwrap();
+            let messages: Vec<_> = result
+                .parts
+                .iter()
+                .filter(|part| part.mime == "message/rfc822")
+                .collect();
+            assert_eq!(messages.len(), 40, "{subtype}, explicit={explicit}");
+            for (index, part) in messages.iter().enumerate() {
+                assert_eq!(part.path, format!("1.{}", index + 1));
+                assert_eq!(part.path.split('.').count(), 2);
+                assert!(!part.undecodable);
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn blocks_cap_refuses_two_thousand_levels_before_malformed_parser_panic() {
+        // Only two message/* headers: refusal must be the BLOCKS cap, not
+        // the message count. Wrap the original shared-boundary debug sentinel
+        // in 2000 multipart levels; the final root takes us over 2000 blocks.
+        let mut raw = "Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n".repeat(2000);
+        raw.push_str("Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n");
         assert_eq!(
             inspect(raw.as_bytes(), None, false).unwrap_err(),
             Error::TooLarge("MIME pre-parse structure limit")
         );
-        // The conservative approximation also charges consecutive empty
-        // separators, without trying to reconstruct the parser's parent state.
-        let empty = format!(
-            "Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n{}",
-            "\r\n".repeat(40)
+    }
+
+    #[test]
+    fn five_hundred_message_levels_parse_and_drop_before_walker_refusal() {
+        // No shared multipart boundaries: each wrapper is a complete message
+        // with its own headers, ending at EOF. This parses in both profiles.
+        let raw = format!(
+            "{}Subject: leaf\r\nContent-Type: text/plain\r\n\r\nx",
+            "Subject: wrapper\r\nContent-Type: message/rfc822\r\n\r\n".repeat(500)
         );
+        structure_preflight(raw.as_bytes()).unwrap();
         assert_eq!(
-            structure_preflight(empty.as_bytes()).unwrap_err(),
-            Error::TooLarge("MIME pre-parse structure limit")
+            inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME structure limit (depth 32, parts 1000, path 64)")
         );
     }
 

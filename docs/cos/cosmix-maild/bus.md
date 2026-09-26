@@ -341,12 +341,13 @@ The raw-message inspection cap is always 64 MiB, even when admission's
 `max_message_size` is larger (startup warns once). Over-cap messages have
 unknown attachment metadata and inspection/export returns `too_large:`;
 diagnostic inputs use the configured bound. The linear pre-parse header scanner
-includes quoted body text: at most 2,000 potential header blocks and 32
+includes quoted body text: at most 2,000 potential header blocks and 1,000
 potential embedded messages (conservatively all `message/*` types). It accepts
 case variations, whitespace anywhere in names (including conservative folded
-names), folded values and comments. After `multipart/digest`, every subsequent
-blank or boundary separator counts as a potential implicit message, including
-empty headers and separators after the digest ends.
+names), folded values and comments. These bound counts, not sibling count as
+depth. Digest blank lines do not count as messages; attached messages and digest
+children can have more than 32 siblings. Each nesting level needs a header block,
+bounding parser recursion before the walker enforces true depth 32.
 False-positive refusals are possible.
 The whole walk has a 128 MiB decoded-byte budget and allows two nested
 encoded re-parses beyond the parser's own limit. Bad individual parts instead
