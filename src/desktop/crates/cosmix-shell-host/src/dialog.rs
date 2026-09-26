@@ -77,27 +77,23 @@ pub(crate) fn dialog_spec(dialog: &QuoinDialog, selected: Option<&OutputKey>) ->
     }
     Some(DialogSpec {
         output: seat.output.clone(),
-        size: (seat.w.round().max(1.0) as u32, seat.h.round().max(1.0) as u32),
+        // The fitted size: the authored one shrunk to the usable zone.
+        size: dialog
+            .size()
+            .map(|size| (size.x.round().max(1.0) as u32, size.y.round().max(1.0) as u32))?,
         root: dialog.root?,
     })
 }
 
-/// Where comp puts the unanchored surface: centred in the output minus the
-/// exclusive zones of Quoin's own mapped panels (the layers that reserve
-/// space on a Quoin desktop). Used to map dialog-local input to output
-/// coordinates; comp's placement stays authoritative for the pixels.
-pub(crate) fn dialog_origin(output: Vec2, size: (u32, u32), frame: &ShellFrame) -> Vec2 {
-    let zone = |edge: Edge| {
-        let panel = frame.panel(edge);
-        if panel.mapped && panel.exclusive_zone_px.is_finite() {
-            panel.exclusive_zone_px.max(0.0)
-        } else {
-            0.0
-        }
-    };
-    let min = Vec2::new(zone(Edge::Left), zone(Edge::Top));
-    let max = output - Vec2::new(zone(Edge::Right), zone(Edge::Bottom));
-    let centre = (min + max) / 2.0;
+/// Where comp puts the unanchored surface: centred in the zone the output
+/// leaves after Quoin's docked panels' exclusive zones (`panel_layout`'s
+/// canvas, the same zone the size is fitted to). Used to map dialog-local
+/// input to output coordinates; comp's placement stays authoritative for the
+/// pixels.
+pub(crate) fn dialog_origin(_output: Vec2, size: (u32, u32), frame: &ShellFrame) -> Vec2 {
+    let canvas = cosmix_shell::host::panel_layout(frame).canvas;
+    let min = Vec2::new(canvas.x, canvas.y);
+    let centre = min + Vec2::new(canvas.width, canvas.height) / 2.0;
     (centre - Vec2::new(size.0 as f32, size.1 as f32) / 2.0).round()
 }
 
@@ -428,6 +424,10 @@ mod tests {
         assert_eq!(dialog_spec(&state(true, false), Some(&selected)), None);
         let other = OutputKey::new("HDMI-A-1").unwrap();
         assert_eq!(dialog_spec(&state(true, true), Some(&other)), None);
+        // A small output maps the fitted size, not the authored one.
+        let mut fitted = state(true, true);
+        fitted.fitted = Some(Vec2::new(880.0, 512.0));
+        assert_eq!(dialog_spec(&fitted, Some(&selected)).unwrap().size, (880, 512));
         assert_eq!(dialog_spec(&state(true, true), None), None);
     }
 
@@ -454,11 +454,10 @@ mod tests {
         let output = Vec2::new(1920.0, 1080.0);
         assert_eq!(dialog_origin(output, (880, 620), &frame), Vec2::new(520.0, 230.0));
         // The 52 px bottom panel docked: comp centres 26 px higher (Stage S
-        // note (a)). An unmapped panel's zone counts for nothing.
+        // note (a)).
         let bottom = &mut frame.panels[Edge::Bottom.index()];
         bottom.mapped = true;
         bottom.exclusive_zone_px = 52.0;
-        frame.panels[Edge::Left.index()].exclusive_zone_px = 400.0;
         assert_eq!(dialog_origin(output, (880, 620), &frame), Vec2::new(520.0, 204.0));
     }
 }

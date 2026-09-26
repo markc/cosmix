@@ -300,11 +300,13 @@ fn dialog_surface(world: &World, scene: &str) -> (bool, Value) {
     };
     let origin = dialog.origin.unwrap_or(Vec2::ZERO);
     let visible = dialog.visible && dialog.origin.is_some();
+    // The actual (fitted) size, as `props.dialog` reports it.
+    let size = dialog.size().unwrap_or(Vec2::new(seat.w, seat.h));
     (
         visible,
         json!({
             "kind": "dialog", "edge": null, "output": seat.output.as_str(),
-            "x": origin.x, "y": origin.y, "w": seat.w, "h": seat.h,
+            "x": origin.x, "y": origin.y, "w": size.x, "h": size.y,
         }),
     )
 }
