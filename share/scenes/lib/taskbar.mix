@@ -114,7 +114,7 @@ end
 fn peek_candidates($windows, $ws_current)
   $out = []
   for each $w in $windows
-    if ($w.workspace ?? $ws_current) == $ws_current and not $w.minimized then
+    if not elsewhere($w, $ws_current) and not $w.minimized then
       push($out, {id: $w.id, generation: $w.generation})
     end
   end
