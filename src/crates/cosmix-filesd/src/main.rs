@@ -1339,17 +1339,30 @@ async fn dispatch_fs(
     blob_service: &str,
     client: &NodedClient,
 ) -> (u8, String) {
-    dispatch_fs_with_bind(cmd, fs, peers, service, lane::bind(client, blob_service)).await
+    dispatch_fs_with_quota(cmd, fs, peers, service, lane::bind(client, blob_service), lane::quota(client, blob_service, service)).await
 }
 
-/// The resolver future is lazy: only the exact, prefixed blob verbs poll it.
-/// Keeping that boundary injectable lets tests prove other verbs never call Bus.
+#[cfg(test)]
 async fn dispatch_fs_with_bind(
     cmd: IncomingCommand,
     fs: Arc<cosmix_files::fsops::FsLayer>,
     peers: Arc<Vec<String>>,
     service: &str,
     bind: impl std::future::Future<Output = Result<String, String>>,
+) -> (u8, String) {
+    dispatch_fs_with_quota(cmd, fs, peers, service, bind,
+        async { panic!("this dispatch must not request quota") }).await
+}
+
+/// The resolver future is lazy: only the exact, prefixed blob verbs poll it.
+/// Keeping that boundary injectable lets tests prove other verbs never call Bus.
+async fn dispatch_fs_with_quota(
+    cmd: IncomingCommand,
+    fs: Arc<cosmix_files::fsops::FsLayer>,
+    peers: Arc<Vec<String>>,
+    service: &str,
+    bind: impl std::future::Future<Output = Result<String, String>>,
+    quota: impl std::future::Future<Output = Result<serde_json::Value, String>>,
 ) -> (u8, String) {
     let (deleg, args) = match gate(&cmd, &peers) {
         Ok(v) => v,
@@ -1361,7 +1374,21 @@ async fn dispatch_fs_with_bind(
         .unwrap_or(&cmd.command)
         .to_string();
     let blob_verb = matches!(cmd.command.as_str(), "fs.blob.ref" | "fs.blob.materialise");
-    let bind = if blob_verb { Some(bind.await) } else { None };
+    let bind = if blob_verb {
+        let mut result = bind.await;
+        if result.is_ok() && cmd.command == "fs.blob.ref" {
+            let source_fs = fs.clone();
+            let source_args = args.clone();
+            let length = tokio::task::spawn_blocking(move || lane::source_length(&source_fs, &source_args))
+                .await.unwrap_or_else(|_| Err("internal error checking source".into()));
+            let preflight = match length {
+                Ok(length) => quota.await.and_then(|value| lane::check_quota(&value, service, length)),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = preflight { result = Err(error); }
+        }
+        Some(result)
+    } else { None };
     let service = service.to_string();
     let command = cmd.command.clone();
     let (rc, body) = tokio::task::spawn_blocking(move || match bind {
@@ -2371,6 +2398,26 @@ mod tests {
             assert!(body.contains("lane_unavailable:"));
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ref_quota_preflight_refuses_before_http() {
+        let (fs, dir) = fs_layer(true);
+        std::fs::write(dir.join("home/file"), b"hello").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        let (rc, body) = dispatch_fs_with_quota(
+            cmd("fs.blob.ref", json!({"path": "home/file"})), Arc::new(fs), Arc::new(vec![]),
+            "filesd-fs", async { Ok(bind) }, async {
+                Ok(json!({"owners": {"filesd-fs": {"limit": 4, "used": 0, "reserved": 0}},
+                    "total": {"limit": 100, "used": 0, "reserved": 0}}))
+            }).await;
+        assert_eq!(rc, 10);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"],
+            "quota: 5 B exceeds remaining 4 B for filesd-fs");
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

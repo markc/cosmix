@@ -23,6 +23,37 @@ pub async fn bind(client: &NodedClient, service: &str) -> Result<String, String>
     bind_from_reply(&reply)
 }
 
+pub async fn quota(client: &NodedClient, service: &str, owner: &str) -> Result<Value, String> {
+    let reply = tokio::time::timeout(PROPS_TIMEOUT,
+        client.call_typed(service, "blob.quota", json!({"owner": owner})))
+        .await.map_err(|_| format!("lane_unavailable: blob.quota on {service} timed out"))?
+        .map_err(|e| format!("lane_unavailable: blob.quota on {service}: {e}"))?;
+    match reply {
+        PortReply::Ok { value, .. } => Ok(value),
+        PortReply::AppError { message, .. } => Err(format!("lane_unavailable: blob.quota: {message}")),
+    }
+}
+
+pub fn source_length(fs: &FsLayer, args: &Value) -> Result<u64, String> {
+    let (file, _, _) = fs.open_blob(super::req(args, "path")?).map_err(super::estr)?;
+    Ok(file.metadata().map_err(|e| super::estr(e.into()))?.len())
+}
+
+/// blobd citizen::verb_quota returns owners[owner] and total, each with numeric
+/// limit, used and reserved. Reservations consume headroom just like pinned data.
+pub fn check_quota(value: &Value, owner: &str, length: u64) -> Result<(), String> {
+    let remaining = |row: &Value| -> Result<u64, String> {
+        let field = |name| row.get(name).and_then(Value::as_u64)
+            .ok_or_else(|| format!("lane_unavailable: invalid blob.quota {name}"));
+        Ok(field("limit")?.saturating_sub(field("used")?).saturating_sub(field("reserved")?))
+    };
+    let room = remaining(&value["owners"][owner])?.min(remaining(&value["total"])?);
+    if length > room {
+        return Err(format!("quota: {length} B exceeds remaining {room} B for {owner}"));
+    }
+    Ok(())
+}
+
 fn checked_bind(bind: &str) -> Result<&str, String> {
     if bind.is_empty() {
         return Err("lane_unavailable: blobd lane not listening".into());
@@ -297,6 +328,13 @@ mod tests {
             let body_len = head.lines().filter_map(|s| s.split_once(':'))
                 .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
                 .map(|(_, value)| value.trim().parse::<usize>().unwrap()).unwrap_or(0);
+            if status.starts_with("413") {
+                // Real admission refusal: never read the request body. A large
+                // upload can see EPIPE/reset before ureq reads this response.
+                write!(reader.get_mut(), "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
+                reader.get_mut().write_all(&bytes).unwrap();
+                return (head, Vec::new());
+            }
             let mut body = vec![0; body_len];
             reader.read_exact(&mut body).unwrap();
             before_reply();
@@ -419,8 +457,8 @@ mod tests {
         let reply = b"{\"error\":\"quota: filesd-test\"}";
         let (bind, worker) = serve_once("413 Payload Too Large", reply, reply.len());
         let result = invoke(&fs, "fs.blob.ref", json!({"path": "home/file"}), &bind);
-        assert!(result.1["error"].as_str().unwrap().contains("quota: filesd-test"));
-        assert_error(result, "quota:");
+        assert_eq!(result.0, 10);
+        assert!(result.1["error"].as_str().unwrap().contains("quota"), "{}", result.1);
         worker.join().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let down = listener.local_addr().unwrap().to_string();
@@ -462,6 +500,31 @@ mod tests {
             assert_error(invoke(&plain, "fs.blob.ref", json!({"path": "home/folder/hard"}), &bind), "bad request:");
         }
         assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn early_quota_refusal_of_large_upload_keeps_quota_hint() {
+        let dir = Scratch::new();
+        fs::write(dir.0.join("large"), vec![0u8; 32 * 1024 * 1024]).unwrap();
+        let reply = b"{\"error\":\"quota: filesd-test\"}";
+        let (bind, worker) = serve_once("413 Payload Too Large", reply, reply.len());
+        let result = invoke(&dir.layer(true, vec![]), "fs.blob.ref", json!({"path": "home/large"}), &bind);
+        assert_eq!(result.0, 10);
+        assert!(result.1["error"].as_str().unwrap().contains("quota"), "{}", result.1);
+        assert!(worker.join().unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn quota_preflight_counts_total_owner_and_reservations() {
+        let mut quota = json!({"owners": {"filesd-test": {"limit": 100, "used": 20, "reserved": 30}},
+            "total": {"limit": 200, "used": 10, "reserved": 0}});
+        assert!(check_quota(&quota, "filesd-test", 50).is_ok());
+        assert_eq!(check_quota(&quota, "filesd-test", 51).unwrap_err(),
+            "quota: 51 B exceeds remaining 50 B for filesd-test");
+        quota["total"]["reserved"] = json!(180);
+        assert_eq!(check_quota(&quota, "filesd-test", 11).unwrap_err(),
+            "quota: 11 B exceeds remaining 10 B for filesd-test");
+        assert!(check_quota(&json!({}), "filesd-test", 1).unwrap_err().starts_with("lane_unavailable:"));
     }
 
     #[test]

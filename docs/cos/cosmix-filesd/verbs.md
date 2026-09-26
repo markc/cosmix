@@ -187,6 +187,12 @@ length and mtime after sending; a change reports `lane: source changed during
 upload (blob may already be pinned)`. This detects ordinary concurrent edits,
 not edits that deliberately restore both length and mtime.
 
+After discovering the lane, ref preflights `blob.quota {owner: bus_service}`
+under the same 10-second timeout. File length must fit both owner and total
+headroom after used and reserved bytes. This is advisory: the lane remains
+authoritative. A concurrent quota refusal may close a large upload before
+ureq reads the 413, yielding `lane:` with a quota hint rather than `quota:`.
+
 `fs.blob.materialise {blob, path, overwrite?}` accepts `b3:<64 lowercase hex>`,
 bare lowercase hex, or a reference map containing `blob`. It streams
 `GET /blob/<hex>` from that local store. A missing blob must first be fetched

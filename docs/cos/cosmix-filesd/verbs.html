@@ -568,6 +568,11 @@ An encoded name longer than 128 bytes is omitted; the reference name is null.</p
 <code>lane: source shrank during upload</code>. Filesd checks the same open descriptor's
 length and mtime after sending; a change reports <code>lane: source changed during upload (blob may already be pinned)</code>. This detects ordinary concurrent edits,
 not edits that deliberately restore both length and mtime.</p>
+<p>After discovering the lane, ref preflights <code>blob.quota {owner: bus_service}</code>
+under the same 10-second timeout. File length must fit both owner and total
+headroom after used and reserved bytes. This is advisory: the lane remains
+authoritative. A concurrent quota refusal may close a large upload before
+ureq reads the 413, yielding <code>lane:</code> with a quota hint rather than <code>quota:</code>.</p>
 <p><code>fs.blob.materialise {blob, path, overwrite?}</code> accepts <code>b3:&lt;64 lowercase hex&gt;</code>,
 bare lowercase hex, or a reference map containing <code>blob</code>. It streams
 <code>GET /blob/&lt;hex&gt;</code> from that local store. A missing blob must first be fetched
