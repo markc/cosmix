@@ -183,7 +183,6 @@ impl Ctx<'_, '_> {
         let text = ed.text;
         let mut budget = SliceBudget::default();
         let mut buf = String::new();
-        let clip = self.g.text_rect();
         for row in rows {
             let (Some(first), Some(last)) = (row.cells.placed.first(), row.cells.placed.last()) else { continue };
             let base = first.range.start;
@@ -199,31 +198,31 @@ impl Ctx<'_, '_> {
                 let class = spans.get(si).filter(|(sr, _)| sr.start <= pc.range.start).map_or(HlClass::Plain, |s| s.1);
                 let slice = &buf[pc.range.start - base..pc.range.end - base];
                 if pc.is_tab || (pc.ascii && pc.cells == 0) {
-                    self.flush(r, &mut run, row, clip);
+                    self.flush(r, &mut run, row);
                     continue;
                 }
                 if pc.ascii {
                     if run.class != Some(class) || run.end_cell != pc.cell || !run.ascii {
-                        self.flush(r, &mut run, row, clip);
+                        self.flush(r, &mut run, row);
                         run = Run { start_cell: pc.cell, end_cell: pc.cell, class: Some(class), ascii: true, text: String::new() };
                     }
                     run.text.push_str(slice);
                     run.end_cell = pc.cell + pc.cells as usize;
                 } else {
-                    self.flush(r, &mut run, row, clip);
+                    self.flush(r, &mut run, row);
                     let shown = if slice.len() > HUGE_CLUSTER { floor_boundary(slice, CLUSTER_DRAW_CAP) } else { slice };
                     run = Run { start_cell: pc.cell, end_cell: pc.cell + pc.cells as usize, class: Some(class), ascii: false, text: shown.to_string() };
-                    self.flush(r, &mut run, row, clip);
+                    self.flush(r, &mut run, row);
                 }
             }
-            self.flush(r, &mut run, row, clip);
+            self.flush(r, &mut run, row);
             if ed.view.whitespace {
-                self.whitespace(r, row, clip);
+                self.whitespace(r, row);
             }
         }
     }
 
-    fn flush<R: atext::Renderer<Font = Font>>(&self, r: &mut R, run: &mut Run, row: &Row, clip: Rectangle) {
+    fn flush<R: atext::Renderer<Font = Font>>(&self, r: &mut R, run: &mut Run, row: &Row) {
         let Some(class) = run.class else { return };
         if run.text.is_empty() {
             *run = Run::default();
@@ -233,13 +232,16 @@ impl Ctx<'_, '_> {
         let colour = if class == HlClass::Plain { p.text } else { p.hl(class) };
         let shaping = if run.ascii { atext::Shaping::Basic } else { atext::Shaping::Advanced };
         let width = (run.end_cell - run.start_cell + 1) as f32 * self.g.metrics.cell_w;
-        self.text(r, std::mem::take(&mut run.text), Point::new(self.x(run.start_cell), row.y), width, colour, shaping, clip);
+        self.text(r, std::mem::take(&mut run.text), Point::new(self.x(run.start_cell), row.y), width, colour, shaping, self.g.text_rect());
         *run = Run::default();
     }
 
+    /// `layer`: the rectangle the text is drawn in (its `with_layer`, or the
+    /// gutter).
     #[allow(clippy::too_many_arguments)]
-    fn text<R: atext::Renderer<Font = Font>>(&self, r: &mut R, content: String, at: Point, width: f32, colour: Color, shaping: atext::Shaping, clip: Rectangle) {
+    fn text<R: atext::Renderer<Font = Font>>(&self, r: &mut R, content: String, at: Point, width: f32, colour: Color, shaping: atext::Shaping, layer: Rectangle) {
         let v = &self.ed.view;
+        let clip = text_clip(at, width, self.g.metrics, layer);
         r.fill_text(
             atext::Text {
                 content,
@@ -259,7 +261,7 @@ impl Ctx<'_, '_> {
     }
 
     /// Show whitespace: `·` per space, `→` per tab, one text call per row.
-    fn whitespace<R: atext::Renderer<Font = Font>>(&self, r: &mut R, row: &Row, clip: Rectangle) {
+    fn whitespace<R: atext::Renderer<Font = Font>>(&self, r: &mut R, row: &Row) {
         let Some(first) = row.cells.placed.first() else { return };
         let mut s = String::new();
         let mut any = false;
@@ -285,7 +287,7 @@ impl Ctx<'_, '_> {
         }
         if any {
             let width = (s.chars().count() + 1) as f32 * self.g.metrics.cell_w;
-            self.text(r, s, Point::new(self.x(first.cell), row.y), width, self.ed.palette.gutter_text, atext::Shaping::Advanced, clip);
+            self.text(r, s, Point::new(self.x(first.cell), row.y), width, self.ed.palette.gutter_text, atext::Shaping::Advanced, self.g.text_rect());
         }
     }
 
@@ -334,7 +336,9 @@ impl Ctx<'_, '_> {
                 let n = row.line.to_string();
                 let x = gr.x + (g.digits - n.len().min(g.digits)) as f32 * cw + cw * 0.5;
                 let colour = if row.line == caret_line { p.text } else { p.gutter_text };
-                self.text(r, n, Point::new(x, row.y), (g.digits + 1) as f32 * cw, colour, atext::Shaping::Basic, gr);
+                // The number's own width keeps its box inside the gutter.
+                let width = (n.len() + 1) as f32 * cw;
+                self.text(r, n, Point::new(x, row.y), width, colour, atext::Shaping::Basic, gr);
             }
         }
         // Origin strip: lines other origins changed since the tab was focused.
@@ -419,7 +423,7 @@ impl Ctx<'_, '_> {
         let w = cells as f32 * self.g.metrics.cell_w;
         let p = self.ed.palette;
         quad(r, Rectangle { x: caret.x, y: caret.y, width: w, height: caret.height }, p.background);
-        self.text(r, st.ime.preedit.clone(), Point::new(caret.x, caret.y), w + self.g.metrics.cell_w, p.text, atext::Shaping::Advanced, self.g.text_rect());
+        self.text(r, st.ime.preedit.clone(), Point::new(caret.x, caret.y), w + self.g.metrics.cell_w, p.text, atext::Shaping::Advanced, self.g.bounds);
         quad(r, Rectangle { x: caret.x, y: caret.y + caret.height - 2.0, width: w, height: 1.0 }, p.caret);
     }
 
@@ -513,6 +517,33 @@ fn quad<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color
     r.fill_quad(renderer::Quad { bounds, ..renderer::Quad::default() }, colour);
 }
 
+/// The clip rectangle a `fill_text` at `at`, `width` wide, drawn in `layer`,
+/// is handed: its own row box with a cell and half a line of slack on every
+/// side, cut to `layer` when the box lies inside it.
+///
+/// iced_tiny_skia 0.14.1 (pinned in Cargo.toml) never pixel-clips a cached
+/// text by this rectangle; it tests it against layer ∩ damage. A text whose
+/// rectangle misses is skipped; one whose rectangle is not inside first
+/// clears and refills a window-sized clip mask. With the whole text area here
+/// every text on screen paid that on every partial frame (~150 ms a frame; a
+/// `ced.action` waited behind it — ced first save, 2026-09-26). Cut to the
+/// layer, a full-layer frame masks only the boxes that really cross its edge
+/// (the partial last row, a line running past the right edge), and the mask
+/// clips only those. Boxes flush with the text area's own edge (column 0, the
+/// top row) are inside it, so they are NOT layer-clipped: ink overhanging into
+/// the gutter padding or above the widget is drawn unclipped.
+///
+/// The slack is the whole budget for ink outside a text's box: each damage
+/// rectangle is filled with the background before drawing, so ink overhanging
+/// its row by more than the slack (stacked combining marks, an outsized
+/// fallback glyph) can be cut off, or drawn twice, where it crosses the edge
+/// of a partly redrawn region. Ink within the slack is unaffected.
+fn text_clip(at: Point, width: f32, m: geo::Metrics, layer: Rectangle) -> Rectangle {
+    let slack = Rectangle { x: at.x - m.cell_w, y: at.y - m.line_h * 0.5, width: width + 2.0 * m.cell_w, height: m.line_h * 2.0 };
+    let own = Rectangle { x: at.x, y: at.y, width, height: m.line_h };
+    if own.is_within(&layer) { slack.intersection(&layer).unwrap_or(own) } else { slack }
+}
+
 fn rounded<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color) {
     let radius = (bounds.width.min(bounds.height) / 2.0).into();
     r.fill_quad(renderer::Quad { bounds, border: Border { radius, ..Border::default() }, ..renderer::Quad::default() }, colour);
@@ -554,3 +585,165 @@ fn ago(secs: u64) -> String {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use cosmix_edit_client::diag::Diagnostics;
+    use cosmix_edit_client::highlight::Highlight;
+    use cosmix_edit_client::model::EditorModel;
+    use cosmix_edit_core::text::Text;
+    use iced::{Background, Transformation};
+
+    use super::super::layout::Metrics;
+    use super::super::{EditorView, Palette};
+    use super::*;
+
+    /// The window the widget sits in (the base layer).
+    const WINDOW: Rectangle = Rectangle { x: 0.0, y: 0.0, width: 1000.0, height: 600.0 };
+
+    /// One `fill_text`: its own box, clip rectangle and the layer it is in.
+    #[derive(Debug)]
+    struct Drawn {
+        own: Rectangle,
+        clip: Rectangle,
+        layer: Rectangle,
+    }
+
+    impl Drawn {
+        /// The damage it reports (iced_graphics `Text::visible_bounds` for a
+        /// cached text: its box ∩ its clip rectangle).
+        fn visible_bounds(&self) -> Rectangle {
+            self.own.intersection(&self.clip).expect("the clip holds the box")
+        }
+    }
+
+    /// Records each `fill_text` with the layer it is drawn in.
+    struct Rec {
+        layers: Vec<Rectangle>,
+        texts: Vec<Drawn>,
+    }
+
+    impl iced::advanced::Renderer for Rec {
+        fn start_layer(&mut self, bounds: Rectangle) {
+            let parent = *self.layers.last().expect("the window layer");
+            self.layers.push(bounds.intersection(&parent).unwrap_or(Rectangle::with_size(Size::ZERO)));
+        }
+        fn end_layer(&mut self) {
+            self.layers.pop();
+        }
+        fn start_transformation(&mut self, _: Transformation) {}
+        fn end_transformation(&mut self) {}
+        fn fill_quad(&mut self, _: renderer::Quad, _: impl Into<Background>) {}
+        fn reset(&mut self, _: Rectangle) {}
+        fn allocate_image(
+            &mut self,
+            _: &iced::advanced::image::Handle,
+            _: impl FnOnce(Result<iced::advanced::image::Allocation, iced::advanced::image::Error>) + Send + 'static,
+        ) {
+        }
+    }
+
+    impl atext::Renderer for Rec {
+        type Font = Font;
+        type Paragraph = ();
+        type Editor = ();
+        const ICON_FONT: Font = Font::DEFAULT;
+        const CHECKMARK_ICON: char = '0';
+        const ARROW_DOWN_ICON: char = '0';
+        const SCROLL_UP_ICON: char = '0';
+        const SCROLL_DOWN_ICON: char = '0';
+        const SCROLL_LEFT_ICON: char = '0';
+        const SCROLL_RIGHT_ICON: char = '0';
+        const ICED_LOGO: char = '0';
+        fn default_font(&self) -> Font {
+            Font::default()
+        }
+        fn default_size(&self) -> Pixels {
+            Pixels(16.0)
+        }
+        fn fill_paragraph(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
+        fn fill_editor(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
+        fn fill_text(&mut self, text: atext::Text, position: Point, _: Color, clip: Rectangle) {
+            let layer = *self.layers.last().expect("the window layer");
+            self.texts.push(Drawn { own: Rectangle::new(position, text.bounds), clip, layer });
+        }
+    }
+
+    fn palette() -> Palette {
+        crate::theme::resolve_selection(&crate::theme::read_selection(None, None, &mut Vec::new()), Vec::new()).palette
+    }
+
+    /// iced_tiny_skia 0.14.1's per-text decision for a damage rectangle
+    /// (`Renderer::draw` → `Engine::draw_text`, `Text::Cached`): the clip
+    /// rectangle is tested against layer ∩ damage; one that meets it is
+    /// drawn, and one that is not inside it first clears and refills a
+    /// window-sized clip mask. (drawn, masked)
+    ///
+    /// Mirrors iced_tiny_skia 0.14.1 `lib.rs` 79-114 (per damage rectangle:
+    /// background fill, layer ∩ damage) and `engine.rs` 418-430 (the
+    /// `Text::Cached` intersects / is_within test) with 836 (`adjust_clip_mask`).
+    /// Re-audit against those lines when the `=0.14.1` pin moves.
+    fn decide(t: &Drawn, damage: &Rectangle) -> (bool, bool) {
+        let Some(bounds) = t.layer.intersection(damage) else { return (false, false) };
+        let drawn = t.clip.intersects(&bounds);
+        (drawn, drawn && !t.clip.is_within(&bounds))
+    }
+
+    fn masks(texts: &[Drawn], damage: &Rectangle) -> usize {
+        texts.iter().filter(|t| decide(t, damage).1).count()
+    }
+
+    /// Each text's clip rectangle is its own row box cut to its layer, so a
+    /// frame masks only texts that must be clipped: none but the boxes that
+    /// cross the layer edge on a full redraw, and only the damaged row's
+    /// neighbours on a one-row redraw. With the whole text area as the clip
+    /// every text on screen cleared a window-sized mask on every partial
+    /// frame (~150 ms a frame; ced first save, 2026-09-26); with the row box
+    /// uncut every text at column 0 and on the top row did so on every full
+    /// frame (review round 1).
+    #[test]
+    fn each_text_is_clipped_to_its_own_row_not_the_text_area() {
+        let mut body = String::new();
+        for n in 0..60 {
+            if n % 7 == 2 {
+                body.push_str(&format!("{}\n", "y".repeat(120)));
+            }
+            body.push_str(&format!("let value_{n} = \"a string\" .. {n} -- a comment · ü\n"));
+        }
+        let text = Text::from_text(&body).unwrap();
+        let model = EditorModel::default();
+        let highlight = Highlight::for_language("text", None);
+        let palette = palette();
+        let diagnostics = Diagnostics::default();
+        let view = EditorView { whitespace: true, ..EditorView::default() };
+        let ed = Editor { text: &text, model: &model, highlight: &highlight, palette: &palette, diagnostics: &diagnostics, view };
+        let metrics = Metrics { cell_w: 10.0, line_h: 20.0 };
+        let mut st = State::default();
+        st.metrics = Some(metrics);
+        st.scroll.first_line = 1;
+        let g = Geometry::new(Rectangle { x: 100.0, y: 50.0, width: 800.0, height: 405.0 }, metrics, text.line_count(), true);
+        let mut r = Rec { layers: vec![WINDOW], texts: Vec::new() };
+        draw(&ed, &st, &g, &mut r, mouse::Cursor::Unavailable);
+        let texts = &r.texts;
+
+        assert!(texts.len() > 40, "the fixture draws a screenful of texts ({})", texts.len());
+        for t in texts {
+            assert!(t.own.is_within(&t.clip), "{t:?}: the clip holds the text's own box");
+        }
+        // A full redraw (scroll, resize): only boxes that cross their layer
+        // edge — the partial last row, the long lines — take the mask (a box
+        // wholly outside its layer is culled).
+        let crossing = texts.iter().filter(|t| t.own.intersects(&t.layer) && !t.own.is_within(&t.layer)).count();
+        assert!(crossing > 0 && crossing * 5 < texts.len(), "{crossing} of {} boxes cross their layer", texts.len());
+        assert_eq!(masks(texts, &WINDOW), crossing, "a full redraw masks only the crossing boxes");
+        // One row redrawn (a caret moving on row 6): its own damage, from
+        // the first run's visible bounds.
+        let row6 = g.bounds.y + 5.0 * metrics.line_h;
+        let first = texts.iter().filter(|t| t.own.y == row6 && t.layer == g.text_rect()).min_by(|a, b| a.own.x.total_cmp(&b.own.x));
+        let damage = first.expect("a run on row 6").visible_bounds();
+        let drawn: Vec<_> = texts.iter().filter(|t| decide(t, &damage).0).collect();
+        assert!(drawn.iter().all(|t| (t.own.y - row6).abs() <= metrics.line_h), "only row 6 and its neighbours are drawn: {drawn:?}");
+        let partial = masks(texts, &damage);
+        assert!(partial * 5 < texts.len(), "{partial} of {} texts clear a window-sized mask for one damaged run", texts.len());
+    }
+}

@@ -50,6 +50,7 @@ CoS — substrate libraries and daemon family
 |---|---|
 | `cosmix-actions` | 0.4.0 |
 | `cosmix-app-identity` | 0.2.0 |
+| `cosmix-blobd` | 0.5.2 |
 | `cosmix-dbusd` | 0.3.1 |
 | `cosmix-dnsd` | 0.3.3 |
 | `cosmix-edit-client` | 0.2.0 |
@@ -82,7 +83,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-maild-bayesian` | 0.7.1 |
 | `cosmix-maild-rules` | 0.3.1 |
 | `cosmix-mcp` | 0.6.0 |
-| `cosmix-mds` | 0.3.1 |
+| `cosmix-mds` | 0.3.4 |
 | `cosmix-mesh-sign` | 0.8.1 |
 | `cosmix-midicomp` | 0.3.1 |
 | `cosmix-mixer-schema` | 0.5.0 |
@@ -106,7 +107,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bterm` | 0.10.1 |
 | `cosmix-busviewer` | 0.1.2 |
 | `cosmix-capture` | 0.2.1 |
-| `cosmix-ced` | 0.1.1 |
+| `cosmix-ced` | 0.1.2 |
 | `cosmix-comp` | 0.69.2 |
 | `cosmix-deco` | 0.4.1 |
 | `cosmix-design` | 0.15.0 |
@@ -124,7 +125,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-shell-host` | 0.11.0 |
 | `cosmix-studio` | 0.4.8 |
 | `cosmix-term` | 0.3.1 |
-| `cosmix-term-core` | 0.8.1 |
+| `cosmix-term-core` | 0.8.2 |
 | `cosmix-tower` | 0.5.5 |
 | `cosmix-tray` | 0.3.2 |
 | `cosmix-trayd` | 0.6.3 |
@@ -137,4 +138,4 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 
 ---
 
-54 crates in `$COSMIX/src` and 33 in the separate `$COSMIX/src/desktop` workspace.
+55 crates in `$COSMIX/src` and 33 in the separate `$COSMIX/src/desktop` workspace.

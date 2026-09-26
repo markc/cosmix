@@ -44,6 +44,15 @@ daemon/namespace identities, not a claim of runtime UID 519/520. The next
 unassigned daemon/shared number is 521, subject to collision checks and host
 preflight. Source reconciliation does not certify a generator or live accounts.
 
+**Registry amendment — version 1.4.7.** Adds daemon-identity entry 521
+`cosmix-blobd` (R6 default Bus name `blobd`, the node blob store: CAS +
+byte lane) and shared-credential group 522 `cosmix-blob` (CAS read access
+for daemon-local ingest and `blob.path`, §3.3). A new allocation, not a
+reconciliation: no reuse, renumbering or reclamation. The two-stream
+non-collision rule (§2.2) holds — the daemon stream takes 521, the
+shared-credential stream takes 522, and the next unassigned
+daemon/shared number is 523.
+
 **Retained observability obligations (legacy Appendix D 1.4.0/1.4.1).**
 The six observability identities require identity-profile L2 from first install,
 including non-ABP-registering upstream binaries. Mask package-native units and
@@ -189,6 +198,8 @@ Appendix A. As a summary:
 | 518 | `cosmix-nspawnd` | `nspawnd` | nspawn host executor: generation-fenced CT lifecycle (nspawn cluster-lite C1) (v1.4.4) |
 | 519 | `cosmix-powerd` | `power` | Reserved power identity; session-user runtime (v1.4.5, explicit R6 exception) |
 | 520 | `cosmix-mprisd` | `mpris` | Reserved media identity; session-user runtime (v1.4.6, explicit R6 exception) |
+| 521 | `cosmix-blobd` | `blobd` | Node blob store (CAS + byte lane) (v1.4.7) |
+| 522 (GID-only) | `cosmix-blob` | — | Shared-credential group: CAS read for ingest/`blob.path` (§3.3) (v1.4.7) |
 | 600 | `cosmix-statecache` | `statecache` | Citizen-identity: SPEC-18 reference citizen (§2.5) |
 
 `cosmix-noded` registers under the ABP service name `noded`,
@@ -1322,7 +1333,7 @@ comment lines (§4.3) and SHALL NOT emit a `u` line.
 
 ```sysusers
 # /usr/lib/sysusers.d/cosmix.conf
-# Generated from Appendix A of cosmix-daemon-identity v1.4.6.
+# Generated from Appendix A of cosmix-daemon-identity v1.4.7.
 # DO NOT EDIT — regenerate from the canonical Markdown registry.
 
 # --- Daemon-identity entries (POSIX user + same-numbered group) ---
@@ -1346,6 +1357,7 @@ u     cosmix-interactd  517  "Cosmix interaction broker"          /nonexistent  
 u     cosmix-nspawnd    518  "Cosmix nspawn host executor"        /nonexistent   /usr/sbin/nologin
 u     cosmix-powerd     519  "Cosmix battery and power daemon"    /nonexistent   /usr/sbin/nologin
 u     cosmix-mprisd     520  "Cosmix MPRIS media-player daemon"   /nonexistent   /usr/sbin/nologin
+u     cosmix-blobd      521  "Cosmix node blob store daemon"      /nonexistent   /usr/sbin/nologin
 
 # --- Shared-credential groups (group only; no associated user) ---
 # cosmix-tls mediates read access to TLS keypairs shared by ≥2 daemons
@@ -1360,6 +1372,13 @@ m     cosmix-webd    cosmix-tls
 # granting cosmix-noded's group any read on the private d2 seed (§3.3).
 g     cosmix-mesh    516
 m     cosmix-wgd     cosmix-mesh
+# cosmix-blob mediates CAS read access for daemon-local ingest: members
+# may hand blobd a path to read (blob.put) and traverse the 0750 CAS
+# root for zero-copy reads (blob.path) (SPEC 10 §3.3). User-side and
+# remote producers push bytes through the byte lane instead — no
+# cross-user path read exists or is needed.
+g     cosmix-blob    522
+m     cosmix-blobd   cosmix-blob
 
 # --- Citizen-identity entries (POSIX user + same-numbered group) ---
 # Citizen-identity entries (SPEC 10 §2.2, §2.5, v1.2.0) have the exact
@@ -1660,10 +1679,10 @@ Notes on the ABP-emit branch:
 
 ---
 
-## Appendix A. UID/GID Registry (1.4.6)
+## Appendix A. UID/GID Registry (1.4.7)
 
 ```
-# Cosmix daemon identity registry — version 1.4.6
+# Cosmix daemon identity registry — version 1.4.7
 # Reconciled: 2026-09-05 (existing allocations, no account migration)
 # Daemon/shared window: 500-599 (preferred fixed-ID window; see §2.1)
 # Citizen window:        600-699 (citizen-identity stream, v1.2.0; §2.1, R7)
@@ -1705,12 +1724,14 @@ uid  name              bus     gecos                                  tier      
 518  cosmix-nspawnd    -       "Cosmix nspawn host executor"          substrate    -
 519  cosmix-powerd     power   "Cosmix battery and power daemon"      session-reserved -
 520  cosmix-mprisd     mpris   "Cosmix MPRIS media-player daemon"     session-reserved -
+521  cosmix-blobd      -       "Cosmix node blob store daemon"        substrate    -
 
 # --- Shared-credential group entries (group only; no associated user) ---
 gid  name        purpose                                                   tombstoned
 ---  ----------  --------------------------------------------------------  ----------
 510  cosmix-tls  Read access to TLS keypairs shared by ≥2 daemons (§3.3)   -
 516  cosmix-mesh Read access to the signed mesh inventory (SPEC-13 INV-1) shared by mesh daemons (§3.3)  -
+522  cosmix-blob CAS read access for daemon-local ingest and blob.path (§3.3)  -
 
 # --- Citizen-identity entries (POSIX user + same-numbered group; §2.5 scoped reuse) ---
 # Columns after gecos: tier, then the §2.5 lifecycle audit triple
@@ -1749,7 +1770,8 @@ cid  name               bus  gecos                               tier     retire
 # group, `cosmix-mesh` (GID 516, signed-inventory read access §3.3); the
 # daemon stream skips 516 to preserve non-collision. Future shared-
 # credential groups continue from the next free GID that does not collide
-# with the daemon-identity frontier (521 as of v1.4.6, after mprisd 520).
+# with the daemon-identity frontier (523 as of v1.4.7, after blobd 521
+# and the cosmix-blob shared-credential group 522).
 #
 # The citizen-identity block lives in its own 600–699 window (§2.1),
 # disjoint from 500–599, so citizen numbering never collides with
@@ -1780,11 +1802,16 @@ cid  name               bus  gecos                               tier     retire
 # v1.4.5 adds powerd 519; v1.4.6 adds mprisd 520. Both reserve fixed
 # identities with session-user runtime; explicit R6 names are power/mpris.
 # No reuse, renumbering or reclamation is introduced by reconciliation.
-# Next free daemon UID: 521 (516 is held by the `cosmix-mesh` shared-
-#   credential group; 517–520 are already assigned).
-# Next free shared-credential GID: 521 (the shared-cred stream holds 510
-#   `cosmix-tls` and 516 `cosmix-mesh`; the daemon stream now also holds
-#   517 through 520).
+# v1.4.7 adds blobd 521 (node blob store: CAS + byte lane; R6 default
+# name blobd) and the cosmix-blob shared-credential group 522 (CAS read
+# access for daemon-local ingest and blob.path, §3.3). A new allocation,
+# not a reconciliation; the two-stream non-collision rule (§2.2) holds.
+# Next free daemon UID: 523 (516 is held by the `cosmix-mesh` and 522 by
+#   the `cosmix-blob` shared-credential groups; 517–521 are already
+#   assigned).
+# Next free shared-credential GID: 523 (the shared-cred stream holds 510
+#   `cosmix-tls`, 516 `cosmix-mesh` and 522 `cosmix-blob`; the daemon
+#   stream now also holds 517 through 521).
 # Next free citizen UID: 601 (lowest-free in 600–699; reclaimed UIDs
 #   re-enter this pool only after R8 — §2.3 R7/R8, §2.5).
 # Tombstones (kept for audit; SHALL NOT be reused per R2): none.

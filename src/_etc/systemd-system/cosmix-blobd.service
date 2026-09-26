@@ -1,0 +1,100 @@
+# /usr/lib/systemd/system/cosmix-blobd.service
+# Cosmix node blob store daemon (CAS + byte lane). Registry UID 521,
+# BUS service "blobd". All per-host values live inside the daemon's
+# config file at /etc/cosmix/blobd/config.conf.mix — no per-host CLI
+# args. A second instance on the same root exits 2 (root flock); a
+# named instance runs as blobd-<name> with its own root and unit drop-in.
+
+[Unit]
+Description=Cosmix node blob store daemon (cosmix-blobd)
+Documentation=https://cosmix.dev/cos/cosmix-blobd/
+After=network-online.target cosmix-noded.service
+Wants=network-online.target cosmix-noded.service
+# Deliberately Wants=, not Requires=, on cosmix-noded.service: the
+# daemon reconnects to the broker every 60s (powerd's citizen shape),
+# so a noded that comes up later is absorbed without a restart.
+# After= keeps the ordering so noded gets a chance to come up first.
+# Bounded restart burst: an OOM-kill or crash loop restarts at most
+# 3 times per 10 min, then systemd gives up until manual start.
+StartLimitIntervalSec=10min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=cosmix-blobd
+Group=cosmix-blobd
+# blobd reads files other daemons hand to blob.put {path} (maild,
+# filesd) and serves CAS paths through blob.path to the same group:
+# shared-credential group cosmix-blob (GID 522, SPEC 10a §3.3). The
+# daemon chgrps its state root and CAS root to cosmix-blob and sets
+# the setgid bit (mode 2750) at open, so every shard directory and CAS
+# file inherits the group — StateDirectoryMode=0750 + UMask=0027
+# alone would leave the tree group cosmix-blobd, untraversable by
+# members. SupplementaryGroups below is what allows that chown: the
+# daemon must be a member of the group it chgrps to.
+SupplementaryGroups=cosmix-blob
+StateDirectory=cosmix/blobd
+StateDirectoryMode=0750
+RuntimeDirectory=cosmix/blobd
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=cosmix/blobd
+ConfigurationDirectoryMode=0755
+WorkingDirectory=%S/cosmix/blobd
+ExecStart=/opt/cosmix/bin/cosmix-blobd -c %E/cosmix/blobd/config.conf.mix
+Restart=on-failure
+# 30s so a crash loop can't thrash; burst cap in [Unit].
+RestartSec=30s
+Environment=RUST_LOG=cosmix_blobd=info
+# Logging is journald-native; route stray stdout/stderr to the journal
+# too, tag entries, and rate-limit so a crash loop can't flood it.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-blobd
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+# HOME redirect at StateDirectory — nothing under blobd reads $HOME,
+# but the redirect keeps any stray resolver (model cache, XDG) inside
+# the daemon's own state instead of an operator home.
+Environment=HOME=%S/cosmix/blobd
+# resolve_noded_url() falls back to a hardcoded broker IP when
+# node.conf.mix isn't found. Under the HOME redirect above, the
+# cosmix_config XDG resolver looks at %S/cosmix/blobd/.config/cosmix/
+# and misses the canonical /etc/cosmix/node.conf.mix. Pin
+# COSMIX_NODE_CONFIG so BUS registration and the reference `origin`
+# node name use the canonical config. Mirrors cosmix-indexd.service.
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+
+# §5.1 required (Level 1)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# §5.2 mandatory hardening (Level 2)
+# AF_UNIX: the Bus broker socket.
+# AF_INET/AF_INET6: the WireGuard-bound byte lane (P1 slice 3) and
+# node-to-node lane clients.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# blobd chgrps its state/CAS root to cosmix-blob at open so group
+# members can traverse the setgid 2750 CAS; rest of @privileged denied.
+SystemCallFilter=@chown
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0027
+
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

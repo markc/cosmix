@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/cosmix-mds/</title>
+    <title>CosMix — cos/cosmix-blobd/verbs</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,150 +441,99 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/cosmix-mds/README.md"><div class="prose"><h1 id="cosmix-mds">cosmix-mds</h1>
-<p><code>cosmix-mds</code> is a metadata-store library and operator binary for immutable content, mutable multi-container metadata, ordered container membership, and change logs. It stores each container set in SQLite and stores content in a shared BLAKE3-addressed blob store. In the <code>bus &lt;- mix &lt;- cos</code> dependency chain it belongs to the <code>cos</code> layer; the default build has no Bus or Mix dependency, while the optional <code>cosmix</code> feature connects its event stream directly to Bus libraries.</p>
-<h2 id="package">Package</h2>
-<table><thead><tr><th>Item</th><th>Name</th></tr></thead><tbody>
-<tr><td>Cargo package</td><td><code>cosmix-mds</code></td></tr>
-<tr><td>Rust library</td><td><code>cosmix_mds</code></td></tr>
-<tr><td>Operator binary</td><td><code>cosmix-mds</code></td></tr>
-<tr><td>Current crate version</td><td><code>0.3.3</code></td></tr>
-<tr><td>Licence</td><td>MIT</td></tr>
-</tbody></table>
-<p>The package also declares <code>cosmix-mds-stress-writer</code>. That binary is an internal crash-recovery test helper, is gated by <code>_stress-helper</code>, and is not part of the operator surface.</p>
-<h2 id="storage-model">Storage model</h2>
-<p><code>SqliteCasMds</code> uses one metadata database per set and one shared derived blob index:</p>
-<pre><code class="language-text">&lt;root&gt;/
-├── containers/
-│   └── &lt;set-uuid&gt;/
-│       └── data.sqlite
-├── blobs.sqlite
-└── blobs/
-    ├── .tmp/
-    └── &lt;hh&gt;/&lt;hh&gt;/&lt;blake3-hex&gt;
+        <div id="content-doc" data-prerendered="cos/cosmix-blobd/verbs.md"><div class="prose"><h1 id="bus-verbs">Bus verbs</h1>
+<p><code>cosmix-blobd</code> registers the <code>blob.*</code> namespace as the <code>blobd</code> service (or <code>blobd-&lt;name&gt;</code> for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is <code>blob.path</code>, cross-node is the byte lane (<code>GET blob.url</code>, or <code>blob.fetch</code> to pull and pin).</p>
+<h2 id="calling-convention">Calling convention</h2>
+<p>For a bare command, arguments are resolved in this order:</p>
+<ol>
+<li>JSON from the Bus <code>args</code> header.</li>
+<li>The command's non-null <code>args</code> value.</li>
+<li>JSON parsed from the raw body.</li>
+</ol>
+<p>Success uses result code <code>0</code>. Errors use result code <code>10</code> and a body shaped as:</p>
+<pre><code class="language-json">{"error":"message"}
 </code></pre>
-<p><code>data.sqlite</code> is the source of truth for containers, items, memberships, and change streams. <code>blobs.sqlite</code> tracks blob rows, item references, refcounts, and verification results. The blob index is rebuildable from the per-set databases and the content-addressable store.</p>
-<p><code>SqliteCasMds::open</code> creates the storage directories, applies blob-index migrations, discovers existing sets, and applies each set's schema migrations. Migrations use <code>PRAGMA user_version</code> and reject databases with the wrong application identifier or a schema newer than the crate understands.</p>
-<p>Blob writes hash bytes with BLAKE3, stage them under <code>blobs/.tmp</code>, fsync the file, and hard-link the result into the sharded CAS path. Repeated writes of identical bytes are idempotent.</p>
-<h2 id="library-surface">Library surface</h2>
-<p>The crate root re-exports:</p>
+<p>Error tokens worth matching on: <code>not_present</code> (blob not held), <code>invalid blob id</code> (malformed <code>b3:</code> reference), <code>quota:</code> (an owner or total cap refusal — the message carries the numbers), <code>busy</code> (the <code>blob.fetch</code> queue is full — retry later), <code>vanished:</code> (the bytes disappeared while the pin was landing — a <code>blob.gc</code> race; retry the put).</p>
+<p>Verbs dispatch concurrently. The data-scaled verbs — <code>blob.put</code>, <code>blob.gc</code>, <code>blob.list</code>, <code>blob.pin</code>, <code>blob.unpin</code> — are bounded by <code>verb_max_concurrent</code> (default 8): each holds one slot, not the connection, and beyond the bound it queues; its reply is late, never lost. Every other verb (<code>blob.fetch</code>'s immediate reply, <code>stat</code>, <code>has</code>, <code>path</code>, <code>url</code>, <code>info</code>, <code>quota</code>, <code>props.*</code>) takes no slot, so eight slow verbs never starve them. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.</p>
+<p>A blob reference is <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…","name":"…"?, "origin":"&lt;node name&gt;"}</code> (<code>name</code> present only when the ingester knew one; <code>origin</code> is a node name, never an IP).</p>
+<h2 id="verbs">Verbs</h2>
+<h3 id="blobput"><code>blob.put</code></h3>
+<p>Daemon-local ingest: hash the file at <code>path</code> streaming into the CAS (copy, reflink with soft fall-through, or hard-link), then pin it.</p>
+<table><thead><tr><th>Argument</th><th style="text-align: right">Default</th><th>Constraints</th></tr></thead><tbody>
+<tr><td><code>path</code></td><td style="text-align: right">Required</td><td>Absolute path readable by the <code>cosmix-blobd</code> user</td></tr>
+<tr><td><code>owner</code></td><td style="text-align: right">The calling service (<code>from</code>)</td><td>Pin owner</td></tr>
+<tr><td><code>mime</code></td><td style="text-align: right">Sniffed from <code>name</code>/<code>path</code> extension</td><td>String</td></tr>
+<tr><td><code>name</code></td><td style="text-align: right">The <code>path</code> file name</td><td>String</td></tr>
+<tr><td><code>mode</code></td><td style="text-align: right"><code>copy</code></td><td>One of <code>copy</code>, <code>reflink</code>, <code>hardlink</code></td></tr>
+<tr><td><code>immutable</code></td><td style="text-align: right"><code>false</code></td><td>Must be <code>true</code> when <code>mode</code> is <code>hardlink</code></td></tr>
+</tbody></table>
+<p><code>hardlink</code> aliases the source inode into the CAS and is only for publishers that promise the source path immutable from the call onward — never a filesd place. Quota (owner cap, then total cap) is checked before the copy. The reply is the reference. Idempotent: a re-put returns the same reference and pins nothing new. Emits <code>blob.pinned</code> when a pin was added.</p>
+<h3 id="blobstat"><code>blob.stat</code></h3>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>blob</code></td><td>Blob id (<code>b3:&lt;64 hex&gt;</code>)</td></tr>
+</tbody></table>
+<p>The response contains <code>present</code>, <code>size</code> (filesystem, or the last known index size when absent), <code>mime</code>, <code>pins</code> (owner list), <code>origin</code> and <code>first_put</code> (milliseconds since the epoch; the latter three are <code>null</code> when blobd holds no attributes row).</p>
+<h3 id="blobpath"><code>blob.path</code></h3>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>blob</code></td><td>Blob id</td></tr>
+</tbody></table>
+<p>The response contains the absolute CAS <code>path</code> for zero-copy same-node reads, or <code>not_present</code> (rc 10) when the bytes are not held.</p>
+<h3 id="bloburl"><code>blob.url</code></h3>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>blob</code></td><td>Blob id</td></tr>
+</tbody></table>
+<p>The response contains <code>url</code>, <code>http://&lt;lane_bind&gt;/blob/&lt;hex&gt;</code> — exactly the path the byte lane serves (<code>GET</code> with <code>Range</code>, <code>HEAD</code>; see the README's Byte lane section). Requires the bytes to be present and <code>lane_bind</code> to be configured; the lane publishes <code>lane.port</code>/<code>lane.bind</code> props only once its socket is listening, so a remote resolves the port with a mesh-open <code>blob.props.get</code> on the origin node's <code>blobd</code> service.</p>
+<h3 id="blobhas"><code>blob.has</code></h3>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>blobs</code></td><td>Array of blob ids</td></tr>
+</tbody></table>
+<p>Bulk presence check. The response contains <code>present</code> and <code>missing</code> arrays of blob ids, in input order.</p>
+<h3 id="blobpin--blobunpin"><code>blob.pin</code> / <code>blob.unpin</code></h3>
+<table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
+<tr><td><code>blob</code></td><td>Blob id</td></tr>
+<tr><td><code>owner</code></td><td>Pin owner (defaults to the calling service)</td></tr>
+</tbody></table>
+<p>Owner-tagged pins (<code>maild:acct7</code>, <code>capture:session-12</code>, <code>filesd:notes</code> style). Both are idempotent; the response contains <code>pinned</code>, whether a pin row actually changed. Pinning requires the bytes to be present; unpinning never does. Emit <code>blob.pinned</code> / <code>blob.unpinned</code> on a transition. Every producer of these two events — <code>blob.put</code>, <code>blob.pin</code>/<code>blob.unpin</code>, a <code>blob.fetch</code> completion — publishes the same body, <code>{blob, owner}</code>; the topic is the event type.</p>
+<h3 id="bloblist"><code>blob.list</code></h3>
+<table><thead><tr><th>Argument</th><th style="text-align: right">Default</th><th>Constraints</th></tr></thead><tbody>
+<tr><td><code>owner</code></td><td style="text-align: right">unset</td><td>Restrict to this owner's pins</td></tr>
+<tr><td><code>limit</code></td><td style="text-align: right"><code>100</code></td><td>Clamped 1 through 1000</td></tr>
+<tr><td><code>cursor</code></td><td style="text-align: right">unset</td><td>Blob id of the last entry of the previous page</td></tr>
+</tbody></table>
+<p>Inventory of blobs blobd knows (attributes or pins — an orphan file with neither is invisible, which is what the restart gate asserts). The response contains <code>blobs</code> (each a reference plus its <code>pins</code>) and <code>next</code>: the blob id of the last entry of the page — the cursor for the next page — or <code>null</code> when the page is empty. A page that comes back short (fewer entries than the limit) is the last; the page after it answers <code>blobs: []</code> with <code>next: null</code>.</p>
+<h3 id="blobquota"><code>blob.quota</code></h3>
+<table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>owner</code></td><td>unset (all owners)</td></tr>
+</tbody></table>
+<p>The response contains <code>owners</code> (<code>&lt;owner&gt;: {used, limit, reserved}</code>) and <code>total: {used, limit, reserved}</code>. <code>used</code> sums distinct pinned blob sizes per owner; <code>reserved</code> is the in-flight upload headroom — bytes admitted to running uploads (lane <code>POST</code>/<code>PUT</code> bodies, <code>blob.fetch</code> downloads) whose pins have not landed yet. A fresh upload is refused against <code>used + reserved</code>, so concurrent uploads cannot each spend the same cap room, and the reservation releases when the pin settles or the upload aborts.</p>
+<h3 id="blobgc"><code>blob.gc</code></h3>
+<table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>dry_run</code></td><td><code>false</code></td></tr>
+</tbody></table>
+<p>Candidates are CAS files with mds refcount 0 (no row counts as 0), no pin, and an mtime older than the 60-second grace window. A dry run lists; a live run unlinks, drops attributes, adjusts quota and emits <code>blob.swept {count}</code>. One sweep at a time: a <code>blob.gc</code> arriving while another runs answers rc 10 <code>busy</code> at once. The response contains <code>dry_run</code>, <code>count</code>, <code>bytes_freed</code>, the swept blob ids, and <code>skipped</code> (<code>referenced</code>, <code>pinned</code>, <code>young</code>).</p>
+<h3 id="blobinfo"><code>blob.info</code></h3>
+<p>No arguments. Version, git sha, build time, <code>root</code>, <code>instance</code>, <code>lane_bind</code> and <code>counts</code> (<code>blobs</code>, <code>pins</code>).</p>
+<h3 id="blobfetch"><code>blob.fetch</code></h3>
+<p>Cross-node pull over the origin's byte lane. <strong>Replies immediately</strong> — never a deferred reply (the mesh response timeout is 30 s; a multi-GiB pull outlives it).</p>
+<table><thead><tr><th>Argument</th><th>Requirement</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>blob</code></td><td>Blob id, or a full reference object</td><td>From a reference, the <code>origin</code> (and an <code>instance</code> member, if present) drive first-try resolution</td></tr>
+<tr><td><code>from</code></td><td>Optional</td><td>Node name; overrides the reference's <code>origin</code> for the first try</td></tr>
+<tr><td><code>instance</code></td><td>Optional</td><td>Remote instance name; the target service becomes <code>blobd-&lt;name&gt;</code></td></tr>
+<tr><td><code>owner</code></td><td>The calling service (<code>from</code>)</td><td>Pin owner for this caller</td></tr>
+</tbody></table>
+<p>The reply is <code>{accepted:true, blob, origin, in_flight, queued, present}</code>:</p>
 <ul>
-<li><code>Mds</code>, the thread-safe storage trait.</li>
-<li><code>SqliteCasMds</code>, the production SQLite and CAS implementation.</li>
-<li><code>SqliteSetTx</code>, the per-set transaction handle.</li>
-<li><code>Error</code> and <code>Result</code>.</li>
-<li>All public identifiers, records, events, tokens, scopes, and report types from <code>types</code>.</li>
+<li><code>present:true</code> — the CAS already had it; the caller's pin landed and this reply is the completion (<code>in_flight</code> and <code>queued</code> are false).</li>
+<li><code>present:false, in_flight:false</code> — this call admitted a new fetch.</li>
+<li><code>present:false, in_flight:true</code> — a fetch for this hash was already in the system (running or queued) and this call joined it: <strong>single-flight per hash</strong>, one download, the joiner's pin lands on completion.</li>
+<li><code>queued</code> — orthogonal to <code>in_flight</code>: true when the fetch this call admitted or joined is waiting for one of the <code>fetch_max_concurrent</code> slots, false when its download holds one. A new fetch takes its slot at admission, so <code>in_flight:false, queued:false</code> means the download is running, not waiting.</li>
 </ul>
-<p><code>Mds</code> is <code>Send + Sync</code>. Calls that use the same set serialize through a per-set lock. Calls on different sets can proceed independently. Events are published only after the transaction that created them commits.</p>
-<h3 id="trait-operations">Trait operations</h3>
-<table><thead><tr><th>Group</th><th>Methods</th></tr></thead><tbody>
-<tr><td>Set lifecycle</td><td><code>create_set</code>, <code>delete_set</code>, <code>list_sets</code></td></tr>
-<tr><td>Container lifecycle</td><td><code>create_container</code>, <code>rename_container</code>, <code>delete_container</code>, <code>list_containers</code>, <code>container_status</code></td></tr>
-<tr><td>Blob CAS</td><td><code>put_blob</code>, <code>get_blob</code>, <code>blob_size</code>, <code>blob_exists</code>, <code>put_blob_path</code>, <code>put_blob_reader</code>, <code>put_blob_reader_expect</code>, <code>blob_file</code></td></tr>
-<tr><td>Item mutation</td><td><code>add_item</code>, <code>copy_item</code>, <code>move_item</code>, <code>remove_membership</code>, <code>store_flags</code></td></tr>
-<tr><td>Keywords</td><td><code>store_membership_keywords</code>, <code>store_item_keywords</code>, <code>item_memberships</code></td></tr>
-<tr><td>Item lookup</td><td><code>fetch_item</code>, <code>fetch_item_meta</code>, <code>find_items_by_blob_hash</code>, <code>search_items</code>, <code>list_items</code></td></tr>
-<tr><td>Change streams</td><td><code>changes_since</code>, <code>changes_since_set</code>, <code>prune_changelog</code>, <code>changelog_floor</code></td></tr>
-<tr><td>Notification</td><td><code>subscribe</code>, <code>subscribe_existing</code></td></tr>
-<tr><td>Maintenance</td><td><code>rebuild_index</code>, <code>verify_blobs</code>, <code>gc</code>, <code>stats</code>, <code>stats_per_set</code></td></tr>
-<tr><td>Transfer</td><td><code>export_set</code>, <code>import_set</code></td></tr>
-</tbody></table>
-<p>The principal identifier wrappers are <code>SetId</code>, <code>ContainerId</code>, <code>ItemId</code>, and <code>BlobHash</code>. Ordering and change tracking use the distinct <code>Seq</code>, <code>ChangeToken</code>, <code>SetChangeToken</code>, and <code>ContainerChangeSetToken</code> types.</p>
-<p><code>Flags</code> stores the system-flag bitmap. Allocated bits represent seen, flagged, answered, draft, and deleted states. <code>Tags</code> stores sorted, unique user keywords.</p>
-<p><code>ItemRecord</code> is a per-membership view joining item metadata with its container sequence, flags, tags, and change token. It is constructed from SQLite on reads and is not a persisted wire snapshot.</p>
-<h2 id="streaming-ingest-and-reads">Streaming ingest and reads</h2>
-<p><code>blob::put_reader</code> streams any <code>Read</code> into the CAS, hashing with BLAKE3 while the bytes are staged under <code>blobs/.tmp</code>; the hash is only known at stream end and the write protocol already tolerates that. A reader error mid-stream removes the staged file and leaves no CAS entry. <code>blob::put</code> is a thin wrapper over it. <code>blob::open</code> returns the CAS file for streaming reads, and <code>Mds::blob_file</code> is its trait-level counterpart.</p>
-<p><code>blob::put_reader_expect</code> is <code>put_reader</code> for a caller that already knows the hash the bytes must land under (a blob-lane <code>PUT /blob/&lt;hex&gt;</code>, a fetch by reference): the staged bytes are compared against <code>expected</code> <strong>before</strong> anything commits, and a mismatch removes the staging and returns <code>Error::BlobCorrupt</code> naming both hashes — a wrong body never enters the CAS under either hash, so no caller has to unlink a wrong-hash landing afterwards. <code>Mds::put_blob_reader_expect</code> is its trait-level counterpart.</p>
-<p><code>blob::put_path</code> ingests a local file under a <code>PutMode</code>:</p>
-<ul>
-<li><code>Copy</code> — plain userspace copy.</li>
-<li><code>Reflink</code> — kernel-side copy (<code>FICLONE</code>, then <code>copy_file_range</code>) that falls through to a full copy on <strong>any</strong> kernel-path error, never merely because the filesystem lacks reflink support: no errno allowlist anticipates every refusal (OpenZFS with block cloning disabled answers <code>FICLONE</code> with <code>EPERM</code>, and a container's seccomp profile can refuse the ioctl outright — both caught on the build cluster, 2026-09-26). The userspace copy that follows either succeeds or surfaces the real error itself.</li>
-<li><code>HardLink</code> — links the source inode into the CAS; only callers that promise the source path immutable from the call onward may use it. A mutable path such as a filesd place must use <code>Copy</code> or <code>Reflink</code>. The staged link is touched to now before it commits (the inode is shared, so the source's mtime moves with it — an mtime is not content).</li>
-</ul>
-<p>Every mode re-hashes the staged bytes against the ingest-time hash before they are linked in, so a source rewritten mid-copy cannot enter the store under a stale hash. <code>SqliteCasMds::blobs_root</code> is public, so an out-of-process CAS owner reaches <code>blob::put_path</code> and <code>blob::open</code> with the same root the store itself uses.</p>
-<p><code>blob_index::BlobRow</code>, <code>blob_row</code>, and <code>list_blob_rows</code> expose the box-wide blob table read-only — a row's hash, size, first and last seen, and refcount — taking the direct <code>blobs.sqlite</code> connection.</p>
-<h2 id="transaction-scope">Transaction scope</h2>
-<p><code>SqliteCasMds::with_set_tx</code> runs a closure inside one <code>BEGIN IMMEDIATE</code> transaction for a set. The set database already has <code>blobs.sqlite</code> attached, so metadata, sidecar tables, and blob references can commit atomically.</p>
-<p><code>SqliteSetTx</code> provides typed operations for:</p>
-<ul>
-<li>Ensuring, creating, renaming, deleting, and updating containers.</li>
-<li>Adding a staging item or an item with multiple memberships.</li>
-<li>Adding, moving, and removing memberships.</li>
-<li>Storing item or membership flags and keywords.</li>
-<li>Reading memberships, sequence validity, and set-wide changes.</li>
-<li>Accessing the underlying <code>rusqlite::Transaction</code> when a typed method is unavailable.</li>
-</ul>
-<p>Do not call an <code>Mds</code> mutation method from inside <code>with_set_tx</code>. It attempts to re-enter the same per-set lock and opens a separate transaction. Use <code>SqliteSetTx</code> methods or its raw transaction handle.</p>
-<p>Typed transaction operations buffer notifier and Bus events. The buffer drains after commit and is discarded on error or panic. Raw SQL through <code>SqliteSetTx::tx</code> does not create events automatically.</p>
-<h2 id="change-notification">Change notification</h2>
-<p><code>subscribe</code> and <code>subscribe_existing</code> return bounded Tokio broadcast receivers keyed by set and container. <code>subscribe_existing</code> checks that both objects exist while holding the same set lock used by container deletion.</p>
-<p>The in-process <code>ContainerEvent</code> variants are:</p>
-<ul>
-<li><code>ItemAdded</code></li>
-<li><code>FlagsChanged</code></li>
-<li><code>ItemRemoved</code></li>
-<li><code>ItemMoved</code></li>
-</ul>
-<p>Slow receivers can observe Tokio's <code>Lagged</code> error. Notifications wake consumers; they do not provide an unbounded event log. Durable consumers use the SQLite change streams.</p>
-<h2 id="bus-events">Bus events</h2>
-<p>The <code>bus</code> module always defines <code>MdsEvent</code>, typed payload structures, topic constants, and <code>EventSink</code>. These types can be used as an in-process broadcast surface without enabling the Bus transport dependencies.</p>
-<table><thead><tr><th>Topic</th><th>Transition</th></tr></thead><tbody>
-<tr><td><code>mds.set.created</code></td><td>Set created</td></tr>
-<tr><td><code>mds.set.deleted</code></td><td>Set deleted</td></tr>
-<tr><td><code>mds.container.created</code></td><td>Container created</td></tr>
-<tr><td><code>mds.container.renamed</code></td><td>Container renamed or moved</td></tr>
-<tr><td><code>mds.container.deleted</code></td><td>Container deleted</td></tr>
-<tr><td><code>mds.item.added</code></td><td>Item added</td></tr>
-<tr><td><code>mds.item.flagged</code></td><td>Item flags changed</td></tr>
-<tr><td><code>mds.item.copied</code></td><td>Membership copied</td></tr>
-<tr><td><code>mds.item.moved</code></td><td>Membership moved</td></tr>
-<tr><td><code>mds.item.removed</code></td><td>Membership removed</td></tr>
-<tr><td><code>mds.gc.completed</code></td><td>Garbage collection completed</td></tr>
-<tr><td><code>mds.verify.completed</code></td><td>Verification completed</td></tr>
-<tr><td><code>mds.verify.failed</code></td><td>One blob failed verification</td></tr>
-<tr><td><code>mds.changelog.pruned</code></td><td>A retained change stream was pruned</td></tr>
-</tbody></table>
-<p>With the <code>cosmix</code> feature, <code>spawn_publisher_task</code> drains an <code>MdsEvent</code> receiver and sends non-retained <code>topic.publish</code> requests through <code>NodedClient</code>. <code>SqliteCasMds::with_bus_events</code> installs a default-capacity event sink and returns its first receiver.</p>
-<p>The crate exposes events, not a Bus command or verb service.</p>
-<h2 id="maintenance">Maintenance</h2>
-<p><code>verify_blobs</code> supports full verification, verification since a time, or verification of blobs referenced by a container. It recomputes BLAKE3 and records success, hash mismatch, or missing-file status in the verification ledger.</p>
-<p><code>gc</code> performs two passes over unreferenced blobs with a quiescence interval between passes. It rechecks refcounts and last-seen timestamps before deletion. Dry-run mode reports the work without unlinking files or deleting rows.</p>
-<p><code>rebuild_index</code> reconstructs the shared blob index from every per-set database and the CAS. It preserves the verification ledger and reports valid CAS files that are not represented in the rebuilt index.</p>
-<p><code>export_set</code> writes a tar archive containing <code>manifest.json</code>, a WAL-free <code>data.sqlite</code> snapshot, and each distinct referenced CAS blob. It does not export <code>blobs.sqlite</code>.</p>
-<p><code>import_set</code> validates the archive layout, manifest, schema version, entry paths, and every blob hash before installing the set. It refuses an existing set UUID and reconstructs the imported set's blob references.</p>
-<p>See <a href="/cos/cosmix-mds/cli">CLI reference</a> for the operator commands.</p>
-<h2 id="configuration">Configuration</h2>
-<table><thead><tr><th>Setting</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>COSMIX_MDS_ROOT</code></td><td>Storage root used by the CLI when <code>--root</code> is absent</td></tr>
-<tr><td><code>COSMIX_MDS_GC_QUIESCENCE_SECS</code></td><td>GC pass interval in integer seconds</td></tr>
-</tbody></table>
-<p>The GC interval defaults to 60 seconds. Values below 5 seconds in <code>COSMIX_MDS_GC_QUIESCENCE_SECS</code> are ignored and the default remains in effect. <code>with_gc_quiescence</code> bypasses that floor for tests.</p>
-<h2 id="cargo-features">Cargo features</h2>
-<table><thead><tr><th>Feature</th><th style="text-align: right">Default</th><th>Effect</th></tr></thead><tbody>
-<tr><td><code>core</code></td><td style="text-align: right">Yes</td><td>Default storage profile; this marker adds no dependencies</td></tr>
-<tr><td><code>cosmix</code></td><td style="text-align: right">No</td><td>Adds <code>cosmix-lib-bus</code> and native <code>cosmix-lib-client</code>, and exposes <code>spawn_publisher_task</code></td></tr>
-<tr><td><code>mem-store</code></td><td style="text-align: right">No</td><td>Exposes <code>MemMds</code>; its current <code>Mds</code> methods are stubs that panic with <code>unimplemented!()</code></td></tr>
-<tr><td><code>_stress-helper</code></td><td style="text-align: right">No</td><td>Internal only; builds <code>cosmix-mds-stress-writer</code> for crash-recovery tests</td></tr>
-</tbody></table>
-<h2 id="modules">Modules</h2>
-<table><thead><tr><th>Module</th><th>Purpose</th></tr></thead><tbody>
-<tr><td><code>store</code></td><td><code>Mds</code>, <code>SqliteCasMds</code>, per-set locking, transactions, and maintenance orchestration</td></tr>
-<tr><td><code>types</code></td><td>Identifiers, flags, tags, records, events, scopes, and reports</td></tr>
-<tr><td><code>container</code></td><td>Container, item, membership, search, and changelog SQL operations</td></tr>
-<tr><td><code>blob</code></td><td>BLAKE3 hashing, streaming ingest (<code>put_reader</code>, <code>put_path</code>), <code>open</code>, and atomic CAS file operations</td></tr>
-<tr><td><code>blob_index</code></td><td>Shared blob index, references, refcounts, verification ledger, and the read-only <code>BlobRow</code> inventory API</td></tr>
-<tr><td><code>schema</code></td><td>Versioned SQLite migration runners</td></tr>
-<tr><td><code>notifier</code></td><td>Per-container in-process broadcast channels</td></tr>
-<tr><td><code>bus</code></td><td>Typed event taxonomy, event sink, and optional Bus publisher</td></tr>
-<tr><td><code>verify</code></td><td>Blob integrity verification</td></tr>
-<tr><td><code>rebuild</code></td><td>Derived blob-index reconstruction</td></tr>
-<tr><td><code>export</code>, <code>import</code></td><td>Set archive transfer</td></tr>
-<tr><td><code>gc</code></td><td>Garbage-collection module boundary</td></tr>
-<tr><td><code>error</code></td><td>Typed crate errors</td></tr>
-<tr><td><code>mem</code></td><td>Feature-gated in-memory stub</td></tr>
-</tbody></table>
-<h2 id="dependencies">Dependencies</h2>
-<p>SQLite persistence uses <code>rusqlite</code>; hashing uses <code>blake3</code>; identifiers use UUID v7 support; <code>put_path</code>'s kernel-side copy uses <code>libc</code> (<code>FICLONE</code>, <code>copy_file_range</code>). Tokio provides broadcast channels, <code>parking_lot</code> provides locks, and Serde supplies typed JSON payloads. The operator binary uses Clap and <code>humantime</code>; archive transfer uses <code>tar</code> and <code>chrono</code>. Bus dependencies remain optional.</p></div></div>
+<p>The immediate reply and <code>blob.fetched</code> are <strong>not ordered</strong> relative to each other — a fast fetch can complete before its reply arrives. Subscribe to <code>blob.fetched</code> before sending the fetch (<code>blob_fetch_wait</code> in <code>mix/blob.mix</code> does).</p>
+<p>Completion is the <code>blob.fetched</code> event (<code>retain: false</code>, so a late subscriber sees nothing) plus the <code>blob.stat</code> transition <code>present:false → true</code>:</p>
+<pre><code class="language-json">{"blob":"b3:…","outcome":"ok","origin_used":"alpha","size":184320}
+</code></pre>
+<p><code>outcome</code> ∈ <code>ok · origin_unreachable · not_found_anywhere · verify_failed · quota · io</code> (<code>origin_used</code> is null and <code>error</code> carries the reason on every non-<code>ok</code> outcome). Quota is settled <strong>per owner</strong> when the pins land: an owner (submitter or joiner) whose cap refuses the pin is listed in <code>refused: [owner…]</code> and gets no pin, while the owners that fit are pinned and the outcome stays <code>ok</code>; when no owner fits, the outcome is <code>quota</code> (with <code>refused</code>). A download that outlives <code>fetch_deadline_secs</code> is <code>origin_unreachable</code> with an <code>error</code> naming the deadline. Resolution tries the origin first (props-resolved lane URL through the local noded), then falls back to a <code>blob.has</code> fan-out over <code>noded.peers</code>; <code>verify_failed</code> is terminal, never retried against another peer. Bounds, classification rules and the transfer details are in the README's <a href="../cosmix-blobd/#fetching">Fetching</a> section.</p>
+<p><code>blob.fetched</code> is <strong>best-effort across a broker reconnect</strong>: events published while blobd has no broker connection are buffered (bounded, 256 — the oldest drop beyond it) and replayed on the next connection, oldest first. Recovery when an event may have been missed: <code>blob.stat</code> showing <code>present:true</code>, and <code>blob_fetch_wait</code>'s own timeout — never polling, never a retained event.</p></div></div>
     </div>
 
 </main>

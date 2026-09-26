@@ -1,0 +1,72 @@
+[package]
+name = "cosmix-blobd"
+version = "0.5.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node blob store daemon: content-addressed bytes, owner pins, quotas, GC"
+
+[lib]
+name = "cosmix_blobd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-blobd"
+path = "src/main.rs"
+required-features = ["cosmix"]
+
+[features]
+default = ["cosmix"]
+# The Bus citizen: registration, verbs, events, props, the byte lane
+# and the cross-node fetch machinery. Off, the crate is the pure store
+# core (tests run here).
+cosmix = [
+    "dep:anyhow",
+    "dep:axum",
+    "dep:clap",
+    "dep:cosmix_buildinfo",
+    "dep:cosmix_bus",
+    "dep:cosmix_client",
+    "dep:cosmix_config",
+    "dep:cosmix_log",
+    "dep:cosmix_props_core",
+    "cosmix_props_core/bus",
+    "dep:futures-util",
+    "dep:http-body-util",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tokio-util",
+]
+
+[dependencies]
+# Core: the store over mds's CAS (BLOBS_LATEST stays 1 — D4).
+cosmix_mds = { package = "cosmix-mds", path = "../cosmix-mds" }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+# flock on <root>/.blobd.lock — one GC owner per root (D4).
+libc = { workspace = true }
+anyhow = { workspace = true, optional = true }
+# The byte lane: GET/HEAD/PUT/POST /blob on the WireGuard address.
+axum = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo", optional = true }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
+# The subscriber main installs (journald-primary, RUST_LOG/EnvFilter) —
+# the dnsd/wgd logging-only shape, stats off.
+cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log", optional = true }
+cosmix_props_core = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", default-features = false, optional = true }
+# blob.fetch: the streaming HTTP client (bytes_stream) and its pump.
+futures-util = { workspace = true, optional = true }
+http-body-util = { version = "0.1", optional = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

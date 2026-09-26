@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-ced"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3066,6 +3066,7 @@ dependencies = [
  "cosmix-lib-config",
  "cosmix-scene",
  "iced",
+ "iced_tiny_skia",
  "proptest",
  "rand 0.8.8",
  "serde",
@@ -3595,7 +3596,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "cosmix-design",
  "cosmix-lib-buildinfo",
