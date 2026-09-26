@@ -118,6 +118,11 @@ impl Lane {
             gets: AtomicU64::new(0),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn gets(&self) -> u64 {
+        self.gets.load(Ordering::Relaxed)
+    }
 }
 
 /// The lane's route table, shared by [`serve_lane`] and the test
@@ -708,6 +713,15 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Store options naming this lane's node `origin` (references and
+    /// fetch bookkeeping report it).
+    pub(crate) fn options_for(origin: &str) -> StoreOptions {
+        StoreOptions {
+            origin: origin.into(),
+            ..options()
+        }
+    }
+
     /// Deterministic pseudo-random bytes (xorshift64*): incompressible
     /// enough that no accidental dedup hides a wrong-range read, and
     /// reproducible across runs.
@@ -724,23 +738,33 @@ pub(crate) mod test_support {
         out
     }
 
-    /// A loopback lane without the counter handle.
-    pub(crate) async fn test_lane(options: StoreOptions) -> (TempDir, Arc<Store>, SocketAddr) {
+    /// A loopback lane with its GET counter exposed (the fetch tests
+    /// assert exactly one download per hash).
+    pub(crate) async fn counted_lane(
+        options: StoreOptions,
+    ) -> (TempDir, Arc<Store>, SocketAddr, Arc<Lane>) {
         let dir = TempDir::new().unwrap();
         let store = Arc::new(Store::open(dir.path(), options).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let lane = Arc::new(Lane::new(Arc::clone(&store), 4));
+        let serve_lane = Arc::clone(&lane);
         tokio::spawn(async move {
             if let Err(error) = axum::serve(
                 listener,
-                lane_router(lane).into_make_service_with_connect_info::<SocketAddr>(),
+                lane_router(serve_lane).into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             {
                 eprintln!("test lane stopped: {error}");
             }
         });
+        (dir, store, addr, lane)
+    }
+
+    /// A loopback lane without the counter handle.
+    pub(crate) async fn test_lane(options: StoreOptions) -> (TempDir, Arc<Store>, SocketAddr) {
+        let (dir, store, addr, _lane) = counted_lane(options).await;
         (dir, store, addr)
     }
 }

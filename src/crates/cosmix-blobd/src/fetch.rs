@@ -1064,6 +1064,48 @@ async fn pump_response(response: reqwest::Response, tx: mpsc::Sender<Frame>, cap
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    /// A static node → lane-URL map; nodes in `unreachable` always
+    /// fail (the `Service 'blobd' not found` shape, from the
+    /// fetcher's point of view).
+    #[derive(Default)]
+    pub(crate) struct MapResolver {
+        urls: HashMap<String, String>,
+        unreachable: HashSet<String>,
+    }
+
+    impl MapResolver {
+        pub(crate) fn map(mut self, node: &str, url: impl Into<String>) -> Self {
+            self.urls.insert(node.to_string(), url.into());
+            self
+        }
+
+        pub(crate) fn unreachable(mut self, node: &str) -> Self {
+            self.unreachable.insert(node.to_string());
+            self
+        }
+    }
+
+    impl Resolver for MapResolver {
+        fn lane_url<'a>(
+            &'a self,
+            node: &'a str,
+            _instance: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(std::future::ready(if self.unreachable.contains(node) {
+                Err(format!(
+                    "Service 'blobd' not found on {node} (test resolver)"
+                ))
+            } else {
+                self.urls
+                    .get(node)
+                    .cloned()
+                    .ok_or_else(|| format!("no lane mapped for {node} (test resolver)"))
+            }))
+        }
+    }
 
     /// Always unreachable — for citizen tests that never fetch.
     pub(crate) struct NullResolver;
@@ -1077,6 +1119,41 @@ pub(crate) mod test_support {
             Box::pin(std::future::ready(Err(format!(
                 "Service 'blobd' not found on {node} (null resolver)"
             ))))
+        }
+    }
+
+    /// A fixed roster whose `blob.has` answers by checking the peer's
+    /// real store — exactly what production's mesh-open `blob.has`
+    /// would say.
+    #[derive(Default)]
+    pub(crate) struct ListPeers {
+        peers: Vec<String>,
+        stores: HashMap<String, Arc<Store>>,
+    }
+
+    impl ListPeers {
+        pub(crate) fn with_peer(mut self, node: &str, store: Arc<Store>) -> Self {
+            self.peers.push(node.to_string());
+            self.stores.insert(node.to_string(), store);
+            self
+        }
+    }
+
+    impl PeerSource for ListPeers {
+        fn peers(&self) -> BoxFuture<'static, Result<Vec<String>, String>> {
+            Box::pin(std::future::ready(Ok(self.peers.clone())))
+        }
+
+        fn has(
+            self: Arc<Self>,
+            node: String,
+            hash: BlobHash,
+        ) -> BoxFuture<'static, Result<bool, String>> {
+            Box::pin(std::future::ready(Ok(self
+                .stores
+                .get(&node)
+                .map(|store| blob::exists(&store.blobs_root(), &hash).unwrap_or(false))
+                .unwrap_or(false))))
         }
     }
 
@@ -1106,5 +1183,653 @@ pub(crate) mod test_support {
             self.0.lock().unwrap().push(event);
             Box::pin(std::future::ready(()))
         }
+    }
+
+    impl TestSink {
+        /// Wait (polling) for the newest event on `topic` whose body
+        /// matches `pred`; `None` on timeout.
+        pub(crate) async fn wait(
+            &self,
+            topic: &str,
+            pred: impl Fn(&Value) -> bool,
+            timeout: Duration,
+        ) -> Option<Value> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let found = {
+                    let events = self.0.lock().unwrap();
+                    events.iter().rev().find_map(|event| {
+                        if event.topic != topic {
+                            return None;
+                        }
+                        let value: Value = serde_json::from_str(&event.message.body).ok()?;
+                        pred(&value).then_some(value)
+                    })
+                };
+                if let Some(value) = found {
+                    return Some(value);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        /// Every event body seen on `topic`, in order.
+        pub(crate) fn bodies(&self, topic: &str) -> Vec<Value> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.topic == topic)
+                .map(|event| serde_json::from_str(&event.message.body).unwrap_or(Value::Null))
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{ListPeers, MapResolver, TestSink};
+    use super::*;
+    use crate::citizen::Citizen;
+    use crate::core::store::{PutOptions, StoreOptions};
+    use crate::lane::test_support::{counted_lane, options_for, pseudo_random};
+    use cosmix_client::IncomingCommand;
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A citizen + fetcher pair over `store`, with the injected
+    /// resolver, roster and recording sink, and the dispatcher running.
+    async fn fetch_setup(
+        store: Arc<Store>,
+        lane_bind: Option<SocketAddr>,
+        resolver: MapResolver,
+        peers: ListPeers,
+    ) -> (Citizen, Fetcher, TestSink) {
+        let sink = TestSink::default();
+        let fetcher = Fetcher::new(
+            Arc::clone(&store),
+            FetchConfig::default(),
+            lane_bind,
+            "default".into(),
+            Arc::new(resolver),
+            Arc::new(peers),
+            Arc::new(sink.clone()),
+        );
+        let citizen = Citizen::new(
+            store,
+            "blobd".into(),
+            "default".into(),
+            lane_bind,
+            Arc::new(fetcher.clone()),
+        );
+        fetcher.spawn_dispatcher().await;
+        (citizen, fetcher, sink)
+    }
+
+    /// A plain store (no lane) named `origin`.
+    fn bare_store(origin: &str) -> (TempDir, Arc<Store>) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path(), options_for(origin)).unwrap();
+        (dir, Arc::new(store))
+    }
+
+    fn command(verb: &str, from: &str, args: Value) -> IncomingCommand {
+        let mut headers = BTreeMap::new();
+        headers.insert("args".into(), args.to_string());
+        IncomingCommand {
+            from: from.into(),
+            command: verb.into(),
+            id: Some("1".into()),
+            args: Value::Null,
+            body: String::new(),
+            headers,
+        }
+    }
+
+    fn tmp_is_empty(store: &Store) -> bool {
+        match std::fs::read_dir(store.blobs_root().join(".tmp")) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Read one HTTP/1.1 request head (through the blank line).
+    async fn read_head(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            assert_eq!(
+                stream.read(&mut byte).await.unwrap(),
+                1,
+                "peer closed mid-head"
+            );
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    // ---- The main lane: A holds ≥ 32 MiB, B fetches ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_pulls_32mib_from_a_lane_to_b_and_pins() {
+        // Node A: a real lane holding a ≥ 32 MiB blob (above
+        // MAX_MESSAGE_BYTES 16 MiB, so it can never ride a Bus frame).
+        let (dir_a, store_a, addr_a, _lane_a) = counted_lane(options_for("A")).await;
+        let bytes = pseudo_random(32 * 1024 * 1024 + 123, 0x5EED);
+        let src = dir_a.path().join("shot.png");
+        std::fs::write(&src, &bytes).unwrap();
+        let outcome = store_a.put(&src, &PutOptions::new("filesd")).unwrap();
+        let hash = outcome.reference.hash;
+        assert_eq!(hash, blob::hash_bytes(&bytes));
+        let id = reference::blob_id(&hash);
+
+        // Node B: a store plus a citizen whose resolver maps A's node
+        // name to its loopback lane.
+        let (_dir_b, store_b) = bare_store("B");
+        let resolver = MapResolver::default().map("A", format!("http://{addr_a}"));
+        let (citizen, fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, ListPeers::default()).await;
+
+        // The immediate reply: accepted, not present, not joined.
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": outcome.reference.to_json()}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["accepted"], true);
+        assert_eq!(reply["blob"], id.as_str());
+        assert_eq!(reply["origin"], "A");
+        assert_eq!(reply["in_flight"], false);
+        assert_eq!(reply["present"], false);
+
+        // Completion: blob.fetched ok from A.
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("blob.fetched ok");
+        assert_eq!(event["outcome"], "ok");
+        assert_eq!(event["origin_used"], "A");
+        assert_eq!(event["size"], bytes.len() as u64);
+
+        // The stat transition, byte equality, the pin, the attrs.
+        let stat = store_b.stat(&hash).unwrap();
+        assert!(stat.present);
+        assert_eq!(stat.pins, vec!["maild".to_string()]);
+        assert_eq!(stat.mime.as_deref(), Some("image/png"));
+        assert_eq!(stat.origin.as_deref(), Some("A"));
+        assert_eq!(blob::get(&store_b.blobs_root(), &hash).unwrap(), bytes);
+        assert_eq!(
+            blob::hash_bytes(&blob::get(&store_b.blobs_root(), &hash).unwrap()),
+            hash
+        );
+
+        // Quota accounted for the fetching owner; gauges settled.
+        let quota = store_b.quota_report(None).unwrap();
+        assert_eq!(quota.owners["maild"].used, bytes.len() as u64);
+        assert_eq!(quota.total.used, bytes.len() as u64);
+        let gauges = fetcher.gauges();
+        assert_eq!(
+            (
+                gauges.in_flight,
+                gauges.queued,
+                gauges.completed,
+                gauges.failed
+            ),
+            (0, 0, 1, 0)
+        );
+        assert!(tmp_is_empty(&store_b));
+
+        // The blob.pinned event rode along (what §4.3's replicate
+        // policy would trigger on), retain:false by construction.
+        let pinned = sink.bodies(crate::citizen::TOPIC_PINNED);
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0]["owner"], "maild");
+    }
+
+    // ---- Single-flight: a second fetch joins, one GET ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn second_fetch_of_an_in_flight_hash_joins_it() {
+        // A scripted origin that serves one byte, then holds until
+        // released — a download slow enough to join deterministically.
+        let bytes = pseudo_random(64 * 1024, 0x51E6);
+        let hash = blob::hash_bytes(&bytes);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU64::new(0));
+        let got_get = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        {
+            let hits = Arc::clone(&hits);
+            let got_get = Arc::clone(&got_get);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let head = read_head(&mut stream).await;
+                    if !head.starts_with("GET") {
+                        continue;
+                    }
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    got_get.notify_one();
+                    let body = bytes.clone();
+                    let release = Arc::clone(&release);
+                    tokio::spawn(async move {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream.write_all(head.as_bytes()).await.unwrap();
+                        stream.write_all(&body[..1]).await.unwrap();
+                        release.notified().await;
+                        stream.write_all(&body[1..]).await.unwrap();
+                    });
+                }
+            });
+        }
+
+        let (_dir_b, store_b) = bare_store("B");
+        let id = reference::blob_id(&hash);
+        let resolver = MapResolver::default().map("A", format!("http://{addr}"));
+        let (citizen, fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, ListPeers::default()).await;
+
+        // First fetch starts the download (in_flight: false)…
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": id, "from": "A"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["in_flight"], false);
+        assert_eq!(reply["present"], false);
+
+        // …the origin is mid-body when the second fetch joins.
+        got_get.notified().await;
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "filesd",
+            json!({"blob": id, "from": "A"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["in_flight"], true);
+        assert_eq!(reply["present"], false);
+
+        release.notify_one();
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("blob.fetched ok");
+        assert_eq!(event["outcome"], "ok");
+
+        // Exactly one GET hit the origin; both joiners pinned.
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        let stat = store_b.stat(&hash).unwrap();
+        assert!(stat.present);
+        assert!(stat.pins.contains(&"maild".to_string()));
+        assert!(stat.pins.contains(&"filesd".to_string()));
+        assert_eq!(fetcher.gauges().completed, 1);
+    }
+
+    // ---- Origin unreachable → fan-out finds it on C ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unreachable_origin_falls_back_to_a_peer() {
+        // C (a real lane) holds the blob; D is a peer that does not.
+        let (dir_c, store_c, addr_c, lane_c) = counted_lane(options_for("C")).await;
+        let (_dir_d, store_d) = bare_store("D");
+        let bytes = pseudo_random(256 * 1024, 0xF11A);
+        let src = dir_c.path().join("data.bin");
+        std::fs::write(&src, &bytes).unwrap();
+        let outcome = store_c.put(&src, &PutOptions::new("filesd")).unwrap();
+        let hash = outcome.reference.hash;
+        let id = reference::blob_id(&hash);
+
+        let (_dir_b, store_b) = bare_store("B");
+        let resolver = MapResolver::default()
+            .unreachable("A")
+            .map("C", format!("http://{addr_c}"));
+        let peers = ListPeers::default()
+            .with_peer("C", Arc::clone(&store_c))
+            .with_peer("D", Arc::clone(&store_d));
+        let (citizen, _fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, peers).await;
+
+        // The reference says A; A is down; C answers the fan-out.
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": outcome.reference.to_json()}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("blob.fetched ok");
+        assert_eq!(event["outcome"], "ok");
+        assert_eq!(event["origin_used"], "C");
+
+        assert_eq!(lane_c.gets(), 1);
+        let stat = store_b.stat(&hash).unwrap();
+        assert!(stat.present);
+        assert_eq!(stat.origin.as_deref(), Some("C"));
+        assert_eq!(blob::get(&store_b.blobs_root(), &hash).unwrap(), bytes);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nobody_holds_it_not_found_anywhere() {
+        let (_dir_c, store_c) = bare_store("C");
+        let (_dir_d, store_d) = bare_store("D");
+        let (_dir_b, store_b) = bare_store("B");
+        let resolver = MapResolver::default().unreachable("A");
+        let peers = ListPeers::default()
+            .with_peer("C", store_c)
+            .with_peer("D", store_d);
+        let (citizen, fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, peers).await;
+
+        let bytes = pseudo_random(4096, 0x0FF);
+        let hash = blob::hash_bytes(&bytes);
+        let id = reference::blob_id(&hash);
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": id, "from": "A"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("blob.fetched");
+        assert_eq!(event["outcome"], "not_found_anywhere");
+        assert_eq!(event["origin_used"], Value::Null);
+        assert!(event["error"].as_str().is_some());
+
+        // The CAS is untouched and the counters landed on `failed`.
+        assert!(!blob::exists(&store_b.blobs_root(), &hash).unwrap());
+        assert!(tmp_is_empty(&store_b));
+        let gauges = fetcher.gauges();
+        assert_eq!(
+            (
+                gauges.in_flight,
+                gauges.queued,
+                gauges.completed,
+                gauges.failed
+            ),
+            (0, 0, 0, 1)
+        );
+    }
+
+    // ---- Wrong bytes: verify_failed, terminal, no peer retry ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wrong_bytes_verify_failed_is_terminal_and_never_retried() {
+        // A hostile origin serves bytes that do not hash to the
+        // requested id; peer C holds the real bytes and must never be
+        // asked (verify is terminal, never retried).
+        let real = pseudo_random(128 * 1024, 0x0BAD);
+        let hash = blob::hash_bytes(&real);
+        let id = reference::blob_id(&hash);
+        let hostile = pseudo_random(128 * 1024, 0xD1CE);
+        let hostile_hash = blob::hash_bytes(&hostile);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hostile_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_head(&mut stream).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    hostile.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&hostile).await;
+            }
+        });
+
+        let (dir_c, store_c, addr_c, lane_c) = counted_lane(options_for("C")).await;
+        let src = dir_c.path().join("real.bin");
+        std::fs::write(&src, &real).unwrap();
+        store_c.put(&src, &PutOptions::new("filesd")).unwrap();
+
+        let (_dir_b, store_b) = bare_store("B");
+        let resolver = MapResolver::default()
+            .map("A", format!("http://{hostile_addr}"))
+            .map("C", format!("http://{addr_c}"));
+        let peers = ListPeers::default().with_peer("C", Arc::clone(&store_c));
+        let (citizen, _fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, peers).await;
+
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": id, "from": "A"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("blob.fetched");
+        assert_eq!(event["outcome"], "verify_failed");
+        assert!(event["error"].as_str().unwrap().contains("hash mismatch"));
+
+        // Terminal: the peer that holds the real bytes was never
+        // asked, and neither hash has a CAS entry (the wrong-hash
+        // landing was unlinked; staging is empty).
+        assert_eq!(lane_c.gets(), 0, "verify_failed must not retry a peer");
+        assert!(!blob::exists(&store_b.blobs_root(), &hash).unwrap());
+        assert!(!blob::exists(&store_b.blobs_root(), &hostile_hash).unwrap());
+        assert!(tmp_is_empty(&store_b));
+        assert_eq!(store_b.quota_report(None).unwrap().total.used, 0);
+    }
+
+    // ---- Quota: refused from Content-Length before the first byte ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quota_refused_from_content_length_before_any_byte() {
+        // The origin declares 1 MiB and never sends a body: a
+        // mid-stream implementation would hang on the 30 s idle
+        // timeout instead, so a prompt `quota` proves the pre-check.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = read_head(&mut stream).await;
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                            Content-Length: 1048576\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(head.as_bytes()).await;
+                // No body, ever.
+            }
+        });
+
+        let capped = StoreOptions {
+            owner_limits: BTreeMap::from([("maild".to_string(), 4 * 1024)]),
+            ..options_for("B")
+        };
+        let dir = TempDir::new().unwrap();
+        let store_b = Arc::new(Store::open(dir.path(), capped).unwrap());
+
+        let bytes = pseudo_random(1024, 0x900D);
+        let hash = blob::hash_bytes(&bytes);
+        let id = reference::blob_id(&hash);
+        let resolver = MapResolver::default().map("A", format!("http://{addr}"));
+        let (citizen, fetcher, sink) =
+            fetch_setup(Arc::clone(&store_b), None, resolver, ListPeers::default()).await;
+
+        let (rc, body, _) = citizen.dispatch(&command(
+            "blob.fetch",
+            "maild",
+            json!({"blob": id, "from": "A"}),
+        ));
+        assert_eq!(rc, 0, "{body}");
+        let event = sink
+            .wait(
+                TOPIC_FETCHED,
+                |v| v["blob"] == id.as_str(),
+                // Well under the 30 s idle bound: the refusal must be
+                // prompt because no byte is ever read.
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("blob.fetched quota");
+        assert_eq!(event["outcome"], "quota");
+        assert!(event["error"].as_str().unwrap().contains("quota"));
+
+        assert!(!blob::exists(&store_b.blobs_root(), &hash).unwrap());
+        assert!(tmp_is_empty(&store_b));
+        assert_eq!(store_b.quota_report(None).unwrap().owners["maild"].used, 0);
+        assert_eq!(fetcher.gauges().failed, 1);
+    }
+
+    // ---- The queue bound: busy, never an unbounded queue ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn beyond_the_queue_bound_the_verb_answers_busy() {
+        // Two slots held by gated downloads, a queue of one, and a
+        // fourth fetch refused busy. The release is a watch latch so a
+        // download that starts after the release still completes.
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let release_rx = release_rx.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let _ = read_head(&mut stream).await;
+                    let mut released = release_rx.clone();
+                    tokio::spawn(async move {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                                    Content-Length: 10\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let _ = stream.write_all(b"x").await;
+                        while !*released.borrow_and_update() {
+                            if released.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                        let _ = stream.write_all(b"123456789").await;
+                    });
+                }
+            });
+        }
+
+        let (_dir_b, store_b) = bare_store("B");
+        let resolver = MapResolver::default().map("A", format!("http://{addr}"));
+        let sink = TestSink::default();
+        let config = FetchConfig {
+            max_concurrent: 2,
+            queue_max: 1,
+        };
+        let fetcher = Fetcher::new(
+            Arc::clone(&store_b),
+            config,
+            None,
+            "default".into(),
+            Arc::new(resolver),
+            Arc::new(ListPeers::default()),
+            Arc::new(sink.clone()),
+        );
+        let citizen = Citizen::new(
+            Arc::clone(&store_b),
+            "blobd".into(),
+            "default".into(),
+            None,
+            Arc::new(fetcher.clone()),
+        );
+        fetcher.spawn_dispatcher().await;
+
+        let id_of = |seed: u64| reference::blob_id(&blob::hash_bytes(&pseudo_random(64, seed)));
+        let mut ids = Vec::new();
+        for seed in [0x11, 0x22, 0x33, 0x44] {
+            let id = id_of(seed);
+            ids.push(id.clone());
+            let (rc, body, _) = citizen.dispatch(&command(
+                "blob.fetch",
+                "maild",
+                json!({"blob": id, "from": "A"}),
+            ));
+            match seed {
+                0x11 | 0x22 => {
+                    assert_eq!(rc, 0, "{body}");
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&body).unwrap()["in_flight"],
+                        false
+                    );
+                }
+                0x33 => {
+                    // Queued behind the two running downloads.
+                    assert_eq!(rc, 0, "{body}");
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&body).unwrap()["in_flight"],
+                        true
+                    );
+                }
+                _ => {
+                    // The queue (depth 1) is full: busy, rc 10.
+                    assert_eq!(rc, 10, "{body}");
+                    assert!(body.contains("busy"), "{body}");
+                }
+            }
+        }
+
+        // Release: all three admitted fetches complete (the queued
+        // hash lands too, and no bytes hash to their claimed ids —
+        // verify_failed, which is exactly the terminal path).
+        release_tx.send(true).unwrap();
+        for id in &ids[..3] {
+            let event = sink
+                .wait(
+                    TOPIC_FETCHED,
+                    |v| v["blob"] == id.as_str(),
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect("blob.fetched for an admitted hash");
+            assert_eq!(event["outcome"], "verify_failed");
+        }
+        let gauges = fetcher.gauges();
+        assert_eq!(
+            (
+                gauges.in_flight,
+                gauges.queued,
+                gauges.completed,
+                gauges.failed
+            ),
+            (0, 0, 0, 3)
+        );
     }
 }
