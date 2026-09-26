@@ -1066,6 +1066,32 @@ name = "cosmix-app-identity"
 version = "0.2.0"
 
 [[package]]
+name = "cosmix-blobd"
+version = "0.5.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-log",
+ "cosmix-lib-props-core",
+ "cosmix-mds",
+ "futures-util",
+ "http-body-util",
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "cosmix-dbusd"
 version = "0.3.1"
 dependencies = [
@@ -1756,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mds"
-version = "0.3.1"
+version = "0.3.4"
 dependencies = [
  "assert_cmd",
  "blake3",

@@ -27,6 +27,98 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+// ---- Public read-only row API ----
+//
+// The inventory surface for an out-of-process CAS owner (blobd).
+// Read-only by construction: every function borrows `&Connection`,
+// so nothing here can mutate the index. Callers pass the direct
+// `blobs.sqlite` connection (the one `delete_set`/`gc` use), not a
+// per-set ATTACH'd handle.
+
+/// One row of the box-wide `blob` table, as created by
+/// `blobs_v1.sql` and written by `add_blob_ref_in_tx`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRow {
+    /// BLAKE3 content hash.
+    pub hash: BlobHash,
+    pub size_bytes: u64,
+    /// Milliseconds since the Unix epoch.
+    pub first_seen: i64,
+    /// Milliseconds since the Unix epoch; only this field moves on a
+    /// duplicate-content addition.
+    pub last_seen: i64,
+    /// One ref = one item; zero marks the blob collectable by `gc`.
+    pub refcount: i64,
+}
+
+/// Read one `blob` row by hash. `Ok(None)` when the index holds no
+/// row for it — a CAS file can exist without a row until some set
+/// references it.
+pub fn blob_row(conn: &Connection, hash: &BlobHash) -> Result<Option<BlobRow>> {
+    conn.query_row(
+        "SELECT size_bytes, first_seen, last_seen, refcount FROM blob WHERE hash = ?1",
+        params![blob::hex(hash)],
+        |r| {
+            Ok(BlobRow {
+                hash: *hash,
+                size_bytes: r.get::<_, i64>(0)? as u64,
+                first_seen: r.get(1)?,
+                last_seen: r.get(2)?,
+                refcount: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| map_sql_err("query blob row", e))
+}
+
+/// Page through the `blob` table in ascending hash order: up to
+/// `limit` rows whose hash sorts after `after` (all rows when
+/// `after` is `None`). Hash order matches the CAS's sharded layout,
+/// so a full inventory is a stable cursor walk.
+pub fn list_blob_rows(
+    conn: &Connection,
+    limit: usize,
+    after: Option<&BlobHash>,
+) -> Result<Vec<BlobRow>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut stmt = conn
+        .prepare(
+            "SELECT hash, size_bytes, first_seen, last_seen, refcount FROM blob \
+             WHERE (?1 IS NULL OR hash > ?1) ORDER BY hash LIMIT ?2",
+        )
+        .map_err(|e| map_sql_err("prepare list blob rows", e))?;
+    let rows = stmt
+        .query_map(params![after.map(blob::hex), limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|e| map_sql_err("query list blob rows", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (hex, size_bytes, first_seen, last_seen, refcount) =
+            row.map_err(|e| map_sql_err("row list blob rows", e))?;
+        let hash = blob::from_hex(&hex).ok_or_else(|| {
+            Error::Other(format!(
+                "list_blob_rows: invalid hex in blob.hash = {hex:?}"
+            ))
+        })?;
+        out.push(BlobRow {
+            hash,
+            size_bytes: size_bytes as u64,
+            first_seen,
+            last_seen,
+            refcount,
+        });
+    }
+    Ok(out)
+}
+
 /// Inside an open per-set transaction (with `blobs_db` attached),
 /// record a new `(set, item, blob)` reference and bump the blob's
 /// refcount. The `blob` row is upserted; only `last_seen` updates on
@@ -376,4 +468,90 @@ fn pass2_apply(
     report.blobs_deleted += 1;
     report.bytes_freed = report.bytes_freed.saturating_add(cand.size_bytes as u64);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Mds, SqliteCasMds};
+    use crate::types::{ContainerAttrs, Flags, Membership, SetId};
+    use tempfile::TempDir;
+
+    fn attrs() -> ContainerAttrs {
+        ContainerAttrs {
+            special_use: None,
+            subscribed: true,
+            extra: serde_json::json!({}),
+        }
+    }
+
+    /// A real store whose index holds exactly two referenced blobs,
+    /// written through the normal delivery path (`put_blob` +
+    /// `add_item`) so the rows are the ones production writes.
+    fn store_with_two_blobs() -> (TempDir, SqliteCasMds, BlobHash, BlobHash) {
+        let d = TempDir::new().unwrap();
+        let mds = SqliteCasMds::open(d.path()).unwrap();
+        let set = SetId(uuid::Uuid::now_v7());
+        mds.create_set(&set).unwrap();
+        let inbox = mds.create_container(&set, None, "INBOX", attrs()).unwrap();
+        let h1 = mds.put_blob(b"first blob body").unwrap();
+        let h2 = mds.put_blob(b"second blob body, longer").unwrap();
+        for h in [&h1, &h2] {
+            mds.add_item(
+                &set,
+                h,
+                &[Membership {
+                    container: inbox,
+                    flags: Flags(0),
+                    added_at: 0,
+                }],
+            )
+            .unwrap();
+        }
+        (d, mds, h1, h2)
+    }
+
+    fn index_conn(root: &Path) -> Connection {
+        Connection::open(root.join("blobs.sqlite")).unwrap()
+    }
+
+    #[test]
+    fn blob_row_reads_one_referenced_blob() {
+        let (d, _mds, h1, _h2) = store_with_two_blobs();
+        let conn = index_conn(d.path());
+        let row = blob_row(&conn, &h1).unwrap().expect("row for h1");
+        assert_eq!(row.hash, h1);
+        assert_eq!(row.size_bytes, b"first blob body".len() as u64);
+        assert_eq!(row.refcount, 1);
+        assert!(row.first_seen > 0);
+        assert!(row.last_seen >= row.first_seen);
+        assert!(
+            blob_row(&conn, &blob::hash_bytes(b"never ingested"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn list_blob_rows_pages_in_hash_order() {
+        let (d, _mds, h1, h2) = store_with_two_blobs();
+        let conn = index_conn(d.path());
+        let (lo, hi) = if blob::hex(&h1) < blob::hex(&h2) {
+            (h1, h2)
+        } else {
+            (h2, h1)
+        };
+
+        let all = list_blob_rows(&conn, 10, None).unwrap();
+        assert_eq!(all.iter().map(|r| r.hash).collect::<Vec<_>>(), vec![lo, hi]);
+
+        let first_page = list_blob_rows(&conn, 1, None).unwrap();
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].hash, lo);
+
+        let rest = list_blob_rows(&conn, 10, Some(&lo)).unwrap();
+        assert_eq!(rest.iter().map(|r| r.hash).collect::<Vec<_>>(), vec![hi]);
+
+        assert!(list_blob_rows(&conn, 10, Some(&hi)).unwrap().is_empty());
+    }
 }

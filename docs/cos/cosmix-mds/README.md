@@ -9,7 +9,7 @@
 | Cargo package | `cosmix-mds` |
 | Rust library | `cosmix_mds` |
 | Operator binary | `cosmix-mds` |
-| Current crate version | `0.1.5` |
+| Current crate version | `0.3.3` |
 | Licence | MIT |
 
 The package also declares `cosmix-mds-stress-writer`. That binary is an internal crash-recovery test helper, is gated by `_stress-helper`, and is not part of the operator surface.
@@ -53,7 +53,7 @@ The crate root re-exports:
 |---|---|
 | Set lifecycle | `create_set`, `delete_set`, `list_sets` |
 | Container lifecycle | `create_container`, `rename_container`, `delete_container`, `list_containers`, `container_status` |
-| Blob CAS | `put_blob`, `get_blob`, `blob_size`, `blob_exists` |
+| Blob CAS | `put_blob`, `get_blob`, `blob_size`, `blob_exists`, `put_blob_path`, `put_blob_reader`, `put_blob_reader_expect`, `blob_file` |
 | Item mutation | `add_item`, `copy_item`, `move_item`, `remove_membership`, `store_flags` |
 | Keywords | `store_membership_keywords`, `store_item_keywords`, `item_memberships` |
 | Item lookup | `fetch_item`, `fetch_item_meta`, `find_items_by_blob_hash`, `search_items`, `list_items` |
@@ -67,6 +67,22 @@ The principal identifier wrappers are `SetId`, `ContainerId`, `ItemId`, and `Blo
 `Flags` stores the system-flag bitmap. Allocated bits represent seen, flagged, answered, draft, and deleted states. `Tags` stores sorted, unique user keywords.
 
 `ItemRecord` is a per-membership view joining item metadata with its container sequence, flags, tags, and change token. It is constructed from SQLite on reads and is not a persisted wire snapshot.
+
+## Streaming ingest and reads
+
+`blob::put_reader` streams any `Read` into the CAS, hashing with BLAKE3 while the bytes are staged under `blobs/.tmp`; the hash is only known at stream end and the write protocol already tolerates that. A reader error mid-stream removes the staged file and leaves no CAS entry. `blob::put` is a thin wrapper over it. `blob::open` returns the CAS file for streaming reads, and `Mds::blob_file` is its trait-level counterpart.
+
+`blob::put_reader_expect` is `put_reader` for a caller that already knows the hash the bytes must land under (a blob-lane `PUT /blob/<hex>`, a fetch by reference): the staged bytes are compared against `expected` **before** anything commits, and a mismatch removes the staging and returns `Error::BlobCorrupt` naming both hashes — a wrong body never enters the CAS under either hash, so no caller has to unlink a wrong-hash landing afterwards. `Mds::put_blob_reader_expect` is its trait-level counterpart.
+
+`blob::put_path` ingests a local file under a `PutMode`:
+
+- `Copy` — plain userspace copy.
+- `Reflink` — kernel-side copy (`FICLONE`, then `copy_file_range`) that falls through to a full copy on **any** kernel-path error, never merely because the filesystem lacks reflink support: no errno allowlist anticipates every refusal (OpenZFS with block cloning disabled answers `FICLONE` with `EPERM`, and a container's seccomp profile can refuse the ioctl outright — both caught on the build cluster, 2026-09-26). The userspace copy that follows either succeeds or surfaces the real error itself.
+- `HardLink` — links the source inode into the CAS; only callers that promise the source path immutable from the call onward may use it. A mutable path such as a filesd place must use `Copy` or `Reflink`. The staged link is touched to now before it commits (the inode is shared, so the source's mtime moves with it — an mtime is not content).
+
+Every mode re-hashes the staged bytes against the ingest-time hash before they are linked in, so a source rewritten mid-copy cannot enter the store under a stale hash. `SqliteCasMds::blobs_root` is public, so an out-of-process CAS owner reaches `blob::put_path` and `blob::open` with the same root the store itself uses.
+
+`blob_index::BlobRow`, `blob_row`, and `list_blob_rows` expose the box-wide blob table read-only — a row's hash, size, first and last seen, and refcount — taking the direct `blobs.sqlite` connection.
 
 ## Transaction scope
 
@@ -162,8 +178,8 @@ The GC interval defaults to 60 seconds. Values below 5 seconds in `COSMIX_MDS_GC
 | `store` | `Mds`, `SqliteCasMds`, per-set locking, transactions, and maintenance orchestration |
 | `types` | Identifiers, flags, tags, records, events, scopes, and reports |
 | `container` | Container, item, membership, search, and changelog SQL operations |
-| `blob` | BLAKE3 hashing and atomic CAS file operations |
-| `blob_index` | Shared blob index, references, refcounts, and verification ledger |
+| `blob` | BLAKE3 hashing, streaming ingest (`put_reader`, `put_path`), `open`, and atomic CAS file operations |
+| `blob_index` | Shared blob index, references, refcounts, verification ledger, and the read-only `BlobRow` inventory API |
 | `schema` | Versioned SQLite migration runners |
 | `notifier` | Per-container in-process broadcast channels |
 | `bus` | Typed event taxonomy, event sink, and optional Bus publisher |
@@ -176,4 +192,4 @@ The GC interval defaults to 60 seconds. Values below 5 seconds in `COSMIX_MDS_GC
 
 ## Dependencies
 
-SQLite persistence uses `rusqlite`; hashing uses `blake3`; identifiers use UUID v7 support. Tokio provides broadcast channels, `parking_lot` provides locks, and Serde supplies typed JSON payloads. The operator binary uses Clap and `humantime`; archive transfer uses `tar` and `chrono`. Bus dependencies remain optional.
+SQLite persistence uses `rusqlite`; hashing uses `blake3`; identifiers use UUID v7 support; `put_path`'s kernel-side copy uses `libc` (`FICLONE`, `copy_file_range`). Tokio provides broadcast channels, `parking_lot` provides locks, and Serde supplies typed JSON payloads. The operator binary uses Clap and `humantime`; archive transfer uses `tar` and `chrono`. Bus dependencies remain optional.
