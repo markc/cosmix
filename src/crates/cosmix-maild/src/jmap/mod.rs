@@ -378,13 +378,29 @@ pub async fn blob_download(
         .await
         {
             Ok(Ok((part, bytes))) => {
+                let mut disposition = String::from("attachment; filename*=UTF-8''");
+                for byte in part.name.as_deref().unwrap_or("part").bytes() {
+                    if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                        disposition.push(char::from(byte));
+                    } else {
+                        disposition.push_str(&format!("%{byte:02X}"));
+                    }
+                }
                 let content_type =
                     axum::http::HeaderValue::from_str(&part.mime).unwrap_or_else(|_| {
                         axum::http::HeaderValue::from_static("application/octet-stream")
                     });
                 (
                     StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, content_type)],
+                    [
+                        (axum::http::header::CONTENT_TYPE, content_type),
+                        (axum::http::header::CONTENT_DISPOSITION,
+                            axum::http::HeaderValue::from_str(&disposition).expect("ASCII RFC 5987 value")),
+                        (axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                            axum::http::HeaderValue::from_static("nosniff")),
+                        (axum::http::header::CONTENT_SECURITY_POLICY,
+                            axum::http::HeaderValue::from_static("sandbox")),
+                    ],
                     bytes,
                 )
                     .into_response()

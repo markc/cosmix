@@ -23,6 +23,20 @@ struct Fixture {
 }
 
 struct LocalLane(Option<String>);
+#[tokio::test]
+async fn html_part_download_is_forced_attachment_and_sandboxed() {
+    let f = Fixture::new().await;
+    let item = f.deliver(b"Content-Type: text/html\r\nContent-Disposition: attachment; filename*=utf-8''caf%C3%A9%0A.html\r\n\r\n<script>alert(1)</script>");
+    let email = get_email(&f, item, Value::Null).await;
+    let id = email["attachments"][0]["blobId"].as_str().unwrap();
+    let response = jmap::blob_download(State(f.state()), Fixture::headers(1), Path(id.into())).await.into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/html");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.headers()["content-security-policy"], "sandbox");
+    assert_eq!(response.headers()["content-disposition"], "attachment; filename*=UTF-8''caf%C3%A9%0A.html");
+}
+
 // Exercise the actual typed Bus decoder, including warning-band preservation.
 async fn migrate_over_port(f: &Fixture, args: Value) -> (u8, Value) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
