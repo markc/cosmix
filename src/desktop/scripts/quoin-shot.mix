@@ -112,12 +112,15 @@ fn show_page($edge, $page)
     $tries = $tries + 1
     sleep(0.05)
   end
+  -- Quoin 0.19.0: pin is an overlay (Pinned). On an edge that was docked
+  -- this undocks it to Pinned, which is fine for a capture.
   panel_verb("shell.panel.pin", $edge, nil)
   return 0
 end
 
--- hide is a no-op while the edge is still pinned, and the unpin lands on the
--- host's next frame, so re-issue the hide until the host reports it hidden.
+-- hide is refused (PANEL_NOT_APPLIED) while the edge is still pinned, and
+-- the unpin lands on the host's next frame, so re-issue the hide until the
+-- host reports it hidden.
 fn hide_edge($edge)
   panel_verb("shell.panel.unpin", $edge, nil)
   $tries = 0

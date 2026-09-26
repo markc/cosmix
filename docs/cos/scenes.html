@@ -457,7 +457,24 @@ node supplies edge, title and extent. Patching that node reapplies the mount.
 fill its panel without the Quoin header bar, for panel-style furniture.
 Chromeless pages have no in-panel page navigation or pin control: use them
 alone on an edge or drive navigation and pinning through Bus verbs.
-An absent or cleared extent uses the shell's output-derived default thickness.
+An authored extent (<code>w</code> on a side edge, <code>h</code> on the top or bottom) is a
+MINIMUM over the edge's remembered thickness: while the page is the edge's
+active page the edge is at least that thick, and showing another page returns
+it to the remembered value. The request never rewrites what a drag or
+<code>shell.panel.resize</code> saved, and <code>panels.&lt;edge&gt;.width_px</code> keeps reporting that
+saved value. An edge with nothing remembered (a fresh install) takes the
+extent itself as its size, even below the output-derived default. It stays
+unremembered: a save records no width for it, so a page's extent never
+becomes a saved width just because it was shown at a save. The extent is clamped to the edge's
+resize range (24–200 px top and bottom, 120–500 left and right) and fitted to
+the output: two docked opposite edges widened at once share the room their
+remembered zones leave, in proportion to how much each widens, so their zones
+never cover the output. A resize below the shown page's extent would be
+invisible, so it never saves: <code>shell.panel.resize</code> is refused rc 10
+<code>{error_code:"PAGE_MINIMUM", message, minimum_px}</code>, a drag stays at the extent
+and keeps the remembered size, and a settings step that would land below it
+changes nothing. Above the extent a resize applies normally. An absent or
+cleared extent, or the page's unmount, imposes no minimum.
 Authored extents fit the output space left by opposing exclusive zones;
 pinning and output changes recheck that budget. Pointer resizes exceeding the
 remaining budget are rejected without changing panel thickness. Clearing ports resets their

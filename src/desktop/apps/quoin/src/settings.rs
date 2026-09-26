@@ -731,17 +731,26 @@ fn plan_verb(
             // drag: the edge's resize range first, the output budget last — a
             // drag stops at the effective limit, and so does a stepper.
             let range = resize_thickness_range(edge);
-            let target = (panel.settled_thickness_px + delta)
+            // While the shown page declares an extent the edge shows at least
+            // that, so step from what is shown. A step that would land below
+            // the extent changes nothing (the model refuses it rather than
+            // save an invisible size); the reply says so and reports the size
+            // that stays saved.
+            let floor = panel.resize_floor_px;
+            let base = floor.map_or(panel.settled_thickness_px, |floor| {
+                panel.settled_thickness_px.max(floor)
+            });
+            let target = (base + delta)
                 .clamp(*range.start(), *range.end())
                 .min(panel.max_thickness_px);
-            if (target - panel.settled_thickness_px).abs() < f32::EPSILON {
-                return (
-                    0,
-                    json!({"accepted": true, "edge": edge_name(edge), "thickness_px": target, "unchanged": true})
-                        .to_string(),
-                    None,
-                    None,
-                );
+            if floor.is_some_and(|floor| target < floor)
+                || (target - panel.settled_thickness_px).abs() < f32::EPSILON
+            {
+                let mut reply = json!({"accepted": true, "edge": edge_name(edge), "thickness_px": panel.settled_thickness_px, "unchanged": true});
+                if let Some(floor) = floor {
+                    reply["minimum_px"] = json!(floor);
+                }
+                return (0, reply.to_string(), None, None);
             }
             (
                 0,
@@ -1178,6 +1187,45 @@ mod tests {
                 thickness_px: 120.0
             }
         );
+    }
+
+    /// Review round 2, items 1 and 3: saved 300 with a 440 page shown. A
+    /// minus step would land below the extent: it changes nothing and says
+    /// so, reporting the 300 that stays saved (never raising it to 440). A
+    /// plus step steps from what is shown. The fresh-edge variant (a 52 px
+    /// extent, nothing saved) reports truthfully too.
+    #[test]
+    fn a_step_below_the_page_extent_changes_nothing() {
+        let mut frame = frame_for("DP-1");
+        let left = &mut frame.panels[Edge::Left.index()];
+        left.settled_thickness_px = 300.0;
+        left.thickness_px = 440.0;
+        left.resize_floor_px = Some(440.0);
+        let step = |frame: &ShellFrame, node: &str| {
+            let (rc, body, command, _) =
+                plan_verb(&event_request("shell.settings.size", node), frame, Duration::ZERO);
+            assert_eq!(rc, 0, "{body}");
+            (serde_json::from_str::<serde_json::Value>(&body).unwrap(), command.map(|c| c.kind))
+        };
+        let (reply, command) = step(&frame, "size_left_minus");
+        assert!(command.is_none(), "{reply}");
+        assert_eq!(reply["unchanged"], true);
+        assert_eq!(reply["thickness_px"].as_f64(), Some(300.0));
+        assert_eq!(reply["minimum_px"].as_f64(), Some(440.0));
+        let (reply, command) = step(&frame, "size_left_plus");
+        assert_eq!(
+            command,
+            Some(ShellCommandKind::ResizeCommit { edge: Edge::Left, thickness_px: 440.0 + STEP_PX })
+        );
+        assert_eq!(reply["thickness_px"].as_f64(), Some(f64::from(440.0 + STEP_PX)));
+        // Fresh bottom edge presenting its 52 px extent.
+        let bottom = &mut frame.panels[Edge::Bottom.index()];
+        bottom.settled_thickness_px = 52.0;
+        bottom.thickness_px = 52.0;
+        bottom.resize_floor_px = Some(52.0);
+        let (reply, command) = step(&frame, "size_bottom_minus");
+        assert!(command.is_none(), "{reply}");
+        assert_eq!(reply["thickness_px"].as_f64(), Some(52.0));
     }
 
     #[test]

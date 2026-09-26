@@ -4,6 +4,7 @@
 //! than pointer samples. Q-0's detector and the future compositor topic source
 //! are interchangeable producers; neither is a window host concern.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
@@ -24,6 +25,10 @@ pub struct ShellModel {
     /// Quoin's scene-only frame. Generic shell hosts can choose their policy.
     suppress_empty_edges: bool,
     thickness_set: [bool; 4],
+    /// Authored page extents: while a listed page is its edge's active page,
+    /// that edge is at least this thick. Never written into the remembered
+    /// thickness, so the edge returns to it when another page is shown.
+    page_minimums: [BTreeMap<String, f32>; 4],
     /// The panel whose surface holds the keyboard, as the host last reported.
     keyboard_focus: Option<Edge>,
     /// Whether the host has ever reported keyboard focus. A host without
@@ -73,6 +78,7 @@ impl ShellModel {
             carousels: std::array::from_fn(|_| Carousel::empty()),
             suppress_empty_edges: false,
             thickness_set: [false; 4],
+            page_minimums: std::array::from_fn(|_| BTreeMap::new()),
             keyboard_focus: None,
             focus_reported: false,
             focus_directive: FocusDirective::Follow,
@@ -100,12 +106,87 @@ impl ShellModel {
         self.fit_output_budget();
     }
 
+    /// The edge as presented. While the active page declares an authored
+    /// extent, a remembered (restored, resized) thickness is widened to it;
+    /// an edge with nothing remembered presents the extent itself, which is
+    /// then its seed as well as its floor. The extent is capped by the edge's
+    /// resize range and by the output budget: two docked opposite edges
+    /// share what their remembered zones leave, in proportion to how much
+    /// each widens, so their zones never exceed the output. A remembered
+    /// `settled_thickness_px` never records a widening; an unremembered one
+    /// reports what is shown, and persistence saves no width for it (it
+    /// stays unremembered across a restart).
     pub fn panel(&self, edge: Edge) -> PanelSnapshot {
+        let mut panel = self.remembered_panel(edge);
+        let Some(wanted) = self.wanted_thickness(edge, &panel) else {
+            return panel;
+        };
+        let (opposite, extent) = self.opposite_extent(edge);
+        let other = self.remembered_panel(opposite);
+        let docked = panel.exclusive_zone_px > 0.0;
+        let other_extra = if other.exclusive_zone_px > 0.0 {
+            self.wanted_thickness(opposite, &other)
+                .map_or(0.0, |other_wanted| other_wanted - other.thickness_px)
+        } else {
+            0.0
+        };
+        let own_extra = if docked { wanted - panel.thickness_px } else { 0.0 };
+        let [own, opp] = fit_docked_pair(
+            (extent - 1.0).max(2.0),
+            [panel.exclusive_zone_px, other.exclusive_zone_px],
+            [own_extra, other_extra],
+        );
+        let remembered = self.thickness_set[edge.index()];
+        let thickness = if docked {
+            panel.thickness_px + own
+        } else {
+            // An overlay fits beside the opposite edge's presented zone.
+            let fitted = wanted.min(self.max_thickness_for_zone(edge, other.exclusive_zone_px + opp));
+            if remembered { fitted.max(panel.thickness_px) } else { fitted }
+        };
+        panel.thickness_px = thickness;
+        if docked {
+            panel.exclusive_zone_px = thickness;
+        }
+        if !remembered && !panel.resize_active {
+            panel.settled_thickness_px = thickness;
+        }
+        panel
+    }
+
+    /// The smallest size a resize of `edge` may leave while its active page
+    /// declares an authored extent: that extent within the resize range and
+    /// the output budget. [`Self::resize_thickness`] refuses anything smaller
+    /// (`PageMinimum`); steppers read it to step from what is shown.
+    pub fn resize_floor(&self, edge: Edge) -> Option<f32> {
+        let range = super::resize_thickness_range(edge);
+        let minimum = self.active_page_minimum(edge)?;
+        Some(minimum.clamp(*range.start(), *range.end()).min(self.max_thickness(edge)))
+    }
+
+    /// The thickness `edge`'s active page asks for: its authored extent within
+    /// the resize range, over the remembered thickness when one exists. `None`
+    /// without an authored extent.
+    fn wanted_thickness(&self, edge: Edge, remembered: &PanelSnapshot) -> Option<f32> {
+        let range = super::resize_thickness_range(edge);
+        let minimum = self
+            .active_page_minimum(edge)?
+            .clamp(*range.start(), *range.end());
+        Some(if self.thickness_set[edge.index()] {
+            remembered.thickness_px.max(minimum)
+        } else {
+            minimum
+        })
+    }
+
+    /// The edge without any page minimum: what a resize or restore changed.
+    fn remembered_panel(&self, edge: Edge) -> PanelSnapshot {
         let mut panel = self.panels[edge.index()].snapshot();
         if self.edge_is_empty(edge) {
             // Keep the saved mode and dimensions, but never present or reserve
             // an empty edge. A later registration resumes those preferences.
             panel.transient_revealed = false;
+            panel.intro_revealed = false;
             panel.mapped = false;
             panel.visible_fraction = 0.0;
             panel.target_fraction = 0.0;
@@ -167,7 +248,10 @@ impl ShellModel {
         thickness: f32,
     ) -> Result<(), PanelConfigError> {
         let thickness = if thickness.is_finite() && thickness > 0.0 {
-            thickness.min(self.max_thickness(edge))
+            // Remembered values budget against remembered values: an opposite
+            // page's minimum must not shrink what this edge remembers.
+            let (opposite, _) = self.opposite_extent(edge);
+            thickness.min(self.max_thickness_against(edge, self.remembered_panel(opposite)))
         } else {
             thickness
         };
@@ -178,17 +262,59 @@ impl ShellModel {
 
     /// Maximum thickness that leaves space for the opposite panel and work area.
     pub fn max_thickness(&self, edge: Edge) -> f32 {
-        let (opposite, extent) = match edge {
+        let (opposite, _) = self.opposite_extent(edge);
+        self.max_thickness_against(edge, self.panel(opposite))
+    }
+
+    fn opposite_extent(&self, edge: Edge) -> (Edge, f32) {
+        match edge {
             Edge::Left => (Edge::Right, self.geometry.width()),
             Edge::Right => (Edge::Left, self.geometry.width()),
             Edge::Top => (Edge::Bottom, self.geometry.height()),
             Edge::Bottom => (Edge::Top, self.geometry.height()),
-        };
+        }
+    }
+
+    fn max_thickness_against(&self, edge: Edge, opposite: PanelSnapshot) -> f32 {
+        self.max_thickness_for_zone(edge, opposite.exclusive_zone_px)
+    }
+
+    fn max_thickness_for_zone(&self, edge: Edge, opposite_zone: f32) -> f32 {
+        let (_, extent) = self.opposite_extent(edge);
         // Leave a positive extent for the opposing surface and the work area.
         // A zero-sized layer configure means "client chooses", not a valid
         // empty viewport, and can otherwise disconnect opposing panels.
         let minimum = 1.0_f32.min(extent / 4.0);
-        (extent - self.panel(opposite).exclusive_zone_px.max(minimum) - minimum).max(minimum)
+        (extent - opposite_zone.max(minimum) - minimum).max(minimum)
+    }
+
+    /// Record `page`'s authored extent on `edge` (`None` clears it). While
+    /// that page is the edge's active page the edge is at least this thick;
+    /// the remembered thickness is untouched, so showing another page returns
+    /// the edge to it. Returns whether anything changed.
+    pub fn set_page_minimum_thickness(
+        &mut self,
+        edge: Edge,
+        page: &str,
+        minimum: Option<f32>,
+    ) -> bool {
+        let minimums = &mut self.page_minimums[edge.index()];
+        match minimum.filter(|minimum| minimum.is_finite() && *minimum > 0.0) {
+            Some(minimum) => minimums.insert(page.to_owned(), minimum) != Some(minimum),
+            None => minimums.remove(page).is_some(),
+        }
+    }
+
+    /// Take the outgoing model's authored page extents. They describe mounted
+    /// pages rather than an output, so every replacement keeps them.
+    pub fn adopt_page_minimums(&mut self, outgoing: &Self) {
+        self.page_minimums = outgoing.page_minimums.clone();
+    }
+
+    /// The active page's authored extent on `edge`, if it declared one.
+    pub fn active_page_minimum(&self, edge: Edge) -> Option<f32> {
+        let page = self.carousel(edge).active_id()?;
+        self.page_minimums[edge.index()].get(page).copied()
     }
 
     fn fit_output_budget(&mut self) {
@@ -197,16 +323,17 @@ impl ShellModel {
             (Edge::Left, Edge::Right, self.geometry.width()),
             (Edge::Top, Edge::Bottom, self.geometry.height()),
         ] {
-            let total = self.panel(a).exclusive_zone_px + self.panel(b).exclusive_zone_px;
+            let total = self.remembered_panel(a).exclusive_zone_px
+                + self.remembered_panel(b).exclusive_zone_px;
             if total > (extent - 1.0).max(2.0) {
                 let ratio = (extent - 1.0).max(2.0) / total;
                 for edge in [a, b] {
-                    let size = (self.panel(edge).thickness_px * ratio).max(1.0);
+                    let size = (self.remembered_panel(edge).thickness_px * ratio).max(1.0);
                     let _ = self.panels[edge.index()].restore_thickness(size);
                 }
             }
             for edge in [a, b] {
-                let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+                let _ = self.restore_thickness(edge, self.remembered_panel(edge).thickness_px);
             }
         }
         self.thickness_set = thickness_set;
@@ -214,6 +341,21 @@ impl ShellModel {
 
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
         let max = self.max_thickness(edge);
+        // Below the shown page's authored extent a resize would be invisible
+        // yet saved. Refuse it without writing the extent over a smaller
+        // remembered size: a drag in progress goes back to where it started
+        // (the edge keeps showing the extent), a commit changes nothing.
+        if let Some(minimum) = self.resize_floor(edge)
+            && thickness < minimum
+        {
+            self.panels[edge.index()].revert_to_resize_start();
+            return Err(PanelConfigError::PageMinimum {
+                edge,
+                requested: thickness,
+                minimum,
+            });
+        }
+        let range = super::resize_thickness_range(edge);
         if thickness > max {
             return Err(PanelConfigError::ThicknessBudget {
                 edge,
@@ -221,7 +363,6 @@ impl ShellModel {
                 max,
             });
         }
-        let range = super::resize_thickness_range(edge);
         if max < *range.start() && thickness == max {
             return self.restore_thickness(edge, thickness);
         }
@@ -281,6 +422,7 @@ impl ShellModel {
         }
         self.carousels = outgoing.carousels.clone();
         self.thickness_set = outgoing.thickness_set;
+        self.page_minimums = outgoing.page_minimums.clone();
         self.last_update = outgoing.last_update;
         self.fit_output_budget();
     }
@@ -334,7 +476,7 @@ impl ShellModel {
             PanelInput::Dock | PanelInput::DockToggle | PanelInput::SetMode(PanelMode::Docked)
         ) {
             let remembered = self.thickness_set[edge.index()];
-            let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+            let _ = self.restore_thickness(edge, self.remembered_panel(edge).thickness_px);
             self.thickness_set[edge.index()] = remembered;
         }
         let panel = &mut self.panels[edge.index()];
@@ -593,6 +735,19 @@ impl ShellModel {
     }
 }
 
+/// Share a docked opposite pair's widening within `budget`. `zones` are the
+/// remembered exclusive zones (already fitted by `fit_output_budget`), and
+/// `extras` how far each edge's presented thickness departs from them (zero
+/// for an edge that is not docked). A narrowing always applies and frees
+/// room; the widenings share what is left, in proportion. Returns each
+/// edge's applied departure.
+fn fit_docked_pair(budget: f32, zones: [f32; 2], extras: [f32; 2]) -> [f32; 2] {
+    let room = budget - zones[0] - zones[1] - extras[0].min(0.0) - extras[1].min(0.0);
+    let growth = extras[0].max(0.0) + extras[1].max(0.0);
+    let scale = if growth > room { room.max(0.0) / growth } else { 1.0 };
+    extras.map(|extra| extra.min(0.0) + extra.max(0.0) * scale)
+}
+
 /// Shell construction failure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ShellError {
@@ -698,5 +853,193 @@ mod empty_edge_tests {
             .unwrap();
         assert!(!model.panel(Edge::Bottom).mapped);
         assert_eq!(model.panel(Edge::Bottom).exclusive_zone_px, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod page_minimum_tests {
+    use super::*;
+
+    fn model() -> ShellModel {
+        let mut model = ShellModel::new(
+            OutputKey::new("test-output").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model
+            .set_carousel(Edge::Left, Carousel::new(["launcher", "notes"]).unwrap());
+        model.restore_thickness(Edge::Left, 422.0).unwrap();
+        model
+    }
+
+    #[test]
+    fn active_page_minimum_widens_the_saved_thickness_while_shown() {
+        let mut model = model();
+        assert!(model.set_page_minimum_thickness(Edge::Left, "launcher", Some(440.0)));
+        assert!(!model.set_page_minimum_thickness(Edge::Left, "launcher", Some(440.0)));
+        model
+            .restore_mode(Edge::Left, Duration::ZERO, PanelMode::Docked)
+            .unwrap();
+        let panel = model.panel(Edge::Left);
+        assert_eq!(panel.thickness_px, 440.0);
+        assert_eq!(panel.exclusive_zone_px, 440.0);
+        assert_eq!(panel.settled_thickness_px, 422.0);
+        // Geometry fitting and dock entry work on the remembered value.
+        model.set_geometry(LogicalSize::new(1200.0, 900.0).unwrap());
+        model.set_mode(Edge::Left, Duration::ZERO, PanelMode::Pinned).unwrap();
+        model.set_mode(Edge::Left, Duration::ZERO, PanelMode::Docked).unwrap();
+        assert_eq!(model.panel(Edge::Left).settled_thickness_px, 422.0);
+        assert_eq!(model.panel(Edge::Left).thickness_px, 440.0);
+        model.carousel_mut(Edge::Left).select_id("notes");
+        assert_eq!(model.panel(Edge::Left).thickness_px, 422.0);
+        assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 422.0);
+        model.carousel_mut(Edge::Left).select_id("launcher");
+        assert_eq!(model.panel(Edge::Left).thickness_px, 440.0);
+        // Clearing the request, or a smaller one, leaves the saved width.
+        model.set_page_minimum_thickness(Edge::Left, "launcher", Some(100.0));
+        assert_eq!(model.panel(Edge::Left).thickness_px, 422.0);
+        assert!(model.set_page_minimum_thickness(Edge::Left, "launcher", None));
+        assert_eq!(model.panel(Edge::Left).thickness_px, 422.0);
+    }
+
+    #[test]
+    fn page_minimum_is_capped_by_the_resize_range() {
+        let mut model = model();
+        model.set_page_minimum_thickness(Edge::Left, "launcher", Some(50_000.0));
+        let panel = model.panel(Edge::Left);
+        assert_eq!(panel.thickness_px, *crate::core::resize_thickness_range(Edge::Left).end());
+        assert_eq!(panel.settled_thickness_px, 422.0);
+    }
+
+    /// Review M1: two docked opposite edges both widened by their pages share
+    /// the room their remembered zones leave; the zones never exceed the
+    /// output (800 px: remembered 300 + 300, pages 440 and 480, which would
+    /// need 920).
+    #[test]
+    fn widened_opposite_docked_edges_fit_the_output_together() {
+        let mut model = ShellModel::new(
+            OutputKey::new("test-output").unwrap(),
+            LogicalSize::new(800.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        for (edge, page, minimum) in [(Edge::Left, "wide", 440.0), (Edge::Right, "wider", 480.0)] {
+            model.set_carousel(edge, Carousel::new([page]).unwrap());
+            model.restore_thickness(edge, 300.0).unwrap();
+            model.restore_mode(edge, Duration::ZERO, PanelMode::Docked).unwrap();
+            model.set_page_minimum_thickness(edge, page, Some(minimum));
+        }
+        let (left, right) = (model.panel(Edge::Left), model.panel(Edge::Right));
+        let zones = left.exclusive_zone_px + right.exclusive_zone_px;
+        assert!(zones <= 799.0 + 1e-3, "zones {zones} overflow 800");
+        // Shared in proportion to each widening (140 and 180 of 199 spare).
+        assert!(left.thickness_px > 300.0 && left.thickness_px < 440.0, "{}", left.thickness_px);
+        assert!(right.thickness_px > 300.0 && right.thickness_px < 480.0, "{}", right.thickness_px);
+        let ratio = (left.thickness_px - 300.0) / (right.thickness_px - 300.0);
+        assert!((ratio - 140.0 / 180.0).abs() < 1e-3, "{ratio}");
+        assert_eq!((left.settled_thickness_px, right.settled_thickness_px), (300.0, 300.0));
+        // One widened edge beside a plain docked one gets all the spare room.
+        model.set_page_minimum_thickness(Edge::Right, "wider", None);
+        assert_eq!(model.panel(Edge::Left).thickness_px, 440.0);
+        assert_eq!(model.panel(Edge::Right).thickness_px, 300.0);
+    }
+
+    /// Review M2: an edge with nothing remembered presents its page's extent
+    /// itself (seed and floor), even below the output-derived default, and
+    /// reports it as settled so the first save persists what was shown.
+    #[test]
+    fn a_fresh_edge_presents_the_authored_extent() {
+        let mut model = ShellModel::new(
+            OutputKey::new("test-output").unwrap(),
+            LogicalSize::new(1920.0, 1080.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model.set_carousel(Edge::Bottom, Carousel::new(["scene-panel"]).unwrap());
+        model.restore_mode(Edge::Bottom, Duration::ZERO, PanelMode::Docked).unwrap();
+        assert!(model.panel(Edge::Bottom).thickness_px > 100.0, "default is taller");
+        model.set_page_minimum_thickness(Edge::Bottom, "scene-panel", Some(52.0));
+        let bottom = model.panel(Edge::Bottom);
+        assert_eq!(
+            (bottom.thickness_px, bottom.exclusive_zone_px, bottom.settled_thickness_px),
+            (52.0, 52.0, 52.0)
+        );
+        // Once a size is remembered, the extent is only a floor over it.
+        model.restore_thickness(Edge::Bottom, 70.0).unwrap();
+        assert_eq!(model.panel(Edge::Bottom).thickness_px, 70.0);
+    }
+
+    /// Review round 2, item 1: saved 300 with a 440 page shown. A shrink
+    /// request below the extent is refused and never writes the extent over
+    /// the smaller remembered size; a request above it applies.
+    #[test]
+    fn a_resize_below_the_shown_extent_is_refused_and_saves_nothing() {
+        let mut model = model();
+        model.restore_thickness(Edge::Left, 300.0).unwrap();
+        model.set_page_minimum_thickness(Edge::Left, "launcher", Some(440.0));
+        assert_eq!(model.resize_floor(Edge::Left), Some(440.0));
+        assert_eq!(
+            model.resize_thickness(Edge::Left, 292.0),
+            Err(PanelConfigError::PageMinimum { edge: Edge::Left, requested: 292.0, minimum: 440.0 })
+        );
+        let panel = model.panel(Edge::Left);
+        assert_eq!((panel.thickness_px, panel.settled_thickness_px), (440.0, 300.0));
+        // A drag that goes above the extent and back below it returns to
+        // where it started; completing it saves the untouched 300.
+        let at = Duration::ZERO;
+        model.panel_input(Edge::Left, at, PanelInput::ResizeStarted).unwrap();
+        model.resize_thickness(Edge::Left, 450.0).unwrap();
+        assert_eq!(model.panel(Edge::Left).thickness_px, 450.0);
+        assert!(model.resize_thickness(Edge::Left, 430.0).is_err());
+        assert_eq!(model.panel(Edge::Left).thickness_px, 440.0);
+        model.panel_input(Edge::Left, at, PanelInput::ResizeCompleted).unwrap();
+        assert_eq!(model.panel(Edge::Left).settled_thickness_px, 300.0);
+        // The notes page (no extent) still shows the remembered 300.
+        model.carousel_mut(Edge::Left).select_id("notes");
+        assert_eq!(model.panel(Edge::Left).thickness_px, 300.0);
+        // Above the extent a resize applies normally.
+        model.carousel_mut(Edge::Left).select_id("launcher");
+        model.resize_thickness(Edge::Left, 460.0).unwrap();
+        assert_eq!(model.panel(Edge::Left).settled_thickness_px, 460.0);
+    }
+
+    /// Review round 2, item 5: a docked widening edge beside a docked
+    /// opposite edge that NARROWS (unremembered, extent below its default)
+    /// gets the room the narrowing frees, and no more.
+    #[test]
+    fn a_widening_edge_uses_the_room_an_unremembered_opposite_frees() {
+        let mut model = ShellModel::new(
+            OutputKey::new("test-output").unwrap(),
+            LogicalSize::new(600.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model.set_carousel(Edge::Left, Carousel::new(["wide"]).unwrap());
+        model.set_carousel(Edge::Right, Carousel::new(["slim"]).unwrap());
+        model.restore_thickness(Edge::Left, 150.0).unwrap();
+        for edge in [Edge::Left, Edge::Right] {
+            model.restore_mode(edge, Duration::ZERO, PanelMode::Docked).unwrap();
+        }
+        let default = model.panel(Edge::Right).thickness_px;
+        assert!(!model.has_remembered_thickness(Edge::Right) && default > 130.0);
+        model.set_page_minimum_thickness(Edge::Left, "wide", Some(450.0));
+        model.set_page_minimum_thickness(Edge::Right, "slim", Some(130.0));
+        let (left, right) = (model.panel(Edge::Left), model.panel(Edge::Right));
+        assert_eq!(right.thickness_px, 130.0);
+        // 599 of budget less 150 and the default leaves less than the +300
+        // the left page asks for; the 130 page frees the rest.
+        assert!(599.0 - 150.0 - default < 300.0, "precondition: needs the freed room");
+        let expected = (599.0 - 150.0 - 130.0_f32).min(300.0) + 150.0;
+        assert_eq!(left.thickness_px, expected);
+        assert!(left.exclusive_zone_px + right.exclusive_zone_px <= 599.0 + 1e-3);
     }
 }

@@ -129,6 +129,9 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     if model.output() == &old_output {
         model.carry_live_state(&world.resource::<ShellRuntime>().model);
     }
+    // Authored page extents belong to the mounted pages, not to an output:
+    // they follow the pages onto any replacement.
+    model.adopt_page_minimums(&world.resource::<ShellRuntime>().model);
     // The holder plane is the compositor's capability, not the output's: a
     // replacement's factory builds a local model, which must not resume local
     // conceal timers while the compositor still drives reveal/conceal.
@@ -159,8 +162,9 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
 }
 
 /// Set an edge preference without emitting a pointer-resize persistence effect.
-/// Production calls this only through `seed_page_thickness`; direct calls are
-/// used by tests to establish remembered preferences.
+/// Production never calls this: scenes declare a page minimum instead
+/// ([`set_page_minimum_thickness`]). Tests use it to establish remembered
+/// preferences.
 pub fn set_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
     let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
         return;
@@ -172,13 +176,22 @@ pub fn set_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
     }
 }
 
-/// Seed an edge once; restored preferences and earlier mounts take precedence.
-pub fn seed_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
-    if world
-        .get_resource::<ShellRuntime>()
-        .is_some_and(|runtime| !runtime.model.has_remembered_thickness(edge))
-    {
-        set_page_thickness(world, edge, thickness);
+/// Declare a page's authored extent (`None` clears it): while `page` is the
+/// edge's active page the edge is at least this thick, and it returns to the
+/// remembered thickness when another page is shown. A scene request never
+/// rewrites the remembered thickness; only a resize or a restore does.
+pub fn set_page_minimum_thickness(
+    world: &mut World,
+    edge: Edge,
+    page: &str,
+    minimum: Option<f32>,
+) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return;
+    };
+    if runtime.model.set_page_minimum_thickness(edge, page, minimum) {
+        let frame = ShellFrame::from_model(&runtime.model);
+        world.resource_mut::<ShellFrameState>().0 = frame;
     }
 }
 
@@ -254,6 +267,8 @@ pub fn remove_shell_page(world: &mut World, edge: Edge, name: &str) {
     {
         let _ = runtime.model.carousel_mut(edge).remove(name);
     }
+    // Host content leaving takes its authored extent with it.
+    runtime.model.set_page_minimum_thickness(edge, name, None);
     let frame = ShellFrame::from_model(&runtime.model);
     world.resource_mut::<ShellFrameState>().0 = frame;
 }
@@ -509,8 +524,11 @@ fn update_model(
                 } else {
                     *thickness_px
                 };
-                if let Err(error) = runtime.model.resize_thickness(*edge, thickness_px) {
-                    bevy::log::warn!("panel drag rejected: {error}");
+                match runtime.model.resize_thickness(*edge, thickness_px) {
+                    // Dragging below the shown page's extent is ordinary: the
+                    // edge stays at the extent and the saved size is untouched.
+                    Ok(()) | Err(crate::core::PanelConfigError::PageMinimum { .. }) => {}
+                    Err(error) => bevy::log::warn!("panel drag rejected: {error}"),
                 }
             }
             ShellCommandKind::ResizeCommit { edge, thickness_px }
@@ -1163,38 +1181,71 @@ mod tests {
     }
 
     #[test]
-    fn scene_seed_respects_resize_and_same_output_replacement() {
+    fn page_minimum_widens_only_its_page_and_survives_replacement() {
         let mut app = app();
         let world = app.world_mut();
-        {
-            let mut runtime = world.resource_mut::<ShellRuntime>();
-            runtime
-                .model
-                .set_geometry(LogicalSize::new(1200.0, 900.0).unwrap());
-            assert!(!runtime.model.has_remembered_thickness(Edge::Left));
-            runtime.model.resize_thickness(Edge::Left, 230.0).unwrap();
+        world
+            .resource_mut::<ShellRuntime>()
+            .model
+            .resize_thickness(Edge::Left, 230.0)
+            .unwrap();
+        set_shell_pages(
+            world,
+            Edge::Left,
+            vec!["launcher".into(), "notes".into()],
+            Some("launcher"),
+        );
+        set_page_minimum_thickness(world, Edge::Left, "launcher", Some(310.0));
+        // (presented thickness, settled thickness) of the left edge.
+        let left = |world: &World| {
+            let panel = world.resource::<ShellFrameState>().0.panel(Edge::Left);
+            (panel.thickness_px, panel.settled_thickness_px)
+        };
+        // Persistence reads the settled value: the request is never saved.
+        assert_eq!(left(world), (310.0, 230.0));
+        // A smaller request never shrinks the remembered thickness.
+        set_page_minimum_thickness(world, Edge::Left, "notes", Some(150.0));
+        set_shell_pages(
+            world,
+            Edge::Left,
+            vec!["launcher".into(), "notes".into()],
+            Some("notes"),
+        );
+        assert_eq!(left(world).0, 230.0);
+        set_shell_pages(
+            world,
+            Edge::Left,
+            vec!["launcher".into(), "notes".into()],
+            Some("launcher"),
+        );
+        // Any replacement, same output or not, keeps authored extents.
+        for output in ["DP-1", "HDMI-A-1"] {
+            let replacement = ShellModel::new(
+                OutputKey::new(output).unwrap(),
+                LogicalSize::new(1000.0, 800.0).unwrap(),
+                Duration::ZERO,
+                Duration::from_millis(800),
+                Duration::from_millis(200),
+            )
+            .unwrap();
+            replace_shell_model(world, replacement);
+            set_shell_pages(
+                world,
+                Edge::Left,
+                vec!["launcher".into(), "notes".into()],
+                Some("launcher"),
+            );
+            assert_eq!(left(world).0, 310.0, "{output}");
         }
-        seed_page_thickness(world, Edge::Left, 310.0);
-        let replacement = ShellModel::new(
-            OutputKey::new("DP-1").unwrap(),
-            LogicalSize::new(1000.0, 800.0).unwrap(),
-            Duration::ZERO,
-            Duration::from_millis(800),
-            Duration::from_millis(200),
-        )
-        .unwrap();
-        replace_shell_model(world, replacement);
-        seed_page_thickness(world, Edge::Left, 320.0);
-        assert_eq!(
-            world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px,
-            230.0
-        );
-        // An untouched edge can still receive its first authored extent.
-        seed_page_thickness(world, Edge::Right, 240.0);
-        assert_eq!(
-            world.resource::<ShellFrameState>().0.panel(Edge::Right).thickness_px,
-            240.0
-        );
+        // A content-only unmount (the registry-removal path, whose carousel
+        // landing is applied elsewhere) drops the extent too.
+        crate::chrome::unmount_page_content(world, Edge::Left, "launcher");
+        assert_eq!(left(world).0, 240.0);
+        set_page_minimum_thickness(world, Edge::Left, "launcher", Some(310.0));
+        // Removing the page takes its extent with it.
+        remove_shell_page(world, Edge::Left, "launcher");
+        set_shell_pages(world, Edge::Left, vec!["launcher".into()], Some("launcher"));
+        assert!(left(world).0 < 310.0);
     }
 
     #[test]
@@ -1258,7 +1309,7 @@ mod tests {
                     input: crate::core::PanelInput::Hide,
                 },
             ),
-            // `PanelToggle` maps to core `Toggle`, NOT to `Reveal`: the
+            // `PanelToggle` maps to core `ToggleShown`, NOT to `Reveal`: the
             // direction binds at Model time. This fixture starts Hidden,
             // where the two coincide, so the row records the mapping rather
             // than discriminating it — the tests that DO discriminate are
@@ -1268,14 +1319,22 @@ mod tests {
                 ShellSemanticVerb::PanelToggle,
                 ShellCommandKind::Panel {
                     edge: Edge::Left,
-                    input: crate::core::PanelInput::Toggle,
+                    input: crate::core::PanelInput::ToggleShown,
                 },
             ),
+            // Pin is an overlay (Pinned); only PanelDock reserves.
             (
                 ShellSemanticVerb::PanelPin,
                 ShellCommandKind::Panel {
                     edge: Edge::Left,
-                    input: crate::core::PanelInput::Dock,
+                    input: crate::core::PanelInput::Pin,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelPinToggle,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::PinToggle,
                 },
             ),
             (

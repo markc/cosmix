@@ -111,7 +111,8 @@ remain required before migrating the host.
 `share/scenes/panel/` is the bottom panel as a file-backed scene. The page ID
 stays `scene-panel`; the mount is today's slim chromeless bottom edge
 (`window: {kind:"edge", edge:"bottom", h:52, chrome:false}`). The authored
-`h` seeds an untouched edge only: Quoin's saved thickness wins, and the
+`h` is the bottom edge's size on a fresh install and a minimum over Quoin's
+saved thickness afterwards (a taller saved bottom edge stays taller), and the
 loader never pins, docks or selects the page, so a bottom edge kept hidden
 stays hidden. Quoin's carousel activates the registered page on its own
 (the page is the edge's only declared slot).
@@ -318,8 +319,10 @@ explicit opens/closes. Already-satisfied phases complete immediately.
 The file remains a bare JSON array of edge strings. Its explicit compatibility
 rule is that legacy Bus `unpin` releases both persistent modes, including dock
 reservations migrated from legacy `pinned: true`. No version conversion is
-needed for this record. Existing Bus `pin` still reserves space; switching
-popup/capture callers to overlay pin intent is a separate API/caller chunk.
+needed for this record. Since quoin 0.19.0 Bus `pin` enters `Pinned`, an
+overlay that reserves no space, so the panel's popups now open over the
+windows beside the edge instead of reflowing them. A record migrated from an
+older reserving pin is still released by `unpin`.
 Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.

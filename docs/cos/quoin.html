@@ -754,12 +754,32 @@ mesh callers, and do not change scenes, panels or keyboard focus.</p>
 that reserves no space) or <code>docked</code> (reserves its full thickness), independent
 of transient visibility. <code>pinned</code> is a read-compatibility shim: true for either
 persistent <code>Pinned</code> or <code>Docked</code>, false for <code>Hidden</code> even while transiently
-revealed. Existing Bus <code>pin</code> retains its reserving behaviour (<code>Docked</code>),
-including the corner-addressed alias, and existing Bus <code>unpin</code> releases either
-persistent mode into transient grace; follow it with <code>hide</code> to conceal. The
-legacy pair is deliberately unchanged; the corner menu, keyboard bindings and
-citizens that need to drive a mode explicitly use the precise verbs below.</p>
-<p>The semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin,dock,mode}</code>,
+revealed. Bus <code>pin</code> (and its corner-addressed alias) enters <code>Pinned</code>: an
+overlay that reserves no space. Since quoin 0.19.0 (Mark, 2026-09-26) it no
+longer docks; a caller that needs reserved space sends <code>shell.panel.dock</code>.
+Bus <code>unpin</code> releases either persistent mode into transient grace; follow it
+with <code>hide</code> to conceal.</p>
+<p><code>shell.panel.toggle {edge}</code> shows or hides an edge whatever its mode. On a
+hidden edge it toggles the transient reveal (the direction binds when the
+model applies it, so two toggles in one batch cancel out). On a pinned or
+docked edge it hides the edge deliberately, exactly as
+<code>shell.panel.mode {mode:"hidden"}</code>: no grace, and the reservation goes.
+The next toggle reveals it transiently. It never restores <code>Docked</code>, because
+docking reflows the workspace and is never a side effect of another verb.
+It replies <code>{accepted:true}</code> on enqueueing; read the state back.</p>
+<p><code>shell.panel.pin.toggle {edge?}</code> releases a pinned edge into a transient
+reveal with normal grace, and pins any other edge (docked included). With
+no <code>edge</code> it picks one from the current state, using the first rule that
+matches exactly one edge: the one live transient reveal (a hover, corner or
+<code>show</code>; the cold-start intro's reveals do not count, so the chord is not
+ambiguous during the intro), else the panel holding the keyboard, else the
+one a focus request targets, else the one pinned edge. A bad <code>edge</code> is rc 10
+<code>{error_code:"INVALID_ARGUMENT", message}</code>; a caller whose provenance cannot
+be established gets <code>CALLER_PROVENANCE</code> (so does <code>shell.focus.next</code>). When a rule matches several edges the reply is rc 10
+<code>{error_code:"PIN_TARGET_AMBIGUOUS", message, edges}</code>; when none matches,
+<code>PIN_TARGET_NONE</code>. Pass <code>edge</code> to choose explicitly. It replies
+<code>{accepted:true}</code> on enqueueing.</p>
+<p>The semantic verbs are <code>shell.panel.{show,hide,toggle,pin,pin.toggle,unpin,dock,mode}</code>, <code>shell.focus.next</code>,
 <code>shell.panel.page.{next,prev,set}</code> and <code>shell.quit</code>. They require a broker-stamped local,
 registered caller and are translated to the same <code>ShellCommand</code> ingress used
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
@@ -789,6 +809,17 @@ a side effect of another verb. <code>shell.panel.mode</code> takes <code>edge</c
 legacy verbs it never leaves a transient reveal behind, and <code>mode=hidden</code>
 conceals at once with no grace delay, because it is a deliberate action. Read
 back <code>shell.props.get path="panels.&lt;edge&gt;.mode"</code> to verify the applied mode.</p>
+<p><code>shell.panel.hide</code> conceals a transient reveal and never changes a persistent
+mode. Its reply waits for the model: <code>{accepted:true, applied:true, panels}</code>
+once the edge is hidden and no longer revealed. On a pinned or docked edge it
+is refused rc 10 <code>{error_code:"PANEL_NOT_APPLIED", message, panels}</code>, and
+the message names the edge's mode and the verb that does hide it,
+<code>shell.panel.mode {edge, mode:"hidden"}</code>. A reveal held by a resize or an
+open menu is refused the same way with a generic message. The corner alias
+<code>shell.corner.hide {corner}</code> replies and refuses exactly the same way for the
+edge its corner summons; a bad <code>corner</code> is rc 10
+<code>{error_code:"INVALID_ARGUMENT", message}</code> and failed provenance
+<code>CALLER_PROVENANCE</code>.</p>
 <p>Sub-panels are addressed by their stable name, unique across every edge and
 output. <code>shell.sub.register</code> takes <code>edge</code> and <code>name</code> (the owner is the
 broker-attested caller) and fills a carousel slot without revealing or
@@ -873,7 +904,9 @@ the panel's marks follow the ingested value). A motion write re-encodes the
 whole <code>conf.mix</code>: other authored values are preserved, but comments and
 formatting are not. <code>shell.settings.size</code> takes <code>edge</code> and <code>delta_px</code> and
 enqueues the same resize commit an edge-drag completion produces, clamped to
-that edge's thickness range and the output budget. Like the scene and
+that edge's thickness range and the output budget. While the shown page
+declares an extent it steps from what is shown; a step that would land below
+the extent changes nothing and replies <code>{accepted:true, unchanged:true, thickness_px, minimum_px}</code> with the size that stays saved. Like the scene and
 sub-panel verbs, settings verbs from a stale Quoin connection are refused.
 Read back <code>shell.props.get path="panels.&lt;edge&gt;.width_px"</code> to verify a size
 change.</p>
@@ -947,7 +980,8 @@ host's <code>wl-output-&lt;id&gt;</code> fallback, the embedded host's pre-obser
 placeholder) restores nothing, claims nothing and is never persisted —
 protocol ids are reassigned across sessions and must not anchor state.</p>
 <p>Modes are the strings <code>hidden</code>, <code>pinned</code> or <code>docked</code>. Thickness must be finite
-and positive; saved page IDs wait for their scene to register, while any live
+and positive, and is omitted for an edge with no width of its own (one that
+presents its page's extent or the default), which restores unremembered; saved page IDs wait for their scene to register, while any live
 page remains available as the reveal default. On restore, an
 output with an entry under its own identity reuses it as-is. The strict
 legacy five-field root (no version) with three-field edges containing
@@ -1282,6 +1316,15 @@ Quoin's own panels holds the keyboard, after a click into it or a cycle stop.
 So a binding can never shadow an application's shortcut. It also means that a
 binding cannot reveal a panel while an application is focused. That route
 needs a chord grab in the compositor, which does not exist yet.</p>
+<p><code>shell.focus.next</code> (no arguments) is the Bus form of <code>cycle_focus</code>: it
+enqueues exactly the command the chord does, so it moves the keyboard to the
+same next stop and follows the same rules. It is how a global chord (an
+inputd binding) reaches the cycle while an application holds the keyboard.
+It replies <code>{accepted:true}</code> on enqueueing; read the result back from
+<code>shell.panel.state edge=&lt;edge&gt;</code>, whose <code>keyboard_requested</code> is true on the
+stop the cycle asked for (none after the last panel, when focus goes back to
+the application). Like the other panel verbs it is open to any caller the
+broker stamps, mesh callers included.</p>
 <p>Keyboard actions target the output of the focused window, or the pointer's
 output when no window has focus. The keys Quoin receives always come from its
 own focused panel, so they target that panel's output. The pointer fallback

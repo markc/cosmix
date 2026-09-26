@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::core::{Edge, OutputKey, PanelInput, PanelMode};
 
-use super::{CarouselInput, ShellCommand, ShellCommandKind};
+use super::{CarouselInput, KeyboardCommand, ShellCommand, ShellCommandKind};
 
 /// Scene requests are handled by the host's scene adapter, not panel motion.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,7 +39,11 @@ pub enum ShellSemanticVerb {
     PanelShow,
     PanelHide,
     PanelToggle,
+    /// Enter `Pinned`: a persistent overlay that reserves no space.
     PanelPin,
+    /// `Pinned` releases into a transient reveal with normal grace; any other
+    /// mode enters `Pinned`. The direction binds at Model time.
+    PanelPinToggle,
     PanelUnpin,
     /// Precise dock: enter `Docked` regardless of the current mode. Docking
     /// reflows the workspace, so it is never a side effect of another verb.
@@ -51,6 +55,11 @@ pub enum ShellSemanticVerb {
     PageNext,
     PagePrevious,
     PageSet(String),
+    /// `shell.focus.next`: the focus-cycle binding's step (shell doc §5) —
+    /// keyboard focus to the next visible pinned or docked panel on the
+    /// output, then back to the application. Output-wide, so the verb's edge
+    /// is ignored; [`focus_next_command`] builds it without one.
+    FocusNext,
     /// Register a sub-panel name on the verb's edge (panel doc §3). Unlike
     /// the panel verbs, identity binds at dispatch: `owner` is the
     /// broker-attested caller, never a caller-supplied field, and the
@@ -83,6 +92,13 @@ pub enum ShellSemanticVerb {
     },
 }
 
+/// The focus-cycle step, shared by Quoin's in-panel chord and the
+/// `shell.focus.next` verb so both move focus identically.
+pub fn focus_next_command(output: OutputKey, at: Duration) -> ShellCommand {
+    // The cycle walks every edge of the output; no edge is addressed.
+    semantic_shell_command(output, at, Edge::Left, ShellSemanticVerb::FocusNext)
+}
+
 /// Produce the same [`ShellCommand`] used by pointer and keyboard input.
 ///
 /// Deliberately takes no frame snapshot: every verb (toggle included) binds
@@ -109,13 +125,17 @@ pub fn semantic_shell_command(
         },
         ShellSemanticVerb::PanelToggle => ShellCommandKind::Panel {
             edge,
-            input: PanelInput::Toggle,
+            input: PanelInput::ToggleShown,
         },
         ShellSemanticVerb::PanelPin => ShellCommandKind::Panel {
             edge,
-            // Legacy Bus pin keeps its reserving behaviour so popup citizens
-            // hold their space; the precise verbs are PanelDock/PanelMode.
-            input: PanelInput::Dock,
+            // Pin is an overlay that reserves no space (Mark, 2026-09-26);
+            // PanelDock is the reserving verb.
+            input: PanelInput::Pin,
+        },
+        ShellSemanticVerb::PanelPinToggle => ShellCommandKind::Panel {
+            edge,
+            input: PanelInput::PinToggle,
         },
         ShellSemanticVerb::PanelUnpin => ShellCommandKind::Panel {
             edge,
@@ -142,6 +162,7 @@ pub fn semantic_shell_command(
             edge,
             input: CarouselInput::SelectId(id),
         },
+        ShellSemanticVerb::FocusNext => ShellCommandKind::Keyboard(KeyboardCommand::CycleFocus),
         ShellSemanticVerb::SubRegister { name, owner } => {
             ShellCommandKind::SubPanelRegister { edge, name, owner }
         }

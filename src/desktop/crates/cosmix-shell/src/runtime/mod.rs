@@ -12,13 +12,13 @@ pub use messages::{
     PanelPresentation, ShellCommand, ShellCommandKind, ShellEffect, ShellFrame, ShellResizeError,
     ShellResizeResult, WakePolicy,
 };
-pub use semantic::{SceneVerb, ShellSemanticVerb, semantic_shell_command};
+pub use semantic::{SceneVerb, ShellSemanticVerb, focus_next_command, semantic_shell_command};
 
 #[cfg(feature = "chrome-core")]
 pub use bevy_runtime::{
     ShellEffects, ShellFrameState, ShellQuitHandler, ShellRuntimePlugin, ShellRuntimeSet,
     ShellStagedIngress, SubPanelRegistryState, forget_shell_subpanel, redeclare_shell_pages,
     register_shell_page, remove_all_owned_subpanels, remove_owned_subpanels_before,
-    remove_shell_page, replace_shell_model, seed_page_thickness, set_page_thickness,
+    remove_shell_page, replace_shell_model, set_page_minimum_thickness, set_page_thickness,
     set_shell_pages,
 };

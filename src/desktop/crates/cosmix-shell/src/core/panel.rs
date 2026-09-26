@@ -89,6 +89,12 @@ pub enum PanelInput {
     /// reveal already false) toggles back open, and two toggles applied in one
     /// drained batch net to identity rather than to a single toggle.
     Toggle,
+    /// The chord and Bus toggle (`shell.panel.toggle`): [`PanelInput::Toggle`]
+    /// on a `Hidden` panel, and on a `Pinned` or `Docked` one a deliberate
+    /// hide into `Hidden`, exactly as `SetMode(Hidden)`. Toggling again then
+    /// reveals transiently: it never restores the persistent mode, because
+    /// docking reflows the workspace and is never a side effect of a toggle.
+    ToggleShown,
     CornerEntered,
     CornerLeft,
     Hide,
@@ -135,6 +141,7 @@ impl PanelInput {
             self,
             Self::Reveal
                 | Self::Toggle
+                | Self::ToggleShown
                 | Self::CornerEntered
                 | Self::PointerEntered
                 | Self::HolderReveal
@@ -222,6 +229,9 @@ pub struct PanelSnapshot {
     pub mode: PanelMode,
     /// Runtime visibility intent only; never persisted. Only true in Hidden.
     pub transient_revealed: bool,
+    /// The transient reveal is the cold-start discovery intro, not a
+    /// deliberate hover, corner or `show`.
+    pub intro_revealed: bool,
     pub visible_fraction: f32,
     pub target_fraction: f32,
     pub velocity_per_second: f32,
@@ -274,6 +284,10 @@ pub struct PanelStateMachine {
     resize_start: Option<f32>,
     corner_inside: bool,
     intro_until: Option<Duration>,
+    /// The transient reveal is the cold-start intro's, through its closing
+    /// grace, until a deliberate input (hover, corner, show, a mode change)
+    /// claims the edge. Reported only while transiently revealed.
+    intro_reveal: bool,
     hide_at: Option<Duration>,
     conceal_reason: Option<ConcealReason>,
     last_update: Duration,
@@ -338,6 +352,7 @@ impl PanelStateMachine {
             resize_start: None,
             corner_inside: false,
             intro_until: None,
+            intro_reveal: false,
             hide_at: None,
             conceal_reason: None,
             hover_latched: false,
@@ -357,6 +372,22 @@ impl PanelStateMachine {
             self.clear_deadline();
         }
         let mut effect = self.advance_to(at)?;
+        // Anything but a departure or a conceal is a deliberate claim on the
+        // edge: from here its reveal is no longer the intro's.
+        if !matches!(
+            input,
+            PanelInput::PointerLeft
+                | PanelInput::CornerLeft
+                | PanelInput::HolderConceal
+                | PanelInput::ResizeStarted
+                | PanelInput::ResizeCompleted
+                | PanelInput::ResizeCancelled
+                | PanelInput::MenuHold(false)
+                | PanelInput::Hide
+                | PanelInput::Escape
+        ) {
+            self.intro_reveal = false;
+        }
         // The local Escape latch suppresses hover only; an explicit action that
         // shows the panel is deliberate and clears it. Inputs that leave a
         // hidden panel hidden (SetMode(Hidden), Unpin, Undock, Release) do not.
@@ -364,6 +395,7 @@ impl PanelStateMachine {
             input,
             PanelInput::Reveal
                 | PanelInput::Toggle
+                | PanelInput::ToggleShown
                 | PanelInput::Pin
                 | PanelInput::PinToggle
                 | PanelInput::Dock
@@ -424,7 +456,13 @@ impl PanelStateMachine {
                 }
                 self.motion.reveal();
             }
-            PanelInput::Toggle => {
+            PanelInput::ToggleShown if self.mode != PanelMode::Hidden => {
+                effect = self.change_mode(PanelMode::Hidden).or(effect);
+                if !plane && (self.pointer_inside || self.corner_inside) {
+                    self.hover_latched = true;
+                }
+            }
+            PanelInput::Toggle | PanelInput::ToggleShown => {
                 if self.mode == PanelMode::Hidden && !self.transient_revealed {
                     self.transient_revealed = true;
                     self.shown = true;
@@ -606,6 +644,7 @@ impl PanelStateMachine {
     pub fn start_intro(&mut self, duration: Duration) {
         if self.mode == PanelMode::Hidden {
             self.intro_until = Some(self.last_update + duration);
+            self.intro_reveal = true;
             self.transient_revealed = true;
             self.clear_deadline();
             self.motion.reveal();
@@ -616,6 +655,14 @@ impl PanelStateMachine {
     pub fn restore_thickness(&mut self, thickness_px: f32) -> Result<(), PanelConfigError> {
         self.config = PanelConfig::new(thickness_px, self.config.grace, self.config.motion_time)?;
         Ok(())
+    }
+
+    /// Put the size back to where the current resize gesture started (no-op
+    /// outside a gesture). The gesture stays open.
+    pub fn revert_to_resize_start(&mut self) {
+        if let Some(start) = self.resize_start {
+            self.config.thickness_px = start;
+        }
     }
 
     /// Runtime commands reject input outside `range` (the edge's
@@ -714,6 +761,7 @@ impl PanelStateMachine {
         PanelSnapshot {
             mode: self.mode,
             transient_revealed: self.transient_revealed,
+            intro_revealed: self.transient_revealed && self.intro_reveal,
             visible_fraction,
             target_fraction: self.motion.target(),
             velocity_per_second: self.motion.velocity_per_second(),
@@ -961,6 +1009,13 @@ pub enum PanelConfigError {
         max: f32,
     },
     Motion(MotionError),
+    /// A resize below the shown page's authored extent: it would be invisible
+    /// on screen, so it is refused rather than saved (or raised to it).
+    PageMinimum {
+        edge: super::Edge,
+        requested: f32,
+        minimum: f32,
+    },
 }
 
 impl Display for PanelConfigError {
@@ -983,6 +1038,14 @@ impl Display for PanelConfigError {
                 )
             }
             Self::Motion(error) => Display::fmt(error, formatter),
+            Self::PageMinimum {
+                edge,
+                requested,
+                minimum,
+            } => write!(
+                formatter,
+                "panel {edge:?} thickness {requested} is below the shown page's extent {minimum}"
+            ),
         }
     }
 }

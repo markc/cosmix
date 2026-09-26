@@ -423,23 +423,26 @@ pub fn reconcile(world: &mut World) {
                     mounted.page,
                     config.as_ref().and_then(|w| w["chrome"].as_bool()) == Some(false),
                 );
-                if mounted.registered {
-                    use cosmix_shell::runtime::ShellFrameState;
-                    let dimension = if matches!(edge, Edge::Left | Edge::Right) {
-                        "w"
-                    } else {
-                        "h"
-                    };
-                    let default_size = cosmix_shell::core::seed_panel_thickness(
-                        edge,
-                        world.resource::<ShellFrameState>().0.geometry.logical_size,
-                    );
-                    let size = config
-                        .as_ref()
-                        .and_then(|window| window[dimension].as_f64())
-                        .map_or(default_size, |size| size.min(f32::MAX as f64) as f32);
-                    cosmix_shell::runtime::seed_page_thickness(world, edge, size);
-                }
+            }
+            if mounted.registered && !dialog {
+                // The scene's w (side edges) or h (top/bottom) is a MINIMUM
+                // over the remembered thickness while this page is shown; it
+                // never rewrites what a drag saved. Re-applied on every
+                // revision, so a patched or removed extent takes effect.
+                let dimension = if matches!(edge, Edge::Left | Edge::Right) {
+                    "w"
+                } else {
+                    "h"
+                };
+                let minimum = mount_config(&entry.tree)
+                    .and_then(|window| window[dimension].as_f64())
+                    .map(|size| size.min(f32::MAX as f64) as f32);
+                cosmix_shell::runtime::set_page_minimum_thickness(
+                    world,
+                    edge,
+                    &page_id(&entry.tree),
+                    minimum,
+                );
             }
         }
         // Hosts read the seat from the shell-side mirror, never from here.
@@ -1776,38 +1779,60 @@ mod tests {
     }
 
     #[test]
-    fn mount_seeds_thickness_only_when_unset() {
-        use cosmix_shell::runtime::{ShellFrameState, set_page_thickness};
+    fn scene_extent_is_a_minimum_over_the_saved_thickness() {
+        use cosmix_shell::runtime::{ShellFrameState, set_page_thickness, set_shell_pages};
         for edge in Edge::ALL {
-            for remembered in [false, true] {
-                let mut app = mount_test_app(true);
-                let world = app.world_mut();
-                if remembered {
-                    set_page_thickness(world, edge, 173.0);
-                }
-                load_mount_test_scene(world, "first", edge, 210);
-                reconcile(world);
-                let expected = if remembered { 173.0 } else { 210.0 };
-                assert_eq!(
-                    world
-                        .resource::<ShellFrameState>()
-                        .0
-                        .panel(edge)
-                        .thickness_px,
-                    expected
-                );
-                load_mount_test_scene(world, "second", edge, 290);
-                reconcile(world);
-                assert_eq!(
-                    world
-                        .resource::<ShellFrameState>()
-                        .0
-                        .panel(edge)
-                        .thickness_px,
-                    expected
-                );
-            }
+            let mut app = mount_test_app(true);
+            let world = app.world_mut();
+            // The saved width is narrower than the scene asks for (the
+            // launcher's w:440 against a dragged 422, scaled to every edge).
+            set_page_thickness(world, edge, 150.0);
+            load_mount_test_scene(world, "wide", edge, 200);
+            reconcile(world);
+            // (presented thickness, settled thickness) of the edge.
+            let panel = |world: &World| {
+                let panel = world.resource::<ShellFrameState>().0.panel(edge);
+                (panel.thickness_px, panel.settled_thickness_px)
+            };
+            assert_eq!(
+                world.resource::<ShellFrameState>().0.panel(edge).active_page_id.as_deref(),
+                Some("scene-wide")
+            );
+            assert_eq!(panel(world), (200.0, 150.0), "{edge:?}");
+            // A page asking for less than the saved width gets the saved one.
+            load_mount_test_scene(world, "narrow", edge, 130);
+            reconcile(world);
+            set_shell_pages(
+                world,
+                edge,
+                vec!["scene-wide".into(), "scene-narrow".into()],
+                Some("scene-narrow"),
+            );
+            assert_eq!(panel(world).0, 150.0, "{edge:?}");
+            // Back on the wide page it grows again; the saved value never moved.
+            set_shell_pages(
+                world,
+                edge,
+                vec!["scene-wide".into(), "scene-narrow".into()],
+                Some("scene-wide"),
+            );
+            assert_eq!(panel(world), (200.0, 150.0), "{edge:?}");
         }
+    }
+
+    /// Review M2: with nothing saved, the scene's extent is the edge's size
+    /// even below the output default (a fresh install's 52 px bottom bar).
+    #[test]
+    fn a_fresh_edge_takes_the_scene_extent() {
+        use cosmix_shell::runtime::ShellFrameState;
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        let default = world.resource::<ShellFrameState>().0.panel(Edge::Bottom).thickness_px;
+        assert!(default > 52.0, "precondition: default {default} is taller");
+        load_mount_test_scene(world, "bar", Edge::Bottom, 52);
+        reconcile(world);
+        let panel = world.resource::<ShellFrameState>().0.panel(Edge::Bottom);
+        assert_eq!((panel.thickness_px, panel.settled_thickness_px), (52.0, 52.0));
     }
 
     #[test]
@@ -1979,6 +2004,39 @@ mod tests {
             .0
             .forget("scene-orphan");
         remove_unseated_scenes(world);
+    }
+
+    /// Review N3 (Opus vs GLM): registry removal lands the carousel through
+    /// `SubPanelRegistry::remove` (a direct carousel remove, not
+    /// `remove_shell_page`) and tears down content via
+    /// `remove_unseated_scenes` → `unmount_page_content`. That path must drop
+    /// the page's extent too, or a later page reusing the id inherits it.
+    #[test]
+    fn registry_removal_drops_the_page_extent() {
+        use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState, set_shell_pages};
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        let output = world.resource::<ShellFrameState>().0.geometry.output.clone();
+        let default = world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px;
+        load_mount_test_scene(world, "extent", Edge::Left, 300);
+        reconcile(world);
+        assert_eq!(world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px, 300.0);
+        world.write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::SubPanelRemove {
+                edge: Edge::Left,
+                name: "scene-extent".into(),
+                owner: "test".into(),
+                accepted_at: 1,
+            },
+        });
+        app.update();
+        let world = app.world_mut();
+        assert!(!world.resource::<SceneStore>().scenes.contains_key("extent"));
+        // A verb-only page reusing the id carries no extent.
+        set_shell_pages(world, Edge::Left, vec!["scene-extent".into()], Some("scene-extent"));
+        assert_eq!(world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px, default);
     }
 
     #[test]
@@ -2833,7 +2891,7 @@ mod tests {
         spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
         queue.apply(world);
         let mut store = SceneStore::default();
-        store.request(SceneVerb::Load, "---\nscene: 1\nname: mount-test\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"left\", w: 200}\n```\n", &Value::Null).unwrap();
+        store.request(SceneVerb::Load, "---\nscene: 1\nname: mount-test\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"left\", w: 300}\n```\n", &Value::Null).unwrap();
         world.insert_resource(store);
         reconcile(world);
         assert_eq!(
@@ -2876,6 +2934,11 @@ mod tests {
                 .as_ref(),
             &["scene-mount-test"]
         );
+        // The authored minimum moved with the page; the left edge dropped it.
+        let frame = &world.resource::<ShellFrameState>().0;
+        // Nothing is remembered on the right edge: the extent is its size.
+        assert_eq!(frame.panel(Edge::Right).thickness_px, 300.0);
+        assert_eq!(frame.panel(Edge::Right).settled_thickness_px, 300.0);
         assert_eq!(
             world.resource::<SceneStore>().scenes["mount-test"]
                 .mounted
@@ -2894,8 +2957,9 @@ mod tests {
             .unwrap();
         reconcile(world);
         let frame = &world.resource::<ShellFrameState>().0;
-        // Clearing an authored extent cannot reset the edge's seeded size.
-        assert_eq!(frame.panel(Edge::Right).thickness_px, 200.0);
+        // Clearing the authored extent drops the minimum: the edge returns to
+        // its remembered (here the output-derived default) thickness.
+        assert_eq!(frame.panel(Edge::Right).thickness_px, 240.0);
         assert!(!frame.panel(Edge::Right).mapped);
         world
             .resource_mut::<SceneStore>()

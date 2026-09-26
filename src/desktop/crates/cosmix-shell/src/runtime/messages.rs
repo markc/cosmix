@@ -186,11 +186,22 @@ pub struct PanelPresentation {
     pub max_thickness_px: f32,
     pub mode: PanelMode,
     pub transient_revealed: bool,
+    /// The transient reveal is the cold-start intro (see
+    /// [`crate::core::PanelSnapshot::intro_revealed`]).
+    pub intro_revealed: bool,
     pub mapped: bool,
     pub visible_fraction: f32,
     pub thickness_px: f32,
     pub resize_active: bool,
     pub settled_thickness_px: f32,
+    /// While the active page declares an authored extent, the smallest size
+    /// a resize may save (see [`crate::core::ShellModel::resize_floor`]).
+    pub resize_floor_px: Option<f32>,
+    /// The edge has a restored or resized thickness of its own. Without one
+    /// it presents its page's extent (or the output default), and
+    /// persistence records no thickness, so a page's extent never becomes a
+    /// saved width by being shown at a save.
+    pub thickness_remembered: bool,
     pub exclusive_zone_px: f32,
     pub keyboard_interactivity: KeyboardInteractivity,
     /// The shell asks for the keyboard in this panel (a focus-cycle stop or
@@ -230,11 +241,14 @@ impl ShellFrame {
                 max_thickness_px: model.max_thickness(edge),
                 mode: panel.mode,
                 transient_revealed: panel.transient_revealed,
+                intro_revealed: panel.intro_revealed,
                 mapped: panel.mapped,
                 visible_fraction: panel.visible_fraction,
                 thickness_px: panel.thickness_px,
                 resize_active: panel.resize_active,
                 settled_thickness_px: panel.settled_thickness_px,
+                resize_floor_px: model.resize_floor(edge),
+                thickness_remembered: model.has_remembered_thickness(edge),
                 exclusive_zone_px: panel.exclusive_zone_px,
                 keyboard_interactivity: match model.focus_directive() {
                     _ if !panel.mapped => KeyboardInteractivity::None,
