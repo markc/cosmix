@@ -669,7 +669,7 @@ mod tests {
         for header in [
             "Content-Type : message/rfc822\r\n\r\n",
             "Content-Type: message\r\n /rfc822\r\n\r\n",
-            "cOnTeNt - TyPe\t: (a (nested\\) comment)) MeSsAgE / (b) RfC822\n\n",
+            "cOnTeNt - TyPe\t: (a (nested) comment) MeSsAgE / (b) RfC822\n\n",
             "Content-Type: ignored\n\tmessage/rfc822\n\n",
             "Content-Type: message/global\r\n\r\n",
             "Content-Type : message/global\r\n\r\n",
@@ -740,6 +740,12 @@ mod tests {
         for header in [
             "Content-\r\n Type: message/rfc822\r\n\r\n",
             "Content-Type: message/unknown\r\n\r\n",
+            // mail-parser 0.11.5 parsers/fields/content_type.rs:452 toggles
+            // the comment escape flag, but :498-499 immediately clears it;
+            // :485-492 therefore closes the comment at the backslashed ')'.
+            // This form parses as c_type ") message", not "message".
+            // Keep it scanner-only: over-counting is the conservative side.
+            "cOnTeNt - TyPe\t: (a (nested\\) comment)) MeSsAgE / (b) RfC822\n\n",
         ] {
             for depth in [MAX_DEPTH + 1, 5000] {
                 let raw = format!("{}Subject: leaf\r\n\r\nx", header.repeat(depth));
