@@ -342,8 +342,11 @@ The raw-message inspection cap is always 64 MiB, even when admission's
 unknown attachment metadata and inspection/export returns `too_large:`;
 diagnostic inputs use the configured bound. The linear pre-parse header scanner
 includes quoted body text: at most 2,000 potential header blocks and 32
-embedded-message media types (`message/rfc822` or `message/global`). It accepts
-case variations, whitespace in names, folded values and comments.
+potential embedded messages (conservatively all `message/*` types). It accepts
+case variations, whitespace anywhere in names (including conservative folded
+names), folded values and comments. After `multipart/digest`, every subsequent
+blank or boundary separator counts as a potential implicit message, including
+empty headers and separators after the digest ends.
 False-positive refusals are possible.
 The whole walk has a 128 MiB decoded-byte budget and allows two nested
 encoded re-parses beyond the parser's own limit. Bad individual parts instead

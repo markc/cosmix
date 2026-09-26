@@ -251,8 +251,19 @@ fn structure_preflight(data: &[u8]) -> Result<(), Error> {
     let mut lines = data.split_inclusive(|b| *b == b'\n').peekable();
     let (mut blocks, mut messages) = (0, 0);
     let mut starts_block = true;
+    // mail-parser 0.11.5 parsers/message.rs:49,64-65 defaults digest children
+    // to Message; :214-236 nests them. Conservatively charge every subsequent
+    // blank/boundary separator, including empty headers, even after the digest
+    // ends. This needs no boundary storage and cannot miss implicit children.
+    let mut digest_seen = false;
     while let Some(line) = lines.next() {
         if line.trim_ascii().is_empty() || line.starts_with(b"--") {
+            if digest_seen {
+                messages += 1;
+                if messages > MAX_DEPTH {
+                    return Err(Error::TooLarge("MIME pre-parse structure limit"));
+                }
+            }
             starts_block = true;
             continue;
         }
@@ -263,7 +274,7 @@ fn structure_preflight(data: &[u8]) -> Result<(), Error> {
                 return Err(Error::TooLarge("MIME pre-parse structure limit"));
             }
         }
-        if let Some(value) = content_type_value(line) {
+        if let Some(value) = content_type_value(line, &mut lines) {
             let mut media = PreflightMedia::default();
             media.feed(value);
             while lines
@@ -274,7 +285,10 @@ fn structure_preflight(data: &[u8]) -> Result<(), Error> {
                 media.feed(lines.next().unwrap());
             }
             media.finish_token();
-            if media.message && media.embedded {
+            digest_seen |= media.multipart && media.digest;
+            // message.rs:59-60 nests rfc822 AND global. Count every message/*
+            // conservatively, including unknown subtypes, before any parsing.
+            if media.message && media.subtype {
                 messages += 1;
                 if messages > MAX_DEPTH {
                     return Err(Error::TooLarge("MIME pre-parse structure limit"));
@@ -285,33 +299,50 @@ fn structure_preflight(data: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn content_type_value(line: &[u8]) -> Option<&[u8]> {
+fn content_type_value<'a>(
+    mut line: &'a [u8],
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
+) -> Option<&'a [u8]> {
     let mut length = 0;
     let mut matches = true;
-    for (index, byte) in line.iter().copied().enumerate() {
-        match byte {
-            b'\n' => return None,
-            b':' if length > 0 => return (matches && length == 12).then_some(&line[index + 1..]),
-            b':' => (), // parse_header_name ignores colons before the first token
-            b if b.is_ascii_whitespace() => (),
-            b => {
-                matches &= b"content-type"
-                    .get(length)
-                    .is_some_and(|v| b.eq_ignore_ascii_case(v));
-                length += 1;
+    // header.rs:115-128 removes all ASCII whitespace within names. Its LF
+    // branch (:112-113) actually rejects folded names; accept those here too
+    // as a conservative superset, without allocating an unfolded header.
+    loop {
+        for (index, byte) in line.iter().copied().enumerate() {
+            match byte {
+                b':' if length > 0 => {
+                    return (matches && length == 12).then_some(&line[index + 1..]);
+                }
+                b':' => (), // parse_header_name ignores colons before the first token
+                b if b.is_ascii_whitespace() => (),
+                b => {
+                    matches &= b"content-type"
+                        .get(length)
+                        .is_some_and(|v| b.eq_ignore_ascii_case(v));
+                    length += 1;
+                }
             }
         }
+        if lines
+            .peek()
+            .is_some_and(|line| matches!(line.first(), Some(b' ' | b'\t')))
+        {
+            line = lines.next().unwrap();
+        } else {
+            return None;
+        }
     }
-    None
 }
 
 #[derive(Default)]
 struct PreflightMedia {
-    token: [u8; 7],
+    token: [u8; 9],
     length: usize,
     subtype: bool,
     message: bool,
-    embedded: bool,
+    multipart: bool,
+    digest: bool,
     comments: usize,
     escaped: bool,
     done: bool,
@@ -321,9 +352,10 @@ impl PreflightMedia {
     fn finish_token(&mut self) {
         let token = self.token.get(..self.length).unwrap_or_default();
         if self.subtype {
-            self.embedded |= token == b"rfc822" || token == b"global";
+            self.digest |= token == b"digest";
         } else {
             self.message |= token == b"message";
+            self.multipart |= token == b"multipart";
         }
         self.length = 0;
     }
@@ -640,6 +672,8 @@ mod tests {
             "cOnTeNt - TyPe\t: (a (nested\\) comment)) MeSsAgE / (b) RfC822\n\n",
             "Content-Type: ignored\n\tmessage/rfc822\n\n",
             "Content-Type: message/global\r\n\r\n",
+            "Content-Type : message/global\r\n\r\n",
+            "Con tent-Type: message/rfc822\r\n\r\n",
         ] {
             // Cross-check the locked dependency's non-recursive header lexer.
             let mut lexer = mail_parser::parsers::MessageStream::new(header.as_bytes());
@@ -686,12 +720,55 @@ mod tests {
         // The same shared-boundary pattern as malformed_nested_messages_contain_the_parser_debug_panic.
         // Reaching mail-parser's debug_assert would yield Unreadable("MIME worker panicked"),
         // so this specific TooLarge result proves refusal before tree parsing.
+        for header in [
+            "Content-Type: message/rfc822\r\n\r\n",
+            "Content-Type : message/global\r\n\r\n",
+        ] {
+            let raw = format!(
+                "Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n{}Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n",
+                header.repeat(5000)
+            );
+            assert_eq!(
+                inspect(raw.as_bytes(), None, false).unwrap_err(),
+                Error::TooLarge("MIME pre-parse structure limit")
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_conservatively_bounds_folded_names_and_all_message_subtypes() {
+        for header in [
+            "Content-\r\n Type: message/rfc822\r\n\r\n",
+            "Content-Type: message/unknown\r\n\r\n",
+        ] {
+            for depth in [MAX_DEPTH + 1, 5000] {
+                let raw = format!("{}Subject: leaf\r\n\r\nx", header.repeat(depth));
+                assert_eq!(
+                    inspect(raw.as_bytes(), None, false).unwrap_err(),
+                    Error::TooLarge("MIME pre-parse structure limit")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_bounds_implicit_digest_messages() {
         let raw = format!(
-            "Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n{}Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n",
-            "Content-Type: message/rfc822\r\n\r\n".repeat(5000)
+            "Content-Type: multipart/digest; boundary=d\r\n\r\n{}--d--\r\n",
+            "--d\r\n\r\nSubject: implicit message\r\n\r\nbody\r\n".repeat(40)
         );
         assert_eq!(
             inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit")
+        );
+        // Empty implicit headers also need charging, even without a boundary
+        // between them: the parser inherits the digest parent while nesting.
+        let empty = format!(
+            "Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n{}",
+            "\r\n".repeat(40)
+        );
+        assert_eq!(
+            structure_preflight(empty.as_bytes()).unwrap_err(),
             Error::TooLarge("MIME pre-parse structure limit")
         );
     }

@@ -291,9 +291,12 @@ and omit `attachments`; attachment inspection/export returns `too_large:`.
 Diagnostic blob inputs still use the configured `max_message_size`.
 
 Before parsing, a linear header-aware scan permits at most 2,000 potential
-header blocks and 32 embedded-message media types (`message/rfc822` or
-`message/global`). It recognises whitespace in header names, folded values
-and comments. Quoted header text in message bodies counts too and can cause a false-positive
+header blocks and 32 potential embedded messages (conservatively all `message/*`
+types). It removes whitespace in header names, conservatively accepts folded
+names, and recognises folded values and comments. After `multipart/digest`,
+every subsequent blank or boundary separator counts as a potential implicit
+message, even after the digest ends. Quoted header text in message bodies
+counts too and can cause a false-positive
 `too_large:` refusal. Parse, walk and tree destruction use a dedicated 64 MiB
 thread stack. The walk permits depth 32, 1,000 parts, path length 64,
 64 MiB per decoded part, an aggregate 128 MiB decoded-byte budget, and at most
