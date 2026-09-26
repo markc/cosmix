@@ -8,7 +8,7 @@
 cosmix-blobd [-c CONFIG]
 ```
 
-The package builds the `cosmix-blobd` binary and the `cosmix_blobd` library. The library follows the core-first pattern (`cosmix-powerd`'s shape): the store core is pure and unit-tested with the `cosmix` feature off; the Bus citizen exists only under that feature.
+The package builds the `cosmix-blobd` binary and the `cosmix_blobd` library. The library follows the core-first pattern (`cosmix-powerd`'s shape): the store core is pure and unit-tested with the `cosmix` feature off; the Bus citizen and the byte lane exist only under that feature.
 
 One instance owns one mds root, enforced by an exclusive `flock` on `<root>/.blobd.lock` at open — a second instance on the same root exits with status 2. That lock is what enforces "one GC owner per root". A named instance (`name:` in the config) registers as `blobd-<name>` with its own root; the verb namespace stays `blob.*` either way.
 
@@ -20,6 +20,7 @@ Flat `key: value` file at `/etc/cosmix/blobd/config.conf.mix`, passed with `-c` 
 root: /var/lib/cosmix/blobd
 name: two
 lane_bind: 10.42.0.5:4210
+lane_max_uploads: 4
 quota_total_bytes: 50GiB
 quota_owner_default_bytes: 10GiB
 quota_owner: maild=1GiB
@@ -30,7 +31,8 @@ quota_owner: capture=2GiB
 |---|---|---|
 | `root` | `/var/lib/cosmix/blobd` (the unit's `StateDirectory`) | mds root this instance owns |
 | `name` | unset (service `blobd`) | Instance name; Bus service becomes `blobd-<name>` |
-| `lane_bind` | unset | Byte-lane bind `<ip>:<port>`. The listener itself arrives in a later slice (P1 slice 3); here it is validated and used to build `blob.url` |
+| `lane_bind` | unset (no lane) | Byte-lane bind `<ip>:<port>`; the IP must be this node's `wg_ip` (see [Byte lane](#byte-lane)) |
+| `lane_max_uploads` | `4` | Concurrent lane uploads admitted; beyond it the lane answers `503` — no queueing |
 | `quota_total_bytes` | `50GiB` | Total cap on accounted (pinned) bytes |
 | `quota_owner_default_bytes` | `10GiB` | Per-owner cap unless overridden |
 | `quota_owner: <owner>=<bytes>` | none (repeatable) | Per-owner cap; later lines for the same owner win |
@@ -40,6 +42,40 @@ Byte values accept plain integers or a binary suffix (`KiB`, `MiB`, `GiB`, `TiB`
 ### Lane port
 
 `lane_bind`'s port is **4210** by operator convention. No port-registry specification exists in `docs/spec/` today (the broker rides a Unix socket; the mesh listener defaults to 4200, MESH-013); this README is the record of the choice — 4210, the next number above the mesh default. The port is published as the `lane.port` prop (props-only, never the signed inventory); a future shared port-registry spec should adopt 4210 rather than renumber.
+
+## Byte lane
+
+The lane is the HTTP listener that moves bytes: blobs never ride a Bus frame, so cross-node reads and user-side producers (capture, webd, Thunderbird) use it. It serves only the WireGuard address — **the bind proof is fail-closed**: `lane_bind`'s IP must equal this node's `wg_ip` from `node.conf.mix` (the same source noded's `bind_is_wg` uses), never unspecified, never loopback, never another interface; a mismatch (or an absent `wg_ip`) exits with status 2 before any socket is opened. The `RestrictAddressFamilies` in the unit already allows INET for it. `lane.bind`/`lane.port` props exist only once the socket is actually listening — main binds before the citizen is constructed.
+
+### Routes
+
+| Route | Meaning |
+|---|---|
+| `GET /blob/<hex>` | Stream the blob (`<hex>` = 64 hex chars, no `b3:` prefix — exactly the path `blob.url` builds) |
+| `HEAD /blob/<hex>` | `GET`'s headers without the body |
+| `PUT /blob/<hex>` | Upload from a client that already knows the hash |
+| `POST /blob` | Server-hashed upload (curl, browsers, FileLink style) |
+
+Reads (`GET`/`HEAD`) answer `200` with `Content-Length`, `Content-Type` from the attributes (else `application/octet-stream`), `Accept-Ranges: bytes`, `ETag: "<hex>"` and `Cache-Control: immutable`, streamed from the CAS file — never read into memory whole. A single `Range: bytes=a-b` / `bytes=a-` / `bytes=-n` answers `206` with `Content-Range` (a past-EOF last byte clamps to EOF); a start at or past EOF, or a zero suffix, answers `416` with `Content-Range: bytes */<size>`; malformed or multi-range specs are ignored and the whole blob is served (RFC 9110). An unknown hash is `404`.
+
+`PUT` streams the body into mds staging, hashing as it lands; on completion the landed hash must equal `<hex>` or the answer is `422` — the CAS keeps no entry for either hash and nothing stays in staging. If the CAS already holds `<hex>`, the lane answers `200` **without reading the body** (the hash is the identity; the body cannot change it) and pins it to the lane owner. `POST` is the same pipeline with the hash discovered at stream end; both answer `201` with the reference JSON on success.
+
+### Headers
+
+| Header | Applies to | Meaning |
+|---|---|---|
+| `X-Cosmix-Owner` | `PUT`/`POST` | Pin owner; otherwise `lane:<peer ip>` |
+| `X-Cosmix-Mime` | `PUT`/`POST` | Recorded mime; otherwise sniffed from `X-Cosmix-Name`, else `application/octet-stream` |
+| `X-Cosmix-Name` | `PUT`/`POST` | Name hint recorded in the attributes |
+| `Range` | `GET`/`HEAD` | Single range, see above |
+
+Every successful upload records attributes (`origin` = this node) and a pin, so `blob.stat`/`blob.list` see it immediately and quota accounts it.
+
+### Caps and bounds
+
+The total cap and the lane owner's remaining quota are enforced **mid-stream** by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers `413`; a declared `Content-Length` over the cap is refused `413` before any byte is read. An idle request body (no data for 30 s) aborts with `408`. At most `lane_max_uploads` (default 4) uploads run concurrently; beyond that the lane answers `503` immediately — there is no queue (the no-poll/no-flood law).
+
+Uploads are **restart-only** in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction.
 
 ## Storage layout
 

@@ -446,13 +446,14 @@
 <h2 id="synopsis">Synopsis</h2>
 <pre><code class="language-text">cosmix-blobd [-c CONFIG]
 </code></pre>
-<p>The package builds the <code>cosmix-blobd</code> binary and the <code>cosmix_blobd</code> library. The library follows the core-first pattern (<code>cosmix-powerd</code>'s shape): the store core is pure and unit-tested with the <code>cosmix</code> feature off; the Bus citizen exists only under that feature.</p>
+<p>The package builds the <code>cosmix-blobd</code> binary and the <code>cosmix_blobd</code> library. The library follows the core-first pattern (<code>cosmix-powerd</code>'s shape): the store core is pure and unit-tested with the <code>cosmix</code> feature off; the Bus citizen and the byte lane exist only under that feature.</p>
 <p>One instance owns one mds root, enforced by an exclusive <code>flock</code> on <code>&lt;root&gt;/.blobd.lock</code> at open — a second instance on the same root exits with status 2. That lock is what enforces "one GC owner per root". A named instance (<code>name:</code> in the config) registers as <code>blobd-&lt;name&gt;</code> with its own root; the verb namespace stays <code>blob.*</code> either way.</p>
 <h2 id="configuration">Configuration</h2>
 <p>Flat <code>key: value</code> file at <code>/etc/cosmix/blobd/config.conf.mix</code>, passed with <code>-c</code> (filesd style: <code>#</code> comments, blank lines, key split on the first <code>:</code>, both sides trimmed).</p>
 <pre><code class="language-text">root: /var/lib/cosmix/blobd
 name: two
 lane_bind: 10.42.0.5:4210
+lane_max_uploads: 4
 quota_total_bytes: 50GiB
 quota_owner_default_bytes: 10GiB
 quota_owner: maild=1GiB
@@ -461,7 +462,8 @@ quota_owner: capture=2GiB
 <table><thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>root</code></td><td><code>/var/lib/cosmix/blobd</code> (the unit's <code>StateDirectory</code>)</td><td>mds root this instance owns</td></tr>
 <tr><td><code>name</code></td><td>unset (service <code>blobd</code>)</td><td>Instance name; Bus service becomes <code>blobd-&lt;name&gt;</code></td></tr>
-<tr><td><code>lane_bind</code></td><td>unset</td><td>Byte-lane bind <code>&lt;ip&gt;:&lt;port&gt;</code>. The listener itself arrives in a later slice (P1 slice 3); here it is validated and used to build <code>blob.url</code></td></tr>
+<tr><td><code>lane_bind</code></td><td>unset (no lane)</td><td>Byte-lane bind <code>&lt;ip&gt;:&lt;port&gt;</code>; the IP must be this node's <code>wg_ip</code> (see <a href="/cos/cosmix-blobd/#byte-lane">Byte lane</a>)</td></tr>
+<tr><td><code>lane_max_uploads</code></td><td><code>4</code></td><td>Concurrent lane uploads admitted; beyond it the lane answers <code>503</code> — no queueing</td></tr>
 <tr><td><code>quota_total_bytes</code></td><td><code>50GiB</code></td><td>Total cap on accounted (pinned) bytes</td></tr>
 <tr><td><code>quota_owner_default_bytes</code></td><td><code>10GiB</code></td><td>Per-owner cap unless overridden</td></tr>
 <tr><td><code>quota_owner: &lt;owner&gt;=&lt;bytes&gt;</code></td><td>none (repeatable)</td><td>Per-owner cap; later lines for the same owner win</td></tr>
@@ -469,6 +471,28 @@ quota_owner: capture=2GiB
 <p>Byte values accept plain integers or a binary suffix (<code>KiB</code>, <code>MiB</code>, <code>GiB</code>, <code>TiB</code>; <code>KB</code>-style spellings are still binary). Unknown keys are ignored.</p>
 <h3 id="lane-port">Lane port</h3>
 <p><code>lane_bind</code>'s port is <strong>4210</strong> by operator convention. No port-registry specification exists in <code>docs/spec/</code> today (the broker rides a Unix socket; the mesh listener defaults to 4200, MESH-013); this README is the record of the choice — 4210, the next number above the mesh default. The port is published as the <code>lane.port</code> prop (props-only, never the signed inventory); a future shared port-registry spec should adopt 4210 rather than renumber.</p>
+<h2 id="byte-lane">Byte lane</h2>
+<p>The lane is the HTTP listener that moves bytes: blobs never ride a Bus frame, so cross-node reads and user-side producers (capture, webd, Thunderbird) use it. It serves only the WireGuard address — <strong>the bind proof is fail-closed</strong>: <code>lane_bind</code>'s IP must equal this node's <code>wg_ip</code> from <code>node.conf.mix</code> (the same source noded's <code>bind_is_wg</code> uses), never unspecified, never loopback, never another interface; a mismatch (or an absent <code>wg_ip</code>) exits with status 2 before any socket is opened. The <code>RestrictAddressFamilies</code> in the unit already allows INET for it. <code>lane.bind</code>/<code>lane.port</code> props exist only once the socket is actually listening — main binds before the citizen is constructed.</p>
+<h3 id="routes">Routes</h3>
+<table><thead><tr><th>Route</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>GET /blob/&lt;hex&gt;</code></td><td>Stream the blob (<code>&lt;hex&gt;</code> = 64 hex chars, no <code>b3:</code> prefix — exactly the path <code>blob.url</code> builds)</td></tr>
+<tr><td><code>HEAD /blob/&lt;hex&gt;</code></td><td><code>GET</code>'s headers without the body</td></tr>
+<tr><td><code>PUT /blob/&lt;hex&gt;</code></td><td>Upload from a client that already knows the hash</td></tr>
+<tr><td><code>POST /blob</code></td><td>Server-hashed upload (curl, browsers, FileLink style)</td></tr>
+</tbody></table>
+<p>Reads (<code>GET</code>/<code>HEAD</code>) answer <code>200</code> with <code>Content-Length</code>, <code>Content-Type</code> from the attributes (else <code>application/octet-stream</code>), <code>Accept-Ranges: bytes</code>, <code>ETag: "&lt;hex&gt;"</code> and <code>Cache-Control: immutable</code>, streamed from the CAS file — never read into memory whole. A single <code>Range: bytes=a-b</code> / <code>bytes=a-</code> / <code>bytes=-n</code> answers <code>206</code> with <code>Content-Range</code> (a past-EOF last byte clamps to EOF); a start at or past EOF, or a zero suffix, answers <code>416</code> with <code>Content-Range: bytes */&lt;size&gt;</code>; malformed or multi-range specs are ignored and the whole blob is served (RFC 9110). An unknown hash is <code>404</code>.</p>
+<p><code>PUT</code> streams the body into mds staging, hashing as it lands; on completion the landed hash must equal <code>&lt;hex&gt;</code> or the answer is <code>422</code> — the CAS keeps no entry for either hash and nothing stays in staging. If the CAS already holds <code>&lt;hex&gt;</code>, the lane answers <code>200</code> <strong>without reading the body</strong> (the hash is the identity; the body cannot change it) and pins it to the lane owner. <code>POST</code> is the same pipeline with the hash discovered at stream end; both answer <code>201</code> with the reference JSON on success.</p>
+<h3 id="headers">Headers</h3>
+<table><thead><tr><th>Header</th><th>Applies to</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>X-Cosmix-Owner</code></td><td><code>PUT</code>/<code>POST</code></td><td>Pin owner; otherwise <code>lane:&lt;peer ip&gt;</code></td></tr>
+<tr><td><code>X-Cosmix-Mime</code></td><td><code>PUT</code>/<code>POST</code></td><td>Recorded mime; otherwise sniffed from <code>X-Cosmix-Name</code>, else <code>application/octet-stream</code></td></tr>
+<tr><td><code>X-Cosmix-Name</code></td><td><code>PUT</code>/<code>POST</code></td><td>Name hint recorded in the attributes</td></tr>
+<tr><td><code>Range</code></td><td><code>GET</code>/<code>HEAD</code></td><td>Single range, see above</td></tr>
+</tbody></table>
+<p>Every successful upload records attributes (<code>origin</code> = this node) and a pin, so <code>blob.stat</code>/<code>blob.list</code> see it immediately and quota accounts it.</p>
+<h3 id="caps-and-bounds">Caps and bounds</h3>
+<p>The total cap and the lane owner's remaining quota are enforced <strong>mid-stream</strong> by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers <code>413</code>; a declared <code>Content-Length</code> over the cap is refused <code>413</code> before any byte is read. An idle request body (no data for 30 s) aborts with <code>408</code>. At most <code>lane_max_uploads</code> (default 4) uploads run concurrently; beyond that the lane answers <code>503</code> immediately — there is no queue (the no-poll/no-flood law).</p>
+<p>Uploads are <strong>restart-only</strong> in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction.</p>
 <h2 id="storage-layout">Storage layout</h2>
 <pre><code class="language-text">/var/lib/cosmix/blobd/
 ├── blobs/&lt;h2&gt;/&lt;h2&gt;/&lt;hash64&gt;   mds CAS: immutable, sharded, BLAKE3-named

@@ -442,7 +442,7 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/cosmix-blobd/verbs.md"><div class="prose"><h1 id="bus-verbs">Bus verbs</h1>
-<p><code>cosmix-blobd</code> registers the <code>blob.*</code> namespace as the <code>blobd</code> service (or <code>blobd-&lt;name&gt;</code> for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is <code>blob.path</code>, cross-node is the byte lane (<code>blob.url</code>, a later slice).</p>
+<p><code>cosmix-blobd</code> registers the <code>blob.*</code> namespace as the <code>blobd</code> service (or <code>blobd-&lt;name&gt;</code> for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is <code>blob.path</code>, cross-node is the byte lane (<code>GET blob.url</code>).</p>
 <h2 id="calling-convention">Calling convention</h2>
 <p>For a bare command, arguments are resolved in this order:</p>
 <ol>
@@ -481,7 +481,7 @@
 <table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
 <tr><td><code>blob</code></td><td>Blob id</td></tr>
 </tbody></table>
-<p>The response contains <code>url</code>, <code>http://&lt;lane_bind&gt;/blob/&lt;hex&gt;</code>, for non-Cosmix clients on the mesh. Requires the bytes to be present and <code>lane_bind</code> to be configured; the lane listener itself arrives in P1 slice 3.</p>
+<p>The response contains <code>url</code>, <code>http://&lt;lane_bind&gt;/blob/&lt;hex&gt;</code> — exactly the path the byte lane serves (<code>GET</code> with <code>Range</code>, <code>HEAD</code>; see the README's Byte lane section). Requires the bytes to be present and <code>lane_bind</code> to be configured; the lane publishes <code>lane.port</code>/<code>lane.bind</code> props only once its socket is listening, so a remote resolves the port with a mesh-open <code>blobd.props.get</code> on the origin node.</p>
 <h3 id="blobhas"><code>blob.has</code></h3>
 <table><thead><tr><th>Argument</th><th>Requirement</th></tr></thead><tbody>
 <tr><td><code>blobs</code></td><td>Array of blob ids</td></tr>

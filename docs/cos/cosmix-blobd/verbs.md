@@ -1,6 +1,6 @@
 # Bus verbs
 
-`cosmix-blobd` registers the `blob.*` namespace as the `blobd` service (or `blobd-<name>` for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is `blob.path`, cross-node is the byte lane (`blob.url`, a later slice).
+`cosmix-blobd` registers the `blob.*` namespace as the `blobd` service (or `blobd-<name>` for a named instance). Metadata only: bytes never ride a Bus frame — same-node movement is `blob.path`, cross-node is the byte lane (`GET blob.url`).
 
 ## Calling convention
 
@@ -59,7 +59,7 @@ The response contains the absolute CAS `path` for zero-copy same-node reads, or 
 |---|---|
 | `blob` | Blob id |
 
-The response contains `url`, `http://<lane_bind>/blob/<hex>`, for non-Cosmix clients on the mesh. Requires the bytes to be present and `lane_bind` to be configured; the lane listener itself arrives in P1 slice 3.
+The response contains `url`, `http://<lane_bind>/blob/<hex>` — exactly the path the byte lane serves (`GET` with `Range`, `HEAD`; see the README's Byte lane section). Requires the bytes to be present and `lane_bind` to be configured; the lane publishes `lane.port`/`lane.bind` props only once its socket is listening, so a remote resolves the port with a mesh-open `blobd.props.get` on the origin node.
 
 ### `blob.has`
 
