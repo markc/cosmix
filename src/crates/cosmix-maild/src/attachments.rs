@@ -240,8 +240,9 @@ pub fn inspect(
 
 // mail-parser 0.11.5: parsers/header.rs:14-30,98-138 skips ASCII whitespace
 // even INSIDE names; :73-75 delegates Content-Type values. Its value lexer in
-// parsers/fields/content_type.rs:282-389,430-497 accepts folds and nested/escaped
-// comments. parsers/message.rs:140-166,214-236 constructs unencoded messages
+// parsers/fields/content_type.rs:282-389,430-499 accepts folds and nested
+// comments (our escape handling is conservative).
+// parsers/message.rs:140-166,214-236 constructs unencoded messages
 // without a depth guard (:59-60 also accepts message/global).
 // Scan potential blocks at start, after blanks and after boundary lines. Scan
 // header-shaped lines elsewhere too: quoted body text may over-count. Unfold
@@ -253,52 +254,164 @@ pub fn inspect(
 // digest children are siblings, not additional levels (message.rs:64-65,214-236).
 // The 64 MiB worker stack handles this bounded parse/drop; the walker then
 // enforces true depth 32. Blank lines alone do not add nesting levels.
+// message.rs:198-211 selects transfer decoding; :353-377 recursively parses
+// decoded messages, up to MAX_NESTED_ENCODED=3 (:17). Raw counts alone cannot
+// bound plain nesting hidden there: scan those buffers with shared counters
+// and a shared 2 * MAX_MESSAGE decoded-byte budget before the first parse.
 fn structure_preflight(data: &[u8]) -> Result<(), Error> {
-    let mut lines = data.split_inclusive(|b| *b == b'\n').peekable();
-    let (mut blocks, mut messages) = (0, 0);
-    let mut starts_block = true;
-    while let Some(line) = lines.next() {
-        if line.trim_ascii().is_empty() || line.starts_with(b"--") {
-            starts_block = true;
-            continue;
-        }
-        if starts_block {
-            blocks += 1;
-            starts_block = false;
-            if blocks > 2 * MAX_PARTS {
-                return Err(Error::TooLarge("MIME pre-parse structure limit"));
+    Preflight::default().scan(data, 0)
+}
+
+#[derive(Default)]
+struct Preflight {
+    blocks: usize,
+    messages: usize,
+    decoded_bytes: usize,
+}
+
+impl Preflight {
+    fn scan(&mut self, data: &[u8], encoded_depth: usize) -> Result<(), Error> {
+        let mut lines = data.split_inclusive(|b| *b == b'\n').peekable();
+        let mut starts_block = true;
+        let (mut has_type, mut message, mut base64, mut qp) = (false, false, false, false);
+        // Conservatively retain digest context after its closing boundary. Only
+        // encoded, untyped blocks use it; blank lines never increment messages.
+        let mut digest_seen = false;
+        while let Some(line) = lines.next() {
+            if line.trim_ascii().is_empty() || line.starts_with(b"--") {
+                if line.trim_ascii().is_empty()
+                    && encoded_depth < 3
+                    && (message || (digest_seen && !has_type))
+                    && (base64 || qp)
+                {
+                    // Every line borrows data. Take the body through the next
+                    // potential boundary (or EOF), without copying the raw input.
+                    let start = line.as_ptr() as usize - data.as_ptr() as usize + line.len();
+                    let tail = &data[start..];
+                    let length: usize = tail
+                        .split_inclusive(|b| *b == b'\n')
+                        .take_while(|line| !line.starts_with(b"--"))
+                        .map(<[u8]>::len)
+                        .sum();
+                    // Retain raw structural counts too. Our conservative
+                    // header matching can recognise encodings the parser
+                    // would instead treat as plain input. Disable decoding
+                    // on this pass so literal QP headers don't reset depth.
+                    self.scan(&tail[..length], 3)?;
+                    for is_base64 in [true, false] {
+                        if (is_base64 && base64) || (!is_base64 && qp) {
+                            self.scan_decoded(&tail[..length], is_base64, encoded_depth)?;
+                        }
+                    }
+                    // Raw counts were checked above; don't decode literal QP
+                    // headers again here as though they were raw siblings.
+                    let mut remaining = length;
+                    while remaining > 0 {
+                        remaining -= lines.next().unwrap().len();
+                    }
+                }
+                (has_type, message, base64, qp) = (false, false, false, false);
+                starts_block = true;
+                continue;
             }
-        }
-        if let Some(value) = content_type_value(line, &mut lines) {
-            let mut media = PreflightMedia::default();
-            media.feed(value);
-            while lines
-                .peek()
-                .is_some_and(|line| matches!(line.first(), Some(b' ' | b'\t')))
-            {
-                // CRLF/LF + SP/HTAB is folding whitespace, not a new header.
-                media.feed(lines.next().unwrap());
-            }
-            media.finish_token();
-            // message.rs:59-60 nests rfc822 AND global. Count every message/*
-            // conservatively, including unknown subtypes, before any parsing.
-            if media.message && media.subtype {
-                messages += 1;
-                if messages > MAX_PARTS {
+            if starts_block {
+                self.blocks += 1;
+                starts_block = false;
+                if self.blocks > 2 * MAX_PARTS {
                     return Err(Error::TooLarge("MIME pre-parse structure limit"));
                 }
             }
+            if let Some((is_type, value)) = preflight_header_value(line, &mut lines) {
+                let mut media = PreflightMedia::default();
+                let mut encoding = Vec::new();
+                if is_type {
+                    media.feed(value);
+                } else {
+                    encoding.extend(
+                        value
+                            .iter()
+                            .copied()
+                            .filter(|b| !b.is_ascii_whitespace())
+                            .take(17),
+                    );
+                }
+                while lines
+                    .peek()
+                    .is_some_and(|line| matches!(line.first(), Some(b' ' | b'\t')))
+                {
+                    // CRLF/LF + SP/HTAB is folding whitespace, not a new header.
+                    let continuation = lines.next().unwrap();
+                    if is_type {
+                        media.feed(continuation);
+                    } else {
+                        encoding.extend(
+                            continuation
+                                .iter()
+                                .copied()
+                                .filter(|b| !b.is_ascii_whitespace())
+                                .take(17 - encoding.len()),
+                        );
+                    }
+                }
+                if !is_type {
+                    base64 |= encoding.eq_ignore_ascii_case(b"base64");
+                    qp |= encoding.eq_ignore_ascii_case(b"quoted-printable");
+                    continue;
+                }
+                has_type = true;
+                media.finish_token();
+                digest_seen |= media.multipart && media.digest;
+                // message.rs:59-60 nests rfc822 AND global. Count every message/*
+                // conservatively, including unknown subtypes, before any parsing.
+                if media.message && media.subtype {
+                    message = true;
+                    self.messages += 1;
+                    if self.messages > MAX_PARTS {
+                        return Err(Error::TooLarge("MIME pre-parse structure limit"));
+                    }
+                }
+            }
         }
+        Ok(())
     }
-    Ok(())
+
+    fn scan_decoded(&mut self, body: &[u8], base64: bool, depth: usize) -> Result<(), Error> {
+        let decoded = if base64 {
+            // A conservative superset of decoders/base64.rs:67-155: ignore all
+            // non-alphabet bytes. Keep padding; use the locked decoder's partial
+            // quartet behaviour rather than a stricter application decoder.
+            let filtered: Vec<_> = body
+                .iter()
+                .copied()
+                .filter(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+                .collect();
+            mail_parser::parsers::MessageStream::new(&filtered)
+                .decode_base64_mime(b"")
+                .1
+                .into_owned()
+        } else {
+            // The actual lenient MIME QP decoder handles soft breaks, =XX,
+            // whitespace and malformed sequences exactly as message.rs does.
+            // A failed decode returns no bytes, never an inspection error.
+            mail_parser::parsers::MessageStream::new(body)
+                .decode_quoted_printable_mime(b"")
+                .1
+                .into_owned()
+        };
+        self.decoded_bytes = self.decoded_bytes.saturating_add(decoded.len());
+        if self.decoded_bytes > 2 * MAX_MESSAGE {
+            return Err(Error::TooLarge("MIME pre-parse decoded-byte limit"));
+        }
+        self.scan(&decoded, depth + 1)
+    }
 }
 
-fn content_type_value<'a>(
+fn preflight_header_value<'a>(
     mut line: &'a [u8],
     lines: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
-) -> Option<&'a [u8]> {
+) -> Option<(bool, &'a [u8])> {
     let mut length = 0;
-    let mut matches = true;
+    let (mut type_matches, mut encoding_matches) = (true, true);
     // header.rs:115-128 removes all ASCII whitespace within names. Its LF
     // branch (:112-113) actually rejects folded names; accept those here too
     // as a conservative superset, without allocating an unfolded header.
@@ -306,12 +419,21 @@ fn content_type_value<'a>(
         for (index, byte) in line.iter().copied().enumerate() {
             match byte {
                 b':' if length > 0 => {
-                    return (matches && length == 12).then_some(&line[index + 1..]);
+                    return if type_matches && length == 12 {
+                        Some((true, &line[index + 1..]))
+                    } else if encoding_matches && length == 25 {
+                        Some((false, &line[index + 1..]))
+                    } else {
+                        None
+                    };
                 }
                 b':' => (), // parse_header_name ignores colons before the first token
                 b if b.is_ascii_whitespace() => (),
                 b => {
-                    matches &= b"content-type"
+                    type_matches &= b"content-type"
+                        .get(length)
+                        .is_some_and(|v| b.eq_ignore_ascii_case(v));
+                    encoding_matches &= b"content-transfer-encoding"
                         .get(length)
                         .is_some_and(|v| b.eq_ignore_ascii_case(v));
                     length += 1;
@@ -331,10 +453,12 @@ fn content_type_value<'a>(
 
 #[derive(Default)]
 struct PreflightMedia {
-    token: [u8; 7],
+    token: [u8; 9],
     length: usize,
     subtype: bool,
     message: bool,
+    multipart: bool,
+    digest: bool,
     comments: usize,
     escaped: bool,
     done: bool,
@@ -345,6 +469,9 @@ impl PreflightMedia {
         let token = self.token.get(..self.length).unwrap_or_default();
         if !self.subtype {
             self.message |= token == b"message";
+            self.multipart |= token == b"multipart";
+        } else {
+            self.digest |= token == b"digest";
         }
         self.length = 0;
     }
@@ -788,6 +915,148 @@ mod tests {
             inspect(raw.as_bytes(), None, false).unwrap_err(),
             Error::TooLarge("MIME pre-parse structure limit")
         );
+    }
+
+    #[test]
+    fn encoded_preflight_follows_plain_nesting_and_shares_counts() {
+        let plain = format!(
+            "{}Content-Type: text/plain\r\n\r\nx",
+            "Content-Type: message/rfc822\r\n\r\n".repeat(5000)
+        );
+        for base64 in [true, false] {
+            let raw = preflight_encoded_fixture(plain.as_bytes(), base64);
+            assert_eq!(
+                inspect(raw.as_bytes(), None, false).unwrap_err(),
+                Error::TooLarge("MIME pre-parse structure limit")
+            );
+            let implicit = raw.replacen("Content-Type: message/rfc822\r\n", "", 1);
+            let digest = format!(
+                "Content-Type: multipart/digest; boundary=x\r\n\r\n--x\r\n{implicit}\r\n--x--\r\n"
+            );
+            assert_eq!(
+                structure_preflight(digest.as_bytes()).unwrap_err(),
+                Error::TooLarge("MIME pre-parse structure limit")
+            );
+        }
+        let mut chain = plain;
+        for _ in 0..3 {
+            chain = preflight_encoded_fixture(chain.as_bytes(), true);
+        }
+        assert_eq!(
+            inspect(chain.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit")
+        );
+        // At a fourth encoded layer mail-parser stops parsing. The walker
+        // preflights again before its own later re-parse, with fresh depth.
+        let fourth = preflight_encoded_fixture(chain.as_bytes(), true);
+        structure_preflight(fourth.as_bytes()).unwrap();
+
+        // Each decoded sibling alone fits; their shared counters must not.
+        let inner = format!(
+            "{}Content-Type: text/plain\r\n\r\nx",
+            "Content-Type: message/rfc822\r\n\r\n".repeat(600)
+        );
+        let sibling = preflight_encoded_fixture(inner.as_bytes(), true);
+        let raw = format!(
+            "Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n{sibling}\r\n--x\r\n{sibling}\r\n--x--\r\n"
+        );
+        assert_eq!(
+            structure_preflight(raw.as_bytes()).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit")
+        );
+    }
+
+    fn preflight_encoded_fixture(inner: &[u8], base64: bool) -> String {
+        use base64::Engine;
+        let (encoding, body) = if base64 {
+            (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(inner),
+            )
+        } else {
+            // Encode every byte so header names and blank lines are invisible
+            // to the raw scanner. Soft breaks exercise MIME QP folding too.
+            let mut body = String::new();
+            for chunk in inner.chunks(20) {
+                for byte in chunk {
+                    body.push_str(&format!("={byte:02X}"));
+                }
+                body.push_str("=\r\n");
+            }
+            ("quoted-printable", body)
+        };
+        format!(
+            "Content-Type: message/rfc822\r\nCon tent-Transfer-Encoding : {encoding}\r\n\r\n{body}"
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn encoded_malformed_sentinel_is_refused_before_parser_panic() {
+        let inner = format!(
+            "Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n{}Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n",
+            "Content-Type: message/rfc822\r\n\r\n".repeat(5000)
+        );
+        for base64 in [true, false] {
+            let raw = preflight_encoded_fixture(inner.as_bytes(), base64);
+            // Reaching the parser would yield unreadable: MIME worker panicked
+            // (or overflow), never this pre-parse token.
+            assert_eq!(
+                inspect(raw.as_bytes(), None, false).unwrap_err(),
+                Error::TooLarge("MIME pre-parse structure limit")
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_forward_and_digest_default_are_inspectable() {
+        let inner = b"Subject: forwarded\r\nContent-Type: text/plain\r\n\r\nhello";
+        for base64 in [true, false] {
+            let forward = preflight_encoded_fixture(inner, base64);
+            for implicit in [false, true] {
+                let child = if implicit {
+                    forward.replacen("Content-Type: message/rfc822\r\n", "", 1)
+                } else {
+                    forward.clone()
+                };
+                let raw = format!(
+                    "Content-Type: multipart/digest; boundary=x\r\n\r\n--x\r\n{child}\r\n--x--\r\n"
+                );
+                structure_preflight(raw.as_bytes()).unwrap();
+                let result = inspect(raw.as_bytes(), Some("1.1.1"), false).unwrap();
+                assert_eq!(result.extracted.unwrap(), b"hello");
+                assert!(
+                    result
+                        .parts
+                        .iter()
+                        .any(|p| p.path == "1.1" && p.mime == "message/rfc822")
+                );
+                assert!(
+                    result
+                        .parts
+                        .iter()
+                        .any(|p| p.path == "1.1.1" && p.embedded && p.mime == "text/plain")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_preflight_budget_is_shared_and_malformed_decoding_is_tolerated() {
+        let mut scan = Preflight {
+            decoded_bytes: 2 * MAX_MESSAGE - 5,
+            ..Preflight::default()
+        };
+        scan.scan_decoded(b"YWJj", true, 0).unwrap();
+        assert_eq!(
+            scan.scan_decoded(b"=61=62=63", false, 0).unwrap_err(),
+            Error::TooLarge("MIME pre-parse decoded-byte limit")
+        );
+        // Non-alphabet base64 is ignored, and malformed QP isn't an error.
+        let mut scan = Preflight::default();
+        scan.scan_decoded(b"Y!WJj", true, 0).unwrap();
+        assert_eq!(scan.decoded_bytes, 3);
+        scan.scan_decoded(b"==broken", false, 0).unwrap();
     }
 
     #[test]

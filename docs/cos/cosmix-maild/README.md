@@ -298,7 +298,12 @@ depth bounds: sibling attached messages and digest children do not add nesting
 depth, and digest body blank lines do not count as messages. Each nesting level
 needs a header block, bounding parser recursion before the walker checks true
 depth. Quoted header text in message bodies counts too and can cause a false-positive
-`too_large:` refusal. Parse, walk and tree destruction use a dedicated 64 MiB
+`too_large:` refusal. Preflight also scans base64/QP-decoded message bodies
+(including encoded digest-default children) through three encoded layers,
+sharing the count limits and a 128 MiB decoded-byte budget. Exceeding that
+budget returns `too_large: MIME pre-parse decoded-byte limit`. This covers
+plain nesting hidden inside the parser's own initial transfer decoding.
+Parse, walk and tree destruction use a dedicated 64 MiB
 thread stack. The walk permits depth 32, 1,000 parts, path length 64,
 64 MiB per decoded part, an aggregate 128 MiB decoded-byte budget, and at most
 two nested encoded re-parses beyond the parser's own encoded nesting limit.

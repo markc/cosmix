@@ -348,6 +348,10 @@ names), folded values and comments. These bound counts, not sibling count as
 depth. Digest blank lines do not count as messages; attached messages and digest
 children can have more than 32 siblings. Each nesting level needs a header block,
 bounding parser recursion before the walker enforces true depth 32.
+Preflight follows base64/QP message bodies, including encoded digest-default
+children, through three encoded layers using the same count limits. Its shared
+128 MiB decoded-byte budget returns `too_large: MIME pre-parse decoded-byte limit`
+when exceeded, before the parser can construct hidden plain nesting.
 False-positive refusals are possible.
 The whole walk has a 128 MiB decoded-byte budget and allows two nested
 encoded re-parses beyond the parser's own limit. Bad individual parts instead
