@@ -705,6 +705,20 @@ describes the user-unit form for hosts that run a user session manager. Validati
 over the session D-Bus. This script replaces that copy. The KWin path is not
 carried over, because cosmix components reach D-Bus only through
 cosmix-dbusd adapters.</p>
+<h2 id="scene-editor-chord-scenes">Scene Editor chord (<code>scenes</code>)</h2>
+<p>inputd's default keymap binds Ctrl+Alt+P twice on <code>KEY_P</code> (code 25): once with
+Left Ctrl and Left Alt, once with Right Ctrl and Left Alt. Both rows send
+<code>scenes.editor.open</code> with body <code>{"safe":true}</code> to the scenes loader, which is
+registered as <code>scenes</code>. Right Alt is not bound, because it is AltGr on some
+layouts. The rows swallow the chord, so applications never receive it, and they
+fire on the press only, not on auto-repeat. A safe open while the shipped
+editor is visible hides it, so the same chord opens and closes the editor. The
+rows and how to add them to an existing keymap file are in
+<a href="/cos/daemon-help#inputd-keymap-rows-and-their-target-service">Inputd keymap rows</a>.</p>
+<p>The same request from a terminal or an agent needs no key:</p>
+<pre><code class="language-mix">$b = json_encode({safe: true})
+send scenes "scenes.editor.open" body=$b
+</code></pre>
 <h2 id="verification">Verification</h2>
 <p><code>tests/desktop-test.mix</code> exercises production request validation and result
 handling without desktop effects. Run it with <code>COSMIX_MESH_OPEN=0</code> in the

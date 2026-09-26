@@ -379,7 +379,6 @@ fn read(path: &Path) -> Result<String, String> {
 /// rewrite re-encodes the whole file: comments and formatting do not survive
 /// a motion write — only the parsed values do.
 pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Result<(), String> {
-    use std::io::Write;
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
@@ -404,6 +403,13 @@ pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Resu
         .to_mix_data_string_pretty()
         .map_err(|error| error.to_string())?;
     ShellConfig::parse(&encoded)?;
+    replace_atomically(path, &encoded)
+}
+
+/// Write `encoded` beside `path` and rename it over, so the watcher only ever
+/// observes a complete file.
+fn replace_atomically(path: &Path, encoded: &str) -> Result<(), String> {
+    use std::io::Write;
     let parent = path.parent().ok_or("config path has no parent")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
@@ -414,6 +420,181 @@ pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Resu
         .map_err(|error| error.to_string())?;
     temp.persist(path).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Most pages `shell.panel.order` accepts on one edge.
+pub(crate) const MAX_ORDER_PAGES: usize = 32;
+
+/// A `shell.panel.order` refusal: rc 10 `{error_code, message, edges?}`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct OrderRefusal {
+    pub code: &'static str,
+    pub message: String,
+    /// The edges the conflict involves, when there is one.
+    pub edges: Vec<&'static str>,
+}
+
+impl OrderRefusal {
+    fn invalid(message: String, edges: Vec<&'static str>) -> Self {
+        Self {
+            code: "INVALID_ARGUMENT",
+            message,
+            edges,
+        }
+    }
+
+    fn write(message: String) -> Self {
+        Self {
+            code: "CONFIG_WRITE",
+            message,
+            edges: Vec::new(),
+        }
+    }
+
+    pub(crate) fn body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({"error_code": self.code, "message": self.message});
+        if !self.edges.is_empty() {
+            body["edges"] = serde_json::json!(self.edges);
+        }
+        body
+    }
+}
+
+/// Parse a `shell.panel.order` body, `{edges:{<edge>:[string], …}}` with one
+/// to four edges. Every page name must be a sub-panel identifier, at most
+/// [`MAX_ORDER_PAGES`] per edge, and no name may repeat within or across the
+/// named edges. The result is in [`Edge::ALL`] order.
+pub(crate) fn parse_panel_order(
+    body: &serde_json::Value,
+) -> Result<Vec<(Edge, Vec<String>)>, OrderRefusal> {
+    let invalid = |message: &str| OrderRefusal::invalid(message.to_owned(), Vec::new());
+    let edges = body
+        .get("edges")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| invalid("edges must be a map of edge to page list"))?;
+    if edges.is_empty() || edges.len() > 4 {
+        return Err(invalid("edges must name one to four edges"));
+    }
+    if let Some(name) = edges
+        .keys()
+        .find(|name| crate::bus_service::parse_edge((*name).to_owned()).is_none())
+    {
+        return Err(OrderRefusal::invalid(
+            format!("{name} is not an edge (left, bottom, right or top)"),
+            Vec::new(),
+        ));
+    }
+    let mut order = Vec::new();
+    for edge in Edge::ALL {
+        let name = crate::edge_name(edge);
+        let Some(pages) = edges.get(name) else {
+            continue;
+        };
+        let pages = pages
+            .as_array()
+            .ok_or_else(|| invalid("each edge takes a list of page names"))?;
+        if pages.len() > MAX_ORDER_PAGES {
+            return Err(OrderRefusal::invalid(
+                format!("{name} names {} pages; at most {MAX_ORDER_PAGES}", pages.len()),
+                vec![name],
+            ));
+        }
+        let pages = pages
+            .iter()
+            .map(|page| {
+                page.as_str()
+                    .filter(|page| identifier(page))
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        OrderRefusal::invalid(
+                            format!("{name}: page names must be non-empty sub-panel identifiers"),
+                            vec![name],
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        order.push((edge, pages));
+    }
+    check_unique(&order)?;
+    Ok(order)
+}
+
+/// A page may be declared once in the whole file.
+fn check_unique(order: &[(Edge, Vec<String>)]) -> Result<(), OrderRefusal> {
+    let mut seen: BTreeMap<&str, Edge> = BTreeMap::new();
+    for (edge, pages) in order {
+        for page in pages {
+            if let Some(first) = seen.insert(page.as_str(), *edge) {
+                let name = crate::edge_name(*edge);
+                return Err(if first == *edge {
+                    OrderRefusal::invalid(format!("page {page} is named twice on {name}"), vec![name])
+                } else {
+                    OrderRefusal::invalid(
+                        format!("page {page} is named on two edges"),
+                        vec![crate::edge_name(first), name],
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `shell.panel.order`'s one write: replace `panels.<edge>` for every edge in
+/// `order` in a single atomic file replacement, so moving a page between
+/// edges is never half-applied. Edges not named keep their declarations, and
+/// a page they declare may not also appear in `order`. Other keys' values are
+/// preserved; comments and formatting are not (as for the motion write). The
+/// watcher then ingests the file exactly like a hand edit.
+pub(crate) fn write_panel_order(
+    path: &Path,
+    order: &[(Edge, Vec<String>)],
+) -> Result<(), OrderRefusal> {
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
+        Err(error) => return Err(OrderRefusal::write(format!("could not read conf.mix: {error}"))),
+    };
+    let current = ShellConfig::parse(&source)
+        .map_err(|error| OrderRefusal::write(format!("current conf.mix is invalid: {error}")))?;
+    let merged: Vec<(Edge, Vec<String>)> = Edge::ALL
+        .into_iter()
+        .map(|edge| {
+            let pages = order
+                .iter()
+                .find(|(named, _)| *named == edge)
+                .map_or_else(|| current.panels[edge.index()].clone(), |(_, pages)| pages.clone());
+            (edge, pages)
+        })
+        .collect();
+    check_unique(&merged)?;
+    let mut value = parse_mix_data(&source).map_err(|error| OrderRefusal::write(error.to_string()))?;
+    let Value::Map(root) = &mut value else {
+        unreachable!("validated config map")
+    };
+    let root = std::rc::Rc::make_mut(root);
+    let panels = root
+        .entry("panels".to_owned())
+        .or_insert_with(|| Value::Map(Default::default()));
+    let Value::Map(panels) = panels else {
+        unreachable!("validated panels map")
+    };
+    let panels = std::rc::Rc::make_mut(panels);
+    for (edge, pages) in order {
+        panels.insert(
+            crate::edge_name(*edge).to_owned(),
+            Value::List(std::rc::Rc::new(
+                pages.iter().cloned().map(Value::String).collect(),
+            )),
+        );
+    }
+    let encoded = value
+        .to_mix_data_string_pretty()
+        .map_err(|error| OrderRefusal::write(error.to_string()))?;
+    ShellConfig::parse(&encoded)
+        .map_err(|error| OrderRefusal::write(format!("re-encoded conf.mix is invalid: {error}")))?;
+    replace_atomically(path, &encoded)
+        .map_err(|error| OrderRefusal::write(format!("could not replace conf.mix: {error}")))
 }
 
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -917,6 +1098,143 @@ mod tests {
                 .iter()
                 .all(|error| error.contains("expected slide or fade"))
         );
+    }
+
+    const ORDER_SOURCE: &str = r#"{
+        panels: {left: ["scene-launcher", "scene-calendar"], right: ["settings.appearance"], top: ["scene-top"]},
+        menu_items: {right: [{label: "Open tools", target: "tools", verb: "tools.open", args: ["main"]}]},
+        bindings: {left: {pin: "Super+Shift+Left"}, cycle_focus: "Super+Tab"},
+        carousel_motion: "fade"
+    }"#;
+
+    fn order(body: serde_json::Value) -> Result<Vec<(Edge, Vec<String>)>, OrderRefusal> {
+        parse_panel_order(&body)
+    }
+
+    #[test]
+    fn panel_order_moves_a_page_across_edges_in_one_replacement() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conf.mix");
+        std::fs::write(&path, ORDER_SOURCE).unwrap();
+        let (reader, watch) = ConfigReader::start(path.clone(), Arc::new(|_, _| {})).unwrap();
+        let mut app = app(model());
+        app.insert_resource(reader);
+        app.update();
+        let before = app.world().resource::<ShellConfig>().clone();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+
+        // scene-calendar leaves left and joins right in the same call.
+        let request = order(serde_json::json!({"edges": {
+            "right": ["scene-calendar", "settings.appearance"],
+            "left": ["scene-launcher"]
+        }}))
+        .unwrap();
+        write_panel_order(&path, &request).unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode,
+            "the file is replaced by rename, never rewritten in place"
+        );
+        let entries = std::fs::read_dir(directory.path()).unwrap().count();
+        assert_eq!(entries, 1, "no temporary file is left behind");
+
+        // Ingested on the watcher path, like a hand edit, in one step.
+        assert!(watch.dispatch_pending().unwrap() > 0);
+        app.update();
+        let after = app.world().resource::<ShellConfig>().clone();
+        assert_eq!(after.panels[Edge::Left.index()], ["scene-launcher"]);
+        assert_eq!(
+            after.panels[Edge::Right.index()],
+            ["scene-calendar", "settings.appearance"]
+        );
+        // Unnamed edges and every other key keep their values.
+        assert_eq!(after.panels[Edge::Top.index()], ["scene-top"]);
+        assert_eq!(after.menu_items, before.menu_items);
+        assert_eq!(after.bindings, before.bindings);
+        assert_eq!(after.cycle_focus, before.cycle_focus);
+        assert_eq!(after.carousel_motion, CarouselMotion::Fade);
+
+        // A later hand edit still wins over the written order.
+        let replacement = directory.path().join("hand.mix");
+        std::fs::write(
+            &replacement,
+            r#"{panels: {left: ["scene-calendar", "scene-launcher"], right: ["settings.appearance"]}}"#,
+        )
+        .unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(watch.dispatch_pending().unwrap() > 0);
+        app.update();
+        let hand = app.world().resource::<ShellConfig>();
+        assert_eq!(
+            hand.panels[Edge::Left.index()],
+            ["scene-calendar", "scene-launcher"]
+        );
+        assert_eq!(hand.panels[Edge::Right.index()], ["settings.appearance"]);
+        assert_eq!(hand.carousel_motion, CarouselMotion::Slide);
+    }
+
+    #[test]
+    fn panel_order_creates_a_missing_file_and_clears_an_edge() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin/conf.mix");
+        let request = order(serde_json::json!({"edges": {"bottom": ["scene-panel"], "top": []}})).unwrap();
+        write_panel_order(&path, &request).unwrap();
+        let written = ShellConfig::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.panels[Edge::Bottom.index()], ["scene-panel"]);
+        assert!(written.panels[Edge::Top.index()].is_empty());
+    }
+
+    #[test]
+    fn panel_order_refuses_bad_requests_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conf.mix");
+        std::fs::write(&path, ORDER_SOURCE).unwrap();
+        let many: Vec<String> = (0..=MAX_ORDER_PAGES).map(|n| format!("p{n}")).collect();
+        for (body, edges) in [
+            (serde_json::json!({}), vec![]),
+            (serde_json::json!({"edges": {}}), vec![]),
+            (serde_json::json!({"edges": []}), vec![]),
+            (serde_json::json!({"edges": {"middle": ["a"]}}), vec![]),
+            (serde_json::json!({"edges": {"left": "a"}}), vec![]),
+            (serde_json::json!({"edges": {"left": [""]}}), vec!["left"]),
+            (serde_json::json!({"edges": {"left": ["has space"]}}), vec!["left"]),
+            (serde_json::json!({"edges": {"left": [7]}}), vec!["left"]),
+            (serde_json::json!({"edges": {"left": many.clone()}}), vec!["left"]),
+            // Within one edge, and across two named edges.
+            (serde_json::json!({"edges": {"left": ["a", "a"]}}), vec!["left"]),
+            (
+                serde_json::json!({"edges": {"left": ["a"], "right": ["a"]}}),
+                vec!["left", "right"],
+            ),
+        ] {
+            let refusal = order(body.clone()).unwrap_err();
+            assert_eq!(refusal.code, "INVALID_ARGUMENT", "{body}");
+            assert_eq!(refusal.edges, edges, "{body}");
+            assert_eq!(refusal.body()["error_code"], "INVALID_ARGUMENT");
+        }
+        let most = serde_json::json!({"edges": {"left": &many[..MAX_ORDER_PAGES]}});
+        assert_eq!(order(most).unwrap()[0].1.len(), MAX_ORDER_PAGES);
+
+        // A page an unnamed edge still declares cannot also be ordered
+        // elsewhere: the "declared on two edges" state is never written.
+        let request = order(serde_json::json!({"edges": {"bottom": ["scene-top"]}})).unwrap();
+        let refusal = write_panel_order(&path, &request).unwrap_err();
+        assert_eq!(
+            refusal,
+            OrderRefusal::invalid(
+                "page scene-top is named on two edges".into(),
+                vec!["bottom", "top"]
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ORDER_SOURCE);
+
+        // An invalid current file is not rewritten.
+        std::fs::write(&path, "{typo: true}").unwrap();
+        let request = order(serde_json::json!({"edges": {"left": ["a"]}})).unwrap();
+        let refusal = write_panel_order(&path, &request).unwrap_err();
+        assert_eq!(refusal.code, "CONFIG_WRITE");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{typo: true}");
     }
 
     #[test]

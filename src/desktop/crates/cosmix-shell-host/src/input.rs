@@ -1020,7 +1020,7 @@ impl ResizeSession {
                 configured_extent - self.starting_extent,
             ),
         };
-        let range = cosmix_shell::core::RESIZE_THICKNESS_RANGE;
+        let range = cosmix_shell::core::resize_thickness_range(self.edge);
         (self.starting_thickness + origin_shift + delta.round()).clamp(*range.start(), *range.end())
     }
 }
@@ -1837,6 +1837,10 @@ mod tests {
     fn raw_resize_delta_handles_all_edges_configure_lag_and_clamps() {
         for edge in Edge::ALL {
             let session = resize_session(edge);
+            // Drag clamps to the same per-orientation range as the verb and
+            // the settings stepper (scene-editor plan §4.3 Q1).
+            let range = cosmix_shell::core::resize_thickness_range(edge);
+            let clamp = |value: f32| value.clamp(*range.start(), *range.end());
             let sign = if matches!(edge, Edge::Left | Edge::Top) {
                 1.0
             } else {
@@ -1844,20 +1848,26 @@ mod tests {
             };
             let outward = Vec2::splat(3.0 + sign * 50.0);
             for _ in 0..4 {
-                assert_eq!(session.thickness(outward, 200.0), 250.0);
+                assert_eq!(session.thickness(outward, 200.0), clamp(250.0));
             }
             let landed = if sign > 0.0 {
                 outward
             } else {
                 Vec2::splat(3.0)
             };
-            assert_eq!(session.thickness(landed, 250.0), 250.0);
+            assert_eq!(session.thickness(landed, 250.0), clamp(250.0));
             assert_eq!(
                 session.thickness(Vec2::splat(3.0 - sign * 50.0), 200.0),
                 150.0
             );
-            assert_eq!(session.thickness(Vec2::splat(sign * 1000.0), 200.0), 500.0);
-            assert_eq!(session.thickness(Vec2::splat(-sign * 1000.0), 200.0), 120.0);
+            assert_eq!(
+                session.thickness(Vec2::splat(sign * 1000.0), 200.0),
+                *range.end()
+            );
+            assert_eq!(
+                session.thickness(Vec2::splat(-sign * 1000.0), 200.0),
+                *range.start()
+            );
         }
         assert_eq!(raw_position((-40.0, 600.0)), Some(Vec2::new(-40.0, 600.0)));
         assert_eq!(raw_position((f64::MAX, 0.0)), None);

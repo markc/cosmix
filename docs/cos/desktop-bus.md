@@ -326,6 +326,25 @@ over the session D-Bus. This script replaces that copy. The KWin path is not
 carried over, because cosmix components reach D-Bus only through
 cosmix-dbusd adapters.
 
+## Scene Editor chord (`scenes`)
+
+inputd's default keymap binds Ctrl+Alt+P twice on `KEY_P` (code 25): once with
+Left Ctrl and Left Alt, once with Right Ctrl and Left Alt. Both rows send
+`scenes.editor.open` with body `{"safe":true}` to the scenes loader, which is
+registered as `scenes`. Right Alt is not bound, because it is AltGr on some
+layouts. The rows swallow the chord, so applications never receive it, and they
+fire on the press only, not on auto-repeat. A safe open while the shipped
+editor is visible hides it, so the same chord opens and closes the editor. The
+rows and how to add them to an existing keymap file are in
+[Inputd keymap rows](daemon-help.md#inputd-keymap-rows-and-their-target-service).
+
+The same request from a terminal or an agent needs no key:
+
+```mix
+$b = json_encode({safe: true})
+send scenes "scenes.editor.open" body=$b
+```
+
 ## Verification
 
 `tests/desktop-test.mix` exercises production request validation and result

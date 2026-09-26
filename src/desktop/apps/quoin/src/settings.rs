@@ -14,8 +14,9 @@
 //! go through `ResizeCommit` — the exact command an edge-drag completion
 //! materialises, so the steppers edit the same remembered per-`(output,
 //! edge)` thickness the drag writes (one source of truth, panel doc §9).
-//! Steppers clamp to the resize range and the output budget, exactly as a
-//! drag stops at the effective limit.
+//! Steppers clamp to the edge's resize range (per orientation, shared with
+//! the verb and drag) and the output budget, exactly as a drag stops at the
+//! effective limit.
 //!
 //! The document uses this host's Bus service name, so its `on_click` handlers come
 //! back over the Bus as `shell.settings.*` verbs on this process (the scene
@@ -45,7 +46,7 @@ use std::time::{Duration, Instant};
 use bevy::prelude::*;
 use cosmix_scene_bevy::{SceneMount, SceneStore};
 use cosmix_shell::chrome::QuoinSchemeSelected;
-use cosmix_shell::core::{Edge, RESIZE_THICKNESS_RANGE};
+use cosmix_shell::core::{Edge, resize_thickness_range};
 use cosmix_shell::runtime::{
     SceneVerb, ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
     SubPanelRegistryState,
@@ -358,10 +359,16 @@ pub(crate) fn snapshot(
     page_owner: Option<&str>,
 ) -> serde_json::Value {
     let mut sizes = serde_json::Map::new();
+    let mut ranges = serde_json::Map::new();
     for edge in Edge::ALL {
         sizes.insert(
             edge_name(edge).to_owned(),
             json!(frame.panel(edge).settled_thickness_px),
+        );
+        let range = resize_thickness_range(edge);
+        ranges.insert(
+            edge_name(edge).to_owned(),
+            json!([range.start(), range.end()]),
         );
     }
     // Constant per build; computed once because the notice compares a fresh
@@ -373,10 +380,6 @@ pub(crate) fn snapshot(
             .map(|scheme| json!({"name": scheme.name(), "accent": scheme_hex(scheme)}))
             .collect()
     });
-    let range = [
-        *RESIZE_THICKNESS_RANGE.start(),
-        *RESIZE_THICKNESS_RANGE.end(),
-    ];
     json!({
         "scheme": scheme,
         "schemes": schemes,
@@ -388,7 +391,7 @@ pub(crate) fn snapshot(
         "fade_reason": FADE_UNAVAILABLE_REASON,
         "sizes": sizes,
         "step_px": STEP_PX,
-        "range_px": range,
+        "range_px": ranges,
         "edge": declared_edge(config).map(edge_name),
         "page_owner": page_owner,
     })
@@ -725,13 +728,11 @@ fn plan_verb(
             };
             let panel = frame.panel(edge);
             // Step from the remembered value (settled), then clamp like a
-            // drag: the resize range first, the output budget last — a drag
-            // stops at the effective limit, and so does a stepper.
+            // drag: the edge's resize range first, the output budget last — a
+            // drag stops at the effective limit, and so does a stepper.
+            let range = resize_thickness_range(edge);
             let target = (panel.settled_thickness_px + delta)
-                .clamp(
-                    *RESIZE_THICKNESS_RANGE.start(),
-                    *RESIZE_THICKNESS_RANGE.end(),
-                )
+                .clamp(*range.start(), *range.end())
                 .min(panel.max_thickness_px);
             if (target - panel.settled_thickness_px).abs() < f32::EPSILON {
                 return (
@@ -1049,11 +1050,9 @@ mod tests {
         let frame = frame_for("DP-1");
         for edge in Edge::ALL {
             let starting = frame.panel(edge).settled_thickness_px;
+            let range = resize_thickness_range(edge);
             let target = (starting + STEP_PX)
-                .clamp(
-                    *RESIZE_THICKNESS_RANGE.start(),
-                    *RESIZE_THICKNESS_RANGE.end(),
-                )
+                .clamp(*range.start(), *range.end())
                 .min(frame.panel(edge).max_thickness_px);
             let drag_path = directory
                 .path()
@@ -1117,7 +1116,7 @@ mod tests {
         // the scene's node form maps each direction and edge.
         let mut at_floor = frame_for("DP-1");
         at_floor.panels[Edge::Bottom.index()].settled_thickness_px =
-            *RESIZE_THICKNESS_RANGE.start();
+            *resize_thickness_range(Edge::Bottom).start();
         let (rc, body, command, _) = plan_verb(
             &event_request("shell.settings.size", "size_bottom_minus"),
             &at_floor,
@@ -1136,6 +1135,47 @@ mod tests {
             ShellCommandKind::ResizeCommit {
                 edge: Edge::Right,
                 thickness_px: frame.panel(Edge::Right).settled_thickness_px - STEP_PX,
+            }
+        );
+    }
+
+    /// The shipped 52 px bottom panel sits inside the top/bottom range, so a
+    /// plus step and a minus step go 52 → 62 → 52 (it used to clamp to 120 and
+    /// could never come back).
+    #[test]
+    fn the_52px_bottom_panel_steps_and_restores() {
+        let mut frame = frame_for("DP-1");
+        let step = |frame: &ShellFrame, node: &str| {
+            let (rc, body, command, _) = plan_verb(
+                &event_request("shell.settings.size", node),
+                frame,
+                Duration::ZERO,
+            );
+            assert_eq!(rc, 0, "{body}");
+            match command.map(|command| command.kind) {
+                Some(ShellCommandKind::ResizeCommit { edge, thickness_px }) => {
+                    assert_eq!(edge, Edge::Bottom);
+                    thickness_px
+                }
+                other => panic!("expected a bottom ResizeCommit, got {other:?}"),
+            }
+        };
+        frame.panels[Edge::Bottom.index()].settled_thickness_px = 52.0;
+        assert_eq!(step(&frame, "size_bottom_plus"), 52.0 + STEP_PX);
+        frame.panels[Edge::Bottom.index()].settled_thickness_px = 52.0 + STEP_PX;
+        assert_eq!(step(&frame, "size_bottom_minus"), 52.0);
+        // The side edges keep their 120 floor.
+        frame.panels[Edge::Left.index()].settled_thickness_px = 125.0;
+        let (_, _, command, _) = plan_verb(
+            &event_request("shell.settings.size", "size_left_minus"),
+            &frame,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            command.unwrap().kind,
+            ShellCommandKind::ResizeCommit {
+                edge: Edge::Left,
+                thickness_px: 120.0
             }
         );
     }

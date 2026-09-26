@@ -8,6 +8,12 @@
 //! [`spawn`], which runs it on its own short-lived thread and hands the
 //! result back as a future, so the single-thread iced executor never waits on
 //! a lint.
+//!
+//! `scene` buffers are linted **in-process** with `cosmix-scene` (parse →
+//! lint → resolve, the registry Quoin validates with; Scene Editor plan D8):
+//! `mix lint` reports a false `MIX-E1003` at the fence of every `scene.mix`.
+//! The result takes the same `mix lint --json` report shape, so it reaches
+//! `Diagnostics` as the lint source like every other language.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -29,8 +35,67 @@ pub fn lints(language: &str) -> bool {
 }
 
 /// Run `mix lint --json -` over `text` with `cwd`; the raw JSON on success.
+/// A `scene` buffer is linted in-process instead ([`scene_report`]).
 pub fn run(tag: &ResultTag, text: &str, cwd: Option<&std::path::Path>) -> Result<String, String> {
+    if tag.language == "scene" {
+        return Ok(scene_report(text));
+    }
     run_with(std::path::Path::new(MIX), tag, text, cwd)
+}
+
+/// One scene-lint finding: 1-based line (scene diagnostics carry no column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneFinding {
+    pub line: usize,
+    pub error: bool,
+    pub code: String,
+    pub message: String,
+}
+
+/// `cosmix_scene::parse` → `lint` → `resolve` over `text`: every finding,
+/// in the order the registry reports them. `resolve` runs only when lint
+/// found no error (it would repeat lint's findings), and adds what only it
+/// checks.
+pub fn scene_findings(text: &str) -> Vec<SceneFinding> {
+    let found = match cosmix_scene::parse(text) {
+        Err(ds) => ds,
+        Ok(doc) => {
+            let mut ds = cosmix_scene::lint(&doc);
+            if !ds.iter().any(|d| d.severity == cosmix_scene::Severity::Error)
+                && let Err(more) = cosmix_scene::resolve(&doc)
+            {
+                for d in more {
+                    if !ds.contains(&d) {
+                        ds.push(d);
+                    }
+                }
+            }
+            ds
+        }
+    };
+    found
+        .into_iter()
+        .map(|d| SceneFinding {
+            line: d.line.max(1),
+            error: d.severity == cosmix_scene::Severity::Error,
+            code: d.code,
+            message: d.message,
+        })
+        .collect()
+}
+
+/// [`scene_findings`] as a `mix lint --json` (schema 2) report.
+pub fn scene_report(text: &str) -> String {
+    let diagnostics: Vec<serde_json::Value> = scene_findings(text)
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "file": "-", "line": f.line, "column": null, "code": f.code,
+                "severity": if f.error { "error" } else { "warning" }, "message": f.message, "hint": null,
+            })
+        })
+        .collect();
+    serde_json::json!({"schema_version": 2, "tool": "cosmix-scene", "diagnostics": diagnostics}).to_string()
 }
 
 /// [`run`] with an explicit binary (tests).
@@ -136,6 +201,62 @@ mod tests {
         assert!(run_with(fake, &tag(), "warn\n", Some(dir.path())).unwrap().contains("schema_version"));
         let err = run_with(fake, &tag(), "bad\n", Some(dir.path())).unwrap_err();
         assert!(err.contains("exit 2") && err.contains("nope"), "{err}");
+    }
+
+    fn shipped_scenes() -> Vec<(std::path::PathBuf, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../share/scenes");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&root).unwrap_or_else(|e| panic!("{}: {e}", root.display())) {
+            let path = entry.unwrap().path().join("scene.mix");
+            if path.is_file() {
+                let text = std::fs::read_to_string(&path).unwrap();
+                out.push((path, text));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn scene_tag() -> ResultTag {
+        ResultTag { language: "scene".into(), ..tag() }
+    }
+
+    /// The D8 regression: `mix lint` flagged the fence of every scene.mix
+    /// (MIX-E1003). In-process, every shipped template is clean, whatever
+    /// binary is (or is not) installed.
+    #[test]
+    fn every_shipped_scene_lints_clean_in_process() {
+        let scenes = shipped_scenes();
+        assert!(scenes.len() >= 6, "the five shipped templates and the editor: {scenes:?}");
+        for (path, text) in scenes {
+            let findings = scene_findings(&text);
+            assert!(findings.is_empty(), "{}: {findings:?}", path.display());
+            let report = run(&scene_tag(), &text, None).unwrap();
+            let mut d = cosmix_edit_client::diag::Diagnostics::default();
+            d.accept(&scene_tag(), scene_tag(), &text, &report, &[]).unwrap();
+            assert!(d.items().is_empty(), "{}: {:?}", path.display(), d.items());
+        }
+    }
+
+    #[test]
+    fn a_binding_policy_error_lands_on_its_line() {
+        let (_, text) = shipped_scenes().into_iter().find(|(p, _)| p.ends_with("calendar/scene.mix")).expect("calendar");
+        let broken = text.replacen("\"text\":\"= $model.day\"", "\"text\":\"= $env.HOME\"", 1);
+        assert_ne!(broken, text, "the calendar day binding is where the test expects it");
+        let line = broken.lines().position(|l| l.starts_with("cal_day:")).unwrap() + 1;
+        let findings = scene_findings(&broken);
+        assert!(
+            findings.iter().any(|f| f.code == "binding-policy" && f.error && f.line == line),
+            "binding-policy on line {line}: {findings:?}"
+        );
+        let report = run(&scene_tag(), &broken, None).unwrap();
+        let mut d = cosmix_edit_client::diag::Diagnostics::default();
+        d.accept(&scene_tag(), scene_tag(), &broken, &report, &[]).unwrap();
+        let hit = d.items().iter().find(|i| i.code == "binding-policy").expect("a binding-policy row");
+        assert_eq!((hit.line, hit.source.as_str()), (line, cosmix_edit_client::diag::LINT_SOURCE));
+        assert!(broken[hit.range.clone()].starts_with("cal_day:"), "the squiggle covers that line");
+        // An envelope error (no fence at all) is reported, not a panic.
+        assert!(scene_findings("not a scene").iter().any(|f| f.error));
     }
 
     #[test]

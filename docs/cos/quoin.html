@@ -710,8 +710,12 @@ the patterns below.</p>
 plane is <code>shell-sub</code>. <code>shell.ping</code> and <code>shell.info</code> provide presence and
 discovery. Live panel state is read through the uniform
 <code>shell.props.{get,list,describe}</code> surface under
-<code>panels.&lt;edge&gt;.{visible,pinned,mode,width_px,page,pages,output}</code>.</p>
-<p><code>shell.panel.state {edge}</code> returns those seven leaves in one JSON object,
+<code>panels.&lt;edge&gt;.{visible,pinned,mode,width_px,page,pages,declared,output}</code>,
+plus <code>dialog</code>. <code>declared</code> is the edge's page order as last ingested from
+<code>conf.mix</code> (the live <code>pages</code> may hold fewer, or tail pages it does not name).
+<code>dialog</code> is the one dialog seat, <code>{scene, visible, w, h, output}</code>, or null
+when no dialog scene is loaded; until dialog scenes land it is always null.</p>
+<p><code>shell.panel.state {edge}</code> returns those eight leaves in one JSON object,
 plus the host's <code>keyboard_focused</code> and <code>keyboard_requested</code> booleans for that
 edge. <code>edge</code> is <code>left</code>, <code>bottom</code>, <code>right</code> or <code>top</code>; an invalid or missing edge
 returns rc 10 with <code>{"error":"edge must be left, bottom, right or top"}</code>.</p>
@@ -745,7 +749,23 @@ registered caller and are translated to the same <code>ShellCommand</code> ingre
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
 persistence. <code>shell.quit</code> requests a successful Bevy exit through the normal render and surface drain
 (<code>QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit</code>). <code>shell.panel.resize</code> accepts
-<code>edge</code> and <code>thickness_px</code> in the supported 120–500 range.</p>
+<code>edge</code> and <code>thickness_px</code> in that edge's range: 24–200 logical px for the top
+and bottom edges and 120–500 for the left and right. The settings steppers and
+pointer drag clamp to the same per-orientation range; a refusal carries it as
+<code>range_px</code>.</p>
+<p><code>shell.panel.order {edges:{&lt;edge&gt;:[page, …], …}}</code> rewrites the page order of
+one to four edges in <code>conf.mix</code> in a single atomic file replacement, and
+replies <code>{edges}</code> as written. Moving a page between edges is one call that
+names both, so the file never declares a page on two edges. Edges it does not
+name keep their declarations, and a page one of them still declares may not
+be ordered elsewhere. The write re-encodes the whole file: other keys' values
+are preserved, but comments and formatting are not. Quoin ingests the new file
+through its watcher exactly like a hand edit, so a later hand edit wins.
+Refusals are rc 10 <code>{error_code, message, edges?}</code>: <code>INVALID_ARGUMENT</code> for a
+missing or empty <code>edges</code> map, an unknown edge, a name that is not a sub-panel
+identifier, more than 32 pages on an edge, or a page named twice (within an
+edge or across edges; <code>edges</code> names them), and <code>CONFIG_WRITE</code> when the current
+file is invalid or cannot be replaced. It is open to mesh callers.</p>
 <p><code>shell.panel.dock</code> takes <code>edge</code> and enters <code>Docked</code> from any current mode —
 the explicit docking route, since docking reflows the workspace and is never
 a side effect of another verb. <code>shell.panel.mode</code> takes <code>edge</code> and
@@ -837,7 +857,7 @@ the panel's marks follow the ingested value). A motion write re-encodes the
 whole <code>conf.mix</code>: other authored values are preserved, but comments and
 formatting are not. <code>shell.settings.size</code> takes <code>edge</code> and <code>delta_px</code> and
 enqueues the same resize commit an edge-drag completion produces, clamped to
-the supported thickness range and the output budget. Like the scene and
+that edge's thickness range and the output budget. Like the scene and
 sub-panel verbs, settings verbs from a stale Quoin connection are refused.
 Read back <code>shell.props.get path="panels.&lt;edge&gt;.width_px"</code> to verify a size
 change.</p>
@@ -846,7 +866,8 @@ change.</p>
 <code>motion</code> (the <em>ingested</em> <code>slide|fade</code>), <code>motions</code> (<code>fade</code> carries
 <code>available:false</code> and its <code>reason</code>), <code>fade_reason</code>, <code>sizes</code> (settled
 thickness in logical pixels per edge; a drag in progress does not change
-them), <code>step_px</code>, <code>range_px</code>, <code>edge</code> (the edge that declares
+them), <code>step_px</code>, <code>range_px</code> (<code>[min, max]</code> per edge: top and bottom
+24–200, left and right 120–500), <code>edge</code> (the edge that declares
 <code>settings.appearance</code>, or null), <code>page_owner</code> (who serves the page:
 <code>quoin@host</code> is the built-in fallback, or null), plus <code>generation</code> and
 <code>revision</code>. Quoin publishes the same body as <code>shell.settings.changed</code> on the
@@ -1105,7 +1126,12 @@ engaged corner presses and their releases, cancelling pending actions on excess
 movement or disengagement. Both buttons act on release; neither has a hold action.
 The menu action calls <code>CornerMenuHook(fn(&amp;mut World, &amp;OutputKey, Corner))</code>.
 The host always provides <strong>Pin / Dock / Hide</strong>, with the current mode checked
-and disabled; Quoin appends <code>conf.mix</code>'s <code>menu_items</code> for that edge. Each mode
+and disabled, then the built-in <strong>Edit panels…</strong>; Quoin appends <code>conf.mix</code>'s
+<code>menu_items</code> for that edge. Edit panels… is frame, not configuration: it is
+on every corner whatever <code>conf.mix</code> says, and sends <code>scenes.editor.open</code> with
+body exactly <code>{"safe":true}</code> to the scenes loader (<code>SCENES_SERVICE</code>, default
+<code>scenes</code>), which opens the shipped Scene Editor. Like the recovery chord it
+toggles: choosing it while that editor is visible closes it. Each mode
 choice uses the same <code>SetMode</code> command as the precise mode verbs. Extra items
 invoke their declared Bus target and verb, with the string list in <code>args</code>.
 The menu uses the panel chrome theme tokens. Arrow keys or Tab select an item;
