@@ -2431,7 +2431,7 @@ mod tests {
         std::fs::write(dir.join("home/file"), b"hello").unwrap();
         for quota in [Err("blob.quota timed out".to_string()),
             Err("blob.quota AppError".to_string()), Ok(json!({})),
-            Ok(json!({"owners": {"filesd-fs": {"limit": 0, "used": 0, "reserved": 0}})))] {
+            Ok(json!({"owners": {"filesd-fs": {"limit": 0, "used": 0, "reserved": 0}}}))] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let bind = listener.local_addr().unwrap().to_string();
             let worker = std::thread::spawn(move || {
