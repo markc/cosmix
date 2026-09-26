@@ -15,6 +15,7 @@
 
 mod config;
 mod delegation;
+mod lane;
 mod props;
 
 use std::collections::BTreeSet;
@@ -1112,6 +1113,18 @@ fn fs_verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
     vec![
         VerbDescriptor::new("HELP", &[], "List all commands this service accepts", true),
         VerbDescriptor::new("fs.places", &[], "List configured places", true),
+        VerbDescriptor::new(
+            "fs.blob.ref",
+            &["path", "name", "mime"],
+            "Stream a place file into blobd and pin it",
+            false,
+        ),
+        VerbDescriptor::new(
+            "fs.blob.materialise",
+            &["blob", "path", "overwrite"],
+            "Verify and land a local blob in a writable place",
+            false,
+        ),
         VerbDescriptor::new("places", &[], "Alias for fs.places", true),
         VerbDescriptor::new(
             "fs.list",
@@ -1290,7 +1303,7 @@ async fn serve_bus_fs(
     };
     while let Some(cmd) = rx.recv().await {
         let (from, command, id) = (cmd.from.clone(), cmd.command.clone(), cmd.id.clone());
-        let (rc, body) = dispatch_fs(cmd, fs.clone(), peers.clone(), service, blob_service).await;
+        let (rc, body) = dispatch_fs(cmd, fs.clone(), peers.clone(), service, blob_service, &client).await;
         let _ = client
             .respond_parts(&from, &command, id.as_deref(), rc, &body)
             .await;
@@ -1303,8 +1316,21 @@ async fn dispatch_fs(
     cmd: IncomingCommand,
     fs: Arc<cosmix_files::fsops::FsLayer>,
     peers: Arc<Vec<String>>,
-    _service: &str,
-    _blob_service: &str,
+    service: &str,
+    blob_service: &str,
+    client: &NodedClient,
+) -> (u8, String) {
+    dispatch_fs_with_bind(cmd, fs, peers, service, lane::bind(client, blob_service)).await
+}
+
+/// The resolver future is lazy: only the exact, prefixed blob verbs poll it.
+/// Keeping that boundary injectable lets tests prove other verbs never call Bus.
+async fn dispatch_fs_with_bind(
+    cmd: IncomingCommand,
+    fs: Arc<cosmix_files::fsops::FsLayer>,
+    peers: Arc<Vec<String>>,
+    service: &str,
+    bind: impl std::future::Future<Output = Result<String, String>>,
 ) -> (u8, String) {
     let (deleg, args) = match gate(&cmd, &peers) {
         Ok(v) => v,
@@ -1315,7 +1341,14 @@ async fn dispatch_fs(
         .strip_prefix("fs.")
         .unwrap_or(&cmd.command)
         .to_string();
-    let (rc, body) = tokio::task::spawn_blocking(move || fs_verb(&fs, &verb, &args))
+    let blob_verb = matches!(cmd.command.as_str(), "fs.blob.ref" | "fs.blob.materialise");
+    let bind = if blob_verb { Some(bind.await) } else { None };
+    let service = service.to_string();
+    let command = cmd.command.clone();
+    let (rc, body) = tokio::task::spawn_blocking(move || match bind {
+        Some(bind) => lane::verb(&fs, &command, &args, &bind, &service),
+        None => fs_verb(&fs, &verb, &args),
+    })
         .await
         .unwrap_or_else(|_| (10, jerr("internal error handling command")));
     if let Some(d) = &deleg {
@@ -2247,6 +2280,55 @@ mod tests {
     }
 
     // ── fs-mode verb table ──────────────────────────────────────────────────────
+    #[test]
+    fn blob_manifest_is_mutating_and_has_no_bare_aliases() {
+        let manifest = fs_verb_manifest();
+        for (name, args) in [
+            ("fs.blob.ref", vec!["path", "name", "mime"]),
+            ("fs.blob.materialise", vec!["blob", "path", "overwrite"]),
+        ] {
+            let entry = manifest.iter().find(|v| v.name == name).unwrap();
+            assert!(!entry.read_only);
+            assert_eq!(entry.args, args);
+        }
+        assert!(!manifest.iter().any(|v| v.name.starts_with("blob.")));
+    }
+
+    #[tokio::test]
+    async fn bare_blob_verbs_do_not_resolve_the_lane() {
+        let (fs, dir) = fs_layer(true);
+        for verb in ["blob.ref", "blob.materialise"] {
+            let (rc, body) = dispatch_fs_with_bind(
+                cmd(verb, json!({})), Arc::new(fs.clone()), Arc::new(vec![]), "filesd-fs",
+                async { panic!("bare blob verbs must not resolve the lane") },
+            ).await;
+            assert_eq!(rc, 10);
+            assert!(body.contains("unknown verb"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blob_dispatch_resolves_per_call_and_reports_unavailable() {
+        let (fs, dir) = fs_layer(true);
+        std::fs::write(dir.join("home/file"), b"x").unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let (rc, body) = dispatch_fs_with_bind(
+                cmd("fs.blob.ref", json!({"path": "home/file"})),
+                Arc::new(fs.clone()), Arc::new(vec![]), "filesd-fs",
+                async {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Err("lane_unavailable: test lane is down".into())
+                },
+            ).await;
+            assert_eq!(rc, 10);
+            assert!(body.contains("lane_unavailable:"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn fs_layer(writable: bool) -> (cosmix_files::fsops::FsLayer, PathBuf) {
         use cosmix_files::fsops::{FsLayer, Place};
         let dir = scratch();
@@ -2335,11 +2417,15 @@ mod tests {
         let peers = Arc::new(vec!["webd".to_string()]);
         // A delegated peer with a valid admin envelope is authorized.
         let good = dcmd("webd", "fs.places", good_envelope(), json!({}));
-        let (rc, _) = dispatch_fs(good, fs.clone(), peers.clone(), "filesd-fs", "blobd").await;
+        let (rc, _) = dispatch_fs_with_bind(good, fs.clone(), peers.clone(), "filesd-fs", async {
+            panic!("non-blob verb must not resolve the lane")
+        }).await;
         assert_eq!(rc, 0);
         // from=webd but no envelope → defence-in-depth refusal (the shared gate).
         let bare = cmd_from("webd", "fs.places", Value::Null);
-        let (rc, body) = dispatch_fs(bare, fs.clone(), peers.clone(), "filesd-fs", "blobd").await;
+        let (rc, body) = dispatch_fs_with_bind(bare, fs.clone(), peers.clone(), "filesd-fs", async {
+            panic!("refused call must not resolve the lane")
+        }).await;
         assert_eq!(rc, 10);
         assert!(
             body.contains("must present a $cosmix_delegation envelope"),
