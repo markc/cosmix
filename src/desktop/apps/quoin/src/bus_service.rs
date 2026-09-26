@@ -3343,8 +3343,22 @@ mod tests {
 
     /// Answer the snapshot a departure message now requests: `keeper` and the
     /// shell are registered, everyone else is gone.
+    /// A full outbound queue defers the request to the retry on the next
+    /// update, so look again after one.
     fn confirm_absent(app: &mut App, peer: &ctk::bus::TestBusPeer) {
-        let id = citizen_snapshot_id(peer);
+        let mut id = None;
+        for _ in 0..3 {
+            id = peer
+                .drain_calls()
+                .into_iter()
+                .find(|call| call.command == "noded.props.get")
+                .map(|call| call.request_id);
+            if id.is_some() {
+                break;
+            }
+            app.update();
+        }
+        let id = id.expect("a departure must request a confirming snapshot");
         reply_citizen_snapshot(peer, id, &["shell", "keeper"]);
         app.update();
     }
@@ -3459,8 +3473,12 @@ mod tests {
         absent(&peer);
         peer.send(scene_load("notes", "owner", "left"));
         app.update();
-        assert_eq!(peer.drain_responses()[0].rc, 0);
-        confirm_absent(&mut app, &peer);
+        // The test peer drains one shared queue, so take the confirming
+        // snapshot request before anything else reads it; the replacement
+        // load is judged by the registry below.
+        let id = citizen_snapshot_id(&peer);
+        reply_citizen_snapshot(&peer, id, &["shell", "keeper"]);
+        app.update();
         let registry = &app.world().resource::<SubPanelRegistryState>().0;
         assert!(registry.seat("scene-notes").is_some());
         assert!(registry.seat("scene-old-only").is_none());
@@ -3526,7 +3544,7 @@ mod tests {
         let notices: Vec<Value> = peer
             .drain_publishes()
             .iter()
-            .filter(|p| p.headers.get("name").is_some_and(|n| n == "shell.scene.changed"))
+            .filter(|p| p.headers.get("name").is_some_and(|n| n.ends_with(".scene.changed")))
             .map(|p| serde_json::from_str(p.body.split_once("\n---\n").unwrap().1).unwrap())
             .collect();
         let departed: Vec<&Value> = notices.iter().filter(|n| n["reason"] == "owner_departed").collect();
@@ -3715,7 +3733,9 @@ mod tests {
         assert!(replies.iter().all(|reply| reply.rc == 0));
         absent(&peer);
         app.update();
-        confirm_absent(&mut app, &peer);
+        // Mesh and anonymous owners are not tracked lifetimes: no departure,
+        // so no confirming snapshot is even requested.
+        assert!(peer.drain_calls().iter().all(|call| call.command != "noded.props.get"));
         let registry = &app.world().resource::<SubPanelRegistryState>().0;
         assert_eq!(
             registry.seat("scene-remote").unwrap().owner,
