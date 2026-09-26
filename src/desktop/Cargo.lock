@@ -3066,6 +3066,7 @@ dependencies = [
  "cosmix-lib-config",
  "cosmix-scene",
  "iced",
+ "iced_tiny_skia",
  "proptest",
  "rand 0.8.8",
  "serde",

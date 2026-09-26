@@ -748,6 +748,9 @@ ced's own stages (<code>model_us</code>, <code>view_us</code>, <code>next_frame_
 edit a frame of a full editor costs tens of milliseconds, so a
 <code>ced.action file.save</code> answers in about 100–300 ms on a nested desktop, of
 which the edit service's write and fsync are about 50–100 ms.</li>
+<li>A glyph whose ink reaches more than half a line above or below its own
+row (tall stacks of combining marks, an outsized fallback glyph) can lose
+that overhang when only the neighbouring row is redrawn.</li>
 <li>A recovered <strong>scratch</strong> buffer with CRLF line endings, reattached by its
 recovery id, is edited as LF: Enter inserts <code>\n</code> (the service's list row
 carries no line-ending field yet). Path buffers are unaffected.</li>

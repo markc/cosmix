@@ -232,13 +232,16 @@ impl Ctx<'_, '_> {
         let colour = if class == HlClass::Plain { p.text } else { p.hl(class) };
         let shaping = if run.ascii { atext::Shaping::Basic } else { atext::Shaping::Advanced };
         let width = (run.end_cell - run.start_cell + 1) as f32 * self.g.metrics.cell_w;
-        self.text(r, std::mem::take(&mut run.text), Point::new(self.x(run.start_cell), row.y), width, colour, shaping);
+        self.text(r, std::mem::take(&mut run.text), Point::new(self.x(run.start_cell), row.y), width, colour, shaping, self.g.text_rect());
         *run = Run::default();
     }
 
-    fn text<R: atext::Renderer<Font = Font>>(&self, r: &mut R, content: String, at: Point, width: f32, colour: Color, shaping: atext::Shaping) {
+    /// `layer`: the rectangle the text is drawn in (its `with_layer`, or the
+    /// gutter).
+    #[allow(clippy::too_many_arguments)]
+    fn text<R: atext::Renderer<Font = Font>>(&self, r: &mut R, content: String, at: Point, width: f32, colour: Color, shaping: atext::Shaping, layer: Rectangle) {
         let v = &self.ed.view;
-        let clip = text_clip(at, width, self.g.metrics.cell_w, self.g.metrics.line_h);
+        let clip = text_clip(at, width, self.g.metrics, layer);
         r.fill_text(
             atext::Text {
                 content,
@@ -284,7 +287,7 @@ impl Ctx<'_, '_> {
         }
         if any {
             let width = (s.chars().count() + 1) as f32 * self.g.metrics.cell_w;
-            self.text(r, s, Point::new(self.x(first.cell), row.y), width, self.ed.palette.gutter_text, atext::Shaping::Advanced);
+            self.text(r, s, Point::new(self.x(first.cell), row.y), width, self.ed.palette.gutter_text, atext::Shaping::Advanced, self.g.text_rect());
         }
     }
 
@@ -333,7 +336,9 @@ impl Ctx<'_, '_> {
                 let n = row.line.to_string();
                 let x = gr.x + (g.digits - n.len().min(g.digits)) as f32 * cw + cw * 0.5;
                 let colour = if row.line == caret_line { p.text } else { p.gutter_text };
-                self.text(r, n, Point::new(x, row.y), (g.digits + 1) as f32 * cw, colour, atext::Shaping::Basic);
+                // The number's own width keeps its box inside the gutter.
+                let width = (n.len() + 1) as f32 * cw;
+                self.text(r, n, Point::new(x, row.y), width, colour, atext::Shaping::Basic, gr);
             }
         }
         // Origin strip: lines other origins changed since the tab was focused.
@@ -402,7 +407,7 @@ impl Ctx<'_, '_> {
         let rect = Rectangle { x, y: at.y, width: w, height: h };
         let bg = renderer::Quad { bounds: rect, border: Border { radius: 4.0.into(), width: 1.0, color: accent }, ..renderer::Quad::default() };
         r.fill_quad(bg, p.gutter_background);
-        self.text(r, label.to_string(), Point::new(x + cw * 0.5, at.y), w, p.text, atext::Shaping::Advanced);
+        self.text(r, label.to_string(), Point::new(x + cw * 0.5, at.y), w, p.text, atext::Shaping::Advanced, self.g.bounds);
     }
 
     fn preedit<R: atext::Renderer<Font = Font>>(&self, r: &mut R, rows: &[Row]) {
@@ -418,7 +423,7 @@ impl Ctx<'_, '_> {
         let w = cells as f32 * self.g.metrics.cell_w;
         let p = self.ed.palette;
         quad(r, Rectangle { x: caret.x, y: caret.y, width: w, height: caret.height }, p.background);
-        self.text(r, st.ime.preedit.clone(), Point::new(caret.x, caret.y), w + self.g.metrics.cell_w, p.text, atext::Shaping::Advanced);
+        self.text(r, st.ime.preedit.clone(), Point::new(caret.x, caret.y), w + self.g.metrics.cell_w, p.text, atext::Shaping::Advanced, self.g.bounds);
         quad(r, Rectangle { x: caret.x, y: caret.y + caret.height - 2.0, width: w, height: 1.0 }, p.caret);
     }
 
@@ -512,16 +517,28 @@ fn quad<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color
     r.fill_quad(renderer::Quad { bounds, ..renderer::Quad::default() }, colour);
 }
 
-/// The clip rectangle a `fill_text` at `at`, `width` wide, is handed: its own
-/// row box, a cell wider and half a line taller on every side (overhangs
-/// stay inside it). Never the whole text area: iced_tiny_skia draws every
-/// text whose clip rectangle meets the damage, and clears and refills a
-/// window-sized clip mask for every one whose clip rectangle is not inside
-/// layer ∩ damage — with the text area here each frame cost ~150 ms and a
-/// `ced.action` waited behind it (ced first save, 2026-09-26). The layer
-/// (`with_layer`) still clips a box that crosses it, through that mask.
-fn text_clip(at: Point, width: f32, cell_w: f32, line_h: f32) -> Rectangle {
-    Rectangle { x: at.x - cell_w, y: at.y - line_h * 0.5, width: width + 2.0 * cell_w, height: line_h * 2.0 }
+/// The clip rectangle a `fill_text` at `at`, `width` wide, drawn in `layer`,
+/// is handed: its own row box with a cell and half a line of slack on every
+/// side, cut to `layer` when the box lies inside it.
+///
+/// iced_tiny_skia 0.14.1 (pinned in Cargo.toml) never pixel-clips a cached
+/// text by this rectangle; it tests it against layer ∩ damage. A text whose
+/// rectangle misses is skipped; one whose rectangle is not inside first
+/// clears and refills a window-sized clip mask. With the whole text area here
+/// every text on screen paid that on every partial frame (~150 ms a frame; a
+/// `ced.action` waited behind it — ced first save, 2026-09-26). Cut to the
+/// layer, a full-layer frame masks only the boxes that really cross its edge
+/// (the partial last row, a line running past the right edge), and the mask
+/// still clips those.
+///
+/// The slack is the whole budget for ink outside a text's box: each damage
+/// rectangle is filled with the background before drawing, so ink reaching
+/// more than half a line into a neighbouring row (stacked combining marks, an
+/// outsized fallback glyph) is erased when that row alone is redrawn.
+fn text_clip(at: Point, width: f32, m: geo::Metrics, layer: Rectangle) -> Rectangle {
+    let slack = Rectangle { x: at.x - m.cell_w, y: at.y - m.line_h * 0.5, width: width + 2.0 * m.cell_w, height: m.line_h * 2.0 };
+    let own = Rectangle { x: at.x, y: at.y, width, height: m.line_h };
+    if own.is_within(&layer) { slack.intersection(&layer).unwrap_or(own) } else { slack }
 }
 
 fn rounded<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color) {
@@ -578,15 +595,39 @@ mod tests {
     use super::super::{EditorView, Palette};
     use super::*;
 
-    /// Records each `fill_text`: its position, box and clip rectangle.
-    #[derive(Default)]
+    /// The window the widget sits in (the base layer).
+    const WINDOW: Rectangle = Rectangle { x: 0.0, y: 0.0, width: 1000.0, height: 600.0 };
+
+    /// One `fill_text`: its own box, clip rectangle and the layer it is in.
+    #[derive(Debug)]
+    struct Drawn {
+        own: Rectangle,
+        clip: Rectangle,
+        layer: Rectangle,
+    }
+
+    impl Drawn {
+        /// The damage it reports (iced_graphics `Text::visible_bounds` for a
+        /// cached text: its box ∩ its clip rectangle).
+        fn visible_bounds(&self) -> Rectangle {
+            self.own.intersection(&self.clip).expect("the clip holds the box")
+        }
+    }
+
+    /// Records each `fill_text` with the layer it is drawn in.
     struct Rec {
-        texts: Vec<(Point, Size, Rectangle)>,
+        layers: Vec<Rectangle>,
+        texts: Vec<Drawn>,
     }
 
     impl iced::advanced::Renderer for Rec {
-        fn start_layer(&mut self, _: Rectangle) {}
-        fn end_layer(&mut self) {}
+        fn start_layer(&mut self, bounds: Rectangle) {
+            let parent = *self.layers.last().expect("the window layer");
+            self.layers.push(bounds.intersection(&parent).unwrap_or(Rectangle::with_size(Size::ZERO)));
+        }
+        fn end_layer(&mut self) {
+            self.layers.pop();
+        }
         fn start_transformation(&mut self, _: Transformation) {}
         fn end_transformation(&mut self) {}
         fn fill_quad(&mut self, _: renderer::Quad, _: impl Into<Background>) {}
@@ -620,7 +661,8 @@ mod tests {
         fn fill_paragraph(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
         fn fill_editor(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
         fn fill_text(&mut self, text: atext::Text, position: Point, _: Color, clip: Rectangle) {
-            self.texts.push((position, text.bounds, clip));
+            let layer = *self.layers.last().expect("the window layer");
+            self.texts.push(Drawn { own: Rectangle::new(position, text.bounds), clip, layer });
         }
     }
 
@@ -628,26 +670,38 @@ mod tests {
         crate::theme::resolve_selection(&crate::theme::read_selection(None, None, &mut Vec::new()), Vec::new()).palette
     }
 
-    /// iced_tiny_skia's per-text decision (`Engine::draw_text`, 0.14): a text
-    /// whose clip rectangle meets the damage is drawn, and one whose clip
-    /// rectangle is not inside it first clears and refills a window-sized
-    /// clip mask.
-    fn masked(clip: &Rectangle, damage: &Rectangle) -> bool {
-        clip.intersects(damage) && !clip.is_within(damage)
+    /// iced_tiny_skia 0.14.1's per-text decision for a damage rectangle
+    /// (`Renderer::draw` → `Engine::draw_text`, `Text::Cached`): the clip
+    /// rectangle is tested against layer ∩ damage; one that meets it is
+    /// drawn, and one that is not inside it first clears and refills a
+    /// window-sized clip mask. (drawn, masked)
+    fn decide(t: &Drawn, damage: &Rectangle) -> (bool, bool) {
+        let Some(bounds) = t.layer.intersection(damage) else { return (false, false) };
+        let drawn = t.clip.intersects(&bounds);
+        (drawn, drawn && !t.clip.is_within(&bounds))
     }
 
-    /// Each text's clip rectangle is its own row box (a cell and half a line
-    /// of slack), so a frame whose damage is one row draws and masks only the
-    /// texts near that row — the whole text area here made every text on
-    /// screen clear a window-sized mask each frame, ~150 ms a frame, and a
-    /// save waited behind it (ced first save, 2026-09-26).
+    fn masks(texts: &[Drawn], damage: &Rectangle) -> usize {
+        texts.iter().filter(|t| decide(t, damage).1).count()
+    }
+
+    /// Each text's clip rectangle is its own row box cut to its layer, so a
+    /// frame masks only texts that must be clipped: none but the boxes that
+    /// cross the layer edge on a full redraw, and only the damaged row's
+    /// neighbours on a one-row redraw. With the whole text area as the clip
+    /// every text on screen cleared a window-sized mask on every partial
+    /// frame (~150 ms a frame; ced first save, 2026-09-26); with the row box
+    /// uncut every text at column 0 and on the top row did so on every full
+    /// frame (review round 1).
     #[test]
     fn each_text_is_clipped_to_its_own_row_not_the_text_area() {
         let mut body = String::new();
         for n in 0..60 {
+            if n % 7 == 2 {
+                body.push_str(&format!("{}\n", "y".repeat(120)));
+            }
             body.push_str(&format!("let value_{n} = \"a string\" .. {n} -- a comment · ü\n"));
         }
-        body.push_str(&"x".repeat(400));
         let text = Text::from_text(&body).unwrap();
         let model = EditorModel::default();
         let highlight = Highlight::for_language("text", None);
@@ -660,24 +714,27 @@ mod tests {
         st.metrics = Some(metrics);
         st.scroll.first_line = 1;
         let g = Geometry::new(Rectangle { x: 100.0, y: 50.0, width: 800.0, height: 405.0 }, metrics, text.line_count(), true);
-        let mut r = Rec::default();
+        let mut r = Rec { layers: vec![WINDOW], texts: Vec::new() };
         draw(&ed, &st, &g, &mut r, mouse::Cursor::Unavailable);
+        let texts = &r.texts;
 
-        assert!(r.texts.len() > 40, "the fixture draws a screenful of texts ({})", r.texts.len());
-        for (at, size, clip) in &r.texts {
-            let own = Rectangle::new(*at, *size);
-            assert!(own.is_within(clip), "the clip {clip:?} holds the text's own box {own:?}");
-            assert!(clip.height <= 2.0 * metrics.line_h, "the clip {clip:?} is a row, not the text area");
+        assert!(texts.len() > 40, "the fixture draws a screenful of texts ({})", texts.len());
+        for t in texts {
+            assert!(t.own.is_within(&t.clip), "{t:?}: the clip holds the text's own box");
         }
-        // One row of damage (a caret moving on row 5): only the texts on it
-        // and its neighbours meet it.
-        let t = g.text_rect();
-        let damage = Rectangle { x: t.x, y: g.bounds.y + 5.0 * metrics.line_h, width: t.width, height: metrics.line_h };
-        let near = |y: f32| (y - damage.y).abs() <= metrics.line_h;
-        let touched: Vec<_> = r.texts.iter().filter(|(_, _, clip)| clip.intersects(&damage)).collect();
-        assert!(!touched.is_empty());
-        assert!(touched.iter().all(|(at, _, _)| near(at.y)), "only texts beside the damaged row are drawn: {touched:?}");
-        let masks = r.texts.iter().filter(|(_, _, clip)| masked(clip, &damage)).count();
-        assert!(masks * 5 < r.texts.len(), "{masks} of {} texts clear a window-sized mask for one damaged row", r.texts.len());
+        // A full redraw (scroll, resize): only boxes that cross their layer
+        // edge — the partial last row, the long lines — take the mask.
+        let crossing = texts.iter().filter(|t| !t.own.is_within(&t.layer)).count();
+        assert!(crossing > 0 && crossing * 5 < texts.len(), "{crossing} of {} boxes cross their layer", texts.len());
+        assert_eq!(masks(texts, &WINDOW), crossing, "a full redraw masks only the crossing boxes");
+        // One row redrawn (a caret moving on row 6): its own damage, from
+        // the first run's visible bounds.
+        let row6 = g.bounds.y + 5.0 * metrics.line_h;
+        let first = texts.iter().filter(|t| t.own.y == row6 && t.layer == g.text_rect()).min_by(|a, b| a.own.x.total_cmp(&b.own.x));
+        let damage = first.expect("a run on row 6").visible_bounds();
+        let drawn: Vec<_> = texts.iter().filter(|t| decide(t, &damage).0).collect();
+        assert!(drawn.iter().all(|t| (t.own.y - row6).abs() <= metrics.line_h), "only row 6 and its neighbours are drawn: {drawn:?}");
+        let partial = masks(texts, &damage);
+        assert!(partial * 5 < texts.len(), "{partial} of {} texts clear a window-sized mask for one damaged run", texts.len());
     }
 }
