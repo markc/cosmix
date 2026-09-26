@@ -29,7 +29,7 @@ cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets", features = ["
 # text culling (a cached text's clip rectangle is tested against layer ∩
 # damage; a rectangle not inside it refills a window-sized mask). Re-check
 # that rule and the draw test before moving this.
-iced_tiny_skia = "=0.14.1"
+iced_tiny_skia = { version = "=0.14.1", default-features = false }
 cosmix-design = { path = "../../crates/cosmix-design" }
 cosmix-edit-client = { path = "../../../crates/cosmix-edit-client" }
 cosmix-edit-core = { path = "../../../crates/cosmix-edit-core" }
