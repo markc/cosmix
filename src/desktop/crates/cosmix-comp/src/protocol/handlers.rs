@@ -2670,6 +2670,14 @@ impl FractionalScaleHandler for WaylandState {
 }
 
 impl ClientDndGrabHandler for WaylandState {
+    fn can_start_drag(&mut self, seat: &Seat<Self>) -> bool {
+        if seat == &self.agent.seat {
+            tracing::debug!("agent seat does not support drag and drop; start refused");
+            return false;
+        }
+        true
+    }
+
     fn started(
         &mut self,
         _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
@@ -2677,8 +2685,8 @@ impl ClientDndGrabHandler for WaylandState {
         seat: Seat<Self>,
     ) {
         if seat != self.human.seat {
-            // Smithay calls started BEFORE installing the grab. Returning (or
-            // unsetting here) cannot prevent that install; interception is chunk 2.
+            // can_start_drag refuses agent starts before icon-role/grab installation.
+            // This callback remains defensive; returning here cannot veto a grab.
             tracing::debug!("ignored non-human drag icon update");
             return;
         }

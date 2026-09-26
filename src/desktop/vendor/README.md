@@ -6,6 +6,9 @@ stores a client predicate in `SeatGlobalData` and delegates visibility through
 The `test-support`-gated `XWaylandClientData::for_test` constructor supplies the
 real client tag without a child process for headless registry-filter tests.
 Only comp's dev-dependency enables it; production builds have no constructor.
+`ClientDndGrabHandler::can_start_drag` is a default-true seat capability hook.
+Data-device StartDrag checks it before assigning the icon role or installing
+either grab; refusal cancels the source. Comp disables DnD on the agent seat.
 
 ## iced_tiny_skia 0.14.1
 

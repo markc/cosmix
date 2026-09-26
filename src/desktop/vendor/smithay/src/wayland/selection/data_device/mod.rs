@@ -124,6 +124,11 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + ClientDndGrabHandler + S
 /// Events that are generated during client initiated drag'n'drop
 #[allow(unused_variables)]
 pub trait ClientDndGrabHandler: SeatHandler + Sized {
+    /// Whether this seat supports client-initiated drag and drop.
+    /// Called before assigning an icon role or installing a pointer/touch grab.
+    /// Returning false cancels the source and leaves the existing grab intact.
+    fn can_start_drag(&mut self, seat: &Seat<Self>) -> bool { true }
+
     /// A client started a drag'n'drop as response to a user pointer action
     ///
     /// * `source` - The data source provided by the client.
