@@ -436,8 +436,25 @@ impl Store {
             .mime
             .map(str::to_string)
             .unwrap_or_else(|| mime::sniff(&os_str_lossy(opts.name, src)).to_string());
-        let name = opts.name.map(str::to_string);
+        self.record_upload(&hash, size, &mime, opts.name, opts.owner)
+    }
 
+    /// Post-stream ingest bookkeeping, shared by `blob.put` and the
+    /// byte lane: attrs (mime, name, `origin` = this node), the owner
+    /// pin and its quota accounting. The bytes must already be
+    /// committed in the CAS. Idempotent per owner: a re-put pins
+    /// nothing new. The returned reference describes the attrs as they
+    /// stand after the call — an already-recorded blob keeps its
+    /// original mime/name, so the reference always matches
+    /// `blob.stat`.
+    pub fn record_upload(
+        &self,
+        hash: &BlobHash,
+        size: u64,
+        mime: &str,
+        name: Option<&str>,
+        owner: &str,
+    ) -> Result<PutOutcome> {
         let mut db = self.db.lock().unwrap();
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -445,26 +462,38 @@ impl Store {
         tx.execute(
             "INSERT OR IGNORE INTO blob_attrs (hash, mime, name_hint, origin, first_put) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![blob::hex(&hash), mime, name, self.options.origin, now_ms()],
+            params![blob::hex(hash), mime, name, self.options.origin, now_ms()],
         )
         .map_err(db_err)?;
+        // Read back what the table now holds: INSERT OR IGNORE keeps a
+        // pre-existing row, and the reference must not claim a mime or
+        // name the store is not serving.
+        let (mime, name): (String, Option<String>) = tx
+            .query_row(
+                "SELECT mime, name_hint FROM blob_attrs WHERE hash = ?1",
+                params![blob::hex(hash)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(db_err)?;
         let pinned = tx
             .execute(
                 "INSERT OR IGNORE INTO pins (hash, owner, created) VALUES (?1, ?2, ?3)",
-                params![blob::hex(&hash), opts.owner, now_ms()],
+                params![blob::hex(hash), owner, now_ms()],
             )
             .map_err(db_err)?
             == 1;
         if pinned {
-            bump_owner_used(&tx, opts.owner, size)?;
+            bump_owner_used(&tx, owner, size)?;
         }
         tx.commit().map_err(db_err)?;
         drop(db);
-        self.bump_generation();
+        if pinned {
+            self.bump_generation();
+        }
 
         Ok(PutOutcome {
             reference: Reference {
-                hash,
+                hash: *hash,
                 size,
                 mime,
                 name,
@@ -472,6 +501,22 @@ impl Store {
             },
             newly_pinned: pinned,
         })
+    }
+
+    /// The largest upload `owner` may land right now: the tighter of
+    /// the owner's remaining headroom and the total cap's. The lane
+    /// checks a declared `Content-Length` against this before the
+    /// first byte and enforces it with a mid-stream counter.
+    pub fn upload_cap(&self, owner: &str) -> Result<u64> {
+        let owner_room = self
+            .options
+            .owner_limit(owner)
+            .saturating_sub(self.owner_used(owner)?);
+        let total_room = self
+            .options
+            .quota_total_bytes
+            .saturating_sub(self.total_used()?);
+        Ok(owner_room.min(total_room))
     }
 
     // ---- Reads ----

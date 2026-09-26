@@ -7,9 +7,7 @@ use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
 /// dispatches.
 #[derive(Debug, Clone)]
 pub struct PropsInput {
-    /// `<ip>:<port>` of the byte lane (served in a later slice; the
-    /// port is published so a remote can resolve it via
-    /// `blobd.props.get` before then).
+    /// `<ip>:<port>` of the byte lane (the WG-bound HTTP listener).
     pub lane_bind: String,
     pub lane_port: u16,
     pub root: String,
@@ -73,7 +71,7 @@ impl PropTree for BlobProps {
             "bind" => PropDescribe::leaf(
                 path.clone(),
                 PropType::String,
-                "Byte-lane bind address (<ip>:<port>); the listener arrives in a later slice.",
+                "Byte-lane bind address (<ip>:<port>); the WG-proven HTTP listener serving /blob.",
             ),
             "port" => PropDescribe::leaf(
                 path.clone(),

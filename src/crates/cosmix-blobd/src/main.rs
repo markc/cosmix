@@ -48,12 +48,14 @@ async fn async_main() -> anyhow::Result<()> {
     });
 
     // `origin` is the node name from node.conf.mix — props-legible,
-    // never an IP.
-    let origin = match cosmix_config::node::load_node_config() {
-        Ok(Some(node)) => node.node,
+    // never an IP. `wg_ip` (the same source noded uses) is what the
+    // lane's bind is proved against.
+    let node = cosmix_config::node::load_node_config();
+    let (origin, wg_ip) = match &node {
+        Ok(Some(node)) => (node.node.clone(), node.wg_ip.clone()),
         Ok(None) | Err(_) => {
             eprintln!("cosmix-blobd: node.conf.mix not found; origin falls back to \"localhost\"");
-            "localhost".to_string()
+            ("localhost".to_string(), String::new())
         }
     };
 
@@ -76,12 +78,47 @@ async fn async_main() -> anyhow::Result<()> {
         );
     }
 
+    // The byte lane. The bind proof runs before any socket is opened —
+    // fail closed: the bind IP must be this node's own wg_ip, never
+    // unspecified, never loopback, never another interface (noded's
+    // bind_is_wg, copied). The listener is bound before the citizen is
+    // constructed, so lane.bind/lane.port props only exist once the
+    // socket is actually listening.
+    let lane = match cfg.lane_bind {
+        Some(bind) if !cosmix_blobd::lane::bind_is_wg(&bind.to_string(), &wg_ip) => {
+            eprintln!(
+                "cosmix-blobd: lane_bind {bind} is not this node's WG address (wg_ip {:?}) — the lane serves only the mesh; refusing to start",
+                if wg_ip.is_empty() { "<absent>" } else { &wg_ip }
+            );
+            std::process::exit(2);
+        }
+        Some(bind) => {
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .map_err(|e| anyhow::anyhow!("bind byte lane {bind}: {e}"))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| anyhow::anyhow!("byte lane local_addr: {e}"))?;
+            let lane_store = Arc::clone(&store);
+            let max_uploads = cfg.lane_max_uploads;
+            tokio::spawn(async move {
+                if let Err(error) = cosmix_blobd::lane::serve_lane(listener, lane_store, max_uploads)
+                    .await
+                {
+                    eprintln!("cosmix-blobd: byte lane stopped: {error}");
+                }
+            });
+            Some(addr)
+        }
+        None => None,
+    };
+
     let instance = cfg.name.clone().unwrap_or_else(|| "default".to_string());
     let citizen = Arc::new(Citizen::new(
         store,
         cfg.service_name(),
         instance,
-        cfg.lane_bind,
+        lane,
     ));
     cosmix_blobd::citizen::serve(citizen).await
 }

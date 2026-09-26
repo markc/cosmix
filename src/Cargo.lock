@@ -1070,6 +1070,7 @@ name = "cosmix-blobd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
@@ -1077,11 +1078,13 @@ dependencies = [
  "cosmix-lib-config",
  "cosmix-lib-props-core",
  "cosmix-mds",
+ "http-body-util",
  "libc",
  "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

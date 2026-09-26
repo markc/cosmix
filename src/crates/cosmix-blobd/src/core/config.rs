@@ -4,10 +4,10 @@
 //! first `:`, both sides trimmed. Repeated keys (`quota_owner:`) are
 //! read from the raw text, not the flat map, so they cannot collide.
 //!
-//! Keys: `root`, `name`, `lane_bind`, `quota_total_bytes`,
-//! `quota_owner_default_bytes`, `quota_owner: <owner>=<bytes>`
-//! (repeatable). The byte values accept plain integers or a `KiB`
-//! family suffix.
+//! Keys: `root`, `name`, `lane_bind`, `lane_max_uploads`,
+//! `quota_total_bytes`, `quota_owner_default_bytes`,
+//! `quota_owner: <owner>=<bytes>` (repeatable). The byte values accept
+//! plain integers or a `KiB` family suffix.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -17,6 +17,9 @@ use std::path::PathBuf;
 pub const DEFAULT_QUOTA_TOTAL_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 /// Default per-owner cap: 10 GiB.
 pub const DEFAULT_QUOTA_OWNER_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Default concurrent lane uploads: 4. Beyond it the lane answers 503
+/// immediately — no queueing (the no-poll/no-flood law).
+pub const DEFAULT_LANE_MAX_UPLOADS: usize = 4;
 
 /// Parsed configuration with defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,9 +30,12 @@ pub struct Config {
     /// Instance name: the Bus service is `blobd` or `blobd-<name>`,
     /// with a root per instance.
     pub name: Option<String>,
-    /// Byte-lane bind `<ip>:<port>`. The lane itself is a later slice;
-    /// here it is only validated and used to build `blob.url`.
+    /// Byte-lane bind `<ip>:<port>`. The listener exists only when
+    /// this is set, and only after `bind_is_wg` has proved the IP is
+    /// this node's `wg_ip` (fail closed, exit 2).
     pub lane_bind: Option<SocketAddr>,
+    /// Concurrent lane uploads admitted at once; beyond it, 503.
+    pub lane_max_uploads: usize,
     pub quota_total_bytes: u64,
     pub quota_owner_default_bytes: u64,
     /// Per-owner caps from repeated `quota_owner: <owner>=<bytes>`
@@ -43,6 +49,7 @@ impl Default for Config {
             root: None,
             name: None,
             lane_bind: None,
+            lane_max_uploads: DEFAULT_LANE_MAX_UPLOADS,
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
             owner_limits: BTreeMap::new(),
@@ -92,6 +99,18 @@ impl Config {
                         .parse()
                         .map_err(|e| format!("lane_bind: {v:?} is not <ip>:<port>: {e}"))?;
                     cfg.lane_bind = Some(addr);
+                }
+                "lane_max_uploads" => {
+                    let n: usize = v
+                        .parse()
+                        .map_err(|e| format!("lane_max_uploads: bad count {v:?}: {e}"))?;
+                    if n == 0 {
+                        return Err(
+                            "lane_max_uploads: must be at least 1 (0 would refuse every upload)"
+                                .into(),
+                        );
+                    }
+                    cfg.lane_max_uploads = n;
                 }
                 "quota_total_bytes" => {
                     cfg.quota_total_bytes = parse_bytes(v)
@@ -154,7 +173,7 @@ mod tests {
     fn parses_every_key() {
         let cfg = Config::parse(
             "# comment\nroot: /var/lib/cosmix/blobd-two\nname: two\n\
-             lane_bind: 10.42.0.5:4210\nquota_total_bytes: 100GiB\n\
+             lane_bind: 10.42.0.5:4210\nlane_max_uploads: 8\nquota_total_bytes: 100GiB\n\
              quota_owner_default_bytes: 512MiB\nquota_owner: maild=1GiB\n\
              quota_owner: capture=2 GiB\nignored_key: whatever\n",
         )
@@ -166,6 +185,7 @@ mod tests {
             cfg.lane_bind.unwrap().to_string(),
             "10.42.0.5:4210".to_string()
         );
+        assert_eq!(cfg.lane_max_uploads, 8);
         assert_eq!(cfg.quota_total_bytes, 100 * 1024 * 1024 * 1024);
         assert_eq!(cfg.quota_owner_default_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.owner_limits["maild"], 1024 * 1024 * 1024);
@@ -182,6 +202,8 @@ mod tests {
     fn rejects_bad_values() {
         assert!(Config::parse("lane_bind: not-an-addr\n").is_err());
         assert!(Config::parse("lane_bind: 10.42.0.5\n").is_err());
+        assert!(Config::parse("lane_max_uploads: 0\n").is_err());
+        assert!(Config::parse("lane_max_uploads: lots\n").is_err());
         assert!(Config::parse("quota_total_bytes: lots\n").is_err());
         assert!(Config::parse("quota_owner: noequals\n").is_err());
         assert!(Config::parse("quota_owner: =5MiB\n").is_err());
