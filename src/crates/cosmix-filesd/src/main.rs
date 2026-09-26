@@ -1017,6 +1017,7 @@ async fn serve_bus(client: Arc<NodedClient>, tx: &mpsc::Sender<WriterCmd>) {
 async fn serve_fs(cfg: config::FsConfig) -> anyhow::Result<()> {
     let config::FsConfig {
         bus_service,
+        blob_service,
         places,
         trash_root,
         delegated_peers,
@@ -1025,7 +1026,7 @@ async fn serve_fs(cfg: config::FsConfig) -> anyhow::Result<()> {
     let peers = Arc::new(delegated_peers);
     eprintln!("cosmix-filesd: serving file-manager fs layer (Bus service '{bus_service}')");
     tokio::select! {
-        r = run_bus_loop_fs(fs, peers, bus_service) => r,
+        r = run_bus_loop_fs(fs, peers, bus_service, blob_service) => r,
         _ = shutdown() => { eprintln!("cosmix-filesd: shutdown"); Ok(()) }
     }
 }
@@ -1244,6 +1245,7 @@ async fn run_bus_loop_fs(
     fs: Arc<cosmix_files::fsops::FsLayer>,
     peers: Arc<Vec<String>>,
     service: String,
+    blob_service: String,
 ) -> anyhow::Result<()> {
     let bi = cosmix_buildinfo::build_info!();
     let prov = cosmix_bus::RegisterProvenance::from_parts(
@@ -1261,7 +1263,13 @@ async fn run_bus_loop_fs(
         {
             Ok(client) => {
                 backoff = Duration::from_secs(1);
-                serve_bus_fs(Arc::new(client.with_verbs(fs_verb_manifest())), &fs, &peers).await; // returns on disconnect
+                serve_bus_fs(
+                    Arc::new(client.with_verbs(fs_verb_manifest())),
+                    &fs,
+                    &peers,
+                    &service,
+                    &blob_service,
+                ).await; // returns on disconnect
             }
             Err(e) => eprintln!("cosmix-filesd: broker unavailable; retry in {backoff:?}: {e}"),
         }
@@ -1274,13 +1282,15 @@ async fn serve_bus_fs(
     client: Arc<NodedClient>,
     fs: &Arc<cosmix_files::fsops::FsLayer>,
     peers: &Arc<Vec<String>>,
+    service: &str,
+    blob_service: &str,
 ) {
     let Some(mut rx) = client.incoming_async().await else {
         return;
     };
     while let Some(cmd) = rx.recv().await {
         let (from, command, id) = (cmd.from.clone(), cmd.command.clone(), cmd.id.clone());
-        let (rc, body) = dispatch_fs(cmd, fs.clone(), peers.clone()).await;
+        let (rc, body) = dispatch_fs(cmd, fs.clone(), peers.clone(), service, blob_service).await;
         let _ = client
             .respond_parts(&from, &command, id.as_deref(), rc, &body)
             .await;
@@ -1293,6 +1303,8 @@ async fn dispatch_fs(
     cmd: IncomingCommand,
     fs: Arc<cosmix_files::fsops::FsLayer>,
     peers: Arc<Vec<String>>,
+    _service: &str,
+    _blob_service: &str,
 ) -> (u8, String) {
     let (deleg, args) = match gate(&cmd, &peers) {
         Ok(v) => v,
@@ -2323,11 +2335,11 @@ mod tests {
         let peers = Arc::new(vec!["webd".to_string()]);
         // A delegated peer with a valid admin envelope is authorized.
         let good = dcmd("webd", "fs.places", good_envelope(), json!({}));
-        let (rc, _) = dispatch_fs(good, fs.clone(), peers.clone()).await;
+        let (rc, _) = dispatch_fs(good, fs.clone(), peers.clone(), "filesd-fs", "blobd").await;
         assert_eq!(rc, 0);
         // from=webd but no envelope → defence-in-depth refusal (the shared gate).
         let bare = cmd_from("webd", "fs.places", Value::Null);
-        let (rc, body) = dispatch_fs(bare, fs.clone(), peers.clone()).await;
+        let (rc, body) = dispatch_fs(bare, fs.clone(), peers.clone(), "filesd-fs", "blobd").await;
         assert_eq!(rc, 10);
         assert!(
             body.contains("must present a $cosmix_delegation envelope"),
