@@ -2789,18 +2789,30 @@ pub(super) fn service_requests(state: &mut WaylandState) {
         state.pending_port_requests.clear();
         return;
     };
+    // A read admitted after parked input cannot observe the state before that
+    // input. Earlier reads may still complete. The control queue's wakeup also
+    // schedules these deferred reads; no polling or separate timer is needed.
+    let fence = state.pending_port_controls.iter().map(crate::port::PortControl::order).min();
+    let mut ready = Vec::new();
+    for request in std::mem::take(&mut state.pending_port_requests) {
+        if fence.is_some_and(|order| request.order > order) {
+            state.pending_port_requests.push(request);
+        } else {
+            ready.push(request);
+        }
+    }
+    if ready.is_empty() { return; }
     let mut scopes = ReadScopes::Paths(Vec::new());
-    for request in &state.pending_port_requests {
+    for request in &ready {
         scopes.add(request.scope.as_deref());
     }
     let Some(snapshot) = read_snapshot(state, &context, &scopes).map(Arc::new) else {
         tracing::warn!(
             "compositor Bus snapshot contains coordinates not exactly representable as f32"
         );
-        state.pending_port_requests.clear();
         return;
     };
-    for request in state.pending_port_requests.drain(..) {
+    for request in ready {
         let _ = request.reply.send(Arc::clone(&snapshot));
     }
 }

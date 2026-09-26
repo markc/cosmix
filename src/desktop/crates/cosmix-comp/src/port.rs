@@ -86,6 +86,7 @@ pub(crate) enum PortCommand {
 }
 
 pub(crate) struct PortRequest {
+    pub(crate) order: u64,
     pub(crate) reply: tokio::sync::oneshot::Sender<Arc<CompSnapshot>>,
     /// The read's own path or prefix, so the snapshot can be scoped to it
     /// (`ReadScopes`); `None` asks for the whole tree.
@@ -760,7 +761,9 @@ impl PortIngress {
         scope: Option<String>,
     ) -> Result<SnapshotAdmission, ()> {
         let (reply, receive) = tokio::sync::oneshot::channel();
-        self.admit(PortCommand::Snapshot(PortRequest { reply, scope }), receive)
+        self.admit(PortCommand::Snapshot(PortRequest {
+            order: self.next_control_order(), reply, scope,
+        }), receive)
             .map(SnapshotAdmission)
     }
 

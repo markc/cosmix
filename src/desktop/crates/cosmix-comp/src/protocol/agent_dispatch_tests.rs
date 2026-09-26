@@ -1,6 +1,29 @@
 // Included by input_injection_tests.rs: real queued Bus controls and wire devices.
 
 #[test]
+fn snapshot_after_parked_agent_motion_waits_for_its_delivery() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    let (id, generation) = window_id_and_generation(&h, &alpha);
+    let mut inputs = Vec::new();
+    for x in 0..9 {
+        inputs.push(ingress.request_input(on_agent(move_op(PointerMoveTarget::Window {
+            id, generation, x: 10.0 + f64::from(x), y: 10.0, require_hit: true,
+        }))).unwrap());
+    }
+    let snapshot = ingress.request_snapshot().unwrap();
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(h.server.state.pending_port_controls.len(), 1);
+    assert_eq!(h.server.state.pending_port_requests.len(), 1, "read cannot overtake ninth motion");
+    h.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    let snapshot = runtime.block_on(snapshot.receive()).unwrap();
+    let input = serde_json::to_value(&snapshot.input).unwrap();
+    assert_eq!(input["seats"]["agent"]["pointer"]["x"], 18.0);
+    assert!(h.server.state.pending_port_requests.is_empty());
+    for input in inputs { let _ = runtime.block_on(input.receive()).unwrap(); }
+}
+
+#[test]
 fn initial_agent_sequence_motion_precedes_a_later_standalone_click() {
     let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
     let (_, _, pointer) = bind_agent_devices(&mut h);
