@@ -714,6 +714,18 @@ mod tests {
         assert!(rect("x") + rect("w") <= 400.0 && rect("y") + rect("h") <= 300.0, "{go}");
         let centre = origin + Vec2::new(rect("x") + rect("w") / 2.0, rect("y") + rect("h") / 2.0);
         peer.drain_calls();
+        #[derive(Resource, Default)]
+        struct Seen(Vec<String>);
+        app.init_resource::<Seen>();
+        app.add_observer(
+            |event: On<bevy::picking::events::Pointer<bevy::picking::events::Click>>,
+             mut seen: ResMut<Seen>| {
+                seen.0.push(format!("click {:?}", event.entity));
+            },
+        );
+        app.add_observer(|event: On<bevy::ui_widgets::Activate>, mut seen: ResMut<Seen>| {
+            seen.0.push(format!("activate {:?}", event.entity));
+        });
 
         let cursor = CursorMoved {
             window,
@@ -740,7 +752,20 @@ mod tests {
             .filter(|call| call.to == "scene-editor" && call.command == "editor.view")
             .collect();
         let seen: Vec<_> = calls.iter().map(|call| (&call.to, &call.command)).collect();
-        assert_eq!(fired.len(), 1, "one click, one handler call: {seen:?}");
+        let world = app.world_mut();
+        let hover = format!("{:?}", world.resource::<bevy::picking::hover::HoverMap>().iter().collect::<Vec<_>>());
+        let pointers = world
+            .query::<(&bevy::picking::pointer::PointerId, &bevy::picking::pointer::PointerLocation)>()
+            .iter(world)
+            .map(|(id, location)| format!("{id:?}@{:?}", location.location))
+            .collect::<Vec<_>>();
+        let target = world.get::<Camera>(camera).map(|camera| format!("{:?}", camera.computed.target_info));
+        let observed = world.resource::<Seen>().0.clone();
+        assert_eq!(
+            fired.len(),
+            1,
+            "one click, one handler call: calls {seen:?}; observed {observed:?}; hover {hover}; pointers {pointers:?}; camera target {target:?}; centre {centre}"
+        );
         let body: serde_json::Value = serde_json::from_str(&fired[0].body).unwrap();
         assert_eq!(body["node"], "go");
         assert_eq!(body["kind"], "click");
