@@ -637,6 +637,9 @@ mod tests {
         use bevy::input::mouse::MouseButtonInput;
         use bevy::window::{CursorMoved, WindowEvent, WindowRef, WindowResolution};
         let mut app = headless_app();
+        // BusBridgePlugin starts its real bridge in PreStartup: run Startup
+        // first, then swap in the test peer.
+        app.update();
         let (bridge, peer) = ctk::bus::test_bridge("shell");
         app.insert_resource(bridge);
         let window = app
