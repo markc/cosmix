@@ -73,6 +73,9 @@ impl RunnerState {
         // must leave through the normal dismiss path — staging its hold
         // release — or its exclusive-keyboard layer and row entities leak.
         let replacing = self.menu.is_some();
+        // Dismissing the incumbent pumps an update before this request's
+        // popup exists: say which request is being opened meanwhile.
+        self.app.insert_resource(ui::CornerMenuOpening(request.serial));
         if replacing {
             self.dismiss_corner_menu(None);
         }
@@ -81,6 +84,7 @@ impl RunnerState {
             // for this request's edge (it may differ from the incumbent's).
             let edge = request.corner.summoned_edge();
             stage_menu_hold(&mut self.app, &request.output, edge, false);
+            self.app.world_mut().remove_resource::<ui::CornerMenuOpening>();
             return Ok(());
         };
         let size = Vec2::new(output.logical_size.width(), output.logical_size.height());
@@ -120,11 +124,15 @@ impl RunnerState {
             None,
             None,
         )
-        .map_err(|e| LayerHostError::new(e.to_string()))?;
+        .map_err(|e| {
+            self.app.world_mut().remove_resource::<ui::CornerMenuOpening>();
+            LayerHostError::new(e.to_string())
+        })?;
         self.app.insert_resource(crate::holders::PopupLayerIdentity {
             output: request.output.clone(), edge: request.corner.summoned_edge(), surface: identity,
             serial: request.serial,
         });
+        self.app.world_mut().remove_resource::<ui::CornerMenuOpening>();
         self.app
             .world_mut()
             .get_mut::<Camera>(surface.camera)

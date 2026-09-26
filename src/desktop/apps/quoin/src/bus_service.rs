@@ -269,6 +269,7 @@ fn reply_session_confirms(
     mut state: ResMut<ShellBusState>,
     queued: Option<Res<cosmix_shell::chrome::corner_menu::CornerMenuRequest>>,
     popup: Option<Res<cosmix_shell_host::holders::PopupLayerIdentity>>,
+    opening: Option<Res<cosmix_shell::chrome::corner_menu::CornerMenuOpening>>,
     mut commands: Commands,
 ) {
     let frame = state.frame;
@@ -278,7 +279,10 @@ fn reply_session_confirms(
         }
         // Matched by serial: a newer step queued on the same corner replaces
         // this one, and its popup must not answer for it.
-        let waiting = queued.as_deref().is_some_and(|step| step.serial == serial);
+        // Queued, or being opened: replacing an open menu pumps an update
+        // after the request is taken and before its popup exists.
+        let waiting = queued.as_deref().is_some_and(|step| step.serial == serial)
+            || opening.as_deref().is_some_and(|opening| opening.0 == serial);
         let (rc, reply) = if waiting && frame < deadline {
             state.pending_confirms.push((request, output, corner, body, serial, deadline));
             continue;
@@ -291,7 +295,7 @@ fn reply_session_confirms(
             reply["applied"] = json!(true);
             (0, reply.to_string())
         } else {
-            if waiting {
+            if waiting && queued.is_some() {
                 // Refused, so it must never show later either.
                 commands.remove_resource::<cosmix_shell::chrome::corner_menu::CornerMenuRequest>();
             }
@@ -3859,6 +3863,31 @@ mod tests {
         assert_eq!((replies[0].rc, applied["action"].clone(), applied["applied"].clone()), (0, json!("restart"), json!(true)));
         assert_eq!(replies[1].rc, 10);
         assert_eq!(serde_json::from_str::<Value>(&replies[1].body).unwrap()["error_code"], "CONFIRM_NOT_SHOWN");
+        // The step replaces an already-open menu: the host takes the request,
+        // and dismissing the incumbent pumps an update before the step's
+        // popup exists. With only the opening marker then, the reply waits;
+        // it answers applied once the popup is up.
+        let mut chord = local("shell.session.confirm");
+        chord.body = json!({"action":"leave", "corner":"bottom-right"}).to_string();
+        peer.send(chord);
+        app.update();
+        let taken = app.world_mut().remove_resource::<CornerMenuRequest>().unwrap();
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        app.insert_resource(cosmix_shell::chrome::corner_menu::CornerMenuOpening(taken.serial));
+        app.update();
+        assert!(peer.drain_responses().is_empty(), "judged during the replacement window");
+        app.world_mut().remove_resource::<cosmix_shell::chrome::corner_menu::CornerMenuOpening>();
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: taken.output.clone(),
+            edge: Corner::BottomRight.summoned_edge(),
+            surface: "menu".into(),
+            serial: taken.serial,
+        });
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(serde_json::from_str::<Value>(&replies[0].body).unwrap()["applied"], true);
         // Refusals: {error_code, message}, and no step opens.
         for args in [json!({}), json!({"action":"reboot"}), json!({"action":"leave", "corner":"middle"})] {
             app.world_mut().remove_resource::<CornerMenuRequest>();

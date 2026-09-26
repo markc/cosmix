@@ -124,6 +124,14 @@ pub struct CornerMenuRequest {
     pub serial: u64,
 }
 
+/// Present while the layer host is opening the request with this serial:
+/// set when it takes the request and cleared once the popup exists (or the
+/// open failed). Replacing an open menu pumps an update in between, so an
+/// asker waiting on the step sees neither the request nor its popup then,
+/// and must read this instead of concluding the step was dropped.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CornerMenuOpening(pub u64);
+
 /// A fresh [`CornerMenuRequest::serial`], unique in this process.
 pub fn next_menu_serial() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
