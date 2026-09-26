@@ -36604,9 +36604,14 @@ fn connect_other_layer_client(harness: &mut KeybindingHarness) -> OtherTestClien
     let (linux_dmabuf, linux_dmabuf_version) = globals["zwp_linux_dmabuf_v1"];
     let (layer_shell, layer_shell_version) = globals["zwlr_layer_shell_v1"];
     // New ids must be dense: the ids the harness gives its other globals
-    // are spare compositor bindings here.
+    // are spare compositor bindings here, except xdg-shell for toplevel tests.
     for id in TEST_COMPOSITOR_ID..TEST_LINUX_DMABUF_ID {
-        bind_global(&mut client, compositor, "wl_compositor", compositor_version.min(5), id);
+        if id == TEST_XDG_WM_BASE_ID {
+            let (global, version) = globals["xdg_wm_base"];
+            bind_global(&mut client, global, "xdg_wm_base", version.min(6), id);
+        } else {
+            bind_global(&mut client, compositor, "wl_compositor", compositor_version.min(5), id);
+        }
     }
     bind_global(
         &mut client,

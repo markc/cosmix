@@ -503,6 +503,35 @@ fn agent_live_surface_unmap_clears_click_grab_without_disturbing_keyboard_or_seq
 }
 
 #[test]
+fn full_agent_click_switches_popup_roots_without_losing_new_press() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    let (seat_a, _, pointer_a) = bind_agent_devices(&mut h);
+    let click = agent_target(&h, &alpha, InputOp::PointerButton { button: BTN_LEFT, action: PressAction::Both });
+    assert_eq!(inject(&mut h, &ingress, &runtime, click).0, 0);
+    let serial = pointer_bodies(&h.sync(), pointer_a, 3).into_iter()
+        .find(|body| word(body, 3) == 1).map(|body| word(&body, 0)).unwrap();
+    map_test_popup_on_seat(&mut h, Some((seat_a, serial)));
+
+    let mut other = connect_other_layer_client(&mut h);
+    swap_test_client(&mut h, &mut other);
+    let (seat_b, _, pointer_b) = bind_agent_devices(&mut h);
+    let (_, xdg_b, _, beta) = map_named_test_toplevel(&mut h, "menu-b", "menu-b");
+    let (id, generation) = window_id_and_generation(&h, &beta);
+    assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(move_op(PointerMoveTarget::Window {
+        id, generation, x: 10.0, y: 10.0, require_hit: true,
+    }))).0, 0);
+    assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(InputOp::PointerButton {
+        button: BTN_LEFT, action: PressAction::Both,
+    })).0, 0);
+    let serial = pointer_bodies(&h.sync(), pointer_b, 3).into_iter()
+        .find(|body| word(body, 3) == 1).map(|body| word(&body, 0)).unwrap();
+    assert_eq!(h.server.state.agent.last_pointer_action.as_ref().map(|(serial, _)| u32::from(*serial)), Some(serial));
+    let (_, popup) = map_test_popup_with_parent_on_seat(&mut h, xdg_b, Some((seat_b, serial)));
+    assert!(h.server.state.agent.pointer.with_grab(|_, grab| grab.is::<PopupPointerGrab<WaylandState>>()).unwrap_or(false));
+    assert!(!h.sync().iter().any(|(object, opcode, _)| *object == popup && *opcode == 1));
+}
+
+#[test]
 fn agent_submenu_destruction_keeps_keys_on_the_live_parent_menu() {
     for keep_keyboard_grab in [true, false] {
         let (mut h, ingress, runtime, _, alpha, _) = two_windows();

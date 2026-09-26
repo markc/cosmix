@@ -349,7 +349,7 @@ impl WaylandState {
             // current_grab already falls back to the root when no popup remains.
             // Retire the installed handles as well as our stored chain: an
             // ended PopupPointerGrab must not block a later targeted key.
-            self.dismiss_agent_popups();
+            self.retire_agent_popup_handles();
         }
         let pointer = self.agent.pointer.clone();
         if pointer.current_pressed().is_empty()
@@ -519,11 +519,6 @@ impl WaylandState {
                     self.delivery_target_on(SeatKind::Agent, false);
                 let pointer = self.agent.pointer.clone();
                 let serial = SERIAL_COUNTER.next_serial();
-                if state == HostButtonState::Pressed {
-                    self.agent.last_pointer_action = pointer.current_focus()
-                        .and_then(|target| target.owned_surface())
-                        .map(|surface| (serial, canonical_root_surface(&self.popup_manager, &surface)));
-                }
                 pointer.button(
                     self,
                     &ButtonEvent {
@@ -533,6 +528,13 @@ impl WaylandState {
                         state: smithay_button_state(state),
                     },
                 );
+                if state == HostButtonState::Pressed {
+                    // A popup grab can dismiss itself and forward this press
+                    // to pending focus. Record its actual delivery root.
+                    self.agent.last_pointer_action = pointer.current_focus()
+                        .and_then(|target| target.owned_surface())
+                        .map(|surface| (serial, canonical_root_surface(&self.popup_manager, &surface)));
+                }
                 pointer.frame(self);
             }
             HostInput::PointerAxis {

@@ -9177,8 +9177,14 @@ impl WaylandState {
     }
 
     fn dismiss_agent_popups(&mut self) {
+        self.retire_agent_popup_handles();
         self.agent.last_keyboard_action = None;
         self.agent.last_pointer_action = None;
+    }
+
+    fn retire_agent_popup_handles(&mut self) {
+        let keyboard_action = self.agent.last_keyboard_action.clone();
+        let pointer_action = self.agent.last_pointer_action.clone();
         if let Some(mut grab) = self.agent.popup_grab.take() {
             let _ = grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
             let pointer = self.agent.pointer.clone();
@@ -9190,6 +9196,10 @@ impl WaylandState {
                 keyboard.unset_grab(self);
             }
         }
+        // Grab teardown can invoke focus_changed. Preserve a fresh action
+        // forwarded while the preceding menu was being dismissed.
+        self.agent.last_keyboard_action = keyboard_action;
+        self.agent.last_pointer_action = pointer_action;
     }
 
     fn with_client_state<T>(
