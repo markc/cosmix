@@ -699,7 +699,18 @@ controls invocation.</p>
 <h3 id="maildpropsrecordschanged"><code>maild.props.records.changed</code></h3>
 <p>Property changes are published without broker retention. <code>maild.props.watch</code> obtains a broker subscription grant before live delivery begins.</p>
 <h2 id="availability">Availability</h2>
-<p>Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.</p></div></div>
+<p>Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.</p>
+<h1 id="structural-inspection-cap">Structural inspection cap</h1>
+<p>The raw-message inspection cap is always 64 MiB, even when admission's
+<code>max_message_size</code> is larger (startup warns once). Over-cap messages have
+unknown attachment metadata and inspection/export returns <code>too_large:</code>;
+diagnostic inputs use the configured bound. Conservative pre-parse occurrence
+counts include quoted body text: at most 2,000 <code>content-type:</code> and 32
+<code>message/rfc822</code> tokens, case-insensitive. False-positive refusals are possible.
+The whole walk has a 128 MiB decoded-byte budget and allows two nested
+encoded re-parses beyond the parser's own limit. Bad individual parts instead
+carry <code>undecodable: true</code>, no download ID or exported blob, and export returns
+<code>unreadable:</code>; healthy sibling parts and recovered display text remain visible.</p></div></div>
     </div>
 
 </main>

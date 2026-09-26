@@ -656,7 +656,23 @@ holding items and backfills old outbound queue entries. Drive it over Bus after
 restart; there is no local migration CLI or second writer. See <a href="/cos/cosmix-maild/bus">bus.md</a>
 for cursors, per-account counts, refusal tokens and the retained-data contract.</p>
 <p>Mail metadata and operational state use SQLite. Mailbox content uses <code>cosmix-mds</code> through <code>SqliteMailStore</code>. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.</p>
-<p>Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.</p></div></div>
+<p>Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.</p>
+<h1 id="mime-inspection-limits">MIME inspection limits</h1>
+<p>MIME inspection has a hard 64 MiB raw-message cap regardless of
+<code>max_message_size</code>. Startup logs one warning if the configured admission
+limit exceeds it. Larger admitted messages project <code>hasAttachment: null</code>
+and omit <code>attachments</code>; attachment inspection/export returns <code>too_large:</code>.
+Diagnostic blob inputs still use the configured <code>max_message_size</code>.</p>
+<p>Before parsing, a conservative case-insensitive raw scan permits at most
+2,000 <code>content-type:</code> occurrences and 32 <code>message/rfc822</code> occurrences.
+Quoted header text in message bodies counts too and can cause a false-positive
+<code>too_large:</code> refusal. Parse, walk and tree destruction use a dedicated 64 MiB
+thread stack. The walk permits depth 32, 1,000 parts, path length 64,
+64 MiB per decoded part, an aggregate 128 MiB decoded-byte budget, and at most
+two nested encoded re-parses beyond the parser's own encoded nesting limit.</p>
+<p>An undecodable part is listed with <code>undecodable: true</code> and has no download
+ID or exportable bytes. Other parts remain available; body values retain
+the parser's recovered display text. Export of that part returns <code>unreadable:</code>.</p></div></div>
     </div>
 
 </main>

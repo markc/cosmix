@@ -278,3 +278,22 @@ for cursors, per-account counts, refusal tokens and the retained-data contract.
 Mail metadata and operational state use SQLite. Mailbox content uses `cosmix-mds` through `SqliteMailStore`. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.
 
 Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.
+# MIME inspection limits
+
+MIME inspection has a hard 64 MiB raw-message cap regardless of
+`max_message_size`. Startup logs one warning if the configured admission
+limit exceeds it. Larger admitted messages project `hasAttachment: null`
+and omit `attachments`; attachment inspection/export returns `too_large:`.
+Diagnostic blob inputs still use the configured `max_message_size`.
+
+Before parsing, a conservative case-insensitive raw scan permits at most
+2,000 `content-type:` occurrences and 32 `message/rfc822` occurrences.
+Quoted header text in message bodies counts too and can cause a false-positive
+`too_large:` refusal. Parse, walk and tree destruction use a dedicated 64 MiB
+thread stack. The walk permits depth 32, 1,000 parts, path length 64,
+64 MiB per decoded part, an aggregate 128 MiB decoded-byte budget, and at most
+two nested encoded re-parses beyond the parser's own encoded nesting limit.
+
+An undecodable part is listed with `undecodable: true` and has no download
+ID or exportable bytes. Other parts remain available; body values retain
+the parser's recovered display text. Export of that part returns `unreadable:`.

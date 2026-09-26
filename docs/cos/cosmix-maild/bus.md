@@ -330,3 +330,15 @@ Property changes are published without broker retention. `maild.props.watch` obt
 ## Availability
 
 Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.
+# Structural inspection cap
+
+The raw-message inspection cap is always 64 MiB, even when admission's
+`max_message_size` is larger (startup warns once). Over-cap messages have
+unknown attachment metadata and inspection/export returns `too_large:`;
+diagnostic inputs use the configured bound. Conservative pre-parse occurrence
+counts include quoted body text: at most 2,000 `content-type:` and 32
+`message/rfc822` tokens, case-insensitive. False-positive refusals are possible.
+The whole walk has a 128 MiB decoded-byte budget and allows two nested
+encoded re-parses beyond the parser's own limit. Bad individual parts instead
+carry `undecodable: true`, no download ID or exported blob, and export returns
+`unreadable:`; healthy sibling parts and recovered display text remain visible.

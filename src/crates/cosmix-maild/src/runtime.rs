@@ -226,6 +226,11 @@ async fn preflight_opaque_namespace_clear(
 /// sequence in `main.rs::Command::Serve` 1:1 — see git history at
 /// commit prior to this extraction for the original implementation.
 pub async fn build_runtime(cfg: &Config, opts: RuntimeOpts) -> Result<BuiltMaild> {
+    if cfg.max_message_size.is_some_and(|size| size > crate::attachments::MAX_MESSAGE) {
+        tracing::warn!(max_message_size = cfg.max_message_size,
+            inspection_cap = crate::attachments::MAX_MESSAGE,
+            "max_message_size exceeds the 64 MiB MIME inspection cap; larger messages have unknown attachment metadata");
+    }
     // Daemon start instant — backs `maild.stats.server` uptime. Captured
     // at the top of the build so it reports time-since-startup, not
     // time-since-Bus-registration.
