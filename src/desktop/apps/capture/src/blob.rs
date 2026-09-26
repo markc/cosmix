@@ -93,14 +93,23 @@ impl Lane {
             ))
             .map_err(|_| "blob.props.get on blobd timed out".to_string())?
             .map_err(|e| format!("blob.props.get on blobd: {e}"))?;
-        match reply {
-            PortReply::Ok { value, .. } => value
-                .get("bind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "props lane carries no bind".into()),
-            PortReply::AppError { message, .. } => Err(message),
-        }
+        bind_from_reply(&reply)
+    }
+}
+
+/// The lane bind out of a `blob.props.get {"path":"lane"}` reply.
+/// blobd publishes an empty `bind` until its lane listens, so an
+/// empty string is refused here — otherwise it would combine into
+/// `http:///blob` and surface as a baffling transport error instead
+/// of "the lane is not up (yet)".
+fn bind_from_reply(reply: &PortReply) -> Result<String, String> {
+    match reply {
+        PortReply::Ok { value, .. } => match value.get("bind").and_then(Value::as_str) {
+            Some(bind) if !bind.is_empty() => Ok(bind.to_string()),
+            Some(_) => Err("blobd lane not listening".into()),
+            None => Err("props lane carries no bind".into()),
+        },
+        PortReply::AppError { message, .. } => Err(message.clone()),
     }
 }
 
@@ -315,6 +324,18 @@ mod tests {
     fn finished_captures_map_to_exactly_two_mimes() {
         assert_eq!(mime(Path::new("/videos/a.png")), "image/png");
         assert_eq!(mime(Path::new("/videos/a.mp4")), "video/mp4");
+    }
+
+    #[test]
+    fn an_empty_lane_bind_means_the_lane_is_not_listening() {
+        // blobd publishes bind:"" until its lane listens; that must
+        // refuse here instead of combining into http:///blob.
+        let empty = PortReply::Ok {
+            rc: 0,
+            value: json!({"bind": ""}),
+        };
+        let error = bind_from_reply(&empty).unwrap_err();
+        assert!(error.contains("blobd lane not listening"), "{error}");
     }
 
     #[test]
