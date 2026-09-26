@@ -15,8 +15,9 @@ use crate::error::{FilesError, Result};
 /// The parent must already exist. Failed reads, length/hash checks and local IO
 /// leave the old target intact and remove staging. Existing mode bits survive;
 /// new files are private (0600 on Unix). Ownership is not preserved.
-/// With `overwrite=false`, a hard-link publication atomically refuses a target
-/// created during the stream; overwrites use rename, as `write_atomic` does.
+/// With `overwrite=false`, Linux uses renameat2(RENAME_NOREPLACE), falling back
+/// to link/unlink, then best-effort check/rename on filesystems without links.
+/// Overwrites use rename, as `write_atomic` does.
 pub fn land_verified(
     path: &Path,
     mut reader: impl Read,
@@ -80,7 +81,7 @@ pub fn land_verified(
     if overwrite {
         fs::rename(&tmp, path)?;
     } else {
-        fs::hard_link(&tmp, path).map_err(|e| {
+        publish_noreplace(&tmp, path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 FilesError::Exists(format!("already exists (overwrite=false): {}", path.display()))
             } else {
@@ -93,6 +94,76 @@ pub fn land_verified(
         let _ = d.sync_all();
     }
     Ok(count)
+}
+
+fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    publish_noreplace_with(from, to, rename_noreplace, |from, to| fs::hard_link(from, to))
+}
+
+fn publish_noreplace_with(
+    from: &Path,
+    to: &Path,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) if rename_needs_fallback(&e) => {}
+        Err(e) => return Err(e),
+    }
+    match link(from, to) {
+        Ok(()) => Ok(()), // TempFile removes the staging name.
+        Err(e) if link_needs_fallback(&e) => {
+            // Last-resort tier: not atomic against a concurrent target create.
+            // symlink_metadata counts dangling symlinks as existing entries too.
+            match fs::symlink_metadata(to) {
+                Ok(_) => Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "target exists")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::rename(from, to),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: the two NUL-terminated paths stay alive throughout the call.
+    #[cfg(target_env = "gnu")]
+    let rc = unsafe {
+        libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+    };
+    // libc exposes the syscall number but not the wrapper on musl.
+    #[cfg(not(target_env = "gnu"))]
+    let rc = unsafe {
+        libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+    };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "renameat2 unavailable"))
+}
+
+fn rename_needs_fallback(e: &std::io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    { matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)) }
+    #[cfg(not(target_os = "linux"))]
+    { e.kind() == std::io::ErrorKind::Unsupported }
+}
+
+fn link_needs_fallback(e: &std::io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // ENOTSUP aliases EOPNOTSUPP on Linux: compare without duplicate patterns.
+        e.raw_os_error().is_some_and(|code| [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code))
+    }
+    #[cfg(not(target_os = "linux"))]
+    { e.kind() == std::io::ErrorKind::Unsupported }
 }
 
 struct TempFile(std::path::PathBuf);
@@ -164,6 +235,11 @@ mod tests {
         let path = dir.join("blob");
         assert_eq!(land_verified(&path, &b"hello"[..], 5, &hash(b"hello"), false).unwrap(), 5);
         assert_eq!(fs::read(&path).unwrap(), b"hello");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().nlink(), 1);
+        }
         assert!(matches!(
             land_verified(&path, &b"other"[..], 5, &hash(b"other"), false),
             Err(FilesError::Exists(_))
@@ -185,6 +261,40 @@ mod tests {
             assert!(!path.exists());
             no_temp(&dir);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_replace_fallback_selection() {
+        let dir = scratch_dir();
+        let from = dir.join("staging");
+        let to = dir.join("target");
+        fs::write(&from, b"new").unwrap();
+        for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            let called = std::cell::Cell::new(false);
+            publish_noreplace_with(&from, &to,
+                |_, _| Err(std::io::Error::from_raw_os_error(code)),
+                |_, _| { called.set(true); Ok(()) }).unwrap();
+            assert!(called.get());
+        }
+        assert!(publish_noreplace_with(&from, &to,
+            |_, _| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+            |_, _| panic!("permission error must not fall through")).is_err());
+        for code in [libc::EPERM, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            fs::write(&to, b"old").unwrap();
+            let error = publish_noreplace_with(&from, &to,
+                |_, _| Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                |_, _| Err(std::io::Error::from_raw_os_error(code))).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&to).unwrap(), b"old");
+            fs::remove_file(&to).unwrap();
+        }
+        publish_noreplace_with(&from, &to,
+            |_, _| Err(std::io::Error::from_raw_os_error(libc::ENOSYS)),
+            |_, _| Err(std::io::Error::from_raw_os_error(libc::EPERM))).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

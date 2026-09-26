@@ -185,8 +185,12 @@ The destination uses the write jail and rejects existing non-plain targets.
 Missing parent directories are created, matching `fs.write`. Bytes stream into
 a unique sibling temporary file, with length and BLAKE3 verification before
 publication. An overwrite preserves mode bits and uses fsync then rename;
-`overwrite=false` uses atomic hard-link publication to refuse a destination
-created during the download. New files are mode 0600 on Unix. Ownership is not
+`overwrite=false` uses Linux `renameat2(RENAME_NOREPLACE)` to publish in one
+step and refuse a destination created during the download. Unsupported
+rename flags fall back to link/unlink (a crash between those steps can leave
+two names). Where links are unsupported, the last tier is best-effort
+check-then-rename and cannot exclude a concurrent target creation. New files
+are mode 0600 on Unix. Ownership is not
 preserved. Staging is removed on errors; the old target survives failed reads
 or verification. Directory fsync is best-effort after publication.
 
