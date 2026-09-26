@@ -379,6 +379,7 @@ fn read(path: &Path) -> Result<String, String> {
 /// rewrite re-encodes the whole file: comments and formatting do not survive
 /// a motion write — only the parsed values do.
 pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Result<(), String> {
+    let _serialised = conf_mix_write_lock();
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
@@ -404,6 +405,20 @@ pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Resu
         .map_err(|error| error.to_string())?;
     ShellConfig::parse(&encoded)?;
     replace_atomically(path, &encoded)
+}
+
+/// Every conf.mix writer (the settings motion write on the app thread, the
+/// `shell.panel.order` writer thread) holds this across its whole
+/// read-validate-replace, so two writers can never interleave and lose one
+/// update (Stage R round 2, GLM N1). Held through the fsyncs: a writer returns
+/// only once its replacement is durable. Poisoning is ignored — the guarded
+/// data is the file, and each writer re-reads it.
+static CONF_MIX_WRITES: Mutex<()> = Mutex::new(());
+
+fn conf_mix_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONF_MIX_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Write `encoded` beside `path` and rename it over, so the watcher only ever
@@ -560,6 +575,7 @@ pub(crate) fn write_panel_order(
     path: &Path,
     order: &[(Edge, Vec<String>)],
 ) -> Result<(), OrderRefusal> {
+    let _serialised = conf_mix_write_lock();
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
@@ -1184,6 +1200,32 @@ mod tests {
         );
         assert_eq!(hand.panels[Edge::Right.index()], ["settings.appearance"]);
         assert_eq!(hand.carousel_motion, CarouselMotion::Slide);
+    }
+
+    /// Stage R round 2 (GLM N1): the motion write (app thread) and the order
+    /// writer (its own thread) interleaving on one file lose nothing. Each
+    /// round both writers race; afterwards the file must hold BOTH latest
+    /// values — an unserialised read-modify-write drops one of them.
+    #[test]
+    fn concurrent_motion_and_order_writes_never_lose_an_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conf.mix");
+        std::fs::write(&path, r#"{panels: {right: ["a"]}}"#).unwrap();
+        for round in 0..40 {
+            let pages = if round % 2 == 0 { ["a", "b"] } else { ["b", "a"] };
+            let motion = if round % 2 == 0 { CarouselMotion::Fade } else { CarouselMotion::Slide };
+            let order_path = path.clone();
+            let order = std::thread::spawn(move || {
+                let request =
+                    parse_panel_order(&serde_json::json!({"edges": {"right": pages}})).unwrap();
+                write_panel_order(&order_path, &request).unwrap();
+            });
+            write_carousel_motion(&path, motion).unwrap();
+            order.join().unwrap();
+            let written = ShellConfig::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(written.panels[Edge::Right.index()], pages, "round {round}: order kept");
+            assert_eq!(written.carousel_motion, motion, "round {round}: motion kept");
+        }
     }
 
     /// Opus n1: a dotfiles-managed conf.mix stays a symlink; its target is

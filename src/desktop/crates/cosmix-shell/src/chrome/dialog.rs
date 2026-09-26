@@ -20,6 +20,7 @@ use bevy::a11y::AccessibilityNode;
 use bevy::ecs::observer::On;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{KeyCode, KeyboardInput};
+use bevy::input_focus::InputFocus;
 use bevy::picking::Pickable;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
@@ -54,6 +55,11 @@ pub struct QuoinDialog {
     /// An IME preedit is active in the dialog window: Escape belongs to the
     /// IME. Tracked from `Ime` messages; cleared when the surface unmaps.
     pub preedit: bool,
+    /// `window` also serves other shell surfaces (the embedded host's one
+    /// output window). Keys and IME events then count for the dialog only
+    /// while the input focus is inside the dialog root, so Escape in a panel
+    /// field never closes the dialog.
+    pub window_shared: bool,
 }
 
 /// `dialog` in `shell.props.get` / `shell.panel.changed`: the fields whose
@@ -319,8 +325,25 @@ fn escape_dialog(
     mut ime: MessageReader<Ime>,
     mut keys: MessageReader<KeyboardInput>,
     mut dialog: ResMut<QuoinDialog>,
+    focus: Option<Res<InputFocus>>,
+    parents: Query<&ChildOf>,
 ) {
-    let Some(window) = dialog.window else {
+    let focus_inside = || {
+        let (Some(root), Some(mut entity)) = (dialog.root, focus.as_ref().and_then(|f| f.get()))
+        else {
+            return false;
+        };
+        loop {
+            if entity == root {
+                return true;
+            }
+            match parents.get(entity) {
+                Ok(parent) => entity = parent.parent(),
+                Err(_) => return false,
+            }
+        }
+    };
+    let Some(window) = dialog.window.filter(|_| !dialog.window_shared || focus_inside()) else {
         ime.clear();
         keys.clear();
         return;
@@ -472,6 +495,46 @@ mod tests {
             window,
             value: "你".into(),
         });
+        app.world_mut().write_message(escape(window, false));
+        app.update();
+        assert!(!app.world().resource::<QuoinDialog>().visible);
+    }
+
+    /// Stage R round 2 (Opus): on the embedded host the output window is
+    /// shared with every panel, so Escape (and the IME guard) belong to the
+    /// dialog only while the input focus is inside the dialog root.
+    #[test]
+    fn a_shared_window_escape_needs_focus_inside_the_dialog() {
+        let mut app = app();
+        app.init_resource::<InputFocus>();
+        let window = app.world_mut().spawn_empty().id();
+        let content = app.world_mut().spawn(Node::default()).id();
+        let field = app.world_mut().spawn(Node::default()).id();
+        app.world_mut().entity_mut(content).add_child(field);
+        mount_dialog_content(app.world_mut(), content, "Scene Editor", true);
+        let panel_field = app.world_mut().spawn(Node::default()).id();
+        {
+            let mut dialog = app.world_mut().resource_mut::<QuoinDialog>();
+            dialog.set_seat(Some(seat("editor", "scenes")));
+            dialog.show("editor");
+            dialog.window = Some(window);
+            dialog.window_shared = true;
+        }
+        for focused in [None, Some(panel_field)] {
+            *app.world_mut().resource_mut::<InputFocus>() =
+                focused.map_or_else(InputFocus::default, InputFocus::from_entity);
+            app.world_mut().write_message(Ime::Preedit {
+                window,
+                value: "ni".into(),
+                cursor: None,
+            });
+            app.world_mut().write_message(escape(window, false));
+            app.update();
+            let dialog = app.world().resource::<QuoinDialog>();
+            assert!(dialog.visible, "{focused:?}: a panel's Escape is not the dialog's");
+            assert!(!dialog.preedit, "{focused:?}: a panel's preedit is not the dialog's");
+        }
+        *app.world_mut().resource_mut::<InputFocus>() = InputFocus::from_entity(field);
         app.world_mut().write_message(escape(window, false));
         app.update();
         assert!(!app.world().resource::<QuoinDialog>().visible);

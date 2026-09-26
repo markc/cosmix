@@ -477,6 +477,11 @@ fn present_dialog(
     if dialog.window != window {
         dialog.window = window;
     }
+    // That window is every panel's too: the dialog owns its keys only while
+    // the focus is inside it (Stage R round 2).
+    if !dialog.window_shared {
+        dialog.window_shared = true;
+    }
 }
 
 /// Above the highest panel band (`panel_z_index` tops out below 200).
@@ -832,11 +837,30 @@ mod tests {
         let hidden: serde_json::Value = serde_json::from_str(&hidden).unwrap();
         assert_eq!((hidden["visible"].as_bool(), &hidden["chrome"]), (Some(false), &serde_json::json!({})));
 
-        // Escape on the output window dismisses it here too.
+        // Escape on the output window dismisses it here too, but only with
+        // the focus inside the dialog: that window is every panel's as well.
         crate::dialog_bus::respond(app.world_mut(), "shell.dialog.show", &serde_json::json!({"scene":"editor"}));
         app.update();
         let dialog = app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>();
-        assert_eq!((dialog.visible, dialog.window), (true, Some(window)));
+        assert_eq!((dialog.visible, dialog.window, dialog.window_shared), (true, Some(window), true));
+        let root = dialog.root.unwrap();
+        let escape = bevy::input::keyboard::KeyboardInput {
+            key_code: KeyCode::Escape,
+            logical_key: bevy::input::keyboard::Key::Escape,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        };
+        app.world_mut().resource_mut::<bevy::input_focus::InputFocus>().clear();
+        app.world_mut().write_message(escape.clone());
+        app.update();
+        assert!(
+            app.world().resource::<cosmix_shell::chrome::dialog::QuoinDialog>().visible,
+            "Escape with the focus outside the dialog is a panel's"
+        );
+        *app.world_mut().resource_mut::<bevy::input_focus::InputFocus>() =
+            bevy::input_focus::InputFocus::from_entity(root);
         app.world_mut().write_message(bevy::input::keyboard::KeyboardInput {
             key_code: KeyCode::Escape,
             logical_key: bevy::input::keyboard::Key::Escape,
