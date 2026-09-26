@@ -4,7 +4,7 @@
 //! (which owns this file and `embedded.rs`) never edit the same file.
 //!
 //! `service_bus` hands each request over ([`DialogRequests::defer`]); [`answer`]
-//! replies in the Presentation stage of the same update, with world access:
+//! replies in the Model stage of the same update, with world access:
 //! the layout verb reads the engine's `ComputedNode`/`UiGlobalTransform`,
 //! which no Bus system parameter can reach. The request/reply/refusal shapes
 //! are frozen in `src/desktop/scripts/tests/fixtures/scene-editor/shell-verbs.json`.
@@ -45,13 +45,19 @@ impl DialogRequests {
     }
 }
 
+/// Answer in Model: after scene reconciliation has mirrored the seat, and
+/// before Presentation, so a show or hide reaches this update's chrome and
+/// `panel.changed` rather than waiting for another wake.
 pub(crate) fn install(app: &mut App) {
     app.init_resource::<DialogRequests>()
-        .add_systems(Update, answer.in_set(ShellRuntimeSet::Presentation));
+        .add_systems(Update, answer.in_set(ShellRuntimeSet::Model));
 }
 
 /// `dialog` in `shell.props.get` and `shell.panel.changed`: `null` while no
 /// dialog is loaded, else `{scene, visible, w, h, output}`.
+// Read by the props/panel.changed snapshots once Q1 threads `dialog`
+// through them (bus_service.rs, merged after Q1); tests use it until then.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn notice(dialog: Option<&QuoinDialog>) -> Value {
     dialog.and_then(QuoinDialog::notice).map_or(Value::Null, |notice| {
         json!({
@@ -300,7 +306,7 @@ mod tests {
             ("shell.dialog.hide", true),
             ("shell.dialog.hide", false),
         ] {
-            let (rc, body) = call(&mut world, command, fixture[command]["request"].clone());
+            let (rc, body) = call(world, command, fixture[command]["request"].clone());
             assert_eq!(rc, 0);
             let mut expected = fixture[command]["reply"].clone();
             expected["applied"] = json!(expect_applied);
@@ -316,13 +322,13 @@ mod tests {
         let mut app = world();
         let world = app.world_mut();
         for command in ["shell.dialog.show", "shell.dialog.hide"] {
-            let (rc, body) = call(&mut world, command, json!({"scene":"absent"}));
+            let (rc, body) = call(world, command, json!({"scene":"absent"}));
             assert_eq!((rc, &body["error_code"]), (10, &fixture[command]["refusals"]["NOT_FOUND"]["error_code"]));
-            let (rc, body) = call(&mut world, command, json!({"scene":"panel"}));
+            let (rc, body) = call(world, command, json!({"scene":"panel"}));
             assert_eq!((rc, &body["error_code"]), (10, &fixture[command]["refusals"]["NOT_DIALOG"]["error_code"]));
             assert_eq!(body["scene"], "panel");
         }
-        let (rc, body) = call(&mut world, "shell.dialog.show", json!({}));
+        let (rc, body) = call(world, "shell.dialog.show", json!({}));
         assert_eq!((rc, body["error_code"].as_str()), (10, Some("INVALID_ARGUMENT")));
     }
 
@@ -332,7 +338,7 @@ mod tests {
         let world = app.world_mut();
         let hdmi = OutputKey::new("HDMI-A-1").unwrap();
         world.resource_mut::<SceneStore>().retarget_dialog("editor", &hdmi);
-        call(&mut world, "shell.dialog.show", json!({"scene":"editor"}));
+        call(world, "shell.dialog.show", json!({"scene":"editor"}));
         let dialog = world.resource::<QuoinDialog>();
         assert_eq!(dialog.output().map(OutputKey::as_str), Some("DP-1"));
         assert!(dialog.visible);
@@ -343,7 +349,7 @@ mod tests {
         let fixture = fixture();
         let mut app = world();
         let world = app.world_mut();
-        let (rc, body) = call(&mut world, "shell.scene.layout", json!({"scene":"editor"}));
+        let (rc, body) = call(world, "shell.scene.layout", json!({"scene":"editor"}));
         assert_eq!(rc, 0);
         let unmapped = &fixture["shell.scene.layout"]["reply_unmapped"];
         assert_eq!(body["visible"], false);
@@ -353,20 +359,20 @@ mod tests {
         assert_eq!(body["surface"]["edge"], Value::Null);
         assert_eq!((body["surface"]["w"].as_f64(), body["surface"]["h"].as_f64()), (Some(880.0), Some(620.0)));
         // Shown but not yet placed by a host: still not on screen.
-        call(&mut world, "shell.dialog.show", json!({"scene":"editor"}));
-        let (_, body) = call(&mut world, "shell.scene.layout", json!({"scene":"editor"}));
+        call(world, "shell.dialog.show", json!({"scene":"editor"}));
+        let (_, body) = call(world, "shell.scene.layout", json!({"scene":"editor"}));
         assert_eq!(body["visible"], false);
         world.resource_mut::<QuoinDialog>().origin = Some(Vec2::new(520.0, 204.0));
-        let (_, body) = call(&mut world, "shell.scene.layout", json!({"scene":"editor"}));
+        let (_, body) = call(world, "shell.scene.layout", json!({"scene":"editor"}));
         assert_eq!(body["visible"], true);
         assert_eq!((body["surface"]["x"].as_f64(), body["surface"]["y"].as_f64()), (Some(520.0), Some(204.0)));
         let keys: Vec<_> = fixture["shell.scene.layout"]["reply"].as_object().unwrap().keys().cloned().collect();
         let got: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
         assert_eq!(got, keys, "reply carries exactly the fixture's fields");
-        let (rc, body) = call(&mut world, "shell.scene.layout", json!({"scene":"absent"}));
+        let (rc, body) = call(world, "shell.scene.layout", json!({"scene":"absent"}));
         assert_eq!((rc, body["error_code"].as_str()), (10, Some("NOT_FOUND")));
         // An edge scene reports its panel surface.
-        let (rc, body) = call(&mut world, "shell.scene.layout", json!({"scene":"panel"}));
+        let (rc, body) = call(world, "shell.scene.layout", json!({"scene":"panel"}));
         assert_eq!(rc, 0);
         assert_eq!((body["surface"]["kind"].as_str(), body["surface"]["edge"].as_str()), (Some("panel"), Some("bottom")));
     }
@@ -404,7 +410,7 @@ mod tests {
             reply_id: Some("1".into()),
         };
         world.resource_mut::<DialogRequests>().defer(request);
-        answer(&mut world);
+        answer(world);
         let replies = peer.drain_responses();
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].rc, 0);
