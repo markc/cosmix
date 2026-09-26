@@ -543,6 +543,12 @@
 <p>Write operations fail for a read-only place.</p>
 <h3 id="binary-blob-bridge">Binary blob bridge</h3>
 <p>Both blob verbs have <code>read_only=false</code> and have no unprefixed aliases.
+Filesystem dispatch runs concurrently with 64 permits; saturation waits for a
+permit. Lane discovery times out after 10 seconds. Transfers remain synchronous:
+size <code>timeout=</code> on Mix <code>send</code> for the file. Cross-node calls are capped by the
+30-second mesh response budget, so drive large transfers from the node owning
+the place. A transfer can finish and pin/land after the caller times out;
+retrying materialise then answers <code>exists:</code> if the earlier transfer landed.
 <code>fs.blob.ref</code> changes blobd's pin state but only needs <strong>read</strong> access to its
 source place; a read-only place is a valid source. <code>fs.blob.materialise</code> needs
 a writable destination place. The existing delegation gate applies to both.</p>

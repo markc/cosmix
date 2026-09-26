@@ -60,7 +60,7 @@ place: public | Public | /var/lib/cosmix/public | writable=false | allow=*.md,ma
 An explicitly empty `delegated_peers:` disables delegated calls in this mode as well.
 
 The blob verbs resolve `blob.props.get {"path":"lane"}` on `blob_service` for
-each call, under a 35-second timeout. The bind is never cached. An empty bind,
+each call, under a 10-second timeout. The bind is never cached. An empty bind,
 failed props call or timeout reports `lane_unavailable:`. Other filesystem
 verbs make no blob-store call. Uploads pin to the filesd `bus_service` name.
 

@@ -9,7 +9,7 @@ use cosmix_files::{FilesError, atomic, fsops::FsLayer};
 use serde_json::{Value, json};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const PROPS_TIMEOUT: Duration = Duration::from_secs(35);
+const PROPS_TIMEOUT: Duration = Duration::from_secs(10);
 const REFERENCE_LIMIT: u64 = 64 * 1024;
 
 pub async fn bind(client: &NodedClient, service: &str) -> Result<String, String> {
