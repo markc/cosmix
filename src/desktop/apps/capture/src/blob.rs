@@ -147,6 +147,29 @@ impl Read for GuardedBody {
     }
 }
 
+/// Whether the lane died under the upload — the socket reset, broken
+/// or aborted mid-body (blobd quota enforcement closes instead of
+/// answering) — as distinct from a timeout or the guard's own
+/// abandon/deadline errors.
+fn lane_closed(error: &ureq::Error) -> bool {
+    let transport = match error {
+        ureq::Error::Status(..) => return false,
+        ureq::Error::Transport(transport) => transport,
+    };
+    transport.kind() == ureq::ErrorKind::Io
+        && std::error::Error::source(transport)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+}
+
 /// POST the finished file to the lane and return the blob reference.
 ///
 /// The body streams from disk under an explicit `Content-Length` —
@@ -160,7 +183,9 @@ impl Read for GuardedBody {
 /// lane that accepts and stalls could hold the worker for the whole
 /// 10 minutes. The agent's 30 s connect/read/write bound every
 /// socket phase (including the 201 reply read); GuardedBody enforces
-/// the whole-upload deadline between chunks.
+/// the whole-upload deadline between chunks. A lane that dies under
+/// the upload — reset or broken pipe, the true early-413 close — is
+/// named as `lane closed during upload` with the quota hint.
 pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result<Value, String> {
     let url = format!("http://{lane_bind}/blob");
     let name = path
@@ -205,6 +230,9 @@ pub fn upload(lane_bind: &str, path: &Path, shutdown: Arc<AtomicBool>) -> Result
                     format!("lane answered {status} for {url}: {body}")
                 }
             }
+            other if lane_closed(&other) => format!(
+                "lane closed during upload (refused? check blobd quota): POST {url}: {other}"
+            ),
             other => format!("POST {url}: {other}"),
         })?;
     if Instant::now() >= deadline {
@@ -535,9 +563,18 @@ mod tests {
 
     #[test]
     fn an_in_flight_upload_is_abandoned_promptly_at_shutdown() {
-        // A lane that drains slowly keeps the guard's checks running
-        // between chunks; shutdown set mid-body errors the upload at
-        // the next one, not at any socket deadline.
+        // The lane drains at a fixed crawl and never finishes inside
+        // the test: the writer paces on that drain, so GuardedBody runs
+        // between chunks and shutdown set at 200 ms errors the upload
+        // at the next chunk, never a socket bound. The 16 MiB body is
+        // larger than any loopback socket buffering (Linux defaults
+        // cap wmem+rmem near 10 MiB), so the pass cannot hinge on the
+        // box's buffer sizes — the cbc2 flake was a 4 MiB body
+        // swallowed whole before the flag was set, parking the client
+        // on the reply read where the guard never runs. A lane that
+        // stopped reading entirely would be no better: it parks the
+        // writer inside a socket write, where only ureq's write bound
+        // (10 s under test, 30 s in production) can end it.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -567,12 +604,12 @@ mod tests {
                     break;
                 }
                 read += n;
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(25));
             }
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cosmix-4.png");
-        fs::write(&path, vec![0u8; 4 * 1024 * 1024]).unwrap();
+        fs::write(&path, vec![0u8; 16 * 1024 * 1024]).unwrap();
         let shutdown = quiet();
         let flag = shutdown.clone();
         let worker = std::thread::spawn(move || upload(&bind, &path, flag));
@@ -582,9 +619,44 @@ mod tests {
         let error = worker.join().unwrap().unwrap_err();
         assert!(error.contains("shutting down"), "{error}");
         assert!(
-            abandoned.elapsed() < io_timeout(),
+            abandoned.elapsed() < Duration::from_secs(2),
             "{:?}: {error}",
             abandoned.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_lane_that_closes_mid_body_is_named_not_a_bare_transport_error() {
+        // blobd quota enforcement closes the connection instead of
+        // answering; the manual documents that this surfaces as a
+        // transport error. Name it: broken pipe or reset, either on the
+        // body write or on the reply read once the RST lands, the
+        // operator must read the quota hint, not a bare io error.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                    return;
+                }
+                let blank = line.trim_end().is_empty();
+                if blank {
+                    // Head read, body never read: the socket dies with
+                    // unread data, so the peer sees a reset.
+                    return;
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cosmix-9.png");
+        fs::write(&path, vec![0u8; 2 * 1024 * 1024]).unwrap();
+        let error = upload(&bind, &path, quiet()).unwrap_err();
+        assert!(
+            error.contains("lane closed during upload") && error.contains("check blobd quota"),
+            "{error}"
         );
     }
 

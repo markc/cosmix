@@ -125,7 +125,8 @@ struct Job {
 /// detached dual-write left, so the next capture may start while that
 /// upload is still in flight.
 fn slot_free(job: &Option<Job>) -> bool {
-    job.as_ref().is_none_or(|job| job.settled.load(Ordering::Relaxed))
+    job.as_ref()
+        .is_none_or(|job| job.settled.load(Ordering::Relaxed))
 }
 fn options() -> Result<Option<Options>, String> {
     let mut output = None;
@@ -347,7 +348,10 @@ fn run_job(
     })();
     let upload = (published && !shutdown.load(Ordering::Relaxed)).then(|| {
         let exit = shutdown.clone();
-        move || lane.bind().and_then(|bind| blob::upload(&bind, &path, exit))
+        move || {
+            lane.bind()
+                .and_then(|bind| blob::upload(&bind, &path, exit))
+        }
     });
     settle_job(&status, generation, &settled, upload, result);
 }
@@ -415,7 +419,9 @@ async fn reap(job: Job, shutdown: &AtomicBool, bound: Duration) -> bool {
     shutdown.store(true, Ordering::Relaxed);
     let thread = job.thread;
     let joined = tokio::task::spawn_blocking(move || thread.join().is_ok());
-    tokio::time::timeout(bound, joined).await.is_ok_and(|joined| joined.is_ok())
+    tokio::time::timeout(bound, joined)
+        .await
+        .is_ok_and(|joined| joined.is_ok())
 }
 
 fn recording_target(elapsed: Duration, fps: u32) -> u64 {
@@ -500,11 +506,17 @@ fn main() -> Result<(), String> {
     // `leading`: capture's option values are free strings with no `--`
     // escape (`--output --version` names an output), so only argv[1] asks.
     cosmix_buildinfo::exit_on_version!(leading);
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("build the tokio runtime")
-        .block_on(async_main())
+        .expect("build the tokio runtime");
+    let result = runtime.block_on(async_main());
+    // A dropped runtime waits out its blocking pool without a bound, so
+    // the worker join `reap` abandoned would hold exit for the worker's
+    // own socket bound (up to 30 s). Bound the wait: the shutdown flag
+    // has already told every worker and uploader it is abandoned.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 async fn async_main() -> Result<(), String> {
@@ -582,6 +594,10 @@ async fn async_main() -> Result<(), String> {
     }
     // Both exit paths — signal and Bus loss — land here; neither may
     // join the worker synchronously inside the runtime (see `reap`).
+    // The flag is set even with no live job: a dual-write detached
+    // from a settled job still runs on its own thread and must see the
+    // exit as promptly as a reap-owned worker does.
+    shutdown.store(true, Ordering::Relaxed);
     if let Some(job) = job {
         let _ = reap(job, &shutdown, Duration::from_secs(5)).await;
     }
@@ -777,13 +793,7 @@ mod tests {
         }));
         let settled = Arc::new(AtomicBool::new(false));
         let expected = reference();
-        settle_job(
-            &status,
-            1,
-            &settled,
-            Some(move || Ok(expected)),
-            Ok(()),
-        );
+        settle_job(&status, 1, &settled, Some(move || Ok(expected)), Ok(()));
         let state = status.lock().unwrap();
         assert_eq!(state.phase, "complete");
         assert!(state.error.is_none());
@@ -810,7 +820,10 @@ mod tests {
         );
         let state = status.lock().unwrap();
         assert_eq!(state.phase, "failed");
-        assert_eq!(state.error.as_deref(), Some("encoder fell behind: 299 frames"));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("encoder fell behind: 299 frames")
+        );
         assert_eq!(state.blob, Some(reference()));
     }
 
@@ -846,13 +859,7 @@ mod tests {
         }));
         let settled = Arc::new(AtomicBool::new(false));
         let expected = reference();
-        settle_job(
-            &status,
-            1,
-            &settled,
-            Some(move || Ok(expected)),
-            Ok(()),
-        );
+        settle_job(&status, 1, &settled, Some(move || Ok(expected)), Ok(()));
         let state = status.lock().unwrap();
         assert!(state.blob.is_none());
         assert!(state.blob_error.is_none());
@@ -861,9 +868,7 @@ mod tests {
     #[test]
     fn blob_pending_marks_an_in_flight_dual_write() {
         // Nothing published, nothing owed.
-        assert!(!Status::default().value()["blob_pending"]
-            .as_bool()
-            .unwrap());
+        assert!(!Status::default().value()["blob_pending"].as_bool().unwrap());
         // A capture that failed without publishing owes no upload.
         let status = Arc::new(Mutex::new(Status {
             generation: 1,
@@ -877,9 +882,11 @@ mod tests {
             None::<fn() -> Result<Value, String>>,
             Err("compositor gone".into()),
         );
-        assert!(!status.lock().unwrap().value()["blob_pending"]
-            .as_bool()
-            .unwrap());
+        assert!(
+            !status.lock().unwrap().value()["blob_pending"]
+                .as_bool()
+                .unwrap()
+        );
         // Published: pending from settle until the upload lands a field.
         let status = Arc::new(Mutex::new(Status {
             generation: 1,
@@ -892,9 +899,11 @@ mod tests {
             1,
             &settled,
             Some(move || {
-                assert!(in_flight.lock().unwrap().value()["blob_pending"]
-                    .as_bool()
-                    .unwrap());
+                assert!(
+                    in_flight.lock().unwrap().value()["blob_pending"]
+                        .as_bool()
+                        .unwrap()
+                );
                 Err("lane answered 413 for http://10.42.0.5:4210/blob".into())
             }),
             Ok(()),
@@ -915,7 +924,16 @@ mod tests {
         let flag = settled.clone();
         let state = status.clone();
         let thread = std::thread::spawn(move || {
-            settle_job(&state, 1, &flag, Some(|| { let _ = parked.recv(); Ok(reference()) }), Ok(()));
+            settle_job(
+                &state,
+                1,
+                &flag,
+                Some(|| {
+                    let _ = parked.recv();
+                    Ok(reference())
+                }),
+                Ok(()),
+            );
         });
         let mut slot = Some(Job {
             cancel: Arc::new(AtomicBool::new(false)),

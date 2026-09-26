@@ -56,7 +56,9 @@ refusal's reply body is readable, a bounded prefix of it — blobd's
 `{"error":"quota: capture"}` is what an operator needs. One caveat inherent
 to the HTTP client: a refusal sent before the request body is read breaks
 the write mid-stream and no response can be read after that, so a truly
-early 413 surfaces as a transport error rather than a status error. Lane
+early 413 surfaces as a transport error rather than a status error — named
+`lane closed during upload (refused? check blobd quota)` so the close reads
+as the refusal it usually is. Lane
 resolution reads blobd's `blob.props.get` lane property (bounded to 35 s);
 an empty `bind` — blobd publishing before its lane listens — is refused as
 `blobd lane not listening` rather than tried as a URL. One attempt,
@@ -65,7 +67,9 @@ an empty `bind` — blobd publishing before its lane listens — is refused as
 between body chunks. Process shutdown — SIGTERM, SIGINT or Bus
 loss — abandons lane
 resolution and an in-flight upload instead of waiting them out, so capture
-never lingers on a stalled lane at exit. The file under `~/Videos/Cosmix`
+exits within about a second of SIGTERM; a worker parked on a stalled lane
+is abandoned within a few bounded seconds at most. The file under
+`~/Videos/Cosmix`
 remains the source of truth; not
 done yet are the `captures` collection over the references and dropping the
 file write.
