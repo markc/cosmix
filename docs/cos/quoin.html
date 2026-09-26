@@ -817,7 +817,9 @@ the message names the edge's mode and the verb that does hide it,
 <code>shell.panel.mode {edge, mode:"hidden"}</code>. A reveal held by a resize or an
 open menu is refused the same way with a generic message. The corner alias
 <code>shell.corner.hide {corner}</code> replies and refuses exactly the same way for the
-edge its corner summons.</p>
+edge its corner summons; a bad <code>corner</code> is rc 10
+<code>{error_code:"INVALID_ARGUMENT", message}</code> and failed provenance
+<code>CALLER_PROVENANCE</code>.</p>
 <p>Sub-panels are addressed by their stable name, unique across every edge and
 output. <code>shell.sub.register</code> takes <code>edge</code> and <code>name</code> (the owner is the
 broker-attested caller) and fills a carousel slot without revealing or

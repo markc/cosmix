@@ -1430,7 +1430,10 @@ fn dispatch_with_declared(
     // operation is well formed and aimed correctly, and they stay.
     // Verbs added since the unified refusal shape (decision 10) use it; the
     // older verbs keep their `{error}` bodies.
-    let unified = request.command == "shell.panel.pin.toggle";
+    let unified = matches!(
+        request.command.as_str(),
+        "shell.panel.pin.toggle" | "shell.corner.hide"
+    );
     if let Err(error) = verify_caller_provenance(request) {
         if unified {
             return (10, provenance_refusal(&error).to_string(), None);
@@ -1455,9 +1458,14 @@ fn dispatch_with_declared(
     };
     let Some(edge) = selected_edge else {
         if unified {
+            let message = if corner_command {
+                "corner must be top-left, bottom-left, bottom-right or top-right"
+            } else {
+                "edge must be left, bottom, right or top"
+            };
             return (
                 10,
-                json!({"error_code":"INVALID_ARGUMENT", "message":"edge must be left, bottom, right or top"}).to_string(),
+                json!({"error_code":"INVALID_ARGUMENT", "message":message}).to_string(),
                 None,
             );
         }
@@ -3654,9 +3662,9 @@ mod tests {
     #[test]
     fn new_verbs_refuse_with_error_code_and_message() {
         let frame = test_frame();
-        for command in ["shell.focus.next", "shell.panel.pin.toggle"] {
+        for command in ["shell.focus.next", "shell.panel.pin.toggle", "shell.corner.hide"] {
             let mut spoofed = local(command);
-            spoofed.body = json!({"edge":"left"}).to_string();
+            spoofed.body = json!({"edge":"left", "corner":"top-left"}).to_string();
             spoofed.headers.insert("signed_ident".into(), "i-said-so".into());
             let (rc, body, command_out) =
                 dispatch_shell_request(&spoofed, &frame, Default::default());
@@ -3673,6 +3681,14 @@ mod tests {
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["error_code"], "INVALID_ARGUMENT");
         assert!(body["message"].as_str().unwrap().contains("edge"));
+        // shell.corner.hide (its reply is new in this change) likewise.
+        let mut bad = local("shell.corner.hide");
+        bad.body = json!({"corner":"middle"}).to_string();
+        let (rc, body, _) = dispatch_shell_request(&bad, &frame, Default::default());
+        assert_eq!(rc, 10, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error_code"], "INVALID_ARGUMENT");
+        assert!(body["message"].as_str().unwrap().contains("corner"));
     }
 
     /// Review N2: a live hover reveal outranks keyboard focus, and the
