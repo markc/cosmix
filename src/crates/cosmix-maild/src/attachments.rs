@@ -221,6 +221,38 @@ pub fn inspect(
     if selected.is_some_and(|p| !valid_path(p)) {
         return Err(Error::NotFound);
     }
+    structure_preflight(data)?;
+    // Callers join from spawn_blocking. Parse, walk AND recursive tree drop
+    // stay on this stack, including all error paths; only owned projections leave.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("maild-mime".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(scope, || inspect_inner(data, selected, body_values))
+            .map_err(|e| Error::Unreadable(format!("MIME thread: {e}")))?
+            .join()
+            .map_err(|_| Error::Unreadable("MIME worker panicked".into()))?
+    })
+}
+
+// Deliberately conservative: quoted header text in bodies counts too. This
+// bounds parser construction and recursive destruction BEFORE walking the tree.
+fn structure_preflight(data: &[u8]) -> Result<(), Error> {
+    for (needle, limit) in [
+        (b"content-type:".as_slice(), 2 * MAX_PARTS),
+        (b"message/rfc822".as_slice(), MAX_DEPTH),
+    ] {
+        if data.windows(needle.len())
+            .filter(|w| w.eq_ignore_ascii_case(needle))
+            .take(limit + 1).count() > limit
+        {
+            return Err(Error::TooLarge("MIME pre-parse structure limit"));
+        }
+    }
+    Ok(())
+}
+
+fn inspect_inner(data: &[u8], selected: Option<&str>, body_values: bool) -> Result<Inspection, Error> {
     let message = MessageParser::default()
         .parse(data)
         .ok_or_else(|| Error::Unreadable("cannot parse message".into()))?;
@@ -370,6 +402,23 @@ impl Walker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_refuses_unencoded_nesting_before_parse_and_walker_bounds_multipart() {
+        let raw = format!("{}Content-Type: text/plain\r\n\r\nx",
+            "cOnTeNt-TyPe: MeSsAgE/RfC822\r\n\r\n".repeat(5000));
+        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit"));
+        // Forty rfc822 wrappers exceed the preflight cap of 32. Multipart
+        // nesting exercises depth 40 BELOW both occurrence-count caps instead.
+        let mut raw = "Content-Type: text/plain\r\n\r\nx".to_owned();
+        for n in 0..40 {
+            raw = format!("Content-Type: multipart/mixed; boundary=b{n}\r\n\r\n--b{n}\r\n{raw}\r\n--b{n}--\r\n");
+        }
+        structure_preflight(raw.as_bytes()).unwrap();
+        assert_eq!(inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME structure limit (depth 32, parts 1000, path 64)"));
+    }
 
     #[test]
     fn identifiers_are_canonical_ascii_and_bounded() {
