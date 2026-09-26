@@ -131,7 +131,9 @@ async fn execute(
                 if let Some(cid) = p.cid {
                     value["content_id"] = json!(cid);
                 }
-                if let Some(reference) = refs.get(&p.path) {
+                if p.undecodable {
+                    value["undecodable"] = json!(true);
+                } else if let Some(reference) = refs.get(&p.path) {
                     value["blob"] = json!(reference.blob);
                 }
                 value

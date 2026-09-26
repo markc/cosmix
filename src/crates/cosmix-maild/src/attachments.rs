@@ -108,6 +108,7 @@ pub struct Part {
     pub disposition: Option<String>,
     pub cid: Option<String>,
     pub attachment: bool,
+    pub undecodable: bool,
     /// Embedded-message children are inspectable but are not outer body parts.
     pub embedded: bool,
     pub text: bool,
@@ -303,18 +304,23 @@ impl Walker<'_> {
             .content_disposition()
             .map(|d| d.c_type.to_ascii_lowercase());
         let attachment = name.is_some() || disposition.as_deref() == Some("attachment");
+        let mut undecodable = false;
         if !matches!(part.body, PartType::Multipart(_)) || attachment {
-            let bytes = decoded(message, part)?;
+            let bytes = match decoded(message, part) {
+                Ok(bytes) => Some(bytes),
+                Err(Error::Unreadable(_)) => { undecodable = true; None }
+                Err(e) => return Err(e),
+            };
             let text = !embedded
                 && !attachment
                 && !attached_parent
-                && message.text_body.contains(&index)
-                && matches!(part.body, PartType::Text(_));
+                && ((message.text_body.contains(&index) && matches!(part.body, PartType::Text(_)))
+                    || (undecodable && part.is_content_type("text", "plain")));
             let html = !embedded
                 && !attachment
                 && !attached_parent
-                && message.html_body.contains(&index)
-                && matches!(part.body, PartType::Html(_));
+                && ((message.html_body.contains(&index) && matches!(part.body, PartType::Html(_)))
+                    || (undecodable && part.is_content_type("text", "html")));
             let value = if self.body_values && (text || html) {
                 match &part.body {
                     PartType::Text(s) | PartType::Html(s) => Some(s.to_string()),
@@ -348,19 +354,22 @@ impl Walker<'_> {
                 path: path.clone(),
                 name,
                 mime,
-                size: bytes.len(),
+                size: bytes.as_ref().map_or(0, Vec::len),
                 disposition,
                 cid: part.content_id().map(str::to_owned),
                 attachment,
+                undecodable,
                 embedded: embedded || attached_parent,
                 text,
                 html,
                 value,
             });
             if self.selected == Some(path.as_str()) {
-                self.result.extracted = Some(bytes);
+                self.result.extracted = Some(bytes.ok_or_else(||
+                    Error::Unreadable("invalid MIME transfer encoding".into()))?);
             }
         }
+        if undecodable { return Ok(()); }
         match &part.body {
             PartType::Multipart(children) => {
                 for (n, child) in children.iter().enumerate() {
@@ -466,6 +475,20 @@ mod tests {
         assert_eq!(result.parts[0].size, 4);
         assert!(result.parts[0].attachment);
         assert!(!result.parts[0].text);
+    }
+
+    #[test]
+    fn undecodable_text_and_html_keep_recovered_display_values() {
+        for (mime, encoding, body) in [("text/plain", "8-bit", "hello"),
+            ("text/html", "base64", "<b>recovered!</b>")] {
+            let raw = format!("Content-Type: {mime}\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n{body}");
+            let result = inspect(raw.as_bytes(), None, true).unwrap();
+            assert!(result.parts[0].undecodable);
+            assert_eq!(result.parts[0].html, mime == "text/html");
+            assert_eq!(result.parts[0].text, mime == "text/plain");
+            assert!(result.parts[0].value.as_deref().unwrap().contains(body));
+            assert!(matches!(inspect(raw.as_bytes(), Some("1"), true), Err(Error::Unreadable(_))));
+        }
     }
 
     #[test]

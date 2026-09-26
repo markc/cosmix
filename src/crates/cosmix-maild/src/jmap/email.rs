@@ -627,11 +627,15 @@ fn add_body_parts(
             part: part.path.clone(),
         }
         .to_string();
-        let projection = serde_json::json!({
+        let mut projection = serde_json::json!({
             "partId": part.path, "blobId": blob_id, "size": part.size,
             "name": part.name, "type": part.mime,
             "disposition": part.disposition, "cid": part.cid,
         });
+        if part.undecodable {
+            projection.as_object_mut().unwrap().remove("blobId");
+            projection["undecodable"] = serde_json::json!(true);
+        }
         if part.attachment && !part.embedded {
             attachments.push(projection.clone());
         }
@@ -647,7 +651,7 @@ fn add_body_parts(
             body_values.insert(
                 part.path,
                 serde_json::json!({
-                    "value": value, "isEncodingProblem": false, "isTruncated": false,
+                    "value": value, "isEncodingProblem": part.undecodable, "isTruncated": false,
                 }),
             );
         }

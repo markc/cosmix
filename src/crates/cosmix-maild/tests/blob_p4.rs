@@ -23,6 +23,30 @@ struct Fixture {
 }
 
 struct LocalLane(Option<String>);
+#[tokio::test]
+async fn broken_sibling_preserves_body_and_projects_undecodable_attachment() {
+    let f = Fixture::new().await;
+    for tail in ["AP!8=\r\n--x--\r\n", "AP!8="] {
+        let raw = format!("Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=bad.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n{tail}");
+        let item = f.deliver(raw.as_bytes());
+        let email = get_email(&f, item, Value::Null).await;
+        assert_eq!(email["hasAttachment"], true);
+        assert_eq!(email["textBody"][0]["partId"], "1.1");
+        assert!(email["bodyValues"]["1.1"]["value"].as_str().unwrap().contains("hello"));
+        assert_eq!(email["attachments"][0]["undecodable"], true);
+        assert!(email["attachments"][0].get("blobId").is_none());
+        let args = json!({"account_id": 1, "email_id": item.0.to_string()});
+        let (rc, list) = attachment_bus(&f, "maild.attachment.list", args.clone(), &LocalLane(None)).await;
+        assert_eq!(rc, 0);
+        assert_eq!(list["parts"][1]["undecodable"], true);
+        let mut args = args;
+        args["part"] = json!("1.2");
+        let (rc, reply) = attachment_bus(&f, "maild.attachment.ref", args, &LocalLane(None)).await;
+        assert_eq!(rc, 10);
+        assert!(reply["error"].as_str().unwrap().starts_with("unreadable:"));
+    }
+}
+
 impl cosmix_maild::blob_lane::Discovery for LocalLane {
     async fn bind(&self) -> Result<String, String> {
         Ok(self.0.as_ref().expect("unexpected lane discovery").clone())
