@@ -195,6 +195,12 @@ enabling the unit.
 `on bus.connected` and `noded.props.changed` repair state with full service
 snapshots and `shell.scenes.list` mount inventory. This also removes mounts
 disabled or removed while the broker was unavailable but still present in Quoin.
+An unload the host answers with "unknown scene" counts as unloaded: Quoin has
+already dropped it (an owner departure), so there is nothing left to remove.
+Any `<host>.scene.changed` notice with `ops:["unloaded"]` marks the scene not
+mounted; an enabled page is remounted at once (reason `owner_departed`), while
+a pre-empted editor waits for the next open. A notice older than the mount the
+loader holds (a lower revision) changes nothing.
 A returning shell is remounted from accepted source/model even when
 the current on-disk edit is broken. Behaviour service disappearance alone
 never unloads a scene. The owner is the verified loading citizen.

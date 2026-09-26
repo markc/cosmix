@@ -568,7 +568,9 @@ fn unload_scene($s, $name)
   try
     return $s.io.rpc($s.host, "shell.scene.unload", {scene:$name})
   catch $message, $error
-    if $error.code == "SCENES_UPSTREAM" and ((($error.details ?? {}).upstream ?? {}).error ?? "") == "unknown scene" then
+    -- A non-JSON refusal body arrives as a string: only a map has .error.
+    $upstream = ($error.details ?? {}).upstream
+    if $error.code == "SCENES_UPSTREAM" and type($upstream) == "map" and ($upstream.error ?? "") == "unknown scene" then
       return {scene:$name, absent:true}
     end
     raise($error.code, $message, $error.details)
@@ -1338,10 +1340,21 @@ end
 -- A host-side unload notice for one of our scenes (dialog pre-emption).
 fn scene_notice($s, $notice)
   if type($notice) != "map" or not has_key($s.scenes, $notice.scene ?? "") then return $s end
-  if $notice.reason == "preempted" and type($notice.ops) == "list" and contains($notice.ops, "unloaded") then
-    $s.scenes[$notice.scene].mounted = false
-    $s.scenes[$notice.scene].visible = false
-    $s.scenes[$notice.scene].pending = false
+  if type($notice.ops) != "list" or not contains($notice.ops, "unloaded") then return $s end
+  $name = $notice.scene
+  $e = $s.scenes[$name]
+  -- A notice about an older mount than the one we hold (we reloaded since)
+  -- changes nothing.
+  if type($notice.revision) == "number" and type($e.revision) == "number" and $e.revision > $notice.revision then return $s end
+  -- The host dropped it (a pre-empting dialog, or an owner departure it
+  -- misjudged): it is not mounted, whatever we last loaded.
+  $s.scenes[$name].mounted = false
+  $s.scenes[$name].visible = false
+  $s.scenes[$name].pending = false
+  -- An enabled page is remounted at once; a pre-empted editor waits for the
+  -- next open (re-taking the seat here would fight the pre-empting owner).
+  if $notice.reason != "preempted" and $e.reserved != true and $e.enabled then
+    $s = reconcile_safe($s, $name, false)
   end
   return $s
 end
@@ -1595,6 +1608,9 @@ fn editor_mount($s, $pick, $fallback)
       $s = invalidate($s, "editor")
       if $s.scenes.editor.mounted then
         try
+          -- Deliberately the raw rpc, not unload_scene: this switch must go
+          -- ahead whatever the host answers (catch-ignore), and unload_scene
+          -- would raise on any refusal but "unknown scene".
           $s.io.rpc($s.host, "shell.scene.unload", {scene:"editor"})
         catch $ignored
         end

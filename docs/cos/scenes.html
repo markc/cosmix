@@ -522,6 +522,7 @@ second dialog load from another scene is refused <code>DIALOG_BUSY</code>, unles
 JSON load envelope carries <code>preempt_dialog:true</code>. In that case the
 incumbent is released, and its owner gets a <code>&lt;host&gt;.scene.changed</code> notice
 with <code>ops:["unloaded"]</code>, <code>reason:"preempted"</code> and <code>by:{scene,owner}</code>.
+(An owner departure unloads with the same notice shape, <code>reason: "owner_departed"</code>; see <a href="quoin">Quoin</a>.)
 Unloading the scene, or its owner disconnecting, releases the seat.</li>
 <li><strong>Surface.</strong> The dialog is an overlay layer surface with no anchors and
 exclusive zone 0. comp centres it in the output's usable area, net of the

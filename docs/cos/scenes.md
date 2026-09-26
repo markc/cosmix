@@ -87,6 +87,8 @@ documents from every other scene.
   JSON load envelope carries `preempt_dialog:true`. In that case the
   incumbent is released, and its owner gets a `<host>.scene.changed` notice
   with `ops:["unloaded"]`, `reason:"preempted"` and `by:{scene,owner}`.
+  (An owner departure unloads with the same notice shape, `reason:
+  "owner_departed"`; see [Quoin](quoin).)
   Unloading the scene, or its owner disconnecting, releases the seat.
 - **Surface.** The dialog is an overlay layer surface with no anchors and
   exclusive zone 0. comp centres it in the output's usable area, net of the

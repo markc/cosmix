@@ -212,14 +212,7 @@ impl SceneStore {
         let result = self.request_mounted(verb, body, args, Some(mount));
         // A pre-empted dialog holder hears about it before the new holder's
         // own summary, so an owner never sees its successor first.
-        for notice in std::mem::take(&mut self.notices) {
-            let wire = format!("---\ncommand: shell.scene.changed\n---\n{notice}");
-            if let Err(error) =
-                bridge.try_publish_topic(format!("{}.scene.changed", bridge.service_name()), false, wire)
-            {
-                warn!("dialog pre-emption notice publish failed: {error}");
-            }
-        }
+        self.publish_notices(bridge);
         match result {
             Ok((reply, summary)) => {
                 if let Some(summary) = summary {
@@ -510,7 +503,29 @@ impl SceneStore {
         self.unload_owned_before(citizen, u64::MAX)
     }
 
+    /// Publish the pending `shell.scene.changed` notices (pre-emptions and
+    /// owner departures) on `<service>.scene.changed`. `dispatch` calls this
+    /// before its own summary; a host that unloads outside a request (an
+    /// owner departure) calls it right after, so nothing waits for the next
+    /// scene request.
+    pub fn publish_notices(&mut self, bridge: &BusBridge) {
+        for notice in std::mem::take(&mut self.notices) {
+            let wire = format!("---\ncommand: shell.scene.changed\n---\n{notice}");
+            if let Err(error) =
+                bridge.try_publish_topic(format!("{}.scene.changed", bridge.service_name()), false, wire)
+            {
+                warn!("scene notice publish failed: {error}");
+            }
+        }
+    }
+
     /// A deferred absence only removes content accepted before its receipt.
+    ///
+    /// Every scene it drops gets a `shell.scene.changed` notice
+    /// `{scene, revision, ops:["unloaded"], reason:"owner_departed", owner}`
+    /// (published by [`Self::publish_notices`]): if the departure was misjudged
+    /// and the owner is in fact back, it hears that its scene is gone and
+    /// remounts it instead of trusting a mount that no longer exists.
     pub fn unload_owned_before(&mut self, citizen: &str, before: u64) -> Vec<String> {
         let names: Vec<String> = self
             .scenes
@@ -531,6 +546,15 @@ impl SceneStore {
                 if let Some(mounted) = entry.mounted {
                     self.removed.push(mounted);
                 }
+                let revision = self.revisions.get(name).copied().unwrap_or(0);
+                self.notices.push(json!({
+                    "scene": name,
+                    "revision": revision,
+                    "ops": ["unloaded"],
+                    "reason": "owner_departed",
+                    "owner": citizen,
+                    "diagnostics": [],
+                }));
             }
         }
         names
@@ -1172,8 +1196,32 @@ item: {widget: "text", text: "{cells[0]}"}
         assert!(store.unload_owned_before("scenes", 3).is_empty(), "accepted at the cutoff stays");
         assert_eq!(store.unload_owned_before("scenes", 4), ["editor"]);
         assert!(store.dialog_seat().is_none());
+        // The departure is announced, so a returning owner remounts.
+        let notices = std::mem::take(&mut store.notices);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0]["scene"], "editor");
+        assert_eq!(notices[0]["reason"], "owner_departed");
+        assert_eq!(notices[0]["ops"], json!(["unloaded"]));
+        assert_eq!(notices[0]["owner"], "scenes");
         // The freed seat is anyone's.
         load(&mut store, &mut registry, "someone", 5, &dialog_source("other-dialog", 400), false).unwrap();
+    }
+
+    /// The loader treats exactly this refusal body as "already unloaded"
+    /// (scenes loader `unload_scene`, matching `upstream.error`). Rewording it
+    /// must break this test, not silently bring back a stuck `mounted:true`.
+    #[test]
+    fn unloading_an_unknown_scene_refuses_with_the_pinned_body() {
+        let (bridge, _peer) = ctk::bus::test_bridge("shell");
+        let mut store = SceneStore::default();
+        let mut registry = SubPanelRegistry::default();
+        let output = OutputKey::new("DP-1").unwrap();
+        let mut mount = SceneMount { registry: &mut registry, output: &output, owner: "scenes", accepted_at: 1 };
+        let (rc, body) = store.dispatch(SceneVerb::Unload, "", &json!({"scene":"gone"}), &bridge, &mut mount);
+        assert_eq!(rc, 10, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"], "unknown scene", "{body}");
+        assert_eq!(body["error_code"], "SCENE_REFUSED", "{body}");
     }
 
     #[test]

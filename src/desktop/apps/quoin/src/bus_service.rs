@@ -491,15 +491,19 @@ fn service_bus(
         }
         if state.live_generation == Some(message.connection_generation) {
             if let Some(live) = registered_services(&message) {
-                state.citizen_receipt = state
-                    .citizen_receipt
-                    .checked_add(1)
-                    .expect("receipt sequence exhausted");
-                let cutoff = state.citizen_receipt;
-                // This full observation supersedes any in-flight snapshot.
-                state.citizen_snapshot = None;
-                state.citizen_snapshot_retry = false;
-                reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                // A departure seen on the topic cannot be fenced: the topic and
+                // the request channel are not ordered, so this message may
+                // drain after a restarted owner's fresh loads, and a drain-time
+                // cutoff would drop them silently. Confirm it with a snapshot
+                // instead, fenced at request time like every other snapshot.
+                if content.registry.0.live_owners().difference(&live).next().is_some() {
+                    request_citizen_snapshot(&bridge, &mut state);
+                } else {
+                    // Nobody left: this full observation supersedes any
+                    // in-flight snapshot.
+                    state.citizen_snapshot = None;
+                    state.citizen_snapshot_retry = false;
+                }
                 if let Some(client) = content.holders.as_deref_mut() { client.presence(&live); }
                 if let Some(observer) = hotspot.as_deref_mut() {
                     observer.presence(&live, &mut hotspot_size);
@@ -931,6 +935,14 @@ fn apply_citizen_disconnects(world: &mut World) {
                 );
             }
         }
+    }
+    // Announce every departure unload now (reason "owner_departed"), not at
+    // the next scene request: an owner that is in fact back hears that its
+    // scene is gone and remounts it.
+    if world.contains_resource::<cosmix_scene_bevy::SceneStore>() && world.contains_resource::<BusBridge>() {
+        world.resource_scope(|world, mut store: Mut<cosmix_scene_bevy::SceneStore>| {
+            store.publish_notices(world.resource::<BusBridge>());
+        });
     }
 }
 
@@ -3329,6 +3341,14 @@ mod tests {
         );
     }
 
+    /// Answer the snapshot a departure message now requests: `keeper` and the
+    /// shell are registered, everyone else is gone.
+    fn confirm_absent(app: &mut App, peer: &ctk::bus::TestBusPeer) {
+        let id = citizen_snapshot_id(peer);
+        reply_citizen_snapshot(peer, id, &["shell", "keeper"]);
+        app.update();
+    }
+
     fn absent(peer: &ctk::bus::TestBusPeer) {
         // The missed owner's name is not even in old: old-minus-new cannot pass.
         peer.deliver_message(services_registered_change(
@@ -3376,6 +3396,7 @@ mod tests {
         );
         absent(&peer);
         app.update();
+        confirm_absent(&mut app, &peer);
         assert!(
             app.world()
                 .resource::<SubPanelRegistryState>()
@@ -3439,6 +3460,7 @@ mod tests {
         peer.send(scene_load("notes", "owner", "left"));
         app.update();
         assert_eq!(peer.drain_responses()[0].rc, 0);
+        confirm_absent(&mut app, &peer);
         let registry = &app.world().resource::<SubPanelRegistryState>().0;
         assert!(registry.seat("scene-notes").is_some());
         assert!(registry.seat("scene-old-only").is_none());
@@ -3457,6 +3479,61 @@ mod tests {
                 .as_deref(),
             Some("scene-notes")
         );
+    }
+
+    /// The departure message drains in a LATER frame than the restarted
+    /// owner's fresh load (the topic and the request channel are unordered).
+    /// It must not drop the fresh load: the departure is confirmed by a
+    /// request-time-fenced snapshot, which finds the owner back.
+    #[test]
+    fn citizen_departure_draining_after_a_replacement_load_keeps_it() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        // The owner restarts: its fresh load lands first, in its own frame.
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        peer.drain_publishes();
+        // Only now does the old process's departure drain.
+        absent(&peer);
+        app.update();
+        assert!(
+            app.world().resource::<SubPanelRegistryState>().0.seat("scene-notes").is_some(),
+            "a topic departure alone never removes content"
+        );
+        let id = citizen_snapshot_id(&peer);
+        reply_citizen_snapshot(&peer, id, &["shell", "keeper", "owner"]);
+        app.update();
+        assert!(app.world().resource::<SubPanelRegistryState>().0.seat("scene-notes").is_some());
+        assert_eq!(
+            app.world().resource::<cosmix_scene_bevy::SceneStore>().scenes_owned_by("owner"),
+            ["notes"]
+        );
+        assert!(
+            app.world().resource::<ShellFrameState>().0.panel(Edge::Left).page_ids.iter().any(|id| id == "scene-notes"),
+            "the panel is still on screen"
+        );
+    }
+
+    /// A confirmed departure unloads and says so: `shell.scene.changed`
+    /// `{ops:["unloaded"], reason:"owner_departed"}` for each scene.
+    #[test]
+    fn citizen_departure_unload_publishes_a_notice() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        peer.drain_publishes();
+        absent(&peer);
+        app.update();
+        confirm_absent(&mut app, &peer);
+        let notices: Vec<Value> = peer
+            .drain_publishes()
+            .iter()
+            .filter(|p| p.headers.get("name").is_some_and(|n| n == "shell.scene.changed"))
+            .map(|p| serde_json::from_str(p.body.split_once("\n---\n").unwrap().1).unwrap())
+            .collect();
+        let departed: Vec<&Value> = notices.iter().filter(|n| n["reason"] == "owner_departed").collect();
+        assert_eq!(departed.len(), 1, "{notices:?}");
+        assert_eq!(departed[0]["scene"], "notes");
+        assert_eq!(departed[0]["ops"], json!(["unloaded"]));
+        assert_eq!(departed[0]["owner"], "owner");
     }
 
     #[test]
@@ -3586,6 +3663,7 @@ mod tests {
         // A later observation still cleans this seat when it really disappears.
         absent(&peer);
         app.update();
+        confirm_absent(&mut app, &peer);
         assert!(
             app.world()
                 .resource::<SubPanelRegistryState>()
@@ -3637,6 +3715,7 @@ mod tests {
         assert!(replies.iter().all(|reply| reply.rc == 0));
         absent(&peer);
         app.update();
+        confirm_absent(&mut app, &peer);
         let registry = &app.world().resource::<SubPanelRegistryState>().0;
         assert_eq!(
             registry.seat("scene-remote").unwrap().owner,

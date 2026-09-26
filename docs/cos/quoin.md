@@ -330,6 +330,16 @@ page after the next frame. An owned scene whose seat is removed or replaced
 by another owner or receipt is removed on the next frame.
 `citizen` is the document's routing `citizen:` metadata; `owner` is the
 broker-verified loader, or null for an unowned scene.
+
+**Owner departure.** When a scene's owner leaves the Bus, Quoin unloads the
+scenes and seats it accepted *before* it saw the owner gone, never later ones,
+so a restarted owner's fresh loads survive. A departure seen on
+`noded.props.changed` is only a hint: Quoin confirms it with a
+`noded.props.get` snapshot fenced at request time, because the topic and the
+request channel are not ordered. Every scene a departure unloads gets a
+`<host>.scene.changed` notice `{scene, revision, ops:["unloaded"],
+reason:"owner_departed", owner, diagnostics:[]}`, so an owner that is in fact
+back remounts instead of trusting a mount that no longer exists.
 `revision` and `digest` match `shell.scene.watch`.
 An empty store returns `[]`. Both reads return rc 0 on success, are open to
 mesh callers, and do not change scenes, panels or keyboard focus.

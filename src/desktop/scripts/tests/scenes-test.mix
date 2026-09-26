@@ -4,7 +4,7 @@ $l = require("../lib/scenes.mix")
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-scenes-test.XXXXXXXX"]))
 $log = $tmp .. "/calls"
 $checks = {count:0}
-$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, unload_absent:nil, load_error:nil, names:["test-shell"],
+$host_state = {panels:{}, apply:false, nil_verb:nil, refuse_verb:nil, unload_error:nil, unload_absent:nil, unload_text:nil, load_error:nil, names:["test-shell"],
   dialog:nil, dialog_mode:"q2", refuse_edge:nil, rollback_fail:nil, hosted:nil, rev:0}
 write_file($log, "")
 
@@ -30,6 +30,8 @@ fn rpc($host, $verb, $body)
   if $verb == "noded.props.get" then return {services:{registered:$host_state.names}} end
   if $verb == "shell.info" and $host_state.info_verbs != nil then return {verbs:$host_state.info_verbs} end
   if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_error then raise("SCENES_UPSTREAM", "unload refused", {}) end
+  -- A refusal whose body was not JSON: upstream is the raw string.
+  if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_text then raise("SCENES_UPSTREAM", "scene host refused request", {rc:10, upstream:"unknown scene"}) end
   if $verb == "shell.scene.unload" and $body.scene == $host_state.unload_absent then
     raise("SCENES_UPSTREAM", "scene host refused request", {rc:10, upstream:{error:"unknown scene", error_code:"SCENE_REFUSED", message:"unknown scene"}})
   end
@@ -651,6 +653,25 @@ try
   $s = $l.request($s, "disable", {name:"zz-good"})
   check($s.rc == 0 and not $s.scenes["zz-good"].mounted and $s.scenes["zz-good"].diagnostic == nil, "unloading a scene the host already dropped counts as unloaded: " .. json_encode($s.scenes["zz-good"].diagnostic))
   $host_state.unload_absent = nil
+  -- A non-JSON refusal body (a string upstream) is a real refusal, raised
+  -- as SCENES_UPSTREAM, never a runtime error reading .error off a string.
+  $s = $l.request($s, "enable", {name:"zz-good"})
+  $host_state.unload_text = "zz-good"
+  $s = $l.request($s, "disable", {name:"zz-good"})
+  $host_state.unload_text = nil
+  check($s.scenes["zz-good"].mounted and $l.failure($s.scenes["zz-good"]).error_code == "SCENES_UPSTREAM", "a string refusal body stays SCENES_UPSTREAM: " .. json_encode($l.failure($s.scenes["zz-good"])))
+
+  -- An unloaded notice from the host (here an owner departure Quoin
+  -- misjudged) remounts an enabled page at once; an older notice than the
+  -- mount we hold changes nothing.
+  $s = $l.request($s, "enable", {name:"zz-good"})
+  check($s.scenes["zz-good"].enabled and $s.scenes["zz-good"].mounted, "zz-good enabled and mounted again: " .. json_encode($s.response))
+  $rev = $s.scenes["zz-good"].revision
+  $m = log_mark()
+  $s = $l.scene_notice($s, {scene:"zz-good", revision:$rev - 1, ops:["unloaded"], reason:"owner_departed", owner:"test-scenes", diagnostics:[]})
+  check($s.scenes["zz-good"].mounted and len(loads_of($m, "zz-good")) == 0, "a stale departure notice changes nothing")
+  $s = $l.scene_notice($s, {scene:"zz-good", revision:$rev, ops:["unloaded"], reason:"owner_departed", owner:"test-scenes", diagnostics:[]})
+  check($s.scenes["zz-good"].mounted and len(loads_of($m, "zz-good")) == 1, "a departure notice remounts the page: " .. json_encode(loads_of($m, "zz-good")))
 
   -- m6/m7: retiring ownership outlives an installation and its replacement.
   install_fixture($s.templates, "worker", true)
@@ -859,7 +880,7 @@ try
   $m = log_mark()
   $s = $l.request($s, "editor.open", {safe:true})
   check($s.rc == 0 and $s.response.pending and len(loads_of($m, "editor")) >= 1 and len(since($m, "shell.dialog.show")) == 1 and len(since($m, "shell.dialog.hide")) == 0, "E6: the next safe open shows it again: " .. json_encode($s.response))
-  $s = $l.scene_notice($s, {scene:"editor", revision:4, ops:["unloaded"], reason:"preempted", by:{scene:"other", owner:"x"}, diagnostics:[]})
+  $s = $l.scene_notice($s, {scene:"editor", revision:$s.scenes.editor.revision, ops:["unloaded"], reason:"preempted", by:{scene:"other", owner:"x"}, diagnostics:[]})
   check(not $s.scenes.editor.mounted, "E6: the pre-emption notice unmounts the record")
 
   -- E7: an editor crash takes the ordinary restart deadline.
