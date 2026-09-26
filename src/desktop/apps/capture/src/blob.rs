@@ -86,14 +86,25 @@ impl Lane {
 
     /// The lane bind (`<ip>:<port>`) blobd proves is its WireGuard
     /// address; capture only ever combines it into `http://<bind>/blob`.
+    ///
+    /// The timed future is constructed inside `block_on`'s async block:
+    /// `tokio::time::timeout` creates its `Sleep` when the future is
+    /// built, which needs the runtime's time-driver handle from the
+    /// thread-local context — present only once `block_on` has entered
+    /// the runtime. This runs on a plain worker thread with no context
+    /// of its own (building it outside, as 0.2.3 did, panicked the
+    /// first live upload).
     pub fn bind(&self) -> Result<String, String> {
         let reply = self
             .handle
-            .block_on(tokio::time::timeout(
-                PROPS_TIMEOUT,
-                self.client
-                    .call_typed("blobd", "blob.props.get", json!({"path": "lane"})),
-            ))
+            .block_on(async {
+                tokio::time::timeout(
+                    PROPS_TIMEOUT,
+                    self.client
+                        .call_typed("blobd", "blob.props.get", json!({"path": "lane"})),
+                )
+                .await
+            })
             .map_err(|_| "blob.props.get on blobd timed out".to_string())?
             .map_err(|e| format!("blob.props.get on blobd: {e}"))?;
         bind_from_reply(&reply)
@@ -311,6 +322,95 @@ mod tests {
         rc::Rc,
         sync::mpsc,
     };
+
+    /// A `type: response` reply to a wire-format request, carrying the
+    /// request's `id` and `command` back — the one correlation the
+    /// client's reader matches on. Built by hand (not `BusMessage`) so
+    /// the test needs no bus dev-dependency.
+    fn bus_response(request: &str, rc: &str) -> String {
+        let header = |name: &str| {
+            request
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+                .unwrap_or_default()
+                .to_string()
+        };
+        format!(
+            "---\ntype: response\ncommand: {}\nfrom: noded\nid: {}\nrc: {rc}\n---\n",
+            header("command"),
+            header("id")
+        )
+    }
+
+    /// A one-shot stub broker: accepts one WebSocket, answers its
+    /// `noded.register` rc=0 (the least a `SupervisedClient` needs to
+    /// come up), then closes and drops the listener — the client's
+    /// outbound lane dies with it, so a later `call_typed` errors
+    /// quickly instead of parking.
+    async fn register_then_close(listener: tokio::net::TcpListener) {
+        let (tcp, _) = listener.accept().await.unwrap();
+        drop(listener);
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let request = match futures_util::StreamExt::next(&mut ws).await {
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => text.to_string(),
+            _ => return,
+        };
+        let _ = futures_util::SinkExt::send(
+            &mut ws,
+            tokio_tungstenite::tungstenite::Message::Text(bus_response(&request, "0").into()),
+        )
+        .await;
+        let _ = ws.close(None).await;
+    }
+
+    /// `Lane::bind` from a bare worker thread, in the production shape:
+    /// the runtime lives on the thread running the Bus loop; the upload
+    /// tail runs on a plain `std::thread` whose only tokio touch is
+    /// `bind`'s `handle.block_on`. 0.2.3 built `tokio::time::timeout`'s
+    /// `Sleep` when the future was constructed — outside the runtime
+    /// context, before `block_on` entered it — so the first live
+    /// screenshot panicked the worker and stranded `blob_pending`.
+    /// The runtime is driven from THIS thread while the worker runs:
+    /// `handle.block_on` parks the worker, and on a current_thread
+    /// runtime only a driving thread fires the timers and IO it parks
+    /// on. Against a broker that has already died, `bind` must return
+    /// `Err` — never panic, never park.
+    #[test]
+    fn lane_bind_on_a_bare_worker_thread_is_an_error_not_a_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        runtime.spawn(register_then_close(listener));
+        let client = Arc::new(
+            runtime
+                .block_on(
+                    cosmix_client::SupervisedClient::connect_options("capture", &url).connect(),
+                )
+                .unwrap(),
+        );
+        let lane = Lane::new(client, runtime.handle().clone());
+        let worker = std::thread::spawn(move || lane.bind());
+        runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !worker.is_finished() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+        assert!(
+            worker.is_finished(),
+            "bind did not return within the drive window"
+        );
+        let error = worker
+            .join()
+            .expect("Lane::bind must not panic")
+            .unwrap_err();
+        assert!(error.contains("blob.props.get"), "{error}");
+    }
 
     /// A reference body from a well-behaved lane, for tests to tweak.
     fn reference_body(blob: &str, extra: &str) -> String {

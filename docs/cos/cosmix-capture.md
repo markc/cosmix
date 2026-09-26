@@ -51,7 +51,8 @@ older job's upload finishes, the stale upload's result is dropped (and
 logged), never written into the new job's status. A
 failed upload never fails the capture: the phase stays `complete`, the file
 is where it always was, and `blob_error` says why the second copy did not
-land. A refused upload names the lane's status in `blob_error` and, when the
+land. An upload that panics lands `blob_error` too, clearing `blob_pending`.
+A refused upload names the lane's status in `blob_error` and, when the
 refusal's reply body is readable, a bounded prefix of it — blobd's
 `{"error":"quota: capture"}` is what an operator needs. One caveat inherent
 to the HTTP client: a refusal sent before the request body is read breaks

@@ -395,9 +395,14 @@ fn settle_job(
     // records `blob_error` and never demotes the terminal phase. The
     // lock is dropped across the upload (a five-minute MP4 takes
     // minutes): status meanwhile shows the terminal phase with
-    // `blob: null`, then the reference.
+    // `blob: null`, then the reference. The upload runs under
+    // `catch_unwind`: a panic in the tail (0.2.3: a timed future built
+    // outside the runtime context) must land `blob_error` and clear
+    // `blob_pending` — never strand `blob_pending: true` on a dead
+    // worker.
     if let Some(upload) = upload {
-        let outcome = upload();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(upload))
+            .unwrap_or_else(|payload| Err(upload_panic_message(&payload)));
         let mut state = status.lock().unwrap();
         if !state.land_upload(generation, outcome) {
             eprintln!(
@@ -406,6 +411,20 @@ fn settle_job(
         }
     }
 }
+
+/// A panicked upload's landing text: the payload's text when it is a
+/// `&str`/`String` (what `panic!("…")` produces), otherwise the bare
+/// prefix — the payload type is all a non-string panic offers.
+fn upload_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        format!("upload panicked: {text}")
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        format!("upload panicked: {text}")
+    } else {
+        "upload panicked".to_string()
+    }
+}
+
 /// Stop the active job for process shutdown and wait for its worker
 /// without ever joining inside the runtime: on this current-thread
 /// runtime only the main thread drives the IO and timers the worker's
@@ -911,6 +930,36 @@ mod tests {
         let landed = status.lock().unwrap().value();
         assert!(!landed["blob_pending"].as_bool().unwrap());
         assert!(landed["blob_error"].is_string());
+    }
+
+    #[test]
+    fn a_panicking_upload_lands_blob_error_and_clears_pending() {
+        // 0.2.3's live failure shape: the worker panicked inside the
+        // upload tail and the thread died after `blob_pending = true`
+        // but before any landing — status read `blob_pending: true,
+        // blob: null, blob_error: null` forever. A panic now lands as
+        // `blob_error`, generation-guarded like any other failure.
+        let status = Arc::new(Mutex::new(Status {
+            generation: 1,
+            ..Default::default()
+        }));
+        let settled = Arc::new(AtomicBool::new(false));
+        settle_job(
+            &status,
+            1,
+            &settled,
+            Some(|| panic!("there is no reactor running")),
+            Ok(()),
+        );
+        let state = status.lock().unwrap();
+        assert_eq!(state.phase, "complete");
+        assert!(state.error.is_none());
+        assert!(state.blob.is_none());
+        assert_eq!(
+            state.blob_error.as_deref(),
+            Some("upload panicked: there is no reactor running")
+        );
+        assert!(!state.blob_pending, "a panic must not strand pending");
     }
 
     #[test]

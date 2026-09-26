@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-capture"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -23,6 +23,11 @@ ureq = { version = "2", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+# Lane::bind's production-shape test only: a one-shot WebSocket stub
+# broker. Versions match the main workspace's so the caches unify.
+tokio = { version = "1", features = ["net"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
 
 [build-dependencies]
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

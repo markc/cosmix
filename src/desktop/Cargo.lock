@@ -3036,16 +3036,18 @@ dependencies = [
 
 [[package]]
 name = "cosmix-capture"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-client",
  "cosmix-lib-config",
+ "futures-util",
  "image",
  "libc",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "ureq",
  "wayland-client",
  "wayland-protocols-wlr",
