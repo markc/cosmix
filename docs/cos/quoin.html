@@ -732,12 +732,17 @@ page after the next frame. An owned scene whose seat is removed or replaced
 by another owner or receipt is removed on the next frame.
 <code>citizen</code> is the document's routing <code>citizen:</code> metadata; <code>owner</code> is the
 broker-verified loader, or null for an unowned scene.</p>
-<p><strong>Owner departure.</strong> When a scene's owner leaves the Bus, Quoin unloads the
-scenes and seats it accepted <em>before</em> it saw the owner gone, never later ones,
-so a restarted owner's fresh loads survive. A departure seen on
-<code>noded.props.changed</code> is only a hint: Quoin confirms it with a
-<code>noded.props.get</code> snapshot fenced at request time, because the topic and the
-request channel are not ordered. Every scene a departure unloads gets a
+<p><strong>Owner departure.</strong> A departure seen on <code>noded.props.changed</code> is only a hint,
+because the topic and the request channel are not ordered. Quoin confirms it
+with a <code>noded.props.get</code> snapshot, and the fence is that snapshot's REQUEST
+time: if the reply shows the owner gone, Quoin unloads the scenes and seats it
+accepted before the request, never later ones. If the owner re-registers
+before noded answers, the snapshot shows it live and the old incarnation's
+seats are kept; the restarted owner adopts them (the loader reconciles its
+mounts on start). That is the intended trade-off: a restart never loses its
+panels. A confirming snapshot that fails (an error, rc≠0 or a timeout) is
+re-requested on the next update, at most three times; after that the
+departure waits for the next registry change. Every scene a departure unloads gets a
 <code>&lt;host&gt;.scene.changed</code> notice <code>{scene, revision, ops:["unloaded"], reason:"owner_departed", owner, diagnostics:[]}</code>, so an owner that is in fact
 back remounts instead of trusting a mount that no longer exists.
 <code>revision</code> and <code>digest</code> match <code>shell.scene.watch</code>.

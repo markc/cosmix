@@ -331,12 +331,17 @@ by another owner or receipt is removed on the next frame.
 `citizen` is the document's routing `citizen:` metadata; `owner` is the
 broker-verified loader, or null for an unowned scene.
 
-**Owner departure.** When a scene's owner leaves the Bus, Quoin unloads the
-scenes and seats it accepted *before* it saw the owner gone, never later ones,
-so a restarted owner's fresh loads survive. A departure seen on
-`noded.props.changed` is only a hint: Quoin confirms it with a
-`noded.props.get` snapshot fenced at request time, because the topic and the
-request channel are not ordered. Every scene a departure unloads gets a
+**Owner departure.** A departure seen on `noded.props.changed` is only a hint,
+because the topic and the request channel are not ordered. Quoin confirms it
+with a `noded.props.get` snapshot, and the fence is that snapshot's REQUEST
+time: if the reply shows the owner gone, Quoin unloads the scenes and seats it
+accepted before the request, never later ones. If the owner re-registers
+before noded answers, the snapshot shows it live and the old incarnation's
+seats are kept; the restarted owner adopts them (the loader reconciles its
+mounts on start). That is the intended trade-off: a restart never loses its
+panels. A confirming snapshot that fails (an error, rc≠0 or a timeout) is
+re-requested on the next update, at most three times; after that the
+departure waits for the next registry change. Every scene a departure unloads gets a
 `<host>.scene.changed` notice `{scene, revision, ops:["unloaded"],
 reason:"owner_departed", owner, diagnostics:[]}`, so an owner that is in fact
 back remounts instead of trusting a mount that no longer exists.

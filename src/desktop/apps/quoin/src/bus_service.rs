@@ -46,6 +46,10 @@ struct ShellBusState {
     /// Request id, connection generation and conservative acceptance cutoff.
     citizen_snapshot: Option<(u64, u64, u64)>,
     citizen_snapshot_retry: bool,
+    /// Re-requests left for a departure's confirming snapshot whose reply
+    /// failed (error, rc≠0, timeout). Reset by a new departure or any good
+    /// snapshot; at zero the departure waits for the next registry trigger.
+    departure_confirm_retries: u8,
     frame: u64,
     applied_panels: Value,
     panel_revision: u64,
@@ -70,6 +74,7 @@ impl Default for ShellBusState {
             disconnected_citizens: BTreeMap::new(),
             citizen_snapshot: None,
             citizen_snapshot_retry: false,
+            departure_confirm_retries: 0,
             frame: 0,
             applied_panels: Value::Null,
             panel_revision: 0,
@@ -441,10 +446,22 @@ fn service_bus(
                             // A reply may have been captured before a new load.
                             // Use the request's fence, never the later reply time.
                             reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                            state.departure_confirm_retries = 0;
                             if let Some(client) = content.holders.as_deref_mut() { client.presence(&live); }
                             if let Some(observer) = hotspot.as_deref_mut() {
                                 observer.presence(&live, &mut hotspot_size);
                             }
+                        } else if state.departure_confirm_retries > 0 {
+                            // A departure is waiting on this answer: on a quiet
+                            // bus nothing else would ever re-ask, and a crashed
+                            // owner's panels would linger. Re-request on the
+                            // next update (the send-retry path), a few times.
+                            state.departure_confirm_retries -= 1;
+                            state.citizen_snapshot_retry = true;
+                            warn!(
+                                retries_left = state.departure_confirm_retries,
+                                "departure-confirming registry snapshot failed; re-requesting"
+                            );
                         } else {
                             warn!("citizen registry snapshot failed; awaiting next Bus trigger");
                         }
@@ -497,6 +514,7 @@ fn service_bus(
                 // cutoff would drop them silently. Confirm it with a snapshot
                 // instead, fenced at request time like every other snapshot.
                 if content.registry.0.live_owners().difference(&live).next().is_some() {
+                    state.departure_confirm_retries = DEPARTURE_CONFIRM_RETRIES;
                     request_citizen_snapshot(&bridge, &mut state);
                 } else {
                     // Nobody left: this full observation supersedes any
@@ -896,6 +914,9 @@ fn attested_owner(request: &InboundRequest, receipt: u64) -> String {
 
 /// Event-driven resync only. A full outbound queue retries this one request
 /// on the next update; a failed RPC waits for the next observation/gap/connect.
+/// Re-requests of a departure's confirming snapshot after a failed reply.
+const DEPARTURE_CONFIRM_RETRIES: u8 = 3;
+
 fn request_citizen_snapshot(bridge: &BusBridge, state: &mut ShellBusState) {
     state.citizen_snapshot_retry = false;
     let Some(generation) = state.live_generation else {
@@ -3529,6 +3550,45 @@ mod tests {
             app.world().resource::<ShellFrameState>().0.panel(Edge::Left).page_ids.iter().any(|id| id == "scene-notes"),
             "the panel is still on screen"
         );
+    }
+
+    /// A departure's confirming snapshot that fails is re-requested on the
+    /// next update (no timer), at most three times; then Quoin gives up and
+    /// waits for the next registry trigger, keeping the seat.
+    #[test]
+    fn citizen_departure_confirm_retries_a_failed_snapshot_three_times() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        absent(&peer);
+        app.update();
+        let fail = |peer: &ctk::bus::TestBusPeer, request_id| {
+            peer.deliver_event(BusBridgeEvent::Reply { request_id, result: Err("timed out".into()) });
+        };
+        let mut id = citizen_snapshot_id(&peer);
+        for attempt in 1..=3 {
+            fail(&peer, id);
+            app.update(); // the failed reply arms the retry
+            app.update(); // the retry re-requests
+            id = peer
+                .drain_calls()
+                .into_iter()
+                .find(|call| call.command == "noded.props.get")
+                .unwrap_or_else(|| panic!("retry {attempt} must re-request the snapshot"))
+                .request_id;
+        }
+        fail(&peer, id);
+        app.update();
+        app.update();
+        assert!(
+            peer.drain_calls().iter().all(|call| call.command != "noded.props.get"),
+            "after three retries it gives up until the next trigger"
+        );
+        assert!(app.world().resource::<SubPanelRegistryState>().0.seat("scene-notes").is_some());
+        // The next departure starts a fresh budget, and a good answer removes it.
+        absent(&peer);
+        app.update();
+        confirm_absent(&mut app, &peer);
+        assert!(app.world().resource::<SubPanelRegistryState>().0.seat("scene-notes").is_none());
     }
 
     /// A confirmed departure unloads and says so: `shell.scene.changed`
