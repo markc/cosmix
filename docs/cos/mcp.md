@@ -120,12 +120,12 @@ have to wonder whether it half-landed.
 |---|---|---|
 | `term_list` | `{}` | Read-only JSON arrays `tabs` and `panes`: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic. |
 | `term_snapshot` | `{}` | Read-only active screen text, cols/rows, cursor, pid, byte counters and diagnostic timings. |
-| `term_type` | `{"text":"echo hello\n"}` | DIAGNOSTIC keyboard-encoder input; newline is Enter. Not the authenticated input API. |
+| `term_type` | `{"pane":3,"text":"echo hello\n"}` or `{"tab":1,"text":"…"}` | DIAGNOSTIC keyboard-encoder input; newline is Enter. `pane` or `tab` is required (ids from `term_list`; a tab means its active pane); neither returns an error without an ABP call. Not the authenticated input API. |
 | `term_tab` | `{"op":"new"}`, `{"op":"select","id":1}`, `{"op":"close","id":1}` | Create/select/close a tab; closing the last tab quits. |
 | `term_pane` | `{"op":"split","dir":"h"}`, `{"op":"select","id":1}`, `{"op":"close"}` | Split/select/close active-tab panes; closing the last pane closes the tab. |
 
-The MCP schemas use String for text/op, optional u64 for id, and optional
-String for dir. Invalid operations, missing required ids/directions, and
+The MCP schemas use String for text/op, optional u64 for id/pane/tab, and
+optional String for dir. Invalid operations, missing required ids/directions, and
 invalid split directions return errors without an ABP call.
 
 Term 0.3.0 changes every request to a JSON object. The verb column is written
@@ -136,7 +136,7 @@ frontend's name**, so against the Bevy frontend these are `bterm.snapshot`,
 | Bus verb | JSON body |
 |---|---|
 | `term.snapshot`, `term.tabs`, `term.tab.new`, `term.panes`, `term.pane.close` | `{}` |
-| `term.type` | `{"text":"..."}` |
+| `term.type` | `{"pane":3,"text":"..."}` or `{"tab":1,"text":"..."}` (one required) |
 | `term.tab.select`, `term.tab.close`, `term.pane.select` | `{"id":1}` (non-negative u64 integer) |
 | `term.pane.split` | `{"dir":"h"}` (h, horizontal, v, vertical) |
 

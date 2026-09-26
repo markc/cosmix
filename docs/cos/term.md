@@ -164,7 +164,7 @@ is a JSON object, and `{}` means no arguments.
 | `term.pane.select` | `{"id":N}` | focus pane N in the active tab |
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |
 | `term.snapshot` | `{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}` (all optional) | read a pane anywhere; default is the focused pane in the selected/active tab; `contents` defaults true; history defaults 0, accepts 0–10000, capped at buffered history above the live screen (offset zero) |
-| `term.type` | `{"pane":N,"text":"..."}` (`pane` optional) | type ASCII as keys into that pane, default focused pane; does not change focus |
+| `term.type` | `{"pane":N,"text":"..."}` or `{"tab":T,"text":"..."}` (`pane` or `tab` **required**) | type ASCII as keys into that pane (a tab means its active pane; with both, the pane must belong to the tab); does not change focus. Neither is refused `invalid-argument` — there is no focused-pane default (term-core 0.8.0: term 0.3.0, bterm 0.10.0), because keys that follow focus land wherever focus has moved (2026-09-25) |
 | `term.scroll` | `{"pane":N,"lines":3}` or `{"page":-1}` or `{"to":"top"}` | move only the viewport; pane defaults to active, including selection across tabs without changing focus; exactly one of signed `lines`, signed `page`, or `to` (`top`/`bottom`) |
 | `term.props.watch` | `{}` | subscribe to the change topics through noded first, then enable publishing with this verb (returns JSON `{topics,revision}`), then read state |
 

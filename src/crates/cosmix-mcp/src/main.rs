@@ -322,6 +322,11 @@ impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
 struct TermTypeParams {
     /// Diagnostic synthetic input; max 8192 UTF-8 bytes including JSON envelope on the wire.
     text: String,
+    /// Pane id to type into (from term_list). Pane or tab is REQUIRED.
+    pane: Option<u64>,
+    /// Tab id: types into that tab's active pane. Pane or tab is REQUIRED;
+    /// with both, the pane must belong to the tab.
+    tab: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -465,6 +470,23 @@ fn term_tab_request(p: TermTabParams) -> Result<(&'static str, serde_json::Value
         }
         _ => Err("op must be new|select|close".into()),
     }
+}
+
+/// The body for a type request. Decision 8 (2026-09-25): typing names its
+/// target; the old active-pane default sent an agent's keys into whatever
+/// pane held focus.
+fn term_type_request(p: TermTypeParams) -> Result<serde_json::Value, String> {
+    if p.pane.is_none() && p.tab.is_none() {
+        return Err("pane or tab is required".into());
+    }
+    let mut body = serde_json::json!({"text": p.text});
+    if let Some(pane) = p.pane {
+        body["pane"] = pane.into();
+    }
+    if let Some(tab) = p.tab {
+        body["tab"] = tab.into();
+    }
+    Ok(body)
 }
 
 /// The verb SUFFIX (namespace-free) and body for a pane operation.
@@ -876,11 +898,15 @@ impl CosmixMcp {
     /// authenticated input API. The term service is a self-asserted diagnostic surface
     /// pending authenticated per-instance identity (P0-I). Text uses the keyboard
     /// encoder; newline is Enter. JSON request is limited to 8192 bytes.
+    /// REQUIRES pane or tab (ids from term_list; a tab means its active pane):
+    /// input never defaults to whichever pane holds focus.
     #[tool]
     async fn term_type(&self, Parameters(p): Parameters<TermTypeParams>) -> String {
         // VERIFY: MCP Term tool is a thin structured-argument ABP translation.
-        self.term_request("type", serde_json::json!({"text": p.text}))
-            .await
+        match term_type_request(p) {
+            Ok(args) => self.term_request("type", args).await,
+            Err(e) => format!("ERROR: {e}"),
+        }
     }
 
     /// Create, select or close a tab in the live CosMix terminal over ABP; select/close require id.
@@ -2835,6 +2861,14 @@ mod tests {
     #[test]
     fn term_translations_and_listing() {
         use super::*;
+        let typed = |pane, tab| term_type_request(TermTypeParams { text: "hi\n".into(), pane, tab });
+        assert_eq!(typed(None, None).unwrap_err(), "pane or tab is required");
+        assert_eq!(typed(Some(3), None).unwrap(), serde_json::json!({"text":"hi\n","pane":3}));
+        assert_eq!(typed(None, Some(2)).unwrap(), serde_json::json!({"text":"hi\n","tab":2}));
+        assert_eq!(
+            typed(Some(3), Some(2)).unwrap(),
+            serde_json::json!({"text":"hi\n","pane":3,"tab":2})
+        );
         for (op, verb) in [
             ("new", "tab.new"),
             ("select", "tab.select"),

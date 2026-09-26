@@ -19,7 +19,10 @@ local caller with no grant: `term.tabs`, `term.tab.new/select/close`,
 plus `INFO`/`HELP` (term 0.8.5, per the 2026-09-15 full-mesh-access law) — each
 in the holding frontend's own namespace.
 These verbs act on the active tab/pane of the instance holding the name at
-delivery time; they carry no target binding. `term.type` revokes any
+delivery time; they carry no target binding. The exception is `term.type`,
+which requires a `pane` or `tab` selector and refuses a body with neither
+(`invalid-argument`) rather than typing into whatever pane holds focus.
+`term.type` revokes any
 delegated control writer exactly as real keys do. Any mutating verb's body
 (`tab.*`, `pane.*`, `type`) may add `"request_id":"<string>"`: a resend of
 the same request (same verb and arguments; JSON key order is free) replays
