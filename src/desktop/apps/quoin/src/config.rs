@@ -281,6 +281,12 @@ impl ShellConfig {
                         .get("confirm")
                         .map(|value| string(value, &format!("{path}.confirm")))
                         .transpose()?;
+                    // The confirm step reserves at most a few row lines for
+                    // its question; a longer one would overflow them.
+                    let limit = cosmix_shell::chrome::corner_menu::QUESTION_MAX_CHARS;
+                    if confirm.as_ref().is_some_and(|question| question.chars().count() > limit) {
+                        return Err(format!("{path}.confirm: at most {limit} characters"));
+                    }
                     config.menu_items[edge.index()].push(MenuItem {
                         label,
                         target,
@@ -917,6 +923,7 @@ mod tests {
             r#"{menu_items: {left: [{label: "Missing action"}]}}"#,
             r#"{menu_items: {left: [{label: "L", target: "t", verb: "t.v", confirm: ""}]}}"#,
             r#"{menu_items: {left: [{label: "L", target: "t", verb: "t.v", confirm: true}]}}"#,
+            r#"{menu_items: {left: [{label: "L", target: "t", verb: "t.v", confirm: "Are you really, truly, completely and utterly sure you want to do this now?"}]}}"#,
             r#"{bindings: {left: {pni: "Super+Left"}}}"#,
             r#"{bindings: {cycle_focus: "Super+Escape"}}"#,
             r#"{bindings: {cycle_focus: "Shfit+Left"}}"#,

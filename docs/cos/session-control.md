@@ -42,8 +42,12 @@ send "desktop-session" desktop.session.leave
   - `SESSION_CONFIG`: a missing `COSMIX_SESSION_USER`, an unknown user or
     home, or a bad `COSMIX_LEAVE_VT`.
   - `RESTART_IN_PROGRESS`: the restart unit is already running.
-  - `STATE_WRITE`: the state file could not be written.
-  - `RESTART_START`: `systemd-run` failed.
+  - `STATE_DIR_UNSAFE`: a level of the state directory is a symlink, is not
+    a directory, is owned by someone other than root, or is writable by
+    others.
+  - `STATE_WRITE`: the state file could not be written (a name already
+    taken included).
+  - `RESTART_START`: `systemd-run` failed; the state file is removed again.
   - `CHVT_FAILED`: `chvt` failed.
 
 ## How a restart survives itself
@@ -55,10 +59,15 @@ came from. So nothing that the desktop owns can carry the restart out.
    `PartOf=` or `BindsTo=` the desktop, so the restart does not stop it. The
    citizen reads the desktop user's live interactive sessions from
    `~/.claude/sessions/<pid>.json` (live means `/proc/<pid>` exists). It
-   writes them to a state file owned by that user,
-   `~/.cache/cosmix/session-resume/sessions-<time>.json`. It then starts the
-   worker with `systemd-run --unit=cosmix-session-restart --collect` and
-   replies.
+   writes them to `/var/lib/cosmix/session-resume/sessions-<time>.json`: a
+   root-owned directory outside the user's home, checked level by level
+   (no symlinks, root-owned, not writable by others) before anything is
+   written, so no path the user controls can steer what root writes. The
+   state file is readable by the user, who owns only its empty `.done`
+   beside it. State older than 7 days is pruned on each restart. It then
+   starts the worker with `systemd-run --unit=cosmix-session-restart
+   --collect` and replies. That unit name is the single name every restart
+   uses, so a second restart while one runs is refused.
 2. The **worker** (`session-resume.mix --phase2`) runs in that transient
    unit, outside both the desktop's cgroup and the citizen's, so neither
    going down can stop it. It:
@@ -66,8 +75,14 @@ came from. So nothing that the desktop owns can carry the restart out.
    - waits until the unit is `active` AND its boot terminal
      (`cosmix-boot-term.service`) is a NEW process. An old terminal still on
      the Bus would take the keys into whatever runs in its active tab;
-   - runs `--resume-fresh` as the desktop user.
-3. **`--resume-fresh`** waits for the terminal on the Bus. For each session it
+   - runs `--resume-fresh STATE PID` as the desktop user, PID being the new
+     boot term's MainPID.
+3. **`--resume-fresh`** waits for the terminal on the Bus and types only into
+   the term PROCESS whose pid is PID: it reads the pid from `term.panes`
+   (term-core 0.8.1 adds `pid=` to each pane line; pane lines carry no text a
+   program could set) before every keystroke batch. Any other process holding
+   the Bus name `term`, such as a terminal that outlived the restart, gets
+   nothing: the worker fails closed with the recovery command. For each session it
    opens a pane: the boot tab's for the first session, a new tab for each
    later one. It then sends a `term.type` with `{pane, instance, text,
    request_id}` of
@@ -78,8 +93,9 @@ came from. So nothing that the desktop owns can carry the restart out.
    - The `request_id`s are stable (keyed on the state file and the session)
      and every resumed id is appended to `<state>.done`. A rerun after a lost
      reply replays; it never types the same keys twice.
-   - A directory or id that would need shell quoting is not typed. The worker
-     logs it for a by-hand resume.
+   - A directory or id that would need shell quoting, or a `flags` value
+     other than empty or `--dangerously-skip-permissions`, is not typed. The
+     worker logs it for a by-hand resume.
 
 The worker logs to `journalctl -u cosmix-session-restart`. Its first line
 names the recovery command:
@@ -95,11 +111,11 @@ each remaining session.
 
 Global chords bind to Quoin's `shell.session.confirm {action}` (through
 inputd), never to the session verbs, so a keypress only ever opens the
-question. The proposed chords are Ctrl+Alt+Backspace (restart) and
-Ctrl+Alt+Delete (leave).
+question. The chords are **Ctrl+Alt+Backspace** (restart) and
+**Ctrl+Alt+End** (leave).
 
-**Ctrl+Alt+Delete is also the kernel's reboot key.** Holding a VT does not
-stop it:
+**Ctrl+Alt+Delete is deliberately NOT bound.** It is the kernel's reboot key,
+and holding a VT does not stop it:
 
 - seatd and logind put the desktop's VT in keyboard mode `K_OFF`.
 - The kernel still handles `KT_SPEC` keys in that mode
@@ -108,12 +124,12 @@ stop it:
 - Ctrl+Alt+Delete's Boot keysym is `KT_SPEC`: `ctrl_alt_del()` sends SIGINT
   to PID 1, which starts `ctrl-alt-del.target`, an alias of `reboot.target`.
 
-It is safe only while the kernel never sees the keystroke. That holds when
-inputd holds an exclusive grab on the keyboard it reads and the chord is a
-bound row: the bound stroke is swallowed and not re-emitted. If inputd is not
-running or not grabbing, the kernel sees the chord and the machine reboots.
-Either choose another chord or run `systemctl mask ctrl-alt-del.target` on the
-host, which makes PID 1 ignore the key.
+So Ctrl+Alt+Delete reboots the machine, while the desktop is running just as
+on a text console, whenever the kernel sees the keystroke. The kernel sees it
+unless inputd holds an exclusive grab on the keyboard and swallows the stroke
+as a bound row. A binding would make it safe only while inputd runs and grabs,
+which is why the leave chord is Ctrl+Alt+End instead. `ctrl-alt-del.target`
+is left as it is.
 
 ## Settings (environment)
 
@@ -125,7 +141,9 @@ host, which makes PID 1 ignore the key.
 | `COSMIX_BOOT_TERM_UNIT` | `cosmix-boot-term.service` | the boot terminal that must come back as a new process |
 | `COSMIX_SESSION_TERM_SERVICE` | `term` | the terminal's Bus service |
 | `COSMIX_LEAVE_VT` | `1` | the VT `leave` switches to (1–63) |
-| `COSMIX_SESSION_WORKER_UNIT` | `cosmix-session-restart` | the transient unit's name |
+| `COSMIX_SESSION_WORKER_UNIT` | `cosmix-session-restart` | the transient unit's name (a `.service` suffix is dropped) |
+| `COSMIX_SESSION_STATE_DIR` | `/var/lib/cosmix/session-resume` | where state files live (root-owned, checked before every write) |
+| `COSMIX_SESSION_TERM_WAIT` | `90` | seconds the worker waits for the new boot term on the Bus |
 | `COSMIX_SESSION_DRY_RUN` | unset | `1`: every request is a dry run |
 
 ## Install
@@ -156,3 +174,7 @@ The tests never restart or switch anything:
   session capture and resume lines, using pure functions against fixtures.
 - `COSMIX=$PWD mix src/desktop/scripts/tests/session-bus-test.mix`: the
   production citizen over a private broker in forced dry-run mode.
+- `COSMIX=$PWD mix src/desktop/scripts/tests/session-resume-test.mix`: the
+  worker against a fake term over a private broker. A term with the wrong pid
+  gets no keys and the worker fails closed; the right one gets the resume
+  line.

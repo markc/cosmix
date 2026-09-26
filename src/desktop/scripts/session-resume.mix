@@ -13,8 +13,13 @@
 --       restart the desktop unit, wait until it is active AND its boot
 --       terminal is a NEW process, then run --resume-fresh as the desktop
 --       user. Never types anywhere while the old terminal could still answer.
---   mix session-resume.mix --resume-fresh STATE  (desktop user)
---   mix session-resume.mix --resume-only STATE   (desktop user, by hand)
+--   mix session-resume.mix --resume-fresh STATE PID  (desktop user)
+--   mix session-resume.mix --resume-only STATE       (desktop user, by hand)
+--       --resume-fresh types only into the term PROCESS whose pid is PID (the
+--       new boot term unit's MainPID, which phase 2 read): it checks the pid
+--       the term's term.panes reports before every keystroke batch, so a stray term
+--       holding the Bus name `term` never receives them. On a mismatch it
+--       fails closed with the recovery hint.
 --       per session: a pane (the boot tab's for the first one after a fresh
 --       restart, else a new tab), then term.type of its resume line. Every
 --       term.tab.new / term.type carries a stable request_id keyed on the
@@ -30,6 +35,9 @@ $session = require("lib/session.mix")
 $SELF = realpath($0)
 $cfg = $session.config()
 $TERM = $cfg.term_service
+-- The term process keys may go to (--resume-fresh), or nil (--resume-only,
+-- where the user is at the keyboard and chose the terminal).
+$EXPECTED_PID = nil
 
 fn fail($msg)
   print("session-resume: " .. $msg)
@@ -45,10 +53,30 @@ fn done_ids($statefile)
   return lines(trim(read_file($statefile .. ".done")))
 end
 
+-- The pid of the term process answering on the Bus, from its term.panes
+-- lines (term-core >= 0.8.1; they carry no free text, so no program running
+-- in a pane can forge it), or nil.
+fn term_pid()
+  $r = send $TERM "term.panes" body="{}" timeout=3
+  if $rc != 0 then return nil end
+  $lines = split(to_string($r), "\n")
+  if len($lines) == 0 then return nil end
+  return $session.reply_int($lines[0], "pid")
+end
+
+-- True when the Bus name answers AND, if a process is expected, is that
+-- process.
+fn term_is_ours()
+  if $EXPECTED_PID == nil then
+    send $TERM "term.tabs" body="{}" timeout=3
+    return $rc == 0
+  end
+  return term_pid() == $EXPECTED_PID
+end
+
 fn wait_term($deadline)
   while time() < $deadline
-    send $TERM "term.tabs" body="{}" timeout=3
-    if $rc == 0 then return true end
+    if term_is_ours() then return true end
     sleep(2)
   end
   return false
@@ -90,9 +118,12 @@ fn resume_sessions($statefile, $fresh)
   -- Keyed on this capture as well as the session: two captures resuming the
   -- same session never collide in the term's replay cache.
   $capture = replace(basename($statefile), ".json", "")
-  $deadline = time() + 90
+  $deadline = time() + $cfg.term_wait + 10 * len($sessions)
   if len($sessions) == 0 then return 0 end
-  if not wait_term($deadline) then fail("the terminal never answered on the Bus; recover with: " .. recovery($statefile)) end
+  if not wait_term($deadline) then
+    $seen = $EXPECTED_PID == nil ? "" : " as the new boot term (expected pid " .. to_string($EXPECTED_PID) .. ", the term answering reports " .. to_string(term_pid()) .. ")"
+    fail("the terminal never answered on the Bus" .. $seen .. "; NOT typing. Recover with: " .. recovery($statefile))
+  end
   sleep(2)
   $use_boot_tab = $fresh and len($done) == 0
   $n = 0
@@ -117,12 +148,21 @@ fn resume_sessions($statefile, $fresh)
         $tab = $session.reply_int(to_string($r), "tab")
         $pane = $session.reply_int(to_string($r), "pane")
         if $tab == nil or $pane == nil then fail("term.tab.new named no tab/pane (" .. to_string($r) .. "); recover with: " .. recovery($statefile)) end
-        $target = pane_target($tab, $pane)
+        $target = nil
+        while $target == nil and time() < $deadline
+          $target = pane_target($tab, $pane)
+          if $target == nil then sleep(1) end
+        end
         if $target == nil then fail("term.panes {tab:" .. to_string($tab) .. "} did not list pane " .. to_string($pane) .. "; recover with: " .. recovery($statefile)) end
         $type_id = "resume-type-tab-" .. $capture .. "-" .. $s.id
         sleep(1)
       end
       $use_boot_tab = false
+      -- The Bus name may have changed hands since the wait: bind every
+      -- keystroke batch to the expected process again.
+      if not term_is_ours() then
+        fail("the term answering on the Bus is not the new boot term (expected pid " .. to_string($EXPECTED_PID) .. ", got " .. to_string(term_pid()) .. "); NOT typing. Recover with: " .. recovery($statefile))
+      end
       $target.text = $line
       $target.request_id = $type_id
       $r = send $TERM "term.type" body=json_encode($target) timeout=5
@@ -148,13 +188,20 @@ fn unit_prop($unit, $prop)
 end
 
 $a = args()
-if len($a) == 2 and ($a[0] == "--resume-only" or $a[0] == "--resume-fresh") then
-  $n = resume_sessions($a[1], $a[0] == "--resume-fresh")
+if len($a) == 2 and $a[0] == "--resume-only" then
+  $n = resume_sessions($a[1], false)
+  print("resume done: " .. to_string($n) .. " session(s)")
+  exit(0)
+end
+if len($a) == 3 and $a[0] == "--resume-fresh" then
+  if not re_match($a[2], "^[1-9][0-9]*$") then fail("--resume-fresh needs the new boot term's pid") end
+  $EXPECTED_PID = to_number($a[2])
+  $n = resume_sessions($a[1], true)
   print("resume done: " .. to_string($n) .. " session(s)")
   exit(0)
 end
 if len($a) != 2 or $a[0] != "--phase2" then
-  fail("usage: session-resume.mix --phase2 STATE | --resume-fresh STATE | --resume-only STATE")
+  fail("usage: session-resume.mix --phase2 STATE | --resume-fresh STATE PID | --resume-only STATE")
 end
 if uid() != 0 then fail("--phase2 must run as root (it restarts " .. $cfg.desktop_unit .. ")") end
 if $cfg.user == "" then fail("COSMIX_SESSION_USER is not set") end
@@ -185,6 +232,8 @@ $env = {HOME: $cfg.home}
 for each $k in ["COSMIX_NODE_CONFIG", "COSMIX_RUN", "COSMIX_SESSION_TERM_SERVICE", "MIX_STATS"]
   if env($k, "") != "" then $env[$k] = env($k, "") end
 end
-$q = run_argv(["runuser", "-u", $cfg.user, "--", $cfg.mix, $SELF, "--resume-fresh", $statefile], {timeout: 300, env: $env})
+-- Budget: the terminal wait, then a few seconds per session.
+$count = len(json_parse(read_file($statefile)))
+$q = run_argv(["runuser", "-u", $cfg.user, "--", $cfg.mix, $SELF, "--resume-fresh", $statefile, $new_term], {timeout: 180 + 20 * $count, env: $env})
 print(trim($q.stdout) .. " " .. trim($q.stderr))
 exit($q.exit_code)

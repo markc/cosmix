@@ -611,10 +611,14 @@ fn handle(
         panic!("test verb: panic holding the tab-set lock");
     }
     match verb {
+        // `pid` lets a caller bind to one term PROCESS (the session-control
+        // resume worker checks it against the boot term unit's MainPID), which
+        // `instance`, reported by that same process, cannot prove.
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
-            "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)\ninstance={}",
+            "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)\ninstance={} pid={}",
             help(service),
-            instance()
+            instance(),
+            std::process::id()
         )),
         "term.session" => {
             let mut status = tabs.session_status();
@@ -721,7 +725,7 @@ fn handle(
             .map(|pane| {
                 let g = pane.geometry;
                 format!(
-                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={} instance={}",
+                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={} instance={} pid={}",
                     pane.id,
                     pane.active,
                     pane.cols,
@@ -733,7 +737,12 @@ fn handle(
                     g.h,
                     id,
                     tabs.revision,
-                    instance()
+                    instance(),
+                    // This term PROCESS: a caller binding keys to one process
+                    // (the session-control resume worker) checks it against
+                    // the unit's MainPID. Pane lines carry no free text, so
+                    // nothing a program sets can forge it.
+                    std::process::id()
                 )
             })
             .collect::<Vec<_>>()
@@ -1194,7 +1203,7 @@ mod tests {
         assert!(
             handle(&set, &cleanup, "INFO", "")
                 .unwrap()
-                .ends_with(&format!("\ninstance={}", instance()))
+                .ends_with(&format!("\ninstance={} pid={}", instance(), std::process::id()))
         );
         cleanup.submit(set.lock().unwrap().shutdown());
         drop(cleanup);
@@ -2138,7 +2147,12 @@ mod tests {
         assert_eq!(panes.lines().count(), 2);
         for line in panes.lines() {
             assert!(
-                line.ends_with(&format!(" tab=1 revision={} instance={}", revision(), instance())),
+                line.ends_with(&format!(
+                    " tab=1 revision={} instance={} pid={}",
+                    revision(),
+                    instance(),
+                    std::process::id()
+                )),
                 "{line}"
             );
         }

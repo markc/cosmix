@@ -49,30 +49,22 @@ fn restart($event)
   $plan = $session.plan_restart($cfg, $sessions, time())
   if $plan.ok != true then return $plan end
   if $req.dry_run then return $session.restart_reply($plan, true, $cfg.worker_unit) end
-  -- The state file belongs to the desktop user: the worker's last phase runs
-  -- as that user, and a by-hand --resume-only recovery must be able to read it.
   $ids = $session.user_ids($cfg.user)
   if $ids == nil then return $session.refuse("SESSION_CONFIG", "unknown user " .. $cfg.user) end
-  try
-    -- Create each missing directory as the user, one level at a time: a
-    -- root-owned ~/.cache/cosmix would break the user's own tools later.
-    $dir = ""
-    for each $part in split(strip_prefix($cfg.state_dir, "/"), "/")
-      $dir = $dir .. "/" .. $part
-      if not exists($dir) then
-        mkdir($dir, {parents: false})
-        chown($dir, $ids.uid, $ids.gid)
-      end
-    end
-    write_file($plan.state_file, json_encode($plan.sessions, true))
-    chown($plan.state_file, $ids.uid, $ids.gid)
-  catch $e
-    return $session.refuse("STATE_WRITE", "cannot write the state file " .. $plan.state_file .. ": " .. to_string($e))
-  end
+  -- The state lives in a root-owned directory outside the user's home (never
+  -- written by root through a path the user controls), checked level by level
+  -- for symlinks and foreign or group/world-writable directories. The user
+  -- gets read access to the state and owns only its .done.
+  $why = $session.prepare_state_dir($cfg.state_dir, uid())
+  if $why != nil then return $session.refuse("STATE_DIR_UNSAFE", "refusing the state directory " .. $cfg.state_dir .. ": " .. $why) end
+  $_pruned = $session.prune_state($cfg.state_dir, time(), 7 * 86400)
+  $why = $session.write_state($cfg.state_dir, $plan.state_file, $plan.sessions, $ids, uid())
+  if $why != nil then return $session.refuse("STATE_WRITE", "cannot write the state file " .. $plan.state_file .. ": " .. $why) end
   -- Detached: the worker survives this reply, and anything the restart takes
   -- down with the desktop (the terminal the caller typed into included).
   $r = run_argv($plan.argv, {timeout: 30})
   if $r.exit_code != 0 then
+    $session.remove_state($plan.state_file)
     return $session.refuse("RESTART_START", "could not start the detached restart unit: " .. trim($r.stderr))
   end
   return $session.restart_reply($plan, false, $cfg.worker_unit)

@@ -317,6 +317,14 @@ mod tests {
     }
 
     #[test]
+    fn built_in_session_questions_fit_their_rows() {
+        for action in SESSION_ACTIONS {
+            let (_, _, question) = session_action(action).unwrap();
+            assert!(question.chars().count() <= cosmix_shell::chrome::corner_menu::QUESTION_MAX_CHARS, "{action}");
+        }
+    }
+
+    #[test]
     fn session_confirm_request_is_question_action_cancel() {
         let output = OutputKey::new("test-output").unwrap();
         for (action, verb) in [("restart", "desktop.session.restart"), ("leave", "desktop.session.leave")] {

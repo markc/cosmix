@@ -41,11 +41,12 @@ fn config()
     desktop_unit: env_or("COSMIX_DESKTOP_UNIT", "cosmix-desktop.service"),
     boot_term_unit: env_or("COSMIX_BOOT_TERM_UNIT", "cosmix-boot-term.service"),
     term_service: env_or("COSMIX_SESSION_TERM_SERVICE", "term"),
+    term_wait: to_number(env_or("COSMIX_SESSION_TERM_WAIT", "90")),
     leave_vt: env_or("COSMIX_LEAVE_VT", "1"),
-    worker_unit: env_or("COSMIX_SESSION_WORKER_UNIT", "cosmix-session-restart"),
+    worker_unit: strip_suffix(env_or("COSMIX_SESSION_WORKER_UNIT", "cosmix-session-restart"), ".service"),
     mix: env_or("COSMIX_SESSION_MIX", "/opt/cosmix/bin/mix"),
     resume_script: env_or("COSMIX_SESSION_RESUME", ""),
-    state_dir: env_or("COSMIX_SESSION_STATE_DIR", $home == "" ? "" : $home .. "/.cache/cosmix/session-resume"),
+    state_dir: env_or("COSMIX_SESSION_STATE_DIR", "/var/lib/cosmix/session-resume"),
     dry_run: env_or("COSMIX_SESSION_DRY_RUN", "") == "1"
   }
 end
@@ -115,6 +116,105 @@ fn vt_number($vt)
   $n = to_number($vt)
   if $n < 1 or $n > 63 then return nil end
   return to_string($n)
+end
+
+-- nil when every level of $dir (an absolute path) is a real directory, not a
+-- symlink, owned by root or $owner, and not writable by others (a sticky
+-- world-writable parent such as /tmp is allowed; the final directory itself
+-- must not be group- or world-writable). Else the reason. The citizen runs as
+-- root, so a path another user could redirect would let that user choose
+-- what root writes and chowns.
+fn unsafe_dir($dir, $owner)
+  if not starts_with($dir, "/") then return "not an absolute path: " .. $dir end
+  $path = ""
+  $parts = split(strip_prefix($dir, "/"), "/")
+  for each $i in range(0, len($parts) - 1)
+    $path = $path .. "/" .. $parts[$i]
+    if not exists($path, {follow_symlinks: false}) then return "missing: " .. $path end
+    $st = stat($path, {follow_symlinks: false})
+    if $st.is_symlink then return "a symlink: " .. $path end
+    if not $st.is_dir then return "not a directory: " .. $path end
+    if $st.uid != 0 and $st.uid != $owner then return "owned by uid " .. to_string($st.uid) .. ": " .. $path end
+    $open = band($st.perm, 0o022) != 0
+    $last = $i == len($parts) - 1
+    if $open and ($last or band($st.perm, 0o1000) == 0) then return "writable by others: " .. $path end
+  end
+  return nil
+end
+
+-- Create $dir's missing levels (mode 0755, owned by whoever runs this) and
+-- check the whole path with unsafe_dir. nil on success, else the reason.
+fn prepare_state_dir($dir, $owner)
+  if not starts_with($dir, "/") then return "not an absolute path: " .. $dir end
+  $path = ""
+  for each $part in split(strip_prefix($dir, "/"), "/")
+    $path = $path .. "/" .. $part
+    -- Checked before descending: never create anything through a link.
+    if exists($path, {follow_symlinks: false}) and stat($path, {follow_symlinks: false}).is_symlink then
+      return "a symlink: " .. $path
+    end
+    if not exists($path, {follow_symlinks: false}) then
+      try
+        mkdir($path, {parents: false})
+        chmod($path, 0o755)
+      catch $e
+        return "cannot create " .. $path .. ": " .. to_string($e)
+      end
+    end
+  end
+  return unsafe_dir($dir, $owner)
+end
+
+-- Write the state file (readable by the desktop user) and an empty .done
+-- beside it that the user owns, so the user-side resume can append to it;
+-- the directory stays root's, so the user can plant nothing in it. Refuses
+-- a name that already exists (a link included). nil on success, else the
+-- reason. $ids = {uid, gid} of the desktop user.
+fn write_state($state_dir, $state_file, $sessions, $ids, $owner)
+  $why = unsafe_dir($state_dir, $owner)
+  if $why != nil then return $why end
+  for each $p in [$state_file, $state_file .. ".done"]
+    if exists($p, {follow_symlinks: false}) then return "already exists: " .. $p end
+  end
+  try
+    write_atomic($state_file, json_encode($sessions, true), {mode: 0o644})
+    write_atomic($state_file .. ".done", "", {mode: 0o644})
+    chown($state_file .. ".done", $ids.uid, $ids.gid)
+  catch $e
+    remove_state($state_file)
+    return to_string($e)
+  end
+  return nil
+end
+
+-- Remove a state file and its .done (an aborted restart's leftovers).
+fn remove_state($state_file)
+  for each $p in [$state_file, $state_file .. ".done"]
+    if exists($p, {follow_symlinks: false}) then
+      try
+        remove($p)
+      catch $e
+        $_ = $e
+      end
+    end
+  end
+end
+
+-- Remove state files (and their .done) older than $max_age seconds.
+fn prune_state($state_dir, $now, $max_age)
+  $n = 0
+  for each $p in glob($state_dir .. "/sessions-*.json*")
+    $st = stat($p, {follow_symlinks: false})
+    if $st.is_file and $now - $st.mtime > $max_age then
+      try
+        remove($p)
+        $n = $n + 1
+      catch $e
+        $_ = $e
+      end
+    end
+  end
+  return $n
 end
 
 -- The leave plan: {argv, vt}, or a refusal.
@@ -201,11 +301,14 @@ fn leave_reply($plan, $dry_run)
 end
 
 -- The command line one session is resumed with, typed into its pane, or nil
--- when the directory or id could not be typed safely. The pane's login shell
--- may be Mix or a POSIX shell, whose quoting differs, so the words are typed
--- bare and anything that would need quoting is refused rather than guessed.
+-- when it could not be typed safely. The pane's login shell may be Mix or a
+-- POSIX shell, whose quoting differs, so the words are typed bare and anything
+-- that would need quoting is refused rather than guessed. The only flag
+-- carried over is --dangerously-skip-permissions; anything else in `flags`
+-- (a hand-edited state file) refuses the line.
 fn resume_line($s)
   if not re_match($s.cwd, "^[A-Za-z0-9_./@+~-]+$") or not re_match($s.id, "^[A-Za-z0-9-]+$") then return nil end
+  if $s.flags != "" and $s.flags != "--dangerously-skip-permissions" then return nil end
   $flags = $s.flags == "" ? "" : $s.flags .. " "
   return "cd " .. $s.cwd .. " && claude " .. $flags .. "--resume " .. $s.id .. "\n"
 end

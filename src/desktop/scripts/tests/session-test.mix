@@ -92,6 +92,51 @@ try
   check($s.resume_line({id: "x-1", cwd: "/tmp/a;rm", flags: ""}) == nil, "a shell metacharacter was typed")
   check($s.resume_line({id: "x 1", cwd: "/tmp", flags: ""}) == nil, "a spaced id was typed")
 
+  -- ── resume line: only the one known flag is carried ──
+  check($s.resume_line({id: "x-1", cwd: "/tmp", flags: "--model evil"}) == nil, "an unknown flag was typed")
+  check($s.resume_line({id: "x-1", cwd: "/tmp", flags: "--dangerously-skip-permissions --x"}) == nil, "a flag suffix was typed")
+
+  -- ── state directory: symlinks and foreign/open levels are refused ──
+  $me = uid()
+  $safe = $tmp .. "/state/ok"
+  check($s.prepare_state_dir($safe, $me) == nil, "a fresh private state dir was refused")
+  check(band(stat($safe).perm, 0o022) == 0, "the state dir is writable by others")
+  -- A planted directory symlink at any level: refused, and nothing is
+  -- written through it.
+  mkdir($tmp .. "/victim")
+  $_ln = run_argv_must(["ln", "-s", $tmp .. "/victim", $tmp .. "/state/link"])
+  $why = $s.prepare_state_dir($tmp .. "/state/link/sub", $me)
+  check($why != nil and contains($why, "symlink"), "a symlinked level was accepted: " .. to_string($why))
+  check(len(glob($tmp .. "/victim/*")) == 0, "something was created through the symlink")
+  $why = $s.write_state($tmp .. "/state/link", $tmp .. "/state/link/sessions-1.json", [], {uid: $me, gid: $me}, $me)
+  check($why != nil and contains($why, "symlink"), "state was written through a symlinked dir: " .. to_string($why))
+  check(len(glob($tmp .. "/victim/*")) == 0, "a state file landed in the symlink target")
+  -- A planted symlink AT the state file's name: refused, target untouched.
+  write_file($tmp .. "/victim/passwd", "original\n")
+  $_ln2 = run_argv_must(["ln", "-s", $tmp .. "/victim/passwd", $safe .. "/sessions-2.json"])
+  $why = $s.write_state($safe, $safe .. "/sessions-2.json", [{id: "a"}], {uid: $me, gid: $me}, $me)
+  check($why != nil and contains($why, "already exists"), "a symlinked state name was written: " .. to_string($why))
+  check(read_file($tmp .. "/victim/passwd") == "original\n", "the symlink target was overwritten")
+  -- A group/world-writable state dir is refused.
+  mkdir($tmp .. "/state/open")
+  chmod($tmp .. "/state/open", 0o777)
+  check($s.unsafe_dir($tmp .. "/state/open", $me) != nil, "a world-writable state dir was accepted")
+  -- The normal write: state readable, .done present, both new files.
+  check($s.write_state($safe, $safe .. "/sessions-3.json", [{id: "a"}], {uid: $me, gid: $me}, $me) == nil, "a safe state write failed")
+  check(band(stat($safe .. "/sessions-3.json").perm, 0o777) == 0o644 and exists($safe .. "/sessions-3.json.done"), "state file mode or .done wrong")
+  -- An aborted restart's leftovers go; old state is pruned, new state kept.
+  $s.remove_state($safe .. "/sessions-3.json")
+  check(not exists($safe .. "/sessions-3.json") and not exists($safe .. "/sessions-3.json.done"), "remove_state left files")
+  write_file($safe .. "/sessions-old.json", "[]")
+  $_touch = run_argv_must(["touch", "-d", "10 days ago", $safe .. "/sessions-old.json"])
+  write_file($safe .. "/sessions-new.json", "[]")
+  check($s.prune_state($safe, time(), 7 * 86400) == 1 and exists($safe .. "/sessions-new.json") and not exists($safe .. "/sessions-old.json"), "prune wrong")
+
+  -- ── worker unit name: a .service suffix is normalised away ──
+  export COSMIX_SESSION_WORKER_UNIT = "cosmix-session-restart.service"
+  check($s.config().worker_unit == "cosmix-session-restart", "worker unit suffix not normalised")
+  export COSMIX_SESSION_WORKER_UNIT = ""
+
   -- ── term reply parsing ──
   check($s.reply_int("opened id=4 tab=4 pane=9", "pane") == 9, "reply_int pane")
   check($s.reply_int("opened id=4 tab=4", "pane") == nil, "reply_int invented a pane")

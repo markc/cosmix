@@ -15,6 +15,13 @@ pub(super) struct NativeCornerMenu {
     rows: Vec<Entity>,
     selected: Option<usize>,
     pressed: Option<usize>,
+    /// A confirm step's accident guards (hover, keys, early presses).
+    guard: ui::MenuInputGuard,
+    /// When the menu opened, on a monotonic clock: the host is event-driven,
+    /// so `Time<Real>` may not have advanced since.
+    opened: std::time::Instant,
+    /// `selected` came from the arrow keys, not from hover.
+    key_selected: bool,
 }
 
 /// Default hook always supplies the three mode items and the built-in
@@ -126,19 +133,23 @@ impl RunnerState {
         self.touch_bridge.cancel(&mut self.app);
         let elapsed = self.app.world().resource::<Time<Real>>().elapsed();
         surface.apply_protocol_ops(&[ProtocolOp::CommitBufferless], elapsed);
-        // The incumbent's dismissal released the hold; the successor
-        // re-acquires after it so the FIFO drain ends held.
-        if replacing {
-            stage_menu_hold(
-                &mut self.app,
-                &request.output,
-                request.corner.summoned_edge(),
-                true,
-            );
-        }
+        // Every open menu holds its edge's reveal, whoever asked for it: a
+        // corner click (which also staged a hold at ingress; holding is
+        // idempotent), a confirm step reopened by a menu choice, or a Bus
+        // verb. After an incumbent's dismissal released its hold, this
+        // re-acquires it, so the FIFO drain ends held.
+        stage_menu_hold(
+            &mut self.app,
+            &request.output,
+            request.corner.summoned_edge(),
+            true,
+        );
         self.menu = Some(NativeCornerMenu {
             surface,
-            origin: ui::menu_origin(request.corner, size, request.items.len()),
+            origin: ui::menu_origin(request.corner, size, &request.items),
+            guard: ui::MenuInputGuard::new(&request.items, std::time::Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
             request,
             rows,
             selected: None,
@@ -168,7 +179,7 @@ impl RunnerState {
             let row = ui::hit_row(
                 Vec2::new(event.position.0 as f32, event.position.1 as f32),
                 menu.origin,
-                menu.rows.len(),
+                &menu.request.items,
             );
             let enabled = row.filter(|i| !menu.request.items[*i].checked);
             match event.kind {
@@ -177,8 +188,10 @@ impl RunnerState {
                         self.dismiss_corner_menu(None);
                         return true;
                     }
+                    // A confirm step ignores presses until armed: the
+                    // second click of a double-click is not a choice.
                     if button == BTN_LEFT {
-                        menu.pressed = enabled;
+                        menu.pressed = enabled.filter(|_| menu.guard.press_counts(menu.opened.elapsed()));
                     }
                 }
                 PointerEventKind::Release {
@@ -187,12 +200,17 @@ impl RunnerState {
                     self.dismiss_corner_menu(enabled);
                     return true;
                 }
-                PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. } => {
+                // A confirm step never selects on hover: a pointer resting on
+                // its action row must not let a stray Enter or Space accept.
+                PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. }
+                    if menu.guard.hover_selects() =>
+                {
                     menu.selected = enabled;
+                    menu.key_selected = false;
                     ui::highlight(self.app.world_mut(), &menu.rows, enabled);
                     self.needs_update = true;
                 }
-                PointerEventKind::Leave { .. } => {
+                PointerEventKind::Leave { .. } if menu.guard.hover_selects() => {
                     menu.selected = None;
                     ui::highlight(self.app.world_mut(), &menu.rows, None);
                     self.needs_update = true;
@@ -212,7 +230,7 @@ impl RunnerState {
             0xff1b => self.dismiss_corner_menu(None),
             0xff0d | 0x20 => {
                 let selected = menu.selected;
-                if selected.is_some() {
+                if selected.is_some() && menu.guard.key_accepts(menu.key_selected) {
                     self.dismiss_corner_menu(selected);
                 }
             }
@@ -233,6 +251,7 @@ impl RunnerState {
                     }
                 }
                 menu.selected = Some(index);
+                menu.key_selected = true;
                 ui::highlight(self.app.world_mut(), &menu.rows, menu.selected);
                 self.needs_update = true;
             }
@@ -259,7 +278,7 @@ impl RunnerState {
             menu.origin = ui::menu_origin(
                 menu.request.corner,
                 Vec2::new(configure.new_size.0 as f32, configure.new_size.1 as f32),
-                menu.rows.len(),
+                &menu.request.items,
             );
             let popup = self
                 .app
@@ -429,6 +448,9 @@ mod tests {
                 rows: vec![],
                 selected: None,
                 pressed: None,
+                guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+                opened: std::time::Instant::now(),
+                key_selected: false,
             };
             dismiss(&mut app, &mut menu, choice);
             let panel = app
@@ -505,6 +527,9 @@ mod tests {
             rows: vec![],
             selected: None,
             pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
         };
         dismiss(&mut app, &mut menu, Some(edit));
         assert_eq!(*CHOSEN.lock().unwrap(), [MenuAction::EditPanels]);
@@ -560,6 +585,9 @@ mod tests {
             rows: vec![],
             selected: None,
             pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
         });
         assert!(dismiss_menu(&mut app, &mut menu, None));
         assert!(menu.is_none());
@@ -614,6 +642,9 @@ mod tests {
             rows: vec![],
             selected: None,
             pressed: None,
+            guard: ui::MenuInputGuard::new(&[], Duration::ZERO),
+            opened: std::time::Instant::now(),
+            key_selected: false,
         };
         // Replacement FIFO, as reconcile drives it: the ingress acquired
         // for the successor, the incumbent's dismissal releases (drained by

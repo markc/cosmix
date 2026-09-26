@@ -570,7 +570,7 @@ is a JSON object, and <code>{}</code> means no arguments.</p>
 <tr><td><code>term.tab.move</code></td><td><code>{"id":N,"index":0}</code></td><td>reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane</td></tr>
 <tr><td><code>term.tab.select</code></td><td><code>{"id":N}</code></td><td>select tab N</td></tr>
 <tr><td><code>term.tab.close</code></td><td><code>{"id":N}</code></td><td>close tab N; closing the last tab quits</td></tr>
-<tr><td><code>term.panes</code></td><td><code>{"tab":N}</code> (optional)</td><td>list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision, instance</td></tr>
+<tr><td><code>term.panes</code></td><td><code>{"tab":N}</code> (optional)</td><td>list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision, instance, and <code>pid</code> (the term process itself; term-core 0.8.1: term 0.3.1, bterm 0.10.1). Pane lines carry no free text, so a program cannot forge it; INFO ends with the same <code>instance=… pid=…</code></td></tr>
 <tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
 <tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>

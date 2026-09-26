@@ -37,6 +37,10 @@ struct ShellBusState {
     /// Panel operations answered from Presentation, after Model. Concealment
     /// uses the host's existing animation frames, never a Bus notification.
     pending_panels: Vec<(InboundRequest, cosmix_shell::core::OutputKey)>,
+    /// `shell.session.confirm` replies, held until the layer host has shown
+    /// the confirm step (or dropped it): request, output, corner, reply body
+    /// on success, and the frame by which the host must have taken it.
+    pending_confirms: Vec<(InboundRequest, cosmix_shell::core::OutputKey, Corner, String, u64)>,
     /// Local receipt ordering, not a broker incarnation token. Absence sweeps
     /// only affect reservations accepted strictly before their cutoff.
     /// CTK uses separate control/telemetry planes: this orders consumption in
@@ -70,6 +74,7 @@ impl Default for ShellBusState {
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
             pending_panels: Vec::new(),
+            pending_confirms: Vec::new(),
             citizen_receipt: 0,
             disconnected_citizens: BTreeMap::new(),
             citizen_snapshot: None,
@@ -141,6 +146,7 @@ impl Plugin for ShellBusPlugin {
             )
             .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
             .add_systems(Update, reply_panels.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(Update, reply_session_confirms.in_set(ShellRuntimeSet::Presentation))
             .add_systems(Update, publish_panel_state.in_set(ShellRuntimeSet::Presentation))
             .add_systems(Update, publish_settings_state.in_set(ShellRuntimeSet::Presentation))
             .add_systems(
@@ -247,6 +253,55 @@ fn panel_notice_snapshot(frame: &ShellFrame, declared: &[Vec<String>; 4]) -> Val
     }
     // `publish_panel_state` fills in the dialog seat (dialog_bus::notice).
     json!({"dialog": Value::Null, "panels": panels})
+}
+
+/// Updates a `shell.session.confirm` waits for the layer host to take its step.
+const CONFIRM_RECEIPT_FRAMES: u64 = 60;
+
+/// Answer `shell.session.confirm` truthfully. The layer host consumes the
+/// queued step after an update: when it opens it, its popup identity names
+/// this output and the corner's edge, and the reply is `applied`; when it
+/// drops it (another output is selected, or no layer host runs here) the
+/// reply is a `CONFIRM_NOT_SHOWN` refusal.
+fn reply_session_confirms(
+    bridge: Res<BusBridge>,
+    mut state: ResMut<ShellBusState>,
+    queued: Option<Res<cosmix_shell::chrome::corner_menu::CornerMenuRequest>>,
+    popup: Option<Res<cosmix_shell_host::holders::PopupLayerIdentity>>,
+    mut commands: Commands,
+) {
+    let frame = state.frame;
+    for (request, output, corner, body, deadline) in std::mem::take(&mut state.pending_confirms) {
+        if state.live_generation != Some(request.connection_generation) {
+            continue;
+        }
+        let waiting = queued
+            .as_deref()
+            .is_some_and(|step| step.output == output && step.corner == corner);
+        let (rc, reply) = if waiting && frame < deadline {
+            state.pending_confirms.push((request, output, corner, body, deadline));
+            continue;
+        } else if !waiting
+            && popup
+                .as_deref()
+                .is_some_and(|popup| popup.output == output && popup.edge == corner.summoned_edge())
+        {
+            let mut reply: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            reply["applied"] = json!(true);
+            (0, reply.to_string())
+        } else {
+            if waiting {
+                // Refused, so it must never show later either.
+                commands.remove_resource::<cosmix_shell::chrome::corner_menu::CornerMenuRequest>();
+            }
+            (10, json!({"error_code":"CONFIRM_NOT_SHOWN", "message":if waiting {
+                "the layer host did not take the confirm step"
+            } else {
+                "the layer host did not show the confirm step (another output is selected, or no layer host runs here)"
+            }}).to_string())
+        };
+        stash_or_respond(&bridge, &mut state, request, rc, reply, None, &mut |_| {});
+    }
 }
 
 /// These idempotent verbs drive the legacy citizen's select/pin/release
@@ -688,7 +743,17 @@ fn service_bus(
                 // it after this update, like a corner-summoned menu.
                 let (rc, body, step) = session_confirm(&request, &frame.0);
                 if let Some(step) = step {
-                    commands.insert_resource(step);
+                    // Answered once the layer host shows the step (or drops
+                    // it): a reply here would claim a menu nobody has seen.
+                    if state.pending_confirms.len() < MAX_PENDING_REPLIES {
+                        let deadline = state.frame.saturating_add(CONFIRM_RECEIPT_FRAMES);
+                        state.pending_confirms.push((request, step.output.clone(), step.corner, body, deadline));
+                        commands.insert_resource(step);
+                    } else {
+                        stash_or_respond(&bridge, &mut state, request, 11,
+                            json!({"error_code":"QUEUE_FULL", "message":"confirm queue full"}).to_string(), None, &mut dispatch);
+                    }
+                    continue;
                 }
                 (rc, body, None)
             } else if request.command == "shell.scenes.list" {
@@ -3723,19 +3788,47 @@ mod tests {
         let (mut app, peer) = mounted_bus_app();
         let mut req = local("shell.session.confirm");
         req.body = json!({"action":"restart", "corner":"bottom-right"}).to_string();
-        peer.send(req);
+        peer.send(req.clone());
         app.update();
-        let replies = peer.drain_responses();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
-        let body: Value = serde_json::from_str(&replies[0].body).unwrap();
-        assert_eq!((body["accepted"].clone(), body["action"].clone(), body["corner"].clone()), (json!(true), json!("restart"), json!("bottom-right")));
-        let step = app.world().resource::<CornerMenuRequest>();
+        assert!(peer.drain_responses().is_empty(), "replied before the host showed the step");
+        let step = app.world().resource::<CornerMenuRequest>().clone();
         assert_eq!(step.corner, Corner::BottomRight);
         assert_eq!(step.items.len(), 3);
         let MenuAction::Extra(extra) = &step.items[1].action else { panic!("action row") };
         assert_eq!(extra.verb, "desktop.session.restart");
         assert!(peer.drain_calls().is_empty(), "the verb itself was called");
+        // The layer host takes the step and opens it (its popup identity).
+        app.world_mut().remove_resource::<CornerMenuRequest>();
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: step.output.clone(),
+            edge: Corner::BottomRight.summoned_edge(),
+            surface: "menu".into(),
+        });
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+        assert_eq!((body["applied"].clone(), body["action"].clone(), body["corner"].clone()), (json!(true), json!("restart"), json!("bottom-right")));
+        // The host drops a step it cannot show: a truthful refusal.
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        peer.send(req.clone());
+        app.update();
+        app.world_mut().remove_resource::<CornerMenuRequest>();
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert_eq!(serde_json::from_str::<Value>(&replies[0].body).unwrap()["error_code"], "CONFIRM_NOT_SHOWN");
+        // Nothing takes it at all: refused at the deadline, and withdrawn.
+        peer.send(req);
+        for _ in 0..=CONFIRM_RECEIPT_FRAMES {
+            app.update();
+        }
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(serde_json::from_str::<Value>(&replies[0].body).unwrap()["error_code"], "CONFIRM_NOT_SHOWN");
+        assert!(!app.world().contains_resource::<CornerMenuRequest>(), "a refused step could still show");
         // Refusals: {error_code, message}, and no step opens.
         for args in [json!({}), json!({"action":"reboot"}), json!({"action":"leave", "corner":"middle"})] {
             app.world_mut().remove_resource::<CornerMenuRequest>();

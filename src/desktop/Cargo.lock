@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bterm"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bevy",
  "bevy_winit",
@@ -3551,7 +3551,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cosmix-design",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "cosmix-design",
  "cosmix-lib-buildinfo",

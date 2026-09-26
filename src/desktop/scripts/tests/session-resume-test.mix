@@ -1,0 +1,116 @@
+-- The resume worker's terminal binding, over a real isolated noded with a
+-- FAKE term citizen (it only records what it is asked to type). The worker's
+-- --resume-fresh STATE PID must type only into the term process whose pid
+-- is PID: a term answering the Bus name with another pid gets nothing, and
+-- the worker fails closed naming the recovery. Nothing restarts, and no real
+-- terminal is involved.
+-- Run from the repo root: COSMIX=$PWD mix src/desktop/scripts/tests/session-resume-test.mix
+$root = env("COSMIX")
+if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
+$scripts = $root .. "/src/desktop/scripts"
+$mix = env("COSMIX_TEST_MIX") ?? ""
+if $mix == "" then $mix = "/opt/cosmix/bin/mix" end
+$noded = env("COSMIX_TEST_NODED") ?? ""
+if $noded == "" then $noded = "/opt/cosmix/bin/cosmix-noded" end
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-session-resume-test.XXXXXXXX"]))
+$tag = uuid()
+$port = random(46000, 46999)
+$node = $tmp .. "/node.conf.mix"
+write_file($node, json_encode({node: "session-resume-test-" .. $tag, wg_ip: "", mesh: "session-resume-test.invalid",
+  noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
+$env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin", HOME: $tmp}
+$term_pid = nil
+$noded_pid = nil
+fn check($condition, $message)
+  if not $condition then raise("SESSION_RESUME_TEST", $message) end
+end
+fn read_file_or($path, $default)
+  try
+    return read_file($path)
+  catch $err
+    return $default
+  end
+end
+-- The fake term: term.panes reports FAKE_TERM_PID as its process; term.type
+-- appends each body to FAKE_TERM_LOG.
+fn write_fake_term()
+  write_file($tmp .. "/fake-term.mix", join([
+    "$pid = env(\"FAKE_TERM_PID\")",
+    "$log = env(\"FAKE_TERM_LOG\")",
+    "on term.tabs",
+    "  reply(0, \"id=1 active=true title=t cols=80 rows=24 child_pid=1 revision=1 instance=7\")",
+    "end",
+    "on term.panes",
+    "  $tab = $event.args == nil ? 1 : ($event.args.tab ?? 1)",
+    "  reply(0, \"id=\" .. to_string($tab) .. \" active=true cols=80 rows=24 child_pid=1 x=0 y=0 w=1 h=1 tab=\" .. to_string($tab) .. \" revision=1 instance=7 pid=\" .. $pid)",
+    "end",
+    "on term.tab.new",
+    "  reply(0, \"opened id=2 tab=2 pane=2 revision=2\")",
+    "end",
+    "on term.type",
+    "  append_file($log, $event.body .. \"\\n\")",
+    "  reply(0, \"typed\")",
+    "end"
+  ], "\n") .. "\n")
+end
+fn start_term($pid)
+  $term_env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
+    FAKE_TERM_PID: to_string($pid), FAKE_TERM_LOG: $tmp .. "/typed.log"}
+  return spawn([$mix, "--serve", $tmp .. "/fake-term.mix", "--name", "term"],
+    {detach: true, env: $term_env, stdout: {file: $tmp .. "/term.log"}, stderr: "stdout"})
+end
+fn wait_term()
+  for each $i in range(1, 80)
+    $r = run_argv([$mix, $tmp .. "/cli.mix", "term", "term.tabs", "{}"], {env: $env, timeout: 25})
+    if $r.ok and contains($r.stdout, "\"rc\":0") then return nil end
+    sleep(0.2)
+  end
+  raise("SESSION_RESUME_TEST", "fake term did not register: " .. read_file_or($tmp .. "/term.log", ""))
+end
+fn stop_term()
+  if $term_pid != nil then $_k = run_argv(["kill", "--", to_string($term_pid)], {timeout: 10}) end
+  $term_pid = nil
+  sleep(0.5)
+end
+fn resume($expected)
+  $worker_env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin", HOME: $tmp,
+    COSMIX_SESSION_TERM_WAIT: "3"}
+  return run_argv([$mix, $scripts .. "/session-resume.mix", "--resume-fresh", $tmp .. "/state.json", to_string($expected)],
+    {env: $worker_env, timeout: 60})
+end
+try
+  write_file($tmp .. "/cli.mix", "send $1 $2 timeout=15 body=$3\nprint(json_encode({rc: $rc, result: $result}))\n")
+  write_fake_term()
+  write_file($tmp .. "/state.json", json_encode([{id: "aaaa-1", cwd: "/tmp", pid: 1, flags: ""}]))
+  write_file($tmp .. "/state.json.done", "")
+  $noded_pid = spawn([$noded, "serve", "--listen", "127.0.0.1:" .. to_string($port),
+    "--node", "session-resume-test-" .. $tag, "--no-monitor", "--no-log"],
+    {detach: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+
+  -- A stray term (pid 4242) holds the name; the new boot term is pid 5151.
+  $term_pid = start_term(4242)
+  wait_term()
+  $r = resume(5151)
+  check($r.exit_code != 0, "the worker succeeded against a stray term: " .. $r.stdout)
+  check(contains($r.stdout, "NOT typing") and contains($r.stdout, "--resume-only"), "no fail-closed message with the recovery: " .. $r.stdout)
+  check(read_file_or($tmp .. "/typed.log", "") == "", "keys reached the stray term: " .. read_file_or($tmp .. "/typed.log", ""))
+  check(trim(read_file($tmp .. "/state.json.done")) == "", "a refused run marked a session done")
+  stop_term()
+
+  -- The expected process: the session is typed into boot tab 1's pane.
+  $term_pid = start_term(5151)
+  wait_term()
+  $r = resume(5151)
+  check($r.exit_code == 0, "the worker failed against the right term: " .. $r.stdout .. $r.stderr)
+  $typed = json_parse(trim(read_file($tmp .. "/typed.log")))
+  check($typed.pane == 1 and $typed.instance == 7 and $typed.text == "cd /tmp && claude --resume aaaa-1\n", "typed body wrong: " .. json_encode($typed))
+  check(starts_with($typed.request_id, "resume-type-boot-state-aaaa-1"), "request_id not stable: " .. json_encode($typed))
+  check(trim(read_file($tmp .. "/state.json.done")) == "aaaa-1", "the resumed session was not marked done")
+  print("PASS session-resume: keys go only to the expected term process; a stray term gets nothing and the worker fails closed")
+finally
+  stop_term()
+  if $noded_pid != nil then $_kill_noded = run_argv(["kill", "--", to_string($noded_pid)], {timeout: 10}) end
+  if starts_with($tmp, "/tmp/cosmix-session-resume-test.") then
+    $_rm = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end
