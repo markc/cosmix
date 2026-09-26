@@ -306,6 +306,7 @@ impl WaylandState {
             .and_then(|target| target.owned_surface()).as_ref().is_some_and(&invalid);
         let parent = self.agent.keyboard_root.clone().filter(|surface| !invalid(surface));
         if pointer_dead {
+            self.agent.last_pointer_action = None;
             let pointer = self.agent.pointer.clone();
             pointer.unset_grab_without_focus_restore(self, SERIAL_COUNTER.next_serial(), monotonic_millis());
             self.release_agent_device_holds(false);
@@ -329,6 +330,11 @@ impl WaylandState {
         position: (f64, f64),
         time: u32,
     ) {
+        let next_root = focus.as_ref().and_then(|(target, _)| target.owned_surface())
+            .map(|surface| canonical_root_surface(&self.popup_manager, &surface));
+        if self.agent.last_pointer_action.as_ref().is_some_and(|(_, root)| Some(root) != next_root.as_ref()) {
+            self.agent.last_pointer_action = None;
+        }
         self.agent.pointer_position = Some(position);
         let pointer = self.agent.pointer.clone();
         pointer.motion(
@@ -453,8 +459,8 @@ impl WaylandState {
                         smithay::input::keyboard::FilterResult::Forward
                     },
                 );
-                self.agent.last_keyboard_action = if state == HostButtonState::Pressed {
-                    keyboard
+                if state == HostButtonState::Pressed {
+                    self.agent.last_keyboard_action = keyboard
                         .current_focus()
                         .and_then(|target| target.owned_surface())
                         .map(|surface| {
@@ -462,10 +468,8 @@ impl WaylandState {
                                 serial,
                                 canonical_root_surface(&self.popup_manager, &surface),
                             )
-                        })
-                } else {
-                    None
-                };
+                        });
+                }
             }
             HostInput::PointerButton {
                 button,
@@ -475,10 +479,16 @@ impl WaylandState {
                 self.agent.delivery.button_delivery =
                     self.delivery_target_on(SeatKind::Agent, false);
                 let pointer = self.agent.pointer.clone();
+                let serial = SERIAL_COUNTER.next_serial();
+                if state == HostButtonState::Pressed {
+                    self.agent.last_pointer_action = pointer.current_focus()
+                        .and_then(|target| target.owned_surface())
+                        .map(|surface| (serial, canonical_root_surface(&self.popup_manager, &surface)));
+                }
                 pointer.button(
                     self,
                     &ButtonEvent {
-                        serial: SERIAL_COUNTER.next_serial(),
+                        serial,
                         time,
                         button,
                         state: smithay_button_state(state),

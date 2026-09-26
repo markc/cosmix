@@ -705,6 +705,7 @@ impl WaylandState {
     fn release_injected(&mut self, seat: SeatKind, time: u32) {
         let holds = std::mem::take(&mut self.comp_seat_mut(seat).held);
         self.release_holds(seat, holds.owners.into_keys().collect(), time);
+        if seat == SeatKind::Agent { self.dismiss_agent_popups(); }
     }
 
     /// Release the given holds the seat still has pressed: keys (newest

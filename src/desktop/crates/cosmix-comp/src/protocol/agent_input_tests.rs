@@ -275,24 +275,21 @@ fn agent_release_all_preserves_human_holds_and_origin_tracks_delivery() {
 #[test]
 fn agent_click_popup_survives_human_focus_and_outside_click_dismisses() {
     let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
-    let (seat, _, _) = bind_agent_devices(&mut h);
+    let (seat, _, pointer) = bind_agent_devices(&mut h);
     let op = agent_target(
         &h,
         &alpha,
         InputOp::PointerButton {
             button: BTN_LEFT,
-            action: PressAction::Press,
+            action: PressAction::Both,
         },
     );
     assert_eq!(inject(&mut h, &ingress, &runtime, op).0, 0);
-    let serial = h
-        .server
-        .state
-        .agent
-        .pointer
-        .with_grab(|serial, _| serial)
-        .unwrap();
-    let (_, popup) = map_test_popup_on_seat(&mut h, Some((seat, serial.into())));
+    assert!(!h.server.state.agent.pointer.is_grabbed(), "click released atomically");
+    let traffic = h.sync();
+    let serial = pointer_bodies(&traffic, pointer, 3).into_iter()
+        .find(|body| word(body, 3) == 1).map(|body| word(&body, 0)).unwrap();
+    let (_, popup) = map_test_popup_on_seat(&mut h, Some((seat, serial)));
     assert!(h.server.state.agent.pointer.is_grabbed());
     let other = h.server.state.surfaces[&beta].role.wl_surface().clone();
     h.server.state.human.keyboard.clone().set_focus(
@@ -529,7 +526,7 @@ fn agent_root_local_motion_rejects_chrome_before_focus_and_uses_local_coordinate
 fn agent_keyboard_popup_uses_the_delivered_press_serial() {
     let (mut h, ingress, runtime, _, alpha, _) = two_windows();
     let (seat, keyboard, _) = bind_agent_devices(&mut h);
-    let op = agent_target(&h, &alpha, agent_key(PressAction::Press, KEY_A));
+    let op = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A));
     assert_eq!(inject(&mut h, &ingress, &runtime, op).0, 0);
     let traffic = h.sync();
     let serial = traffic
@@ -554,6 +551,32 @@ fn agent_keyboard_popup_uses_the_delivered_press_serial() {
             .iter()
             .any(|(object, opcode, _)| *object == popup && *opcode == 1)
     );
+}
+
+#[test]
+fn release_all_dismisses_agent_popup_but_human_scoped_cleanup_does_not() {
+    for args in [json!({}), json!({"seat":"agent"})] {
+        let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+        let (seat, keyboard, _) = bind_agent_devices(&mut h);
+        let op = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A));
+        assert_eq!(inject(&mut h, &ingress, &runtime, op).0, 0);
+        let traffic = h.sync();
+        let serial = traffic.iter().find_map(|(object, opcode, body)| {
+            (*object == keyboard && *opcode == 3).then(|| word(body, 0))
+        }).unwrap();
+        let (_, popup) = map_test_popup_on_seat(&mut h, Some((seat, serial)));
+        let human = crate::port::parse_input_op("comp.input.release_all", &json!({"seat":"human"})).unwrap();
+        assert_eq!(inject(&mut h, &ingress, &runtime, human).0, 0);
+        assert!(h.server.state.agent.pointer.is_grabbed());
+        let _ = h.sync();
+        let release = crate::port::parse_input_op("comp.input.release_all", &args).unwrap();
+        assert_eq!(inject(&mut h, &ingress, &runtime, release).0, 0);
+        assert!(!h.server.state.agent.pointer.is_grabbed());
+        assert!(!h.server.state.agent.keyboard.is_grabbed());
+        assert!(h.sync().iter().any(|(object, opcode, _)| *object == popup && *opcode == 1));
+        assert!(h.server.state.agent.last_keyboard_action.is_none());
+        assert!(h.server.state.agent.last_pointer_action.is_none());
+    }
 }
 
 #[test]

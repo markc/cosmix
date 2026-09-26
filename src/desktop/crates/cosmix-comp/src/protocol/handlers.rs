@@ -1604,8 +1604,14 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         };
-        let pointer_action = pointer.has_grab(serial)
-            && pointer_grab_targets_surface(&pointer, &self.popup_manager, &root);
+        let pointer_action = (pointer.has_grab(serial)
+            && pointer_grab_targets_surface(&pointer, &self.popup_manager, &root))
+            || (kind == SeatKind::Agent && comp_seat.last_pointer_action.as_ref().is_some_and(|(action, target)| {
+                *action == serial && *target == canonical_root_surface(&self.popup_manager, &root)
+                    && pointer.current_focus().and_then(|focus| focus.owned_surface())
+                        .is_some_and(|focus| canonical_root_surface(&self.popup_manager, &focus) == *target)
+                    && self.surfaces.get(&target.id()).is_some_and(|record| record.mapped)
+            }));
         let keyboard_action = keyboard_action_matches_root(
             last_keyboard_action
                 .as_ref()
@@ -1667,6 +1673,11 @@ impl XdgShellHandler for WaylandState {
                     != Some(KeyboardInteractivity::None)
                 {
                     keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+                }
+                if kind == SeatKind::Agent {
+                    self.agent.last_pointer_action = None;
+                    self.agent.last_keyboard_action = None;
+                    self.agent.popup_grab = Some(grab);
                 }
             }
             Err(error) => {

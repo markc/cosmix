@@ -3360,6 +3360,8 @@ impl ProtocolServer {
                 #[cfg(feature = "bus")]
                 pointer_position: None,
                 last_keyboard_action: None,
+                last_pointer_action: None,
+                popup_grab: None,
                 keyboard_root: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
@@ -3380,6 +3382,8 @@ impl ProtocolServer {
                 #[cfg(feature = "bus")]
                 pointer_position: None,
                 last_keyboard_action: None,
+                last_pointer_action: None,
+                popup_grab: None,
                 keyboard_root: None,
                 #[cfg(feature = "bus")]
                 held: Default::default(),
@@ -9138,6 +9142,8 @@ impl WaylandState {
         #[cfg(feature = "bus")]
         self.cancel_agent_sequences();
         self.agent.last_keyboard_action = None;
+        self.agent.last_pointer_action = None;
+        self.dismiss_agent_popups();
         let keyboard = self.agent.keyboard.clone();
         let pointer = self.agent.pointer.clone();
         keyboard.unset_grab(self);
@@ -9169,6 +9175,22 @@ impl WaylandState {
             serial: SERIAL_COUNTER.next_serial(), time,
         });
         pointer.frame(self);
+    }
+
+    fn dismiss_agent_popups(&mut self) {
+        self.agent.last_keyboard_action = None;
+        self.agent.last_pointer_action = None;
+        if let Some(mut grab) = self.agent.popup_grab.take() {
+            grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
+            let pointer = self.agent.pointer.clone();
+            let keyboard = self.agent.keyboard.clone();
+            if pointer.with_grab(|_, grab| grab.is::<PopupPointerGrab<WaylandState>>()).unwrap_or(false) {
+                pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), monotonic_millis());
+            }
+            if keyboard.with_grab(|_, grab| grab.is::<PopupKeyboardGrab<WaylandState>>()).unwrap_or(false) {
+                keyboard.unset_grab(self);
+            }
+        }
     }
 
     fn with_client_state<T>(

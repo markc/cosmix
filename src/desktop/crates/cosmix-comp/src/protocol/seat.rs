@@ -40,6 +40,9 @@ pub(super) struct CompSeat {
     pub keyboard: KeyboardHandle<WaylandState>,
     pub pointer: PointerHandle<WaylandState>,
     pub last_keyboard_action: Option<(Serial, WlSurface)>,
+    /// One recent press per device survives a synthetic release for popup requests.
+    pub last_pointer_action: Option<(Serial, WlSurface)>,
+    pub popup_grab: Option<smithay::desktop::PopupGrab<WaylandState>>,
     /// Surviving canonical parent used when an agent popup loses its surface.
     pub keyboard_root: Option<WlSurface>,
     #[cfg(feature = "bus")]

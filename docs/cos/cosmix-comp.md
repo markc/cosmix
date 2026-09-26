@@ -1086,6 +1086,13 @@ host hold. An explicit release
 clears injected ownership of that key/button on that seat. Taps and clicks
 release their generated presses; `action:"press"` can retain a hold.
 
+An agent tap or click retains one recent press serial per device for a later
+popup grab on the same root, without yielding inside the operation. A later
+press replaces it; relevant focus changes and cleanup invalidate it; a successful
+popup grab consumes it. Human clicks outside do not dismiss agent popups.
+`release_all` with no seat or with `seat:"agent"` dismisses the agent popup chain
+and removes its keyboard/pointer grabs; `seat:"human"` leaves it alone.
+
 A sequence has at most 256 steps and 4096 generated events in total. Delays
 run on compositor timers, before the step, defaulting to `interval_ms` (default
 0), and total at most 60 seconds. It yields after 256 injected events; runs can
