@@ -239,10 +239,10 @@ fn dialog_root_origin(world: &World) -> Vec2 {
 /// edge scene).
 fn frame_controls(world: &World, mapped_dialog: bool) -> Value {
     let dialog = world.resource::<QuoinDialog>();
-    let close = mapped_dialog
-        .then_some(())
-        .filter(|()| dialog.seat.as_ref().is_some_and(|seat| seat.chrome))
-        .and_then(|()| dialog.root)
+    let chromed = mapped_dialog && dialog.seat.as_ref().is_some_and(|seat| seat.chrome);
+    let close = dialog
+        .root
+        .filter(|_| chromed)
         .and_then(|root| world.get::<cosmix_shell::chrome::dialog::QuoinDialogParts>(root))
         .and_then(|parts| {
             let node = world.get::<bevy::ui::ComputedNode>(parts.close)?;
