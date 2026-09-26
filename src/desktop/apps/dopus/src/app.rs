@@ -8,9 +8,10 @@
 //! - worker replies arrive on the core's `mpsc::Receiver`; a pumper thread
 //!   forwards each into the futures channel the subscription drains, and the
 //!   UI thread feeds every one through `core.on_event` exactly once — law 2.
-//! - `Msg::Frame` fires per redraw and calls `core.tick(now)` — law 1 (the
-//!   same frames make the rows widget re-format relative modified times on
-//!   the app's clock).
+//! - law 1's cadence is threefold: `Msg::Frame` ticks per redraw (which also
+//!   re-formats the rows' relative modified times), a 200 ms `Msg::Tick`
+//!   heartbeat ticks when the window is idle (frames only fire on redraws),
+//!   and `quit` ticks once before exit so pending config persists.
 //! - derived `ConfirmRequested`/`PromptRequested` are answered immediately
 //!   (`No`/dismissal): P1 has no dialog surface, and law 3 forbids letting
 //!   one wedge — a P2 dialog UI replaces these arms.
@@ -61,6 +62,8 @@ pub enum Msg {
     Window(iced::window::Event),
     /// One redraw (law 1's tick).
     Frame(Instant),
+    /// The 200 ms heartbeat (law 1's tick while idle + the chord-deadline poll).
+    Tick(Instant),
     Noop,
 }
 
@@ -79,7 +82,6 @@ pub struct Dopus {
     action_table: Vec<ActionRow>,
     dirs: Option<AppDirs>,
     service: String,
-    window: Size,
     tint: String,
     quitting: bool,
 }
@@ -142,7 +144,6 @@ pub fn run(
         action_table,
         dirs,
         service: service.to_owned(),
-        window: Size::new(980.0, 640.0),
         tint: tint.clone(),
         quitting: false,
     };
@@ -151,11 +152,16 @@ pub fn run(
         app.status = Some(format!("Theme: {note}"));
     }
 
-    let streams = deliveries.map(|deliveries| Streams {
-        deliveries,
+    // Built unconditionally: the core channel is pumped whether or not the
+    // Bus exists (a no-broker windowed run still hears the core — law 2).
+    // With no Bus, deliveries drain an always-empty channel.
+    let streams = Streams {
+        deliveries: deliveries
+            .unwrap_or_else(|| iced::futures::channel::mpsc::unbounded().1),
         core_events: pump(core_events),
-    });
-    if STREAMS.set(Mutex::new(streams)).is_err() {
+        heartbeat: heartbeat(),
+    };
+    if STREAMS.set(Mutex::new(Some(streams))).is_err() {
         anyhow::bail!("app::run called twice in one process");
     }
 
@@ -207,6 +213,26 @@ fn pump(receiver: std::sync::mpsc::Receiver<CoreEvent>) -> UnboundedReceiver<Cor
     rx
 }
 
+/// Law 1's idle heartbeat: frames only fire on redraws, so a std thread
+/// sends `Instant::now()` every 200 ms into the merged stream — the cadence
+/// the config debounce, count dispatch and chord deadlines advance on while
+/// the window is idle or occluded (ced's shape: everything through the one
+/// `Subscription::run` stream; `iced::time::every` is not in this
+/// feature set).
+fn heartbeat() -> UnboundedReceiver<Instant> {
+    let (tx, rx) = iced::futures::channel::mpsc::unbounded();
+    std::thread::Builder::new()
+        .name("dopus-heartbeat".to_owned())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if tx.unbounded_send(Instant::now()).is_err() {
+                return;
+            }
+        })
+        .expect("spawning the heartbeat thread");
+    rx
+}
+
 /// One background thread for iced's tasks (the `apps/term` executor).
 struct SingleThread(iced::futures::executor::ThreadPool);
 
@@ -232,17 +258,22 @@ impl iced::Executor for SingleThread {
 struct Streams {
     deliveries: UnboundedReceiver<Delivery>,
     core_events: UnboundedReceiver<CoreEvent>,
+    heartbeat: UnboundedReceiver<Instant>,
 }
 
 static STREAMS: OnceLock<Mutex<Option<Streams>>> = OnceLock::new();
 
-/// Bus deliveries and core events, merged. Built once: iced keeps a
-/// `Subscription::run` alive for as long as it is returned.
+/// Bus deliveries, core events and the heartbeat, merged. Built once: iced
+/// keeps a `Subscription::run` alive for as long as it is returned.
 fn streams() -> impl iced::futures::Stream<Item = Msg> {
     use iced::futures::StreamExt;
     let taken = STREAMS.get().and_then(|m| m.lock().ok()?.take());
     match taken {
-        Some(s) => iced::futures::stream::select(s.deliveries.map(Msg::Bus), s.core_events.map(Msg::Core)).boxed(),
+        Some(s) => iced::futures::stream::select(
+            iced::futures::stream::select(s.deliveries.map(Msg::Bus), s.core_events.map(Msg::Core)),
+            s.heartbeat.map(Msg::Tick),
+        )
+        .boxed(),
         None => {
             tracing::error!("dopus: the delivery streams were already taken; the window will not hear the core");
             iced::futures::stream::empty().boxed()
@@ -287,6 +318,19 @@ impl Dopus {
                 let derived = self.core.tick(now);
                 self.on_derived(derived);
                 Task::none()
+            }
+            Msg::Tick(now) => {
+                // Law 1 while idle (frames only fire on redraws), plus the
+                // chord-deadline poll: an expired chord resolves without
+                // waiting for the next keypress.
+                let derived = self.core.tick(now);
+                self.on_derived(derived);
+                let actions = keys::poll_timeout(&self.router);
+                if actions.is_empty() {
+                    Task::none()
+                } else {
+                    self.on_actions(&actions)
+                }
             }
             Msg::Noop => Task::none(),
         }
@@ -475,7 +519,6 @@ impl Dopus {
                     self.action_table = action_table(&router.keymap);
                 }
             }
-            iced::window::Event::Resized(size) => self.window = size,
             iced::window::Event::CloseRequested => return self.quit(),
             _ => {}
         }
@@ -487,6 +530,10 @@ impl Dopus {
             return Task::none();
         }
         self.quitting = true;
+        // Law 1's final tick: persist the pending config before the window
+        // (and its frames) go away.
+        let derived = self.core.tick(Instant::now());
+        self.on_derived(derived);
         if let Some(bus) = &self.bus {
             bus.quit();
         }
@@ -497,6 +544,7 @@ impl Dopus {
         Subscription::batch([
             Subscription::run(streams),
             iced::window::frames().map(Msg::Frame),
+            // The idle heartbeat rides the merged stream (see `heartbeat`).
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Window(
                     e @ (iced::window::Event::Resized(_)

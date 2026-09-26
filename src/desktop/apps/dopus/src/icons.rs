@@ -155,6 +155,11 @@ pub fn file_icon(path: &std::path::Path, is_dir: bool, expanded: bool) -> Icon {
     }
 }
 
+/// The raster size, physical pixels: every icon is drawn at 16 logical px
+/// and rasterised at ×2 (the default Wayland scale) and downscaled, so a
+/// scale-1 draw is still crisp. One constant so every `get` site agrees.
+pub const RASTER_PX: u32 = 16 * 2;
+
 /// `Color` → `#rrggbb`, the form an SVG `currentColor` replacement needs.
 pub fn hex(color: iced::Color) -> String {
     let channel = |c: f32| format!("{:02x}", (c.clamp(0.0, 1.0) * 255.0).round() as u8);
@@ -194,6 +199,10 @@ impl Icons {
             return;
         }
         state.ensured = Some((tint.to_owned(), physical));
+        // A re-tint leaves every other tint's rasters stale; drop them so the
+        // cache holds only what the current theme can draw. The key is the
+        // (icon, tint, physical-px) triple.
+        state.cache.retain(|key, _| key.1 == tint);
         let icons = Arc::clone(&self.state);
         let tint = tint.to_owned();
         // Startup and re-tint rasterisation: off the UI thread (35 SVG parses).
@@ -272,11 +281,18 @@ mod tests {
 
     #[test]
     fn tint_replaces_current_color_and_rasterises() {
-        // A real bundled icon, tinted red, renders non-transparent pixels.
-        let pixmap = render(Icon::Folder.bytes(), "#ff0000", 16).expect("folder.svg rasterises");
-        assert_eq!((pixmap.width(), pixmap.height()), (16, 16));
-        let pixels = pixmap.data();
-        assert!(pixels.chunks(4).any(|px| px[0] > 0 && px[3] > 0), "red ink present");
+        // A real bundled icon, tinted red: the ink must actually be red. A
+        // white-ink render (an asset missing `currentColor`) or a no-op tint
+        // fails here.
+        let pixmap = render(Icon::Folder.bytes(), "#ff0000", RASTER_PX).expect("folder.svg rasterises");
+        assert_eq!((pixmap.width(), pixmap.height()), (RASTER_PX, RASTER_PX));
+        let ink = pixmap
+            .data()
+            .chunks(4)
+            .filter(|px| px[3] > 0)
+            .find(|px| px[0] > 0)
+            .expect("red ink present");
+        assert_eq!((ink[1], ink[2]), (0, 0), "ink is the requested tint, not white");
     }
 
     #[test]

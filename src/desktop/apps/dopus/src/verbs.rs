@@ -202,6 +202,9 @@ pub struct ServerMeta {
     pub service: String,
     pub headless: bool,
     pub config_path: Option<String>,
+    /// The RESOLVED scheme/mode names, reported by `dopus.state`. A headless
+    /// caller paints nothing and resolves no theme: it passes empty strings
+    /// (and `dopus.state` reports them empty on purpose).
     pub theme_scheme: String,
     pub theme_mode: String,
     /// The `dopus.actions.list` table, built once at boot from the effective
@@ -239,7 +242,9 @@ impl Served {
 }
 
 /// The P1 action table: `(action, label)`. `app.quit` is served; everything
-/// `file.*`/`place.*` is keyboard-only until P2/P3 (see the module header).
+/// `file.*`/`place.*` is keyboard-only until P2/P3 (see the module header) —
+/// `file.open` too: the Bus arm refuses every `file.*`, so it appears here
+/// for the keyboard path and `dopus.actions.list` only.
 pub const P1_ACTIONS: &[(ActionId, &str)] = &[
     (filemgr::FILE_OPEN, "Open the selection"),
     (filemgr::NAV_BACK, "Go back"),
@@ -443,6 +448,16 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
         }
         "dopus.action" => match serde_json::from_str::<ActionReq>(&command.body) {
             Ok(req) => match ActionId::intern(&req.id) {
+                // The Bus never opens (or otherwise touches) files: `file.*`
+                // is keyboard-only in P1, even though the keyboard arm of
+                // `apply_action` serves `file.open` (a directory in place, a
+                // file as a status line). Matching filemgr's rule — a remote
+                // caller never mutates the filesystem through a file manager.
+                Ok(action) if action.as_str().starts_with("file.") => vec![Served::error(
+                    command.id,
+                    code::FORBIDDEN,
+                    format!("{action} is keyboard-only in P1 — the Bus never opens files"),
+                )],
                 Ok(action) => match apply_action(action, core) {
                     Ok(Applied::Done) => vec![Served::reply_json(
                         command.id,

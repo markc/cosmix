@@ -54,15 +54,12 @@ pub fn load(custom_path: Option<&Path>) -> Result<Keymap, String> {
 }
 
 /// The keymap plus the chord-progress state one input adapter owns. Shared
-/// between the router widget and the app (hot reload) behind a mutex — both
-/// live on the UI thread, so contention is nil.
+/// between the router widget and the app (hot reload, the tick poll) behind
+/// a mutex — both live on the UI thread, so contention is nil.
 #[derive(Default)]
 pub struct Router {
     pub keymap: Keymap,
     pub state: ResolveState,
-    /// The last plain press, to detect OS key repeat (iced's key events do
-    /// not carry a repeat flag; an identical immediate press is one).
-    last: Option<(AKey, AModifiers)>,
 }
 
 pub type SharedRouter = Arc<Mutex<Router>>;
@@ -72,7 +69,6 @@ pub fn initial(custom_path: Option<&Path>) -> Result<SharedRouter, String> {
     Ok(Arc::new(Mutex::new(Router {
         keymap: load(custom_path)?,
         state: ResolveState::default(),
-        last: None,
     })))
 }
 
@@ -90,6 +86,20 @@ pub fn reload(shared: &SharedRouter, custom_path: Option<&Path>) {
     }
     router.keymap = reloaded;
     router.state.cancel();
+}
+
+/// Resolve a chord whose deadline expired while idle: the app's `Msg::Tick`
+/// calls this every 200 ms, so a pending chord times out without waiting for
+/// the next keypress. Returns any actions the expiry emitted.
+pub fn poll_timeout(shared: &SharedRouter) -> Vec<ActionId> {
+    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = tick();
+    let Router { keymap, state, .. } = &mut *router;
+    if state.deadline().is_some_and(|deadline| now >= deadline) {
+        cosmix_actions::resolve_timeout(&FocusContext::global(), keymap, state, now).actions
+    } else {
+        Vec::new()
+    }
 }
 
 /// Milliseconds since process start, the monotonic [`Tick`] cosmix-actions
@@ -149,6 +159,21 @@ fn named_key(named: Named) -> Option<AKey> {
 
 fn modifiers(m: keyboard::Modifiers) -> AModifiers {
     AModifiers { control: m.control(), alt: m.alt(), shift: m.shift(), super_key: m.logo() }
+}
+
+/// An iced keyboard event becomes the [`RawInput`] the resolver takes,
+/// carrying iced's own `repeat` flag (term/src/main.rs's rule — never
+/// reconstruct repeat by comparing strokes).
+fn key_input(event: &keyboard::Event) -> Option<RawInput> {
+    match event {
+        keyboard::Event::KeyPressed { key, physical_key, modifiers, repeat, .. } => {
+            raw_input(key, *physical_key, *modifiers, true, *repeat)
+        }
+        keyboard::Event::KeyReleased { key, physical_key, modifiers, .. } => {
+            raw_input(key, *physical_key, *modifiers, false, false)
+        }
+        _ => None,
+    }
 }
 
 /// The pure translation, testable without a widget tree: an iced key event
@@ -230,28 +255,12 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Event::Keyboard(keyboard::Event::KeyPressed { key, physical_key, modifiers, .. })
-        | Event::Keyboard(keyboard::Event::KeyReleased { key, physical_key, modifiers, .. }) = event
-            && let Some(input) = raw_input(
-                key,
-                *physical_key,
-                *modifiers,
-                matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. })),
-                false,
-            )
+        if let Event::Keyboard(keyboard_event) = event
+            && let Some(input) = key_input(keyboard_event)
         {
             let resolved = {
                 let mut router = self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let now = tick();
-                // OS repeat: an identical immediate press of the last key.
-                let mut input = input;
-                if input.state == RawInputState::Pressed {
-                    let stroke = (input.key, input.modifiers);
-                    input.repeat = router.last == Some(stroke);
-                    router.last = Some(stroke);
-                } else {
-                    router.last = None;
-                }
                 // Split-borrow the router's own fields so the resolver can
                 // hold the keymap while mutating the chord state.
                 let Router { keymap, state, .. } = &mut *router;

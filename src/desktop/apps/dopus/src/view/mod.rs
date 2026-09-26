@@ -64,7 +64,7 @@ pub fn root<'a>(
     column![
         header(look, icons, tint, pane),
         sort_header(look, pane),
-        rows::FileList::new(rows, pane.selected.as_deref(), &pane.expanded, icons, tint, look),
+        rows::FileList::new(rows, pane.selected.as_deref(), &pane.path, &pane.expanded, icons, tint, look),
         status::bar(look, pane, info),
     ]
     .width(Length::Fill)
@@ -140,7 +140,7 @@ fn button_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::
 /// A cached icon handle as an iced image widget, at the header's 16 px; a
 /// blank 16 px filler while the rasterisation is still in flight.
 fn image_widget(icons: &Icons, tint: &str, icon: icons::Icon) -> Element<'static, Msg> {
-    match icons.get(icon, tint, 32) {
+    match icons.get(icon, tint, icons::RASTER_PX) {
         Some(handle) => image(handle).width(Length::Fixed(16.0)).height(Length::Fixed(16.0)).into(),
         None => container(Space::new())
             .width(Length::Fixed(16.0))

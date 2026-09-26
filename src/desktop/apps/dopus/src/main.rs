@@ -8,7 +8,8 @@ use cosmix_dopus::dirs::{AppDirs, COMPONENT};
 
 const HELP: &str = "cosmix-dopus — the CosMix twin-pane file manager (iced; P1: one live pane)\n\
 Usage: cosmix-dopus [PATH…]\n\
-  --headless        no window: the core and the `dopus` Bus port only\n\
+  --headless        no window: the core and the `dopus` Bus port only
+                    (PATH… arguments are currently ignored)\n\
   --service NAME    register as NAME instead of `dopus` (tests)\n\
   --noded-url URL   Bus broker endpoint (default: node.conf.mix's noded_url)\n\
   --print-config    print the resolved configuration and exit\n\

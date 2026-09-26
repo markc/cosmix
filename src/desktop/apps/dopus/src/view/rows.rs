@@ -88,6 +88,9 @@ struct RowState {
     /// The tint the cache was built for (a re-tint clears it).
     tint: String,
     last_selected: Option<PathBuf>,
+    /// The listing the scroll state belongs to (the pane's root path): a new
+    /// listing starts at the top.
+    listing: Option<PathBuf>,
     /// Where a button went down, waiting for its release.
     press: Option<(Point, usize)>,
     /// The last completed click: `(when, row)` — a second on the same row
@@ -104,6 +107,7 @@ impl RowState {
             metrics_key: None,
             tint: String::new(),
             last_selected: None,
+            listing: None,
             press: None,
             last_click: None,
             cache: HashMap::new(),
@@ -134,6 +138,9 @@ impl RowState {
 pub struct FileList<'a> {
     rows: &'a [VisibleRow],
     selected: Option<&'a Path>,
+    /// The pane's root path — the listing's identity (a change resets the
+    /// scroll state).
+    root: &'a Path,
     /// The directories currently expanded (chevron + children).
     expanded: &'a HashSet<PathBuf>,
     icons: &'a Icons,
@@ -145,12 +152,13 @@ impl<'a> FileList<'a> {
     pub fn new(
         rows: &'a [VisibleRow],
         selected: Option<&'a Path>,
+        root: &'a Path,
         expanded: &'a HashSet<PathBuf>,
         icons: &'a Icons,
         tint: &'a str,
         look: Look,
     ) -> Self {
-        Self { rows, selected, expanded, icons, tint, look }
+        Self { rows, selected, root, expanded, icons, tint, look }
     }
 
     fn is_expanded(&self, path: &Path) -> bool {
@@ -163,6 +171,11 @@ impl<'a> FileList<'a> {
         let key = (self.look.ui_font, self.look.px.to_bits());
         if st.metrics_key == Some(key) {
             return;
+        }
+        if st.metrics_key.is_some() {
+            // Typography changed: every shaped row is stale (the cache keys
+            // on text + tint, not on the font), so shape from scratch.
+            st.cache.clear();
         }
         let line_h = self.look.px * 1.4;
         let sample = Para::with_text(atext::Text {
@@ -236,6 +249,17 @@ impl<'a> FileList<'a> {
         }
     }
 
+    /// A new listing (the pane navigated) resets the scroll state: the deep
+    /// offset of the previous directory must not carry into the next one.
+    fn reset_on_relist(&self, st: &mut RowState) {
+        if st.listing.as_deref() == Some(self.root) {
+            return;
+        }
+        st.listing = Some(self.root.to_path_buf());
+        st.offset = 0.0;
+        st.last_selected = None;
+    }
+
     /// Follow the selection when it changes: keep the selected row visible.
     fn follow_selection(&self, st: &mut RowState, height: f32) {
         let Some(selected) = self.selected else { return };
@@ -296,6 +320,7 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
         let Some(clip) = bounds.intersection(viewport) else { return };
         let st = tree.state.downcast_mut::<RowState>();
         self.ensure_metrics(st);
+        self.reset_on_relist(st);
         self.follow_selection(st, clip.height);
         st.clamp(self.rows.len(), clip.height);
         self.sync_cache(st, clip.height, SystemTime::now());
@@ -327,16 +352,23 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
                 }
                 let row = &self.rows[index];
                 // The toggle zone: the leftmost TOGGLE_W of the row, on a
-                // directory — click it (or double-click the row) to expand.
+                // directory — click it to expand. A toggle is not a row
+                // click: it stays out of the double-click tracker, so a fast
+                // double-click in the chevron zone toggles once.
                 let row_x = position.x - bounds.x - row.depth as f32 * DEPTH_INDENT;
                 let in_toggle = row.entry.is_dir && row_x < TOGGLE_W;
-                let double =
-                    st.last_click.is_some_and(|(when, at)| when.elapsed() < DOUBLE_CLICK && at == index);
-                st.last_click = Some((Instant::now(), index));
-                if in_toggle || (double && row.entry.is_dir) {
+                if in_toggle {
+                    st.last_click = None;
                     shell.publish(crate::app::Msg::Rows(RowsMsg::Toggle(row.entry.path.clone())));
-                } else if !double {
-                    shell.publish(crate::app::Msg::Rows(RowsMsg::Select(row.entry.path.clone())));
+                } else {
+                    let double =
+                        st.last_click.is_some_and(|(when, at)| when.elapsed() < DOUBLE_CLICK && at == index);
+                    st.last_click = Some((Instant::now(), index));
+                    if double && row.entry.is_dir {
+                        shell.publish(crate::app::Msg::Rows(RowsMsg::Toggle(row.entry.path.clone())));
+                    } else if !double {
+                        shell.publish(crate::app::Msg::Rows(RowsMsg::Select(row.entry.path.clone())));
+                    }
                 }
                 shell.capture_event();
             }
@@ -388,22 +420,30 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
             let baseline = y + ROW_PAD;
             let x = bounds.x + row.depth as f32 * DEPTH_INDENT;
 
-            // Toggle chevron for directories; always the file icon.
+            // Directories paint the chevron in their toggle zone; every row
+            // paints its file icon (open when the directory is expanded).
+            if row.entry.is_dir {
+                let chevron_bounds = Rectangle {
+                    x,
+                    y: baseline + (st.row_h - 2.0 * ROW_PAD - TOGGLE_W) / 2.0,
+                    width: TOGGLE_W,
+                    height: TOGGLE_W,
+                };
+                let chevron =
+                    if self.is_expanded(&row.entry.path) { icons::Icon::ChevronDown } else { icons::Icon::ChevronRight };
+                if let Some(handle) = self.icons.get(chevron, self.tint, icons::RASTER_PX) {
+                    renderer.draw_image(aimage::Image::new(handle), chevron_bounds, clip);
+                }
+            }
             let icon_bounds = Rectangle {
                 x: x + TOGGLE_W,
                 y: baseline + (st.row_h - 2.0 * ROW_PAD - ICON_PX) / 2.0,
                 width: ICON_PX,
                 height: ICON_PX,
             };
-            if row.entry.is_dir {
-                let chevron =
-                    if self.is_expanded(&row.entry.path) { icons::Icon::ChevronDown } else { icons::Icon::ChevronRight };
-                if let Some(handle) = self.icons.get(chevron, self.tint, (ICON_PX as u32) * 2) {
-                    renderer.draw_image(aimage::Image::new(handle), icon_bounds, clip);
-                }
-            }
-            let file_icon = icons::file_icon(&row.entry.path, row.entry.is_dir, false);
-            if let Some(handle) = self.icons.get(file_icon, self.tint, (ICON_PX as u32) * 2) {
+            let expanded = self.is_expanded(&row.entry.path);
+            let file_icon = icons::file_icon(&row.entry.path, row.entry.is_dir, expanded);
+            if let Some(handle) = self.icons.get(file_icon, self.tint, icons::RASTER_PX) {
                 renderer.draw_image(aimage::Image::new(handle), icon_bounds, clip);
             }
 

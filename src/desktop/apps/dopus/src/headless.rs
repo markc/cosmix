@@ -74,7 +74,9 @@ pub fn run(
         service: service.to_owned(),
         headless: true,
         config_path: dirs.as_ref().map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
-        // A headless process paints nothing; theme.set is refused below.
+        // A headless process paints nothing and resolves no theme, so
+        // `dopus.state` reports empty theme_scheme/theme_mode on purpose;
+        // theme.set is refused below.
         theme_scheme: String::new(),
         theme_mode: String::new(),
         actions: verbs::action_table(&keymap),
@@ -90,12 +92,18 @@ pub fn run(
         std::thread::Builder::new()
             .name("dopus-headless-core".to_owned())
             .spawn(move || loop {
+                // Recv OUTSIDE the lock: a parked recv must never hold the
+                // core hostage to `dopus.state`/`dopus.action` callers.
+                let event = match receiver.recv_timeout(DRAIN_TICK) {
+                    Ok(event) => Some(event),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                };
                 let derived = {
                     let mut core = lock(&core);
-                    match receiver.recv_timeout(DRAIN_TICK) {
-                        Ok(event) => core.on_event(event),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => core.tick(Instant::now()),
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    match event {
+                        Some(event) => core.on_event(event),
+                        None => core.tick(Instant::now()),
                     }
                 };
                 answer_derived(&mut lock(&core), derived, |line| tracing::info!("{line}"));
