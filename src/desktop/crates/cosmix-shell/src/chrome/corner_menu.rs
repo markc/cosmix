@@ -18,10 +18,11 @@ pub enum MenuAction {
     Mode(PanelMode),
     Extra(MenuExtra),
     /// Built-in "Edit panels…" (scene-editor plan §4.3 Q1): frame, not
-    /// content, so it is never a `conf.mix` extra. It sends
-    /// `scenes.editor.open` with body exactly `{"safe":true}` to
-    /// `env("SCENES_SERVICE","scenes")`; the menu lists it after the mode
-    /// items on every corner. Declared in Stage S; Q1 wires it.
+    /// content, so it is never a `conf.mix` extra. The app's
+    /// [`CornerMenuActionHook`] sends `scenes.editor.open` with body exactly
+    /// `{"safe":true}` to `env("SCENES_SERVICE","scenes")`; the menu lists
+    /// it right after the mode items on every corner. Safe open toggles, so
+    /// choosing it while the shipped editor is visible closes the editor.
     EditPanels,
 }
 
@@ -47,6 +48,11 @@ impl MenuItem {
     }
 }
 
+/// Label of the built-in [`MenuAction::EditPanels`] row.
+pub const EDIT_PANELS_LABEL: &str = "Edit panels…";
+
+/// Pin, Dock, Hide, the built-in "Edit panels…", then the app's extras. The
+/// built-in row does not depend on configuration: it is always present.
 pub fn menu_items(mode: PanelMode, extras: &[MenuExtra]) -> Vec<MenuItem> {
     [
         ("Pin", PanelMode::Pinned),
@@ -59,6 +65,11 @@ pub fn menu_items(mode: PanelMode, extras: &[MenuExtra]) -> Vec<MenuItem> {
         checked: mode == value,
         action: MenuAction::Mode(value),
     })
+    .chain(std::iter::once(MenuItem {
+        label: EDIT_PANELS_LABEL.into(),
+        checked: false,
+        action: MenuAction::EditPanels,
+    }))
     .chain(extras.iter().cloned().map(|extra| MenuItem {
         label: extra.label.clone(),
         checked: false,
@@ -75,9 +86,11 @@ pub struct CornerMenuRequest {
     pub items: Vec<MenuItem>,
 }
 
-/// App-owned Bus dispatch, called only for a user-selected extra item.
+/// App-owned Bus dispatch, called for a user-selected item that is not a mode
+/// ([`MenuAction::Extra`] or [`MenuAction::EditPanels`]); mode items become
+/// shell commands through [`MenuItem::command`] instead.
 #[derive(Resource, Clone, Copy)]
-pub struct CornerMenuExtraHook(pub fn(&mut World, MenuExtra));
+pub struct CornerMenuActionHook(pub fn(&mut World, MenuAction));
 
 pub const ROW_HEIGHT: f32 = 32.0;
 pub const MENU_WIDTH: f32 = 220.0;
@@ -245,13 +258,32 @@ mod tests {
             let items = menu_items(mode, std::slice::from_ref(&extra));
             assert_eq!(
                 items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
-                ["Pin", "Dock", "Hide", "Tools"]
+                ["Pin", "Dock", "Hide", EDIT_PANELS_LABEL, "Tools"]
             );
             assert_eq!(items.iter().filter(|i| i.checked).count(), 1);
             let current = items.iter().find(|i| i.checked).unwrap();
             assert_eq!(current.action, MenuAction::Mode(mode));
             assert_eq!(current.command(Edge::Left), None);
-            assert_eq!(items[3].action, MenuAction::Extra(extra));
+            assert_eq!(items[3].action, MenuAction::EditPanels);
+            assert_eq!(items[4].action, MenuAction::Extra(extra));
+        }
+    }
+
+    #[test]
+    fn edit_panels_is_built_in_on_every_corner_and_never_a_shell_command() {
+        for mode in [PanelMode::Hidden, PanelMode::Pinned, PanelMode::Docked] {
+            let items = menu_items(mode, &[]);
+            assert_eq!(items.len(), 4, "present without config extras");
+            let edit = &items[3];
+            assert_eq!(
+                (edit.label.as_str(), edit.checked, &edit.action),
+                (EDIT_PANELS_LABEL, false, &MenuAction::EditPanels)
+            );
+            // Every corner summons an edge; the item is a Bus call, not a
+            // mode change, on each of them.
+            for corner in Corner::ALL {
+                assert_eq!(edit.command(corner.summoned_edge()), None);
+            }
         }
     }
     #[test]

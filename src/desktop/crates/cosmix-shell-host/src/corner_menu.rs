@@ -2,7 +2,7 @@
 //! The compositor's existing exclusive-layer policy owns focus on dismissal.
 use super::*;
 use cosmix_shell::chrome::corner_menu::{
-    self as ui, CornerMenuExtraHook, CornerMenuRequest, MenuAction,
+    self as ui, CornerMenuActionHook, CornerMenuRequest, MenuAction,
 };
 use cosmix_shell::core::PanelInput;
 use smithay_client_toolkit::seat::pointer::{BTN_LEFT, PointerEventKind};
@@ -17,7 +17,8 @@ pub(super) struct NativeCornerMenu {
     pressed: Option<usize>,
 }
 
-/// Default hook always supplies the three mode items. The app may add extras.
+/// Default hook always supplies the three mode items and the built-in
+/// "Edit panels…" row. The app may add extras.
 pub fn open(world: &mut World, output: &OutputKey, corner: cosmix_shell::core::Corner) {
     let Some(frame) = world.get_resource::<ShellFrameState>() else {
         return;
@@ -361,13 +362,11 @@ fn dismiss(app: &mut App, menu: &mut NativeCornerMenu, choice: Option<usize>) {
         stage_shell_command(app, menu.request.output.clone(), command);
     }
     stage_menu_hold(app, &menu.request.output, edge, false);
-    if let Some(ui::MenuItem {
-        action: MenuAction::Extra(extra),
-        ..
-    }) = item
-        && let Some(hook) = app.world().get_resource::<CornerMenuExtraHook>().copied()
+    if let Some(ui::MenuItem { action, .. }) = item
+        && !matches!(action, MenuAction::Mode(_))
+        && let Some(hook) = app.world().get_resource::<CornerMenuActionHook>().copied()
     {
-        (hook.0)(app.world_mut(), extra);
+        (hook.0)(app.world_mut(), action);
     }
     menu.surface.close(app);
     app.update();
@@ -452,6 +451,59 @@ mod tests {
                 "dropping the exclusive layer releases keyboard focus"
             );
         }
+    }
+
+    #[test]
+    fn choosing_edit_panels_calls_the_app_hook_and_changes_no_mode() {
+        static CHOSEN: Mutex<Vec<MenuAction>> = Mutex::new(Vec::new());
+        fn record(_: &mut World, action: MenuAction) {
+            CHOSEN.lock().unwrap().push(action);
+        }
+        let output = OutputKey::new("test-output").unwrap();
+        let model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        app.insert_resource(CornerMenuActionHook(record));
+        let sequence = Arc::new(Mutex::new(Vec::new()));
+        let surface = PanelSurface::test_double(&mut app, SurfacePhase::Configured, sequence);
+        app.world_mut()
+            .entity_mut(surface.camera)
+            .insert(Camera::default());
+        let items = ui::menu_items(PanelMode::Hidden, &[]);
+        let edit = items
+            .iter()
+            .position(|item| item.action == MenuAction::EditPanels)
+            .expect("the built-in row is present without extras");
+        let mut menu = NativeCornerMenu {
+            surface,
+            request: CornerMenuRequest {
+                output,
+                corner: cosmix_shell::core::Corner::BottomRight,
+                items,
+            },
+            origin: Vec2::ZERO,
+            rows: vec![],
+            selected: None,
+            pressed: None,
+        };
+        dismiss(&mut app, &mut menu, Some(edit));
+        assert_eq!(*CHOSEN.lock().unwrap(), [MenuAction::EditPanels]);
+        let edge = cosmix_shell::core::Corner::BottomRight.summoned_edge();
+        assert_eq!(
+            app.world().resource::<ShellFrameState>().0.panel(edge).mode,
+            PanelMode::Hidden
+        );
+        assert_eq!(menu.surface.phase, SurfacePhase::Closed);
+        menu.surface.retire(&mut app);
     }
 
     #[test]

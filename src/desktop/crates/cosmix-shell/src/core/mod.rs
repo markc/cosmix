@@ -20,9 +20,9 @@ pub use dialog::{DialogSeat, DialogSeatError, DialogSlot};
 pub use keyboard::{FocusDirective, FocusStop, keyboard_target_output, next_focus_stop};
 pub use motion::{MotionError, PanelMotion};
 pub use panel::{
-    ConcealReason, PanelConfig, PanelConfigError, PanelEffect, PanelInput, PanelMode,
-    PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate, PanelWake,
-    RESIZE_THICKNESS_RANGE, RevealTrigger,
+    ConcealReason, HORIZONTAL_RESIZE_RANGE, PanelConfig, PanelConfigError, PanelEffect,
+    PanelInput, PanelMode, PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate,
+    PanelWake, RevealTrigger, VERTICAL_RESIZE_RANGE, resize_thickness_range,
 };
 pub use shell::{FOCUS_GRANT_TIMEOUT, ShellError, ShellModel};
 pub use subpanel::{SubPanelRegistry, SubPanelRegistryError, SubPanelSeat};

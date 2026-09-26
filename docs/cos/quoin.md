@@ -306,9 +306,13 @@ Quoin registers the stable Bus service identity `shell`; its subscription
 plane is `shell-sub`. `shell.ping` and `shell.info` provide presence and
 discovery. Live panel state is read through the uniform
 `shell.props.{get,list,describe}` surface under
-`panels.<edge>.{visible,pinned,mode,width_px,page,pages,output}`.
+`panels.<edge>.{visible,pinned,mode,width_px,page,pages,declared,output}`,
+plus `dialog`. `declared` is the edge's page order as last ingested from
+`conf.mix` (the live `pages` may hold fewer, or tail pages it does not name).
+`dialog` is the one dialog seat, `{scene, visible, w, h, output}`, or null
+when no dialog scene is loaded; until dialog scenes land it is always null.
 
-`shell.panel.state {edge}` returns those seven leaves in one JSON object,
+`shell.panel.state {edge}` returns those eight leaves in one JSON object,
 plus the host's `keyboard_focused` and `keyboard_requested` booleans for that
 edge. `edge` is `left`, `bottom`, `right` or `top`; an invalid or missing edge
 returns rc 10 with `{"error":"edge must be left, bottom, right or top"}`.
@@ -346,7 +350,24 @@ registered caller and are translated to the same `ShellCommand` ingress used
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
 persistence. `shell.quit` requests a successful Bevy exit through the normal render and surface drain
 (`QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit`). `shell.panel.resize` accepts
-`edge` and `thickness_px` in the supported 120–500 range.
+`edge` and `thickness_px` in that edge's range: 24–200 logical px for the top
+and bottom edges and 120–500 for the left and right. The settings steppers and
+pointer drag clamp to the same per-orientation range; a refusal carries it as
+`range_px`.
+
+`shell.panel.order {edges:{<edge>:[page, …], …}}` rewrites the page order of
+one to four edges in `conf.mix` in a single atomic file replacement, and
+replies `{edges}` as written. Moving a page between edges is one call that
+names both, so the file never declares a page on two edges. Edges it does not
+name keep their declarations, and a page one of them still declares may not
+be ordered elsewhere. The write re-encodes the whole file: other keys' values
+are preserved, but comments and formatting are not. Quoin ingests the new file
+through its watcher exactly like a hand edit, so a later hand edit wins.
+Refusals are rc 10 `{error_code, message, edges?}`: `INVALID_ARGUMENT` for a
+missing or empty `edges` map, an unknown edge, a name that is not a sub-panel
+identifier, more than 32 pages on an edge, or a page named twice (within an
+edge or across edges; `edges` names them), and `CONFIG_WRITE` when the current
+file is invalid or cannot be replaced. It is open to mesh callers.
 
 `shell.panel.dock` takes `edge` and enters `Docked` from any current mode —
 the explicit docking route, since docking reflows the workspace and is never
@@ -445,7 +466,7 @@ the panel's marks follow the ingested value). A motion write re-encodes the
 whole `conf.mix`: other authored values are preserved, but comments and
 formatting are not. `shell.settings.size` takes `edge` and `delta_px` and
 enqueues the same resize commit an edge-drag completion produces, clamped to
-the supported thickness range and the output budget. Like the scene and
+that edge's thickness range and the output budget. Like the scene and
 sub-panel verbs, settings verbs from a stale Quoin connection are refused.
 Read back `shell.props.get path="panels.<edge>.width_px"` to verify a size
 change.
@@ -455,7 +476,8 @@ change.
 `motion` (the *ingested* `slide|fade`), `motions` (`fade` carries
 `available:false` and its `reason`), `fade_reason`, `sizes` (settled
 thickness in logical pixels per edge; a drag in progress does not change
-them), `step_px`, `range_px`, `edge` (the edge that declares
+them), `step_px`, `range_px` (`[min, max]` per edge: top and bottom
+24–200, left and right 120–500), `edge` (the edge that declares
 `settings.appearance`, or null), `page_owner` (who serves the page:
 `quoin@host` is the built-in fallback, or null), plus `generation` and
 `revision`. Quoin publishes the same body as `shell.settings.changed` on the
@@ -736,7 +758,12 @@ engaged corner presses and their releases, cancelling pending actions on excess
 movement or disengagement. Both buttons act on release; neither has a hold action.
 The menu action calls `CornerMenuHook(fn(&mut World, &OutputKey, Corner))`.
 The host always provides **Pin / Dock / Hide**, with the current mode checked
-and disabled; Quoin appends `conf.mix`'s `menu_items` for that edge. Each mode
+and disabled, then the built-in **Edit panels…**; Quoin appends `conf.mix`'s
+`menu_items` for that edge. Edit panels… is frame, not configuration: it is
+on every corner whatever `conf.mix` says, and sends `scenes.editor.open` with
+body exactly `{"safe":true}` to the scenes loader (`SCENES_SERVICE`, default
+`scenes`), which opens the shipped Scene Editor. Like the recovery chord it
+toggles: choosing it while that editor is visible closes it. Each mode
 choice uses the same `SetMode` command as the precise mode verbs. Extra items
 invoke their declared Bus target and verb, with the string list in `args`.
 The menu uses the panel chrome theme tokens. Arrow keys or Tab select an item;
