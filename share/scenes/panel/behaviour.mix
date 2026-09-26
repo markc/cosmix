@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 -- The bottom panel's behaviour: compositor, tray, notification and popup
 -- state in; one complete model out through the loader (scenes.model). The
 -- layout is static in scene.mix. Clicks arrive as {scene,node,kind,item?};
@@ -22,6 +22,33 @@ $PW_RUNTIME = env("PIPEWIRE_RUNTIME_DIR", "/run/user/" .. to_string(uid()))
 $POPUPS = {launcher: env("PANEL_LAUNCHER_SCENE", "launcher"),
   calendar: env("PANEL_CALENDAR_SCENE", "calendar"), notes: env("PANEL_NOTES_SCENE", "notes")}
 
+-- The panel's own settings, beside its scene (SCENE_DIR is the scene
+-- directory, the user copy on a live desktop). tasks_scope: "all" (default,
+-- like Plasma) or "current". Missing = the default; unreadable or invalid =
+-- the default, said once on stderr.
+$SETTINGS = env("SCENE_DIR", ".") .. "/settings.conf.mix"
+
+fn load_scope()
+  if not is_file($SETTINGS) then return "all" end
+  try
+    $data = load_data($SETTINGS)
+    $scope = $t.valid_scope(type($data) == "map" ? $data.tasks_scope : nil)
+    if $scope != nil then return $scope end
+    eprint("panel: " .. $SETTINGS .. ": tasks_scope must be \"all\" or \"current\"; using \"all\"")
+  catch $message
+    eprint("panel: " .. $SETTINGS .. " unreadable (" .. to_string($message) .. "); using \"all\"")
+  end
+  return "all"
+end
+
+fn settings_text($scope)
+  return "-- The bottom panel's settings (edit here, in the Scene Editor, or with\n" ..
+    "-- `send scene-panel panel.tasks_scope {\"scope\":\"current\"}`).\n" ..
+    "-- tasks_scope: \"all\" shows windows from every workspace (Plasma's default);\n" ..
+    "-- \"current\" shows only the current workspace's windows.\n" ..
+    "schema: 1\ntasks_scope: \"" .. $scope .. "\"\n"
+end
+
 fn empty_icons()
   return {themed: {}, plain: {}, windows: {}}
 end
@@ -32,7 +59,8 @@ $state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes
   icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false, status_refreshing: false,
   net_watch: nil, net_started: 0, net_retry: 5, net_retrying: false,
   audio_watch: nil, audio_started: 0, audio_retry: 5, audio_retrying: false, audio_unavailable: false,
-  model: nil}
+  model: nil, settings_watch: nil}
+$state.tasks_scope = load_scope()
 
 -- ── status: network + volume, pushed by the kernel and PipeWire ─────────
 -- rtnetlink link events and a `pactl subscribe` stream (net_watch /
@@ -217,7 +245,7 @@ fn resolve_icons()
       $state.icons.themed[$name] = apps_icon($name, $size, $ICON_THEME)
     end
   end
-  for each $w in $t.current_tasks($state.windows, $state.ws_current, $m.MAX_TASKS)
+  for each $w in $t.panel_tasks($state.windows, $state.ws_current, $state.tasks_scope, $m.MAX_TASKS)
     $key = to_string($w.app_id)
     if not has_key($state.icons.windows, $key) then $state.icons.windows[$key] = window_icon($w.app_id) end
   end
@@ -229,7 +257,7 @@ end
 
 fn snapshot()
   return {windows: $state.windows, ws_count: $state.ws_count, ws_current: $state.ws_current,
-    tray: $state.tray, notes_count: $state.notes_count, net: $state.net, vol: $state.vol,
+    tasks_scope: $state.tasks_scope, tray: $state.tray, notes_count: $state.notes_count, net: $state.net, vol: $state.vol,
     open: $state.open, peeked: length($state.peeked) > 0}
 end
 
@@ -393,11 +421,22 @@ end
 on task async
   $item = $r.event_args($event).item
   if not fetch_windows() then $r.respond($r.failure("comp_unavailable", "window list unavailable")); return end
-  $action = $t.task_action($state.windows, $item)
+  $action = $t.task_action_at($state.windows, $item, $state.ws_current)
   if not $action.ok then
     schedule()
     $r.respond($r.failure($action.error_code, $action.message))
     return
+  end
+  -- A window on another workspace: go there first, then act on it (the
+  -- compositor re-checks its generation, so a window that changed meanwhile
+  -- is still refused).
+  if $action.workspace != nil then
+    $switched = $r.call($COMP, "comp.workspace.switch", {index: $action.workspace})
+    if not $switched.ok then
+      schedule()
+      $r.respond($switched)
+      return
+    end
   end
   $out = $r.call($COMP, $action.verb, $action.args)
   schedule()
@@ -453,6 +492,25 @@ end
 
 on panel.state desc "panel model {model}; the last model the loader accepted"
   reply(0, json_encode({model: $state.model}))
+end
+
+on panel.tasks_scope desc "set the task scope {scope: all|current}, or toggle it {}; persisted beside the scene; replies {scope, file}"
+  $args = type($event.args) == "map" ? $event.args : {}
+  $scope = $args.scope
+  if $scope == nil then $scope = $state.tasks_scope == "all" ? "current" : "all" end
+  if $t.valid_scope($scope) == nil then
+    reply(10, json_encode({error_code: "invalid_args", message: "scope must be \"all\" or \"current\""}))
+    return
+  end
+  try
+    write_atomic($SETTINGS, settings_text($scope))
+  catch $message
+    reply(10, json_encode({error_code: "settings_unwritable", message: to_string($message), file: $SETTINGS}))
+    return
+  end
+  $state.tasks_scope = $scope
+  schedule()
+  reply(0, json_encode({scope: $scope, file: $SETTINGS}))
 end
 
 on panel.refresh desc "queue one rebuild from fresh service state {}"
@@ -580,6 +638,24 @@ on audio.retry async
   schedule()
 end
 
+-- A hand edit of settings.conf.mix (ced, the Scene Editor) applies live:
+-- inotify on the scene directory, re-read on a change to that file or an
+-- overflow. The panel's own write lands here too and changes nothing.
+on fs.changed
+  if len(keys($event.headers)) != 0 then return end
+  if $event.args.watch != $state.settings_watch then return end
+  $touched = $event.args.overflow == true
+  for each $c in $event.args.changes ?? []
+    if type($c) == "map" and $c.path == $SETTINGS then $touched = true end
+  end
+  if not $touched then return end
+  $scope = load_scope()
+  if $scope != $state.tasks_scope then
+    $state.tasks_scope = $scope
+    schedule()
+  end
+end
+
 -- ── init: subscribe before the first snapshot ───────────────────────────
 subscribe($COMP .. ".props.changed")
 subscribe($TRAY .. ".item.added")
@@ -591,6 +667,11 @@ subscribe($APPS .. ".changed")
 subscribe($NODED .. ".props.changed")
 subscribe("scenes.changed")
 start_status()
+try
+  $state.settings_watch = fs_watch(dirname($SETTINGS), {recursive: false, events: ["created", "modified", "deleted", "moved"]})
+catch $message
+  eprint("panel: settings watch unavailable (" .. to_string($message) .. "); edits apply on the next start")
+end
 $state.services = registered() ?? []
 $ready = $r.ready($ctx)
 if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end

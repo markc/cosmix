@@ -22,6 +22,32 @@ fn current_tasks($windows, $ws_current, $limit)
   return $tasks
 end
 
+-- The panel's task scope (Plasma's "Show only tasks from the current
+-- desktop", off by default): "all" or "current"; anything else is nil.
+$SCOPES = ["all", "current"]
+fn valid_scope($scope)
+  if type($scope) == "string" and contains($SCOPES, $scope) then return $scope end
+  return nil
+end
+
+-- The tasks the panel shows for $scope, bounded. "all" keeps every normal
+-- window in id order, whatever its workspace; "current" is current_tasks.
+fn panel_tasks($windows, $ws_current, $scope, $limit)
+  if $scope == "current" then return current_tasks($windows, $ws_current, $limit) end
+  $tasks = []
+  for each $w in $windows
+    if length($tasks) >= $limit then break end
+    push($tasks, $w)
+  end
+  return $tasks
+end
+
+-- A window on another workspace than $ws_current (a window without a
+-- workspace belongs to the current one).
+fn elsewhere($w, $ws_current)
+  return ($w.workspace ?? $ws_current) != $ws_current
+end
+
 fn refusal($code, $message)
   return {ok: false, error_code: $code, message: $message}
 end
@@ -31,7 +57,19 @@ end
 -- against a FRESH window list: a window that has since changed identity (same
 -- id, new generation) or closed is refused rather than acted on, and the
 -- compositor re-checks the generation it receives as well.
+-- task_action is the pre-scope form, kept because user copies of the panel
+-- behaviour call it with two arguments against this shared library; it
+-- treats every window as on the current workspace.
 fn task_action($windows, $item)
+  return task_action_at($windows, $item, nil)
+end
+
+-- A window on another workspace than $ws_current is brought to: the action
+-- carries `workspace` (switch there first), then restores a minimised window
+-- or focuses it. It is never minimised from another workspace, because it is
+-- not the focused window the user is looking at. $ws_current nil = no
+-- workspace check.
+fn task_action_at($windows, $item, $ws_current)
   if type($item) != "map" or type($item.window) != "number" or type($item.generation) != "number" then
     return refusal("invalid_args", "item must carry the window id and generation")
   end
@@ -41,6 +79,10 @@ fn task_action($windows, $item)
         return refusal("stale_window", "window changed since the panel was drawn")
       end
       $args = {id: $w.id, generation: $w.generation}
+      if $ws_current != nil and elsewhere($w, $ws_current) then
+        $verb = $w.minimized ? "comp.window.restore" : "comp.window.focus"
+        return {ok: true, verb: $verb, args: $args, workspace: $w.workspace}
+      end
       if $w.minimized then return {ok: true, verb: "comp.window.restore", args: $args} end
       if $w.focused then return {ok: true, verb: "comp.window.minimize", args: $args} end
       -- comp.window.focus raises by default

@@ -159,10 +159,30 @@ and `tray` read the complete published row from `$event.args.item`
 (`index`, `window`+`generation`, `key`), never a generated node ID. A task
 click re-reads `comp.windows.list` and refuses `stale_window` when that window
 closed or its generation changed; the compositor re-checks the generation it
-receives too. Peek minimises the current workspace's visible windows and
-restores exactly the id+generation pairs it minimised. Replies carry the
-upstream outcome or a `{error_code,message}` refusal. `panel.state` returns
-the last accepted model; `panel.refresh` queues one rebuild.
+receives too. A task on another workspace switches there first
+(`comp.workspace.switch`), then focuses the window, or restores it if minimised.
+It is never minimised from another workspace. Peek minimises the current
+workspace's visible windows and restores exactly the id+generation pairs it
+minimised. Replies carry the upstream outcome or a `{error_code,message}`
+refusal. `panel.state` returns the last accepted model; `panel.refresh`
+queues one rebuild.
+
+**Task scope** (Plasma's "Show only tasks from the current desktop"):
+`settings.conf.mix` beside the panel scene holds `tasks_scope`.
+
+- `"all"` is the default, and also applies when the file is missing. It shows
+  windows from every workspace in id order. Another workspace's task has no
+  button background and dimmed text.
+- `"current"` shows only the current workspace's windows, as the legacy panel
+  did.
+- `panel.tasks_scope {scope}` on `scene-panel` sets the scope, and `{}`
+  toggles it. The file is written atomically and the reply is `{scope, file}`.
+  A bad scope is refused with `invalid_args`; an unwritable file is refused
+  with `settings_unwritable` and the scope is left unchanged.
+- A hand edit of the file, in ced or the Scene Editor, applies live: the
+  behaviour watches the scene directory with inotify.
+- An unreadable or invalid file falls back to `"all"` with one stderr line.
+- Peek stays current-workspace only.
 
 The clock is one `task_start` wall-clock deadline per displayed minute and
 only redraws the time. Network and volume are event-driven: `net_watch`
@@ -230,8 +250,8 @@ nothing of its own.
 - **Tasks and pager** — `comp.windows.list` and `comp.props.get
   workspaces`. A click focuses and raises a window, minimises the focused
   one, and restores a minimised one (Plasma's task semantics); pager
-  buttons call `comp.workspace.switch`. Only the current workspace's
-  windows are shown.
+  buttons call `comp.workspace.switch`. Every workspace's windows are
+  shown by default; see **Task scope** for the `"current"` setting.
 - **Tray** — the `tray` adapter (`tray.list`, `tray.activate`), shown only
   when an application publishes a StatusNotifierItem.
 - **Notifications** — the `notify` adapter (`notify.list`,
