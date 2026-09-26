@@ -532,9 +532,10 @@ fn quad<R: iced::advanced::Renderer>(r: &mut R, bounds: Rectangle, colour: Color
 /// still clips those.
 ///
 /// The slack is the whole budget for ink outside a text's box: each damage
-/// rectangle is filled with the background before drawing, so ink reaching
-/// more than half a line into a neighbouring row (stacked combining marks, an
-/// outsized fallback glyph) is erased when that row alone is redrawn.
+/// rectangle is filled with the background before drawing, so ink overhanging
+/// its row by more than the slack (stacked combining marks, an outsized
+/// fallback glyph) can be cut off, or drawn twice, where it crosses the edge
+/// of a partly redrawn region. Ink within the slack is unaffected.
 fn text_clip(at: Point, width: f32, m: geo::Metrics, layer: Rectangle) -> Rectangle {
     let slack = Rectangle { x: at.x - m.cell_w, y: at.y - m.line_h * 0.5, width: width + 2.0 * m.cell_w, height: m.line_h * 2.0 };
     let own = Rectangle { x: at.x, y: at.y, width, height: m.line_h };
@@ -675,6 +676,11 @@ mod tests {
     /// rectangle is tested against layer ∩ damage; one that meets it is
     /// drawn, and one that is not inside it first clears and refills a
     /// window-sized clip mask. (drawn, masked)
+    ///
+    /// Mirrors iced_tiny_skia 0.14.1 `lib.rs` 79-114 (per damage rectangle:
+    /// background fill, layer ∩ damage) and `engine.rs` 418-430 (the
+    /// `Text::Cached` intersects / is_within test) with 836 (`adjust_clip_mask`).
+    /// Re-audit against those lines when the `=0.14.1` pin moves.
     fn decide(t: &Drawn, damage: &Rectangle) -> (bool, bool) {
         let Some(bounds) = t.layer.intersection(damage) else { return (false, false) };
         let drawn = t.clip.intersects(&bounds);
