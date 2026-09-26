@@ -190,7 +190,10 @@ not edits that deliberately restore both length and mtime.
 After discovering the lane, ref preflights `blob.quota {owner: bus_service}`
 under the same 10-second timeout. File length must fit both owner and total
 headroom after used and reserved bytes. This is advisory: the lane remains
-authoritative. A concurrent quota refusal may close a large upload before
+authoritative. A timeout, lookup error or malformed quota reply logs one line
+and skips the preflight, allowing the upload to proceed. Only a well-formed
+reply showing insufficient room refuses the upload with `quota:`.
+A concurrent quota refusal may close a large upload before
 ureq reads the 413, yielding `lane:` with a quota hint rather than `quota:`.
 
 `fs.blob.materialise {blob, path, overwrite?}` accepts `b3:<64 lowercase hex>`,

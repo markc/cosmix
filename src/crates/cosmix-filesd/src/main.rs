@@ -1381,11 +1381,14 @@ async fn dispatch_fs_with_quota(
             let source_args = args.clone();
             let length = tokio::task::spawn_blocking(move || lane::source_length(&source_fs, &source_args))
                 .await.unwrap_or_else(|_| Err("internal error checking source".into()));
-            let preflight = match length {
-                Ok(length) => quota.await.and_then(|value| lane::check_quota(&value, service, length)),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = preflight { result = Err(error); }
+            match length {
+                Ok(length) => match quota.await.and_then(|value| lane::check_quota(&value, service, length)) {
+                    Ok(Some(refusal)) => result = Err(refusal),
+                    Ok(None) => {}
+                    Err(reason) => eprintln!("cosmix-filesd: skipping advisory quota preflight: {reason}"),
+                },
+                Err(error) => result = Err(error),
+            }
         }
         Some(result)
     } else { None };
@@ -2398,6 +2401,43 @@ mod tests {
             assert!(body.contains("lane_unavailable:"));
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ref_quota_failure_or_malformed_reply_still_uploads() {
+        use std::io::{BufRead, Read, Write};
+        let (fs, dir) = fs_layer(true);
+        std::fs::write(dir.join("home/file"), b"hello").unwrap();
+        for quota in [Err("blob.quota timed out".to_string()),
+            Err("blob.quota AppError".to_string()), Ok(json!({})),
+            Ok(json!({"owners": {"filesd-fs": {"limit": 0, "used": 0, "reserved": 0}})))] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let bind = listener.local_addr().unwrap().to_string();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    head.push_str(&line);
+                    if line == "\r\n" { break; }
+                }
+                assert!(head.starts_with("POST /blob HTTP/1.1\r\n"));
+                let mut body = [0; 5];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"hello");
+                let reply = json!({"blob": format!("b3:{}", "a".repeat(64)), "size": 5}).to_string();
+                write!(reader.get_mut(), "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            });
+            let (rc, body) = dispatch_fs_with_quota(
+                cmd("fs.blob.ref", json!({"path": "home/file"})), Arc::new(fs.clone()),
+                Arc::new(vec![]), "filesd-fs", async { Ok(bind) }, async { quota }).await;
+            assert_eq!(rc, 0, "{body}");
+            worker.join().unwrap();
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

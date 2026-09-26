@@ -41,7 +41,7 @@ pub fn source_length(fs: &FsLayer, args: &Value) -> Result<u64, String> {
 
 /// blobd citizen::verb_quota returns owners[owner] and total, each with numeric
 /// limit, used and reserved. Reservations consume headroom just like pinned data.
-pub fn check_quota(value: &Value, owner: &str, length: u64) -> Result<(), String> {
+pub fn check_quota(value: &Value, owner: &str, length: u64) -> Result<Option<String>, String> {
     let remaining = |row: &Value| -> Result<u64, String> {
         let field = |name| row.get(name).and_then(Value::as_u64)
             .ok_or_else(|| format!("lane_unavailable: invalid blob.quota {name}"));
@@ -49,9 +49,9 @@ pub fn check_quota(value: &Value, owner: &str, length: u64) -> Result<(), String
     };
     let room = remaining(&value["owners"][owner])?.min(remaining(&value["total"])?);
     if length > room {
-        return Err(format!("quota: {length} B exceeds remaining {room} B for {owner}"));
+        return Ok(Some(format!("quota: {length} B exceeds remaining {room} B for {owner}")));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn checked_bind(bind: &str) -> Result<&str, String> {
@@ -520,11 +520,11 @@ mod tests {
     fn quota_preflight_counts_total_owner_and_reservations() {
         let mut quota = json!({"owners": {"filesd-test": {"limit": 100, "used": 20, "reserved": 30}},
             "total": {"limit": 200, "used": 10, "reserved": 0}});
-        assert!(check_quota(&quota, "filesd-test", 50).is_ok());
-        assert_eq!(check_quota(&quota, "filesd-test", 51).unwrap_err(),
+        assert_eq!(check_quota(&quota, "filesd-test", 50).unwrap(), None);
+        assert_eq!(check_quota(&quota, "filesd-test", 51).unwrap().unwrap(),
             "quota: 51 B exceeds remaining 50 B for filesd-test");
         quota["total"]["reserved"] = json!(180);
-        assert_eq!(check_quota(&quota, "filesd-test", 11).unwrap_err(),
+        assert_eq!(check_quota(&quota, "filesd-test", 11).unwrap().unwrap(),
             "quota: 11 B exceeds remaining 10 B for filesd-test");
         assert!(check_quota(&json!({}), "filesd-test", 1).unwrap_err().starts_with("lane_unavailable:"));
     }
