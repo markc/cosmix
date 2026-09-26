@@ -1066,6 +1066,26 @@ name = "cosmix-app-identity"
 version = "0.2.0"
 
 [[package]]
+name = "cosmix-blobd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-props-core",
+ "cosmix-mds",
+ "libc",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cosmix-dbusd"
 version = "0.3.1"
 dependencies = [
