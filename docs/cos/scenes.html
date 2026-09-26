@@ -490,9 +490,10 @@ did not change but whose model dependencies did.
 Model patches that change a scene's mount page or edge are refused with
 <code>SUBPANEL_COLLISION</code>; unload and load explicitly to move that mount.</p>
 <p>Subscribe to <code>&lt;host&gt;.panel.changed</code> for inner command <code>shell.panel.changed</code>:
-<code>{generation,revision,panels:{left,...}}</code>. Each panel has the same applied
-<code>visible</code>, <code>pinned</code>, <code>mode</code>, <code>page</code>, <code>pages</code>, <code>width_px</code> and <code>output</code> values as
-<code>shell.props.get</code>. Publication follows scene reconciliation and model
+<code>{generation,revision,dialog,panels:{left,...}}</code>. Each panel has the same applied
+<code>visible</code>, <code>pinned</code>, <code>mode</code>, <code>page</code>, <code>pages</code>, <code>declared</code>, <code>width_px</code> and
+<code>output</code> values as <code>shell.props.get</code>, and <code>dialog</code> is the dialog seat or null.
+A <code>conf.mix</code> order change (<code>declared</code>) publishes like any other change. Publication follows scene reconciliation and model
 application; unchanged snapshots produce no event. Take a property snapshot
 after subscribing and resynchronise after a connection/gap. Enqueue replies
 are not applied-state receipts, so page selection and temporary pin release

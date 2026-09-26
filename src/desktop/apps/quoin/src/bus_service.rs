@@ -151,14 +151,16 @@ impl Plugin for ShellBusPlugin {
 /// than command enqueue acceptance. No timer and no idle publication.
 fn publish_panel_state(
     bridge: Res<BusBridge>,
-    frame: Res<ShellFrameState>,
+    (frame, config): (Res<ShellFrameState>, Res<crate::config::ShellConfig>),
     mut state: ResMut<ShellBusState>,
 ) {
     if state.live_generation.is_none() { return; }
-    let panels = panel_notice_snapshot(&frame.0);
+    let panels = panel_notice_snapshot(&frame.0, &config.panels);
     if panels == state.applied_panels { return; }
     let revision = state.panel_revision.saturating_add(1);
-    let body = json!({"generation":state.live_generation,"revision":revision,"panels":panels});
+    let mut body = panels.clone();
+    body["generation"] = json!(state.live_generation);
+    body["revision"] = json!(revision);
     let wire = format!("---\ncommand: shell.panel.changed\n---\n{body}");
     let topic = format!("{}.panel.changed", bridge.service_name());
     if bridge.try_publish_topic(&topic, true, wire).is_ok() {
@@ -217,7 +219,10 @@ fn settings_page_owner(registry: &cosmix_shell::core::SubPanelRegistry) -> Optio
 /// the settled width; publish the final size once, without serialising the
 /// entire property tree on every animation frame. `visible` is a boolean,
 /// so reveal/conceal emits only its mapping transitions, not motion fractions.
-fn panel_notice_snapshot(frame: &ShellFrame) -> Value {
+/// `declared` (the `conf.mix` order) and `dialog` are part of the compared
+/// snapshot, so a `shell.panel.order` ingestion or a dialog change publishes
+/// with a new revision (scene-editor plan §4.3).
+fn panel_notice_snapshot(frame: &ShellFrame, declared: &[Vec<String>; 4]) -> Value {
     let mut panels = serde_json::Map::new();
     for edge in Edge::ALL {
         let panel = frame.panel(edge);
@@ -228,10 +233,12 @@ fn panel_notice_snapshot(frame: &ShellFrame) -> Value {
             "width_px": panel.settled_thickness_px,
             "page": panel.active_page_id,
             "pages": panel.page_ids.as_ref(),
+            "declared": declared[edge.index()],
             "output": frame.geometry.output.as_str(),
         }));
     }
-    Value::Object(panels)
+    // The dialog seat is null until Stage Q2 mounts dialog scenes.
+    json!({"dialog": Value::Null, "panels": panels})
 }
 
 /// These idempotent verbs drive the legacy citizen's select/pin/release
@@ -239,7 +246,7 @@ fn panel_notice_snapshot(frame: &ShellFrame) -> Value {
 /// not a success inferred from enqueueing. Reads remain immediate snapshots.
 fn reply_panels(
     bridge: Res<BusBridge>,
-    frame: Res<ShellFrameState>,
+    (frame, config): (Res<ShellFrameState>, Res<crate::config::ShellConfig>),
     mut state: ResMut<ShellBusState>,
 ) {
     for (request, output) in std::mem::take(&mut state.pending_panels) {
@@ -266,7 +273,7 @@ fn reply_panels(
         }
         // A pointer/holder reveal does not undo the applied persistent mode.
         // Report its actual visible:true state instead of a false refusal.
-        let snapshot = Value::from(&ShellProps(&frame.0).snapshot());
+        let snapshot = Value::from(&ShellProps(&frame.0, &config.panels).snapshot());
         let body = if applied {
             json!({"accepted":true, "applied":true, "panels":snapshot["panels"]})
         } else {
@@ -597,14 +604,22 @@ fn service_bus(
                 let (rc, body) = crate::dialog_bus::dispatch(&request.command);
                 (rc, body, None)
             } else if request.command == "shell.panel.order" {
-                // Scene Editor plan §4.3 Q1: frozen request/reply in
-                // tests/fixtures/scene-editor/shell-verbs.json; Q1 implements.
-                (
-                    10,
-                    json!({"error_code":"UNIMPLEMENTED", "message":"shell.panel.order arrives in Stage Q1 of the Scene Editor plan"})
-                        .to_string(),
-                    None,
-                )
+                // Scene Editor plan §4.3 Q1; request/reply frozen in
+                // tests/fixtures/scene-editor/shell-verbs.json. The same
+                // stale-connection fence as the settings writes: a stale
+                // request must not spend a conf.mix rewrite.
+                let (rc, body) = if state
+                    .live_generation
+                    .is_some_and(|generation| generation != request.connection_generation)
+                {
+                    (
+                        10,
+                        json!({"error_code":"STALE_CONNECTION", "message":"panel.order request belongs to a stale Quoin connection"}),
+                    )
+                } else {
+                    panel_order(&request.body, &crate::config::conf_mix_path())
+                };
+                (rc, body.to_string(), None)
             } else if request.command == "shell.scenes.list" {
                 (
                     0,
@@ -716,7 +731,7 @@ fn service_bus(
                     None,
                 )
             } else {
-                dispatch_shell_request(&request, &frame.0, time.elapsed())
+                dispatch_with_declared(&request, &frame.0, &content.config.panels, time.elapsed())
             };
         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         state.diagnostics.record(rc, command.is_some(), elapsed_us);
@@ -1083,9 +1098,46 @@ pub(crate) fn register_sub_panel(
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
+/// `shell.panel.order {edges:{<edge>:[string], …}}` → `{edges}` as written.
+/// One atomic `conf.mix` replacement; the file watcher ingests it like a
+/// hand edit, so a later hand edit still wins. Mesh-open: what stays is
+/// well-formedness (edges, identifiers, no page on two edges).
+fn panel_order(body: &str, path: &std::path::Path) -> (u8, Value) {
+    let order = serde_json::from_str::<Value>(body)
+        .map_err(|error| crate::config::OrderRefusal {
+            code: "INVALID_ARGUMENT",
+            message: format!("body is not JSON: {error}"),
+            edges: Vec::new(),
+        })
+        .and_then(|body| crate::config::parse_panel_order(&body));
+    match order.and_then(|order| crate::config::write_panel_order(path, &order).map(|()| order)) {
+        Ok(order) => {
+            let edges: serde_json::Map<String, Value> = order
+                .into_iter()
+                .map(|(edge, pages)| (edge_name(edge).to_owned(), json!(pages)))
+                .collect();
+            (0, json!({"edges": edges}))
+        }
+        Err(refusal) => (10, refusal.body()),
+    }
+}
+
+/// [`dispatch_with_declared`] for a host with no `conf.mix` declarations.
+#[cfg(test)]
 fn dispatch_shell_request(
     request: &InboundRequest,
     frame: &ShellFrame,
+    at: std::time::Duration,
+) -> (u8, String, Option<ShellCommand>) {
+    dispatch_with_declared(request, frame, &NO_DECLARED, at)
+}
+
+/// `declared` is the last accepted `conf.mix` page order per edge, which the
+/// props tree reports as `panels.<edge>.declared`.
+fn dispatch_with_declared(
+    request: &InboundRequest,
+    frame: &ShellFrame,
+    declared: &[Vec<String>; 4],
     at: std::time::Duration,
 ) -> (u8, String, Option<ShellCommand>) {
     if request.command == "shell.ping" {
@@ -1100,7 +1152,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1117,7 +1169,7 @@ fn dispatch_shell_request(
     if let Some(suffix) = request.command.strip_prefix("shell.props.") {
         let args = parse_args(request);
         let response = cosmix_props_core::bus::dispatch_props(
-            &ShellProps(frame),
+            &ShellProps(frame, declared),
             suffix,
             args.as_ref(),
             false,
@@ -1136,7 +1188,7 @@ fn dispatch_shell_request(
                 None,
             );
         };
-        let snapshot = Value::from(&ShellProps(frame).snapshot());
+        let snapshot = Value::from(&ShellProps(frame, declared).snapshot());
         let mut state = snapshot["panels"][edge_name(edge)].clone();
         let panel = frame.panel(edge);
         state["keyboard_focused"] = json!(panel.keyboard_focused);
@@ -1178,13 +1230,23 @@ fn dispatch_shell_request(
                 None,
             );
         };
+        // One per-orientation range shared with the settings stepper and
+        // pointer drag (scene-editor plan §4.3 Q1).
+        let range = cosmix_shell::core::resize_thickness_range(edge);
         let Some(thickness_px) = number_argument(request, "thickness_px")
             .map(|value| value as f32)
-            .filter(|value| cosmix_shell::core::RESIZE_THICKNESS_RANGE.contains(value))
+            .filter(|value| range.contains(value))
         else {
             return (
                 10,
-                json!({"error":"thickness_px must be a number in 120..=500"}).to_string(),
+                json!({
+                    "error": format!(
+                        "thickness_px must be a number in {}..={} for the {} edge",
+                        range.start(), range.end(), edge_name(edge)
+                    ),
+                    "range_px": [range.start(), range.end()],
+                })
+                .to_string(),
                 None,
             );
         };
@@ -1435,11 +1497,19 @@ pub(crate) fn parse_edge(value: String) -> Option<Edge> {
     }
 }
 
-struct ShellProps<'a>(&'a ShellFrame);
+/// No `conf.mix` declarations: what a host without the config reader reports.
+#[cfg(test)]
+const NO_DECLARED: [Vec<String>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+
+/// The live frame plus the last accepted `conf.mix` page order per edge
+/// (`ShellConfig::panels`, indexed by `Edge::index`).
+struct ShellProps<'a>(&'a ShellFrame, &'a [Vec<String>; 4]);
 
 impl PropTree for ShellProps<'_> {
     fn snapshot(&self) -> PropValue {
-        let mut leaves = Vec::new();
+        // The one dialog seat (scene-editor plan §4.3): null until a dialog
+        // scene is loaded, which needs Stage Q2.
+        let mut leaves = vec![leaf("dialog".to_owned(), PropValue::Null)];
         for edge in Edge::ALL {
             let name = edge_name(edge);
             let panel = self.0.panel(edge);
@@ -1470,6 +1540,10 @@ impl PropTree for ShellProps<'_> {
                     panel.page_ids.iter().cloned().collect::<Vec<_>>().into(),
                 ),
                 leaf(
+                    format!("panels.{name}.declared"),
+                    self.1[edge.index()].clone().into(),
+                ),
+                leaf(
                     format!("panels.{name}.output"),
                     self.0.geometry.output.as_str().into(),
                 ),
@@ -1479,9 +1553,9 @@ impl PropTree for ShellProps<'_> {
     }
 
     fn list(&self) -> Vec<PropPath> {
-        let mut paths = Vec::new();
+        let mut paths = vec![PropPath::new("dialog".to_owned()).unwrap()];
         for edge in Edge::ALL {
-            for field in ["visible", "pinned", "mode", "width_px", "page", "pages", "output"] {
+            for field in ["visible", "pinned", "mode", "width_px", "page", "pages", "declared", "output"] {
                 paths.push(PropPath::new(format!("panels.{}.{}", edge_name(edge), field)).unwrap());
             }
         }
@@ -1494,13 +1568,18 @@ impl PropTree for ShellProps<'_> {
             "visible" | "pinned" => PropType::Bool,
             "mode" | "page" | "output" => PropType::String,
             "width_px" => PropType::Number,
-            "pages" => PropType::List,
+            "pages" | "declared" => PropType::List,
+            "dialog" => PropType::Object,
             _ => return None,
         };
         Some(PropDescribe::leaf(
             path.clone(),
             ty,
             match field {
+                "declared" => "the conf.mix page order for this edge (shell.panel.order writes it)",
+                "dialog" => {
+                    "the dialog seat {scene, visible, w, h, output}, or null when no dialog scene is loaded"
+                }
                 "pinned" => {
                     "compatibility shim: true for persistent Pinned or Docked; false for Hidden, including transient reveal"
                 }
@@ -1783,7 +1862,7 @@ mod tests {
                 assert_eq!(rc, 0, "{body}");
                 assert!(command.is_none());
                 let mut actual: Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(actual.as_object().unwrap().len(), 9);
+                assert_eq!(actual.as_object().unwrap().len(), 10);
                 assert_eq!(actual["keyboard_focused"], frame.panel(edge).keyboard_focused);
                 assert_eq!(
                     actual["keyboard_requested"],
@@ -2091,6 +2170,39 @@ mod tests {
             let (rc, _, command) = dispatch_shell_request(&req, &frame, std::time::Duration::ZERO);
             assert_eq!(rc, 10, "rejected: {bad}");
             assert!(command.is_none(), "no command for: {bad}");
+        }
+    }
+
+    /// Top/bottom take 24..=200 and left/right 120..=500, so the shipped
+    /// 52 px bottom panel can be both stepped and restored over the verb.
+    #[test]
+    fn resize_range_is_per_orientation() {
+        let frame = test_frame();
+        let resize = |edge: &str, thickness: f64| {
+            let mut req = local("shell.panel.resize");
+            req.body = json!({"edge":edge, "thickness_px":thickness}).to_string();
+            let (rc, body, command) =
+                dispatch_shell_request(&req, &frame, std::time::Duration::ZERO);
+            (rc, serde_json::from_str::<Value>(&body).unwrap(), command)
+        };
+        for edge in ["top", "bottom"] {
+            for ok in [24.0, 52.0, 56.0, 200.0] {
+                let (rc, body, command) = resize(edge, ok);
+                assert_eq!(rc, 0, "{edge} {ok}: {body}");
+                assert!(command.is_some());
+            }
+            for bad in [23.0, 201.0, 240.0] {
+                let (rc, body, command) = resize(edge, bad);
+                assert_eq!(rc, 10, "{edge} {bad}");
+                assert!(command.is_none());
+                assert_eq!(body["range_px"], json!([24.0, 200.0]));
+            }
+        }
+        for edge in ["left", "right"] {
+            let (rc, body, _) = resize(edge, 52.0);
+            assert_eq!(rc, 10, "{edge} 52");
+            assert_eq!(body["range_px"], json!([120.0, 500.0]));
+            assert_eq!(resize(edge, 500.0).0, 0);
         }
     }
 
@@ -2859,22 +2971,141 @@ mod tests {
     #[test]
     fn panel_notices_coalesce_resize_and_reveal_frames() {
         let mut frame = test_frame();
-        let before = panel_notice_snapshot(&frame);
+        let before = panel_notice_snapshot(&frame, &NO_DECLARED);
         for fraction in [0.1, 0.25, 0.5, 0.75, 1.0] {
             let panel = &mut frame.panels[Edge::Left.index()];
             panel.resize_active = true;
             panel.thickness_px += 1.0;
             panel.visible_fraction = fraction;
-            assert_eq!(panel_notice_snapshot(&frame), before);
+            assert_eq!(panel_notice_snapshot(&frame, &NO_DECLARED), before);
         }
         let panel = &mut frame.panels[Edge::Left.index()];
         panel.resize_active = false;
         panel.settled_thickness_px = panel.thickness_px;
-        let settled = panel_notice_snapshot(&frame);
+        let settled = panel_notice_snapshot(&frame, &NO_DECLARED);
         assert_ne!(settled, before);
-        assert_eq!(settled["left"]["width_px"], json!(frame.panel(Edge::Left).thickness_px));
+        assert_eq!(settled["panels"]["left"]["width_px"], json!(frame.panel(Edge::Left).thickness_px));
         frame.panels[Edge::Left.index()].mapped = !frame.panel(Edge::Left).mapped;
-        assert_ne!(panel_notice_snapshot(&frame), settled);
+        assert_ne!(panel_notice_snapshot(&frame, &NO_DECLARED), settled);
+    }
+
+    /// The frozen request/reply/refusal shapes of
+    /// `fixtures/scene-editor/shell-verbs.json`.
+    #[test]
+    fn panel_order_matches_the_frozen_fixture() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../scripts/tests/fixtures/scene-editor/shell-verbs.json"
+        ))
+        .unwrap();
+        let fixture = &fixtures["shell.panel.order"];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conf.mix");
+        std::fs::write(&path, r#"{panels: {right: ["scene-notes"], left: ["scene-calendar"]}}"#)
+            .unwrap();
+        let (rc, reply) = panel_order(&fixture["request"].to_string(), &path);
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply, fixture["reply"]);
+        let written =
+            crate::config::ShellConfig::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written.panels[Edge::Right.index()],
+            ["scene-notes", "settings.appearance"]
+        );
+
+        let expected = &fixture["refusals"]["INVALID_ARGUMENT"];
+        let (rc, reply) = panel_order(
+            &json!({"edges": {"left": ["scene-notes"], "right": ["scene-notes"]}}).to_string(),
+            &path,
+        );
+        assert_eq!(rc, 10);
+        assert_eq!(reply, *expected);
+        let (rc, reply) = panel_order("not json", &path);
+        assert_eq!((rc, reply["error_code"].as_str()), (10, Some("INVALID_ARGUMENT")));
+
+        // An unwritable location is CONFIG_WRITE, never a partial file.
+        let blocked = directory.path().join("file-not-dir");
+        std::fs::write(&blocked, "").unwrap();
+        let (rc, reply) = panel_order(
+            &fixture["request"].to_string(),
+            &blocked.join("conf.mix"),
+        );
+        assert_eq!(rc, 10);
+        assert_eq!(reply["error_code"], fixture["refusals"]["CONFIG_WRITE"]["error_code"]);
+    }
+
+    fn panel_notices(peer: &ctk::bus::TestBusPeer) -> Vec<Value> {
+        peer.drain_publishes()
+            .iter()
+            .filter(|p| p.headers.get("name").is_some_and(|n| n == "quoin.panel.changed"))
+            .map(|p| serde_json::from_str(p.body.split_once("\n---\n").unwrap().1).unwrap())
+            .collect()
+    }
+
+    /// Scene-editor plan §4.3 Q1: `panel.changed` and `props.get` carry the
+    /// dialog seat (null before Q2) and each panel's `conf.mix` order; a new
+    /// declared order publishes once with a new revision, an unchanged
+    /// snapshot publishes nothing.
+    #[test]
+    fn notices_and_props_carry_declared_order_and_a_null_dialog() {
+        let config = crate::config::ShellConfig::parse(
+            r#"{panels: {right: ["scene-notes", "settings.appearance"]}}"#,
+        )
+        .unwrap();
+        let (mut app, peer) = mounted_bus_app_with_config(Some(config));
+        // The mount helper's drain discarded the first notice; a reconnect
+        // republishes the full snapshot.
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+        let notices = panel_notices(&peer);
+        let first = notices.last().expect("the connected host publishes a snapshot");
+        assert_eq!(first["dialog"], Value::Null);
+        assert!(first.as_object().unwrap().contains_key("dialog"));
+        assert_eq!(
+            first["panels"]["right"]["declared"],
+            json!(["scene-notes", "settings.appearance"])
+        );
+        for edge in ["left", "bottom", "top"] {
+            assert_eq!(first["panels"][edge]["declared"], json!([]), "{edge}");
+        }
+        let revision = first["revision"].as_u64().unwrap();
+        app.update();
+        assert!(panel_notices(&peer).is_empty(), "unchanged: nothing published");
+
+        let reordered = crate::config::ShellConfig::parse(
+            r#"{panels: {right: ["settings.appearance", "scene-notes"]}}"#,
+        )
+        .unwrap();
+        app.insert_resource(reordered.clone());
+        app.update();
+        let notices = panel_notices(&peer);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0]["revision"].as_u64().unwrap() > revision);
+        assert_eq!(
+            notices[0]["panels"]["right"]["declared"],
+            json!(["settings.appearance", "scene-notes"])
+        );
+        app.update();
+        assert!(panel_notices(&peer).is_empty());
+
+        // props.get reports the same fields.
+        let frame = app.world().resource::<ShellFrameState>().0.clone();
+        let get = |path: &str| {
+            let mut props = request("shell.props.get");
+            props.body = json!({"path": path}).to_string();
+            let (rc, body, _) =
+                dispatch_with_declared(&props, &frame, &reordered.panels, Default::default());
+            assert_eq!(rc, 0, "{path}: {body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        assert_eq!(get("dialog"), Value::Null);
+        assert_eq!(
+            get("panels.right.declared"),
+            json!(["settings.appearance", "scene-notes"])
+        );
+        assert_eq!(get("panels.top.declared"), json!([]));
     }
 
     #[test]
@@ -2909,7 +3140,7 @@ mod tests {
             assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
             let body: Value = serde_json::from_str(&replies[0].body).unwrap();
             assert_eq!(body["applied"], true);
-            let snapshot = Value::from(&ShellProps(&app.world().resource::<ShellFrameState>().0).snapshot());
+            let snapshot = Value::from(&ShellProps(&app.world().resource::<ShellFrameState>().0, &NO_DECLARED).snapshot());
             assert_eq!(body["panels"], snapshot["panels"]);
             if verb == "shell.panel.pin" {
                 // Let reveal progress before hiding; otherwise concealment

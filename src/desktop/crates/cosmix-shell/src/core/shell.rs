@@ -221,10 +221,11 @@ impl ShellModel {
                 max,
             });
         }
-        if max < *super::RESIZE_THICKNESS_RANGE.start() && thickness == max {
+        let range = super::resize_thickness_range(edge);
+        if max < *range.start() && thickness == max {
             return self.restore_thickness(edge, thickness);
         }
-        self.panels[edge.index()].resize_thickness(thickness)?;
+        self.panels[edge.index()].resize_thickness(thickness, range)?;
         self.thickness_set[edge.index()] = true;
         Ok(())
     }
