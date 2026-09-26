@@ -11,13 +11,13 @@ fn normal_windows($windows)
   return sort_by($out, function ($w) = $w.id)
 end
 
--- The current workspace's windows (Plasma's default filter), bounded. A
--- window without a workspace belongs to the current one.
+-- The current workspace's windows, bounded. A window without a workspace
+-- (or comp's 0 before its first map) belongs to the current one.
 fn current_tasks($windows, $ws_current, $limit)
   $tasks = []
   for each $w in $windows
     if length($tasks) >= $limit then break end
-    if ($w.workspace ?? $ws_current) == $ws_current then push($tasks, $w) end
+    if not elsewhere($w, $ws_current) then push($tasks, $w) end
   end
   return $tasks
 end
@@ -30,22 +30,27 @@ fn valid_scope($scope)
   return nil
 end
 
--- The tasks the panel shows for $scope, bounded. "all" keeps every normal
--- window in id order, whatever its workspace; "current" is current_tasks.
+-- The tasks the panel shows for $scope, bounded, in id order. "all" takes
+-- the current workspace's windows first, so the cap never drops a window the
+-- user is looking at, then fills from the other workspaces; "current" is
+-- current_tasks.
 fn panel_tasks($windows, $ws_current, $scope, $limit)
-  if $scope == "current" then return current_tasks($windows, $ws_current, $limit) end
-  $tasks = []
+  $here = current_tasks($windows, $ws_current, $limit)
+  if $scope == "current" then return $here end
+  $tasks = $here
   for each $w in $windows
     if length($tasks) >= $limit then break end
-    push($tasks, $w)
+    if elsewhere($w, $ws_current) then push($tasks, $w) end
   end
-  return $tasks
+  return sort_by($tasks, function ($w) = $w.id)
 end
 
--- A window on another workspace than $ws_current (a window without a
--- workspace belongs to the current one).
+-- A window on another workspace than $ws_current. A window without a
+-- workspace, or with comp's 0 before its first map, belongs to the current one.
 fn elsewhere($w, $ws_current)
-  return ($w.workspace ?? $ws_current) != $ws_current
+  $ws = $w.workspace
+  if type($ws) != "number" or $ws < 1 then return false end
+  return $ws != $ws_current
 end
 
 fn refusal($code, $message)
@@ -64,11 +69,11 @@ fn task_action($windows, $item)
   return task_action_at($windows, $item, nil)
 end
 
--- A window on another workspace than $ws_current is brought to: the action
--- carries `workspace` (switch there first), then restores a minimised window
--- or focuses it. It is never minimised from another workspace, because it is
--- not the focused window the user is looking at. $ws_current nil = no
--- workspace check.
+-- A window on another workspace than $ws_current is focused, or restored if
+-- minimised, and never minimised: it is not the window the user is looking
+-- at. The compositor shows its workspace itself (comp.window.focus and
+-- restore switch only when the operation is allowed, so a refused click
+-- never moves the desktop). $ws_current nil = no workspace check.
 fn task_action_at($windows, $item, $ws_current)
   if type($item) != "map" or type($item.window) != "number" or type($item.generation) != "number" then
     return refusal("invalid_args", "item must carry the window id and generation")
@@ -80,8 +85,7 @@ fn task_action_at($windows, $item, $ws_current)
       end
       $args = {id: $w.id, generation: $w.generation}
       if $ws_current != nil and elsewhere($w, $ws_current) then
-        $verb = $w.minimized ? "comp.window.restore" : "comp.window.focus"
-        return {ok: true, verb: $verb, args: $args, workspace: $w.workspace}
+        return {ok: true, verb: $w.minimized ? "comp.window.restore" : "comp.window.focus", args: $args}
       end
       if $w.minimized then return {ok: true, verb: "comp.window.restore", args: $args} end
       if $w.focused then return {ok: true, verb: "comp.window.minimize", args: $args} end

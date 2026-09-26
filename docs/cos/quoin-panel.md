@@ -159,9 +159,10 @@ and `tray` read the complete published row from `$event.args.item`
 (`index`, `window`+`generation`, `key`), never a generated node ID. A task
 click re-reads `comp.windows.list` and refuses `stale_window` when that window
 closed or its generation changed; the compositor re-checks the generation it
-receives too. A task on another workspace switches there first
-(`comp.workspace.switch`), then focuses the window, or restores it if minimised.
-It is never minimised from another workspace. Peek minimises the current
+receives too. A task on another workspace is focused, or restored if minimised,
+and never minimised. The compositor shows its workspace as part of that
+operation, and only when the operation is allowed, so a refused click never
+moves the desktop. Peek minimises the current
 workspace's visible windows and restores exactly the id+generation pairs it
 minimised. Replies carry the upstream outcome or a `{error_code,message}`
 refusal. `panel.state` returns the last accepted model; `panel.refresh`
@@ -170,18 +171,27 @@ queues one rebuild.
 **Task scope** (Plasma's "Show only tasks from the current desktop"):
 `settings.conf.mix` beside the panel scene holds `tasks_scope`.
 
-- `"all"` is the default, and also applies when the file is missing. It shows
-  windows from every workspace in id order. Another workspace's task has no
-  button background and dimmed text.
+- `"all"` is the default, and also applies when the file or the key is
+  missing. It shows windows from every workspace in id order. Another
+  workspace's task has no button background and dimmed text. Under the
+  50-button cap, the current workspace's windows are always kept.
 - `"current"` shows only the current workspace's windows, as the legacy panel
   did.
 - `panel.tasks_scope {scope}` on `scene-panel` sets the scope, and `{}`
-  toggles it. The file is written atomically and the reply is `{scope, file}`.
-  A bad scope is refused with `invalid_args`; an unwritable file is refused
-  with `settings_unwritable` and the scope is left unchanged.
-- A hand edit of the file, in ced or the Scene Editor, applies live: the
-  behaviour watches the scene directory with inotify.
-- An unreadable or invalid file falls back to `"all"` with one stderr line.
+  toggles it. The file is written atomically, other keys are kept, and the
+  reply is `{scope, file}`. Refusals:
+  - a bad scope or non-map args: `invalid_args`;
+  - a toggle while the file cannot be read: `settings_invalid` (an explicit
+    scope replaces the file);
+  - an unwritable file: `settings_unwritable`, with the scope unchanged.
+- A hand edit of the file (open it in ced) applies live: the behaviour
+  watches the scene directory with inotify.
+- An unreadable or invalid file keeps the scope in force, and says why on
+  stderr, so a save caught half-written never flips the panel. At start that
+  scope is `"all"`.
+- Snapshots from a behaviour copy older than the setting carry no scope. The
+  shared model draws those current-workspace only, as they always were;
+  resetting the copy (`scenes-cli.mix reset panel`) brings in the setting.
 - Peek stays current-workspace only.
 
 The clock is one `task_start` wall-clock deadline per displayed minute and

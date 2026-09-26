@@ -84,7 +84,8 @@ end
 
 -- The bottom panel's complete runtime model, as the legacy builder drew it.
 -- $snap: {windows (normal band, id order), ws_count, ws_current,
---         tasks_scope ("all" default | "current"), tray,
+--         tasks_scope ("all" | "current"; absent = "current", what a
+--         behaviour copy older than the setting draws), tray,
 --         notes_count, net:{up,wireless}, vol:{ok,level,muted},
 --         open:{launcher,calendar,notes}, peeked (bool)}
 -- $icons: {themed:{name:path} (dark status theme), plain:{name:path}
@@ -109,7 +110,7 @@ fn panel($snap, $icons, $now)
   -- A window on another workspace (tasks_scope "all") has no button
   -- background and dimmed text, like a minimised one reads fainter still.
   $tasks = []
-  for each $w in $t.panel_tasks($snap.windows ?? [], $ws_current, $snap.tasks_scope ?? "all", $MAX_TASKS)
+  for each $w in $t.panel_tasks($snap.windows ?? [], $ws_current, $snap.tasks_scope ?? "current", $MAX_TASKS)
     $away = $t.elsewhere($w, $ws_current)
     $background = nil
     if $w.focused and not $w.minimized and not $away then

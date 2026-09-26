@@ -22,31 +22,53 @@ $PW_RUNTIME = env("PIPEWIRE_RUNTIME_DIR", "/run/user/" .. to_string(uid()))
 $POPUPS = {launcher: env("PANEL_LAUNCHER_SCENE", "launcher"),
   calendar: env("PANEL_CALENDAR_SCENE", "calendar"), notes: env("PANEL_NOTES_SCENE", "notes")}
 
--- The panel's own settings, beside its scene (SCENE_DIR is the scene
--- directory, the user copy on a live desktop). tasks_scope: "all" (default,
--- like Plasma) or "current". Missing = the default; unreadable or invalid =
--- the default, said once on stderr.
-$SETTINGS = env("SCENE_DIR", ".") .. "/settings.conf.mix"
+-- The panel's own settings, beside its scene (SCENE_DIR, the user copy on a
+-- live desktop), canonicalised because inotify reports canonical paths.
+-- tasks_scope: "all" (Plasma's default) or "current". A missing file or key
+-- is "all"; an unreadable or invalid file keeps the scope in force (start:
+-- "all") and says why on stderr, so a half-written save never flips the panel.
+fn scene_dir()
+  $dir = env("SCENE_DIR", "")
+  if $dir == "" then $dir = cwd() end
+  try
+    return realpath($dir)
+  catch $ignored
+    return $dir
+  end
+end
+$SETTINGS = scene_dir() .. "/settings.conf.mix"
 
-fn load_scope()
-  if not is_file($SETTINGS) then return "all" end
+-- {scope, data, why}: scope nil = the file exists but cannot be used.
+fn read_settings()
+  if not is_file($SETTINGS) then return {scope: "all", data: {}, why: nil} end
   try
     $data = load_data($SETTINGS)
-    $scope = $t.valid_scope(type($data) == "map" ? $data.tasks_scope : nil)
-    if $scope != nil then return $scope end
-    eprint("panel: " .. $SETTINGS .. ": tasks_scope must be \"all\" or \"current\"; using \"all\"")
+    if type($data) != "map" then return {scope: nil, data: nil, why: "not a key: value file"} end
+    if $data.tasks_scope == nil then return {scope: "all", data: $data, why: nil} end
+    $scope = $t.valid_scope($data.tasks_scope)
+    if $scope == nil then return {scope: nil, data: $data, why: "tasks_scope must be \"all\" or \"current\""} end
+    return {scope: $scope, data: $data, why: nil}
   catch $message
-    eprint("panel: " .. $SETTINGS .. " unreadable (" .. to_string($message) .. "); using \"all\"")
+    return {scope: nil, data: nil, why: to_string($message)}
   end
-  return "all"
 end
 
-fn settings_text($scope)
-  return "-- The bottom panel's settings (edit here, in the Scene Editor, or with\n" ..
-    "-- `send scene-panel panel.tasks_scope {\"scope\":\"current\"}`).\n" ..
+-- The whole file, other keys kept (comments are not: the header is rewritten).
+fn settings_text($data)
+  $out = "-- The bottom panel's settings: edit here (ced), or send\n" ..
+    "-- `panel.tasks_scope {\"scope\":\"current\"}` to scene-panel ({} toggles).\n" ..
     "-- tasks_scope: \"all\" shows windows from every workspace (Plasma's default);\n" ..
-    "-- \"current\" shows only the current workspace's windows.\n" ..
-    "schema: 1\ntasks_scope: \"" .. $scope .. "\"\n"
+    "-- \"current\" shows only the current workspace's windows.\n"
+  $keys = ["schema", "tasks_scope"]
+  for each $k in sort(keys($data))
+    if not contains($keys, $k) then push($keys, $k) end
+  end
+  for each $k in $keys
+    if not has_key($data, $k) then continue end
+    if not re_match($k, "^[a-z_][a-z0-9_]*$") then return $out .. data_encode($data, true) .. "\n" end
+    $out = $out .. $k .. ": " .. data_encode($data[$k]) .. "\n"
+  end
+  return $out
 end
 
 fn empty_icons()
@@ -60,7 +82,9 @@ $state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes
   net_watch: nil, net_started: 0, net_retry: 5, net_retrying: false,
   audio_watch: nil, audio_started: 0, audio_retry: 5, audio_retrying: false, audio_unavailable: false,
   model: nil, settings_watch: nil}
-$state.tasks_scope = load_scope()
+$first = read_settings()
+$state.tasks_scope = $first.scope ?? "all"
+if $first.scope == nil then eprint("panel: " .. $SETTINGS .. ": " .. $first.why .. "; using \"all\"") end
 
 -- ── status: network + volume, pushed by the kernel and PipeWire ─────────
 -- rtnetlink link events and a `pactl subscribe` stream (net_watch /
@@ -427,17 +451,6 @@ on task async
     $r.respond($r.failure($action.error_code, $action.message))
     return
   end
-  -- A window on another workspace: go there first, then act on it (the
-  -- compositor re-checks its generation, so a window that changed meanwhile
-  -- is still refused).
-  if $action.workspace != nil then
-    $switched = $r.call($COMP, "comp.workspace.switch", {index: $action.workspace})
-    if not $switched.ok then
-      schedule()
-      $r.respond($switched)
-      return
-    end
-  end
   $out = $r.call($COMP, $action.verb, $action.args)
   schedule()
   $r.respond($out)
@@ -495,15 +508,31 @@ on panel.state desc "panel model {model}; the last model the loader accepted"
 end
 
 on panel.tasks_scope desc "set the task scope {scope: all|current}, or toggle it {}; persisted beside the scene; replies {scope, file}"
-  $args = type($event.args) == "map" ? $event.args : {}
+  if $event.args != nil and type($event.args) != "map" then
+    reply(10, json_encode({error_code: "invalid_args", message: "args must be {} or {scope}"}))
+    return
+  end
+  $args = $event.args ?? {}
+  $current = read_settings()
   $scope = $args.scope
-  if $scope == nil then $scope = $state.tasks_scope == "all" ? "current" : "all" end
+  if $scope == nil then
+    -- A toggle is relative to the file; one that cannot be read is not
+    -- overwritten on a guess (an explicit scope replaces it).
+    if $current.scope == nil then
+      reply(10, json_encode({error_code: "settings_invalid", message: $current.why, file: $SETTINGS}))
+      return
+    end
+    $scope = $current.scope == "all" ? "current" : "all"
+  end
   if $t.valid_scope($scope) == nil then
     reply(10, json_encode({error_code: "invalid_args", message: "scope must be \"all\" or \"current\""}))
     return
   end
+  $data = type($current.data) == "map" ? $current.data : {}
+  $data.schema = $data.schema ?? 1
+  $data.tasks_scope = $scope
   try
-    write_atomic($SETTINGS, settings_text($scope))
+    write_atomic($SETTINGS, settings_text($data))
   catch $message
     reply(10, json_encode({error_code: "settings_unwritable", message: to_string($message), file: $SETTINGS}))
     return
@@ -649,9 +678,13 @@ on fs.changed
     if type($c) == "map" and $c.path == $SETTINGS then $touched = true end
   end
   if not $touched then return end
-  $scope = load_scope()
-  if $scope != $state.tasks_scope then
-    $state.tasks_scope = $scope
+  $now = read_settings()
+  if $now.scope == nil then
+    eprint("panel: " .. $SETTINGS .. ": " .. $now.why .. "; keeping \"" .. $state.tasks_scope .. "\"")
+    return
+  end
+  if $now.scope != $state.tasks_scope then
+    $state.tasks_scope = $now.scope
     schedule()
   end
 end
