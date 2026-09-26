@@ -1,0 +1,23 @@
+# desktop/crates/cosmix-dopus-core — headless twin-pane file-manager core,
+# ported verbatim from desktop/apps/filemgr (Bevy/ctk); see desktop/APPS.md.
+[package]
+name = "cosmix-dopus-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "Renderer-free core of dopus: twin-pane navigation, sorting, async listings and counts, file operations and .conf.mix persistence"
+
+[package.metadata.cosmix]
+kind = "library"
+component = "dopus"
+
+[dependencies]
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config" }
+cosmix-files = { package = "cosmix-lib-files", path = "../../../crates/cosmix-lib-files" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
