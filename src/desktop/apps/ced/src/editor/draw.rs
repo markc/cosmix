@@ -565,3 +565,118 @@ fn ago(secs: u64) -> String {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use cosmix_edit_client::diag::Diagnostics;
+    use cosmix_edit_client::highlight::Highlight;
+    use cosmix_edit_client::model::EditorModel;
+    use cosmix_edit_core::text::Text;
+    use iced::{Background, Transformation};
+
+    use super::super::layout::Metrics;
+    use super::super::{EditorView, Palette};
+    use super::*;
+
+    /// Records each `fill_text`: its position, box and clip rectangle.
+    #[derive(Default)]
+    struct Rec {
+        texts: Vec<(Point, Size, Rectangle)>,
+    }
+
+    impl iced::advanced::Renderer for Rec {
+        fn start_layer(&mut self, _: Rectangle) {}
+        fn end_layer(&mut self) {}
+        fn start_transformation(&mut self, _: Transformation) {}
+        fn end_transformation(&mut self) {}
+        fn fill_quad(&mut self, _: renderer::Quad, _: impl Into<Background>) {}
+        fn reset(&mut self, _: Rectangle) {}
+        fn allocate_image(
+            &mut self,
+            _: &iced::advanced::image::Handle,
+            _: impl FnOnce(Result<iced::advanced::image::Allocation, iced::advanced::image::Error>) + Send + 'static,
+        ) {
+        }
+    }
+
+    impl atext::Renderer for Rec {
+        type Font = Font;
+        type Paragraph = ();
+        type Editor = ();
+        const ICON_FONT: Font = Font::DEFAULT;
+        const CHECKMARK_ICON: char = '0';
+        const ARROW_DOWN_ICON: char = '0';
+        const SCROLL_UP_ICON: char = '0';
+        const SCROLL_DOWN_ICON: char = '0';
+        const SCROLL_LEFT_ICON: char = '0';
+        const SCROLL_RIGHT_ICON: char = '0';
+        const ICED_LOGO: char = '0';
+        fn default_font(&self) -> Font {
+            Font::default()
+        }
+        fn default_size(&self) -> Pixels {
+            Pixels(16.0)
+        }
+        fn fill_paragraph(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
+        fn fill_editor(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
+        fn fill_text(&mut self, text: atext::Text, position: Point, _: Color, clip: Rectangle) {
+            self.texts.push((position, text.bounds, clip));
+        }
+    }
+
+    fn palette() -> Palette {
+        crate::theme::resolve_selection(&crate::theme::read_selection(None, None, &mut Vec::new()), Vec::new()).palette
+    }
+
+    /// iced_tiny_skia's per-text decision (`Engine::draw_text`, 0.14): a text
+    /// whose clip rectangle meets the damage is drawn, and one whose clip
+    /// rectangle is not inside it first clears and refills a window-sized
+    /// clip mask.
+    fn masked(clip: &Rectangle, damage: &Rectangle) -> bool {
+        clip.intersects(damage) && !clip.is_within(damage)
+    }
+
+    /// Each text's clip rectangle is its own row box (a cell and half a line
+    /// of slack), so a frame whose damage is one row draws and masks only the
+    /// texts near that row — the whole text area here made every text on
+    /// screen clear a window-sized mask each frame, ~150 ms a frame, and a
+    /// save waited behind it (ced first save, 2026-09-26).
+    #[test]
+    fn each_text_is_clipped_to_its_own_row_not_the_text_area() {
+        let mut body = String::new();
+        for n in 0..60 {
+            body.push_str(&format!("let value_{n} = \"a string\" .. {n} -- a comment · ü\n"));
+        }
+        body.push_str(&"x".repeat(400));
+        let text = Text::from_text(&body).unwrap();
+        let model = EditorModel::default();
+        let highlight = Highlight::for_language("text", None);
+        let palette = palette();
+        let diagnostics = Diagnostics::default();
+        let view = EditorView { whitespace: true, ..EditorView::default() };
+        let ed = Editor { text: &text, model: &model, highlight: &highlight, palette: &palette, diagnostics: &diagnostics, view };
+        let metrics = Metrics { cell_w: 10.0, line_h: 20.0 };
+        let mut st = State::default();
+        st.metrics = Some(metrics);
+        let g = Geometry::new(Rectangle { x: 100.0, y: 50.0, width: 800.0, height: 405.0 }, metrics, text.line_count(), true);
+        let mut r = Rec::default();
+        draw(&ed, &st, &g, &mut r, mouse::Cursor::Unavailable);
+
+        assert!(r.texts.len() > 40, "the fixture draws a screenful of texts ({})", r.texts.len());
+        for (at, size, clip) in &r.texts {
+            let own = Rectangle::new(*at, *size);
+            assert!(own.is_within(clip), "the clip {clip:?} holds the text's own box {own:?}");
+            assert!(clip.height <= 2.0 * metrics.line_h, "the clip {clip:?} is a row, not the text area");
+        }
+        // One row of damage (a caret moving on row 5): only the texts on it
+        // and its neighbours meet it.
+        let t = g.text_rect();
+        let damage = Rectangle { x: t.x, y: g.bounds.y + 5.0 * metrics.line_h, width: t.width, height: metrics.line_h };
+        let near = |y: f32| (y - damage.y).abs() <= metrics.line_h;
+        let touched: Vec<_> = r.texts.iter().filter(|(_, _, clip)| clip.intersects(&damage)).collect();
+        assert!(!touched.is_empty());
+        assert!(touched.iter().all(|(at, _, _)| near(at.y)), "only texts beside the damaged row are drawn: {touched:?}");
+        let masks = r.texts.iter().filter(|(_, _, clip)| masked(clip, &damage)).count();
+        assert!(masks * 5 < r.texts.len(), "{masks} of {} texts clear a window-sized mask for one damaged row", r.texts.len());
+    }
+}
