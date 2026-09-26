@@ -501,6 +501,19 @@ same HTTP 404 <code>blob not found</code>. Malformed IDs return HTTP 400 <code>i
 an inspection limit returns HTTP 413 <code>too_large: …</code>; unreadable or corrupt
 owned messages return HTTP 500 <code>unreadable: message</code>. No part bytes are stored
 as new CAS blobs by inspection or download.</p>
+<h3 id="blob-byte-lane">Blob byte lane</h3>
+<p>Maild uses the local blobd HTTP byte lane, discovered over Bus with
+<code>blob.props.get {"path":"lane"}</code>. Uploads use owner <code>maild:&lt;account_id&gt;</code> and
+an advisory <code>blob.quota</code> check; unavailable advisory quota does not suppress
+the authoritative HTTP admission check. Discovery and quota have 10-second
+deadlines, HTTP connects have a 10-second deadline, and upload progress and
+response reads have 30-second idle limits with no total transfer deadline.
+Redirects, proxies and automatic response decompression are disabled.</p>
+<p>Names are hints: non-printable bytes, spaces, percent signs and UTF-8 bytes
+are percent-encoded, and the name header is omitted if that exceeds 128
+bytes. Blobd's first-writer-wins name and MIME are returned unchanged.
+Downloads use only the local lane and verify BLAKE3 and length before use;
+an absent local blob is never fetched implicitly from its reference origin.</p>
 <h3 id="smtp">SMTP</h3>
 <p><code>smtp_inbound</code> enables inbound SMTP. <code>smtp_smtps</code> enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.</p>
 <p>Inbound delivery resolves local accounts and aliases, applies mail-auth checks, the rules engine, Bayesian classification, optional Mix routing, and retention-related metadata before committing mail to the mailbox store. Remote submissions enter the retry queue and outbound delivery path.</p>

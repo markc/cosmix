@@ -74,6 +74,22 @@ an inspection limit returns HTTP 413 `too_large: …`; unreadable or corrupt
 owned messages return HTTP 500 `unreadable: message`. No part bytes are stored
 as new CAS blobs by inspection or download.
 
+### Blob byte lane
+
+Maild uses the local blobd HTTP byte lane, discovered over Bus with
+`blob.props.get {"path":"lane"}`. Uploads use owner `maild:<account_id>` and
+an advisory `blob.quota` check; unavailable advisory quota does not suppress
+the authoritative HTTP admission check. Discovery and quota have 10-second
+deadlines, HTTP connects have a 10-second deadline, and upload progress and
+response reads have 30-second idle limits with no total transfer deadline.
+Redirects, proxies and automatic response decompression are disabled.
+
+Names are hints: non-printable bytes, spaces, percent signs and UTF-8 bytes
+are percent-encoded, and the name header is omitted if that exceeds 128
+bytes. Blobd's first-writer-wins name and MIME are returned unchanged.
+Downloads use only the local lane and verify BLAKE3 and length before use;
+an absent local blob is never fetched implicitly from its reference origin.
+
 ### SMTP
 
 `smtp_inbound` enables inbound SMTP. `smtp_smtps` enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.
