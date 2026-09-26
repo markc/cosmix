@@ -39,7 +39,11 @@ pub enum ShellSemanticVerb {
     PanelShow,
     PanelHide,
     PanelToggle,
+    /// Enter `Pinned`: a persistent overlay that reserves no space.
     PanelPin,
+    /// `Pinned` releases into a transient reveal with normal grace; any other
+    /// mode enters `Pinned`. The direction binds at Model time.
+    PanelPinToggle,
     PanelUnpin,
     /// Precise dock: enter `Docked` regardless of the current mode. Docking
     /// reflows the workspace, so it is never a side effect of another verb.
@@ -121,13 +125,17 @@ pub fn semantic_shell_command(
         },
         ShellSemanticVerb::PanelToggle => ShellCommandKind::Panel {
             edge,
-            input: PanelInput::Toggle,
+            input: PanelInput::ToggleShown,
         },
         ShellSemanticVerb::PanelPin => ShellCommandKind::Panel {
             edge,
-            // Legacy Bus pin keeps its reserving behaviour so popup citizens
-            // hold their space; the precise verbs are PanelDock/PanelMode.
-            input: PanelInput::Dock,
+            // Pin is an overlay that reserves no space (Mark, 2026-09-26);
+            // PanelDock is the reserving verb.
+            input: PanelInput::Pin,
+        },
+        ShellSemanticVerb::PanelPinToggle => ShellCommandKind::Panel {
+            edge,
+            input: PanelInput::PinToggle,
         },
         ShellSemanticVerb::PanelUnpin => ShellCommandKind::Panel {
             edge,

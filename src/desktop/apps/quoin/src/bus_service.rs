@@ -265,7 +265,8 @@ fn reply_panels(
         let panel = frame.0.panel(edge);
         let applied = output == frame.0.geometry.output && match request.command.as_str() {
             "shell.panel.page.set" => panel.active_page_id == argument(&request, "id"),
-            "shell.panel.pin" => panel.mode == PanelMode::Docked && panel.mapped,
+            // Pin is an overlay (Mark, 2026-09-26): applied once Pinned.
+            "shell.panel.pin" => panel.mode == PanelMode::Pinned && panel.mapped,
             "shell.panel.mode" => Some(panel.mode.as_str().to_owned()) == argument(&request, "mode"),
             // Hide only conceals a transient reveal. Its concealment is
             // observable at once (no longer revealed); it is not held until
@@ -1219,7 +1220,7 @@ fn dispatch_with_declared(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","focus.next","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scene.layout","scenes.list","dialog.show","dialog.hide"],
+            "verbs":["quit","focus.next","panel.show","panel.hide","panel.toggle","panel.pin","panel.pin.toggle","panel.unpin","panel.dock","panel.mode","panel.resize","panel.order","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","settings.get","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.validate","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scene.layout","scenes.list","dialog.show","dialog.hide"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1436,6 +1437,11 @@ fn dispatch_with_declared(
             "top-right" => Some(Corner::TopRight.summoned_edge()),
             _ => None,
         })
+    } else if request.command == "shell.panel.pin.toggle" && argument(request, "edge").is_none() {
+        match pin_toggle_target(frame) {
+            Ok(edge) => Some(edge),
+            Err(refusal) => return (10, refusal.to_string(), None),
+        }
     } else {
         argument(request, "edge").and_then(parse_edge)
     };
@@ -1479,12 +1485,53 @@ fn dispatch_with_declared(
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
+/// The edge an edgeless `shell.panel.pin.toggle` (the Super+Alt+P chord)
+/// acts on, from the current frame, first rule that picks exactly one:
+/// 1. the panel holding the keyboard, else the one a focus request targets;
+/// 2. the one transiently revealed edge (a hover or `show` about to be pinned);
+/// 3. the one `Pinned` edge (about to be unpinned).
+///
+/// Otherwise a refusal naming the candidates: `PIN_TARGET_AMBIGUOUS` when a
+/// rule matched several edges, `PIN_TARGET_NONE` when nothing matched.
+fn pin_toggle_target(frame: &ShellFrame) -> Result<Edge, Value> {
+    let rules: [(&str, fn(&cosmix_shell::runtime::PanelPresentation) -> bool); 4] = [
+        ("keyboard_focused", |panel| panel.keyboard_focused),
+        ("keyboard_requested", |panel| panel.keyboard_requested),
+        ("transient_revealed", |panel| {
+            panel.mode == PanelMode::Hidden && panel.transient_revealed
+        }),
+        ("pinned", |panel| panel.mode == PanelMode::Pinned),
+    ];
+    for (rule, matches) in rules {
+        let edges: Vec<Edge> = Edge::ALL
+            .into_iter()
+            .filter(|&edge| matches(frame.panel(edge)))
+            .collect();
+        match edges.as_slice() {
+            [] => continue,
+            [edge] => return Ok(*edge),
+            _ => {
+                return Err(json!({
+                    "error_code":"PIN_TARGET_AMBIGUOUS",
+                    "message":format!("several edges are {rule}; pass edge"),
+                    "edges":edges.iter().map(|&edge| edge_name(edge)).collect::<Vec<_>>(),
+                }));
+            }
+        }
+    }
+    Err(json!({
+        "error_code":"PIN_TARGET_NONE",
+        "message":"no focused, revealed or pinned edge to toggle; pass edge",
+    }))
+}
+
 fn semantic_verb(request: &InboundRequest) -> Option<ShellSemanticVerb> {
     Some(match request.command.as_str() {
         "shell.panel.show" | "shell.corner.show" => ShellSemanticVerb::PanelShow,
         "shell.panel.hide" | "shell.corner.hide" => ShellSemanticVerb::PanelHide,
         "shell.panel.toggle" | "shell.corner.toggle" => ShellSemanticVerb::PanelToggle,
         "shell.panel.pin" | "shell.corner.pin" => ShellSemanticVerb::PanelPin,
+        "shell.panel.pin.toggle" => ShellSemanticVerb::PanelPinToggle,
         "shell.panel.unpin" | "shell.corner.unpin" => ShellSemanticVerb::PanelUnpin,
         "shell.panel.dock" => ShellSemanticVerb::PanelDock,
         "shell.panel.mode" => {
@@ -2506,7 +2553,7 @@ mod tests {
                 json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
-                    input: PanelInput::Toggle,
+                    input: PanelInput::ToggleShown,
                 },
             ),
             (
@@ -2514,7 +2561,15 @@ mod tests {
                 json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
-                    input: PanelInput::Dock,
+                    input: PanelInput::Pin,
+                },
+            ),
+            (
+                "shell.panel.pin.toggle",
+                json!({"edge":"bottom"}),
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::PinToggle,
                 },
             ),
             (
@@ -3390,6 +3445,121 @@ mod tests {
             assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
             assert_eq!(requested(&app), expected);
         }
+    }
+
+    fn send_until_reply(
+        app: &mut App,
+        peer: &ctk::bus::TestBusPeer,
+        command: &str,
+        body: Value,
+    ) -> (u8, Value) {
+        let mut request = local(command);
+        request.body = body.to_string();
+        peer.send(request);
+        for _ in 0..120 {
+            app.update();
+            let replies = peer.drain_responses();
+            peer.drain_publishes();
+            if let Some(reply) = replies.first() {
+                assert_eq!(replies.len(), 1, "{command}");
+                return (reply.rc, serde_json::from_str(&reply.body).unwrap());
+            }
+        }
+        panic!("{command}: no reply");
+    }
+
+    fn settle(app: &mut App, peer: &ctk::bus::TestBusPeer) {
+        for _ in 0..30 {
+            app.update();
+            peer.drain_responses();
+            peer.drain_publishes();
+        }
+    }
+
+    fn left_panel(app: &App) -> (PanelMode, bool, f32) {
+        let panel = app.world().resource::<ShellFrameState>().0.panel(Edge::Left);
+        (panel.mode, panel.transient_revealed, panel.exclusive_zone_px)
+    }
+
+    /// Item 8a (Mark, 2026-09-26): `shell.panel.pin` is an overlay. It
+    /// enters Pinned and reserves nothing; `shell.panel.dock` reserves.
+    #[test]
+    fn pin_is_an_overlay_and_dock_reserves() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "overlay", "owner", "left");
+        let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.pin", json!({"edge":"left"}));
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["applied"], true);
+        assert_eq!(body["panels"]["left"]["mode"], "pinned");
+        settle(&mut app, &peer);
+        assert_eq!(left_panel(&app), (PanelMode::Pinned, false, 0.0));
+        let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.dock", json!({"edge":"left"}));
+        assert_eq!(rc, 0, "{body}");
+        settle(&mut app, &peer);
+        let (mode, _, zone) = left_panel(&app);
+        assert_eq!(mode, PanelMode::Docked);
+        assert!(zone > 0.0);
+    }
+
+    /// The Super+Alt+arrow chords' verb: `shell.panel.toggle` hides a pinned
+    /// or docked edge (no item-8b false success), and the next toggle only
+    /// reveals it transiently.
+    #[test]
+    fn toggle_hides_a_persistent_edge_then_reveals_transiently() {
+        for mode in ["pinned", "docked"] {
+            let (mut app, peer) = mounted_bus_app();
+            load_scene(&mut app, &peer, "toggled", "owner", "left");
+            send_until_reply(&mut app, &peer, "shell.panel.mode", json!({"edge":"left", "mode":mode}));
+            settle(&mut app, &peer);
+            let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.toggle", json!({"edge":"left"}));
+            assert_eq!(rc, 0, "{mode}: {body}");
+            settle(&mut app, &peer);
+            assert_eq!(left_panel(&app), (PanelMode::Hidden, false, 0.0), "{mode}");
+            assert!(!app.world().resource::<ShellFrameState>().0.panel(Edge::Left).mapped);
+            send_until_reply(&mut app, &peer, "shell.panel.toggle", json!({"edge":"left"}));
+            let (mode_after, revealed, zone) = left_panel(&app);
+            assert_eq!((mode_after, revealed, zone), (PanelMode::Hidden, true, 0.0), "{mode}");
+        }
+    }
+
+    /// `shell.panel.pin.toggle` without an edge (the Super+Alt+P chord)
+    /// resolves its target from the frame: focus, then the one transient
+    /// reveal, then the one pinned edge; otherwise a named refusal.
+    #[test]
+    fn edgeless_pin_toggle_targets_the_revealed_then_the_pinned_edge() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "pin-left", "owner", "left");
+        load_scene(&mut app, &peer, "pin-right", "owner", "right");
+        // Nothing revealed, focused or pinned.
+        let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.pin.toggle", json!({}));
+        assert_eq!(rc, 10, "{body}");
+        assert_eq!(body["error_code"], "PIN_TARGET_NONE");
+        // One transient reveal: that edge is pinned.
+        send_until_reply(&mut app, &peer, "shell.panel.show", json!({"edge":"left"}));
+        let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.pin.toggle", json!({}));
+        assert_eq!(rc, 0, "{body}");
+        settle(&mut app, &peer);
+        assert_eq!(left_panel(&app).0, PanelMode::Pinned);
+        // Now the one pinned edge: it is released again.
+        let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.pin.toggle", json!({}));
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(left_panel(&app).0, PanelMode::Hidden);
+        // Two transient reveals: ambiguous, and the candidates are named.
+        send_until_reply(&mut app, &peer, "shell.panel.show", json!({"edge":"left"}));
+        send_until_reply(&mut app, &peer, "shell.panel.show", json!({"edge":"right"}));
+        let (rc, body) = send_until_reply(&mut app, &peer, "shell.panel.pin.toggle", json!({}));
+        assert_eq!(rc, 10, "{body}");
+        assert_eq!(body["error_code"], "PIN_TARGET_AMBIGUOUS");
+        assert_eq!(body["edges"], json!(["left", "right"]));
+        // An explicit edge always wins.
+        let (rc, body) =
+            send_until_reply(&mut app, &peer, "shell.panel.pin.toggle", json!({"edge":"right"}));
+        assert_eq!(rc, 0, "{body}");
+        settle(&mut app, &peer);
+        assert_eq!(
+            app.world().resource::<ShellFrameState>().0.panel(Edge::Right).mode,
+            PanelMode::Pinned
+        );
     }
 
     /// Item 8b: hide on a pinned or docked edge used to answer

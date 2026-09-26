@@ -89,6 +89,12 @@ pub enum PanelInput {
     /// reveal already false) toggles back open, and two toggles applied in one
     /// drained batch net to identity rather than to a single toggle.
     Toggle,
+    /// The chord and Bus toggle (`shell.panel.toggle`): [`PanelInput::Toggle`]
+    /// on a `Hidden` panel, and on a `Pinned` or `Docked` one a deliberate
+    /// hide into `Hidden`, exactly as `SetMode(Hidden)`. Toggling again then
+    /// reveals transiently: it never restores the persistent mode, because
+    /// docking reflows the workspace and is never a side effect of a toggle.
+    ToggleShown,
     CornerEntered,
     CornerLeft,
     Hide,
@@ -135,6 +141,7 @@ impl PanelInput {
             self,
             Self::Reveal
                 | Self::Toggle
+                | Self::ToggleShown
                 | Self::CornerEntered
                 | Self::PointerEntered
                 | Self::HolderReveal
@@ -364,6 +371,7 @@ impl PanelStateMachine {
             input,
             PanelInput::Reveal
                 | PanelInput::Toggle
+                | PanelInput::ToggleShown
                 | PanelInput::Pin
                 | PanelInput::PinToggle
                 | PanelInput::Dock
@@ -424,7 +432,13 @@ impl PanelStateMachine {
                 }
                 self.motion.reveal();
             }
-            PanelInput::Toggle => {
+            PanelInput::ToggleShown if self.mode != PanelMode::Hidden => {
+                effect = self.change_mode(PanelMode::Hidden).or(effect);
+                if !plane && (self.pointer_inside || self.corner_inside) {
+                    self.hover_latched = true;
+                }
+            }
+            PanelInput::Toggle | PanelInput::ToggleShown => {
                 if self.mode == PanelMode::Hidden && !self.transient_revealed {
                     self.transient_revealed = true;
                     self.shown = true;

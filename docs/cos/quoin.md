@@ -356,13 +356,32 @@ From a Mix script: `send shell shell.scenes.list` and
 that reserves no space) or `docked` (reserves its full thickness), independent
 of transient visibility. `pinned` is a read-compatibility shim: true for either
 persistent `Pinned` or `Docked`, false for `Hidden` even while transiently
-revealed. Existing Bus `pin` retains its reserving behaviour (`Docked`),
-including the corner-addressed alias, and existing Bus `unpin` releases either
-persistent mode into transient grace; follow it with `hide` to conceal. The
-legacy pair is deliberately unchanged; the corner menu, keyboard bindings and
-citizens that need to drive a mode explicitly use the precise verbs below.
+revealed. Bus `pin` (and its corner-addressed alias) enters `Pinned`: an
+overlay that reserves no space. Since quoin 0.19.0 (Mark, 2026-09-26) it no
+longer docks; a caller that needs reserved space sends `shell.panel.dock`.
+Bus `unpin` releases either persistent mode into transient grace; follow it
+with `hide` to conceal.
 
-The semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin,dock,mode}`,
+`shell.panel.toggle {edge}` shows or hides an edge whatever its mode. On a
+hidden edge it toggles the transient reveal (the direction binds when the
+model applies it, so two toggles in one batch cancel out). On a pinned or
+docked edge it hides the edge deliberately, exactly as
+`shell.panel.mode {mode:"hidden"}`: no grace, and the reservation goes.
+The next toggle reveals it transiently. It never restores `Docked`, because
+docking reflows the workspace and is never a side effect of another verb.
+It replies `{accepted:true}` on enqueueing; read the state back.
+
+`shell.panel.pin.toggle {edge?}` releases a pinned edge into a transient
+reveal with normal grace, and pins any other edge (docked included). With
+no `edge` it picks one from the current state, using the first rule that
+matches exactly one edge: the panel holding the keyboard, else the one a
+focus request targets, else the one transiently revealed edge, else the one
+pinned edge. When a rule matches several edges the reply is rc 10
+`{error_code:"PIN_TARGET_AMBIGUOUS", message, edges}`; when none matches,
+`PIN_TARGET_NONE`. Pass `edge` to choose explicitly. It replies
+`{accepted:true}` on enqueueing.
+
+The semantic verbs are `shell.panel.{show,hide,toggle,pin,pin.toggle,unpin,dock,mode}`, `shell.focus.next`,
 `shell.panel.page.{next,prev,set}` and `shell.quit`. They require a broker-stamped local,
 registered caller and are translated to the same `ShellCommand` ingress used
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk

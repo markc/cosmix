@@ -1301,7 +1301,7 @@ mod tests {
                     input: crate::core::PanelInput::Hide,
                 },
             ),
-            // `PanelToggle` maps to core `Toggle`, NOT to `Reveal`: the
+            // `PanelToggle` maps to core `ToggleShown`, NOT to `Reveal`: the
             // direction binds at Model time. This fixture starts Hidden,
             // where the two coincide, so the row records the mapping rather
             // than discriminating it — the tests that DO discriminate are
@@ -1311,14 +1311,22 @@ mod tests {
                 ShellSemanticVerb::PanelToggle,
                 ShellCommandKind::Panel {
                     edge: Edge::Left,
-                    input: crate::core::PanelInput::Toggle,
+                    input: crate::core::PanelInput::ToggleShown,
                 },
             ),
+            // Pin is an overlay (Pinned); only PanelDock reserves.
             (
                 ShellSemanticVerb::PanelPin,
                 ShellCommandKind::Panel {
                     edge: Edge::Left,
-                    input: crate::core::PanelInput::Dock,
+                    input: crate::core::PanelInput::Pin,
+                },
+            ),
+            (
+                ShellSemanticVerb::PanelPinToggle,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: crate::core::PanelInput::PinToggle,
                 },
             ),
             (

@@ -71,7 +71,8 @@ on "shell.panel.pin"
   if ($mode.show_refused ?? false) or ($mode.pin_refused ?? false) then reply(14, "{}"); return end
   $pins = $pins + 1
   $edges[$event.args.edge].pinned = true
-  $edges[$event.args.edge].mode = "docked"
+  -- Quoin 0.19.0: pin is an overlay (Pinned), not Docked.
+  $edges[$event.args.edge].mode = "pinned"
   $edges[$event.args.edge].visible = true
   applied()
   if $mode.lose_pin_read ?? false then $mode.props_refused_once = true end

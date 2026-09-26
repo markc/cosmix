@@ -227,6 +227,34 @@ fn a_docked_panel_ignores_the_toggle_in_both_directions() {
     assert_eq!(update.snapshot.exclusive_zone_px, 100.0);
 }
 
+/// The chord/Bus toggle is the one toggle a persistent panel obeys: from
+/// Pinned or Docked it hides deliberately (no zone, no grace), and the next
+/// toggle only reveals transiently — it never re-docks.
+#[test]
+fn toggle_shown_hides_a_persistent_panel_and_reveals_transiently() {
+    for enter in [PanelInput::Pin, PanelInput::Dock] {
+        let mut panel = panel();
+        panel.apply(ms(0), enter).unwrap();
+        panel.tick(ms(200)).unwrap();
+        let update = panel.apply(ms(300), PanelInput::ToggleShown).unwrap();
+        assert!(update.changed, "{enter:?}");
+        assert_eq!(update.snapshot.mode, PanelMode::Hidden, "{enter:?}");
+        assert!(!update.snapshot.transient_revealed, "{enter:?}");
+        assert_eq!(update.snapshot.exclusive_zone_px, 0.0, "{enter:?}");
+        assert_eq!(
+            update.effect,
+            Some(PanelEffect::ModeChanged { mode: PanelMode::Hidden }),
+            "{enter:?}"
+        );
+        panel.tick(ms(600)).unwrap();
+        let update = panel.apply(ms(600), PanelInput::ToggleShown).unwrap();
+        assert_eq!(update.snapshot.mode, PanelMode::Hidden, "{enter:?}");
+        assert!(update.snapshot.transient_revealed, "{enter:?}");
+        let update = panel.apply(ms(700), PanelInput::ToggleShown).unwrap();
+        assert!(!update.snapshot.transient_revealed, "{enter:?}");
+    }
+}
+
 #[test]
 fn escape_never_undocks() {
     let mut panel = panel();
