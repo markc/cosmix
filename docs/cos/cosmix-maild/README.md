@@ -90,6 +90,16 @@ bytes. Blobd's first-writer-wins name and MIME are returned unchanged.
 Downloads use only the local lane and verify BLAKE3 and length before use;
 an absent local blob is never fetched implicitly from its reference origin.
 
+The Bus verbs `maild.attachment.list`, `maild.attachment.ref` and
+`maild.message.ref` inspect or export account-owned mail. Exports run in
+eight tracked tasks; a full pool returns `busy:` immediately, and a session
+end cancels outstanding transfers. Validated references are saved separately
+from messages, including origin and the message hash; repeats reuse the
+saved reference. Pins and bookkeeping survive mail/account deletion until
+later reconciliation. No detach or message rewrite occurs. `message.ref`
+is export, not a new `Email/import` input. See [bus.md](bus.md) for arguments,
+reply fields, errors and lifecycle details.
+
 ### SMTP
 
 `smtp_inbound` enables inbound SMTP. `smtp_smtps` enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.

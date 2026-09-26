@@ -22,6 +22,253 @@ struct Fixture {
     inbox: ContainerId,
 }
 
+struct LocalLane(Option<String>);
+impl cosmix_maild::blob_lane::Discovery for LocalLane {
+    async fn bind(&self) -> Result<String, String> {
+        Ok(self.0.as_ref().expect("unexpected lane discovery").clone())
+    }
+    async fn quota(&self, owner: &str) -> Result<Value, String> {
+        assert!(self.0.is_some(), "unexpected quota discovery");
+        assert_eq!(owner, "maild:1");
+        Err("test advisory quota unavailable".into())
+    }
+}
+
+async fn export_server(
+    f: &Fixture,
+    expected: &[u8],
+    wrong_hash: bool,
+) -> (LocalLane, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bind = listener.local_addr().unwrap().to_string();
+    let bytes = expected.to_vec();
+    let db = f.state().db.clone();
+    let worker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+            assert!(head.len() < 8192);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let length = head
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .unwrap()
+            .1
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        let mut incoming = vec![0; length];
+        socket.read_exact(&mut incoming).await.unwrap();
+        assert_eq!(incoming, bytes);
+        assert!(db.conn.try_lock().is_ok(), "DB mutex held across HTTP");
+        let hash = if wrong_hash {
+            "0".repeat(64)
+        } else {
+            blake3::hash(&bytes).to_hex().to_string()
+        };
+        let body = json!({"blob": format!("b3:{hash}"), "size": bytes.len(),
+            "mime": "application/octet-stream", "name": "first-writer", "origin": "alpha"})
+        .to_string();
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        head
+    });
+    (LocalLane(Some(bind)), worker)
+}
+
+async fn attachment_bus(
+    f: &Fixture,
+    command: &str,
+    args: Value,
+    discovery: &LocalLane,
+) -> (u8, Value) {
+    let state = f.state();
+    let lane = cosmix_maild::blob_lane::Lane::new().unwrap();
+    let (rc, body) = cosmix_maild::bus::attachments::dispatch(
+        command,
+        args,
+        &state.db,
+        &state.mailstore,
+        &lane,
+        discovery,
+    )
+    .await;
+    (rc, serde_json::from_str(&body).unwrap())
+}
+
+#[tokio::test]
+async fn attachment_and_message_exports_are_idempotent_and_retain_bookkeeping() {
+    let f = Fixture::new().await;
+    let item = f.deliver(MIME);
+    let args = json!({"account_id": 1, "email_id": item.0.to_string()});
+    let (rc, list) =
+        attachment_bus(&f, "maild.attachment.list", args.clone(), &LocalLane(None)).await;
+    assert_eq!(rc, 0, "{list}");
+    assert_eq!(list["parts"][2]["part"], "1.2");
+    assert!(list["parts"][2].get("blob").is_none());
+    let mut part_args = args.clone();
+    part_args["part"] = json!("1.2");
+    part_args["name"] = json!("café.bin");
+    let (discovery, server) = export_server(&f, &[0, 255], false).await;
+    let (rc, reference) =
+        attachment_bus(&f, "maild.attachment.ref", part_args.clone(), &discovery).await;
+    assert_eq!(rc, 0, "{reference}");
+    let headers = server.await.unwrap().to_ascii_lowercase();
+    assert!(headers.contains("x-cosmix-owner: maild:1"));
+    assert!(headers.contains("x-cosmix-name: caf%c3%a9.bin"));
+    assert_eq!(reference["name"], "first-writer");
+    assert_eq!(reference["origin"], "alpha");
+    assert_eq!(reference["part"], "1.2");
+    part_args["name"] = json!("new hint ignored");
+    assert_eq!(
+        attachment_bus(
+            &f,
+            "maild.attachment.ref",
+            part_args.clone(),
+            &LocalLane(None)
+        )
+        .await,
+        (0, reference.clone())
+    );
+    let (_, list) =
+        attachment_bus(&f, "maild.attachment.list", args.clone(), &LocalLane(None)).await;
+    assert_eq!(list["parts"][2]["blob"], reference["blob"]);
+
+    let (discovery, server) = export_server(&f, MIME, false).await;
+    let (rc, message_ref) = attachment_bus(&f, "maild.message.ref", args.clone(), &discovery).await;
+    assert_eq!(rc, 0, "{message_ref}");
+    assert!(
+        server
+            .await
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("x-cosmix-mime: message/rfc822")
+    );
+    assert_eq!(message_ref["blob"], list["blob"]);
+    assert!(message_ref.get("part").is_none());
+    assert_eq!(
+        attachment_bus(&f, "maild.message.ref", args.clone(), &LocalLane(None)).await,
+        (0, message_ref)
+    );
+
+    part_args["account_id"] = json!(2);
+    let (rc, denied) =
+        attachment_bus(&f, "maild.attachment.ref", part_args, &LocalLane(None)).await;
+    assert_eq!(rc, 10);
+    assert_eq!(denied["error"], "not_found: message or part");
+    let state = f.state();
+    state.mailstore.delete_email(1, item).unwrap();
+    assert_eq!(
+        attachment_bus(&f, "maild.message.ref", args, &LocalLane(None))
+            .await
+            .0,
+        10
+    );
+    for table in ["attachment_refs", "message_refs"] {
+        let count: i64 = state
+            .db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+#[tokio::test]
+async fn failed_export_validation_or_database_write_never_records_a_reference() {
+    let f = Fixture::new().await;
+    let item = f.deliver(MIME);
+    let args = json!({"account_id": 1, "email_id": item.0.to_string(), "part": "1.2"});
+    let (discovery, server) = export_server(&f, &[0, 255], true).await;
+    let (rc, reply) = attachment_bus(&f, "maild.attachment.ref", args.clone(), &discovery).await;
+    assert_eq!(rc, 10);
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("verify_failed:")
+    );
+    server.await.unwrap();
+    let state = f.state();
+    state.db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_reference BEFORE INSERT ON attachment_refs BEGIN SELECT RAISE(FAIL, 'fixture'); END;").unwrap();
+    let (discovery, server) = export_server(&f, &[0, 255], false).await;
+    let (rc, reply) = attachment_bus(&f, "maild.attachment.ref", args.clone(), &discovery).await;
+    assert_eq!(rc, 10);
+    assert!(reply["error"].as_str().unwrap().starts_with("unreadable:"));
+    server.await.unwrap();
+    let count: i64 = state
+        .db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM attachment_refs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    state
+        .db
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_reference;")
+        .unwrap();
+    let (discovery, server) = export_server(&f, &[0, 255], false).await;
+    assert_eq!(
+        attachment_bus(&f, "maild.attachment.ref", args, &discovery)
+            .await
+            .0,
+        0
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn list_and_export_refuse_invalid_or_unreadable_messages_before_lane_use() {
+    let f = Fixture::new().await;
+    let item = f.deliver(MIME);
+    for part in ["0", "1.02", "1/2", "é", "1.999"] {
+        let (rc, _) = attachment_bus(
+            &f,
+            "maild.attachment.ref",
+            json!({"account_id": 1, "email_id": item.0.to_string(), "part": part}),
+            &LocalLane(None),
+        )
+        .await;
+        assert_eq!(rc, 10);
+    }
+    let args = json!({"account_id": 1, "email_id": item.0.to_string()});
+    let state = f.state();
+    let hash = state.mailstore.get_email(1, item).unwrap().blob_hash;
+    let path = cosmix_mds::blob::blob_path(&state.mailstore.mds().blobs_root(), &hash);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(cosmix_maild::attachments::MAX_MESSAGE as u64 + 1)
+        .unwrap();
+    let (rc, reply) =
+        attachment_bus(&f, "maild.attachment.list", args.clone(), &LocalLane(None)).await;
+    assert_eq!(rc, 10);
+    assert!(reply["error"].as_str().unwrap().starts_with("too_large:"));
+    std::fs::remove_file(path).unwrap();
+    let (rc, reply) = attachment_bus(&f, "maild.attachment.list", args, &LocalLane(None)).await;
+    assert_eq!(rc, 10);
+    assert!(reply["error"].as_str().unwrap().starts_with("unreadable:"));
+}
+
 const MIME: &[u8] = b"Subject: parts\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: multipart/alternative; boundary=y\r\n\r\n--y\r\nContent-Type: text/plain\r\n\r\nhello\r\n--y\r\nContent-Type: text/html\r\n\r\n<b>hello</b>\r\n--y--\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename*=utf-8''caf%C3%A9.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n";
 
 #[tokio::test]

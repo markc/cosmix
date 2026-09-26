@@ -5,6 +5,7 @@ pub mod blob;
 pub mod calendar;
 pub mod changelog;
 pub mod contact;
+pub mod references;
 pub mod token;
 pub mod tombstone;
 pub mod vacation;
@@ -206,6 +207,34 @@ impl Db {
 }
 
 pub(crate) const SCHEMA: &str = r#"
+-- Export bookkeeping lives in the global DB, not an MDS set. Retain rows
+-- after mail/account deletion for future pin reconciliation; no delete hook.
+CREATE TABLE IF NOT EXISTS attachment_refs (
+    account_id INTEGER NOT NULL,
+    item_id TEXT NOT NULL,
+    message_hash TEXT NOT NULL,
+    part TEXT NOT NULL,
+    blob TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    mime TEXT NOT NULL,
+    name TEXT,
+    origin TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(account_id, item_id, message_hash, part)
+);
+CREATE TABLE IF NOT EXISTS message_refs (
+    account_id INTEGER NOT NULL,
+    item_id TEXT NOT NULL,
+    message_hash TEXT NOT NULL,
+    blob TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    mime TEXT NOT NULL,
+    name TEXT,
+    origin TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(account_id, item_id, message_hash)
+);
+
 -- accounts
 CREATE TABLE IF NOT EXISTS accounts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -514,6 +514,15 @@ are percent-encoded, and the name header is omitted if that exceeds 128
 bytes. Blobd's first-writer-wins name and MIME are returned unchanged.
 Downloads use only the local lane and verify BLAKE3 and length before use;
 an absent local blob is never fetched implicitly from its reference origin.</p>
+<p>The Bus verbs <code>maild.attachment.list</code>, <code>maild.attachment.ref</code> and
+<code>maild.message.ref</code> inspect or export account-owned mail. Exports run in
+eight tracked tasks; a full pool returns <code>busy:</code> immediately, and a session
+end cancels outstanding transfers. Validated references are saved separately
+from messages, including origin and the message hash; repeats reuse the
+saved reference. Pins and bookkeeping survive mail/account deletion until
+later reconciliation. No detach or message rewrite occurs. <code>message.ref</code>
+is export, not a new <code>Email/import</code> input. See <a href="/cos/cosmix-maild/bus">bus.md</a> for arguments,
+reply fields, errors and lifecycle details.</p>
 <h3 id="smtp">SMTP</h3>
 <p><code>smtp_inbound</code> enables inbound SMTP. <code>smtp_smtps</code> enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.</p>
 <p>Inbound delivery resolves local accounts and aliases, applies mail-auth checks, the rules engine, Bayesian classification, optional Mix routing, and retention-related metadata before committing mail to the mailbox store. Remote submissions enter the retry queue and outbound delivery path.</p>

@@ -41,7 +41,7 @@ pub struct PartBlobId {
     pub part: String,
 }
 
-fn valid_path(path: &str) -> bool {
+pub(crate) fn valid_path(path: &str) -> bool {
     path.len() <= MAX_PATH
         && path.is_ascii()
         && path.split('.').count() <= MAX_DEPTH

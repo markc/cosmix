@@ -464,6 +464,47 @@
 <tr><td><code>maild.accounts.unlock</code></td><td>Required <code>email</code></td><td>Restore the preserved password hash</td></tr>
 </tbody></table>
 <p>An unknown account and a wrong password both produce <code>valid: false</code> from <code>verify</code>. Lock and unlock are idempotent.</p>
+<h2 id="attachments-and-message-exports">Attachments and message exports</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Read-only</th></tr></thead><tbody>
+<tr><td><code>maild.attachment.list</code></td><td><code>account_id</code>, <code>email_id</code></td><td>yes</td></tr>
+<tr><td><code>maild.attachment.ref</code></td><td><code>account_id</code>, <code>email_id</code>, <code>part</code>, optional <code>name</code></td><td>no</td></tr>
+<tr><td><code>maild.message.ref</code></td><td><code>account_id</code>, <code>email_id</code></td><td>no</td></tr>
+</tbody></table>
+<p>These accept a positive integer account ID and a message UUID. Every call
+resolves that message through the account-owned mail store before reading
+bytes or reference rows. Unknown/foreign messages and absent parts use
+rc 10 <code>not_found: message or part</code>; malformed arguments use
+<code>invalid_arguments:</code>. Inspection limits and failures use <code>too_large:</code> and
+<code>unreadable:</code>. Nothing is written by inspection.</p>
+<p><code>attachment.list</code> replies with
+<code>{"email_id":"&lt;UUID&gt;","blob":"b3:&lt;message hash&gt;","parts":[...]}</code>.
+Each part has <code>part</code>, <code>mime</code>, decoded <code>size</code>, nullable <code>disposition</code>, and
+<code>is_attachment</code>; optional <code>name</code> and <code>content_id</code> are omitted when absent.
+An exported part also has <code>blob: "b3:&lt;part hash&gt;"</code>. The list uses the same
+root-<code>1</code> MIME paths as JMAP, including embedded-message children. It does not
+publish a partial list when inspection fails.</p>
+<p><code>attachment.ref</code> extracts and exports one part. <code>message.ref</code> exports the
+whole RFC 5322 message with the upload MIME hint <code>message/rfc822</code>. Successful
+exports return the canonical reference fields <code>blob</code>, <code>size</code>, <code>mime</code>,
+optional <code>name</code>, <code>origin</code>, plus <code>email_id</code> and (for a part) <code>part</code>.
+The owner is <code>maild:&lt;account_id&gt;</code>. Names and MIME are hints: blobd retains
+first-writer metadata, and replies preserve that metadata.</p>
+<p>Validated references persist in the global <code>attachment_refs</code> and
+<code>message_refs</code> tables, keyed by account, item and message hash (plus part
+for attachments). Repeats return the saved reference without contacting the
+lane. Concurrent exports converge on one row and the same owner/hash pin.
+Pins and reference rows are retained after mail/account deletion; release
+belongs to later reconciliation. An interrupted export or a DB failure
+after upload can leave a pin without a reference row; retry is safe and
+does not remove that pin. No DB mutex is held across HTTP.</p>
+<p>Exports run in a session-owned pool of eight tasks outside serial Bus
+dispatch. A full pool immediately returns rc 10
+<code>busy: maild blob transfer pool is full (8)</code>. Reconnect or session shutdown
+cancels the tasks. Lane failures use <code>lane_unavailable:</code>, <code>quota:</code>, <code>lane:</code>,
+<code>not_present:</code> or <code>verify_failed:</code>; all are rc 10. There is no detach,
+message rewrite, shared-root access or implicit remote fetch.
+<code>message.ref</code> is export, not import: JMAP <code>Email/import</code> still requires an
+upload UUID, and <code>/jmap/blob</code> still reads maild's own MDS store.</p>
 <h2 id="legacy-blob-migration">Legacy blob migration</h2>
 <p><code>maild.blob.migrate {apply?: false, account_id?, cursor?: 0, limit?: 500}</code>
 runs on the daemon's own store handle. It accepts at most 500 rows per call;

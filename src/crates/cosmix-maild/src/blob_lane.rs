@@ -358,16 +358,20 @@ pub struct Transfers {
 }
 
 impl Transfers {
-    pub fn spawn(
-        &mut self,
-        work: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<(), &'static str> {
+    pub fn is_full(&mut self) -> bool {
         while let Some(result) = self.tasks.try_join_next() {
             if let Err(e) = result {
                 tracing::warn!(error = %e, "blob transfer worker failed");
             }
         }
-        if self.tasks.len() >= 8 {
+        self.tasks.len() >= 8
+    }
+
+    pub fn spawn(
+        &mut self,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), &'static str> {
+        if self.is_full() {
             return Err("busy: maild blob transfer pool is full (8)");
         }
         self.tasks.spawn(work);

@@ -14,6 +14,7 @@
 //! do not leave maild permanently invisible to Bus until process restart.
 
 pub mod accounts;
+pub mod attachments;
 pub mod bayesian;
 pub mod blobs;
 pub mod dkim;
@@ -354,6 +355,24 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new("maild.rules.reload", &[], "Reload mail rules", false),
         VerbDescriptor::new(
+            "maild.attachment.list",
+            &["account_id", "email_id"],
+            "Inspect message MIME parts",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.attachment.ref",
+            &["account_id", "email_id", "part", "name"],
+            "Export and pin a MIME part",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.message.ref",
+            &["account_id", "email_id"],
+            "Export and pin a whole message",
+            false,
+        ),
+        VerbDescriptor::new(
             "maild.blob.migrate",
             &["apply", "account_id", "cursor", "limit"],
             "Migrate a bounded page of legacy blobs (dry-run by default)",
@@ -609,8 +628,35 @@ async fn dispatch_loop(
         }
     };
 
+    let mut transfers = crate::blob_lane::Transfers::default();
     while let Some(cmd) = rx.recv().await {
-        let (rc, body) = if cmd.command == "maild.blob.migrate" {
+        if !client.is_connected() {
+            break;
+        }
+        if is_transfer(&cmd.command) {
+            if transfers.is_full() {
+                let body =
+                    serde_json::json!({"error": "busy: maild blob transfer pool is full (8)"})
+                        .to_string();
+                if let Err(e) = client.respond(&cmd, 10, &body).await {
+                    tracing::warn!(error = %e, "Bus busy response failed");
+                }
+                continue;
+            }
+            let client = client.clone();
+            let db = db.clone();
+            let mailstore = mailstore.clone();
+            transfers.spawn(async move {
+                let (rc, body) = dispatch_attachment(&cmd, &db, &mailstore, &client).await;
+                if let Err(e) = client.respond(&cmd, rc, &body).await {
+                    tracing::warn!(error = %e, command = %cmd.command, "Bus transfer response failed");
+                }
+            }).expect("slot checked without yielding or sharing the task set");
+            continue;
+        }
+        let (rc, body) = if cmd.command == "maild.attachment.list" {
+            dispatch_attachment(&cmd, &db, &mailstore, &client).await
+        } else if cmd.command == "maild.blob.migrate" {
             blobs::dispatch(&cmd, &db, &mailstore).await
         } else if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
             rules::dispatch(
@@ -648,7 +694,34 @@ async fn dispatch_loop(
             tracing::warn!(error = %e, command = %cmd.command, "Bus response send failed");
         }
     }
+    transfers.shutdown().await;
     DispatchLoopExit::StreamEnded
+}
+
+fn is_transfer(command: &str) -> bool {
+    matches!(command, "maild.attachment.ref" | "maild.message.ref")
+}
+
+async fn dispatch_attachment(
+    cmd: &IncomingCommand,
+    db: &db::Db,
+    ms: &Arc<SqliteMailStore>,
+    client: &NodedClient,
+) -> (u8, String) {
+    let args = match try_resolve_args(cmd) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                10,
+                serde_json::json!({"error": format!("invalid_arguments: {e}")}).to_string(),
+            );
+        }
+    };
+    let lane = match crate::blob_lane::Lane::new() {
+        Ok(lane) => lane,
+        Err(e) => return (10, serde_json::json!({"error": e}).to_string()),
+    };
+    attachments::dispatch(&cmd.command, args, db, ms, &lane, client).await
 }
 
 /// Bridge an [`IncomingCommand`] into the [`PropsRouter`]'s
@@ -690,6 +763,37 @@ fn unknown_action_body(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_manifest_and_transfer_admission_match_the_wire_contract() {
+        let manifest = verb_manifest();
+        for (name, args, read_only) in [
+            (
+                "maild.attachment.list",
+                vec!["account_id", "email_id"],
+                true,
+            ),
+            (
+                "maild.attachment.ref",
+                vec!["account_id", "email_id", "part", "name"],
+                false,
+            ),
+            ("maild.message.ref", vec!["account_id", "email_id"], false),
+            (
+                "maild.blob.migrate",
+                vec!["apply", "account_id", "cursor", "limit"],
+                false,
+            ),
+        ] {
+            let verb = manifest.iter().find(|v| v.name == name).unwrap();
+            assert_eq!(verb.args, args);
+            assert_eq!(verb.read_only, read_only);
+        }
+        assert!(is_transfer("maild.attachment.ref"));
+        assert!(is_transfer("maild.message.ref"));
+        assert!(!is_transfer("maild.attachment.list"));
+        assert!(!is_transfer("maild.blob.migrate"));
+    }
 
     #[test]
     fn unknown_action_rc_is_in_error_range() {

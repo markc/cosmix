@@ -31,6 +31,54 @@ Success uses `rc = 0`. Caller, validation, and engine failures use `rc = 10` wit
 
 An unknown account and a wrong password both produce `valid: false` from `verify`. Lock and unlock are idempotent.
 
+## Attachments and message exports
+
+| Verb | Arguments | Read-only |
+|---|---|---|
+| `maild.attachment.list` | `account_id`, `email_id` | yes |
+| `maild.attachment.ref` | `account_id`, `email_id`, `part`, optional `name` | no |
+| `maild.message.ref` | `account_id`, `email_id` | no |
+
+These accept a positive integer account ID and a message UUID. Every call
+resolves that message through the account-owned mail store before reading
+bytes or reference rows. Unknown/foreign messages and absent parts use
+rc 10 `not_found: message or part`; malformed arguments use
+`invalid_arguments:`. Inspection limits and failures use `too_large:` and
+`unreadable:`. Nothing is written by inspection.
+
+`attachment.list` replies with
+`{"email_id":"<UUID>","blob":"b3:<message hash>","parts":[...]}`.
+Each part has `part`, `mime`, decoded `size`, nullable `disposition`, and
+`is_attachment`; optional `name` and `content_id` are omitted when absent.
+An exported part also has `blob: "b3:<part hash>"`. The list uses the same
+root-`1` MIME paths as JMAP, including embedded-message children. It does not
+publish a partial list when inspection fails.
+
+`attachment.ref` extracts and exports one part. `message.ref` exports the
+whole RFC 5322 message with the upload MIME hint `message/rfc822`. Successful
+exports return the canonical reference fields `blob`, `size`, `mime`,
+optional `name`, `origin`, plus `email_id` and (for a part) `part`.
+The owner is `maild:<account_id>`. Names and MIME are hints: blobd retains
+first-writer metadata, and replies preserve that metadata.
+
+Validated references persist in the global `attachment_refs` and
+`message_refs` tables, keyed by account, item and message hash (plus part
+for attachments). Repeats return the saved reference without contacting the
+lane. Concurrent exports converge on one row and the same owner/hash pin.
+Pins and reference rows are retained after mail/account deletion; release
+belongs to later reconciliation. An interrupted export or a DB failure
+after upload can leave a pin without a reference row; retry is safe and
+does not remove that pin. No DB mutex is held across HTTP.
+
+Exports run in a session-owned pool of eight tasks outside serial Bus
+dispatch. A full pool immediately returns rc 10
+`busy: maild blob transfer pool is full (8)`. Reconnect or session shutdown
+cancels the tasks. Lane failures use `lane_unavailable:`, `quota:`, `lane:`,
+`not_present:` or `verify_failed:`; all are rc 10. There is no detach,
+message rewrite, shared-root access or implicit remote fetch.
+`message.ref` is export, not import: JMAP `Email/import` still requires an
+upload UUID, and `/jmap/blob` still reads maild's own MDS store.
+
 ## Legacy blob migration
 
 `maild.blob.migrate {apply?: false, account_id?, cursor?: 0, limit?: 500}`
