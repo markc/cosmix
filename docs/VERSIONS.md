@@ -106,11 +106,13 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bg-showcase` | 0.2.6 |
 | `cosmix-bterm` | 0.10.1 |
 | `cosmix-busviewer` | 0.1.2 |
-| `cosmix-capture` | 0.2.1 |
+| `cosmix-capture` | 0.2.4 |
 | `cosmix-ced` | 0.1.2 |
 | `cosmix-comp` | 0.69.2 |
 | `cosmix-deco` | 0.4.1 |
 | `cosmix-design` | 0.15.0 |
+| `cosmix-dopus` | 0.1.0 |
+| `cosmix-dopus-core` | 0.1.0 |
 | `cosmix-filemgr` | 0.9.8 |
 | `cosmix-flock` | 0.1.0 |
 | `cosmix-iced-widgets` | 0.1.2 |
@@ -122,7 +124,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-scene` | 0.6.0 |
 | `cosmix-scene-bevy` | 0.7.0 |
 | `cosmix-shell` | 0.19.0 |
-| `cosmix-shell-host` | 0.11.0 |
+| `cosmix-shell-host` | 0.11.1 |
 | `cosmix-studio` | 0.4.8 |
 | `cosmix-term` | 0.3.1 |
 | `cosmix-term-core` | 0.8.2 |
@@ -138,4 +140,4 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 
 ---
 
-55 crates in `$COSMIX/src` and 33 in the separate `$COSMIX/src/desktop` workspace.
+55 crates in `$COSMIX/src` and 35 in the separate `$COSMIX/src/desktop` workspace.
