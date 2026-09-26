@@ -6281,6 +6281,7 @@ struct WaylandState {
     /// Held, never read — same reason as the globals above.
     #[allow(dead_code)]
     input_method_state: InputMethodManagerState,
+    // Human-only: agent motion never enters the relative-pointer protocol path.
     pending_relative_motion: Option<PendingRelativeMotion>,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,

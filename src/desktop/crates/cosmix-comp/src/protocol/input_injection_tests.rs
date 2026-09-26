@@ -652,6 +652,7 @@ fn injected_move_and_click_reach_the_window_under_the_point() {
             .stats
             .input_mark(input_seq, injected_at_us),
         Some(input_injection::InputMark {
+        seat: crate::protocol::SeatKind::Human,
             input_seq,
             injected_at_us,
         })

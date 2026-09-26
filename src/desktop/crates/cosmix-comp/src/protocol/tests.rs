@@ -33421,6 +33421,7 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
 
     // Injected input: the next update committed after it answers it.
     let mark = presentation_stats::InputMark {
+        seat: crate::protocol::SeatKind::Human,
         input_seq: 1,
         injected_at_us: crate::frame_trace::monotonic_us(),
     };

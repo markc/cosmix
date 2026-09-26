@@ -113,6 +113,7 @@ pub(crate) struct InjectionState {
     next_seq: u64,
     /// The sequence whose step is running (the owner of what it presses).
     current_run: Option<u64>,
+    reconciling: bool,
     /// Injected events so far (for the sequence yield).
     pub(super) events: u64,
     host_passthrough: bool,
@@ -131,6 +132,7 @@ impl Default for InjectionState {
         Self {
             next_seq: 0,
             current_run: None,
+            reconciling: false,
             events: 0,
             host_passthrough: true,
             host_held_keys: BTreeSet::new(),
@@ -260,7 +262,10 @@ impl WaylandState {
         self.injection.events = self.injection.events.wrapping_add(1);
         match seat {
             SeatKind::Human => self.handle_host_input(input),
-            SeatKind::Agent => self.deliver_agent_input(input),
+            SeatKind::Agent => {
+                self.deliver_agent_input(input);
+                if !self.injection.reconciling { self.notify_idle_activity(SeatKind::Agent); }
+            }
         }
     }
 
@@ -494,6 +499,7 @@ impl WaylandState {
                 if seat == SeatKind::Agent {
                     if let Err(reply) = self.move_agent_pointer(target, time) { return reply; }
                     self.injection.events = self.injection.events.wrapping_add(1);
+                    self.notify_idle_activity(SeatKind::Agent);
                 } else {
                 let input = match self.pointer_move_input(target, time) {
                     Ok(input) => input,
@@ -661,6 +667,7 @@ impl WaylandState {
         self.note_injected_input(
             target.map(|(id, _)| SurfaceId(id)),
             InputMark {
+                seat,
                 input_seq,
                 injected_at_us,
             },
@@ -996,10 +1003,12 @@ impl WaylandState {
     /// owner (another run, a single verb) still holds.
     fn abort_sequence(&mut self, id: u64) -> Option<SequenceRun> {
         let run = self.injection.sequences.remove(&id)?;
+        let reconciling = std::mem::replace(&mut self.injection.reconciling, true);
         for seat in [SeatKind::Human, SeatKind::Agent] {
             let orphaned = self.comp_seat_mut(seat).held.drop_owner(Some(id));
             self.release_holds(seat, orphaned, monotonic_millis());
         }
+        self.injection.reconciling = reconciling;
         Some(run)
     }
 
