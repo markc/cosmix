@@ -225,8 +225,10 @@ pub fn materialise(fs: &FsLayer, a: &Value, bind: Result<&str, &str>) -> Result<
     if response.status() != 200 {
         return Err(format!("lane: expected HTTP 200, got {}", response.status()));
     }
-    // Feature unification may enable ureq decompression in a workspace build.
-    // The lane's protocol is raw Content-Length bytes; reject alternate framing.
+    // default-features=false does not disable gzip enabled by workspace feature
+    // unification. ureq strips Content-Encoding AND Content-Length when decoding;
+    // that case fails closed at the missing-Content-Length check below. Reject
+    // any encoding/framing headers that remain visible as well.
     if response.header("Transfer-Encoding").is_some()
         || response.header("Content-Encoding").is_some()
     {
