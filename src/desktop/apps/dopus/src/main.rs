@@ -7,7 +7,9 @@
 use cosmix_dopus::dirs::{AppDirs, COMPONENT};
 
 const HELP: &str = "cosmix-dopus — the CosMix twin-pane file manager (iced; twin panes,\n\
-Places sidebar, per-pane location bars)\n\
+Places sidebar, per-pane location bars, file operations: keyboard +\n\
+dialogs — new folder, rename, copy/move to the other pane, delete, and\n\
+`xdg-open` for files)\n\
 Usage: cosmix-dopus [PATH…]\n\
   PATH…             the first PATH opens in the left pane, the second in\n\
                     the right; extras are ignored\n\
@@ -17,8 +19,9 @@ Usage: cosmix-dopus [PATH…]\n\
   --noded-url URL   Bus broker endpoint (default: node.conf.mix's noded_url)\n\
   --print-config    print the resolved configuration and exit\n\
   --version         print version and build hash, and nothing else\n\
-Bus: serves `dopus.*` (schema dopus.v1); file-mutating actions stay\n\
-keyboard-only in P2 and are refused on the Bus (FORBIDDEN).";
+Bus: serves `dopus.*` (schema dopus.v1); the file operations are\n\
+keyboard + dialog only — the Bus never mutates the filesystem, and every\n\
+`file.*` action is refused (FORBIDDEN).";
 
 struct Args {
     headless: bool,

@@ -28,16 +28,19 @@ use crate::verbs::{self, ServerMeta, Served};
 const DRAIN_TICK: Duration = Duration::from_millis(200);
 
 /// What the shared law-wiring does with the core's derived events: answer
-/// every dialog (law 3), refuse `OpenFile` with a log line (law 4's P2
-/// posture — no file-operations surface until P3). Shared verbatim by the
-/// windowed app's handler.
+/// every dialog (law 3 — fail-closed: no dialog can ever be up in a
+/// headless process, since no Bus verb raises one), refuse `OpenFile` with
+/// a log line (law 4's headless posture — headless never spawns). The
+/// windowed app's law-3 arm is NOT this shape: it queues the dialogs
+/// (`view::dialogs::ModalQueue`) and answers them through the dialog
+/// surface.
 pub fn answer_derived(core: &mut DopusCore, events: Vec<CoreEvent>, log: impl Fn(String)) {
     for event in events {
         match event {
             CoreEvent::ConfirmRequested { token, .. } => core.confirm(token, ConfirmAnswer::No),
             CoreEvent::PromptRequested { token, .. } => core.prompt_text(token, None),
             CoreEvent::OpenFile(path) => log(format!(
-                "refusing OpenFile({}), no file-operations surface until P3",
+                "refusing OpenFile({}), headless never spawns",
                 cosmix_dopus_core::sanitise_display_path(&path)
             )),
             CoreEvent::Status { .. }

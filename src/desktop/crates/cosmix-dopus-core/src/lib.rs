@@ -61,8 +61,8 @@ pub use config::{ConfigFile, DOpusConfig, PaneConfig, SortColumn, CURRENT_SCHEMA
 pub use events::{ConfirmAnswer, CoreEvent, PromptKind};
 pub use model::{
     AvailabilitySnapshot, DopusCore, DropAction, DropActionMask, DropModifiers, FileEntry,
-    NavigationHistory, PaneId, PaneModel, VisibleRow, format_child_count, format_modified_at,
-    format_size, home_directory, pane_summary, places, sanitise_display_path,
+    NavigationHistory, PaneId, PaneModel, ReservationKind, VisibleRow, format_child_count,
+    format_modified_at, format_size, home_directory, pane_summary, places, sanitise_display_path,
     sanitise_display_text, validate_filename,
 };
 pub use ops::{FileOpKind, FileOperation};
