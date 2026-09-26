@@ -261,7 +261,7 @@ fn reply_panels(
         if state.live_generation != Some(request.connection_generation) {
             continue;
         }
-        let edge = argument(&request, "edge").and_then(parse_edge).expect("validated edge");
+        let edge = request_edge(&request).expect("validated edge");
         let panel = frame.0.panel(edge);
         let applied = output == frame.0.geometry.output && match request.command.as_str() {
             "shell.panel.page.set" => panel.active_page_id == argument(&request, "id"),
@@ -271,7 +271,9 @@ fn reply_panels(
             // Hide only conceals a transient reveal. Its concealment is
             // observable at once (no longer revealed); it is not held until
             // unmapped, as nothing about a hidden mode is being committed.
-            "shell.panel.hide" => panel.mode == PanelMode::Hidden && !panel.transient_revealed,
+            "shell.panel.hide" | "shell.corner.hide" => {
+                panel.mode == PanelMode::Hidden && !panel.transient_revealed
+            }
             _ => unreachable!("only applied panel verbs are queued"),
         };
         // Hidden mode is applied before its outgoing motion completes. The
@@ -289,11 +291,13 @@ fn reply_panels(
         let snapshot = Value::from(&ShellProps(&frame.0, &config.panels, PropValue::Null).snapshot());
         let body = if applied {
             json!({"accepted":true, "applied":true, "panels":snapshot["panels"]})
-        } else if request.command == "shell.panel.hide" && panel.mode != PanelMode::Hidden {
+        } else if matches!(request.command.as_str(), "shell.panel.hide" | "shell.corner.hide")
+            && panel.mode != PanelMode::Hidden
+        {
             // A pinned or docked edge is a persistent mode, which hide never
             // changes: say so rather than accept and do nothing.
             json!({"error_code":"PANEL_NOT_APPLIED",
-                "message":format!("the {} edge is {}; shell.panel.hide only conceals a transient reveal. Use shell.panel.mode {{edge:\"{}\", mode:\"hidden\"}} to hide it", edge_name(edge), panel.mode.as_str(), edge_name(edge)),
+                "message":format!("the {} edge is {}; {} only conceals a transient reveal. Use shell.panel.mode {{edge:\"{}\", mode:\"hidden\"}} to hide it", edge_name(edge), panel.mode.as_str(), request.command, edge_name(edge)),
                 "panels":snapshot["panels"]})
         } else {
             json!({"error_code":"PANEL_NOT_APPLIED", "message":"panel command was superseded or could not apply", "panels":snapshot["panels"]})
@@ -839,7 +843,8 @@ fn service_bus(
             continue;
         }
         if rc == 0 && matches!(request.command.as_str(),
-            "shell.panel.page.set" | "shell.panel.pin" | "shell.panel.mode" | "shell.panel.hide")
+            "shell.panel.page.set" | "shell.panel.pin" | "shell.panel.mode" | "shell.panel.hide"
+                | "shell.corner.hide")
             && let Some(command) = &command
         {
             if state.pending_panels.len() < MAX_PENDING_REPLIES {
@@ -1430,13 +1435,7 @@ fn dispatch_with_declared(
     }
     let corner_command = request.command.starts_with("shell.corner.");
     let selected_edge = if corner_command {
-        argument(request, "corner").and_then(|value| match value.as_str() {
-            "top-left" => Some(Corner::TopLeft.summoned_edge()),
-            "bottom-left" => Some(Corner::BottomLeft.summoned_edge()),
-            "bottom-right" => Some(Corner::BottomRight.summoned_edge()),
-            "top-right" => Some(Corner::TopRight.summoned_edge()),
-            _ => None,
-        })
+        argument(request, "corner").and_then(|value| corner_edge(&value))
     } else if request.command == "shell.panel.pin.toggle" && argument(request, "edge").is_none() {
         match pin_toggle_target(frame) {
             Ok(edge) => Some(edge),
@@ -1483,6 +1482,26 @@ fn dispatch_with_declared(
     // page.set/pin/mode to applied receipts in Presentation; other legacy
     // verbs retain their acceptance reply and require state readback.
     (0, json!({"accepted":true}).to_string(), Some(command))
+}
+
+/// The edge a `shell.corner.*` verb's `corner` summons (clockwise mapping).
+fn corner_edge(corner: &str) -> Option<Edge> {
+    Some(match corner {
+        "top-left" => Corner::TopLeft.summoned_edge(),
+        "bottom-left" => Corner::BottomLeft.summoned_edge(),
+        "bottom-right" => Corner::BottomRight.summoned_edge(),
+        "top-right" => Corner::TopRight.summoned_edge(),
+        _ => return None,
+    })
+}
+
+/// A queued panel reply's edge: its `edge`, or the edge its `corner` summons.
+fn request_edge(request: &InboundRequest) -> Option<Edge> {
+    if request.command.starts_with("shell.corner.") {
+        argument(request, "corner").and_then(|value| corner_edge(&value))
+    } else {
+        argument(request, "edge").and_then(parse_edge)
+    }
 }
 
 /// A named frame predicate for [`pin_toggle_target`].
@@ -3571,7 +3590,15 @@ mod tests {
     /// naming the verb that does hide a persistent mode.
     #[test]
     fn hide_on_a_pinned_or_docked_edge_is_refused_with_the_mode_verb() {
-        for mode in ["pinned", "docked"] {
+        // The corner alias (top-left summons left) refuses the same way.
+        let panel_hide = ("shell.panel.hide", json!({"edge":"left"}));
+        let corner_hide = ("shell.corner.hide", json!({"corner":"top-left"}));
+        for ((verb, args), mode) in [
+            (panel_hide.clone(), "pinned"),
+            (panel_hide, "docked"),
+            (corner_hide.clone(), "pinned"),
+            (corner_hide, "docked"),
+        ] {
             let (mut app, peer) = mounted_bus_app();
             load_scene(&mut app, &peer, "persistent", "owner", "left");
             let mut set = local("shell.panel.mode");
@@ -3579,18 +3606,19 @@ mod tests {
             peer.send(set);
             for _ in 0..30 { app.update(); }
             peer.drain_responses();
-            let mut hide = local("shell.panel.hide");
-            hide.body = json!({"edge":"left"}).to_string();
+            let mut hide = local(verb);
+            hide.body = args.to_string();
             peer.send(hide);
             app.update();
             let replies = peer.drain_responses();
-            assert_eq!(replies.len(), 1, "{mode}");
-            assert_eq!(replies[0].rc, 10, "{mode}: {}", replies[0].body);
+            assert_eq!(replies.len(), 1, "{verb} {mode}");
+            assert_eq!(replies[0].rc, 10, "{verb} {mode}: {}", replies[0].body);
             let body: Value = serde_json::from_str(&replies[0].body).unwrap();
             assert_eq!(body["error_code"], "PANEL_NOT_APPLIED", "{mode}");
             let message = body["message"].as_str().unwrap();
             assert!(message.contains("shell.panel.mode"), "{message}");
             assert!(message.contains(mode), "{message}");
+            assert!(message.contains(verb), "{message}");
             assert_eq!(body["panels"]["left"]["mode"], mode);
             assert_eq!(
                 app.world().resource::<ShellFrameState>().0.panel(Edge::Left).mode.as_str(),

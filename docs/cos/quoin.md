@@ -421,7 +421,8 @@ is refused rc 10 `{error_code:"PANEL_NOT_APPLIED", message, panels}`, and
 the message names the edge's mode and the verb that does hide it,
 `shell.panel.mode {edge, mode:"hidden"}`. A reveal held by a resize or an
 open menu is refused the same way with a generic message. The corner alias
-`shell.corner.hide` keeps its acceptance-only reply.
+`shell.corner.hide {corner}` replies and refuses exactly the same way for the
+edge its corner summons.
 
 Sub-panels are addressed by their stable name, unique across every edge and
 output. `shell.sub.register` takes `edge` and `name` (the owner is the
