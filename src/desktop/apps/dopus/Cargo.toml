@@ -1,0 +1,60 @@
+[package]
+name = "cosmix-dopus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "dopus, the CosMix twin-pane file manager: an iced desktop app over the headless cosmix-dopus-core (the eventual replacement for filemgr)"
+
+[lib]
+name = "cosmix_dopus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-dopus"
+path = "src/main.rs"
+
+# The Bus name `dopus` is a NEW service name: 5 characters (the noded limit is
+# 31), and it deliberately does not reuse any daemon stem or the `filemgr`
+# name it will one day replace — distinct slug, distinct verb namespace.
+[package.metadata.cosmix]
+kind = "app"
+component = "dopus"
+display = "CosMix DOpus"
+engine = "iced"
+
+[dependencies]
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "crisp", "thread-pool", "wayland", "tiny-skia", "image"] }
+# The renderer type, named directly (the ced/term pattern) so custom widgets
+# can be concrete over it; `image` turns on the tiny-skia draw_image pipeline.
+iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["image", "wayland"] }
+# The `image` feature beyond ced's set is deliberate: rows draw icon RGBA
+# handles rasterised at startup (icons.rs) through the tiny-skia image
+# pipeline. iced's `svg` feature is forbidden — resvg is pinned below.
+cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets", features = ["tiny-skia"] }
+cosmix-design = { path = "../../crates/cosmix-design" }
+cosmix-dopus-core = { path = "../../crates/cosmix-dopus-core" }
+cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
+cosmix-bus = { package = "cosmix-lib-bus", path = "../../../crates/cosmix-lib-bus" }
+cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+cosmix-actions = { path = "../../../crates/cosmix-actions" }
+# Pinned: shares the lock entry with bevy_resvg, so anything that moved this
+# off 0.47 would fork the tree. Never let a dependency pull resvg 0.45, and
+# never enable iced's `svg` feature (it would want the older resvg).
+resvg = "=0.47.0"
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+# Relative modified times in the rows and the info line (law 1: formatted on
+# the app's own clock, never the core's).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
