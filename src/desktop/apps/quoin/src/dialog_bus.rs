@@ -185,10 +185,68 @@ pub(crate) fn respond(world: &mut World, command: &str, args: &Value) -> (u8, St
                 // An unmapped scene has no on-screen geometry to report.
                 body["nodes"] = json!({});
                 body["instances"] = json!({});
+            } else {
+                let offset = if kind == Some(true) {
+                    dialog_root_origin(world)
+                } else {
+                    embedded_panel_origin(world, scene)
+                };
+                if offset != Vec2::ZERO {
+                    shift_rects(&mut body, offset);
+                }
             }
             (0, body.to_string())
         }
         _ => refusal("UNKNOWN_COMMAND", format!("{command} is not a dialog verb"), None),
+    }
+}
+
+/// Rects are relative to the scene's surface. On the layer host the dialog
+/// chrome root fills its own window, so its origin is zero; in comp's
+/// renderer the root sits at the dialog's output position. Measuring the
+/// root keeps one rule for both hosts.
+fn dialog_root_origin(world: &World) -> Vec2 {
+    world
+        .resource::<QuoinDialog>()
+        .root
+        .and_then(|root| {
+            let node = world.get::<bevy::ui::ComputedNode>(root)?;
+            let transform = world.get::<bevy::ui::UiGlobalTransform>(root)?;
+            Some(transform.transform_point2(node.border_box().min) * node.inverse_scale_factor)
+        })
+        .unwrap_or(Vec2::ZERO)
+}
+
+/// In comp's renderer every panel shares the output camera; a layer-host
+/// panel is its own window and needs no shift.
+fn embedded_panel_origin(world: &World, scene: &str) -> Vec2 {
+    if !world.contains_resource::<crate::embedded::EmbeddedOutput>() {
+        return Vec2::ZERO;
+    }
+    let Some((_, edge)) = world.resource::<SceneStore>().edge_page(scene) else {
+        return Vec2::ZERO;
+    };
+    let rect = panel_layout(&world.resource::<ShellFrameState>().0).panels[edge.index()];
+    Vec2::new(rect.x, rect.y)
+}
+
+fn shift_rects(body: &mut Value, offset: Vec2) {
+    let mut shift = |rect: &mut Value| {
+        for (key, delta) in [("x", offset.x), ("y", offset.y)] {
+            if let Some(value) = rect[key].as_f64() {
+                rect[key] = json!(value - f64::from(delta));
+            }
+        }
+    };
+    if let Some(nodes) = body["nodes"].as_object_mut() {
+        nodes.values_mut().for_each(&mut shift);
+    }
+    if let Some(lists) = body["instances"].as_object_mut() {
+        for rows in lists.values_mut() {
+            if let Some(rows) = rows.as_object_mut() {
+                rows.values_mut().for_each(&mut shift);
+            }
+        }
     }
 }
 
