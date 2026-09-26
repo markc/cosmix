@@ -673,6 +673,17 @@ try
   $s = $l.scene_notice($s, {scene:"zz-good", revision:$rev, ops:["unloaded"], reason:"owner_departed", owner:"test-scenes", diagnostics:[]})
   check($s.scenes["zz-good"].mounted and len(loads_of($m, "zz-good")) == 1, "a departure notice remounts the page: " .. json_encode(loads_of($m, "zz-good")))
 
+  -- A behaviour's own files beside its scene (the panel's settings.conf.mix
+  -- and write_atomic's hidden temp) are not scene files: writing them never
+  -- reloads the scene or relaunches the behaviour (panel tasks_scope).
+  $generation = $s.scenes["zz-good"].generation
+  $m = log_mark()
+  write_file($s.root .. "/zz-good/settings.conf.mix", "schema: 1\ntasks_scope: \"current\"\n")
+  $s = $l.filesystem($s, {overflow:false, changes:[{path:$s.root .. "/zz-good/.settings.conf.mix.mixtmp-x1", kind:"created"},
+    {path:$s.root .. "/zz-good/settings.conf.mix", kind:"moved"}]})
+  check(len(filter(since($m, nil), fn($c) = contains(["shell.scene.load", "shell.scene.unload", "launch", "stop"], $c.verb))) == 0 and $s.scenes["zz-good"].generation == $generation and $s.scenes["zz-good"].mounted,
+    "a settings file beside a scene never reloads it or relaunches its behaviour")
+
   -- m6/m7: retiring ownership outlives an installation and its replacement.
   install_fixture($s.templates, "worker", true)
   $s = $l.request($s, "install", {template:"worker",name:"handover",enable:true})

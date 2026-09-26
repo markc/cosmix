@@ -314,7 +314,8 @@ for each $case in $panel_cases
     notes: notes_of($case.notes), vol: $case.vol, net: $case.net,
     launcher_open: $case.open.launcher ?? false, calendar_open: $case.open.calendar ?? false,
     notes_open: $case.open.notes ?? false, peeked: $case.peeked ? [{id: 1, generation: 1}] : []}
-  $snap = {windows: $windows, ws_count: $case.ws_count, ws_current: $case.ws_current, tray: $case.tray,
+  -- The legacy builder drew the current workspace only: parity pins "current".
+  $snap = {windows: $windows, ws_count: $case.ws_count, ws_current: $case.ws_current, tasks_scope: "current", tray: $case.tray,
     notes_count: $case.notes, vol: $case.vol, net: $case.net, open: $case.open, peeked: $case.peeked}
   $doc = $old.capture("panel", $legacy, $at, $case.icons)
   $model = $models.panel($snap, $case.icons, $at)
@@ -364,16 +365,61 @@ fn click($list, $item)
   return {args: {scene: "panel", node: $list, kind: "click", item: $item}}
 end
 $fresh = $taskbar.normal_windows($raw_busy)
-$focus = $taskbar.task_action($fresh, $runtime.event_args(click("tasks", $busy.tasks[0])).item)
+$focus = $taskbar.task_action_at($fresh, $runtime.event_args(click("tasks", $busy.tasks[0])).item, 2)
 check($focus.ok and $focus.verb == "comp.window.focus" and deep_eq($focus.args, {id: 4, generation: 1}), "unfocused task focuses with its generation")
-$restore = $taskbar.task_action($fresh, $runtime.event_args(click("tasks", $busy.tasks[1])).item)
+$restore = $taskbar.task_action_at($fresh, $runtime.event_args(click("tasks", $busy.tasks[1])).item, 2)
 check($restore.verb == "comp.window.restore" and $restore.args.generation == 7, "minimised task restores")
-$minimize = $taskbar.task_action($fresh, $runtime.event_args(click("tasks", $busy.tasks[2])).item)
+$minimize = $taskbar.task_action_at($fresh, $runtime.event_args(click("tasks", $busy.tasks[2])).item, 2)
 check($minimize.verb == "comp.window.minimize" and $minimize.args.id == 12, "focused task minimises")
 $reused = $taskbar.normal_windows([window_row(12, 4, 2, "Recycled id", "example.editor", true, false)])
-check($taskbar.task_action($reused, $busy.tasks[2]).error_code == "stale_window", "a recycled window id with a new generation is refused")
-check($taskbar.task_action([], $busy.tasks[2]).error_code == "stale_window", "a closed window is refused")
-check($taskbar.task_action($fresh, {id: "t_4"}).error_code == "invalid_args", "a row without window/generation is refused")
+check($taskbar.task_action_at($reused, $busy.tasks[2], 2).error_code == "stale_window", "a recycled window id with a new generation is refused")
+check($taskbar.task_action_at([], $busy.tasks[2], 2).error_code == "stale_window", "a closed window is refused")
+check($taskbar.task_action_at($fresh, {id: "t_4"}, 2).error_code == "invalid_args", "a row without window/generation is refused")
+
+-- tasks_scope "all" (the behaviour's default, Plasma's): every workspace's
+-- windows in id order; another workspace's task is dimmed, has no button
+-- background, and a click focuses/restores it (comp shows its workspace).
+-- A snapshot without tasks_scope (a behaviour copy older than the setting)
+-- keeps drawing the current workspace only.
+$all_snap = {windows: $fresh, ws_count: 3, ws_current: 2, tray: [], notes_count: 0, vol: {ok: false, level: 0, muted: false},
+  net: {up: false, wireless: false}, open: {}, peeked: false}
+check(deep_eq(map($models.panel($all_snap, $icons_busy, date_parse("2024-02-29T21:05:07Z")).tasks, fn($x) = $x.id), ["t_4", "t_9", "t_12", "t_30"]), "a snapshot without tasks_scope draws the current workspace (old behaviour copies)")
+$all_snap.tasks_scope = "all"
+$all = $models.panel($all_snap, $icons_busy, date_parse("2024-02-29T21:05:07Z"))
+check(deep_eq(map($all.tasks, fn($x) = $x.id), ["t_4", "t_9", "t_12", "t_20", "t_30"]), "scope all: other workspaces included, overlay still excluded, id order")
+$away = $all.tasks[3]
+check($away.color == "#a1a9b1" and $away.background == nil, "another workspace's task is dimmed with no button background")
+check($all.tasks[0].background != nil and $all.tasks[0].color == "#fcfcfc", "current workspace tasks keep their look")
+check($all.tasks[4].background != nil, "a window without a workspace belongs to the current one")
+$all_snap.tasks_scope = "current"
+check(deep_eq(map($models.panel($all_snap, $icons_busy, date_parse("2024-02-29T21:05:07Z")).tasks, fn($x) = $x.id), ["t_4", "t_9", "t_12", "t_30"]), "scope current shows this workspace only")
+$go = $taskbar.task_action_at($fresh, $runtime.event_args(click("tasks", $away)).item, 2)
+check($go.ok and $go.verb == "comp.window.focus" and deep_eq($go.args, {id: 20, generation: 1}) and not has_key($go, "workspace"), "another workspace's task focuses (comp switches, never the panel)")
+$hidden_away = $taskbar.normal_windows([window_row(20, 1, 1, "Other workspace", "example.editor", false, true)])
+$go2 = $taskbar.task_action_at($hidden_away, {window: 20, generation: 1}, 2)
+check($go2.verb == "comp.window.restore", "a minimised window elsewhere restores")
+$focused_away = $taskbar.normal_windows([window_row(20, 1, 1, "Other workspace", "example.editor", true, false)])
+check($taskbar.task_action_at($focused_away, {window: 20, generation: 1}, 2).verb == "comp.window.focus", "a window elsewhere is never minimised from the panel")
+check($taskbar.task_action($focused_away, {window: 20, generation: 1}).verb == "comp.window.minimize" and $taskbar.task_action($fresh, $busy.tasks[0]).workspace == nil, "the two-argument task_action user copies call is unchanged")
+$many_all = []
+for $i = 1 to 60
+  push($many_all, window_row($i, 1, ($i % 3) + 1, "Window " .. to_string($i), "example.app", false, false))
+end
+check(length($taskbar.panel_tasks($many_all, 1, "all", 50)) == 50, "scope all keeps the task cap")
+-- 50 windows elsewhere with low ids, then two on the current workspace: the
+-- cap keeps both current ones and the result stays in id order.
+$crowd = []
+for $i = 1 to 50
+  push($crowd, window_row($i, 1, 2, "Elsewhere " .. to_string($i), "example.app", false, false))
+end
+push($crowd, window_row(90, 1, 1, "Here A", "example.app", true, false))
+push($crowd, window_row(91, 1, 1, "Here B", "example.app", false, false))
+$capped = $taskbar.panel_tasks($crowd, 1, "all", 50)
+$capped_ids = map($capped, fn($w) = $w.id)
+check(length($capped) == 50 and contains($capped_ids, 90) and contains($capped_ids, 91), "the cap never drops a current-workspace window")
+check(deep_eq($capped_ids, sort($capped_ids)), "capped tasks stay in id order")
+check(not $taskbar.elsewhere({workspace: 0}, 2) and not $taskbar.elsewhere({}, 2) and $taskbar.elsewhere({workspace: 3}, 2), "workspace 0 (unmapped) and none count as current")
+check($taskbar.valid_scope("all") == "all" and $taskbar.valid_scope("current") == "current" and $taskbar.valid_scope("ALL") == nil and $taskbar.valid_scope(nil) == nil and $taskbar.valid_scope(1) == nil, "scope validation")
 check($taskbar.workspace_index($runtime.event_args(click("pager", $busy.workspaces[2])).item) == 3, "workspace click index")
 check($taskbar.workspace_index({index: 0}) == nil and $taskbar.workspace_index({index: 1.5}) == nil, "bad workspace index refused")
 check($taskbar.tray_key($runtime.event_args(click("tray", $changed.tray[1])).item) == "i3", "tray click resolves the adapter key")

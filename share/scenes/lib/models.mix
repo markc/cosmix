@@ -83,7 +83,9 @@ fn icon_choice($paths, $name, $fallback)
 end
 
 -- The bottom panel's complete runtime model, as the legacy builder drew it.
--- $snap: {windows (normal band, id order), ws_count, ws_current, tray,
+-- $snap: {windows (normal band, id order), ws_count, ws_current,
+--         tasks_scope ("all" | "current"; absent = "current", what a
+--         behaviour copy older than the setting draws), tray,
 --         notes_count, net:{up,wireless}, vol:{ok,level,muted},
 --         open:{launcher,calendar,notes}, peeked (bool)}
 -- $icons: {themed:{name:path} (dark status theme), plain:{name:path}
@@ -105,18 +107,27 @@ fn panel($snap, $icons, $now)
       current: $current, background: $current ? $C.accent : $C.task_bg, color: $current ? "#0b1f2b" : $C.dim})
   end
 
+  -- A window on another workspace (tasks_scope "all") has no button
+  -- background and dimmed text, like a minimised one reads fainter still.
   $tasks = []
-  for each $w in $t.current_tasks($snap.windows ?? [], $ws_current, $MAX_TASKS)
+  for each $w in $t.panel_tasks($snap.windows ?? [], $ws_current, $snap.tasks_scope ?? "current", $MAX_TASKS)
+    $away = $t.elsewhere($w, $ws_current)
     $background = nil
-    if $w.focused and not $w.minimized then
+    if $w.focused and not $w.minimized and not $away then
       $background = $C.accent_bg
-    elif not $w.minimized then
+    elif not $w.minimized and not $away then
       $background = $C.task_bg
+    end
+    $color = $C.fg
+    if $w.minimized then
+      $color = $C.faint
+    elif $away then
+      $color = $C.dim
     end
     $icon = $window_icons[to_string($w.app_id)] ?? ""
     push($tasks, {id: "t_" .. to_string($w.id), cells: [], window: $w.id, generation: $w.generation,
       title: $p.short_title($w.title, 40), icon: $icon, has_icon: $icon != "",
-      background: $background, color: $w.minimized ? $C.faint : $C.fg})
+      background: $background, color: $color})
   end
 
   -- Row ids carry the adapter's store key, so a click resolves to the exact

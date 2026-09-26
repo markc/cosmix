@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 -- The bottom panel's behaviour: compositor, tray, notification and popup
 -- state in; one complete model out through the loader (scenes.model). The
 -- layout is static in scene.mix. Clicks arrive as {scene,node,kind,item?};
@@ -22,6 +22,53 @@ $PW_RUNTIME = env("PIPEWIRE_RUNTIME_DIR", "/run/user/" .. to_string(uid()))
 $POPUPS = {launcher: env("PANEL_LAUNCHER_SCENE", "launcher"),
   calendar: env("PANEL_CALENDAR_SCENE", "calendar"), notes: env("PANEL_NOTES_SCENE", "notes")}
 
+-- The panel's own settings, beside its scene (SCENE_DIR, the user copy on a
+-- live desktop), canonicalised because inotify reports canonical paths.
+-- tasks_scope: "all" (Plasma's default) or "current". A missing file or key
+-- is "all"; an unreadable or invalid file keeps the scope in force (start:
+-- "all") and says why on stderr, so a half-written save never flips the panel.
+fn scene_dir()
+  $dir = env("SCENE_DIR", "")
+  if $dir == "" then $dir = cwd() end
+  return realpath($dir) ?? $dir
+end
+$SETTINGS = scene_dir() .. "/settings.conf.mix"
+
+-- {scope, data, why}: scope nil = the file exists but cannot be used.
+fn read_settings()
+  if not is_file($SETTINGS) then return {scope: "all", data: {}, why: nil} end
+  try
+    $data = load_data($SETTINGS)
+    if type($data) != "map" then return {scope: nil, data: nil, why: "not a key: value file"} end
+    if $data.tasks_scope == nil then return {scope: "all", data: $data, why: nil} end
+    $scope = $t.valid_scope($data.tasks_scope)
+    if $scope == nil then return {scope: nil, data: $data, why: "tasks_scope must be \"all\" or \"current\""} end
+    return {scope: $scope, data: $data, why: nil}
+  catch $message
+    return {scope: nil, data: nil, why: to_string($message)}
+  end
+end
+
+-- The whole file, other keys kept (comments are not: the header is rewritten).
+fn settings_text($data)
+  $out = "-- The bottom panel's settings: edit here (ced), or send\n" ..
+    "-- `panel.tasks_scope {\"scope\":\"current\"}` to scene-panel ({} toggles).\n" ..
+    "-- tasks_scope: \"all\" shows windows from every workspace (Plasma's default);\n" ..
+    "-- \"current\" shows only the current workspace's windows.\n"
+  $keys = ["schema", "tasks_scope"]
+  for each $k in sort(keys($data))
+    if not contains($keys, $k) then push($keys, $k) end
+  end
+  for each $k in $keys
+    if not has_key($data, $k) then continue end
+    -- The panel's own keys are written bare, any other key quoted (load_data
+    -- reads both, and quoting needs no pattern match).
+    $name = contains(["schema", "tasks_scope"], $k) ? $k : data_encode($k)
+    $out = $out .. $name .. ": " .. data_encode($data[$k]) .. "\n"
+  end
+  return $out
+end
+
 fn empty_icons()
   return {themed: {}, plain: {}, windows: {}}
 end
@@ -32,7 +79,10 @@ $state = {ready: false, windows: [], ws_count: 1, ws_current: 1, tray: [], notes
   icons: empty_icons(), services: [], dirty: false, rebuilding: false, clock_armed: false, status_refreshing: false,
   net_watch: nil, net_started: 0, net_retry: 5, net_retrying: false,
   audio_watch: nil, audio_started: 0, audio_retry: 5, audio_retrying: false, audio_unavailable: false,
-  model: nil}
+  model: nil, settings_watch: nil}
+$first = read_settings()
+$state.tasks_scope = $first.scope ?? "all"
+if $first.scope == nil then eprint("panel: " .. $SETTINGS .. ": " .. $first.why .. "; using \"all\"") end
 
 -- ── status: network + volume, pushed by the kernel and PipeWire ─────────
 -- rtnetlink link events and a `pactl subscribe` stream (net_watch /
@@ -217,7 +267,7 @@ fn resolve_icons()
       $state.icons.themed[$name] = apps_icon($name, $size, $ICON_THEME)
     end
   end
-  for each $w in $t.current_tasks($state.windows, $state.ws_current, $m.MAX_TASKS)
+  for each $w in $t.panel_tasks($state.windows, $state.ws_current, $state.tasks_scope, $m.MAX_TASKS)
     $key = to_string($w.app_id)
     if not has_key($state.icons.windows, $key) then $state.icons.windows[$key] = window_icon($w.app_id) end
   end
@@ -229,7 +279,7 @@ end
 
 fn snapshot()
   return {windows: $state.windows, ws_count: $state.ws_count, ws_current: $state.ws_current,
-    tray: $state.tray, notes_count: $state.notes_count, net: $state.net, vol: $state.vol,
+    tasks_scope: $state.tasks_scope, tray: $state.tray, notes_count: $state.notes_count, net: $state.net, vol: $state.vol,
     open: $state.open, peeked: length($state.peeked) > 0}
 end
 
@@ -393,7 +443,7 @@ end
 on task async
   $item = $r.event_args($event).item
   if not fetch_windows() then $r.respond($r.failure("comp_unavailable", "window list unavailable")); return end
-  $action = $t.task_action($state.windows, $item)
+  $action = $t.task_action_at($state.windows, $item, $state.ws_current)
   if not $action.ok then
     schedule()
     $r.respond($r.failure($action.error_code, $action.message))
@@ -453,6 +503,46 @@ end
 
 on panel.state desc "panel model {model}; the last model the loader accepted"
   reply(0, json_encode({model: $state.model}))
+end
+
+on panel.tasks_scope desc "set the task scope {scope: all|current}, or toggle it {}; persisted beside the scene; replies {scope, file}"
+  if $event.args != nil and $event.args != "" and type($event.args) != "map" then
+    reply(10, json_encode({error_code: "invalid_args", message: "args must be {} or {scope}"}))
+    return
+  end
+  $args = type($event.args) == "map" ? $event.args : {}
+  $current = read_settings()
+  $scope = $args.scope
+  if $scope == nil then
+    -- A toggle is relative to the file; one that cannot be read is not
+    -- overwritten on a guess (an explicit scope replaces it).
+    if $current.scope == nil then
+      reply(10, json_encode({error_code: "settings_invalid", message: $current.why, file: $SETTINGS}))
+      return
+    end
+    $scope = $current.scope == "all" ? "current" : "all"
+  end
+  if $t.valid_scope($scope) == nil then
+    reply(10, json_encode({error_code: "invalid_args", message: "scope must be \"all\" or \"current\""}))
+    return
+  end
+  $data = type($current.data) == "map" ? $current.data : {}
+  $data.schema = $data.schema ?? 1
+  $data.tasks_scope = $scope
+  try
+    write_atomic($SETTINGS, settings_text($data))
+  catch $message
+    reply(10, json_encode({error_code: "settings_unwritable", message: to_string($message), file: $SETTINGS}))
+    return
+  end
+  $state.tasks_scope = $scope
+  -- The scope and file changed: say so even if the redraw cannot be queued.
+  try
+    schedule()
+  catch $message
+    eprint("panel: tasks_scope redraw not scheduled: " .. to_string($message))
+  end
+  reply(0, json_encode({scope: $scope, file: $SETTINGS}))
 end
 
 on panel.refresh desc "queue one rebuild from fresh service state {}"
@@ -580,6 +670,28 @@ on audio.retry async
   schedule()
 end
 
+-- A hand edit of settings.conf.mix (ced, the Scene Editor) applies live:
+-- inotify on the scene directory, re-read on a change to that file or an
+-- overflow. The panel's own write lands here too and changes nothing.
+on fs.changed
+  if len(keys($event.headers)) != 0 then return end
+  if $event.args.watch != $state.settings_watch then return end
+  $touched = $event.args.overflow == true
+  for each $c in $event.args.changes ?? []
+    if type($c) == "map" and $c.path == $SETTINGS then $touched = true end
+  end
+  if not $touched then return end
+  $now = read_settings()
+  if $now.scope == nil then
+    eprint("panel: " .. $SETTINGS .. ": " .. $now.why .. "; keeping \"" .. $state.tasks_scope .. "\"")
+    return
+  end
+  if $now.scope != $state.tasks_scope then
+    $state.tasks_scope = $now.scope
+    schedule()
+  end
+end
+
 -- ── init: subscribe before the first snapshot ───────────────────────────
 subscribe($COMP .. ".props.changed")
 subscribe($TRAY .. ".item.added")
@@ -591,6 +703,11 @@ subscribe($APPS .. ".changed")
 subscribe($NODED .. ".props.changed")
 subscribe("scenes.changed")
 start_status()
+try
+  $state.settings_watch = fs_watch(dirname($SETTINGS), {recursive: false, events: ["created", "modified", "deleted", "moved"]})
+catch $message
+  eprint("panel: settings watch unavailable (" .. to_string($message) .. "); edits apply on the next start")
+end
 $state.services = registered() ?? []
 $ready = $r.ready($ctx)
 if not $ready.ok then raise("SCENE_READY", json_encode($ready.value)) end
