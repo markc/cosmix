@@ -10,6 +10,44 @@ fn relay_devices(h: &mut KeybindingHarness) -> (u32, u32, u32) {
     (manager, human_device, agent_device)
 }
 
+#[cfg(feature = "xwayland")]
+#[test]
+fn xwayland_teardown_clears_both_seat_offers_only_while_x11_owns_them() {
+    for replace_clipboard in [false, true] {
+        let mut h = KeybindingHarness::new(false);
+        let (manager, human, agent) = relay_devices(&mut h);
+        for target in [SelectionTarget::Clipboard, SelectionTarget::Primary] {
+            h.server.state.x11_new_selection(target, vec!["text/plain".into()]);
+        }
+        let events = h.sync();
+        for device in [human, agent] {
+            assert_ne!(relay_offer(&events, device, false), 0);
+            assert_ne!(relay_offer(&events, device, true), 0);
+        }
+        let replacement = replace_clipboard.then(|| {
+            let source = relay_source(&mut h, manager);
+            send_request(&mut h.client, agent, 0, &words(&[source]));
+            let events = h.sync();
+            (source, relay_offer(&events, human, false))
+        });
+        // The offline XWM fixture supplies ownership callbacks; use the real
+        // shared teardown reached by shutdown and failed generations.
+        h.server.state.shutdown_xwayland();
+        let events = h.sync();
+        for device in [human, agent] {
+            assert_eq!(relay_offer(&events, device, true), 0);
+            if replacement.is_none() {
+                assert_eq!(relay_offer(&events, device, false), 0);
+            } else {
+                assert!(!events.iter().any(|(object, opcode, _)| *object == device && *opcode == 1));
+            }
+        }
+        if let Some((source, offer)) = replacement {
+            relay_transfer(&mut h, offer, source, b"Wayland replacement survives");
+        }
+    }
+}
+
 fn relay_source(h: &mut KeybindingHarness, manager: u32) -> u32 {
     let source = h.allocate_object_id();
     send_request(&mut h.client, manager, 0, &words(&[source]));

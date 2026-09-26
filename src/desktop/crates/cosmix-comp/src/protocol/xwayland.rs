@@ -1055,6 +1055,10 @@ impl WaylandState {
     /// Shared teardown for failure and orderly shutdown: descriptor first,
     /// then the source/XWM/client, then X records.
     fn teardown_xwayland_generation(&mut self) {
+        // Retire offers before the live XWM becomes a draining generation.
+        // Provenance guards preserve a newer Wayland-owned replacement.
+        self.clear_x11_relay(SelectionTarget::Clipboard);
+        self.clear_x11_relay(SelectionTarget::Primary);
         remove_xwayland_descriptor(self.xwayland.descriptor_path.as_ref());
         self.xwayland.descriptor_path = None;
         if self.xwayland.display_number.take().is_some() {
