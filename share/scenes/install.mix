@@ -1,4 +1,4 @@
--- version: 0.1.1
+-- version: 0.1.2
 -- Install the shipped catalogue + shared libraries only. Does not enable,
 -- replace user scenes, contact a host, or migrate the running panel.
 -- Usage: mix share/scenes/install.mix [destination]
@@ -11,6 +11,8 @@ for each $dir in ["lib", "panel", "launcher", "calendar", "notes", "settings", "
   $files = $dir == "lib" ? ["data.mix", "models.mix", "runtime.mix", "taskbar.mix"] : ["scene.mix", "behaviour.mix", "template.conf.mix"]
   -- The Scene Editor keeps its helpers beside it (scene-editor plan D1).
   if $dir == "editor" then push($files, "lib.mix") end
+  -- The panel's settings file (tasks_scope) ships with it.
+  if $dir == "panel" then push($files, "settings.conf.mix") end
   for each $file in $files
     copy($source .. "/" .. $dir .. "/" .. $file, $dest .. "/" .. $dir .. "/" .. $file)
   end

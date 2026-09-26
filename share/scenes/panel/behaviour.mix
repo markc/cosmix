@@ -538,7 +538,12 @@ on panel.tasks_scope desc "set the task scope {scope: all|current}, or toggle it
     return
   end
   $state.tasks_scope = $scope
-  schedule()
+  -- The scope and file changed: say so even if the redraw cannot be queued.
+  try
+    schedule()
+  catch $message
+    eprint("panel: tasks_scope redraw not scheduled: " .. to_string($message))
+  end
   reply(0, json_encode({scope: $scope, file: $SETTINGS}))
 end
 
