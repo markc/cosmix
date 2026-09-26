@@ -19,7 +19,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use cosmix_mds::Mds;
@@ -42,7 +44,7 @@ pub const LOCK_FILE: &str = ".blobd.lock";
 pub const DEFAULT_GC_GRACE_SECS: u64 = 60;
 
 const BLOBD_APPLICATION_ID: i32 = 0x626C_6F62; // 'blob'
-const BLOBD_LATEST: u32 = 1;
+const BLOBD_LATEST: u32 = 2;
 const BLOBD_V1_SQL: &str = "\
 PRAGMA application_id = 0x626C6F62;        -- 'blob'
 PRAGMA user_version   = 1;
@@ -69,6 +71,11 @@ CREATE TABLE quota (
     used_bytes INTEGER NOT NULL DEFAULT 0
 );
 ";
+/// v2 (F6): the pin row records the size it accounted, so an unpin
+/// releases exactly what the pin paid even when the CAS file and the
+/// mds row are both gone. Pre-v2 rows carry the default 0 and fall
+/// back to the legacy index/file read at unpin time.
+const BLOBD_V2_SQL: &str = "ALTER TABLE pins ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;";
 
 /// Store-level errors. `Locked` is the exit-2 case; the rest map to
 /// Bus rc 10 with `{"error": …}`.
@@ -606,16 +613,14 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(db_err)?;
-        let pinned = tx
-            .execute(
-                "INSERT OR IGNORE INTO pins (hash, owner, created) VALUES (?1, ?2, ?3)",
-                params![blob::hex(hash), owner, now_ms()],
-            )
-            .map_err(db_err)?
-            == 1;
-        if pinned {
-            bump_owner_used(&tx, owner, size)?;
-        }
+        let pinned = pin_with_cap(
+            &tx,
+            &blob::hex(hash),
+            owner,
+            size,
+            self.options.owner_limit(owner),
+            self.options.quota_total_bytes,
+        )?;
         tx.commit().map_err(db_err)?;
         drop(db);
         if pinned {
@@ -671,15 +676,15 @@ impl Store {
         .map_err(db_err)?;
         let mut newly_pinned = Vec::new();
         for owner in owners {
-            let inserted = tx
-                .execute(
-                    "INSERT OR IGNORE INTO pins (hash, owner, created) VALUES (?1, ?2, ?3)",
-                    params![blob::hex(hash), owner, now_ms()],
-                )
-                .map_err(db_err)?
-                == 1;
+            let inserted = pin_with_cap(
+                &tx,
+                &blob::hex(hash),
+                owner,
+                size,
+                self.options.owner_limit(owner),
+                self.options.quota_total_bytes,
+            )?;
             if inserted {
-                bump_owner_used(&tx, owner, size)?;
                 newly_pinned.push(owner.clone());
             }
         }
@@ -761,7 +766,10 @@ impl Store {
     /// Pin `hash` to `owner`. Idempotent; returns whether a pin row
     /// was added. Requires the bytes to be present — re-checked under
     /// the db lock so a concurrent `blob.gc` sweep surfaces as
-    /// `Vanished` instead of a dangling pin (M1).
+    /// `Vanished` instead of a dangling pin (M1). The pin pays the
+    /// owner's cap at insert time (F6): a present-hash pin still
+    /// costs its owner the bytes, and a refusal is
+    /// `QuotaOwner`/`QuotaTotal` with nothing written.
     pub fn pin(&self, hash: &BlobHash, owner: &str) -> Result<bool> {
         if !blob::exists(&self.blobs_root(), hash)? {
             return Err(StoreError::NotPresent(blob::hex(hash)));
@@ -774,16 +782,14 @@ impl Store {
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
-        let inserted = tx
-            .execute(
-                "INSERT OR IGNORE INTO pins (hash, owner, created) VALUES (?1, ?2, ?3)",
-                params![blob::hex(hash), owner, now_ms()],
-            )
-            .map_err(db_err)?
-            == 1;
-        if inserted {
-            bump_owner_used(&tx, owner, size)?;
-        }
+        let inserted = pin_with_cap(
+            &tx,
+            &blob::hex(hash),
+            owner,
+            size,
+            self.options.owner_limit(owner),
+            self.options.quota_total_bytes,
+        )?;
         tx.commit().map_err(db_err)?;
         drop(db);
         if inserted {
@@ -794,7 +800,10 @@ impl Store {
 
     /// Drop `owner`'s pin on `hash`. Idempotent; returns whether a pin
     /// row was removed. The bytes need not be present (a dangling pin
-    /// is dropped all the same).
+    /// is dropped all the same). Quota releases exactly what the pin
+    /// row recorded (F6, schema v2); a pre-v2 row (size 0 — an empty
+    /// blob's real size is 0 too, so the fallback is harmless) falls
+    /// back to the mds index row, then the file on disk.
     pub fn unpin(&self, hash: &BlobHash, owner: &str) -> Result<bool> {
         // Index read first, outside the db lock, so the two mutexes are
         // never nested in this path (lock order elsewhere is one at a
@@ -815,6 +824,14 @@ impl Store {
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
+        let recorded: Option<i64> = tx
+            .query_row(
+                "SELECT size_bytes FROM pins WHERE hash = ?1 AND owner = ?2",
+                params![blob::hex(hash), owner],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
         let removed = tx
             .execute(
                 "DELETE FROM pins WHERE hash = ?1 AND owner = ?2",
@@ -823,11 +840,16 @@ impl Store {
             .map_err(db_err)?
             == 1;
         if removed {
-            let delta = index_size.unwrap_or_else(|| {
-                fs::metadata(blob::blob_path(&self.blobs_root(), hash))
-                    .map(|m| m.len())
-                    .unwrap_or(0)
-            });
+            let delta = match recorded {
+                // A v2 row: release exactly what the pin paid.
+                Some(bytes) if bytes > 0 => bytes as u64,
+                // A pre-v2 row (or an empty blob): the legacy read.
+                _ => index_size.unwrap_or_else(|| {
+                    fs::metadata(blob::blob_path(&self.blobs_root(), hash))
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                }),
+            };
             shrink_owner_used(&tx, owner, delta)?;
         }
         tx.commit().map_err(db_err)?;
@@ -1287,6 +1309,65 @@ fn bump_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) -> R
     Ok(())
 }
 
+/// Insert one pin row when the caps allow it (F6: every pin path pays
+/// the size — a present-hash pin still costs its owner the bytes),
+/// recording the size on the row so a later unpin releases exactly
+/// what was paid. `Ok(false)` = the owner already pinned (idempotent
+/// no-op); `Err(QuotaOwner|QuotaTotal)` = refused, nothing written.
+fn pin_with_cap(
+    tx: &rusqlite::Transaction<'_>,
+    hash_hex: &str,
+    owner: &str,
+    size: u64,
+    owner_limit: u64,
+    total_limit: u64,
+) -> Result<bool> {
+    let already: i64 = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1 AND owner = ?2)",
+            params![hash_hex, owner],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    if already != 0 {
+        return Ok(false);
+    }
+    let owner_used: i64 = tx
+        .query_row(
+            "SELECT COALESCE((SELECT used_bytes FROM quota WHERE owner = ?1), 0)",
+            params![owner],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let would_use = owner_used as u64 + size;
+    if would_use > owner_limit {
+        return Err(StoreError::QuotaOwner {
+            owner: owner.to_string(),
+            would_use,
+            limit: owner_limit,
+        });
+    }
+    let total_used: i64 = tx
+        .query_row("SELECT COALESCE(SUM(used_bytes), 0) FROM quota", params![], |r| {
+            r.get(0)
+        })
+        .map_err(db_err)?;
+    let total_would = total_used as u64 + size;
+    if total_would > total_limit {
+        return Err(StoreError::QuotaTotal {
+            would_use: total_would,
+            limit: total_limit,
+        });
+    }
+    tx.execute(
+        "INSERT INTO pins (hash, owner, created, size_bytes) VALUES (?1, ?2, ?3, ?4)",
+        params![hash_hex, owner, now_ms(), size as i64],
+    )
+    .map_err(db_err)?;
+    bump_owner_used(tx, owner, size)?;
+    Ok(true)
+}
+
 fn shrink_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) -> Result<()> {
     tx.execute(
         "UPDATE quota SET used_bytes = MAX(0, used_bytes - ?2) WHERE owner = ?1",
@@ -1415,6 +1496,7 @@ fn apply_blobd_migrations(conn: &mut Connection) -> Result<()> {
     for v in (version + 1)..=BLOBD_LATEST {
         let sql = match v {
             1 => BLOBD_V1_SQL,
+            2 => BLOBD_V2_SQL,
             _ => {
                 return Err(StoreError::Db(format!(
                     "blobd.sqlite: missing migration v{v}"
@@ -1973,6 +2055,55 @@ mod tests {
         assert!(store.put(&src, &PutOptions::new("maild")).is_ok());
     }
 
+    // ---- F6: every pin pays its cap; unpin releases what was paid ----
+
+    #[test]
+    fn pin_beyond_the_owner_cap_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                origin: "testnode".into(),
+                owner_limits: BTreeMap::from([(
+                    ("tightside").to_string(),
+                    16u64,
+                )]),
+                ..options()
+            },
+        )
+        .unwrap();
+        // Land 20 bytes under an owner whose cap allows it, then pin
+        // the same present bytes as the 16-byte owner: a present-hash
+        // pin still costs the bytes (F6) — refused, nothing written.
+        let src = write_src(&dir, "pinme.bin", &[3u8; 20]);
+        let out = store.put(&src, &PutOptions::new("roomy")).unwrap();
+        let err = store.pin(&out.reference.hash, "tightside").unwrap_err();
+        assert!(
+            matches!(err, StoreError::QuotaOwner { ref owner, would_use: 20, limit: 16 } if owner == "tightside"),
+            "got {err:?}"
+        );
+        assert!(store.pin_owners(&out.reference.hash).unwrap() == vec!["roomy".to_string()]);
+        assert_eq!(store.quota_report(None).unwrap().owners["tightside"].used, 0);
+    }
+
+    #[test]
+    fn unpin_releases_the_recorded_size_with_file_and_row_gone() {
+        // The F6 bug: unpin of a hash with no mds row and no CAS file
+        // released 0 and the owner's quota leaked forever. The v2 pin
+        // row records what the pin paid; that is what unpin releases.
+        let (dir, store) = store();
+        let src = write_src(&dir, "leaky.bin", &[5u8; 50]);
+        let out = store.put(&src, &PutOptions::new("leaker")).unwrap();
+        assert_eq!(store.quota_report(None).unwrap().owners["leaker"].used, 50);
+        // No mds row (blobd puts are rowless) and no file: only the
+        // pin row remembers the size.
+        fs::remove_file(store.path(&out.reference.hash).unwrap()).unwrap();
+        assert!(store.unpin(&out.reference.hash, "leaker").unwrap());
+        let report = store.quota_report(None).unwrap();
+        assert_eq!(report.owners["leaker"].used, 0, "quota must not leak");
+        assert_eq!(report.total.used, 0);
+    }
+
     #[test]
     fn second_open_of_same_root_fails_on_flock() {
         let (dir, store) = store();
@@ -2051,13 +2182,13 @@ mod tests {
     }
 
     #[test]
-    fn blobd_sqlite_schema_is_v1_with_expected_tables() {
+    fn blobd_sqlite_schema_is_v2_with_expected_tables() {
         let (dir, store) = store();
         let conn = Connection::open(dir.path().join("blobd.sqlite")).unwrap();
         let v: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
         for tbl in ["blob_attrs", "pins", "quota"] {
             let n: i64 = conn
                 .query_row(
@@ -2068,6 +2199,15 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {tbl}");
         }
+        // v2 (F6): the pins row records the size it accounted.
+        let cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pins') WHERE name='size_bytes';",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 1, "pins.size_bytes missing");
         // mds's blobs.sqlite is untouched: still BLOBS_LATEST = 1.
         let blobs = Connection::open(dir.path().join("blobs.sqlite")).unwrap();
         let bv: u32 = blobs

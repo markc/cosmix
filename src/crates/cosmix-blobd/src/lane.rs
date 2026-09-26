@@ -514,7 +514,17 @@ impl Lane {
                     None => lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
                 }
             }
+            Ok(Err(UploadError::Store(
+                e @ (StoreError::QuotaOwner { .. } | StoreError::QuotaTotal { .. }),
+            ))) => {
+                let _ = pump.await;
+                // F6: the pin's cap check lost a race at settle time
+                // (another owner's pin landed inside the reservation
+                // window) — the same quota band as admission's 413.
+                lane_error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string())
+            }
             Ok(Err(UploadError::Store(e))) => {
+                let _ = pump.await;
                 lane_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
             }
             Err(join) => lane_error(
