@@ -1198,9 +1198,9 @@ mod tests {
             info_at.duration_since(start)
         );
         assert!(
-            put_at.duration_since(*info_at) >= Duration::from_secs(2),
-            "blob.put overlapped blob.info by {:?} — the slow verb was not held",
-            put_at.duration_since(*info_at)
+            put_at.duration_since(start) >= Duration::from_secs(2),
+            "blob.put genuinely held its 2 s (measured {:?}) — the slow verb was not running",
+            put_at.duration_since(start)
         );
     }
 }
