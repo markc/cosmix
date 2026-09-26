@@ -1026,7 +1026,9 @@ occlusion do not exclude it; `require_hit` adds no human-visibility restriction.
 Outside that tree, the move refuses without changing focus.
 
 For agent `{x,y,output}`, hit-testing considers visible mapped client surfaces;
-chrome refuses. Empty space clears agent pointer focus and permits a subsequent
+chrome and embedded Quoin panels refuse before focus changes. An existing implicit
+agent button grab may cross chrome while retaining its client target.
+Empty space clears agent pointer focus and permits a subsequent
 click to dismiss an agent popup. `{dx,dy}` offsets the known agent position;
 it sends ordinary pointer motion, never relative-pointer protocol events. A
 targeted agent button uses the current agent position when it belongs to that

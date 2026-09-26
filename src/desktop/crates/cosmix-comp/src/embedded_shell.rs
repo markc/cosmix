@@ -31,6 +31,12 @@ struct InputState {
 pub(crate) struct EmbeddedShellBridge(Arc<Mutex<InputState>>);
 
 impl EmbeddedShellBridge {
+    #[cfg(test)]
+    pub(crate) fn for_test(regions: Vec<PanelRect>) -> Self {
+        let bridge = Self::default();
+        bridge.0.lock().unwrap().regions = regions;
+        bridge
+    }
     pub(crate) fn suspend(&self, suspended: bool) {
         self.reset();
         self.0.lock().unwrap_or_else(|p| p.into_inner()).suspended = suspended;

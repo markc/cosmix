@@ -389,13 +389,11 @@ impl WaylandState {
                 (None, x, y)
             }
         };
+        let click_grab = self.agent.pointer
+            .with_grab(|_, grab| grab.is::<smithay::input::pointer::ClickGrab<WaylandState>>())
+            .unwrap_or(false);
         if self.agent.pointer.is_grabbed() && !self.agent_popup_pointer_grab() {
-            if !self
-                .agent
-                .pointer
-                .with_grab(|_, grab| grab.is::<smithay::input::pointer::ClickGrab<WaylandState>>())
-                .unwrap_or(false)
-            {
+            if !click_grab {
                 return Err(Self::agent_refusal("pointer_grab"));
             }
             // The ordinary implicit button grab may continue within its root.
@@ -413,7 +411,13 @@ impl WaylandState {
                 return Err(Self::agent_refusal("pointer_grab"));
             }
         }
-        if root.is_none()
+        #[cfg(feature = "embedded-quoin")]
+        if root.is_none() && !click_grab
+            && self.embedded_shell.as_ref().is_some_and(|bridge| bridge.covers(x, y))
+        {
+            return Err(Self::agent_refusal("chrome_target"));
+        }
+        if root.is_none() && !click_grab
             && matches!(
                 self.pointer_target_at(x, y),
                 Some(PointerTarget::Chrome { .. })

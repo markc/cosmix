@@ -91,6 +91,48 @@ fn finish_test_sequences(h: &mut KeybindingHarness) {
 }
 
 #[test]
+fn agent_implicit_drag_crosses_ssd_chrome() {
+    let (mut h, _, alpha, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    bind_agent_devices(&mut h);
+    let press = agent_target(&h, &alpha, InputOp::PointerButton { button: BTN_LEFT, action: PressAction::Press });
+    assert!(matches!(h.server.state.service_input_op(&press), ControlReply::Body(_)));
+    let (x, y) = chrome_titlebar_point(&h);
+    assert!(matches!(h.server.state.pointer_target_at(x, y), Some(PointerTarget::Chrome { .. })));
+    let op = on_agent(move_op(PointerMoveTarget::Output { output: None, x, y }));
+    assert!(matches!(h.server.state.service_input_op(&op), ControlReply::Body(_)));
+    assert_eq!(h.server.state.agent.pointer.current_focus().and_then(|focus| focus.owned_surface()).map(|surface| surface.id()), Some(alpha));
+}
+
+#[cfg(feature = "embedded-quoin")]
+#[test]
+fn agent_coordinates_refuse_embedded_panel_but_implicit_drag_crosses_it() {
+    let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+    bind_agent_devices(&mut h);
+    place_record(&mut h, &alpha, (80.0, 90.0, 200.0, 150.0));
+    let press = agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A));
+    assert_eq!(inject(&mut h, &ingress, &runtime, press).0, 0);
+    let (id, generation) = window_id_and_generation(&h, &alpha);
+    assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(move_op(PointerMoveTarget::Window {
+        id, generation, x: 20.0, y: 30.0, require_hit: true,
+    }))).0, 0);
+    let before = h.server.state.agent.pointer.current_focus();
+    let position = h.server.state.agent.pointer_position;
+    h.server.state.embedded_shell = Some(crate::embedded_shell::EmbeddedShellBridge::for_test(vec![
+        cosmix_shell::host::PanelRect { x: 80.0, y: 90.0, width: 200.0, height: 150.0 },
+    ]));
+    let motion = on_agent(move_op(PointerMoveTarget::Output { output: None, x: 110.0, y: 125.0 }));
+    let (rc, body) = inject(&mut h, &ingress, &runtime, motion.clone());
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "chrome_target");
+    assert_eq!(h.server.state.agent.pointer.current_focus(), before);
+    assert_eq!(h.server.state.agent.pointer_position, position);
+    assert_eq!(inject(&mut h, &ingress, &runtime, on_agent(InputOp::PointerButton {
+        button: BTN_LEFT, action: PressAction::Press,
+    })).0, 0);
+    assert_eq!(inject(&mut h, &ingress, &runtime, motion).0, 0);
+}
+
+#[test]
 fn agent_targeted_key_preserves_human_focus_activation_and_stack() {
     let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
     let (_, keyboard, _) = bind_agent_devices(&mut h);
