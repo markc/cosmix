@@ -57,46 +57,6 @@ pub enum Icon {
 }
 
 impl Icon {
-    fn filename(self) -> &'static str {
-        match self {
-            Self::Archive => "archive.svg",
-            Self::ArrowLeft => "arrow-left.svg",
-            Self::ArrowRight => "arrow-right.svg",
-            Self::ArrowUp => "arrow-up.svg",
-            Self::ChevronDown => "chevron-down.svg",
-            Self::ChevronRight => "chevron-right.svg",
-            Self::ChevronUp => "chevron-up.svg",
-            Self::Copy => "copy.svg",
-            Self::Download => "download.svg",
-            Self::Eye => "eye.svg",
-            Self::EyeOff => "eye-off.svg",
-            Self::File => "file.svg",
-            Self::FileCode => "file-code.svg",
-            Self::FileImage => "file-image.svg",
-            Self::FileMusic => "file-music.svg",
-            Self::FileText => "file-text.svg",
-            Self::FileVideo => "file-video-camera.svg",
-            Self::Folder => "folder.svg",
-            Self::FolderOpen => "folder-open.svg",
-            Self::Grid => "grid-2x2.svg",
-            Self::HardDrive => "hard-drive.svg",
-            Self::House => "house.svg",
-            Self::Info => "info.svg",
-            Self::List => "list.svg",
-            Self::LogOut => "log-out.svg",
-            Self::Menu => "menu.svg",
-            Self::MoveHorizontal => "arrow-left-right.svg",
-            Self::Music => "music.svg",
-            Self::PanelLeft => "panel-left.svg",
-            Self::PanelRight => "panel-right.svg",
-            Self::Pin => "pin.svg",
-            Self::PinOff => "pin-off.svg",
-            Self::Refresh => "refresh-cw.svg",
-            Self::Search => "search.svg",
-            Self::Trash => "trash-2.svg",
-        }
-    }
-
     fn bytes(self) -> &'static [u8] {
         match self {
             Self::Archive => include_bytes!("../assets/icons/archive.svg"),
@@ -204,6 +164,7 @@ pub fn hex(color: iced::Color) -> String {
 /// Cache key: icon, tint, logical pixels.
 type Key = (Icon, String, u32);
 
+#[derive(Default)]
 struct State {
     cache: HashMap<Key, iced::widget::image::Handle>,
     /// The `(tint, size)` a rasterisation is running (or has run) for.
@@ -289,7 +250,7 @@ mod tests {
 
     #[test]
     fn file_types_map_to_distinct_icons() {
-        let p = |name: &str| std::path::Path::new(name);
+        let p = std::path::Path::new;
         assert_eq!(file_icon(p("notes.txt"), false, false), Icon::FileText);
         assert_eq!(file_icon(p("song.FLAC"), false, false), Icon::FileMusic);
         assert_eq!(file_icon(p("clip.mkv"), false, false), Icon::FileVideo);

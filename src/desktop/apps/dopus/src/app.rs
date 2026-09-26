@@ -79,7 +79,6 @@ pub struct Dopus {
     action_table: Vec<ActionRow>,
     dirs: Option<AppDirs>,
     service: String,
-    noded_url: String,
     window: Size,
     tint: String,
     quitting: bool,
@@ -117,13 +116,15 @@ pub fn run(
     };
 
     let keymap_path = dirs.as_ref().map(|d| d.keymap_file());
-    let router = keys::initial(keymap_path.as_deref())?;
+    let router = keys::initial(keymap_path.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let action_table = {
         let router = router.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         action_table(&router.keymap)
     };
 
     let theme = theme::resolve(app_theme_override(dirs.as_ref()).as_deref());
+    // Read before `theme` moves into the app: iced's default font.
+    let ui_font = theme.ui_font;
     let tint = icons::hex(theme.tokens.text);
     let icons = Icons::new();
     icons.ensure(&tint, ICON_PX, ICON_SCALE);
@@ -141,7 +142,6 @@ pub fn run(
         action_table,
         dirs,
         service: service.to_owned(),
-        noded_url: noded_url.to_owned(),
         window: Size::new(980.0, 640.0),
         tint: tint.clone(),
         quitting: false,
@@ -160,7 +160,6 @@ pub fn run(
     }
 
     let state = std::cell::RefCell::new(Some(app));
-    let ui_font = state.borrow().theme.ui_font;
     iced::application(move || state.borrow_mut().take().expect("iced boots once"), Dopus::update, Dopus::view)
         .executor::<SingleThread>()
         .title(Dopus::title)
@@ -321,7 +320,11 @@ impl Dopus {
                 CoreEvent::ListingStarted { .. }
                 | CoreEvent::ListingArrived { .. }
                 | CoreEvent::CountArrived { .. }
-                | CoreEvent::OperationArrived { .. } => {}
+                | CoreEvent::OperationArrived { .. }
+                // The view re-renders from the core after every message, so
+                // "config persisted" and "both panes stale" need no reaction.
+                | CoreEvent::ConfigSettled(_)
+                | CoreEvent::RefreshAll => {}
             }
         }
     }
@@ -334,11 +337,17 @@ impl Dopus {
                 // in-session override and re-resolve from the files.
                 self.theme_override = None;
                 self.reload_theme();
+                Task::none()
             }
-            Delivery::Connected => tracing::info!("Bus connected as `{}`", self.service),
-            Delivery::Disconnected => tracing::warn!("Bus disconnected; reconnecting in the background"),
+            Delivery::Connected => {
+                tracing::info!("Bus connected as `{}`", self.service);
+                Task::none()
+            }
+            Delivery::Disconnected => {
+                tracing::warn!("Bus disconnected; reconnecting in the background");
+                Task::none()
+            }
         }
-        Task::none()
     }
 
     /// Answer one Bus command through the shared serving layer.
@@ -406,8 +415,11 @@ impl Dopus {
                 self.set_override(None, Some(mode));
                 continue;
             }
-            if let Some(scheme) = verbs::scheme_action(*action) {
-                self.set_override(scheme, None);
+            if let Some(name) = verbs::scheme_action(*action) {
+                // The action names are exactly the scheme names, so this
+                // always parses; a stray name falls back to the current
+                // scheme inside set_override.
+                self.set_override(Scheme::from_name(name), None);
                 continue;
             }
             match verbs::apply_action(*action, &mut self.core) {
@@ -434,10 +446,9 @@ impl Dopus {
         Ok(())
     }
 
-    fn set_override(&mut self, scheme: Option<&str>, mode: Option<Mode>) {
+    fn set_override(&mut self, scheme: Option<Scheme>, mode: Option<Mode>) {
         let current = self.theme_override.take().unwrap_or((self.theme.scheme, self.theme.mode));
-        let scheme = scheme.map(|name| Scheme::from_name(name)).flatten().unwrap_or(current.0);
-        self.theme_override = Some((scheme, mode.unwrap_or(current.1)));
+        self.theme_override = Some((scheme.unwrap_or(current.0), mode.unwrap_or(current.1)));
         self.reload_theme();
     }
 
@@ -460,7 +471,7 @@ impl Dopus {
                 let keymap_path = self.dirs.as_ref().map(|d| d.keymap_file());
                 keys::reload(&self.router, keymap_path.as_deref());
                 {
-                    let mut router = self.router.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let router = self.router.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     self.action_table = action_table(&router.keymap);
                 }
             }
@@ -497,10 +508,10 @@ impl Dopus {
         ])
     }
 
-    fn look(&self) -> Look<'_> {
+    fn look(&self) -> Look {
         Look {
-            tokens: &self.theme.tokens,
-            chrome: &self.theme.chrome,
+            tokens: self.theme.tokens,
+            chrome: self.theme.chrome,
             ui_font: self.theme.ui_font,
             mono_font: self.theme.mono_font,
             px: self.theme.ui_px(),
@@ -509,13 +520,12 @@ impl Dopus {
     }
 
     fn view(&self) -> Element<'_, Msg, iced::Theme, Renderer> {
-        let look = self.look();
         let info = self.status.as_deref().unwrap_or(self.core.info());
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops
         // keys under load — the ced/term rule).
         keys::router(
-            view::root(&look, &self.icons, &self.tint, self.core.pane(PaneId::Left), &self.rows, info),
+            view::root(self.look(), &self.icons, &self.tint, self.core.pane(PaneId::Left), &self.rows, info),
             self.router.clone(),
             Msg::Actions,
         )

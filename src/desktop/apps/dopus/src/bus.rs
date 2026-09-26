@@ -239,7 +239,7 @@ fn anonymous_call(url: &str, service: &str, verb: &str, body: &serde_json::Value
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
     runtime.block_on(async {
         let call = async {
-            let client = NodedClient::connect_anonymous(&url).await.ok()?;
+            let client = NodedClient::connect_anonymous(url).await.ok()?;
             let reply = client.call_with_headers_raw(service, verb, &BTreeMap::new(), &body.to_string()).await.ok();
             client.close().await;
             reply.map(|(rc, body, _)| (rc, body))

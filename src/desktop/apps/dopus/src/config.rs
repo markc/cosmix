@@ -12,7 +12,10 @@ use cosmix_dopus_core::{ConfigFile, DOpusConfig};
 /// nothing to load and nothing to save into.
 pub fn load(dir: Option<&Path>) -> (DOpusConfig, Option<ConfigFile>) {
     match dir {
-        Some(dir) => ConfigFile::load(dir),
+        Some(dir) => {
+            let (config, file) = ConfigFile::load(dir);
+            (config, Some(file))
+        }
         None => (DOpusConfig::default(), None),
     }
 }

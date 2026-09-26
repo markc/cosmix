@@ -3130,6 +3130,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-dopus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "cosmix-actions",
+ "cosmix-design",
+ "cosmix-dopus-core",
+ "cosmix-iced-widgets",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "iced",
+ "iced_tiny_skia",
+ "resvg",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cosmix-dopus-core"
 version = "0.1.0"
 dependencies = [

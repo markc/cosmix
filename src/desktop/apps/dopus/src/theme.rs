@@ -146,7 +146,11 @@ pub fn resolve_selection(selection: &Selection, mut notes: Vec<String>) -> Theme
     let (tokens, chrome, typography) = match compiled {
         Ok(Compiled { dictionary, typography }) => match (Tokens::from_dictionary(&dictionary), build_chrome(&dictionary)) {
             (Ok(tokens), Ok(chrome)) => (tokens, chrome, Some(typography)),
-            (Err(error), _) | (_, Err(error)) => {
+            (Err(error), _) => {
+                notes.push(format!("design dictionary: {error}"));
+                fallback()
+            }
+            (_, Err(error)) => {
                 notes.push(format!("design dictionary: {error}"));
                 fallback()
             }

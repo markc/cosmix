@@ -7,7 +7,6 @@ pub mod status;
 
 use iced::widget::{button, column, container, image, row, text, Space};
 use iced::{Border, Element, Length};
-use iced_tiny_skia::Renderer;
 
 use cosmix_actions::{filemgr, ActionId};
 use cosmix_dopus_core::{PaneModel, VisibleRow};
@@ -18,23 +17,26 @@ use crate::icons::{self, Icons};
 use crate::theme::Chrome;
 
 /// What the view draws with: the compiled tokens plus the resolved fonts.
-/// Passed by reference through every view fn (the ced `chrome::Look` shape).
-pub struct Look<'a> {
-    pub tokens: &'a Tokens,
-    pub chrome: &'a Chrome,
+/// Passed by value through every view fn (the ced `chrome::Look` shape —
+/// everything is `Copy`, so styling closures capture copies and stay
+/// `'static` instead of borrowing a local `Look`).
+#[derive(Debug, Clone, Copy)]
+pub struct Look {
+    pub tokens: Tokens,
+    pub chrome: Chrome,
     pub ui_font: iced::Font,
     pub mono_font: iced::Font,
     pub px: f32,
     pub mono_px: f32,
 }
 
-impl Look<'_> {
+impl Look {
     /// A full-width strip (header, status bar) in the given token colours.
     pub fn strip(
         &self,
         background: iced::Color,
         text_color: iced::Color,
-    ) -> impl Fn(&iced::Theme) -> container::Style + '_ {
+    ) -> impl Fn(&iced::Theme) -> container::Style + 'static {
         move |_| container::Style {
             background: Some(background.into()),
             text_color: Some(text_color),
@@ -52,7 +54,7 @@ pub const STATUS_H: f32 = 26.0;
 
 /// The whole window: header strips, the listing, the status bar.
 pub fn root<'a>(
-    look: &'a Look<'a>,
+    look: Look,
     icons: &'a Icons,
     tint: &'a str,
     pane: &'a PaneModel,
@@ -72,19 +74,16 @@ pub fn root<'a>(
 
 /// The navigation strip: back / forward / parent / home / refresh /
 /// toggle-hidden icon buttons, then the sanitised path.
-fn header<'a>(look: &'a Look<'a>, icons: &'a Icons, tint: &'a str, pane: &'a PaneModel) -> Element<'a, Msg> {
+fn header<'a>(look: Look, icons: &'a Icons, tint: &'a str, pane: &'a PaneModel) -> Element<'a, Msg> {
     let icon_button = |icon: icons::Icon, action: ActionId| {
-        let look = button_look(look);
-        button(
-            image_widget(icons, tint, icon)
-                .unwrap_or_else(|| Space::new(Length::Fixed(16.0), Length::Fixed(16.0))),
-        )
-        .padding(4)
-        .on_press_maybe(
-            availability(pane, action)
-                .then_some(Msg::Actions(vec![action])),
-        )
-        .style(look)
+        let style = button_look(&look);
+        button(image_widget(icons, tint, icon))
+            .padding(4)
+            .on_press_maybe(
+                availability(pane, action)
+                    .then_some(Msg::Actions(vec![action])),
+            )
+            .style(style)
     };
     container(
         row![
@@ -122,39 +121,41 @@ fn availability(pane: &PaneModel, action: ActionId) -> bool {
     true
 }
 
-/// A ghost button style over the secondary strip: quiet until hovered.
-fn button_look(
-    look: &Look<'_>,
-) -> impl Fn(&iced::Theme, button::Status) -> button::Style + '_ {
+/// A ghost button style over the secondary strip: quiet until hovered. The
+/// colours are `Copy` tokens, so the closure captures values and is
+/// `'static` (the ced `chrome::Look::flat` shape).
+fn button_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
     let (text, hover, radius) = (look.chrome.secondary_text, look.tokens.muted_surface, look.tokens.radius);
     move |_theme, status| button::Style {
         background: match status {
             button::Status::Hovered | button::Status::Pressed => Some(hover.into()),
             _ => None,
         },
-        text_color: Some(text),
+        text_color: text,
         border: Border { radius: radius.into(), ..Default::default() },
         ..Default::default()
     }
 }
 
-/// A cached icon handle as an iced image widget, at the header's 16 px.
-fn image_widget(
-    icons: &Icons,
-    tint: &str,
-    icon: icons::Icon,
-) -> Option<iced::widget::Image<iced::widget::image::Handle>> {
-    let handle = icons.get(icon, tint, 32)?;
-    Some(image(handle).width(Length::Fixed(16.0)).height(Length::Fixed(16.0)))
+/// A cached icon handle as an iced image widget, at the header's 16 px; a
+/// blank 16 px filler while the rasterisation is still in flight.
+fn image_widget(icons: &Icons, tint: &str, icon: icons::Icon) -> Element<'static, Msg> {
+    match icons.get(icon, tint, 32) {
+        Some(handle) => image(handle).width(Length::Fixed(16.0)).height(Length::Fixed(16.0)).into(),
+        None => container(Space::new())
+            .width(Length::Fixed(16.0))
+            .height(Length::Fixed(16.0))
+            .into(),
+    }
 }
 
 /// The sort headers: the three columns as buttons publishing the
 /// `view.sort-*` actions; the active column shows its direction. The two
 /// secondary columns are fixed-width, mirroring the row layout's right edge
 /// ([`rows::SIZE_W`] / [`rows::MODIFIED_W`]).
-fn sort_header<'a>(look: &'a Look<'a>, pane: &'a PaneModel) -> Element<'a, Msg> {
+fn sort_header<'a>(look: Look, pane: &'a PaneModel) -> Element<'a, Msg> {
     let header_button = |label: &str, action: ActionId, column_sort| {
-        let look = button_look(look);
+        let style = button_look(&look);
         let active = pane.sort == column_sort;
         let label = if active {
             format!("{label} {}", if pane.ascending { "↑" } else { "↓" })
@@ -169,15 +170,15 @@ fn sort_header<'a>(look: &'a Look<'a>, pane: &'a PaneModel) -> Element<'a, Msg> 
         )
         .padding([2, 6])
         .on_press(Msg::Actions(vec![action]))
-        .style(look)
+        .style(style)
     };
     container(
         row![
             header_button("Name", filemgr::VIEW_SORT_NAME, cosmix_dopus_core::SortColumn::Name),
-            Space::new(Length::Fill, Length::Fixed(0.0)),
+            container(Space::new()).width(Length::Fill).height(Length::Fixed(0.0)),
             header_button("Size", filemgr::VIEW_SORT_SIZE, cosmix_dopus_core::SortColumn::Size)
                 .width(Length::Fixed(rows::SIZE_W)),
-            Space::new(Length::Fixed(rows::GAP), Length::Fixed(0.0)),
+            container(Space::new()).width(Length::Fixed(rows::GAP)).height(Length::Fixed(0.0)),
             header_button("Modified", filemgr::VIEW_SORT_MODIFIED, cosmix_dopus_core::SortColumn::Modified)
                 .width(Length::Fixed(rows::MODIFIED_W + 4.0)),
         ]

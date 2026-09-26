@@ -111,7 +111,7 @@ impl RowState {
     }
 
     fn clamp(&mut self, rows: usize, height: f32) {
-        let max = (rows as f32 * self.row_h).saturating_sub(height).max(0.0);
+        let max = (rows as f32 * self.row_h - height).max(0.0);
         self.offset = self.offset.clamp(0.0, max);
     }
 
@@ -138,7 +138,7 @@ pub struct FileList<'a> {
     expanded: &'a HashSet<PathBuf>,
     icons: &'a Icons,
     tint: &'a str,
-    look: &'a Look<'a>,
+    look: Look,
 }
 
 impl<'a> FileList<'a> {
@@ -148,7 +148,7 @@ impl<'a> FileList<'a> {
         expanded: &'a HashSet<PathBuf>,
         icons: &'a Icons,
         tint: &'a str,
-        look: &'a Look<'a>,
+        look: Look,
     ) -> Self {
         Self { rows, selected, expanded, icons, tint, look }
     }
@@ -287,7 +287,7 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &Renderer,
+        _renderer: &Renderer,
         _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, crate::app::Msg>,
         viewport: &Rectangle,
@@ -425,7 +425,7 @@ impl Widget<crate::app::Msg, iced::Theme, Renderer> for FileList<'_> {
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        mouse::Interaction::Default
+        mouse::Interaction::Idle
     }
 }
 

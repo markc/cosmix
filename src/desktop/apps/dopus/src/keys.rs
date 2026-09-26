@@ -24,7 +24,7 @@ use std::time::Instant;
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
 use iced::keyboard::{self, Key, key::Named};
-use iced::{Element, Event, Rectangle, Size, Vector};
+use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
 use cosmix_actions::{
     ActionId, FocusContext, Key as AKey, Keymap, Modifiers as AModifiers, RawInput, RawInputState,
@@ -69,7 +69,11 @@ pub type SharedRouter = Arc<Mutex<Router>>;
 
 /// Build the starting router (packaged defaults, overlay applied on top).
 pub fn initial(custom_path: Option<&Path>) -> Result<SharedRouter, String> {
-    Ok(Arc::new(Mutex::new(Router { keymap: load(custom_path)?, state: ResolveState::default() })))
+    Ok(Arc::new(Mutex::new(Router {
+        keymap: load(custom_path)?,
+        state: ResolveState::default(),
+        last: None,
+    })))
 }
 
 /// Hot reload on window focus (filemgr's `reload_keymap_on_focus`): replace
@@ -144,7 +148,7 @@ fn named_key(named: Named) -> Option<AKey> {
 }
 
 fn modifiers(m: keyboard::Modifiers) -> AModifiers {
-    AModifiers { control: m.control(), alt: m.alt(), shift: m.shift(), super_key: m.super_key() }
+    AModifiers { control: m.control(), alt: m.alt(), shift: m.shift(), super_key: m.logo() }
 }
 
 /// The pure translation, testable without a widget tree: an iced key event
@@ -248,18 +252,21 @@ where
                 } else {
                     router.last = None;
                 }
-                let mut resolved = resolve(input, &FocusContext::global(), &router.keymap, &mut router.state, now);
+                // Split-borrow the router's own fields so the resolver can
+                // hold the keymap while mutating the chord state.
+                let Router { keymap, state, .. } = &mut *router;
+                let mut resolved = resolve(input, &FocusContext::global(), keymap, state, now);
                 // A chord that was waiting for a second stroke expired while
                 // nothing was pressed: resolve it opportunistically here (P1
                 // defaults have no multi-stroke chords; users can add them).
                 if resolved.actions.is_empty()
-                    && let Some(deadline) = router.state.deadline()
+                    && let Some(deadline) = state.deadline()
                     && now >= deadline
                 {
                     let late = cosmix_actions::resolve_timeout(
                         &FocusContext::global(),
-                        &router.keymap,
-                        &mut router.state,
+                        keymap,
+                        state,
                         now,
                     );
                     resolved.actions.extend(late.actions);
@@ -274,7 +281,7 @@ where
                 shell.capture_event();
                 return;
             }
-            if resolved.outcome == cosmix_actions::ResolveOutcome::Pending {
+            if matches!(resolved.outcome, cosmix_actions::ResolveOutcome::Pending { .. }) {
                 // A longer chord may still win: do not let a child treat the
                 // stroke as its own (P1: only matters with custom overlays).
                 shell.capture_event();
@@ -349,8 +356,9 @@ mod tests {
         let (key, physical) = match name {
             "F5" => (Key::Named(Named::F5), Physical::Unidentified(NativeCode::Unidentified)),
             "ArrowDown" => (Key::Named(Named::ArrowDown), Physical::Unidentified(NativeCode::Unidentified)),
+            "ArrowUp" => (Key::Named(Named::ArrowUp), Physical::Unidentified(NativeCode::Unidentified)),
             "Enter" => (Key::Named(Named::Enter), Physical::Unidentified(NativeCode::Unidentified)),
-            c => (Key::Character(c.to_owned()), Physical::Unidentified(NativeCode::Unidentified)),
+            c => (Key::Character(c.into()), Physical::Unidentified(NativeCode::Unidentified)),
         };
         raw_input(&key, physical, mods, true, false)
     }
@@ -372,7 +380,7 @@ mod tests {
     #[test]
     fn arrow_keys_resolve_to_selection_actions() {
         let shared = initial(None).unwrap();
-        let mut router = shared.lock().unwrap();
+        let router = shared.lock().unwrap();
         let mut state = ResolveState::default();
         for (text, action) in [
             ("ArrowDown", filemgr::SELECT_NEXT),
@@ -392,10 +400,10 @@ mod tests {
     #[test]
     fn non_vocabulary_keys_are_no_match_not_a_crash() {
         let shared = initial(None).unwrap();
-        let mut router = shared.lock().unwrap();
+        let router = shared.lock().unwrap();
         let mut state = ResolveState::default();
         let input = raw_input(
-            &Key::Character("é".to_owned()),
+            &Key::Character("é".into()),
             Physical::Unidentified(NativeCode::Unidentified),
             keyboard::Modifiers::empty(),
             true,
@@ -410,7 +418,7 @@ mod tests {
     #[test]
     fn releases_resolve_nothing() {
         let shared = initial(None).unwrap();
-        let mut router = shared.lock().unwrap();
+        let router = shared.lock().unwrap();
         let mut state = ResolveState::default();
         let input = raw_input(
             &Key::Named(Named::ArrowDown),

@@ -46,7 +46,9 @@ pub fn answer_derived(core: &mut DopusCore, events: Vec<CoreEvent>, log: impl Fn
             | CoreEvent::ListingStarted { .. }
             | CoreEvent::ListingArrived { .. }
             | CoreEvent::CountArrived { .. }
-            | CoreEvent::OperationArrived { .. } => {}
+            | CoreEvent::OperationArrived { .. }
+            | CoreEvent::ConfigSettled(_)
+            | CoreEvent::RefreshAll => {}
         }
     }
 }
@@ -67,7 +69,7 @@ pub fn run(
     noded_url: &str,
 ) -> anyhow::Result<()> {
     let keymap_path: Option<PathBuf> = dirs.as_ref().map(|d| d.keymap_file());
-    let keymap = keys::load(keymap_path.as_deref())?;
+    let keymap = keys::load(keymap_path.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let meta = ServerMeta {
         service: service.to_owned(),
         headless: true,

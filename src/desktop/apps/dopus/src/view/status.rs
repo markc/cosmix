@@ -14,12 +14,12 @@ use crate::app::Msg;
 use crate::view::Look;
 
 /// The status bar strip.
-pub fn bar<'a>(look: &'a Look<'a>, pane: &'a PaneModel, info: &'a str) -> Element<'a, Msg> {
+pub fn bar<'a>(look: Look, pane: &'a PaneModel, info: &'a str) -> Element<'a, Msg> {
     let summary = cosmix_dopus_core::pane_summary(&pane.root);
     container(
         row![
             text(info).font(look.ui_font).size(look.px * 0.85).color(look.chrome.secondary_text),
-            Space::new(Length::Fill, Length::Fixed(0.0)),
+            container(Space::new()).width(Length::Fill),
             text(summary).font(look.mono_font).size(look.mono_px * 0.85).color(look.tokens.muted_text),
         ],
     )
