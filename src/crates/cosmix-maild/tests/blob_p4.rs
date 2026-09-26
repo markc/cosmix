@@ -22,6 +22,82 @@ struct Fixture {
     inbox: ContainerId,
 }
 
+const MIME: &[u8] = b"Subject: parts\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: multipart/alternative; boundary=y\r\n\r\n--y\r\nContent-Type: text/plain\r\n\r\nhello\r\n--y\r\nContent-Type: text/html\r\n\r\n<b>hello</b>\r\n--y--\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename*=utf-8''caf%C3%A9.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n";
+
+async fn get_email(f: &Fixture, id: cosmix_mds::ItemId, properties: Value) -> Value {
+    let state = f.state();
+    let result = jmap::email::get(
+        &state.db,
+        &state.mailstore,
+        1,
+        json!({"ids": [id.0.to_string()], "properties": properties,
+            "fetchTextBodyValues": true, "fetchHTMLBodyValues": true}),
+    )
+    .await
+    .unwrap();
+    result["list"][0].clone()
+}
+
+#[tokio::test]
+async fn mime_projection_has_one_part_scheme_and_honours_properties() {
+    let f = Fixture::new().await;
+    let id = f.deliver(MIME);
+    let email = get_email(&f, id, Value::Null).await;
+    assert_eq!(email["hasAttachment"], true);
+    assert_eq!(email["attachments"][0]["partId"], "1.2");
+    assert_eq!(email["attachments"][0]["name"], "café.bin");
+    assert_eq!(email["attachments"][0]["size"], 2);
+    assert_eq!(email["textBody"][0]["partId"], "1.1.1");
+    assert_eq!(email["htmlBody"][0]["partId"], "1.1.2");
+    for kind in ["textBody", "htmlBody"] {
+        let path = email[kind][0]["partId"].as_str().unwrap();
+        assert!(
+            email["bodyValues"][path]["value"]
+                .as_str()
+                .unwrap()
+                .contains("hello")
+        );
+        let blob = cosmix_maild::attachments::PartBlobId::parse(
+            email[kind][0]["blobId"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(blob.part, path);
+        assert_eq!(blob.item, id);
+    }
+    let filtered = get_email(&f, id, json!(["attachments"])).await;
+    assert_eq!(filtered.as_object().unwrap().len(), 2); // id is mandatory
+    assert_eq!(filtered["attachments"], email["attachments"]);
+    let plain = f.deliver(b"Subject: plain\r\n\r\nhello");
+    let email = get_email(&f, plain, Value::Null).await;
+    assert_eq!(email["hasAttachment"], false);
+    assert_eq!(email["attachments"], json!([]));
+    assert_eq!(email["textBody"][0]["partId"], "1");
+}
+
+#[tokio::test]
+async fn unreadable_and_over_cap_messages_project_unknown_not_false() {
+    let f = Fixture::new().await;
+    let id = f.deliver(MIME);
+    let state = f.state();
+    let hash = state.mailstore.get_email(1, id).unwrap().blob_hash;
+    let path = cosmix_mds::blob::blob_path(&state.mailstore.mds().blobs_root(), &hash);
+    // A sparse oversized fixture exercises the pre-read cap without allocating 64 MiB.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(cosmix_maild::attachments::MAX_MESSAGE as u64 + 1)
+        .unwrap();
+    let email = get_email(&f, id, Value::Null).await;
+    assert!(email["hasAttachment"].is_null());
+    assert!(email.get("attachments").is_none());
+    assert!(email.get("bodyValues").is_none());
+    std::fs::remove_file(path).unwrap();
+    let email = get_email(&f, id, Value::Null).await;
+    assert!(email["hasAttachment"].is_null());
+    assert!(email.get("attachments").is_none());
+}
+
 async fn migrate(f: &Fixture, args: Value) -> (u8, Value) {
     let state = f.state();
     let (rc, body) = cosmix_maild::bus::blobs::migrate(&state.db, &state.mailstore, args).await;

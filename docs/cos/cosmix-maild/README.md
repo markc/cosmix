@@ -41,6 +41,31 @@ The HTTP listener serves:
 
 Implemented JMAP method families are `Mailbox`, `Email`, `Thread`, `EmailSubmission`, `Identity`, `Calendar`, `CalendarEvent`, `AddressBook`, `Contact`, and `VacationResponse`. `Core/echo` is also available.
 
+#### MIME projections (0.10.0)
+
+`Email/get` derives `hasAttachment`, `attachments`, `textBody`, `htmlBody` and
+requested `bodyValues` from one bounded MIME inspection. A filename or an
+`attachment` disposition marks an attachment; an inline part with a filename
+also qualifies. Embedded-message children are inspectable but are not outer
+message body parts or duplicate outer attachments.
+
+All projections use the same part paths: root `1`, children `1.1`, `1.2`, and
+so on. An embedded message's root appends `.1`. These replace the old sequential
+text-only IDs; part IDs are per-response and must not be persisted by clients.
+Part blob IDs are `mp1_<32hex item UUID>_<64hex message hash>_<path with underscores>`.
+They are canonical lowercase ASCII and bind a part to the account-owned message
+and its current content hash. `Email/import` still accepts upload UUIDs, not part
+blob IDs.
+
+Inspection reads at most 64 MiB of raw message, with a 64 MiB decoded-part cap,
+depth 32, 1,000 MIME parts and path length 64. These limits apply independently
+of the configured inbound message limit, so messages admitted through IMAP can
+be inspected. Unreadable, corrupt or over-limit messages return
+`hasAttachment: null` and omit `attachments` and body projections; they never
+report a false negative or a partial attachment list. Property filtering still
+applies. Downloadable parts preserve transfer-decoded octets, including original
+text charset bytes; body display values may be charset-converted to UTF-8.
+
 ### SMTP
 
 `smtp_inbound` enables inbound SMTP. `smtp_smtps` enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.

@@ -12,6 +12,7 @@
 //! ports without replicating the wiring; `main.rs::Command::Serve`
 //! drives the same entry point.
 
+pub mod attachments;
 pub mod auth;
 pub mod bus;
 pub mod config;
