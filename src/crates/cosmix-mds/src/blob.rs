@@ -87,18 +87,42 @@ pub enum PutMode {
     HardLink,
 }
 
+/// Set a file's atime and mtime to now (`utimensat` with null
+/// timespecs). The GC grace window is mtime-based, so every path that
+/// lands on or re-acknowledges an existing CAS entry refreshes it: an
+/// idempotent re-put of bytes whose file has gone quiescent must not
+/// present a months-old mtime to a concurrent sweep (blobd's M1/F3).
+pub fn touch_path(p: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes())
+        .map_err(|_| Error::Io(std::io::Error::other("path contains a NUL byte")))?;
+    // SAFETY: utimensat on a live path with a null timespec pointer
+    // sets both timestamps to now; no pointers to Rust data.
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), std::ptr::null(), 0) };
+    if rc != 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// Stream `r` into the CAS, hashing with BLAKE3 while the bytes are
 /// staged — the hash is only known at stream end, and the write
 /// protocol already tolerates that (the idempotence check happens
 /// after staging instead of before). Returns the hash and the byte
 /// count. A reader error mid-stream removes the staged file and
 /// leaves no CAS entry.
+///
+/// Idempotent hits refresh the existing file's mtime (best-effort —
+/// see [`touch_path`]) so a GC grace window judged on mtime covers the
+/// re-acknowledged bytes, not their first landing.
 pub fn put_reader(blobs_root: &Path, r: impl Read) -> Result<(BlobHash, u64)> {
     let (hash, size, tmp_path) = stage(blobs_root, r)?;
     if blob_path(blobs_root, &hash).exists() {
         // Idempotent: identical bytes are already committed. Drop the
-        // staged copy rather than rewriting the entry.
+        // staged copy rather than rewriting the entry, and refresh the
+        // committed file's grace window.
         let _ = fs::remove_file(&tmp_path);
+        let _ = touch_path(&blob_path(blobs_root, &hash));
         return Ok((hash, size));
     }
 
@@ -136,6 +160,7 @@ pub fn put_reader_expect(
     }
     if blob_path(blobs_root, &landed).exists() {
         let _ = fs::remove_file(&tmp_path);
+        let _ = touch_path(&blob_path(blobs_root, &landed));
         return Ok((landed, size));
     }
 
@@ -235,10 +260,14 @@ fn stream_to_tmp(
 /// immutability promise mid-call.
 ///
 /// Idempotent: if the CAS already holds the hash, nothing is written
-/// (the source is still read once — the hash must be computed).
+/// (the source is still read once — the hash must be computed) and the
+/// existing file's mtime is refreshed (best-effort, see
+/// [`touch_path`]) so the GC grace window covers the re-acknowledged
+/// bytes.
 pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHash, u64)> {
     let (hash, size) = hash_file(src)?;
     if blob_path(blobs_root, &hash).exists() {
+        let _ = touch_path(&blob_path(blobs_root, &hash));
         return Ok((hash, size));
     }
 
@@ -682,6 +711,70 @@ mod tests {
             "HardLink must alias the source inode, not copy it"
         );
         assert_eq!(get(d.path(), &h).unwrap(), b"hard link me");
+    }
+
+    /// Set a file's mtime two minutes into the past (beyond blobd's
+    /// GC grace window) using only std.
+    fn age_path(path: &Path) {
+        let f = File::open(path).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(past)
+                .set_modified(past),
+        )
+        .unwrap();
+    }
+
+    fn mtime_age(path: &Path) -> std::time::Duration {
+        std::time::SystemTime::now()
+            .duration_since(
+                std::fs::metadata(path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn idempotent_hits_refresh_the_cas_mtime() {
+        // A GC grace window judged on mtime must cover a
+        // re-acknowledged blob, not its first landing: an idempotent
+        // hit on months-old bytes leaves them young (blobd M1c).
+        let d = root();
+        let cas = {
+            let bytes = b"refresh my grace window";
+            let h = put(d.path(), bytes).unwrap();
+            let p = blob_path(d.path(), &h);
+            age_path(&p);
+            assert!(mtime_age(&p) >= std::time::Duration::from_secs(60));
+            // put_reader's idempotent branch…
+            let (h2, _) = put_reader(d.path(), &bytes[..]).unwrap();
+            assert_eq!(h, h2);
+            p
+        };
+        assert!(
+            mtime_age(&cas) < std::time::Duration::from_secs(60),
+            "put_reader idempotent hit must touch the CAS file"
+        );
+
+        // …put_reader_expect's…
+        let bytes = b"expect a refresh";
+        let h = put(d.path(), bytes).unwrap();
+        let p = blob_path(d.path(), &h);
+        age_path(&p);
+        let _ = put_reader_expect(d.path(), &bytes[..], &h).unwrap();
+        assert!(mtime_age(&p) < std::time::Duration::from_secs(60));
+
+        // …and put_path's.
+        let src = d.path().join("path-src.bin");
+        std::fs::write(&src, b"put_path refresh").unwrap();
+        let (h, _) = put_path(d.path(), &src, PutMode::Copy).unwrap();
+        let p = blob_path(d.path(), &h);
+        age_path(&p);
+        let _ = put_path(d.path(), &src, PutMode::Copy).unwrap();
+        assert!(mtime_age(&p) < std::time::Duration::from_secs(60));
     }
 
     #[test]

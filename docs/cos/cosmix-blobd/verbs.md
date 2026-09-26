@@ -16,7 +16,7 @@ Success uses result code `0`. Errors use result code `10` and a body shaped as:
 {"error":"message"}
 ```
 
-Error tokens worth matching on: `not_present` (blob not held), `invalid blob id` (malformed `b3:` reference), `quota:` (an owner or total cap refusal — the message carries the numbers), `busy` (the `blob.fetch` queue is full — retry later).
+Error tokens worth matching on: `not_present` (blob not held), `invalid blob id` (malformed `b3:` reference), `quota:` (an owner or total cap refusal — the message carries the numbers), `busy` (the `blob.fetch` queue is full — retry later), `vanished:` (the bytes disappeared while the pin was landing — a `blob.gc` race; retry the put).
 
 Verbs dispatch concurrently, bounded by `verb_max_concurrent` (default 8): a slow `blob.put` or `blob.gc` holds one slot, not the connection — other verbs (including `blob.fetch`'s immediate reply) keep answering. Beyond the bound a verb queues; its reply is late, never lost. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.
 

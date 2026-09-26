@@ -81,6 +81,10 @@ pub enum StoreError {
     InvalidBlob(String),
     /// The blob is not present in the CAS.
     NotPresent(String),
+    /// The bytes were present when the caller looked, but vanished
+    /// before the pin landed — a `blob.gc` race (M1). The pin is
+    /// refused, never dangled; retry the put.
+    Vanished(String),
     /// An owner is at its cap: it would use `would_use` of `limit`.
     QuotaOwner {
         owner: String,
@@ -112,6 +116,10 @@ impl std::fmt::Display for StoreError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::InvalidBlob(s) => write!(f, "invalid blob id: {s:?}"),
             Self::NotPresent(s) => write!(f, "not_present: {s}"),
+            Self::Vanished(s) => write!(
+                f,
+                "vanished: {s} — the bytes disappeared while the pin was landing (blob.gc race); retry the put"
+            ),
             Self::QuotaOwner {
                 owner,
                 would_use,
@@ -449,10 +457,12 @@ impl Store {
     /// Post-stream ingest bookkeeping, shared by `blob.put` and the
     /// byte lane: attrs (mime, name, `origin` = this node), the owner
     /// pin and its quota accounting. The bytes must already be
-    /// committed in the CAS. Idempotent per owner: a re-put pins
-    /// nothing new. The returned reference describes the attrs as they
-    /// stand after the call — an already-recorded blob keeps its
-    /// original mime/name, so the reference always matches
+    /// committed in the CAS; the existence re-check under the db lock
+    /// refuses `Vanished` if a concurrent `blob.gc` swept them (M1) —
+    /// an acknowledged pin never dangles. Idempotent per owner: a
+    /// re-put pins nothing new. The returned reference describes the
+    /// attrs as they stand after the call — an already-recorded blob
+    /// keeps its original mime/name, so the reference always matches
     /// `blob.stat`.
     pub fn record_upload(
         &self,
@@ -463,6 +473,9 @@ impl Store {
         owner: &str,
     ) -> Result<PutOutcome> {
         let mut db = self.db.lock().unwrap();
+        if !blob::blob_path(&self.blobs_root(), hash).exists() {
+            return Err(StoreError::Vanished(blob::hex(hash)));
+        }
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
@@ -514,9 +527,10 @@ impl Store {
     /// `origin = source_node` (the node the bytes came from — a
     /// fetched blob's reference should point at its origin, not claim
     /// this node minted it) and one pin per joining owner. The bytes
-    /// must already be committed in the CAS. Returns the owners whose
-    /// pin row was added (an owner that already pinned the blob is
-    /// skipped, idempotently).
+    /// must already be committed in the CAS; the existence re-check
+    /// under the db lock refuses `Vanished` if a concurrent `blob.gc`
+    /// swept them (M1). Returns the owners whose pin row was added (an
+    /// owner that already pinned the blob is skipped, idempotently).
     pub fn record_fetch(
         &self,
         hash: &BlobHash,
@@ -526,6 +540,9 @@ impl Store {
         owners: &[String],
     ) -> Result<Vec<String>> {
         let mut db = self.db.lock().unwrap();
+        if !blob::blob_path(&self.blobs_root(), hash).exists() {
+            return Err(StoreError::Vanished(blob::hex(hash)));
+        }
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
@@ -642,13 +659,18 @@ impl Store {
     // ---- Pins ----
 
     /// Pin `hash` to `owner`. Idempotent; returns whether a pin row
-    /// was added. Requires the bytes to be present.
+    /// was added. Requires the bytes to be present — re-checked under
+    /// the db lock so a concurrent `blob.gc` sweep surfaces as
+    /// `Vanished` instead of a dangling pin (M1).
     pub fn pin(&self, hash: &BlobHash, owner: &str) -> Result<bool> {
         if !blob::exists(&self.blobs_root(), hash)? {
             return Err(StoreError::NotPresent(blob::hex(hash)));
         }
         let size = blob::size(&self.blobs_root(), hash)?;
         let mut db = self.db.lock().unwrap();
+        if !blob::blob_path(&self.blobs_root(), hash).exists() {
+            return Err(StoreError::Vanished(blob::hex(hash)));
+        }
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
@@ -958,6 +980,13 @@ impl Store {
     /// is older than the grace window. Dry run lists candidates; a
     /// live run unlinks, drops attrs and (defensively) pins with their
     /// quota accounting, and reports the freed bytes.
+    ///
+    /// The db mutex is held across each candidate's pin check, mtime
+    /// re-stat and unlink (M1): `record_upload`/`record_fetch`/`pin`
+    /// insert their pin row (and re-check existence) under the same
+    /// mutex, so either the pin lands first and the candidate is
+    /// skipped, or the sweep wins and the pin is refused `Vanished` —
+    /// never an acknowledged pin whose bytes were just unlinked.
     pub fn gc(&self, dry_run: bool) -> Result<GcSweep> {
         let grace = Duration::from_secs(DEFAULT_GC_GRACE_SECS);
         let mut report = GcSweep::default();
@@ -969,12 +998,33 @@ impl Store {
                 report.skipped_referenced += 1;
                 continue;
             }
-            let pins = self.pin_owners(&file.hash)?;
-            if !pins.is_empty() {
+            let mut db = self.db.lock().unwrap();
+            // Pin check under the lock (the stray-pin cleanup below
+            // keeps quota from drifting if a row raced in anyway).
+            let pinned: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1)",
+                    params![file.hash_hex()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(db_err)?
+                != 0;
+            if pinned {
                 report.skipped_pinned += 1;
                 continue;
             }
-            if file.age().unwrap_or(Duration::ZERO) <= grace {
+            // Re-stat the mtime under the lock: the scan's metadata is
+            // stale, and an idempotent re-put's touch (M1c) is exactly
+            // the concurrent modification it can miss.
+            let Ok(md) = fs::metadata(&file.path) else {
+                continue; // already gone (another sweep, manual removal)
+            };
+            let age = md
+                .modified()
+                .ok()
+                .and_then(|m| SystemTime::now().duration_since(m).ok())
+                .unwrap_or(Duration::ZERO);
+            if age <= grace {
                 report.skipped_young += 1;
                 continue;
             }
@@ -988,7 +1038,6 @@ impl Store {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(StoreError::Io(e)),
             }
-            let mut db = self.db.lock().unwrap();
             let tx = db
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(db_err)?;
@@ -1212,6 +1261,7 @@ fn open_index_conn(root: &Path) -> Result<Connection> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     use super::super::config::{DEFAULT_QUOTA_OWNER_BYTES, DEFAULT_QUOTA_TOTAL_BYTES};
@@ -1484,6 +1534,123 @@ mod tests {
         age_file(&store.path(&hash).unwrap());
         let dry = store.gc(true).unwrap();
         assert_eq!(dry.swept, vec![blob::hex(&hash)]);
+    }
+
+    // ---- M1: GC may never delete bytes a pin just acknowledged ----
+
+    #[test]
+    fn record_upload_and_record_fetch_refuse_vanished_bytes() {
+        // The existence re-check under the db lock: bytes that a
+        // concurrent sweep (or anything else) removed never get a pin
+        // row — the refusal is Vanished, not a dangling pin.
+        let (dir, store) = store();
+        let src = write_src(&dir, "gone.bin", b"vanishing act");
+        let out = store.put(&src, &PutOptions::new("maild")).unwrap();
+        store.unpin(&out.reference.hash, "maild").unwrap();
+        fs::remove_file(store.path(&out.reference.hash).unwrap()).unwrap();
+
+        let err = store
+            .record_upload(
+                &out.reference.hash,
+                15,
+                "application/octet-stream",
+                None,
+                "lane:127.0.0.1",
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Vanished(_)), "got {err:?}");
+
+        let err = store
+            .record_fetch(
+                &out.reference.hash,
+                15,
+                "application/octet-stream",
+                "A",
+                &["maild".to_string()],
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Vanished(_)), "got {err:?}");
+
+        // No pin rows landed; quota is untouched.
+        assert!(store.pin_owners(&out.reference.hash).unwrap().is_empty());
+        assert_eq!(store.quota_report(None).unwrap().total.used, 0);
+    }
+
+    #[test]
+    fn gc_never_sweeps_bytes_a_concurrent_pin_just_acked() {
+        // The M1 race, hammered: an unpinned blob older than the grace
+        // window; a lane-style idempotent re-put (record_upload) runs
+        // concurrently with blob.gc. The db mutex is held across GC's
+        // pin check, mtime re-stat and unlink, and record_upload
+        // re-checks existence inside the same mutex, so every
+        // interleaving ends either pinned-and-present or
+        // refused-vanished — never an acknowledged pin on unlinked
+        // bytes.
+        for _ in 0..25 {
+            let (dir, store) = store();
+            let src = write_src(&dir, "race.bin", b"race me");
+            let out = store
+                .put(&src, &PutOptions::new("first"))
+                .unwrap();
+            store.unpin(&out.reference.hash, "first").unwrap();
+            age_file(&store.path(&out.reference.hash).unwrap());
+            let store = Arc::new(store);
+
+            let pinning = {
+                let store = Arc::clone(&store);
+                let hash = out.reference.hash;
+                std::thread::spawn(move || {
+                    store.record_upload(
+                        &hash,
+                        7,
+                        "application/octet-stream",
+                        None,
+                        "lane:127.0.0.1",
+                    )
+                })
+            };
+            let _sweep = store.gc(false).unwrap();
+            let pinned = pinning.join().unwrap();
+
+            let present = blob::exists(&store.blobs_root(), &out.reference.hash).unwrap();
+            match &pinned {
+                Ok(_) => assert!(
+                    present,
+                    "an acknowledged pin must never dangle (gc swept it underneath)"
+                ),
+                Err(e) => {
+                    assert!(
+                        matches!(e, StoreError::Vanished(_)),
+                        "the losing interleaving must be Vanished, got {e:?}"
+                    );
+                    assert!(!present);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn idempotent_re_put_refreshes_the_grace_window() {
+        // M1c: bytes already in the CAS keep their 60 s grace on a
+        // re-put — the idempotent branch touches the file's mtime, so
+        // a dry run that swept the aged blob before the re-put must
+        // find it young after.
+        let (dir, store) = store();
+        let src = write_src(&dir, "idem.bin", b"idempotent me");
+        let out = store.put(&src, &PutOptions::new("maild")).unwrap();
+        store.unpin(&out.reference.hash, "maild").unwrap();
+        age_file(&store.path(&out.reference.hash).unwrap());
+        let before = store.gc(true).unwrap();
+        assert_eq!(before.swept.len(), 1, "aged and unpinned: a candidate");
+
+        let again = store.put(&src, &PutOptions::new("maild")).unwrap();
+        assert_eq!(again.reference.hash, out.reference.hash);
+        assert!(again.newly_pinned, "the unpin removed the row; the re-put re-pins");
+        store.unpin(&out.reference.hash, "maild").unwrap();
+
+        let after = store.gc(true).unwrap();
+        assert!(after.swept.is_empty(), "the re-put refreshed the grace window");
+        assert_eq!(after.skipped_young, 1);
     }
 
     #[test]
