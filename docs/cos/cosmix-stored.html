@@ -572,6 +572,19 @@ fault and kick <code>stored.work</code> or restart to recover the pending intent
 until a separate release policy is designed. Blobd quota counts unique bytes
 per owner, including manifest bytes, and pending upload reservations; it is
 not the old pilot's logical snapshot quota. This is an explicit policy change.</p>
+<h3 id="what-stored-relies-on">What stored relies on</h3>
+<ul>
+<li>Blobd owns the GC/pin exclusion guarantee. In
+<code>cosmix-blobd/src/core/store.rs</code>, <code>pin</code> rechecks file presence under the
+database lock (lines 962–972); <code>gc</code> checks pins and removes files under that
+same lock (lines 1344–1380). Stored's earlier stat/size check is not that
+guarantee. Changing blobd's locking or under-lock recheck can reopen the
+GC race and requires revalidating this protocol.</li>
+<li>Blobd's upload commit verifies the content identity before returning its
+durable receipt; stored verifies the returned manifest identity and size.</li>
+<li>SQLite FULL transactions publish catalogue membership and committed state
+together. Local completion events remain advisory; durable status is final.</li>
+</ul>
 <h2 id="errors">Errors</h2>
 <p>Citizen refusals use rc 10 and <code>{error_code,message}</code>. A failed durable job
 stores and emits an <code>error</code> string in <code>CODE: message</code> form; the client prints
@@ -705,7 +718,9 @@ It pins the same runtime <code>RUST_LOG</code> targets as the statecache citizen
 instances. Set real collection limits during the separately authorised
 migration/deployment; creating a collection does not create quota policy.</p>
 <p>Nothing in B1 prunes client resume records, <code>STATE/manifests</code> or
-<code>STATE/uploads</code>. Their reconciliation, along with retained pins, belongs to
+<code>STATE/uploads</code>. Reloads create new epoch-specific manifest upload records;
+records from earlier epochs accumulate even after a later epoch commits.
+Their reconciliation, along with retained pins, belongs to
 the deferred retention reconciler. Blobd session expiry is a separate policy
 and does not remove these catalogue/client files.</p>
 <p>The maintainer's private <code>stored_gate.mix</code> is intentionally outside this

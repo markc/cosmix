@@ -152,6 +152,19 @@ until a separate release policy is designed. Blobd quota counts unique bytes
 per owner, including manifest bytes, and pending upload reservations; it is
 not the old pilot's logical snapshot quota. This is an explicit policy change.
 
+### What stored relies on
+
+- Blobd owns the GC/pin exclusion guarantee. In
+  `cosmix-blobd/src/core/store.rs`, `pin` rechecks file presence under the
+  database lock (lines 962–972); `gc` checks pins and removes files under that
+  same lock (lines 1344–1380). Stored's earlier stat/size check is not that
+  guarantee. Changing blobd's locking or under-lock recheck can reopen the
+  GC race and requires revalidating this protocol.
+- Blobd's upload commit verifies the content identity before returning its
+  durable receipt; stored verifies the returned manifest identity and size.
+- SQLite FULL transactions publish catalogue membership and committed state
+  together. Local completion events remain advisory; durable status is final.
+
 ## Errors
 
 Citizen refusals use rc 10 and `{error_code,message}`. A failed durable job
@@ -305,7 +318,9 @@ instances. Set real collection limits during the separately authorised
 migration/deployment; creating a collection does not create quota policy.
 
 Nothing in B1 prunes client resume records, `STATE/manifests` or
-`STATE/uploads`. Their reconciliation, along with retained pins, belongs to
+`STATE/uploads`. Reloads create new epoch-specific manifest upload records;
+records from earlier epochs accumulate even after a later epoch commits.
+Their reconciliation, along with retained pins, belongs to
 the deferred retention reconciler. Blobd session expiry is a separate policy
 and does not remove these catalogue/client files.
 
