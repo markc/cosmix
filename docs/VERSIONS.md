@@ -48,7 +48,7 @@ CoS — substrate libraries and daemon family
 
 | crate | version |
 |---|---|
-| `cosmix-actions` | 0.4.1 |
+| `cosmix-actions` | 0.4.2 |
 | `cosmix-app-identity` | 0.2.0 |
 | `cosmix-blobd` | 0.6.1 |
 | `cosmix-dbusd` | 0.3.1 |
@@ -111,8 +111,8 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-comp` | 0.72.0 |
 | `cosmix-deco` | 0.4.1 |
 | `cosmix-design` | 0.15.0 |
-| `cosmix-dopus` | 0.2.0 |
-| `cosmix-dopus-core` | 0.2.0 |
+| `cosmix-dopus` | 0.3.0 |
+| `cosmix-dopus-core` | 0.3.0 |
 | `cosmix-filemgr` | 0.9.8 |
 | `cosmix-flock` | 0.1.0 |
 | `cosmix-iced-widgets` | 0.1.3 |
