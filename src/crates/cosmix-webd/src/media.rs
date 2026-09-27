@@ -634,20 +634,14 @@ pub(crate) async fn media_delete(
 /// Called under the physical-path lock, with NO database lock held. Shared
 /// document roots across active vhosts must not unlink one another's media.
 async fn path_in_use(node: &NodeState, path: &Path) -> bool {
-    let key = physical_key(path);
+    use std::os::unix::fs::MetadataExt;
+    let Ok(candidate) = std::fs::metadata(path) else { return true; };
     let directory = node.vhosts.load_full();
     for primary in &directory.primaries {
         let vhost = &primary.state;
         let Some(db) = &vhost.db else {
             continue;
         };
-        let Ok(root) = vhost.www_dir.canonicalize() else {
-            return true;
-        };
-        let Ok(relative) = key.strip_prefix(&root) else {
-            continue;
-        };
-        let url = format!("/{}", relative.to_string_lossy());
         let db = db.lock().await;
         // A vhost with no media table cannot reference the file. Other schema or
         // query failures retain it conservatively for later reconciliation.
@@ -660,15 +654,15 @@ async fn path_in_use(node: &NodeState, path: &Path) -> bool {
             Ok(true) => (),
             Err(_) => return true,
         }
-        let used = db
-            .query_row(
-                "SELECT count(*) FROM media WHERE storage='disk' AND url_path=?1",
-                [url],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(1);
-        if used != 0 {
-            return true;
+        let Ok(mut stmt) = db.prepare("SELECT url_path FROM media WHERE storage='disk'") else { return true; };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else { return true; };
+        for url in rows {
+            let Ok(url) = url else { return true; };
+            let Some(path) = safe_disk_path(&vhost.www_dir, &url) else { return true; };
+            let Ok(other) = std::fs::metadata(path) else { return true; };
+            if (candidate.dev(), candidate.ino()) == (other.dev(), other.ino()) {
+                return true;
+            }
         }
     }
     false
@@ -724,6 +718,30 @@ mod tests {
             "not_found"
         );
     }
+    #[tokio::test]
+    async fn delete_retains_symlinked_image_used_by_surviving_row() {
+        let (tmp, node, vhost) = crate::shares::tests::fixture().await;
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("x.png"), b"image").unwrap();
+        std::os::unix::fs::symlink(&outside, vhost.www_dir.join("img")).unwrap();
+        {
+            let db = vhost.db.as_ref().unwrap().lock().await;
+            ensure_media_schema(&db).unwrap();
+            db.execute_batch("CREATE TABLE users(username TEXT,role TEXT); INSERT INTO users VALUES('user@example.test','author');
+                INSERT INTO media(filename,mime,storage,url_path) VALUES('x','image/png','disk','/img/x.png'),('y','image/png','disk','/img/x.png');").unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", format!("cosmix_session={}", crate::shares::tests::cookie(&node, "maild", 0)).parse().unwrap());
+        let response = media_delete(State(node.clone()), Extension(vhost.clone()), headers,
+            Form(std::collections::HashMap::from([("id".into(), "1".into())]))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(std::fs::read(outside.join("x.png")).unwrap(), b"image");
+        let db = vhost.db.as_ref().unwrap().lock().await;
+        assert!(row(&db, 2).is_ok());
+        assert!(row(&db, 1).is_err());
+    }
+
     #[tokio::test]
     async fn row_first_upload_survives_lane_outage_and_ref_rejects_inline() {
         let (_tmp, node, vhost) = crate::shares::tests::fixture().await;
