@@ -46,7 +46,6 @@ mod tests {
     use crate::{app::Msg, icons::Icons, theme};
     use cosmix_design::{Mode, Scheme};
     use cosmix_dopus_core::{DOpusConfig, DopusCore, PaneId, properties::Properties};
-    use iced::advanced::text::Paragraph as _;
     use iced::advanced::{Layout, graphics::text::Paragraph, layout, widget::Tree};
     use iced::{Element, Size};
     use iced_tiny_skia::Renderer;
