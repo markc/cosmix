@@ -134,7 +134,7 @@ fn origin_scheme_host(v: &str) -> Option<(&str, &str, Option<&str>)> {
 /// fail-closed rule regressed cookieless workers fleet-wide). This mirrors the
 /// general handler gate; the media routes run their own admin-session auth after
 /// this check, so a header-less request still faces real authorization.
-fn same_origin(headers: &HeaderMap, fqdn: &str) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap, fqdn: &str) -> bool {
     for h in [axum::http::header::ORIGIN, axum::http::header::REFERER] {
         // A PRESENT header (even non-UTF-8) is authoritative: garbage bytes can't
         // be a legitimate same-origin request, so present-but-unparseable →

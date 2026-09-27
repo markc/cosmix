@@ -2052,6 +2052,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bcrypt",
  "blake3",
  "chacha20poly1305",
  "clap",

@@ -1,7 +1,40 @@
 # Public shares
 
-P5 is being delivered in slices. The catalogue and root configuration are
-implemented first; this checkpoint does **not** expose HTTP or Bus share routes.
+P5 is being delivered in slices. Catalogue management is available over the Bus
+and HTTP; public download routing follows in slice 5.
+
+## Management
+
+Mesh-open Bus verbs use JSON arguments (no capability check):
+
+- `webd.share.create {vhost, account, rel_path?, blob?, kind?, name?, password?, expires?}`
+  requires exactly one target; `kind` defaults to `file`. `blob` is the complete
+  reference object, not an ID string. `name` overrides its optional name and is
+  refused for path targets. Returns `{token, url}` (relative `/s/...` URL).
+- `webd.share.list {vhost, account, after?, limit?}` returns `{shares, next}`.
+  Limit defaults to 100 (range 1..100); `next` is the last token or null.
+- `webd.share.revoke {vhost, account, token}` returns `{revoked: bool}`; false
+  includes an absent, already revoked or differently owned token.
+
+`vhost` accepts a configured primary or alias; catalogues and blob owners use
+the primary. Success is Bus rc=0; errors are rc=10 with `{error: "token..."}`.
+Eight session-owned workers perform these operations; broker disconnect aborts
+them. Saturation returns `busy: webd transfer workers full (8)`.
+
+HTTP JSON management is `GET/POST /api/shares` and
+`POST /api/shares/{token}/revoke`. GET accepts `after` and `limit` query values.
+Create accepts `{rel_path, kind?, password?, expires?}` only: identity comes
+from the unified maild cookie; `account`, `blob` and root overrides are rejected.
+The live session epoch must match. Mutations require `X-CSRF-Token` equal to
+the sealed token and reject a mismatched Origin/Referer. Create returns 201;
+list/revoke return 200. Missing identity returns 401, CSRF failure 403, invalid
+arguments 400, missing catalogue 404, resource saturation 503. Extractor errors
+use axum's 400/413/415/422 statuses. All management responses are private/no-store.
+
+Passwords contain 1..72 UTF-8 bytes and hash with bcrypt cost 12 on at most four
+blocking workers. Verification permits stored costs 4..14; malformed or more
+expensive hashes fail closed. Cancellation retains worker admission until the
+blocking computation ends. Passwords are never accepted in a query string.
 
 ## Identity and roots
 

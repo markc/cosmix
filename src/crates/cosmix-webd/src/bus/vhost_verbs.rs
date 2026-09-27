@@ -896,6 +896,7 @@ mod tests {
 
         Arc::new(NodeState {
             share_roots: crate::file_share::Roots::default(),
+            share_runtime: crate::shares::Runtime::default(),
             service_jmap_tokens: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -1627,6 +1628,7 @@ mod tests {
             let force_queue = node.acme_force_renew_queue.clone();
             Arc::new(NodeState {
                 share_roots: crate::file_share::Roots::default(),
+                share_runtime: crate::shares::Runtime::default(),
                 service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),

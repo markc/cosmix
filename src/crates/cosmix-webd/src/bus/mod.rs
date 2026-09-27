@@ -8,7 +8,7 @@
 //! initial connect failures and mid-life stream ends both fall back
 //! into the same backoff loop.
 //!
-//! **v0 verb surface — read-only by construction:**
+//! **Read-only snapshots (the synchronous dispatch subset):**
 //!
 //! * `webd.routes.list` — vhost map snapshot (per-vhost
 //!   primary FQDN, aliases, presence-of CMS / JMAP / WS / docs).
@@ -20,8 +20,9 @@
 //! * `webd.autoconfig.served_domains` — the `served_mail_domains`
 //!   allowlist (the autoconfig admission gate).
 //!
-//! Anything else returns `rc=10` (the caller-error sentinel). v1 write
-//! plumbing is deferred — see the plan's "Why no writes in v0".
+//! Mutations have explicit asynchronous dispatchers. Share operations run on
+//! eight session-owned workers; mesh callers need no additional authorisation.
+//! Unknown verbs return `rc=10` (the caller-error sentinel).
 //!
 //! **Goal-(c)-equivalent:** the HTTPS / HTTP serve loops and the C5d
 //! provisioner run in sibling tokio tasks; broker outages affect only
@@ -32,6 +33,7 @@ pub mod listener_verbs;
 pub mod props_publisher;
 pub mod routes;
 pub mod session_verbs;
+pub mod share_verbs;
 pub mod stats;
 pub mod subscribe_granter;
 pub mod tls;
@@ -142,7 +144,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// a tight reconnect/log loop.
 const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
 
-/// Connect to the broker and run the read-only dispatch loop. Spawn
+/// Connect to the broker and run the dispatch loop. Spawn
 /// once at startup with `tokio::spawn(bus::run(node.clone()))`. Holds
 /// a shared reference to the live [`NodeState`] (for vhost map +
 /// per-vhost [`crate::stats::WebdStats`] reads).
@@ -270,7 +272,38 @@ pub async fn run(node: Arc<NodeState>) {
                 continue;
             }
         };
+        let mut workers = tokio::task::JoinSet::new();
         while let Some(cmd) = rx.recv().await {
+            while let Some(result) = workers.try_join_next() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "share worker failed");
+                }
+            }
+            if share_verbs::handles(&cmd.command) {
+                if workers.len() >= 8 {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        client_arc.respond(
+                            &cmd,
+                            10,
+                            r#"{"error":"busy: webd transfer workers full (8)"}"#,
+                        ),
+                    )
+                    .await;
+                } else {
+                    let node = node.clone();
+                    let client = client_arc.clone();
+                    workers.spawn(async move {
+                        let (rc, body) = share_verbs::dispatch(&node, &cmd).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            client.respond(&cmd, rc, &body),
+                        )
+                        .await;
+                    });
+                }
+                continue;
+            }
             let (rc, body) = if let Some(suffix) = cmd.command.strip_prefix("webd.props.") {
                 // SPEC-12 verb surface. PropsRouter::dispatch handles
                 // its own auth check + error projection — anything not
@@ -324,6 +357,7 @@ pub async fn run(node: Arc<NodeState>) {
                 );
             }
         }
+        workers.shutdown().await;
         let session_lifetime = session_started.elapsed();
         if session_lifetime >= HEALTHY_SESSION_THRESHOLD {
             delay = INITIAL_BACKOFF;
@@ -430,6 +464,24 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new("webd.tls.reload", &[], "Reload TLS identities", false),
         VerbDescriptor::new(
+            "webd.share.create",
+            &["vhost", "account"],
+            "Create a path or pinned local blob share",
+            false,
+        ),
+        VerbDescriptor::new(
+            "webd.share.list",
+            &["vhost", "account"],
+            "List account shares",
+            true,
+        ),
+        VerbDescriptor::new(
+            "webd.share.revoke",
+            &["vhost", "account", "token"],
+            "Revoke an account share",
+            false,
+        ),
+        VerbDescriptor::new(
             "webd.session.revoke",
             &["email"],
             "Revoke an account's web sessions",
@@ -487,7 +539,7 @@ fn dispatch(cmd: &IncomingCommand, node: &Arc<NodeState>) -> (u8, String) {
         other => (
             RC_CALLER_ERROR,
             serde_json::json!({
-                "error": "unknown or non-read-only action",
+                "error": "unknown action (no asynchronous dispatcher or snapshot handler)",
                 "action": other,
                 "read_only_actions": [
                     "webd.routes.list",
@@ -694,6 +746,7 @@ mod tests {
             tokio::sync::watch::channel(crate::tls_status::TlsStatusSnapshot::default());
         Arc::new(NodeState {
             share_roots: crate::file_share::Roots::default(),
+            share_runtime: crate::shares::Runtime::default(),
             service_jmap_tokens: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),

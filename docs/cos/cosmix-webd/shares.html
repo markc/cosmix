@@ -442,8 +442,37 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/cosmix-webd/shares.md"><div class="prose"><h1 id="public-shares">Public shares</h1>
-<p>P5 is being delivered in slices. The catalogue and root configuration are
-implemented first; this checkpoint does <strong>not</strong> expose HTTP or Bus share routes.</p>
+<p>P5 is being delivered in slices. Catalogue management is available over the Bus
+and HTTP; public download routing follows in slice 5.</p>
+<h2 id="management">Management</h2>
+<p>Mesh-open Bus verbs use JSON arguments (no capability check):</p>
+<ul>
+<li><code>webd.share.create {vhost, account, rel_path?, blob?, kind?, name?, password?, expires?}</code>
+requires exactly one target; <code>kind</code> defaults to <code>file</code>. <code>blob</code> is the complete
+reference object, not an ID string. <code>name</code> overrides its optional name and is
+refused for path targets. Returns <code>{token, url}</code> (relative <code>/s/...</code> URL).</li>
+<li><code>webd.share.list {vhost, account, after?, limit?}</code> returns <code>{shares, next}</code>.
+Limit defaults to 100 (range 1..100); <code>next</code> is the last token or null.</li>
+<li><code>webd.share.revoke {vhost, account, token}</code> returns <code>{revoked: bool}</code>; false
+includes an absent, already revoked or differently owned token.</li>
+</ul>
+<p><code>vhost</code> accepts a configured primary or alias; catalogues and blob owners use
+the primary. Success is Bus rc=0; errors are rc=10 with <code>{error: "token..."}</code>.
+Eight session-owned workers perform these operations; broker disconnect aborts
+them. Saturation returns <code>busy: webd transfer workers full (8)</code>.</p>
+<p>HTTP JSON management is <code>GET/POST /api/shares</code> and
+<code>POST /api/shares/{token}/revoke</code>. GET accepts <code>after</code> and <code>limit</code> query values.
+Create accepts <code>{rel_path, kind?, password?, expires?}</code> only: identity comes
+from the unified maild cookie; <code>account</code>, <code>blob</code> and root overrides are rejected.
+The live session epoch must match. Mutations require <code>X-CSRF-Token</code> equal to
+the sealed token and reject a mismatched Origin/Referer. Create returns 201;
+list/revoke return 200. Missing identity returns 401, CSRF failure 403, invalid
+arguments 400, missing catalogue 404, resource saturation 503. Extractor errors
+use axum's 400/413/415/422 statuses. All management responses are private/no-store.</p>
+<p>Passwords contain 1..72 UTF-8 bytes and hash with bcrypt cost 12 on at most four
+blocking workers. Verification permits stored costs 4..14; malformed or more
+expensive hashes fail closed. Cancellation retains worker admission until the
+blocking computation ends. Passwords are never accepted in a query string.</p>
 <h2 id="identity-and-roots">Identity and roots</h2>
 <p>The catalogue uses the exact canonical email from the unified maild session
 cookie as <code>account TEXT</code>. This is an explicit C1 deviation: webd has no stable

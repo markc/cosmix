@@ -154,7 +154,7 @@ pub fn valid_relative_path(rel: &str) -> bool {
 
 /// Validated operator roots, never request data. Handles pin their directory identity.
 #[derive(Default)]
-pub struct Roots(BTreeMap<String, cosmix_files::rooted_read::ReadRoot>);
+pub struct Roots(BTreeMap<String, std::sync::Arc<cosmix_files::rooted_read::ReadRoot>>);
 
 impl Roots {
     pub fn from_config(config: &cosmix_config::node::WebdSharesConfig) -> Self {
@@ -169,7 +169,7 @@ impl Roots {
                 .and_then(|p| cosmix_files::rooted_read::ReadRoot::open(&p).ok());
             match canonical {
                 Some(path) => {
-                    roots.insert(account.clone(), path);
+                    roots.insert(account.clone(), std::sync::Arc::new(path));
                 }
                 None => tracing::warn!(account, "ignoring invalid webd.shares root"),
             }
@@ -177,7 +177,10 @@ impl Roots {
         Self(roots)
     }
 
-    pub fn get(&self, account: &str) -> Option<&cosmix_files::rooted_read::ReadRoot> {
+    pub fn get(
+        &self,
+        account: &str,
+    ) -> Option<&std::sync::Arc<cosmix_files::rooted_read::ReadRoot>> {
         self.0.get(account)
     }
 }

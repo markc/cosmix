@@ -19,6 +19,7 @@ mod mxresolve;
 mod portal_auth;
 mod public_response_cache;
 mod session;
+mod shares;
 mod stats;
 mod tls_status;
 mod vhost_directory;
@@ -688,8 +689,13 @@ struct WebdConnHandler {
 
 #[async_trait::async_trait]
 impl ConnHandler for WebdConnHandler {
-    async fn handle(&self, stream: AcceptedStream, _ctx: ConnCtx) {
-        let svc = hyper_util::service::TowerToHyperService::new(self.app.clone());
+    async fn handle(&self, stream: AcceptedStream, ctx: ConnCtx) {
+        let peer = shares::Peer {
+            ip: ctx.peer_addr.ip(),
+            tls: matches!(&stream, AcceptedStream::Tls(_)),
+        };
+        let svc =
+            hyper_util::service::TowerToHyperService::new(self.app.clone().layer(Extension(peer)));
         let builder =
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
         match stream {
@@ -803,9 +809,7 @@ pub(crate) fn empty_listener_tls(strict_sni: bool) -> Result<ListenerTls> {
 ///   the provisioner publishes the cert into this same handle. Never
 ///   plaintext on a TLS port;
 /// * no handle → `Plain` (a listener with no TLS vhosts at all).
-pub(crate) fn listener_bind_tls(
-    tls: Option<&ListenerTls>,
-) -> (Option<ListenerTls>, TlsMode, bool) {
+pub(crate) fn listener_bind_tls(tls: Option<&ListenerTls>) -> (Option<ListenerTls>, TlsMode, bool) {
     match tls {
         Some(t) if t.is_enabled() => (Some(t.clone()), TlsMode::Terminate, false),
         Some(t) if t.is_pending() => (Some(t.clone()), TlsMode::Terminate, true),
@@ -820,8 +824,8 @@ pub(crate) fn listener_bind_tls(
 /// `reqwest::Client` per node), and the host-routing map.
 struct NodeState {
     /// Startup-validated operator roots; never sourced from a request.
-    #[allow(dead_code)] // P5 slice 4 wires share management after the checkpoint.
     share_roots: file_share::Roots,
+    share_runtime: shares::Runtime,
     /// Hot-swappable host-routing snapshot (C3b). Carries every
     /// host-derived view — lookup by Host, plain-HTTP admit set,
     /// per-primary group with aliases — behind a single `ArcSwap`
@@ -2320,6 +2324,7 @@ fn canonical_db_key(path: &std::path::Path) -> PathBuf {
 /// interpolated.
 fn open_db(path: &std::path::Path, aux: &[(String, std::path::PathBuf)]) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    file_share::init_schema(&conn)?;
     // busy_timeout mirrors the props-substrate connection: the vhost
     // connection is shared across concurrent request tasks, so a brief lock
     // wait must retry rather than fail the request.
@@ -6028,6 +6033,18 @@ fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
 fn build_per_vhost_router(node: Arc<NodeState>) -> Router {
     Router::new()
         .route(
+            "/api/shares",
+            axum::routing::get(shares::http_list)
+                .post(shares::http_create)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+                .layer(axum::middleware::from_fn(shares::private_response)),
+        )
+        .route(
+            "/api/shares/{token}/revoke",
+            axum::routing::post(shares::http_revoke)
+                .layer(axum::middleware::from_fn(shares::private_response)),
+        )
+        .route(
             "/api/posts",
             axum::routing::get(list_posts).post(create_post),
         )
@@ -6415,6 +6432,7 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
         tokio::sync::watch::channel(tls_status::TlsStatusSnapshot::default());
     let node = Arc::new(NodeState {
         share_roots: file_share::Roots::default(),
+        share_runtime: crate::shares::Runtime::default(),
         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7279,6 +7297,7 @@ async fn async_main() -> Result<()> {
                     // pre-ACME bootstrap listener wants.
                     let bootstrap_node = Arc::new(NodeState {
                         share_roots: file_share::Roots::default(),
+                        share_runtime: crate::shares::Runtime::default(),
                         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7930,6 +7949,7 @@ async fn async_main() -> Result<()> {
                     .as_ref()
                     .map(|c| file_share::Roots::from_config(&c.webd.shares))
                     .unwrap_or_default(),
+                share_runtime: shares::Runtime::default(),
                 service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -8163,11 +8183,8 @@ async fn async_main() -> Result<()> {
                 // (handshakes refused until issuance fills the handle).
                 let (tls, tls_mode, tls_pending) = listener_bind_tls(tls_listeners.get(&l.id));
                 if tls_pending {
-                    let hosts: Vec<&String> = l
-                        .hosts
-                        .iter()
-                        .filter(|h| all_hosts.contains(*h))
-                        .collect();
+                    let hosts: Vec<&String> =
+                        l.hosts.iter().filter(|h| all_hosts.contains(*h)).collect();
                     tracing::warn!(
                         listener = %l.id,
                         tls = "pending",
@@ -8969,6 +8986,7 @@ vhost: [
             Arc::new(ArcSwap::from(Arc::new(directory)));
         Arc::new(NodeState {
             share_roots: file_share::Roots::default(),
+            share_runtime: crate::shares::Runtime::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -10166,7 +10184,7 @@ mod session_login_tests {
     /// INDETERMINATE here — without break-glass every login refuses with
     /// `err=unavailable` (pinned by
     /// `login_with_indeterminate_mfa_fails_closed`).
-    fn synth_jmap_node(td: &TempDir, stub: &str) -> Arc<NodeState> {
+    pub(crate) fn synth_jmap_node(td: &TempDir, stub: &str) -> Arc<NodeState> {
         synth_jmap_node_with(td, stub, true)
     }
 
@@ -10235,6 +10253,7 @@ mod session_login_tests {
     ) -> Arc<NodeState> {
         Arc::new(NodeState {
             share_roots: file_share::Roots::default(),
+            share_runtime: crate::shares::Runtime::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
