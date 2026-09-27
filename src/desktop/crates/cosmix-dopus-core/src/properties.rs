@@ -26,7 +26,8 @@ pub enum Properties {
     },
     Entry {
         entry: FileEntry,
-        metadata: Option<Result<Metadata, String>>,
+        count_pending: bool,
+        metadata: Option<Result<Box<Metadata>, String>>,
     },
 }
 
@@ -158,5 +159,32 @@ pub fn file_kind(path: &Path) -> String {
             "{} file ({mime}, guessed)",
             sanitise_display_text(&extension.to_uppercase())
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn permission_special_bits_are_not_lost() {
+        assert_eq!(permissions(0o100644), "rw-r--r-- (0644)");
+        assert_eq!(permissions(0o104755), "rwsr-xr-x (4755)");
+        assert_eq!(permissions(0o107644), "rwSr-Sr-T (7644)");
+    }
+    #[test]
+    fn unknown_mime_is_explicitly_a_guess() {
+        assert!(file_kind(Path::new("movie.MKV")).contains("video/x-matroska"));
+        assert!(file_kind(Path::new("unknown.xyz")).contains("application/octet-stream, guessed"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn broken_links_have_metadata_and_a_sanitised_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("link");
+        std::os::unix::fs::symlink("absent\nfile", &path).unwrap();
+        let meta = read(&path).unwrap();
+        assert_eq!(meta.kind, "Symbolic link");
+        assert!(!meta.symlink_target.unwrap().contains('\n'));
+        assert!(meta.owner_group.contains(':'));
     }
 }

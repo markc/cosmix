@@ -229,6 +229,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_one_migrates_without_losing_pane_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.conf.mix");
+        let raw = "schema_version: 1\nleft: {path: \"/tmp/source\", show_hidden: true, sort: \"modified\", ascending: false}\nright: {path: \"/tmp/target\", sort: \"size\"}\nactive_pane: \"right\"\nsplit_ratio: 0.7\n";
+        std::fs::write(&path, raw).unwrap();
+        let (config, file) = ConfigFile::load(dir.path());
+        assert!(file.allow_save);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            raw,
+            "load does not write"
+        );
+        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.left.path, Path::new("/tmp/source"));
+        assert!(config.left.show_hidden);
+        assert_eq!(config.left.sort, SortColumn::Modified);
+        assert!(!config.left.ascending);
+        assert_eq!(config.right.path, Path::new("/tmp/target"));
+        assert_eq!(config.right.sort, SortColumn::Size);
+        assert_eq!(config.active_pane, "right");
+        assert_eq!(config.split_ratio, 0.7);
+        assert_eq!(config.places, SidebarConfig::default());
+        assert_eq!(config.properties, SidebarConfig::default());
+        file.save(&config).unwrap();
+        assert_eq!(ConfigFile::load(dir.path()).0, config);
+    }
+
+    #[test]
+    fn schema_two_preserves_hidden_panels_and_clamps_widths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.conf.mix"), "schema_version: 2\nplaces: {open: false, width: 0.24}\nproperties: {open: false, width: 9.0}\n").unwrap();
+        let (config, file) = ConfigFile::load(dir.path());
+        assert!(file.allow_save);
+        assert_eq!(
+            config.places,
+            SidebarConfig {
+                open: false,
+                width: 0.24
+            }
+        );
+        assert_eq!(
+            config.properties,
+            SidebarConfig {
+                open: false,
+                width: 0.3
+            }
+        );
+        assert_eq!(
+            SidebarConfig {
+                width: f32::NAN,
+                ..Default::default()
+            }
+            .normalised()
+            .width,
+            0.15
+        );
+    }
+
+    #[test]
+    fn malformed_config_remains_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.conf.mix");
+        let raw = "schema_version: 2\nplaces: {open: \"invalid\"}\n";
+        std::fs::write(&path, raw).unwrap();
+        let (_, file) = ConfigFile::load(dir.path());
+        assert!(!file.allow_save);
+        assert!(!file.save(&DOpusConfig::default()).unwrap());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
     fn config_round_trips_through_native_mix_data() {
         let config = DOpusConfig::default();
         let raw = to_conf_mix_string(&config).unwrap();

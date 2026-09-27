@@ -47,7 +47,9 @@ pub struct ModalQueue<T> {
 
 impl<T> Default for ModalQueue<T> {
     fn default() -> Self {
-        Self { waiting: std::collections::VecDeque::new() }
+        Self {
+            waiting: std::collections::VecDeque::new(),
+        }
     }
 }
 
@@ -63,7 +65,9 @@ impl<T> ModalQueue<T> {
     /// Once nothing is open, show the oldest queued dialog.
     pub fn next(&mut self, current: &mut Option<T>) {
         while current.is_none() {
-            let Some(m) = self.waiting.pop_front() else { break };
+            let Some(m) = self.waiting.pop_front() else {
+                break;
+            };
             *current = Some(m);
         }
     }
@@ -89,7 +93,11 @@ mod queue_tests {
         assert_eq!(open, Some(1), "nothing open: shown at once");
         q.offer(&mut open, 2);
         q.offer(&mut open, 3);
-        assert_eq!((open, q.len()), (Some(1), 2), "the open decision is kept; the rest wait");
+        assert_eq!(
+            (open, q.len()),
+            (Some(1), 2),
+            "the open decision is kept; the rest wait"
+        );
         q.next(&mut open);
         assert_eq!(open, Some(1), "nothing shows over an open dialog");
         open = None;
@@ -130,7 +138,12 @@ impl Dialog {
     /// A prompt as the core raised it: seeded with the initial text and
     /// validated once so the field starts in a known state.
     pub fn prompt(token: u64, kind: PromptKind, initial: String) -> Self {
-        let mut dialog = Dialog::Prompt { token, kind, text: initial, error: None };
+        let mut dialog = Dialog::Prompt {
+            token,
+            kind,
+            text: initial,
+            error: None,
+        };
         dialog.revalidate();
         dialog
     }
@@ -157,14 +170,34 @@ impl Dialog {
             Dialog::Confirm { message, .. } => frame(
                 look,
                 "Confirm",
-                text(message.as_str()).font(look.ui_font).size(look.px).into(),
+                text(message.as_str())
+                    .font(look.ui_font)
+                    .size(look.px)
+                    .into(),
                 vec![
-                    dialog_button(look, "Yes", Msg::Dialog(DialogMsg::Answer(true)), Kind::Danger, true),
-                    dialog_button(look, "No", Msg::Dialog(DialogMsg::Answer(false)), Kind::Quiet, true),
+                    dialog_button(
+                        look,
+                        "Yes",
+                        Msg::Dialog(DialogMsg::Answer(true)),
+                        Kind::Danger,
+                        true,
+                    ),
+                    dialog_button(
+                        look,
+                        "No",
+                        Msg::Dialog(DialogMsg::Answer(false)),
+                        Kind::Quiet,
+                        true,
+                    ),
                 ],
-                CONFIRM_W,
+                look.chrome.icon * 28.0,
             ),
-            Dialog::Prompt { kind, text: value, error, .. } => {
+            Dialog::Prompt {
+                kind,
+                text: value,
+                error,
+                ..
+            } => {
                 let title = match kind {
                     PromptKind::NewFolder => "New folder",
                     PromptKind::Rename => "Rename",
@@ -174,11 +207,11 @@ impl Dialog {
                         .id(PROMPT_INPUT)
                         .on_input(|text| Msg::Dialog(DialogMsg::Input(text)))
                         .width(Length::Fill)
-                        .padding(iced::Padding::from([4, 8]))
+                        .padding(iced::Padding::from([look.chrome.small, look.chrome.pad]))
                         .size(look.px)
                         .style(field_look(look, error.is_some())),
                 ]
-                .spacing(6);
+                .spacing(look.chrome.small + 2.0 * look.chrome.edge);
                 if let Some(message) = error {
                     body = body.push(
                         text(message.as_str())
@@ -192,10 +225,22 @@ impl Dialog {
                     title,
                     body.into(),
                     vec![
-                        dialog_button(look, "OK", Msg::Dialog(DialogMsg::Submit), Kind::Primary, error.is_none()),
-                        dialog_button(look, "Cancel", Msg::Dialog(DialogMsg::Dismiss), Kind::Quiet, true),
+                        dialog_button(
+                            look,
+                            "OK",
+                            Msg::Dialog(DialogMsg::Submit),
+                            Kind::Primary,
+                            error.is_none(),
+                        ),
+                        dialog_button(
+                            look,
+                            "Cancel",
+                            Msg::Dialog(DialogMsg::Dismiss),
+                            Kind::Quiet,
+                            true,
+                        ),
                     ],
-                    CONFIRM_W,
+                    look.chrome.icon * 28.0,
                 )
             }
         }
@@ -203,7 +248,6 @@ impl Dialog {
 }
 
 /// Confirm and prompt cards share one width.
-const CONFIRM_W: f32 = 460.0;
 
 /// Button weight: the primary submit, the destructive confirming action of a
 /// delete confirm, or a quiet dismissal.
@@ -216,7 +260,13 @@ enum Kind {
 
 /// A dialog button; `enabled = false` greys it and takes its press away
 /// (an invalid prompt cannot submit).
-fn dialog_button<'a>(look: Look, label: &'static str, msg: Msg, kind: Kind, enabled: bool) -> Element<'a, Msg> {
+fn dialog_button<'a>(
+    look: Look,
+    label: &'static str,
+    msg: Msg,
+    kind: Kind,
+    enabled: bool,
+) -> Element<'a, Msg> {
     let t = look.tokens;
     let (background, text_color, border) = match kind {
         Kind::Primary => (Some(t.primary), t.primary_text, t.primary),
@@ -238,7 +288,7 @@ fn dialog_button<'a>(look: Look, label: &'static str, msg: Msg, kind: Kind, enab
             .size(look.px * 0.9)
             .color(if disabled { t.muted_text } else { text_color }),
     )
-    .padding([4, 14])
+    .padding([look.chrome.small, look.chrome.gap])
     .on_press_maybe(enabled.then_some(msg))
     .style(move |_theme, status| button::Style {
         background: match status {
@@ -248,7 +298,7 @@ fn dialog_button<'a>(look: Look, label: &'static str, msg: Msg, kind: Kind, enab
         text_color: if disabled { t.muted_text } else { text_color },
         border: Border {
             color: border,
-            width: if quiet { 1.0 } else { 0.0 },
+            width: if quiet { look.chrome.edge } else { 0.0 },
             radius: look.tokens.radius.into(),
         },
         ..Default::default()
@@ -261,7 +311,8 @@ fn dialog_button<'a>(look: Look, label: &'static str, msg: Msg, kind: Kind, enab
 fn field_look(
     look: Look,
     invalid: bool,
-) -> impl Fn(&iced::Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style + 'static {
+) -> impl Fn(&iced::Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style + 'static
+{
     let (background, border, text_color, muted, ring, warning, selection, radius) = (
         look.tokens.input,
         look.tokens.border,
@@ -281,7 +332,7 @@ fn field_look(
                 _ if invalid => warning,
                 _ => border,
             },
-            width: 1.0,
+            width: look.chrome.edge,
             radius: radius.into(),
         },
         icon: muted,
@@ -302,38 +353,58 @@ pub fn frame<'a>(
     width: f32,
 ) -> Element<'a, Msg, iced::Theme, Renderer> {
     let t = look.tokens;
-    let mut actions = row![iced::widget::space().width(Length::Fill)].spacing(8).align_y(Alignment::Center);
+    let mut actions = row![iced::widget::space().width(Length::Fill)]
+        .spacing(look.chrome.pad)
+        .align_y(Alignment::Center);
     for b in buttons {
         actions = actions.push(b);
     }
     let card = container(
         column![
-            text(title).font(look.ui_font).size(look.px * 1.15).color(t.popover_text),
+            text(title)
+                .font(look.ui_font)
+                .size(look.px * 1.15)
+                .color(t.popover_text),
             body,
             actions,
         ]
-        .spacing(14),
+        .spacing(look.chrome.gap),
     )
-    .padding(Padding::from([18, 20]))
+    .padding(Padding::from([
+        look.chrome.icon,
+        look.chrome.icon + look.chrome.small,
+    ]))
     .width(Length::Fixed(width))
     .style(move |_| container::Style {
         background: Some(Background::Color(t.popover)),
         text_color: Some(t.popover_text),
-        border: Border { color: t.border, width: 1.0, radius: (t.radius * 1.5).into() },
+        border: Border {
+            color: t.border,
+            width: look.chrome.edge,
+            radius: (t.radius * 1.5).into(),
+        },
         shadow: Shadow {
-            color: Color { a: 0.35, ..darker(t.surface, t.text) },
-            offset: Vector::new(0.0, 6.0),
-            blur_radius: 24.0,
+            color: Color {
+                a: 0.35,
+                ..darker(t.surface, t.text)
+            },
+            offset: Vector::new(0.0, look.chrome.small + 2.0 * look.chrome.edge),
+            blur_radius: look.chrome.gap * 2.0,
         },
         ..container::Style::default()
     });
-    let scrim = Color { a: 0.55, ..darker(t.surface, t.text) };
+    let scrim = Color {
+        a: 0.55,
+        ..darker(t.surface, t.text)
+    };
     iced::widget::opaque(
         iced::widget::mouse_area(
-            container(iced::widget::opaque(card)).center(Length::Fill).style(move |_| container::Style {
-                background: Some(Background::Color(scrim)),
-                ..container::Style::default()
-            }),
+            container(iced::widget::opaque(card))
+                .center(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(scrim)),
+                    ..container::Style::default()
+                }),
         )
         .on_press(Msg::Dialog(DialogMsg::Dismiss)),
     )

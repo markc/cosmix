@@ -31,6 +31,7 @@ use crate::theme::Chrome;
 /// `'static` instead of borrowing a local `Look`).
 #[derive(Debug, Clone, Copy)]
 pub struct Look {
+    pub small_px: f32,
     pub tokens: cosmix_iced_widgets::Tokens,
     pub chrome: Chrome,
     pub ui_font: iced::Font,
@@ -53,13 +54,6 @@ impl Look {
         }
     }
 }
-
-/// Pane header height (nav strip + location bar), logical px.
-pub const HEADER_H: f32 = 34.0;
-/// Sort-header height.
-pub const SORT_H: f32 = 26.0;
-/// Status bar height.
-pub const STATUS_H: f32 = 26.0;
 
 /// The whole window: sidebar · left pane · divider · right pane, then the
 /// status bar. `split_ratio` (the core's live value) quantises the pane

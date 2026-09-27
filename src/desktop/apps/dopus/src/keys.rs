@@ -45,8 +45,8 @@ use cosmix_actions::{DOPUS_DEFAULT_KEYMAP_MIX, load_keymap, parse_keymap};
 /// The effective keymap: packaged dopus defaults + the user's overlay
 /// (filemgr/src/action.rs `load_effective_keymap`, kept in step).
 pub fn load(custom_path: Option<&Path>) -> Result<Keymap, String> {
-    let mut keymap = parse_keymap(DOPUS_DEFAULT_KEYMAP_MIX)
-        .expect("checked-in dopus keymap must stay valid");
+    let mut keymap =
+        parse_keymap(DOPUS_DEFAULT_KEYMAP_MIX).expect("checked-in dopus keymap must stay valid");
     let Some(path) = custom_path else {
         return Ok(keymap);
     };
@@ -107,7 +107,9 @@ pub fn initial(custom_path: Option<&Path>) -> Result<SharedRouter, String> {
 /// is `allow_in_editable: false`, so while this is on the resolver emits no
 /// actions and keys fall through to the editor widget.
 pub fn set_focus_editable(shared: &SharedRouter, editable: bool) {
-    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut router = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if router.focus_editable != editable {
         router.focus_editable = editable;
         // Focus changed hands: a half-typed chord must not fire into (or
@@ -121,7 +123,9 @@ pub fn set_focus_editable(shared: &SharedRouter, editable: bool) {
 /// rejects globals under a modal), and the router turns Enter/Escape into
 /// [`ModalKey`] messages for the dialog.
 pub fn set_modal(shared: &SharedRouter, open: bool) {
-    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut router = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let next = open.then_some(MODAL_SCOPE);
     if router.modal != next {
         router.modal = next;
@@ -153,9 +157,13 @@ fn note_ime(shared: &SharedRouter, event: &iced::advanced::input_method::Event) 
     use iced::advanced::input_method;
     let next = match event {
         input_method::Event::Preedit(text, _) => !text.is_empty(),
-        input_method::Event::Commit(_) | input_method::Event::Closed | input_method::Event::Opened => false,
+        input_method::Event::Commit(_)
+        | input_method::Event::Closed
+        | input_method::Event::Opened => false,
     };
-    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut router = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     router.composing = next;
 }
 
@@ -187,7 +195,9 @@ pub fn reload(shared: &SharedRouter, custom_path: Option<&Path>) {
         // load() already validated; a broken overlay keeps the current keymap.
         return;
     };
-    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut router = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if reloaded == router.keymap {
         return;
     }
@@ -199,7 +209,9 @@ pub fn reload(shared: &SharedRouter, custom_path: Option<&Path>) {
 /// calls this every 200 ms, so a pending chord times out without waiting for
 /// the next keypress. Returns any actions the expiry emitted.
 pub fn poll_timeout(shared: &SharedRouter) -> Vec<ActionId> {
-    let mut router = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut router = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = tick();
     let context = focus_context(&router);
     let Router { keymap, state, .. } = &mut *router;
@@ -266,7 +278,12 @@ fn named_key(named: Named) -> Option<AKey> {
 }
 
 fn modifiers(m: keyboard::Modifiers) -> AModifiers {
-    AModifiers { control: m.control(), alt: m.alt(), shift: m.shift(), super_key: m.logo() }
+    AModifiers {
+        control: m.control(),
+        alt: m.alt(),
+        shift: m.shift(),
+        super_key: m.logo(),
+    }
 }
 
 /// An iced keyboard event becomes the [`RawInput`] the resolver takes,
@@ -274,12 +291,19 @@ fn modifiers(m: keyboard::Modifiers) -> AModifiers {
 /// reconstruct repeat by comparing strokes).
 fn key_input(event: &keyboard::Event) -> Option<RawInput> {
     match event {
-        keyboard::Event::KeyPressed { key, physical_key, modifiers, repeat, .. } => {
-            raw_input(key, *physical_key, *modifiers, true, *repeat)
-        }
-        keyboard::Event::KeyReleased { key, physical_key, modifiers, .. } => {
-            raw_input(key, *physical_key, *modifiers, false, false)
-        }
+        keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            repeat,
+            ..
+        } => raw_input(key, *physical_key, *modifiers, true, *repeat),
+        keyboard::Event::KeyReleased {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        } => raw_input(key, *physical_key, *modifiers, false, false),
         _ => None,
     }
 }
@@ -296,7 +320,11 @@ pub fn raw_input(
     Some(RawInput {
         key: iced_key(key, physical)?,
         modifiers: modifiers(mods),
-        state: if pressed { RawInputState::Pressed } else { RawInputState::Released },
+        state: if pressed {
+            RawInputState::Pressed
+        } else {
+            RawInputState::Released
+        },
         repeat,
     })
 }
@@ -358,7 +386,11 @@ pub fn router<'a, Message, Theme, Renderer>(
 
 impl<'a, Message, Theme, Renderer> KeyRouter<'a, Message, Theme, Renderer> {
     /// Escape and presses outside this editor cancel it; Enter stays with TextField.
-    pub fn on_edit_cancel(mut self, id: impl Into<iced::advanced::widget::Id>, message: Message) -> Self {
+    pub fn on_edit_cancel(
+        mut self,
+        id: impl Into<iced::advanced::widget::Id>,
+        message: Message,
+    ) -> Self {
         self.on_edit_cancel = Some((id.into(), message));
         self
     }
@@ -379,11 +411,15 @@ impl<'a, Message, Theme, Renderer> KeyRouter<'a, Message, Theme, Renderer> {
     /// Whether an IME composition is in flight ([`Router::composing`], fed
     /// by [`note_ime`]).
     fn composing(&self) -> bool {
-        self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).composing
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .composing
     }
 }
 
-impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for KeyRouter<'_, Message, Theme, Renderer>
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for KeyRouter<'_, Message, Theme, Renderer>
 where
     Message: Clone,
     Renderer: iced::advanced::Renderer,
@@ -408,12 +444,25 @@ where
         self.content.as_widget().size()
     }
 
-    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
         self.content.as_widget_mut().layout(tree, renderer, limits)
     }
 
-    fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
-        self.content.as_widget_mut().operate(tree, layout, renderer, operation);
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(tree, layout, renderer, operation);
     }
 
     fn update(
@@ -441,7 +490,12 @@ where
         // RepeatPolicy::Ignore names dialogs for exactly this; the capture
         // bypasses the resolver, so the check lives here).
         if self.modal
-            && let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, repeat, .. }) = event
+            && let Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) = event
             && !repeat
             && !modifiers.control()
             && !modifiers.alt()
@@ -456,7 +510,8 @@ where
         if !self.modal
             && let Some((_, message)) = &self.on_edit_cancel
             && let Event::Keyboard(keyboard::Event::KeyPressed {
-                key: Key::Named(Named::Escape), ..
+                key: Key::Named(Named::Escape),
+                ..
             }) = event
         {
             shell.publish(message.clone());
@@ -467,7 +522,10 @@ where
             && let Some(input) = key_input(keyboard_event)
         {
             let resolved = {
-                let mut router = self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut router = self
+                    .shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let now = tick();
                 let context = focus_context(&router);
                 // Split-borrow the router's own fields so the resolver can
@@ -494,7 +552,10 @@ where
                 shell.capture_event();
                 return;
             }
-            if matches!(resolved.outcome, cosmix_actions::ResolveOutcome::Pending { .. }) {
+            if matches!(
+                resolved.outcome,
+                cosmix_actions::ResolveOutcome::Pending { .. }
+            ) {
                 // A longer chord may still win: do not let a child treat the
                 // stroke as its own (P1: only matters with custom overlays).
                 shell.capture_event();
@@ -506,7 +567,9 @@ where
         if !self.modal
             && self.on_edit_cancel.is_some()
             && let Event::Keyboard(keyboard::Event::KeyPressed {
-                key: Key::Named(Named::Enter), modifiers, ..
+                key: Key::Named(Named::Enter),
+                modifiers,
+                ..
             }) = event
             && (modifiers.control() || modifiers.alt() || modifiers.logo())
         {
@@ -519,18 +582,27 @@ where
         // that never move far enough to publish Split.
         if !self.modal
             && let Some((id, message)) = &self.on_edit_cancel
-            && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                | Event::Touch(iced::touch::Event::FingerPressed { .. }))
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                    | Event::Touch(iced::touch::Event::FingerPressed { .. })
+            )
         {
-            let mut hit = EditorHit { id: id.clone(), cursor, inside: false };
-            self.content.as_widget_mut().operate(tree, layout, renderer, &mut hit);
+            let mut hit = EditorHit {
+                id: id.clone(),
+                cursor,
+                inside: false,
+            };
+            self.content
+                .as_widget_mut()
+                .operate(tree, layout, renderer, &mut hit);
             if !hit.inside {
                 shell.publish(message.clone());
             }
         }
-        self.content
-            .as_widget_mut()
-            .update(tree, event, layout, cursor, renderer, clipboard, shell, viewport);
+        self.content.as_widget_mut().update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
     }
 
     fn draw(
@@ -543,7 +615,9 @@ where
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget().draw(tree, renderer, theme, style, layout, cursor, viewport);
+        self.content
+            .as_widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
     }
 
     fn mouse_interaction(
@@ -554,7 +628,9 @@ where
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.content.as_widget().mouse_interaction(tree, layout, cursor, viewport, renderer)
+        self.content
+            .as_widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
     }
 
     fn overlay<'b>(
@@ -565,11 +641,14 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(tree, layout, renderer, viewport, translation)
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
     }
 }
 
-impl<'a, Message, Theme, Renderer> From<KeyRouter<'a, Message, Theme, Renderer>> for Element<'a, Message, Theme, Renderer>
+impl<'a, Message, Theme, Renderer> From<KeyRouter<'a, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
     Theme: 'a,
@@ -600,13 +679,42 @@ mod tests {
             name = rest;
         }
         let (key, physical) = match name {
-            "F2" => (Key::Named(Named::F2), Physical::Unidentified(NativeCode::Unidentified)),
-            "F5" => (Key::Named(Named::F5), Physical::Unidentified(NativeCode::Unidentified)),
-            "ArrowDown" => (Key::Named(Named::ArrowDown), Physical::Unidentified(NativeCode::Unidentified)),
-            "ArrowUp" => (Key::Named(Named::ArrowUp), Physical::Unidentified(NativeCode::Unidentified)),
-            "Enter" => (Key::Named(Named::Enter), Physical::Unidentified(NativeCode::Unidentified)),
-            "Delete" => (Key::Named(Named::Delete), Physical::Unidentified(NativeCode::Unidentified)),
-            c => (Key::Character(c.into()), Physical::Unidentified(NativeCode::Unidentified)),
+            "F2" => (
+                Key::Named(Named::F2),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "F5" => (
+                Key::Named(Named::F5),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "F9" => (
+                Key::Named(Named::F9),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "F10" => (
+                Key::Named(Named::F10),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "ArrowDown" => (
+                Key::Named(Named::ArrowDown),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "ArrowUp" => (
+                Key::Named(Named::ArrowUp),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "Enter" => (
+                Key::Named(Named::Enter),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "Delete" => (
+                Key::Named(Named::Delete),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            c => (
+                Key::Character(c.into()),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
         };
         raw_input(&key, physical, mods, true, false)
     }
@@ -639,9 +747,17 @@ mod tests {
             ("Ctrl+2", filemgr::VIEW_SORT_SIZE),
             ("Ctrl+3", filemgr::VIEW_SORT_MODIFIED),
             ("Ctrl+L", cosmix_actions::location::FOCUS),
+            ("F9", cosmix_actions::view::TOGGLE_PLACES),
+            ("F10", cosmix_actions::view::TOGGLE_PROPERTIES),
         ] {
             let input = press(text).unwrap_or_else(|| panic!("{text}"));
-            let resolved = resolve(input, &FocusContext::global(), &router.keymap, &mut state, tick());
+            let resolved = resolve(
+                input,
+                &FocusContext::global(),
+                &router.keymap,
+                &mut state,
+                tick(),
+            );
             assert_eq!(resolved.actions, vec![action], "{text}");
         }
     }
@@ -658,9 +774,18 @@ mod tests {
             true,
             false,
         );
-        assert!(input.is_none(), "untranslatable keys never reach the resolver");
+        assert!(
+            input.is_none(),
+            "untranslatable keys never reach the resolver"
+        );
         let input = press("Enter").unwrap();
-        let resolved = resolve(input, &FocusContext::global(), &router.keymap, &mut state, tick());
+        let resolved = resolve(
+            input,
+            &FocusContext::global(),
+            &router.keymap,
+            &mut state,
+            tick(),
+        );
         assert_eq!(resolved.actions, vec![filemgr::FILE_OPEN]);
     }
 
@@ -675,7 +800,15 @@ mod tests {
         // file.open); under a modal scope none of them fires — the dialog
         // owns the keyboard, and Enter/Escape reach it only through the
         // router's ModalKey capture.
-        for text in ["Enter", "Escape", "F5", "Delete", "Ctrl+C", "F2", "Ctrl+Shift+N"] {
+        for text in [
+            "Enter",
+            "Escape",
+            "F5",
+            "Delete",
+            "Ctrl+C",
+            "F2",
+            "Ctrl+Shift+N",
+        ] {
             let input = press(text).unwrap_or_else(|| panic!("{text}"));
             let resolved = resolve(input, &context, &router.keymap, &mut state, tick());
             assert!(resolved.actions.is_empty(), "{text} fired under a modal");
@@ -691,7 +824,10 @@ mod tests {
 
     #[test]
     fn enter_confirms_only_outside_a_composition() {
-        assert_eq!(modal_key(&Key::Named(Named::Enter), false), Some(ModalKey::Confirm));
+        assert_eq!(
+            modal_key(&Key::Named(Named::Enter), false),
+            Some(ModalKey::Confirm)
+        );
         assert_eq!(
             modal_key(&Key::Named(Named::Enter), true),
             None,
@@ -718,9 +854,18 @@ mod tests {
             false,
         )
         .unwrap();
-        let resolved = resolve(input, &FocusContext::global(), &router.keymap, &mut state, tick());
+        let resolved = resolve(
+            input,
+            &FocusContext::global(),
+            &router.keymap,
+            &mut state,
+            tick(),
+        );
         assert!(resolved.actions.is_empty());
-        assert_eq!(resolved.outcome, cosmix_actions::ResolveOutcome::IgnoredRelease);
+        assert_eq!(
+            resolved.outcome,
+            cosmix_actions::ResolveOutcome::IgnoredRelease
+        );
     }
 }
 
@@ -732,9 +877,9 @@ mod tests {
 #[cfg(all(test, debug_assertions))]
 mod widget_tests {
     use super::*;
+    use cosmix_iced_widgets::TextField;
     use iced::advanced::widget::operation::focusable;
     use iced::keyboard::key::{NativeCode, Physical};
-    use cosmix_iced_widgets::TextField;
 
     #[derive(Debug, Clone, PartialEq)]
     enum Message {
@@ -763,22 +908,40 @@ mod widget_tests {
             iced::widget::mouse_area(iced::widget::Space::new().width(300).height(40))
                 .on_press(Message::OtherEdit),
         ];
-        let mut router = router(content, shared, Message::Actions)
-            .on_edit_cancel("location", Message::Cancel);
+        let mut router =
+            router(content, shared, Message::Actions).on_edit_cancel("location", Message::Cancel);
         let mut tree = Tree::new(&router as &dyn Widget<Message, iced::Theme, ()>);
         let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
         let node = router.layout(&mut tree, &(), &limits);
-        router.operate(&mut tree, Layout::new(&node), &(), &mut focusable::focus::<()>("location".into()));
+        router.operate(
+            &mut tree,
+            Layout::new(&node),
+            &(),
+            &mut focusable::focus::<()>("location".into()),
+        );
         (router, tree)
     }
 
-    fn send(router: &mut TestRouter, tree: &mut Tree, event: Event, cursor: mouse::Cursor) -> (Vec<Message>, bool) {
+    fn send(
+        router: &mut TestRouter,
+        tree: &mut Tree,
+        event: Event,
+        cursor: mouse::Cursor,
+    ) -> (Vec<Message>, bool) {
         let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
         let node = router.layout(tree, &(), &layout::Limits::new(Size::ZERO, bounds.size()));
         let mut messages = Vec::new();
         let mut shell = Shell::new(&mut messages);
-        router.update(tree, &event, Layout::new(&node), cursor, &(),
-            &mut iced::advanced::clipboard::Null, &mut shell, &bounds);
+        router.update(
+            tree,
+            &event,
+            Layout::new(&node),
+            cursor,
+            &(),
+            &mut iced::advanced::clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
         let captured = shell.is_event_captured();
         (messages, captured)
     }
@@ -797,40 +960,68 @@ mod widget_tests {
 
     #[test]
     fn editable_custom_modified_enter_runs_before_submit_guard() {
-        let (mut router, mut tree) = fixture(r#"{
+        let (mut router, mut tree) = fixture(
+            r#"{
             version: 1, chord_timeout_ms: 1000, defaults: [],
             custom: [{action: "theme.mode-toggle", chord: ["Ctrl+Enter"],
                 scope: "global", repeat: "ignore", allow_in_editable: true}]
-        }"#);
-        let (messages, captured) = send(&mut router, &mut tree,
-            enter(keyboard::Modifiers::CTRL), mouse::Cursor::Unavailable);
-        assert_eq!(messages, [Message::Actions(vec![cosmix_actions::theme::MODE_TOGGLE])]);
+        }"#,
+        );
+        let (messages, captured) = send(
+            &mut router,
+            &mut tree,
+            enter(keyboard::Modifiers::CTRL),
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(
+            messages,
+            [Message::Actions(vec![cosmix_actions::theme::MODE_TOGGLE])]
+        );
         assert!(captured);
     }
 
     #[test]
     fn only_unhandled_modified_enter_is_suppressed() {
-        let (mut router, mut tree) = fixture(r#"{
+        let (mut router, mut tree) = fixture(
+            r#"{
             version: 1, chord_timeout_ms: 1000, defaults: [], custom: []
-        }"#);
-        let (messages, captured) = send(&mut router, &mut tree,
-            enter(keyboard::Modifiers::CTRL), mouse::Cursor::Unavailable);
+        }"#,
+        );
+        let (messages, captured) = send(
+            &mut router,
+            &mut tree,
+            enter(keyboard::Modifiers::CTRL),
+            mouse::Cursor::Unavailable,
+        );
         assert!(messages.is_empty());
         assert!(captured);
-        assert_eq!(send(&mut router, &mut tree,
-            enter(keyboard::Modifiers::empty()), mouse::Cursor::Unavailable).0,
-            [Message::Submit]);
+        assert_eq!(
+            send(
+                &mut router,
+                &mut tree,
+                enter(keyboard::Modifiers::empty()),
+                mouse::Cursor::Unavailable
+            )
+            .0,
+            [Message::Submit]
+        );
     }
 
     #[test]
     fn modified_enter_can_start_an_editable_custom_chord() {
-        let (mut router, mut tree) = fixture(r#"{
+        let (mut router, mut tree) = fixture(
+            r#"{
             version: 1, chord_timeout_ms: 1000, defaults: [],
             custom: [{action: "theme.mode-toggle", chord: ["Ctrl+Enter", "Ctrl+K"],
                 scope: "global", repeat: "ignore", allow_in_editable: true}]
-        }"#);
-        let (messages, captured) = send(&mut router, &mut tree,
-            enter(keyboard::Modifiers::CTRL), mouse::Cursor::Unavailable);
+        }"#,
+        );
+        let (messages, captured) = send(
+            &mut router,
+            &mut tree,
+            enter(keyboard::Modifiers::CTRL),
+            mouse::Cursor::Unavailable,
+        );
         assert!(messages.is_empty());
         assert!(captured);
         assert!(router.shared.lock().unwrap().state.deadline().is_some());
@@ -838,20 +1029,51 @@ mod widget_tests {
 
     #[test]
     fn outside_press_cancels_before_child_messages_but_inside_press_does_not() {
-        let (mut router, mut tree) = fixture(r#"{
+        let (mut router, mut tree) = fixture(
+            r#"{
             version: 1, chord_timeout_ms: 1000, defaults: [], custom: []
-        }"#);
+        }"#,
+        );
         let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
-        let inside = send(&mut router, &mut tree, press.clone(),
-            mouse::Cursor::Available(iced::Point::new(10.0, 10.0))).0;
+        let inside = send(
+            &mut router,
+            &mut tree,
+            press.clone(),
+            mouse::Cursor::Available(iced::Point::new(10.0, 10.0)),
+        )
+        .0;
         assert!(!inside.contains(&Message::Cancel));
-        let node = router.layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)));
-        let other = Layout::new(&node).children().nth(1).unwrap().bounds().center();
-        assert_eq!(send(&mut router, &mut tree, press.clone(), mouse::Cursor::Available(other)).0,
-            [Message::Cancel, Message::OtherEdit]);
+        let node = router.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
+        let other = Layout::new(&node)
+            .children()
+            .nth(1)
+            .unwrap()
+            .bounds()
+            .center();
+        assert_eq!(
+            send(
+                &mut router,
+                &mut tree,
+                press.clone(),
+                mouse::Cursor::Available(other)
+            )
+            .0,
+            [Message::Cancel, Message::OtherEdit]
+        );
         // A press on blank chrome/divider has no child action to dismiss for us.
-        assert_eq!(send(&mut router, &mut tree, press,
-            mouse::Cursor::Available(iced::Point::new(290.0, 99.0))).0,
-            [Message::Cancel]);
+        assert_eq!(
+            send(
+                &mut router,
+                &mut tree,
+                press,
+                mouse::Cursor::Available(iced::Point::new(290.0, 99.0))
+            )
+            .0,
+            [Message::Cancel]
+        );
     }
 }

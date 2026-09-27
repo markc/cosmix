@@ -46,15 +46,17 @@ use iced_tiny_skia::Renderer;
 
 use cosmix_actions::{ActionId, Keymap};
 use cosmix_design::{Mode, Scheme};
-use cosmix_dopus_core::{ConfigFile, ConfirmAnswer, CoreEvent, DOpusConfig, DopusCore, PaneId, SortColumn, VisibleRow};
+use cosmix_dopus_core::{
+    ConfigFile, ConfirmAnswer, CoreEvent, DOpusConfig, DopusCore, PaneId, SortColumn, VisibleRow,
+};
 
 use crate::bus::{self, BusHandle, Delivery};
 use crate::dirs::AppDirs;
 use crate::icons::{self, Icons};
 use crate::keys::{self, ModalKey};
 use crate::theme::{self, Theme};
-use crate::verbs::{self, ActionRow, ServerMeta, Served};
-use crate::view::{self, dialogs, rows, Look};
+use crate::verbs::{self, ActionRow, Served, ServerMeta};
+use crate::view::{self, Look, dialogs, rows};
 
 /// The Wayland application id.
 pub const APP_ID: &str = "dev.cosmix.dopus";
@@ -188,9 +190,13 @@ pub fn run(
                 return bus::forward_open(noded_url, service, paths)
                     .map_err(|e| anyhow::anyhow!("forwarding to the running dopus: {e}"));
             }
-            anyhow::bail!("the Bus name `{service}` is taken, but nothing answers dopus.ping on it");
+            anyhow::bail!(
+                "the Bus name `{service}` is taken, but nothing answers dopus.ping on it"
+            );
         }
-        Err(bus::StartError::Rejected(message)) => anyhow::bail!("noded refused registration as `{service}`: {message}"),
+        Err(bus::StartError::Rejected(message)) => {
+            anyhow::bail!("noded refused registration as `{service}`: {message}")
+        }
         // A file manager works standalone: no broker, no Bus.
         Err(bus::StartError::Unreachable(message)) => {
             tracing::info!("running without a Bus: {message}");
@@ -201,7 +207,9 @@ pub fn run(
     let keymap_path = dirs.as_ref().map(|d| d.keymap_file());
     let router = keys::initial(keymap_path.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let action_table = {
-        let router = router.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let router = router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         action_table(&router.keymap)
     };
 
@@ -244,8 +252,7 @@ pub fn run(
     // Bus exists (a no-broker windowed run still hears the core — law 2).
     // With no Bus, deliveries drain an always-empty channel.
     let streams = Streams {
-        deliveries: deliveries
-            .unwrap_or_else(|| iced::futures::channel::mpsc::unbounded().1),
+        deliveries: deliveries.unwrap_or_else(|| iced::futures::channel::mpsc::unbounded().1),
         core_events: pump(core_events),
         heartbeat: heartbeat(),
     };
@@ -254,28 +261,32 @@ pub fn run(
     }
 
     let state = std::cell::RefCell::new(Some(app));
-    iced::application(move || state.borrow_mut().take().expect("iced boots once"), Dopus::update, Dopus::view)
-        .executor::<SingleThread>()
-        .title(Dopus::title)
-        .subscription(Dopus::subscription)
-        .theme(|app: &Dopus| app.theme.iced_theme())
-        .style(|app: &Dopus, _| iced::theme::Style {
-            background_color: app.theme.tokens.surface,
-            text_color: app.theme.tokens.text,
-        })
-        .default_font(ui_font)
-        .window(iced::window::Settings {
-            size: Size::new(980.0, 640.0),
-            min_size: Some(Size::new(420.0, 240.0)),
-            exit_on_close_request: false,
-            platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: APP_ID.to_owned(),
-                ..Default::default()
-            },
+    iced::application(
+        move || state.borrow_mut().take().expect("iced boots once"),
+        Dopus::update,
+        Dopus::view,
+    )
+    .executor::<SingleThread>()
+    .title(Dopus::title)
+    .subscription(Dopus::subscription)
+    .theme(|app: &Dopus| app.theme.iced_theme())
+    .style(|app: &Dopus, _| iced::theme::Style {
+        background_color: app.theme.tokens.surface,
+        text_color: app.theme.tokens.text,
+    })
+    .default_font(ui_font)
+    .window(iced::window::Settings {
+        size: Size::new(980.0, 640.0),
+        min_size: Some(Size::new(420.0, 240.0)),
+        exit_on_close_request: false,
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: APP_ID.to_owned(),
             ..Default::default()
-        })
-        .run()
-        .map_err(|e| anyhow::anyhow!("window: {e}"))
+        },
+        ..Default::default()
+    })
+    .run()
+    .map_err(|e| anyhow::anyhow!("window: {e}"))
 }
 
 /// The per-app theme override path, when the directory exists to hold one.
@@ -311,10 +322,12 @@ fn heartbeat() -> UnboundedReceiver<Instant> {
     let (tx, rx) = iced::futures::channel::mpsc::unbounded();
     std::thread::Builder::new()
         .name("dopus-heartbeat".to_owned())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if tx.unbounded_send(Instant::now()).is_err() {
-                return;
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if tx.unbounded_send(Instant::now()).is_err() {
+                    return;
+                }
             }
         })
         .expect("spawning the heartbeat thread");
@@ -363,7 +376,9 @@ fn streams() -> impl iced::futures::Stream<Item = Msg> {
         )
         .boxed(),
         None => {
-            tracing::error!("dopus: the delivery streams were already taken; the window will not hear the core");
+            tracing::error!(
+                "dopus: the delivery streams were already taken; the window will not hear the core"
+            );
             iced::futures::stream::empty().boxed()
         }
     }
@@ -377,7 +392,10 @@ fn action_table(keymap: &Keymap) -> Vec<ActionRow> {
 impl Dopus {
     fn title(&self) -> String {
         let pane = self.core.pane(self.core.active());
-        format!("{} — CosMix DOpus", cosmix_dopus_core::sanitise_display_path(&pane.path))
+        format!(
+            "{} — CosMix DOpus",
+            cosmix_dopus_core::sanitise_display_path(&pane.path)
+        )
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
@@ -414,7 +432,11 @@ impl Dopus {
                 Task::none()
             }
             Msg::LocationSubmit(pane) => {
-                let text = self.editing.as_ref().map(|(_, text)| text.clone()).unwrap_or_default();
+                let text = self
+                    .editing
+                    .as_ref()
+                    .map(|(_, text)| text.clone())
+                    .unwrap_or_default();
                 self.stop_editing();
                 // An empty submit is a cancel: the bar was cleared, not
                 // aimed anywhere — navigating to "" would be a permanent
@@ -425,7 +447,8 @@ impl Dopus {
                 // Leading `~` expands to home; a file path lands on its
                 // parent (verbs::navigable); the core re-lists and
                 // status-lines a path it cannot read.
-                self.core.navigate(pane, verbs::navigable(crate::dirs::expand_tilde(&text)));
+                self.core
+                    .navigate(pane, verbs::navigable(crate::dirs::expand_tilde(&text)));
                 Task::none()
             }
             Msg::LocationCancel => {
@@ -436,7 +459,8 @@ impl Dopus {
                 self.stop_editing();
                 // Law 7: persistence derives from core state only — the core
                 // settles the changed ratio through its own debounce.
-                self.core.set_split_ratio(ratio.clamp(view::panes::SPLIT_MIN, view::panes::SPLIT_MAX));
+                self.core
+                    .set_split_ratio(ratio.clamp(view::panes::SPLIT_MIN, view::panes::SPLIT_MAX));
                 Task::none()
             }
             Msg::SidebarWidth(sidebar, width) => {
@@ -477,7 +501,10 @@ impl Dopus {
 
     /// Refresh the per-pane view snapshots (listings + the split ratio).
     fn refresh_panes(&mut self) {
-        self.rows = [self.core.visible_rows(PaneId::Left), self.core.visible_rows(PaneId::Right)];
+        self.rows = [
+            self.core.visible_rows(PaneId::Left),
+            self.core.visible_rows(PaneId::Right),
+        ];
         self.split_ratio = self.core.config_snapshot().split_ratio;
     }
 
@@ -619,9 +646,18 @@ impl Dopus {
     fn on_dialog(&mut self, msg: DialogMsg) -> Task<Msg> {
         match msg {
             DialogMsg::Answer(yes) => {
-                let Some(dialogs::Dialog::Confirm { token, .. }) = &self.dialog else { return Task::none() };
+                let Some(dialogs::Dialog::Confirm { token, .. }) = &self.dialog else {
+                    return Task::none();
+                };
                 let token = *token;
-                self.core.confirm(token, if yes { ConfirmAnswer::Yes } else { ConfirmAnswer::No });
+                self.core.confirm(
+                    token,
+                    if yes {
+                        ConfirmAnswer::Yes
+                    } else {
+                        ConfirmAnswer::No
+                    },
+                );
                 self.advance_dialog()
             }
             DialogMsg::Input(text) => {
@@ -658,7 +694,9 @@ impl Dopus {
     /// submit and dismiss respectively. A prompt only submits while its live
     /// validation is satisfied — an invalid name is not a resolution.
     fn on_dialog_key(&mut self, key: ModalKey) -> Task<Msg> {
-        let Some(dialog) = &self.dialog else { return Task::none() };
+        let Some(dialog) = &self.dialog else {
+            return Task::none();
+        };
         match (dialog, key) {
             (dialogs::Dialog::Confirm { token, .. }, ModalKey::Confirm) => {
                 let token = *token;
@@ -733,7 +771,10 @@ impl Dopus {
             service: self.service.clone(),
             headless: false,
             location_focus_available: self.dialog.is_none() && !self.quitting,
-            config_path: self.dirs.as_ref().map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
+            config_path: self
+                .dirs
+                .as_ref()
+                .map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
             theme_scheme: self.theme.scheme.name().to_owned(),
             theme_mode: self.theme.mode.name().to_owned(),
             actions: self.action_table.clone(),
@@ -742,20 +783,36 @@ impl Dopus {
 
     /// Answer one Bus command through the shared serving layer.
     fn serve(&mut self, command: &bus::Command) -> Task<Msg> {
-        let Some(bus) = &self.bus else { return Task::none() };
+        let Some(bus) = &self.bus else {
+            return Task::none();
+        };
         let handle = bus.clone();
         let meta = self.server_meta();
         let info = cosmix_buildinfo::build_info!();
         let mut tasks = Vec::new();
         for served in verbs::serve_command(command, &mut self.core, &meta, &info) {
             match served {
-                Served::ToggleSidebar { id, sidebar, action } => {
-                    self.stop_editing();
-                    self.core.toggle_sidebar(sidebar);
-                    handle.respond(id, 0, serde_json::to_string(&verbs::ActionReply { id: action, ok: true, result: None }).unwrap_or_default());
+                Served::ToggleSidebar {
+                    id,
+                    sidebar,
+                    action,
+                } => {
+                    self.toggle_sidebar(sidebar);
+                    handle.respond(
+                        id,
+                        0,
+                        serde_json::to_string(&verbs::ActionReply {
+                            id: action,
+                            ok: true,
+                            result: None,
+                        })
+                        .unwrap_or_default(),
+                    );
                 }
                 Served::Reply { id, rc, body } => handle.respond(id, rc, body),
-                Served::LocationFocus { id, pane } => tasks.push(self.serve_location_focus(id, pane)),
+                Served::LocationFocus { id, pane } => {
+                    tasks.push(self.serve_location_focus(id, pane))
+                }
                 Served::ThemeSet { id, scheme, mode } => {
                     let result = self.select_theme(scheme.as_deref(), mode.as_deref());
                     self.theme_reply(id, result);
@@ -767,7 +824,11 @@ impl Dopus {
                     let result = match action {
                         verbs::ThemeAction::Scheme(name) => self.select_theme(Some(&name), None),
                         verbs::ThemeAction::ModeToggle => {
-                            let mode = match self.theme_override.map(|(_, m)| m).unwrap_or(self.theme.mode) {
+                            let mode = match self
+                                .theme_override
+                                .map(|(_, m)| m)
+                                .unwrap_or(self.theme.mode)
+                            {
                                 Mode::Dark => Mode::Light,
                                 _ => Mode::Dark,
                             };
@@ -780,7 +841,8 @@ impl Dopus {
                     handle.respond(
                         id,
                         0,
-                        serde_json::to_string(&verbs::QuitReply { quitting: true }).unwrap_or_default(),
+                        serde_json::to_string(&verbs::QuitReply { quitting: true })
+                            .unwrap_or_default(),
                     );
                     // Quit terminates the batch: the whole Vec is processed
                     // IN ORDER and everything after the FIRST Quit is
@@ -799,17 +861,26 @@ impl Dopus {
     fn serve_location_focus(&mut self, id: u64, pane: PaneId) -> Task<Msg> {
         // Repeated Bus focus must not replace the human's unfinished draft.
         // Switching panes still starts an editor seeded from the new path.
-        let task = if self.editing.as_ref().is_some_and(|(editing_pane, _)| *editing_pane == pane) {
+        let task = if self
+            .editing
+            .as_ref()
+            .is_some_and(|(editing_pane, _)| *editing_pane == pane)
+        {
             Task::none()
         } else {
             self.begin_edit(pane)
         };
         if let Some(bus) = &self.bus {
-            bus.respond(id, 0, serde_json::to_string(&verbs::ActionReply {
-                id: cosmix_actions::location::FOCUS.to_string(),
-                ok: true,
-                result: None,
-            }).unwrap_or_default());
+            bus.respond(
+                id,
+                0,
+                serde_json::to_string(&verbs::ActionReply {
+                    id: cosmix_actions::location::FOCUS.to_string(),
+                    ok: true,
+                    result: None,
+                })
+                .unwrap_or_default(),
+            );
         }
         task
     }
@@ -849,7 +920,11 @@ impl Dopus {
         let mut tasks = Vec::new();
         for action in actions {
             if *action == cosmix_actions::theme::MODE_TOGGLE {
-                let mode = match self.theme_override.map(|(_, m)| m).unwrap_or(self.theme.mode) {
+                let mode = match self
+                    .theme_override
+                    .map(|(_, m)| m)
+                    .unwrap_or(self.theme.mode)
+                {
                     Mode::Dark => Mode::Light,
                     _ => Mode::Dark,
                 };
@@ -865,7 +940,7 @@ impl Dopus {
             }
             match verbs::apply_action(*action, &mut self.core) {
                 Ok(verbs::Applied::Done) => {}
-                Ok(verbs::Applied::ToggleSidebar(sidebar)) => { self.stop_editing(); self.core.toggle_sidebar(sidebar); }
+                Ok(verbs::Applied::ToggleSidebar(sidebar)) => self.toggle_sidebar(sidebar),
                 Ok(verbs::Applied::LocationFocus(pane)) => tasks.push(self.begin_edit(pane)),
                 // Unreachable from this path (the theme pre-filter above
                 // consumed every theme id) but the shared layer must stay
@@ -875,7 +950,11 @@ impl Dopus {
                     let _ = match action {
                         verbs::ThemeAction::Scheme(name) => self.select_theme(Some(&name), None),
                         verbs::ThemeAction::ModeToggle => {
-                            let mode = match self.theme_override.map(|(_, m)| m).unwrap_or(self.theme.mode) {
+                            let mode = match self
+                                .theme_override
+                                .map(|(_, m)| m)
+                                .unwrap_or(self.theme.mode)
+                            {
                                 Mode::Dark => Mode::Light,
                                 _ => Mode::Dark,
                             };
@@ -906,7 +985,10 @@ impl Dopus {
     }
 
     fn set_override(&mut self, scheme: Option<Scheme>, mode: Option<Mode>) {
-        let current = self.theme_override.take().unwrap_or((self.theme.scheme, self.theme.mode));
+        let current = self
+            .theme_override
+            .take()
+            .unwrap_or((self.theme.scheme, self.theme.mode));
         self.theme_override = Some((scheme.unwrap_or(current.0), mode.unwrap_or(current.1)));
         self.reload_theme();
     }
@@ -914,7 +996,10 @@ impl Dopus {
     /// Re-resolve the theme from the files plus the in-session override, and
     /// re-tint the icons to the new text token.
     fn reload_theme(&mut self) {
-        self.theme = theme::resolve_selected(self.theme_override, app_theme_override(self.dirs.as_ref()).as_deref());
+        self.theme = theme::resolve_selected(
+            self.theme_override,
+            app_theme_override(self.dirs.as_ref()).as_deref(),
+        );
         if let Some(note) = self.theme.notes.clone() {
             self.status = Some(format!("Theme: {note}"));
         }
@@ -930,7 +1015,10 @@ impl Dopus {
                 let keymap_path = self.dirs.as_ref().map(|d| d.keymap_file());
                 keys::reload(&self.router, keymap_path.as_deref());
                 {
-                    let router = self.router.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let router = self
+                        .router
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     self.action_table = action_table(&router.keymap);
                 }
             }
@@ -978,6 +1066,7 @@ impl Dopus {
 
     fn look(&self) -> Look {
         Look {
+            small_px: self.theme.small_px,
             tokens: self.theme.tokens,
             chrome: self.theme.chrome,
             ui_font: self.theme.ui_font,
@@ -987,9 +1076,17 @@ impl Dopus {
         }
     }
 
+    fn toggle_sidebar(&mut self, sidebar: cosmix_dopus_core::config::Sidebar) {
+        self.stop_editing();
+        self.core.toggle_sidebar(sidebar);
+    }
+
     fn view(&self) -> Element<'_, Msg, iced::Theme, Renderer> {
         let info = self.status.as_deref().unwrap_or(self.core.info());
-        let editing = self.editing.as_ref().map(|(pane, text)| (*pane, text.as_str()));
+        let editing = self
+            .editing
+            .as_ref()
+            .map(|(pane, text)| (*pane, text.as_str()));
         let content = view::root(
             self.look(),
             &self.icons,
@@ -1005,15 +1102,18 @@ impl Dopus {
             self.dialog.as_ref(),
             self.core.places(),
             self.core.properties(self.core.active()),
-            self.core.sidebar(cosmix_dopus_core::config::Sidebar::Places),
-            self.core.sidebar(cosmix_dopus_core::config::Sidebar::Properties),
+            self.core
+                .sidebar(cosmix_dopus_core::config::Sidebar::Places),
+            self.core
+                .sidebar(cosmix_dopus_core::config::Sidebar::Properties),
         );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops
         // keys under load — the ced/term rule). While a dialog is up it
         // resolves nothing (the modal scope) and hands Enter/Escape to the
         // dialog instead.
-        let mut routed = keys::router(content, self.router.clone(), Msg::Actions).modal(self.dialog.is_some());
+        let mut routed =
+            keys::router(content, self.router.clone(), Msg::Actions).modal(self.dialog.is_some());
         if self.dialog.is_some() {
             routed = routed.on_modal_key(Msg::DialogKey);
         } else if let Some((pane, _)) = self.editing.as_ref() {
@@ -1044,6 +1144,61 @@ fn focus_prompt() -> Task<Msg> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sidebar_bus_actions_reach_the_window_and_refuse_headless_or_busy() {
+        use cosmix_dopus_core::config::Sidebar;
+        let (_dir, mut app) = fixture();
+        let info = cosmix_buildinfo::build_info!();
+        for (action, sidebar) in [
+            (cosmix_actions::view::TOGGLE_PLACES, Sidebar::Places),
+            (cosmix_actions::view::TOGGLE_PROPERTIES, Sidebar::Properties),
+        ] {
+            let command = bus::Command {
+                id: 43,
+                verb: "dopus.action".into(),
+                body: format!(r#"{{"id":"{action}","pane":"right"}}"#),
+                caller_key: "mesh:caller@example".into(),
+            };
+            let meta = app.server_meta();
+            let before = app.core.sidebar(sidebar);
+            let served = verbs::serve_command(&command, &mut app.core, &meta, &info);
+            let [
+                Served::ToggleSidebar {
+                    sidebar: target, ..
+                },
+            ] = served.as_slice()
+            else {
+                panic!("missing window performer")
+            };
+            assert_eq!(*target, sidebar);
+            assert_eq!(
+                app.core.sidebar(sidebar),
+                before,
+                "dispatch alone must not mutate"
+            );
+            app.toggle_sidebar(*target);
+            assert_eq!(app.core.sidebar(sidebar).open, !before.open);
+            assert_eq!(app.core.active(), PaneId::Left);
+            for headless in [true, false] {
+                let mut meta = app.server_meta();
+                meta.headless = headless;
+                meta.location_focus_available = false;
+                let before = app.core.sidebar(sidebar);
+                let served = verbs::serve_command(&command, &mut app.core, &meta, &info);
+                let [Served::Reply { rc: 10, body, .. }] = served.as_slice() else {
+                    panic!("must refuse")
+                };
+                let refusal: verbs::Refusal = serde_json::from_str(body).unwrap();
+                assert_eq!(refusal.error_code, "UNAVAILABLE");
+                assert_eq!(
+                    refusal.reason.as_deref(),
+                    Some(if headless { "headless" } else { "window_busy" })
+                );
+                assert_eq!(app.core.sidebar(sidebar), before);
+            }
+        }
+    }
+
     fn fixture() -> (tempfile::TempDir, Dopus) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = DOpusConfig::default();
@@ -1057,11 +1212,14 @@ mod tests {
             editing: None,
             router: keys::initial(None).unwrap(),
             icons: Icons::new(),
-            theme: theme::resolve_selection(&theme::Selection {
-                scheme: Scheme::default(),
-                mode: Mode::default(),
-                design_source: None,
-            }, Vec::new()),
+            theme: theme::resolve_selection(
+                &theme::Selection {
+                    scheme: Scheme::default(),
+                    mode: Mode::default(),
+                    design_source: None,
+                },
+                Vec::new(),
+            ),
             theme_override: None,
             status: None,
             dialog: None,
@@ -1118,7 +1276,10 @@ mod tests {
         let _ = app.begin_edit(PaneId::Left);
         let _ = app.update(Msg::LocationInput("~/unfinished draft".into()));
         let _ = app.serve_location_focus(1, PaneId::Right);
-        assert_eq!(app.editing, Some((PaneId::Right, pane_path_text(&app.core, PaneId::Right))));
+        assert_eq!(
+            app.editing,
+            Some((PaneId::Right, pane_path_text(&app.core, PaneId::Right)))
+        );
         assert_eq!(app.core.active(), PaneId::Right);
         assert!(app.router.lock().unwrap().focus_editable);
     }
@@ -1141,7 +1302,10 @@ mod tests {
         assert_eq!(*id, 42);
         assert_eq!(*pane, PaneId::Right);
         let _ = app.serve_location_focus(*id, *pane);
-        assert_eq!(app.editing, Some((PaneId::Right, pane_path_text(&app.core, PaneId::Right))));
+        assert_eq!(
+            app.editing,
+            Some((PaneId::Right, pane_path_text(&app.core, PaneId::Right)))
+        );
         assert!(app.router.lock().unwrap().focus_editable);
         assert_eq!(app.core.active(), PaneId::Right);
 
@@ -1149,13 +1313,21 @@ mod tests {
             let mut meta = app.server_meta();
             meta.headless = headless;
             meta.location_focus_available = available;
-            let listed = bus::Command { verb: "dopus.actions.list".into(), body: "{}".into(), ..command.clone() };
+            let listed = bus::Command {
+                verb: "dopus.actions.list".into(),
+                body: "{}".into(),
+                ..command.clone()
+            };
             let served = verbs::serve_command(&listed, &mut app.core, &meta, &info);
             let [Served::Reply { rc: 0, body, .. }] = served.as_slice() else {
                 panic!("actions.list must reply");
             };
             let reply: verbs::ActionsReply = serde_json::from_str(body).unwrap();
-            let row = reply.actions.iter().find(|row| row.id == "location.focus").unwrap();
+            let row = reply
+                .actions
+                .iter()
+                .find(|row| row.id == "location.focus")
+                .unwrap();
             assert_eq!(row.enabled, !headless && available);
             if !row.enabled {
                 let served = verbs::serve_command(&command, &mut app.core, &meta, &info);
@@ -1164,10 +1336,16 @@ mod tests {
                 };
                 let refusal: verbs::Refusal = serde_json::from_str(body).unwrap();
                 assert_eq!(refusal.error_code, verbs::code::UNAVAILABLE);
-                assert_eq!(refusal.reason.as_deref(), Some(if headless { "headless" } else { "window_busy" }));
+                assert_eq!(
+                    refusal.reason.as_deref(),
+                    Some(if headless { "headless" } else { "window_busy" })
+                );
             }
         }
-        app.dialog = Some(dialogs::Dialog::Confirm { token: 1, message: "Confirm".into() });
+        app.dialog = Some(dialogs::Dialog::Confirm {
+            token: 1,
+            message: "Confirm".into(),
+        });
         assert!(!app.server_meta().location_focus_available);
         app.dialog = None;
         app.quitting = true;

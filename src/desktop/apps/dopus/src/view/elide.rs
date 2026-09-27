@@ -94,7 +94,9 @@ pub struct Label {
     pub color: iced::Color,
 }
 impl<M> iced::advanced::Widget<M, iced::Theme, Renderer> for Label {
-    fn tag(&self) -> iced::advanced::widget::tree::Tag { iced::advanced::widget::tree::Tag::of::<Para>() }
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<Para>()
+    }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Shrink)
     }
@@ -146,5 +148,59 @@ impl<M> iced::advanced::Widget<M, iced::Theme, Renderer> for Label {
 impl<'a, M: 'a> From<Label> for Element<'a, M, iced::Theme, Renderer> {
     fn from(label: Label) -> Self {
         Element::new(label)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn width(s: &str) -> f32 {
+        s.graphemes(true).count() as f32
+    }
+    #[test]
+    fn short_names_are_untouched() {
+        for name in ["a.txt", "Documents", ".profile", ""] {
+            assert_eq!(middle(name, 40.0, width), name);
+        }
+    }
+    #[test]
+    fn extensions_and_graphemes_survive_elision() {
+        for name in [
+            "a-very-long-filename.tar.gz",
+            "e\u{301}e\u{301}e\u{301}-👨\u{200d}👩\u{200d}👧.png",
+            "long-directory-name",
+        ] {
+            let result = middle(name, 8.0, width);
+            assert!(width(&result) <= 8.0);
+            assert!(result.contains('…'));
+            assert!(!result.starts_with('\u{301}'));
+            if name.ends_with(".png") {
+                assert!(result.ends_with(".png"));
+            }
+            if name.ends_with(".gz") {
+                assert!(result.ends_with(".gz"));
+            }
+            if name.ends_with("name") {
+                assert!(result.ends_with('e'));
+            }
+        }
+    }
+    #[test]
+    fn tiny_or_invalid_widths_are_safe() {
+        assert_eq!(middle("long-name.md", 1.0, width), "…");
+        for budget in [0.0, 0.5, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(middle("long-name.md", budget, width), "");
+        }
+    }
+    #[test]
+    fn long_extension_has_a_bounded_tail_and_search() {
+        let mut calls = 0;
+        let result = middle("report.this-extension-is-far-too-long", 18.0, |s| {
+            calls += 1;
+            width(s)
+        });
+        assert!(result.ends_with(".ar-too-long"));
+        assert!(calls <= 32);
+        assert!(width(&result) <= 18.0);
     }
 }

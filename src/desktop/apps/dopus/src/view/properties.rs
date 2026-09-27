@@ -21,12 +21,16 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
             fields.push(("Contents", summary));
             path
         }
-        Properties::Entry { entry, metadata } => {
+        Properties::Entry {
+            entry,
+            count_pending,
+            metadata,
+        } => {
             let size = if entry.is_dir {
                 entry
                     .child_count
                     .map(|n| format!("{n} {}", if n == 1 { "item" } else { "items" }))
-                    .unwrap_or_else(|| "…".into())
+                    .unwrap_or_else(|| if count_pending { "…" } else { "Unavailable" }.into())
             } else {
                 entry
                     .size
@@ -61,6 +65,10 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
                     }
                 }
             }
+            fields.push((
+                "Path",
+                cosmix_dopus_core::sanitise_display_path(&entry.path),
+            ));
             entry.name
         }
     };

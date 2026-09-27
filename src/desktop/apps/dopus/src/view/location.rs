@@ -36,7 +36,12 @@ pub fn location_id(pane: PaneId) -> &'static str {
 
 /// The bar above one pane's listing. `editing` is `Some(text)` when THIS
 /// pane's bar is in edit mode (the real path text, not sanitised).
-pub fn bar<'a>(look: Look, pane: &'a PaneModel, pane_id: PaneId, editing: Option<&'a str>) -> Element<'a, Msg> {
+pub fn bar<'a>(
+    look: Look,
+    pane: &'a PaneModel,
+    pane_id: PaneId,
+    editing: Option<&'a str>,
+) -> Element<'a, Msg> {
     match editing {
         Some(text) => editor(look, pane_id, text),
         None => display(look, pane, pane_id),
@@ -47,13 +52,16 @@ pub fn bar<'a>(look: Look, pane: &'a PaneModel, pane_id: PaneId, editing: Option
 fn display(look: Look, pane: &PaneModel, pane_id: PaneId) -> Element<'static, Msg> {
     let path = cosmix_dopus_core::sanitise_display_path(&pane.path);
     container(
-        button(
-            iced::widget::text(path)
-                .font(look.mono_font)
-                .size(look.mono_px * 0.9)
-                .color(look.chrome.secondary_text),
-        )
-        .padding([2, 6])
+        button(super::elide::Label {
+            text: path,
+            font: look.mono_font,
+            px: look.mono_px * 0.9,
+            color: look.chrome.secondary_text,
+        })
+        .padding([
+            look.chrome.edge * 2.0,
+            look.chrome.small + look.chrome.edge * 2.0,
+        ])
         .width(Length::Fill)
         .on_press(Msg::LocationEdit(pane_id))
         .style(bar_look(&look)),
@@ -69,7 +77,10 @@ fn editor(look: Look, pane_id: PaneId, text: &str) -> Element<'_, Msg> {
         .on_input(Msg::LocationInput)
         .on_submit(Msg::LocationSubmit(pane_id))
         .width(Length::Fill)
-        .padding(iced::Padding::from([2, 6]))
+        .padding(iced::Padding::from([
+            look.chrome.edge * 2.0,
+            look.chrome.small + look.chrome.edge * 2.0,
+        ]))
         .size(look.mono_px * 0.9)
         .style(field_look(&look));
     field.into()
@@ -78,6 +89,7 @@ fn editor(look: Look, pane_id: PaneId, text: &str) -> Element<'_, Msg> {
 /// The at-rest bar, styled as a button that reads like the editor it opens:
 /// the same `input` background and `border`, hovered.
 fn bar_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
+    let edge = look.chrome.edge;
     let (background, border, text_color, ring, radius) = (
         look.tokens.input,
         look.tokens.border,
@@ -93,7 +105,7 @@ fn bar_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::Sty
                 button::Status::Hovered | button::Status::Pressed => ring,
                 _ => border,
             },
-            width: 1.0,
+            width: edge,
             radius: radius.into(),
         },
         ..Default::default()
@@ -106,7 +118,9 @@ fn bar_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::Sty
 /// reads as a button until clicked.
 fn field_look(
     look: &Look,
-) -> impl Fn(&iced::Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style + 'static {
+) -> impl Fn(&iced::Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style + 'static
+{
+    let edge = look.chrome.edge;
     let (background, border, text_color, muted, ring, selection, radius) = (
         look.tokens.input,
         look.tokens.border,
@@ -123,7 +137,7 @@ fn field_look(
                 iced::widget::text_input::Status::Focused { .. } => ring,
                 _ => border,
             },
-            width: 1.0,
+            width: edge,
             radius: radius.into(),
         },
         icon: muted,

@@ -3134,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-dopus"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3160,7 +3160,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-dopus-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "cosmix-lib-config",

@@ -21,7 +21,7 @@ use cosmix_dopus_core::{ConfigFile, ConfirmAnswer, CoreEvent, DOpusConfig, Dopus
 use crate::bus::{self, Delivery};
 use crate::dirs::AppDirs;
 use crate::keys;
-use crate::verbs::{self, ServerMeta, Served};
+use crate::verbs::{self, Served, ServerMeta};
 
 /// The drain cadence: bounds how long a worker reply waits (law 2) and is
 /// the tick period (law 1).
@@ -60,7 +60,8 @@ pub fn answer_derived(core: &mut DopusCore, events: Vec<CoreEvent>, log: impl Fn
 /// Lock helper that recovers from a poisoned guard (a panicked drainer must
 /// not take the whole process down with it).
 fn lock(core: &Mutex<DopusCore>) -> MutexGuard<'_, DopusCore> {
-    core.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    core.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Run headless until `dopus.quit`. `paths` are the argv `dopus.open` PATHs:
@@ -82,7 +83,9 @@ pub fn run(
         service: service.to_owned(),
         headless: true,
         location_focus_available: false,
-        config_path: dirs.as_ref().map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
+        config_path: dirs
+            .as_ref()
+            .map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
         // A headless process paints nothing and resolves no theme, so
         // `dopus.state` reports empty theme_scheme/theme_mode on purpose;
         // theme.set is refused below.
@@ -94,29 +97,32 @@ pub fn run(
     let (mut core, receiver) = DopusCore::new(config, config_file);
     verbs::apply_open_paths(&mut core, paths);
     let core = Arc::new(Mutex::new(core));
-    let (bus, mut deliveries) = bus::spawn(service, noded_url).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (bus, mut deliveries) =
+        bus::spawn(service, noded_url).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // The drainer: laws 1-4 on one thread.
     {
         let core = Arc::clone(&core);
         std::thread::Builder::new()
             .name("dopus-headless-core".to_owned())
-            .spawn(move || loop {
-                // Recv OUTSIDE the lock: a parked recv must never hold the
-                // core hostage to `dopus.state`/`dopus.action` callers.
-                let event = match receiver.recv_timeout(DRAIN_TICK) {
-                    Ok(event) => Some(event),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                };
-                let derived = {
-                    let mut core = lock(&core);
-                    match event {
-                        Some(event) => core.on_event(event),
-                        None => core.tick(Instant::now()),
-                    }
-                };
-                answer_derived(&mut lock(&core), derived, |line| tracing::info!("{line}"));
+            .spawn(move || {
+                loop {
+                    // Recv OUTSIDE the lock: a parked recv must never hold the
+                    // core hostage to `dopus.state`/`dopus.action` callers.
+                    let event = match receiver.recv_timeout(DRAIN_TICK) {
+                        Ok(event) => Some(event),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    };
+                    let derived = {
+                        let mut core = lock(&core);
+                        match event {
+                            Some(event) => core.on_event(event),
+                            None => core.tick(Instant::now()),
+                        }
+                    };
+                    answer_derived(&mut lock(&core), derived, |line| tracing::info!("{line}"));
+                }
             })
             .expect("spawning the headless core drainer");
     }
@@ -128,14 +134,17 @@ pub fn run(
     tracing::info!("dopus headless as `{service}`");
     runtime.block_on(async {
         while let Some(delivery) = deliveries.next().await {
-            let Delivery::Command(command) = delivery else { continue };
+            let Delivery::Command(command) = delivery else {
+                continue;
+            };
             if command.verb == "dopus.theme.set" {
                 bus.respond(
                     command.id,
                     10,
                     serde_json::to_string(&verbs::Refusal {
                         error_code: verbs::code::UNAVAILABLE.to_owned(),
-                        message: "theme selection needs the windowed app (headless paints nothing)".to_owned(),
+                        message: "theme selection needs the windowed app (headless paints nothing)"
+                            .to_owned(),
                         reason: Some("headless".to_owned()),
                     })
                     .unwrap_or_default(),
@@ -143,21 +152,33 @@ pub fn run(
                 continue;
             }
             let mut quit = false;
-            for served in verbs::serve_command(&command, &mut lock(&core), &meta, &cosmix_buildinfo::build_info!()) {
+            for served in verbs::serve_command(
+                &command,
+                &mut lock(&core),
+                &meta,
+                &cosmix_buildinfo::build_info!(),
+            ) {
                 match served {
                     Served::Reply { id, rc, body } => bus.respond(id, rc, body),
                     Served::ThemeSet { .. } => unreachable!("theme.set was refused above"),
                     // Headless never sees a theme action: serve_command
                     // refuses Applied::Theme UNAVAILABLE before this point
                     // (same posture as the theme.set pre-refusal above).
-                    Served::ThemeAction { .. } => unreachable!("theme actions are refused for headless"),
-                    Served::LocationFocus { .. } => unreachable!("location focus is refused for headless"),
-                    Served::ToggleSidebar { .. } => unreachable!("sidebar toggles are refused for headless"),
+                    Served::ThemeAction { .. } => {
+                        unreachable!("theme actions are refused for headless")
+                    }
+                    Served::LocationFocus { .. } => {
+                        unreachable!("location focus is refused for headless")
+                    }
+                    Served::ToggleSidebar { .. } => {
+                        unreachable!("sidebar toggles are refused for headless")
+                    }
                     Served::Quit { id } => {
                         bus.respond(
                             id,
                             0,
-                            serde_json::to_string(&verbs::QuitReply { quitting: true }).unwrap_or_default(),
+                            serde_json::to_string(&verbs::QuitReply { quitting: true })
+                                .unwrap_or_default(),
                         );
                         quit = true;
                     }

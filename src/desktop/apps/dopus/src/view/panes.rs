@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, row};
 use iced::{Element, Event, Length, Rectangle, Size};
 
 use cosmix_dopus_core::{PaneId, PaneModel, VisibleRow};
@@ -114,10 +114,12 @@ fn pane_header<'a>(
                     },
                     PaneOp::ToggleHidden
                 ),
-                text(cosmix_dopus_core::sanitise_display_path(&pane.path))
-                    .font(look.mono_font)
-                    .size(look.mono_px * 0.9)
-                    .color(caption_color),
+                super::elide::Label {
+                    text: cosmix_dopus_core::sanitise_display_path(&pane.path),
+                    font: look.mono_font,
+                    px: look.mono_px * 0.9,
+                    color: caption_color
+                },
             ]
             .spacing(look.chrome.small)
             .align_y(iced::Alignment::Center),
@@ -387,5 +389,61 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
 impl<'a> From<Divider> for Element<'a, Msg, iced::Theme, Renderer> {
     fn from(divider: Divider) -> Self {
         Element::new(divider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmix_dopus_core::config::Sidebar;
+    #[test]
+    fn divider_geometry_tracks_all_panel_combinations() {
+        let viewport = Rectangle {
+            x: 30.0,
+            y: 0.0,
+            width: 1200.0,
+            height: 700.0,
+        };
+        let t = cosmix_iced_widgets::Tokens::default();
+        for sides in [[0, 0], [150, 0], [0, 150], [240, 190]] {
+            let mut divider = Divider {
+                width: 6.0,
+                edge: 1.0,
+                target: None,
+                sides,
+                border: t.border,
+                accent: t.ring,
+            };
+            let available =
+                viewport.width - sides.iter().filter(|s| **s > 0).count() as f32 * divider.width;
+            let left = viewport.x
+                + available * sides[0] as f32 / 1000.0
+                + if sides[0] > 0 { divider.width } else { 0.0 };
+            let panes = available * (1000 - sides[0] - sides[1]) as f32 / 1000.0 - divider.width;
+            for ratio in [0.1, 0.5, 0.9] {
+                let Msg::Split(actual) =
+                    divider.message_at(left + panes * ratio + divider.width / 2.0, &viewport)
+                else {
+                    panic!("wrong divider")
+                };
+                assert!((actual - ratio).abs() < 0.0001);
+            }
+            divider.target = Some(Sidebar::Places);
+            let Msg::SidebarWidth(Sidebar::Places, width) = divider.message_at(
+                viewport.x + available * 0.2 + divider.width / 2.0,
+                &viewport,
+            ) else {
+                panic!("wrong divider")
+            };
+            assert!((width - 0.2).abs() < 0.0001);
+            divider.target = Some(Sidebar::Properties);
+            let Msg::SidebarWidth(Sidebar::Properties, width) = divider.message_at(
+                viewport.x + viewport.width - available * 0.25 - divider.width / 2.0,
+                &viewport,
+            ) else {
+                panic!("wrong divider")
+            };
+            assert!((width - 0.25).abs() < 0.0001);
+        }
     }
 }

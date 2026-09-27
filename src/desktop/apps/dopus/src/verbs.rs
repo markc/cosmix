@@ -169,7 +169,9 @@ impl<'de> Deserialize<'de> for PaneTarget {
                 "left" => Ok(Self::Left),
                 "right" => Ok(Self::Right),
                 "active" => Ok(Self::Active),
-                _ => Err(serde::de::Error::custom("pane must be left, right, active, 0 or 1")),
+                _ => Err(serde::de::Error::custom(
+                    "pane must be left, right, active, 0 or 1",
+                )),
             },
             Target::Index(0) => Ok(Self::Left),
             Target::Index(1) => Ok(Self::Right),
@@ -252,8 +254,8 @@ pub struct QuitReply {
 // cannot drift. The window applies theme and location-focus effects;
 // headless refuses them because there is no window to act on.
 
-use cosmix_actions::filemgr;
 use cosmix_actions::ActionId;
+use cosmix_actions::filemgr;
 use cosmix_dopus_core::{DopusCore, PaneId};
 
 /// What the caller tells the served verbs about itself.
@@ -276,12 +278,20 @@ pub struct ServerMeta {
 
 /// One served command's answer.
 pub enum Served {
-    ToggleSidebar { id: u64, sidebar: cosmix_dopus_core::config::Sidebar, action: String },
+    ToggleSidebar {
+        id: u64,
+        sidebar: cosmix_dopus_core::config::Sidebar,
+        action: String,
+    },
     /// Reply `(rc, body)` to command `id`.
     Reply { id: u64, rc: u8, body: String },
     /// Apply the theme selection, then reply to `id` with the resolved
     /// `(scheme, mode)` names.
-    ThemeSet { id: u64, scheme: Option<String>, mode: Option<String> },
+    ThemeSet {
+        id: u64,
+        scheme: Option<String>,
+        mode: Option<String>,
+    },
     /// Perform the theme selection of a `dopus.action theme.*` call: the
     /// windowed twin of [`Served::ThemeSet`] (mode-toggle resolves against
     /// the live selection; headless refuses UNAVAILABLE).
@@ -294,19 +304,31 @@ pub enum Served {
 
 impl Served {
     fn reply_json<T: serde::Serialize>(id: u64, value: &T) -> Self {
-        Self::Reply { id, rc: 0, body: serde_json::to_string(value).unwrap_or_else(|_| "{}".into()) }
+        Self::Reply {
+            id,
+            rc: 0,
+            body: serde_json::to_string(value).unwrap_or_else(|_| "{}".into()),
+        }
     }
 
     fn refusal(id: u64, refusal: Refusal) -> Self {
         Self::Reply {
             id,
             rc: 10,
-            body: serde_json::to_string(&refusal).unwrap_or_else(|_| format!("{{\"error_code\":\"{}\"}}", code::INTERNAL)),
+            body: serde_json::to_string(&refusal)
+                .unwrap_or_else(|_| format!("{{\"error_code\":\"{}\"}}", code::INTERNAL)),
         }
     }
 
     fn error(id: u64, error_code: &str, message: String) -> Self {
-        Self::refusal(id, Refusal { error_code: error_code.to_owned(), message, reason: None })
+        Self::refusal(
+            id,
+            Refusal {
+                error_code: error_code.to_owned(),
+                message,
+                reason: None,
+            },
+        )
     }
 }
 
@@ -317,7 +339,10 @@ impl Served {
 /// core's availability ([`apply_availability`]).
 pub const ACTIONS: &[(ActionId, &str)] = &[
     (cosmix_actions::view::TOGGLE_PLACES, "Show or hide Places"),
-    (cosmix_actions::view::TOGGLE_PROPERTIES, "Show or hide Properties"),
+    (
+        cosmix_actions::view::TOGGLE_PROPERTIES,
+        "Show or hide Properties",
+    ),
     (cosmix_actions::location::FOCUS, "Focus the location bar"),
     (filemgr::FILE_OPEN, "Open the selection"),
     (filemgr::FILE_NEW_FOLDER, "New folder"),
@@ -416,7 +441,8 @@ fn name_edit_pending(core: &DopusCore) -> bool {
     core.outstanding_reservations().iter().any(|(_, kind)| {
         matches!(
             kind,
-            cosmix_dopus_core::ReservationKind::NewFolder | cosmix_dopus_core::ReservationKind::Rename
+            cosmix_dopus_core::ReservationKind::NewFolder
+                | cosmix_dopus_core::ReservationKind::Rename
         )
     })
 }
@@ -439,9 +465,21 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
 
 /// Apply pane-local navigation, view and selection actions directly to the
 /// target. Global actions (switch-pane, theme, quit) retain their meaning.
-pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> Result<Applied, Refusal> {
-    if action == cosmix_actions::view::TOGGLE_PLACES { return Ok(Applied::ToggleSidebar(cosmix_dopus_core::config::Sidebar::Places)); }
-    if action == cosmix_actions::view::TOGGLE_PROPERTIES { return Ok(Applied::ToggleSidebar(cosmix_dopus_core::config::Sidebar::Properties)); }
+pub fn apply_action_in(
+    action: ActionId,
+    core: &mut DopusCore,
+    pane: PaneId,
+) -> Result<Applied, Refusal> {
+    if action == cosmix_actions::view::TOGGLE_PLACES {
+        return Ok(Applied::ToggleSidebar(
+            cosmix_dopus_core::config::Sidebar::Places,
+        ));
+    }
+    if action == cosmix_actions::view::TOGGLE_PROPERTIES {
+        return Ok(Applied::ToggleSidebar(
+            cosmix_dopus_core::config::Sidebar::Properties,
+        ));
+    }
     let done = Ok(Applied::Done);
     if action == cosmix_actions::location::FOCUS {
         return Ok(Applied::LocationFocus(pane));
@@ -603,14 +641,19 @@ pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> 
 /// Non-file rows are enabled here; [`serve_command`] additionally gates
 /// location.focus on window availability. The table is built once at boot
 /// and its flags are refreshed for every `dopus.actions.list` reply.
-pub fn apply_availability(actions: &mut [ActionRow], availability: &cosmix_dopus_core::AvailabilitySnapshot) {
+pub fn apply_availability(
+    actions: &mut [ActionRow],
+    availability: &cosmix_dopus_core::AvailabilitySnapshot,
+) {
     for row in actions {
         let selection = availability.has_selection;
         let idle = !availability.operation_running;
         row.enabled = match row.id.as_str() {
             "file.open" => selection,
             "file.new-folder" => idle,
-            "file.rename" | "file.copy-other-pane" | "file.move-other-pane" | "file.delete" => selection && idle,
+            "file.rename" | "file.copy-other-pane" | "file.move-other-pane" | "file.delete" => {
+                selection && idle
+            }
             _ => true,
         };
     }
@@ -695,7 +738,10 @@ fn pane_state(core: &DopusCore, pane_id: PaneId) -> PaneState {
         }
         .to_owned(),
         ascending: pane.ascending,
-        selected: pane.selected.as_ref().map(|p| cosmix_dopus_core::sanitise_display_path(p)),
+        selected: pane
+            .selected
+            .as_ref()
+            .map(|p| cosmix_dopus_core::sanitise_display_path(p)),
         rows: core.visible_rows(pane_id).len(),
         status: pane.status.clone(),
     }
@@ -703,7 +749,12 @@ fn pane_state(core: &DopusCore, pane_id: PaneId) -> PaneState {
 
 /// Serve one Bus command. Never panics, never leaves a command unanswered:
 /// every arm ends in a `Served`.
-pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: &ServerMeta, info: &cosmix_buildinfo::BuildInfo) -> Vec<Served> {
+pub fn serve_command(
+    command: &crate::bus::Command,
+    core: &mut DopusCore,
+    meta: &ServerMeta,
+    info: &cosmix_buildinfo::BuildInfo,
+) -> Vec<Served> {
     match command.verb.as_str() {
         "dopus.ping" => vec![Served::reply_json(
             command.id,
@@ -724,7 +775,7 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                 view: "dopus".to_owned(),
                 engine: "iced".to_owned(),
                 version: info.version.to_owned(),
-                description: "the CosMix twin-pane file manager (P3: file operations via keyboard and dialogs; the Bus never mutates)".to_owned(),
+                description: "the CosMix twin-pane file manager (P4: plain Places and Properties panels; file operations via keyboard and dialogs; file.* stays Bus-forbidden)".to_owned(),
                 controls: Vec::new(),
                 verbs: VERBS.iter().map(|(verb, _)| (*verb).to_owned()).collect(),
             },

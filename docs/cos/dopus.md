@@ -15,6 +15,8 @@ Names in listings and Places middle-elide to their measured width, preserving
 the final extension where space permits. Headers and rows share one column
 layout: Name uses the remaining space; Size and Modified align right in
 reserved columns. Each column and the list viewport clip their contents.
+Secondary columns use the desktop Small type size with the mono family,
+leaving a useful Name budget when both sidebars are open.
 Selection uses the design's selection pair, and a tinted header marks the
 active pane. Modified times follow filemgr's rule: relative below seven days,
 otherwise local `DD/MM/YY at h:mm am/pm`, refreshed by the frontend clock.
@@ -248,3 +250,28 @@ selection, availability, refusals, single-instance registration and
 reply-before-exit. Core tests cover operations and their relist law.
 File-operation dialogs and keyboard focus need a windowed gate: the Bus
 test cannot drive operations through the deliberately forbidden `file.*` ids.
+
+P4 tests also cover filename elision (including graphemes and tiny widths),
+shared column geometry, panel divider geometry with either/both panels hidden,
+schema migration and preservation, metadata permissions/symlinks/stale replies,
+F9/F10 resolution and toggle availability. The headless e2e asserts both panel
+state records, disabled toggle actions and `UNAVAILABLE` without state mutation.
+Windowed acceptance should check all four open/closed combinations, resizing,
+theme changes, long names and the last partially visible row, then restart
+to confirm persisted widths and visibility.
+
+## Filemgr parity choices in P4
+
+- Keep its measured middle elision and final-extension rule (at most 12
+  graphemes), but use iced shaping and clipping instead of Bevy text systems.
+- Keep relative timestamps below seven days and the local absolute format
+  otherwise. The existing frontend tick refreshes them; no Bevy timer is needed.
+- Use fixed measured secondary columns instead of filemgr's percentage widths.
+- Use plain sidebars, both open at filemgr's 15% default. Do not import its
+  DCS pin/float/carousel state, preview or bookmark placeholders, or config.
+  Limit widths to 30% each so the panes retain space.
+- Name the RHS Properties and show a folder summary without a selection,
+  instead of the old Information title and idle selection prompt.
+- Display numeric owner/group IDs; do not resolve accounts through a name
+  service. MIME hints use common extensions and fall back to
+  `application/octet-stream`; they never inspect file contents.

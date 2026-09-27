@@ -439,9 +439,10 @@ impl DopusCore {
                 .filter(|(generation, path, _)| {
                     *generation == model.generation && *path == row.entry.path
                 })
-                .map(|(_, _, result)| result.clone());
+                .map(|(_, _, result)| result.clone().map(Box::new));
             crate::properties::Properties::Entry {
                 entry: row.entry,
+                count_pending: model.pending_counts > 0,
                 metadata,
             }
         } else {
@@ -609,14 +610,23 @@ impl DopusCore {
     }
 
     pub fn sidebar(&self, sidebar: crate::config::Sidebar) -> crate::config::SidebarConfig {
-        self.sidebars[match sidebar { crate::config::Sidebar::Places => 0, crate::config::Sidebar::Properties => 1 }]
+        self.sidebars[match sidebar {
+            crate::config::Sidebar::Places => 0,
+            crate::config::Sidebar::Properties => 1,
+        }]
     }
     pub fn toggle_sidebar(&mut self, sidebar: crate::config::Sidebar) {
-        let index = match sidebar { crate::config::Sidebar::Places => 0, crate::config::Sidebar::Properties => 1 };
+        let index = match sidebar {
+            crate::config::Sidebar::Places => 0,
+            crate::config::Sidebar::Properties => 1,
+        };
         self.sidebars[index].open = !self.sidebars[index].open;
     }
     pub fn set_sidebar_width(&mut self, sidebar: crate::config::Sidebar, width: f32) {
-        let index = match sidebar { crate::config::Sidebar::Places => 0, crate::config::Sidebar::Properties => 1 };
+        let index = match sidebar {
+            crate::config::Sidebar::Places => 0,
+            crate::config::Sidebar::Properties => 1,
+        };
         self.sidebars[index].width = width;
         self.sidebars[index] = self.sidebars[index].normalised();
     }
@@ -1873,6 +1883,92 @@ mod tests {
 
     fn now_instant() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn properties_reject_stale_selection_and_generation_and_never_wait_for_counts() {
+        use crate::properties::Properties;
+        let (_dir, mut core, _rx) = core_fixture();
+        let pane = PaneId::Left;
+        let generation = core.pane(pane).generation;
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
+        core.panes[0].root = vec![entry("first", false), entry("second", true)];
+        core.select_path(pane, Some(first.clone()));
+        core.properties[0].in_flight = Some((generation, first.clone()));
+        core.select_path(pane, Some(second.clone()));
+        core.on_event(CoreEvent::PropertiesArrived {
+            pane,
+            generation,
+            path: first,
+            result: Err("stale selection".into()),
+        });
+        assert!(core.properties[0].in_flight.is_none());
+        assert!(matches!(
+            core.properties(pane),
+            Properties::Entry { metadata: None, .. }
+        ));
+        core.properties[0].in_flight = Some((generation - 1, second.clone()));
+        core.on_event(CoreEvent::PropertiesArrived {
+            pane,
+            generation: generation - 1,
+            path: second.clone(),
+            result: Err("stale generation".into()),
+        });
+        assert!(matches!(
+            core.properties(pane),
+            Properties::Entry { metadata: None, .. }
+        ));
+        core.properties[0].in_flight = Some((generation, second.clone()));
+        core.on_event(CoreEvent::PropertiesArrived {
+            pane,
+            generation,
+            path: second,
+            result: Err("permission denied".into()),
+        });
+        let Properties::Entry {
+            entry,
+            metadata: Some(Err(error)),
+            ..
+        } = core.properties(pane)
+        else {
+            panic!("current result missing")
+        };
+        assert_eq!(
+            entry.child_count, None,
+            "metadata does not await the count queue"
+        );
+        assert_eq!(error, "permission denied");
+        core.select_path(pane, None);
+        let Properties::Folder { summary, .. } = core.properties(pane) else {
+            panic!("summary missing")
+        };
+        assert_eq!(summary, pane_summary(&core.pane(pane).root));
+    }
+
+    #[test]
+    fn sidebar_changes_settle_and_persist_without_changing_panes() {
+        use crate::config::Sidebar;
+        let (_dir, mut core, _rx) = core_fixture();
+        let before = core.config_snapshot();
+        let now = Instant::now();
+        core.tick(now);
+        core.toggle_sidebar(Sidebar::Places);
+        core.set_sidebar_width(Sidebar::Properties, 0.25);
+        core.tick(now + Duration::from_millis(10));
+        let events = core.tick(now + Duration::from_millis(400));
+        let snapshot = core.config_snapshot();
+        assert_eq!(snapshot.left, before.left);
+        assert_eq!(snapshot.right, before.right);
+        assert_eq!(snapshot.active_pane, before.active_pane);
+        assert_eq!(snapshot.split_ratio, before.split_ratio);
+        assert!(!snapshot.places.open);
+        assert_eq!(snapshot.properties.width, 0.25);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ConfigSettled(c) if c == &snapshot))
+        );
     }
 
     /// A core rooted at a temp directory with `left/` and `right/` panes.

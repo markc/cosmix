@@ -62,7 +62,7 @@ pub struct Columns {
 impl Columns {
     pub fn new(look: Look) -> Self {
         let measure = |s| {
-            FileList::shape(s, look.mono_font, look.mono_px)
+            FileList::shape(s, look.mono_font, look.small_px)
                 .min_bounds()
                 .width
         };
@@ -85,6 +85,46 @@ impl Columns {
             (size, size_end - size),
             (modified, end - modified),
         ]
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    #[test]
+    fn header_and_rows_share_reserved_right_edges() {
+        // Geometry supplied by the same Columns::cells call in both widgets;
+        // use non-default metrics to catch hard-coded header/row padding.
+        let columns = Columns {
+            size: 87.0,
+            modified: 183.0,
+            gap: 11.0,
+            pad: 7.0,
+        };
+        for width in [400.0, 617.0, 920.0] {
+            let [name, size, modified] = columns.cells(width);
+            assert_eq!(name.0, 7.0);
+            assert_eq!(name.0 + name.1 + columns.gap, size.0);
+            assert_eq!(size.1, 87.0);
+            assert_eq!(size.0 + size.1 + columns.gap, modified.0);
+            assert_eq!(modified.1, 183.0);
+            assert_eq!(modified.0 + modified.1 + columns.pad, width);
+        }
+    }
+    #[test]
+    fn narrow_panes_reserve_modified_first_without_negative_cells() {
+        let columns = Columns {
+            size: 90.0,
+            modified: 180.0,
+            gap: 12.0,
+            pad: 8.0,
+        };
+        for width in [0.0, 20.0, 100.0, 200.0, 300.0] {
+            let cells = columns.cells(width);
+            assert!(cells.iter().all(|(_, w)| *w >= 0.0));
+            assert_eq!(cells[0].1, 0.0);
+            assert!(cells[2].0 + cells[2].1 <= width);
+        }
     }
 }
 /// List rows per wheel notch.
@@ -110,7 +150,7 @@ struct RowState {
     /// Pixels scrolled past the top of the list.
     offset: f32,
     row_h: f32,
-    metrics_key: Option<(iced::Font, u32)>,
+    metrics_key: Option<(iced::Font, u32, iced::Font, u32)>,
     /// The tint the cache was built for (a re-tint clears it).
     tint: String,
     last_selected: Option<PathBuf>,
@@ -126,10 +166,10 @@ struct RowState {
 }
 
 impl RowState {
-    fn new() -> Self {
+    fn new(look: Look) -> Self {
         Self {
             offset: 0.0,
-            row_h: 22.0,
+            row_h: look.px.max(look.small_px) * 1.4 + 2.0 * look.chrome.small,
             metrics_key: None,
             tint: String::new(),
             last_selected: None,
@@ -162,6 +202,7 @@ impl RowState {
 
 /// One pane's listing.
 pub struct FileList<'a> {
+    columns: Columns,
     rows: &'a [VisibleRow],
     selected: Option<&'a Path>,
     /// The pane's root path — the listing's identity (a change resets the
@@ -185,6 +226,7 @@ impl<'a> FileList<'a> {
         look: Look,
     ) -> Self {
         Self {
+            columns: Columns::new(look),
             rows,
             selected,
             root,
@@ -202,7 +244,12 @@ impl<'a> FileList<'a> {
     /// Row height from the theme's font metrics (ced's `ensure_metrics`
     /// trick): shape a sample line once per `(font, px)` and pad it.
     fn ensure_metrics(&self, st: &mut RowState) {
-        let key = (self.look.ui_font, self.look.px.to_bits());
+        let key = (
+            self.look.ui_font,
+            self.look.px.to_bits(),
+            self.look.mono_font,
+            self.look.small_px.to_bits(),
+        );
         if st.metrics_key == Some(key) {
             return;
         }
@@ -223,7 +270,12 @@ impl<'a> FileList<'a> {
             shaping: atext::Shaping::Basic,
             wrapping: atext::Wrapping::None,
         });
-        st.row_h = sample.min_bounds().height.max(line_h) + 2.0 * self.look.chrome.small;
+        st.row_h = sample
+            .min_bounds()
+            .height
+            .max(line_h)
+            .max(self.look.small_px * 1.4)
+            + 2.0 * self.look.chrome.small;
         st.metrics_key = Some(key);
     }
 
@@ -264,7 +316,7 @@ impl<'a> FileList<'a> {
             .map(|m| cosmix_dopus_core::format_modified_at(m, now))
             .unwrap_or_else(|| "—".into());
         let name = row.entry.name.clone();
-        let name_width = (Columns::new(self.look).cells(width)[0].1
+        let name_width = (self.columns.cells(width)[0].1
             - (row.depth as f32 + 2.0) * self.look.chrome.icon
             - self.look.chrome.small)
             .max(0.0);
@@ -285,9 +337,9 @@ impl<'a> FileList<'a> {
             name: Self::shape(&elided, self.look.ui_font, self.look.px),
             name_of: name,
             name_width: name_width.to_bits(),
-            size: Self::shape(&size_text, self.look.mono_font, self.look.mono_px),
+            size: Self::shape(&size_text, self.look.mono_font, self.look.small_px),
             size_of: size_text,
-            modified: Self::shape(&modified_text, self.look.mono_font, self.look.mono_px),
+            modified: Self::shape(&modified_text, self.look.mono_font, self.look.small_px),
             modified_of: modified_text,
         };
         st.cache.insert(row.entry.path.clone(), shaped);
@@ -349,13 +401,15 @@ impl<'a> FileList<'a> {
 }
 
 impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
-    fn tag(&self) -> tree::Tag { tree::Tag::of::<RowState>() }
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<RowState>()
+    }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Fill)
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(RowState::new())
+        tree::State::new(RowState::new(self.look))
     }
 
     fn layout(
@@ -475,7 +529,7 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         };
         let st = tree.state.downcast_ref::<RowState>();
         let t = self.look.tokens;
-        let cells = Columns::new(self.look).cells(bounds.width);
+        let cells = self.columns.cells(bounds.width);
         let icon_px = self.look.chrome.icon;
         let row_pad = self.look.chrome.small;
         renderer.with_layer(clip, |renderer| {

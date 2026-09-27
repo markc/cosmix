@@ -27,6 +27,8 @@ use iced::Color;
 const APP: &str = "dopus";
 
 pub struct Theme {
+    /// Small role size for dense secondary columns, retaining the mono family.
+    pub small_px: f32,
     /// Chrome colours (rows, headers, status bar, stock widgets).
     pub tokens: Tokens,
     /// Extra token colours the `Tokens` set does not carry.
@@ -198,6 +200,7 @@ pub fn resolve_selection(selection: &Selection, mut notes: Vec<String>) -> Theme
     let mono_font = font_for(&mono, true);
     let ui_font = font_for(&ui, false);
     Theme {
+        small_px: role(TypographyRole::Small).font_size as f32,
         tokens,
         chrome,
         mono: (family_name(&mono_font), mono.font_size as f32),
@@ -280,12 +283,23 @@ pub fn build_chrome(d: &ResolvedDictionary) -> Result<Chrome, String> {
             .ok_or_else(|| format!("pair {name}"))
     };
     let secondary = pair("secondary")?;
-    let spacing = |index: usize| d.scales.get("spacing").and_then(|s| s.get(index)).copied()
-        .filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as f32)
-        .ok_or_else(|| format!("spacing[{index}]"));
-    let edge = d.metrics.get("button.border_width")
-        .filter(|m| m.kind == cosmix_design::ResolvedMetricKind::Px && m.value.is_finite() && m.value >= 0.0)
-        .ok_or_else(|| "button.border_width".to_owned())?.value as f32;
+    let spacing = |index: usize| {
+        d.scales
+            .get("spacing")
+            .and_then(|s| s.get(index))
+            .copied()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v as f32)
+            .ok_or_else(|| format!("spacing[{index}]"))
+    };
+    let edge = d
+        .metrics
+        .get("button.border_width")
+        .filter(|m| {
+            m.kind == cosmix_design::ResolvedMetricKind::Px && m.value.is_finite() && m.value >= 0.0
+        })
+        .ok_or_else(|| "button.border_width".to_owned())?
+        .value as f32;
     Ok(Chrome {
         gap: spacing(6)?,
         pad: spacing(4)?,

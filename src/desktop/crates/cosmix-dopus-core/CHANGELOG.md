@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- Add non-blocking `properties(pane)` snapshots with bounded metadata
+  workers and stale generation/selection reply rejection. Preserve symlink
+  metadata and targets; expose timestamps, Unix mode and numeric owner/group.
+- Reuse the count queue for folder item counts and status-bar totals for
+  unselected-folder summaries. MIME descriptions are extension-based hints.
+- Persist plain Places/Properties open states and widths in schema 2;
+  migrate schema 1 while retaining pane/split state and malformed-config
+  overwrite protection. Default both panels open at 15%.
+- Add metadata, stale-reply, persistence and config migration tests.
+
 ## 0.2.0
 
 - Add explicit-pane navigation, refresh, hidden toggle and sort methods

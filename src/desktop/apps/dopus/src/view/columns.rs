@@ -30,12 +30,14 @@ impl Header {
             } else {
                 label.into()
             };
-            shape(&label, self.look.ui_font, self.look.px)
+            shape(&label, self.look.ui_font, self.look.small_px)
         })
     }
 }
 impl Widget<Msg, iced::Theme, Renderer> for Header {
-    fn tag(&self) -> tree::Tag { tree::Tag::of::<[Para; 3]>() }
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<[Para; 3]>()
+    }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Shrink)
     }

@@ -1,4 +1,4 @@
--- End-to-end (dopus P3): a private noded and the real `cosmix-dopus
+-- End-to-end (dopus P4): a private noded and the real `cosmix-dopus
 -- --headless --service dopus-test --noded-url …`, driven by one-shot Mix
 -- clients. The twin panes are proven over the Bus: dopus.info reports two
 -- panes; dopus.open lands the first PATH in the left pane and the second in
@@ -143,7 +143,7 @@ try
     "dopus.ping: " .. json_encode($pong))
   $desc = ok('dopus.describe', {})
   check($desc.contract == "ctk-app-control.v0" and $desc.app == "dopus" and $desc.engine == "iced"
-    and contains(join($desc.verbs, " "), "dopus.state") and contains($desc.description, "P3"),
+    and contains(join($desc.verbs, " "), "dopus.state") and contains($desc.description, "P4"),
     "dopus.describe: " .. json_encode($desc))
 
   -- 1. boot: two panes, both at home, pane 0 active, name ascending
@@ -306,6 +306,31 @@ try
     end
   end
   check($location_rows == 1, "actions.list must contain location.focus")
+
+  -- P4: plain panel state exists headless, but toggles require a window.
+  $before_panels = ok('dopus.state', {})
+  check($before_panels.places.open and $before_panels.properties.open,
+    "both panels default open")
+  check($before_panels.places.width > 0.149 and $before_panels.places.width < 0.151
+    and $before_panels.properties.width > 0.149 and $before_panels.properties.width < 0.151,
+    "both panel widths default to 15%")
+  for each $id in ["view.toggle-places", "view.toggle-properties"]
+    $refusal = refused('dopus.action id=$a.id pane="right"', {id: $id}, "UNAVAILABLE")
+    check($refusal.reason == "headless", $id .. " must report headless")
+    $found = 0
+    for each $row in $acts.actions
+      if $row.id == $id then
+        $found = $found + 1
+        check(not $row.enabled, $id .. " must be disabled headless")
+        check(length($row.keys) > 0, $id .. " needs a default key")
+      end
+    end
+    check($found == 1, "missing or duplicate action " .. $id)
+  end
+  $after_panels = ok('dopus.state', {})
+  check($after_panels.places == $before_panels.places
+    and $after_panels.properties == $before_panels.properties,
+    "refused headless toggles changed panel state")
   refused('dopus.frobnicate', {}, "UNKNOWN_VERB")
   refused('dopus.theme.set mode="dark"', {}, "UNAVAILABLE")
   -- The theme.* actions share theme.set's posture: UNAVAILABLE (the
@@ -334,7 +359,7 @@ try
   -- actions: there is deliberately no Bus verb that triggers one, so the
   -- headless fail-closed answers (law 3) are trivially satisfied and
   -- nothing here can drive a dialog. dopus.state's shape is the whole
-  -- contract and P3 added NO verb-visible fields — assert every documented
+  -- contract includes P4 panel fields — assert every documented
   -- one (selected is legitimately nil before a selection).
   $st = ok('dopus.state', {})
   check(length($st.panes) == 2, "dopus.state panes: " .. json_encode($st))

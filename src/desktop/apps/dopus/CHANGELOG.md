@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+- Middle-elide listing and Places names with measured, grapheme-safe,
+  extension-preserving text. Share fixed right-aligned Size/Modified columns
+  between headers and rows, reserve the absolute timestamp width and clip
+  each column and the list viewport.
+- Use the desktop design's selection pair and a tinted active-pane header;
+  derive layout spacing from design tokens.
+- Add a plain Properties sidebar with asynchronous metadata, count-queue
+  folder sizes and an unselected-folder summary matching the status bar.
+- Add F9/F10 and clickable Places/Properties toggles, draggable dividers,
+  persisted open/width state and schema-1-to-2 migration.
+- Serve both toggle actions windowed, refuse headless/busy with UNAVAILABLE,
+  and expose `places`/`properties` in `dopus.state`. Keep all `file.*` forbidden.
+- Add elision, column/divider geometry, metadata, migration, key and Bus
+  availability regression coverage, plus headless Bus e2e assertions.
+
 ## 0.2.0
 
 - Add optional pane targets to dopus.v1 actions and open requests, preserving
