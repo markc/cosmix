@@ -3,8 +3,11 @@
 ## Streaming file download (0.97.0)
 
 `http_get_file(url, path[, opts]) -> map<http_file_response>` streams GET to a
-unique sibling created exclusively with mode 0666 under the process umask,
-matching `write_atomic` for a new destination. It hashes while writing,
+unique sibling created exclusively. For a new destination it uses mode 0666
+under the process umask, matching `write_atomic`. When the destination exists,
+staging starts at 0600, before any append prefix or incoming body is copied;
+the target's permission bits are applied through the open descriptor only
+after verification, just before publication. It hashes while writing,
 syncs the completed file, publishes atomically, then syncs the directory.
 The parent directory must exist. Defaults refuse an existing destination:
 Linux uses `renameat2(RENAME_NOREPLACE)`, with atomic hard-link creation as

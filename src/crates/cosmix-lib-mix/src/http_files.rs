@@ -418,7 +418,7 @@ impl Drop for Staging {
     }
 }
 
-fn staging(path: &Path) -> io::Result<(File, Staging)> {
+fn staging(path: &Path, private: bool) -> io::Result<(File, Staging)> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("destination has no file name"))?;
@@ -434,7 +434,7 @@ fn staging(path: &Path) -> io::Result<(File, Staging)> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o666);
+            options.mode(if private { 0o600 } else { 0o666 });
         }
         match options.open(&tmp) {
             Ok(file) => return Ok((file, Staging(tmp))),
@@ -536,7 +536,14 @@ pub(super) fn get(args: Vec<Value>) -> MixResult<Option<Value>> {
     let mut code = "FILE_IO";
     let result = (|| -> io::Result<()> {
         check_deadline(opts.deadline)?;
-        let (mut file, tmp) = staging(path)?;
+        // A replacement must not expose a private target's prefix or incoming
+        // bytes before verification. Apply its final mode only at publication.
+        let private = match std::fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        let (mut file, tmp) = staging(path, private)?;
         let mut hash = blake3::Hasher::new();
         let mut buf = [0u8; BUFFER];
         if append {
@@ -973,6 +980,85 @@ mod tests {
             "expect_blake3".into(),
             Value::String(blake3::hash(bytes).to_hex().to_string()),
         )])
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replacement_staging_stays_private_while_prefix_and_body_are_in_flight() {
+        use std::os::unix::fs::PermissionsExt;
+        for append in [false, true] {
+            let dir = Temp::new();
+            let path = dir.0.join("target");
+            std::fs::write(&path, b"secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/file", listener.local_addr().unwrap());
+            let parent = dir.0.clone();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                let temp = std::fs::read_dir(&parent)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .find(|p| {
+                        p.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".target.http-")
+                    })
+                    .unwrap();
+                assert_eq!(
+                    std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                if append {
+                    assert_eq!(std::fs::read(&temp).unwrap(), b"secret");
+                }
+                let status = if append { 206 } else { 200 };
+                let range = if append {
+                    "Content-Range: bytes 6-7/8\r\n"
+                } else {
+                    ""
+                };
+                socket.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: 2\r\n{range}Connection: close\r\n\r\na").as_bytes()).unwrap();
+                let until = Instant::now() + Duration::from_secs(5);
+                let expected_len = if append { 7 } else { 1 };
+                while std::fs::metadata(&temp).unwrap().len() < expected_len {
+                    assert!(Instant::now() < until, "body byte was not staged");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(
+                    std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                socket.write_all(b"b").unwrap();
+            });
+            let expected: &[u8] = if append { b"secretab" } else { b"ab" };
+            let mut opts = hash_option(expected);
+            opts.insert(
+                if append { "append" } else { "overwrite" }.into(),
+                Value::Bool(true),
+            );
+            let result = download(url, &path, opts);
+            server.join().unwrap();
+            assert!(
+                matches!(result["published"], Value::Bool(true)),
+                "{result:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
