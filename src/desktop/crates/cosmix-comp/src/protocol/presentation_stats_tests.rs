@@ -14,6 +14,7 @@ fn present(tv_us: u64, committed: u64, refresh: Option<u64>) -> PresentSample {
 
 fn mark(input_seq: u64, injected_at_us: u64) -> InputMark {
     InputMark {
+        seat: crate::protocol::SeatKind::Human,
         input_seq,
         injected_at_us,
     }

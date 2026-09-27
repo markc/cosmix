@@ -56,6 +56,8 @@ const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
 
 #[derive(Debug)]
 pub(crate) struct SharedSurfaceState {
+    #[cfg(feature = "test-support")]
+    keyboard_enters: usize,
     pub(super) alive: bool,
     pub(super) wl_surface_id: Option<u32>,
     pub(super) wl_surface_serial: Option<u64>,
@@ -155,6 +157,13 @@ pub enum WmWindowProperty {
 }
 
 impl X11Surface {
+    /// Number of keyboard enters, before any X11 SetInputFocus/WM_TAKE_FOCUS.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn keyboard_enters_for_test(&self) -> usize {
+        self.state.lock().unwrap().keyboard_enters
+    }
+
     /// Create a new [`X11Surface`] usually handled by an [`X11Wm`](super::X11Wm)
     ///
     /// ## Arguments
@@ -179,6 +188,8 @@ impl X11Surface {
             conn,
             atoms,
             state: Arc::new(Mutex::new(SharedSurfaceState {
+                #[cfg(feature = "test-support")]
+                keyboard_enters: 0,
                 alive: true,
                 wl_surface_id: None,
                 wl_surface_serial: None,
@@ -1114,6 +1125,8 @@ impl IsAlive for X11Surface {
 
 impl<D: SeatHandler + 'static> KeyboardTarget<D> for X11Surface {
     fn enter(&self, seat: &Seat<D>, data: &mut D, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
+        #[cfg(feature = "test-support")]
+        { self.state.lock().unwrap().keyboard_enters += 1; }
         let (set_input_focus, send_take_focus) = match self.input_mode() {
             InputMode::None => return,
             InputMode::Passive => (true, false),

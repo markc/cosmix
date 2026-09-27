@@ -68,7 +68,7 @@ use crate::mailstore::{
 /// post-migration form. The companion `blob_download` handler
 /// accepts both the legacy UUID form (for emails uploaded via
 /// `db::blob`) and the CAS hex form, gating the CAS branch on
-/// per-account ownership via `db::blob`.
+/// per-account live MDS ownership, with a legacy upload fallback.
 ///
 /// `receivedAt` and `date` project as JMAP `UTCDate` strings (RFC
 /// 8620 §1.4 / RFC 3339, `Z`-suffixed) rather than raw integers.
@@ -150,12 +150,8 @@ fn record_to_jmap(r: &EmailRecord) -> serde_json::Value {
         "date": date,
         // Substrate-pending (C6).
         "preview": serde_json::Value::Null,
-        // `hasAttachment` is substrate-pending (C6): MIME structure
-        // is not yet derived during ingest. Projecting `false` would
-        // be a definitive negative answer that would silently flip
-        // for messages that genuinely had attachments under the
-        // legacy projection — null preserves the wire key while
-        // signaling "unknown" until C6 derives it.
+        // Email/get replaces this after successful bounded MIME inspection.
+        // Unreadable and over-limit messages retain an unknown value.
         "hasAttachment": serde_json::Value::Null,
         "spamScore": serde_json::Value::Null,
         "spamVerdict": serde_json::Value::Null,
@@ -566,60 +562,41 @@ pub async fn get(
         })
         .await??;
 
-    let list: Vec<serde_json::Value> = if fetch_text || fetch_html {
-        // Spawn the per-record blob reads up-front so they queue into
-        // the tokio blocking pool together rather than one-await-at-
-        // a-time. Note: `SqliteCasMds::get_blob` takes the per-set
-        // connection mutex (cosmix-mds/src/sqlite_mds.rs `with_conn`),
-        // so true I/O parallelism is bounded by the per-set lock —
-        // what this fan-out actually buys is overlapped wakeup +
-        // scheduler interleaving with other async work, not unbounded
-        // disk concurrency. Worth revisiting if blob fetches become
-        // the bottleneck.
-        let mut blob_handles = Vec::with_capacity(records.len());
-        for record in &records {
+    let inspect_mime = fetch_text
+        || fetch_html
+        || properties.as_ref().is_none_or(|p| {
+            p.iter().any(|p| {
+                matches!(
+                    p.as_str(),
+                    "hasAttachment" | "attachments" | "textBody" | "htmlBody" | "bodyValues"
+                )
+            })
+        });
+    let mut list = Vec::with_capacity(records.len());
+    for record in records {
+        let mut val = record_to_jmap(&record);
+        if inspect_mime {
+            // One message at a time bounds raw-buffer residency even for a
+            // large Email/get. Parsing and file reads stay off the async loop.
             let ms = mailstore.clone();
-            let blob_hash = record.blob_hash;
-            blob_handles.push(tokio::task::spawn_blocking(move || {
-                ms.mds().get_blob(&blob_hash)
-            }));
-        }
-
-        let mut result = Vec::with_capacity(records.len());
-        for (record, handle) in records.iter().zip(blob_handles) {
-            let mut val = record_to_jmap(record);
-            // Distinguish the two error classes:
-            //   - `JoinError` (panic in the blocking task) is a real
-            //     bug — propagate so callers see a 500, not a
-            //     silently-bodyless email row.
-            //   - `Err(_)` from `get_blob` (missing blob, IO error)
-            //     elides body parts only; metadata projection still
-            //     ships.
-            // The legacy `if let Ok(Ok(...)) = handle.await` swallowed
-            // both, hiding panics behind "looks fine to the client".
-            match handle.await {
-                Ok(Ok(blob_data)) => {
-                    add_body_parts(&mut val, &blob_data, fetch_text, fetch_html);
+            let hash = record.blob_hash;
+            let result = tokio::task::spawn_blocking(move || {
+                let data = crate::attachments::read_message(&ms, &hash)?;
+                crate::attachments::inspect(&data, None, fetch_text || fetch_html)
+            })
+            .await?;
+            match result {
+                Ok(mime) => add_body_parts(&mut val, &record, mime, fetch_text, fetch_html),
+                Err(e) => {
+                    // Unknown is not false. Do not publish a partial list.
+                    tracing::warn!(item_id = %record.id.0, error = %e,
+                        "MIME inspection failed for Email/get");
+                    val["hasAttachment"] = serde_json::Value::Null;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        item_id = %record.id.0,
-                        error = %e,
-                        "blob fetch failed for Email/get; eliding body parts"
-                    );
-                }
-                Err(join_err) => return Err(join_err.into()),
             }
-            val = apply_email_properties(val, properties.as_deref());
-            result.push(val);
         }
-        result
-    } else {
-        records
-            .iter()
-            .map(|r| apply_email_properties(record_to_jmap(r), properties.as_deref()))
-            .collect()
-    };
+        list.push(apply_email_properties(val, properties.as_deref()));
+    }
 
     let resp = serde_json::json!({
         "accountId": acct,
@@ -631,73 +608,58 @@ pub async fn get(
     Ok(resp)
 }
 
-/// Parse a message and add textBody, htmlBody, bodyValues to the JSON response.
-fn add_body_parts(val: &mut serde_json::Value, data: &[u8], fetch_text: bool, fetch_html: bool) {
-    use mail_parser::{MessageParser, PartType};
-
-    let parser = MessageParser::default();
-    let Some(msg) = parser.parse(data) else {
-        return;
-    };
-
-    let mut body_values = serde_json::Map::new();
+/// One part-path scheme for attachment metadata and all body projections.
+fn add_body_parts(
+    val: &mut serde_json::Value,
+    record: &EmailRecord,
+    mime: crate::attachments::Inspection,
+    fetch_text: bool,
+    fetch_html: bool,
+) {
+    let mut attachments = Vec::new();
     let mut text_body = Vec::new();
     let mut html_body = Vec::new();
-    let mut part_idx = 0u32;
-
-    for part in msg.parts.iter() {
-        let (is_text, is_html, body_text) = match &part.body {
-            PartType::Text(text) => (true, false, text.as_ref().to_string()),
-            PartType::Html(html) => (false, true, html.as_ref().to_string()),
-            _ => continue,
-        };
-
-        if body_text.is_empty() {
-            continue;
+    let mut body_values = serde_json::Map::new();
+    for part in mime.parts {
+        let blob_id = crate::attachments::PartBlobId {
+            item: record.id,
+            message_hash: record.blob_hash,
+            part: part.path.clone(),
         }
-
-        let pid = part_idx.to_string();
-        let mime_type = if is_text { "text/plain" } else { "text/html" };
-
-        if is_text {
-            text_body.push(serde_json::json!({
-                "partId": pid,
-                "type": mime_type,
-            }));
-            if fetch_text {
-                body_values.insert(
-                    pid.clone(),
-                    serde_json::json!({
-                        "value": body_text,
-                        "isEncodingProblem": false,
-                        "isTruncated": false,
-                    }),
-                );
-            }
+        .to_string();
+        let mut projection = serde_json::json!({
+            "partId": part.path, "blobId": blob_id, "size": part.size,
+            "name": part.name, "type": part.mime,
+            "disposition": part.disposition, "cid": part.cid,
+        });
+        if part.undecodable {
+            projection.as_object_mut().unwrap().remove("blobId");
+            projection["undecodable"] = serde_json::json!(true);
         }
-
-        if is_html {
-            html_body.push(serde_json::json!({
-                "partId": pid,
-                "type": mime_type,
-            }));
-            if fetch_html {
-                body_values.insert(
-                    pid.clone(),
-                    serde_json::json!({
-                        "value": body_text,
-                        "isEncodingProblem": false,
-                        "isTruncated": false,
-                    }),
-                );
-            }
+        if part.attachment && !part.embedded {
+            attachments.push(projection.clone());
         }
-
-        part_idx += 1;
+        if part.text {
+            text_body.push(projection.clone());
+        }
+        if part.html {
+            html_body.push(projection);
+        }
+        if ((part.text && fetch_text) || (part.html && fetch_html))
+            && let Some(value) = part.value
+        {
+            body_values.insert(
+                part.path,
+                serde_json::json!({
+                    "value": value, "isEncodingProblem": part.undecodable, "isTruncated": false,
+                }),
+            );
+        }
     }
-
-    val["textBody"] = serde_json::Value::Array(text_body);
-    val["htmlBody"] = serde_json::Value::Array(html_body);
+    val["hasAttachment"] = serde_json::json!(!attachments.is_empty());
+    val["attachments"] = serde_json::json!(attachments);
+    val["textBody"] = serde_json::json!(text_body);
+    val["htmlBody"] = serde_json::json!(html_body);
     val["bodyValues"] = serde_json::Value::Object(body_values);
 }
 
@@ -3566,6 +3528,7 @@ mod tests {
         let tmp_blob = tempfile::tempdir().unwrap();
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
             blob_dir: tmp_blob.path().to_path_buf(),
         };
 

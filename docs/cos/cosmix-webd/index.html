@@ -449,6 +449,7 @@
 <p>The binary provides server, database, certificate, vhost, ACME, route, statistics, TLS, and autoconfiguration commands.</p>
 <p>See <a href="/cos/cosmix-webd/commands-and-configuration">commands and configuration</a> for the full command and configuration surface.</p>
 <p>See <a href="/cos/cosmix-webd/bus-verbs">Bus verbs</a> for the daemon's Bus service and SPEC 12 property namespaces.</p>
+<p>Version 0.12.0 adds <a href="/cos/cosmix-webd/shares">public shares</a> and <a href="/cos/cosmix-webd/media-references">media blob references</a>.</p>
 <h2 id="what-it-provides">What it provides</h2>
 <ul>
 <li>Host-routed HTTP and HTTPS serving for multiple virtual hosts.</li>
@@ -468,6 +469,9 @@
 <table><thead><tr><th>Path</th><th>Methods</th><th>Purpose</th></tr></thead><tbody>
 <tr><td><code>/api/posts</code></td><td><code>GET</code>, <code>POST</code></td><td>List or create CMS posts</td></tr>
 <tr><td><code>/api/posts/{id}</code></td><td><code>GET</code>, <code>PUT</code>, <code>DELETE</code></td><td>Read, update, or delete one post</td></tr>
+<tr><td><code>/api/shares</code></td><td><code>GET</code>, <code>POST</code></td><td>List own shares or create an account-root path share</td></tr>
+<tr><td><code>/api/shares/{token}/revoke</code></td><td><code>POST</code></td><td>Revoke an own share</td></tr>
+<tr><td><code>/s/{token}</code></td><td><code>GET</code>, <code>HEAD</code></td><td>Gated public file or local blob download</td></tr>
 <tr><td><code>/jmap</code></td><td>Any</td><td>Proxy a JMAP request to the vhost upstream</td></tr>
 <tr><td><code>/jmap/{path}</code></td><td>Any</td><td>Proxy a JMAP sub-path</td></tr>
 <tr><td><code>/.well-known/jmap</code></td><td>Any</td><td>Proxy JMAP session discovery</td></tr>
@@ -509,7 +513,10 @@
 <ul>
 <li><code>posts</code>, the CMS post table.</li>
 <li><code>session_epochs</code>, per-account counters used to invalidate sealed session cookies.</li>
+<li><code>file_shares</code>, the preserving, email-keyed token catalogue with exclusive path/blob targets.</li>
 </ul>
+<p>The native and Mix CMS schema entry points also preserve media rows while adding
+nullable reference JSON in <code>media.blob</code>. Files remain the served image source.</p>
 <p>Production serving also stores SPEC 12 property rows in the configured web database. Per-vhost CMS databases are optional and may attach named auxiliary databases.</p>
 <h2 id="virtual-hosts-and-listeners">Virtual hosts and listeners</h2>
 <p>Each configured vhost has its own static root and optional CMS database, JMAP upstream, broker WebSocket upstream, documentation directory, and authentication credentials. Primary hosts and configured aliases share runtime state and counters.</p>
@@ -521,7 +528,7 @@
 <p>Manual-PEM deployments can reload certificate contents without restarting through <code>webd.tls.reload</code>. Validation failure keeps every previous resolver active.</p>
 <h2 id="bus-citizenship">Bus citizenship</h2>
 <p>The daemon registers the Bus service name <code>webd</code>. Broker connection failures and mid-session disconnects enter an exponential reconnect loop capped at 60 seconds. HTTP serving and ACME renewal continue while the Bus surface is offline.</p>
-<p>The service exposes read-only snapshots, ergonomic lifecycle verbs, listener controls, session revocation, TLS reload, and the generic <code>webd.props.*</code> family. Property changes publish on <code>webd.props.records.changed</code>; watch grants are refreshed after broker reconnection.</p>
+<p>The service exposes read-only snapshots, ergonomic lifecycle verbs, listener controls, session revocation, TLS reload, share management, media-reference recovery, and the generic <code>webd.props.*</code> family. Property changes publish on <code>webd.props.records.changed</code>; watch grants are refreshed after broker reconnection.</p>
 <h2 id="cargo-features">Cargo features</h2>
 <p>This crate defines no Cargo features. Bus citizenship and the embedded Mix runtime are unconditional dependencies.</p>
 <h2 id="main-source-modules">Main source modules</h2>

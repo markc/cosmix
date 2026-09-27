@@ -86,6 +86,7 @@ pub(crate) enum PortCommand {
 }
 
 pub(crate) struct PortRequest {
+    pub(crate) order: u64,
     pub(crate) reply: tokio::sync::oneshot::Sender<Arc<CompSnapshot>>,
     /// The read's own path or prefix, so the snapshot can be scoped to it
     /// (`ReadScopes`); `None` asks for the whole tree.
@@ -331,6 +332,7 @@ pub(crate) enum KeySpec {
 /// One `comp.input.*` operation, parsed and bounded on the worker.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InputOp {
+    OnSeat { seat: crate::protocol::SeatKind, op: Box<InputOp> },
     /// Focus and inject in one compositor-thread dispatch.
     Targeted {
         id: u64,
@@ -368,6 +370,7 @@ impl InputOp {
     /// is held, which earlier (capped) verbs bounded.
     pub(crate) fn event_bound(&self) -> usize {
         match self {
+            Self::OnSeat { op, .. } => op.event_bound(),
             Self::Targeted { op, .. } => op.event_bound() + usize::from(matches!(op.as_ref(), Self::PointerButton { .. })),
             Self::PointerMove { .. } | Self::PointerScroll { .. } | Self::ReleaseAll => 1,
             Self::PointerButton { .. } => 2,
@@ -379,6 +382,7 @@ impl InputOp {
 
 pub(crate) struct PortInputRequest {
     pub(crate) order: u64,
+    pub(crate) agent_epoch: u64,
     pub(crate) op: InputOp,
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
 }
@@ -399,6 +403,7 @@ pub(crate) enum LongOp {
         timeout: Duration,
     },
     Sequence(Vec<SequenceStep>),
+    SeatedSequence { seat: crate::protocol::SeatKind, steps: Vec<SequenceStep> },
     Wait(WaitSpec),
     /// Polite close now; if the same `{id, generation}` is still alive at
     /// the deadline, kill its client.
@@ -420,7 +425,7 @@ impl LongOp {
                     + crate::protocol::region_selection::REGION_CLEANUP_BUDGET
                     + Duration::from_secs(1)
             }
-            Self::Sequence(steps) => steps.iter().map(|step| step.delay).sum(),
+            Self::Sequence(steps) | Self::SeatedSequence { steps, .. } => steps.iter().map(|step| step.delay).sum(),
             Self::Wait(spec) => spec.timeout,
             Self::ForceClose { timeout, .. } => *timeout,
         }
@@ -429,6 +434,7 @@ impl LongOp {
 
 pub(crate) struct PortLongRequest {
     pub(crate) order: u64,
+    pub(crate) agent_epoch: u64,
     pub(crate) op: Option<LongOp>,
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
     /// The queue slot this request holds until the protocol thread has
@@ -441,6 +447,7 @@ pub(crate) struct PortLongRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ControlReply {
+    WithInputSeat { seat: crate::protocol::SeatKind, reply: Box<ControlReply> },
     PointerWatch {
         topic: String,
         lease_ms: u64,
@@ -530,6 +537,12 @@ impl ControlReply {
 
     pub(crate) fn into_wire(self) -> (u8, Arc<str>) {
         match self {
+            Self::WithInputSeat { seat, reply } => {
+                let (rc, body) = reply.into_wire();
+                let mut body: Value = serde_json::from_str(&body).expect("control replies are JSON");
+                body["seat"] = json!(seat.name());
+                (rc, Arc::from(body.to_string()))
+            }
             Self::PointerWatch { topic, lease_ms } => (
                 0,
                 Arc::from(json!({"version":1,"topic":topic,"lease_ms":lease_ms}).to_string()),
@@ -673,6 +686,36 @@ pub(crate) enum PortControl {
 }
 
 impl PortControl {
+    pub(crate) fn uses_agent(&self) -> bool {
+        match self {
+            Self::Input(request) => matches!(request.op, InputOp::OnSeat { seat: crate::protocol::SeatKind::Agent, .. }),
+            Self::Long(request) => match request.op.as_ref() {
+                Some(LongOp::Sequence(steps) | LongOp::SeatedSequence { steps, .. }) => steps.iter().any(|step|
+                    matches!(step.op, InputOp::OnSeat { seat: crate::protocol::SeatKind::Agent, .. })),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Refuse old admissions even if they were still in the ingress channel at
+    /// the lifecycle boundary. Other controls keep their relative order.
+    pub(crate) fn refuse_cleared_agent(&mut self, epoch: u64) -> bool {
+        if !self.uses_agent() { return false; }
+        let reply = match self {
+            Self::Input(request) if request.agent_epoch != epoch => request.reply.take(),
+            Self::Long(request) if request.agent_epoch != epoch => {
+                request.slot.take();
+                request.reply.take()
+            }
+            _ => return false,
+        };
+        if let Some(reply) = reply {
+            let _ = reply.send(ControlReply::refused("input_cleared", json!({"seat":"agent", "released":true})));
+        }
+        true
+    }
+
     pub(crate) fn order(&self) -> u64 {
         match self {
             Self::Panel(request) => request.order,
@@ -692,6 +735,7 @@ pub(crate) struct PortIngress {
     sender: channel::SyncSender<PortCommand>,
     queue_depth: Arc<AtomicUsize>,
     control_order: Arc<AtomicU64>,
+    agent_epoch: Arc<AtomicU64>,
     pending_idle_order: Arc<AtomicU64>,
     pending_active_order: Arc<AtomicU64>,
 }
@@ -717,7 +761,9 @@ impl PortIngress {
         scope: Option<String>,
     ) -> Result<SnapshotAdmission, ()> {
         let (reply, receive) = tokio::sync::oneshot::channel();
-        self.admit(PortCommand::Snapshot(PortRequest { reply, scope }), receive)
+        self.admit(PortCommand::Snapshot(PortRequest {
+            order: self.next_control_order(), reply, scope,
+        }), receive)
             .map(SnapshotAdmission)
     }
 
@@ -776,6 +822,7 @@ impl PortIngress {
         self.admit(
             PortCommand::Input(PortInputRequest {
                 order: self.next_control_order(),
+                agent_epoch: self.agent_epoch.load(Ordering::Acquire),
                 op,
                 reply: Some(reply),
             }),
@@ -792,6 +839,7 @@ impl PortIngress {
         let slot = self.reserve_slot()?;
         let command = PortCommand::Long(PortLongRequest {
             order: self.next_control_order(),
+            agent_epoch: self.agent_epoch.load(Ordering::Acquire),
             op: Some(op),
             reply: Some(reply),
             slot: Some(slot),
@@ -930,6 +978,7 @@ pub(crate) fn test_wiring(
         sender,
         queue_depth: context.queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
+        agent_epoch: context.agent_epoch.clone(),
         pending_idle_order: context.pending_idle_order.clone(),
         pending_active_order: context.pending_active_order.clone(),
     };
@@ -956,6 +1005,7 @@ pub(crate) fn test_wiring_with_observation_capacity(
         sender,
         queue_depth: context.queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
+        agent_epoch: context.agent_epoch.clone(),
         pending_idle_order: context.pending_idle_order.clone(),
         pending_active_order: context.pending_active_order.clone(),
     };
@@ -1053,6 +1103,7 @@ pub(crate) fn prepare(
     let lost_count = Arc::new(AtomicU64::new(0));
     let pending_idle_order = Arc::new(AtomicU64::new(0));
     let pending_active_order = Arc::new(AtomicU64::new(0));
+    let agent_epoch = Arc::new(AtomicU64::new(0));
     let (observation_producer, observations) = port_observation::outbox(Arc::clone(&lost_count));
     let observation_notifier = observation_producer.notifier();
     let (sender, source) = channel::sync_channel(PORT_QUEUE_CAPACITY);
@@ -1060,6 +1111,7 @@ pub(crate) fn prepare(
         sender,
         queue_depth: queue_depth.clone(),
         control_order: Arc::new(AtomicU64::new(0)),
+        agent_epoch: agent_epoch.clone(),
         pending_idle_order: pending_idle_order.clone(),
         pending_active_order: pending_active_order.clone(),
     };
@@ -1080,6 +1132,7 @@ pub(crate) fn prepare(
         lost_count: lost_count.clone(),
         pending_idle_order,
         pending_active_order,
+        agent_epoch,
     });
     Ok((
         PortProtocolWiring {
@@ -2696,6 +2749,40 @@ fn modifier_spec(value: &Value) -> Result<KeySpec, ControlReply> {
 /// Parse one `comp.input.*` verb's arguments. Shared by the direct verbs
 /// and `comp.input.sequence` steps, so a step is exactly the verb.
 pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, ControlReply> {
+    use crate::protocol::SeatKind;
+    let explicit_seat = parse_input_seat(args.get("seat"))?;
+    let seat = explicit_seat.unwrap_or(DEFAULT_INPUT_SEAT);
+    let mut args = args.clone();
+    if let Some(object) = args.as_object_mut() {
+        object.remove("seat");
+    }
+    let op = parse_seated_input_op(verb, &args, seat)?;
+    // Bare cleanup always releases both seats' injected holds, regardless of
+    // the delivery default. An explicit (including inherited) seat scopes it.
+    if verb == "comp.input.release_all" && explicit_seat.is_none() {
+        return Ok(op);
+    }
+    // Keep the internal human operation shape stable for existing call sites.
+    Ok(if seat == SeatKind::Human && !(verb == "comp.input.release_all" && explicit_seat.is_some()) {
+        op
+    } else { InputOp::OnSeat { seat, op: Box::new(op) } })
+}
+
+// Human-semantic callers must select human explicitly; the hub gates migrate
+// with this release. Bare release_all remains both-seat cleanup above.
+pub(crate) const DEFAULT_INPUT_SEAT: crate::protocol::SeatKind = crate::protocol::SeatKind::Agent;
+
+fn parse_input_seat(value: Option<&Value>) -> Result<Option<crate::protocol::SeatKind>, ControlReply> {
+    use crate::protocol::SeatKind;
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) if value == "human" => Ok(Some(SeatKind::Human)),
+        Some(Value::String(value)) if value == "agent" => Ok(Some(SeatKind::Agent)),
+        _ => Err(invalid_argument("seat", "string", "agent|human")),
+    }
+}
+
+fn parse_seated_input_op(verb: &str, args: &Value, seat: crate::protocol::SeatKind) -> Result<InputOp, ControlReply> {
     let op = parse_input_payload(verb, args)?;
     if !matches!(verb, "comp.input.key" | "comp.input.pointer.button") {
         return Ok(op);
@@ -2722,10 +2809,16 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
         .ok_or_else(|| invalid_argument("window.id", "unsigned integer", "required"))?;
     let generation = window_arg(window, "generation")?
         .ok_or_else(|| invalid_argument("window.generation", "unsigned integer", "required"))?;
+    let raise = bool_arg(object, "raise", seat == crate::protocol::SeatKind::Human)?;
+    if seat == crate::protocol::SeatKind::Agent && raise {
+        return Err(ControlReply::refused("invalid_argument", json!({
+            "field":"raise", "seat":"agent", "message":"agent input never raises a window",
+        })));
+    }
     Ok(InputOp::Targeted {
         id,
         generation,
-        raise: bool_arg(object, "raise", true)?,
+        raise,
         op: Box::new(op),
     })
 }
@@ -3080,6 +3173,7 @@ mod agent_control_argument_tests {
             ("comp.input.key", json!({"text":"hello"})),
             ("comp.input.pointer.button", json!({"button":"left"})),
         ] {
+            args["seat"] = json!("human");
             args["window"] = json!({"id":7,"generation":3});
             assert!(matches!(parse_input_op(verb, &args), Ok(InputOp::Targeted {
                 id:7, generation:3, raise:true, ..
@@ -3131,8 +3225,9 @@ fn parse_region_select(args: &Value) -> Result<LongOp, ControlReply> {
 /// delays together are capped at 60 s.
 fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
     let empty = serde_json::Map::new();
-    const ALLOWED: &[&str] = &["steps", "interval_ms"];
+    const ALLOWED: &[&str] = &["steps", "interval_ms", "seat"];
     let object = args_object(args, &empty, ALLOWED)?;
+    let seat = parse_input_seat(object.get("seat"))?;
     let interval = delay_arg(present(object, "interval_ms"), "interval_ms")?.unwrap_or_default();
     let steps = match present(object, "steps") {
         Some(Value::Array(steps)) if !steps.is_empty() && steps.len() <= SEQUENCE_MAX_STEPS => {
@@ -3171,8 +3266,15 @@ fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
                     "comp.input.pointer.move|pointer.button|pointer.scroll|key|release_all",
                 )
             })?;
+        let mut args = step.get("args").cloned().unwrap_or(Value::Null);
+        if let Some(seat) = seat {
+            if args.is_null() { args = json!({}); }
+            if let Some(object) = args.as_object_mut() {
+                object.entry("seat").or_insert_with(|| json!(seat.name()));
+            }
+        }
         let op =
-            parse_input_op(verb, step.get("args").unwrap_or(&Value::Null)).map_err(|reply| {
+            parse_input_op(verb, &args).map_err(|reply| {
                 match reply {
                     ControlReply::Validation(SetValidationError::InvalidValue {
                         path,
@@ -3209,7 +3311,76 @@ fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
         }
         parsed.push(SequenceStep { verb, op, delay });
     }
-    Ok(LongOp::Sequence(parsed))
+    Ok(match seat {
+        Some(seat) => LongOp::SeatedSequence { seat, steps: parsed },
+        None => LongOp::Sequence(parsed),
+    })
+}
+
+#[cfg(test)]
+mod agent_seat_parse_tests {
+    use super::*;
+    use crate::protocol::SeatKind;
+
+    #[test]
+    fn seat_defaults_raise_policy_and_release_all_are_explicit() {
+        let bare = parse_input_op("comp.input.key", &json!({"key":"a","raise":true})).unwrap_err().wire_json();
+        let human = parse_input_op("comp.input.key", &json!({"seat":"human","key":"a","raise":true})).unwrap_err().wire_json();
+        assert_eq!(bare, human);
+        assert_eq!(bare["range"], "requires window");
+        let window = json!({"id":1,"generation":2});
+        assert!(matches!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"human"})).unwrap(), InputOp::Targeted { raise:true, .. }));
+        let InputOp::OnSeat { seat, op } = parse_input_op("comp.input.key", &json!({"window":window,"key":"a"})).unwrap() else { panic!("default agent wrapper") };
+        assert_eq!(seat, SeatKind::Agent);
+        assert!(matches!(*op, InputOp::Targeted { raise:false, .. }));
+        assert!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a","raise":true})).is_err());
+        let InputOp::OnSeat { seat, op } = parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"agent"})).unwrap() else { panic!("agent wrapper") };
+        assert_eq!(seat, SeatKind::Agent);
+        assert!(matches!(*op, InputOp::Targeted { raise:false, .. }));
+        assert!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"agent","raise":true})).is_err());
+        for seat in [json!(null), json!(false), json!("other")] {
+            assert!(parse_input_op("comp.input.key", &json!({"key":"a","seat":seat})).is_err());
+        }
+        assert_eq!(parse_input_op("comp.input.release_all", &json!({})).unwrap(), InputOp::ReleaseAll);
+        assert_eq!(parse_input_op("comp.input.release_all", &json!({"seat":"human"})).unwrap(), InputOp::OnSeat { seat: SeatKind::Human, op: Box::new(InputOp::ReleaseAll) });
+        assert_eq!(parse_input_op("comp.input.release_all", &json!({"seat":"agent"})).unwrap(), InputOp::OnSeat { seat: SeatKind::Agent, op: Box::new(InputOp::ReleaseAll) });
+        assert_eq!(parse_input_op("comp.input.release_all", &Value::Null).unwrap(), InputOp::ReleaseAll);
+    }
+
+    #[test]
+    fn every_delivery_verb_defaults_to_agent_and_bare_sequence_cleanup_stays_both() {
+        assert_eq!(DEFAULT_INPUT_SEAT, SeatKind::Agent);
+        for (verb, args) in [
+            ("comp.input.key", json!({"key":"a"})),
+            ("comp.input.key", json!({"text":"a"})),
+            ("comp.input.pointer.move", json!({"x":1,"y":2})),
+            ("comp.input.pointer.button", Value::Null),
+            ("comp.input.pointer.scroll", json!({"dy":15})),
+        ] {
+            assert!(matches!(parse_input_op(verb, &args).unwrap(), InputOp::OnSeat { seat: SeatKind::Agent, .. }), "{verb}");
+        }
+        let LongOp::Sequence(steps) = parse_sequence(&json!({"steps":[
+            {"verb":"comp.input.key","args":{"text":"a"}},
+            {"verb":"comp.input.key","args":{"text":"b","seat":"human"}},
+            {"verb":"comp.input.release_all"}
+        ]})).unwrap() else { panic!("default sequence") };
+        assert!(matches!(steps[0].op, InputOp::OnSeat { seat: SeatKind::Agent, .. }));
+        assert_eq!(steps[1].op, InputOp::Text("b".into()));
+        assert_eq!(steps[2].op, InputOp::ReleaseAll);
+    }
+
+    #[test]
+    fn sequence_seat_is_inherited_and_each_step_can_override_it() {
+        let LongOp::SeatedSequence { seat, steps } = parse_sequence(&json!({"seat":"agent","steps":[
+            {"verb":"comp.input.key","args":{"text":"a"}},
+            {"verb":"comp.input.key","args":{"text":"b","seat":"human"}},
+            {"verb":"comp.input.release_all"}
+        ]})).unwrap() else { panic!("seated sequence") };
+        assert_eq!(seat, SeatKind::Agent);
+        assert!(matches!(steps[0].op, InputOp::OnSeat { seat:SeatKind::Agent, .. }));
+        assert_eq!(steps[1].op, InputOp::Text("b".into()));
+        assert!(matches!(steps[2].op, InputOp::OnSeat { seat:SeatKind::Agent, .. }));
+    }
 }
 
 /// `comp.window.stats {id, generation | source, registration?, samples?}`
@@ -4025,6 +4196,7 @@ mod tests {
                 sender,
                 queue_depth: Arc::clone(&queue_depth),
                 control_order: Arc::new(AtomicU64::new(0)),
+                agent_epoch: Arc::new(AtomicU64::new(0)),
                 pending_idle_order: Arc::new(AtomicU64::new(0)),
                 pending_active_order: Arc::new(AtomicU64::new(0)),
             },
@@ -5228,7 +5400,7 @@ mod tests {
     #[test]
     fn input_verbs_parse_every_documented_form() {
         assert_eq!(
-            parse_input_op("comp.input.pointer.move", &json!({"x": 40, "y": 30.5})),
+            parse_input_op("comp.input.pointer.move", &json!({"seat": "human", "x": 40, "y": 30.5})),
             Ok(move_op(PointerMoveTarget::Output {
                 output: None,
                 x: 40.0,
@@ -5238,7 +5410,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.move",
-                &json!({"output": "o_nested", "x": 1, "y": 2})
+                &json!({"seat": "human", "output": "o_nested", "x": 1, "y": 2})
             ),
             Ok(move_op(PointerMoveTarget::Output {
                 output: Some("o_nested".into()),
@@ -5247,13 +5419,13 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_input_op("comp.input.pointer.move", &json!({"dx": -3})),
+            parse_input_op("comp.input.pointer.move", &json!({"seat": "human", "dx": -3})),
             Ok(move_op(PointerMoveTarget::Relative { dx: -3.0, dy: 0.0 }))
         );
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.move",
-                &json!({"window": {"id": 7, "generation": 3}, "x": 4, "y": 5, "require_hit": true})
+                &json!({"seat": "human", "window": {"id": 7, "generation": 3}, "x": 4, "y": 5, "require_hit": true})
             ),
             Ok(move_op(PointerMoveTarget::Window {
                 id: 7,
@@ -5264,7 +5436,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_input_op("comp.input.pointer.button", &Value::Null),
+            parse_input_op("comp.input.pointer.button", &json!({"seat": "human"})),
             Ok(InputOp::PointerButton {
                 button: BTN_LEFT,
                 action: PressAction::Both
@@ -5273,7 +5445,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.button",
-                &json!({"button": "right", "action": "press"})
+                &json!({"seat": "human", "button": "right", "action": "press"})
             ),
             Ok(InputOp::PointerButton {
                 button: BTN_RIGHT,
@@ -5283,7 +5455,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.button",
-                &json!({"button": 0x113, "action": "release"})
+                &json!({"seat": "human", "button": 0x113, "action": "release"})
             ),
             Ok(InputOp::PointerButton {
                 button: 0x113,
@@ -5293,7 +5465,7 @@ mod tests {
         // A wheel derives detents (15 units = 120); a finger has none and a
         // missing axis stays missing.
         assert_eq!(
-            parse_input_op("comp.input.pointer.scroll", &json!({"dy": 15})),
+            parse_input_op("comp.input.pointer.scroll", &json!({"seat": "human", "dy": 15})),
             Ok(InputOp::PointerScroll {
                 dx: None,
                 dy: Some(15.0),
@@ -5304,7 +5476,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.scroll",
-                &json!({"dx": 0, "source": "finger"})
+                &json!({"seat": "human", "dx": 0, "source": "finger"})
             ),
             Ok(InputOp::PointerScroll {
                 dx: Some(0.0),
@@ -5316,7 +5488,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.scroll",
-                &json!({"dy": 10, "v120": {"dy": -240}})
+                &json!({"seat": "human", "dy": 10, "v120": {"dy": -240}})
             ),
             Ok(InputOp::PointerScroll {
                 dx: None,
@@ -5328,7 +5500,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.key",
-                &json!({"key": "q", "modifiers": ["super", "shift"]})
+                &json!({"seat": "human", "key": "q", "modifiers": ["super", "shift"]})
             ),
             Ok(InputOp::Key {
                 key: KeySpec::Name("q".into()),
@@ -5340,7 +5512,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_input_op("comp.input.key", &json!({"key": 28, "action": "press"})),
+            parse_input_op("comp.input.key", &json!({"seat": "human", "key": 28, "action": "press"})),
             Ok(InputOp::Key {
                 key: KeySpec::Evdev(28),
                 action: PressAction::Press,
@@ -5348,7 +5520,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_input_op("comp.input.key", &json!({"text": "ok\n"})),
+            parse_input_op("comp.input.key", &json!({"seat": "human", "text": "ok\n"})),
             Ok(InputOp::Text("ok\n".into()))
         );
         assert_eq!(
@@ -5581,7 +5753,10 @@ mod tests {
             panic!("text admitted");
         };
         assert!(first.order < second.order && second.order < third.order);
-        assert_eq!(third.op, InputOp::Text("ok".into()));
+        assert_eq!(third.op, InputOp::OnSeat {
+            seat: crate::protocol::SeatKind::Agent,
+            op: Box::new(InputOp::Text("ok".into())),
+        });
         assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert_eq!(depth.load(Ordering::Acquire), 3);
         // Taking the long request off the queue frees its slot while the
@@ -5645,7 +5820,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.move",
-                &json!({"dx": 1, "corners": false})
+                &json!({"seat": "human", "dx": 1, "corners": false})
             ),
             Ok(InputOp::PointerMove {
                 target: PointerMoveTarget::Relative { dx: 1.0, dy: 0.0 },

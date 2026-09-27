@@ -48,6 +48,8 @@ rustdoc-args = [
 ]
 
 [features]
+# Headless protocol fixtures; enabled only by downstream dev-dependencies.
+test-support = []
 # CosMix vendor addition: compiles the two `*_offline` X11Surface setters
 # used by downstream deterministic compositor tests. Only dev-dependencies
 # enable it, so a plain release build graph cannot compile them.

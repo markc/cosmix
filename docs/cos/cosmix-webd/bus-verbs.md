@@ -186,6 +186,52 @@ The handler schema enforces:
 - A relative `.mix` handler reference with no parent traversal.
 - Known capability tokens and explicit delegated-verb allowlists.
 
+## Shares and media references (0.12.0)
+
+These four verbs are **mesh-open**. They require no capability or node ACL;
+public HTTP access has the separate token/session gates described in [shares](shares.md).
+Arguments are a JSON object. Transport headers are not argument fallbacks.
+Unknown fields and wrong types are refused with rc=10 `invalid_arguments:`.
+
+| Verb | Required arguments | Optional arguments | Success (rc=0) |
+|---|---|---|---|
+| `webd.share.create` | `vhost: string`, `account: string`, exactly one of `rel_path: string` or `blob: reference object` | `kind: "file"` (default), `name: string` (blob only), `password: string`, `expires: integer` | `{token, url}`; URL is relative `/s/{token}` |
+| `webd.share.list` | `vhost: string`, `account: string` | `after: token string`, `limit: integer` (1..100, default 100) | `{shares: [...], next: token-or-null, skipped: integer}` |
+| `webd.share.revoke` | `vhost: string`, `account: string`, `token: string` | None | `{revoked: boolean}` |
+| `webd.media.ref` | `vhost: string`, `id: integer` (>0) | None | Reference object directly: `{blob, size, mime, name?, origin}` |
+
+`account` is the exact canonical session email, not a numeric maild/CMS account
+ID. `expires` is an absolute Unix timestamp in seconds and must be in the future
+at creation. `blob` contains `{blob: "b3:<64 lowercase hex>", size: integer,
+mime: string, name?: string, origin: string}`. A missing local blob is refused;
+these verbs do not fetch from the reference's origin. Path creation requires
+an operator-configured root for that account, even over the Bus.
+
+Vhost aliases resolve to their primary's catalogue and hashed blob owner. Share
+creation pins before token publication. Revoke is account-scoped and idempotent:
+false means absent, already revoked, or another account's token. Lists omit
+revoked rows and password hashes, retain expired rows, and paginate by token;
+unservable rows contribute to `skipped`. The cursor advances over skipped rows;
+`next=null` means no rows were scanned.
+
+All four operations run on at most eight workers owned by the current broker
+session. Reconnect aborts that session's workers. Password verification has four
+bcrypt workers and creation has one separate worker; admission lasts until
+blocking work ends. Busy replies run outside the receive loop with a 30-second
+timeout. At most 32 busy replies may be pending across reconnects; excess replies
+are dropped with one warning, leaving the caller to time out. Worker saturation is
+rc=10 `{"error":"busy: webd transfer workers full (8)"}`. All other failures
+also return rc=10 with `{"error":"<token>[: details]"}`; no new payload bytes
+travel in Bus frames.
+
+Share tokens/errors: `not_found`, `expired`, `revoked`, `unauthorized`,
+`invalid_arguments:`; resource/internal failures use `busy:` and `internal:`.
+Lane failures retain `lane_unavailable:`, `quota:`, `lane:`, `not_present:`,
+`verify_failed:`. Media additionally uses `unsupported_storage:`, `too_large:`,
+and `conflict:`. See [media references](media-references.md) for recovery and
+retention. `webd.media.ref` is advertised as mutating because it may write a
+blob, pin and catalogue reference.
+
 ## Unknown verbs
 
 An unsupported `webd.*` command returns `rc=10`, identifies the action, and reports the fixed read-only snapshot list. Mutation verbs are accepted only by their explicit asynchronous dispatchers or the property router.

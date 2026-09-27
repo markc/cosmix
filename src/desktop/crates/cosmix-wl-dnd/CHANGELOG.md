@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3
+
+- Exclude the agent seat from pointer/data-device binding, waiting for seat
+  names before binding so human OS drags remain attributable.
+
 Backfilled 2026-07-26 from the release commits; earlier entries are
 reconstructions, not contemporaneous notes.
 

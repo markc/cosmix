@@ -3083,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.69.2"
+version = "0.72.0"
 dependencies = [
  "bevy",
  "chrono",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -3308,10 +3308,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-files"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "blake3",
  "cosmix-lib-bus",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3491,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3549,7 +3550,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bevy",
  "bevy_winit",
@@ -3725,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wl-dnd"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "getrandom 0.4.3",
  "libc",

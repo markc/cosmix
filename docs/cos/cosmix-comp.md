@@ -535,6 +535,10 @@ input.corners.{holders,enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance
                enforced.{top,bottom,left,right},
                held.{top,bottom,left,right}}     (enforced, held: volatile)
 input.host.passthrough            (nested backend only)
+input.seats.{human,agent}.{name,keyboard_focus:{id,generation}|null,
+                          pointer_focus:{id,generation}|null,
+                          pointer:{output,x,y}|null,last_input_us}  (volatile)
+input.last_origin                (human|agent|null; volatile)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
@@ -949,169 +953,273 @@ rounds half away from zero on both sides of the origin.
 
 ### Input injection
 
-`comp.input.key` (including its `{text}` form) and `comp.input.pointer.button`
-accept `window:{id,generation}` and `raise?:bool` (default true). Both identity
-fields are required; `raise` requires `window`. The compositor focuses the window
-using the focus verb's path, applies the requested raise policy, then injects
-within the same compositor-thread operation. The input reply includes
-`{input_seq,injected_at_us,pointer,target,targeted,completed_events}`.
-`targeted:{id,generation}` records the requested window; `target` records client
-delivery of the key/text payload or button (null for a compositor-consumed
-binding). Modifier setup and release cleanup do not claim payload delivery.
-Target continuity is checked before every generated key press. A binding that
-changes focus stops subsequent presses with rc 10 `target_changed`, reporting
-`completed_events` and releasing this operation's new holds. Completed events
-are not rolled back. Sequence steps accept exactly the same arguments.
+**0.72.0 (unreleased):** Bus input and sequences now default to the agent seat;
+callers needing human focus, bindings, chrome or idle activity must pass
+`seat:"human"`. Bare `release_all {}` still clears both seats' injected holds.
 
-The focus-and-inject ordering guarantee applies to Wayland seat delivery.
-For Xwayland, Smithay sends X focus requests (`SetInputFocus` / `WM_TAKE_FOCUS`)
-without waiting for X focus confirmation; keys travel over the Wayland
-connection. A successful reply therefore does not guarantee that the X client
-has taken focus before the first key, especially with client-driven focus.
-Use client-side acknowledgement when X client focus ordering matters.
+`cosmix-input-probe --seats` binds each advertised
+seat's keyboard and pointer and labels their events by the quoted seat name.
+`--idle-timeout-ms N` enables the same mode and adds one ext-idle-notify-v1
+notification per seat: `PROBE seat "cosmix" idled` / `resumed` (likewise for
+`cosmix-agent`). `PROBE seats_ready` follows a roundtrip confirming setup;
+`PROBE seats_done` follows the final event-draining roundtrip. With neither
+flag the probe retains its existing bindings and output. The flags do not
+change the compositor's input default.
 
-Targeted buttons direct the seat pointer to the named window at the current
-cursor position, expressed relative to its buffer origin; they do not warp the
-cursor. The ordinary device-click focus/raise policy is skipped because the
-targeted operation has already applied it, including `raise:false`. Buttons
-still pass through region, corner-release, KMS quarantine and delivery gates.
-After delivery, pointer focus is reconciled with the cursor position (respecting
-an ongoing implicit grab), so the next device click uses the ordinary target.
-An unmapped, minimised, off-workspace or non-presentable window, a session lock,
-an exclusive layer, an active region-selection run (`reason:"region_select"`),
-or an interfering grab returns rc 10
-`target_unfocusable` with `reason`, `id` and `generation`, and injects no key or
-button. Unlike the standalone focus verb, targeted input never switches workspace
-or restores a window. Unknown or stale identities retain the existing target errors.
-If focus arbitration itself returns `focus_refused`, focus/stacking changes made
-by that arbitration may remain; no payload key or button was injected.
-Targeted key releases still validate the window identity, but do not require
-focus eligibility or refocus/raise the window; the seat's modal and lock gates
-continue to handle those releases.
+The former 0.71.0/0.71.1 development versions were never installed; their seat
+delivery and probe changes ship together in 0.72.0. `cosmix-agent` has its own
+keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
+hidden from Xwayland. Every `comp.input.*` verb accepts `seat:"human"` or
+`seat:"agent"`; there are no caller authorisation gates on either choice.
+Clipboard and primary selections now relay between the two seats with source
+provenance. Consecutive compatible agent motions coalesce, and agent delivery
+runs in bounded batches after ready human input. Full-click menu switching
+preserves the next menu's press serial; unmapping a menu's root retires its grabs.
 
-Without `window`, `no_keyboard_target` is returned only after the seat finds no
-client/native focus, compositor binding or modal owner for a non-modifier payload press.
-Bare modifier presses are accepted and held as prefixes for later bindings;
-an engaged hot corner alone does not consume keyboard input.
-Releases and keys already held by injection are always processed; generated new
-holds are cleaned up on refusal. Modifier setup can advance XKB before the
-payload is refused. Empty workspaces still accept compositor chords, and Escape
-still cancels region selection. Untargeted buttons retain their existing
-behaviour: a null pointer delivery target can also mean chrome, a panel or a hot
-corner, so it is not a reliable empty-space refusal.
+The default is **agent** (`cosmix-agent`). Select `seat:"human"` explicitly for
+human input semantics (including X11 targets). The deliberate exception
+is `release_all`: without a seat it releases **both seats' injected holds**. A sequence's
+explicit `seat` is inherited by its steps; `args.seat` overrides it for a step.
+Without a sequence-level seat, each verb uses its own default.
 
-The `comp.input.*` verbs feed the seat exactly as a device does. Every event
-enters the one seat entry point with user activity on, so these all apply
-unchanged: bindings (an injected `Super+Shift+M` restores a window, and the
-client never sees the M), pointer grabs and constraints, click-to-focus and
-raise, idle notification, and the session lock. Under a session lock,
-injected input reaches only the lock surface.
+| Behaviour | `seat:"human"` | `seat:"agent"` |
+| --- | --- | --- |
+| Keyboard | Human keymap/modifiers and compositor bindings | Independent keymap/modifiers; every key forwards, no compositor chords |
+| Targeted focus | Existing window focus arbitration | Agent keyboard only; no `Activated`, restack, restore or workspace switch |
+| Omitted `raise` | `true` for a targeted key/button | `false`; explicit `true` returns `invalid_argument` |
+| Idle | Human activity resumes idle notifications on both seats | Neither seat's idle notification is reset; no user-activity observation |
+| Session lock | Untargeted input retains the lock-screen path | All verbs refuse with `session_lock` |
+| Pointer | Device path, including chrome, corners and constraints | Client surfaces only; independent position; human cursor image/position unchanged |
+| Clipboard and primary | Shared selection, including the XWM bridge | Shared selection, with the source seat and generation tracked explicitly |
 
-Event timestamps are CLOCK_MONOTONIC milliseconds, wrapping at 32 bits. That
-is the clock `wp_presentation` reports, so a client can subtract an input
-event time from a presentation time. Real input from the nested host window
-uses the same clock.
+Bus injection now records agent origin unless `seat:"human"` is selected.
+Successful agent delivery updates `input.seats.agent.last_input_us` and
+`input.last_origin:"agent"`. Human delivery updates the human leaves and reports
+`last_origin:"human"`. The existing focus/pointer leaves retain their human
+meaning. Human Bus injection still follows `inject → handle_host_input →
+notify_idle_activity(Human)`; agent delivery uses the agent Smithay handles.
 
-| Verb | Arguments |
+Clipboard and primary are separate logical selections, each offered on both
+seats. A client setting either selection replaces the other seat's mirror;
+clearing it or destroying/disconnecting its current source clears both offers.
+Destroying a replaced source leaves the newer selection intact. Data-control
+history clients on either seat see each replacement once. Mirrors use
+compositor selection setters, which do not invoke the source-change callback,
+so they cannot echo ownership back and forth.
+
+Each mirror records a source seat (or X11) and a selection generation. Reading
+a replaced mirror closes the transfer fd without serving newer clipboard data.
+For a current Wayland source, the relay passes the recipient's fd to that
+source; clipboard bytes do not pass through comp. X11 offers carry X11
+provenance on both seats. An X11 paste of an agent-sourced selection routes
+explicitly through the relay to the agent source, never through a presumed
+human source. Xwayland generation teardown clears its clipboard and primary
+offers on both seats; newer Wayland-owned replacements survive that teardown.
+Clipboard sharing is independent of input reachability: agent
+key and pointer delivery to X11 still returns `x11_unsupported`.
+
+| Verb | Arguments, in addition to `seat?` |
 | --- | --- |
-| `comp.input.pointer.move` | One of three forms. `{x,y,output?}`: output-local absolute; `output` is an `outputs` key or output name, and defaults to the default output. `{dx,dy}`: relative. `{window:{id,generation},x,y,require_hit?}`: relative to the window-geometry origin. Any form takes `corners?` (default `true`); `false` keeps the move from arming a hot corner. |
-| `comp.input.pointer.button` | `{button?,action?,window?,raise?}`. `button`: `left` (default), `right`, `middle`, or an evdev code `0x100..=0x2ff`. `action`: `press`, `release` or `click` (default). |
-| `comp.input.pointer.scroll` | `{dx?,dy?,source?,v120?}`. At least one axis is required; an omitted axis stays absent. Positive `dy` scrolls down. `source`: `wheel` (default), `finger` or `continuous`; a zero on `finger` or `continuous` is an axis stop. `v120:{dx?,dy?}` sets wheel detents; without it, a wheel derives 120 per 15 units. |
-| `comp.input.key` | `{key,action?,modifiers?,window?,raise?}`. `key`: an XKB keysym name (`Return`, `a`, `F5`, `Super_L`) or an evdev code. `action`: `press`, `release` or `tap` (default). `modifiers`: any of `shift`, `ctrl`, `alt`, `super`, `altgr`, held around the key. A keysym that needs Shift gets Shift added. **Or** `{text,window?,raise?}`, at most 256 characters. |
-| `comp.input.release_all` | `{}` |
-| `comp.input.sequence` | `{steps:[{verb,args?,delay_ms?}],interval_ms?}` |
+| `comp.input.pointer.move` | `{x,y,output?}` for output-local absolute coordinates; `{dx,dy}` for displacement; or `{window:{id,generation},x,y,require_hit?}`. `output` is an output key or name, defaulting to the default output. `corners?` defaults to `true` on the human path and has no effect on the agent path. |
+| `comp.input.pointer.button` | `{button?,action?,window?,raise?}`. `button`: `left` (default), `right`, `middle`, or evdev `0x100..=0x2ff`. `action`: `press`, `release` or `click` (default). |
+| `comp.input.pointer.scroll` | `{dx?,dy?,source?,v120?}`. At least one axis; positive `dy` scrolls down. `source`: `wheel` (default), `finger` or `continuous`; zero on finger/continuous is an axis stop. `v120:{dx?,dy?}` supplies wheel detents; otherwise a wheel derives 120 per 15 units. |
+| `comp.input.key` | `{key,action?,modifiers?,window?,raise?}` or `{text,window?,raise?}`. `key` is an XKB keysym name or evdev code; `action` is `press`, `release` or `tap` (default). `modifiers` accepts `shift`, `ctrl`, `alt`, `super`, `altgr`. `text` is at most 256 characters. |
+| `comp.input.release_all` | `{seat?}`; omitted seat cleans both seats (`seat:"both"` in the reply). |
+| `comp.input.sequence` | `{seat?,steps:[{verb,args?,delay_ms?}],interval_ms?}`. |
 
-Each single verb replies:
+Targeted keys, text and buttons require both identity fields in
+`window:{id,generation}`. Resolve, focus and injection run without yielding to
+the event loop. Before each generated press, the compositor rechecks the
+identity against the **driven seat's** delivery target. A change returns
+`target_changed` and releases this operation's new holds; already delivered
+events are not rolled back. `raise` requires a window.
+
+Agent targeting accepts mapped windows on other workspaces, minimised windows
+and windows hidden from the human view, including while an exclusive layer has
+human focus. It retains mapping, presentation and session-lock checks. An
+interfering agent grab returns `keyboard_grab` or `pointer_grab`; a matching
+popup chain is allowed. Untargeted keys use the agent keyboard's existing focus
+or return `no_keyboard_target`. Agent shortcuts reach the client: use compositor
+verbs for window management, or explicitly choose the human seat to test a
+compositor binding.
+
+Hidden and off-workspace windows receive no frame callbacks. A FIFO client can
+receive these input events yet defer processing them until the window becomes
+visible: protocol delivery does not guarantee application progress.
+
+Agent reachability checks run **before either device's focus changes**:
+
+- `x11_unsupported`: X11 targets, including coordinate-selected descendants.
+- `agent_seat_unbound`: the target client is **currently unbound** on the
+  agent keyboard or pointer needed by the operation. There is no silent fallback.
+- `chrome_target`: compositor chrome, decoration or a requested root-local
+  point that does not hit that window's client tree.
+
+These errors include `hint:{seat:"human"}`. Clients that bind only one seat
+need that explicit opt-in. Toolkit compatibility still needs the release's
+toolkit matrix; successful protocol tests do not establish toolkit support.
+
+For agent `{window,x,y}`, coordinates are relative to the **window-geometry
+origin**, exactly as on the human seat (CSD shadows do not shift the requested
+point when switching seats). Hit-testing still uses wl_surface layout origins and
+considers only that root's mapped client tree, including subsurfaces and popups,
+in committed stacking order and with committed input regions. Every ancestor
+must remain mapped. Workspace, minimisation, visibility and other windows'
+occlusion do not exclude it; `require_hit` adds no human-visibility restriction.
+Outside that tree, the move refuses without changing focus.
+
+For agent `{x,y,output}`, hit-testing considers visible mapped client surfaces;
+chrome and embedded Quoin panels refuse before focus changes. An existing implicit
+agent button grab may cross chrome while retaining its client target.
+Empty space clears agent pointer focus and permits a subsequent
+click to dismiss an agent popup. `{dx,dy}` offsets the known agent position;
+it sends ordinary pointer motion, never relative-pointer protocol events. A
+targeted agent button uses the current agent position when it belongs to that
+window, otherwise the centre of the root buffer, and validates the client hit
+before focusing. Untargeted buttons/scroll need an agent pointer target (or a
+popup grab handling an outside click), otherwise `no_pointer_target` is returned.
+
+Agent input does not drive hot corners, pointer constraints, interactive
+move/resize, compositor decorations or drag and drop. A client `StartDrag` on
+the agent seat is refused before Smithay assigns an icon role or installs a
+grab; its supplied data source is cancelled. A null-source `StartDrag` is also
+refused but has no data source through which to send cancellation feedback.
+Popup grabs use the agent seat's
+own input serials and survive changes to human focus.
+
+Human window-relative moves retain the window-geometry-origin contract.
+`require_hit:true` additionally requires an on-output hit of that window/frame;
+failure is `off_output` or `occluded` (with `under`). Human targeted keys/buttons
+retain `target_unfocusable` with `reason`, `id` and `generation` for unmapped,
+minimised, off-workspace, invisible or non-presentable windows, session lock,
+exclusive layers, region selection or interfering grabs. They never restore a
+window or switch workspace. Targeted releases reconcile holds without refocusing.
+Human targeted buttons use the existing pointer route at the human cursor and
+then reconcile pointer focus. Untargeted human input retains bindings, modal
+owners and lock-screen delivery. Human pointer moves arm corners unless
+`corners:false`; that option still permits leaving an engaged corner.
+
+For human Xwayland targets, Smithay sends `SetInputFocus` / `WM_TAKE_FOCUS`
+without waiting for X focus confirmation. A successful injection reply does
+not guarantee X focus has completed before the first key; use client-side
+acknowledgement when that ordering matters.
+
+Each successful single verb replies:
 
 ```text
-{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null, targeted:{id,generation}|null, completed_events}
+{seat, input_seq, injected_at_us, pointer:{output,x,y}|null,
+ target:{id,generation}|null, targeted:{id,generation}|null, completed_events}
 ```
 
-- `input_seq` increases by one per verb.
-- `injected_at_us` is CLOCK_MONOTONIC microseconds.
-- `pointer` is the cursor after the verb, in output-local coordinates.
-- `targeted` is the requested window, or null for untargeted input.
-- `target` records client delivery of the payload for keys and targeted buttons,
-  not the keyboard focus after a binding runs. It is null when a binding consumes
-  the payload. Untargeted pointer verbs retain their pointer-focus fallback.
-  A delivery target can be a layer or lock surface, not only a window.
-- `completed_events` counts generated key events processed before completion or refusal.
+`input_seq` increases per verb. `pointer` is the driven seat's output-local
+position; `targeted` identifies an explicit targeted key/button. `target` is
+payload delivery, not a later focus state; consumed human bindings report null.
+`completed_events` counts generated key events processed before completion or
+refusal. Runtime refusals also identify the seat. Unknown/stale window identities
+retain the existing target errors; moves retain `unknown_output` and
+`out_of_bounds`. Later target changes can refuse after partial key delivery.
 
-`text` maps each character through the live seat keymap, honouring Caps Lock
-and the active layout. Only characters on the first two shift levels map; each
-is typed as press and release, with Shift where needed. A newline types
-Return. Characters that need AltGr (the third and fourth levels), a dead
-key or a compose sequence are refused as unmappable. If any character cannot
-be typed, nothing is sent and the reply is
-`{"error":"unmappable","char","index"}`. While an input method holds the
-keyboard, `text` is refused with `{"error":"ime_active"}`, because the IME
-would turn the keys into something other than the text sent. Some input
-methods hold that grab whenever a text field has focus; with one of those,
-every `text` call is refused, so type with `comp.input.key` instead. An unknown key
-name replies `{"error":"unknown_key","key"}`.
+Timestamps use CLOCK_MONOTONIC: microseconds in replies, wrapping 32-bit
+milliseconds on input events, matching the clock advertised by `wp_presentation`.
+Text resolves against the driven keyboard's live keymap, locked modifiers and
+layout. It uses the first two shift levels, adding Shift where required; newline
+types Return. AltGr-only, dead-key and compose characters are `unmappable`
+(`char` and `index`) before anything is typed. Unknown key names return
+`unknown_key`; human text under an input-method grab retains `ime_active`.
 
-An absolute or window-relative move is real pointer motion, so moving into an
-output corner arms the hot corner exactly as a mouse would; pass
-`corners:false` to move without arming one. Such a move still leaves an
-engaged corner and cancels a pending dwell.
+Holds belong to a seat and an operation owner. `release_all` releases both seats'
+injected holds unless explicitly scoped with `seat`, never a physical-device or
+host hold. An explicit release
+clears injected ownership of that key/button on that seat. Taps and clicks
+release their generated presses; `action:"press"` can retain a hold.
 
-One verb injects at most 4096 seat events (a whole sequence included; a text
-character counts four, a key with modifiers two per key). A larger request is
-refused before anything is sent with `invalid_value` naming the limit.
+An agent tap or click retains one recent press serial per device for a later
+popup grab on the same root, without yielding inside the operation. A later
+press replaces it; relevant focus changes and cleanup invalidate it; a successful
+popup grab consumes it. Human clicks outside do not dismiss agent popups.
+`release_all` with no seat or with `seat:"agent"` dismisses the agent popup chain
+and removes its keyboard/pointer grabs; `seat:"human"` leaves it alone.
+The agent half of bare cleanup does not record agent input activity or change
+`input.last_origin`. Naturally ended popup chains retire their handles while
+preserving a newer press that may open the next menu. Explicit dismissal clears
+both device action slots. A chain whose popup or root has unmapped is also
+retired; a newly created popup may still complete its initial configure/map
+handshake, provided its root remains mapped.
+Keys during that interval refuse with `unmapped`: validation checks the popup
+the keyboard grab would deliver to, rather than its mapped parent.
+Explicit agent key/button releases bypass target candidacy and focus mutation,
+so a hold can be retired after its old target unmaps; session lock still refuses.
 
-Every refusal is decided before anything is sent:
-- `stale_target`, or another window-target error, for the `window` form;
-- `occluded` when `require_hit` is true and the point is not on that window or
-  its frame. `under` names the window actually at that point, or is null;
-- `off_output` when `require_hit` is true and no output shows the point;
-- `unknown_output`;
-- `out_of_bounds`, with the output size, for a point outside the output.
+A sequence has at most 256 steps and 4096 generated events in total. Delays
+run on compositor timers, before the step, defaulting to `interval_ms` (default
+0), and total at most 60 seconds. It yields after 256 injected events; runs can
+interleave at delays and yields. The reply is
+`{seat,steps:[<each step's reply, including its seat>],elapsed_ms}`.
+An explicitly seated sequence reports that seat at the top level. An unseated
+sequence reports `human`, `agent` or `mixed` from the steps reached, including
+the refusing step for `step_failed`; bare both-seat cleanup counts as `mixed`.
+An empty capability probe is refused with `invalid_argument` before any seat
+applies. Per-step seats are unchanged.
+On a failed step, it returns `step_failed` with `index`, `verb`, `step`,
+`completed` and `released:true`, and gives up its holds on **both** seats.
+Other owners' holds remain. Caller cancellation also releases the run's holds.
+Eight sequence permits are available; admission beyond that returns `busy`.
 
-Untargeted input is not refused while the session is locked; the seat decides
-where it goes. Targeted input refuses the locked window as described above.
+Within a dispatch batch, only consecutive agent motions to the same live client
+surface and with the same coordinate contract coalesce. Window motions must
+name the same window generation; output motions must use the same output
+selector; consecutive relative deltas are summed. Grabs, surface transitions,
+sequence delays and intervening controls (including keys, buttons and scroll)
+are delivery boundaries. Human motions retain their existing path and cannot
+merge with agent motions. Separate sequence runs are also boundaries.
 
-`release_all` releases the keys and buttons that injection pressed and has not
-released. It never releases anything a physical device holds. Taps and clicks
-never leave a key or button down; only `action: press` holds one.
+Each coalesced request is answered **after** the final motion is delivered.
+Its reply reports that final position, target, timestamp and shared `input_seq`,
+with `coalesced:N` giving the number of requests represented by that delivery.
+Intermediate coordinates are not reported as delivered. Sequence replies keep
+one entry per requested step, sharing those delivery fields for a coalesced run.
 
-`comp.input.sequence` runs up to 256 steps in order:
-- Each step is one of the single input verbs above, with its usual arguments.
-- `delay_ms` is a wait before that step, on a compositor timer. It defaults to
-  `interval_ms`, which defaults to 0. The delays together may total at most 60
-  seconds.
-- A drag is a `press`, some moves, and a `release`.
-- The reply is `{steps:[<each step's reply>],elapsed_ms}`.
-- A run yields to the event loop after every 256 injected events, so a long
-  zero-delay stretch cannot fill a client's socket in one pass. A run is
-  therefore not atomic even without delays: other runs and single verbs can
-  interleave at those yields (and at every delay).
-- If a step is refused, the run stops and gives up the keys and buttons it
-  pressed. A hold is released only when no other owner (another run, or a
-  single verb that pressed the same key) still holds it; an explicit release
-  by anyone lets the key go for every owner.
-  The reply is rc 10
-  `{"error":"step_failed",index,verb,step:<the refusal>,completed:[...],released:true}`.
-- If the caller stops waiting, the run also stops and releases its own holds.
+Ready human `HostInput` drains before Bus delivery. Each dispatch services at
+most eight agent controls (standalone verbs or sequence admissions) and one
+resumption burst, plus a separate allowance for one initial sequence burst.
+The initial burst counts toward the eight-control budget and runs its own
+sequence at its admission position, before later controls. Resumptions cannot
+spend that allowance. A second initial sequence and all later controls remain
+queued for the next dispatch. Snapshot/props reads admitted after
+parked controls wait for those controls to finish; earlier reads can complete.
+Sequences yield at the existing 256-event boundary between atomic operations.
+Sequences using the agent seat also yield after visiting 256 steps so
+coalescing cannot create an unbounded scan. Ready agent sequences rotate in
+queue order. Queued agent work wakes the event loop directly: continuously
+arriving human input cannot postpone it indefinitely, and no polling timer is
+used for agent continuation. Explicitly requested delays still use one-shot
+timers. Resolve, focus and each individual input operation remain atomic.
 
-Sequences use their own pool of eight permits. Each waits for its own delays
-plus one second, not the two-second budget of other verbs. When all eight
-permits are in use, a new sequence gets `busy`.
+Lock entry, VT switching, session pause and input-authority loss clear agent
+holds, grabs and focus and cancel sequences using the agent seat with
+`input_cleared`. They also refuse parked agent controls and pending sequence
+admissions with `input_cleared`, `seat:"agent"`, `released:true`. An admission
+epoch catches requests still in ingress at the boundary, so stale queued work
+cannot recreate cleared holds. Other controls retain their order.
+Surface loss is reconciled per device without cancelling sequences:
+a dead pointer target loses pointer focus and pointer holds; a dead keyboard
+target keeps an active popup keyboard grab, which delivers the next key to its
+topmost live menu. Without that grab it returns to its nearest live ancestor,
+or loses keyboard focus and
+key holds if no parent survives. This does not arbitrate human focus. Unlock reconciliation samples human
+pressed state only. Agent cleanup does not reset idle notifications.
+Human region selection and nested keyboard-focus loss do not clear agent state.
 
-`input.host.passthrough` exists only on the nested backend; on KMS the path is
-`unknown_path`. Setting it to `false` stops the host window's pointer motion,
-buttons, scroll and keys reaching the seat, so the host cursor cannot
-overwrite an injected position. Output resize and scale, pointer leave and
-touch still pass. A host key or button pressed before the switch still gets
-its release. A host focus loss releases only those host keys, never an
-injected hold, and still resets compositor chrome state (a title-bar drag,
-hover, cursor override). The value persists until it is set back to `true`
-or the compositor exits; a script that turns it off should turn it on again.
+`input.host.passthrough` remains nested-only (`unknown_path` on KMS) and controls
+the **human** host path. Setting it false suppresses host keys, motion, buttons
+and scroll; resize, scale, pointer leave and touch still pass. Pre-existing host
+holds still receive releases. Restore it to true when finished; the value lasts
+until changed or comp exits.
 
-The frame trace records each injected verb as `comp_input_injected`:
-- subject: `input_seq`;
-- detail: the verb kind (1 move, 2 button, 3 scroll, 4 key, 5 text,
-  6 release_all);
-- aux: the target id, or 0.
+The frame trace retains `comp_input_injected`: subject `input_seq`, detail
+1 move / 2 button / 3 scroll / 4 key / 5 text / 6 release_all, aux target id or 0.
+Presentation input marks also retain the originating seat.
+
 
 The compositor publishes non-retained messages under the registered service
 namespace. The seat instance therefore uses `comp.*`, the default nested
@@ -1509,6 +1617,14 @@ application and the panel and menu are enforced. After `SIGCONT` the shell's
 own conceal returns `enforced` to 0, and `held.<edge>` returns to 0 once its
 menus have closed.
 
+The per-seat `input.seats.*` observations and `input.last_origin` are also
+read-only and volatile: `get`, `list` and `describe` serve them, but
+`props.changed` never reports them. Focus identifies a surface by `{id,generation}`
+or is null; pointer coordinates are output-local logical coordinates or null
+when unknown or locked. `last_input_us` uses CLOCK_MONOTONIC microseconds and
+is null before input. An unset `last_origin` is omitted from the serialised
+tree (a direct read returns null). Existing focus and pointer leaves remain human.
+
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry
 change, session lock, disable, or config invalidation. `corner` is `tl`, `tr`,
@@ -1845,7 +1961,8 @@ the updates it skipped count as `discarded`.
   started (the first update, registration, compositor start, or the last
   reset).
 
-The presentation leaves and the whole `sources` subtree are **volatile**:
+The presentation leaves, the whole `sources` subtree, `input.seats.*` and
+`input.last_origin` are **volatile**:
 `get`, `list` and `describe` serve them (`describe` says `volatile: true`),
 but `props.changed` never reports them, so a watched client presenting at
 60 Hz does not flood the topic. Row add and remove events carry no
@@ -2393,6 +2510,10 @@ fault's unhealthy window is at most one dispatch cycle, so the leaves are
 process-lifetime constants in practice — poll them, don't watch them.
 
 ## Vendored changes
+
+Smithay's `SeatState::new_wl_seat_with_filter` filters seat-global visibility
+per client through `GlobalDispatch::can_view`. The existing `new_wl_seat`
+delegates with an always-true predicate.
 
 The vendored Smithay layer-surface handle has an additive `reset_after_unmap`
 helper so the compositor can clear Smithay's private configure queue while

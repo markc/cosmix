@@ -225,6 +225,14 @@ const fn grab_is_attributable(has_grab: bool, pointer_capable_seats: usize) -> b
     has_grab && pointer_capable_seats == 1
 }
 
+// Keep in step with cosmix-comp/src/protocol/seat.rs (source-pinned below).
+const AGENT_SEAT_NAME: &str = "cosmix-agent";
+
+fn seat_accepts_human_drag(name: Option<&str>, version: u32) -> bool {
+    // Name events exist from v2. Wait for them before binding any devices.
+    name.map_or(version < 2, |name| name != AGENT_SEAT_NAME)
+}
+
 /// The reason a terminated outgoing drag reports.
 ///
 /// Split out of [`WaylandBridge::terminate_outgoing`] for the same reason as
@@ -957,16 +965,8 @@ impl WaylandBridge {
             .map_err(|error| InitError::MissingDataDeviceManager(error.to_string()))?;
         let supported_protocol =
             DataDeviceProtocolV3::try_from(data_device_manager.data_device_manager().version())?;
-        let data_devices = create_data_devices(supported_protocol, || {
-            seat_state
-                .seats()
-                .map(|seat| SeatObjects {
-                    data_device: data_device_manager.get_data_device(&qh, &seat),
-                    seat,
-                    pointer: None,
-                })
-                .collect()
-        });
+        // Seat names arrive asynchronously. Device binding waits for discovery.
+        let data_devices = create_data_devices(supported_protocol, Vec::new);
         let (worker_tx, worker_rx) = mpsc::channel();
         let (send_worker_tx, send_worker_rx) = mpsc::channel();
 
@@ -1421,6 +1421,10 @@ impl WaylandBridge {
             self.lose_connection(error.to_string());
             return Ok(self.drain_app_frame());
         }
+        // SCTK has no seat-name callback. Reconcile after pending events so
+        // capabilities-before-name and hot-added seats follow the same policy.
+        let qh = self.event_queue.as_ref().unwrap().handle();
+        self.state.reconcile_seats(&qh);
         self.run_frame(now, |bridge| bridge.flush_connection())
     }
 
@@ -3789,43 +3793,30 @@ impl ShmHandler for TransportState {
     }
 }
 
-impl SeatHandler for TransportState {
-    fn seat_state(&mut self) -> &mut SeatState {
-        self.seat_state
-            .as_mut()
-            .expect("production transport owns seat state")
+impl TransportState {
+    fn reconcile_seats(&mut self, qh: &QueueHandle<Self>) {
+        let seats = self.seat_state().seats().collect::<Vec<_>>();
+        for seat in seats {
+            self.ensure_seat_devices(qh, seat);
+        }
     }
 
-    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat) {
-        // Seat creation owns a protocol object and is not per-drag lifecycle
-        // work. Record it in this callback so drag queue pressure cannot leave
-        // a hot-added seat without a data device.
+    fn ensure_seat_devices(&mut self, qh: &QueueHandle<Self>, seat: WlSeat) {
+        let Some(info) = self.seat_state().info(&seat) else { return };
+        if !seat_accepts_human_drag(info.name.as_deref(), seat.version()) {
+            return;
+        }
         let already_present = self.data_devices.iter().any(|objects| objects.seat == seat);
-        let Some(vacant) = admit_unique_seat(already_present) else {
-            return;
-        };
-        let data_device = create_seat_object(vacant, || {
-            self.data_device_manager
-                .as_ref()
-                .expect("production transport owns a data-device manager")
-                .get_data_device(qh, &seat)
-        });
-        self.data_devices.push(SeatObjects {
-            seat,
-            data_device,
-            pointer: None,
-        });
-    }
-
-    fn new_capability(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        seat: WlSeat,
-        capability: Capability,
-    ) {
-        if capability != Capability::Pointer {
-            return;
+        if let Some(vacant) = admit_unique_seat(already_present) {
+            let data_device = create_seat_object(vacant, || {
+                self.data_device_manager
+                    .as_ref()
+                    .expect("production transport owns a data-device manager")
+                    .get_data_device(qh, &seat)
+            });
+            self.data_devices.push(SeatObjects {
+                seat: seat.clone(), data_device, pointer: None,
+            });
         }
         let Some(index) = self
             .data_devices
@@ -3834,11 +3825,25 @@ impl SeatHandler for TransportState {
         else {
             return;
         };
-        if self.data_devices[index].pointer.is_some() {
+        if !info.has_pointer || self.data_devices[index].pointer.is_some() {
             return;
         }
         let pointer = self.seat_state().get_pointer(qh, &seat).ok();
         self.data_devices[index].pointer = pointer;
+    }
+}
+
+impl SeatHandler for TransportState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        self.seat_state.as_mut().expect("production transport owns seat state")
+    }
+
+    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat) {
+        self.ensure_seat_devices(qh, seat);
+    }
+
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat, _: Capability) {
+        self.ensure_seat_devices(qh, seat);
     }
 
     fn remove_capability(
@@ -4448,6 +4453,23 @@ fn from_wayland_mask(mask: WlDndAction) -> ActionMask {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_seat_name_matches_comp_declaration() {
+        let comp = include_str!("../../cosmix-comp/src/protocol/seat.rs");
+        let expected = format!("pub const AGENT_SEAT_NAME: &str = {:?};", super::AGENT_SEAT_NAME);
+        assert!(comp.lines().any(|line| line == expected),
+            "comp and wl-dnd seat names must be edited together: {expected}");
+    }
+
+    #[test]
+    fn agent_named_seat_does_not_count_towards_human_drag_attribution() {
+        let names = [Some("seat0"), Some(super::AGENT_SEAT_NAME), None];
+        let count = names.into_iter().filter(|name| super::seat_accepts_human_drag(*name, 9)).count();
+        assert_eq!(count, 1);
+        assert!(super::grab_is_attributable(true, count));
+        assert!(!super::seat_accepts_human_drag(None, 2));
+        assert!(super::seat_accepts_human_drag(None, 1));
+    }
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::os::fd::OwnedFd;

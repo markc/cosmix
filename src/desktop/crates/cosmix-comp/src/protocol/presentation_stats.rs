@@ -94,6 +94,8 @@ impl Ring {
 /// An injected input that a later presentation answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InputMark {
+    /// Input correlation belongs to the driven seat, not the human focus owner.
+    pub(crate) seat: super::SeatKind,
     pub(crate) input_seq: u64,
     pub(crate) injected_at_us: u64,
 }
@@ -661,6 +663,7 @@ impl StatsRegistry {
     /// match the mark later by `input_seq`. Returns false (and records
     /// nothing) for an `input_seq` not newer than the last one accepted.
     pub(crate) fn mark_input(&mut self, window: Option<(u64, u64)>, mark: InputMark) -> bool {
+        tracing::trace!(seat = mark.seat.name(), input_seq = mark.input_seq, "recording injected input presentation mark");
         if mark.input_seq <= self.last_input_seq {
             return false;
         }

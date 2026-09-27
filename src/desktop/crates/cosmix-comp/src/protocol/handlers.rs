@@ -1414,11 +1414,15 @@ impl XdgShellHandler for WaylandState {
         seat_resource: wl_seat::WlSeat,
         serial: Serial,
     ) {
+        if self.agent.seat.owns(&seat_resource) {
+            tracing::debug!("refused agent-seat interactive move");
+            return;
+        }
         if self.chrome_pointer_grab.is_some()
-            || !self.seat.owns(&seat_resource)
-            || !self.pointer.has_grab(serial)
+            || !self.human.seat.owns(&seat_resource)
+            || !self.human.pointer.has_grab(serial)
             || !pointer_grab_targets_surface(
-                &self.pointer,
+                &self.human.pointer,
                 &self.popup_manager,
                 surface.wl_surface(),
             )
@@ -1454,12 +1458,16 @@ impl XdgShellHandler for WaylandState {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
+        if self.agent.seat.owns(&seat_resource) {
+            tracing::debug!("refused agent-seat interactive resize");
+            return;
+        }
         if self.chrome_pointer_grab.is_some()
             || edges == xdg_toplevel::ResizeEdge::None
-            || !self.seat.owns(&seat_resource)
-            || !self.pointer.has_grab(serial)
+            || !self.human.seat.owns(&seat_resource)
+            || !self.human.pointer.has_grab(serial)
             || !pointer_grab_targets_surface(
-                &self.pointer,
+                &self.human.pointer,
                 &self.popup_manager,
                 surface.wl_surface(),
             )
@@ -1576,21 +1584,36 @@ impl XdgShellHandler for WaylandState {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat_resource: wl_seat::WlSeat, serial: Serial) {
-        if !self.seat.owns(&seat_resource) {
+        let comp_seat = if self.human.seat.owns(&seat_resource) {
+            &self.human
+        } else if self.agent.seat.owns(&seat_resource) {
+            &self.agent
+        } else {
             tracing::warn!("dismissed popup grab for an unknown seat");
             surface.send_popup_done();
             return;
-        }
+        };
+        let kind = comp_seat.kind;
+        let seat = comp_seat.seat.clone();
+        let pointer = comp_seat.pointer.clone();
+        let keyboard = comp_seat.keyboard.clone();
+        let last_keyboard_action = comp_seat.last_keyboard_action.clone();
         let popup = PopupKind::Xdg(surface.clone());
         let Ok(root) = find_popup_root_surface(&popup) else {
             tracing::warn!("dismissed popup grab without a live root surface");
             surface.send_popup_done();
             return;
         };
-        let pointer_action = self.pointer.has_grab(serial)
-            && pointer_grab_targets_surface(&self.pointer, &self.popup_manager, &root);
+        let pointer_action = (pointer.has_grab(serial)
+            && pointer_grab_targets_surface(&pointer, &self.popup_manager, &root))
+            || (kind == SeatKind::Agent && comp_seat.last_pointer_action.as_ref().is_some_and(|(action, target)| {
+                *action == serial && *target == canonical_root_surface(&self.popup_manager, &root)
+                    && pointer.current_focus().and_then(|focus| focus.owned_surface())
+                        .is_some_and(|focus| canonical_root_surface(&self.popup_manager, &focus) == *target)
+                    && self.surfaces.get(&target.id()).is_some_and(|record| record.mapped)
+            }));
         let keyboard_action = keyboard_action_matches_root(
-            self.last_keyboard_action
+            last_keyboard_action
                 .as_ref()
                 .map(|(action_serial, focus)| {
                     (
@@ -1601,7 +1624,7 @@ impl XdgShellHandler for WaylandState {
             serial,
             canonical_root_surface(&self.popup_manager, &root),
         );
-        let touch_action = self.seat.get_touch().is_some_and(|touch| {
+        let touch_action = seat.get_touch().is_some_and(|touch| {
             touch.has_grab(serial)
                 && touch
                     .grab_start_data()
@@ -1620,7 +1643,8 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         }
-        if let Some(exclusive) = self.exclusive_keyboard_focus.as_ref()
+        if kind == SeatKind::Human
+            && let Some(exclusive) = self.exclusive_keyboard_focus.as_ref()
             && self.layer_root_object_for_surface(&root).as_ref() != Some(exclusive)
         {
             // xdg_popup.grab requires the topmost grabbing popup to retain
@@ -1635,21 +1659,25 @@ impl XdgShellHandler for WaylandState {
             surface.send_popup_done();
             return;
         }
-        let seat = self.seat.clone();
         let root_target = SeatFocusTarget::Wayland(root);
         match self
             .popup_manager
             .grab_popup(root_target, popup, &seat, serial)
         {
             Ok(grab) => {
-                self.cancel_chrome_pointer_grab(true);
-                let pointer = self.pointer.clone();
+                if kind == SeatKind::Human {
+                    self.cancel_chrome_pointer_grab(true);
+                }
                 pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
                 if self.layer_keyboard_interactivity_for_surface(surface.wl_surface())
                     != Some(KeyboardInteractivity::None)
                 {
-                    let keyboard = self.keyboard.clone();
                     keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+                }
+                if kind == SeatKind::Agent {
+                    self.agent.last_pointer_action = None;
+                    self.agent.last_keyboard_action = None;
+                    self.agent.popup_grab = Some(grab);
                 }
             }
             Err(error) => {
@@ -2082,7 +2110,6 @@ impl SeatHandler for WaylandState {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&SeatFocusTarget>) {
-        invalidate_keyboard_action(&mut self.last_keyboard_action);
         let focused_surface = focused
             .and_then(SeatFocusTarget::surface)
             .map(Cow::into_owned);
@@ -2106,13 +2133,33 @@ impl SeatHandler for WaylandState {
             })
             .flatten();
         set_data_device_focus(&self.display_handle, seat, data_device_client);
-        // Text-input focus is NOT automatic: nothing in Smithay's keyboard
-        // touches `text_input`, so the compositor must drive it or a client's
-        // `zwp_text_input_v3` never learns which surface is focused and an IME
-        // has nothing to attach to. Routed through the same
-        // resolved-focus surface every other consumer here uses, so text input
-        // cannot disagree with keyboard focus about where typing goes.
+        // Keep text-input bookkeeping on the supplied seat. Smithay also
+        // updates it from WlSurface keyboard enter/leave; this assignment is
+        // idempotent and uses the same resolved surface as data-device focus.
         seat.text_input().set_focus(focused_surface.clone());
+        // Seat identity, not its advertised name, owns desktop activation.
+        // Other seats retain their own protocol focus without disturbing the
+        // human's popup provenance, window state or fullscreen stacking.
+        if seat != &self.human.seat {
+            if seat == &self.agent.seat {
+                invalidate_keyboard_action(&mut self.agent.last_keyboard_action);
+                let mut ancestors = Vec::new();
+                let mut parent = focused_surface.as_ref()
+                    .and_then(|surface| self.surfaces.get(&surface.id()))
+                    .and_then(|record| record.layout.parent);
+                while let Some(id) = parent {
+                    let Some(record) = self.surface_objects.get(&id)
+                        .and_then(|object| self.surfaces.get(object)) else { break };
+                    let surface = record.role.wl_surface().clone();
+                    if ancestors.contains(&surface) { break; }
+                    ancestors.push(surface);
+                    parent = record.layout.parent;
+                }
+                self.agent.keyboard_ancestors = ancestors;
+            }
+            return;
+        }
+        invalidate_keyboard_action(&mut self.human.last_keyboard_action);
         // Temporary native modal focus is a seat transition, not window
         // deactivation: do not configure clients or demote fullscreen stacking.
         #[cfg(feature = "bus")]
@@ -2200,8 +2247,10 @@ impl SeatHandler for WaylandState {
         );
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        self.set_cursor_image(image);
+    fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) {
+        if seat == &self.human.seat {
+            self.set_cursor_image(image);
+        }
     }
 }
 
@@ -2220,53 +2269,31 @@ impl ForeignToplevelListHandler for WaylandState {
 }
 
 impl SelectionHandler for WaylandState {
-    type SelectionUserData = ();
+    type SelectionUserData = super::selection_relay::SelectionProvenance;
 
     fn new_selection(
         &mut self,
         target: SelectionTarget,
         source: Option<SelectionSource>,
-        _seat: Seat<Self>,
+        seat: Seat<Self>,
     ) {
-        tracing::debug!(
-            ?target,
-            mime_types = ?source.as_ref().map(SelectionSource::mime_types),
-            "nested client selection changed"
-        );
-        // Client-to-client transfers remain entirely fd-driven inside
-        // Smithay: the source receives wl_data_source.send with the receiver's
-        // pipe fd and writes directly, so the protocol thread never copies or
-        // blocks on clipboard payload bytes. Host clipboard bridging is a
-        // later phase concern.
-        //
-        // X-2b: mirror a WAYLAND client's selection onto the X side so an X
-        // client can paste it. Only a real client source is mirrored — a
-        // `None` source, or one comp itself installed while bridging an X
-        // selection the other way, must not be echoed back, or the two sides
-        // would hand ownership to each other in a loop.
-        #[cfg(feature = "xwayland")]
-        {
-            let offered = source.as_ref().map(SelectionSource::mime_types);
-            self.bridge_selection_to_x11(target, offered.as_deref());
-        }
+        self.relay_client_selection(target, source, seat);
     }
 
-    /// An X client is pasting a selection comp advertised on Wayland'\''s behalf.
-    ///
-    /// Reached only for a selection whose source is the COMPOSITOR — which, in
-    /// this compositor, means one bridged from X by `x11_new_selection`. So the
-    /// answer is to ask the X side for the bytes.
-    #[cfg_attr(not(feature = "xwayland"), allow(unused_variables))]
+    fn selection_source_destroyed(&mut self, source: SelectionSource) {
+        self.relay_source_destroyed(source);
+    }
+
+    /// Resolve every compositor offer through explicit source provenance.
     fn send_selection(
         &mut self,
         target: SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
-        _user_data: &(),
+        user_data: &Self::SelectionUserData,
     ) {
-        #[cfg(feature = "xwayland")]
-        self.serve_x11_selection(target, mime_type, fd);
+        self.send_relay_selection(target, mime_type, fd, user_data);
     }
 }
 
@@ -2284,6 +2311,10 @@ impl TabletSeatHandler for WaylandState {
 
 impl PointerConstraintsHandler for WaylandState {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        if pointer != &self.human.pointer {
+            tracing::debug!("ignored non-human pointer constraint");
+            return;
+        }
         // Activation is compositor policy — Smithay deliberately does not do it
         // for you. The policy here is the conventional one: a constraint becomes
         // active only while its surface actually has the pointer, so a client
@@ -2633,12 +2664,26 @@ impl FractionalScaleHandler for WaylandState {
 }
 
 impl ClientDndGrabHandler for WaylandState {
+    fn can_start_drag(&mut self, seat: &Seat<Self>) -> bool {
+        if seat == &self.agent.seat {
+            tracing::debug!("agent seat does not support drag and drop; start refused");
+            return false;
+        }
+        true
+    }
+
     fn started(
         &mut self,
         _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
         icon: Option<WlSurface>,
-        _seat: Seat<Self>,
+        seat: Seat<Self>,
     ) {
+        if seat != self.human.seat {
+            // can_start_drag refuses agent starts before icon-role/grab installation.
+            // This callback remains defensive; returning here cannot veto a grab.
+            tracing::debug!("ignored non-human drag icon update");
+            return;
+        }
         if let Some(icon) = icon {
             self.retire_unadopted_roleless_buffer(&icon);
         }

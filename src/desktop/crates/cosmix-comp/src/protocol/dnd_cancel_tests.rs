@@ -36,13 +36,13 @@ fn begin_drag_contact(harness: &mut KeybindingHarness, touch: bool) -> u32 {
         assert!(
             harness
                 .server
-                .state
+                .state.human
                 .seat
                 .get_touch()
                 .unwrap()
                 .has_grab(serial.into())
         );
-        assert!(!harness.server.state.pointer.is_grabbed());
+        assert!(!harness.server.state.human.pointer.is_grabbed());
         return serial;
     }
     let pointer = harness.bind_pointer();
@@ -137,9 +137,9 @@ fn start_accepted_client_drag(harness: &mut KeybindingHarness, touch: bool) -> (
 
 fn assert_drag_grab(harness: &KeybindingHarness, touch: bool, expected: bool) {
     let grabbed = if touch {
-        harness.server.state.seat.get_touch().unwrap().is_grabbed()
+        harness.server.state.human.seat.get_touch().unwrap().is_grabbed()
     } else {
-        harness.server.state.pointer.is_grabbed()
+        harness.server.state.human.pointer.is_grabbed()
     };
     assert_eq!(grabbed, expected, "drag grab lifetime (touch={touch})");
 }
@@ -159,7 +159,7 @@ fn start_accepted_server_drag(harness: &mut KeybindingHarness, touch: bool) -> (
     );
     let _ = harness.sync();
 
-    let seat = harness.server.state.seat.clone();
+    let seat = harness.server.state.human.seat.clone();
     let dh = harness.server.state.display_handle.clone();
     // start_dnd is Smithay's production API for compositor-owned sources;
     // there is deliberately no client start_drag request or wl_data_source.
@@ -469,7 +469,7 @@ fn dnd_session_lock_cancels_without_drop() {
             .any(|(object, opcode, _)| *object == device && *opcode == 2),
         "session lock must send wl_data_device.leave (opcode 2): {traffic:?}"
     );
-    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!harness.server.state.human.pointer.is_grabbed());
     // LOAD-BEARING: proves cancel revoked the offer (offer_data.active = false).
     assert_offer_revoked(&mut harness, offer);
 }
@@ -499,7 +499,7 @@ fn dnd_pointer_release_still_delivers_drop() {
             .any(|(object, opcode, _)| *object == source && *opcode == 2),
         "accepted button-release drop must not cancel its source: {traffic:?}"
     );
-    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!harness.server.state.human.pointer.is_grabbed());
 }
 
 #[test]
@@ -528,7 +528,7 @@ fn dnd_source_destroy_cancels_without_drop() {
             .any(|(object, opcode, _)| *object == device && *opcode == 2),
         "source destruction must send wl_data_device.leave (opcode 2): {traffic:?}"
     );
-    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!harness.server.state.human.pointer.is_grabbed());
     // LOAD-BEARING: proves cancel revoked the offer (offer_data.active = false).
     assert_offer_revoked(&mut harness, offer);
 }

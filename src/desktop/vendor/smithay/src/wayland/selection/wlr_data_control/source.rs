@@ -57,12 +57,15 @@ where
     }
 
     fn destroyed(
-        _state: &mut D,
+        state: &mut D,
         _client: ClientId,
-        _resource: &ZwlrDataControlSourceV1,
+        resource: &ZwlrDataControlSourceV1,
         data: &DataControlSourceUserData,
     ) {
         data.alive_tracker.destroy_notify();
+        state.selection_source_destroyed(super::super::SelectionSource {
+            provider: super::super::source::SelectionSourceProvider::WlrDataControl(resource.clone()),
+        });
     }
 }
 

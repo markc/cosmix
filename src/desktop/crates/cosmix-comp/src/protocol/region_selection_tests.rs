@@ -55,7 +55,7 @@ fn injected_escape_without_client_focus_cancels_region_and_releases() {
     use crate::port::{InputOp, KeySpec, PressAction};
     let mut h = KeybindingHarness::new(true);
     let mut rx = begin(&mut h);
-    assert!(h.server.state.keyboard.current_focus().is_none());
+    assert!(h.server.state.human.keyboard.current_focus().is_none());
     let reply = h.server.state.service_input_op(&InputOp::Key {
         key: KeySpec::Name("Escape".into()),
         action: PressAction::Both,
@@ -64,8 +64,8 @@ fn injected_escape_without_client_focus_cancels_region_and_releases() {
     assert!(matches!(reply, ControlReply::Body(_)), "{reply:?}");
     clean_frame(&mut h);
     assert_eq!(body(&mut rx)["status"], "cancelled");
-    assert!(h.server.state.injection.held.is_empty());
-    assert!(h.server.state.keyboard.pressed_keys().is_empty());
+    assert!(h.server.state.human.held.is_empty());
+    assert!(h.server.state.human.keyboard.pressed_keys().is_empty());
 }
 
 #[test]
@@ -88,9 +88,9 @@ fn targeted_button_during_region_selection_refuses_before_focus_or_input() {
     });
     assert_eq!(reply.wire_json()["reason"], "region_select");
     assert_eq!(h.server.state.injection.events, before);
-    assert!(h.server.state.keyboard.current_focus().is_none());
+    assert!(h.server.state.human.keyboard.current_focus().is_none());
     assert_eq!(test_toplevel_record(&h).layout.z, z);
-    assert!(h.server.state.pointer.current_pressed().is_empty());
+    assert!(h.server.state.human.pointer.current_pressed().is_empty());
     assert!(h.server.state.region.suspended);
 }
 
@@ -223,7 +223,7 @@ fn region_focus_loss_after_cancel_drains_held_keys_and_buttons() {
         let mut busy = begin(&mut h);
         assert_eq!(busy.try_recv().unwrap(), ControlReply::Busy);
         h.server.state.handle_host_input(event);
-        assert!(h.server.state.keyboard.pressed_keys().is_empty());
+        assert!(h.server.state.human.keyboard.pressed_keys().is_empty());
         let mut next = begin(&mut h);
         assert!(next.try_recv().is_err());
         assert!(h.server.state.region.suspended);
@@ -401,11 +401,11 @@ fn region_escape_and_right_button_cancel_and_swallow_release_tails() {
                 state: HostButtonState::Released,
                 time: 2,
             });
-            assert!(h.server.state.keyboard.pressed_keys().is_empty());
+            assert!(h.server.state.human.keyboard.pressed_keys().is_empty());
         } else {
             button(&mut h, 0x111, HostButtonState::Released);
         }
-        assert!(h.server.state.pointer.current_pressed().is_empty());
+        assert!(h.server.state.human.pointer.current_pressed().is_empty());
         let mut next = begin(&mut h);
         assert!(next.try_recv().is_err(), "tails do not strand busy state");
     }
@@ -480,7 +480,7 @@ fn region_focus_suspension_preserves_fullscreen_activation_and_stack() {
     let before = (record.focused, record.layout.z);
     assert!(before.0);
     let mut rx = begin(&mut h);
-    assert!(h.server.state.keyboard.current_focus().is_none());
+    assert!(h.server.state.human.keyboard.current_focus().is_none());
     assert_eq!(
         (
             test_toplevel_record(&h).focused,
@@ -494,14 +494,14 @@ fn region_focus_suspension_preserves_fullscreen_activation_and_stack() {
         .state
         .arbitrate_keyboard_focus(Some(surface.clone()), true, false);
     h.server.state.retarget_pointer_after_visibility_change();
-    assert!(h.server.state.keyboard.current_focus().is_none());
-    assert!(h.server.state.pointer.current_focus().is_none());
+    assert!(h.server.state.human.keyboard.current_focus().is_none());
+    assert!(h.server.state.human.pointer.current_focus().is_none());
     button(&mut h, 0x111, HostButtonState::Pressed);
     clean_frame(&mut h);
     assert_eq!(body(&mut rx)["status"], "cancelled");
     assert_eq!(
         h.server
-            .state
+            .state.human
             .keyboard
             .current_focus()
             .unwrap()
@@ -561,11 +561,11 @@ fn region_popup_grab_and_touch_sequence_are_busy() {
     map_test_popup(&mut h, Some(serial));
     route_pointer_button(&mut h, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let _ = h.sync();
-    assert!(h.server.state.pointer.is_grabbed());
+    assert!(h.server.state.human.pointer.is_grabbed());
     let mut rx = begin(&mut h);
     assert_eq!(rx.try_recv().unwrap(), ControlReply::Busy);
     assert!(
-        h.server.state.pointer.is_grabbed(),
+        h.server.state.human.pointer.is_grabbed(),
         "admission must not destroy the existing popup grab"
     );
 
@@ -599,7 +599,7 @@ fn region_locked_pointer_is_released_and_reconsidered_after_selection() {
     assert!(h.server.state.pointer_is_locked());
     let mut rx = begin(&mut h);
     let active = |h: &KeybindingHarness| {
-        with_pointer_constraint(&surface, &h.server.state.pointer, |c| {
+        with_pointer_constraint(&surface, &h.server.state.human.pointer, |c| {
             c.is_some_and(|c| c.is_active())
         })
     };
@@ -631,12 +631,12 @@ fn region_entry_reconciles_preheld_keys_without_stale_enter_keys() {
     map_initial_test_toplevel(&mut h);
     h.key(42, HostButtonState::Pressed); // Shift
     let mut rx = begin(&mut h);
-    assert!(h.server.state.keyboard.pressed_keys().is_empty());
+    assert!(h.server.state.human.keyboard.pressed_keys().is_empty());
     h.key(42, HostButtonState::Released);
     button(&mut h, 0x111, HostButtonState::Pressed);
     clean_frame(&mut h);
     assert_eq!(body(&mut rx)["status"], "cancelled");
-    assert!(h.server.state.keyboard.pressed_keys().is_empty());
+    assert!(h.server.state.human.keyboard.pressed_keys().is_empty());
 }
 
 #[test]
@@ -652,7 +652,7 @@ fn region_saved_focus_is_not_restored_to_a_minimised_window() {
     button(&mut h, 0x111, HostButtonState::Pressed);
     clean_frame(&mut h);
     assert_eq!(body(&mut rx)["status"], "cancelled");
-    assert!(h.server.state.keyboard.current_focus().is_none());
+    assert!(h.server.state.human.keyboard.current_focus().is_none());
     assert!(!test_toplevel_record(&h).focused);
 }
 

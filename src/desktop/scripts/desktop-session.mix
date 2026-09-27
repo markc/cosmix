@@ -1,4 +1,4 @@
--- version: 0.3.6
+-- version: 0.3.8
 -- Run with mix --serve desktop-session.mix --name desktop-SESSION.
 -- Bind its systemd unit and clipboard-owner children to the desktop lifetime.
 $desktop = require("lib/desktop.mix")
@@ -14,7 +14,7 @@ fn respond($event)
   if $plan.action == nil then
     return {rc:$plan.rc, body:$plan.body, context:$plan.context}
   end
-  $result = run_argv($plan.argv, $plan.options)
+  $result = $desktop.execute($plan)
   $finish_ctx = $plan.context == nil ? $session_context : $plan.context
   $response = $desktop.finish($finish_ctx, $plan, $result)
   return {rc:$response.rc, body:$response.body, context:$response.context}

@@ -55,7 +55,7 @@ impl WaylandState {
         if candidates.is_empty() {
             return;
         }
-        let current = self
+        let current = self.human
             .keyboard
             .current_focus()
             .and_then(|target| target.owned_surface())

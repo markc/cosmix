@@ -88,16 +88,16 @@ impl WaylandState {
             || self.region.bridge.is_none()
             || !self.region.buttons.is_empty()
             || !self.region.keys.is_empty()
-            || self.pointer.is_grabbed()
-            || self.keyboard.is_grabbed()
-            || self.seat.input_method().keyboard_grabbed()
-            || !self.pointer.current_pressed().is_empty()
+            || self.human.pointer.is_grabbed()
+            || self.human.keyboard.is_grabbed()
+            || self.human.seat.input_method().keyboard_grabbed()
+            || !self.human.pointer.current_pressed().is_empty()
             || self.chrome_pointer_grab.is_some()
             || self.chrome_pressed.is_some()
             || self.interactive_pointer.is_some()
             || !self.region.touches.is_empty()
             || !self.injection.sequences.is_empty()
-            || self.seat.get_touch().is_some_and(|t| t.is_grabbed());
+            || self.human.seat.get_touch().is_some_and(|t| t.is_grabbed());
         #[cfg(feature = "embedded-quoin")]
         let busy = busy || self.embedded_shell.as_ref().is_some_and(|b| b.held());
         if busy {
@@ -140,7 +140,7 @@ impl WaylandState {
         let run = Run {
             view,
             requested: output,
-            focus: self.keyboard.current_focus(),
+            focus: self.human.keyboard.current_focus(),
             cursor: self.cursor_selection.clone(),
             deadline: admitted + timeout,
             // Three seconds to remove and submit furniture; LongOp reserves four.
@@ -155,7 +155,7 @@ impl WaylandState {
         self.reset_corner_detector();
         self.update_chrome_hover(None);
         self.titlebar_click_candidate = None;
-        self.last_keyboard_action = None;
+        self.human.last_keyboard_action = None;
         self.chrome_cursor_override = None;
         #[cfg(feature = "embedded-quoin")]
         if let Some(bridge) = &self.embedded_shell {
@@ -164,14 +164,14 @@ impl WaylandState {
         // Unlike session lock, leave focus before retiring presses: wl_keyboard.leave
         // tells the client to release all keys. Smithay still updates its internal
         // pressed set with no focus, without forwarding releases to that client.
-        self.keyboard
+        self.human.keyboard
             .clone()
             .set_focus(self, None, SERIAL_COUNTER.next_serial());
         // Retire pre-existing forwarded presses while focus is None. Merely
         // intercepting later releases leaves Smithay's forwarded set stale.
-        self.region.keys.extend(self.keyboard.pressed_keys());
+        self.region.keys.extend(self.human.keyboard.pressed_keys());
         self.release_pressed_keys();
-        self.pointer.clone().motion(
+        self.human.pointer.clone().motion(
             self,
             None,
             &MotionEvent {
@@ -180,7 +180,7 @@ impl WaylandState {
                 time: monotonic_millis(),
             },
         );
-        self.pointer.clone().frame(self);
+        self.human.pointer.clone().frame(self);
         self.pointer_focus_local_position = None;
         self.pending_relative_motion = None;
         self.cursor_selection = CursorSelection::Hidden;
@@ -310,7 +310,7 @@ impl WaylandState {
             return;
         }
         self.finish_region_selection(ControlReply::Busy);
-        let held = self.keyboard.pressed_keys();
+        let held = self.human.keyboard.pressed_keys();
         for key in std::mem::take(&mut self.region.keys) {
             if held.contains(&key) {
                 self.region_key(key, HostButtonState::Released, monotonic_millis());
@@ -342,7 +342,7 @@ impl WaylandState {
         self.pending_relative_motion = None;
         // This still invokes clipboard/text-input hooks, but suspension prevents
         // activation/configure/restacking changes in SeatHandler::focus_changed.
-        self.keyboard
+        self.human.keyboard
             .clone()
             .set_focus(self, focus, SERIAL_COUNTER.next_serial());
         self.region.suspended = false;
@@ -350,11 +350,11 @@ impl WaylandState {
         if let Some(bridge) = &self.embedded_shell {
             bridge.suspend(false);
         }
-        self.arbitrate_keyboard_focus(None, self.keyboard.current_focus().is_none(), false);
+        self.arbitrate_keyboard_focus(None, self.human.keyboard.current_focus().is_none(), false);
         // The saved surface may have been unmapped/minimised while suspended.
         // Even None -> None must now reconcile stale desktop activation flags.
-        let seat = self.seat.clone();
-        let focused = self.keyboard.current_focus();
+        let seat = self.human.seat.clone();
+        let focused = self.human.keyboard.current_focus();
         self.focus_changed(&seat, focused.as_ref());
         self.retarget_pointer_after_visibility_change();
         self.service_deferred_constraint_activation();
@@ -537,7 +537,7 @@ impl WaylandState {
 
     fn region_key(&mut self, keycode: Keycode, state: HostButtonState, time: u32) {
         let pressed = state == HostButtonState::Pressed;
-        let action = self
+        let action = self.human
             .keyboard
             .clone()
             .input::<Option<BindingAction>, _>(
@@ -560,7 +560,7 @@ impl WaylandState {
                 },
             )
             .flatten();
-        self.last_keyboard_action = None;
+        self.human.last_keyboard_action = None;
         if let Some(action) = action {
             self.finish_region_selection(ControlReply::Busy);
             self.handle_binding_action(action);

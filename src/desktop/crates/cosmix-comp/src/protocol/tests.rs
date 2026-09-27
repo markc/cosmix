@@ -48,6 +48,7 @@ const EVENT_LOOP_PUMP_LIMIT: usize = 200;
 #[cfg(feature = "bus")]
 fn snapshot_context(backend: &'static str) -> port_snapshot::SnapshotContext {
     port_snapshot::SnapshotContext {
+        agent_epoch: Arc::new(AtomicU64::new(0)),
         service: Arc::from(if backend == "kms" {
             "comp"
         } else {
@@ -1040,7 +1041,9 @@ fn read_event(client: &mut UnixStream, deadline: Instant, awaited: &str) -> (u32
     (object_id, opcode, body)
 }
 
-#[cfg(feature = "explicit-sync-live-test")]
+// Selection relay tests drain trailing sync/delete_id traffic before recvmsg
+// reads the source.send event carrying the transfer fd.
+#[cfg(any(feature = "explicit-sync-live-test", feature = "bus"))]
 fn drain_buffered_events(client: &mut UnixStream) -> Vec<(u32, u16, Vec<u8>)> {
     client
         .set_nonblocking(true)
@@ -1171,7 +1174,41 @@ fn wire_string_argument(value: &str) -> Vec<u8> {
     body
 }
 
-fn registry_globals(client: &mut UnixStream, callback_id: u32) -> HashMap<String, (u32, u32)> {
+#[derive(Default, Debug)]
+struct RegistryGlobals {
+    registry_id: u32,
+    by_interface: HashMap<String, Vec<(u32, u32)>>,
+}
+
+impl RegistryGlobals {
+    fn record_announcement(&mut self, interface: String, global: (u32, u32)) {
+        self.by_interface.entry(interface).or_default().push(global);
+    }
+
+    fn all(&self, interface: &str) -> &[(u32, u32)] {
+        self.by_interface.get(interface).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn get(&self, interface: &str) -> Option<&(u32, u32)> {
+        let globals = self.all(interface);
+        assert!(globals.len() <= 1, "ambiguous global interface {interface}; select explicitly");
+        globals.first()
+    }
+
+    fn contains_key(&self, interface: &str) -> bool {
+        !self.all(interface).is_empty()
+    }
+}
+
+impl std::ops::Index<&str> for RegistryGlobals {
+    type Output = (u32, u32);
+
+    fn index(&self, interface: &str) -> &Self::Output {
+        self.get(interface).unwrap_or_else(|| panic!("missing global {interface}"))
+    }
+}
+
+fn registry_globals(client: &mut UnixStream, callback_id: u32) -> RegistryGlobals {
     registry_globals_for(client, 2, callback_id)
 }
 
@@ -1179,10 +1216,10 @@ fn registry_globals_for(
     client: &mut UnixStream,
     registry_id: u32,
     callback_id: u32,
-) -> HashMap<String, (u32, u32)> {
+) -> RegistryGlobals {
     let awaited = format!("registry globals before sync callback {callback_id}");
     let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
-    let mut globals = HashMap::new();
+    let mut globals = RegistryGlobals { registry_id, ..RegistryGlobals::default() };
     for _ in 0..64 {
         let (object_id, opcode, body) = read_event(client, deadline, &awaited);
         if object_id == callback_id && opcode == 0 {
@@ -1205,9 +1242,116 @@ fn registry_globals_for(
                 .try_into()
                 .expect("global version"),
         );
-        globals.insert(interface, (name, version));
+        globals.record_announcement(interface, (name, version));
     }
     panic!("registry callback {callback_id} did not complete");
+}
+
+fn select_named_seat(seats: &[(String, (u32, u32))], requested: &str) -> (u32, u32) {
+    let matches = seats.iter().filter(|(name, _)| name == requested).collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "expected exactly one seat named {requested}: {seats:?}");
+    matches[0].1
+}
+
+/// Probe seats using a previously completed callback id, then bind the named
+/// global at `seat_id`. The latter must be the next available dense object id:
+/// it is temporarily a sync callback while the probe is alive. Each probe is
+/// released before reuse. Return unrelated traffic for the caller's next drain.
+fn bind_named_seat(
+    client: &mut UnixStream,
+    globals: &RegistryGlobals,
+    requested: &str,
+    maximum: u32,
+    seat_id: u32,
+    probe_id: u32,
+    mut dispatch: impl FnMut(),
+) -> Vec<(u32, u16, Vec<u8>)> {
+    let mut named = Vec::new();
+    let mut pending = Vec::new();
+    let mut candidates = globals.all("wl_seat").to_vec();
+    let mut next = 0;
+    while next < candidates.len() {
+        assert!(next < 64, "seat discovery exceeded 64 probes");
+        let (global, version) = candidates[next];
+        next += 1;
+        assert!(version >= 5, "seat probing needs name and release requests");
+        bind_global_for(client, globals.registry_id, global, "wl_seat", version.min(9), probe_id);
+        send_display_request(client, 0, seat_id);
+        dispatch();
+        let events = events_until_callback(client, seat_id);
+        let mut name = None;
+        for (object, opcode, body) in events {
+            if object == probe_id {
+                if opcode == 1 {
+                    name = Some(wire_string(&body, &mut 0));
+                }
+            } else {
+                pending.push((object, opcode, body));
+            }
+        }
+        named.push((name.expect("wl_seat.name before sync"), (global, version)));
+        send_request(client, probe_id, 3, &[]); // wl_seat.release
+        // A barrier makes release/reuse explicit even for a threaded server.
+        send_display_request(client, 0, seat_id);
+        dispatch();
+        pending.extend(events_until_callback(client, seat_id));
+        // Both barriers can carry globals announced after the initial sync.
+        // Keep the traffic for callers too; only probe each global once.
+        for event in &pending {
+            if let Some(candidate) = registry_global_from_events(
+                std::slice::from_ref(event), globals.registry_id, "wl_seat",
+            ) && !candidates.iter().any(|&(name, _)| name == candidate.0) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    let (global, version) = select_named_seat(&named, requested);
+    bind_global_for(client, globals.registry_id, global, "wl_seat", version.min(maximum), seat_id);
+    pending
+}
+
+#[test]
+fn registry_singleton_rejects_duplicate_interfaces() {
+    let mut globals = RegistryGlobals::default();
+    globals.by_interface.insert("wl_seat".into(), vec![(1, 9), (2, 9)]);
+    assert_eq!(globals.all("wl_seat"), &[(1, 9), (2, 9)]);
+    assert!(std::panic::catch_unwind(|| globals["wl_seat"]).is_err());
+}
+
+#[test]
+fn registry_late_announcements_append_without_hiding_ambiguity() {
+    let mut globals = RegistryGlobals::default();
+    globals.record_announcement("wl_compositor".into(), (1, 5));
+    assert_eq!(globals.get("wl_output"), None);
+    globals.record_announcement("wl_output".into(), (2, 4));
+    assert_eq!(globals.get("wl_output"), Some(&(2, 4)));
+    globals.record_announcement("wl_output".into(), (3, 4));
+    assert_eq!(globals.all("wl_output"), &[(2, 4), (3, 4)]);
+    assert!(std::panic::catch_unwind(|| globals["wl_output"]).is_err());
+    assert_eq!(globals["wl_compositor"], (1, 5));
+}
+
+#[test]
+fn seat_name_constants_match_shell_host_declarations() {
+    let shell_host = include_str!("../../../cosmix-shell-host/src/runner.rs");
+    for (constant, value) in [
+        ("HUMAN_SEAT_NAME", HUMAN_SEAT_NAME),
+        ("AGENT_SEAT_NAME", AGENT_SEAT_NAME),
+    ] {
+        let expected = format!("pub const {constant}: &str = {value:?};");
+        assert!(
+            shell_host.lines().any(|line| line == expected),
+            "the two crates' seat names must be edited together: shell-host must declare {expected}"
+        );
+    }
+}
+
+#[test]
+fn named_seat_requires_exactly_one_matching_name() {
+    let seats = vec![(AGENT_SEAT_NAME.into(), (1, 9))];
+    assert!(std::panic::catch_unwind(|| select_named_seat(&seats, HUMAN_SEAT_NAME)).is_err());
+    let seats = vec![(HUMAN_SEAT_NAME.into(), (1, 9)), (HUMAN_SEAT_NAME.into(), (2, 9))];
+    assert!(std::panic::catch_unwind(|| select_named_seat(&seats, HUMAN_SEAT_NAME)).is_err());
 }
 
 fn registry_global_from_events(
@@ -1258,6 +1402,17 @@ fn bind_global(
     version: u32,
     new_id: u32,
 ) {
+    bind_global_for(client, 2, global_name, interface, version, new_id);
+}
+
+fn bind_global_for(
+    client: &mut UnixStream,
+    registry_id: u32,
+    global_name: u32,
+    interface: &str,
+    version: u32,
+    new_id: u32,
+) {
     let string_len = interface.len() + 1;
     let padded_len = string_len.div_ceil(4) * 4;
     let mut body = Vec::with_capacity(12 + padded_len);
@@ -1267,7 +1422,7 @@ fn bind_global(
     body.resize(8 + padded_len, 0);
     body.extend_from_slice(&version.to_ne_bytes());
     body.extend_from_slice(&new_id.to_ne_bytes());
-    send_request(client, 2, 0, &body);
+    send_request(client, registry_id, 0, &body);
 }
 
 const TEST_COMPOSITOR_ID: u32 = 4;
@@ -1293,7 +1448,8 @@ mod region_selection_tests;
 struct KeybindingHarness {
     server: ProtocolServer,
     client: UnixStream,
-    registry_globals: HashMap<String, (u32, u32)>,
+    registry_globals: RegistryGlobals,
+    pending_events: Vec<(u32, u16, Vec<u8>)>,
     ecs_actions: Receiver<EcsAction>,
     commands: CommandSender<ProtocolCommand>,
     renderer_events: Receiver<Vec<ProtocolEvent>>,
@@ -1657,7 +1813,8 @@ impl KeybindingHarness {
         let mut harness = Self {
             server,
             client,
-            registry_globals: HashMap::new(),
+            registry_globals: RegistryGlobals::default(),
+            pending_events: Vec::new(),
             ecs_actions,
             commands,
             renderer_events,
@@ -1689,7 +1846,9 @@ impl KeybindingHarness {
         send_display_request(&mut self.client, 0, callback_id);
         self.dispatch_client();
         self.assert_client_connected(&format!("before sync callback {callback_id}"));
-        events_until_callback(&mut self.client, callback_id)
+        let mut events = std::mem::take(&mut self.pending_events);
+        events.extend(events_until_callback(&mut self.client, callback_id));
+        events
     }
 
     fn arm_explicit_sync_withdrawal_probe(&mut self) -> GlobalId {
@@ -1753,7 +1912,6 @@ impl KeybindingHarness {
         let globals = registry_globals(&mut self.client, 3);
         let (compositor, compositor_version) = globals["wl_compositor"];
         let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
-        let (seat, seat_version) = globals["wl_seat"];
         let (subcompositor, subcompositor_version) = globals["wl_subcompositor"];
         let (linux_dmabuf, linux_dmabuf_version) = globals["zwp_linux_dmabuf_v1"];
         let (layer_shell, layer_shell_version) = globals["zwlr_layer_shell_v1"];
@@ -1771,13 +1929,19 @@ impl KeybindingHarness {
             xdg_version.min(6),
             TEST_XDG_WM_BASE_ID,
         );
-        bind_global(
+        let server = &mut self.server;
+        self.pending_events.extend(bind_named_seat(
             &mut self.client,
-            seat,
-            "wl_seat",
-            seat_version.min(9),
+            &globals,
+            HUMAN_SEAT_NAME,
+            9,
             TEST_SEAT_ID,
-        );
+            3,
+            || {
+                server.display.dispatch_clients(&mut server.state).unwrap();
+                server.display.flush_clients().unwrap();
+            },
+        ));
         bind_global(
             &mut self.client,
             subcompositor,
@@ -1852,7 +2016,7 @@ impl KeybindingHarness {
             .find(|surface| surface.id().protocol_id() == TEST_SUBSURFACE_SURFACE_ID)
             .expect("real subsurface exists")
             .clone();
-        let keyboard = self.server.state.keyboard.clone();
+        let keyboard = self.server.state.human.keyboard.clone();
         keyboard.set_focus(
             &mut self.server.state,
             Some(SeatFocusTarget::Wayland(focused)),
@@ -2231,6 +2395,361 @@ impl KeybindingHarness {
             .to_strict_data()
             .contains("\"interception_enabled\": true")
     }
+}
+
+type WireEvents = Vec<(u32, u16, Vec<u8>)>;
+
+fn seat_discovery_traffic(
+    h: &mut KeybindingHarness,
+    reverse: bool,
+) -> (RegistryGlobals, u32, WireEvents) {
+    named_seat_discovery_traffic(h, HUMAN_SEAT_NAME, reverse)
+}
+
+fn named_seat_discovery_traffic(
+    h: &mut KeybindingHarness,
+    name: &str,
+    reverse: bool,
+) -> (RegistryGlobals, u32, WireEvents) {
+    let registry = h.allocate_object_id();
+    let callback = h.allocate_object_id();
+    send_display_request(&mut h.client, 1, registry);
+    send_display_request(&mut h.client, 0, callback);
+    h.dispatch_client();
+    let mut globals = registry_globals_for(&mut h.client, registry, callback);
+    if reverse {
+        globals.by_interface.get_mut("wl_seat").unwrap().reverse();
+    }
+    let seat_id = h.allocate_object_id();
+    let server = &mut h.server;
+    let mut traffic = bind_named_seat(&mut h.client, &globals, name, 9, seat_id, callback, || {
+        server.display.dispatch_clients(&mut server.state).unwrap();
+        server.display.flush_clients().unwrap();
+    });
+    traffic.extend(h.sync());
+    (globals, seat_id, traffic)
+}
+
+#[test]
+fn production_seats_advertise_human_first_and_agent_without_touch() {
+    let mut h = KeybindingHarness::new(false);
+    let (globals, seat_id, traffic) = seat_discovery_traffic(&mut h, false);
+    assert_eq!(globals.all("wl_seat").len(), 2);
+    let seats = globals.all("wl_seat");
+    assert!(seats[0].0 < seats[1].0);
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == seat_id && *opcode == 1 && wire_string(body, &mut 0) == HUMAN_SEAT_NAME
+    }), "production wl_seat.name must match the shell-host contract");
+    assert_eq!(seat_capabilities(&traffic, seat_id), vec![SEAT_CAPS_WITHOUT_TOUCH]);
+    assert_eq!(h.server.state.human.kind, SeatKind::Human);
+    assert_eq!(h.server.state.human.pose, None);
+    let resource = h.server.state.human.seat.client_seats(
+        &h.subsurface().client().unwrap(),
+    ).into_iter().find(|seat| seat.id().protocol_id() == seat_id);
+    assert!(resource.is_some(), "the named binding belongs to the production human seat");
+    let (_, agent_id, traffic) = named_seat_discovery_traffic(&mut h, AGENT_SEAT_NAME, false);
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == agent_id && *opcode == 1 && wire_string(body, &mut 0) == AGENT_SEAT_NAME
+    }));
+    assert_eq!(seat_capabilities(&traffic, agent_id), vec![SEAT_CAPS_WITHOUT_TOUCH]);
+    assert_eq!(h.server.state.agent.kind, SeatKind::Agent);
+    assert_eq!(h.server.state.agent.pose, None);
+    assert_ne!(h.server.state.human.keyboard, h.server.state.agent.keyboard);
+    // Bind the lower global explicitly: registry order alone is not a name check.
+    let lower_id = h.allocate_object_id();
+    bind_global_for(&mut h.client, globals.registry_id, seats[0].0, "wl_seat", 9, lower_id);
+    let traffic = h.sync();
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == lower_id && *opcode == 1 && wire_string(body, &mut 0) == HUMAN_SEAT_NAME
+    }));
+}
+
+#[test]
+fn named_seat_binding_discovers_human_announced_after_initial_sync() {
+    // Exercise announcements during both the probe and its release barrier.
+    for announce_on_dispatch in [1, 2] {
+        let mut h = KeybindingHarness::new(false);
+        let dh = h.server.state.display_handle.clone();
+        dh.disable_global::<WaylandState>(h.server.state.human.seat.global().unwrap());
+        let agent = h.server.state.agent.seat.clone();
+        let registry = h.allocate_object_id();
+        let callback = h.allocate_object_id();
+        send_display_request(&mut h.client, 1, registry);
+        send_display_request(&mut h.client, 0, callback);
+        h.dispatch_client();
+        let globals = registry_globals_for(&mut h.client, registry, callback);
+        assert_eq!(globals.all("wl_seat").len(), 1);
+
+        let seat_id = h.allocate_object_id();
+        let server = &mut h.server;
+        let mut late_human = None;
+        let mut dispatch_count = 0;
+        let mut traffic = bind_named_seat(
+            &mut h.client, &globals, HUMAN_SEAT_NAME, 9, seat_id, callback, || {
+                dispatch_count += 1;
+                if dispatch_count == announce_on_dispatch {
+                    late_human = Some(server.state.seat_state.new_wl_seat(&dh, HUMAN_SEAT_NAME));
+                }
+                server.display.dispatch_clients(&mut server.state).unwrap();
+                server.display.flush_clients().unwrap();
+            },
+        );
+        traffic.extend(h.sync());
+        assert!(registry_global_from_events(&traffic, registry, "wl_seat").is_some(),
+            "late announcement remains available to the caller");
+        let client = h.subsurface().client().unwrap();
+        assert!(late_human.unwrap().client_seats(&client).iter()
+            .any(|seat| seat.id().protocol_id() == seat_id));
+        assert!(agent.client_seats(&client).is_empty(), "probe bindings are released");
+    }
+}
+
+#[test]
+fn named_seat_binding_chooses_human_in_both_registry_orders() {
+    for reverse in [false, true] {
+        let mut h = KeybindingHarness::new(false);
+        let agent = h.server.state.agent.seat.clone();
+        let (globals, seat_id, traffic) = seat_discovery_traffic(&mut h, reverse);
+        assert_eq!(globals.all("wl_seat").len(), 2);
+        assert_eq!(seat_capabilities(&traffic, seat_id), vec![SEAT_CAPS_WITHOUT_TOUCH]);
+        let client = h.subsurface().client().unwrap();
+        assert!(h.server.state.human.seat.client_seats(&client).iter()
+            .any(|seat| seat.id().protocol_id() == seat_id));
+        assert!(agent.client_seats(&client).is_empty(), "probe bindings are released");
+    }
+}
+
+#[cfg(feature = "xwayland")]
+#[test]
+fn xwayland_tagged_client_sees_only_human_seat() {
+    let mut h = KeybindingHarness::new(false);
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let xclient = h.server.state.display_handle.insert_client(
+        server, Arc::new(smithay::xwayland::XWaylandClientData::for_test()),
+    ).unwrap();
+    send_display_request(&mut client, 1, 2);
+    send_display_request(&mut client, 0, 3);
+    h.dispatch_client();
+    let globals = registry_globals(&mut client, 3);
+    assert_eq!(globals.all("wl_seat").len(), 1);
+    let server = &mut h.server;
+    let mut traffic = bind_named_seat(&mut client, &globals, HUMAN_SEAT_NAME, 9, 4, 3, || {
+        server.display.dispatch_clients(&mut server.state).unwrap();
+        server.display.flush_clients().unwrap();
+    });
+    send_display_request(&mut client, 0, 5);
+    h.dispatch_client();
+    traffic.extend(events_until_callback(&mut client, 5));
+    assert!(traffic.iter().any(|(object, opcode, body)| {
+        *object == 4 && *opcode == 1 && wire_string(body, &mut 0) == HUMAN_SEAT_NAME
+    }));
+    assert_eq!(h.server.state.human.seat.client_seats(&xclient).len(), 1);
+    assert!(h.server.state.agent.seat.client_seats(&xclient).is_empty());
+    // Guess the global name observed by the native client (human is first).
+    // Hiding the advertisement must also forbid a direct wl_registry.bind.
+    let (agent_global, version) = h.registry_globals.all("wl_seat")[1];
+    bind_global_for(&mut client, globals.registry_id, agent_global, "wl_seat", version.min(9), 6);
+    h.dispatch_client();
+    let (object, code, message) = read_protocol_error(&mut client);
+    assert_eq!(object, 1, "bind rejection is a wl_display error: {message}");
+    assert_eq!(
+        code,
+        ::wayland_client::protocol::wl_display::Error::InvalidObject as u32,
+        "{message}"
+    );
+    assert!(h.server.state.agent.seat.client_seats(&xclient).is_empty());
+}
+
+#[test]
+fn both_seats_idle_and_only_human_activity_resumes_them() {
+    let mut h = KeybindingHarness::new(false);
+    let (_, agent_seat, _) = named_seat_discovery_traffic(&mut h, AGENT_SEAT_NAME, false);
+    let notifier = h.bind_test_global("ext_idle_notifier_v1", 2);
+    let human_idle = h.allocate_object_id();
+    let agent_idle = h.allocate_object_id();
+    for (notification, seat) in [(human_idle, TEST_SEAT_ID), (agent_idle, agent_seat)] {
+        send_request(&mut h.client, notifier, 1, &words(&[notification, 20, seat]));
+    }
+    h.dispatch_client();
+    h.server.state.notify_idle_activity(SeatKind::Agent);
+    h.server.event_loop.dispatch(Some(Duration::from_millis(40)), &mut h.server.state).unwrap();
+    let mut traffic = h.sync();
+    // calloop can return after the first of two adjacent deadlines.
+    h.server.event_loop.dispatch(Some(Duration::from_millis(40)), &mut h.server.state).unwrap();
+    traffic.extend(h.sync());
+    for notification in [human_idle, agent_idle] {
+        assert!(traffic.iter().any(|(object, opcode, _)| *object == notification && *opcode == 0),
+            "both seats must idle without human activity: {traffic:?}");
+    }
+    h.server.state.notify_idle_activity(SeatKind::Agent);
+    let traffic = h.sync();
+    assert!(!traffic.iter().any(|(object, opcode, _)| {
+        [human_idle, agent_idle].contains(object) && *opcode == 1
+    }), "agent activity must not resume either notification: {traffic:?}");
+    h.key(24, HostButtonState::Pressed);
+    let traffic = h.sync();
+    for notification in [human_idle, agent_idle] {
+        assert!(traffic.iter().any(|(object, opcode, _)| *object == notification && *opcode == 1),
+            "human input must resume both notifications: {traffic:?}");
+    }
+}
+
+#[test]
+fn session_lock_clears_agent_focus_and_pressed_state() {
+    let mut h = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut h);
+    let surface = test_toplevel_record(&h).role.wl_surface().clone();
+    let keyboard = h.server.state.agent.keyboard.clone();
+    let pointer = h.server.state.agent.pointer.clone();
+    keyboard.set_focus(&mut h.server.state, Some(surface.clone().into()), SERIAL_COUNTER.next_serial());
+    let key = Keycode::new(50);
+    keyboard.input::<(), _>(&mut h.server.state, key, KeyState::Pressed,
+        SERIAL_COUNTER.next_serial(), 1, |_, _, _| FilterResult::Forward);
+    pointer.motion(&mut h.server.state, Some((surface.into(), (0.0, 0.0).into())), &MotionEvent {
+        location: (10.0, 10.0).into(), serial: SERIAL_COUNTER.next_serial(), time: 1,
+    });
+    pointer.button(&mut h.server.state, &ButtonEvent {
+        button: 0x110, state: ButtonState::Pressed, serial: SERIAL_COUNTER.next_serial(), time: 1,
+    });
+    assert!(!keyboard.pressed_keys().is_empty());
+    assert!(!pointer.current_pressed().is_empty());
+    let _ = request_test_session_lock(&mut h);
+    assert!(h.server.state.session_lock_active());
+    assert!(keyboard.current_focus().is_none());
+    assert!(pointer.current_focus().is_none());
+    assert!(keyboard.pressed_keys().is_empty());
+    assert!(pointer.current_pressed().is_empty());
+    assert!(!keyboard.is_grabbed());
+    assert!(!pointer.is_grabbed());
+}
+
+#[test]
+fn agent_popup_grab_survives_human_focus_change() {
+    let mut h = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut h);
+    let root = test_toplevel_record(&h).role.wl_surface().clone();
+    let other = map_test_undecorated_toplevel(&mut h);
+    let (_, agent_seat, _) = named_seat_discovery_traffic(&mut h, AGENT_SEAT_NAME, false);
+    let keyboard_id = h.allocate_object_id();
+    send_request(&mut h.client, agent_seat, 1, &words(&[keyboard_id]));
+    let _ = h.sync();
+    let keyboard = h.server.state.agent.keyboard.clone();
+    keyboard.set_focus(&mut h.server.state, Some(root.clone().into()), SERIAL_COUNTER.next_serial());
+    let serial = SERIAL_COUNTER.next_serial();
+    keyboard.input::<(), _>(&mut h.server.state, Keycode::new(38), KeyState::Pressed,
+        serial, 1, |_, _, _| FilterResult::Forward);
+    h.server.state.agent.last_keyboard_action = Some((serial, root));
+    let (_, popup) = map_test_popup_on_seat(&mut h, Some((agent_seat, serial.into())));
+    assert!(keyboard.has_grab(serial));
+    assert!(h.server.state.agent.pointer.has_grab(serial));
+    assert!(!h.server.state.human.keyboard.is_grabbed());
+    assert!(!h.server.state.human.pointer.is_grabbed());
+    let target = h.server.state.surfaces[&other].role.wl_surface().clone();
+    h.server.state.human.keyboard.clone().set_focus(
+        &mut h.server.state, Some(target.into()), SERIAL_COUNTER.next_serial(),
+    );
+    let traffic = h.sync();
+    assert!(keyboard.has_grab(serial));
+    assert!(h.server.state.agent.pointer.has_grab(serial));
+    assert!(!traffic.iter().any(|(object, opcode, _)| *object == popup && *opcode == 1),
+        "human focus must not dismiss an agent popup: {traffic:?}");
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn seat_props_are_volatile_read_only_and_preserve_human_observations() {
+    let mut h = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut h);
+    route_pointer_to(&mut h, 10.0, 10.0);
+    h.server.state.notify_idle_activity(SeatKind::Human);
+    let context = snapshot_context("nested");
+    let snapshot = port_snapshot::read_snapshot(&h.server.state, &context, &port_snapshot::ReadScopes::All).unwrap();
+    let input = serde_json::to_value(&snapshot.input).unwrap();
+    let human = &input["seats"]["human"];
+    let agent = &input["seats"]["agent"];
+    assert_eq!(human["name"], HUMAN_SEAT_NAME);
+    assert_eq!(agent["name"], AGENT_SEAT_NAME);
+    assert_eq!(human["keyboard_focus"]["id"], serde_json::to_value(snapshot.focus.keyboard).unwrap());
+    assert_eq!(human["pointer_focus"]["id"], serde_json::to_value(snapshot.focus.pointer).unwrap());
+    let cursor = *h.server.state.cursor_position_snapshot.lock().unwrap();
+    let output = snapshot.outputs.values().next().unwrap();
+    assert_eq!(human["pointer"]["output"], output.name.as_str());
+    assert_eq!(human["pointer"]["x"], cursor.x - f64::from(output.x));
+    assert_eq!(human["pointer"]["y"], cursor.y - f64::from(output.y));
+    for focus in ["keyboard_focus", "pointer_focus"] {
+        if let Some(id) = human[focus]["id"].as_u64() {
+            let record = h.server.state.surfaces.values().find(|record| record.id.0 == id).unwrap();
+            assert_eq!(human[focus]["generation"], record.generation);
+        }
+    }
+    assert!(human["last_input_us"].is_u64());
+    assert!(agent["last_input_us"].is_null());
+    assert!(agent["keyboard_focus"].is_null());
+    assert!(agent["pointer_focus"].is_null());
+    assert!(agent["pointer"].is_null());
+    assert_eq!(input["last_origin"], "human");
+    for path in ["input.seats.human.name", "input.seats.agent.pointer", "input.last_origin"] {
+        assert!(port_snapshot::volatile_path(path));
+        assert!(matches!(port_observation::validate_set_request(path, &serde_json::Value::Null),
+            Err(port_observation::SetValidationError::ReadOnly)));
+    }
+    h.server.state.notify_idle_activity(SeatKind::Agent);
+    let next = port_snapshot::read_snapshot(&h.server.state, &context, &port_snapshot::ReadScopes::All).unwrap();
+    let next = serde_json::to_value(next.input).unwrap();
+    assert_eq!(next["last_origin"], "agent");
+    assert_eq!(next["seats"]["human"]["last_input_us"], human["last_input_us"]);
+    assert!(next["seats"]["agent"]["last_input_us"].is_u64());
+}
+
+#[test]
+fn other_seat_focus_preserves_human_activation_stacking_and_popup_serial() {
+    let (mut h, _, object, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
+    let other = map_test_undecorated_toplevel(&mut h);
+    let target = h.server.state.surfaces[&other].role.wl_surface().clone();
+    let human_surface = h.server.state.surfaces[&object].role.wl_surface().clone();
+    h.server.state.human.keyboard.clone().set_focus(
+        &mut h.server.state, Some(human_surface.clone().into()), SERIAL_COUNTER.next_serial(),
+    );
+    let traffic = request_test_fullscreen(&mut h, true);
+    commit_test_toplevel_state(&mut h, configured_toplevel_serial(&traffic));
+    let before_focus = h.server.state.human.keyboard.current_focus();
+    assert!(h.server.state.surfaces[&object].committed_fullscreen);
+    assert!(h.server.state.surfaces[&object].focused);
+    let before_stack = h.server.state.surfaces.iter()
+        .map(|(id, record)| (id.clone(), (record.focused, record.layout.z)))
+        .collect::<HashMap<_, _>>();
+    let action = (SERIAL_COUNTER.next_serial(), human_surface);
+    h.server.state.human.last_keyboard_action = Some(action.clone());
+    let _ = h.sync();
+    // Deliberately duplicate the name: callback ownership must use identity.
+    let mut other_seat = h.server.state.seat_state.new_seat(HUMAN_SEAT_NAME);
+    let keyboard = other_seat.add_keyboard(Default::default(), 500, 30).unwrap();
+    keyboard.set_focus(&mut h.server.state, Some(target.into()), SERIAL_COUNTER.next_serial());
+    assert_eq!(h.server.state.human.keyboard.current_focus(), before_focus);
+    assert_eq!(h.server.state.human.last_keyboard_action, Some(action));
+    for (id, expected) in before_stack {
+        let record = &h.server.state.surfaces[&id];
+        assert_eq!((record.focused, record.layout.z), expected);
+    }
+    let traffic = h.sync();
+    assert!(toplevel_configure_states(&traffic, TEST_TOPLEVEL_ID).is_empty(),
+        "agent focus must not emit an activation configure: {traffic:?}");
+    assert!(keyboard.current_focus().is_some());
+}
+
+#[test]
+fn other_seat_cursor_callback_preserves_published_human_cursor() {
+    let mut h = KeybindingHarness::new(false);
+    let other = h.server.state.seat_state.new_seat(HUMAN_SEAT_NAME);
+    h.server.state.events.clear();
+    let before = h.server.state.cursor_selection.clone();
+    SeatHandler::cursor_image(&mut h.server.state, &other, CursorImageStatus::Hidden);
+    assert_eq!(h.server.state.cursor_selection, before);
+    assert!(h.server.state.events.is_empty());
+    let human = h.server.state.human.seat.clone();
+    SeatHandler::cursor_image(&mut h.server.state, &human, CursorImageStatus::Hidden);
+    assert_eq!(h.server.state.cursor_selection, CursorSelection::Hidden);
 }
 
 #[test]
@@ -4249,7 +4768,7 @@ fn live_syncobj_registry(
     render_dev_t: u64,
     adapter_name: &str,
     drm_adapter: &cosmix_wgpu_dmabuf::VulkanDrmAdapter,
-) -> (HashMap<String, (u32, u32)>, ExplicitSyncStartupReport) {
+) -> (RegistryGlobals, ExplicitSyncStartupReport) {
     let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
         .expect("XDG_RUNTIME_DIR is required for the live syncobj registry test");
     let unique = SystemTime::now()
@@ -4332,7 +4851,7 @@ fn live_syncobj_registry(
 /// third failure, distinct from both, and one no re-probe could ever have seen.
 #[cfg(feature = "explicit-sync-live-test")]
 fn assert_production_exposure_advertises(
-    globals: &HashMap<String, (u32, u32)>,
+    globals: &RegistryGlobals,
     report: &ExplicitSyncStartupReport,
     when: &str,
 ) {
@@ -9592,7 +10111,7 @@ fn kms_quarantined_release_reconciles_gated_xkb_before_a_later_bare_fn() {
         state: HostButtonState::Pressed,
         time: 1,
     });
-    assert!(harness.server.state.keyboard.modifier_state().ctrl);
+    assert!(harness.server.state.human.keyboard.modifier_state().ctrl);
     assert!(
         harness
             .server
@@ -9609,7 +10128,7 @@ fn kms_quarantined_release_reconciles_gated_xkb_before_a_later_bare_fn() {
         time: 2,
     });
     assert_eq!(
-        harness.server.state.keyboard.modifier_state(),
+        harness.server.state.human.keyboard.modifier_state(),
         smithay::input::keyboard::ModifiersState::default(),
         "the quarantined release still clears Smithay's XKB modifier state"
     );
@@ -12487,6 +13006,40 @@ fn stage_test_synchronized_subsurface(harness: &mut KeybindingHarness, parent: u
 }
 
 fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> (ObjectId, u32) {
+    map_test_popup_on_seat(harness, grab_serial.map(|serial| (TEST_SEAT_ID, serial)))
+}
+
+fn map_test_popup_on_seat(harness: &mut KeybindingHarness, grab: Option<(u32, u32)>) -> (ObjectId, u32) {
+    map_test_popup_with_parent_on_seat(harness, TEST_XDG_SURFACE_ID, grab)
+}
+
+fn map_test_popup_with_parent_on_seat(
+    harness: &mut KeybindingHarness,
+    parent_xdg_surface: u32,
+    grab: Option<(u32, u32)>,
+) -> (ObjectId, u32) {
+    let (surface, xdg_surface, popup, serial) = configure_test_popup_with_parent_on_seat(harness, parent_xdg_surface, grab);
+    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial]));
+    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
+    harness.dispatch_client();
+    let object = harness
+        .server
+        .state
+        .surfaces
+        .keys()
+        .find(|object| object.protocol_id() == surface)
+        .cloned()
+        .expect("mapped popup remains tracked");
+    (object, popup)
+}
+
+fn configure_test_popup_with_parent_on_seat(
+    harness: &mut KeybindingHarness,
+    parent_xdg_surface: u32,
+    grab: Option<(u32, u32)>,
+) -> (u32, u32, u32, u32) {
     let positioner = harness.allocate_object_id();
     let surface = harness.allocate_object_id();
     let xdg_surface = harness.allocate_object_id();
@@ -12515,14 +13068,14 @@ fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> 
         &mut harness.client,
         xdg_surface,
         2,
-        &words(&[popup, TEST_XDG_SURFACE_ID, positioner]),
+        &words(&[popup, parent_xdg_surface, positioner]),
     );
-    if let Some(serial) = grab_serial {
+    if let Some((seat, serial)) = grab {
         send_request(
             &mut harness.client,
             popup,
             1,
-            &words(&[TEST_SEAT_ID, serial]),
+            &words(&[seat, serial]),
         );
     }
     send_request(&mut harness.client, surface, 6, &[]);
@@ -12535,20 +13088,7 @@ fn map_test_popup(harness: &mut KeybindingHarness, grab_serial: Option<u32>) -> 
                 .then(|| u32::from_ne_bytes(body[0..4].try_into().expect("popup serial")))
         })
         .expect("popup receives an initial configure");
-    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial]));
-    let buffer = harness.create_dmabuf_buffer_sized(32, 24);
-    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
-    send_request(&mut harness.client, surface, 6, &[]);
-    harness.dispatch_client();
-    let object = harness
-        .server
-        .state
-        .surfaces
-        .keys()
-        .find(|object| object.protocol_id() == surface)
-        .cloned()
-        .expect("mapped popup remains tracked");
-    (object, popup)
+    (surface, xdg_surface, popup, serial)
 }
 
 fn map_test_undecorated_toplevel(harness: &mut KeybindingHarness) -> ObjectId {
@@ -13350,7 +13890,7 @@ fn click_inside_a_grabbing_popup_delivers_the_button_without_dismissing_it() {
     let (popup_object, popup_role) = map_test_popup(&mut harness, Some(serial));
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let _ = harness.sync();
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
 
     let (px, py) = {
         let record = harness
@@ -13380,7 +13920,7 @@ fn click_inside_a_grabbing_popup_delivers_the_button_without_dismissing_it() {
         "the press inside the popup must reach the client"
     );
     assert!(
-        harness.server.state.pointer.is_grabbed(),
+        harness.server.state.human.pointer.is_grabbed(),
         "the popup grab survives an in-popup press"
     );
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
@@ -13466,7 +14006,7 @@ fn click_inside_a_grabbing_popup_survives_fractional_scale() {
     let (popup_object, popup_role) = map_test_popup(&mut harness, Some(serial));
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let _ = harness.sync();
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
 
     let (px, py) = {
         let record = harness
@@ -13496,7 +14036,7 @@ fn click_inside_a_grabbing_popup_survives_fractional_scale() {
         "at 250% scale the press inside the popup must reach the client"
     );
     assert!(
-        harness.server.state.pointer.is_grabbed(),
+        harness.server.state.human.pointer.is_grabbed(),
         "at 250% scale the popup grab survives an in-popup press"
     );
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
@@ -13513,7 +14053,7 @@ fn live_popup_pointer_grab_bypasses_chrome_and_receives_the_outside_click() {
     let (_, popup_role) = map_test_popup(&mut harness, Some(serial));
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let _ = harness.sync();
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
 
     let titlebar = chrome_titlebar_point(&harness);
     route_pointer_to(&mut harness, titlebar.0, titlebar.1);
@@ -13568,7 +14108,7 @@ fn popup_keyboard_grab_cancels_an_active_caption_capture_without_firing_it() {
             .suppressed_chrome_buttons
             .contains(&PRIMARY_POINTER_BUTTON)
     );
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
 
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let release = harness.sync();
@@ -13601,7 +14141,7 @@ fn popup_grab_blocks_stationary_scene_retarget_from_relighting_chrome() {
     let _ = map_test_popup(&mut harness, Some(word(&press, 0)));
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let _ = harness.sync();
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
 
     let close = chrome_button_point(&harness, CaptionButton::Close);
     route_pointer_to(&mut harness, close.0, close.1);
@@ -13812,7 +14352,7 @@ fn maximize_placement_is_adopted_only_by_the_exact_acked_commit() {
         .role
         .wl_surface()
         .clone();
-    let keyboard = harness.server.state.keyboard.clone();
+    let keyboard = harness.server.state.human.keyboard.clone();
     keyboard.set_focus(
         &mut harness.server.state,
         None,
@@ -14108,7 +14648,7 @@ fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointe
         .role
         .wl_surface()
         .clone();
-    let keyboard = harness.server.state.keyboard.clone();
+    let keyboard = harness.server.state.human.keyboard.clone();
     keyboard.set_focus(
         &mut harness.server.state,
         Some(SeatFocusTarget::Wayland(root.clone())),
@@ -14138,7 +14678,7 @@ fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointe
     assert!(!harness.server.state.surfaces[&object].layout.visible);
     assert!(!harness.server.state.surfaces[&popup].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             harness.server.state.surfaces[&replacement]
                 .role
@@ -14147,7 +14687,7 @@ fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointe
         )
     );
     assert_eq!(
-        focused_surface(harness.server.state.pointer.current_focus()),
+        focused_surface(harness.server.state.human.pointer.current_focus()),
         Some(
             harness.server.state.surfaces[&replacement]
                 .role
@@ -14170,7 +14710,7 @@ fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointe
     assert!(harness.server.state.surfaces[&object].layout.visible);
     assert!(harness.server.state.surfaces[&popup].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             harness.server.state.surfaces[&object]
                 .role
@@ -14241,7 +14781,7 @@ fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
         .role
         .wl_surface()
         .clone();
-    let keyboard = harness.server.state.keyboard.clone();
+    let keyboard = harness.server.state.human.keyboard.clone();
     // Toggle focus away and back so the traffic carries the root's current
     // configure: that is the size the client last saw, the reference for
     // "no new size" below.
@@ -14300,7 +14840,7 @@ fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
     assert!(harness.server.state.surfaces[&elsewhere].layout.visible);
     assert!(harness.server.state.minimized_toplevels.is_empty());
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             harness.server.state.surfaces[&elsewhere]
                 .role
@@ -14362,7 +14902,7 @@ fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
     assert!(!harness.server.state.surfaces[&elsewhere].layout.visible);
     assert!(!harness.server.state.surfaces[&object].minimized);
     assert!(
-        focused_surface(harness.server.state.keyboard.current_focus()).is_some(),
+        focused_surface(harness.server.state.human.keyboard.current_focus()).is_some(),
         "a visible toplevel takes focus again"
     );
     let _ = harness.sync();
@@ -14398,7 +14938,7 @@ fn new_windows_join_the_current_workspace_at_map() {
     assert!(!harness.server.state.surfaces[&first].layout.visible);
     // Whatever the map-time focus policy does, the hidden window is not it.
     assert_ne!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             harness.server.state.surfaces[&first]
                 .role
@@ -14717,7 +15257,7 @@ fn workspace_jump_chord_switches_and_never_reaches_the_client() {
     assert_eq!(harness.server.state.workspace_current(), 1);
     assert!(harness.server.state.surfaces[&object].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface.clone())
     );
     let _ = harness.sync();
@@ -14729,7 +15269,7 @@ fn workspace_jump_chord_switches_and_never_reaches_the_client() {
     assert!(harness.server.state.surfaces[&object].layout.visible);
     assert!(!harness.server.state.surfaces[&object].minimized);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface.clone()),
         "the moved window keeps focus on its new workspace"
     );
@@ -14803,7 +15343,7 @@ fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuse
     // predicate refuses and nothing switches.
     let mut harness = KeybindingHarness::new(true);
     assert!(
-        harness.server.state.keyboard.current_focus().is_some(),
+        harness.server.state.human.keyboard.current_focus().is_some(),
         "precondition: the harness parks focus on the unmapped initial toplevel"
     );
     let unmapped = test_toplevel_record(&harness).role.wl_surface().id();
@@ -14827,7 +15367,7 @@ fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuse
         .state
         .arbitrate_keyboard_focus(None, false, true);
     assert!(
-        harness.server.state.keyboard.current_focus().is_none(),
+        harness.server.state.human.keyboard.current_focus().is_none(),
         "precondition: no keyboard focus held"
     );
     harness.chord(&[125, 42, 3]);
@@ -14837,7 +15377,7 @@ fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuse
         "a move chord with nothing to move does not switch"
     );
     assert!(
-        harness.server.state.keyboard.current_focus().is_none(),
+        harness.server.state.human.keyboard.current_focus().is_none(),
         "and hands the keyboard to nobody"
     );
     let entered = keyboard_enter_surfaces(&harness.sync());
@@ -14871,7 +15411,7 @@ fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuse
     harness.server.state.activate_managed_window(&surface);
     let _ = harness.sync();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface.clone())
     );
     assert_eq!(harness.server.state.surfaces[&leaving].workspace, 1);
@@ -14884,7 +15424,7 @@ fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuse
     assert!(harness.server.state.surfaces[&object].layout.visible);
     assert!(harness.server.state.surfaces[&leaving].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface.clone()),
         "a refused move leaves focus alone"
     );
@@ -14914,7 +15454,7 @@ fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuse
         "the moved window arrives on top of the target's bystander"
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface.clone())
     );
     let entered = keyboard_enter_surfaces(&harness.sync());
@@ -14972,7 +15512,7 @@ fn workspace_move_chord_keeps_the_keyboard_on_a_bottom_band_window_below_a_norma
     harness.server.state.activate_managed_window(&surface);
     let _ = harness.sync();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface.clone()),
         "precondition: the bottom-band window holds the keyboard on workspace 1"
     );
@@ -14988,7 +15528,7 @@ fn workspace_move_chord_keeps_the_keyboard_on_a_bottom_band_window_below_a_norma
         "the moved window stays BELOW the normal-band bystander (a band raise is not a stack raise)"
     );
     assert_eq!(
-        focused_surface(state.keyboard.current_focus()),
+        focused_surface(state.human.keyboard.current_focus()),
         Some(surface.clone()),
         "and still holds the keyboard"
     );
@@ -15034,12 +15574,12 @@ fn workspace_move_chord_is_withheld_under_an_exclusive_layer() {
         .wl_surface()
         .clone();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(layer_surface),
         "precondition: the exclusive layer takes the keyboard"
     );
     assert!(harness.server.state.highest_exclusive_layer().is_some());
-    let keyboard = harness.server.state.keyboard.clone();
+    let keyboard = harness.server.state.human.keyboard.clone();
     keyboard.set_focus(
         &mut harness.server.state,
         Some(SeatFocusTarget::Wayland(surface.clone())),
@@ -15047,7 +15587,7 @@ fn workspace_move_chord_is_withheld_under_an_exclusive_layer() {
     );
     let _ = harness.sync();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(surface.clone()),
         "precondition: the toplevel holds the keyboard under the layer (forced)"
     );
@@ -15094,7 +15634,7 @@ fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
         );
         assert!(!harness.server.state.surfaces[&second.id()].minimized);
         assert_eq!(
-            focused_surface(harness.server.state.keyboard.current_focus()),
+            focused_surface(harness.server.state.human.keyboard.current_focus()),
             Some(second.clone())
         );
         assert!(
@@ -15162,7 +15702,7 @@ fn both_binding_profiles_restore_the_current_workspaces_minimized_toplevel_first
         );
         assert_eq!(harness.server.state.workspace_current(), 1);
         assert_eq!(
-            focused_surface(harness.server.state.keyboard.current_focus()),
+            focused_surface(harness.server.state.human.keyboard.current_focus()),
             Some(first.clone())
         );
         harness.chord(&[125, 42, 50]);
@@ -15178,7 +15718,7 @@ fn both_binding_profiles_restore_the_current_workspaces_minimized_toplevel_first
             assert!(harness.server.state.surfaces[&second.id()].layout.visible);
             assert!(!harness.server.state.surfaces[&first.id()].layout.visible);
             assert_eq!(
-                focused_surface(harness.server.state.keyboard.current_focus()),
+                focused_surface(harness.server.state.human.keyboard.current_focus()),
                 Some(second.clone())
             );
         } else {
@@ -15224,7 +15764,7 @@ fn xdg_activation_switches_workspace_first() {
     let _ = harness.sync();
     assert!(!harness.server.state.surfaces[&second].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(first.clone())
     );
 
@@ -15243,7 +15783,7 @@ fn xdg_activation_switches_workspace_first() {
     assert!(harness.server.state.surfaces[&second].layout.visible);
     assert!(!harness.server.state.surfaces[&first].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(second.clone())
     );
 }
@@ -15276,7 +15816,7 @@ fn xdg_activation_of_a_minimised_window_restores_it() {
         vec![second.clone()]
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(first),
         "minimising moved focus off the hidden window"
     );
@@ -15292,7 +15832,7 @@ fn xdg_activation_of_a_minimised_window_restores_it() {
     assert!(record.layout.visible, "restored: raised into view");
     assert!(record.focused);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(second_surface)
     );
     assert!(
@@ -15354,7 +15894,7 @@ fn xdg_activation_of_a_minimised_window_on_another_workspace_restores_and_switch
     assert!(record.focused);
     assert!(!harness.server.state.surfaces[&first].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(second_surface)
     );
     assert!(
@@ -15424,7 +15964,7 @@ fn a_withheld_switch_withholds_the_focus_at_xdg_activation_and_restore() {
             "and not focused off screen"
         );
         assert_eq!(
-            focused_surface(state.keyboard.current_focus()),
+            focused_surface(state.human.keyboard.current_focus()),
             Some(first_surface.clone())
         );
     }
@@ -15443,7 +15983,7 @@ fn a_withheld_switch_withholds_the_focus_at_xdg_activation_and_restore() {
             "and not focused off screen"
         );
         assert_eq!(
-            focused_surface(state.keyboard.current_focus()),
+            focused_surface(state.human.keyboard.current_focus()),
             Some(first_surface.clone())
         );
     }
@@ -15528,7 +16068,7 @@ fn bringing_a_window_into_view_never_focuses_the_arriving_workspaces_bystander()
         assert!(state.surfaces[&target].layout.visible, "{path}");
         assert!(state.surfaces[&bystander].layout.visible, "{path}");
         assert_eq!(
-            focused_surface(state.keyboard.current_focus()),
+            focused_surface(state.human.keyboard.current_focus()),
             Some(target_surface.clone()),
             "{path}: the keyboard ends on the target"
         );
@@ -15614,7 +16154,7 @@ fn a_replaced_default_output_keeps_its_workspace_and_a_changed_one_settles() {
     assert!(!state.surfaces[&second].layout.visible);
     assert!(!state.surfaces[&first].layout.visible);
     assert_eq!(
-        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(third.clone()),
         "precondition: the keyboard is on the window on screen"
     );
@@ -15643,7 +16183,7 @@ fn a_replaced_default_output_keeps_its_workspace_and_a_changed_one_settles() {
     assert!(!state.surfaces[&second].layout.visible);
     assert!(!state.surfaces[&first].layout.visible);
     assert_eq!(
-        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(third.clone()),
         "nothing observable changed: no settle ran"
     );
@@ -15665,7 +16205,7 @@ fn a_replaced_default_output_keeps_its_workspace_and_a_changed_one_settles() {
     assert!(!state.surfaces[&third].layout.visible);
     assert!(!state.surfaces[&first].layout.visible);
     assert_eq!(
-        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(second.clone()),
         "a changed current settles: the keyboard lands on the workspace now shown"
     );
@@ -21420,7 +21960,6 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
     let (compositor, compositor_version) = globals["wl_compositor"];
     let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
     let (shm, shm_version) = globals["wl_shm"];
-    let (seat, seat_version) = globals["wl_seat"];
     bind_global(
         &mut client,
         compositor,
@@ -21436,7 +21975,7 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
         5,
     );
     bind_global(&mut client, shm, "wl_shm", shm_version.min(1), 6);
-    bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 7);
+    let mut seat_setup = bind_named_seat(&mut client, &globals, HUMAN_SEAT_NAME, 7, 7, 3, || {});
     send_request(&mut client, 7, 1, &words(&[8])); // wl_seat.get_keyboard
     send_request(&mut client, 7, 0, &words(&[9])); // wl_seat.get_pointer
 
@@ -21449,7 +21988,8 @@ fn injected_key_reaches_a_focused_client_while_acquire_is_blocked() {
     send_request(&mut client, 11, 1, &words(&[12])); // xdg_surface.get_toplevel
     send_request(&mut client, 10, 6, &[]); // initial empty commit
     send_display_request(&mut client, 0, 13);
-    let serial = events_until_callback(&mut client, 13)
+    seat_setup.extend(events_until_callback(&mut client, 13));
+    let serial = seat_setup
         .iter()
         .find_map(|(object, opcode, body)| (*object == 11 && *opcode == 0).then(|| word(body, 0)))
         .expect("xdg_surface.configure follows the initial empty commit");
@@ -21760,7 +22300,6 @@ fn map_toplevel_without_touch_capability(client: &mut UnixStream) {
     let (compositor, compositor_version) = globals["wl_compositor"];
     let (xdg_wm_base, xdg_version) = globals["xdg_wm_base"];
     let (shm, shm_version) = globals["wl_shm"];
-    let (seat, seat_version) = globals["wl_seat"];
     bind_global(
         client,
         compositor,
@@ -21770,7 +22309,7 @@ fn map_toplevel_without_touch_capability(client: &mut UnixStream) {
     );
     bind_global(client, xdg_wm_base, "xdg_wm_base", xdg_version.min(6), 5);
     bind_global(client, shm, "wl_shm", shm_version.min(1), 6);
-    bind_global(client, seat, "wl_seat", seat_version.min(7), 7);
+    let mut seat_setup = bind_named_seat(client, &globals, HUMAN_SEAT_NAME, 7, 7, 3, || {});
     send_request(client, 7, 1, &words(&[8])); // wl_seat.get_keyboard
 
     // The capability before any touch device exists. A compositor that called
@@ -21778,7 +22317,8 @@ fn map_toplevel_without_touch_capability(client: &mut UnixStream) {
     // assertion below would still pass — which is exactly why the transition,
     // not the final value, is what this test pins.
     send_display_request(client, 0, 9);
-    let caps_before = seat_capabilities(&events_until_callback(client, 9), 7);
+    seat_setup.extend(events_until_callback(client, 9));
+    let caps_before = seat_capabilities(&seat_setup, 7);
     assert_eq!(
         caps_before.last(),
         Some(&SEAT_CAPS_WITHOUT_TOUCH),
@@ -22478,7 +23018,7 @@ pub(crate) struct RealSsdSubsurfaceSceneClient {
     next_sync: u32,
 }
 
-fn connect_ssd_scene_client(socket_name: &str) -> UnixStream {
+fn connect_ssd_scene_client(socket_name: &str) -> (UnixStream, WireEvents) {
     let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
         .expect("XDG_RUNTIME_DIR is required for the SSD scene oracle");
     let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(socket_name))
@@ -22492,17 +23032,19 @@ fn connect_ssd_scene_client(socket_name: &str) -> UnixStream {
         ("wl_shm", 6, 1),
         ("wl_subcompositor", 7, 1),
         ("zxdg_decoration_manager_v1", 8, 1),
-        ("wl_seat", 9, 7),
     ] {
         let (global, version) = globals[interface];
         bind_global(&mut client, global, interface, version.min(maximum), id);
     }
-    client
+    let pending = bind_named_seat(&mut client, &globals, HUMAN_SEAT_NAME, 7, 9, 3, || {});
+    // The probe also drains earlier global-bind traffic, including wl_shm
+    // format events. Preserve it for the caller's setup/error checks.
+    (client, pending)
 }
 
 impl PendingSsdSubsurfaceSceneClient {
     pub(crate) fn connect(socket_name: &str) -> Self {
-        let mut client = connect_ssd_scene_client(socket_name);
+        let (mut client, mut ready) = connect_ssd_scene_client(socket_name);
         send_request(&mut client, 4, 0, &words(&[SSD_SCENE_PARENT_SURFACE]));
         send_request(&mut client, 4, 0, &words(&[SSD_SCENE_CHILD_SURFACE]));
         send_request(
@@ -22516,7 +23058,7 @@ impl PendingSsdSubsurfaceSceneClient {
             ]),
         );
         send_display_request(&mut client, 0, 13);
-        let ready = events_until_callback(&mut client, 13);
+        ready.extend(events_until_callback(&mut client, 13));
         assert!(
             ready
                 .iter()
@@ -22791,11 +23333,11 @@ impl RealCursorSceneClient {
         send_display_request(&mut client, 1, 13);
         send_display_request(&mut client, 0, 14);
         let globals = registry_globals_for(&mut client, 13, 14);
-        let (seat, seat_version) = globals["wl_seat"];
-        bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 15);
+        let mut seat_setup = bind_named_seat(&mut client, &globals, HUMAN_SEAT_NAME, 7, 15, 14, || {});
         send_request(&mut client, 15, 0, &words(&[16]));
         send_display_request(&mut client, 0, 17);
-        events_until_callback(&mut client, 17);
+        seat_setup.extend(events_until_callback(&mut client, 17));
+        assert!(seat_setup.iter().all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)));
 
         runtime
             .finish_frame(vec![HostInput::PointerMotionAbsolute {
@@ -23105,12 +23647,11 @@ fn map_focus_client(socket_path: &std::path::Path, memfd_name: &str) -> FocusCli
     send_display_request(&mut socket, 1, 13); // second wl_registry
     send_display_request(&mut socket, 0, 14);
     let globals = registry_globals_for(&mut socket, 13, 14);
-    let (seat, seat_version) = globals["wl_seat"];
-    bind_global(&mut socket, seat, "wl_seat", seat_version.min(7), 15);
+    let mut ready = bind_named_seat(&mut socket, &globals, HUMAN_SEAT_NAME, 7, 15, 14, || {});
     send_request(&mut socket, 15, 0, &words(&[FOCUS_POINTER_ID])); // wl_seat.get_pointer
     send_request(&mut socket, 15, 1, &words(&[FOCUS_KEYBOARD_ID])); // wl_seat.get_keyboard
     send_display_request(&mut socket, 0, 18);
-    let ready = events_until_callback(&mut socket, 18);
+    ready.extend(events_until_callback(&mut socket, 18));
     assert!(
         ready
             .iter()
@@ -25034,11 +25575,10 @@ fn destroying_a_surface_does_not_enter_its_orphaned_descendant() {
     send_display_request(&mut client, 1, 22); // wl_display.get_registry
     send_display_request(&mut client, 0, 23);
     let globals = registry_globals_for(&mut client, 22, 23);
-    let (seat, seat_version) = globals["wl_seat"];
-    bind_global(&mut client, seat, "wl_seat", seat_version.min(7), 24);
+    let mut ready = bind_named_seat(&mut client, &globals, HUMAN_SEAT_NAME, 7, 24, 23, || {});
     send_request(&mut client, 24, 0, &words(&[ORPHAN_POINTER_ID])); // wl_seat.get_pointer
     send_display_request(&mut client, 0, 26);
-    let ready = events_until_callback(&mut client, 26);
+    ready.extend(events_until_callback(&mut client, 26));
     assert!(
         ready
             .iter()
@@ -29319,7 +29859,7 @@ fn committed_layer_band_change_retargets_a_stationary_pointer_on_the_wire() {
     assert_eq!(
         harness
             .server
-            .state
+            .state.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -29337,7 +29877,7 @@ fn committed_layer_band_change_retargets_a_stationary_pointer_on_the_wire() {
     assert_eq!(
         harness
             .server
-            .state
+            .state.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -29403,7 +29943,7 @@ fn background_layer_mapped_last_and_clicked_never_crosses_normal_band() {
     );
     let before = test_layer_record(&harness, background.surface).layout.z;
     assert!(before < normal_key);
-    let focus_before = focused_surface(harness.server.state.keyboard.current_focus());
+    let focus_before = focused_surface(harness.server.state.human.keyboard.current_focus());
 
     route_pointer_to(&mut harness, 5.0, 5.0);
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
@@ -29414,11 +29954,11 @@ fn background_layer_mapped_last_and_clicked_never_crosses_normal_band() {
     );
     assert!(test_layer_record(&harness, background.surface).layout.z < normal_key);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         focus_before
     );
     assert_ne!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             test_layer_record(&harness, background.surface)
                 .role
@@ -29523,7 +30063,7 @@ fn layer_keyboard_interactivity_none_and_on_demand_follow_click_policy() {
     route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     assert_eq!(
-        focused_surface(none.server.state.keyboard.current_focus()),
+        focused_surface(none.server.state.human.keyboard.current_focus()),
         Some(toplevel.clone())
     );
     let (none_layer, _) = map_test_layer_surface(
@@ -29540,7 +30080,7 @@ fn layer_keyboard_interactivity_none_and_on_demand_follow_click_policy() {
     route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     route_pointer_button(&mut none, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     assert_eq!(
-        focused_surface(none.server.state.keyboard.current_focus()),
+        focused_surface(none.server.state.human.keyboard.current_focus()),
         Some(toplevel)
     );
     assert_eq!(
@@ -29562,7 +30102,7 @@ fn layer_keyboard_interactivity_none_and_on_demand_follow_click_policy() {
     route_pointer_button(&mut demand, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     route_pointer_button(&mut demand, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     assert_eq!(
-        focused_surface(demand.server.state.keyboard.current_focus()),
+        focused_surface(demand.server.state.human.keyboard.current_focus()),
         Some(
             test_layer_record(&demand, demand_layer.surface)
                 .role
@@ -29590,7 +30130,7 @@ fn focused_on_demand_layer_committing_none_falls_back_to_the_toplevel() {
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             test_layer_record(&harness, layer.surface)
                 .role
@@ -29608,7 +30148,7 @@ fn focused_on_demand_layer_committing_none_falls_back_to_the_toplevel() {
     send_request(&mut harness.client, layer.surface, 6, &[]);
     harness.dispatch_client();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(test_toplevel_record(&harness).role.wl_surface().clone())
     );
     assert!(test_toplevel_record(&harness).focused);
@@ -29638,7 +30178,7 @@ fn exclusive_layer_demoted_to_on_demand_keeps_focus_until_clicked_away() {
         .wl_surface()
         .clone();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(layer_surface.clone())
     );
     assert!(harness.server.state.exclusive_keyboard_focus.is_some());
@@ -29653,7 +30193,7 @@ fn exclusive_layer_demoted_to_on_demand_keeps_focus_until_clicked_away() {
     let _ = harness.sync();
     assert_eq!(harness.server.state.exclusive_keyboard_focus, None);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(layer_surface),
         "the demoted layer keeps the keyboard it was granted"
     );
@@ -29669,7 +30209,7 @@ fn exclusive_layer_demoted_to_on_demand_keeps_focus_until_clicked_away() {
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let _ = harness.sync();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(test_toplevel_record(&harness).role.wl_surface().clone()),
         "a click on a window now takes focus away"
     );
@@ -29706,7 +30246,7 @@ fn exclusive_layer_latch_survives_toplevel_click_then_releases_on_unmap() {
         .wl_surface()
         .clone();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(layer_surface.clone())
     );
     assert!(!test_toplevel_record(&harness).focused);
@@ -29728,7 +30268,7 @@ fn exclusive_layer_latch_survives_toplevel_click_then_releases_on_unmap() {
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(layer_surface)
     );
     assert!(test_toplevel_record(&harness).layout.z > normal_before);
@@ -29738,7 +30278,7 @@ fn exclusive_layer_latch_survives_toplevel_click_then_releases_on_unmap() {
     send_request(&mut harness.client, layer.surface, 6, &[]);
     harness.dispatch_client();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(test_toplevel_record(&harness).role.wl_surface().clone())
     );
     assert!(test_toplevel_record(&harness).focused);
@@ -30144,7 +30684,7 @@ fn port_corner_clicked_requires_engaged_left_release() {
     assert_eq!(corner, corner::Corner::TopLeft);
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     assert!(drain_observations(&observations).is_empty());
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let records = drain_observations(&observations);
     assert_eq!(records.len(), 2, "legacy and v2 click observations");
@@ -30367,7 +30907,7 @@ fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
                     .map(|record| record.role.wl_surface().id().protocol_id()),
                 Some(layer.surface)
             );
-            assert!(harness.server.state.pointer.current_focus().is_some());
+            assert!(harness.server.state.human.pointer.current_focus().is_some());
             harness
                 .server
                 .event_loop
@@ -30377,7 +30917,7 @@ fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
             drain_observations(&observations);
             route_pointer_button(&mut harness, button, ButtonState::Pressed);
             assert!(pointer_bodies(&harness.sync(), pointer, 3).is_empty());
-            assert!(harness.server.state.pointer.current_pressed().is_empty());
+            assert!(harness.server.state.human.pointer.current_pressed().is_empty());
             match cancellation {
                 "drag" => {
                     // Still within the square 10px hotspot, but >10px from press.
@@ -31717,7 +32257,7 @@ fn minimized_prop_round_trips_and_restores_that_window() {
     assert_eq!(state.minimized_toplevels, std::slice::from_ref(&beta));
     assert!(state.surfaces[&alpha].focused);
     assert_eq!(
-        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(alpha.clone())
     );
     port_observation::service_observations(&mut harness.server.state);
@@ -32331,7 +32871,7 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         assert!(body.get("title").is_some() && body.get("app_id").is_some());
         assert!(!harness.server.state.surfaces[object].minimized);
         assert_eq!(
-            focused_surface(harness.server.state.keyboard.current_focus())
+            focused_surface(harness.server.state.human.keyboard.current_focus())
                 .map(|surface| surface.id()),
             Some(object.clone())
         );
@@ -32466,7 +33006,7 @@ fn restore_prefers_the_current_workspaces_most_recent_minimised_window() {
         std::slice::from_ref(&beta)
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(alpha.clone())
     );
 
@@ -32486,7 +33026,7 @@ fn restore_prefers_the_current_workspaces_most_recent_minimised_window() {
     assert!(harness.server.state.surfaces[&beta].layout.visible);
     assert!(!harness.server.state.surfaces[&alpha].layout.visible);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()).map(|surface| surface.id()),
         Some(beta.clone())
     );
     assert!(harness.server.state.minimized_toplevels.is_empty());
@@ -32901,6 +33441,7 @@ fn presentation_stats_are_read_and_reset_but_never_diffed() {
 
     // Injected input: the next update committed after it answers it.
     let mark = presentation_stats::InputMark {
+        seat: crate::protocol::SeatKind::Human,
         input_seq: 1,
         injected_at_us: crate::frame_trace::monotonic_us(),
     };
@@ -34109,7 +34650,7 @@ fn exclusive_layer_dismisses_an_existing_toplevel_popup_keyboard_grab() {
         })
         .expect("focused toplevel receives the popup-grab key");
     let (popup_surface, popup_role) = map_test_popup(&mut harness, Some(word(&key, 0)));
-    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(harness.server.state.human.keyboard.is_grabbed());
     let (layer, _) = map_test_layer_surface(
         &mut harness,
         0,
@@ -34126,10 +34667,10 @@ fn exclusive_layer_dismisses_an_existing_toplevel_popup_keyboard_grab() {
             .any(|(object, opcode, _)| *object == popup_role && *opcode == 1),
         "transferring focus to Exclusive dismisses the old popup tree: {traffic:?}"
     );
-    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!harness.server.state.human.keyboard.is_grabbed());
     assert!(!harness.server.state.surfaces[&popup_surface].mapped);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             test_layer_record(&harness, layer.surface)
                 .role
@@ -34158,7 +34699,7 @@ fn on_demand_layer_popup_grab_is_dismissed_when_parent_commits_none() {
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let grab_serial = press_test_key_and_serial(&mut harness, 24);
     let popup = map_test_grabbing_layer_popup(&mut harness, layer, grab_serial);
-    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(harness.server.state.human.keyboard.is_grabbed());
 
     send_request(
         &mut harness.client,
@@ -34175,10 +34716,10 @@ fn on_demand_layer_popup_grab_is_dismissed_when_parent_commits_none() {
             .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
         "OnDemand to None dismisses the active popup grab: {traffic:?}"
     );
-    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!harness.server.state.human.keyboard.is_grabbed());
     assert!(!test_layer_record(&harness, popup.surface).mapped);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(test_toplevel_record(&harness).role.wl_surface().clone())
     );
 }
@@ -34199,7 +34740,7 @@ fn exclusive_layer_popup_grab_is_dismissed_when_parent_commits_on_demand() {
     );
     let grab_serial = press_test_key_and_serial(&mut harness, 24);
     let popup = map_test_grabbing_layer_popup(&mut harness, layer, grab_serial);
-    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(harness.server.state.human.keyboard.is_grabbed());
 
     harness.key(25, HostButtonState::Pressed);
     let popup_key = harness.sync();
@@ -34208,7 +34749,7 @@ fn exclusive_layer_popup_grab_is_dismissed_when_parent_commits_on_demand() {
         .wl_surface()
         .clone();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(popup_surface.clone()),
         "the popup grab moves keyboard focus into the Exclusive layer's popup: {popup_key:?}"
     );
@@ -34228,10 +34769,10 @@ fn exclusive_layer_popup_grab_is_dismissed_when_parent_commits_on_demand() {
             .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
         "an ordinary Exclusive-layer redraw leaves its own popup open: {redraw:?}"
     );
-    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(harness.server.state.human.keyboard.is_grabbed());
     assert!(test_layer_record(&harness, popup.surface).mapped);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(popup_surface)
     );
 
@@ -34250,11 +34791,11 @@ fn exclusive_layer_popup_grab_is_dismissed_when_parent_commits_on_demand() {
             .any(|(object, opcode, _)| *object == popup.popup && *opcode == 1),
         "Exclusive to OnDemand dismisses the active popup grab: {traffic:?}"
     );
-    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!harness.server.state.human.keyboard.is_grabbed());
     assert!(!test_layer_record(&harness, popup.surface).mapped);
     assert_eq!(harness.server.state.exclusive_keyboard_focus, None);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(test_toplevel_record(&harness).role.wl_surface().clone())
     );
 }
@@ -34284,7 +34825,7 @@ fn nested_popup_grab_of_an_exclusive_layer_survives_a_plain_layer_redraw() {
         .wl_surface()
         .clone();
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(child_surface.clone()),
         "the nested related popup receives keyboard focus: {child_key:?}"
     );
@@ -34301,11 +34842,11 @@ fn nested_popup_grab_of_an_exclusive_layer_survives_a_plain_layer_redraw() {
         }),
         "the layer redraw dismisses neither popup in its related chain: {redraw:?}"
     );
-    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(harness.server.state.human.keyboard.is_grabbed());
     assert!(test_layer_record(&harness, parent.surface).mapped);
     assert!(test_layer_record(&harness, child.surface).mapped);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(child_surface)
     );
 }
@@ -34332,7 +34873,7 @@ fn layer_policy_and_synchronized_region_commit_defer_popup_pointer_grab_teardown
     let _ = harness.sync();
     let grab_serial = press_test_key_and_serial(&mut harness, 24);
     let popup = map_test_grabbing_layer_popup(&mut harness, layer, grab_serial);
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
     let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
 
     let empty = harness.allocate_object_id();
@@ -34357,7 +34898,7 @@ fn layer_policy_and_synchronized_region_commit_defer_popup_pointer_grab_teardown
         1,
         "policy, popup dismissal and synchronized region state reconcile once"
     );
-    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!harness.server.state.human.pointer.is_grabbed());
     assert!(!test_layer_record(&harness, popup.surface).mapped);
 }
 
@@ -34432,9 +34973,9 @@ fn exclusive_latch_denies_unrelated_toplevel_popup_keyboard_grab() {
             .any(|(object, opcode, _)| *object == popup && *opcode == 1),
         "a popup that cannot own keyboard focus is immediately dismissed: {denied:?}"
     );
-    assert!(!harness.server.state.keyboard.is_grabbed());
+    assert!(!harness.server.state.human.keyboard.is_grabbed());
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(layer_surface.clone())
     );
 
@@ -34446,7 +34987,7 @@ fn exclusive_latch_denies_unrelated_toplevel_popup_keyboard_grab() {
             .any(|(object, opcode, _)| { *object == TEST_KEYBOARD_ID && *opcode == 3 })
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(layer_surface),
         "the denied popup cannot divert the next key from the Exclusive layer"
     );
@@ -34477,7 +35018,7 @@ fn clicking_lower_exclusive_layer_raises_within_band_and_transfers_latch() {
         },
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             test_layer_record(&harness, right.surface)
                 .role
@@ -34493,7 +35034,7 @@ fn clicking_lower_exclusive_layer_raises_within_band_and_transfers_latch() {
     assert_eq!(left_after.band, left_before.band);
     assert!(left_after > test_layer_record(&harness, right.surface).layout.z);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(
             test_layer_record(&harness, left.surface)
                 .role
@@ -34807,7 +35348,7 @@ fn synchronized_unmap_defers_pointer_grab_teardown_until_the_transaction_is_curr
     );
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     let _ = harness.sync();
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
 
     let reconciliations_before = harness.server.state.pointer_hit_test_reconciliations;
     send_request(&mut harness.client, a, 1, &words(&[0, 0, 0]));
@@ -34840,14 +35381,14 @@ fn synchronized_unmap_defers_pointer_grab_teardown_until_the_transaction_is_curr
     assert_eq!(
         harness
             .server
-            .state
+            .state.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id())
             .map(|surface| surface.protocol_id()),
         Some(b)
     );
-    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!harness.server.state.human.pointer.is_grabbed());
     assert_eq!(
         harness.server.state.pointer_hit_test_reconciliations - reconciliations_before,
         1,
@@ -35124,7 +35665,7 @@ fn output_resize_reconciles_pointer_once_after_layers_and_toplevels_finish_movin
         "the transient toplevel position is never entered: {resized:?}"
     );
     assert_eq!(
-        focused_surface(harness.server.state.pointer.current_focus()),
+        focused_surface(harness.server.state.human.pointer.current_focus()),
         None
     );
     assert_eq!(
@@ -35517,7 +36058,7 @@ fn kms_output_replacement_defers_explicit_layer_pointer_teardown_until_batch_end
         if with_popup_grab {
             let serial = press_test_key_and_serial(&mut harness, 24);
             let _popup = map_test_grabbing_layer_popup(&mut harness, layer, serial);
-            assert!(harness.server.state.pointer.is_grabbed());
+            assert!(harness.server.state.human.pointer.is_grabbed());
             let _ = harness.sync();
         }
 
@@ -35575,7 +36116,7 @@ fn kms_output_replacement_defers_explicit_layer_pointer_teardown_until_batch_end
             reconciliations_before + 1,
             "the topology batch performs one final hit-test"
         );
-        assert!(!harness.server.state.pointer.is_grabbed());
+        assert!(!harness.server.state.human.pointer.is_grabbed());
     }
 
     run(false);
@@ -35774,7 +36315,7 @@ fn popup_holder_release_restores_previous_focus() {
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let _ = harness.sync();
     let panel_surface = test_layer_record(&harness, panel.surface).role.wl_surface().clone();
-    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.human.keyboard.current_focus());
     assert_eq!(focus(&harness), Some(panel_surface.clone()));
     let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.1","mode":"hidden"});
     assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
@@ -35988,7 +36529,7 @@ fn nested_popups_restore_focus_in_chain() {
     let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);
     let output = harness.server.state.backend.default_output().unwrap().name();
-    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.human.keyboard.current_focus());
     let (panel, _) = map_named_test_layer_surface(
         &mut harness,
         0,
@@ -36075,9 +36616,14 @@ fn connect_other_layer_client(harness: &mut KeybindingHarness) -> OtherTestClien
     let (linux_dmabuf, linux_dmabuf_version) = globals["zwp_linux_dmabuf_v1"];
     let (layer_shell, layer_shell_version) = globals["zwlr_layer_shell_v1"];
     // New ids must be dense: the ids the harness gives its other globals
-    // are spare compositor bindings here.
+    // are spare compositor bindings here, except xdg-shell for toplevel tests.
     for id in TEST_COMPOSITOR_ID..TEST_LINUX_DMABUF_ID {
-        bind_global(&mut client, compositor, "wl_compositor", compositor_version.min(5), id);
+        if id == TEST_XDG_WM_BASE_ID {
+            let (global, version) = globals["xdg_wm_base"];
+            bind_global(&mut client, global, "xdg_wm_base", version.min(6), id);
+        } else {
+            bind_global(&mut client, compositor, "wl_compositor", compositor_version.min(5), id);
+        }
     }
     bind_global(
         &mut client,
@@ -36548,7 +37094,7 @@ fn stalled_owner_probe_frees_the_keyboard_and_enforces() {
     map_initial_test_toplevel(&mut harness);
     let toplevel = test_toplevel_record(&harness).role.wl_surface().clone();
     let toplevel_id = test_toplevel_record(&harness).id;
-    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.human.keyboard.current_focus());
     let output = harness.server.state.backend.default_output().unwrap().name();
     let (width, height) = harness.server.state.backend.seat_extent();
     // Away from the panel and from the menu, which centres on the output.
@@ -36597,7 +37143,7 @@ fn stalled_owner_probe_frees_the_keyboard_and_enforces() {
 fn healthy_owner_answers_the_probe_and_is_untouched() {
     let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);
-    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.human.keyboard.current_focus());
     let output = harness.server.state.backend.default_output().unwrap().name();
     let (width, height) = harness.server.state.backend.seat_extent();
     route_pointer_to(&mut harness, f64::from(width) * 0.8, f64::from(height) * 0.8);
@@ -36894,7 +37440,7 @@ fn popup_restore_yields_to_focus_moved_deliberately() {
         route_pointer_button(harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
         let _ = harness.sync();
     };
-    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.human.keyboard.current_focus());
     let (panel, _) = map_named_test_layer_surface(
         &mut harness,
         0,
@@ -38819,7 +39365,7 @@ fn disconnect_test_client(harness: &mut KeybindingHarness) {
 
 fn connect_secondary_client(
     harness: &mut KeybindingHarness,
-) -> (UnixStream, HashMap<String, (u32, u32)>) {
+) -> (UnixStream, RegistryGlobals) {
     let (mut client, server) = UnixStream::pair().expect("secondary Wayland test socket pair");
     let client_state = Arc::new(WaylandClientState::new(
         harness.server.state.client_disconnect_sender.clone(),
@@ -39643,7 +40189,7 @@ fn session_lock_routes_input_only_to_lock_surfaces() {
     assert_eq!(
         harness
             .server
-            .state
+            .state.human
             .keyboard
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -39653,7 +40199,7 @@ fn session_lock_routes_input_only_to_lock_surfaces() {
     assert_eq!(
         harness
             .server
-            .state
+            .state.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -39673,7 +40219,7 @@ fn session_lock_entry_cancels_grabs_popups_dnd_and_touch() {
     let (popup_surface, popup_role) = map_test_popup(&mut harness, Some(key_serial));
     harness.key(24, HostButtonState::Released);
     let _ = harness.sync();
-    assert!(harness.server.state.keyboard.is_grabbed());
+    assert!(harness.server.state.human.keyboard.is_grabbed());
 
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
     let pressed = harness.sync();
@@ -39694,7 +40240,7 @@ fn session_lock_entry_cancels_grabs_popups_dnd_and_touch() {
         &words(&[0, TEST_TOPLEVEL_SURFACE_ID, 0, pointer_serial]),
     );
     let _ = harness.sync();
-    assert!(harness.server.state.pointer.is_grabbed());
+    assert!(harness.server.state.human.pointer.is_grabbed());
 
     harness.route(InputEvent::DeviceAdded {
         device: FakeDevice::Touchscreen,
@@ -39713,8 +40259,8 @@ fn session_lock_entry_cancels_grabs_popups_dnd_and_touch() {
     let _ = harness.sync();
 
     let (_, _, _, entry) = request_test_session_lock_with_traffic(&mut harness);
-    assert!(!harness.server.state.keyboard.is_grabbed());
-    assert!(!harness.server.state.pointer.is_grabbed());
+    assert!(!harness.server.state.human.keyboard.is_grabbed());
+    assert!(!harness.server.state.human.pointer.is_grabbed());
     assert!(!harness.server.state.surfaces[&popup_surface].mapped);
     assert!(
         entry
@@ -39727,11 +40273,11 @@ fn session_lock_entry_cancels_grabs_popups_dnd_and_touch() {
             .any(|(object, opcode, _)| *object == touch && *opcode == 4)
     );
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         None
     );
     assert_eq!(
-        focused_surface(harness.server.state.pointer.current_focus()),
+        focused_surface(harness.server.state.human.pointer.current_focus()),
         None
     );
 }
@@ -39990,7 +40536,7 @@ fn session_lock_unlock_restores_scene_focus_input_and_frames() {
         ProtocolEvent::SurfaceUpserted { id, .. } if *id == normal_id
     )));
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         Some(normal)
     );
     assert!(
@@ -40017,7 +40563,7 @@ fn session_lock_unlock_restores_scene_focus_input_and_frames() {
     assert_eq!(
         harness
             .server
-            .state
+            .state.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -40772,14 +41318,14 @@ fn kms_unlock_reconciles_lock_input_and_keeps_normal_focus_hidden() {
     harness.server.state.lock_lifecycle = LockLifecycle::Unlocked;
     harness.server.state.deactivate_all_lock_surfaces();
 
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         None
     );
     assert_eq!(
-        focused_surface(harness.server.state.pointer.current_focus()),
+        focused_surface(harness.server.state.human.pointer.current_focus()),
         None
     );
     assert!(harness.server.state.surface_at(8.0, 8.0).is_none());
@@ -40941,11 +41487,11 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
             time: 21,
         });
     assert_eq!(
-        harness.server.state.keyboard.pressed_keys(),
+        harness.server.state.human.keyboard.pressed_keys(),
         HashSet::from([Keycode::new(38)]),
         "the gated keyboard state advances only so compositor VT chords remain recognisable"
     );
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     assert!(
         harness
             .server
@@ -40971,11 +41517,11 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
     ));
     assert!(harness.server.state.kms_session_lock_gate.deferred_unlock);
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         None
     );
     assert_eq!(
-        focused_surface(harness.server.state.pointer.current_focus()),
+        focused_surface(harness.server.state.human.pointer.current_focus()),
         None
     );
     assert!(harness.server.state.surface_at(8.0, 8.0).is_none());
@@ -40987,8 +41533,8 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
             .contains(&harness.server.state.surfaces[&normal_object].id),
         "the ordinary surface is staged for the renderer while input remains gated"
     );
-    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
-    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    assert!(harness.server.state.human.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.human.pointer.current_pressed().is_empty());
     assert!(harness.server.state.saved_cursor_selection.is_some());
     #[cfg(feature = "bus")]
     {
@@ -41055,7 +41601,7 @@ fn kms_locked_pause_unlock_and_resume_restore_only_after_displayed_epoch() {
         .expect("resume arms ordinary-scene display barrier")
         .presentation_epoch;
     assert_eq!(
-        focused_surface(harness.server.state.keyboard.current_focus()),
+        focused_surface(harness.server.state.human.keyboard.current_focus()),
         None
     );
     assert!(
@@ -41444,6 +41990,9 @@ impl ScreencopyWireHarness {
 
     fn new_first_light() -> (Self, crate::backend::render::tests::FirstLightCaptureDriver) {
         let mut harness = KeybindingHarness::new_with_backend(false, BackendKind::Kms);
+        // KeybindingHarness constructs Winit first, then swaps backend data:
+        // its nested output global remains advertised outside the KMS registry.
+        let initial_outputs = harness.registry_globals.all("wl_output").to_vec();
         let key = kms_security_test_key(226, "Blocked-1");
         submit_kms_security_lifecycle(
             &mut harness,
@@ -41466,16 +42015,40 @@ impl ScreencopyWireHarness {
             state.backend.kms_output_is_ready(1, &key)
         });
         let announced = harness.sync();
-        let output_global = registry_global_from_events(&announced, 2, "wl_output")
-            .expect("first-light KMS output is announced");
-        harness
-            .registry_globals
-            .insert("wl_output".into(), output_global);
+        // Keep the nested output and every late announcement in the registry.
+        // Select the newly admitted first-light output explicitly, not whichever
+        // output a singleton or last-wins lookup happens to return.
+        let mut late_outputs = Vec::new();
+        for event in &announced {
+            if let Some(global) =
+                registry_global_from_events(std::slice::from_ref(event), 2, "wl_output")
+            {
+                harness
+                    .registry_globals
+                    .record_announcement("wl_output".into(), global);
+                late_outputs.push(global);
+            }
+        }
+        assert_eq!(
+            late_outputs.len(),
+            1,
+            "first-light KMS announces exactly one output"
+        );
+        let (output_global, output_version) = late_outputs[0];
+        assert!(initial_outputs.iter().all(|(name, _)| *name != output_global));
 
         let feed = harness.take_renderer_feed();
         let driver = crate::backend::render::tests::first_light_capture_driver(feed);
         let manager = harness.bind_test_global("zwlr_screencopy_manager_v1", 3);
-        let output = harness.bind_test_global("wl_output", 4);
+        let output = harness.allocate_object_id();
+        bind_global(
+            &mut harness.client,
+            output_global,
+            "wl_output",
+            output_version.min(4),
+            output,
+        );
+        harness.dispatch_client();
         let shm = harness.bind_test_global("wl_shm", 1);
         let _ = harness.sync();
         (
@@ -44769,7 +45342,7 @@ mod x11 {
         // A REAL grab is installed (Wayland start focus = the OR surface,
         // so `x11_pointer_grab_targets` passes) — without it the grab gate
         // would refuse first and deleting the OR refusal would stay green.
-        let pointer = harness.server.state.pointer.clone();
+        let pointer = harness.server.state.human.pointer.clone();
         pointer.set_grab(
             &mut harness.server.state,
             TestHeldGrab {
@@ -44832,7 +45405,7 @@ mod x11 {
             .arbitrate_keyboard_focus(Some(app_surface.clone()), false, false);
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 49
             ),
             "precondition: the app holds the keyboard"
@@ -44863,7 +45436,7 @@ mod x11 {
         route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 49
             ),
             "a press on an OR window leaves keyboard focus exactly where the \
@@ -44880,7 +45453,7 @@ mod x11 {
             .arbitrate_keyboard_focus(Some(or_surface.clone()), false, true);
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 49
             ),
             "arbitration itself refuses an OR surface, regardless of caller"
@@ -44970,6 +45543,31 @@ mod x11 {
         ));
     }
 
+    #[cfg(feature = "bus")]
+    #[test]
+    fn agent_x11_target_refuses_before_keyboard_enter_or_set_input_focus() {
+        use crate::port::{InputOp, KeySpec, PressAction};
+        let mut h = KeybindingHarness::new(true);
+        let (surface_id, _, window, object) = associate_normal_window(&mut h, 147);
+        commit_dmabuf(&mut h, surface_id, 32, 24);
+        let record = &h.server.state.surfaces[&object];
+        let (id, generation) = (record.id.0, record.generation);
+        let before = window.keyboard_enters_for_test();
+        let human = h.server.state.human.keyboard.current_focus();
+        let op = InputOp::OnSeat { seat: SeatKind::Agent, op: Box::new(InputOp::Targeted {
+            id, generation, raise: false, op: Box::new(InputOp::Key {
+                key: KeySpec::Evdev(30), action: PressAction::Both, modifiers: vec![],
+            }),
+        }) };
+        let body = h.server.state.service_input_op(&op).wire_json();
+        assert_eq!(body["error"], "x11_unsupported");
+        assert_eq!(body["hint"]["seat"], "human");
+        assert_eq!(window.keyboard_enters_for_test(), before,
+            "no KeyboardTarget::enter, hence no X11 SetInputFocus or WM_TAKE_FOCUS");
+        assert_eq!(h.server.state.human.keyboard.current_focus(), human);
+        assert!(h.server.state.agent.keyboard.current_focus().is_none());
+    }
+
     #[test]
     fn x11_keyboard_focus_marks_record_focused_and_falls_back_after_unmap() {
         let mut harness = KeybindingHarness::new(true);
@@ -44991,7 +45589,7 @@ mod x11 {
         );
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(_))
             ),
             "the seat holds the X11 focus target"
@@ -45007,7 +45605,7 @@ mod x11 {
                 .is_some_and(|record| record.focused),
             "an unmapped X11 window cannot stay focused"
         );
-        let fallback = focused_surface(harness.server.state.keyboard.current_focus());
+        let fallback = focused_surface(harness.server.state.human.keyboard.current_focus());
         assert_eq!(
             fallback.as_ref(),
             Some(test_toplevel_record(&harness).role.wl_surface()),
@@ -45274,7 +45872,7 @@ mod x11 {
             .state
             .arbitrate_keyboard_focus(None, false, true);
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "precondition: no keyboard focus held"
         );
         // The stand-in source makes the token-drop half of teardown
@@ -45366,7 +45964,7 @@ mod x11 {
             "one 60s one-shot retry backstop is armed"
         );
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "teardown of a generation that held no focus must not steal one"
         );
         // The token-drop half IS asserted: `remove(token)` dropping the
@@ -45432,17 +46030,17 @@ mod x11 {
             .state
             .arbitrate_keyboard_focus(None, false, true);
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "precondition: no keyboard focus held"
         );
         harness.server.state.x11_unmapped_window(window.clone());
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "unmap of an unfocused X11 window must not steal focus"
         );
         harness.server.state.x11_destroyed_window(window);
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "destroy of an unfocused X11 window must not steal focus"
         );
         assert!(
@@ -45905,7 +46503,7 @@ mod x11 {
             .arbitrate_keyboard_focus(Some(surface_a.clone()), false, false);
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 78
             ),
             "precondition: the X11 window holds the keyboard"
@@ -45921,7 +46519,7 @@ mod x11 {
         // must not hold the keyboard...
         assert!(
             !matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 78
             ),
             "the withdrawn record does not keep the keyboard while absent"
@@ -45941,7 +46539,7 @@ mod x11 {
         commit_dmabuf(&mut harness, sid_b, 32, 24);
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 78
             ),
             "keyboard focus returns when the replacement surface presents"
@@ -45976,7 +46574,7 @@ mod x11 {
             .arbitrate_keyboard_focus(Some(surface_a.clone()), false, false);
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 79
             ),
             "precondition: the X11 window holds the keyboard"
@@ -45989,7 +46587,7 @@ mod x11 {
             .server
             .state
             .x11_associate_window(surface_b.clone(), window);
-        let fallback_focus = harness.server.state.keyboard.current_focus();
+        let fallback_focus = harness.server.state.human.keyboard.current_focus();
         assert!(
             harness.server.state.xwayland.refocus.is_some(),
             "the swap records the focus debt"
@@ -46001,7 +46599,7 @@ mod x11 {
             .state
             .arbitrate_keyboard_focus(None, false, true);
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "precondition: the deliberate choice differs from the fallback"
         );
         assert!(
@@ -46011,7 +46609,7 @@ mod x11 {
         // The replacement presents: the debt must be dropped, not paid.
         commit_dmabuf(&mut harness, sid_b, 32, 24);
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "focus stays where the user deliberately put it"
         );
         assert!(
@@ -46059,7 +46657,7 @@ mod x11 {
         commit_dmabuf(&mut harness, sid_b, 32, 24);
         assert!(
             !matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 81
             ),
             "the remap does not pay a forfeited debt"
@@ -46181,7 +46779,7 @@ mod x11 {
         // state: the fallback must have landed on the xdg toplevel
         // specifically.
         assert_eq!(
-            harness.server.state.keyboard.current_focus(),
+            harness.server.state.human.keyboard.current_focus(),
             Some(SeatFocusTarget::Wayland(toplevel_surface.clone())),
             "precondition: the fallback landed on the xdg toplevel"
         );
@@ -46200,7 +46798,7 @@ mod x11 {
         commit_dmabuf(&mut harness, sid_b, 32, 24);
         assert!(
             matches!(
-                harness.server.state.keyboard.current_focus(),
+                harness.server.state.human.keyboard.current_focus(),
                 Some(SeatFocusTarget::X11(target)) if target.window_id() == 83
             ),
             "an undisturbed real fallback pays the debt back to the window"
@@ -46273,7 +46871,7 @@ mod x11 {
         // None → the debt drops and focus stays where the user put it.
         commit_dmabuf(&mut harness, sid_b, 32, 24);
         assert!(
-            harness.server.state.keyboard.current_focus().is_none(),
+            harness.server.state.human.keyboard.current_focus().is_none(),
             "a dying X11 fallback must not read as an unfocused seat; the debt drops"
         );
         assert!(
@@ -46421,7 +47019,7 @@ mod x11 {
             f64::from(record.window_origin.0) + 10.0,
             f64::from(record.window_origin.1) + 10.0,
         );
-        let pointer = harness.server.state.pointer.clone();
+        let pointer = harness.server.state.human.pointer.clone();
         pointer.set_grab(
             &mut harness.server.state,
             TestHeldGrab {
@@ -46435,7 +47033,7 @@ mod x11 {
             smithay::input::pointer::Focus::Keep,
         );
         assert!(
-            harness.server.state.pointer.is_grabbed(),
+            harness.server.state.human.pointer.is_grabbed(),
             "precondition: a grab is held with the X11 window's surface as start focus"
         );
         assert!(

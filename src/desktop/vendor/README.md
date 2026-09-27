@@ -1,5 +1,20 @@
 # Vendored upstream sources
 
+Smithay agent-seat additions (comp 0.71.0): `SeatState::new_wl_seat_with_filter`
+stores a client predicate in `SeatGlobalData` and delegates visibility through
+`GlobalDispatch::can_view`; `new_wl_seat` keeps its always-visible behaviour.
+The `test-support`-gated `XWaylandClientData::for_test` constructor supplies the
+real client tag without a child process for headless registry-filter tests.
+Only comp's dev-dependency enables it; production builds have no constructor.
+`ClientDndGrabHandler::can_start_drag` is a default-true seat capability hook.
+Data-device StartDrag checks it before assigning the icon role or installing
+either grab; refusal cancels the source. Comp disables DnD on the agent seat.
+The `test-support` X11 keyboard-enter counter lets offline tests prove refusal
+precedes `KeyboardTarget::enter` and therefore any X11 focus request.
+`SelectionHandler::selection_source_destroyed` is a default no-op hook called
+by clipboard, primary, wlr-data-control and ext-data-control source destruction.
+Comp uses it to invalidate cross-seat selection mirrors without polling.
+
 ## iced_tiny_skia 0.14.1
 
 | Provenance | Value |

@@ -82,6 +82,9 @@ where
 
     fn destroyed(state: &mut D, _client: ClientId, resource: &WlDataSource, data: &DataSourceUserData) {
         data.alive_tracker.destroy_notify();
+        state.selection_source_destroyed(super::super::SelectionSource {
+            provider: super::super::source::SelectionSourceProvider::DataDevice(resource.clone()),
+        });
 
         // cosmix patch: Destroy and client disconnect must cancel matching active drags immediately.
         // Inspect the existing seat grabs; release with_grab's lock before unsetting the grab.

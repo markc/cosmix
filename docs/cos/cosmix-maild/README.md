@@ -41,6 +41,81 @@ The HTTP listener serves:
 
 Implemented JMAP method families are `Mailbox`, `Email`, `Thread`, `EmailSubmission`, `Identity`, `Calendar`, `CalendarEvent`, `AddressBook`, `Contact`, and `VacationResponse`. `Core/echo` is also available.
 
+#### MIME projections (0.10.0)
+
+`Email/get` derives `hasAttachment`, `attachments`, `textBody`, `htmlBody` and
+requested `bodyValues` from one bounded MIME inspection. A filename or an
+`attachment` disposition marks an attachment; an inline part with a filename
+also qualifies. Embedded-message children are inspectable but are not outer
+message body parts or duplicate outer attachments.
+
+All projections use the same part paths: root `1`, children `1.1`, `1.2`, and
+so on. An embedded message's root appends `.1`. These replace the old sequential
+text-only IDs; part IDs are per-response and must not be persisted by clients.
+Part blob IDs are `mp1_<32hex item UUID>_<64hex message hash>_<path with underscores>`.
+They are canonical lowercase ASCII and bind a part to the account-owned message
+and its current content hash. `Email/import` still accepts upload UUIDs, not part
+blob IDs.
+Part downloads retain the sender's content type, but force attachment disposition
+with an RFC 5987 filename, `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox`.
+
+Inspection reads at most 64 MiB of raw message, with a 64 MiB decoded-part cap,
+depth 32, 1,000 MIME parts and path length 64. These limits apply independently
+of the configured inbound message limit, so messages admitted through IMAP can
+be inspected. Unreadable storage, corrupt message hashes or over-limit messages return
+`hasAttachment: null` and omit `attachments` and body projections; they never
+report a false negative or a partial attachment list. Property filtering still
+applies. Downloadable parts preserve transfer-decoded octets, including original
+text charset bytes; body display values may be charset-converted to UTF-8.
+
+`GET /jmap/blob/{blobId}` accepts these part IDs alongside upload UUIDs and
+whole-message hashes. Authentication and account ownership precede file reads.
+A foreign item, missing item, stale message hash or absent part returns the
+same HTTP 404 `blob not found`. Malformed IDs return HTTP 400 `invalid blob id`;
+an inspection limit returns HTTP 413 `too_large: …`; unreadable or corrupt
+owned messages return HTTP 500 `unreadable: message`. No part bytes are stored
+as new CAS blobs by inspection or download.
+
+Blobd export references (`b3:` IDs) are separate from JMAP part/upload IDs.
+Exporting a part or message does not replace its JMAP `blobId`, redirect
+`/jmap/blob` to blobd, or change `Email/import`'s upload-UUID input.
+
+### Blob byte lane
+
+Maild uses the local blobd HTTP byte lane, discovered over Bus with
+`blob.props.get {"path":"lane"}`. Uploads use owner `maild:<account_id>` and
+an advisory `blob.quota` check; unavailable advisory quota does not suppress
+the authoritative HTTP admission check. Discovery and quota have 10-second
+deadlines, HTTP connects have a 10-second deadline, and upload progress and
+response reads have 30-second idle limits with no total transfer deadline.
+Redirects, proxies and automatic response decompression are disabled.
+
+Names are hints: non-printable bytes, spaces, percent signs and UTF-8 bytes
+are percent-encoded, and the name header is omitted if that exceeds 128
+bytes. Blobd's first-writer-wins name and MIME are returned unchanged.
+Downloads use only the local lane and verify BLAKE3 and length before use;
+an absent local blob is never fetched implicitly from its reference origin.
+
+The Bus verbs `maild.attachment.list`, `maild.attachment.ref` and
+`maild.message.ref` inspect or export account-owned mail. Lists and exports run in
+eight tracked tasks; a full pool returns `busy:` immediately, and a session
+end cancels outstanding transfers. Validated references are saved separately
+from messages, including origin and the message hash; repeats reuse the
+saved reference. Pins and bookkeeping survive mail/account deletion until
+later reconciliation. No detach or message rewrite occurs. `message.ref`
+is export, not a new `Email/import` input. See [bus.md](bus.md) for arguments,
+reply fields, errors and lifecycle details.
+
+`maild.rules.explain` and `maild.bayesian.classify` accept exactly one of a
+local `blob` reference/ID or the retained `message_b64` compatibility input.
+Both use the configured `max_message_size` bound (default 25 MiB), and blob
+downloads are verified before evaluation. Blob-input diagnostics share the
+export task pool; legacy calls retain serial dispatch. Replies retain the
+existing verdict/explanation
+shape; new clients should carry references over Bus. Missing local blobs
+return `not_present:` rather than initiating a mesh fetch.
+
 ### SMTP
 
 `smtp_inbound` enables inbound SMTP. `smtp_smtps` enables implicit-TLS authenticated submission. Either setting accepts one listen address or a list.
@@ -191,6 +266,55 @@ The retention defaults delete nothing: both age windows are zero, `dry_run` is t
 
 ## Storage and background work
 
+JMAP uploads write only the MDS CAS and an account-scoped, expiring upload
+alias. Hash downloads require live mail ownership or a valid alias in the
+authenticated account; old uploads retain an account-scoped legacy fallback.
+Global CAS presence never grants download access. Legacy UUID downloads and
+imports remain supported, and legacy files and database rows are retained.
+
+`maild.blob.migrate` performs bounded, resumable legacy migration inside the
+running daemon (dry-run by default). It preserves old upload UUIDs with durable
+holding items and backfills old outbound queue entries. Drive it over Bus after
+restart; there is no local migration CLI or second writer. See [bus.md](bus.md)
+for cursors, per-account counts, refusal tokens and the retained-data contract.
+
 Mail metadata and operational state use SQLite. Mailbox content uses `cosmix-mds` through `SqliteMailStore`. The runtime also starts upload-expiry, IMAP retraining, rule-stat flush, retention, SMTP delivery, Bus, and protocol listener tasks as applicable.
 
 Rule statistics are diagnostic counters, not Bayesian training data. Their SQLite store uses periodic snapshots and does not perform a final graceful-shutdown flush.
+
+## MIME inspection limits
+
+MIME inspection has a hard 64 MiB raw-message cap regardless of
+`max_message_size`. Startup logs one warning if the configured admission
+limit exceeds it. Larger admitted messages project `hasAttachment: null`
+and omit `attachments`; attachment inspection/export returns `too_large:`.
+Diagnostic blob inputs still use the configured `max_message_size`.
+
+The vendored mail-parser 0.11.5 caps message ownership nesting at 64 across
+plain and encoded messages. At the cap it keeps an ordinary undecoded body
+instead of constructing another nested message. This is the hard parser bound;
+the preflight below is defence in depth, not the safety invariant.
+
+Before parsing, a linear header-aware scan permits at most 2,000 potential
+header blocks and 1,000 potential embedded messages (conservatively all `message/*`
+types). It removes whitespace in header names, conservatively accepts folded
+names, and recognises folded values and comments. Every `--` occurrence is a
+potential block start, including mid-line and boundary-abutting headers.
+These are count bounds, not
+depth bounds: sibling attached messages and digest children do not add nesting
+depth, and digest body blank lines do not count as messages. Each nesting level
+needs a header block, bounding parser recursion before the walker checks true
+depth. Quoted header text in message bodies counts too and can cause a false-positive
+`too_large:` refusal. Preflight also scans base64/QP-decoded message bodies
+(including encoded digest-default children) through three encoded layers,
+sharing the count limits and a 128 MiB decoded-byte budget. Exceeding that
+budget returns `too_large: MIME pre-parse decoded-byte limit`. This covers
+plain nesting hidden inside the parser's own initial transfer decoding.
+Parse, walk and tree destruction use a dedicated 64 MiB
+thread stack. The walk permits depth 32, 1,000 parts, path length 64,
+64 MiB per decoded part, an aggregate 128 MiB decoded-byte budget, and at most
+two nested encoded re-parses beyond the parser's own encoded nesting limit.
+
+An undecodable part is listed with `undecodable: true` and has no download
+ID or exportable bytes. Other parts remain available; body values retain
+the parser's recovered display text. Export of that part returns `unreadable:`.

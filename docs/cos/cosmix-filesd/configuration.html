@@ -469,6 +469,7 @@ delegated_peers: webd
 <p>Filesystem mode requires <code>mode: fs</code>, <code>trash_root</code>, and at least one <code>place:</code> line.</p>
 <pre><code class="language-text">mode: fs
 bus_service: filesd-fs
+blob_service: blobd
 trash_root: /var/lib/cosmix/filesd/trash
 delegated_peers: webd
 
@@ -478,11 +479,18 @@ place: public | Public | /var/lib/cosmix/public | writable=false | allow=*.md,ma
 <table><thead><tr><th>Key</th><th>Required</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>mode</code></td><td>Yes</td><td>None</td><td>Must be <code>fs</code></td></tr>
 <tr><td><code>bus_service</code></td><td>No</td><td><code>filesd-fs</code></td><td>Bus service registration name</td></tr>
+<tr><td><code>blob_service</code></td><td>No</td><td><code>blobd</code></td><td>Local blob-store Bus service used by <code>fs.blob.ref</code> and <code>fs.blob.materialise</code>; use <code>blobd-two</code> for an instance named <code>two</code></td></tr>
 <tr><td><code>trash_root</code></td><td>Yes</td><td>None</td><td>Root used by trash operations</td></tr>
 <tr><td><code>delegated_peers</code></td><td>No</td><td><code>webd</code></td><td>Comma-separated peers allowed to send delegated calls</td></tr>
 <tr><td><code>place</code></td><td>One or more</td><td>None</td><td>Place definition; repeated lines are allowed</td></tr>
 </tbody></table>
 <p>An explicitly empty <code>delegated_peers:</code> disables delegated calls in this mode as well.</p>
+<p>The blob verbs resolve <code>blob.props.get {"path":"lane"}</code> on <code>blob_service</code> for
+each call, under a 10-second timeout. The bind is never cached. An empty bind,
+failed props call or timeout reports <code>lane_unavailable:</code>. Other filesystem
+verbs make no blob-store call. Uploads pin to the filesd <code>bus_service</code> name.</p>
+<p><code>blob_service</code> must match <code>^[a-z][a-z0-9-]{1,30}$</code> (2–31 ASCII characters).
+An empty, malformed or node-qualified service name is a startup config error.</p>
 <h2 id="place-definitions">Place definitions</h2>
 <p>The place form is:</p>
 <pre><code class="language-text">place: ID | LABEL | ROOT | group=GROUP | icon=ICON | writable=BOOL | allow=PATTERNS | deny=PATTERNS

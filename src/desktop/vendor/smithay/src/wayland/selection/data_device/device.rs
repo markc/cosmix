@@ -67,6 +67,10 @@ where
                 icon,
                 serial,
             } => {
+                if !handler.can_start_drag(&seat) {
+                    if let Some(source) = source { source.cancelled(); }
+                    return;
+                }
                 let serial = Serial::from(serial);
                 if let Some(pointer) = seat.get_pointer() {
                     if pointer.has_grab(serial) {

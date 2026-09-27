@@ -3197,11 +3197,26 @@ impl ProtocolServer {
             |_client| true,
         );
         let mut seat_state = SeatState::new();
-        let mut seat = seat_state.new_wl_seat(&display_handle, "cosmix");
+        let mut seat = seat_state.new_wl_seat(&display_handle, HUMAN_SEAT_NAME);
         let keyboard = seat
             .add_keyboard(Default::default(), 500, 30)
             .map_err(|error| error.to_string())?;
         let pointer = seat.add_pointer();
+        // The human global is deliberately created first for legacy clients.
+        let mut agent_seat = seat_state.new_wl_seat_with_filter(
+            &display_handle,
+            AGENT_SEAT_NAME,
+            |_client| {
+                #[cfg(feature = "xwayland")]
+                { _client.get_data::<smithay::xwayland::XWaylandClientData>().is_none() }
+                #[cfg(not(feature = "xwayland"))]
+                { true }
+            },
+        );
+        let agent_keyboard = agent_seat
+            .add_keyboard(Default::default(), 500, 30)
+            .map_err(|error| error.to_string())?;
+        let agent_pointer = agent_seat.add_pointer();
         let diagnostic_sender = spawn_shm_diagnostic_worker();
 
         let backend = match backend_kind {
@@ -3338,9 +3353,48 @@ impl ProtocolServer {
             wlr_data_control_state,
             ext_data_control_state,
             seat_state,
-            seat,
-            keyboard,
+            selection_relay: Default::default(),
+            human: CompSeat {
+                kind: SeatKind::Human,
+                #[cfg(feature = "bus")]
+                last_input_us: None,
+                #[cfg(feature = "bus")]
+                pointer_position: None,
+                last_keyboard_action: None,
+                last_pointer_action: None,
+                popup_grab: None,
+                keyboard_ancestors: Vec::new(),
+                #[cfg(feature = "bus")]
+                held: Default::default(),
+                #[cfg(feature = "bus")]
+                delivery: Default::default(),
+                seat,
+                keyboard,
+                pointer,
+                pose: None,
+            },
             input_ingress: input::InputIngressState::default(),
+            #[cfg(feature = "bus")]
+            last_input_origin: None,
+            agent: CompSeat {
+                kind: SeatKind::Agent,
+                #[cfg(feature = "bus")]
+                last_input_us: None,
+                #[cfg(feature = "bus")]
+                pointer_position: None,
+                last_keyboard_action: None,
+                last_pointer_action: None,
+                popup_grab: None,
+                keyboard_ancestors: Vec::new(),
+                #[cfg(feature = "bus")]
+                held: Default::default(),
+                #[cfg(feature = "bus")]
+                delivery: Default::default(),
+                seat: agent_seat,
+                keyboard: agent_keyboard,
+                pointer: agent_pointer,
+                pose: None,
+            },
             touch_devices: 0,
             bindings: BindingState::for_profile(binding_profile, keybindings_enabled)
                 .with_bus_key(f9_bus.is_some()),
@@ -3353,7 +3407,6 @@ impl ProtocolServer {
             ecs_action_sender,
             kms_render_command_sender,
             vt_switch_requested,
-            pointer,
             popup_manager: PopupManager::default(),
             backend,
             cursor_position: (0.0, 0.0),
@@ -3406,6 +3459,8 @@ impl ProtocolServer {
             #[cfg(feature = "bus")]
             pending_port_controls: Vec::with_capacity(PORT_QUEUE_CAPACITY),
             #[cfg(feature = "bus")]
+            input_wakeup: event_loop.get_signal(),
+            #[cfg(feature = "bus")]
             injection: input_injection::InjectionState::default(),
             #[cfg(feature = "bus")]
             region: region_selection::RegionSelection::default(),
@@ -3433,7 +3488,6 @@ impl ProtocolServer {
             surface_count: 0,
             subsurface_topology: HashMap::new(),
             damage_requests_since_apply: HashMap::new(),
-            last_keyboard_action: None,
             shm_bytes: 0,
             diagnostic_sender,
             shutdown_cause: None,
@@ -4030,6 +4084,11 @@ impl ProtocolServer {
         self.state.backend.maintain_after_protocol_dispatch();
         self.state.popup_manager.cleanup();
         self.state.refresh_occlusion();
+        // All ready HostInput sources have run before bounded Bus delivery.
+        // Calloop's channels bound their own drain and re-ping when still ready,
+        // so continuously arriving host motion cannot starve this stage.
+        #[cfg(feature = "bus")]
+        self.state.service_ready_agent_sequence();
         #[cfg(feature = "bus")]
         port_observation::service_observations(&mut self.state);
         #[cfg(feature = "bus")]
@@ -6236,13 +6295,19 @@ struct WaylandState {
     /// Held, never read — same reason as the globals above.
     #[allow(dead_code)]
     input_method_state: InputMethodManagerState,
+    // Human-only by construction: host motion owns relative-pointer delivery;
+    // agent motion resolves client targets directly in agent_seat, including
+    // coalesced Bus deltas, and never writes this slot.
     pending_relative_motion: Option<PendingRelativeMotion>,
     primary_selection_state: PrimarySelectionState,
     wlr_data_control_state: WlrDataControlState,
     ext_data_control_state: ExtDataControlState,
     seat_state: SeatState<Self>,
-    seat: Seat<Self>,
-    keyboard: KeyboardHandle<Self>,
+    selection_relay: selection_relay::SelectionRelay,
+    human: CompSeat,
+    agent: CompSeat,
+    #[cfg(feature = "bus")]
+    last_input_origin: Option<SeatKind>,
     input_ingress: input::InputIngressState,
     /// How many attached devices report a touch capability.
     ///
@@ -6258,7 +6323,6 @@ struct WaylandState {
     ecs_action_sender: SyncSender<EcsAction>,
     kms_render_command_sender: Sender<KmsRenderCommand>,
     vt_switch_requested: Option<Box<dyn Fn(u8) + Send>>,
-    pointer: PointerHandle<Self>,
     popup_manager: PopupManager,
     backend: BackendData,
     cursor_position: (f64, f64),
@@ -6324,6 +6388,8 @@ struct WaylandState {
     pending_port_requests: Vec<PortRequest>,
     #[cfg(feature = "bus")]
     pending_port_controls: Vec<PortControl>,
+    #[cfg(feature = "bus")]
+    input_wakeup: smithay::reexports::calloop::LoopSignal,
     /// Bus-injected input: held keys/buttons, sequences, host passthrough.
     #[cfg(feature = "bus")]
     injection: input_injection::InjectionState,
@@ -6368,7 +6434,6 @@ struct WaylandState {
     surface_count: usize,
     subsurface_topology: HashMap<ObjectId, SubsurfaceTopology>,
     damage_requests_since_apply: HashMap<ObjectId, usize>,
-    last_keyboard_action: Option<(Serial, WlSurface)>,
     shm_bytes: usize,
     diagnostic_sender: SyncSender<ShmDiagnostic>,
     shutdown_cause: Option<ProtocolShutdownCause>,
@@ -8142,6 +8207,7 @@ impl WaylandState {
     }
 
     fn teardown_input_for_session_lock(&mut self) {
+        self.clear_agent_input();
         #[cfg(feature = "bus")]
         self.finish_region_selection(crate::port::ControlReply::Locked);
         #[cfg(feature = "bus")]
@@ -8166,11 +8232,11 @@ impl WaylandState {
         for parent in popup_parents {
             self.dismiss_popup_descendants(&parent);
         }
-        if self.keyboard.is_grabbed() {
-            self.keyboard.clone().unset_grab(self);
+        if self.human.keyboard.is_grabbed() {
+            self.human.keyboard.clone().unset_grab(self);
         }
-        if self.pointer.is_grabbed() {
-            self.pointer.clone().unset_grab_without_focus_restore(
+        if self.human.pointer.is_grabbed() {
+            self.human.pointer.clone().unset_grab_without_focus_restore(
                 self,
                 SERIAL_COUNTER.next_serial(),
                 monotonic_millis(),
@@ -8181,12 +8247,12 @@ impl WaylandState {
         self.finish_interactive_pointer(false);
         self.interactive_pointer = None;
         self.exclusive_keyboard_focus = None;
-        self.last_keyboard_action = None;
-        self.keyboard
+        self.human.last_keyboard_action = None;
+        self.human.keyboard
             .clone()
             .set_focus(self, None, SERIAL_COUNTER.next_serial());
         let (x, y) = self.cursor_position;
-        self.pointer.clone().motion(
+        self.human.pointer.clone().motion(
             self,
             None,
             &MotionEvent {
@@ -8195,7 +8261,7 @@ impl WaylandState {
                 time: monotonic_millis(),
             },
         );
-        self.pointer.clone().frame(self);
+        self.human.pointer.clone().frame(self);
         self.pointer_focus_local_position = None;
         if self.saved_cursor_selection.is_none() {
             self.saved_cursor_selection = Some(self.cursor_selection.clone());
@@ -8399,8 +8465,8 @@ impl WaylandState {
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     fn reconcile_input_before_kms_unlock(&mut self) {
-        let keys = self.keyboard.pressed_keys();
-        let buttons = self.pointer.current_pressed();
+        let keys = self.human.keyboard.pressed_keys();
+        let buttons = self.human.pointer.current_pressed();
         self.kms_session_lock_gate
             .quarantine_current_input(keys.iter().copied(), buttons.iter().copied());
         let held = input::SeatHeldState {
@@ -8413,7 +8479,7 @@ impl WaylandState {
         }
         self.release_pressed_keys();
         let time = monotonic_millis();
-        for button in self.pointer.current_pressed() {
+        for button in self.human.pointer.current_pressed() {
             self.pointer_button(button, HostButtonState::Released, time);
         }
         self.teardown_input_for_session_lock();
@@ -8912,14 +8978,14 @@ impl WaylandState {
             && self.consume_corner_release(*button)
         {
             if user_activity {
-                self.notify_idle_activity();
+                self.notify_idle_activity(SeatKind::Human);
             }
             return;
         }
         #[cfg(feature = "bus")]
         if self.region_input(&input) {
             if user_activity {
-                self.notify_idle_activity();
+                self.notify_idle_activity(SeatKind::Human);
             }
             return;
         }
@@ -8937,7 +9003,7 @@ impl WaylandState {
                 | HostInput::TouchCancel
         );
         if user_activity && exposure_sensitive {
-            self.notify_idle_activity();
+            self.notify_idle_activity(SeatKind::Human);
         }
         if user_activity && matches!(self.backend, BackendData::Kms(_)) {
             self.kms_session_lock_gate.observe_physical_touch(&input);
@@ -9068,9 +9134,95 @@ impl WaylandState {
         }
     }
 
-    fn notify_idle_activity(&mut self) {
-        let seat = self.seat.clone();
-        self.idle_notifier_state.notify_activity(&seat);
+    fn notify_idle_activity(&mut self, origin: SeatKind) {
+        #[cfg(feature = "bus")]
+        {
+            let seat = match origin {
+                SeatKind::Human => &mut self.human,
+                SeatKind::Agent => &mut self.agent,
+            };
+            seat.last_input_us = Some(monotonic_micros());
+            self.last_input_origin = Some(origin);
+        }
+        if origin == SeatKind::Human {
+            self.idle_notifier_state.notify_activity(&self.human.seat);
+            self.idle_notifier_state.notify_activity(&self.agent.seat);
+        }
+    }
+
+    fn clear_agent_input(&mut self) {
+        #[cfg(feature = "bus")]
+        {
+            if let Some(context) = &self.port_context {
+                let epoch = context.agent_epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+                self.pending_port_controls.retain_mut(|control| !control.refuse_cleared_agent(epoch));
+            }
+            self.cancel_agent_sequences();
+        }
+        self.agent.last_keyboard_action = None;
+        self.agent.last_pointer_action = None;
+        self.dismiss_agent_popups();
+        let keyboard = self.agent.keyboard.clone();
+        let pointer = self.agent.pointer.clone();
+        keyboard.unset_grab(self);
+        pointer.unset_grab_without_focus_restore(
+            self, SERIAL_COUNTER.next_serial(), monotonic_millis(),
+        );
+        let time = monotonic_millis();
+        for key in keyboard.pressed_keys() {
+            keyboard.input::<(), _>(
+                self, key, KeyState::Released, SERIAL_COUNTER.next_serial(), time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+        for button in pointer.current_pressed() {
+            pointer.button(self, &ButtonEvent {
+                serial: SERIAL_COUNTER.next_serial(), time, button,
+                state: ButtonState::Released,
+            });
+        }
+        #[cfg(feature = "bus")]
+        {
+            self.agent.held = Default::default();
+            self.agent.delivery = Default::default();
+            self.agent.pointer_position = None;
+        }
+        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        pointer.motion(self, None, &MotionEvent {
+            location: pointer.current_location(),
+            serial: SERIAL_COUNTER.next_serial(), time,
+        });
+        pointer.frame(self);
+    }
+
+    fn dismiss_agent_popups(&mut self) {
+        self.retire_agent_popup_handles();
+        self.agent.last_keyboard_action = None;
+        self.agent.last_pointer_action = None;
+    }
+
+    fn retire_agent_popup_handles(&mut self) {
+        let keyboard_action = self.agent.last_keyboard_action.clone();
+        let pointer_action = self.agent.last_pointer_action.clone();
+        if let Some(mut grab) = self.agent.popup_grab.take() {
+            let _ = grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
+            let pointer = self.agent.pointer.clone();
+            let keyboard = self.agent.keyboard.clone();
+            if pointer.with_grab(|_, grab| grab.is::<PopupPointerGrab<WaylandState>>()).unwrap_or(false) {
+                pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), monotonic_millis());
+            }
+            if keyboard.with_grab(|_, grab| grab.is::<PopupKeyboardGrab<WaylandState>>()).unwrap_or(false) {
+                keyboard.unset_grab(self);
+            }
+        }
+        // Grab teardown can invoke focus_changed. Preserve a fresh action
+        // forwarded while the preceding menu was being dismissed.
+        // A fresh action on a surviving root must survive menu switching; an
+        // action naming an unmapped/destroyed root is no longer provenance.
+        let live_root = |action: &(Serial, WlSurface)| self.surfaces.get(&action.1.id())
+            .is_some_and(|record| record.mapped);
+        self.agent.last_keyboard_action = keyboard_action.filter(live_root);
+        self.agent.last_pointer_action = pointer_action.filter(live_root);
     }
 
     fn with_client_state<T>(
@@ -10727,6 +10879,8 @@ impl WaylandState {
                 self.clear_focus_for_surface(&surface);
             }
         }
+        #[cfg(feature = "bus")]
+        self.reconcile_agent_focus();
     }
 
     fn commit_subsurface_stack(&mut self, parent: &WlSurface) -> bool {
@@ -10958,15 +11112,15 @@ impl WaylandState {
 
     fn clear_focus_for_surface(&mut self, surface: &WlSurface) {
         let clears_keyboard =
-            focus_targets_surface(self.keyboard.current_focus().as_ref(), surface)
+            focus_targets_surface(self.human.keyboard.current_focus().as_ref(), surface)
                 || self.exclusive_keyboard_focus.as_ref() == Some(&surface.id());
         if clears_keyboard {
             self.arbitrate_keyboard_focus(None, false, true);
         }
 
         let pointer_focus_matches =
-            focus_targets_surface(self.pointer.current_focus().as_ref(), surface);
-        let pointer_grab_matches = self
+            focus_targets_surface(self.human.pointer.current_focus().as_ref(), surface);
+        let pointer_grab_matches = self.human
             .pointer
             .grab_start_data()
             .and_then(|start| start.focus)
@@ -10976,7 +11130,7 @@ impl WaylandState {
                     .is_some_and(|focused| focused.as_ref() == surface)
             });
         if pointer_focus_matches || pointer_grab_matches {
-            let pointer = self.pointer.clone();
+            let pointer = self.human.pointer.clone();
             if self.pointer_hit_test_reconciliation_deferred() {
                 if pointer_grab_matches {
                     self.pointer_grab_teardown_deferred = true;
@@ -10998,7 +11152,7 @@ impl WaylandState {
                     (f64::from(record.layout.x), f64::from(record.layout.y)).into(),
                 )
             });
-            let pointer = self.pointer.clone();
+            let pointer = self.human.pointer.clone();
             pointer.motion(
                 self,
                 replacement.clone(),
@@ -11768,7 +11922,7 @@ impl WaylandState {
             }
             return;
         }
-        let target = if self.pointer.is_grabbed() {
+        let target = if self.human.pointer.is_grabbed() {
             self.client_pointer_target_at(x, y)
         } else {
             self.pointer_target_at(x, y)
@@ -11780,7 +11934,7 @@ impl WaylandState {
             }
             Some(PointerTarget::Chrome { .. }) | None => None,
         };
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         // `zwp_relative_pointer_v1` before `wl_pointer.motion`, matching the
         // ordering every other compositor ships: a client reading both sees the
         // delta that produced the position it is about to be given.
@@ -11831,13 +11985,13 @@ impl WaylandState {
     /// that this compositor has not activated (it activates on pointer focus),
     /// and an inactive constraint must not freeze anything.
     fn pointer_is_locked(&self) -> bool {
-        let Some(focus) = self.pointer.current_focus() else {
+        let Some(focus) = self.human.pointer.current_focus() else {
             return false;
         };
         let Some(surface) = focus.owned_surface() else {
             return false;
         };
-        with_pointer_constraint(&surface, &self.pointer, |constraint| {
+        with_pointer_constraint(&surface, &self.human.pointer, |constraint| {
             constraint.is_some_and(|constraint| {
                 constraint.is_active() && matches!(&*constraint, PointerConstraint::Locked(_))
             })
@@ -11866,7 +12020,7 @@ impl WaylandState {
                 }
                 Some(PointerTarget::Chrome { .. }) | None => None,
             };
-            let pointer = self.pointer.clone();
+            let pointer = self.human.pointer.clone();
             if let Some(relative) = self.pending_relative_motion.take() {
                 pointer.relative_motion(
                     self,
@@ -11893,7 +12047,7 @@ impl WaylandState {
         // liveness check (a stopped shell menu must not keep the input).
         #[cfg(feature = "bus")]
         if state == HostButtonState::Pressed {
-            let client = self
+            let client = self.human
                 .pointer
                 .current_focus()
                 .and_then(|target| target.owned_surface())
@@ -11909,7 +12063,7 @@ impl WaylandState {
             return;
         }
         #[cfg(feature = "bus")]
-        if let Some((id, generation)) = self.injection.targeted_button {
+        if let Some((id, generation)) = self.human.delivery.targeted_button {
             // All modal, quarantine and delivery gates have already run in
             // handle_host_input. Only device hit-testing/raising is replaced.
             self.targeted_pointer_button(id, generation, button, state, time);
@@ -11922,7 +12076,7 @@ impl WaylandState {
                 self.cursor_position.1,
                 button,
                 state == HostButtonState::Pressed,
-                self.pointer.is_grabbed() || self.chrome_pointer_grab.is_some(),
+                self.human.pointer.is_grabbed() || self.chrome_pointer_grab.is_some(),
             )
         {
             self.titlebar_click_candidate = None;
@@ -11968,7 +12122,7 @@ impl WaylandState {
             return;
         }
 
-        if !self.pointer.is_grabbed()
+        if !self.human.pointer.is_grabbed()
             && let Some(PointerTarget::Chrome {
                 object,
                 part,
@@ -12026,7 +12180,7 @@ impl WaylandState {
             }
         }
 
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         pointer.button(
             self,
             &ButtonEvent {
@@ -12049,7 +12203,7 @@ impl WaylandState {
     fn add_touch_device(&mut self) {
         self.touch_devices = self.touch_devices.saturating_add(1);
         if self.touch_devices == 1 {
-            self.seat.clone().add_touch();
+            self.human.seat.clone().add_touch();
         }
     }
 
@@ -12087,7 +12241,7 @@ impl WaylandState {
         self.touch_devices -= 1;
         self.cancel_touch();
         if self.touch_devices == 0 {
-            self.seat.clone().remove_touch();
+            self.human.seat.clone().remove_touch();
         }
     }
 
@@ -12130,7 +12284,7 @@ impl WaylandState {
     /// down: `DefaultGrab::down` installs the grab as part of handling the first
     /// contact, and the last `up` removes it.
     fn touch_down(&mut self, slot: TouchSlot, x: f64, y: f64, time: u32) {
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.human.seat.get_touch() else {
             return;
         };
         let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions()).position;
@@ -12178,7 +12332,7 @@ impl WaylandState {
     /// only on `down`. It is handed over because that is the documented way a
     /// future drag-and-drop grab learns what is under a moving finger.
     fn touch_motion(&mut self, slot: TouchSlot, x: f64, y: f64, time: u32) {
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.human.seat.get_touch() else {
             return;
         };
         let (x, y) = clamp_point_to_seat((x, y), &self.backend.seat_regions()).position;
@@ -12197,7 +12351,7 @@ impl WaylandState {
     }
 
     fn touch_up(&mut self, slot: TouchSlot, time: u32) {
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.human.seat.get_touch() else {
             return;
         };
         touch.up(
@@ -12220,7 +12374,7 @@ impl WaylandState {
     /// has no `TouchFrameEvent` at all — must produce its own at whatever its
     /// real batching boundary is, rather than have this end of the pipe guess.
     fn touch_frame(&mut self) {
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.human.seat.get_touch() else {
             return;
         };
         touch.frame(self);
@@ -12238,7 +12392,7 @@ impl WaylandState {
     /// and stacking are left exactly as they are, because a cancelled gesture is
     /// not an undo of the focus the first contact legitimately took.
     fn cancel_touch(&mut self) {
-        let Some(touch) = self.seat.get_touch() else {
+        let Some(touch) = self.human.seat.get_touch() else {
             return;
         };
         touch.cancel(self);
@@ -12272,7 +12426,7 @@ impl WaylandState {
         }
         // Finger and continuous sources have a defined end of sequence, so a
         #[cfg(feature = "embedded-quoin")]
-        if !self.pointer.is_grabbed()
+        if !self.human.pointer.is_grabbed()
             && let Some(bridge) = &self.embedded_shell
             && bridge.covers(self.cursor_position.0, self.cursor_position.1)
         {
@@ -12319,7 +12473,7 @@ impl WaylandState {
             return;
         }
 
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         pointer.axis(self, frame);
         pointer.frame(self);
     }
@@ -12338,7 +12492,7 @@ impl WaylandState {
     fn keyboard_keycode(&mut self, keycode: Keycode, state: HostButtonState, time: u32) {
         #[cfg(feature = "bus")]
         if state == HostButtonState::Pressed {
-            let client = self
+            let client = self.human
                 .keyboard
                 .current_focus()
                 .and_then(|target| target.owned_surface())
@@ -12346,7 +12500,7 @@ impl WaylandState {
                 .map(|client| client.id());
             port_observation::note_user_input(self, client);
         }
-        let keyboard = self.keyboard.clone();
+        let keyboard = self.human.keyboard.clone();
         let serial = SERIAL_COUNTER.next_serial();
         let pressed = state == HostButtonState::Pressed;
         let action = keyboard
@@ -12368,12 +12522,12 @@ impl WaylandState {
                     #[cfg(feature = "bus")]
                     {
                         let forwarded = matches!(&disposition, KeyDisposition::Forward);
-                        state.injection.key_handled = !forwarded
-                            || state.keyboard.current_focus().is_some()
+                        state.human.delivery.key_handled = !forwarded
+                            || state.human.keyboard.current_focus().is_some()
                             // Bare modifiers are prefixes for a later binding,
                             // even when there is no focused client yet.
                             || keysym.is_some_and(|sym| sym.is_modifier_key());
-                        state.injection.key_delivery = if forwarded {
+                        state.human.delivery.key_delivery = if forwarded {
                             state.delivery_target(true)
                         } else {
                             None
@@ -12386,7 +12540,7 @@ impl WaylandState {
 
         if pressed {
             if action.is_none() {
-                self.last_keyboard_action = keyboard
+                self.human.last_keyboard_action = keyboard
                     .current_focus()
                     .and_then(|target| target.owned_surface())
                     .map(|surface| {
@@ -12396,10 +12550,10 @@ impl WaylandState {
                         )
                     });
             } else {
-                invalidate_keyboard_action(&mut self.last_keyboard_action);
+                invalidate_keyboard_action(&mut self.human.last_keyboard_action);
             }
         } else {
-            invalidate_keyboard_action(&mut self.last_keyboard_action);
+            invalidate_keyboard_action(&mut self.human.last_keyboard_action);
         }
 
         if let Some(action) = action {
@@ -12416,7 +12570,7 @@ impl WaylandState {
         state: HostButtonState,
         time: u32,
     ) {
-        let keyboard = self.keyboard.clone();
+        let keyboard = self.human.keyboard.clone();
         let pressed = state == HostButtonState::Pressed;
         let action = keyboard
             .input::<Option<BindingAction>, _>(
@@ -12441,7 +12595,7 @@ impl WaylandState {
                 },
             )
             .flatten();
-        invalidate_keyboard_action(&mut self.last_keyboard_action);
+        invalidate_keyboard_action(&mut self.human.last_keyboard_action);
         if let Some(action) = action {
             self.handle_binding_action(action);
         }
@@ -12462,7 +12616,7 @@ impl WaylandState {
     /// loss: a pause-specific variant would be the first place the two disagree
     /// about what a stuck modifier means.
     fn release_pressed_keys(&mut self) {
-        let keyboard = self.keyboard.clone();
+        let keyboard = self.human.keyboard.clone();
         let pressed_keys = keyboard.pressed_keys();
         if !pressed_keys.is_empty() {
             tracing::debug!(
@@ -12478,14 +12632,15 @@ impl WaylandState {
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     fn reconcile_all_input_authority_loss(&mut self) {
+        self.clear_agent_input();
         #[cfg(feature = "bus")]
         self.abandon_region_input();
         self.cancel_chrome_pointer_grab(true);
         self.update_chrome_hover(None);
         self.set_chrome_cursor_override(None);
         let held = input::SeatHeldState {
-            keys: self.keyboard.pressed_keys(),
-            buttons: self.pointer.current_pressed(),
+            keys: self.human.keyboard.pressed_keys(),
+            buttons: self.human.pointer.current_pressed(),
         };
         let inputs = self.input_ingress.all_devices_lost_authority(&held);
         if !inputs.is_empty() {
@@ -12503,7 +12658,7 @@ impl WaylandState {
         match action {
             BindingAction::RequestCloseFocused => {
                 debug_assert!(!action.needs_ecs());
-                let Some(focused) = self
+                let Some(focused) = self.human
                     .keyboard
                     .current_focus()
                     .and_then(|target| target.owned_surface())
@@ -12566,7 +12721,7 @@ impl WaylandState {
             }
             BindingAction::WorkspaceMove(n) => {
                 debug_assert!(!action.needs_ecs());
-                let Some(focused) = self
+                let Some(focused) = self.human
                     .keyboard
                     .current_focus()
                     .and_then(|target| target.owned_surface())
@@ -12643,6 +12798,7 @@ impl WaylandState {
                 }
             }
             BindingAction::SwitchVt(vt) => {
+                self.clear_agent_input();
                 debug_assert!(!action.needs_ecs());
                 if let Some(request) = self.vt_switch_requested.as_ref() {
                     request(vt);
@@ -12748,12 +12904,12 @@ impl WaylandState {
             return;
         }
         let (x, y) = self.cursor_position;
-        let target = if self.pointer.is_grabbed() {
+        let target = if self.human.pointer.is_grabbed() {
             self.client_pointer_target_at(x, y)
         } else {
             self.pointer_target_at(x, y)
         };
-        let current = self
+        let current = self.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id());
@@ -12774,7 +12930,7 @@ impl WaylandState {
                 if !local_changed {
                     return;
                 }
-                let pointer = self.pointer.clone();
+                let pointer = self.human.pointer.clone();
                 pointer.motion(
                     self,
                     Some((self.seat_focus_target_for(&surface), origin)),
@@ -12795,7 +12951,7 @@ impl WaylandState {
         requested: Option<&(SeatFocusTarget, Point<f64, Logical>)>,
         global: (f64, f64),
     ) {
-        let current = self.pointer.current_focus();
+        let current = self.human.pointer.current_focus();
         let previous = self.pointer_focus_local_position.take();
         self.pointer_focus_local_position = current.and_then(|current| {
             let current_id = current.surface_id()?;
@@ -12844,7 +13000,7 @@ impl WaylandState {
             self.mark_pointer_hit_test_dirty();
             return;
         }
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         pointer.unset_grab_without_focus_restore(
             self,
             SERIAL_COUNTER.next_serial(),
@@ -12856,7 +13012,7 @@ impl WaylandState {
     fn reconcile_deferred_pointer_hit_test(&mut self) {
         let teardown_grab = mem::take(&mut self.pointer_grab_teardown_deferred);
         if teardown_grab {
-            let pointer = self.pointer.clone();
+            let pointer = self.human.pointer.clone();
             pointer.unset_grab_without_focus_restore(
                 self,
                 SERIAL_COUNTER.next_serial(),
@@ -13025,7 +13181,7 @@ impl WaylandState {
 
     fn refresh_chrome_pointer_after_scene_change(&mut self) {
         let (x, y) = self.cursor_position;
-        let target = if self.pointer.is_grabbed() {
+        let target = if self.human.pointer.is_grabbed() {
             self.client_pointer_target_at(x, y)
         } else {
             self.pointer_target_at(x, y)
@@ -13049,7 +13205,7 @@ impl WaylandState {
         button: u32,
     ) -> bool {
         if button != PRIMARY_POINTER_BUTTON
-            || self.pointer.is_grabbed()
+            || self.human.pointer.is_grabbed()
             || self.chrome_pointer_grab.is_some()
             || self.interactive_pointer.is_some()
         {
@@ -13489,7 +13645,7 @@ impl WaylandState {
     }
 
     fn raise_focused_toplevel_after_fullscreen(&mut self) {
-        let Some(surface) = self
+        let Some(surface) = self.human
             .keyboard
             .current_focus()
             .and_then(|focus| focus.owned_surface())
@@ -13552,14 +13708,14 @@ impl WaylandState {
     /// focus. A reserved break-constraint binding is a pending design call.
     #[cfg(feature = "bus")]
     pub(crate) fn break_pointer_constraint_for_corner(&mut self) {
-        let Some(surface) = self
+        let Some(surface) = self.human
             .pointer
             .current_focus()
             .and_then(|focus| focus.owned_surface())
         else {
             return;
         };
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         with_pointer_constraint(&surface, &pointer, |constraint| {
             if let Some(constraint) = constraint
                 && constraint.is_active()
@@ -13595,14 +13751,14 @@ impl WaylandState {
     /// `service_deferred_constraint_activation`.
     #[cfg(feature = "bus")]
     fn activate_pointer_constraint_after_corner(&mut self) {
-        let Some(surface) = self
+        let Some(surface) = self.human
             .pointer
             .current_focus()
             .and_then(|focus| focus.owned_surface())
         else {
             return;
         };
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         with_pointer_constraint(&surface, &pointer, |constraint| {
             if let Some(constraint) = constraint
                 && !constraint.is_active()
@@ -13748,7 +13904,7 @@ impl WaylandState {
         self.mark_focus_before_change("wayland.focus");
         'focus_policy: {
             let previous_exclusive = self.exclusive_keyboard_focus.take();
-            let current_focus_surface = self
+            let current_focus_surface = self.human
                 .keyboard
                 .current_focus()
                 .and_then(|target| target.owned_surface());
@@ -13808,7 +13964,7 @@ impl WaylandState {
                 // A layer with an active popup keyboard grab keeps the
                 // documented dismissal instead.
                 let demoted_keeps_focus = !fallback
-                    && !self.keyboard.is_grabbed()
+                    && !self.human.keyboard.is_grabbed()
                     && previous_exclusive.is_some()
                     && current_focus_surface.as_ref().is_some_and(|focus| {
                         previous_exclusive.as_ref() == Some(&focus.id())
@@ -13835,16 +13991,16 @@ impl WaylandState {
             {
                 break 'focus_policy;
             }
-            if self.keyboard.is_grabbed() {
-                let popup_root = self
+            if self.human.keyboard.is_grabbed() {
+                let popup_root = self.human
                     .keyboard
                     .grab_start_data()
                     .and_then(|start| start.focus)
                     .and_then(|focus| focus.owned_surface());
-                let keyboard = self.keyboard.clone();
+                let keyboard = self.human.keyboard.clone();
                 keyboard.unset_grab(self);
                 if let Some(root) = popup_root {
-                    let pointer_grabs_root = self
+                    let pointer_grabs_root = self.human
                         .pointer
                         .grab_start_data()
                         .and_then(|start| start.focus)
@@ -13860,7 +14016,7 @@ impl WaylandState {
                 }
             }
             let target = target.map(|surface| self.seat_focus_target_for(&surface));
-            let keyboard = self.keyboard.clone();
+            let keyboard = self.human.keyboard.clone();
             keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
         }
     }
@@ -13869,14 +14025,14 @@ impl WaylandState {
         let Some(target) = target else {
             return false;
         };
-        let Some(current) = self
+        let Some(current) = self.human
             .keyboard
             .current_focus()
             .and_then(|focus| focus.owned_surface())
         else {
             return false;
         };
-        let Some(grab_root) = self
+        let Some(grab_root) = self.human
             .keyboard
             .grab_start_data()
             .and_then(|start| start.focus)
@@ -13899,7 +14055,7 @@ impl WaylandState {
             return;
         }
         let (x, y) = self.cursor_position;
-        let target = if self.pointer.is_grabbed() {
+        let target = if self.human.pointer.is_grabbed() {
             self.client_pointer_target_at(x, y)
         } else {
             self.pointer_target_at(x, y)
@@ -13911,7 +14067,7 @@ impl WaylandState {
             }
             Some(PointerTarget::Chrome { .. }) | None => None,
         };
-        let pointer = self.pointer.clone();
+        let pointer = self.human.pointer.clone();
         pointer.motion(
             self,
             focus.clone(),
@@ -16452,16 +16608,20 @@ mod acquire_gate;
 pub(crate) mod dmabuf_ledger;
 mod explicit_sync;
 mod focus;
+mod seat;
 mod handlers;
 mod input;
 #[cfg(feature = "bus")]
 mod input_injection;
+#[cfg(feature = "bus")]
+mod agent_seat;
 mod occlusion;
 pub(crate) mod presentation;
 pub(crate) mod presentation_stats;
 #[cfg(feature = "bus")]
 pub(crate) mod region_selection;
 mod release_use;
+mod selection_relay;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;
@@ -16470,6 +16630,8 @@ pub(crate) mod workspaces;
 mod xwayland;
 
 use focus::{SeatFocusTarget, focus_targets_surface};
+use seat::{AGENT_SEAT_NAME, CompSeat, HUMAN_SEAT_NAME};
+pub(crate) use seat::SeatKind;
 
 struct WaylandClientState {
     compositor_state: CompositorClientState,

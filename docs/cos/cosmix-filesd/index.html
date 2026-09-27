@@ -519,6 +519,8 @@ cosmix-filesd serve [OPTIONS]
 <li><code>fs.stat</code></li>
 <li><code>fs.tree</code></li>
 <li><code>fs.read_blob</code></li>
+<li><code>fs.blob.ref</code></li>
+<li><code>fs.blob.materialise</code></li>
 <li><code>fs.search</code></li>
 <li><code>fs.mkdir</code></li>
 <li><code>fs.touch</code></li>
@@ -533,6 +535,20 @@ cosmix-filesd serve [OPTIONS]
 </ul>
 <p>Successful commands return Bus result code <code>0</code> with a JSON body. Handler, validation, authorisation, and filesystem errors return code <code>10</code> with an <code>error</code> field.</p>
 <p>See <a href="/cos/cosmix-filesd/verbs">verbs.md</a> for arguments, defaults, limits, and response shapes.</p>
+<p>The binary bridge uses the configured <code>blob_service</code> (default <code>blobd</code>), resolving
+its byte-lane bind anew on each call. Both verbs are marked mutating and require
+their <code>fs.</code> prefix:</p>
+<table><thead><tr><th>Verb</th><th>Arguments and defaults</th><th>Result / error tokens</th></tr></thead><tbody>
+<tr><td><code>fs.blob.ref</code></td><td><code>path</code>; <code>name</code> defaults to filename, <code>mime</code> to source extension</td><td>Streams a plain file via POST, pins to <code>bus_service</code>, returns reference plus <code>path</code>; <code>lane_unavailable:</code>, <code>quota:</code>, <code>lane:</code></td></tr>
+<tr><td><code>fs.blob.materialise</code></td><td><code>blob</code> (reference, b3 id or bare hash), <code>path</code>; <code>overwrite=false</code></td><td>GET, BLAKE3 verification, atomic landing; <code>invalid blob id</code>, <code>lane_unavailable:</code>, <code>not_present:</code>, <code>verify_failed:</code>, <code>lane:</code></td></tr>
+</tbody></table>
+<p>Both pass filesystem errors through unchanged (<code>denied:</code>, <code>not found:</code>,
+<code>exists:</code>, <code>bad request:</code>, <code>i/o error:</code>). Ref can read a read-only place;
+materialise requires a writable place and creates missing parents like
+<code>fs.write</code>. No blob bytes cross Bus. Materialise requires the blob to be on
+this node already; use <code>blob.fetch</code> first otherwise. See the
+<a href="/cos/cosmix-filesd/verbs#binary-blob-bridge">binary bridge contract</a> for staging, permissions,
+transport bounds and framing limitations.</p>
 <h2 id="properties">Properties</h2>
 <p>Corpus mode provides a read-only SPEC-07 L1 property tree.</p>
 <table><thead><tr><th>Path</th><th>Type</th><th>Meaning</th></tr></thead><tbody>

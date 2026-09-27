@@ -1,0 +1,63 @@
+-- Clipboard seat routing and background-owner lifetime; no real clipboard.
+$d = require("../lib/desktop.mix")
+fn check($condition, $message)
+  if not $condition then raise("CLIPBOARD_SEAT_TEST", $message) end
+end
+for each $action in ["read", "write", "clipboard_pick", "clipboard_rotate"]
+  $plan = {action:$action, argv:$d.clipboard_argv("clipboard-helper",["--type","text"]), options:{stdin:"payload"}}
+  check(len($plan.argv) == 5 and $plan.argv[1] == "--seat","missing seat pin")
+  $missing = {ok:false, timed_out:false, stderr_truncated:false, stderr:"No such seat: " .. $plan.argv[2] .. "\n"}
+  $retry = $d.clipboard_fallback($plan,$missing)
+  check(deep_eq($retry.argv,["clipboard-helper","--type","text"]),"fallback arguments changed")
+  check(deep_eq($retry.options,$plan.options),"fallback lost stdin or limits")
+  check($d.clipboard_fallback($retry,$missing) == nil,"second retry permitted")
+  for each $result in [{ok:true,stderr:$missing.stderr}, {ok:false,timed_out:true,stderr:$missing.stderr}, {ok:false,stderr_truncated:true,stderr:$missing.stderr}, {ok:false,stderr:"This seat has no keyboard"}, {ok:false,stderr:"No such seat: another"}, {ok:false,stderr:"No such seat: " .. $plan.argv[2] .. "\nadditional error"}]
+    check($d.clipboard_fallback($plan,$result) == nil,"unrelated or ambiguous outcome retried")
+  end
+end
+check($d.clipboard_fallback({action:"open"},{ok:false,stderr:"No such seat: anything"}) == nil,"open retried")
+print("PASS clipboard seat pin, exact missing-seat fallback, preserved payload/limits, and single retry")
+
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-clipboard-seat.XXXXXXXX"]))
+$fixture = realpath(dirname($0) .. "/fixtures/clipboard-fork.mix")
+try
+  -- Control: prove this fixture retains the pipe beyond the parent exit.
+  $control_pid = $tmp .. "/control.pid"
+  try
+    $control = run_argv([$fixture], {timeout:1, stdin:{null:true}, stdout:"null", stderr:"capture",
+      env:{CHILD_PID_FILE:$control_pid, MISSING_SEAT:"0"}})
+    check($control.timed_out,"fixture did not reproduce inherited stderr pipe timeout")
+  finally
+    if exists($control_pid) then
+      $_ = run_argv(["kill", "-TERM", trim(read_file($control_pid))], {stderr:"null"})
+      remove($control_pid)
+    end
+  end
+  for each $action in ["write", "clipboard_pick", "clipboard_rotate"]
+    for each $missing in ["0", "1"]
+      $pidfile = $tmp .. "/child.pid"
+      $plan = {action:$action, copy_runtime:$tmp, argv:$d.clipboard_argv($fixture,[]),
+        options:{timeout:1, stdin:"payload", stdout:"null", stderr:"null",
+          env:{CHILD_PID_FILE:$pidfile, MISSING_SEAT:$missing}}}
+      try
+        $result = $d.execute($plan)
+        check($result.ok and not $result.timed_out and $result.duration_ms < 1000,
+          "forking copy waited for stderr EOF: " .. json_encode($result))
+        check(len(glob($tmp .. "/cosmix-clipboard-stderr-*")) == 0,"stderr file leaked")
+        -- The owner must outlive the call deadline, not merely the parent.
+        sleep(1.2)
+        $pid = trim(read_file($pidfile))
+        check(run_argv(["kill", "-0", $pid]).ok,"selection owner did not survive")
+        check(not contains(read_file("/proc/" .. $pid .. "/status"), "Z (zombie)"),"selection owner was killed")
+      finally
+        if exists($pidfile) then
+          $_ = run_argv(["kill", "-TERM", trim(read_file($pidfile))], {stderr:"null"})
+          remove($pidfile)
+        end
+      end
+    end
+  end
+finally
+  $_ = run_argv_must(["rmdir", "--", $tmp])
+end
+print("PASS write/pick/rotate return before deadline; inherited-stderr owners survive, including missing-seat retry; files removed")

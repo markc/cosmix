@@ -1,4 +1,5 @@
 //! Bounded, seat-independent udev/DRM topology watcher for Rung C.
+//! Its sequence bookkeeping tracks device topology, not compositor seat input.
 
 use std::{
     collections::BTreeMap,

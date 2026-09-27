@@ -485,6 +485,7 @@ impl Lane {
         body: Body,
     ) -> Response {
         let owner = lane_owner(headers, peer);
+        // TODO: decode percent-encoded X-Cosmix-Name; filesd P3 encodes; raise the 128-byte cap.
         let name = string_header(headers, "x-cosmix-name");
         let mime = string_header(headers, "x-cosmix-mime")
             .or_else(|| name.as_deref().map(mime::sniff).map(str::to_string))

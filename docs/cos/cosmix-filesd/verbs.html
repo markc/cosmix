@@ -532,6 +532,8 @@
 <tr><td><code>fs.mkdir</code></td><td>Required <code>path</code>; optional <code>parents</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.touch</code></td><td>Required <code>path</code></td></tr>
 <tr><td><code>fs.write</code></td><td>Required <code>path</code>; optional <code>content</code> (empty string), <code>overwrite</code> (<code>false</code>)</td></tr>
+<tr><td><code>fs.blob.ref</code></td><td>Required <code>path</code>; optional <code>name</code> (source filename), <code>mime</code> (source extension)</td></tr>
+<tr><td><code>fs.blob.materialise</code></td><td>Required <code>blob</code>, <code>path</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.copy</code></td><td>Required <code>from</code> and <code>to</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.move</code></td><td>Required <code>from</code> and <code>to</code>; optional <code>overwrite</code> (<code>false</code>)</td></tr>
 <tr><td><code>fs.trash</code></td><td>Required <code>path</code></td></tr>
@@ -539,6 +541,83 @@
 <tr><td><code>fs.trash.restore</code></td><td>Required <code>token</code></td></tr>
 </tbody></table>
 <p>Write operations fail for a read-only place.</p>
+<h3 id="binary-blob-bridge">Binary blob bridge</h3>
+<p>Both blob verbs have <code>read_only=false</code> and have no unprefixed aliases.
+Filesystem dispatch runs concurrently with 64 permits; saturation waits for a
+permit. Lane discovery times out after 10 seconds. Transfers remain synchronous:
+size <code>timeout=</code> on Mix <code>send</code> for the file. Cross-node calls are capped by the
+30-second mesh response budget, so drive large transfers from the node owning
+the place. A transfer can finish and pin/land after the caller times out;
+retrying materialise then answers <code>exists:</code> if the earlier transfer landed.
+<code>fs.blob.ref</code> changes blobd's pin state but only needs <strong>read</strong> access to its
+source place; a read-only place is a valid source. <code>fs.blob.materialise</code> needs
+a writable destination place. The existing delegation gate applies to both.</p>
+<p><code>fs.blob.ref {path, name?, mime?}</code> opens a plain, single-link regular file under
+the place jail and streams it to <code>POST /blob</code> on the configured <code>blob_service</code>'s
+byte lane. Place roots, directories, symlink files, hardlinks, special files and
+policy-prefix paths are refused. The body uses an explicit <code>Content-Length</code>;
+the pin owner is the filesd <code>bus_service</code>. The MIME default is the same extension
+table as <code>fs.read_blob</code>. A 201 response returns the validated blob reference
+with <code>path</code> added; optional reference attributes (including a named store's
+<code>instance</code>) are preserved. File bytes are never carried in a Bus frame.</p>
+<p>Filename hints (including an explicit <code>name</code>) percent-encode UTF-8 bytes outside
+printable non-space ASCII, plus <code>%</code>, for the HTTP header. blobd currently stores
+the encoded name verbatim, so <code>Résumé.pdf</code> returns as <code>R%C3%A9sum%C3%A9.pdf</code>.
+An encoded name longer than 128 bytes is omitted; the reference name is null.</p>
+<p>A source shrinking during the upload aborts immediately with
+<code>lane: source shrank during upload</code>. Filesd checks the same open descriptor's
+length and mtime after sending; a change reports <code>lane: source changed during upload (blob may already be pinned)</code>. This detects ordinary concurrent edits,
+not edits that deliberately restore both length and mtime.</p>
+<p>After discovering the lane, ref preflights <code>blob.quota {owner: bus_service}</code>
+under the same 10-second timeout. File length must fit both owner and total
+headroom after used and reserved bytes. This is advisory: the lane remains
+authoritative. A timeout, lookup error or malformed quota reply logs one line
+and skips the preflight, allowing the upload to proceed. Only a well-formed
+reply showing insufficient room refuses the upload with <code>quota:</code>.
+A concurrent quota refusal may close a large upload before
+ureq reads the 413, yielding <code>lane:</code> with a quota hint rather than <code>quota:</code>.</p>
+<p><code>fs.blob.materialise {blob, path, overwrite?}</code> accepts <code>b3:&lt;64 lowercase hex&gt;</code>,
+bare lowercase hex, or a reference map containing <code>blob</code>. It streams
+<code>GET /blob/&lt;hex&gt;</code> from that local store. A missing blob must first be fetched
+with <code>blob.fetch</code>; materialise does not initiate a cross-node fetch.</p>
+<p>The destination uses the write jail and rejects symlink or non-regular targets
+on overwrite. In unrestricted places a hard-linked target is replaced by
+rename, leaving its other links unchanged, like <code>fs.write</code>; policy-scoped
+places still reject hard-linked targets in the resolver.
+Missing parent directories are created only after a successful GET response,
+immediately before landing; a 404 or connection failure creates none. Bytes stream into
+a unique sibling temporary file, with length and BLAKE3 verification before
+publication. An overwrite preserves mode bits and uses fsync then rename;
+<code>overwrite=false</code> uses Linux <code>renameat2(RENAME_NOREPLACE)</code> to publish in one
+step and refuse a destination created during the download. Unsupported
+rename flags fall back to link/unlink (a crash between those steps can leave
+two names). Where links are unsupported, the last tier is best-effort
+check-then-rename and cannot exclude a concurrent target creation. New files
+use mode 0666 filtered by the process umask, like <code>fs.write</code>. Ownership is not
+preserved. Staging is removed on errors; the old target survives failed reads
+or verification. Directory fsync is best-effort after publication.</p>
+<p>Success is <code>{"ok":true,"path":...,"blob":"b3:...","size":N}</code>. The HTTP
+client has 30-second connect/read/write bounds, refuses redirects and encoded
+responses, and requires <code>Content-Length</code> on GET. The reader-driven landing
+primitive checks short and long inputs. ureq 2 exposes only the declared HTTP
+body, so trailing wire bytes beyond <code>Content-Length</code> are not visible to it;
+the framed body must still match the requested hash. The existing resolver's
+documented path-based check/use race posture is unchanged.</p>
+<p>All failures use rc 10 and <code>{"error":...}</code>:</p>
+<table><thead><tr><th>Leading text</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>lane_unavailable:</code></td><td>Lane props failed, timed out, or supplied an empty/invalid bind</td></tr>
+<tr><td><code>quota:</code></td><td>HTTP 413, including a bounded prefix of blobd's error body</td></tr>
+<tr><td><code>lane:</code></td><td>Other HTTP/transport errors, invalid references or response framing; a mid-upload close includes <code>lane closed during upload</code> and a quota hint</td></tr>
+<tr><td><code>not_present:</code></td><td><code>blob is not on this node — blob.fetch it first</code> (GET 404)</td></tr>
+<tr><td><code>verify_failed:</code></td><td>Body length or BLAKE3 mismatch</td></tr>
+<tr><td><code>invalid blob id</code></td><td>Invalid materialise <code>blob</code> argument</td></tr>
+<tr><td><code>missing or empty arg:</code></td><td>A required string argument, such as <code>path</code>, is absent, empty or not a string</td></tr>
+<tr><td><code>denied:</code>, <code>not found:</code>, <code>exists:</code>, <code>bad request:</code>, <code>i/o error:</code></td><td>Filesystem-layer errors, passed through unchanged</td></tr>
+</tbody></table>
+<p>A truncated HTTP body reported by ureq as a read error uses <code>lane:</code>. A short
+reader ending cleanly uses <code>verify_failed:</code>. A failed body read or verification may have created
+parent directories; a failed upload response does not undo a pin already
+committed by blobd.</p>
 <h3 id="irreversible-operations">Irreversible operations</h3>
 <table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
 <tr><td><code>fs.delete</code></td><td>Required <code>path</code> and <code>confirm: true</code>; optional <code>recursive</code> (<code>false</code>)</td></tr>

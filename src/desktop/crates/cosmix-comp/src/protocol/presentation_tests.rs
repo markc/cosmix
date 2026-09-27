@@ -331,6 +331,7 @@ fn source_timing_input_and_reset() {
     let marks = |seq: u64, at_us: u64| {
         (seq == 42)
             .then_some(InputMark {
+                seat: crate::protocol::SeatKind::Human,
                 input_seq: 42,
                 injected_at_us: 1_000,
             })

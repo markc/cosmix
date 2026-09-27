@@ -1,5 +1,9 @@
 # Commands and configuration
 
+For account-root path sharing, configure `webd.shares.roots` in `node.conf.mix`.
+See [public shares](shares.md) for the exact email-keyed map, startup validation,
+and the C1/C6 scope. Roots are operator configuration, never HTTP/Bus arguments.
+
 `cosmix-webd` is a subcommand-driven daemon binary. Server flags override matching values resolved from `node.conf.mix`.
 
 ## Commands

@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-filesd"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1193,6 +1193,7 @@ dependencies = [
  "notify",
  "serde_json",
  "tokio",
+ "ureq",
 ]
 
 [[package]]
@@ -1341,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -1408,10 +1409,11 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-files"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "blake3",
  "cosmix-lib-bus",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1641,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-maild"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2042,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-webd"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2050,6 +2052,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bcrypt",
  "blake3",
  "chacha20poly1305",
  "clap",
@@ -2058,6 +2061,7 @@ dependencies = [
  "cosmix-lib-client",
  "cosmix-lib-config",
  "cosmix-lib-daemon",
+ "cosmix-lib-files",
  "cosmix-lib-log",
  "cosmix-lib-log-props",
  "cosmix-lib-mix",
@@ -4373,8 +4377,6 @@ dependencies = [
 [[package]]
 name = "mail-parser"
 version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47785d444be4d32c1709171c6219a90f667c0ad0ffe68b4b179e794f31f4f9e8"
 dependencies = [
  "encoding_rs",
  "hashify",

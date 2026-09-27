@@ -56,7 +56,7 @@ use smithay::reexports::calloop::channel;
 use smithay::reexports::calloop::{EventSource, LoopHandle};
 use smithay::utils::{Logical, Point};
 
-use super::{HostAxis, HostButtonState, HostInput, WaylandState};
+use super::{HostAxis, HostButtonState, HostInput, SeatKind, WaylandState};
 
 /// The held input contributions attributed to one device lifetime.
 #[derive(Default)]
@@ -148,6 +148,16 @@ pub(crate) struct InputIngressState {
 }
 
 impl InputIngressState {
+    #[cfg(feature = "bus")]
+    pub(super) fn physically_holds_key(&self, key: smithay::input::keyboard::Keycode) -> bool {
+        self.devices.values().any(|device| device.keys.contains(&key))
+    }
+
+    #[cfg(feature = "bus")]
+    pub(super) fn physically_holds_button(&self, button: u32) -> bool {
+        self.devices.values().any(|device| device.buttons.contains(&button))
+    }
+
     fn added(&mut self, device: &impl Device) {
         let id = device.id();
         if let Some(_existing) = self.devices.get_mut(&id) {
@@ -742,8 +752,8 @@ pub(crate) fn route_input_event<B: InputBackend>(state: &mut WaylandState, event
     // pulse pacing events.
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     let _dispatch_span = crate::frame_trace::span("comp_input_dispatch", input_event_code(&event));
-    let keyboard = &state.keyboard;
-    let pointer = &state.pointer;
+    let keyboard = &state.human.keyboard;
+    let pointer = &state.human.pointer;
     let routing = host_input_from_event(
         &mut state.input_ingress,
         &event,
@@ -765,7 +775,7 @@ pub(crate) fn route_input_event<B: InputBackend>(state: &mut WaylandState, event
             }
         }
         InputRouting::ActivityOnly(reason) => {
-            state.notify_idle_activity();
+            state.notify_idle_activity(SeatKind::Human);
             tracing::trace!(reason, "input event carries activity but no seat operation");
         }
         InputRouting::Ignored(reason) => {

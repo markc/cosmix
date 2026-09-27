@@ -68,6 +68,7 @@ pub(super) fn exact_logical_output_rect(
 
 #[derive(Debug)]
 pub(crate) struct SnapshotContext {
+    pub(crate) agent_epoch: Arc<AtomicU64>,
     pub(crate) service: Arc<str>,
     pub(crate) version: Arc<str>,
     pub(crate) backend: &'static str,
@@ -351,6 +352,10 @@ pub(crate) struct BindingRowSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct InputSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) seats: Option<BTreeMap<&'static str, SeatSnapshot>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_origin: Option<&'static str>,
     pub(crate) corners: CornersSnapshot,
     /// Nested backend only: whether host pointer/key input reaches the seat.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,6 +365,28 @@ pub(crate) struct InputSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(crate) struct HostInputSnapshot {
     pub(crate) passthrough: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct SeatSnapshot {
+    name: &'static str,
+    keyboard_focus: Option<SeatFocusSnapshot>,
+    pointer_focus: Option<SeatFocusSnapshot>,
+    pointer: Option<SeatPointerSnapshot>,
+    last_input_us: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct SeatFocusSnapshot {
+    id: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct SeatPointerSnapshot {
+    output: String,
+    x: f64,
+    y: f64,
 }
 
 /// The XWayland runtime switch as a props subtree: `xwayland.enabled` is
@@ -550,6 +577,7 @@ impl CompSnapshot {
                 PatternSegment::SourceKey => {
                     append_segments(&mut paths, self.sources.keys().map(String::as_str));
                 }
+                PatternSegment::SeatKey => append_segments(&mut paths, ["human", "agent"]),
                 PatternSegment::SurfaceKey => match pattern.first() {
                     Some(PatternSegment::Literal("surfaces")) => {
                         append_segments(&mut paths, self.surfaces.keys().map(String::as_str))
@@ -799,6 +827,8 @@ impl InputSnapshot {
     fn select(&self, path: &[&str]) -> Option<Value> {
         match path {
             [] => serialise_selected(self),
+            ["seats", tail @ ..] => self.seats.as_ref().and_then(|seats| select_serialised(seats, tail)),
+            ["last_origin"] => serialise_selected(&self.last_origin),
             ["corners", tail @ ..] => self.corners.select(tail),
             ["host"] => self.host.as_ref().and_then(serialise_selected),
             ["host", "passthrough"] => self
@@ -812,6 +842,8 @@ impl InputSnapshot {
     fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
         match path {
             [] | ["corners"] => Some(SnapshotNodeKind::Object),
+            ["seats", tail @ ..] => self.seats.as_ref().and_then(|seats| serialised_node_kind(seats, tail)),
+            ["last_origin"] => Some(SnapshotNodeKind::Leaf),
             ["corners", tail @ ..] => self.corners.node_kind(tail),
             ["host"] => self.host.map(|_| SnapshotNodeKind::Object),
             ["host", "passthrough"] => self.host.map(|_| SnapshotNodeKind::Leaf),
@@ -1143,10 +1175,47 @@ fn project_workspaces(
     }
 }
 
+fn project_seats(state: &WaylandState) -> BTreeMap<&'static str, SeatSnapshot> {
+    let outputs = project_outputs(state);
+    let focus = |target: Option<super::SeatFocusTarget>| {
+        target.and_then(|target| target.surface_id())
+            .and_then(|object| state.surfaces.get(&object))
+            .map(|record| SeatFocusSnapshot { id: record.id.0, generation: record.generation })
+    };
+    [
+        ("human", super::HUMAN_SEAT_NAME, &state.human),
+        ("agent", super::AGENT_SEAT_NAME, &state.agent),
+    ].into_iter().map(|(key, name, seat)| {
+        let position = match seat.kind {
+            super::SeatKind::Human => {
+                let cursor = *state.cursor_position_snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                (cursor.on_output && state.backend.pointer_session_active())
+                    .then_some((cursor.x, cursor.y))
+            }
+            super::SeatKind::Agent => seat.pointer_position,
+        };
+        let pointer = position.filter(|_| !state.session_lock_active()).and_then(|(x, y)| {
+            outputs.as_ref()?.rows.values().find_map(|row| {
+                let x = x - f64::from(row.x);
+                let y = y - f64::from(row.y);
+                (x >= 0.0 && y >= 0.0 && x < f64::from(row.width) && y < f64::from(row.height))
+                    .then(|| SeatPointerSnapshot { output: row.name.clone(), x, y })
+            })
+        });
+        (key, SeatSnapshot {
+            name,
+            keyboard_focus: focus(seat.keyboard.current_focus()),
+            pointer_focus: focus(seat.pointer.current_focus()),
+            pointer,
+            last_input_us: seat.last_input_us,
+        })
+    }).collect()
+}
+
 pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
     let session_lock_active = state.session_lock_active();
     FocusSnapshot {
-        keyboard: state
+        keyboard: state.human
             .keyboard
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -1157,7 +1226,7 @@ pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
             .as_ref()
             .and_then(|object| state.surfaces.get(object))
             .map(|record| record.id.0),
-        pointer: state
+        pointer: state.human
             .pointer
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -1278,6 +1347,8 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 .collect(),
         },
         input: InputSnapshot {
+            seats: None,
+            last_origin: None,
             corners: state.observations.corner_config.into(),
             host: state.host_input_snapshot(),
         },
@@ -1372,6 +1443,13 @@ pub(super) fn read_snapshot(
     let (enforced, held) = super::port_observation::panel_edge_counts(state);
     snapshot.input.corners.enforced = Some(enforced);
     snapshot.input.corners.held = Some(held);
+    if scopes.wants("input.seats") {
+        snapshot.input.seats = Some(project_seats(state));
+    }
+    snapshot.input.last_origin = state.last_input_origin.map(|kind| match kind {
+        super::SeatKind::Human => "human",
+        super::SeatKind::Agent => "agent",
+    });
     let stats = &state.presentation.stats;
     for (key, window) in &mut snapshot.windows {
         if !scopes.wants(&format!("windows.{key}.presentation")) {
@@ -1569,7 +1647,7 @@ fn pointer_grab_name(state: &WaylandState) -> &'static str {
             InteractivePointer::Resize { .. } => "resize",
         };
     }
-    if state.pointer.is_grabbed() {
+    if state.human.pointer.is_grabbed() {
         "popup"
     } else {
         "none"
@@ -1604,6 +1682,7 @@ pub(crate) enum PatternSegment {
     SurfaceKey,
     /// A content source id (`[a-z0-9_-]{1,64}`).
     SourceKey,
+    SeatKey,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1676,9 +1755,22 @@ macro_rules! volatile {
     };
 }
 
-use PatternSegment::{Literal as L, OutputKey as O, SourceKey as C, SurfaceKey as S};
+use PatternSegment::{Literal as L, OutputKey as O, SeatKey as K, SourceKey as C, SurfaceKey as S};
 
 pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
+    volatile!([L("input"), L("seats"), K, L("name")], String, "Advertised wl_seat name"),
+    volatile!([L("input"), L("seats"), K, L("keyboard_focus")], Object, "Keyboard focus identity and generation, or null"),
+    volatile!([L("input"), L("seats"), K, L("keyboard_focus"), L("id")], Number, "Keyboard focus surface id"),
+    volatile!([L("input"), L("seats"), K, L("keyboard_focus"), L("generation")], Number, "Keyboard focus surface generation"),
+    volatile!([L("input"), L("seats"), K, L("pointer_focus")], Object, "Pointer focus identity and generation, or null"),
+    volatile!([L("input"), L("seats"), K, L("pointer_focus"), L("id")], Number, "Pointer focus surface id"),
+    volatile!([L("input"), L("seats"), K, L("pointer_focus"), L("generation")], Number, "Pointer focus surface generation"),
+    volatile!([L("input"), L("seats"), K, L("pointer")], Object, "Output-local pointer position, or null when unknown or locked"),
+    volatile!([L("input"), L("seats"), K, L("pointer"), L("output")], String, "Raw protocol output name"),
+    volatile!([L("input"), L("seats"), K, L("pointer"), L("x")], Number, "Output-local logical pointer x"),
+    volatile!([L("input"), L("seats"), K, L("pointer"), L("y")], Number, "Output-local logical pointer y"),
+    volatile!([L("input"), L("seats"), K, L("last_input_us")], Number, "Last input CLOCK_MONOTONIC microseconds, or null before input"),
+    volatile!([L("input"), L("last_origin")], String, "human, agent, or null before input"),
     descriptor!(
         &[L("surfaces"), S, L("occluded")],
         Bool,
@@ -2610,6 +2702,7 @@ impl DescribeEntry {
                 .all(|(actual, expected)| match expected {
                     PatternSegment::Literal(expected) => actual == expected,
                     PatternSegment::OutputKey => actual.starts_with("o_") && actual.len() > 2,
+                    PatternSegment::SeatKey => matches!(*actual, "human" | "agent"),
                     PatternSegment::SurfaceKey => actual.strip_prefix('s').is_some_and(|id| {
                         !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
                     }),
@@ -2663,6 +2756,9 @@ fn is_false(value: &bool) -> bool {
 /// diagnostics served only by reads.
 pub(crate) fn volatile_path(path: &str) -> bool {
     path == "sources"
+        || path == "input.last_origin"
+        || path == "input.seats"
+        || path.starts_with("input.seats.")
         || path.starts_with("sources.")
         || path == "input.corners.enforced"
         || path.starts_with("input.corners.enforced.")
@@ -2693,18 +2789,30 @@ pub(super) fn service_requests(state: &mut WaylandState) {
         state.pending_port_requests.clear();
         return;
     };
+    // A read admitted after parked input cannot observe the state before that
+    // input. Earlier reads may still complete. The control queue's wakeup also
+    // schedules these deferred reads; no polling or separate timer is needed.
+    let fence = state.pending_port_controls.iter().map(crate::port::PortControl::order).min();
+    let mut ready = Vec::new();
+    for request in std::mem::take(&mut state.pending_port_requests) {
+        if fence.is_some_and(|order| request.order > order) {
+            state.pending_port_requests.push(request);
+        } else {
+            ready.push(request);
+        }
+    }
+    if ready.is_empty() { return; }
     let mut scopes = ReadScopes::Paths(Vec::new());
-    for request in &state.pending_port_requests {
+    for request in &ready {
         scopes.add(request.scope.as_deref());
     }
     let Some(snapshot) = read_snapshot(state, &context, &scopes).map(Arc::new) else {
         tracing::warn!(
             "compositor Bus snapshot contains coordinates not exactly representable as f32"
         );
-        state.pending_port_requests.clear();
         return;
     };
-    for request in state.pending_port_requests.drain(..) {
+    for request in ready {
         let _ = request.reply.send(Arc::clone(&snapshot));
     }
 }
@@ -3313,6 +3421,23 @@ mod tests {
                 }],
             },
             input: InputSnapshot {
+                seats: Some(BTreeMap::from([
+                    ("human", SeatSnapshot {
+                        name: super::super::HUMAN_SEAT_NAME,
+                        keyboard_focus: Some(SeatFocusSnapshot { id: 2, generation: 1 }),
+                        pointer_focus: Some(SeatFocusSnapshot { id: 2, generation: 1 }),
+                        pointer: Some(SeatPointerSnapshot { output: "DP-1".into(), x: 10.0, y: 20.0 }),
+                        last_input_us: Some(42),
+                    }),
+                    ("agent", SeatSnapshot {
+                        name: super::super::AGENT_SEAT_NAME,
+                        keyboard_focus: None,
+                        pointer_focus: None,
+                        pointer: None,
+                        last_input_us: None,
+                    }),
+                ])),
+                last_origin: Some("human"),
                 // A read snapshot, with the volatile holder-plane counts.
                 corners: CornersSnapshot {
                     enforced: Some(EdgeCounts { left: 1, ..EdgeCounts::default() }),
@@ -3526,6 +3651,7 @@ mod tests {
                     PatternSegment::OutputKey => "o_dp_1",
                     PatternSegment::SurfaceKey => "s2",
                     PatternSegment::SourceKey => "scene",
+                    PatternSegment::SeatKey => "human",
                 })
                 .collect::<Vec<_>>()
                 .join(".");
@@ -3534,7 +3660,8 @@ mod tests {
         }
         // + 8: the four `input.corners.enforced.*` and four `held.*` counts.
         // + 3: the `dmabuf.*` import ledger.
-        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4 + 8 + 3);
+        // + 13: per-seat observations and last input origin.
+        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4 + 8 + 3 + 13);
     }
 
     #[test]

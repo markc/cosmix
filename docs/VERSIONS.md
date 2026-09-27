@@ -56,7 +56,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-edit-client` | 0.2.0 |
 | `cosmix-edit-core` | 0.1.1 |
 | `cosmix-editd` | 0.2.0 |
-| `cosmix-filesd` | 0.8.2 |
+| `cosmix-filesd` | 0.9.0 |
 | `cosmix-indexd` | 0.9.2 |
 | `cosmix-input-core` | 0.1.4 |
 | `cosmix-input-schema` | 0.1.4 |
@@ -64,11 +64,11 @@ CoS — substrate libraries and daemon family
 | `cosmix-interactd` | 0.5.2 |
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
-| `cosmix-lib-config` | 0.8.5 |
+| `cosmix-lib-config` | 0.8.6 |
 | `cosmix-lib-daemon` | 0.7.1 |
 | `cosmix-lib-davproto` | 0.1.2 |
 | `cosmix-lib-dns` | 0.3.0 |
-| `cosmix-lib-files` | 0.7.0 |
+| `cosmix-lib-files` | 0.8.1 |
 | `cosmix-lib-llm` | 0.2.0 |
 | `cosmix-lib-log-props` | 0.2.0 |
 | `cosmix-lib-mesh` | 0.6.0 |
@@ -78,7 +78,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-lib-skills` | 0.1.1 |
 | `cosmix-lib-wg` | 0.2.0 |
 | `cosmix-lsh` | 0.1.0 |
-| `cosmix-maild` | 0.9.1 |
+| `cosmix-maild` | 0.10.0 |
 | `cosmix-maild-auth` | 0.2.0 |
 | `cosmix-maild-bayesian` | 0.7.1 |
 | `cosmix-maild-rules` | 0.3.1 |
@@ -93,7 +93,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-nspawnd` | 0.2.2 |
 | `cosmix-powerd` | 0.1.1 |
 | `cosmix-song` | 0.2.0 |
-| `cosmix-webd` | 0.11.1 |
+| `cosmix-webd` | 0.12.0 |
 | `cosmix-wgd` | 0.4.2 |
 
 ## desktop
@@ -106,11 +106,13 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bg-showcase` | 0.2.6 |
 | `cosmix-bterm` | 0.10.1 |
 | `cosmix-busviewer` | 0.1.2 |
-| `cosmix-capture` | 0.2.1 |
+| `cosmix-capture` | 0.2.4 |
 | `cosmix-ced` | 0.1.2 |
-| `cosmix-comp` | 0.69.2 |
+| `cosmix-comp` | 0.72.0 |
 | `cosmix-deco` | 0.4.1 |
 | `cosmix-design` | 0.15.0 |
+| `cosmix-dopus` | 0.1.0 |
+| `cosmix-dopus-core` | 0.1.0 |
 | `cosmix-filemgr` | 0.9.8 |
 | `cosmix-flock` | 0.1.0 |
 | `cosmix-iced-widgets` | 0.1.2 |
@@ -118,11 +120,11 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-interactgui` | 0.1.3 |
 | `cosmix-mail` | 0.1.1 |
 | `cosmix-media` | 0.1.3 |
-| `cosmix-quoin` | 0.20.0 |
+| `cosmix-quoin` | 0.20.1 |
 | `cosmix-scene` | 0.6.0 |
 | `cosmix-scene-bevy` | 0.7.0 |
 | `cosmix-shell` | 0.19.0 |
-| `cosmix-shell-host` | 0.11.0 |
+| `cosmix-shell-host` | 0.11.1 |
 | `cosmix-studio` | 0.4.8 |
 | `cosmix-term` | 0.3.1 |
 | `cosmix-term-core` | 0.8.2 |
@@ -131,11 +133,11 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-trayd` | 0.6.3 |
 | `cosmix-wallpaper` | 0.2.1 |
 | `cosmix-wgpu-dmabuf` | 0.16.2 |
-| `cosmix-wl-dnd` | 0.4.2 |
+| `cosmix-wl-dnd` | 0.4.3 |
 | `ctk` | 0.58.1 |
 | `spike-wl-dnd` | 0.1.1 |
 | `term-native-test-broker` | 0.0.0 |
 
 ---
 
-55 crates in `$COSMIX/src` and 33 in the separate `$COSMIX/src/desktop` workspace.
+55 crates in `$COSMIX/src` and 35 in the separate `$COSMIX/src/desktop` workspace.

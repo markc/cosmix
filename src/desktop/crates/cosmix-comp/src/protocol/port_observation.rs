@@ -1422,7 +1422,7 @@ impl WaylandState {
                 || button == super::PRIMARY_POINTER_BUTTON + 1)
         {
             // Read calloop-owned keyboard state now; release may have different modifiers.
-            let state = self.keyboard.modifier_state();
+            let state = self.human.keyboard.modifier_state();
             let modifiers = [
                 (state.shift, "shift"),
                 (state.ctrl, "ctrl"),
@@ -2094,7 +2094,7 @@ fn service_focus_edge(state: &mut WaylandState) {
 
 fn project_focus_edge(state: &WaylandState) -> FocusEdgeStart {
     FocusEdgeStart {
-        keyboard: state
+        keyboard: state.human
             .keyboard
             .current_focus()
             .and_then(|target| target.surface_id())
@@ -3134,11 +3134,74 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
         }
     }
     controls.sort_by_key(PortControl::order);
+    if let Some(context) = &state.port_context {
+        let epoch = context.agent_epoch.load(Ordering::Acquire);
+        controls.retain_mut(|control| !control.refuse_cleared_agent(epoch));
+    }
+    // HostInput ready this turn has already drained. Bound agent verbs without
+    // reordering the remaining controls: a suffix stays queued and wakes the
+    // next dispatch. Each admitted verb also has the parser's event bound.
+    const AGENT_CONTROL_BATCH: usize = 8;
+    let mut agent_ops = 0;
+    // Resumptions cannot consume the admission allowance and repeatedly park
+    // unrelated controls behind a fresh sequence. Both allowances are bounded.
+    let mut initial_sequence_available = true;
+    let end = controls.iter().position(|control| {
+        if control.uses_agent() {
+            if matches!(control, PortControl::Long(_)) {
+                // Only a second fresh admission spends this allowance. Running
+                // sequences retain their separate round-robin resumption slot.
+                if !initial_sequence_available { return true; }
+                initial_sequence_available = false;
+            }
+            agent_ops += 1;
+        }
+        agent_ops > AGENT_CONTROL_BATCH
+    }).unwrap_or(controls.len());
+    state.pending_port_controls = controls.split_off(end);
+    if !state.pending_port_controls.is_empty() { state.input_wakeup.wakeup(); }
     let mut changes = PendingPropChanges::new();
     let mut mutated = ControlMutation::None;
     // Mutations run in arrival order, so a script's set -> minimise ->
     // restore -> click lands in the order it was sent.
-    for control in &mut controls {
+    let mut cursor = 0;
+    while cursor < controls.len() {
+        // An earlier human verb in this very batch can switch VT. Recheck the
+        // epoch here too: these controls are temporarily outside the state queue.
+        if let Some(context) = &state.port_context
+            && controls[cursor].refuse_cleared_agent(context.agent_epoch.load(Ordering::Acquire))
+        {
+            cursor += 1;
+            continue;
+        }
+        // Complete every reply only after the group's final motion is delivered.
+        // Shared input_seq/coordinates describe that delivery, not intermediate
+        // coordinates which the client never saw. Every other control is a fence.
+        if let PortControl::Input(request) = &controls[cursor] {
+            let mut op = request.op.clone();
+            let mut end = cursor + 1;
+            while let Some(PortControl::Input(next)) = controls.get(end) {
+                let Some(combined) = state.coalesce_agent_motion(&op, &next.op) else { break };
+                op = combined;
+                end += 1;
+            }
+            if end > cursor + 1 {
+                mutated = mutated.max(ControlMutation::Input);
+                let mut reply = state.service_input_op(&op);
+                if let ControlReply::Body(body) = &mut reply {
+                    body["coalesced"] = serde_json::json!(end - cursor);
+                }
+                for control in &mut controls[cursor..end] {
+                    if let PortControl::Input(request) = control
+                        && let Some(sender) = request.reply.take()
+                    { let _ = sender.send(reply.clone()); }
+                }
+                cursor = end;
+                continue;
+            }
+        }
+        let control = &mut controls[cursor];
+        cursor += 1;
         match control {
             PortControl::Panel(request) => {
                 state.observations.panel_request_serviced = true;
@@ -3171,7 +3234,7 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
                 // its own permit and deadline, not on the bounded queue.
                 request.slot.take();
                 if let (Some(op), Some(reply)) = (request.op.take(), request.reply.take()) {
-                    state.start_long_op(op, reply, request.admitted);
+                    state.start_ordered_long_op(op, reply, request.admitted);
                 }
             }
             PortControl::Watch(_)
@@ -3500,8 +3563,8 @@ fn focus_surface_id(
 ///   drop, its keyboard focus stops counting and its Exclusive grab goes, the
 ///   edge conceals, and the showing layers are hidden and excluded at once.
 fn track_panel_holders(state: &mut WaylandState, now: Instant) -> bool {
-    let pointer = focus_surface_id(state, state.pointer.current_focus());
-    let keyboard = focus_surface_id(state, state.keyboard.current_focus());
+    let pointer = focus_surface_id(state, state.human.pointer.current_focus());
+    let keyboard = focus_surface_id(state, state.human.keyboard.current_focus());
     let user_input = std::mem::take(&mut state.observations.user_input);
     // The hotspot the pointer is in, by output key; dwelling engages it.
     let detector = &state.observations.corner_detector;
@@ -3835,7 +3898,7 @@ fn service_popup_restores(state: &mut WaylandState) -> bool {
         else {
             continue;
         };
-        let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
+        let current = focus_surface_id(state, state.human.keyboard.current_focus()).map(|id| id.0);
         if current != fallback || current == Some(prior) {
             continue;
         }
@@ -3997,7 +4060,7 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
 /// then the one its own focus change replaced. A popup without focus yet
 /// records what it displaces when it takes focus ([`note_popup_focus`]).
 fn record_popup_focus(state: &mut WaylandState, popup: SurfaceId) {
-    let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
+    let current = focus_surface_id(state, state.human.keyboard.current_focus()).map(|id| id.0);
     let prior = (current == Some(popup.0))
         .then(|| {
             state
@@ -4827,6 +4890,9 @@ fn known_read_only_path(path: &str) -> bool {
         return true;
     }
     path == "input"
+        || path == "input.last_origin"
+        || path == "input.seats"
+        || path.starts_with("input.seats.")
         || path == "input.corners"
         || path == "input.host"
         || ROOTS
