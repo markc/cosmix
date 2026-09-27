@@ -513,6 +513,8 @@ for producers such as maild (P4), with paths visible to blobd itself.</p>
 <p><code>PUT /blob/&lt;hex&gt;</code> and <code>POST /blob</code> remain <strong>restart-only</strong>: a dropped or failed upload starts again from zero. Their body pump aborts with <code>408</code> after <code>lane_upload_deadline_secs</code> (default 3600), even if bytes keep arriving. The deadline bounds body reception, not blocking filesystem sync or metadata settlement. Resumable clients use the session routes below.</p>
 <p>A <code>blob.fetch</code> interrupted by a restart leaves at most staging residue under <code>blobs/.tmp</code>, which startup cleanup removes — the same crash-safety the lane's uploads have.</p>
 <h3 id="durable-upload-sessions-060">Durable upload sessions (0.6.0)</h3>
+<p>Every session-route response carries <code>Cache-Control: no-store</code>, including
+axum-generated method errors (405) and extractor rejections before a handler.</p>
 <table><thead><tr><th>Route</th><th>Success</th><th>Contract</th></tr></thead><tbody>
 <tr><td><code>POST /blob/uploads</code></td><td><code>201</code> new; <code>200</code> key replay</td><td>Create from headers, no body; return session JSON and <code>Location: /blob/uploads/&lt;uuid&gt;</code></td></tr>
 <tr><td><code>HEAD /blob/uploads/&lt;uuid&gt;</code></td><td><code>200</code></td><td>Durable offset and identity headers, no body, including on error</td></tr>

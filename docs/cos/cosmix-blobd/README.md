@@ -103,6 +103,9 @@ A `blob.fetch` interrupted by a restart leaves at most staging residue under `bl
 
 ### Durable upload sessions (0.6.0)
 
+Every session-route response carries `Cache-Control: no-store`, including
+axum-generated method errors (405) and extractor rejections before a handler.
+
 | Route | Success | Contract |
 |---|---|---|
 | `POST /blob/uploads` | `201` new; `200` key replay | Create from headers, no body; return session JSON and `Location: /blob/uploads/<uuid>` |

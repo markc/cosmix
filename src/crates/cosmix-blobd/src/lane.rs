@@ -147,12 +147,7 @@ impl Lane {
 /// The lane's route table, shared by [`serve_lane`] and the test
 /// constructor.
 fn lane_router(lane: Arc<Lane>) -> Router {
-    Router::new()
-        .route(
-            "/blob/{hex}",
-            get(get_blob).put(put_upload).post(post_upload),
-        )
-        .route("/blob", post(post_upload))
+    let sessions = Router::new()
         .route("/blob/uploads", post(uploads::create))
         .route(
             "/blob/uploads/{id}",
@@ -161,6 +156,15 @@ fn lane_router(lane: Arc<Lane>) -> Router {
                 .delete(uploads::abort),
         )
         .route("/blob/uploads/{id}/commit", post(uploads::commit))
+        // Layer the router (including method fallbacks), not just handler
+        // responses: generated 405s and extractor refusals must not be cached.
+        .layer(axum::middleware::map_response(|response: Response| async move {
+            uploads::no_store(response)
+        }));
+    Router::new()
+        .route("/blob/{hex}", get(get_blob).put(put_upload).post(post_upload))
+        .route("/blob", post(post_upload))
+        .merge(sessions)
         .with_state(lane)
 }
 

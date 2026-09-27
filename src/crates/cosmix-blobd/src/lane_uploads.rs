@@ -113,7 +113,7 @@ fn metadata_headers(mut response: Response, s: &UploadSession) -> Response {
     no_store(response)
 }
 
-fn no_store(mut response: Response) -> Response {
+pub(super) fn no_store(mut response: Response) -> Response {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
@@ -429,6 +429,23 @@ mod tests {
         assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
         assert_eq!(client.delete(&url).send().await.unwrap().status(), 204);
         assert_eq!(store.quota_report(None).unwrap().total.used, 3);
+    }
+
+    #[tokio::test]
+    async fn session_generated_405_and_extractor_rejections_are_no_store() {
+        let (_dir, _store, addr) = test_lane(options()).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}/blob/uploads");
+        for url in [base.clone(), format!("{base}/00000000-0000-0000-0000-000000000001"), format!("{base}/00000000-0000-0000-0000-000000000001/commit")] {
+            let response = client.get(url).send().await.unwrap();
+            assert_eq!(response.status(), 405);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+        // The Path<String> extractor refuses non-UTF8 percent-decoded bytes
+        // before entering the session handler.
+        let response = client.head(format!("{base}/%FF")).send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.headers()["cache-control"], "no-store");
     }
 
     #[tokio::test]
