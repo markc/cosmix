@@ -381,6 +381,7 @@ fn _blob_upload_file($path, $opts)
   $until = monotonic() + $commit_timeout
   $poll = false
   $backoff = 1
+  $last_commit = monotonic()
   while monotonic() < $until
     if $poll then
       sleep(min($backoff, max(0, $until - monotonic())))
@@ -398,11 +399,14 @@ fn _blob_upload_file($path, $opts)
       if $head.status == 0 or $head.status == 503 then continue end
       $status = _file_status_response($head, $record)
       if not $status.ok then return $status end
-      if $status.result.state == "committing" then continue end
+      -- A transient server failure can leave intent without a live worker.
+      -- Replay at most every 30 seconds; the guard returns 409 if still busy.
+      if $status.result.state == "committing" and monotonic() - $last_commit < 30 then continue end
       $remaining = $until - monotonic()
       if $remaining < 1 then break end
       $control.timeout = min($control.timeout, floor($remaining))
     end
+    $last_commit = monotonic()
     $committed = http_request("POST", $url .. "/commit", nil, {}, $control)
     if $committed.status == 200 or $committed.status == 201 then
       $ref = json_parse($committed.body)

@@ -722,8 +722,10 @@ reported as transport status 0 with the server diagnostic lost, so HEAD is
 authoritative for recovery. Call again with the same record. Empty files commit
 without PATCH. Commit accepts 201 or the replayed 200 receipt. After a lost
 response (status 0), 409 or 503 it polls HEAD with backoff (1 second doubling
-to 30 seconds), waiting while the state is committing, then replays commit
-to read the receipt. <code>opts.commit_timeout</code> bounds this recovery loop (positive
+to 30 seconds). While the state remains committing it replays commit at most
+every 30 seconds: a live worker returns 409, while a stranded intent restarts
+publication/settlement. Once complete it replays commit to read the receipt;
+failed state exits immediately. <code>opts.commit_timeout</code> bounds this recovery loop (positive
 integer seconds, default 900); individual calls use <code>control_timeout</code> (default
 30 whole seconds), capped by the remaining whole seconds; recovery stops
 when less than a second remains, never passing zero as an unlimited timeout.

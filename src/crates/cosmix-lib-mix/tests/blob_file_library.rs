@@ -115,7 +115,11 @@ async fn upload(bus: Rc<Bus>, dir: &Path) -> serde_json::Value {
 }
 
 fn request(listener: &TcpListener) -> (TcpStream, String, Vec<u8>) {
-    let until = Instant::now() + Duration::from_secs(10);
+    request_with_timeout(listener, Duration::from_secs(10))
+}
+
+fn request_with_timeout(listener: &TcpListener, timeout: Duration) -> (TcpStream, String, Vec<u8>) {
+    let until = Instant::now() + timeout;
     let mut socket = loop {
         match listener.accept() {
             Ok((s, _)) => break s,
@@ -293,6 +297,68 @@ async fn blob_upload_lost_create_reply_persisted_key_409_head_and_commit_replay(
     server.join().unwrap();
     assert_eq!(second["ok"], true, "{second}");
     assert_eq!(second["result"]["size"], 4);
+}
+
+#[tokio::test]
+async fn blob_upload_replays_stranded_committing_session_after_thirty_seconds() {
+    let dir = Temp::new();
+    std::fs::write(dir.0.join("source"), b"").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bus = Rc::new(Bus {
+        bind: listener.local_addr().unwrap().to_string(),
+        pinned: false,
+        discovery: Cell::new(0),
+    });
+    let resume = dir.0.join("resume.json");
+    let server = std::thread::spawn(move || {
+        let hash = blake3::hash(b"").to_hex().to_string();
+        let mut first_commit = None;
+        let mut heads = 0;
+        loop {
+            let (mut socket, head, _) = request_with_timeout(&listener, Duration::from_secs(40));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&resume).unwrap()).unwrap();
+            let key = saved["key"].as_str().unwrap();
+            if head.starts_with("POST /blob/uploads ") {
+                reply(&mut socket, 201, "", &format!("{{\"upload\":\"{ID}\"}}"));
+            } else if head.starts_with("HEAD ") {
+                heads += 1;
+                let state = if first_commit.is_some() {
+                    "committing"
+                } else {
+                    "active"
+                };
+                reply(
+                    &mut socket,
+                    200,
+                    &format!(
+                        "X-Cosmix-Offset: 0\r\nX-Cosmix-Size: 0\r\nX-Cosmix-Owner: tester\r\nX-Cosmix-Mime: application/octet-stream\r\nX-Cosmix-Expect: b3:{hash}\r\nX-Cosmix-Upload-Key: {key}\r\nX-Cosmix-State: {state}\r\n"
+                    ),
+                    "",
+                );
+            } else {
+                assert!(head.starts_with(&format!("POST /blob/uploads/{ID}/commit ")));
+                if let Some(started) = first_commit {
+                    assert!(Instant::now().duration_since(started) >= Duration::from_secs(30));
+                    assert!(heads > 1);
+                    reply(
+                        &mut socket,
+                        200,
+                        "",
+                        &format!("{{\"blob\":\"b3:{hash}\",\"size\":0}}"),
+                    );
+                    break;
+                }
+                // The worker died after persisting intent; HEAD cannot advance
+                // it. Only a second guarded commit can finish this session.
+                first_commit = Some(Instant::now());
+            }
+        }
+    });
+    let result = execute(bus, &format!("$out = $b.blob_upload_file({}, {{service:\"blobd-test\", owner:\"tester\", resume_file:{}, commit_timeout:70}})", quoted(&dir.0.join("source")), quoted(&dir.0.join("resume.json")))).await;
+    server.join().unwrap();
+    assert_eq!(result["ok"], true, "{result}");
 }
 
 #[tokio::test]
