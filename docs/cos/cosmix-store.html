@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/</title>
+    <title>CosMix — cos/cosmix-store</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,60 +441,11 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/README.md"><div class="prose"><h1 id="cos--component-docs">cos — component docs</h1>
-<p>Summary documentation for the <strong>cos</strong> daemon family, one page per component. The
-canonical home of these pages is
-<a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> in the public
-<a href="https://github.com/markc/cosmix">markc/cos</a> repo; add a page by dropping
-<code>COMPONENT.md</code> there. The same files render three ways:</p>
-<ul>
-<li><strong>Web</strong> — <a href="https://markc.github.io/cos/">markc.github.io/cos</a> serves this manual in the site's left-hand <strong>Components</strong> pane; any page deep-links as <code>#_man/PAGE.md</code>.</li>
-<li><strong>GitHub</strong> — browse <a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> directly; this file doubles as the directory README.</li>
-<li><strong>Local clone</strong> — plain markdown with relative links; any editor or viewer works.</li>
-</ul>
-<p>These are <strong>summaries</strong> — what each component is and how to use it — not
-exhaustive manpages. For the language that drives these daemons, see the
-<a href="https://markc.github.io/mix/">mix manual</a>.</p>
-<h2 id="start-here">Start here</h2>
-<ul>
-<li><strong><a href="/cos/overview">overview</a></strong> — what cos is, how the workspace is laid out, how it fits with bus and mix.</li>
-</ul>
-<h2 id="daemons">Daemons</h2>
-<ul>
-<li><strong><a href="/cos/noded">noded</a></strong> — the Bus broker; every node runs one.</li>
-<li><strong><a href="/cos/maild">maild</a></strong> — JMAP-native mail daemon (SMTP + IMAP + JMAP + spam).</li>
-<li><strong><a href="/cos/webd">webd</a></strong> — multi-vhost HTTPS + ACME; server-rendered web UI.</li>
-<li><strong><a href="/cos/dnsd">dnsd</a></strong> — authoritative WireGuard-mesh DNS.</li>
-<li><strong><a href="/cos/indexd">indexd</a></strong> — vector knowledge base / indexer.</li>
-<li><strong><a href="/cos/cosmix-stored">stored</a></strong> — Mix snapshot catalogue and resumable offsite client over blobd's bytes.</li>
-<li><strong><a href="/cos/desktop">desktop</a></strong> — the CosMix desktop: <code>cosmix-comp</code> (Smithay + Bevy Wayland compositor), the <code>ctk</code> toolkit and the native apps.</li>
-<li><strong><a href="/cos/cosmix-comp">cosmix-comp</a></strong> — Wayland compositor and supported protocol globals.</li>
-<li><strong><a href="/cos/term">term</a></strong> — the lightweight iced + wgpu terminal: tabs, split panes, foot-style font sizing, the <code>term.*</code> Bus surface.</li>
-<li><strong><a href="/cos/quoin">quoin</a></strong> — corner-driven desktop panels with standalone SCTK and experimental compositor hosts.</li>
-<li><strong><a href="/cos/quoin-panel">quoin-panel</a></strong> — the Plasma-style bottom panel, launcher, calendar and notifications as Mix Scenes.</li>
-<li><strong><a href="/cos/cosmix-bg-showcase">cosmix-bg-showcase</a></strong> — shared Bloom, Shapes, Boing and Boids demos with native Bus controls.</li>
-<li><strong><a href="/cos/cosmix-capture">cosmix-capture</a></strong> — native Wayland screenshots and full-output MP4 recording controlled through Bus.</li>
-<li><strong><a href="/cos/cosmix-media">cosmix-media</a></strong> — native CTK MP3/MP4 player with PipeWire-compatible audio and Bus playback controls.</li>
-<li><strong><a href="/cos/cosmix-wallpaper">cosmix-wallpaper</a></strong> — GPU-rendered flocking background with window avoidance, pointer repulsion and native Bus preferences.</li>
-<li><strong><a href="/cos/agentd">agentd</a></strong> — agent supervision.</li>
-<li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power state.</li>
-<li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
-<li><strong><a href="/cos/dbusd">dbusd</a></strong> — the D-Bus boundary daemon: hosts the per-domain D-Bus adapters.</li>
-<li><strong><a href="/cos/edit">edit</a></strong> — the <code>edit</code> Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo, crash-recovery files); the core of ced.</li>
-<li><strong><a href="/cos/ced">ced</a></strong> — the CosMix Editor: an iced desktop editor over <code>edit</code> with live agent edits, per-origin undo, lsh/Mix highlighting and the <code>ced.*</code> Bus verbs.</li>
-<li><strong><a href="/cos/dopus">dopus</a></strong> — the iced twin-pane file manager replacing filemgr: navigation, Places, local file operations and the <code>dopus.v1</code> Bus port.</li>
-</ul>
-<h2 id="bridge--libraries">Bridge &amp; libraries</h2>
-<ul>
-<li><strong><a href="/cos/foreman">foreman</a></strong> — task runner, policy gate, verifier, and refinery operator runbook.</li>
-<li><strong><a href="/cos/mcp">mcp</a></strong> — the Claude Code MCP bridge.</li>
-<li><strong><a href="/cos/libraries">libraries</a></strong> — the shared <code>cosmix-lib-*</code> substrate crates.</li>
-</ul>
-<h2 id="see-also">See also</h2>
-<ul>
-<li>Repos: <a href="https://github.com/markc/cosmix">markc/cos</a> · <a href="https://github.com/markc/cosmix">markc/mix</a> · <a href="https://github.com/markc/cosmix">markc/bus</a>.</li>
-<li>The <a href="https://markc.github.io/mix/">mix manual</a> — the language and shell used to operate these daemons.</li>
-</ul></div></div>
+        <div id="content-doc" data-prerendered="cos/cosmix-store.md"><div class="prose"><h1 id="cosmix-store">cosmix-store</h1>
+<p>The former offsite pilot is superseded by the Mix catalogue citizen and
+native client. See <a href="/cos/cosmix-stored">cosmix-stored</a> for the current contract,
+manifest format, quota policy and packaging. This page does not describe or
+authorise migration or deployment of existing pilot stores.</p></div></div>
     </div>
 
 </main>

@@ -1,0 +1,18 @@
+-- version: 0.1.0
+-- Real native Bus and streaming lane boundary; no path-based daemon ingest.
+$b = require("blob.mix")
+$service = env("STORED_BLOBD", "blobd")
+fn unwrap($r)
+  if not $r.ok then raise("STORE_BLOB", json_encode($r)) end
+  return $r.result
+end
+fn inspect_blob($id)
+  return unwrap($b.blob_stat($id, {service: $service}))
+end
+fn pin($id, $owner)
+  -- pinned:false is an existing pin, not refusal. The rc is authoritative.
+  return unwrap($b.blob_pin($id, $owner, {service: $service}))
+end
+fn upload($file, $owner, $resume)
+  return unwrap($b.blob_upload_file($file, {service: $service, owner: $owner, resume_file: $resume, mime: "application/json"}))
+end

@@ -1,0 +1,189 @@
+-- version: 0.10.0
+$c = require("store_client.mix")
+$checks = buffer()
+$clock = buffer()
+$status_times = buffer()
+$wait_events = buffer()
+$wait_io = {
+  now: fn() = length(freeze($clock)) / 20,
+  pause: fn($seconds) = buffer_push($clock, 1),
+  status: fn($ctx)
+    buffer_push($status_times, floor(length(freeze($clock)) / 20));
+    return {state: length(freeze($status_times)) == 3 ? "committed" : "pending"}
+  end
+}
+$dir = env("TMPDIR", "/tmp") .. "/store-client-test-" .. uuid()
+mkdir($dir)
+fn check($condition, $token)
+  if not $condition then raise("TEST", $token) end
+  buffer_push($checks, 1)
+end
+try
+  check($c.wait_status({collection: "test", id: "id", timeout: 30}, $wait_events, 0, $wait_io).state == "committed", "REMOTE_WITHOUT_EVENT_COMPLETES")
+  check(deep_eq(freeze($status_times), bytes_from([2, 6, 14])), "STATUS_BACKOFF_2_4_8")
+  $clock = buffer()
+  $status_times = buffer()
+  $wait_io = {now: fn() = length(freeze($clock)) / 20, pause: fn($seconds) = buffer_push($clock, 1), status: fn($ctx)
+    buffer_push($status_times, floor(length(freeze($clock)) / 20));
+    return {state: "pending"}
+  end}
+  $caught = ""
+  try
+    $c.wait_status({collection: "test", id: "id", timeout: 200}, $wait_events, 0, $wait_io)
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_COMMIT" and deep_eq(freeze($status_times), bytes_from([2, 6, 14, 30, 62, 122, 182, 200])), "BOUNDED_BACKOFF_CAP_AND_TIMEOUT")
+  for each $result in ["pending", "error"]
+    $clock = buffer()
+    $status_times = buffer()
+    $wait_io = {now: fn() = length(freeze($clock)) / 20, pause: fn($seconds) = buffer_push($clock, 1), status: fn($ctx)
+      buffer_push($status_times, 1);
+      buffer_push($clock, repeat("x", $ctx.rpc_timeout * 20));
+      if $ctx.inject_error then raise("INJECT_TIMEOUT", "status read timed out") end;
+      return {state: "pending"}
+    end}
+    $caught = ""
+    try
+      $c.wait_status({collection: "test", id: "id", timeout: 2.1, inject_error: $result == "error"}, $wait_events, 0, $wait_io)
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_COMMIT" and length(freeze($status_times)) == 1 and length(freeze($clock)) == 60, "NO_SECOND_EXPIRED_READ_" .. $result)
+  end
+  $clock = buffer()
+  $status_times = buffer()
+  buffer_push($wait_events, json_encode({collection: "test", id: "id"}) .. "\n")
+  $wait_io = {now: fn() = 0, pause: fn($seconds) = raise("TEST", "EVENT_SHOULD_NOT_SLEEP"), status: fn($ctx) = {state: "committed"}}
+  check($c.wait_status({collection: "test", id: "id", timeout: 30}, $wait_events, 0, $wait_io).state == "committed", "EVENT_FIRST")
+  $destination = $c.restore_begin($dir .. "/restored")
+  write_file($destination.root .. "/verified", "bytes")
+  check(not exists($destination.requested) and contains($destination.root, ".restored.partial-"), "INCOMPLETE_RESTORE_IS_DISTINCT")
+  check($c.restore_publish($destination) == $dir .. "/restored" and read_file($dir .. "/restored/verified") == "bytes", "PUBLISH_COMPLETE_TREE")
+  $caught = ""
+  try
+    $c.restore_begin($dir .. "/restored")
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_DESTINATION", "RESTORE_NO_CLOBBER")
+  $boundary = $c.restore_begin($dir .. "/" .. repeat("a", 209))
+  check(byte_length(basename($boundary.root)) == 255 and is_dir($boundary.root), "RESTORE_PARTIAL_NAME_AT_LIMIT")
+  remove_dir($boundary.root)
+  for each $name in [repeat("a", 210), repeat("é", 105)]
+    $before = sort(ls($dir))
+    $caught = ""
+    try
+      $c.restore_begin($dir .. "/" .. $name)
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_DESTINATION" and deep_eq(sort(ls($dir)), $before), "RESTORE_LONG_NAME_REFUSED_WITHOUT_WRITES")
+  end
+  mkdir($dir .. "/tree/nested")
+  write_file($dir .. "/tree/empty", "")
+  write_file($dir .. "/tree/nested/binary", bytes_from([0, 255, 1, 128]))
+  write_file($dir .. "/tree/copy", bytes_from([0, 255, 1, 128]))
+  $v = $c.inventory($dir .. "/tree")
+  check($v.file_count == 3 and $v.size == 8, "BINARY_EMPTY_NESTED")
+  check(length(keys($v.objects)) == 2, "DUPLICATE_BYTES")
+  check($v.manifest.files[0].blob == "b3:" .. hash_file($dir .. "/tree/copy", "blake3"), "EXPLICIT_BLAKE3")
+  check($c.inventory($dir .. "/tree").canonical == $v.canonical, "STABLE_INVENTORY")
+  write_file($dir .. "/tree/copy", "changed")
+  check($c.inventory($dir .. "/tree").id != $v.id, "MUTATION_DETECTED")
+  symlink("nested/binary", $dir .. "/tree/link")
+  $caught = ""
+  try
+    $c.inventory($dir .. "/tree")
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_SOURCE", "SYMLINK_REFUSED")
+  write_file($dir .. "/tree/.storeignore", "# literal rules\nlink\nnested/\n.storeignore\n")
+  $ignored = $c.inventory($dir .. "/tree")
+  check($ignored.file_count == 2, "LITERAL_AND_SUBTREE_IGNORE")
+  write_file($dir .. "/tree/notes:2026.txt", "not representable")
+  write_file($dir .. "/tree/*.tmp", "literal star")
+  write_file($dir .. "/tree/.storeignore", "link\nnotes:2026.txt\n*.tmp\n.storeignore\n")
+  check($c.inventory($dir .. "/tree").file_count == 3, "EXCLUDE_BEFORE_PATH_VALIDATION_AND_LITERAL_STAR")
+  write_file($dir .. "/tree/.storeignore", "../escape\n")
+  $caught = ""
+  try
+    $c.inventory($dir .. "/tree")
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_IGNORE", "STRUCTURAL_IGNORE_VALIDATION")
+  mkdir($dir .. "/excluded")
+  $rules = ".storeignore\n"
+  for $i = 0 to 10000
+    $name = "e" .. to_string($i)
+    write_file($dir .. "/excluded/" .. $name, "")
+    $rules = $rules .. $name .. "\n"
+  end
+  write_file($dir .. "/excluded/.storeignore", $rules)
+  check($c.inventory($dir .. "/excluded").file_count == 0, "EXCLUSIONS_DO_NOT_SPEND_WALK_LIMIT")
+  $cfg = $c.configuration({node: "archive", instance: "two", "local-blobd": "blobd-fetch"})
+  $caught = ""
+  try
+    $c.configuration({cache: ""})
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_CONFIG", "EMPTY_CACHE_ROOT_REFUSED")
+  $probe = '$c = require(' .. json_encode(realpath("src/crates/cosmix-blobd/mix/store_client.mix")) .. '); $c.configuration({})'
+  $no_home = run_argv(["/opt/cosmix/bin/mix", "-c", $probe], {env: {HOME: ""}})
+  check(not $no_home.ok and contains($no_home.stderr, "STORE_CONFIG"), "EMPTY_HOME_CLIENT_REFUSED")
+  $probe = '$c = require(' .. json_encode(realpath("src/crates/cosmix-blobd/mix/store_client.mix")) .. '); print($c.configuration({cache: ' .. json_encode($dir .. "/explicit") .. "}).cache)"
+  check(run_argv(["/opt/cosmix/bin/mix", "-c", $probe], {env: {HOME: ""}}).ok, "EXPLICIT_CACHE_WITHOUT_HOME")
+  check($cfg.service == "stored-two.archive.bus" and $cfg.blobd == "blobd-two.archive.bus" and $cfg.local_blobd == "blobd-fetch", "EXPLICIT_ROUTING")
+  check(length($c.configuration({instance: repeat("x", 24)}).service) == 31, "MAX_SERVICE_NAME")
+  for each $opts in [{instance: "-two"}, {"local-blobd": "blobd--two"}, {"local-blobd": "blobd-"}, {instance: "Two"}]
+    $caught = ""
+    try
+      $c.configuration($opts)
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_CONFIG", "INSTANCE_GRAMMAR_REFUSED")
+  end
+  check($c.configuration({instance: "0-a-"}).local_target == "blobd-0-a-", "INSTANCE_ALPHANUMERIC_FIRST")
+  $caught = ""
+  try
+    $c.configuration({instance: repeat("x", 25)})
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_CONFIG", "OVERSIZE_SERVICE_REFUSED")
+  $c.cache_lock($dir .. "/cache", nil)
+  mkdir($dir .. "/existing-cache")
+  chmod($dir .. "/existing-cache", 0o755)
+  $c.cache_lock($dir .. "/existing-cache", nil)
+  check(stat($dir .. "/existing-cache").perm == 0o755, "EXISTING_CACHE_MODE_PRESERVED")
+  symlink($dir .. "/tree", $dir .. "/tree-alias")
+  for each $cache in [$dir .. "/tree/.", $dir .. "/tree/child-cache", $dir .. "/tree/new-parent/child-cache", $dir .. "/tree-alias/alias-child", $dir .. "/outside-parent/../tree-alias/alias-child"]
+    $caught = ""
+    try
+      $c.cache_lock($cache, realpath($dir .. "/tree"))
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_CACHE" and not exists($cache .. "/.lock"), "INSIDE_SOURCE_REFUSED_BEFORE_LOCK")
+  end
+  check(not exists($dir .. "/tree/child-cache") and not exists($dir .. "/tree/new-parent") and not exists($dir .. "/tree/alias-child") and not exists($dir .. "/outside-parent"), "INSIDE_SOURCE_REFUSED_BEFORE_MKDIR")
+  $c.cache_lock($dir .. "/outside-cache/nested", realpath($dir .. "/tree"))
+  check(is_file($dir .. "/outside-cache/nested/.lock"), "OUTSIDE_CACHE_PARENTS_ALLOWED")
+  $probe = "if flock(" .. json_encode($dir .. "/cache/.lock") .. ") then exit(1) end"
+  check(run_argv(["/opt/cosmix/bin/mix", "-c", $probe]).ok, "SECOND_PROCESS_LOCK_REFUSED")
+  check(stat($dir .. "/cache").perm == 0o700, "PRIVATE_CACHE")
+  $caught = ""
+  try
+    mkdir($dir .. "/tree", {parents: false})
+  catch $message
+    $caught = $message
+  end
+  check($caught != "", "EXISTING_RESTORE_ROOT_REFUSED")
+finally
+  remove_dir($dir)
+end
+print("store_client_test: PASS " .. to_string(length(freeze($checks))))

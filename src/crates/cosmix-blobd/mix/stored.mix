@@ -1,0 +1,85 @@
+-- version: 0.7.0
+-- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
+$catalogue = require("store_catalogue.mix")
+$commit = require("store_commit.mix")
+$io = require("store_blob.mix")
+$worker = require("store_worker.mix")
+$manifest = require("store_manifest.mix")
+$manifest.service_name(serve_name() ?? "stored", "stored")
+$STATE = $catalogue.state_root({STORED_STATE_DIR: env("STORED_STATE_DIR"), STATE_DIRECTORY: env("STATE_DIRECTORY"), COSMIX_VAR: env("COSMIX_VAR"), XDG_STATE_HOME: env("XDG_STATE_HOME"), HOME: env("HOME")})
+$BLOBD = env("STORED_BLOBD", "blobd")
+$manifest.service_name($BLOBD, "blobd")
+mkdir($STATE)
+if not stat($STATE, {follow_symlinks: false}).is_dir then raise("STORE_CONFIG", "state must be a real directory") end
+if not flock($STATE .. "/.writer-lock") then raise("STORE_LOCKED", "another stored owns this state directory") end
+$DB_PATH = $STATE .. "/catalogue.sqlite"
+$catalogue.initialise($DB_PATH, $BLOBD)
+$EPOCH = $commit.epoch($DB_PATH)
+$WORKER_BUSY = nil
+
+fn answer($verb, $args)
+  $db = nil
+  try
+    $db = $catalogue.connect($DB_PATH)
+    $result = $catalogue.request($db, $verb, $args ?? {})
+    reply(0, json_encode($result))
+  catch $message, $error
+    reply(10, json_encode({error_code: $error.code, message: $message}))
+  finally
+    if $db != nil then sqlclose($db) end
+  end
+end
+
+on store.collection.list desc "List collections {after?,limit?}"
+  answer("store.collection.list", $event.args)
+end
+on store.collection.create desc "Idempotently create collection {name}"
+  answer("store.collection.create", $event.args)
+end
+on store.snapshot.list desc "List live snapshots {collection,after?,limit?}"
+  answer("store.snapshot.list", $event.args)
+end
+on store.snapshot.get desc "Read and verify manifest {collection,id}"
+  answer("store.snapshot.get", $event.args)
+end
+on store.snapshot.forget desc "Tombstone snapshot, retaining all pins {collection,id}"
+  answer("store.snapshot.forget", $event.args)
+end
+on store.commit.status desc "Durable commit status {collection,id}"
+  answer("store.commit.status", $event.args)
+end
+on store.info desc "Catalogue counts, schema, local blobd and retention policy"
+  answer("store.info", $event.args)
+end
+on store.snapshot.commit desc "Accept durable commit {collection,manifest}; completion is store.commit.finished"
+  try
+    $accepted = $commit.admit($DB_PATH, $event.args.collection, $event.args.manifest)
+    if $accepted.state == "pending" then task_start("stored.work", "{}") end
+    reply(0, json_encode($accepted))
+  catch $message, $error
+    reply(10, json_encode({error_code: $error.code, message: $message}))
+  end
+end
+on stored.work desc "Idempotent mesh-open kick for pending work, including recovery" async
+  if $WORKER_BUSY != nil then
+    if $event.headers.type == "request" then reply(0, "{}") end
+    return
+  end
+  $worker_epoch = $EPOCH
+  $WORKER_BUSY = $worker_epoch
+  try
+    $context = {commit: $commit, db: $DB_PATH, state: $STATE, epoch: $worker_epoch, io: $io}
+    $run_job = fn($ctx) = $ctx.commit.run_pending($ctx.db, $ctx.state, $ctx.epoch, $ctx.io)
+    $finish = fn($finished) = publish("store.commit.finished", json_encode($finished), {retain: false})
+    -- publish is blocking. Drain again for work admitted at async Bus yields.
+    $worker.drain($run_job, $finish, fn($seconds) = sleep($seconds), $context)
+  catch $message
+    eprint("stored worker: " .. $message)
+  finally
+    if $WORKER_BUSY == $worker_epoch then $WORKER_BUSY = nil end
+    -- task_start has no request context; reply there is a runtime error.
+    if $event.headers.type == "request" then reply(0, "{}") end
+  end
+end
+task_start("stored.work", "{}")
+print("stored: catalogue ready")

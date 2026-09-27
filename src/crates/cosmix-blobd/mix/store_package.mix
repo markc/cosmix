@@ -1,0 +1,21 @@
+-- version: 0.2.0
+-- Stage packaging assets without root, account creation or service changes.
+$parsed = getopt(args(), {source: {arg: true}, destdir: {arg: true}})
+if length($parsed.errors) > 0 or length($parsed.rest) > 0 or $parsed.opts.destdir == nil then
+  raise("STORE_USAGE", "store_package.mix --source CHECKOUT --destdir NEW_DIRECTORY")
+end
+$source = realpath($parsed.opts.source ?? cwd())
+if $source == nil or not is_file($source .. "/bootstrap") then raise("STORE_PACKAGE", "source must be the checkout root") end
+$dest = $parsed.opts.destdir
+mkdir($dest, {parents: false})
+$share = $dest .. "/opt/cosmix/share/cosmix/stored"
+mkdir($share)
+for each $name in ["blob.mix", "store_manifest.mix", "store_catalogue.mix", "store_commit.mix", "store_worker.mix", "store_blob.mix", "stored.mix", "store_client.mix", "store.mix"]
+  copy($source .. "/src/crates/cosmix-blobd/mix/" .. $name, $share .. "/" .. $name)
+  chmod($share .. "/" .. $name, 0o644)
+end
+mkdir($dest .. "/usr/lib/systemd/system")
+mkdir($dest .. "/usr/lib/sysusers.d")
+copy($source .. "/src/_etc/systemd-system/cosmix-stored.service", $dest .. "/usr/lib/systemd/system/cosmix-stored.service")
+copy($source .. "/src/_etc/sysusers/cosmix.conf", $dest .. "/usr/lib/sysusers.d/cosmix.conf")
+print("stored package staged: " .. realpath($dest))
