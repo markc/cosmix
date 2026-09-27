@@ -1330,7 +1330,8 @@ impl Store {
             // keeps quota from drifting if a row raced in anyway).
             let pinned: bool = db
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1)",
+                    "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1)
+                     OR EXISTS(SELECT 1 FROM upload_sessions WHERE state='committing' AND actual_hash=?1)",
                     params![file.hash_hex()],
                     |r| r.get::<_, i64>(0),
                 )

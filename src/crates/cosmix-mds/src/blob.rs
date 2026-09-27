@@ -217,6 +217,44 @@ fn commit_staged(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> Result<
 }
 
 fn commit_staged_inner(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> Result<()> {
+    publish_hashed_staging(blobs_root, tmp_path, hash)?;
+    let _ = fs::remove_file(tmp_path);
+    Ok(())
+}
+
+/// Publish an exclusively owned regular staging file into the CAS without
+/// consuming it. Verifies BLAKE3 before publication, syncs the bytes and all
+/// shard directory links, and uses an atomic no-replace hard link. On both
+/// success and error the source name remains owned by the caller, who must
+/// never write the inode after calling this function (a failed directory sync
+/// can still leave the CAS link present). Durable upload coordinators retain
+/// their source until their metadata transaction has committed, then unlink
+/// and sync the source directory. Source and CAS must be on one filesystem.
+/// This changes no blob-index rows or schema.
+pub fn publish_staged_preserving_source(
+    blobs_root: &Path,
+    staged: &Path,
+    expected: &BlobHash,
+) -> Result<u64> {
+    let md = fs::symlink_metadata(staged)?;
+    if !md.file_type().is_file() {
+        return Err(Error::Io(std::io::Error::other(
+            "staging must be a regular file",
+        )));
+    }
+    let (hash, size) = hash_file(staged)?;
+    if hash != *expected {
+        return Err(Error::BlobCorrupt(
+            "staged upload hash mismatch before publication".into(),
+        ));
+    }
+    publish_hashed_staging(blobs_root, staged, expected)?;
+    Ok(size)
+}
+
+/// Shared no-replace publication protocol. Callers prove the hash before
+/// entering; source cleanup is deliberately outside this function.
+fn publish_hashed_staging(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> Result<()> {
     // 2. fsync temp. Opened read-only: fsync flushes the inode, not
     // the fd's write mode.
     File::open(tmp_path)?.sync_all()?;
@@ -225,20 +263,29 @@ fn commit_staged_inner(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> R
     let final_path = blob_path(blobs_root, hash);
     let parent = final_path.parent().expect("blob path has parent");
     fs::create_dir_all(parent)?;
+    // Sync the links for newly created shards too, including when recovering
+    // an earlier failed sync. Syncing only the leaf misses its parent links.
+    let upper = parent.parent().expect("CAS shard has parent");
+    fsync_dir(upper)?;
+    fsync_dir(blobs_root)?;
     match fs::hard_link(tmp_path, &final_path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Race: another writer placed the same hash. Both inputs
-            // are identical (CAS), so dropping ours is safe.
+            // Do not acknowledge a corrupt existing entry as an idempotent
+            // success, and never overwrite it with the staged inode.
+            if hash_file(&final_path)?.0 != *hash {
+                return Err(Error::BlobCorrupt(
+                    "existing CAS entry hash mismatch".into(),
+                ));
+            }
         }
         Err(e) => return Err(Error::Io(e)),
     }
 
+    touch_path(&final_path)?;
+    File::open(&final_path)?.sync_all()?;
     // 4. fsync the parent directory so the link survives a crash.
     fsync_dir(parent)?;
-
-    // 5. Best-effort temp cleanup.
-    let _ = fs::remove_file(tmp_path);
 
     Ok(())
 }
@@ -507,6 +554,37 @@ mod tests {
         assert_eq!(bytes, b"hello world");
         assert_eq!(size(d.path(), &h).unwrap(), 11);
         assert!(exists(d.path(), &h).unwrap());
+    }
+
+    #[test]
+    fn preserving_publication_keeps_source_on_success_error_and_replay() {
+        let d = root();
+        let src = d.path().join(".tmp/session");
+        fs::write(&src, b"durable").unwrap();
+        let hash = hash_bytes(b"durable");
+        assert!(publish_staged_preserving_source(d.path(), &src, &hash_bytes(b"wrong")).is_err());
+        assert!(src.exists());
+        assert!(!blob_path(d.path(), &hash).exists());
+        assert_eq!(
+            publish_staged_preserving_source(d.path(), &src, &hash).unwrap(),
+            7
+        );
+        assert!(src.exists());
+        publish_staged_preserving_source(d.path(), &src, &hash).unwrap();
+        assert_eq!(fs::read(&src).unwrap(), b"durable");
+        assert_eq!(get(d.path(), &hash).unwrap(), b"durable");
+        let other = hash_bytes(b"other");
+        let src = d.path().join(".tmp/session-other");
+        fs::write(&src, b"other").unwrap();
+        let blocker = blob_path(d.path(), &other)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::write(&blocker, b"not a directory").unwrap();
+        assert!(publish_staged_preserving_source(d.path(), &src, &other).is_err());
+        assert!(src.exists());
     }
 
     #[test]

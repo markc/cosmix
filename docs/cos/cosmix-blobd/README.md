@@ -134,6 +134,16 @@ session (never extends it), and removes orphan staging. The v1 `.tmp` wipe
 remains separate. Session and receipt counts are bounded independently of
 active HTTP transfer concurrency. The mds blob-index schema remains v1.
 
+Session commit persists a `committing` row and actual hash before publishing
+the verified file with mds's preserve-source, no-replace hard-link helper.
+GC treats that pending hash as pinned. One blobd transaction then settles
+the reservation, attributes, owner pin and completion receipt; only afterwards
+is staging unlinked. Restart replays pending commits before ordinary expiry
+and CAS reconciliation. Completed receipts last 24 hours: repeating commit
+returns the same reference without charging or pinning again, even if its
+first response was lost. A hash mismatch fails and discards the session before
+publication. Aborting a completed session never removes its pin or object.
+
 
 ```text
 /var/lib/cosmix/blobd/

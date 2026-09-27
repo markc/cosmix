@@ -541,6 +541,148 @@ impl Store {
         Ok(())
     }
 
+    /// Commit a complete session, or replay its durable receipt. The bool is
+    /// true only for a new completion (HTTP 201); replay returns HTTP 200.
+    pub fn upload_commit(&self, id: &str) -> Result<(Reference, bool)> {
+        let _guard = self.upload_guard(id)?;
+        let s = self.upload_row(id)?;
+        if s.state == "complete" {
+            if s.expires_at <= now_ms() {
+                self.expire_upload(&s)?;
+                return Err(StoreError::UploadMissing);
+            }
+            let reference = s
+                .result
+                .as_ref()
+                .and_then(Reference::from_json)
+                .ok_or_else(|| StoreError::Db("invalid upload completion receipt".into()))?;
+            return Ok((reference, false));
+        }
+        let prepared = if s.state == "active" {
+            if s.expires_at <= now_ms() {
+                self.expire_upload(&s)?;
+                return Err(StoreError::UploadMissing);
+            }
+            self.prepare_upload_commit(&s)?
+        } else if s.state == "committing" {
+            s
+        } else {
+            return Err(s.conflict("session is not active"));
+        };
+        self.finish_upload_commit(&prepared).map(|r| (r, true))
+    }
+
+    fn prepare_upload_commit(&self, s: &UploadSession) -> Result<UploadSession> {
+        if s.offset != s.size {
+            return Err(s.conflict("upload incomplete"));
+        }
+        let mut file = self.open_upload_file(s)?;
+        file.set_len(s.offset)?; // Discard any uncommitted tail before hashing.
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let hash = hasher.finalize().to_hex().to_string();
+        if s.expected_hash
+            .as_ref()
+            .is_some_and(|expected| expected != &hash)
+        {
+            self.fail_upload(s, "expected BLAKE3 mismatch")?;
+            return Err(StoreError::UploadVerify);
+        }
+        file.sync_all()?;
+        if s.expires_at <= now_ms() {
+            self.expire_upload(s)?;
+            return Err(StoreError::UploadMissing);
+        }
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE upload_sessions SET state='committing',actual_hash=?1
+            WHERE id=?2 AND state='active'",
+                params![hash, s.id],
+            )
+            .map_err(db_err)?;
+        self.upload_row(&s.id)
+    }
+
+    fn finish_upload_commit(&self, s: &UploadSession) -> Result<Reference> {
+        let hash = s
+            .actual_hash
+            .as_deref()
+            .and_then(blob::from_hex)
+            .ok_or_else(|| StoreError::Db("committing session has no valid hash".into()))?;
+        // The preserve-source primitive is replayable after every filesystem
+        // boundary. A committing row protects this hash from blob.gc.
+        let staged = self.upload_path(&s.id)?;
+        match fs::symlink_metadata(&staged) {
+            Ok(md) if md.is_file() && md.len() == s.size => {
+                blob::publish_staged_preserving_source(&self.blobs_root(), &staged, &hash)?;
+            }
+            Ok(_) => {
+                self.fail_upload(s, "committing staging is short or not regular")?;
+                return Err(s.conflict("invalid committing staging"));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Missing staging is explicit failure even if a CAS entry was
+                // published. No invented offset, no unverified pin; GC owns
+                // any now-unpinned CAS entry after its grace window.
+                self.fail_upload(s, "committing staging is missing")?;
+                return Err(s.conflict("missing committing staging"));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let holds = self.reserved.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &holds, None, Some(&s.id))?;
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        tx.execute("INSERT OR IGNORE INTO blob_attrs(hash,mime,name_hint,origin,first_put) VALUES (?1,?2,?3,?4,?5)",
+            params![blob::hex(&hash),s.mime,s.name,self.options.origin,now_ms()]).map_err(db_err)?;
+        let (mime, name, origin): (String, Option<String>, String) = tx
+            .query_row(
+                "SELECT mime,name_hint,origin FROM blob_attrs WHERE hash=?1",
+                [blob::hex(&hash)],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(db_err)?;
+        pin_with_cap(
+            &tx,
+            &blob::hex(&hash),
+            &s.owner,
+            s.size,
+            self.options.owner_limit(&s.owner),
+            self.options.quota_total_bytes,
+            &totals,
+        )?;
+        let reference = Reference {
+            hash,
+            size: s.size,
+            mime,
+            name,
+            origin,
+        };
+        tx.execute("UPDATE upload_sessions SET state='complete',result=?1,expires_at=?2 WHERE id=?3 AND state='committing'",
+            params![reference.to_json().to_string(),now_ms() + RECEIPT_TTL_MS,s.id]).map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        drop(db);
+        drop(holds);
+        self.bump_generation();
+        // Receipt is the truth now. A cleanup failure must not turn a durable
+        // completion into a failure; restart/sweep retries the unlink.
+        if let Err(error) = self.remove_staging(&s.id) {
+            tracing::warn!("completed upload staging cleanup deferred: {error}");
+        }
+        Ok(reference)
+    }
+
     fn all_uploads(&self, owner: Option<&str>) -> Result<Vec<UploadSession>> {
         let db = self.db.lock().unwrap();
         let mut stmt = db
@@ -578,6 +720,11 @@ impl Store {
 
     pub fn sweep_uploads(&self) -> Result<()> {
         for s in self.all_uploads(None)? {
+            if matches!(s.state.as_str(), "complete" | "failed" | "aborted") {
+                if let Ok(_guard) = self.upload_guard(&s.id) {
+                    self.remove_staging(&s.id)?;
+                }
+            }
             if s.expires_at <= now_ms() && s.state != "committing" {
                 match self.upload_guard(&s.id) {
                     Ok(_guard) => {
@@ -599,7 +746,14 @@ impl Store {
         fs::set_permissions(self.uploads_root(), fs::Permissions::from_mode(0o2700))?;
         sync_dir(&self.blobs_root())?;
         for s in self.all_uploads(None)? {
-            if s.state == "active" {
+            if s.state == "committing" {
+                // Recover publication and settlement before expiry/reconcile.
+                // A transient disk/quota error leaves the protected row for a
+                // client commit retry; one damaged session never blocks open.
+                if let Err(error) = self.finish_upload_commit(&s) {
+                    tracing::warn!("upload commit recovery deferred: {error}");
+                }
+            } else if s.state == "active" {
                 match self.open_upload_file(&s) {
                     Ok(f) => {
                         f.set_len(s.offset)?;
@@ -822,5 +976,108 @@ mod tests {
             Err(StoreError::UploadLimit)
         ));
         assert_eq!(fs::read_dir(store.uploads_root()).unwrap().count(), 1);
+    }
+
+    fn complete_bytes(store: &Store, bytes: &[u8]) -> UploadSession {
+        let (s, _) = store.upload_create(&create(bytes.len() as u64)).unwrap();
+        if !bytes.is_empty() {
+            store
+                .upload_append(&s.id, 0, bytes.len() as u64 - 1, bytes.len() as u64, bytes)
+                .unwrap();
+        }
+        store.upload_status(&s.id).unwrap()
+    }
+
+    #[test]
+    fn crash_after_commit_intent_before_publication_recovers() {
+        let (dir, store) = store();
+        let s = complete_bytes(&store, b"recover");
+        store.prepare_upload_commit(&s).unwrap();
+        drop(store);
+        let store = Store::open(dir.path(), options()).unwrap();
+        let (reference, new) = store.upload_commit(&s.id).unwrap();
+        assert!(!new);
+        assert_eq!(reference.hash, blob::hash_bytes(b"recover"));
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
+        assert_eq!(store.quota_report(None).unwrap().total.used, 7);
+    }
+
+    #[test]
+    fn crash_after_publication_before_settlement_is_gc_protected_and_recovers() {
+        let (dir, store) = store();
+        let s = complete_bytes(&store, b"recover");
+        let prepared = store.prepare_upload_commit(&s).unwrap();
+        let hash = blob::from_hex(prepared.actual_hash.as_ref().unwrap()).unwrap();
+        blob::publish_staged_preserving_source(
+            &store.blobs_root(),
+            &store.upload_path(&s.id).unwrap(),
+            &hash,
+        )
+        .unwrap();
+        let cas = blob::blob_path(&store.blobs_root(), &hash);
+        File::open(&cas)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(store.gc(false).unwrap().skipped_pinned, 1);
+        assert!(cas.exists());
+        drop(store);
+        let store = Store::open(dir.path(), options()).unwrap();
+        assert_eq!(store.upload_status(&s.id).unwrap().state, "complete");
+        assert_eq!(store.stat(&hash).unwrap().pins, vec!["uploader"]);
+    }
+
+    #[test]
+    fn crash_after_settlement_before_cleanup_or_response_replays_same_receipt() {
+        let (dir, store) = store();
+        let s = complete_bytes(&store, b"recover");
+        let (reference, new) = store.upload_commit(&s.id).unwrap();
+        assert!(new);
+        fs::hard_link(
+            store.path(&reference.hash).unwrap(),
+            store.upload_path(&s.id).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        let store = Store::open(dir.path(), options()).unwrap();
+        assert!(!store.upload_path(&s.id).unwrap().exists());
+        assert_eq!(
+            store.upload_commit(&s.id).unwrap(),
+            (reference.clone(), false)
+        );
+        store.upload_abort(&s.id).unwrap();
+        assert_eq!(store.stat(&reference.hash).unwrap().pins, vec!["uploader"]);
+        assert_eq!(store.quota_report(None).unwrap().total.used, 7);
+    }
+
+    #[test]
+    fn hash_mismatch_discards_only_session_and_never_publishes() {
+        let (_dir, store) = store();
+        let mut opts = create(3);
+        opts.expected_hash = Some(blob::hash_bytes(b"yes"));
+        let (s, _) = store.upload_create(&opts).unwrap();
+        store.upload_append(&s.id, 0, 2, 3, &b"bad"[..]).unwrap();
+        assert!(matches!(
+            store.upload_commit(&s.id),
+            Err(StoreError::UploadVerify)
+        ));
+        assert_eq!(store.upload_status(&s.id).unwrap().state, "failed");
+        assert!(!store.upload_path(&s.id).unwrap().exists());
+        for hash in [blob::hash_bytes(b"yes"), blob::hash_bytes(b"bad")] {
+            assert!(!blob::exists(&store.blobs_root(), &hash).unwrap());
+        }
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
+    }
+
+    #[test]
+    fn empty_session_commits_without_patch_and_receipt_is_24_hours() {
+        let (_dir, store) = store();
+        let (s, _) = store.upload_create(&create(0)).unwrap();
+        let before = now_ms();
+        let (r, new) = store.upload_commit(&s.id).unwrap();
+        assert!(new);
+        assert_eq!(r.hash, blob::hash_bytes(b""));
+        assert!(store.upload_status(&s.id).unwrap().expires_at >= before + RECEIPT_TTL_MS);
+        assert_eq!(store.upload_commit(&s.id).unwrap(), (r, false));
     }
 }

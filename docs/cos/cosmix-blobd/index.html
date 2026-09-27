@@ -535,6 +535,15 @@ uncommitted tails to that offset, records missing or short staging as a failed
 session (never extends it), and removes orphan staging. The v1 <code>.tmp</code> wipe
 remains separate. Session and receipt counts are bounded independently of
 active HTTP transfer concurrency. The mds blob-index schema remains v1.</p>
+<p>Session commit persists a <code>committing</code> row and actual hash before publishing
+the verified file with mds's preserve-source, no-replace hard-link helper.
+GC treats that pending hash as pinned. One blobd transaction then settles
+the reservation, attributes, owner pin and completion receipt; only afterwards
+is staging unlinked. Restart replays pending commits before ordinary expiry
+and CAS reconciliation. Completed receipts last 24 hours: repeating commit
+returns the same reference without charging or pinning again, even if its
+first response was lost. A hash mismatch fails and discards the session before
+publication. Aborting a completed session never removes its pin or object.</p>
 <pre><code class="language-text">/var/lib/cosmix/blobd/
 ├── blobs/&lt;h2&gt;/&lt;h2&gt;/&lt;hash64&gt;   mds CAS: immutable, sharded, BLAKE3-named
 ├── blobs/.tmp/                staging (emptied at every startup)
