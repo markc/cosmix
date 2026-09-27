@@ -562,6 +562,16 @@ pub struct WebdConfig {
     /// permissive every-WG-peer posture of `vhosts`/`accounts`).
     #[serde(default)]
     pub listeners: WebdListenersConfig,
+    /// Operator-owned account roots. Invalid paths are skipped by webd at startup.
+    #[serde(default)]
+    pub shares: WebdSharesConfig,
+}
+
+/// Native config: `webd: { shares: { roots: { "user@example.test": "/srv/files/user" } } }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WebdSharesConfig {
+    pub roots: std::collections::BTreeMap<String, PathBuf>,
 }
 
 /// `[webd.listeners]` — listener-control settings (the SPEC-12
@@ -598,6 +608,7 @@ impl Default for WebdConfig {
             vhost: Vec::new(),
             listener: Vec::new(),
             listeners: WebdListenersConfig::default(),
+            shares: WebdSharesConfig::default(),
         }
     }
 }

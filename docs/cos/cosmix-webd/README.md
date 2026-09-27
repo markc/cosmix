@@ -14,6 +14,8 @@ See [commands and configuration](commands-and-configuration.md) for the full com
 
 See [Bus verbs](bus-verbs.md) for the daemon's Bus service and SPEC 12 property namespaces.
 
+See [public shares](shares.md) for the P5 catalogue contract and delivery status.
+
 ## What it provides
 
 - Host-routed HTTP and HTTPS serving for multiple virtual hosts.

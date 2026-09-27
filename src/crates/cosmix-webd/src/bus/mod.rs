@@ -693,6 +693,7 @@ mod tests {
         let (_tx, rx) =
             tokio::sync::watch::channel(crate::tls_status::TlsStatusSnapshot::default());
         Arc::new(NodeState {
+            share_roots: crate::file_share::Roots::default(),
             service_jmap_tokens: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),

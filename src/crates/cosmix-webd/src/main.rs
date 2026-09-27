@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod acme_provisioner;
+mod blob_reference;
 mod bus;
 mod bus_call_handler;
 mod db;
@@ -817,6 +818,9 @@ pub(crate) fn listener_bind_tls(
 /// admission set + resolver, the HTTP client (single
 /// `reqwest::Client` per node), and the host-routing map.
 struct NodeState {
+    /// Startup-validated operator roots; never sourced from a request.
+    #[allow(dead_code)] // P5 slice 4 wires share management after the checkpoint.
+    share_roots: file_share::Roots,
     /// Hot-swappable host-routing snapshot (C3b). Carries every
     /// host-derived view — lookup by Host, plain-HTTP admit set,
     /// per-primary group with aliases — behind a single `ArcSwap`
@@ -6409,6 +6413,7 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
     let (_tls_status_tx, tls_status_rx) =
         tokio::sync::watch::channel(tls_status::TlsStatusSnapshot::default());
     let node = Arc::new(NodeState {
+        share_roots: file_share::Roots::default(),
         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7272,6 +7277,7 @@ async fn async_main() -> Result<()> {
                     // non-ACME-challenge Host with 400. Exactly what the
                     // pre-ACME bootstrap listener wants.
                     let bootstrap_node = Arc::new(NodeState {
+                        share_roots: file_share::Roots::default(),
                         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7919,6 +7925,10 @@ async fn async_main() -> Result<()> {
                     .context("loading webd session sealing key")?,
             );
             let node = Arc::new(NodeState {
+                share_roots: node_cfg
+                    .as_ref()
+                    .map(|c| file_share::Roots::from_config(&c.webd.shares))
+                    .unwrap_or_default(),
                 service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -8957,6 +8967,7 @@ vhost: [
         let vhosts: Arc<ArcSwap<vhost_directory::VhostDirectory>> =
             Arc::new(ArcSwap::from(Arc::new(directory)));
         Arc::new(NodeState {
+            share_roots: file_share::Roots::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -10222,6 +10233,7 @@ mod session_login_tests {
         handlers: mix_handler::HandlerTable,
     ) -> Arc<NodeState> {
         Arc::new(NodeState {
+            share_roots: file_share::Roots::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

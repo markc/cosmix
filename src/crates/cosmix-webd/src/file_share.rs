@@ -1,68 +1,124 @@
-//! Public file shares — the Nextcloud public-link replacement (WS4 scaffold).
+//! Token catalogue for public file shares. P5 slices 1–3 are foundations only:
+//! HTTP/Bus routes are wired after the cluster checkpoint.
 //!
-//! **Status: compiling SCAFFOLD, not a routed production surface.** This
-//! module owns the share *catalogue* + the security-critical primitives
-//! (token minting, path jail, token → jailed-path resolution, expiry /
-//! revocation / password gates). What is deliberately NOT wired this run:
-//! the axum routes (`GET/HEAD /s/<token>`, the authenticated
-//! `share.create|list|revoke` handler), file-drop upload, and Thunderbird
-//! FileLink. Those integrate against webd's vhost/router/DB state in a
-//! follow-up; the contracts they must honour are in
-//! `_decisions/2026-07-13-files-sync-contracts.md` (C6).
-//!
-//! Why this shape (Codex D7): the 54 live NC public links are the real
-//! Nextcloud dependency, not a sync daemon. Bytes live once under a
-//! filesd-jailed per-account root; a share is a catalogue row mapping an
-//! opaque token to a *relative* path under that root — the token never
-//! carries a filesystem path, so a leaked/guessed token cannot escape the
-//! jail even if the catalogue is intact.
-//!
-//! `dead_code` is allowed module-wide **because** the module is not yet
-//! wired into the router — the public surface is exercised only by this
-//! module's tests. Remove the allow in the same change that adds routes.
+//! Account identity is the exact canonical email in the unified session. Legacy
+//! numeric rows survive migration but cannot resolve until explicitly mapped.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 
-/// Share kinds. `File`/`Dir` are read-only download links; `Drop` is a
-/// write-only inbox (outsiders upload) — the upload route is a documented
-/// follow-up, but the kind is modelled now so the schema is stable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShareKind {
-    File,
-    Dir,
-    Drop,
+use crate::blob_reference::Reference;
+
+const SCHEMA: &str = "
+CREATE TABLE file_shares (
+    token TEXT PRIMARY KEY,
+    account TEXT,
+    maild_account_id INTEGER,
+    rel_path TEXT,
+    blob TEXT,
+    kind TEXT NOT NULL,
+    password_hash TEXT,
+    expires_at INTEGER,
+    created_at INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    download_count INTEGER NOT NULL DEFAULT 0,
+    CHECK ((rel_path IS NOT NULL AND blob IS NULL) OR
+           (rel_path IS NULL AND blob IS NOT NULL)),
+    CHECK (account IS NOT NULL OR maild_account_id IS NOT NULL)
+);";
+const INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_file_shares_account
+    ON file_shares(account) WHERE revoked = 0;";
+
+/// Initialise or atomically migrate the old numeric-account scaffold.
+/// No guesses about email identity: old rows retain their ID with account=NULL.
+pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='file_shares')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        tx.execute_batch(SCHEMA)?;
+    } else {
+        let old: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('file_shares') WHERE name='account_id')",
+            [],
+            |r| r.get(0),
+        )?;
+        if old {
+            tx.execute_batch(
+                &SCHEMA.replace("CREATE TABLE file_shares", "CREATE TABLE file_shares_p5"),
+            )?;
+            tx.execute_batch(
+                "INSERT INTO file_shares_p5
+                    (token, account, maild_account_id, rel_path, blob, kind,
+                     password_hash, expires_at, created_at, revoked, download_count)
+                 SELECT token, NULL, account_id, rel_path, NULL, kind,
+                     password_hash, expires_at, created_at, revoked, download_count
+                 FROM file_shares;
+                 DROP TABLE file_shares;
+                 ALTER TABLE file_shares_p5 RENAME TO file_shares;",
+            )?;
+        }
+    }
+    tx.execute_batch(INDEX)?;
+    // Also fail on an incompatible pre-existing table, instead of claiming migration succeeded.
+    tx.prepare(
+        "SELECT token, account, maild_account_id, rel_path, blob, kind,
+        password_hash, expires_at, created_at, revoked, download_count FROM file_shares LIMIT 0",
+    )?;
+    tx.commit()
 }
 
-impl ShareKind {
-    pub fn as_str(self) -> &'static str {
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("not_found")]
+    NotFound,
+    #[error("expired")]
+    Expired,
+    #[error("revoked")]
+    Revoked,
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("invalid_arguments: {0}")]
+    InvalidArguments(&'static str),
+    #[error("share catalogue unavailable")]
+    Database(#[from] rusqlite::Error),
+}
+
+/// Only file targets are deliverable this arc. Old unknown/dir/drop rows fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Target {
+    Path { rel_path: String },
+    Blob { reference: Reference },
+}
+
+impl Target {
+    pub fn validate(&self) -> Result<(), Error> {
         match self {
-            ShareKind::File => "file",
-            ShareKind::Dir => "dir",
-            ShareKind::Drop => "drop",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "file" => Some(ShareKind::File),
-            "dir" => Some(ShareKind::Dir),
-            "drop" => Some(ShareKind::Drop),
-            _ => None,
+            Self::Path { rel_path } if valid_relative_path(rel_path) => Ok(()),
+            Self::Path { .. } => Err(Error::InvalidArguments("unsafe relative path")),
+            Self::Blob { reference } => reference
+                .validate()
+                .map_err(|_| Error::InvalidArguments("invalid blob reference")),
         }
     }
 }
 
-/// A catalogue row (what `share.list` returns; `password_hash` is never
-/// surfaced).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Share {
     pub token: String,
-    pub account_id: i64,
-    pub rel_path: String,
-    pub kind: ShareKind,
+    pub account: String,
+    pub maild_account_id: Option<i64>,
+    pub target: Target,
+    pub kind: String,
     pub has_password: bool,
     pub expires_at: Option<i64>,
     pub created_at: i64,
@@ -70,215 +126,263 @@ pub struct Share {
     pub download_count: i64,
 }
 
-/// Why a token failed to resolve to a servable path. All map to a
-/// deliberately indistinguishable client response (404 for
-/// absent/revoked/expired, 401 for a password-required/mismatch) so a
-/// probe learns nothing about which tokens exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShareDenied {
-    NotFound,
-    Revoked,
-    Expired,
-    PasswordRequired,
-    PasswordMismatch,
-    /// The stored `rel_path` failed the jail (corrupt/hostile catalogue
-    /// row) — never serve it.
-    Unsafe,
+/// Exact session identity: do not lowercase the local part or equate CMS IDs
+/// with maild IDs. The identity provider owns canonicalisation.
+pub fn valid_account(account: &str) -> bool {
+    let Some((local, domain)) = account.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !domain.contains('@')
+        && account.len() <= 320
+        && !account.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-/// Initialise the share catalogue. Idempotent.
-pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS file_shares (
-            token          TEXT PRIMARY KEY,
-            account_id     INTEGER NOT NULL,
-            rel_path       TEXT NOT NULL,
-            kind           TEXT NOT NULL,
-            password_hash  TEXT,
-            expires_at     INTEGER,
-            created_at     INTEGER NOT NULL,
-            revoked        INTEGER NOT NULL DEFAULT 0,
-            download_count INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_file_shares_account
-            ON file_shares(account_id) WHERE revoked = 0;",
-    )?;
-    Ok(())
+pub fn valid_relative_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && rel.len() <= 4096
+        && !rel.contains('\\')
+        && !rel.chars().any(char::is_control)
+        && rel
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// Mint a 160-bit opaque, URL-safe token. Unguessable — the only
-/// authorisation a share link carries.
+/// Validated operator roots, never request data. Slice 2 pins directory handles.
+#[derive(Default)]
+pub struct Roots(BTreeMap<String, PathBuf>);
+
+impl Roots {
+    pub fn from_config(config: &cosmix_config::node::WebdSharesConfig) -> Self {
+        let mut roots = BTreeMap::new();
+        for (account, path) in &config.roots {
+            let safe = valid_account(account)
+                && path.is_absolute()
+                && !path.components().any(|c| matches!(c, Component::ParentDir));
+            let canonical = safe
+                .then(|| path.canonicalize().ok())
+                .flatten()
+                .filter(|p| p.is_dir());
+            match canonical {
+                Some(path) => {
+                    roots.insert(account.clone(), path);
+                }
+                None => tracing::warn!(account, "ignoring invalid webd.shares root"),
+            }
+        }
+        Self(roots)
+    }
+
+    pub fn get(&self, account: &str) -> Option<&Path> {
+        self.0.get(account).map(PathBuf::as_path)
+    }
+}
+
 pub fn mint_token() -> String {
     let mut buf = [0u8; 20];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-/// Jail a caller-supplied relative path to a per-account root. Rejects
-/// absolute paths, `..`, `.`, root/prefix/current-dir components, and
-/// (belt over the component check) any residual `..` — a share path must
-/// stay strictly inside `root`. Returns the absolute on-disk path.
-///
-/// This is the ONE place a token becomes a filesystem path; every serve
-/// call goes through it, so a corrupt catalogue row can never escape.
-pub fn jail_path(root: &Path, rel: &str) -> Result<PathBuf, ShareDenied> {
-    if rel.is_empty() {
-        return Err(ShareDenied::Unsafe);
-    }
-    let candidate = Path::new(rel);
-    // Only plain, forward path segments are allowed.
-    for comp in candidate.components() {
-        match comp {
-            Component::Normal(_) => {}
-            _ => return Err(ShareDenied::Unsafe),
-        }
-    }
-    // Defence in depth: even after the component check, refuse a literal
-    // `..` anywhere in the raw string (covers exotic encodings the
-    // component iterator might normalise).
-    if rel.split(['/', '\\']).any(|seg| seg == "..") {
-        return Err(ShareDenied::Unsafe);
-    }
-    Ok(root.join(candidate))
+pub fn valid_token(token: &str) -> bool {
+    token.len() == 27
+        && token
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
-/// Create a share. `password_hash` is a pre-hashed bcrypt string (webd's
-/// authenticated handler hashes the plaintext before calling — this
-/// module never sees the plaintext). Caller is responsible for having
-/// verified `account_id` owns `rel_path`; `jail_path` is re-checked at
-/// serve time regardless.
-#[allow(clippy::too_many_arguments)]
+/// Caller checks path ownership or establishes the blob pin BEFORE publishing.
+/// Password hashing is performed outside the DB lock by the management layer.
 pub fn create(
     conn: &Connection,
-    account_id: i64,
-    rel_path: &str,
-    kind: ShareKind,
+    account: &str,
+    kind: &str,
+    target: &Target,
     password_hash: Option<&str>,
     expires_at: Option<i64>,
     now: i64,
-) -> rusqlite::Result<String> {
+) -> Result<String, Error> {
+    if !valid_account(account) {
+        return Err(Error::InvalidArguments("invalid account"));
+    }
+    if kind != "file" {
+        return Err(Error::InvalidArguments(
+            "only file shares are supported; dir and drop are deferred",
+        ));
+    }
+    target.validate()?;
+    if expires_at.is_some_and(|e| e <= now) {
+        return Err(Error::InvalidArguments("expires must be in the future"));
+    }
     let token = mint_token();
+    let (path, blob) = match target {
+        Target::Path { rel_path } => (Some(rel_path.as_str()), None),
+        Target::Blob { reference } => (
+            None,
+            Some(
+                serde_json::to_string(reference)
+                    .map_err(|_| Error::InvalidArguments("invalid blob reference"))?,
+            ),
+        ),
+    };
     conn.execute(
         "INSERT INTO file_shares
-            (token, account_id, rel_path, kind, password_hash, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            token,
-            account_id,
-            rel_path,
-            kind.as_str(),
-            password_hash,
-            expires_at,
-            now,
-        ],
+         (token, account, rel_path, blob, kind, password_hash, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7)",
+        params![token, account, path, blob, password_hash, expires_at, now],
     )?;
     Ok(token)
 }
 
-fn row_to_share(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Share, Option<String>)> {
-    let kind_s: String = row.get("kind")?;
-    let pw: Option<String> = row.get("password_hash")?;
-    let share = Share {
-        token: row.get("token")?,
-        account_id: row.get("account_id")?,
-        rel_path: row.get("rel_path")?,
-        kind: ShareKind::parse(&kind_s).unwrap_or(ShareKind::File),
-        has_password: pw.is_some(),
-        expires_at: row.get("expires_at")?,
-        created_at: row.get("created_at")?,
-        revoked: row.get::<_, i64>("revoked")? != 0,
-        download_count: row.get("download_count")?,
-    };
-    Ok((share, pw))
+struct Row {
+    token: String,
+    account: Option<String>,
+    maild_account_id: Option<i64>,
+    rel_path: Option<String>,
+    blob: Option<String>,
+    kind: String,
+    password_hash: Option<String>,
+    expires_at: Option<i64>,
+    created_at: i64,
+    revoked: bool,
+    download_count: i64,
 }
 
-/// List an account's non-revoked shares (newest first). Never returns
-/// the password hash.
-pub fn list(conn: &Connection, account_id: i64) -> rusqlite::Result<Vec<Share>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM file_shares
-         WHERE account_id = ?1 AND revoked = 0
-         ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map(params![account_id], |r| Ok(row_to_share(r)?.0))?;
-    rows.collect()
-}
-
-/// Revoke a share the account owns. Returns `true` if a row was revoked
-/// (idempotent: re-revoking an already-revoked/absent token = `false`).
-/// Scoped by `account_id` so one tenant can't revoke another's token.
-pub fn revoke(conn: &Connection, account_id: i64, token: &str) -> rusqlite::Result<bool> {
-    let n = conn.execute(
-        "UPDATE file_shares SET revoked = 1
-         WHERE token = ?1 AND account_id = ?2 AND revoked = 0",
-        params![token, account_id],
-    )?;
-    Ok(n > 0)
-}
-
-/// The outcome of resolving a public token to a servable path.
-#[derive(Debug)]
-pub struct Resolved {
-    pub share: Share,
-    /// Absolute, jailed on-disk path under the account root.
-    pub path: PathBuf,
-}
-
-/// Resolve a public `GET /s/<token>` to a jailed on-disk path, enforcing
-/// revocation, expiry, and (via `verify_password`) any password gate.
-/// `account_root_for` maps the row's `account_id` to that account's
-/// filesd root (the caller owns the root layout). `password` is the
-/// visitor's submitted plaintext (None if none supplied); `verify_password`
-/// checks it against the stored hash in constant time (bcrypt).
-///
-/// Does NOT increment the download counter — the caller does that only
-/// after a byte actually ships (see `bump_download`).
-pub fn resolve<F, V>(
-    conn: &Connection,
-    token: &str,
-    now: i64,
-    password: Option<&str>,
-    account_root_for: F,
-    verify_password: V,
-) -> Result<Resolved, ShareDenied>
-where
-    F: FnOnce(i64) -> Option<PathBuf>,
-    V: FnOnce(&str, &str) -> bool,
-{
-    let mut stmt = conn
-        .prepare("SELECT * FROM file_shares WHERE token = ?1")
-        .map_err(|_| ShareDenied::NotFound)?;
-    let row = stmt
-        .query_row(params![token], row_to_share)
-        .optional()
-        .map_err(|_| ShareDenied::NotFound)?;
-    let (share, pw_hash) = row.ok_or(ShareDenied::NotFound)?;
-
-    if share.revoked {
-        return Err(ShareDenied::Revoked);
+impl Row {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            token: row.get("token")?,
+            account: row.get("account")?,
+            maild_account_id: row.get("maild_account_id")?,
+            rel_path: row.get("rel_path")?,
+            blob: row.get("blob")?,
+            kind: row.get("kind")?,
+            password_hash: row.get("password_hash")?,
+            expires_at: row.get("expires_at")?,
+            created_at: row.get("created_at")?,
+            revoked: row.get::<_, i64>("revoked")? != 0,
+            download_count: row.get("download_count")?,
+        })
     }
-    if share.expires_at.is_some_and(|e| now >= e) {
-        return Err(ShareDenied::Expired);
-    }
-    if let Some(hash) = pw_hash.as_deref() {
-        match password {
-            None => return Err(ShareDenied::PasswordRequired),
-            Some(p) if verify_password(p, hash) => {}
-            Some(_) => return Err(ShareDenied::PasswordMismatch),
+
+    fn share(self) -> Result<Share, Error> {
+        let account = self
+            .account
+            .filter(|a| valid_account(a))
+            .ok_or(Error::NotFound)?;
+        if self.kind != "file" {
+            return Err(Error::NotFound);
         }
+        let target = match (self.rel_path, self.blob) {
+            (Some(rel_path), None) => Target::Path { rel_path },
+            (None, Some(blob)) => {
+                let value = serde_json::from_str(&blob).map_err(|_| Error::NotFound)?;
+                Target::Blob {
+                    reference: Reference::from_json(&value).map_err(|_| Error::NotFound)?,
+                }
+            }
+            _ => return Err(Error::NotFound),
+        };
+        target.validate().map_err(|_| Error::NotFound)?;
+        Ok(Share {
+            token: self.token,
+            account,
+            maild_account_id: self.maild_account_id,
+            target,
+            kind: self.kind,
+            has_password: self.password_hash.is_some(),
+            expires_at: self.expires_at,
+            created_at: self.created_at,
+            revoked: self.revoked,
+            download_count: self.download_count,
+        })
     }
-
-    let root = account_root_for(share.account_id).ok_or(ShareDenied::NotFound)?;
-    let path = jail_path(&root, &share.rel_path)?;
-    Ok(Resolved { share, path })
 }
 
-/// Increment a share's download counter (best-effort telemetry; call
-/// after a successful serve).
+/// Bounded, cursor-paginated management inventory. Password hashes never leave it.
+pub fn list(
+    conn: &Connection,
+    account: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Share>, Error> {
+    if !valid_account(account) || !(1..=100).contains(&limit) {
+        return Err(Error::InvalidArguments(
+            "invalid account or list limit (1..100)",
+        ));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT * FROM file_shares WHERE account=?1 AND revoked=0 AND token>?2 ORDER BY token LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![account, after.unwrap_or(""), limit as i64],
+        Row::read,
+    )?;
+    rows.map(|row| row.map_err(Error::from)?.share()).collect()
+}
+
+pub fn revoke(conn: &Connection, account: &str, token: &str) -> Result<bool, Error> {
+    Ok(conn.execute(
+        "UPDATE file_shares SET revoked=1 WHERE token=?1 AND account=?2 AND revoked=0",
+        params![token, account],
+    )? > 0)
+}
+
+/// Snapshot the gate without filesystem/lane access. The caller drops the DB
+/// lock before bounded bcrypt work, then reloads this gate before target access.
+pub struct Gate {
+    pub share: Share,
+    pub password_hash: Option<String>,
+}
+
+pub fn resolve(conn: &Connection, token: &str, now: i64) -> Result<Gate, Error> {
+    if !valid_token(token) {
+        return Err(Error::NotFound);
+    }
+    let row = conn
+        .query_row(
+            "SELECT * FROM file_shares WHERE token=?1",
+            [token],
+            Row::read,
+        )
+        .optional()?
+        .ok_or(Error::NotFound)?;
+    if row.revoked {
+        return Err(Error::Revoked);
+    }
+    if row.expires_at.is_some_and(|e| now >= e) {
+        return Err(Error::Expired);
+    }
+    let password_hash = row.password_hash.clone();
+    Ok(Gate {
+        share: row.share()?,
+        password_hash,
+    })
+}
+
+impl Gate {
+    /// A bcrypt result is accepted only for the exact hash that was checked.
+    /// Re-resolve first so revocation/expiry/password changes cannot race the gate.
+    pub fn authorize(&self, verified_hash: Option<&str>) -> Result<&Target, Error> {
+        if let Some(expected) = &self.password_hash
+            && verified_hash != Some(expected.as_str())
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(&self.share.target)
+    }
+}
+
+/// Best-effort download-start telemetry, invoked once on first emitted body bytes.
+/// HEAD, denial and empty-body responses do not increment.
 pub fn bump_download(conn: &Connection, token: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE file_shares SET download_count = download_count + 1 WHERE token = ?1",
-        params![token],
+        "UPDATE file_shares SET download_count=download_count+1 WHERE token=?1",
+        [token],
     )?;
     Ok(())
 }
@@ -286,143 +390,190 @@ pub fn bump_download(conn: &Connection, token: &str) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ACCOUNT: &str = "user@example.test";
 
-    fn mem() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        init_schema(&c).unwrap();
-        c
+    fn db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        init_schema(&db).unwrap();
+        db
     }
-
-    #[test]
-    fn token_is_urlsafe_and_unique() {
-        let a = mint_token();
-        let b = mint_token();
-        assert_ne!(a, b);
-        assert!(!a.contains('/') && !a.contains('+') && !a.contains('='));
-        assert!(a.len() >= 26); // 20 bytes base64url-nopad = 27 chars
+    fn path() -> Target {
+        Target::Path {
+            rel_path: "Docs/report.pdf".into(),
+        }
     }
-
-    #[test]
-    fn jail_rejects_traversal_and_absolute() {
-        let root = Path::new("/srv/acct/7");
-        assert_eq!(jail_path(root, "../etc/passwd"), Err(ShareDenied::Unsafe));
-        assert_eq!(jail_path(root, "a/../../b"), Err(ShareDenied::Unsafe));
-        assert_eq!(jail_path(root, "/etc/passwd"), Err(ShareDenied::Unsafe));
-        assert_eq!(jail_path(root, ""), Err(ShareDenied::Unsafe));
-        assert_eq!(jail_path(root, "."), Err(ShareDenied::Unsafe));
-        // A legitimate nested path stays inside the root.
-        assert_eq!(
-            jail_path(root, "Photos/2020/img.jpg").unwrap(),
-            PathBuf::from("/srv/acct/7/Photos/2020/img.jpg")
-        );
+    fn blob() -> Target {
+        Target::Blob {
+            reference: Reference {
+                blob: format!("b3:{}", "a".repeat(64)),
+                size: 3,
+                mime: "text/plain".into(),
+                name: Some("file.txt".into()),
+                origin: "alpha".into(),
+            },
+        }
     }
 
     #[test]
-    fn create_list_revoke_roundtrip() {
-        let c = mem();
-        let t = create(&c, 7, "Docs/report.pdf", ShareKind::File, None, None, 1000).unwrap();
-        let shares = list(&c, 7).unwrap();
-        assert_eq!(shares.len(), 1);
-        assert_eq!(shares[0].token, t);
-        assert_eq!(shares[0].rel_path, "Docs/report.pdf");
-        assert!(!shares[0].has_password);
-        // Another account can't see it.
-        assert!(list(&c, 8).unwrap().is_empty());
-        // Another account can't revoke it.
-        assert!(!revoke(&c, 8, &t).unwrap());
-        assert_eq!(list(&c, 7).unwrap().len(), 1);
-        // Owner revokes; idempotent second revoke is false.
-        assert!(revoke(&c, 7, &t).unwrap());
-        assert!(!revoke(&c, 7, &t).unwrap());
-        assert!(list(&c, 7).unwrap().is_empty());
-    }
-
-    fn root_for(id: i64) -> Option<PathBuf> {
-        Some(PathBuf::from(format!("/srv/acct/{id}")))
-    }
-    fn pw_never(_p: &str, _h: &str) -> bool {
-        false
-    }
-    fn pw_always(_p: &str, _h: &str) -> bool {
-        true
+    fn fresh_schema_target_check_and_repeated_init() {
+        let db = db();
+        init_schema(&db).unwrap();
+        for target in [path(), blob()] {
+            let token = create(&db, ACCOUNT, "file", &target, None, None, 1).unwrap();
+            assert_eq!(resolve(&db, &token, 2).unwrap().share.target, target);
+            assert!(
+                db.execute(
+                    "UPDATE file_shares SET rel_path=NULL, blob=NULL WHERE token=?1",
+                    [&token]
+                )
+                .is_err()
+            );
+            assert!(
+                db.execute(
+                    "UPDATE file_shares SET rel_path='a', blob='{}' WHERE token=?1",
+                    [&token]
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
-    fn resolve_happy_path() {
-        let c = mem();
-        let t = create(&c, 3, "a/b.txt", ShareKind::File, None, None, 1000).unwrap();
-        let r = resolve(&c, &t, 2000, None, root_for, pw_never).unwrap();
-        assert_eq!(r.path, PathBuf::from("/srv/acct/3/a/b.txt"));
-        assert_eq!(r.share.account_id, 3);
-    }
-
-    #[test]
-    fn resolve_rejects_revoked_expired_missing() {
-        let c = mem();
-        assert_eq!(
-            resolve(&c, "nope", 2000, None, root_for, pw_never).unwrap_err(),
-            ShareDenied::NotFound
-        );
-        let t = create(&c, 3, "a.txt", ShareKind::File, None, Some(1500), 1000).unwrap();
-        assert_eq!(
-            resolve(&c, &t, 2000, None, root_for, pw_never).unwrap_err(),
-            ShareDenied::Expired
-        );
-        // not yet expired
-        assert!(resolve(&c, &t, 1400, None, root_for, pw_never).is_ok());
-        revoke(&c, 3, &t).unwrap();
-        assert_eq!(
-            resolve(&c, &t, 1400, None, root_for, pw_never).unwrap_err(),
-            ShareDenied::Revoked
-        );
-    }
-
-    #[test]
-    fn resolve_password_gate() {
-        let c = mem();
-        let t = create(
-            &c,
-            3,
-            "a.txt",
-            ShareKind::File,
-            Some("bcrypt$stored"),
-            None,
-            1000,
+    fn legacy_migration_preserves_every_field_and_refuses_unmapped_identity() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE file_shares (
+            token TEXT PRIMARY KEY, account_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
+            kind TEXT NOT NULL, password_hash TEXT, expires_at INTEGER, created_at INTEGER NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0, download_count INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX idx_file_shares_account ON file_shares(account_id) WHERE revoked=0;",
         )
         .unwrap();
-        assert_eq!(
-            resolve(&c, &t, 2000, None, root_for, pw_always).unwrap_err(),
-            ShareDenied::PasswordRequired
-        );
-        assert_eq!(
-            resolve(&c, &t, 2000, Some("wrong"), root_for, pw_never).unwrap_err(),
-            ShareDenied::PasswordMismatch
-        );
-        assert!(resolve(&c, &t, 2000, Some("right"), root_for, pw_always).is_ok());
-    }
-
-    #[test]
-    fn resolve_rejects_corrupt_relpath() {
-        let c = mem();
-        // Hostile catalogue row (simulating tampering) must not escape.
-        c.execute(
-            "INSERT INTO file_shares (token, account_id, rel_path, kind, created_at)
-             VALUES ('x', 3, '../../etc/passwd', 'file', 1000)",
-            [],
+        let token = mint_token();
+        db.execute(
+            "INSERT INTO file_shares VALUES (?1,7,'Docs/a','file','bcrypt',50,1,0,12)",
+            [&token],
         )
         .unwrap();
+        init_schema(&db).unwrap();
+        init_schema(&db).unwrap();
+        let row = db
+            .query_row("SELECT * FROM file_shares", [], Row::read)
+            .unwrap();
+        assert_eq!(row.account, None);
+        assert_eq!(row.maild_account_id, Some(7));
+        assert_eq!(row.rel_path.as_deref(), Some("Docs/a"));
+        assert_eq!(row.password_hash.as_deref(), Some("bcrypt"));
         assert_eq!(
-            resolve(&c, "x", 2000, None, root_for, pw_never).unwrap_err(),
-            ShareDenied::Unsafe
+            (
+                row.expires_at,
+                row.created_at,
+                row.revoked,
+                row.download_count
+            ),
+            (Some(50), 1, false, 12)
+        );
+        assert!(matches!(resolve(&db, &token, 2), Err(Error::NotFound)));
+        db.execute(
+            "UPDATE file_shares SET account=?1 WHERE token=?2",
+            params![ACCOUNT, token],
+        )
+        .unwrap();
+        assert_eq!(resolve(&db, &token, 2).unwrap().share.account, ACCOUNT);
+    }
+
+    #[test]
+    fn migration_failure_rolls_back_original_table() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE file_shares (token TEXT, account_id INTEGER);
+            INSERT INTO file_shares VALUES ('untouched',7);",
+        )
+        .unwrap();
+        assert!(init_schema(&db).is_err());
+        assert_eq!(
+            db.query_row("SELECT token FROM file_shares", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "untouched"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='file_shares_p5'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
         );
     }
 
     #[test]
-    fn download_counter_bumps() {
-        let c = mem();
-        let t = create(&c, 3, "a.txt", ShareKind::File, None, None, 1000).unwrap();
-        bump_download(&c, &t).unwrap();
-        bump_download(&c, &t).unwrap();
-        assert_eq!(list(&c, 3).unwrap()[0].download_count, 2);
+    fn account_scope_gates_and_telemetry() {
+        let db = db();
+        let token = create(&db, ACCOUNT, "file", &path(), Some("hash"), Some(10), 1).unwrap();
+        assert!(
+            list(&db, "other@example.test", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!revoke(&db, "other@example.test", &token).unwrap());
+        let gate = resolve(&db, &token, 2).unwrap();
+        assert!(matches!(gate.authorize(None), Err(Error::Unauthorized)));
+        assert!(gate.authorize(Some("hash")).is_ok());
+        assert!(matches!(resolve(&db, &token, 10), Err(Error::Expired)));
+        bump_download(&db, &token).unwrap();
+        assert_eq!(list(&db, ACCOUNT, None, 100).unwrap()[0].download_count, 1);
+        assert!(revoke(&db, ACCOUNT, &token).unwrap());
+        assert!(matches!(resolve(&db, &token, 2), Err(Error::Revoked)));
+    }
+
+    #[test]
+    fn unsupported_or_corrupt_targets_fail_closed() {
+        let db = db();
+        for kind in ["dir", "drop", "garbage"] {
+            assert!(create(&db, ACCOUNT, kind, &path(), None, None, 1).is_err());
+        }
+        for rel_path in ["", "/etc/passwd", "../x", "a/../b", "a/./b", "a//b", "a\\b"] {
+            assert!(!valid_relative_path(rel_path));
+        }
+        let token = create(&db, ACCOUNT, "file", &blob(), None, None, 1).unwrap();
+        db.execute(
+            "UPDATE file_shares SET kind='unknown' WHERE token=?1",
+            [&token],
+        )
+        .unwrap();
+        assert!(matches!(resolve(&db, &token, 2), Err(Error::NotFound)));
+        db.execute(
+            "UPDATE file_shares SET kind='file',blob='{}' WHERE token=?1",
+            [&token],
+        )
+        .unwrap();
+        assert!(matches!(resolve(&db, &token, 2), Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn roots_skip_bad_entries_and_preserve_exact_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cosmix_config::node::WebdSharesConfig {
+            roots: BTreeMap::from([
+                (ACCOUNT.into(), dir.path().into()),
+                ("bad@example.test".into(), PathBuf::from("relative")),
+                ("parent@example.test".into(), dir.path().join("../x")),
+                ("missing@example.test".into(), dir.path().join("absent")),
+                ("not-email".into(), dir.path().into()),
+            ]),
+        };
+        let roots = Roots::from_config(&cfg);
+        assert!(roots.get(ACCOUNT).is_some());
+        for account in [
+            "bad@example.test",
+            "parent@example.test",
+            "missing@example.test",
+            "not-email",
+            "USER@example.test",
+        ] {
+            assert!(roots.get(account).is_none());
+        }
     }
 }
