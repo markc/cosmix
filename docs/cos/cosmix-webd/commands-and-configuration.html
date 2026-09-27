@@ -442,6 +442,9 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/cosmix-webd/commands-and-configuration.md"><div class="prose"><h1 id="commands-and-configuration">Commands and configuration</h1>
+<p>For account-root path sharing, configure <code>webd.shares.roots</code> in <code>node.conf.mix</code>.
+See <a href="/cos/cosmix-webd/shares">public shares</a> for the exact email-keyed map, startup validation,
+and the C1/C6 scope. Roots are operator configuration, never HTTP/Bus arguments.</p>
 <p><code>cosmix-webd</code> is a subcommand-driven daemon binary. Server flags override matching values resolved from <code>node.conf.mix</code>.</p>
 <h2 id="commands">Commands</h2>
 <table><thead><tr><th>Command</th><th>Purpose</th></tr></thead><tbody>

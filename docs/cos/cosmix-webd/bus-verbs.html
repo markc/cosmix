@@ -577,6 +577,44 @@
 <li>A relative <code>.mix</code> handler reference with no parent traversal.</li>
 <li>Known capability tokens and explicit delegated-verb allowlists.</li>
 </ul>
+<h2 id="shares-and-media-references-0120">Shares and media references (0.12.0)</h2>
+<p>These four verbs are <strong>mesh-open</strong>. They require no capability or node ACL;
+public HTTP access has the separate token/session gates described in <a href="/cos/cosmix-webd/shares">shares</a>.
+Arguments are a JSON object. Transport headers are not argument fallbacks.
+Unknown fields and wrong types are refused with rc=10 <code>invalid_arguments:</code>.</p>
+<table><thead><tr><th>Verb</th><th>Required arguments</th><th>Optional arguments</th><th>Success (rc=0)</th></tr></thead><tbody>
+<tr><td><code>webd.share.create</code></td><td><code>vhost: string</code>, <code>account: string</code>, exactly one of <code>rel_path: string</code> or <code>blob: reference object</code></td><td><code>kind: "file"</code> (default), <code>name: string</code> (blob only), <code>password: string</code>, <code>expires: integer</code></td><td><code>{token, url}</code>; URL is relative <code>/s/{token}</code></td></tr>
+<tr><td><code>webd.share.list</code></td><td><code>vhost: string</code>, <code>account: string</code></td><td><code>after: token string</code>, <code>limit: integer</code> (1..100, default 100)</td><td><code>{shares: [...], next: token-or-null, skipped: integer}</code></td></tr>
+<tr><td><code>webd.share.revoke</code></td><td><code>vhost: string</code>, <code>account: string</code>, <code>token: string</code></td><td>None</td><td><code>{revoked: boolean}</code></td></tr>
+<tr><td><code>webd.media.ref</code></td><td><code>vhost: string</code>, <code>id: integer</code> (&gt;0)</td><td>None</td><td>Reference object directly: <code>{blob, size, mime, name?, origin}</code></td></tr>
+</tbody></table>
+<p><code>account</code> is the exact canonical session email, not a numeric maild/CMS account
+ID. <code>expires</code> is an absolute Unix timestamp in seconds and must be in the future
+at creation. <code>blob</code> contains <code>{blob: "b3:&lt;64 lowercase hex&gt;", size: integer, mime: string, name?: string, origin: string}</code>. A missing local blob is refused;
+these verbs do not fetch from the reference's origin. Path creation requires
+an operator-configured root for that account, even over the Bus.</p>
+<p>Vhost aliases resolve to their primary's catalogue and hashed blob owner. Share
+creation pins before token publication. Revoke is account-scoped and idempotent:
+false means absent, already revoked, or another account's token. Lists omit
+revoked rows and password hashes, retain expired rows, and paginate by token;
+unservable rows contribute to <code>skipped</code>. The cursor advances over skipped rows;
+<code>next=null</code> means no rows were scanned.</p>
+<p>All four operations run on at most eight workers owned by the current broker
+session. Reconnect aborts that session's workers. Password verification has four
+bcrypt workers and creation has one separate worker; admission lasts until
+blocking work ends. Busy replies run outside the receive loop with a 30-second
+timeout. At most 32 busy replies may be pending across reconnects; excess replies
+are dropped with one warning, leaving the caller to time out. Worker saturation is
+rc=10 <code>{"error":"busy: webd transfer workers full (8)"}</code>. All other failures
+also return rc=10 with <code>{"error":"&lt;token&gt;[: details]"}</code>; no new payload bytes
+travel in Bus frames.</p>
+<p>Share tokens/errors: <code>not_found</code>, <code>expired</code>, <code>revoked</code>, <code>unauthorized</code>,
+<code>invalid_arguments:</code>; resource/internal failures use <code>busy:</code> and <code>internal:</code>.
+Lane failures retain <code>lane_unavailable:</code>, <code>quota:</code>, <code>lane:</code>, <code>not_present:</code>,
+<code>verify_failed:</code>. Media additionally uses <code>unsupported_storage:</code>, <code>too_large:</code>,
+and <code>conflict:</code>. See <a href="/cos/cosmix-webd/media-references">media references</a> for recovery and
+retention. <code>webd.media.ref</code> is advertised as mutating because it may write a
+blob, pin and catalogue reference.</p>
 <h2 id="unknown-verbs">Unknown verbs</h2>
 <p>An unsupported <code>webd.*</code> command returns <code>rc=10</code>, identifies the action, and reports the fixed read-only snapshot list. Mutation verbs are accepted only by their explicit asynchronous dispatchers or the property router.</p></div></div>
     </div>

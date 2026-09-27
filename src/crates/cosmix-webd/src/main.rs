@@ -2,6 +2,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod acme_provisioner;
+mod blob_lane;
+mod blob_reference;
 mod bus;
 mod bus_call_handler;
 mod db;
@@ -17,8 +19,11 @@ mod mxresolve;
 mod portal_auth;
 mod public_response_cache;
 mod session;
+mod shares;
 mod stats;
 mod tls_status;
+#[cfg(test)]
+mod transfer_tests;
 mod vhost_directory;
 mod vhosts_bootstrap;
 mod vhosts_namespace;
@@ -686,8 +691,13 @@ struct WebdConnHandler {
 
 #[async_trait::async_trait]
 impl ConnHandler for WebdConnHandler {
-    async fn handle(&self, stream: AcceptedStream, _ctx: ConnCtx) {
-        let svc = hyper_util::service::TowerToHyperService::new(self.app.clone());
+    async fn handle(&self, stream: AcceptedStream, ctx: ConnCtx) {
+        let peer = shares::Peer {
+            ip: ctx.peer_addr.ip(),
+            tls: matches!(&stream, AcceptedStream::Tls(_)),
+        };
+        let svc =
+            hyper_util::service::TowerToHyperService::new(self.app.clone().layer(Extension(peer)));
         let builder =
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
         match stream {
@@ -801,9 +811,7 @@ pub(crate) fn empty_listener_tls(strict_sni: bool) -> Result<ListenerTls> {
 ///   the provisioner publishes the cert into this same handle. Never
 ///   plaintext on a TLS port;
 /// * no handle → `Plain` (a listener with no TLS vhosts at all).
-pub(crate) fn listener_bind_tls(
-    tls: Option<&ListenerTls>,
-) -> (Option<ListenerTls>, TlsMode, bool) {
+pub(crate) fn listener_bind_tls(tls: Option<&ListenerTls>) -> (Option<ListenerTls>, TlsMode, bool) {
     match tls {
         Some(t) if t.is_enabled() => (Some(t.clone()), TlsMode::Terminate, false),
         Some(t) if t.is_pending() => (Some(t.clone()), TlsMode::Terminate, true),
@@ -817,6 +825,10 @@ pub(crate) fn listener_bind_tls(
 /// admission set + resolver, the HTTP client (single
 /// `reqwest::Client` per node), and the host-routing map.
 struct NodeState {
+    /// Startup-validated operator roots; never sourced from a request.
+    share_roots: file_share::Roots,
+    share_runtime: shares::Runtime,
+    media_runtime: media::Runtime,
     /// Hot-swappable host-routing snapshot (C3b). Carries every
     /// host-derived view — lookup by Host, plain-HTTP admit set,
     /// per-primary group with aliases — behind a single `ArcSwap`
@@ -2319,8 +2331,9 @@ fn open_db(path: &std::path::Path, aux: &[(String, std::path::PathBuf)]) -> Resu
     // connection is shared across concurrent request tasks, so a brief lock
     // wait must retry rather than fail the request.
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
     )?;
+    file_share::init_schema(&conn)?;
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (name, aux_path) in aux {
         if !is_valid_schema_name(name) {
@@ -5416,6 +5429,7 @@ struct DisabledVhost {
 
 fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
     let mut vhosts: HashMap<String, Arc<VhostState>> = HashMap::new();
+    let mut cms_paths = std::collections::HashSet::new();
     let mut identities: Vec<TlsIdentityConfig> = Vec::new();
     // B1 fail-soft — rows whose per-vhost validation failed. Populated
     // in the row loop below; the healthy subset still resolves.
@@ -5718,6 +5732,9 @@ fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
             let db = match &row.cms_db_path {
                 Some(p) => {
                     let path = PathBuf::from(p);
+                    if !cms_paths.insert(canonical_db_key(&path)) {
+                        anyhow::bail!("cms_db_path duplicates an earlier primary vhost");
+                    }
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent).with_context(|| {
                             format!(
@@ -5862,6 +5879,24 @@ fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
     // behaviour) so a plain-HTTP-with-tls_server_name deployment
     // still gets `/api/posts` working under the legacy host keys.
     let legacy_active = legacy_tls.is_some() || !inputs.webd.tls_server_name.is_empty();
+    let legacy_active =
+        if legacy_active && !cms_paths.insert(canonical_db_key(&inputs.legacy_db_path)) {
+            let reason = "cms_db_path duplicates an earlier primary vhost".to_string();
+            tracing::warn!(%reason, "legacy vhost disabled");
+            disabled_vhosts.push(DisabledVhost {
+                host: inputs
+                    .webd
+                    .tls_server_name
+                    .first()
+                    .cloned()
+                    .unwrap_or_default(),
+                names: inputs.webd.tls_server_name.clone(),
+                reason,
+            });
+            false
+        } else {
+            legacy_active
+        };
     if legacy_active {
         // Both arms of legacy_active require tls_server_name to be
         // non-empty: the TLS arm needs it as the validator's SAN-list,
@@ -6022,6 +6057,23 @@ fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
 /// middleware.
 fn build_per_vhost_router(node: Arc<NodeState>) -> Router {
     Router::new()
+        .route(
+            "/api/shares",
+            axum::routing::get(shares::http_list)
+                .post(shares::http_create)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+                .layer(axum::middleware::from_fn(shares::private_response)),
+        )
+        .route(
+            "/s/{token}",
+            axum::routing::any(shares::serve)
+                .layer(axum::middleware::from_fn(shares::public_headers)),
+        )
+        .route(
+            "/api/shares/{token}/revoke",
+            axum::routing::post(shares::http_revoke)
+                .layer(axum::middleware::from_fn(shares::private_response)),
+        )
         .route(
             "/api/posts",
             axum::routing::get(list_posts).post(create_post),
@@ -6409,6 +6461,9 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
     let (_tls_status_tx, tls_status_rx) =
         tokio::sync::watch::channel(tls_status::TlsStatusSnapshot::default());
     let node = Arc::new(NodeState {
+        share_roots: file_share::Roots::default(),
+        share_runtime: crate::shares::Runtime::default(),
+        media_runtime: crate::media::Runtime::default(),
         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7272,6 +7327,9 @@ async fn async_main() -> Result<()> {
                     // non-ACME-challenge Host with 400. Exactly what the
                     // pre-ACME bootstrap listener wants.
                     let bootstrap_node = Arc::new(NodeState {
+                        share_roots: file_share::Roots::default(),
+                        share_runtime: crate::shares::Runtime::default(),
+                        media_runtime: crate::media::Runtime::default(),
                         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7919,6 +7977,19 @@ async fn async_main() -> Result<()> {
                     .context("loading webd session sealing key")?,
             );
             let node = Arc::new(NodeState {
+                share_roots: node_cfg
+                    .as_ref()
+                    .map(|c| {
+                        let mut roots = file_share::Roots::from_config(&c.webd.shares);
+                        roots.exclude_public(&file_share::public_roots(
+                            &vhost_directory_handle.load(),
+                        ));
+                        roots.warn_identity_providers(&vhost_directory_handle.load());
+                        roots
+                    })
+                    .unwrap_or_default(),
+                share_runtime: shares::Runtime::default(),
+                media_runtime: crate::media::Runtime::default(),
                 service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -8152,11 +8223,8 @@ async fn async_main() -> Result<()> {
                 // (handshakes refused until issuance fills the handle).
                 let (tls, tls_mode, tls_pending) = listener_bind_tls(tls_listeners.get(&l.id));
                 if tls_pending {
-                    let hosts: Vec<&String> = l
-                        .hosts
-                        .iter()
-                        .filter(|h| all_hosts.contains(*h))
-                        .collect();
+                    let hosts: Vec<&String> =
+                        l.hosts.iter().filter(|h| all_hosts.contains(*h)).collect();
                     tracing::warn!(
                         listener = %l.id,
                         tls = "pending",
@@ -8638,6 +8706,59 @@ mod vhost_tests {
     // =========================================================
 
     #[test]
+    fn cms_open_configures_pragmas_and_catalogue() {
+        let td = TempDir::new().unwrap();
+        let conn = open_db(&td.path().join("cms.db"), &[]).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5000
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        conn.prepare("SELECT primary_fqdn FROM file_shares")
+            .unwrap();
+    }
+
+    #[test]
+    fn duplicate_cms_path_disables_later_primary() {
+        let td = TempDir::new().unwrap();
+        let www = mkdir(&td, "www");
+        let mut webd = cosmix_config::node::WebdConfig::default();
+        webd.http_listen = Some("0.0.0.0:80".into());
+        for host in ["a.example", "b.example"] {
+            webd.vhost.push(cosmix_config::node::WebdVhostConfig {
+                host: host.into(),
+                www_dir: www.to_string_lossy().into_owned(),
+                cms_db_path: Some(td.path().join("cms.db").to_string_lossy().into_owned()),
+                acme: Some(cosmix_config::node::WebdVhostAcmeConfig {
+                    provider: cosmix_config::node::WebdAcmeProvider::LetsEncryptStaging,
+                    challenge: cosmix_config::node::WebdAcmeChallenge::Http01,
+                    contact_email: "ops@example.com".into(),
+                }),
+                ..Default::default()
+            });
+        }
+        let resolved = resolve_node_state(base_inputs(&webd, &td)).unwrap();
+        assert!(resolved.vhosts.contains_key("a.example"));
+        assert!(!resolved.vhosts.contains_key("b.example"));
+        assert!(
+            resolved
+                .disabled_vhosts
+                .iter()
+                .any(|v| v.host == "b.example" && v.reason.contains("duplicates"))
+        );
+    }
+
+    #[test]
     fn vhost_block_parses_minimal() {
         // `.conf.mix` strict-data form (the real load format post-migration):
         // a `vhost` list of maps. Map entries use `,` separators (newlines
@@ -8957,6 +9078,9 @@ vhost: [
         let vhosts: Arc<ArcSwap<vhost_directory::VhostDirectory>> =
             Arc::new(ArcSwap::from(Arc::new(directory)));
         Arc::new(NodeState {
+            share_roots: file_share::Roots::default(),
+            share_runtime: crate::shares::Runtime::default(),
+            media_runtime: crate::media::Runtime::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -10154,7 +10278,7 @@ mod session_login_tests {
     /// INDETERMINATE here — without break-glass every login refuses with
     /// `err=unavailable` (pinned by
     /// `login_with_indeterminate_mfa_fails_closed`).
-    fn synth_jmap_node(td: &TempDir, stub: &str) -> Arc<NodeState> {
+    pub(crate) fn synth_jmap_node(td: &TempDir, stub: &str) -> Arc<NodeState> {
         synth_jmap_node_with(td, stub, true)
     }
 
@@ -10222,6 +10346,9 @@ mod session_login_tests {
         handlers: mix_handler::HandlerTable,
     ) -> Arc<NodeState> {
         Arc::new(NodeState {
+            share_roots: file_share::Roots::default(),
+            share_runtime: crate::shares::Runtime::default(),
+            media_runtime: crate::media::Runtime::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

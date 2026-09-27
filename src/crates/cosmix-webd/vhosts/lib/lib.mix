@@ -43,6 +43,7 @@ function cms_init()
   ensure_col("media", "storage TEXT NOT NULL DEFAULT 'inline'")
   ensure_col("media", "url_path TEXT NOT NULL DEFAULT ''")
   ensure_col("media", "hash TEXT NOT NULL DEFAULT ''")
+  ensure_col("media", "blob TEXT NULL")
   -- `updated` on media + users so every non-PIM datatable can default-sort on it (the
   -- uniform datatable contract). SQLite ALTER ADD COLUMN needs a CONSTANT default, so add
   -- DEFAULT '' then backfill from `created` (the row's only timestamp). media rows are
@@ -111,12 +112,15 @@ end
 
 -- Add a column if it isn't already there (SQLite has no ADD COLUMN IF NOT
 -- EXISTS). `$table`/`$coldef` are fixed literals from cms_init, never client
--- input. A duplicate-column ALTER raises; swallow it.
+-- input. Only a duplicate-column error is harmless. PRAGMA (including its
+-- table-valued functions) is deliberately denied by WebdDbHandler.
 function ensure_col($table, $coldef)
   try
     db_exec("ALTER TABLE " .. $table .. " ADD COLUMN " .. $coldef, [])
   catch $e
-    -- column already exists — nothing to do
+    if not contains("" .. $e, "duplicate column name:") then
+      raise("SCHEMA_MIGRATION_FAILED", $e)
+    end
   end
 end
 

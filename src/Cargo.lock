@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-files"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "blake3",
  "cosmix-lib-bus",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-webd"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2052,6 +2052,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bcrypt",
  "blake3",
  "chacha20poly1305",
  "clap",
@@ -2060,6 +2061,7 @@ dependencies = [
  "cosmix-lib-client",
  "cosmix-lib-config",
  "cosmix-lib-daemon",
+ "cosmix-lib-files",
  "cosmix-lib-log",
  "cosmix-lib-log-props",
  "cosmix-lib-mix",
