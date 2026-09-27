@@ -83,7 +83,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-maild-bayesian` | 0.7.1 |
 | `cosmix-maild-rules` | 0.3.1 |
 | `cosmix-mcp` | 0.6.0 |
-| `cosmix-mds` | 0.3.4 |
+| `cosmix-mds` | 0.3.5 |
 | `cosmix-mesh-sign` | 0.8.1 |
 | `cosmix-midicomp` | 0.3.1 |
 | `cosmix-mixer-schema` | 0.5.0 |
