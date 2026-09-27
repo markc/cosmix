@@ -167,8 +167,9 @@ Mutation admission is nonblocking per session. PATCH and commit share the
 16-worker control pool. Under global overload `503` can precede the session
 conflict check. Default active bounds are 16 per owner and 64 total, including
 `committing`; configure these with `upload_per_owner` and `upload_total`.
-Terminal rows do not consume these slots. A separate global budget of 1024
-receipts reserves one future receipt slot for each admitted live session;
+Terminal rows do not consume these slots. A separate global receipt budget of
+`max(1024, 2 × upload_total)` (1024 by default, 8192 at the maximum configuration)
+reserves one future receipt slot for each admitted live session;
 creation returns 429 when that budget is full. Receipts are never evicted
 before their TTL. Aborts delete the row and free the owner/key immediately;
 failed rows remain visible for at most 24 hours. Zero-byte sessions count too.

@@ -40,7 +40,7 @@ WHERE state IN ('active','committing');
 const SELECT: &str = "SELECT id,owner,upload_key,size,offset,expected_hash,mime,name,
 created_at,expires_at,state,actual_hash,result,error,staging_dev,staging_ino FROM upload_sessions";
 pub(super) const RECEIPT_TTL_MS: i64 = 86_400_000;
-const RECEIPT_LIMIT: u64 = 1024;
+const MIN_RECEIPT_LIMIT: u64 = 1024;
 
 /// Active sessions and terminal receipts have separate finite bounds. Receipts
 /// are never evicted early to admit a new upload (commit replay lasts 24 h).
@@ -62,6 +62,15 @@ impl Default for UploadLimits {
 }
 
 impl UploadLimits {
+    fn receipt_limit(&self) -> Result<u64> {
+        let twice_total = self
+            .total
+            .checked_mul(2)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| StoreError::BadRequest("upload receipt bound overflow".into()))?;
+        Ok(MIN_RECEIPT_LIMIT.max(twice_total))
+    }
+
     pub fn from_config(cfg: &Config) -> Result<Self> {
         let limits = Self {
             ttl_ms: cfg
@@ -384,7 +393,7 @@ impl Store {
         // unexpired receipt, and never charge terminal rows to an owner slot.
         if active >= self.upload_limits.total as u64
             || owner_active >= self.upload_limits.per_owner as u64
-            || receipts.saturating_add(active) >= RECEIPT_LIMIT
+            || receipts.saturating_add(active) >= self.upload_limits.receipt_limit()?
         {
             return Err(StoreError::UploadLimit);
         }
@@ -1523,7 +1532,7 @@ mod tests {
         store.upload_commit(&seed.id).unwrap();
         {
             let db = store.db.lock().unwrap();
-            for _ in 1..RECEIPT_LIMIT {
+            for _ in 1..store.upload_limits.receipt_limit().unwrap() {
                 db.execute("INSERT INTO upload_sessions(id,owner,size,mime,created_at,expires_at,state,result)
                     SELECT ?1,owner,size,mime,created_at,expires_at,state,result FROM upload_sessions WHERE id=?2",
                     params![uuid::Uuid::new_v4().to_string(), seed.id]).unwrap();
@@ -1552,6 +1561,48 @@ mod tests {
             store.upload_status(&seed.id),
             Err(StoreError::UploadMissing)
         ));
+    }
+
+    #[test]
+    fn receipt_bound_scales_with_configured_total_and_admits_past_1024() {
+        for (total, expected) in [(64, 1024), (512, 1024), (513, 1026), (4096, 8192)] {
+            let limits = UploadLimits {
+                total,
+                ..UploadLimits::default()
+            };
+            assert_eq!(limits.receipt_limit().unwrap(), expected);
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open_with_uploads(
+            dir.path(),
+            options(),
+            UploadLimits {
+                total: 4096,
+                ..UploadLimits::default()
+            },
+        )
+        .unwrap();
+        let (seed, _) = store.upload_create(&create(0)).unwrap();
+        store.upload_commit(&seed.id).unwrap();
+        {
+            let mut db = store.db.lock().unwrap();
+            let tx = db.transaction().unwrap();
+            for _ in 1..MIN_RECEIPT_LIMIT {
+                tx.execute("INSERT INTO upload_sessions(id,owner,size,mime,created_at,expires_at,state,result)
+                    SELECT ?1,owner,size,mime,created_at,expires_at,state,result FROM upload_sessions WHERE id=?2",
+                    params![uuid::Uuid::new_v4().to_string(), seed.id]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let (next, _) = store
+            .upload_create(&UploadCreate {
+                key: None,
+                ..create(0)
+            })
+            .unwrap();
+        assert_eq!(next.state, "active");
+        assert_eq!(store.all_uploads(None).unwrap().len(), 1025);
+        assert_eq!(store.upload_status(&seed.id).unwrap().state, "complete");
     }
 
     #[test]
