@@ -1041,6 +1041,40 @@ mod tests {
     }
 
     #[test]
+    fn dark_quiet_foreground_anchor_clears_aa_on_the_dark_muted_surface() {
+        let document = crate::parse_design_source(
+            crate::SourceIdentity::new("embedded:quiet-foreground-dark"),
+            crate::EMBEDDED_DEFAULT_SOURCE,
+        )
+        .expect("the embedded default parses");
+        for scheme in Scheme::ALL {
+            let result = crate::compile_design(
+                &document,
+                DesignContext {
+                    scheme,
+                    mode: Mode::Dark,
+                    ..Default::default()
+                },
+            );
+            let crate::DesignCompileResult::Success(success) = result else {
+                panic!("{} / dark did not compile: {result:#?}", scheme.name())
+            };
+            let colours = &success.candidate.dictionary().colours;
+            // Dark's muted pair keeps the default foreground, so the quiet
+            // anchor is only reachable as a bare primitive today — but a
+            // dark consumer must not silently inherit the light L 0.45
+            // value, which fails AA on every dark surface.
+            let quiet = colours.primitives["palette.foreground.quiet"];
+            let ratio = contrast_ratio(quiet, colours.pairs["muted"].rendered_surface);
+            assert!(
+                ratio >= 4.5,
+                "{} / dark quiet foreground on the muted surface: {ratio:.3}:1",
+                scheme.name()
+            );
+        }
+    }
+
+    #[test]
     fn invisible_ring_is_fatal_but_decorative_border_is_a_warning() {
         let mut source = fixture_source();
         source.semantics.non_text.get_mut("ring").unwrap().value = "dark".into();
@@ -1167,6 +1201,21 @@ mod tests {
         source.semantics.pairs.insert(
             "card".into(),
             PairSource::authored("transparent", "dark", Some("light".into())),
+        );
+        // The fixture seats the elevated roles on the L 0.62 grey precisely
+        // because `light` cannot clear AA there — the §3.6 fallback tests'
+        // premise — and this recipe's permitted override foreground is
+        // `light`, which must clear AA on every admitted pair's lifted
+        // surface; no 0.03 lift rescues 3.1:1 on that grey. This test
+        // exercises the domain gate, not the fallback, so both elevated
+        // roles sit on the muted grey, where `light` is AA-safe.
+        source.semantics.pairs.insert(
+            "elevated".into(),
+            PairSource::authored("mutedbg", "light", None),
+        );
+        source.semantics.pairs.insert(
+            "popover".into(),
+            PairSource::authored("mutedbg", "light", None),
         );
         source.semantics.pairs.insert(
             "secondary".into(),

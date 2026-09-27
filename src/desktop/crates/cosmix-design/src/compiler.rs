@@ -1679,16 +1679,26 @@ mod tests {
         let DesignCompileResult::Success(success) = &result else {
             panic!("the fallback repairs rather than refuses: {result:#?}")
         };
-        // The fallback warns once for the authored donor; the alias-filled
-        // popover copy is attributed to it, and the warning is invariant
-        // across every reachable context.
+        // The fallback warns on the authored donor in every reachable
+        // context and never on the alias-filled popover copy, which the
+        // donor attribution covers. compile_design collapses a diagnostic
+        // to one unqualified entry only when its code, path and message
+        // are identical in every context; this message embeds each
+        // context's measured ratios, so all twelve stay qualified — one
+        // per scheme×mode context.
         let fallbacks = success
             .diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.code == "elevated-text-fallback")
             .collect::<Vec<_>>();
-        assert_eq!(fallbacks.len(), 1, "{:?}", success.diagnostics);
-        assert!(fallbacks[0].path.ends_with("pairs.elevated"));
+        assert_eq!(
+            fallbacks.len(),
+            12,
+            "one elevated-text-fallback per reachable context: {:?}",
+            success.diagnostics
+        );
+        assert!(fallbacks.iter().all(|diagnostic| diagnostic.path.ends_with("pairs.elevated")));
+        assert!(fallbacks.iter().all(|diagnostic| !diagnostic.path.ends_with("pairs.popover")));
 
         let dictionary = success.candidate.dictionary();
         assert_eq!(

@@ -41,9 +41,12 @@ design: {
         "palette.background.elevated": { color_space: "oklch", l: 0.85, c: 0.018, h: 220.0 },
         "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.06, h: 220.0 },
         "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.06, h: 220.0 },
-        # Declared in the base so the light modifier blocks may override it:
-        # a modifier cannot introduce a path the base never authored. The base
-        # value is the ocean light anchor; dark never reads it.
+        # Declared in the base so the modifier blocks may override it: a
+        # modifier cannot introduce a path the base never authored. The base
+        # value is the ocean light anchor; every other block re-authors it —
+        # light per scheme, dark at the L 0.65 tier that clears WCAG AA on
+        # the L 0.26 dark muted surface (the dark muted foreground's L 0.61
+        # measures 4.10:1 there).
         "palette.foreground.quiet": { color_space: "oklch", l: 0.45, c: 0.06, h: 220.0 },
         "palette.accent.default": { color_space: "oklch", l: 0.50, c: 0.12, h: 220.0 },
         "palette.accent.hover": { color_space: "oklch", l: 0.45, c: 0.14, h: 220.0 },
@@ -127,6 +130,7 @@ design: {
             "palette.background.elevated": { color_space: "oklch", l: 0.34, c: 0.025, h: 220.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 220.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.04, h: 220.0 },
+            "palette.foreground.quiet": { color_space: "oklch", l: 0.65, c: 0.04, h: 220.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.75, c: 0.12, h: 220.0 },
             "palette.accent.hover": { color_space: "oklch", l: 0.85, c: 0.10, h: 220.0 }
           }
@@ -168,6 +172,7 @@ design: {
             "palette.background.elevated": { color_space: "oklch", l: 0.34, c: 0.025, h: 25.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 25.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.03, h: 25.0 },
+            "palette.foreground.quiet": { color_space: "oklch", l: 0.65, c: 0.03, h: 25.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.63, c: 0.23, h: 25.0 },
             "palette.accent.hover": { color_space: "oklch", l: 0.70, c: 0.25, h: 25.0 }
           }
@@ -209,6 +214,7 @@ design: {
             "palette.background.elevated": { color_space: "oklch", l: 0.34, c: 0.015, h: 60.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.01, h: 60.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.015, h: 60.0 },
+            "palette.foreground.quiet": { color_space: "oklch", l: 0.65, c: 0.015, h: 60.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.80, c: 0.03, h: 60.0 },
             "palette.accent.hover": { color_space: "oklch", l: 0.90, c: 0.02, h: 60.0 }
           }
@@ -250,6 +256,7 @@ design: {
             "palette.background.elevated": { color_space: "oklch", l: 0.34, c: 0.025, h: 150.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 150.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.04, h: 150.0 },
+            "palette.foreground.quiet": { color_space: "oklch", l: 0.65, c: 0.04, h: 150.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.70, c: 0.12, h: 150.0 },
             "palette.accent.hover": { color_space: "oklch", l: 0.80, c: 0.10, h: 150.0 }
           }
@@ -291,6 +298,7 @@ design: {
             "palette.background.elevated": { color_space: "oklch", l: 0.34, c: 0.03, h: 45.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.025, h: 45.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.05, h: 45.0 },
+            "palette.foreground.quiet": { color_space: "oklch", l: 0.65, c: 0.05, h: 45.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.72, c: 0.14, h: 45.0 },
             "palette.accent.hover": { color_space: "oklch", l: 0.82, c: 0.12, h: 45.0 }
           }
@@ -332,6 +340,7 @@ design: {
             "palette.background.elevated": { color_space: "oklch", l: 0.34, c: 0.0, h: 0.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.0, h: 0.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.0, h: 0.0 },
+            "palette.foreground.quiet": { color_space: "oklch", l: 0.65, c: 0.0, h: 0.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.85, c: 0.0, h: 0.0 },
             "palette.accent.hover": { color_space: "oklch", l: 0.92, c: 0.0, h: 0.0 }
           }
