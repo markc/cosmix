@@ -1,4 +1,4 @@
--- version: 0.5.0
+-- version: 0.6.0
 -- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
 $catalogue = require("store_catalogue.mix")
 $commit = require("store_commit.mix")
@@ -62,13 +62,12 @@ on store.snapshot.commit desc "Accept durable commit {collection,manifest}; comp
 end
 on stored.work desc "Idempotent mesh-open kick for pending work, including recovery" async
   if $WORKER_BUSY != nil then
-    if $event.headers.id != nil then reply(0, json_encode({accepted: true, busy: true})) end
+    if $event.headers.type == "request" then reply(0, "{}") end
     return
   end
   $worker_epoch = $EPOCH
   $WORKER_BUSY = $worker_epoch
   try
-    if $event.headers.id != nil then reply(0, json_encode({accepted: true, busy: false})) end
     $context = {commit: $commit, db: $DB_PATH, state: $STATE, epoch: $worker_epoch, io: $io}
     $run_job = fn($ctx) = $ctx.commit.run_pending($ctx.db, $ctx.state, $ctx.epoch, $ctx.io)
     $finish = fn($finished) = publish("store.commit.finished", json_encode($finished), {retain: false})
@@ -78,6 +77,8 @@ on stored.work desc "Idempotent mesh-open kick for pending work, including recov
     eprint("stored worker: " .. $message)
   finally
     if $WORKER_BUSY == $worker_epoch then $WORKER_BUSY = nil end
+    -- task_start has no request context; reply there is a runtime error.
+    if $event.headers.type == "request" then reply(0, "{}") end
   end
 end
 task_start("stored.work", "{}")

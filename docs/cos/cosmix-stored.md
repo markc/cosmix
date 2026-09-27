@@ -79,7 +79,7 @@ The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.
 | `store.snapshot.forget` | `collection`, `id` | Tombstone; `pins_retained:true` |
 | `store.commit.status` | `collection`, `id` | Durable state, error, times, forgotten flag |
 | `store.info` | none | Counts, schema, blobd target and release policy |
-| `stored.work` | none | Idempotent mesh-open kick; `accepted`, `busy` |
+| `stored.work` | none | Idempotent mesh-open kick; `{}` |
 
 Lists default to 100, accept 1..100, use exclusive lexical cursors. An exact
 full final page can require one extra empty read. Unknown records return
@@ -122,7 +122,11 @@ the citizen's work or a streaming transfer. A timed-out caller must use the
 durable status/recovery protocol rather than infer failure or cancellation.
 
 Any mesh caller may kick `stored.work`; it is fenced and only one worker
-owns the current epoch. A retired worker clears its busy flag only if it
+owns the current epoch. Request deliveries (`headers.type == "request"`)
+receive rc 0 and `{}` after draining, or immediately if a worker is already
+active. Local `task_start` continuations have no request context and never
+call `reply()`. A long drain can outlast the requester's timeout; use durable
+commit status to determine the outcome. A retired worker clears its busy flag only if it
 still owns that epoch. Escaping infrastructure failures (including connection
 or failed-state-write errors) get at most three retries, separated by 60 s.
 This is an error backstop, not a poll. After exhaustion, fix the underlying
