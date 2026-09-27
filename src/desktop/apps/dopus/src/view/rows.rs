@@ -61,7 +61,7 @@ pub struct Columns {
 }
 impl Columns {
     fn new(look: Look, values: &HashSet<String>) -> Self {
-        let measure = |s| {
+        let measure = |s: &str| -> f32 {
             FileList::shape(s, look.mono_font, look.small_px)
                 .min_bounds()
                 .width
