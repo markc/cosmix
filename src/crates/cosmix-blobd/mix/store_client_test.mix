@@ -1,0 +1,57 @@
+-- version: 0.1.0
+$c = require("store_client.mix")
+$checks = buffer()
+$dir = env("TMPDIR", "/tmp") .. "/store-client-test-" .. uuid()
+mkdir($dir)
+fn check($condition, $token)
+  if not $condition then raise("TEST", $token) end
+  buffer_push($checks, 1)
+end
+try
+  mkdir($dir .. "/tree/nested")
+  write_file($dir .. "/tree/empty", "")
+  write_file($dir .. "/tree/nested/binary", bytes_from([0, 255, 1, 128]))
+  write_file($dir .. "/tree/copy", bytes_from([0, 255, 1, 128]))
+  $v = $c.inventory($dir .. "/tree")
+  check($v.file_count == 3 and $v.size == 8, "BINARY_EMPTY_NESTED")
+  check(length(keys($v.objects)) == 2, "DUPLICATE_BYTES")
+  check($v.manifest.files[0].blob == "b3:" .. hash_file($dir .. "/tree/copy", "blake3"), "EXPLICIT_BLAKE3")
+  check($c.inventory($dir .. "/tree").canonical == $v.canonical, "STABLE_INVENTORY")
+  write_file($dir .. "/tree/copy", "changed")
+  check($c.inventory($dir .. "/tree").id != $v.id, "MUTATION_DETECTED")
+  symlink("nested/binary", $dir .. "/tree/link")
+  $caught = ""
+  try
+    $c.inventory($dir .. "/tree")
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_SOURCE", "SYMLINK_REFUSED")
+  write_file($dir .. "/tree/.storeignore", "# literal rules\nlink\nnested/\n.storeignore\n")
+  $ignored = $c.inventory($dir .. "/tree")
+  check($ignored.file_count == 2, "LITERAL_AND_SUBTREE_IGNORE")
+  write_file($dir .. "/tree/.storeignore", "*.tmp\n")
+  $caught = ""
+  try
+    $c.inventory($dir .. "/tree")
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_IGNORE", "NO_SILENT_GLOB_INTERPRETATION")
+  $cfg = $c.configuration({node: "archive", instance: "two", "local-blobd": "blobd-fetch"})
+  check($cfg.service == "stored-two.archive.bus" and $cfg.blobd == "blobd-two.archive.bus" and $cfg.local_blobd == "blobd-fetch", "EXPLICIT_ROUTING")
+  $c.cache_lock($dir .. "/cache")
+  $probe = "if flock(" .. json_encode($dir .. "/cache/.lock") .. ") then exit(1) end"
+  check(run_argv(["/opt/cosmix/bin/mix", "-c", $probe]).ok, "SECOND_PROCESS_LOCK_REFUSED")
+  check(stat($dir .. "/cache").perm == 0o700, "PRIVATE_CACHE")
+  $caught = ""
+  try
+    mkdir($dir .. "/tree", {parents: false})
+  catch $message
+    $caught = $message
+  end
+  check($caught != "", "EXISTING_RESTORE_ROOT_REFUSED")
+finally
+  remove_dir($dir)
+end
+print("store_client_test: PASS " .. to_string(length(freeze($checks))))

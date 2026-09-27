@@ -38,6 +38,7 @@ From the checkout, without root or a broker:
 mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
 mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
 mix src/crates/cosmix-blobd/mix/store_commit_test.mix
+mix src/crates/cosmix-blobd/mix/store_client_test.mix
 ```
 
 ## Catalogue citizen
@@ -101,3 +102,52 @@ Failed work may retain partial pins and upload receipts. This is intentional
 until a separate release policy is designed. Blobd quota counts unique bytes
 per owner, including manifest bytes, and pending upload reservations; it is
 not the old pilot's logical snapshot quota. This is an explicit policy change.
+
+## Client
+
+Run the shipped `mix/store.mix` beside the libraries:
+
+```text
+mix store.mix --node archive push source ./source
+mix store.mix --node archive list source
+mix store.mix --node archive status source b3:…
+mix store.mix --node archive restore source b3:… ./new-restore
+```
+
+Without `--node`, the target is local. `--instance two` selects both
+`stored-two` and `blobd-two`; `--local-blobd` selects the restore receiver
+(default `blobd`). Discovery checks that stored is bound to that target.
+Restore resolves each reference's origin from the target's `blob.stat`,
+calls `blob_fetch_wait` sequentially with an explicit restore owner, then
+downloads from the local lane with `expect_blake3`, no-clobber publication,
+size verification and a final BLAKE3 check. The destination must not exist;
+its parent must exist. Failure leaves verified partial files. Restore pins
+under `store-restore:<collection>` are retained in this arc too.
+
+Push walks regular files only, hashes explicitly with BLAKE3 and uses
+`blob.has` only to choose transfers. Present objects are pinned and size
+checked; missing objects use durable upload sessions. Each path is rehashed
+after transfer, then the whole inventory is compared again before commit.
+Keep the source quiescent: this detects changes, but is not a filesystem
+snapshot or protection against hostile concurrent namespace replacement.
+Empty directories and file metadata are not archived.
+
+`.storeignore` contains literal root-relative paths or trailing-slash subtree
+rules, one per line; blank lines and `#` comments are ignored. Globs and
+negations are refused. The file itself is included unless `.storeignore` is
+listed. Excluded entries are not inspected. The control file is at most
+64 KiB and a walk visits at most 10000 entries, besides manifest limits.
+
+The default cache is `~/.cache/cosmix/store/` (override `--cache`). One
+exclusive process lock covers it; it cannot live inside the source tree.
+Target, collection and source root isolate resume records; object identity
+names each record. Atomic mode-0600 records retain B0's session key, identity
+and server receipt across a killed push. Retry the same command. Changed
+bytes get a different record; old receipts/reservations are retained until
+blobd expiry or explicit operator abort. Transfers are sequential; `--chunk`
+accepts 1..8388608 bytes and `--timeout` defaults to 900 seconds.
+
+The client subscribes before commit, then checks durable status once after
+completion or timeout. Pending is never reported as committed. `list` follows
+all pages; `status` exposes the durable job including failure or tombstone.
+One-shot event users finish with `quit()`; failures exit nonzero.
