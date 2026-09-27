@@ -4,7 +4,7 @@
 
 use cosmix_design::{LinearRgba, ResolvedColours, ResolvedDictionary, ResolvedMetricKind};
 use iced_core::{Border, Color};
-use iced_widget::text_input;
+use iced_widget::{container, text_input};
 
 use crate::{AudioStyle, MenuStyle};
 
@@ -154,6 +154,29 @@ impl Tokens {
         }
     }
 
+    /// Opaque tooltip chrome using the same neutral popover pair as menus.
+    /// Pass the resolved `button.border_width` metric (1 px in the default
+    /// design); padding belongs to the tooltip's spacing-scale configuration.
+    /// Opacity is enforced even for custom designs and preview palettes.
+    pub fn tooltip_style(self, border_width: f32) -> container::Style {
+        container::Style {
+            background: Some(
+                Color {
+                    a: 1.0,
+                    ..self.popover
+                }
+                .into(),
+            ),
+            text_color: Some(self.popover_text),
+            border: Border {
+                color: self.border,
+                width: border_width,
+                radius: self.radius.into(),
+            },
+            ..Default::default()
+        }
+    }
+
     /// Style for the pro-audio controls and canvases. Meter zones run
     /// primary (below -12 dB), accent (to -3 dB), destructive (above).
     pub fn audio_style(self) -> AudioStyle {
@@ -298,6 +321,39 @@ mod tests {
         assert_eq!(audio.meter_clip, tokens.destructive);
         assert_eq!(audio.background, tokens.card);
         assert_eq!(audio.radius, 4.0);
+    }
+
+    #[test]
+    fn tooltip_style_is_pure_token_chrome_and_always_opaque() {
+        for tokens in [
+            Tokens::default(),
+            Tokens::from_dictionary(&dictionary()).unwrap(),
+        ] {
+            let tokens = Tokens {
+                popover: Color {
+                    a: 0.25,
+                    ..tokens.popover
+                },
+                ..tokens
+            };
+            let style = tokens.tooltip_style(1.0);
+            assert_eq!(style, tokens.tooltip_style(1.0));
+            assert_eq!(
+                style.background,
+                Some(
+                    Color {
+                        a: 1.0,
+                        ..tokens.popover
+                    }
+                    .into()
+                )
+            );
+            assert_eq!(style.text_color, Some(tokens.popover_text));
+            assert_eq!(style.border.color, tokens.border);
+            assert_eq!(style.border.width, 1.0);
+            assert_eq!(style.border.radius, tokens.radius.into());
+            assert_eq!(tokens.tooltip_style(2.0).border.width, 2.0);
+        }
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 ## 0.3.1
 
+- Use the shared widgets tooltip style: opaque neutral popover background,
+  matching text, muted token border and rounded corners with token padding.
 - Give each pane a small muted summary box below its clipped list. Keep
   panel toggles and messages in the shared status bar; expose the same
   totals as an additive `summary` field in each Bus pane state.

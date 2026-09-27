@@ -36,7 +36,7 @@ pub fn tip<'a, M: 'a>(
     )
     .padding(look.chrome.pad)
     .gap(look.chrome.small)
-    .style(look.strip(look.tokens.popover, look.tokens.popover_text))
+    .style(move |_| look.tokens.tooltip_style(look.chrome.edge))
     .into()
 }
 

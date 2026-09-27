@@ -25,7 +25,10 @@ All icon controls have iced tooltips, including Places, sort headers, listing
 icons and expansion chevrons. Action tooltips and status-bar shortcut labels
 read the effective keymap, including custom remaps and unbindings, and update
 when the keymap reloads. Ctrl alternatives appear before function keys in
-tooltip labels. Tooltip colours and spacing use design tokens; the design
+tooltip labels. Tooltips reuse `cosmix-iced-widgets`' `Tokens::tooltip_style`:
+an opaque neutral popover surface and its on-surface text, a muted border
+(the default design's 1-px border metric), token radius and spacing-scale padding.
+Even a translucent custom popover colour is made opaque. The design
 currently has no timing token, so iced's default delay applies.
 Each pane shows only its editable location bar above the column headers;
 there is no duplicate path beside the toolbar. Ctrl+L and `location.focus`
