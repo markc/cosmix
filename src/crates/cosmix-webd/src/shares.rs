@@ -448,6 +448,15 @@ fn challenge() -> Response {
         .insert("www-authenticate", "Basic realm=\"share\"".parse().unwrap());
     response
 }
+fn public_error(reason: String) -> Response {
+    let token = reason.split_once(':').map(|(prefix, _)| format!("{prefix}:"));
+    if let Some(token) = token {
+        tracing::warn!(%reason, "public share request failed");
+        error(token)
+    } else {
+        error(reason)
+    }
+}
 fn attachment(name: &str) -> String {
     let name = name.rsplit(['/', '\\']).next().unwrap_or("download");
     let name: String = name.chars().filter(|c| !c.is_control()).take(200).collect();
@@ -475,21 +484,21 @@ pub async fn serve(
         return (StatusCode::METHOD_NOT_ALLOWED, [("allow", "GET, HEAD")]).into_response();
     }
     let Some(db) = &vhost.db else {
-        return error("not_found".into());
+        return public_error("not_found".into());
     };
     let gate = {
         let db = db.lock().await;
         match file_share::resolve(&db, &vhost.fqdn, &token, session::now_secs()) {
             Ok(g) => g,
-            Err(e) => return error(catalogue_error(e)),
+            Err(e) => return public_error(catalogue_error(e)),
         }
     };
     let Some(Extension(peer)) = peer else {
-        return error("busy: peer context unavailable".into());
+        return public_error("busy: peer context unavailable".into());
     };
     let permit = match node.share_runtime.downloads.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return error("busy: public download pool full (8)".into()),
+        Err(_) => return public_error("busy: public download pool full (8)".into()),
     };
     let verified = if let Some(hash) = gate.password_hash {
         if !peer.tls {
@@ -517,7 +526,7 @@ pub async fn serve(
                     .failed(&token, peer.ip, Instant::now());
                 return challenge();
             },
-            Err(e) => return error(e),
+            Err(e) => return public_error(e),
         }
     } else {
         None
@@ -527,7 +536,7 @@ pub async fn serve(
         let db = db.lock().await;
         let gate = match file_share::resolve(&db, &vhost.fqdn, &token, session::now_secs()) {
             Ok(g) => g,
-            Err(e) => return error(catalogue_error(e)),
+            Err(e) => return public_error(catalogue_error(e)),
         };
         match gate.authorize(verified.as_deref()) {
             Ok(t) => (gate.share.account.clone(), t.clone()),
@@ -536,7 +545,7 @@ pub async fn serve(
     };
     let range = headers.get("range").cloned();
     if range.as_ref().is_some_and(|r| r.as_bytes().len() > 1024) {
-        return error("invalid_arguments: Range too long".into());
+        return public_error("invalid_arguments: Range too long".into());
     }
     let result = match target.1 {
         file_share::Target::Blob { reference } => {
@@ -561,7 +570,7 @@ pub async fn serve(
     };
     let (download, name) = match result {
         Ok(value) => value,
-        Err(e) => return error(e),
+        Err(e) => return public_error(e),
     };
     let mut response = Response::new(
         if method == Method::HEAD || download.status == StatusCode::RANGE_NOT_SATISFIABLE {
@@ -725,6 +734,13 @@ fn counted_body_with_deadlines(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn public_lane_errors_do_not_disclose_upstream_details() {
+        let response = public_error("lane: http://127.0.0.1:9999/blob secret upstream body".into());
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({"error":"lane:"}));
+    }
     #[tokio::test]
     async fn stalled_reader_releases_public_and_upstream_permits() {
         let (_tmp, _node, vhost) = fixture().await;
