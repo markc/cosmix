@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE upload_sessions (
@@ -208,6 +208,35 @@ fn check_upload_device(cas_device: u64, staging_device: u64) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static UPLOAD_LINK_PROBE_EXDEV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UPLOAD_SETGID_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+// Group inheritance is optional: unprivileged containers can refuse setgid.
+// The caller establishes private 0700 permissions first, including on restore.
+fn apply_upload_setgid(path: &Path) {
+    let setgid = || -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(errno) = UPLOAD_SETGID_ERROR.with(|error| error.take()) {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o2700))?;
+        // chmod can succeed while the kernel silently drops S_ISGID when
+        // the daemon is not a member of the directory's group.
+        if fs::metadata(path)?.mode() & 0o2000 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "kernel silently dropped the setgid bit",
+            ));
+        }
+        Ok(())
+    };
+    if let Err(error) = setgid() {
+        tracing::warn!(
+            target: "cosmix_blobd",
+            "setgid {} (mode 2700) failed: {error}; upload staging stays private (mode 0700)",
+            path.display()
+        );
+    }
 }
 
 fn probe_upload_links(uploads: &Path, temporary: &Path) -> Result<()> {
@@ -950,12 +979,17 @@ impl Store {
     }
 
     pub(super) fn restore_uploads(&self) -> Result<()> {
-        fs::create_dir_all(self.uploads_root())?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(self.uploads_root())?;
         check_upload_device(
             fs::metadata(self.blobs_root())?.dev(),
             fs::metadata(self.uploads_root())?.dev(),
         )?;
-        fs::set_permissions(self.uploads_root(), fs::Permissions::from_mode(0o2700))?;
+        // Privacy is required; the setgid upgrade is only best-effort.
+        fs::set_permissions(self.uploads_root(), fs::Permissions::from_mode(0o700))?;
+        apply_upload_setgid(&self.uploads_root());
         probe_upload_links(&self.uploads_root(), &self.blobs_root().join(".tmp"))?;
         sync_dir(&self.blobs_root())?;
         self.db
@@ -1022,6 +1056,33 @@ mod tests {
             mime: "application/octet-stream".into(),
             name: None,
             key: Some("retry-key".into()),
+        }
+    }
+
+    #[test]
+    fn startup_setgid_refusal_keeps_private_staging_and_opens_store() {
+        for errno in [libc::EPERM, libc::ENOTSUP] {
+            let dir = tempfile::TempDir::new().unwrap();
+            // Upgrade the 0750 staging directory left by a failed 0.6.0 start.
+            let uploads = dir.path().join("blobs/.uploads");
+            fs::create_dir_all(&uploads).unwrap();
+            fs::set_permissions(&uploads, fs::Permissions::from_mode(0o750)).unwrap();
+            assert_eq!(fs::metadata(&uploads).unwrap().mode() & 0o7777, 0o750);
+            // Exercise both the upgrade and reopening an existing store.
+            for _ in 0..2 {
+                UPLOAD_SETGID_ERROR.with(|error| error.set(Some(errno)));
+                let result = Store::open(dir.path(), options());
+                let pending = UPLOAD_SETGID_ERROR.with(|error| error.take());
+                let store = result.unwrap();
+                assert_eq!(pending, None, "setgid failure injection was not consumed");
+                assert_eq!(
+                    fs::metadata(store.uploads_root()).unwrap().mode() & 0o7777,
+                    0o700
+                );
+                let (session, _) = store.upload_create(&create(0)).unwrap();
+                assert_eq!(session.offset, 0);
+                store.upload_abort(&session.id).unwrap();
+            }
         }
     }
 
