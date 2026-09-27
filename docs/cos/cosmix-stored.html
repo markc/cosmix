@@ -546,7 +546,11 @@ Restore resolves each reference's origin from the target's <code>blob.stat</code
 calls <code>blob_fetch_wait</code> sequentially with an explicit restore owner, then
 downloads from the local lane with <code>expect_blake3</code>, no-clobber publication,
 size verification and a final BLAKE3 check. The destination must not exist;
-its parent must exist. Failure leaves verified partial files. Restore pins
+its parent must exist. Files are verified inside a sibling
+<code>.&lt;name&gt;.partial-&lt;uuid&gt;</code> directory; only a completely verified tree is renamed
+onto the requested name. Failure leaves that visibly partial directory. Keep
+the destination parent free of concurrent namespace writers; Mix's rename is
+atomic but does not offer <code>RENAME_NOREPLACE</code>. Restore pins
 under <code>store-restore:&lt;collection&gt;</code> are retained in this arc too.</p>
 <p>Push walks regular files only, hashes explicitly with BLAKE3 and uses
 <code>blob.has</code> only to choose transfers. Present objects are pinned and size

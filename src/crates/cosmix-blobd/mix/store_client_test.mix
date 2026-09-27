@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 $c = require("store_client.mix")
 $checks = buffer()
 $dir = env("TMPDIR", "/tmp") .. "/store-client-test-" .. uuid()
@@ -8,6 +8,17 @@ fn check($condition, $token)
   buffer_push($checks, 1)
 end
 try
+  $destination = $c.restore_begin($dir .. "/restored")
+  write_file($destination.root .. "/verified", "bytes")
+  check(not exists($destination.requested) and contains($destination.root, ".restored.partial-"), "INCOMPLETE_RESTORE_IS_DISTINCT")
+  check($c.restore_publish($destination) == $dir .. "/restored" and read_file($dir .. "/restored/verified") == "bytes", "PUBLISH_COMPLETE_TREE")
+  $caught = ""
+  try
+    $c.restore_begin($dir .. "/restored")
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_DESTINATION", "RESTORE_NO_CLOBBER")
   mkdir($dir .. "/tree/nested")
   write_file($dir .. "/tree/empty", "")
   write_file($dir .. "/tree/nested/binary", bytes_from([0, 255, 1, 128]))

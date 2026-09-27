@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -169,6 +169,23 @@ fn push_tree($cfg, $collection, $directory, $events)
   return commit_wait($cfg, $collection, $v, $events)
 end
 
+fn restore_begin($directory)
+  if exists($directory, {follow_symlinks: false}) then raise("STORE_DESTINATION", "restore destination already exists") end
+  $parent = realpath(dirname($directory))
+  $name = basename($directory)
+  if $parent == nil or contains(["", ".", ".."], $name) then raise("STORE_DESTINATION", "restore needs an existing parent and a new name") end
+  $requested = $parent .. "/" .. $name
+  $partial = $parent .. "/." .. $name .. ".partial-" .. uuid()
+  mkdir($partial, {parents: false})
+  return {root: $partial, requested: $requested}
+end
+
+fn restore_publish($destination)
+  if exists($destination.requested, {follow_symlinks: false}) then raise("STORE_DESTINATION", "restore destination appeared during transfer") end
+  rename($destination.root, $destination.requested)
+  return $destination.requested
+end
+
 fn restore_tree($cfg, $collection, $id, $directory)
   $m.collection($collection)
   $m.blob($id)
@@ -176,9 +193,8 @@ fn restore_tree($cfg, $collection, $id, $directory)
   $snapshot = rpc($cfg.service, "store.snapshot.get", {collection: $collection, id: $id})
   $v = $m.verify($snapshot.manifest, $id)
   if $snapshot.id != $id or $snapshot.manifest_blob != $id then raise("STORE_IDENTITY", "catalogue reference differs") end
-  -- create_dir (not create_dir_all) refuses an existing file/dir/symlink.
-  mkdir($directory, {parents: false})
-  $root = realpath($directory)
+  $destination = restore_begin($directory)
+  $root = $destination.root
   for each $entry in $v.manifest.files
     $remote = unwrap($b.blob_stat($entry.blob, {service: $cfg.blobd}))
     if $remote.present != true or $remote.size != $entry.size then raise("STORE_SIZE", "restore source differs") end
@@ -198,5 +214,5 @@ fn restore_tree($cfg, $collection, $id, $directory)
     unwrap($b.blob_download_file($ref, $file, {service: $cfg.local_blobd, max_bytes: $entry.size}))
     if stat($file).size != $entry.size or hash_file($file, "blake3") != slice($entry.blob, 3) then raise("STORE_IDENTITY", "restored file differs") end
   end
-  return {collection: $collection, id: $id, restored: $v.file_count, directory: $root}
+  return {collection: $collection, id: $id, restored: $v.file_count, directory: restore_publish($destination)}
 end
