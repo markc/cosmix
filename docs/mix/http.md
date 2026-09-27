@@ -1,5 +1,47 @@
 # http — HTTP client builtins
 
+## Streaming file download (0.97.0)
+
+`http_get_file(url, path[, opts]) -> map<http_file_response>` streams GET to a
+unique sibling created exclusively with mode 0600. It hashes while writing,
+syncs the completed file, publishes atomically, then syncs the directory.
+The parent directory must exist. Defaults refuse an existing destination:
+Linux uses `renameat2(RENAME_NOREPLACE)`, with atomic hard-link creation as
+the fallback. Unsupported filesystems fail; there is no check-then-rename
+fallback. `overwrite: true` permits atomic replacement of a regular file,
+preserving its current permission bits. Symlink replacement is refused.
+
+Options are `overwrite`, `append`, `expect_blake3` (64 lowercase hex digits),
+`max_bytes`, `headers`, and the upload timeout/TLS options below. Redirects
+are returned. Only a 200 or 204 installs a fresh file. HTTP error bodies may
+be returned in `body`/`bytes` (64 MiB cap), but never become the destination.
+Successful file bodies stay on disk; `body` is nil and `bytes` empty.
+
+`append: true` requires `expect_blake3` for the **whole final file** and an
+existing regular prefix file. It copies and hashes the prefix into staging,
+requests `Range: bytes=<prefix-size>-`, and accepts only a 206 with one
+Content-Range starting at that size and ending at the representation's final
+byte. An ignored Range, wrong range, short read or hash mismatch leaves the
+prefix unchanged. Append and overwrite are mutually exclusive; append itself
+authorises replacing the prefix after verification. Keep the destination
+exclusive to this caller during append/overwrite. The builtin owns Range and
+Accept-Encoding (requests identity); these headers cannot be overridden.
+
+`max_bytes` applies to the final size, including the prefix, and defaults to
+9007199254740991 (the exact integer limit). `bytes_written` counts downloaded
+bytes written to staging; `size` includes the copied prefix. `blake3` is the
+verified final digest, or nil on failure. The extra `published` boolean is
+true once publication succeeds, including the rare status-0 directory-sync
+failure after publication; callers must not interpret that failure as rollback.
+All earlier failures remove staging and preserve the destination.
+
+Operational failures return status 0 with `FILE_IO`, `FILE_EXISTS`,
+`HTTP_RANGE`, `HTTP_HASH_MISMATCH`, `HTTP_SHORT_READ`, `HTTP_BODY_LIMIT`, or
+the HTTP transport/body codes. Invalid options raise. Network and FsWrite
+are unconditional; append:true or ca_file additionally requires FsRead.
+The same socket inactivity and cooperative deadline limitations apply as for
+uploads. Memory use for successful downloads stays bounded by a 64 KiB buffer.
+
 ## Streaming file upload (0.97.0)
 
 `http_put_file(url, path[, opts]) -> map<http_file_response>` streams a regular
@@ -23,7 +65,7 @@ seconds, up to one year.
 
 The distinct `http_file_response` has `status`, `headers`, `bytes_written`,
 `size`, `blake3`, `body`, `bytes`, `final_url`, `duration_ms`, `error_code`, and
-`error`. For uploads, `bytes_written` counts source bytes consumed, not a
+`error`, and `published` (false for uploads). For uploads, `bytes_written` counts source bytes consumed, not a
 server's durable acknowledgement; `size` is the selected window size and
 `blake3` is its lowercase digest (nil on failure). Response bodies are capped
 at 64 MiB. HTTP failures retain their real status; IO/transport failures return

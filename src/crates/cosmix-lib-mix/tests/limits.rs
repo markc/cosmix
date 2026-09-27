@@ -41,6 +41,19 @@ async fn upload_requires_read_capability_even_without_options() {
     assert!(err.contains("fs-read"), "{err}");
 }
 
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn download_requires_write_and_append_requires_read() {
+    for (src,caps,want) in [
+        ("$r = http_get_file(\"http://invalid.invalid\", \"absent\")", vec![CapabilityClass::Network], "fs-write"),
+        ("$r = http_get_file(\"http://invalid.invalid\", \"absent\", {append:true})", vec![CapabilityClass::Network,CapabilityClass::FsWrite], "fs-read"),
+    ] {
+        let err = run(src, |e| e.set_capability_policy(Rc::new(CategoryAllowList::new(&caps))))
+            .await.expect_err("capability must be checked before IO");
+        assert!(err.contains(want),"{err}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Knob B — recursion-depth cap (every native path)
 // ---------------------------------------------------------------------------

@@ -24,6 +24,20 @@ fn codes(src: &str) -> Vec<String> {
     lint(src).into_iter().map(|(c, _)| c).collect()
 }
 
+#[test]
+fn streaming_http_contracts_include_filesystem_capabilities() {
+    for (name,cap) in [("http_put_file","fs-read"),("http_get_file","fs-write")] {
+        let src = format!("$r = {name}(\"https://example.invalid/file\", \"file\")\nprint($r.status)\n");
+        let tokens = Lexer::new(&src).tokenize().unwrap();
+        let stmts = Parser::new(tokens,&src).parse_program().unwrap();
+        let a = analyze(&stmts,Some("test.mix"),&AnalyzerConfig::default());
+        assert!(a.capabilities.contains(&"network"));
+        assert!(a.capabilities.contains(&cap));
+        let info = cosmix_mix::builtins::builtin_info_of(name).unwrap();
+        assert_eq!(info.signature(),format!("{name}(url, path[, opts]) -> map<http_file_response>"));
+    }
+}
+
 /// Like `lint`, but keeps the code + hint so a test can pin the FIX a
 /// diagnostic names, not just that it fired.
 fn lint_full(src: &str) -> Vec<(String, Option<String>)> {
