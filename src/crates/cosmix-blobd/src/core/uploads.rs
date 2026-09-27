@@ -219,7 +219,16 @@ fn apply_upload_setgid(path: &Path) {
         if let Some(errno) = UPLOAD_SETGID_ERROR.with(|error| error.take()) {
             return Err(io::Error::from_raw_os_error(errno));
         }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o2700))
+        fs::set_permissions(path, fs::Permissions::from_mode(0o2700))?;
+        // chmod can succeed while the kernel silently drops S_ISGID when
+        // the daemon is not a member of the directory's group.
+        if fs::metadata(path)?.mode() & 0o2000 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "kernel silently dropped the setgid bit",
+            ));
+        }
+        Ok(())
     };
     if let Err(error) = setgid() {
         tracing::warn!(
@@ -1054,7 +1063,12 @@ mod tests {
     fn startup_setgid_refusal_keeps_private_staging_and_opens_store() {
         for errno in [libc::EPERM, libc::ENOTSUP] {
             let dir = tempfile::TempDir::new().unwrap();
-            // Exercise both initial creation and reopening an existing store.
+            // Upgrade the 0750 staging directory left by a failed 0.6.0 start.
+            let uploads = dir.path().join("blobs/.uploads");
+            fs::create_dir_all(&uploads).unwrap();
+            fs::set_permissions(&uploads, fs::Permissions::from_mode(0o750)).unwrap();
+            assert_eq!(fs::metadata(&uploads).unwrap().mode() & 0o7777, 0o750);
+            // Exercise both the upgrade and reopening an existing store.
             for _ in 0..2 {
                 UPLOAD_SETGID_ERROR.with(|error| error.set(Some(errno)));
                 let result = Store::open(dir.path(), options());
