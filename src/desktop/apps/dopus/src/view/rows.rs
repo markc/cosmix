@@ -138,8 +138,9 @@ fn size_text(entry: &FileEntry) -> String {
     }
 }
 
-// Size/count strings use the mono role. Keep only a bounded set of longest
-// strings; shaping every distinct file size makes large relists expensive.
+// Size/count strings use the mono role, assuming width follows grapheme count.
+// Overrides may use a proportional family: retain every tie at the fourth
+// longest length so equal-length values cannot hide a wider candidate.
 const SIZE_CANDIDATES: usize = 4;
 
 fn listing_size_width<S: AsRef<str>>(
@@ -154,16 +155,21 @@ fn listing_size_width<S: AsRef<str>>(
     for value in values {
         let length = value.as_ref().graphemes(true).count();
         let position = longest.partition_point(|(n, _)| *n >= length);
-        if position < SIZE_CANDIDATES {
-            if longest.len() == SIZE_CANDIDATES {
-                longest.pop();
-            }
+        if longest.len() < SIZE_CANDIDATES || length >= longest[SIZE_CANDIDATES - 1].0 {
             longest.insert(position, (length, value));
+            if longest.len() > SIZE_CANDIDATES {
+                let cutoff = longest[SIZE_CANDIDATES - 1].0;
+                let keep = longest.partition_point(|(n, _)| *n >= cutoff);
+                longest.truncate(keep);
+            }
         }
     }
+    let mut measured = HashSet::new();
     longest
         .iter()
-        .map(|(_, s)| measure(s.as_ref()))
+        .map(|(_, s)| s.as_ref())
+        .filter(|s| measured.insert(*s))
+        .map(measure)
         .fold(floor, f32::max)
         .min(ceiling)
         + 2.0 * padding
@@ -172,8 +178,8 @@ fn listing_size_width<S: AsRef<str>>(
 type ColumnMetrics = (iced::Font, u32, iced::Font, u32, crate::theme::Chrome);
 
 /// Shared header/row measurements. Unchanged signatures do no formatting or
-/// shaping. Changed listings shape at most four Size candidates plus the
-/// floor, ceiling, Modified sample and Name minimum (eight paragraphs).
+/// shaping. Changed listings shape the four longest Size candidates and all
+/// cutoff ties (deduplicated), plus four fixed layout samples.
 #[derive(Default)]
 pub struct ColumnCache {
     root: Option<PathBuf>,
@@ -196,7 +202,7 @@ impl ColumnCache {
             look.chrome,
         );
         if self.metrics.as_ref() != Some(&metrics) {
-            self.signature = None;
+            self.reset_measurements();
         }
         self.refresh_columns(
             &pane.path,
@@ -204,6 +210,12 @@ impl ColumnCache {
             || Columns::new(look, rows),
         );
         self.metrics = Some(metrics);
+    }
+
+    fn reset_measurements(&mut self) {
+        self.signature = None;
+        self.root = None;
+        self.columns = None;
     }
 
     fn refresh_columns(
@@ -915,7 +927,7 @@ mod column_tests {
     }
 
     #[test]
-    fn five_thousand_values_have_bounded_shaping_and_unchanged_frames_do_no_work() {
+    fn five_thousand_values_without_cutoff_ties_shape_eight_paragraphs() {
         use std::cell::Cell;
         let calls = Cell::new(0);
         let measure = |s: &str| {
@@ -928,7 +940,16 @@ mod column_tests {
         let root = Path::new("/listing");
         let signature = (1, 1, 5000);
         cache.refresh_columns(root, signature, || Columns {
-            size: listing_size_width((0..5000).map(|i| format_size(i * 1031)), 4.0, measure),
+            size: listing_size_width(
+                (0..4996).map(|_| "1 B").chain([
+                    "1.0 KiB",
+                    "99.9 KiB",
+                    "1023.9 KiB",
+                    "999999 items",
+                ]),
+                4.0,
+                measure,
+            ),
             // The production constructor also shapes these two samples.
             name_min: measure("MMMM"),
             modified: measure("88/88/88 88:88"),
@@ -941,6 +962,18 @@ mod column_tests {
             });
         }
         assert_eq!(calls.get(), SIZE_CANDIDATES + 4);
+    }
+
+    #[test]
+    fn proportional_widths_keep_every_cutoff_tie() {
+        let values = ["11111111", "22222222", "33333333", "44444444", "88888888"];
+        let width = listing_size_width(values.into_iter(), 0.0, |s: &str| match s {
+            "99.9 MiB" => 5.0,
+            "999999 items" => 20.0,
+            "88888888" => 15.0,
+            _ => 8.0,
+        });
+        assert_eq!(width, 15.0, "the fifth equal-length candidate is widest");
     }
 
     #[test]
@@ -960,6 +993,10 @@ mod column_tests {
         }
         cache.refresh_columns(Path::new("/other"), (3, 4, 8), || with_size(70.0));
         assert_eq!(cache.columns.unwrap().size, 70.0);
+        // A typography change resets hysteresis even with identical root/signature.
+        cache.reset_measurements();
+        cache.refresh_columns(Path::new("/other"), (3, 4, 8), || with_size(40.0));
+        assert_eq!(cache.columns.unwrap().size, 40.0);
     }
 
     #[test]

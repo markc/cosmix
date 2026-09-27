@@ -47,10 +47,13 @@ Size reserves the widest shaped size/count value in that pane's listing, with
 a `99.9 MiB` floor and `999999 items` ceiling plus token padding. The cached
 width updates on relists, count replies and typography changes; headers and
 rows receive the same layout. A generation/reply-revision/row-count signature
-skips unchanged listings before formatting. Only the four longest Size strings
-are shaped, with eight paragraphs at most per changed column-cache refresh
-including fixed samples. Size grows but never shrinks within the same pane
-root; navigating to another root resets it. Small-file listings leave more
+skips unchanged listings before formatting. The four longest Size strings and
+all ties at the fourth-longest grapheme count are shaped, deduplicating identical
+values. This assumes the Mono role is monospaced; retaining ties also handles
+equal-length values in proportional overrides. With no extra ties, at most eight
+paragraphs are shaped including fixed samples; each extra distinct tie adds one.
+Size grows but never shrinks within the same pane root and typography;
+navigating to another root or changing typography resets it. Small-file listings leave more
 room for names.
 Selection uses the design's `selection`/`selection_text` pair, and a
 `muted_surface` header marks the active pane. Modified times are always local
