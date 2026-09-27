@@ -645,6 +645,55 @@ committing hashes as pinned until settlement or explicit failure.</p>
 <li><code>blob.props.changed</code> (SPEC-07 shape; <code>lifecycle.generation</code> is transient)</li>
 </ul>
 <h2 id="mix">Mix</h2>
+<h3 id="caller-local-file-transfer-blobmix-020-mix-0970">Caller-local file transfer (blob.mix 0.2.0, Mix 0.97.0)</h3>
+<p><code>blob_upload_file(path, opts)</code> streams a caller-local file through durable
+sessions. Required options are <code>owner</code> and <code>resume_file</code>; <code>service</code> defaults to
+<code>blobd</code>, and <code>chunk</code> defaults to 8 MiB. Optional <code>mime</code> defaults to
+<code>application/octet-stream</code>; <code>name</code> is optional. Keep the source immutable and
+the resume record exclusive to one caller. Sizes/chunks must be exact Mix
+integers through 9007199254740991; chunk must be positive.</p>
+<p>The library hashes the source, then checks <code>blob.stat</code> on the target service.
+Presence <strong>and this owner's pin</strong> return a reference immediately without an
+upload or lane discovery. Otherwise <code>blob.props.get path="lane.bind"</code> discovers
+the target's HTTP lane over the Bus. There is no hard-coded lane address or
+alternate control transport.</p>
+<p>The caller-owned JSON record contains <code>service</code>, <code>owner</code>, <code>size</code>, <code>blake3</code>
+(bare lowercase digest), <code>upload</code> (UUID or initially null), <code>key</code>, <code>mime</code>, and
+<code>name</code>. It is written atomically with file+directory sync and mode 0600 before
+create, then updated with the upload ID before the first byte. A lost create
+response therefore retains the idempotency key. Re-entry verifies the record's
+identity, replays create with that key, and takes its offset from HEAD. A swept
+session can start again under the same key. Failed sessions remain explicit
+failures: abort/remove the caller's record deliberately to start afresh.
+The record is never removed implicitly, including after success. It must be
+a regular file separate from the source; existing symlinks are refused.</p>
+<p>PATCH sends inclusive windows with exact Content-Range and Content-Length.
+The library reads HEAD after success, 409, or a lost response, verifies session
+identity, and resumes from the durable offset. Three consecutive no-progress
+attempts return an error; call again with the same record. Empty files commit
+without PATCH. Commit accepts 201 or the replayed 200 receipt and retries a
+lost response, 409 or 503 up to three times. Receipts last 24 hours; the
+owner-pin check also resolves completion after receipt expiry.</p>
+<p><code>blob_download_file(ref, path[, opts])</code> discovers the target lane and calls
+<code>http_get_file</code> with <code>expect_blake3</code> from the reference. It returns the verified
+<code>http_file_response</code> under <code>result</code>. Options <code>append</code>, <code>overwrite</code>, and
+<code>max_bytes</code> follow the <a href="/mix/http">Mix HTTP contract</a>. <code>service</code> selects
+the target explicitly; the reference's origin does not silently change routing.</p>
+<p>Both helpers retain <code>{ok, rc, result}</code>. Bus failures keep their rc; local,
+protocol and transfer failures use rc 10 with a message or HTTP response under
+<code>result</code>. Upload success returns the blob reference. They catch argument/IO
+errors into this envelope. Transfer options <code>idle_timeout</code>, <code>deadline</code>,
+<code>ssl_verify</code>, <code>ca_file</code>, and <code>ca_pem</code> are forwarded. The deadline applies per
+PATCH/GET and is cooperative, best-effort during blocking DNS/IO, not a hard
+bound on the library call. Body-free HEAD/create/commit calls use buffered
+<code>http_request</code> with <code>control_timeout</code> (default 30 seconds) and the TLS options.</p>
+<pre><code class="language-mix">$b = require("/path/to/cosmix-blobd/mix/blob.mix")
+$up = $b.blob_upload_file("capture.png", {owner: "capture", resume_file: "capture.upload.json"})
+if not $up.ok then die to_string($up.result) end
+$down = $b.blob_download_file($up.result, "verified.png", {})
+if not $down.ok then die to_string($down.result) end
+</code></pre>
+<h3 id="bus-verb-wrappers">Bus verb wrappers</h3>
 <p><code>mix/blob.mix</code> (shipped beside the daemon) is the script surface: a <code>require()</code> library, not builtins — thin wrappers over <code>send</code> that inherit its non-fatal failure bands for free instead of re-encoding them. Load it beside the crate or from an install:</p>
 <pre><code class="language-mix">$b = require("/path/to/cosmix-blobd/mix/blob.mix")
 $r = $b.blob_put("/var/lib/cosmix/capture/shot.png", {owner: "capture"})

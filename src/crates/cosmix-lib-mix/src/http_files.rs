@@ -23,7 +23,7 @@ fn text<'a>(value: &'a Value, name: &str) -> MixResult<&'a str> {
 fn integer(value: &Value, name: &str) -> MixResult<u64> {
     match value {
         Value::Number(n)
-            if n.is_finite() && *n >= 0.0 && *n <= MAX_EXACT as f64 && n.fract() == 0.0 =>
+            if n.is_finite() && (0.0..=MAX_EXACT as f64).contains(n) && n.fract() == 0.0 =>
         {
             Ok(*n as u64)
         }

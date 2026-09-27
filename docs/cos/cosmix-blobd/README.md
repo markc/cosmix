@@ -266,6 +266,65 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 
 ## Mix
 
+### Caller-local file transfer (blob.mix 0.2.0, Mix 0.97.0)
+
+`blob_upload_file(path, opts)` streams a caller-local file through durable
+sessions. Required options are `owner` and `resume_file`; `service` defaults to
+`blobd`, and `chunk` defaults to 8 MiB. Optional `mime` defaults to
+`application/octet-stream`; `name` is optional. Keep the source immutable and
+the resume record exclusive to one caller. Sizes/chunks must be exact Mix
+integers through 9007199254740991; chunk must be positive.
+
+The library hashes the source, then checks `blob.stat` on the target service.
+Presence **and this owner's pin** return a reference immediately without an
+upload or lane discovery. Otherwise `blob.props.get path="lane.bind"` discovers
+the target's HTTP lane over the Bus. There is no hard-coded lane address or
+alternate control transport.
+
+The caller-owned JSON record contains `service`, `owner`, `size`, `blake3`
+(bare lowercase digest), `upload` (UUID or initially null), `key`, `mime`, and
+`name`. It is written atomically with file+directory sync and mode 0600 before
+create, then updated with the upload ID before the first byte. A lost create
+response therefore retains the idempotency key. Re-entry verifies the record's
+identity, replays create with that key, and takes its offset from HEAD. A swept
+session can start again under the same key. Failed sessions remain explicit
+failures: abort/remove the caller's record deliberately to start afresh.
+The record is never removed implicitly, including after success. It must be
+a regular file separate from the source; existing symlinks are refused.
+
+PATCH sends inclusive windows with exact Content-Range and Content-Length.
+The library reads HEAD after success, 409, or a lost response, verifies session
+identity, and resumes from the durable offset. Three consecutive no-progress
+attempts return an error; call again with the same record. Empty files commit
+without PATCH. Commit accepts 201 or the replayed 200 receipt and retries a
+lost response, 409 or 503 up to three times. Receipts last 24 hours; the
+owner-pin check also resolves completion after receipt expiry.
+
+`blob_download_file(ref, path[, opts])` discovers the target lane and calls
+`http_get_file` with `expect_blake3` from the reference. It returns the verified
+`http_file_response` under `result`. Options `append`, `overwrite`, and
+`max_bytes` follow the [Mix HTTP contract](../../mix/http.md). `service` selects
+the target explicitly; the reference's origin does not silently change routing.
+
+Both helpers retain `{ok, rc, result}`. Bus failures keep their rc; local,
+protocol and transfer failures use rc 10 with a message or HTTP response under
+`result`. Upload success returns the blob reference. They catch argument/IO
+errors into this envelope. Transfer options `idle_timeout`, `deadline`,
+`ssl_verify`, `ca_file`, and `ca_pem` are forwarded. The deadline applies per
+PATCH/GET and is cooperative, best-effort during blocking DNS/IO, not a hard
+bound on the library call. Body-free HEAD/create/commit calls use buffered
+`http_request` with `control_timeout` (default 30 seconds) and the TLS options.
+
+```mix
+$b = require("/path/to/cosmix-blobd/mix/blob.mix")
+$up = $b.blob_upload_file("capture.png", {owner: "capture", resume_file: "capture.upload.json"})
+if not $up.ok then die to_string($up.result) end
+$down = $b.blob_download_file($up.result, "verified.png", {})
+if not $down.ok then die to_string($down.result) end
+```
+
+### Bus verb wrappers
+
 `mix/blob.mix` (shipped beside the daemon) is the script surface: a `require()` library, not builtins — thin wrappers over `send` that inherit its non-fatal failure bands for free instead of re-encoding them. Load it beside the crate or from an install:
 
 ```mix
