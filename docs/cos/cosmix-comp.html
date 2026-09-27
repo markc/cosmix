@@ -1515,8 +1515,8 @@ interleave at delays and yields. The reply is
 An explicitly seated sequence reports that seat at the top level. An unseated
 sequence reports <code>human</code>, <code>agent</code> or <code>mixed</code> from the steps reached, including
 the refusing step for <code>step_failed</code>; bare both-seat cleanup counts as <code>mixed</code>.
-An empty unseated capability probe reports the default (<code>agent</code>). Per-step
-seats are unchanged.
+An empty capability probe is refused with <code>invalid_argument</code> before any seat
+applies. Per-step seats are unchanged.
 On a failed step, it returns <code>step_failed</code> with <code>index</code>, <code>verb</code>, <code>step</code>,
 <code>completed</code> and <code>released:true</code>, and gives up its holds on <strong>both</strong> seats.
 Other owners' holds remain. Caller cancellation also releases the run's holds.

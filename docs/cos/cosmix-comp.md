@@ -1158,8 +1158,8 @@ interleave at delays and yields. The reply is
 An explicitly seated sequence reports that seat at the top level. An unseated
 sequence reports `human`, `agent` or `mixed` from the steps reached, including
 the refusing step for `step_failed`; bare both-seat cleanup counts as `mixed`.
-An empty unseated capability probe reports the default (`agent`). Per-step
-seats are unchanged.
+An empty capability probe is refused with `invalid_argument` before any seat
+applies. Per-step seats are unchanged.
 On a failed step, it returns `step_failed` with `index`, `verb`, `step`,
 `completed` and `released:true`, and gives up its holds on **both** seats.
 Other owners' holds remain. Caller cancellation also releases the run's holds.

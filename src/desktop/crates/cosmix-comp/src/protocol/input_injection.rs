@@ -162,7 +162,7 @@ pub(super) struct SequenceRun {
 impl SequenceRun {
     fn reply_seat(&self) -> &'static str {
         self.seat.map(SeatKind::name).or(self.driven_seat)
-            .unwrap_or(crate::port::DEFAULT_INPUT_SEAT.name())
+            .expect("unseated sequences are nonempty and record the attempted seat before replying")
     }
 }
 

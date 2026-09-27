@@ -1050,6 +1050,32 @@ fn unseated_sequence_reports_human_or_mixed_on_success_and_failure() {
 }
 
 #[test]
+fn unseated_agent_sequence_counts_a_refusing_human_step() {
+    for fail in [false, true] {
+        let (mut h, ingress, runtime, _, alpha, _) = two_windows();
+        bind_agent_devices(&mut h);
+        let mut steps = vec![step("comp.input.key", agent_target(&h, &alpha, agent_key(PressAction::Both, KEY_A)), 0)];
+        if fail {
+            steps.push(step("comp.input.key", InputOp::Key {
+                key: crate::port::KeySpec::Name("not_a_real_keysym".into()),
+                action: PressAction::Both, modifiers: Vec::new(),
+            }, 0));
+        }
+        let admission = ingress.request_long(crate::port::LongOp::Sequence(steps)).unwrap();
+        let (rc, body) = long_reply(&mut h, &runtime, admission, |state| state.injection.sequences.is_empty());
+        assert_eq!(rc == 0, !fail, "{body}");
+        assert_eq!(body["seat"], if fail { "mixed" } else { "agent" });
+        if fail {
+            assert_eq!(body["error"], "step_failed");
+            assert_eq!(body["completed"][0]["seat"], "agent");
+            assert_eq!(body["step"]["seat"], "human");
+        } else {
+            assert_eq!(body["steps"][0]["seat"], "agent");
+        }
+    }
+}
+
+#[test]
 fn mixed_seat_sequence_replies_name_the_default_and_each_driven_seat() {
     let (mut h, ingress, runtime, _, alpha, _) = two_windows();
     bind_agent_devices(&mut h);
