@@ -923,6 +923,55 @@ mod tests {
     }
 
     #[test]
+    fn patch_sqlite_failure_after_fsync_truncates_to_durable_offset_before_retry() {
+        let (_dir, store) = store();
+        let (s, _) = store.upload_create(&create(4)).unwrap();
+        store.upload_append(&s.id, 0, 1, 4, &b"ab"[..]).unwrap();
+        // The offset UPDATE runs only after the chunk's sync_all. Inject an
+        // error there, after the file has advanced but before a durable offset.
+        // The caller sees a database failure and must re-read authoritative
+        // state instead of inferring whether the write committed.
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_patch_offset AFTER UPDATE OF offset ON upload_sessions
+             BEGIN SELECT RAISE(ABORT, 'injected offset failure after fsync'); END;",
+            )
+            .unwrap();
+        let error = store.upload_append(&s.id, 2, 3, 4, &b"cd"[..]).unwrap_err();
+        assert!(
+            matches!(error, StoreError::Db(ref message) if message.contains("injected offset failure"))
+        );
+        let current = store.upload_status(&s.id).unwrap();
+        assert_eq!(current.offset, 2);
+        assert_eq!(current.state, "active");
+        assert_eq!(fs::read(store.upload_path(&s.id).unwrap()).unwrap(), b"ab");
+        // Admission has been released only after truncate-back and fsync.
+        let guard = store.upload_guard(&s.id).unwrap();
+        assert_eq!(
+            fs::metadata(store.upload_path(&s.id).unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(guard);
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_patch_offset")
+            .unwrap();
+        let done = store.upload_append(&s.id, 2, 3, 4, &b"cd"[..]).unwrap();
+        assert_eq!(done.offset, 4);
+        assert_eq!(
+            fs::read(store.upload_path(&s.id).unwrap()).unwrap(),
+            b"abcd"
+        );
+    }
+
+    #[test]
     fn negative_upload_integers_are_corruption_and_checks_remain() {
         let (_dir, store) = store();
         let (s, _) = store.upload_create(&create(0)).unwrap();
