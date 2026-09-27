@@ -17,7 +17,12 @@ resolver = "2"
 members = ["crates/*"]
 # cosmix-foreman: development halted 2026-08-30 (see docs/cos/foreman.md); it is
 # excluded from the workspace rather than maintained — its tests are not a gate.
-exclude = ["desktop", "crates/cosmix-foreman"]
+# Vendor sources are patched dependencies, not workspace members (as in desktop/).
+exclude = ["desktop", "crates/cosmix-foreman", "vendor"]
+
+[patch.crates-io]
+# Upstream provenance and the hard parser nesting cap: vendor/mail-parser/README.patch.md.
+mail-parser = { path = "vendor/mail-parser" }
 
 [workspace.package]
 edition = "2024"

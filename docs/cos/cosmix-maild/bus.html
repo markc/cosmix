@@ -464,13 +464,144 @@
 <tr><td><code>maild.accounts.unlock</code></td><td>Required <code>email</code></td><td>Restore the preserved password hash</td></tr>
 </tbody></table>
 <p>An unknown account and a wrong password both produce <code>valid: false</code> from <code>verify</code>. Lock and unlock are idempotent.</p>
+<h2 id="attachments-and-message-exports">Attachments and message exports</h2>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Read-only</th></tr></thead><tbody>
+<tr><td><code>maild.attachment.list</code></td><td><code>account_id</code>, <code>email_id</code></td><td>yes</td></tr>
+<tr><td><code>maild.attachment.ref</code></td><td><code>account_id</code>, <code>email_id</code>, <code>part</code>, optional <code>name</code></td><td>no</td></tr>
+<tr><td><code>maild.message.ref</code></td><td><code>account_id</code>, <code>email_id</code></td><td>no</td></tr>
+</tbody></table>
+<p>These accept a positive integer account ID and a message UUID. Every call
+resolves that message through the account-owned mail store before reading
+bytes or reference rows. Unknown/foreign messages and absent parts use
+rc 10 <code>not_found: message or part</code>; malformed arguments use
+<code>invalid_arguments:</code>. Inspection limits and failures use <code>too_large:</code> and
+<code>unreadable:</code>. Nothing is written by inspection.</p>
+<p><code>attachment.list</code> replies with
+<code>{"email_id":"&lt;UUID&gt;","blob":"b3:&lt;message hash&gt;","parts":[...]}</code>.
+Each part has <code>part</code>, <code>mime</code>, decoded <code>size</code>, nullable <code>disposition</code>, and
+<code>is_attachment</code>; optional <code>name</code> and <code>content_id</code> are omitted when absent.
+An exported part also has <code>blob: "b3:&lt;part hash&gt;"</code>. The list uses the same
+root-<code>1</code> MIME paths as JMAP, including embedded-message children. It does not
+publish a partial list when inspection fails.</p>
+<p><code>attachment.ref</code> extracts and exports one part. <code>message.ref</code> exports the
+whole RFC 5322 message with the upload MIME hint <code>message/rfc822</code>. Successful
+exports return the canonical reference fields <code>blob</code>, <code>size</code>, <code>mime</code>,
+optional <code>name</code>, <code>origin</code>, plus <code>email_id</code> and (for a part) <code>part</code>.
+The owner is <code>maild:&lt;account_id&gt;</code>. Names and MIME are hints: blobd retains
+first-writer metadata, and replies preserve that metadata.</p>
+<p>Validated references persist in the global <code>attachment_refs</code> and
+<code>message_refs</code> tables, keyed by account, item and message hash (plus part
+for attachments). Repeats return the saved reference without contacting the
+lane. Concurrent exports converge on one row and the same owner/hash pin.
+Pins and reference rows are retained after mail/account deletion; release
+belongs to later reconciliation. An interrupted export or a DB failure
+after upload can leave a pin without a reference row; retry is safe and
+does not remove that pin. No DB mutex is held across HTTP.</p>
+<p>Before quota or HTTP, exports hash their local bytes and call <code>blob.stat</code>.
+A present blob already pinned by this owner repairs missing bookkeeping
+without quota or HTTP. Otherwise the advisory quota preflight precedes
+<code>PUT /blob/&lt;hex&gt;</code>; a present hash uses blobd's pin-and-return path. Hash and
+size are verified against returned references. The current <code>blob.stat</code> reply
+omits the optional filename, so a reference recovered through stat omits
+<code>name</code> rather than inventing a new first-writer hint.</p>
+<p>Attachment lists and exports run in a session-owned pool of eight tasks outside serial Bus
+dispatch. A full pool immediately returns rc 10
+<code>busy: maild blob transfer pool is full (8)</code>. Reconnect or session shutdown
+cancels the tasks. Lane failures use <code>lane_unavailable:</code>, <code>quota:</code>, <code>lane:</code>,
+<code>not_present:</code> or <code>verify_failed:</code>; all are rc 10. There is no detach,
+message rewrite, shared-root access or implicit remote fetch.
+Transfer replies and busy refusals have a 30-second Bus send deadline;
+timeout logs once and releases the task slot. A stalled broker cannot retain
+a completed transfer indefinitely.
+<code>message.ref</code> is export, not import: JMAP <code>Email/import</code> still requires an
+upload UUID, and <code>/jmap/blob</code> still reads maild's own MDS store.</p>
+<h2 id="legacy-blob-migration">Legacy blob migration</h2>
+<p>Migration runs outside serial dispatch in its own single maintenance slot.
+A concurrent page receives rc 10 <code>busy: migration already running</code>.
+The slot remains held until blocking work finishes, including across Bus
+cancellation or reconnect, and through the bounded response send.</p>
+<p><code>maild.blob.migrate {apply?: false, account_id?, cursor?: 0, limit?: 500}</code>
+runs on the daemon's own store handle. It accepts at most 500 rows per call;
+pages stop before a subsequent row would exceed 64 MiB of declared source data (only the first row can exceed
+that budget). Copy and verification stream through a fixed-size buffer.</p>
+<p>The default is read-only inspection: no set provisioning, CAS writes, aliases
+or queue changes. <code>apply: true</code> verifies each legacy file's hash and size,
+copies it into MDS, preserves its UUID alias and adds a non-expiring holding
+item in <code>__upload_staging__</code>. The membership's sole tag is
+<code>maild:legacy-blob:&lt;UUID&gt;</code>; alias expiry and temp-item fields are NULL. This
+marker and alias commit together. Repeating a page creates no extra holds.
+The holds intentionally survive upload expiry and mail retention until a
+later explicit legacy retirement; this verb deletes no legacy rows or files.</p>
+<p>Verified rows backfill <code>smtp_queue.blob_hash</code>; the old UUID is retained.
+Existing conflicting aliases or queue hashes are refused. A retry after a
+queue update failure reuses the committed hold and finishes the queue update.</p>
+<p>Replies contain <code>done</code>, <code>next</code> (a numeric rowid cursor or null), and per-account
+<code>planned</code>, <code>migrated</code>, <code>already_migrated</code>, <code>missing</code>, <code>corrupt</code>, <code>conflicting</code>
+and <code>failed</code> counts, plus <code>orphan</code> for rows whose account no longer exists.
+Orphans are skipped without copying blobs or creating holding items; they
+advance the cursor normally and do not mark the page failed.
+Pass <code>next</code> as <code>cursor</code>, retaining the same account filter
+and apply mode. <code>done</code> means enumeration finished, not that every row passed.
+Rerun from cursor 0 after repairing failures. Up to 20 bounded diagnostics are
+returned. All successful rows return rc 0; any failed row returns rc 5 with
+<code>migration:</code> and the page report intact. Validation errors use
+<code>invalid_arguments:</code>. Row diagnostics distinguish <code>missing:</code>, <code>corrupt:</code>,
+<code>conflicting:</code> and <code>unreadable:</code>; other storage errors count as <code>failed</code>.</p>
+<p>This is a Bus maintenance operation, not a local CLI subcommand. No second
+MDS instance is opened and no blobd service or shared root is involved.</p>
+<p>The complete successful page shape is:</p>
+<pre><code class="language-json">{
+  "apply": false,
+  "failed": false,
+  "done": false,
+  "next": 742,
+  "accounts": {
+    "42": {
+      "planned": 500,
+      "orphan": 0,
+      "migrated": 0,
+      "already_migrated": 0,
+      "missing": 0,
+      "corrupt": 0,
+      "conflicting": 0,
+      "failed": 0
+    }
+  },
+  "errors": []
+}
+</code></pre>
+<p><code>apply</code> echoes the boolean mode. <code>accounts</code> is an object keyed by decimal
+account ID, containing only accounts encountered in this page; every count
+is present and counts are per call, not cumulative. <code>planned</code> counts new
+work in dry-run, <code>migrated</code> counts completed new work in apply mode, and
+<code>already_migrated</code> counts verified existing holds in either mode. A retry
+that completes a previously failed queue backfill may count as already
+migrated. An empty page has <code>accounts: {}</code>, <code>errors: []</code>, <code>done: true</code>,
+<code>next: null</code>.</p>
+<p><code>cursor</code> is the last processed legacy <code>blobs.rowid</code>, not an offset or an
+account ID. It defaults to 0 and must be a nonnegative integer. Rows are
+selected in increasing rowid order with <code>rowid &gt; cursor</code>, optionally filtered
+by positive integer <code>account_id</code>. <code>limit</code> is an integer in 1..500, default
+500. <code>next</code> is the last processed rowid when more enumeration remains;
+otherwise it is null. Failed rows also advance the cursor. Use the returned
+cursor unchanged and keep the same filter and mode; begin apply at cursor 0
+after finishing dry-run, and restart at 0 to retry repaired failures.</p>
+<p>A page with failed rows retains all these fields, returns warning rc 5
+(so Bus clients preserve the page value), sets <code>"failed": true</code> and adds
+<code>"error":"migration: some rows failed; legacy data retained"</code>.
+<code>errors</code> contains up to 20 objects of the form
+<code>{"cursor":742,"account_id":42,"error":"missing: legacy file"}</code>;
+each diagnostic is truncated to 256 characters. Validation or page-level
+worker/database failure instead returns only <code>{"error":"..."}</code> with rc 10
+and an <code>invalid_arguments:</code> or <code>migration:</code> prefix; it supplies no resume
+cursor. Unknown argument names are rejected.</p>
 <h2 id="rules-and-bayesian-verbs">Rules and Bayesian verbs</h2>
 <table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
 <tr><td><code>maild.rules.reload</code></td><td>None</td><td>Reload the configured pack and return load metadata</td></tr>
 <tr><td><code>maild.rules.stats</code></td><td>Optional <code>top_n</code></td><td>Return pack metadata and persistent verdict and rule-hit counters</td></tr>
-<tr><td><code>maild.rules.explain</code></td><td>Envelope and base64 message</td><td>Explain rule evaluation without delivering</td></tr>
+<tr><td><code>maild.rules.explain</code></td><td>Envelope and exactly one of <code>message_b64</code> / <code>blob</code></td><td>Explain rule evaluation without delivering</td></tr>
 <tr><td><code>maild.bayesian.stats</code></td><td><code>account_id</code> or <code>email</code></td><td>Return per-account corpus statistics, read-only, echoing the resolved <code>account_id</code> and <code>email</code>; an account with no row is refused</td></tr>
-<tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, <code>message_b64</code></td><td>Classify without recording a training label</td></tr>
+<tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, exactly one of <code>message_b64</code> / <code>blob</code></td><td>Classify without recording a training label</td></tr>
 <tr><td><code>maild.bayesian.train</code></td><td><code>account_id</code> or <code>email</code>; <code>email_id</code> or <code>message_id</code>; <code>class</code> (<code>spam</code> / <code>ham</code>)</td><td>Train one stored message through the Junk-move path; returns <code>result</code> (<code>applied</code> / <code>already_labeled</code>)</td></tr>
 <tr><td><code>maild.bayesian.untrain</code></td><td><code>account_id</code> or <code>email</code>; <code>email_id</code> or <code>message_id</code></td><td>Remove the message's training label and reverse its counts; returns <code>removed</code> (<code>spam</code>, <code>ham</code>, or null)</td></tr>
 </tbody></table>
@@ -487,6 +618,36 @@
 }
 </code></pre>
 <p><code>account_id</code> may be omitted for engine defaults. It may otherwise be a non-negative JSON integer or an all-digit string. <code>mail_auth</code> is reserved; the handler currently synthesises a no-DNS verification result for explanation.</p>
+<p>Both diagnostic verbs require <strong>exactly one</strong> input key: <code>message_b64</code> must
+be a string, or <code>blob</code> must be a canonical lowercase <code>b3:&lt;64hex&gt;</code> string or
+a reference object with that <code>blob</code> member. Both keys (even if one is null)
+or neither key return rc 10 <code>invalid_arguments: exactly one of message_b64 or blob is required</code>. Invalid IDs return <code>invalid blob id</code>; invalid base64
+retains the <code>message_b64 decode:</code> prefix. Malformed argument JSON is refused.</p>
+<p><code>blob</code> downloads only from the local lane, ignores reference origin for
+routing, and verifies hash and length before rule evaluation/classification.
+If an input map supplies <code>size</code>, it must match the verified response length.
+HTTP 404 returns <code>not_present: blob is not on this node — blob.fetch it first</code>;
+there is no implicit mesh fetch. The configured <code>max_message_size</code> (default
+25 MiB) bounds both decoded legacy input and downloaded bytes. Oversized input
+returns <code>too_large: message exceeds max_message_size</code>. Other lane failures
+use the lane tokens documented above. Diagnostic replies keep their existing
+shape and do not include message bytes.</p>
+<p>Blob-input diagnostic calls share the eight-task pool with exports, so
+they can also return <code>busy:</code>. Legacy-input calls and other existing verbs
+retain serial dispatch. <code>message_b64</code> remains an explicit compatibility
+exception to the reference-only Bus rule; new callers should use <code>blob</code>.</p>
+<p>The complete P4 manifest additions and expanded argument lists are:</p>
+<table><thead><tr><th>Verb</th><th>Manifest args, in order</th><th>Read-only</th></tr></thead><tbody>
+<tr><td><code>maild.blob.migrate</code></td><td><code>apply</code>, <code>account_id</code>, <code>cursor</code>, <code>limit</code></td><td>no</td></tr>
+<tr><td><code>maild.attachment.list</code></td><td><code>account_id</code>, <code>email_id</code></td><td>yes</td></tr>
+<tr><td><code>maild.attachment.ref</code></td><td><code>account_id</code>, <code>email_id</code>, <code>part</code>, <code>name</code></td><td>no</td></tr>
+<tr><td><code>maild.message.ref</code></td><td><code>account_id</code>, <code>email_id</code></td><td>no</td></tr>
+<tr><td><code>maild.rules.explain</code></td><td><code>account_id</code>, <code>envelope_from</code>, <code>envelope_to</code>, <code>peer_ip</code>, <code>message_b64</code>, <code>blob</code>, <code>sender_authenticated</code>, <code>mail_auth</code></td><td>yes</td></tr>
+<tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, <code>message_b64</code>, <code>blob</code></td><td>yes</td></tr>
+</tbody></table>
+<p>The last two verbs already existed; their sole new manifest argument is
+<code>blob</code>. Manifest metadata advertises capabilities; broker policy still
+controls invocation.</p>
 <p><code>maild.rules.stats</code> returns at most 256 rule entries by default and clamps <code>top_n</code> to 4096. <code>top_n: 0</code> returns rule cardinality without the per-rule map.</p>
 <h2 id="search-and-statistics-verbs">Search and statistics verbs</h2>
 <table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
@@ -542,7 +703,33 @@
 <h3 id="maildpropsrecordschanged"><code>maild.props.records.changed</code></h3>
 <p>Property changes are published without broker retention. <code>maild.props.watch</code> obtains a broker subscription grant before live delivery begins.</p>
 <h2 id="availability">Availability</h2>
-<p>Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.</p></div></div>
+<p>Bus runs in a sibling task to the mail protocols. Broker connection loss removes the management and event surface temporarily but does not stop mail serving.</p>
+<h2 id="structural-inspection-cap">Structural inspection cap</h2>
+<p>The raw-message inspection cap is always 64 MiB, even when admission's
+<code>max_message_size</code> is larger (startup warns once). Over-cap messages have
+unknown attachment metadata and inspection/export returns <code>too_large:</code>;
+diagnostic inputs use the configured bound. The linear pre-parse header scanner
+includes quoted body text and every potential <code>--</code> boundary, including mid-line
+and boundary-abutting headers: at most 2,000 potential header blocks and 1,000
+potential embedded messages (conservatively all <code>message/*</code> types). It accepts
+case variations, whitespace anywhere in names (including conservative folded
+names), folded values and comments. These bound counts, not sibling count as
+depth. Digest blank lines do not count as messages; attached messages and digest
+children can have more than 32 siblings. Each nesting level needs a header block,
+bounding parser recursion before the walker enforces true depth 32.
+Preflight follows base64/QP message bodies, including encoded digest-default
+children, through three encoded layers using the same count limits. Its shared
+128 MiB decoded-byte budget returns <code>too_large: MIME pre-parse decoded-byte limit</code>
+when exceeded, before the parser can construct hidden plain nesting.
+False-positive refusals are possible.
+The vendored mail-parser 0.11.5 independently caps ownership nesting at 64,
+sharing the bound across plain and encoded ancestors. At that cap it retains
+an ordinary undecoded body. This parser cap is the hard invariant; preflight
+is defence in depth and the walker still enforces depth 32.
+The whole walk has a 128 MiB decoded-byte budget and allows two nested
+encoded re-parses beyond the parser's own limit. Bad individual parts instead
+carry <code>undecodable: true</code>, no download ID or exported blob, and export returns
+<code>unreadable:</code>; healthy sibling parts and recovered display text remain visible.</p></div></div>
     </div>
 
 </main>

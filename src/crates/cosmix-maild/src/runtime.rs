@@ -76,7 +76,7 @@ impl Default for RuntimeOpts {
 
 /// Result of [`build_runtime`]. Hold this for the lifetime of the
 /// serving process. Dropping it releases the property-substrate
-/// runtimes only; the SMTP accept loops and the expiry worker are
+/// runtimes and cancels the Bus session; the SMTP accept loops and expiry worker are
 /// detached tokio tasks and continue running until the tokio runtime
 /// itself shuts down.
 pub struct BuiltMaild {
@@ -125,7 +125,16 @@ pub struct BuiltMaild {
     /// this to `cosmix_log_props::attach_props` so an operator's
     /// `props.set maild.log { level: "debug" }` swaps the live filter.
     log_runtime: cosmix_log_props::LogPropsRuntime,
-    _bus_task: Option<JoinHandle<()>>,
+    _bus_task: Option<BusTask>,
+}
+
+// Cancelling the session drops its transfer JoinSet, aborting lane work. Keep
+// this guard on the private field so public BuiltMaild fields remain movable.
+struct BusTask(JoinHandle<()>);
+impl Drop for BusTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl BuiltMaild {
@@ -217,6 +226,16 @@ async fn preflight_opaque_namespace_clear(
 /// sequence in `main.rs::Command::Serve` 1:1 — see git history at
 /// commit prior to this extraction for the original implementation.
 pub async fn build_runtime(cfg: &Config, opts: RuntimeOpts) -> Result<BuiltMaild> {
+    if cfg
+        .max_message_size
+        .is_some_and(|size| size > crate::attachments::MAX_MESSAGE)
+    {
+        tracing::warn!(
+            max_message_size = cfg.max_message_size,
+            inspection_cap = crate::attachments::MAX_MESSAGE,
+            "max_message_size exceeds the 64 MiB MIME inspection cap; larger messages have unknown attachment metadata"
+        );
+    }
     // Daemon start instant — backs `maild.stats.server` uptime. Captured
     // at the top of the build so it reports time-since-startup, not
     // time-since-Bus-registration.
@@ -691,7 +710,7 @@ pub async fn build_runtime(cfg: &Config, opts: RuntimeOpts) -> Result<BuiltMaild
     // `BuiltMaild::tls_state()` returns.
     let tls_state_for_built = tls_state.clone();
     let _bus_task = if opts.enable_bus {
-        Some(tokio::spawn(bus::run(
+        Some(BusTask(tokio::spawn(bus::run(
             rule_engine.clone(),
             rule_stats.clone(),
             classifier.clone(),
@@ -709,7 +728,8 @@ pub async fn build_runtime(cfg: &Config, opts: RuntimeOpts) -> Result<BuiltMaild
             retention_state,
             vtoken_state,
             bayesian_state,
-        )))
+            cfg.max_message_size.unwrap_or(25 * 1024 * 1024),
+        ))))
     } else {
         let _ = props_router;
         let _ = subscribe_granter;
