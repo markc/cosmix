@@ -596,6 +596,23 @@ pub(super) fn get(args: Vec<Value>) -> MixResult<Option<Value>> {
             drain_response(response, &mut map, opts.deadline);
             return Ok(());
         }
+        // With gzip enabled (including via feature unification), ureq decodes
+        // and removes BOTH encoding and length headers. Identity-framed file
+        // transfers must therefore require the length, not just inspect CE.
+        code = "HTTP_IDENTITY_FRAMING";
+        if matches!(status, 200 | 206) && response.header("Content-Length").is_none() {
+            return Err(io::Error::other(
+                "identity framing requires Content-Length; encoded or unframed response refused",
+            ));
+        }
+        if response
+            .header("Content-Encoding")
+            .is_some_and(|s| !s.eq_ignore_ascii_case("identity"))
+        {
+            return Err(io::Error::other(
+                "identity framing required; Content-Encoding is not identity",
+            ));
+        }
         code = "HTTP_RANGE";
         let total = if append {
             if status != 206 || response.all("Content-Range").len() != 1 {
@@ -616,12 +633,6 @@ pub(super) fn get(args: Vec<Value>) -> MixResult<Option<Value>> {
             }
             None
         };
-        if response
-            .header("Content-Encoding")
-            .is_some_and(|s| !s.eq_ignore_ascii_case("identity"))
-        {
-            return Err(io::Error::other("encoded representation refused"));
-        }
         let lengths = response.all("Content-Length");
         if lengths.len() > 1 {
             return Err(io::Error::other("ambiguous Content-Length"));
@@ -737,9 +748,10 @@ mod tests {
     }
 
     fn server(
-        response: &'static str,
+        response: impl AsRef<[u8]>,
         pause: Duration,
     ) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
+        let response = response.as_ref().to_vec();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/file", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
@@ -766,7 +778,7 @@ mod tests {
             let mut body = vec![0; len];
             socket.read_exact(&mut body).unwrap();
             std::thread::sleep(pause);
-            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(&response);
             (head, body)
         });
         (url, handle)
@@ -1021,5 +1033,66 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn download_gzip_200_and_206_refuse_without_publishing() {
+        // Valid gzip member for "llo": stored DEFLATE block, CRC32 and ISIZE.
+        let gzip = [
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 1, 3, 0, 252, 255, 108, 108, 111, 52, 179, 201, 170,
+            3, 0, 0, 0,
+        ];
+        let dir = Temp::new();
+        let path = dir.0.join("target");
+        for append in [false, true] {
+            if append {
+                std::fs::write(&path, b"he").unwrap();
+            }
+            let (status, range) = if append {
+                (206, "Content-Range: bytes 2-4/5\r\n")
+            } else {
+                (200, "")
+            };
+            let mut wire = format!("HTTP/1.1 {status} Test\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n{range}Connection: close\r\n\r\n",gzip.len()).into_bytes();
+            wire.extend_from_slice(&gzip);
+            let (url, srv) = server(wire, Duration::ZERO);
+            let mut opts = hash_option(if append { b"hello" } else { b"llo" });
+            opts.insert("append".into(), Value::Bool(append));
+            let result = download(url, &path, opts);
+            let (head, _) = srv.join().unwrap();
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("accept-encoding: identity\r\n")
+            );
+            assert!(
+                matches!(&result["error_code"],Value::String(s) if s == "HTTP_IDENTITY_FRAMING")
+            );
+            assert!(matches!(result["published"], Value::Bool(false)));
+            assert!(matches!(&result["error"],Value::String(s) if s.contains("identity framing")));
+            if append {
+                assert_eq!(std::fs::read(&path).unwrap(), b"he");
+            } else {
+                assert!(!path.exists());
+            }
+            assert_eq!(
+                std::fs::read_dir(&dir.0).unwrap().count(),
+                usize::from(append)
+            );
+        }
+    }
+
+    #[test]
+    fn download_missing_identity_length_refuses_before_publication() {
+        let dir = Temp::new();
+        let path = dir.0.join("target");
+        let (url, srv) = server(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody",
+            Duration::ZERO,
+        );
+        let result = download(url, &path, IndexMap::new());
+        srv.join().unwrap();
+        assert!(matches!(&result["error_code"],Value::String(s) if s == "HTTP_IDENTITY_FRAMING"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
     }
 }

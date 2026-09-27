@@ -455,7 +455,13 @@ preserving its current permission bits. Symlink replacement is refused.</p>
 <code>max_bytes</code>, <code>headers</code>, and the upload timeout/TLS options below. Redirects
 are returned. Only a 200 or 204 installs a fresh file. HTTP error bodies may
 be returned in <code>body</code>/<code>bytes</code> (64 MiB cap), but never become the destination.
-Successful file bodies stay on disk; <code>body</code> is nil and <code>bytes</code> empty.</p>
+Successful file bodies stay on disk; <code>body</code> is nil and <code>bytes</code> empty.
+From 0.97.1, 200/206 downloads require identity framing with Content-Length.
+Missing length or non-identity encoding returns status 0 with
+<code>HTTP_IDENTITY_FRAMING</code> and leaves the destination untouched. This also rejects
+ureq's transparent gzip decoding, which removes both Content-Encoding and
+Content-Length. Chunked/close-delimited 200/206 bodies are deliberately refused;
+blobd's lane supplies Content-Length. A body-free 204 remains supported.</p>
 <p><code>append: true</code> requires <code>expect_blake3</code> for the <strong>whole final file</strong> and an
 existing regular prefix file. It copies and hashes the prefix into staging,
 requests <code>Range: bytes=&lt;prefix-size&gt;-</code>, and accepts only a 206 with one

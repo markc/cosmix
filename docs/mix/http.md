@@ -16,6 +16,12 @@ Options are `overwrite`, `append`, `expect_blake3` (64 lowercase hex digits),
 are returned. Only a 200 or 204 installs a fresh file. HTTP error bodies may
 be returned in `body`/`bytes` (64 MiB cap), but never become the destination.
 Successful file bodies stay on disk; `body` is nil and `bytes` empty.
+From 0.97.1, 200/206 downloads require identity framing with Content-Length.
+Missing length or non-identity encoding returns status 0 with
+`HTTP_IDENTITY_FRAMING` and leaves the destination untouched. This also rejects
+ureq's transparent gzip decoding, which removes both Content-Encoding and
+Content-Length. Chunked/close-delimited 200/206 bodies are deliberately refused;
+blobd's lane supplies Content-Length. A body-free 204 remains supported.
 
 `append: true` requires `expect_blake3` for the **whole final file** and an
 existing regular prefix file. It copies and hashes the prefix into staging,
