@@ -60,7 +60,7 @@ pub struct Columns {
     pub pad: f32,
 }
 impl Columns {
-    fn new(look: Look, values: &HashSet<String>) -> Self {
+    fn new(look: Look, rows: &[VisibleRow]) -> Self {
         let measure = |s: &str| -> f32 {
             FileList::shape(s, look.mono_font, look.small_px)
                 .min_bounds()
@@ -69,7 +69,7 @@ impl Columns {
         Self {
             name_min: look.chrome.icon * 2.0 + look.chrome.small + Self::name_measure(look),
             size: listing_size_width(
-                values.iter().map(String::as_str),
+                rows.iter().map(|row| size_text(&row.entry)),
                 look.chrome.small,
                 measure,
             ),
@@ -138,29 +138,56 @@ fn size_text(entry: &FileEntry) -> String {
     }
 }
 
-fn listing_size_width<'a>(
-    values: impl Iterator<Item = &'a str>,
+// Size/count strings use the mono role. Keep only a bounded set of longest
+// strings; shaping every distinct file size makes large relists expensive.
+const SIZE_CANDIDATES: usize = 4;
+
+fn listing_size_width<S: AsRef<str>>(
+    values: impl Iterator<Item = S>,
     padding: f32,
     measure: impl Fn(&str) -> f32,
 ) -> f32 {
     let floor = measure("99.9 MiB");
     let ceiling = measure("999999 items").max(floor);
-    values.map(&measure).fold(floor, f32::max).min(ceiling) + 2.0 * padding
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut longest: Vec<(usize, S)> = Vec::with_capacity(SIZE_CANDIDATES);
+    for value in values {
+        let length = value.as_ref().graphemes(true).count();
+        let position = longest.partition_point(|(n, _)| *n >= length);
+        if position < SIZE_CANDIDATES {
+            if longest.len() == SIZE_CANDIDATES {
+                longest.pop();
+            }
+            longest.insert(position, (length, value));
+        }
+    }
+    longest
+        .iter()
+        .map(|(_, s)| measure(s.as_ref()))
+        .fold(floor, f32::max)
+        .min(ceiling)
+        + 2.0 * padding
 }
 
 type ColumnMetrics = (iced::Font, u32, iced::Font, u32, crate::theme::Chrome);
 
-/// Per-listing measurements shared by the header and all rows. Values are
-/// deduplicated; only a relist/count change or theme change shapes them again.
+/// Shared header/row measurements. Unchanged signatures do no formatting or
+/// shaping. Changed listings shape at most four Size candidates plus the
+/// floor, ceiling, Modified sample and Name minimum (eight paragraphs).
 #[derive(Default)]
 pub struct ColumnCache {
-    values: HashSet<String>,
+    root: Option<PathBuf>,
+    signature: Option<(u64, u64, usize)>,
     metrics: Option<ColumnMetrics>,
     columns: Option<Columns>,
 }
 impl ColumnCache {
-    pub fn refresh(&mut self, look: Look, rows: &[VisibleRow]) {
-        let values = rows.iter().map(|row| size_text(&row.entry)).collect();
+    pub fn refresh(
+        &mut self,
+        look: Look,
+        pane: &cosmix_dopus_core::PaneModel,
+        rows: &[VisibleRow],
+    ) {
         let metrics = (
             look.ui_font,
             look.px.to_bits(),
@@ -168,19 +195,40 @@ impl ColumnCache {
             look.small_px.to_bits(),
             look.chrome,
         );
-        if self.columns.is_none()
-            || self.metrics.as_ref() != Some(&metrics)
-            || self.values != values
-        {
-            self.columns = Some(Columns::new(look, &values));
-            self.values = values;
-            self.metrics = Some(metrics);
+        if self.metrics.as_ref() != Some(&metrics) {
+            self.signature = None;
         }
+        self.refresh_columns(
+            &pane.path,
+            (pane.generation, pane.listing_revision, rows.len()),
+            || Columns::new(look, rows),
+        );
+        self.metrics = Some(metrics);
+    }
+
+    fn refresh_columns(
+        &mut self,
+        root: &Path,
+        signature: (u64, u64, usize),
+        build: impl FnOnce() -> Columns,
+    ) {
+        let same_root = self.root.as_deref() == Some(root);
+        if same_root && self.signature == Some(signature) {
+            return;
+        }
+        let mut columns = build();
+        if same_root && let Some(previous) = self.columns {
+            columns.size = columns.size.max(previous.size);
+        }
+        self.columns = Some(columns);
+        if !same_root {
+            self.root = Some(root.to_path_buf());
+        }
+        self.signature = Some(signature);
     }
 
     pub fn get(&self, look: Look) -> Columns {
-        self.columns
-            .unwrap_or_else(|| Columns::new(look, &HashSet::new()))
+        self.columns.unwrap_or_else(|| Columns::new(look, &[]))
     }
 }
 
@@ -864,6 +912,54 @@ mod column_tests {
             gap: 12.0,
             pad: 8.0,
         }
+    }
+
+    #[test]
+    fn five_thousand_values_have_bounded_shaping_and_unchanged_frames_do_no_work() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let measure = |s: &str| {
+            calls.set(calls.get() + 1);
+            FileList::shape(s, iced::Font::MONOSPACE, 11.0)
+                .min_bounds()
+                .width
+        };
+        let mut cache = ColumnCache::default();
+        let root = Path::new("/listing");
+        let signature = (1, 1, 5000);
+        cache.refresh_columns(root, signature, || Columns {
+            size: listing_size_width((0..5000).map(|i| format_size(i * 1031)), 4.0, measure),
+            // The production constructor also shapes these two samples.
+            name_min: measure("MMMM"),
+            modified: measure("88/88/88 88:88"),
+            ..columns()
+        });
+        assert_eq!(calls.get(), SIZE_CANDIDATES + 4);
+        for _ in 0..100 {
+            cache.refresh_columns(root, signature, || {
+                panic!("unchanged listing was formatted")
+            });
+        }
+        assert_eq!(calls.get(), SIZE_CANDIDATES + 4);
+    }
+
+    #[test]
+    fn size_only_grows_until_the_pane_root_changes() {
+        let mut cache = ColumnCache::default();
+        let root = Path::new("/listing");
+        let with_size = |size| Columns { size, ..columns() };
+        cache.refresh_columns(root, (1, 1, 10), || with_size(80.0));
+        // A count reply grows Size even though the row count is unchanged.
+        cache.refresh_columns(root, (1, 2, 10), || with_size(110.0));
+        assert_eq!(cache.columns.unwrap().size, 110.0);
+        // Collapse, expand and a new generation (refresh/hidden toggle)
+        // must not shrink it while the root identity stays the same.
+        for signature in [(1, 2, 5), (1, 2, 10), (2, 3, 8)] {
+            cache.refresh_columns(root, signature, || with_size(70.0));
+            assert_eq!(cache.columns.unwrap().size, 110.0);
+        }
+        cache.refresh_columns(Path::new("/other"), (3, 4, 8), || with_size(70.0));
+        assert_eq!(cache.columns.unwrap().size, 70.0);
     }
 
     #[test]

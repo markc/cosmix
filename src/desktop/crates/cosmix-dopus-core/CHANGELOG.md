@@ -2,6 +2,8 @@
 
 ## 0.3.0
 
+- Expose a per-pane listing/count reply revision for inexpensive UI cache
+  invalidation, including multiple replies delivered in one update.
 - Retry pending Properties reads automatically when metadata worker capacity
   frees; never cache a transient busy result. Retain timeout error caching.
 - Apply the Properties-specific 22% width default to partial schema-2

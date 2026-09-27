@@ -24,8 +24,9 @@ selection-tinted buttons; hidden panels have muted icons.
 All icon controls have iced tooltips, including Places, sort headers, listing
 icons and expansion chevrons. Action tooltips and status-bar shortcut labels
 read the effective keymap, including custom remaps and unbindings, and update
-when the keymap reloads. Tooltip colours and spacing use design tokens;
-the design currently has no timing token, so iced's default delay applies.
+when the keymap reloads. Ctrl alternatives appear before function keys in
+tooltip labels. Tooltip colours and spacing use design tokens; the design
+currently has no timing token, so iced's default delay applies.
 Each pane shows only its editable location bar above the column headers;
 there is no duplicate path beside the toolbar. Ctrl+L and `location.focus`
 keep their existing behaviour. Toolbar clicks invoke the existing actions,
@@ -45,7 +46,12 @@ leaving a useful Name budget when both sidebars are open.
 Size reserves the widest shaped size/count value in that pane's listing, with
 a `99.9 MiB` floor and `999999 items` ceiling plus token padding. The cached
 width updates on relists, count replies and typography changes; headers and
-rows receive the same layout. Small-file listings leave more room for names.
+rows receive the same layout. A generation/reply-revision/row-count signature
+skips unchanged listings before formatting. Only the four longest Size strings
+are shaped, with eight paragraphs at most per changed column-cache refresh
+including fixed samples. Size grows but never shrinks within the same pane
+root; navigating to another root resets it. Small-file listings leave more
+room for names.
 Selection uses the design's `selection`/`selection_text` pair, and a
 `muted_surface` header marks the active pane. Modified times are always local
 `dd/mm/yy HH:MM` in 24-hour format. There is no relative-time refresh.

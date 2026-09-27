@@ -115,6 +115,9 @@ pub struct PaneModel {
     // The worker-side mirror of `generation` lives in `WorkerHandle::
     // generations` (worker.rs) — one array, updated only by
     // `store_generation`; panes hold no second copy to drift.
+    /// Accepted listing/count replies, including child listings. A cheap
+    /// cache key that cannot miss replies batched into one UI update.
+    pub listing_revision: u64,
     pub listing: bool,
     pub root: Vec<FileEntry>,
     pub children: HashMap<PathBuf, Vec<FileEntry>>,
@@ -139,6 +142,7 @@ impl PaneModel {
         Self {
             path,
             generation: 0,
+            listing_revision: 0,
             listing: false,
             root: Vec::new(),
             children: HashMap::new(),
@@ -1073,6 +1077,7 @@ impl DopusCore {
             if pane.generation != generation || root && pane.path != path {
                 return;
             }
+            pane.listing_revision = pane.listing_revision.wrapping_add(1);
             pane.pending_children.remove(&path);
             if root {
                 pane.listing = false;
@@ -1172,6 +1177,7 @@ impl DopusCore {
             return;
         }
         pane.pending_counts = pane.pending_counts.saturating_sub(1);
+        pane.listing_revision = pane.listing_revision.wrapping_add(1);
         pane.count_sort_dirty |=
             set_backing_child_count(pane, &path, count) && pane.sort == SortColumn::Size;
         // A count for the active pane's selected row repaints the information
@@ -2351,6 +2357,7 @@ mod tests {
 
         core.navigate(PaneId::Left, PathBuf::from("/music"));
         let generation = core.pane(PaneId::Left).generation;
+        let revision = core.pane(PaneId::Left).listing_revision;
 
         // Both match: accepted.
         let events = core.on_event(CoreEvent::ListingArrived {
@@ -2362,6 +2369,7 @@ mod tests {
         });
         assert!(!events.is_empty(), "the matching reply is accepted");
         assert!(!core.pane(PaneId::Left).listing);
+        assert_eq!(core.pane(PaneId::Left).listing_revision, revision + 1);
 
         // Generation mismatch: rejected.
         core.navigate(PaneId::Left, PathBuf::from("/music"));
@@ -2388,6 +2396,20 @@ mod tests {
             result: Ok(vec![entry("/other/x", false)]),
         });
         assert!(core.pane(PaneId::Left).root.is_empty());
+    }
+
+    #[test]
+    fn listing_revision_tracks_count_replies_even_when_batched() {
+        let (_dir, mut core, _rx) = core_fixture();
+        let pane = PaneId::Left;
+        let generation = core.pane(pane).generation;
+        let revision = core.pane(pane).listing_revision;
+        let path = core.pane(pane).path.join("folder");
+        core.receive_count(pane, generation.wrapping_add(1), path.clone(), Some(1));
+        assert_eq!(core.pane(pane).listing_revision, revision);
+        core.receive_count(pane, generation, path.clone(), Some(2));
+        core.receive_count(pane, generation, path, Some(3));
+        assert_eq!(core.pane(pane).listing_revision, revision + 2);
     }
 
     /// The port-restructured interaction the new test pins: a lazy child

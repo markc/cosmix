@@ -2,6 +2,9 @@
 
 ## 0.3.0
 
+- Skip unchanged Size measurements with a cheap listing signature; shape at
+  most four candidates (eight paragraphs including layout samples). Keep Size
+  grow-only until the pane root changes, and list Ctrl alternatives first in tooltips.
 - Measure Size from each listing's actual values, bounded by a readable floor
   and count ceiling; share the cached layout between headers and rows.
 - Use quiet input borders on location bars, reserving the ring for focused editing.

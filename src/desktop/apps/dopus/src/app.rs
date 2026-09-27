@@ -508,8 +508,8 @@ impl Dopus {
             self.core.visible_rows(PaneId::Right),
         ];
         let look = self.look();
-        for (cache, rows) in self.column_cache.iter_mut().zip(&self.rows) {
-            cache.refresh(look, rows);
+        for (index, pane) in [PaneId::Left, PaneId::Right].into_iter().enumerate() {
+            self.column_cache[index].refresh(look, self.core.pane(pane), &self.rows[index]);
         }
         self.split_ratio = self.core.config_snapshot().split_ratio;
     }

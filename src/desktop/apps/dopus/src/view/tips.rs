@@ -9,7 +9,11 @@ use iced_tiny_skia::Renderer;
 
 pub fn action_label(actions: &[ActionRow], action: ActionId, label: &str) -> String {
     match actions.iter().find(|row| row.id == action.as_str()) {
-        Some(row) if !row.keys.is_empty() => format!("{label} ({})", row.keys.join(", ")),
+        Some(row) if !row.keys.is_empty() => {
+            let mut keys: Vec<&str> = row.keys.iter().map(String::as_str).collect();
+            keys.sort_by_key(|key| !key.starts_with("Ctrl+"));
+            format!("{label} ({})", keys.join(", "))
+        }
         _ => label.to_owned(),
     }
 }
@@ -81,6 +85,10 @@ mod tests {
     #[test]
     fn labels_include_function_keys_and_desktop_alternates() {
         let actions = crate::verbs::action_table(&crate::keys::load(None).unwrap());
+        assert_eq!(
+            action_label(&actions, cosmix_actions::filemgr::VIEW_REFRESH, "Refresh"),
+            "Refresh (Ctrl+R, F5)"
+        );
         for (action, label, original, alternate) in [
             (
                 cosmix_actions::filemgr::VIEW_REFRESH,
