@@ -1,4 +1,4 @@
--- version: 0.9.0
+-- version: 0.10.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -236,7 +236,9 @@ fn restore_begin($directory)
   $name = basename($directory)
   if $parent == nil or contains(["", ".", ".."], $name) then raise("STORE_DESTINATION", "restore needs an existing parent and a new name") end
   $requested = $parent .. "/" .. $name
-  $partial = $parent .. "/." .. $name .. ".partial-" .. uuid()
+  $partial_name = "." .. $name .. ".partial-" .. uuid()
+  if byte_length($partial_name) > 255 then raise("STORE_DESTINATION", "partial restore name exceeds 255 UTF-8 bytes; destination basename must fit in 209 bytes") end
+  $partial = $parent .. "/" .. $partial_name
   mkdir($partial, {parents: false})
   return {root: $partial, requested: $requested}
 end

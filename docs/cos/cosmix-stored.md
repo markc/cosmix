@@ -144,10 +144,16 @@ call `reply()`. A long drain can outlast the requester's timeout; use durable
 commit status to determine the outcome. A retired worker clears its busy flag only if it
 still owns that epoch. `STORE_SUPERSEDED` terminates the drain immediately,
 including when raised during failure handling; it never sleeps or retries,
-and a request kick still receives its reply. Escaping infrastructure failures (including connection
-or failed-state-write errors) get at most three retries, separated by 60 s.
-This is an error backstop, not a poll. After exhaustion, fix the underlying
-fault and kick `stored.work` or restart to recover the pending intent.
+and a request kick still receives its reply. Escaping infrastructure failures
+(including connection, failed-state-write and completion-publish errors)
+share a budget of at most three retries per drain, separated by 60 s.
+A failed completion publish retries the same payload without rerunning the
+terminal job; successful publication resumes draining. This is an error
+backstop, not a poll. After exhaustion, fix the underlying fault and kick
+`stored.work` or restart to recover any pending intent. A publish failure
+does not undo a terminal job. Completion retries may duplicate an event if
+its acknowledgement was lost; payloads are retained only in memory during
+that drain, not in a durable outbox. Durable status remains authoritative.
 
 Failed work may retain partial pins and upload receipts. This is intentional
 until a separate release policy is designed. Blobd quota counts unique bytes
@@ -232,7 +238,10 @@ downloads from the local lane with `expect_blake3`, no-clobber publication,
 size verification and a final BLAKE3 check. The destination must not exist;
 its parent must exist. Files are verified inside a sibling
 `.<name>.partial-<uuid>` directory; only a completely verified tree is renamed
-onto the requested name. Failure leaves that visibly partial directory. Keep
+onto the requested name. The composed partial basename must fit in 255 UTF-8
+bytes, leaving at most 209 bytes for the requested basename; longer names
+raise `STORE_DESTINATION` before any directory is created. Filesystems may
+impose stricter limits. Failure after creation leaves that visibly partial directory. Keep
 the destination parent free of concurrent namespace writers; Mix's rename is
 atomic but does not offer `RENAME_NOREPLACE`. Restore pins
 under `store-restore:<collection>` are retained in this arc too.

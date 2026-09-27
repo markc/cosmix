@@ -1,4 +1,4 @@
--- version: 0.9.0
+-- version: 0.10.0
 $c = require("store_client.mix")
 $checks = buffer()
 $clock = buffer()
@@ -67,6 +67,19 @@ try
     $caught = $error.code
   end
   check($caught == "STORE_DESTINATION", "RESTORE_NO_CLOBBER")
+  $boundary = $c.restore_begin($dir .. "/" .. repeat("a", 209))
+  check(byte_length(basename($boundary.root)) == 255 and is_dir($boundary.root), "RESTORE_PARTIAL_NAME_AT_LIMIT")
+  remove_dir($boundary.root)
+  for each $name in [repeat("a", 210), repeat("é", 105)]
+    $before = sort(ls($dir))
+    $caught = ""
+    try
+      $c.restore_begin($dir .. "/" .. $name)
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_DESTINATION" and deep_eq(sort(ls($dir)), $before), "RESTORE_LONG_NAME_REFUSED_WITHOUT_WRITES")
+  end
   mkdir($dir .. "/tree/nested")
   write_file($dir .. "/tree/empty", "")
   write_file($dir .. "/tree/nested/binary", bytes_from([0, 255, 1, 128]))

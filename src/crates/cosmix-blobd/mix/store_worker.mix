@@ -1,10 +1,14 @@
--- version: 0.2.0
+-- version: 0.3.0
 -- Primary wakes are explicit kicks. Only escaping infrastructure failures retry.
 fn drain($run_job, $finish, $pause, $context)
   $retries = 0
+  $finished = nil
   while true
     try
-      $finished = $run_job($context)
+      if $finished == nil then $finished = $run_job($context) end
+      if $finished == nil then return end
+      $finish($finished)
+      $finished = nil
     catch $message, $error
       if $error.code == "STORE_SUPERSEDED" then return end
       eprint("stored retry: " .. $error.code .. ": " .. $message)
@@ -13,7 +17,5 @@ fn drain($run_job, $finish, $pause, $context)
       $pause(60)
       continue
     end
-    if $finished == nil then return end
-    $finish($finished)
   end
 end
