@@ -160,7 +160,14 @@ Revision-1 colour primitives are the web-shared **role anchors** —
 `palette.accent.default`, `palette.accent.hover`, the mode-dependent
 `status.success`, `status.warning`, `status.danger`, and `transparent`
 — authored in OKLCH (§3) and shared **verbatim** with the web design
-system (§11.2). The names are a source-format wire contract on the same
+system (§11.2). Two further **desktop-only** background anchors —
+`palette.background.muted` and `palette.background.elevated` — carry
+the §2.4 quiet and elevated chrome surfaces: they are not
+web-published and the verbatim claim does not cover them, but they
+stand on the same wire-contract footing, and they exist because §3.6's
+distinctness floor cannot be met from the seven web anchors alone —
+revision-1's one-step backgrounds clear barely 1.05:1 against
+`background.1`. The names are a source-format wire contract on the same
 footing as §2.4's semantic vocabulary: an authored theme references them
 by string, so renaming one is a format break. A later source revision
 MAY introduce Radix-model 12-step hue ramps with semantically assigned
@@ -198,8 +205,15 @@ uniformly `<name>` + `<name>.foreground`), and `destructive` carries an
 explicit authored foreground rather than an implied one (§2.3 admits no
 foreground-less text surface):
 
-- pairs: `base`, `card`, `popover`, `primary`, `secondary`, `muted`,
-  `accent`, `destructive` (each `<name>` + `<name>.foreground`);
+- pairs: `base`, `card`, `popover`, `elevated`, `primary`, `secondary`,
+  `muted`, `accent`, `destructive` (each `<name>` +
+  `<name>.foreground`). `elevated` extends shadcn's set as the
+  popover/tooltip/menu role, and `popover` is its **compatibility
+  alias**: a source that authors only one of the two compiles with the
+  other taking the same authored or derived form — resolved on the
+  flattened pair map (§11.2), before the closed-vocabulary check, so a
+  source naming neither is reported as missing both — and a source that
+  authors both keeps both;
 - **non-text colour tokens:** `border`, `input`, `ring` — lone colours
   by design, carrying no text-contrast claim. The compiler MUST reject
   a non-text token in any text-bearing position (§10.3's positional
@@ -338,7 +352,7 @@ at an adjacency set no author could satisfy.
 3.5.2 **Derived focus indicators.** One lone `ring` value cannot satisfy
 §3.5 across the shipped contexts. A button family draws focus on at
 least four surfaces — secondary/control, primary, destructive, and the
-muted composite — and in every dark context the luminance window that
+Ghost's transparent composite — and in every dark context the luminance window that
 clears 3:1 against the near-black background is disjoint from the one
 that clears it against the light accent: the requirement is infeasible,
 not merely unauthored, and no choice of hue changes that because
@@ -485,8 +499,8 @@ that pair's surface sits in the seed's own luminance band, which for
 revision-1's ring-seeded calls means the accent's — and the
 honest response is to say so, not to refuse to compile. The threshold is
 **300 steps** (0.30 in lightness). It was **chosen from measurement**
-rather than picked, and the measurement is this: across the ninety-six
-pair-context cells of revision-1, seventy-two need
+rather than picked, and the measurement is this: across the one-hundred-and-eight
+pair-context cells of revision-1, eighty-four need
 no walk at all, twenty-one land between 0.057 and 0.30, and exactly
 three exceed it — `mono`/dark/destructive at 0.437, `stone`/dark/
 destructive at 0.385, and `ocean`/dark/destructive at 0.342. Only
@@ -497,7 +511,7 @@ stays silent on the twenty-one routine walks reports outliers rather
 than narrating the normal case.
 
 The same measurement retires the bounded alternative on evidence: a
-±0.25 bound would have been **fatal on eighteen of the ninety-six
+±0.25 bound would have been **fatal on eighteen of the one-hundred-and-eight
 cells**, including `primary` and `destructive` in nearly every context.
 It was never satisfiable by the shipped palette.
 
@@ -510,6 +524,26 @@ just above the boundary, and not only through the revision-1 counts
 (§15) — a test that asserts "three cells warn" is a regression test for
 the palette; a test that asserts "0.300 is silent and 0.301 warns" is a
 test of the gate.
+
+3.6 **Role surfaces must be visibly distinct from the page.** `muted`
+and `elevated` are chrome roles, not page colours: a tooltip, menu,
+popover, active-pane header or status strip painted on a surface equal
+to `base` renders as whatever it covers. Each role's **rendered**
+surface MUST therefore differ from `base`'s rendered surface by at
+least **1.25:1 luminance contrast** in the §3.2 pipeline, and failure
+is fatal per §11.5 with the diagnostic naming the role
+(`surface-not-distinct-from-base`). The gate is on the rendered
+surface, so a transparent surface composited over a `base`-coloured
+backdrop is caught as surely as an authored equal colour. Nothing
+comparable is demanded of the other roles: they sit inside page
+content, where matching the page can be the point — the shipped
+revision-1 `card` *is* the transparent-over-page pair the Ghost
+variant rests on — and §3.4's AA gate already fixes their text. The
+floor is deliberately far below AA, because distinctness, not
+legibility, is the claim; near-black and near-white bases make OKLCH
+lightness steps cheap and luminance contrast expensive, which is why
+the revision-1 muted and elevated surfaces are dedicated anchors (§2.2)
+rather than palette steps.
 
 ## §4 Component mapping algebra
 
@@ -744,7 +778,8 @@ distinction it now draws is the whole reason. A surface-moving recipe
 can never change a fully transparent surface's delivered bytes, in any
 palette, by construction — so a dictionary containing a transparent
 pair could not satisfy the old clause at all. The shipped dictionary
-contains one (`muted`), and the Ghost variant's resting identity *is*
+contains one (`card`, the transparent-over-page pair the Ghost rests
+on), and the Ghost variant's resting identity *is*
 that transparency, so the choice was never between a strict rule and a
 lax one: it was between dropping transparent pairs from the vocabulary
 and degrading the failure to a warning nobody reads. Making
@@ -876,7 +911,7 @@ documentation, and the whole point of §10.3's typing is that the
 assertion is load-bearing.
 
 Per cell is where evaluation *happens*; it is not a licence to report
-the same fact ninety-six times. Two evaluations whose recipe and whose
+the same fact one-hundred-and-eight times. Two evaluations whose recipe and whose
 every bound input are identical have one outcome by determinism
 (§10.1), so the compiler MUST evaluate them once and report a failure
 once. This is not diagnostic de-duplication after the fact — the
@@ -1122,7 +1157,7 @@ counts are then asserted separately as a *palette* regression — the
 three cells above the threshold each warn and name both their
 `step_index` and the seed they walked from, the twenty-one routine
 walks at or below it stay silent (the threshold is strict, so 300 is
-itself silent), and the seventy-two zero-distance cells record a
+itself silent), and the eighty-four zero-distance cells record a
 `step_index` of zero rather than no distance at all. A *warning*, never
 a rejection, so a compile that emits it still succeeds. Plus totality asserted directly — for every cell of every
 context, **at least one direction reaches 3:1**;
@@ -1130,7 +1165,17 @@ context, **at least one direction reaches 3:1**;
 reachable focus-visible cell of a family carries an indicator (lone
 token or derivation), with `disabled` exempt because a disabled control
 takes no focus and the shipped button suppresses its indicator there,
-so requiring one would gate a state the user cannot reach; §4.2
+so requiring one would gate a state the user cannot reach; §2.4's
+popover/elevated alias proven in both directions (a source authoring
+only `popover` compiles with `elevated` taking its form and vice versa,
+delivering equal rendered values, and a source naming neither is
+missing both) and pinned on the shipped revision-1 design, whose
+un-authored `popover` delivers the authored `elevated` pair exactly;
+§3.6 surface-distinctness rejection — a design whose `muted` or
+`elevated` rendered surface sits below 1.25:1 against `base` is
+refused with the diagnostic naming the role in both its path and
+message, and the revision-1 palette clears the floor for `muted`,
+`elevated` and the aliased `popover` in all twelve contexts; §4.2
 forbidden-construct rejection (component
 names / selectors / expressions / undeclared axes in data); §4.3
 ambiguity rejection; §4.4 mandatory-base rejection; §4.6 coverage

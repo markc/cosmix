@@ -3126,7 +3126,7 @@ version = "0.4.1"
 
 [[package]]
 name = "cosmix-design"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "cosmix-lib-mix",
  "serde",
@@ -3212,7 +3212,7 @@ version = "0.1.0"
 
 [[package]]
 name = "cosmix-iced-widgets"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cosmix-design",
  "iced",
