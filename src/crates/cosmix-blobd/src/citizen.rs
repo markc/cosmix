@@ -204,6 +204,7 @@ impl Citizen {
             "present": stat.present,
             "size": stat.size,
             "mime": stat.mime,
+            "name": stat.name,
             "pins": stat.pins,
             "origin": stat.origin,
             "first_put": stat.first_put,
@@ -1040,6 +1041,26 @@ mod tests {
         let quota: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(quota["owners"]["maild"]["used"], 11);
         assert_eq!(quota["total"]["used"], 11);
+    }
+
+    #[test]
+    fn stat_returns_stored_name_and_metadata_or_explicit_null() {
+        let (dir, c) = citizen();
+        for (i, name) in [Some("stored.bin"), None].into_iter().enumerate() {
+            let source = dir.path().join(format!("source-{i}"));
+            std::fs::write(&source, format!("payload-{i}")).unwrap();
+            let (rc, body, _) = c.dispatch(&command("blob.put", "tester", json!({"path":source,"name":name,"mime":"application/x-stored"})));
+            assert_eq!(rc, 0, "{body}");
+            let reference: Value = serde_json::from_str(&body).unwrap();
+            let (rc, body, _) = c.dispatch(&command("blob.put", "tester", json!({"path":source,"name":"new-hint.txt","mime":"text/plain"})));
+            assert_eq!(rc, 0, "{body}");
+            let (rc, body, _) = c.dispatch(&command("blob.stat", "tester", json!({"blob":reference["blob"]})));
+            assert_eq!(rc, 0, "{body}");
+            let stat: Value = serde_json::from_str(&body).unwrap();
+            assert!(stat.get("name").is_some(), "name must be explicit even when null");
+            assert_eq!(stat["name"], json!(name));
+            for field in ["mime", "size", "origin"] { assert_eq!(stat[field], reference[field]); }
+        }
     }
 
     #[tokio::test]

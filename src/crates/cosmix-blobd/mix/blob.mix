@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.2.1
 -- mix/blob.mix — the Mix surface over cosmix-blobd's blob.* verbs (the
 -- design's §4.4: a require() library, not builtins). Bus verbs wrap send;
 -- caller-local file transfers use the discovered HTTP lane. Both answer
@@ -107,7 +107,7 @@ fn blob_put($path, $opts)
   return _done($rc, $r)
 end
 
--- blob.stat: {present, size, mime, pins, origin, first_put}.
+-- blob.stat: {present, size, mime, name, pins, origin, first_put}.
 fn blob_stat($ref, $opts)
   $r = send _svc($opts) blob.stat blob=_id($ref)
   return _done($rc, $r)
@@ -290,7 +290,7 @@ fn _blob_upload_file($path, $opts)
   if not $present.ok then return $present end
   if $present.result.present == true and contains($present.result.pins, $owner) then
     if $present.result.size != $size then return _file_error("stored size differs from source") end
-    return {ok: true, rc: 0, result: {blob: "b3:" .. $hash, size: $size, mime: $present.result.mime, origin: $present.result.origin}}
+    return {ok: true, rc: 0, result: {blob: "b3:" .. $hash, size: $present.result.size, mime: $present.result.mime, name: $present.result.name, origin: $present.result.origin}}
   end
   $record = $identity
   if exists($resume, {follow_symlinks: false}) then

@@ -253,6 +253,7 @@ pub struct StatInfo {
     pub present: bool,
     pub size: Option<u64>,
     pub mime: Option<String>,
+    pub name: Option<String>,
     pub pins: Vec<String>,
     pub origin: Option<String>,
     pub first_put: Option<i64>,
@@ -901,22 +902,23 @@ impl Store {
                 .optional()
                 .map_err(db_err)?
         };
-        let (mime, origin, first_put): (Option<String>, Option<String>, Option<i64>) = self
+        let (mime, origin, first_put, name): (Option<String>, Option<String>, Option<i64>, Option<String>) = self
             .db
             .lock()
             .unwrap()
             .query_row(
-                "SELECT mime, origin, first_put FROM blob_attrs WHERE hash = ?1",
+                "SELECT mime, origin, first_put, name_hint FROM blob_attrs WHERE hash = ?1",
                 params![blob::hex(hash)],
-                |r| Ok((r.get(0)?, r.get(1)?, Some(sql_timestamp(r, 2)?))),
+                |r| Ok((r.get(0)?, r.get(1)?, Some(sql_timestamp(r, 2)?), r.get(3)?)),
             )
             .optional()
             .map_err(db_err)?
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, None));
         Ok(StatInfo {
             present,
             size,
             mime,
+            name,
             pins: self.pin_owners(hash)?,
             origin,
             first_put,

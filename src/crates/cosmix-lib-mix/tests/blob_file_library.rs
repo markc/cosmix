@@ -64,10 +64,8 @@ impl BusHandler for Bus {
                         }),
                     ),
                     ("size".into(), Value::Number(4.0)),
-                    (
-                        "mime".into(),
-                        Value::String("application/octet-stream".into()),
-                    ),
+                    ("mime".into(), Value::String("application/x-stored".into())),
+                    ("name".into(), Value::String("stored.bin".into())),
                     ("origin".into(), Value::String("test-node".into())),
                 ])),
                 "blob.props.get" => {
@@ -164,9 +162,12 @@ async fn blob_upload_owner_pin_short_circuits_before_lane_and_record() {
         pinned: true,
         discovery: Cell::new(0),
     });
-    let result = upload(Rc::clone(&bus), &dir.0).await;
+    let result = execute(Rc::clone(&bus), &format!("$out = $b.blob_upload_file({}, {{service:\"blobd-test\", owner:\"tester\", resume_file:{}, mime:\"text/plain\", name:\"caller-hint.txt\"}})", quoted(&dir.0.join("source")), quoted(&dir.0.join("resume.json")))).await;
     assert_eq!(result["ok"], true);
     assert_eq!(result["result"]["size"], 4);
+    assert_eq!(result["result"]["mime"], "application/x-stored");
+    assert_eq!(result["result"]["name"], "stored.bin");
+    assert_eq!(result["result"]["origin"], "test-node");
     assert_eq!(bus.discovery.get(), 0);
     assert!(!dir.0.join("resume.json").exists());
 }

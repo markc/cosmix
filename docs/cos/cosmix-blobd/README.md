@@ -278,7 +278,7 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 
 ## Mix
 
-### Caller-local file transfer (blob.mix 0.2.0, Mix 0.97.0)
+### Caller-local file transfer (blob.mix 0.2.1, Mix 0.97.1)
 
 `blob_upload_file(path, opts)` streams a caller-local file through durable
 sessions. Required options are `owner` and `resume_file`; `service` defaults to
@@ -288,7 +288,9 @@ the resume record exclusive to one caller. Sizes/chunks must be exact Mix
 integers through 9007199254740991; chunk must be positive.
 
 The library hashes the source, then checks `blob.stat` on the target service.
-Presence **and this owner's pin** return a reference immediately without an
+`blob.stat` includes the stored `name` (explicit null when absent), alongside
+size, mime and origin. Presence **and this owner's pin** return a reference
+using those stored fields, including name, rather than the caller's hints, without an
 upload or lane discovery. Otherwise `blob.props.get path="lane.bind"` discovers
 the target's HTTP lane over the Bus. There is no hard-coded lane address or
 alternate control transport.
