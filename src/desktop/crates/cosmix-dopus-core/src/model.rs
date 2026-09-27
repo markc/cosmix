@@ -242,6 +242,10 @@ impl ConfirmBook {
 /// thread; filesystem work happens on detached worker threads that reply
 /// through the channel returned by [`DopusCore::new`].
 pub struct DopusCore {
+    places_home: PathBuf,
+    places_cache: std::cell::OnceCell<Vec<(&'static str, PathBuf)>>,
+    #[cfg(test)]
+    places_stat_passes: std::cell::Cell<usize>,
     panes: [PaneModel; 2],
     active: PaneId,
     split_ratio: f32,
@@ -276,6 +280,10 @@ impl DopusCore {
         let left_start = configured_directory(&config.left.path, &home);
         let right_start = configured_directory(&config.right.path, &home);
         let mut core = Self {
+            places_home: home,
+            places_cache: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            places_stat_passes: std::cell::Cell::new(0),
             panes: [
                 PaneModel::new(
                     left_start,
@@ -321,6 +329,21 @@ impl DopusCore {
 
     pub fn active(&self) -> PaneId {
         self.active
+    }
+
+    /// Cached Places projection. Repeated views do no filesystem stats.
+    /// Every relist and explicit Places refresh invalidates the snapshot.
+    pub fn places(&self) -> &[(&'static str, PathBuf)] {
+        self.places_cache.get_or_init(|| {
+            #[cfg(test)]
+            self.places_stat_passes.set(self.places_stat_passes.get() + 1);
+            places(&self.places_home)
+        })
+    }
+
+    /// Recheck Places on the next view, coalescing multiple invalidations.
+    pub fn refresh_places(&mut self) {
+        self.places_cache.take();
     }
 
     /// The flatten projection (browser.rs `flatten_entries`, 1991-2012,
@@ -1127,6 +1150,7 @@ impl DopusCore {
     /// pane's queued count jobs, clears rows/children/expansion, and spawns
     /// the listing.
     fn start_listing(&mut self, pane_id: PaneId) {
+        self.refresh_places();
         self.listing_nonce += 1;
         let generation = self.listing_nonce;
         let (path, show_hidden) = {
@@ -2727,6 +2751,39 @@ mod tests {
             2,
             "failure relists both panes exactly once"
         );
+    }
+
+    #[test]
+    fn places_views_share_one_stat_pass_until_refresh_or_operation_reply() {
+        let (dir, mut core, _rx) = core_fixture();
+        core.places_home = dir.path().to_owned();
+        let first = core.places().to_vec();
+        assert_eq!(core.places(), first.as_slice());
+        assert_eq!(core.places_stat_passes.get(), 1);
+
+        let documents = dir.path().join("Documents");
+        std::fs::create_dir(&documents).unwrap();
+        assert!(!core.places().iter().any(|(_, path)| path == &documents));
+        core.refresh_places();
+        assert!(core.places().iter().any(|(_, path)| path == &documents));
+        assert_eq!(core.places_stat_passes.get(), 2);
+
+        for result in [Ok("done".to_owned()), Err("partial failure".to_owned())] {
+            let before = core.places_stat_passes.get();
+            core.on_event(CoreEvent::OperationArrived {
+                kind: FileOpKind::Copy,
+                source_pane: PaneId::Left,
+                result,
+            });
+            core.places();
+            core.places();
+            assert_eq!(core.places_stat_passes.get(), before + 1,
+                "both relists coalesce into one Places stat pass");
+        }
+        let before = core.places_stat_passes.get();
+        core.refresh();
+        core.places();
+        assert_eq!(core.places_stat_passes.get(), before + 1);
     }
 
     // -- config settle debounce (browser.rs:3564-3622) -------------------------

@@ -80,6 +80,7 @@ pub fn root<'a>(
     editing: Option<(PaneId, &'a str)>,
     info: &'a str,
     dialog: Option<&'a dialogs::Dialog>,
+    places: &'a [(&'static str, std::path::PathBuf)],
 ) -> Element<'a, Msg> {
     let (left_edit, right_edit) = match editing {
         Some((PaneId::Left, text)) => (Some(text), None),
@@ -95,7 +96,7 @@ pub fn root<'a>(
     let left_portion = (split_ratio.clamp(panes::SPLIT_MIN, panes::SPLIT_MAX) * 100.0).round() as u16;
     let content = column![
         row![
-            places::sidebar(look, icons, tint, active, active_pane),
+            places::sidebar(look, icons, tint, active, active_pane, places),
             panes::pane_column(
                 look, icons, tint, PaneId::Left, left, left_rows, left_portion, active == PaneId::Left, left_edit,
             ),

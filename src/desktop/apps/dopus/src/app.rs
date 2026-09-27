@@ -87,6 +87,8 @@ pub enum Msg {
     LocationSubmit(PaneId),
     /// Escape in the editor: cancel.
     LocationCancel,
+    /// Recheck the Places sidebar's directory existence snapshot.
+    RefreshPlaces,
     /// The divider moved (ratio clamped 0.1–0.9) or double-clicked (0.5).
     Split(f32),
     /// A raw core event, back from the pumper (law 2's feed).
@@ -399,6 +401,11 @@ impl Dopus {
                 Task::none()
             }
             Msg::LocationEdit(pane) => self.begin_edit(pane),
+            Msg::RefreshPlaces => {
+                self.stop_editing();
+                self.core.refresh_places();
+                Task::none()
+            }
             Msg::LocationInput(text) => {
                 if let Some((_, current)) = &mut self.editing {
                     *current = text;
@@ -958,6 +965,7 @@ impl Dopus {
             editing,
             info,
             self.dialog.as_ref(),
+            self.core.places(),
         );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops

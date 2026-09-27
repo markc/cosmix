@@ -42,21 +42,23 @@ pub fn sidebar<'a>(
     tint: &'a str,
     active: PaneId,
     pane: &'a PaneModel,
+    places: &'a [(&'static str, std::path::PathBuf)],
 ) -> Element<'a, Msg> {
-    let home = cosmix_dopus_core::home_directory();
     let mut list = column![
-        text("Places")
+        button(text("Places")
             .font(look.ui_font)
             .size(look.px * 0.8)
-            .color(look.tokens.muted_text),
+            .color(look.tokens.muted_text))
+            .on_press(Msg::RefreshPlaces)
+            .style(place_look(&look, false)),
         Space::new().height(Length::Fixed(4.0)),
     ]
     .padding(Padding { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 })
     .spacing(2)
     .width(Length::Fill);
-    for (name, path) in cosmix_dopus_core::places(&home) {
-        let selected = pane.path == path;
-        let label = text(name.to_owned())
+    for (name, path) in places {
+        let selected = pane.path == *path;
+        let label = text((*name).to_owned())
             .font(look.ui_font)
             .size(look.px * 0.9)
             .color(if selected { look.chrome.accent } else { look.chrome.secondary_text });
@@ -69,7 +71,7 @@ pub fn sidebar<'a>(
             )
             .padding([4, 10])
             .width(Length::Fill)
-            .on_press(Msg::Go(active, path))
+            .on_press(Msg::Go(active, path.clone()))
             .style(style),
         );
     }
