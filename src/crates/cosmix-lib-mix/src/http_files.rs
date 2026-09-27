@@ -728,10 +728,12 @@ mod tests {
     }
 
     fn map(value: Option<Value>) -> Rc<IndexMap<String, Value>> {
-        let Some(Value::Map(map)) = value else {
+        // `Value` implements Drop, so the payload cannot be moved out of the
+        // pattern; borrow it and clone the Rc.
+        let Some(Value::Map(ref map)) = value else {
             panic!("expected map")
         };
-        map
+        map.clone()
     }
 
     fn server(
