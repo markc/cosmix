@@ -151,3 +151,52 @@ The client subscribes before commit, then checks durable status once after
 completion or timeout. Pending is never reported as committed. `list` follows
 all pages; `status` exposes the durable job including failure or tombstone.
 One-shot event users finish with `quit()`; failures exit nonzero.
+
+## Packaging and verification
+
+The citizen and client live in `src/crates/cosmix-blobd/mix/`. They require
+Mix 0.97.0 or later and blobd 0.6.1 or later. There is no new Rust binary.
+The package installs the eight runtime scripts together under
+`/opt/cosmix/share/cosmix/stored/`; relative `require()` paths stay intact.
+Run the installed client as `mix /opt/cosmix/share/cosmix/stored/store.mix`.
+
+Stage a package without root, account creation or service changes:
+
+```text
+mix src/crates/cosmix-blobd/mix/store_package.mix --source . --destdir /tmp/stored-package
+mix src/crates/cosmix-blobd/mix/store_test.mix
+systemd-analyze verify --man=no src/_etc/systemd-system/cosmix-stored.service
+```
+
+The destination must not exist. The rootless suite registers all four focused
+test scripts, checks lint/syntax/version for every Mix file in this directory,
+stages the assets and verifies script bytes, unit state settings and registry
+projection. It needs neither cargo nor a broker.
+
+The shipped unit is `src/_etc/systemd-system/cosmix-stored.service`;
+`src/_etc/sysusers/cosmix.conf` projects registered citizen UID/GID 601,
+`cosmix-stored`. An operator installs the staged assets, applies sysusers and
+enables the unit in a separately authorised deployment. Systemd creates
+`/var/lib/cosmix/stored` with mode 0700 and supplies `STATE_DIRECTORY`.
+No `cosmix-blob` membership or CAS filesystem access is needed: even manifest
+bytes go through the lane. Named instances need a separate unit/drop-in with
+distinct state, `--name stored-<instance>` and `STORED_BLOBD=blobd-<instance>`.
+The unit uses Wants/After dependencies so broker reconnect remains native.
+
+The maintainer's private `stored_gate.mix` is intentionally outside this
+public repository. It starts isolated named citizens on the workstation,
+round-trips generated binary/empty/duplicate files through a separate fetch
+receiver, kills a push after a durable partial offset, resumes the same
+session/key, proves commit replay, tombstones without unpinning, checks SQLite
+rows directly and restarts the catalogue. Every arm has an exact failure
+token and a negative self-test. It does not exercise production deployment.
+
+Pilot migration and cutover are separate, unimplemented slices. Migration
+must first verify old raw-byte SHA-256 identities, import without deletion,
+and durably map old IDs to new IDs; a second phase must restore **every**
+snapshot through both clients and compare path sets, sizes and exact bytes
+before cutover. A rollback set includes the pilot data and writer lock,
+configuration and ACL/quota policy, old daemon **and client**, units/drop-ins
+and environment, ownership/modes, deploy inventory and ID mapping. Keep that
+set and the new catalogue/blob pins intact until rollback is explicitly
+retired. No migration, quota configuration or fleet deployment occurs here.

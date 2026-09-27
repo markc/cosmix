@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 $m = require("store_manifest.mix")
 $checks = buffer()
 fn check($condition, $token)
@@ -25,6 +25,8 @@ $other = {size: 0, path: "é/quote\"", blob: $hash}
 $first = $m.canonicalise({files: [$other, $entry], schema_version: 2})
 $second = $m.canonicalise({schema_version: 2, files: [$entry, $other]})
 check($first.canonical == $second.canonical and $first.manifest.files[0].path == "a", "ORDER")
+$unicode_bytes = "{\"files\":[{\"blob\":\"" .. $hash .. "\",\"path\":\"a\",\"size\":0},{\"blob\":\"" .. $hash .. "\",\"path\":\"é/quote\\\"\",\"size\":0}],\"schema_version\":2}"
+check($first.canonical == $unicode_bytes, "UNICODE_QUOTE_EXACT_BYTES")
 check($first.file_count == 2 and length(keys($first.objects)) == 1, "DISTINCT_OBJECTS")
 for each $bad in ["", "/a", "../a", "a/..", "a/./b", "a//b", "a/", "a\\b", "C:a", "a\n", "a\u{0085}", repeat("é", 513)]
   refuses({schema_version: 2, files: [{blob: $hash, path: $bad, size: 0}]}, "STORE_PATH")
@@ -50,6 +52,8 @@ end
 refuses({schema_version: 2, files: $many}, "STORE_LIMIT")
 $old = "{\"files\":[],\"schema_version\":1}"
 check($m.verify_legacy($old, hash_sha256($old)).schema_version == 1, "LEGACY_RAW")
+$old_ordered = "{\"files\":[{\"path\":\"z\",\"sha256\":\"" .. repeat("a", 64) .. "\",\"size\":0},{\"path\":\"a\",\"sha256\":\"" .. repeat("b", 64) .. "\",\"size\":1}],\"schema_version\":1}"
+check($m.verify_legacy($old_ordered, hash_sha256($old_ordered)).files[0].path == "z", "LEGACY_ARRAY_ORDER_EXACT_BYTES")
 $caught = ""
 try
   $m.verify_legacy($old .. "\n", hash_sha256($old))

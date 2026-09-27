@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 $c = require("store_catalogue.mix")
 $p = require("store_commit.mix")
 $m = require("store_manifest.mix")
@@ -60,6 +60,13 @@ try
     check($c.request($db, "store.commit.status", {collection: "test", id: $a.id}).state == "failed", "DURABLE_FAILURE_" .. $case)
     $p.admit($path, "test", $manifest)
   end
+  buffer_push($fault, "|")
+  sqlexec($db, "CREATE TRIGGER fail_member BEFORE INSERT ON snapshot_objects BEGIN SELECT RAISE(ABORT,'INJECT_MEMBER_FAILURE'); END")
+  $rolled_back = $p.run_pending($path, $dir, $epoch, $io)
+  check($rolled_back.state == "failed" and contains($rolled_back.error, "INJECT_MEMBER_FAILURE"), "PUBLICATION_TRANSACTION_FAILURE")
+  check(length(sqlexec($db, "SELECT * FROM snapshots")) == 0 and length(sqlexec($db, "SELECT * FROM snapshot_objects")) == 0, "PUBLICATION_ALL_OR_NOTHING")
+  sqlexec($db, "DROP TRIGGER fail_member")
+  $p.admit($path, "test", $manifest)
   buffer_push($fault, "|fence")
   $fenced = $p.run_pending($path, $dir, $epoch, $io)
   check($fenced == nil, "OLD_GENERATION_FENCED")

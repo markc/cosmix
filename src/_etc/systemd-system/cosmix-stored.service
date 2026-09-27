@@ -1,0 +1,54 @@
+# Citizen UID/GID 601; bytes use the lane, so no cosmix-blob group membership.
+[Unit]
+Description=Cosmix snapshot catalogue citizen (cosmix-stored)
+Documentation=https://cosmix.dev/cos/cosmix-stored.html
+After=network-online.target cosmix-noded.service cosmix-blobd.service
+Wants=network-online.target cosmix-noded.service cosmix-blobd.service
+StartLimitIntervalSec=10min
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=cosmix-stored
+Group=cosmix-stored
+StateDirectory=cosmix/stored
+StateDirectoryMode=0700
+RuntimeDirectory=cosmix/stored
+RuntimeDirectoryMode=0700
+WorkingDirectory=%S/cosmix/stored
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/cosmix/stored/stored.mix --name stored
+Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
+Environment=STORED_BLOBD=blobd
+Restart=on-failure
+RestartSec=30s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cosmix-stored
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

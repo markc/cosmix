@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.3.0
 -- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
 $catalogue = require("store_catalogue.mix")
 $commit = require("store_commit.mix")
@@ -62,8 +62,13 @@ on stored.work async
   if length(keys($event.headers)) != 0 or $WORKER_BUSY then return end
   $WORKER_BUSY = true
   try
-    $finished = $commit.run_pending($DB_PATH, $STATE, $EPOCH, $io)
-    if $finished != nil then publish("store.commit.finished", json_encode($finished), {retain: false}) end
+    while true
+      $finished = $commit.run_pending($DB_PATH, $STATE, $EPOCH, $io)
+      if $finished == nil then break end
+      publish("store.commit.finished", json_encode($finished), {retain: false})
+      -- Publication yields: a new intent may have been admitted while this
+      -- worker was busy. Drain it before releasing the in-process guard.
+    end
   catch $message
     eprint("stored worker: " .. $message)
   finally

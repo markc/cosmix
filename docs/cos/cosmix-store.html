@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/cosmix-stored</title>
+    <title>CosMix — cos/cosmix-store</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,169 +441,11 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/cosmix-stored.md"><div class="prose"><h1 id="cosmix-stored">cosmix-stored</h1>
-<p>The offsite store names immutable snapshots over blobd's bytes. Its control
-surface is a mesh-open Mix citizen; file bytes use blobd's discovered lane.</p>
-<h2 id="manifest-v2">Manifest v2</h2>
-<p>The only fields are <code>schema_version: 2</code> and <code>files</code>, an array of objects with
-exactly <code>blob</code>, <code>path</code>, <code>size</code>. Blob IDs are lowercase <code>b3:&lt;64 hex&gt;</code>. Sizes and
-their sum are exact nonnegative integers through 9007199254740991. One blob
-cannot have conflicting sizes. Empty files and empty snapshots are valid.</p>
-<p><code>mix/store_manifest.mix</code> beside blobd is the shared canonicaliser. It emits
-compact UTF-8 JSON, lexical field order (<code>files</code>, <code>schema_version</code>; <code>blob</code>,
-<code>path</code>, <code>size</code>), files sorted lexically by path, no trailing newline. String
-scalars use JSON escaping; identity is BLAKE3 of those exact encoded bytes.
-Origin, instance, creation time and collection do not participate in identity.</p>
-<p>Limits: 1000 files, 128 KiB canonical UTF-8 bytes, 1024 UTF-8 bytes per path.
-Paths reject Unicode control characters, backslashes, colons, empty components,
-absolute paths, <code>.</code>/<code>..</code>, duplicates and file/directory prefix collisions.
-No MIME, times, permissions, xattrs, links or empty directory preservation.
-Collection names match <code>[A-Za-z0-9_-]{1,64}</code>; owners are <code>store:&lt;collection&gt;</code>.</p>
-<h2 id="old-pilot-identity">Old pilot identity</h2>
-<p>Migration first verifies SHA-256 of the <strong>original raw manifest bytes</strong>, then
-validates schema 1 and requires exact canonical-byte equality. The pilot's
-file-array order is significant and MUST NOT be sorted before verification.
-Only afterwards may a v2 manifest be constructed. Rewritten manifests must
-pass the new byte limit; migration must never truncate or omit entries.</p>
-<h2 id="tests">Tests</h2>
-<p>From the checkout, without root or a broker:</p>
-<pre><code class="language-text">mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
-mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
-mix src/crates/cosmix-blobd/mix/store_commit_test.mix
-mix src/crates/cosmix-blobd/mix/store_client_test.mix
-</code></pre>
-<h2 id="catalogue-citizen">Catalogue citizen</h2>
-<p>Run <code>mix --serve stored.mix --name stored</code>. <code>STORED_STATE_DIR</code> overrides the
-state root; otherwise <code>STATE_DIRECTORY</code>, then the Cosmix/XDG state root is
-used. <code>STORED_BLOBD</code> selects a <strong>local</strong> instance (default <code>blobd</code>). A catalogue
-is bound to that instance and refuses accidental rebinding. An exclusive root
-lock prevents another process owning the same catalogue.</p>
-<p>SQLite schema 1 uses WAL, synchronous FULL, foreign keys, short transactions
-and explicit handle closure. Manifest JSON is TEXT, never a SQL BLOB. It
-records collections, snapshots, snapshot-object membership and commit intents.
-The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.</p>
-<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
-<tr><td><code>store.collection.create</code></td><td><code>name</code></td><td>Idempotent collection record</td></tr>
-<tr><td><code>store.collection.list</code></td><td><code>after?</code>, <code>limit?</code></td><td><code>collections</code>, <code>next</code></td></tr>
-<tr><td><code>store.snapshot.list</code></td><td><code>collection</code>, <code>after?</code>, <code>limit?</code></td><td>Live <code>snapshots</code>, <code>next</code></td></tr>
-<tr><td><code>store.snapshot.get</code></td><td><code>collection</code>, <code>id</code></td><td>Verified <code>id</code>, <code>manifest</code>, <code>manifest_blob</code></td></tr>
-<tr><td><code>store.snapshot.forget</code></td><td><code>collection</code>, <code>id</code></td><td>Tombstone; <code>pins_retained:true</code></td></tr>
-<tr><td><code>store.commit.status</code></td><td><code>collection</code>, <code>id</code></td><td>Durable state, error, times, forgotten flag</td></tr>
-<tr><td><code>store.info</code></td><td>none</td><td>Counts, schema, blobd target and release policy</td></tr>
-</tbody></table>
-<p>Lists default to 100, accept 1..100, use exclusive lexical cursors. An exact
-full final page can require one extra empty read. Unknown records return
-<code>STORE_NOT_FOUND</code>; tombstoned gets return <code>STORE_FORGOTTEN</code>. Errors use rc 10
-with <code>error_code</code> and <code>message</code>. All verbs are mesh-open: owner labels account
-bytes and are not authenticated principals. Forget never releases blob pins.</p>
-<h2 id="commit-protocol">Commit protocol</h2>
-<p><code>store.snapshot.commit {collection,manifest}</code> validates and canonicalises v2,
-then durably records a pending intent before replying
-<code>{accepted:true,state:"pending",collection,id,replay}</code>. Acceptance is <strong>not</strong>
-publication. Only one pending commit is admitted across the catalogue;
-another identity gets <code>STORE_BUSY</code>. Replaying the same collection/manifest
-returns its pending or committed state. Replaying a failed job retries it;
-a tombstoned snapshot refuses with <code>STORE_FORGOTTEN</code>.</p>
-<p>A local asynchronous worker checks size and pins each distinct data object
-under <code>store:&lt;collection&gt;</code>. It treats rc success with <code>pinned:false</code> as an
-existing successful pin. <code>blob.pin</code> rechecks presence under blobd's GC lock;
-<code>blob.has</code> alone cannot establish retention. The worker uploads the exact
-canonical manifest through the local blobd lane with the same owner, verifies
-the returned identity and size, then inserts the snapshot, distinct membership
-and committed status in <strong>one FULL SQLite transaction</strong>. No transaction spans
-Bus or lane I/O. No failure, retry or forget unpins anything.</p>
-<p>After completion it publishes non-retained <code>store.commit.finished</code> with
-<code>collection,id,state</code> and an <code>error</code> on failure. Subscribe before submission;
-the authoritative fallback is <code>store.commit.status</code>. Lost events cannot lose
-the result. A restart resumes pending intent. Reload replaces a durable
-generation fence so an old worker cannot publish catalogue rows. Manifest
-upload resume records are generation-specific to avoid concurrent writers
-during reload. Async Bus waits yield; the bounded manifest HTTP transfer is
-currently a blocking Mix builtin.</p>
-<p>Failed work may retain partial pins and upload receipts. This is intentional
-until a separate release policy is designed. Blobd quota counts unique bytes
-per owner, including manifest bytes, and pending upload reservations; it is
-not the old pilot's logical snapshot quota. This is an explicit policy change.</p>
-<h2 id="client">Client</h2>
-<p>Run the shipped <code>mix/store.mix</code> beside the libraries:</p>
-<pre><code class="language-text">mix store.mix --node archive push source ./source
-mix store.mix --node archive list source
-mix store.mix --node archive status source b3:…
-mix store.mix --node archive restore source b3:… ./new-restore
-</code></pre>
-<p>Without <code>--node</code>, the target is local. <code>--instance two</code> selects both
-<code>stored-two</code> and <code>blobd-two</code>; <code>--local-blobd</code> selects the restore receiver
-(default <code>blobd</code>). Discovery checks that stored is bound to that target.
-Restore resolves each reference's origin from the target's <code>blob.stat</code>,
-calls <code>blob_fetch_wait</code> sequentially with an explicit restore owner, then
-downloads from the local lane with <code>expect_blake3</code>, no-clobber publication,
-size verification and a final BLAKE3 check. The destination must not exist;
-its parent must exist. Failure leaves verified partial files. Restore pins
-under <code>store-restore:&lt;collection&gt;</code> are retained in this arc too.</p>
-<p>Push walks regular files only, hashes explicitly with BLAKE3 and uses
-<code>blob.has</code> only to choose transfers. Present objects are pinned and size
-checked; missing objects use durable upload sessions. Each path is rehashed
-after transfer, then the whole inventory is compared again before commit.
-Keep the source quiescent: this detects changes, but is not a filesystem
-snapshot or protection against hostile concurrent namespace replacement.
-Empty directories and file metadata are not archived.</p>
-<p><code>.storeignore</code> contains literal root-relative paths or trailing-slash subtree
-rules, one per line; blank lines and <code>#</code> comments are ignored. Globs and
-negations are refused. The file itself is included unless <code>.storeignore</code> is
-listed. Excluded entries are not inspected. The control file is at most
-64 KiB and a walk visits at most 10000 entries, besides manifest limits.</p>
-<p>The default cache is <code>~/.cache/cosmix/store/</code> (override <code>--cache</code>). One
-exclusive process lock covers it; it cannot live inside the source tree.
-Target, collection and source root isolate resume records; object identity
-names each record. Atomic mode-0600 records retain B0's session key, identity
-and server receipt across a killed push. Retry the same command. Changed
-bytes get a different record; old receipts/reservations are retained until
-blobd expiry or explicit operator abort. Transfers are sequential; <code>--chunk</code>
-accepts 1..8388608 bytes and <code>--timeout</code> defaults to 900 seconds.</p>
-<p>The client subscribes before commit, then checks durable status once after
-completion or timeout. Pending is never reported as committed. <code>list</code> follows
-all pages; <code>status</code> exposes the durable job including failure or tombstone.
-One-shot event users finish with <code>quit()</code>; failures exit nonzero.</p>
-<h2 id="packaging-and-verification">Packaging and verification</h2>
-<p>The citizen and client live in <code>src/crates/cosmix-blobd/mix/</code>. They require
-Mix 0.97.0 or later and blobd 0.6.1 or later. There is no new Rust binary.
-The package installs the eight runtime scripts together under
-<code>/opt/cosmix/share/cosmix/stored/</code>; relative <code>require()</code> paths stay intact.
-Run the installed client as <code>mix /opt/cosmix/share/cosmix/stored/store.mix</code>.</p>
-<p>Stage a package without root, account creation or service changes:</p>
-<pre><code class="language-text">mix src/crates/cosmix-blobd/mix/store_package.mix --source . --destdir /tmp/stored-package
-mix src/crates/cosmix-blobd/mix/store_test.mix
-systemd-analyze verify --man=no src/_etc/systemd-system/cosmix-stored.service
-</code></pre>
-<p>The destination must not exist. The rootless suite registers all four focused
-test scripts, checks lint/syntax/version for every Mix file in this directory,
-stages the assets and verifies script bytes, unit state settings and registry
-projection. It needs neither cargo nor a broker.</p>
-<p>The shipped unit is <code>src/_etc/systemd-system/cosmix-stored.service</code>;
-<code>src/_etc/sysusers/cosmix.conf</code> projects registered citizen UID/GID 601,
-<code>cosmix-stored</code>. An operator installs the staged assets, applies sysusers and
-enables the unit in a separately authorised deployment. Systemd creates
-<code>/var/lib/cosmix/stored</code> with mode 0700 and supplies <code>STATE_DIRECTORY</code>.
-No <code>cosmix-blob</code> membership or CAS filesystem access is needed: even manifest
-bytes go through the lane. Named instances need a separate unit/drop-in with
-distinct state, <code>--name stored-&lt;instance&gt;</code> and <code>STORED_BLOBD=blobd-&lt;instance&gt;</code>.
-The unit uses Wants/After dependencies so broker reconnect remains native.</p>
-<p>The maintainer's private <code>stored_gate.mix</code> is intentionally outside this
-public repository. It starts isolated named citizens on the workstation,
-round-trips generated binary/empty/duplicate files through a separate fetch
-receiver, kills a push after a durable partial offset, resumes the same
-session/key, proves commit replay, tombstones without unpinning, checks SQLite
-rows directly and restarts the catalogue. Every arm has an exact failure
-token and a negative self-test. It does not exercise production deployment.</p>
-<p>Pilot migration and cutover are separate, unimplemented slices. Migration
-must first verify old raw-byte SHA-256 identities, import without deletion,
-and durably map old IDs to new IDs; a second phase must restore <strong>every</strong>
-snapshot through both clients and compare path sets, sizes and exact bytes
-before cutover. A rollback set includes the pilot data and writer lock,
-configuration and ACL/quota policy, old daemon <strong>and client</strong>, units/drop-ins
-and environment, ownership/modes, deploy inventory and ID mapping. Keep that
-set and the new catalogue/blob pins intact until rollback is explicitly
-retired. No migration, quota configuration or fleet deployment occurs here.</p></div></div>
+        <div id="content-doc" data-prerendered="cos/cosmix-store.md"><div class="prose"><h1 id="cosmix-store">cosmix-store</h1>
+<p>The former offsite pilot is superseded by the Mix catalogue citizen and
+native client. See <a href="/cos/cosmix-stored">cosmix-stored</a> for the current contract,
+manifest format, quota policy and packaging. This page does not describe or
+authorise migration or deployment of existing pilot stores.</p></div></div>
     </div>
 
 </main>

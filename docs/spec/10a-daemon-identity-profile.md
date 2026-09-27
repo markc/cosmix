@@ -1,9 +1,9 @@
 ---
 title: Managed Daemon Identity Profile — Retained Contract
 chapter: 10a
-version: 0.2.2
+version: 0.2.3
 status: draft
-date: 2026-09-10
+date: 2026-09-27
 ---
 
 # Managed Daemon Identity Profile — Retained Contract
@@ -52,6 +52,12 @@ reconciliation: no reuse, renumbering or reclamation. The two-stream
 non-collision rule (§2.2) holds — the daemon stream takes 521, the
 shared-credential stream takes 522, and the next unassigned
 daemon/shared number is 523.
+
+**Registry amendment — version 1.4.8.** Allocates the lowest free citizen
+UID/GID 601 to `cosmix-stored`, R6 default Bus name `stored`, the persistent
+Mix snapshot catalogue over blobd. No reuse or reclamation is involved.
+The next free citizen UID is 602; daemon/shared numbering is unchanged.
+It uses the byte lane and needs no `cosmix-blob` group membership.
 
 **Retained observability obligations (legacy Appendix D 1.4.0/1.4.1).**
 The six observability identities require identity-profile L2 from first install,
@@ -201,6 +207,7 @@ Appendix A. As a summary:
 | 521 | `cosmix-blobd` | `blobd` | Node blob store (CAS + byte lane) (v1.4.7) |
 | 522 (GID-only) | `cosmix-blob` | — | Shared-credential group: CAS read for ingest/`blob.path` (§3.3) (v1.4.7) |
 | 600 | `cosmix-statecache` | `statecache` | Citizen-identity: SPEC-18 reference citizen (§2.5) |
+| 601 | `cosmix-stored` | `stored` | Citizen-identity: persistent snapshot catalogue (v1.4.8) |
 
 `cosmix-noded` registers under the ABP service name `noded`,
 matching the binary name. The historical alias `hub` was
@@ -1390,6 +1397,7 @@ m     cosmix-blobd   cosmix-blob
 # in the canonical registry (Appendix A) and SHALL NOT appear below
 # (SPEC 10 §4.3, §9.1). The consumer is SPEC 18 (Mix Citizen Runtime).
 u     cosmix-statecache 600 "Cosmix SPEC-18 reference citizen" /nonexistent   /usr/sbin/nologin
+u     cosmix-stored     601 "Cosmix snapshot catalogue citizen" /nonexistent /usr/sbin/nologin
 ```
 
 `Home=/nonexistent` matches §4.3; daemons and citizens own state
@@ -1743,6 +1751,7 @@ gid  name        purpose                                                   tombs
 cid  name               bus  gecos                               tier     retired     reclaimed   verifier
 ---  -----------------  ---  ----------------------------------  -------  ----------  ----------  --------
 600  cosmix-statecache  -    "Cosmix SPEC-18 reference citizen"  citizen  -           -           -
+601  cosmix-stored      -    "Cosmix snapshot catalogue citizen" citizen  -           -           -
 
 # `-` in the bus column means the default derivation applies (name minus
 # "cosmix-" prefix). Entry 500 follows the default — it registers as
@@ -1812,7 +1821,7 @@ cid  name               bus  gecos                               tier     retire
 # Next free shared-credential GID: 523 (the shared-cred stream holds 510
 #   `cosmix-tls`, 516 `cosmix-mesh` and 522 `cosmix-blob`; the daemon
 #   stream now also holds 517 through 521).
-# Next free citizen UID: 601 (lowest-free in 600–699; reclaimed UIDs
+# Next free citizen UID: 602 (lowest-free in 600–699; reclaimed UIDs
 #   re-enter this pool only after R8 — §2.3 R7/R8, §2.5).
 # Tombstones (kept for audit; SHALL NOT be reused per R2): none.
 # Citizens in quarantine (retired:, not yet R8-reclaimed): none.
