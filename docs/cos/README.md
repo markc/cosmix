@@ -25,6 +25,7 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[webd](webd.md)** — multi-vhost HTTPS + ACME; server-rendered web UI.
 - **[dnsd](dnsd.md)** — authoritative WireGuard-mesh DNS.
 - **[indexd](indexd.md)** — vector knowledge base / indexer.
+- **[stored](cosmix-stored.md)** — Mix snapshot catalogue and resumable offsite client over blobd's bytes.
 - **[desktop](desktop.md)** — the CosMix desktop: `cosmix-comp` (Smithay + Bevy Wayland compositor), the `ctk` toolkit and the native apps.
 - **[cosmix-comp](cosmix-comp.md)** — Wayland compositor and supported protocol globals.
 - **[term](term.md)** — the lightweight iced + wgpu terminal: tabs, split panes, foot-style font sizing, the `term.*` Bus surface.

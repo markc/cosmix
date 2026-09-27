@@ -1,0 +1,40 @@
+-- version: 0.1.0
+-- Native offsite store client. Use --help for routing and command syntax.
+$client = require("store_client.mix")
+$blobd_fetched = []
+$COMPLETIONS = buffer()
+on store.commit.finished
+  buffer_push($COMPLETIONS, json_encode($event.args) .. "\n")
+end
+try
+  $parsed = getopt(args(), {help: {}, node: {arg: true}, instance: {arg: true}, "local-blobd": {arg: true}, cache: {arg: true}, timeout: {arg: true}, chunk: {arg: true}})
+  if length($parsed.errors) > 0 then raise("STORE_USAGE", join($parsed.errors, "; ")) end
+  if $parsed.opts.help then
+    print("store.mix [--node NODE] [--instance NAME] [--local-blobd blobd] [--cache DIR] [--timeout SECONDS] [--chunk BYTES] push COLLECTION DIR | restore COLLECTION ID NEW_DIR | list [COLLECTION] | status COLLECTION ID")
+  else
+    $cfg = $client.configuration($parsed.opts)
+    $a = $parsed.rest
+    $verb = $a[0] ?? ""
+    if $verb == "push" and length($a) == 3 then
+      print(json_encode($client.push_tree($cfg, $a[1], $a[2], $COMPLETIONS)))
+    elif $verb == "restore" and length($a) == 4 then
+      print(json_encode($client.restore_tree($cfg, $a[1], $a[2], $a[3])))
+    elif $verb == "list" and (length($a) == 1 or length($a) == 2) then
+      $after = ""
+      while $after != nil
+        $page = length($a) == 1 ? $client.rpc($cfg.service, "store.collection.list", {after: $after}) : $client.rpc($cfg.service, "store.snapshot.list", {collection: $a[1], after: $after})
+        print(json_encode($page))
+        $after = $page.next
+      end
+    elif $verb == "status" and length($a) == 3 then
+      print(json_encode($client.rpc($cfg.service, "store.commit.status", {collection: $a[1], id: $a[2]})))
+    else
+      raise("STORE_USAGE", "use --help")
+    end
+  end
+catch $message, $error
+  eprint($error.code .. ": " .. $message)
+  quit()
+  exit(1)
+end
+quit()

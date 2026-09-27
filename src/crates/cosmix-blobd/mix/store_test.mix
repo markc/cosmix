@@ -1,0 +1,34 @@
+-- version: 0.2.0
+-- Rootless registered suite: run from the checkout root, no cargo or broker.
+$root = cwd()
+$mix = "/opt/cosmix/bin/mix"
+$base = $root .. "/src/crates/cosmix-blobd/mix/"
+for each $name in sort(ls($base))
+  if not ends_with($name, ".mix") then continue end
+  $lint = [$mix, "lint", "--deny-warnings"]
+  if $name == "blob.mix" then push($lint, "--allow-global"); push($lint, "blobd_fetched") end
+  push($lint, $base .. $name)
+  run_argv_must($lint)
+  run_argv_must([$mix, "--check", $base .. $name])
+  $version = run_argv_must([$mix, $base .. $name, "--version"])
+  if contains($version, "unversioned") then raise("TEST", "VERSION_" .. $name) end
+end
+for each $name in ["store_manifest_test.mix", "store_catalogue_test.mix", "store_commit_test.mix", "store_client_test.mix", "store_worker_test.mix"]
+  print(trim(run_argv_must([$mix, $base .. $name])))
+end
+$temp = env("TMPDIR", "/tmp") .. "/store-package-test-" .. uuid()
+try
+  print(trim(run_argv_must([$mix, $base .. "store_package.mix", "--source", $root, "--destdir", $temp])))
+  for each $name in ["blob.mix", "store_manifest.mix", "store_catalogue.mix", "store_commit.mix", "store_worker.mix", "store_blob.mix", "stored.mix", "store_client.mix", "store.mix"]
+    if hash_file($base .. $name, "blake3") != hash_file($temp .. "/opt/cosmix/share/cosmix/stored/" .. $name, "blake3") then raise("TEST", "PACKAGE_" .. $name) end
+  end
+  $sysusers = read_file($temp .. "/usr/lib/sysusers.d/cosmix.conf")
+  $spec = read_file($root .. "/docs/spec/10a-daemon-identity-profile.md")
+  $row = "u     cosmix-stored     601 \"Cosmix snapshot catalogue citizen\" /nonexistent /usr/sbin/nologin"
+  if not contains($sysusers, $row) or not contains($spec, $row) then raise("TEST", "REGISTRY_PROJECTION") end
+  $unit = read_file($temp .. "/usr/lib/systemd/system/cosmix-stored.service")
+  if not contains($unit, "StateDirectory=cosmix/stored") or not contains($unit, "User=cosmix-stored") then raise("TEST", "UNIT_STATE") end
+finally
+  if exists($temp) then remove_dir($temp) end
+end
+print("store_test: PASS lint/check/version, five suites, package and registry")

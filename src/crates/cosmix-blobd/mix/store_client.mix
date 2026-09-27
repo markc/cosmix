@@ -1,0 +1,281 @@
+-- version: 0.10.0
+$m = require("store_manifest.mix")
+$b = require("blob.mix")
+
+fn unwrap($r)
+  if not $r.ok then raise("STORE_BLOB", json_encode($r)) end
+  return $r.result
+end
+
+fn rpc($service, $verb, $args)
+  $r = send $service $verb body=json_encode($args) timeout=30
+  if $rc != 0 then raise("STORE_REMOTE", json_encode({rc: $rc, result: $r})) end
+  return $r
+end
+
+fn configuration($opts)
+  $node = $opts.node ?? ""
+  $instance = $opts.instance ?? ""
+  if $node != "" and not re_match($node, "^[a-zA-Z0-9_-]+$") then raise("STORE_CONFIG", "invalid node") end
+  if $instance != "" and not re_match($instance, "^[a-z0-9][a-z0-9-]*$") then raise("STORE_CONFIG", "invalid instance") end
+  $suffix = $instance == "" ? "" : "-" .. $instance
+  $route = $node == "" ? "" : "." .. $node .. ".bus"
+  $local = $opts["local-blobd"] ?? "blobd"
+  $m.service_name("stored" .. $suffix, "stored")
+  $m.service_name("blobd" .. $suffix, "blobd")
+  $m.service_name($local, "blobd")
+  $timeout = $m.uint(to_number($opts.timeout ?? "900"))
+  $chunk = $m.uint(to_number($opts.chunk ?? "8388608"))
+  if $timeout < 1 or $chunk < 1 or $chunk > 8388608 then raise("STORE_CONFIG", "positive timeout and chunk <=8MiB required") end
+  $cache = $opts.cache
+  if $cache == nil then $cache = $m.root_path(env("HOME"), "HOME") .. "/.cache/cosmix/store" end
+  $cache = $m.root_path($cache, "cache root")
+  return {service: "stored" .. $suffix .. $route, blobd: "blobd" .. $suffix .. $route,
+    local_blobd: $local, local_target: "blobd" .. $suffix, node: $node, instance: $instance,
+    timeout: $timeout, chunk: $chunk, cache: $cache}
+end
+
+fn ignores($root)
+  $path = $root .. "/.storeignore"
+  if not exists($path, {follow_symlinks: false}) then return {exact: {}, subtrees: {}} end
+  if not stat($path, {follow_symlinks: false}).is_file then raise("STORE_SOURCE", ".storeignore must be regular") end
+  if stat($path).size > 65536 then raise("STORE_LIMIT", ".storeignore exceeds 64KiB") end
+  $out = {exact: {}, subtrees: {}}
+  for each $line in lines(read_file($path))
+    $rule = trim($line)
+    if $rule == "" or starts_with($rule, "#") then continue end
+    $bare = ends_with($rule, "/") ? slice($rule, 0, length($rule)-1) : $rule
+    for each $part in split($bare, "/")
+      if contains(["", ".", ".."], $part) then raise("STORE_IGNORE", "ignore rules must be structurally relative") end
+    end
+    if ends_with($rule, "/") then $out.subtrees[$bare] = true
+    else $out.exact[$bare] = true end
+  end
+  return $out
+end
+
+fn excluded($relative, $rules)
+  if has_key($rules.exact, $relative) then return true end
+  $prefix = ""
+  for each $part in split($relative, "/")
+    $prefix = $prefix == "" ? $part : $prefix .. "/" .. $part
+    if has_key($rules.subtrees, $prefix) then return true end
+  end
+  return false
+end
+
+fn inventory($directory)
+  if not stat($directory, {follow_symlinks: false}).is_dir then raise("STORE_SOURCE", "source must be a real directory") end
+  $root = realpath($directory)
+  $rules = ignores($root)
+  $files = []
+  $queue = [""]
+  $visited = 0
+  while length($queue) > 0
+    $parent = pop($queue)
+    $dir = $parent == "" ? $root : $root .. "/" .. $parent
+    if not stat($dir, {follow_symlinks: false}).is_dir then raise("STORE_CHANGED", "source directory changed") end
+    for each $name in sort(ls($dir))
+      $relative = $parent == "" ? $name : $parent .. "/" .. $name
+      if excluded($relative, $rules) then continue end
+      $m.path($relative)
+      $visited = $visited + 1
+      if $visited > 10000 then raise("STORE_LIMIT", "walk exceeds 10000 entries") end
+      $file = $root .. "/" .. $relative
+      $s = stat($file, {follow_symlinks: false})
+      if $s.is_dir then
+        push($queue, $relative)
+      elif $s.is_file then
+        $hash = hash_file($file, "blake3")
+        $after = stat($file, {follow_symlinks: false})
+        if not $after.is_file or $after.size != $s.size or $after.ino != $s.ino or $after.dev != $s.dev or $after.mtime != $s.mtime or $after.mtime_nsec != $s.mtime_nsec then raise("STORE_CHANGED", "source changed while hashing") end
+        push($files, {path: $relative, blob: "b3:" .. $hash, size: $s.size})
+        if length($files) > 1000 then raise("STORE_LIMIT", "too many files") end
+      else
+        raise("STORE_SOURCE", "symlink or special file: " .. $relative)
+      end
+    end
+  end
+  $v = $m.canonicalise({schema_version: 2, files: $files})
+  $v.root = $root
+  return $v
+end
+
+fn outside_source($canonical, $source_root)
+  if $canonical == nil then raise("STORE_CACHE", "cache path cannot be resolved") end
+  if $source_root != nil and ($canonical == $source_root or $source_root == "/" or starts_with($canonical, $source_root .. "/")) then raise("STORE_CACHE", "resume cache cannot be inside the source tree") end
+end
+
+fn cache_before_mkdir($path, $source_root)
+  $absolute = starts_with($path, "/") ? $path : realpath(".") .. "/" .. $path
+  $ancestor = $absolute
+  while not exists($ancestor, {follow_symlinks: false})
+    $ancestor = dirname($ancestor)
+  end
+  $canonical = realpath($ancestor)
+  outside_source($canonical, $source_root)
+  -- Resolve the missing suffix without writing. A '..' can lead back into
+  -- existing paths, including aliases of the source, so inspect each step.
+  for each $part in split(slice($absolute, length($ancestor)), "/")
+    if $part == "" or $part == "." then continue end
+    if $part == ".." then $canonical = dirname($canonical)
+    else $canonical = ($canonical == "/" ? "" : $canonical) .. "/" .. $part end
+    if exists($canonical, {follow_symlinks: false}) then $canonical = realpath($canonical) end
+    outside_source($canonical, $source_root)
+  end
+end
+
+fn cache_lock($path, $source_root)
+  cache_before_mkdir($path, $source_root)
+  if not exists($path, {follow_symlinks: false}) then
+    mkdir($path)
+    chmod($path, 0o700)
+  end
+  if not stat($path, {follow_symlinks: false}).is_dir then raise("STORE_CACHE", "cache must be a real directory") end
+  $canonical = realpath($path)
+  outside_source($canonical, $source_root)
+  if not flock($path .. "/.lock") then raise("STORE_LOCKED", "another store client owns this cache") end
+end
+
+fn target($cfg)
+  $info = rpc($cfg.service, "store.info", {})
+  if $info.blobd != $cfg.local_target then raise("STORE_CONFIG", "stored uses a different blobd target") end
+end
+
+fn wait_status($context, $events, $base, $io)
+  $deadline = $io.now() + $context.timeout
+  $delay = 2
+  $next_check = $io.now() + $delay
+  $last = {collection: $context.collection, id: $context.id, state: "unknown"}
+  while true
+    $matched = false
+    $bytes = freeze($events)
+    for each $line in lines(bytes_to_string(slice($bytes, $base)))
+      if $line == "" then continue end
+      $event = json_parse($line)
+      if $event.collection == $context.collection and $event.id == $context.id then $matched = true end
+    end
+    $base = length($bytes)
+    $expired = $io.now() >= $deadline
+    if $matched or $io.now() >= $next_check or $expired then
+      $context.rpc_timeout = min(30, max(1, ceil($deadline - $io.now())))
+      try
+        $last = $io.status($context)
+      catch $message, $error
+        $last = {collection: $context.collection, id: $context.id, state: "unknown", error: $error.code .. ": " .. $message}
+      end
+      if $last.state == "committed" then return $last end
+      if $last.state == "failed" or $io.now() >= $deadline then raise("STORE_COMMIT", json_encode($last)) end
+      $delay = min($delay * 2, 60)
+      $next_check = $io.now() + $delay
+    end
+    $io.pause(min(0.05, max(0, $deadline - $io.now())))
+  end
+end
+
+fn commit_wait($cfg, $collection, $v, $events)
+  subscribe("store.commit.finished")
+  try
+    $base = length(freeze($events))
+    $accepted = rpc($cfg.service, "store.snapshot.commit", {collection: $collection, manifest: $v.manifest})
+    if $accepted.id != $v.id then raise("STORE_IDENTITY", "commit identity differs") end
+    if $accepted.state == "committed" then return $accepted end
+    $status_request = fn($ctx)
+      $service = $ctx.service
+      $result = send $service store.commit.status body=json_encode({collection: $ctx.collection, id: $ctx.id}) timeout=$ctx.rpc_timeout
+      if $rc != 0 then raise("STORE_REMOTE", json_encode({rc: $rc, result: $result})) end
+      return $result
+    end
+    $io = {now: fn() = monotonic(), pause: fn($seconds) = sleep($seconds), status: $status_request}
+    return wait_status({service: $cfg.service, collection: $collection, id: $v.id, timeout: $cfg.timeout}, $events, $base, $io)
+  finally
+    unsubscribe("store.commit.finished")
+  end
+end
+
+fn push_tree($cfg, $collection, $directory, $events)
+  $m.collection($collection)
+  $source_root = realpath($directory)
+  if $source_root == nil then raise("STORE_SOURCE", "source directory does not exist") end
+  cache_lock($cfg.cache, $source_root)
+  target($cfg)
+  $v = inventory($directory)
+  rpc($cfg.service, "store.collection.create", {name: $collection})
+  $identity = hash_blake3(json_encode({service: $cfg.blobd, collection: $collection, root: $v.root}))
+  $cache = $cfg.cache .. "/" .. $identity
+  mkdir($cache)
+  write_atomic($cache .. "/manifest.json", $v.canonical, {durability: "full", mode: 0o600})
+  $owner = "store:" .. $collection
+  $opts = {service: $cfg.blobd}
+  $presence = unwrap($b.blob_has(sort(keys($v.objects)), $opts))
+  $done = {}
+  for each $entry in $v.manifest.files
+    $file = $v.root .. "/" .. $entry.path
+    if not has_key($done, $entry.blob) then
+      if contains($presence.present, $entry.blob) then
+        unwrap($b.blob_pin($entry.blob, $owner, $opts))
+        $s = unwrap($b.blob_stat($entry.blob, $opts))
+        if $s.present != true or $s.size != $entry.size then raise("STORE_SIZE", "present object differs") end
+      else
+        $ref = unwrap($b.blob_upload_file($file, {service: $cfg.blobd, owner: $owner, chunk: $cfg.chunk,
+          resume_file: $cache .. "/" .. slice($entry.blob, 3) .. ".json"}))
+        if $ref.blob != $entry.blob or $ref.size != $entry.size then raise("STORE_CHANGED", "transfer source differs from inventory") end
+      end
+      $done[$entry.blob] = true
+    end
+    if not stat($file, {follow_symlinks: false}).is_file or hash_file($file, "blake3") != slice($entry.blob, 3) then raise("STORE_CHANGED", "source changed after transfer") end
+  end
+  -- Detect additions/deletions, changed ignore rules and duplicate-content paths.
+  if inventory($v.root).canonical != $v.canonical then raise("STORE_CHANGED", "source tree changed during push") end
+  return commit_wait($cfg, $collection, $v, $events)
+end
+
+fn restore_begin($directory)
+  if exists($directory, {follow_symlinks: false}) then raise("STORE_DESTINATION", "restore destination already exists") end
+  $parent = realpath(dirname($directory))
+  $name = basename($directory)
+  if $parent == nil or contains(["", ".", ".."], $name) then raise("STORE_DESTINATION", "restore needs an existing parent and a new name") end
+  $requested = $parent .. "/" .. $name
+  $partial_name = "." .. $name .. ".partial-" .. uuid()
+  if byte_length($partial_name) > 255 then raise("STORE_DESTINATION", "partial restore name exceeds 255 UTF-8 bytes; destination basename must fit in 209 bytes") end
+  $partial = $parent .. "/" .. $partial_name
+  mkdir($partial, {parents: false})
+  return {root: $partial, requested: $requested}
+end
+
+fn restore_publish($destination)
+  if exists($destination.requested, {follow_symlinks: false}) then raise("STORE_DESTINATION", "restore destination appeared during transfer") end
+  rename($destination.root, $destination.requested)
+  return $destination.requested
+end
+
+fn restore_tree($cfg, $collection, $id, $directory)
+  $m.collection($collection)
+  $m.blob($id)
+  target($cfg)
+  $snapshot = rpc($cfg.service, "store.snapshot.get", {collection: $collection, id: $id})
+  $v = $m.verify($snapshot.manifest, $id)
+  if $snapshot.id != $id or $snapshot.manifest_blob != $id then raise("STORE_IDENTITY", "catalogue reference differs") end
+  $destination = restore_begin($directory)
+  $root = $destination.root
+  for each $entry in $v.manifest.files
+    $remote = unwrap($b.blob_stat($entry.blob, {service: $cfg.blobd}))
+    if $remote.present != true or $remote.size != $entry.size then raise("STORE_SIZE", "restore source differs") end
+    $ref = {blob: $entry.blob, size: $entry.size, origin: $remote.origin}
+    $fetch_opts = {service: $cfg.local_blobd, owner: "store-restore:" .. $collection}
+    if $cfg.node != "" then $fetch_opts.from = $cfg.node end
+    if $cfg.instance != "" then $fetch_opts.instance = $cfg.instance end
+    unwrap($b.blob_fetch_wait($ref, $cfg.timeout, $fetch_opts))
+    $parent = $root
+    $parts = split($entry.path, "/")
+    for each $part in slice($parts, 0, length($parts)-1)
+      $parent = $parent .. "/" .. $part
+      if not exists($parent, {follow_symlinks: false}) then mkdir($parent, {parents: false}) end
+      if not stat($parent, {follow_symlinks: false}).is_dir then raise("STORE_DESTINATION", "restore parent changed") end
+    end
+    $file = $root .. "/" .. $entry.path
+    unwrap($b.blob_download_file($ref, $file, {service: $cfg.local_blobd, max_bytes: $entry.size}))
+    if stat($file).size != $entry.size or hash_file($file, "blake3") != slice($entry.blob, 3) then raise("STORE_IDENTITY", "restored file differs") end
+  end
+  return {collection: $collection, id: $id, restored: $v.file_count, directory: restore_publish($destination)}
+end

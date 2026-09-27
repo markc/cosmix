@@ -1,0 +1,76 @@
+-- version: 0.3.0
+$w = require("store_worker.mix")
+$calls = buffer()
+$delays = buffer()
+$events = buffer()
+$checks = buffer()
+fn check($value, $token)
+  if not $value then raise("TEST", $token) end
+  buffer_push($checks, 1)
+end
+$run_job = fn($context)
+  if $context.epoch != "captured-epoch" then raise("TEST", "LOST_CONTEXT") end
+  buffer_push($calls, 1)
+  $n = length(freeze($calls))
+  if $n <= 2 then raise("INJECT_DB_BUSY", "no job was read") end
+  return $n == 3 ? {state: "committed"} : nil
+end
+$pause = fn($seconds)
+  if $seconds < 60 then raise("TEST", "RETRY_TOO_FAST") end
+  buffer_push($delays, 1)
+end
+$finish = fn($result)
+  if $result.state != "committed" then raise("TEST", "BAD_EVENT") end
+  buffer_push($events, 1)
+end
+$w.drain($run_job, $finish, $pause, {epoch: "captured-epoch"})
+check(length(freeze($calls)) == 4, "RECOVER_ESCAPING_ERROR")
+check(length(freeze($delays)) == 2, "ONLY_FAILURES_DELAY")
+check(length(freeze($events)) == 1, "ONE_COMPLETION")
+$caught = ""
+try
+  $w.drain(fn($context) = raise("INJECT_DISK_FULL", "failed update"), $finish, $pause, {})
+catch $message, $error
+  $caught = $error.code
+end
+check($caught == "INJECT_DISK_FULL", "BOUNDED_ERROR_PRESERVED")
+check(length(freeze($delays)) == 5, "THREE_RETRIES_MAXIMUM")
+check(length(freeze($events)) == 1, "NO_FALSE_COMPLETION")
+$w.drain(fn($context) = raise("STORE_SUPERSEDED", "retired generation"), $finish, fn($seconds) = raise("TEST", "SUPERSEDED_MUST_NOT_SLEEP"), {})
+check(length(freeze($events)) == 1, "SUPERSEDED_TERMINAL_WITHOUT_COMPLETION")
+$publish_calls = buffer()
+$drain_calls = buffer()
+$published = buffer()
+$run_job = fn($context)
+  buffer_push($drain_calls, 1)
+  $n = length(freeze($drain_calls))
+  return $n <= 2 ? {id: to_string($n), state: "committed"} : nil
+end
+$finish = fn($result)
+  buffer_push($publish_calls, 1)
+  if length(freeze($publish_calls)) <= 2 then raise("INJECT_PUBLISH", "broker unavailable") end
+  buffer_push($published, $result.id)
+end
+$w.drain($run_job, $finish, $pause, {})
+check(bytes_to_string(freeze($published)) == "12", "RETRY_SAME_COMPLETION_THEN_DRAIN_NEXT_JOB")
+check(length(freeze($drain_calls)) == 3 and length(freeze($publish_calls)) == 4, "PUBLISH_RETRY_DOES_NOT_RERUN_JOB")
+check(length(freeze($delays)) == 7, "PUBLISH_BACKSTOP_DELAYS")
+$publish_calls = buffer()
+$drain_calls = buffer()
+$run_job = fn($context)
+  buffer_push($drain_calls, 1)
+  return {state: "committed"}
+end
+$finish = fn($result)
+  buffer_push($publish_calls, 1)
+  raise("INJECT_PUBLISH", "broker unavailable")
+end
+$caught = ""
+try
+  $w.drain($run_job, $finish, $pause, {})
+catch $message, $error
+  $caught = $error.code
+end
+check($caught == "INJECT_PUBLISH" and length(freeze($publish_calls)) == 4 and length(freeze($drain_calls)) == 1, "PUBLISH_RETRIES_BOUNDED")
+check(length(freeze($delays)) == 10, "PUBLISH_THREE_RETRIES_MAXIMUM")
+print("store_worker_test: PASS " .. to_string(length(freeze($checks))))
