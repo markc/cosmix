@@ -421,7 +421,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_tooltips_use_opaque_contrast_checked_muted_pairs() {
+    fn embedded_tooltips_use_opaque_contrast_checked_elevated_pairs() {
         for scheme in Scheme::ALL {
             for mode in Mode::ALL {
                 let compiled = compile(&Selection {
@@ -434,9 +434,12 @@ mod tests {
                 let tokens = Tokens::from_dictionary(dictionary).unwrap();
                 let style =
                     tokens.tooltip_style(dictionary.metrics["button.border_width"].value as f32);
-                assert_eq!(style.background, Some(tokens.muted_surface.into()));
-                assert_eq!(style.text_color, Some(tokens.muted_text));
-                assert_eq!(tokens.muted_surface.a, 1.0);
+                assert_eq!(style.background, Some(tokens.elevated.into()));
+                assert_eq!(style.text_color, Some(tokens.elevated_text));
+                assert_eq!(tokens.elevated.a, 1.0);
+                assert!(dictionary.colours.pairs["elevated"].contrast_ratio >= 4.5);
+                // The active-pane header pair stays on the now-real muted
+                // surface, which must also clear AA.
                 assert!(dictionary.colours.pairs["muted"].contrast_ratio >= 4.5);
             }
         }

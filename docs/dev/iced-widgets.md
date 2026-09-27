@@ -78,11 +78,12 @@ Tokens::default()                           // preview palette only
 tokens.text_input(status) -> text_input::Style
 tokens.menu_style() -> MenuStyle
 tokens.audio_style() -> AudioStyle
+tokens.tooltip_style(border_width) -> container::Style  // elevated pair
 tokens::colour(LinearRgba) -> iced::Color   // linear -> encoded sRGB
-Tokens { surface, text, popover, popover_text, card, card_text, primary,
-         primary_text, destructive, destructive_text, muted_surface,
-         muted_text, selection, selection_text, border, input, ring,
-         radius }                            // pub fields
+Tokens { surface, text, popover, popover_text, elevated, elevated_text,
+         card, card_text, primary, primary_text, destructive,
+         destructive_text, muted_surface, muted_text, selection,
+         selection_text, border, input, ring, radius }   // pub fields
 
 // Pro-audio controls. All are controlled: store each published value and
 // pass it back. Generic over Theme; Fader and Knob need Message: Clone.
@@ -268,9 +269,11 @@ target for a focused field.
 `Tokens::from_colours` uses those colours with a six-pixel radius. Both return
 an error for missing required colours. Text input uses the base, muted and
 accent pairs plus input/border/ring; menus use popover, muted and accent plus
-border. Pair colours use the resolved rendered values. This adapter does not
-extend the design compiler's closed family schema. `Tokens::default()` is a
-standalone preview palette; applications should pass their resolved design.
+border; tooltips use the elevated pair plus border, so their text never sits
+on the surface they cover. Pair colours use the resolved rendered values.
+This adapter does not extend the design compiler's closed family schema.
+`Tokens::default()` is a standalone preview palette; applications should pass
+their resolved design.
 
 From `src/desktop`, build the gallery on a build worker:
 

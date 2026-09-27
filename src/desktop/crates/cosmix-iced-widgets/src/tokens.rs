@@ -38,6 +38,8 @@ pub struct Tokens {
     pub text: Color,
     pub popover: Color,
     pub popover_text: Color,
+    pub elevated: Color,
+    pub elevated_text: Color,
     pub card: Color,
     pub card_text: Color,
     pub primary: Color,
@@ -55,8 +57,8 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    /// Maps the `base`, `popover`, `card`, `primary`, `destructive`, `muted`
-    /// and `accent` pairs plus the
+    /// Maps the `base`, `popover`, `elevated`, `card`, `primary`,
+    /// `destructive`, `muted` and `accent` pairs plus the
     /// `border`, `input` and `ring` colours. Radius is 6 px.
     pub fn from_colours(colours: &ResolvedColours) -> Result<Self, TokenError> {
         let pair = |name| colours.pairs.get(name).ok_or(TokenError(name));
@@ -69,6 +71,7 @@ impl Tokens {
         };
         let base = pair("base")?;
         let popover = pair("popover")?;
+        let elevated = pair("elevated")?;
         let muted = pair("muted")?;
         let accent = pair("accent")?;
         let card = pair("card")?;
@@ -79,6 +82,8 @@ impl Tokens {
             text: colour(base.rendered_foreground),
             popover: colour(popover.rendered_surface),
             popover_text: colour(popover.rendered_foreground),
+            elevated: colour(elevated.rendered_surface),
+            elevated_text: colour(elevated.rendered_foreground),
             card: colour(card.rendered_surface),
             card_text: colour(card.rendered_foreground),
             primary: colour(primary.rendered_surface),
@@ -154,14 +159,16 @@ impl Tokens {
         }
     }
 
-    /// Tooltip chrome using the compiled neutral muted pair.
-    /// Pass the resolved `button.border_width` metric (1 px in the default
-    /// design); padding belongs to the tooltip's spacing-scale configuration.
-    /// The compiler guarantees an opaque surface and contrast for this pair.
+    /// Tooltip chrome using the compiled `elevated` pair, so tooltip text
+    /// never sits on the surface it covers. Pass the resolved
+    /// `button.border_width` metric (1 px in the default design); padding
+    /// belongs to the tooltip's spacing-scale configuration. The compiler
+    /// guarantees an opaque, base-distinct surface and AA contrast for this
+    /// pair.
     pub fn tooltip_style(self, border_width: f32) -> container::Style {
         container::Style {
-            background: Some(self.muted_surface.into()),
-            text_color: Some(self.muted_text),
+            background: Some(self.elevated.into()),
+            text_color: Some(self.elevated_text),
             border: Border {
                 color: self.border,
                 width: border_width,
@@ -208,6 +215,8 @@ impl Default for Tokens {
             text: Color::from_rgb8(230, 234, 241),
             popover: Color::from_rgb8(32, 36, 45),
             popover_text: Color::from_rgb8(230, 234, 241),
+            elevated: Color::from_rgb8(44, 50, 61),
+            elevated_text: Color::from_rgb8(230, 234, 241),
             card: Color::from_rgb8(30, 33, 40),
             card_text: Color::from_rgb8(230, 234, 241),
             primary: Color::from_rgb8(64, 160, 110),
@@ -236,6 +245,7 @@ mod tests {
         for name in [
             "base",
             "popover",
+            "elevated",
             "muted",
             "accent",
             "card",
@@ -318,16 +328,16 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_style_is_pure_and_uses_the_muted_pair() {
+    fn tooltip_style_is_pure_and_uses_the_elevated_pair() {
         for tokens in [
             Tokens::default(),
             Tokens::from_dictionary(&dictionary()).unwrap(),
         ] {
             let style = tokens.tooltip_style(1.0);
             assert_eq!(style, tokens.tooltip_style(1.0));
-            assert_eq!(style.background, Some(tokens.muted_surface.into()));
-            assert_eq!(style.text_color, Some(tokens.muted_text));
-            assert_eq!(tokens.muted_surface.a, 1.0);
+            assert_eq!(style.background, Some(tokens.elevated.into()));
+            assert_eq!(style.text_color, Some(tokens.elevated_text));
+            assert_eq!(tokens.elevated.a, 1.0);
             assert_eq!(style.border.color, tokens.border);
             assert_eq!(style.border.width, 1.0);
             assert_eq!(style.border.radius, tokens.radius.into());
