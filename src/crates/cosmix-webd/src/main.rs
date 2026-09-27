@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod acme_provisioner;
+mod blob_lane;
 mod blob_reference;
 mod bus;
 mod bus_call_handler;

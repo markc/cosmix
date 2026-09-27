@@ -74,3 +74,45 @@ released this arc, including on revoke or expiry. Reconciliation is deferred.
 Share error tokens are `not_found`, `expired`, `revoked`, `unauthorized` and
 `invalid_arguments:`. Public responses collapse missing/revoked/expired to 404
 and password failures to 401. Database faults remain internal failures.
+
+## Local lane adapter (checkpoint foundation)
+
+`blob_lane::local` loads the current `node.broker_handle` for each operation.
+Discovery calls the local `blobd` citizen's `blob.props.get {path: "lane"}`;
+only a socket address is accepted. A reference's `origin` is provenance, never
+a request destination. The dedicated reqwest client disables redirects,
+proxies and decompression. A missing local blob returns `not_present:`; serving
+does not trigger a cross-node fetch.
+
+One shared `Lane` instance admits at most eight operations, without a waiting
+queue. GET bodies retain admission through completion or drop. Bus calls have
+a 10-second deadline; lane headers and each pending upstream body read have a
+30-second deadline. Backpressure from a slow downstream keeps its permit: this
+is an upstream I/O idle deadline, not a total public download lifetime. Public
+connection deadlines and admission of catalogue/password work are wired with
+the HTTP handler in later slices.
+
+GET/HEAD forward Range and check 200/206/416 against the reference size and the
+requested extent. Single ranges follow blobd's semantics: malformed/multiple
+ranges are ignored; valid out-of-bounds ranges return 416. The adapter checks
+Content-Length, Content-Range and Accept-Ranges, rejects encoded/chunked byte
+responses, and aborts a body that is short or exceeds the declared extent.
+416 diagnostics are discarded and replaced by an empty body with validated
+Content-Range. Only Content-Type (from the validated reference), Content-Length,
+Content-Range and Accept-Ranges leave this adapter; public attachment/security
+headers are added by the later share route.
+
+The media-reference foundation hashes the complete bytes with BLAKE3, checks
+`blob.stat` first, and recovers or adds an owner pin without uploading existing
+bytes. `blob.stat` has no name field today, so recovered references omit the
+optional name. Missing content uses hash-addressed PUT with advisory quota
+preflight, bounded upload chunks and an upload progress watchdog. Both 201 and
+the present-hash early 200 are accepted, but the returned hash and size must
+match. Reference replies are capped at 64 KiB and 30 seconds. Pin publication
+is separate from catalogue publication; these foundations do not yet dual-write
+media or expose a `webd.media.ref` verb.
+
+Lane errors retain `lane_unavailable:`, `quota:`, `lane:`, `not_present:` and
+`verify_failed:`. Saturation is `lane: transfer pool full (8)`; invalid caller
+references are `invalid_arguments:`. An error after response headers aborts
+the body stream rather than attempting a second HTTP status.

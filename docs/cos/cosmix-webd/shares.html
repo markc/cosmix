@@ -499,7 +499,43 @@ The owner is <code>webd:share:&lt;first-16-hex-of-BLAKE3(primary-fqdn)&gt;</code
 released this arc, including on revoke or expiry. Reconciliation is deferred.</p>
 <p>Share error tokens are <code>not_found</code>, <code>expired</code>, <code>revoked</code>, <code>unauthorized</code> and
 <code>invalid_arguments:</code>. Public responses collapse missing/revoked/expired to 404
-and password failures to 401. Database faults remain internal failures.</p></div></div>
+and password failures to 401. Database faults remain internal failures.</p>
+<h2 id="local-lane-adapter-checkpoint-foundation">Local lane adapter (checkpoint foundation)</h2>
+<p><code>blob_lane::local</code> loads the current <code>node.broker_handle</code> for each operation.
+Discovery calls the local <code>blobd</code> citizen's <code>blob.props.get {path: "lane"}</code>;
+only a socket address is accepted. A reference's <code>origin</code> is provenance, never
+a request destination. The dedicated reqwest client disables redirects,
+proxies and decompression. A missing local blob returns <code>not_present:</code>; serving
+does not trigger a cross-node fetch.</p>
+<p>One shared <code>Lane</code> instance admits at most eight operations, without a waiting
+queue. GET bodies retain admission through completion or drop. Bus calls have
+a 10-second deadline; lane headers and each pending upstream body read have a
+30-second deadline. Backpressure from a slow downstream keeps its permit: this
+is an upstream I/O idle deadline, not a total public download lifetime. Public
+connection deadlines and admission of catalogue/password work are wired with
+the HTTP handler in later slices.</p>
+<p>GET/HEAD forward Range and check 200/206/416 against the reference size and the
+requested extent. Single ranges follow blobd's semantics: malformed/multiple
+ranges are ignored; valid out-of-bounds ranges return 416. The adapter checks
+Content-Length, Content-Range and Accept-Ranges, rejects encoded/chunked byte
+responses, and aborts a body that is short or exceeds the declared extent.
+416 diagnostics are discarded and replaced by an empty body with validated
+Content-Range. Only Content-Type (from the validated reference), Content-Length,
+Content-Range and Accept-Ranges leave this adapter; public attachment/security
+headers are added by the later share route.</p>
+<p>The media-reference foundation hashes the complete bytes with BLAKE3, checks
+<code>blob.stat</code> first, and recovers or adds an owner pin without uploading existing
+bytes. <code>blob.stat</code> has no name field today, so recovered references omit the
+optional name. Missing content uses hash-addressed PUT with advisory quota
+preflight, bounded upload chunks and an upload progress watchdog. Both 201 and
+the present-hash early 200 are accepted, but the returned hash and size must
+match. Reference replies are capped at 64 KiB and 30 seconds. Pin publication
+is separate from catalogue publication; these foundations do not yet dual-write
+media or expose a <code>webd.media.ref</code> verb.</p>
+<p>Lane errors retain <code>lane_unavailable:</code>, <code>quota:</code>, <code>lane:</code>, <code>not_present:</code> and
+<code>verify_failed:</code>. Saturation is <code>lane: transfer pool full (8)</code>; invalid caller
+references are <code>invalid_arguments:</code>. An error after response headers aborts
+the body stream rather than attempting a second HTTP status.</p></div></div>
     </div>
 
 </main>

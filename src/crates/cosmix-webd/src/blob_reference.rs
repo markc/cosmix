@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Reference {
+pub struct Reference {
     pub blob: String,
     pub size: u64,
     pub mime: String,
