@@ -39,6 +39,7 @@ mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
 mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
 mix src/crates/cosmix-blobd/mix/store_commit_test.mix
 mix src/crates/cosmix-blobd/mix/store_client_test.mix
+mix src/crates/cosmix-blobd/mix/store_worker_test.mix
 ```
 
 ## Catalogue citizen
@@ -63,6 +64,7 @@ The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.
 | `store.snapshot.forget` | `collection`, `id` | Tombstone; `pins_retained:true` |
 | `store.commit.status` | `collection`, `id` | Durable state, error, times, forgotten flag |
 | `store.info` | none | Counts, schema, blobd target and release policy |
+| `stored.work` | none | Idempotent mesh-open kick; `accepted`, `busy` |
 
 Lists default to 100, accept 1..100, use exclusive lexical cursors. An exact
 full final page can require one extra empty read. Unknown records return
@@ -97,6 +99,13 @@ generation fence so an old worker cannot publish catalogue rows. Manifest
 upload resume records are generation-specific to avoid concurrent writers
 during reload. Async Bus waits yield; the bounded manifest HTTP transfer is
 currently a blocking Mix builtin.
+
+Any mesh caller may kick `stored.work`; it is fenced and only one worker
+owns the current epoch. A retired worker clears its busy flag only if it
+still owns that epoch. Escaping infrastructure failures (including connection
+or failed-state-write errors) get at most three retries, separated by 60 s.
+This is an error backstop, not a poll. After exhaustion, fix the underlying
+fault and kick `stored.work` or restart to recover the pending intent.
 
 Failed work may retain partial pins and upload receipts. This is intentional
 until a separate release policy is designed. Blobd quota counts unique bytes
@@ -156,7 +165,7 @@ One-shot event users finish with `quit()`; failures exit nonzero.
 
 The citizen and client live in `src/crates/cosmix-blobd/mix/`. They require
 Mix 0.97.0 or later and blobd 0.6.1 or later. There is no new Rust binary.
-The package installs the eight runtime scripts together under
+The package installs the nine runtime scripts together under
 `/opt/cosmix/share/cosmix/stored/`; relative `require()` paths stay intact.
 Run the installed client as `mix /opt/cosmix/share/cosmix/stored/store.mix`.
 
@@ -168,7 +177,7 @@ mix src/crates/cosmix-blobd/mix/store_test.mix
 systemd-analyze verify --man=no src/_etc/systemd-system/cosmix-stored.service
 ```
 
-The destination must not exist. The rootless suite registers all four focused
+The destination must not exist. The rootless suite registers all five focused
 test scripts, checks lint/syntax/version for every Mix file in this directory,
 stages the assets and verifies script bytes, unit state settings and registry
 projection. It needs neither cargo nor a broker.

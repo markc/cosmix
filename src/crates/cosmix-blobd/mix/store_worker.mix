@@ -1,0 +1,18 @@
+-- version: 0.1.0
+-- Primary wakes are explicit kicks. Only escaping infrastructure failures retry.
+fn drain($run_job, $finish, $pause, $context)
+  $retries = 0
+  while true
+    try
+      $finished = $run_job($context)
+    catch $message, $error
+      eprint("stored retry: " .. $error.code .. ": " .. $message)
+      if $retries >= 3 then raise($error.code, $message) end
+      $retries = $retries + 1
+      $pause(60)
+      continue
+    end
+    if $finished == nil then return end
+    $finish($finished)
+  end
+end

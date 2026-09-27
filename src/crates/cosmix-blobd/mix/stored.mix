@@ -1,8 +1,9 @@
--- version: 0.3.0
+-- version: 0.4.0
 -- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
 $catalogue = require("store_catalogue.mix")
 $commit = require("store_commit.mix")
 $io = require("store_blob.mix")
+$worker = require("store_worker.mix")
 $STATE = env("STORED_STATE_DIR", env("STATE_DIRECTORY", env("COSMIX_VAR", env("XDG_STATE_HOME", env("HOME") .. "/.local/state") .. "/cosmix") .. "/stored"))
 $BLOBD = env("STORED_BLOBD", "blobd")
 if not re_match($BLOBD, "^blobd(-[a-z0-9-]+)?$") then raise("STORE_CONFIG", "STORED_BLOBD must be a local blobd service") end
@@ -12,7 +13,7 @@ if not flock($STATE .. "/.writer-lock") then raise("STORE_LOCKED", "another stor
 $DB_PATH = $STATE .. "/catalogue.sqlite"
 $catalogue.initialise($DB_PATH, $BLOBD)
 $EPOCH = $commit.epoch($DB_PATH)
-$WORKER_BUSY = false
+$WORKER_BUSY = nil
 
 fn answer($verb, $args)
   $db = nil
@@ -57,22 +58,24 @@ on store.snapshot.commit desc "Accept durable commit {collection,manifest}; comp
     reply(10, json_encode({error_code: $error.code, message: $message}))
   end
 end
-on stored.work async
-  -- Only task_start's local continuation; there is no caller authorisation gate.
-  if length(keys($event.headers)) != 0 or $WORKER_BUSY then return end
-  $WORKER_BUSY = true
+on stored.work desc "Idempotent mesh-open kick for pending work, including recovery" async
+  if $WORKER_BUSY != nil then
+    if $event.headers.id != nil then reply(0, json_encode({accepted: true, busy: true})) end
+    return
+  end
+  $worker_epoch = $EPOCH
+  $WORKER_BUSY = $worker_epoch
   try
-    while true
-      $finished = $commit.run_pending($DB_PATH, $STATE, $EPOCH, $io)
-      if $finished == nil then break end
-      publish("store.commit.finished", json_encode($finished), {retain: false})
-      -- Publication yields: a new intent may have been admitted while this
-      -- worker was busy. Drain it before releasing the in-process guard.
-    end
+    if $event.headers.id != nil then reply(0, json_encode({accepted: true, busy: false})) end
+    $context = {commit: $commit, db: $DB_PATH, state: $STATE, epoch: $worker_epoch, io: $io}
+    $run_job = fn($ctx) = $ctx.commit.run_pending($ctx.db, $ctx.state, $ctx.epoch, $ctx.io)
+    $finish = fn($finished) = publish("store.commit.finished", json_encode($finished), {retain: false})
+    -- publish is blocking. Drain again for work admitted at async Bus yields.
+    $worker.drain($run_job, $finish, fn($seconds) = sleep($seconds), $context)
   catch $message
     eprint("stored worker: " .. $message)
   finally
-    $WORKER_BUSY = false
+    if $WORKER_BUSY == $worker_epoch then $WORKER_BUSY = nil end
   end
 end
 task_start("stored.work", "{}")

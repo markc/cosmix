@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 -- Durable orchestration; only the injected io boundary talks to blobd.
 $c = require("store_catalogue.mix")
 $m = require("store_manifest.mix")
@@ -95,6 +95,8 @@ fn run_pending($path, $state_dir, $epoch, $io)
     if $error.code == "STORE_SUPERSEDED" then return nil end
     if $job == nil then raise($error.code, $message) end
     fence($db, $epoch)
+    $current = sqlexec($db, "SELECT state FROM commit_intents WHERE collection=? AND id=?", [$job.collection, $job.id])
+    if length($current) == 0 or $current[0].state != "pending" then return nil end
     $reason = $error.code .. ": " .. $message
     sqlexec($db, "UPDATE commit_intents SET state='failed',error=?,updated_at=? WHERE collection=? AND id=? AND state='pending'", [$reason, floor(time()), $job.collection, $job.id])
     return {collection: $job.collection, id: $job.id, state: "failed", error: $reason}

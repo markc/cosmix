@@ -471,6 +471,7 @@ pass the new byte limit; migration must never truncate or omit entries.</p>
 mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
 mix src/crates/cosmix-blobd/mix/store_commit_test.mix
 mix src/crates/cosmix-blobd/mix/store_client_test.mix
+mix src/crates/cosmix-blobd/mix/store_worker_test.mix
 </code></pre>
 <h2 id="catalogue-citizen">Catalogue citizen</h2>
 <p>Run <code>mix --serve stored.mix --name stored</code>. <code>STORED_STATE_DIR</code> overrides the
@@ -490,6 +491,7 @@ The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.</p>
 <tr><td><code>store.snapshot.forget</code></td><td><code>collection</code>, <code>id</code></td><td>Tombstone; <code>pins_retained:true</code></td></tr>
 <tr><td><code>store.commit.status</code></td><td><code>collection</code>, <code>id</code></td><td>Durable state, error, times, forgotten flag</td></tr>
 <tr><td><code>store.info</code></td><td>none</td><td>Counts, schema, blobd target and release policy</td></tr>
+<tr><td><code>stored.work</code></td><td>none</td><td>Idempotent mesh-open kick; <code>accepted</code>, <code>busy</code></td></tr>
 </tbody></table>
 <p>Lists default to 100, accept 1..100, use exclusive lexical cursors. An exact
 full final page can require one extra empty read. Unknown records return
@@ -520,6 +522,12 @@ generation fence so an old worker cannot publish catalogue rows. Manifest
 upload resume records are generation-specific to avoid concurrent writers
 during reload. Async Bus waits yield; the bounded manifest HTTP transfer is
 currently a blocking Mix builtin.</p>
+<p>Any mesh caller may kick <code>stored.work</code>; it is fenced and only one worker
+owns the current epoch. A retired worker clears its busy flag only if it
+still owns that epoch. Escaping infrastructure failures (including connection
+or failed-state-write errors) get at most three retries, separated by 60 s.
+This is an error backstop, not a poll. After exhaustion, fix the underlying
+fault and kick <code>stored.work</code> or restart to recover the pending intent.</p>
 <p>Failed work may retain partial pins and upload receipts. This is intentional
 until a separate release policy is designed. Blobd quota counts unique bytes
 per owner, including manifest bytes, and pending upload reservations; it is
@@ -567,7 +575,7 @@ One-shot event users finish with <code>quit()</code>; failures exit nonzero.</p>
 <h2 id="packaging-and-verification">Packaging and verification</h2>
 <p>The citizen and client live in <code>src/crates/cosmix-blobd/mix/</code>. They require
 Mix 0.97.0 or later and blobd 0.6.1 or later. There is no new Rust binary.
-The package installs the eight runtime scripts together under
+The package installs the nine runtime scripts together under
 <code>/opt/cosmix/share/cosmix/stored/</code>; relative <code>require()</code> paths stay intact.
 Run the installed client as <code>mix /opt/cosmix/share/cosmix/stored/store.mix</code>.</p>
 <p>Stage a package without root, account creation or service changes:</p>
@@ -575,7 +583,7 @@ Run the installed client as <code>mix /opt/cosmix/share/cosmix/stored/store.mix<
 mix src/crates/cosmix-blobd/mix/store_test.mix
 systemd-analyze verify --man=no src/_etc/systemd-system/cosmix-stored.service
 </code></pre>
-<p>The destination must not exist. The rootless suite registers all four focused
+<p>The destination must not exist. The rootless suite registers all five focused
 test scripts, checks lint/syntax/version for every Mix file in this directory,
 stages the assets and verifies script bytes, unit state settings and registry
 projection. It needs neither cargo nor a broker.</p>

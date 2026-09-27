@@ -1,0 +1,39 @@
+-- version: 0.1.0
+$w = require("store_worker.mix")
+$calls = buffer()
+$delays = buffer()
+$events = buffer()
+$checks = buffer()
+fn check($value, $token)
+  if not $value then raise("TEST", $token) end
+  buffer_push($checks, 1)
+end
+$run_job = fn($context)
+  if $context.epoch != "captured-epoch" then raise("TEST", "LOST_CONTEXT") end
+  buffer_push($calls, 1)
+  $n = length(freeze($calls))
+  if $n <= 2 then raise("INJECT_DB_BUSY", "no job was read") end
+  return $n == 3 ? {state: "committed"} : nil
+end
+$pause = fn($seconds)
+  if $seconds < 60 then raise("TEST", "RETRY_TOO_FAST") end
+  buffer_push($delays, 1)
+end
+$finish = fn($result)
+  if $result.state != "committed" then raise("TEST", "BAD_EVENT") end
+  buffer_push($events, 1)
+end
+$w.drain($run_job, $finish, $pause, {epoch: "captured-epoch"})
+check(length(freeze($calls)) == 4, "RECOVER_ESCAPING_ERROR")
+check(length(freeze($delays)) == 2, "ONLY_FAILURES_DELAY")
+check(length(freeze($events)) == 1, "ONE_COMPLETION")
+$caught = ""
+try
+  $w.drain(fn($context) = raise("INJECT_DISK_FULL", "failed update"), $finish, $pause, {})
+catch $message, $error
+  $caught = $error.code
+end
+check($caught == "INJECT_DISK_FULL", "BOUNDED_ERROR_PRESERVED")
+check(length(freeze($delays)) == 5, "THREE_RETRIES_MAXIMUM")
+check(length(freeze($events)) == 1, "NO_FALSE_COMPLETION")
+print("store_worker_test: PASS " .. to_string(length(freeze($checks))))
