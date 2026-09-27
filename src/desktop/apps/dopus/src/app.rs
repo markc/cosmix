@@ -212,7 +212,11 @@ pub fn run(
     let tint = icons::hex(theme.tokens.text);
     let icons = Icons::new();
     icons.ensure(
-        &[&tint, &icons::hex(theme.tokens.muted_text)],
+        &[
+            &tint,
+            &icons::hex(theme.tokens.muted_text),
+            &icons::hex(theme.tokens.selection_text),
+        ],
         ICON_PX,
         ICON_SCALE,
     );
@@ -995,7 +999,11 @@ impl Dopus {
         }
         self.tint = icons::hex(self.theme.tokens.text);
         self.icons.ensure(
-            &[&self.tint, &icons::hex(self.theme.tokens.muted_text)],
+            &[
+                &self.tint,
+                &icons::hex(self.theme.tokens.muted_text),
+                &icons::hex(self.theme.tokens.selection_text),
+            ],
             ICON_PX,
             ICON_SCALE,
         );
@@ -1100,6 +1108,7 @@ impl Dopus {
                 .sidebar(cosmix_dopus_core::config::Sidebar::Places),
             self.core
                 .sidebar(cosmix_dopus_core::config::Sidebar::Properties),
+            &self.action_table,
         );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops

@@ -49,11 +49,12 @@ pub fn pane_column<'a>(
     portion: u16,
     active: bool,
     editing: Option<&'a str>,
+    actions: &'a [crate::verbs::ActionRow],
 ) -> Element<'a, Msg> {
     container(
         column![
             pane_header(look, pane, pane_id, active, editing),
-            sort_header(look, pane, pane_id),
+            sort_header(look, pane, pane_id, actions),
             Element::new(rows::FileList::new(
                 pane_rows,
                 pane.selected.as_deref(),
@@ -62,6 +63,7 @@ pub fn pane_column<'a>(
                 icons,
                 tint,
                 look,
+                actions,
             ))
             .map(move |m| Msg::PaneRows(pane_id, m)),
         ]
@@ -103,14 +105,13 @@ fn pane_header<'a>(
 /// column shows its direction. A click activates the pane then sorts it
 /// (`Msg::Pane`; law 5 — the core adopts a new column ascending and toggles
 /// a same-column repeat itself).
-fn sort_header<'a>(look: Look, pane: &'a PaneModel, pane_id: PaneId) -> Element<'a, Msg> {
-    super::columns::Header {
-        look,
-        pane: pane_id,
-        sort: pane.sort,
-        ascending: pane.ascending,
-    }
-    .into()
+fn sort_header<'a>(
+    look: Look,
+    pane: &'a PaneModel,
+    pane_id: PaneId,
+    actions: &[crate::verbs::ActionRow],
+) -> Element<'a, Msg> {
+    super::columns::Header::new(look, pane_id, pane.sort, pane.ascending, actions).into()
 }
 
 // -- the divider --------------------------------------------------------------

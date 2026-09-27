@@ -17,13 +17,15 @@ pub fn bar<'a>(
     info: &'a str,
     places_open: bool,
     properties_open: bool,
+    actions: &[crate::verbs::ActionRow],
 ) -> Element<'a, Msg> {
     let summary = cosmix_dopus_core::pane_summary(&pane.root);
     container(row![
         button(
             text(format!(
-                "{} Places (Ctrl+B)",
-                if places_open { "●" } else { "○" }
+                "{} {}",
+                if places_open { "●" } else { "○" },
+                super::tips::action_label(actions, cosmix_actions::view::TOGGLE_PLACES, "Places"),
             ))
             .font(look.ui_font)
             .size(look.small_px)
@@ -33,8 +35,13 @@ pub fn bar<'a>(
         .on_press(Msg::Actions(vec![cosmix_actions::view::TOGGLE_PLACES])),
         button(
             text(format!(
-                "{} Properties (Ctrl+I)",
-                if properties_open { "●" } else { "○" }
+                "{} {}",
+                if properties_open { "●" } else { "○" },
+                super::tips::action_label(
+                    actions,
+                    cosmix_actions::view::TOGGLE_PROPERTIES,
+                    "Properties"
+                ),
             ))
             .font(look.ui_font)
             .size(look.small_px)

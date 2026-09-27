@@ -15,6 +15,7 @@ pub mod places;
 pub mod properties;
 pub mod rows;
 pub mod status;
+pub mod tips;
 pub mod toolbar;
 
 use iced::widget::{column, container, row};
@@ -82,6 +83,7 @@ pub fn root<'a>(
     properties: cosmix_dopus_core::properties::Properties,
     places_config: cosmix_dopus_core::config::SidebarConfig,
     properties_config: cosmix_dopus_core::config::SidebarConfig,
+    actions: &'a [crate::verbs::ActionRow],
 ) -> Element<'a, Msg> {
     let (left_edit, right_edit) = match editing {
         Some((PaneId::Left, text)) => (Some(text), None),
@@ -115,6 +117,7 @@ pub fn root<'a>(
                     active,
                     active_pane,
                     places,
+                    actions,
                 ))
                 .width(Length::FillPortion(sides[0]))
                 .height(Length::Fill),
@@ -136,7 +139,8 @@ pub fn root<'a>(
                 left_rows,
                 left_portion,
                 active == PaneId::Left,
-                left_edit
+                left_edit,
+                actions
             ),
             panes::Divider::new(&look, None, sides),
             panes::pane_column(
@@ -148,7 +152,8 @@ pub fn root<'a>(
                 right_rows,
                 100 - left_portion,
                 active == PaneId::Right,
-                right_edit
+                right_edit,
+                actions
             ),
         ]
         .width(Length::FillPortion(1000 - sides[0] - sides[1]))
@@ -168,14 +173,22 @@ pub fn root<'a>(
             );
     }
     let content = column![
-        toolbar::navigation(look, icons, tint, active_pane),
+        toolbar::navigation(
+            look,
+            icons,
+            tint,
+            active_pane,
+            [places_config.open, properties_config.open],
+            actions
+        ),
         body,
         status::bar(
             look,
             active_pane,
             info,
             places_config.open,
-            properties_config.open
+            properties_config.open,
+            actions
         ),
     ]
     .width(Length::Fill)

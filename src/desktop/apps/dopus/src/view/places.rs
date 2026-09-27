@@ -39,6 +39,7 @@ pub fn sidebar<'a>(
     active: PaneId,
     pane: &'a PaneModel,
     places: &'a [(&'static str, std::path::PathBuf)],
+    actions: &[crate::verbs::ActionRow],
 ) -> Element<'a, Msg> {
     let mut list = column![
         button(
@@ -72,17 +73,28 @@ pub fn sidebar<'a>(
             },
         };
         let style = place_look(&look, selected);
-        list = list.push(
-            button(
-                row![image_widget(look, icons, tint, place_icon(name)), label]
-                    .spacing(look.chrome.pad)
-                    .align_y(iced::Alignment::Center),
-            )
-            .padding([look.chrome.small, look.chrome.pad])
-            .width(Length::Fill)
-            .on_press(Msg::Go(active, path.clone()))
-            .style(style),
-        );
+        let entry = button(
+            row![image_widget(look, icons, tint, place_icon(name)), label]
+                .spacing(look.chrome.pad)
+                .align_y(iced::Alignment::Center),
+        )
+        .padding([look.chrome.small, look.chrome.pad])
+        .width(Length::Fill)
+        .on_press(Msg::Go(active, path.clone()))
+        .style(style);
+        let label = if *name == "Home" {
+            super::tips::action_label(actions, cosmix_actions::filemgr::NAV_HOME, name)
+        } else {
+            (*name).to_owned()
+        };
+        list = list.push(super::tips::tip(
+            look,
+            entry,
+            format!(
+                "{label}: {}",
+                cosmix_dopus_core::sanitise_display_path(path)
+            ),
+        ));
     }
     container(Scrollable::new(list))
         .width(Length::Fill)

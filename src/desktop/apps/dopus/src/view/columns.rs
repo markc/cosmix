@@ -16,8 +16,32 @@ pub struct Header {
     pub pane: PaneId,
     pub sort: SortColumn,
     pub ascending: bool,
+    labels: [String; 3],
+    tips: Vec<Element<'static, Msg>>,
 }
 impl Header {
+    pub fn new(
+        look: Look,
+        pane: PaneId,
+        sort: SortColumn,
+        ascending: bool,
+        actions: &[crate::verbs::ActionRow],
+    ) -> Self {
+        use cosmix_actions::filemgr;
+        Self {
+            look,
+            pane,
+            sort,
+            ascending,
+            tips: Vec::new(),
+            labels: [
+                (filemgr::VIEW_SORT_NAME, "Sort by name"),
+                (filemgr::VIEW_SORT_SIZE, "Sort by size"),
+                (filemgr::VIEW_SORT_MODIFIED, "Sort by modified time"),
+            ]
+            .map(|(id, label)| super::tips::action_label(actions, id, label)),
+        }
+    }
     fn labels(&self) -> [Para; 3] {
         [
             ("Name", SortColumn::Name),
@@ -35,6 +59,9 @@ impl Header {
     }
 }
 impl Widget<Msg, iced::Theme, Renderer> for Header {
+    fn diff(&self, _tree: &mut Tree) {
+        // Region children are reconciled in layout, once widths are known.
+    }
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<[Para; 3]>()
     }
@@ -44,24 +71,65 @@ impl Widget<Msg, iced::Theme, Renderer> for Header {
     fn state(&self) -> tree::State {
         tree::State::new(self.labels())
     }
-    fn layout(&mut self, tree: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
         let labels = self.labels();
         let height = labels[0].min_bounds().height + self.look.chrome.small * 2.0;
         *tree.state.downcast_mut::<[Para; 3]>() = labels;
-        layout::Node::new(limits.resolve(Length::Fill, Length::Shrink, Size::new(0.0, height)))
+        let size = limits.resolve(Length::Fill, Length::Shrink, Size::new(0.0, height));
+        let regions = Columns::new(self.look)
+            .cells(size.width)
+            .into_iter()
+            .zip(&self.labels)
+            .filter(|((_, width), _)| *width > 0.0)
+            .map(|((x, width), label)| {
+                (
+                    Rectangle {
+                        x,
+                        y: 0.0,
+                        width,
+                        height,
+                    },
+                    label.clone(),
+                )
+            })
+            .collect();
+        super::tips::regions(self.look, regions, &mut self.tips, tree, renderer, size)
     }
     fn update(
         &mut self,
-        _: &mut Tree,
+        tree: &mut Tree,
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _: &Renderer,
-        _: &mut dyn Clipboard,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Msg>,
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
+        let hover = if bounds
+            .intersection(viewport)
+            .is_some_and(|clip| cursor.is_over(clip))
+        {
+            cursor
+        } else {
+            mouse::Cursor::Unavailable
+        };
+        for ((tip, state), child) in self
+            .tips
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            tip.as_widget_mut().update(
+                state, event, child, hover, renderer, clipboard, shell, viewport,
+            );
+        }
         if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
@@ -134,6 +202,24 @@ impl Widget<Msg, iced::Theme, Renderer> for Header {
                 });
             }
         });
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, Msg, iced::Theme, Renderer>> {
+        iced::advanced::overlay::from_children(
+            &mut self.tips,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 impl<'a> From<Header> for Element<'a, Msg> {

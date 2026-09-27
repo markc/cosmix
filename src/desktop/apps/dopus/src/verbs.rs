@@ -668,8 +668,7 @@ pub fn action_table(keymap: &cosmix_actions::Keymap) -> Vec<ActionRow> {
             id: action.to_string(),
             label: (*label).to_owned(),
             keys: keymap
-                .defaults
-                .iter()
+                .effective_bindings()
                 .filter(|b| b.action == *action)
                 .map(|b| b.chord.to_string())
                 .collect(),

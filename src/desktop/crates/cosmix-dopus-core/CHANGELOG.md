@@ -2,6 +2,8 @@
 
 ## 0.3.0
 
+- Apply the Properties-specific 22% width default to partial schema-2
+  records, preserving explicit widths and open state.
 - Add non-blocking `properties(pane)` snapshots with bounded metadata
   workers and stale generation/selection reply rejection. Preserve symlink
   metadata and targets; expose timestamps, Unix mode and resolved owner/group

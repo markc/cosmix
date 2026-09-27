@@ -2,6 +2,11 @@
 
 ## 0.3.0
 
+- Add Lucide panel-left/panel-right toolbar buttons at the window edges,
+  with docked/hidden state styling and the existing sidebar actions.
+- Add token-styled iced tooltips to navigation, panel toggles, Places,
+  sort headers and listing icons/chevrons. Tooltips, status labels and Bus
+  action listings use effective bindings, including remaps and unbindings.
 - Preserve a usable Name column in narrow panes by hiding Modified first,
   then hiding Size when necessary; never elide numeric cells. Cap tree indentation
   to the same name budget; keep header and row geometry in step.

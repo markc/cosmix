@@ -456,6 +456,16 @@ Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
 active pane and follows F6 or a pane click; Back/Forward are disabled when
 that pane's corresponding history is empty, and Up is disabled at the root.
 Disabled icons use the theme's muted foreground, matching disabled dialog buttons.
+Lucide <code>panel-left</code> and <code>panel-right</code> buttons sit at the far left and right of
+the same row, with navigation centred between them. They toggle Places and
+Properties through the same actions as the keyboard and Bus: docked means
+open, undocked means hidden, without floating windows. Open panels have
+selection-tinted buttons; hidden panels have muted icons.
+All icon controls have iced tooltips, including Places, sort headers, listing
+icons and expansion chevrons. Action tooltips and status-bar shortcut labels
+read the effective keymap, including custom remaps and unbindings, and update
+when the keymap reloads. Tooltip colours and spacing use design tokens;
+the design currently has no timing token, so iced's default delay applies.
 Each pane shows only its editable location bar above the column headers;
 there is no duplicate path beside the toolbar. Ctrl+L and <code>location.focus</code>
 keep their existing behaviour. Toolbar clicks invoke the existing actions,
@@ -491,7 +501,7 @@ Unavailable timestamps display <code>—</code>.
 Folder sizes show the existing count queue's item count (<code>…</code> while pending),
 never a recursive byte walk. With no selection it shows the current path
 and the same folder/file counts and total file size as the status bar.
-Metadata runs on at most one worker per pane; stale replies are discarded.
+Metadata has at most four outstanding reads per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.</p>
 <p><strong>Ctrl+B</strong> toggles Places and <strong>Ctrl+I</strong> toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
@@ -667,6 +677,8 @@ defaults and disables saving, preserving the original file.
 Schema 1 migrates to 2 in memory, preserving pane paths, sorting, hidden
 settings, active pane and split, and adding both panels open (Places 15%,
 Properties 22%). Schema 2 saves retain their existing widths.
+Partial sidebar records also use their own defaults: <code>properties: {open:false}</code>
+keeps Properties hidden at 22%, while an explicit saved width is preserved.
 The normal settled atomic write saves schema 2; no filemgr config is imported.
 <code>--print-config</code> prints the resolved config as JSON.
 Theme changes are session selections, not persisted config fields.</p>

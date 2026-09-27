@@ -2,9 +2,9 @@
 //! (the `apps/term/src/cpu_widget.rs` pattern: a widget that draws its rows
 //! itself).
 //!
-//! Layout is O(1): the widget knows its row height (shaped once per
+//! Layout touches only visible icon tooltip regions; row height is shaped once per
 //! font/size, the ced editor's `ensure_metrics` trick) and the scroll offset,
-//! so it lays out nothing and draws only the rows in the viewport. Name,
+//! so it lays out hit regions and draws only the rows in the viewport. Name,
 //! size and modified paragraphs are shaped once per row and cached in the
 //! widget's [`Tree`] state keyed by row path (a full re-shape every frame is
 //! what ced's P0 round just paid down); a cache entry is re-shaped when the
@@ -209,9 +209,12 @@ pub struct FileList<'a> {
     icons: &'a Icons,
     tint: &'a str,
     look: Look,
+    tips: Vec<Element<'static, RowsMsg>>,
+    open_label: String,
 }
 
 impl<'a> FileList<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rows: &'a [VisibleRow],
         selected: Option<&'a Path>,
@@ -220,6 +223,7 @@ impl<'a> FileList<'a> {
         icons: &'a Icons,
         tint: &'a str,
         look: Look,
+        actions: &[crate::verbs::ActionRow],
     ) -> Self {
         Self {
             columns: Columns::new(look),
@@ -230,6 +234,12 @@ impl<'a> FileList<'a> {
             icons,
             tint,
             look,
+            tips: Vec::new(),
+            open_label: super::tips::action_label(
+                actions,
+                cosmix_actions::filemgr::FILE_OPEN,
+                "Open",
+            ),
         }
     }
 
@@ -399,6 +409,9 @@ impl<'a> FileList<'a> {
 }
 
 impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
+    fn diff(&self, _tree: &mut Tree) {
+        // Preserve hover state until layout reconciles visible icon regions.
+    }
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<RowState>()
     }
@@ -412,12 +425,74 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
 
     fn layout(
         &mut self,
-        _tree: &mut Tree,
-        _renderer: &Renderer,
+        tree: &mut Tree,
+        renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        // O(1): rows hang off the scroll offset; nothing is laid out.
-        layout::Node::new(limits.resolve(Length::Fill, Length::Fill, Size::ZERO))
+        let size = limits.resolve(Length::Fill, Length::Fill, Size::ZERO);
+        let st = tree.state.downcast_mut::<RowState>();
+        self.ensure_metrics(st);
+        self.reset_on_relist(st);
+        self.follow_selection(st, size.height);
+        st.clamp(self.rows.len(), size.height);
+        let icon = self.look.chrome.icon;
+        let cell = self.columns.cells(size.width)[0];
+        let clip = Rectangle {
+            x: cell.0,
+            y: 0.0,
+            width: cell.1,
+            height: size.height,
+        };
+        let mut regions = Vec::new();
+        let first = (st.offset / st.row_h).floor().max(0.0) as usize;
+        for (index, row) in self.rows.iter().enumerate().skip(first) {
+            let y = index as f32 * st.row_h - st.offset;
+            if y >= size.height {
+                break;
+            }
+            let x = cell.0 + self.columns.indentation(size.width, row.depth, icon);
+            let y = y + (st.row_h - icon) / 2.0;
+            if row.entry.is_dir {
+                let label = format!(
+                    "{} {}",
+                    if self.is_expanded(&row.entry.path) {
+                        "Collapse"
+                    } else {
+                        "Expand"
+                    },
+                    row.entry.name
+                );
+                if let Some(bounds) = (Rectangle {
+                    x,
+                    y,
+                    width: icon,
+                    height: icon,
+                })
+                .intersection(&clip)
+                {
+                    regions.push((bounds, label));
+                }
+            }
+            if let Some(bounds) = (Rectangle {
+                x: x + icon,
+                y,
+                width: icon,
+                height: icon,
+            })
+            .intersection(&clip)
+            {
+                regions.push((
+                    bounds,
+                    format!(
+                        "{}: {} — {}",
+                        if row.entry.is_dir { "Folder" } else { "File" },
+                        row.entry.name,
+                        self.open_label
+                    ),
+                ));
+            }
+        }
+        super::tips::regions(self.look, regions, &mut self.tips, tree, renderer, size)
     }
 
     fn update(
@@ -426,8 +501,8 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _renderer: &Renderer,
-        _clipboard: &mut dyn Clipboard,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, RowsMsg>,
         viewport: &Rectangle,
     ) {
@@ -435,6 +510,21 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         let Some(clip) = bounds.intersection(viewport) else {
             return;
         };
+        let hover = if cursor.is_over(clip) {
+            cursor
+        } else {
+            mouse::Cursor::Unavailable
+        };
+        for ((tip, state), child) in self
+            .tips
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            tip.as_widget_mut().update(
+                state, event, child, hover, renderer, clipboard, shell, &clip,
+            );
+        }
         let st = tree.state.downcast_mut::<RowState>();
         self.ensure_metrics(st);
         self.reset_on_relist(st);
@@ -451,6 +541,7 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 if lines != 0.0 {
                     st.offset -= lines * st.row_h;
                     st.clamp(self.rows.len(), clip.height);
+                    shell.invalidate_layout();
                     shell.capture_event();
                 }
             }
@@ -678,6 +769,24 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         mouse::Interaction::Idle
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, RowsMsg, iced::Theme, Renderer>> {
+        iced::advanced::overlay::from_children(
+            &mut self.tips,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 

@@ -95,6 +95,7 @@ impl Default for PaneConfig {
 #[serde(default)]
 pub struct DOpusConfig {
     pub places: SidebarConfig,
+    #[serde(deserialize_with = "deserialize_properties")]
     pub properties: SidebarConfig,
     pub schema_version: u32,
     pub left: PaneConfig,
@@ -103,6 +104,22 @@ pub struct DOpusConfig {
     pub active_pane: String,
     #[serde(default = "default_split_ratio")]
     pub split_ratio: f32,
+}
+
+fn deserialize_properties<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SidebarConfig, D::Error> {
+    #[derive(Deserialize)]
+    struct Partial {
+        open: Option<bool>,
+        width: Option<f32>,
+    }
+    let partial = Partial::deserialize(deserializer)?;
+    let default = Sidebar::Properties.default_config();
+    Ok(SidebarConfig {
+        open: partial.open.unwrap_or(default.open),
+        width: partial.width.unwrap_or(default.width),
+    })
 }
 
 impl Default for DOpusConfig {
@@ -239,6 +256,35 @@ fn default_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_schema_two_panels_keep_sidebar_specific_defaults_and_explicit_widths() {
+        let dir = tempfile::tempdir().unwrap();
+        for (record, open, width) in [
+            ("{}", true, 0.22),
+            ("{open: false}", false, 0.22),
+            ("{width: 0.27}", true, 0.27),
+            ("{open: false, width: 0.18}", false, 0.18),
+        ] {
+            std::fs::write(
+                dir.path().join("config.conf.mix"),
+                format!("schema_version: 2\nplaces: {{open: false}}\nproperties: {record}\n"),
+            )
+            .unwrap();
+            let (config, file) = ConfigFile::load(dir.path());
+            assert!(file.allow_save, "valid partial record: {record}");
+            assert_eq!(config.properties, SidebarConfig { open, width });
+            assert_eq!(
+                config.places,
+                SidebarConfig {
+                    open: false,
+                    width: 0.15
+                }
+            );
+            file.save(&config).unwrap();
+            assert_eq!(ConfigFile::load(dir.path()).0, config);
+        }
+    }
 
     #[test]
     fn schema_one_migrates_without_losing_pane_state() {
