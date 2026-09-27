@@ -1,4 +1,4 @@
--- version: 0.7.0
+-- version: 0.8.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -17,7 +17,7 @@ fn configuration($opts)
   $node = $opts.node ?? ""
   $instance = $opts.instance ?? ""
   if $node != "" and not re_match($node, "^[a-zA-Z0-9_-]+$") then raise("STORE_CONFIG", "invalid node") end
-  if $instance != "" and not re_match($instance, "^[a-z0-9-]+$") then raise("STORE_CONFIG", "invalid instance") end
+  if $instance != "" and not re_match($instance, "^[a-z0-9][a-z0-9-]*$") then raise("STORE_CONFIG", "invalid instance") end
   $suffix = $instance == "" ? "" : "-" .. $instance
   $route = $node == "" ? "" : "." .. $node .. ".bus"
   $local = $opts["local-blobd"] ?? "blobd"

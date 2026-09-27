@@ -489,7 +489,8 @@ mix src/crates/cosmix-blobd/mix/store_worker_test.mix
 <h2 id="catalogue-citizen">Catalogue citizen</h2>
 <p>Run <code>mix --serve stored.mix --name stored</code>. <code>STORED_STATE_DIR</code> overrides the
 state root; otherwise <code>STATE_DIRECTORY</code>, then the Cosmix/XDG state root is
-used. <code>STORED_BLOBD</code> selects a <strong>local</strong> instance (default <code>blobd</code>). A catalogue
+used. <code>STORED_BLOBD</code> selects a <strong>local</strong> instance (default <code>blobd</code>), matching
+<code>^blobd(-[a-z0-9][a-z0-9-]*)?$</code>. A catalogue
 is bound to that instance and refuses accidental rebinding. An exclusive root
 lock prevents another process owning the same catalogue (<code>STORE_LOCKED</code>).
 Configuration refusals use <code>STORE_CONFIG</code>: the resolved state root must be

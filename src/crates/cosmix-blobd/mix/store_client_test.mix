@@ -1,4 +1,4 @@
--- version: 0.7.0
+-- version: 0.8.0
 $c = require("store_client.mix")
 $checks = buffer()
 $clock = buffer()
@@ -101,13 +101,23 @@ try
     $caught = $error.code
   end
   check($caught == "STORE_CONFIG", "EMPTY_CACHE_ROOT_REFUSED")
-  $probe = "$c = require(" .. json_encode(realpath("src/crates/cosmix-blobd/mix/store_client.mix")) .. "); $c.configuration({})"
+  $probe = '$c = require(' .. json_encode(realpath("src/crates/cosmix-blobd/mix/store_client.mix")) .. '); $c.configuration({})'
   $no_home = run_argv(["/opt/cosmix/bin/mix", "-c", $probe], {env: {HOME: ""}})
   check(not $no_home.ok and contains($no_home.stderr, "STORE_CONFIG"), "EMPTY_HOME_CLIENT_REFUSED")
-  $probe = "$c = require(" .. json_encode(realpath("src/crates/cosmix-blobd/mix/store_client.mix")) .. "); print($c.configuration({cache: " .. json_encode($dir .. "/explicit") .. "}).cache)"
+  $probe = '$c = require(' .. json_encode(realpath("src/crates/cosmix-blobd/mix/store_client.mix")) .. '); print($c.configuration({cache: ' .. json_encode($dir .. "/explicit") .. "}).cache)"
   check(run_argv(["/opt/cosmix/bin/mix", "-c", $probe], {env: {HOME: ""}}).ok, "EXPLICIT_CACHE_WITHOUT_HOME")
   check($cfg.service == "stored-two.archive.bus" and $cfg.blobd == "blobd-two.archive.bus" and $cfg.local_blobd == "blobd-fetch", "EXPLICIT_ROUTING")
   check(length($c.configuration({instance: repeat("x", 24)}).service) == 31, "MAX_SERVICE_NAME")
+  for each $opts in [{instance: "-two"}, {"local-blobd": "blobd--two"}, {"local-blobd": "blobd-"}, {instance: "Two"}]
+    $caught = ""
+    try
+      $c.configuration($opts)
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_CONFIG", "INSTANCE_GRAMMAR_REFUSED")
+  end
+  check($c.configuration({instance: "0-a-"}).local_target == "blobd-0-a-", "INSTANCE_ALPHANUMERIC_FIRST")
   $caught = ""
   try
     $c.configuration({instance: repeat("x", 25)})
