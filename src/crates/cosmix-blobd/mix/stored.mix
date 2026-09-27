@@ -1,4 +1,4 @@
--- version: 0.6.0
+-- version: 0.7.0
 -- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
 $catalogue = require("store_catalogue.mix")
 $commit = require("store_commit.mix")
@@ -6,7 +6,7 @@ $io = require("store_blob.mix")
 $worker = require("store_worker.mix")
 $manifest = require("store_manifest.mix")
 $manifest.service_name(serve_name() ?? "stored", "stored")
-$STATE = env("STORED_STATE_DIR", env("STATE_DIRECTORY", env("COSMIX_VAR", env("XDG_STATE_HOME", env("HOME") .. "/.local/state") .. "/cosmix") .. "/stored"))
+$STATE = $catalogue.state_root({STORED_STATE_DIR: env("STORED_STATE_DIR"), STATE_DIRECTORY: env("STATE_DIRECTORY"), COSMIX_VAR: env("COSMIX_VAR"), XDG_STATE_HOME: env("XDG_STATE_HOME"), HOME: env("HOME")})
 $BLOBD = env("STORED_BLOBD", "blobd")
 $manifest.service_name($BLOBD, "blobd")
 mkdir($STATE)

@@ -491,7 +491,10 @@ mix src/crates/cosmix-blobd/mix/store_worker_test.mix
 state root; otherwise <code>STATE_DIRECTORY</code>, then the Cosmix/XDG state root is
 used. <code>STORED_BLOBD</code> selects a <strong>local</strong> instance (default <code>blobd</code>). A catalogue
 is bound to that instance and refuses accidental rebinding. An exclusive root
-lock prevents another process owning the same catalogue.</p>
+lock prevents another process owning the same catalogue (<code>STORE_LOCKED</code>).
+Configuration refusals use <code>STORE_CONFIG</code>: the resolved state root must be
+nonempty, and the home-based fallback requires a nonempty <code>HOME</code>. An explicit
+state root (including systemd's <code>STATE_DIRECTORY</code>) does not require <code>HOME</code>.</p>
 <p>SQLite schema 1 uses WAL, synchronous FULL, foreign keys, short transactions
 and explicit handle closure. Manifest JSON is TEXT, never a SQL BLOB. It
 records collections, snapshots, snapshot-object membership and commit intents.
@@ -635,7 +638,9 @@ The file itself is included unless <code>.storeignore</code> is
 listed. Excluded entries are not inspected. The control file is at most
 64 KiB and a walk inspects at most 10000 non-excluded entries, besides manifest limits.</p>
 <p>The default cache is <code>~/.cache/cosmix/store/</code> (override <code>--cache</code>). One
-exclusive process lock covers it; it cannot live inside the source tree.
+exclusive process lock covers it (<code>STORE_LOCKED</code> on contention); it cannot
+live inside the source tree. An empty <code>--cache</code> or an empty <code>HOME</code> when using
+the default cache is refused with <code>STORE_CONFIG</code> before filesystem writes.
 Only newly created cache directories are chmodded to 0700; existing directory
 modes are preserved. Canonical paths are compared before creating <code>.lock</code>,
 including aliases of the source root.

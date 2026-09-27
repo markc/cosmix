@@ -1,4 +1,4 @@
--- version: 0.6.0
+-- version: 0.7.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -27,9 +27,12 @@ fn configuration($opts)
   $timeout = $m.uint(to_number($opts.timeout ?? "900"))
   $chunk = $m.uint(to_number($opts.chunk ?? "8388608"))
   if $timeout < 1 or $chunk < 1 or $chunk > 8388608 then raise("STORE_CONFIG", "positive timeout and chunk <=8MiB required") end
+  $cache = $opts.cache
+  if $cache == nil then $cache = $m.root_path(env("HOME"), "HOME") .. "/.cache/cosmix/store" end
+  $cache = $m.root_path($cache, "cache root")
   return {service: "stored" .. $suffix .. $route, blobd: "blobd" .. $suffix .. $route,
     local_blobd: $local, local_target: "blobd" .. $suffix, node: $node, instance: $instance,
-    timeout: $timeout, chunk: $chunk, cache: $opts.cache ?? env("HOME") .. "/.cache/cosmix/store"}
+    timeout: $timeout, chunk: $chunk, cache: $cache}
 end
 
 fn ignores($root)

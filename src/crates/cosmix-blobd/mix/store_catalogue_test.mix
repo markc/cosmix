@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.3.0
 $c = require("store_catalogue.mix")
 $m = require("store_manifest.mix")
 $protocol = require("store_commit.mix")
@@ -12,6 +12,18 @@ fn check($condition, $token)
   buffer_push($checks, 1)
 end
 try
+  $caught = ""
+  try
+    $c.state_root({})
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_CONFIG", "MISSING_HOME_REFUSED")
+  check($c.state_root({HOME: "/home/example"}) == "/home/example/.local/state/cosmix/stored", "HOME_STATE_FALLBACK")
+  check($c.state_root({HOME: "", STATE_DIRECTORY: "/tmp/state"}) == "/tmp/state", "SYSTEMD_STATE_WITHOUT_HOME")
+  check($c.state_root({STORED_STATE_DIR: "/tmp/override", STATE_DIRECTORY: "/tmp/state"}) == "/tmp/override", "STATE_OVERRIDE_PRECEDENCE")
+  check($c.state_root({COSMIX_VAR: "/tmp/var", XDG_STATE_HOME: "/tmp/xdg"}) == "/tmp/var/stored", "COSMIX_STATE_PRECEDENCE")
+  check($c.state_root({XDG_STATE_HOME: "/tmp/xdg"}) == "/tmp/xdg/cosmix/stored", "XDG_STATE_FALLBACK")
   $c.initialise($path, "blobd-two")
   $c.initialise($path, "blobd-two")
   $db = $c.connect($path)

@@ -1,4 +1,4 @@
--- version: 0.3.0
+-- version: 0.4.0
 -- Shared, byte-exact store manifest contract. No filesystem or Bus effects.
 fn fail($code, $message)
   raise($code, $message)
@@ -28,6 +28,11 @@ fn service_name($name, $prefix)
     fail("STORE_CONFIG", $prefix .. " service name must be valid and at most 31 bytes")
   end
   return $name
+end
+
+fn root_path($value, $label)
+  if type($value) != "string" or $value == "" then fail("STORE_CONFIG", $label .. " must be nonempty") end
+  return $value
 end
 
 fn blob($id)
