@@ -164,6 +164,9 @@ listed. Excluded entries are not inspected. The control file is at most
 
 The default cache is `~/.cache/cosmix/store/` (override `--cache`). One
 exclusive process lock covers it; it cannot live inside the source tree.
+Only newly created cache directories are chmodded to 0700; existing directory
+modes are preserved. Canonical paths are compared before creating `.lock`,
+including aliases of the source root.
 Target, collection and source root isolate resume records; object identity
 names each record. Atomic mode-0600 records retain B0's session key, identity
 and server receipt across a killed push. Retry the same command. Changed

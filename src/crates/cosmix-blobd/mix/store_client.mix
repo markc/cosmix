@@ -1,4 +1,4 @@
--- version: 0.3.0
+-- version: 0.4.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -96,10 +96,14 @@ fn inventory($directory)
   return $v
 end
 
-fn cache_lock($path)
-  mkdir($path)
+fn cache_lock($path, $source_root)
+  if not exists($path, {follow_symlinks: false}) then
+    mkdir($path)
+    chmod($path, 0o700)
+  end
   if not stat($path, {follow_symlinks: false}).is_dir then raise("STORE_CACHE", "cache must be a real directory") end
-  chmod($path, 0o700)
+  $canonical = realpath($path)
+  if $source_root != nil and ($canonical == $source_root or $source_root == "/" or starts_with($canonical, $source_root .. "/")) then raise("STORE_CACHE", "resume cache cannot be inside the source tree") end
   if not flock($path .. "/.lock") then raise("STORE_LOCKED", "another store client owns this cache") end
 end
 
@@ -139,10 +143,11 @@ end
 
 fn push_tree($cfg, $collection, $directory, $events)
   $m.collection($collection)
-  cache_lock($cfg.cache)
+  $source_root = realpath($directory)
+  if $source_root == nil then raise("STORE_SOURCE", "source directory does not exist") end
+  cache_lock($cfg.cache, $source_root)
   target($cfg)
   $v = inventory($directory)
-  if $cfg.cache == $v.root or starts_with(realpath($cfg.cache), $v.root .. "/") then raise("STORE_CACHE", "resume cache cannot be inside the source tree") end
   rpc($cfg.service, "store.collection.create", {name: $collection})
   $identity = hash_blake3(json_encode({service: $cfg.blobd, collection: $collection, root: $v.root}))
   $cache = $cfg.cache .. "/" .. $identity

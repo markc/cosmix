@@ -1,4 +1,4 @@
--- version: 0.3.0
+-- version: 0.4.0
 $c = require("store_client.mix")
 $checks = buffer()
 $dir = env("TMPDIR", "/tmp") .. "/store-client-test-" .. uuid()
@@ -64,7 +64,20 @@ try
   check($c.inventory($dir .. "/excluded").file_count == 0, "EXCLUSIONS_DO_NOT_SPEND_WALK_LIMIT")
   $cfg = $c.configuration({node: "archive", instance: "two", "local-blobd": "blobd-fetch"})
   check($cfg.service == "stored-two.archive.bus" and $cfg.blobd == "blobd-two.archive.bus" and $cfg.local_blobd == "blobd-fetch", "EXPLICIT_ROUTING")
-  $c.cache_lock($dir .. "/cache")
+  $c.cache_lock($dir .. "/cache", nil)
+  mkdir($dir .. "/existing-cache")
+  chmod($dir .. "/existing-cache", 0o755)
+  $c.cache_lock($dir .. "/existing-cache", nil)
+  check(stat($dir .. "/existing-cache").perm == 0o755, "EXISTING_CACHE_MODE_PRESERVED")
+  for each $cache in [$dir .. "/tree/.", $dir .. "/tree/child-cache"]
+    $caught = ""
+    try
+      $c.cache_lock($cache, realpath($dir .. "/tree"))
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_CACHE" and not exists($cache .. "/.lock"), "INSIDE_SOURCE_REFUSED_BEFORE_LOCK")
+  end
   $probe = "if flock(" .. json_encode($dir .. "/cache/.lock") .. ") then exit(1) end"
   check(run_argv(["/opt/cosmix/bin/mix", "-c", $probe]).ok, "SECOND_PROCESS_LOCK_REFUSED")
   check(stat($dir .. "/cache").perm == 0o700, "PRIVATE_CACHE")
