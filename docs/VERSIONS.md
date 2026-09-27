@@ -108,7 +108,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-busviewer` | 0.1.2 |
 | `cosmix-capture` | 0.2.4 |
 | `cosmix-ced` | 0.1.2 |
-| `cosmix-comp` | 0.71.0 |
+| `cosmix-comp` | 0.72.0 |
 | `cosmix-deco` | 0.4.1 |
 | `cosmix-design` | 0.15.0 |
 | `cosmix-dopus` | 0.1.0 |
@@ -120,7 +120,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-interactgui` | 0.1.3 |
 | `cosmix-mail` | 0.1.1 |
 | `cosmix-media` | 0.1.3 |
-| `cosmix-quoin` | 0.20.0 |
+| `cosmix-quoin` | 0.20.1 |
 | `cosmix-scene` | 0.6.0 |
 | `cosmix-scene-bevy` | 0.7.0 |
 | `cosmix-shell` | 0.19.0 |
