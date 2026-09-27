@@ -247,8 +247,6 @@ impl Dialog {
     }
 }
 
-/// Confirm and prompt cards share one width.
-
 /// Button weight: the primary submit, the destructive confirming action of a
 /// delete confirm, or a quiet dismissal.
 #[derive(Clone, Copy, PartialEq, Eq)]

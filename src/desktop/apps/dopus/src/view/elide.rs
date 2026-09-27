@@ -15,7 +15,7 @@ pub fn shape(content: &str, font: iced::Font, px: f32) -> Para {
         font,
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
-        shaping: text::Shaping::Basic,
+        shaping: text::Shaping::Advanced,
         wrapping: text::Wrapping::None,
     })
 }

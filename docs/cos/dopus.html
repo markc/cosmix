@@ -455,6 +455,7 @@ directory checks. The divider persists its position; double-click centres it.</p
 Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
 active pane and follows F6 or a pane click; Back/Forward are disabled when
 that pane's corresponding history is empty, and Up is disabled at the root.
+Disabled icons use the theme's muted foreground, matching disabled dialog buttons.
 Each pane shows only its editable location bar above the column headers;
 there is no duplicate path beside the toolbar. Ctrl+L and <code>location.focus</code>
 keep their existing behaviour. Toolbar clicks invoke the existing actions,
@@ -462,7 +463,12 @@ without changing keyboard bindings or Bus behaviour.</p>
 <p>Names in listings and Places middle-elide to their measured width, preserving
 the final extension where space permits. Headers and rows share one column
 layout: Name uses the remaining space; Size and Modified align right in
-reserved columns. Each column and the list viewport clip their contents.
+reserved columns. Narrow panes preserve room for icons and four measured name
+characters: Modified hides first, then Size shrinks to a compact width (eliding
+long values), then hides if necessary. Deep tree indentation also yields to
+that name budget. Headers and rows use identical responsive thresholds.
+Each column and the list viewport clip their contents. Name measurement and
+rendering both use advanced shaping for complex scripts and font fallback.
 Secondary columns use the desktop Small type size with the mono family,
 leaving a useful Name budget when both sidebars are open.
 Selection uses the design's selection pair, and a tinted header marks the
@@ -681,7 +687,8 @@ to confirm persisted widths and visibility.</p>
 graphemes), but use iced shaping and clipping instead of Bevy text systems.</li>
 <li>Keep relative timestamps below seven days and the local absolute format
 otherwise. The existing frontend tick refreshes them; no Bevy timer is needed.</li>
-<li>Use fixed measured secondary columns instead of filemgr's percentage widths.</li>
+<li>Use measured secondary columns instead of filemgr's percentage widths,
+hiding Modified and shrinking/hiding Size as panes narrow to preserve names.</li>
 <li>Use plain sidebars, both open at filemgr's 15% default. Do not import its
 DCS pin/float/carousel state, preview or bookmark placeholders, or config.
 Limit widths to 30% each so the panes retain space.</li>

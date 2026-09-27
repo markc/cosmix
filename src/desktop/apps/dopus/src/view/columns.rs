@@ -111,6 +111,9 @@ impl Widget<Msg, iced::Theme, Renderer> for Header {
                 .zip(tree.state.downcast_ref::<[Para; 3]>())
                 .enumerate()
             {
+                if width <= 0.0 {
+                    continue;
+                }
                 let cell = Rectangle {
                     x: bounds.x + start,
                     width,

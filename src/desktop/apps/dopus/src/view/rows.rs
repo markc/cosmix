@@ -54,6 +54,8 @@ pub enum RowsMsg {
 /// in the resolved mono role, including the widest absolute time form.
 #[derive(Clone, Copy, Debug)]
 pub struct Columns {
+    pub name_min: f32,
+    pub size_min: f32,
     pub size: f32,
     pub modified: f32,
     pub gap: f32,
@@ -67,66 +69,61 @@ impl Columns {
                 .width
         };
         Self {
+            name_min: look.chrome.icon * 2.0 + look.chrome.small + Self::name_measure(look),
+            size_min: measure("9.9 KiB").max(
+                FileList::shape("Size ↓", look.ui_font, look.small_px)
+                    .min_bounds()
+                    .width,
+            ),
             size: measure("999999 items"),
             modified: measure("88/88/88 at 88:88 pm"),
             gap: look.chrome.gap,
             pad: look.chrome.pad,
         }
     }
-    /// Local x/width pairs in display order. Modified is reserved first,
-    /// including at narrow widths; the remaining name budget may be zero.
+    fn name_measure(look: Look) -> f32 {
+        FileList::shape("MMMM", look.ui_font, look.px)
+            .min_bounds()
+            .width
+    }
+    /// Local x/width pairs shared by headers and rows. Preserve a usable
+    /// name before secondary columns: hide Modified, shrink Size, then hide
+    /// Size if even its compact form would consume the name budget.
     pub fn cells(self, width: f32) -> [(f32, f32); 3] {
-        let end = (width - self.pad).max(0.0);
-        let modified = (end - self.modified).max(0.0);
-        let size_end = (modified - self.gap).max(0.0);
-        let size = (size_end - self.size).max(0.0);
+        let pad = self.pad.min(width.max(0.0) / 2.0);
+        let available = (width - 2.0 * pad).max(0.0);
+        let modified = if available >= self.name_min + self.size + self.modified + 2.0 * self.gap {
+            self.modified
+        } else {
+            0.0
+        };
+        let size_budget = available - self.name_min - self.gap;
+        let size = if modified > 0.0 {
+            self.size
+        } else if size_budget >= self.size_min {
+            self.size.min(size_budget)
+        } else {
+            0.0
+        };
+        let name = available
+            - size
+            - modified
+            - if size > 0.0 { self.gap } else { 0.0 }
+            - if modified > 0.0 { self.gap } else { 0.0 };
+        let size_x = pad + name + if size > 0.0 { self.gap } else { 0.0 };
         [
-            (self.pad, (size - self.gap - self.pad).max(0.0)),
-            (size, size_end - size),
-            (modified, end - modified),
+            (pad, name),
+            (size_x, size),
+            (width.max(0.0) - pad - modified, modified),
         ]
+    }
+
+    /// Tree indentation yields to the same minimum name budget as columns.
+    fn indentation(self, width: f32, depth: usize, icon: f32) -> f32 {
+        (depth as f32 * icon).min((self.cells(width)[0].1 - self.name_min).max(0.0))
     }
 }
 
-#[cfg(test)]
-mod column_tests {
-    use super::*;
-    #[test]
-    fn header_and_rows_share_reserved_right_edges() {
-        // Geometry supplied by the same Columns::cells call in both widgets;
-        // use non-default metrics to catch hard-coded header/row padding.
-        let columns = Columns {
-            size: 87.0,
-            modified: 183.0,
-            gap: 11.0,
-            pad: 7.0,
-        };
-        for width in [400.0, 617.0, 920.0] {
-            let [name, size, modified] = columns.cells(width);
-            assert_eq!(name.0, 7.0);
-            assert_eq!(name.0 + name.1 + columns.gap, size.0);
-            assert_eq!(size.1, 87.0);
-            assert_eq!(size.0 + size.1 + columns.gap, modified.0);
-            assert_eq!(modified.1, 183.0);
-            assert_eq!(modified.0 + modified.1 + columns.pad, width);
-        }
-    }
-    #[test]
-    fn narrow_panes_reserve_modified_first_without_negative_cells() {
-        let columns = Columns {
-            size: 90.0,
-            modified: 180.0,
-            gap: 12.0,
-            pad: 8.0,
-        };
-        for width in [0.0, 20.0, 100.0, 200.0, 300.0] {
-            let cells = columns.cells(width);
-            assert!(cells.iter().all(|(_, w)| *w >= 0.0));
-            assert_eq!(cells[0].1, 0.0);
-            assert!(cells[2].0 + cells[2].1 <= width);
-        }
-    }
-}
 /// List rows per wheel notch.
 const WHEEL_ROWS: f32 = 3.0;
 /// A second press on the same row inside this window is a double-click.
@@ -141,6 +138,7 @@ struct Cached {
     name_width: u32,
     size: Para,
     size_of: String,
+    size_width: u32,
     modified: Para,
     modified_of: String,
 }
@@ -267,7 +265,7 @@ impl<'a> FileList<'a> {
             font: self.look.ui_font,
             align_x: atext::Alignment::Left,
             align_y: alignment::Vertical::Top,
-            shaping: atext::Shaping::Basic,
+            shaping: atext::Shaping::Advanced,
             wrapping: atext::Wrapping::None,
         });
         st.row_h = sample
@@ -288,7 +286,7 @@ impl<'a> FileList<'a> {
             font,
             align_x: atext::Alignment::Left,
             align_y: alignment::Vertical::Top,
-            shaping: atext::Shaping::Basic,
+            shaping: atext::Shaping::Advanced,
             wrapping: atext::Wrapping::None,
         })
     }
@@ -316,14 +314,19 @@ impl<'a> FileList<'a> {
             .map(|m| cosmix_dopus_core::format_modified_at(m, now))
             .unwrap_or_else(|| "—".into());
         let name = row.entry.name.clone();
+        let size_width = self.columns.cells(width)[1].1;
         let name_width = (self.columns.cells(width)[0].1
-            - (row.depth as f32 + 2.0) * self.look.chrome.icon
+            - self
+                .columns
+                .indentation(width, row.depth, self.look.chrome.icon)
+            - 2.0 * self.look.chrome.icon
             - self.look.chrome.small)
             .max(0.0);
         if let Some(cached) = st.cache.get(&row.entry.path)
             && cached.name_of == name
             && cached.name_width == name_width.to_bits()
             && cached.size_of == size_text
+            && cached.size_width == size_width.to_bits()
             && cached.modified_of == modified_text
         {
             return;
@@ -337,8 +340,17 @@ impl<'a> FileList<'a> {
             name: Self::shape(&elided, self.look.ui_font, self.look.px),
             name_of: name,
             name_width: name_width.to_bits(),
-            size: Self::shape(&size_text, self.look.mono_font, self.look.small_px),
+            size: Self::shape(
+                &super::elide::middle(&size_text, size_width, |s| {
+                    Self::shape(s, self.look.mono_font, self.look.small_px)
+                        .min_bounds()
+                        .width
+                }),
+                self.look.mono_font,
+                self.look.small_px,
+            ),
             size_of: size_text,
+            size_width: size_width.to_bits(),
             modified: Self::shape(&modified_text, self.look.mono_font, self.look.small_px),
             modified_of: modified_text,
         };
@@ -489,8 +501,10 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 // double-click in the chevron zone toggles once.
                 let row_x = position.x
                     - bounds.x
-                    - self.look.chrome.pad
-                    - row.depth as f32 * self.look.chrome.icon;
+                    - self.columns.cells(bounds.width)[0].0
+                    - self
+                        .columns
+                        .indentation(bounds.width, row.depth, self.look.chrome.icon);
                 let in_toggle = row.entry.is_dir && row_x >= 0.0 && row_x < self.look.chrome.icon;
                 if in_toggle {
                     st.last_click = None;
@@ -568,7 +582,9 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     continue;
                 }
                 let baseline = y + row_pad;
-                let x = bounds.x + cells[0].0 + row.depth as f32 * icon_px;
+                let x = bounds.x
+                    + cells[0].0
+                    + self.columns.indentation(bounds.width, row.depth, icon_px);
                 let name_clip = Rectangle {
                     x: bounds.x + cells[0].0,
                     y: clip.y,
@@ -627,6 +643,9 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 for (para, (start, width)) in
                     [(&cached.size, cells[1]), (&cached.modified, cells[2])]
                 {
+                    if width <= 0.0 {
+                        continue;
+                    }
                     let cell = Rectangle {
                         x: bounds.x + start,
                         y: clip.y,
@@ -666,5 +685,63 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
 impl<'a> From<FileList<'a>> for Element<'a, RowsMsg, iced::Theme, Renderer> {
     fn from(list: FileList<'a>) -> Self {
         Element::new(list)
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    fn columns() -> Columns {
+        Columns {
+            name_min: 90.0,
+            size_min: 50.0,
+            size: 90.0,
+            modified: 180.0,
+            gap: 12.0,
+            pad: 8.0,
+        }
+    }
+
+    #[test]
+    fn header_and_rows_share_reserved_right_edges() {
+        let columns = columns();
+        for width in [400.0, 617.0, 920.0] {
+            let [name, size, modified] = columns.cells(width);
+            assert_eq!(name.0, columns.pad);
+            assert_eq!(name.0 + name.1 + columns.gap, size.0);
+            assert_eq!(size.1, columns.size);
+            assert_eq!(size.0 + size.1 + columns.gap, modified.0);
+            assert_eq!(modified.1, columns.modified);
+            assert_eq!(modified.0 + modified.1 + columns.pad, width);
+        }
+    }
+
+    #[test]
+    fn capped_sidebars_leave_a_name_and_compact_size_at_190_pixels() {
+        let columns = columns();
+        let [name, size, modified] = columns.cells(190.0);
+        assert!(name.1 >= columns.name_min);
+        assert!(size.1 >= columns.size_min && size.1 < columns.size);
+        assert_eq!(modified.1, 0.0);
+        assert_eq!(size.0 + size.1 + columns.pad, 190.0);
+        // Deep tree rows keep the text budget; draw and hit-testing share this.
+        assert_eq!(columns.indentation(190.0, 20, 16.0), 0.0);
+    }
+
+    #[test]
+    fn responsive_columns_hide_modified_before_size_and_never_overflow() {
+        let columns = columns();
+        assert_eq!(columns.cells(300.0)[1].1, columns.size);
+        assert_eq!(columns.cells(300.0)[2].1, 0.0);
+        assert_eq!(columns.cells(150.0)[1].1, 0.0);
+        for width in 0..1000 {
+            let width = width as f32;
+            let cells = columns.cells(width);
+            for (x, w) in cells {
+                assert!(x >= 0.0 && w >= 0.0 && x + w <= width);
+            }
+            assert!(cells[0].1 >= columns.name_min.min((width - 2.0 * columns.pad).max(0.0)));
+        }
     }
 }

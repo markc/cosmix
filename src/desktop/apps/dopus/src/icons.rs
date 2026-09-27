@@ -142,15 +142,30 @@ pub const ALL: [Icon; 35] = [
 /// `ctk/src/icons.rs::file_icon` (keep in step).
 pub fn file_icon(path: &std::path::Path, is_dir: bool, expanded: bool) -> Icon {
     if is_dir {
-        return if expanded { Icon::FolderOpen } else { Icon::Folder };
+        return if expanded {
+            Icon::FolderOpen
+        } else {
+            Icon::Folder
+        };
     }
-    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
-        Some("mid" | "midi" | "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac") => Icon::FileMusic,
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mid" | "midi" | "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac") => {
+            Icon::FileMusic
+        }
         Some("mp4" | "mkv" | "webm" | "mov" | "avi" | "mpeg" | "mpg") => Icon::FileVideo,
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tiff") => Icon::FileImage,
-        Some("rs" | "c" | "h" | "cpp" | "js" | "ts" | "html" | "css" | "sh" | "mix") => Icon::FileCode,
+        Some("rs" | "c" | "h" | "cpp" | "js" | "ts" | "html" | "css" | "sh" | "mix") => {
+            Icon::FileCode
+        }
         Some("zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar") => Icon::Archive,
-        Some("txt" | "md" | "pdf" | "doc" | "docx" | "odt" | "csv" | "toml" | "json") => Icon::FileText,
+        Some("txt" | "md" | "pdf" | "doc" | "docx" | "odt" | "csv" | "toml" | "json") => {
+            Icon::FileText
+        }
         _ => Icon::File,
     }
 }
@@ -163,7 +178,12 @@ pub const RASTER_PX: u32 = 16 * 2;
 /// `Color` → `#rrggbb`, the form an SVG `currentColor` replacement needs.
 pub fn hex(color: iced::Color) -> String {
     let channel = |c: f32| format!("{:02x}", (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-    format!("#{}{}{}", channel(color.r), channel(color.g), channel(color.b))
+    format!(
+        "#{}{}{}",
+        channel(color.r),
+        channel(color.g),
+        channel(color.b)
+    )
 }
 
 /// Cache key: icon, tint, logical pixels.
@@ -172,8 +192,8 @@ type Key = (Icon, String, u32);
 #[derive(Default)]
 struct State {
     cache: HashMap<Key, iced::widget::image::Handle>,
-    /// The `(tint, size)` a rasterisation is running (or has run) for.
-    ensured: Option<(String, u32)>,
+    /// The `(palette, size)` a rasterisation is running (or has run) for.
+    ensured: Option<(Vec<String>, u32)>,
 }
 
 /// The shared icon cache. Clone the `Arc` into widgets; `get` never blocks on
@@ -188,34 +208,45 @@ impl Icons {
         Self::default()
     }
 
-    /// Make sure the catalogue is rasterised for `(tint, px)`; if the current
+    /// Make sure the catalogue is rasterised for `(palette, px)`; if the current
     /// snapshot differs, spawn a std thread to rasterise all of [`ALL`] and
     /// fill the cache. Failures are logged and simply leave that icon absent
     /// (`get` returns `None`; the row draws nothing).
-    pub fn ensure(&self, tint: &str, px: u32, scale: u32) {
+    pub fn ensure(&self, tints: &[&str], px: u32, scale: u32) {
         let physical = px.saturating_mul(scale).max(1);
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.ensured.as_ref() == Some(&(tint.to_owned(), physical)) {
+        let palette: Vec<String> = tints.iter().map(|tint| (*tint).to_owned()).collect();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.ensured.as_ref() == Some(&(palette.clone(), physical)) {
             return;
         }
-        state.ensured = Some((tint.to_owned(), physical));
-        // A re-tint leaves every other tint's rasters stale; drop them so the
-        // cache holds only what the current theme can draw. The key is the
-        // (icon, tint, physical-px) triple.
-        state.cache.retain(|key, _| key.1 == tint);
+        state.ensured = Some((palette.clone(), physical));
+        // Retain both enabled and disabled roles for this theme only.
+        state
+            .cache
+            .retain(|key, _| palette.contains(&key.1) && key.2 == physical);
         let icons = Arc::clone(&self.state);
-        let tint = tint.to_owned();
-        // Startup and re-tint rasterisation: off the UI thread (35 SVG parses).
+        // Startup and re-tint rasterisation: off the UI thread, once per role.
         std::thread::Builder::new()
             .name("dopus-icons".to_owned())
             .spawn(move || {
-                for icon in ALL {
-                    match raster(icon.bytes(), &tint, physical) {
-                        Ok(handle) => {
-                            let mut state = icons.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            state.cache.insert((icon, tint.clone(), physical), handle);
+                for tint in &palette {
+                    for icon in ALL {
+                        match raster(icon.bytes(), tint, physical) {
+                            Ok(handle) => {
+                                let mut state = icons
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                // A newer theme may have replaced this worker's palette.
+                                if state.ensured.as_ref() != Some(&(palette.clone(), physical)) {
+                                    return;
+                                }
+                                state.cache.insert((icon, tint.clone(), physical), handle);
+                            }
+                            Err(error) => tracing::warn!(?icon, %error, "icon raster unavailable"),
                         }
-                        Err(error) => tracing::warn!(?icon, %error, "icon raster unavailable"),
                     }
                 }
             })
@@ -225,7 +256,10 @@ impl Icons {
     /// The cached handle for `(icon, tint, px)`, or `None` while the
     /// rasterisation is still in flight (the row draws nothing).
     pub fn get(&self, icon: Icon, tint: &str, px: u32) -> Option<iced::widget::image::Handle> {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.cache.get(&(icon, tint.to_owned(), px)).cloned()
     }
 }
@@ -233,7 +267,8 @@ impl Icons {
 /// Rasterise one SVG at `px` physical pixels, tinted. `Err` names the icon
 /// file so the warning is actionable.
 fn raster(bytes: &[u8], tint: &str, px: u32) -> Result<iced::widget::image::Handle, String> {
-    render(bytes, tint, px).map(|pixmap| iced::widget::image::Handle::from_rgba(px, px, pixmap.take()))
+    render(bytes, tint, px)
+        .map(|pixmap| iced::widget::image::Handle::from_rgba(px, px, pixmap.take()))
 }
 
 /// The raster itself, split from [`raster`] so tests inspect pixels without
@@ -246,9 +281,11 @@ fn render(bytes: &[u8], tint: &str, px: u32) -> Result<tiny_skia::Pixmap, String
         .replace("currentColor", tint);
     let tree = usvg::Tree::from_data(tinted.as_bytes(), &usvg::Options::default())
         .map_err(|error| format!("parsing svg: {error}"))?;
-    let mut pixmap = tiny_skia::Pixmap::new(px, px).ok_or_else(|| format!("allocating {px}x{px} icon"))?;
+    let mut pixmap =
+        tiny_skia::Pixmap::new(px, px).ok_or_else(|| format!("allocating {px}x{px} icon"))?;
     let source = tree.size();
-    let transform = tiny_skia::Transform::from_scale(px as f32 / source.width(), px as f32 / source.height());
+    let transform =
+        tiny_skia::Transform::from_scale(px as f32 / source.width(), px as f32 / source.height());
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     Ok(pixmap)
 }
@@ -269,7 +306,11 @@ mod tests {
         assert_eq!(file_icon(p("README"), false, false), Icon::File);
         assert_eq!(file_icon(p("src"), true, false), Icon::Folder);
         assert_eq!(file_icon(p("src"), true, true), Icon::FolderOpen);
-        assert_eq!(file_icon(p("src"), false, true), Icon::File, "expanded only means folders");
+        assert_eq!(
+            file_icon(p("src"), false, true),
+            Icon::File,
+            "expanded only means folders"
+        );
     }
 
     #[test]
@@ -284,7 +325,8 @@ mod tests {
         // A real bundled icon, tinted red: the ink must actually be red. A
         // white-ink render (an asset missing `currentColor`) or a no-op tint
         // fails here.
-        let pixmap = render(Icon::Folder.bytes(), "#ff0000", RASTER_PX).expect("folder.svg rasterises");
+        let pixmap =
+            render(Icon::Folder.bytes(), "#ff0000", RASTER_PX).expect("folder.svg rasterises");
         assert_eq!((pixmap.width(), pixmap.height()), (RASTER_PX, RASTER_PX));
         let ink = pixmap
             .data()
@@ -292,7 +334,11 @@ mod tests {
             .filter(|px| px[3] > 0)
             .find(|px| px[0] > 0)
             .expect("red ink present");
-        assert_eq!((ink[1], ink[2]), (0, 0), "ink is the requested tint, not white");
+        assert_eq!(
+            (ink[1], ink[2]),
+            (0, 0),
+            "ink is the requested tint, not white"
+        );
     }
 
     #[test]
@@ -300,12 +346,16 @@ mod tests {
         let icons = Icons::new();
         assert!(icons.get(Icon::Folder, "#ffffff", 16).is_none());
         // ensure() runs the rasterisation on its own thread; poll briefly.
-        icons.ensure("#ffffff", 16, 1);
+        icons.ensure(&["#ffffff", "#888888"], 16, 1);
         let key = (Icon::Folder, "#ffffff".to_owned(), 16);
         for _ in 0..200 {
             {
                 let state = icons.state.lock().unwrap();
-                if state.cache.contains_key(&key) {
+                if state.cache.contains_key(&key)
+                    && state
+                        .cache
+                        .contains_key(&(Icon::Folder, "#888888".to_owned(), 16))
+                {
                     return;
                 }
             }
@@ -317,9 +367,9 @@ mod tests {
     #[test]
     fn ensure_is_idempotent_for_the_same_tint() {
         let icons = Icons::new();
-        icons.ensure("#ffffff", 16, 1);
+        icons.ensure(&["#ffffff"], 16, 1);
         let ensured = icons.state.lock().unwrap().ensured.clone();
-        icons.ensure("#ffffff", 16, 1);
+        icons.ensure(&["#ffffff"], 16, 1);
         assert_eq!(icons.state.lock().unwrap().ensured, ensured);
     }
 }

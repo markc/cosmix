@@ -14,10 +14,13 @@ pub fn navigation<'a>(
     tint: &str,
     active: &PaneModel,
 ) -> Element<'a, Msg> {
+    let disabled_tint = crate::icons::hex(look.tokens.muted_text);
     let control = |icon, action| {
+        let enabled = enabled(active, action);
+        let tint = if enabled { tint } else { &disabled_tint };
         button(super::image_widget(look, icons, tint, icon))
             .padding(look.chrome.small)
-            .on_press_maybe(enabled(active, action).then_some(Msg::Actions(vec![action])))
+            .on_press_maybe(enabled.then_some(Msg::Actions(vec![action])))
             .style(super::button_look(&look))
     };
     let controls = row![

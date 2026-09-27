@@ -2,6 +2,14 @@
 
 ## 0.3.0
 
+- Preserve a usable Name column in narrow panes by hiding Modified first,
+  shrinking/eliding Size, then hiding Size when necessary. Cap tree indentation
+  to the same name budget; keep header and row geometry in step.
+- Use advanced text shaping for filename measurement and drawing, including
+  complex scripts and fallback fonts. Tint disabled navigation icons with the
+  design tokens' muted foreground.
+- Fix clippy doc-comment and test-module placement findings.
+
 - Consolidate navigation into one window-centred icon strip acting on the
   active pane through existing actions. Disable Back/Forward for empty
   histories and Up at the root; retain only each pane's editable location bar.

@@ -212,7 +212,11 @@ pub fn run(
     let ui_font = theme.ui_font;
     let tint = icons::hex(theme.tokens.text);
     let icons = Icons::new();
-    icons.ensure(&tint, ICON_PX, ICON_SCALE);
+    icons.ensure(
+        &[&tint, &icons::hex(theme.tokens.muted_text)],
+        ICON_PX,
+        ICON_SCALE,
+    );
 
     let (mut core, core_events) = DopusCore::new(config, config_file);
     // Startup `dopus.open` PATHs land in the panes before the first frame.
@@ -992,7 +996,11 @@ impl Dopus {
             self.status = Some(format!("Theme: {note}"));
         }
         self.tint = icons::hex(self.theme.tokens.text);
-        self.icons.ensure(&self.tint, ICON_PX, ICON_SCALE);
+        self.icons.ensure(
+            &[&self.tint, &icons::hex(self.theme.tokens.muted_text)],
+            ICON_PX,
+            ICON_SCALE,
+        );
     }
 
     fn on_window(&mut self, event: iced::window::Event) -> Task<Msg> {
