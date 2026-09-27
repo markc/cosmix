@@ -19769,9 +19769,8 @@ fn http_response_meta_into_map(resp: &ureq::Response, map: &mut indexmap::IndexM
 /// Classify a ureq transport error into a stable HTTP_* code (D8) from
 /// the TYPED `ErrorKind` rather than display text — a ureq/rustls
 /// wording change can't silently reclassify a failure (codex 0.30
-/// review, MAJOR). Only the TLS-vs-generic-Io split falls back to the
-/// source chain, because ureq wraps rustls errors inside `Io` with no
-/// dedicated kind.
+/// review, MAJOR). Socket timeouts, closed connections and TLS failures
+/// inspect typed sources because ureq wraps them in transport errors.
 #[cfg(feature = "http")]
 fn http_transport_error_code(e: &ureq::Error) -> &'static str {
     use ureq::ErrorKind;
@@ -19781,6 +19780,12 @@ fn http_transport_error_code(e: &ureq::Error) -> &'static str {
     // consult these (codex convergence review, MAJOR).
     if source_is_timeout(e) {
         return "HTTP_TIMEOUT";
+    }
+    if source_has_io_kind(
+        e,
+        &[std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::ConnectionReset],
+    ) {
+        return "HTTP_TRANSPORT";
     }
     if source_is_tls(e) {
         return "HTTP_TLS";
@@ -19812,15 +19817,30 @@ fn source_is_tls(e: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Walk the error source chain for a TimedOut io error.
+/// Socket inactivity can surface as TimedOut or WouldBlock, depending on
+/// the platform and which socket operation stalled.
 #[cfg(feature = "http")]
 fn source_is_timeout(e: &(dyn std::error::Error + 'static)) -> bool {
+    source_has_io_kind(
+        e,
+        &[std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock],
+    )
+}
+
+#[cfg(feature = "http")]
+fn source_has_io_kind(e: &(dyn std::error::Error + 'static), kinds: &[std::io::ErrorKind]) -> bool {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = cur {
-        if let Some(io) = err.downcast_ref::<std::io::Error>()
-            && io.kind() == std::io::ErrorKind::TimedOut
-        {
-            return true;
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if kinds.contains(&io.kind()) {
+                return true;
+            }
+            // io::Error::source delegates to its payload's source, which
+            // can skip a nested io::Error. Inspect the payload itself first.
+            if let Some(inner) = io.get_ref() {
+                cur = Some(inner);
+                continue;
+            }
         }
         cur = err.source();
     }

@@ -177,10 +177,7 @@ fn failure(map: &mut IndexMap<String, Value>, code: &str, error: impl std::fmt::
 }
 
 fn io_code(error: &io::Error) -> &'static str {
-    if matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-    ) {
+    if source_is_timeout(error) {
         "HTTP_TIMEOUT"
     } else {
         "FILE_IO"
@@ -260,10 +257,7 @@ fn drain_response(
             map,
             if over_cap {
                 "HTTP_BODY_LIMIT"
-            } else if matches!(
-                e.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-            ) {
+            } else if source_is_timeout(&e) {
                 "HTTP_TIMEOUT"
             } else {
                 "HTTP_BODY"
@@ -702,10 +696,7 @@ pub(super) fn get(args: Vec<Value>) -> MixResult<Option<Value>> {
     map.insert("bytes_written".into(), Value::Number(received as f64));
     map.insert("size".into(), Value::Number(count as f64));
     if let Err(e) = result {
-        let code = if matches!(
-            e.kind(),
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-        ) {
+        let code = if source_is_timeout(&e) {
             "HTTP_TIMEOUT"
         } else if e.kind() == io::ErrorKind::AlreadyExists {
             "FILE_EXISTS"
@@ -926,10 +917,34 @@ mod tests {
             "write did not time out: {elapsed:?}"
         );
         assert!(matches!(result["status"], Value::Number(0.0)));
-        assert!(matches!(&result["error_code"], Value::String(s) if s == "HTTP_TIMEOUT"));
+        assert!(
+            matches!(&result["error_code"], Value::String(s) if s == "HTTP_TIMEOUT"),
+            "unexpected error_code: {:?}; error: {:?}",
+            result["error_code"],
+            result["error"]
+        );
         assert!(
             matches!(result["bytes_written"], Value::Number(n) if n > 0.0 && n < length as f64)
         );
+    }
+
+    #[test]
+    fn wrapped_transport_io_errors_keep_timeout_and_closed_classification() {
+        for (kind, expected) in [
+            (io::ErrorKind::TimedOut, "HTTP_TIMEOUT"),
+            (io::ErrorKind::WouldBlock, "HTTP_TIMEOUT"),
+            (io::ErrorKind::BrokenPipe, "HTTP_TRANSPORT"),
+            (io::ErrorKind::ConnectionReset, "HTTP_TRANSPORT"),
+            (io::ErrorKind::InvalidInput, "HTTP_TRANSPORT"),
+        ] {
+            // The same classifier handles PUT send errors and GET call errors.
+            let error = ureq::Error::from(io::Error::other(io::Error::from(kind)));
+            assert_eq!(
+                http_transport_error_code(&error),
+                expected,
+                "{kind:?}: {error}"
+            );
+        }
     }
 
     #[test]
