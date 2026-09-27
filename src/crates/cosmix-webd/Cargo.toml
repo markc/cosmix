@@ -11,6 +11,7 @@ name = "cosmix-webd"
 path = "src/main.rs"
 
 [dependencies]
+cosmix_files = { package = "cosmix-lib-files", path = "../cosmix-lib-files" }
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"] }
 cosmix_daemon = { package = "cosmix-lib-daemon", path = "../cosmix-lib-daemon", features = ["tls"] }
 cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log" }

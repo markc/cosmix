@@ -29,6 +29,18 @@ logs and skips roots that are relative, contain `..`, or are not existing
 directories. Missing roots deny path shares. Roots never come from requests.
 Keep these trees outside public document roots and readable by the service.
 
+Startup canonicalises each configured root and pins an open directory descriptor.
+Reads use `cosmix-lib-files::rooted_read::ReadRoot::open_regular`: Linux `openat2`
+resolves beneath that descriptor, rejecting all descendant symlinks, including
+links to files inside the root. Only regular files are returned. Renaming or
+replacing the root pathname cannot redirect an existing root handle. Relative
+paths reject absolute paths, empty components, `.` and `..`.
+
+This requires Linux with `openat2` support (Linux 5.6 or later). Unsupported
+kernels/platforms or failed root opens skip the root at startup; there is no
+path-check/open fallback. The configured root itself may be a symlink because
+it is canonicalised before opening; descendant symlinks are always refused.
+
 ## Catalogue contract
 
 Only `kind=file` is supported: either a jailed relative path or a validated

@@ -464,6 +464,16 @@ configuration), not a new configuration file or TOML parser. At startup webd
 logs and skips roots that are relative, contain <code>..</code>, or are not existing
 directories. Missing roots deny path shares. Roots never come from requests.
 Keep these trees outside public document roots and readable by the service.</p>
+<p>Startup canonicalises each configured root and pins an open directory descriptor.
+Reads use <code>cosmix-lib-files::rooted_read::ReadRoot::open_regular</code>: Linux <code>openat2</code>
+resolves beneath that descriptor, rejecting all descendant symlinks, including
+links to files inside the root. Only regular files are returned. Renaming or
+replacing the root pathname cannot redirect an existing root handle. Relative
+paths reject absolute paths, empty components, <code>.</code> and <code>..</code>.</p>
+<p>This requires Linux with <code>openat2</code> support (Linux 5.6 or later). Unsupported
+kernels/platforms or failed root opens skip the root at startup; there is no
+path-check/open fallback. The configured root itself may be a symlink because
+it is canonicalised before opening; descendant symlinks are always refused.</p>
 <h2 id="catalogue-contract">Catalogue contract</h2>
 <p>Only <code>kind=file</code> is supported: either a jailed relative path or a validated
 local blob reference. <code>dir</code> and <code>drop</code> creation is refused with

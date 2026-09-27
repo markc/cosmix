@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-files"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "blake3",
  "cosmix-lib-bus",
@@ -2060,6 +2060,7 @@ dependencies = [
  "cosmix-lib-client",
  "cosmix-lib-config",
  "cosmix-lib-daemon",
+ "cosmix-lib-files",
  "cosmix-lib-log",
  "cosmix-lib-log-props",
  "cosmix-lib-mix",

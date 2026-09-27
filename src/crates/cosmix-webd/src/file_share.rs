@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -152,9 +152,9 @@ pub fn valid_relative_path(rel: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// Validated operator roots, never request data. Slice 2 pins directory handles.
+/// Validated operator roots, never request data. Handles pin their directory identity.
 #[derive(Default)]
-pub struct Roots(BTreeMap<String, PathBuf>);
+pub struct Roots(BTreeMap<String, cosmix_files::rooted_read::ReadRoot>);
 
 impl Roots {
     pub fn from_config(config: &cosmix_config::node::WebdSharesConfig) -> Self {
@@ -166,7 +166,7 @@ impl Roots {
             let canonical = safe
                 .then(|| path.canonicalize().ok())
                 .flatten()
-                .filter(|p| p.is_dir());
+                .and_then(|p| cosmix_files::rooted_read::ReadRoot::open(&p).ok());
             match canonical {
                 Some(path) => {
                     roots.insert(account.clone(), path);
@@ -177,8 +177,8 @@ impl Roots {
         Self(roots)
     }
 
-    pub fn get(&self, account: &str) -> Option<&Path> {
-        self.0.get(account).map(PathBuf::as_path)
+    pub fn get(&self, account: &str) -> Option<&cosmix_files::rooted_read::ReadRoot> {
+        self.0.get(account)
     }
 }
 
@@ -390,6 +390,7 @@ pub fn bump_download(conn: &Connection, token: &str) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     const ACCOUNT: &str = "user@example.test";
 
     fn db() -> Connection {
