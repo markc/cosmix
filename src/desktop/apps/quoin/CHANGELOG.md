@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.1 — 2026-09-27
+
+- Include shell-host 0.11.1's human-seat preference for keyboard, pointer and
+  touch, excluding the agent seat from fallback selection.
+
 ## 0.5.0 — 2026-09-02
 
 - Ship the Bus service `shell`: open read surface (`shell.ping`, `shell.info`,

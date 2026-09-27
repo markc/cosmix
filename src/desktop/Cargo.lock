@@ -3492,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
