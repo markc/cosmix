@@ -907,7 +907,7 @@ mod tests {
     fn citizen() -> (TempDir, Citizen) {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 origin: "testnode".into(),
                 quota_total_bytes: crate::core::DEFAULT_QUOTA_TOTAL_BYTES,
@@ -1040,6 +1040,34 @@ mod tests {
         let quota: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(quota["owners"]["maild"]["used"], 11);
         assert_eq!(quota["total"]["used"], 11);
+    }
+
+    #[tokio::test]
+    async fn bus_put_cannot_publish_session_inode_before_next_patch() {
+        let (dir, c) = citizen();
+        let (addr, _) = crate::lane::test_support::serve_store(
+            Arc::clone(&c.store), std::time::Duration::from_secs(30),
+        ).await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}/blob/uploads");
+        let session: Value = client.post(&base).header("X-Cosmix-Owner", "tester")
+            .header("X-Cosmix-Size", "2").send().await.unwrap().json().await.unwrap();
+        let id = session["upload"].as_str().unwrap();
+        let url = format!("{base}/{id}");
+        assert_eq!(client.patch(&url).header("Content-Range", "bytes 0-0/2").body("a").send().await.unwrap().status(), 200);
+        let staged = c.store.blobs_root().join(".uploads").join(id);
+        let alias = dir.path().join("session-symlink");
+        std::os::unix::fs::symlink(&staged, &alias).unwrap();
+        for path in [&staged, &alias] {
+            for mode in ["copy", "reflink", "hardlink"] {
+                let (rc, body, _) = c.dispatch(&command("blob.put", "other", json!({"path":path,"mode":mode,"immutable":true})));
+                assert_eq!(rc, 10, "{body}");
+                assert!(body.contains("invalid_arguments: source inside the store"), "{body}");
+            }
+        }
+        assert_eq!(client.patch(&url).header("Content-Range", "bytes 1-1/2").body("b").send().await.unwrap().status(), 200);
+        assert_eq!(std::fs::read(staged).unwrap(), b"ab");
+        assert!(!c.store.stat(&cosmix_mds::blob::hash_bytes(b"a")).unwrap().present);
     }
 
     #[test]

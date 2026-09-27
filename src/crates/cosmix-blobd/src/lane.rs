@@ -899,7 +899,12 @@ pub(crate) mod test_support {
         upload_deadline: Duration,
     ) -> (TempDir, Arc<Store>, SocketAddr, Arc<Lane>) {
         let dir = TempDir::new().unwrap();
-        let store = Arc::new(Store::open(dir.path(), options).unwrap());
+        let store = Arc::new(Store::open(dir.path().join("store"), options).unwrap());
+        let (addr, lane) = serve_store(Arc::clone(&store), upload_deadline).await;
+        (dir, store, addr, lane)
+    }
+
+    pub(crate) async fn serve_store(store: Arc<Store>, upload_deadline: Duration) -> (SocketAddr, Arc<Lane>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let lane = Arc::new(Lane::new(Arc::clone(&store), 4, upload_deadline));
@@ -914,7 +919,7 @@ pub(crate) mod test_support {
                 eprintln!("test lane stopped: {error}");
             }
         });
-        (dir, store, addr, lane)
+        (addr, lane)
     }
 
     /// A loopback lane without the counter handle.

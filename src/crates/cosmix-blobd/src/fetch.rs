@@ -1635,7 +1635,7 @@ mod tests {
     /// A plain store (no lane) named `origin`.
     fn bare_store(origin: &str) -> (TempDir, Arc<Store>) {
         let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path(), options_for(origin)).unwrap();
+        let store = Store::open(dir.path().join("store"), options_for(origin)).unwrap();
         (dir, Arc::new(store))
     }
 

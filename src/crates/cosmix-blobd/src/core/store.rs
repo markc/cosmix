@@ -48,7 +48,7 @@ pub const LOCK_FILE: &str = ".blobd.lock";
 pub const DEFAULT_GC_GRACE_SECS: u64 = 60;
 
 const BLOBD_APPLICATION_ID: i32 = 0x626C_6F62; // 'blob'
-const BLOBD_LATEST: u32 = 3;
+const BLOBD_LATEST: u32 = 4;
 const BLOBD_V1_SQL: &str = "\
 PRAGMA application_id = 0x626C6F62;        -- 'blob'
 PRAGMA user_version   = 1;
@@ -116,6 +116,7 @@ pub enum StoreError {
     },
     /// Bad request (e.g. `mode: hardlink` without `immutable: true`).
     BadRequest(String),
+    SourceInsideStore,
     /// A bounded resource is taken; the verb replies rc 10 `busy:
     /// <why>` — the `blob.fetch` queue is full (`fetch_queue_max`), or
     /// another `blob.gc` is already sweeping (one GC owner, M2b).
@@ -162,6 +163,7 @@ impl std::fmt::Display for StoreError {
                 write!(f, "quota: total would use {would_use} over the cap {limit}")
             }
             Self::BadRequest(s) => write!(f, "bad request: {s}"),
+            Self::SourceInsideStore => write!(f, "invalid_arguments: source inside the store"),
             Self::Busy(why) => write!(f, "busy: {why}; retry later"),
             Self::UploadMissing => write!(f, "upload unknown or expired"),
             Self::UploadConflict { offset, reason } => {
@@ -634,6 +636,13 @@ impl Store {
     /// Idempotent: a re-put returns the same reference and pins
     /// nothing new.
     pub fn put(&self, src: &Path, opts: &PutOptions<'_>) -> Result<PutOutcome> {
+        // Resolve symlink aliases before admitting any mode, including copies.
+        // Pass the resolved source onwards instead of reusing the alias.
+        let source = fs::canonicalize(src)?;
+        if source.starts_with(fs::canonicalize(self.root())?) {
+            return Err(StoreError::SourceInsideStore);
+        }
+        let src = source.as_path();
         if opts.mode == PutMode::HardLink && !opts.immutable {
             return Err(StoreError::BadRequest(
                 "mode \"hardlink\" requires \"immutable\": true — only a publisher that \
@@ -1742,6 +1751,7 @@ fn apply_blobd_migrations(conn: &mut Connection) -> Result<()> {
             1 => BLOBD_V1_SQL,
             2 => BLOBD_V2_SQL,
             3 => uploads::SCHEMA,
+            4 => uploads::INODE_SCHEMA,
             _ => {
                 return Err(StoreError::Db(format!(
                     "blobd.sqlite: missing migration v{v}"
@@ -1875,7 +1885,7 @@ mod tests {
 
     pub(super) fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
-        let s = Store::open(dir.path(), options()).unwrap();
+        let s = Store::open(dir.path().join("store"), options()).unwrap();
         (dir, s)
     }
 
@@ -1996,7 +2006,7 @@ mod tests {
             owner_limits: BTreeMap::from([("small".into(), 10u64), ("other".into(), 1000u64)]),
             cas_group: "cosmix-blob".into(),
         };
-        let store = Store::open(dir.path(), opts).unwrap();
+        let store = Store::open(dir.path().join("store"), opts).unwrap();
         let big = write_src(&dir, "big.bin", &[7u8; 80]);
         let small = write_src(&dir, "small.bin", &[7u8; 16]);
 
@@ -2122,7 +2132,7 @@ mod tests {
         let bytes = b"row with refcount zero";
         let hash = cosmix_mds::blob::put(&store.blobs_root(), bytes).unwrap();
         {
-            let conn = Connection::open(dir.path().join("blobs.sqlite")).unwrap();
+            let conn = Connection::open(dir.path().join("store").join("blobs.sqlite")).unwrap();
             conn.execute(
                 "INSERT INTO blob (hash, size_bytes, first_seen, last_seen, refcount) \
                  VALUES (?1, ?2, 0, 0, 0)",
@@ -2184,7 +2194,7 @@ mod tests {
             owner_limits: BTreeMap::from([("tiny".to_string(), 10)]),
             ..options()
         };
-        let store = Store::open(dir.path(), options).unwrap();
+        let store = Store::open(dir.path().join("store"), options).unwrap();
         let hash = blob::put(&store.blobs_root(), &[7u8; 50]).unwrap();
         let owners = ["maild".to_string(), "tiny".to_string()];
         let pins = store
@@ -2291,7 +2301,7 @@ mod tests {
     fn reservations_bound_concurrent_admissions_and_report() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 origin: "testnode".into(),
                 quota_total_bytes: 2 * 1024 * 1024,
@@ -2336,7 +2346,7 @@ mod tests {
     fn all_pin_paths_respect_other_transfer_holds() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 quota_total_bytes: 100,
                 quota_owner_default_bytes: 100,
@@ -2370,7 +2380,7 @@ mod tests {
     fn settlement_consumes_only_its_identified_hold() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 quota_total_bytes: 100,
                 quota_owner_default_bytes: 100,
@@ -2395,7 +2405,7 @@ mod tests {
     fn fetch_settlement_prioritises_its_hold_and_refuses_joiner() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 quota_total_bytes: 100,
                 quota_owner_default_bytes: 100,
@@ -2442,7 +2452,7 @@ mod tests {
         };
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 cas_group: group.clone(),
                 ..options()
@@ -2466,7 +2476,7 @@ mod tests {
                 path.display()
             );
         };
-        assert_grouped(dir.path());
+        assert_grouped(&dir.path().join("store"));
         assert_grouped(&store.blobs_root());
         let cas = store.path(&out.reference.hash).unwrap();
         // Both shard dirs inherit the setgid bit and the group; the CAS
@@ -2490,7 +2500,7 @@ mod tests {
         // daemon-owned, and the store still serves verbs.
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 cas_group: "cosmix-blob-definitely-not-on-any-host".into(),
                 ..options()
@@ -2507,7 +2517,7 @@ mod tests {
     fn pin_beyond_the_owner_cap_is_refused() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 origin: "testnode".into(),
                 owner_limits: BTreeMap::from([(("tightside").to_string(), 16u64)]),
@@ -2554,14 +2564,14 @@ mod tests {
     fn second_open_of_same_root_fails_on_flock() {
         let (dir, store) = store();
         // The live store holds the flock; a second open must refuse.
-        let err = match Store::open(dir.path(), options()) {
+        let err = match Store::open(dir.path().join("store"), options()) {
             Err(err) => err,
             Ok(_) => panic!("second open of a locked root must fail"),
         };
         assert!(matches!(err, StoreError::Locked(_)), "got {err:?}");
         // Dropping the holder releases it (fd closed).
         drop(store);
-        assert!(Store::open(dir.path(), options()).is_ok());
+        assert!(Store::open(dir.path().join("store"), options()).is_ok());
     }
 
     #[test]
@@ -2586,16 +2596,16 @@ mod tests {
             out
         }
         let (dir, _store) = store();
-        fs::remove_dir(dir.path().join("containers")).unwrap();
-        let before = snapshot(dir.path());
+        fs::remove_dir(dir.path().join("store").join("containers")).unwrap();
+        let before = snapshot(&dir.path().join("store"));
         std::thread::sleep(Duration::from_millis(20));
-        let err = match Store::open(dir.path(), options()) {
+        let err = match Store::open(dir.path().join("store"), options()) {
             Err(err) => err,
             Ok(_) => panic!("second open of a locked root must fail"),
         };
         assert!(matches!(err, StoreError::Locked(_)), "got {err:?}");
         assert_eq!(
-            snapshot(dir.path()),
+            snapshot(&dir.path().join("store")),
             before,
             "the refused open touched the root"
         );
@@ -2607,7 +2617,7 @@ mod tests {
         {
             // Pre-create the root via mds, drop staging junk plus an
             // aged orphan CAS file, then open the store.
-            let mds = SqliteCasMds::open(dir.path()).unwrap();
+            let mds = SqliteCasMds::open(dir.path().join("store")).unwrap();
             let tmp = mds.blobs_root().join(".tmp");
             std::fs::write(tmp.join("junk1"), b"x").unwrap();
             std::fs::write(tmp.join("junk2"), b"y").unwrap();
@@ -2615,7 +2625,7 @@ mod tests {
             let orphan_path = cosmix_mds::blob::blob_path(&mds.blobs_root(), &orphan_hash);
             age_file(&orphan_path);
         }
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         let report = store.startup_report();
         assert_eq!(report.tmp_removed, 2);
         assert!(
@@ -2643,10 +2653,10 @@ mod tests {
     fn young_orphan_is_not_reported_at_startup() {
         let dir = TempDir::new().unwrap();
         {
-            let mds = SqliteCasMds::open(dir.path()).unwrap();
+            let mds = SqliteCasMds::open(dir.path().join("store")).unwrap();
             cosmix_mds::blob::put(&mds.blobs_root(), b"fresh bytes").unwrap();
         }
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         assert!(store.startup_report().orphans.is_empty());
     }
 
@@ -2700,7 +2710,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             conn.query_row(
@@ -2714,13 +2724,51 @@ mod tests {
     }
 
     #[test]
-    fn blobd_sqlite_schema_is_v3_with_expected_tables() {
+    fn v4_migration_fails_legacy_unfinished_sessions_without_inventing_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(BLOBD_V1_SQL).unwrap();
+        conn.execute_batch(BLOBD_V2_SQL).unwrap();
+        conn.execute_batch(uploads::SCHEMA).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        for state in ["active", "committing", "complete"] {
+            conn.execute("INSERT INTO upload_sessions(id,owner,size,mime,created_at,expires_at,state) VALUES (?1,'test',0,'text/plain',0,1,?1)", [state]).unwrap();
+        }
+        apply_blobd_migrations(&mut conn).unwrap();
+        for id in ["active", "committing", "complete"] {
+            let (state, dev, ino): (String, Option<String>, Option<String>) = conn.query_row(
+                "SELECT state,staging_dev,staging_ino FROM upload_sessions WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).unwrap();
+            assert_eq!(state, if id == "complete" { "complete" } else { "failed" });
+            assert!(dev.is_none() && ino.is_none());
+        }
+    }
+
+    #[test]
+    fn local_ingest_refuses_all_store_sources_and_symlink_aliases_in_every_mode() {
         let (dir, store) = store();
-        let conn = Connection::open(dir.path().join("blobd.sqlite")).unwrap();
+        let hash = blob::put(&store.blobs_root(), b"cas").unwrap();
+        let staging = store.blobs_root().join(".tmp/input");
+        fs::write(&staging, b"staged").unwrap();
+        let alias = dir.path().join("root-alias");
+        std::os::unix::fs::symlink(store.root(), &alias).unwrap();
+        for source in [store.root().join("blobd.sqlite"), staging, blob::blob_path(&store.blobs_root(), &hash), alias.join("blobd.sqlite")] {
+            for mode in [PutMode::Copy, PutMode::Reflink, PutMode::HardLink] {
+                let mut opts = PutOptions::new("tester");
+                opts.mode = mode;
+                opts.immutable = true;
+                assert!(matches!(store.put(&source, &opts), Err(StoreError::SourceInsideStore)));
+            }
+        }
+    }
+
+    #[test]
+    fn blobd_sqlite_schema_is_v4_with_expected_tables() {
+        let (dir, store) = store();
+        let conn = Connection::open(dir.path().join("store").join("blobd.sqlite")).unwrap();
         let v: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         for tbl in ["blob_attrs", "pins", "quota", "upload_sessions"] {
             let n: i64 = conn
                 .query_row(
@@ -2741,7 +2789,7 @@ mod tests {
             .unwrap();
         assert_eq!(cols, 1, "pins.size_bytes missing");
         // mds's blobs.sqlite is untouched: still BLOBS_LATEST = 1.
-        let blobs = Connection::open(dir.path().join("blobs.sqlite")).unwrap();
+        let blobs = Connection::open(dir.path().join("store").join("blobs.sqlite")).unwrap();
         let bv: u32 = blobs
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
@@ -2752,13 +2800,13 @@ mod tests {
     #[test]
     fn open_refuses_wrong_magic_db() {
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.path().join("store")).unwrap();
         {
-            let conn = Connection::open(dir.path().join("blobd.sqlite")).unwrap();
+            let conn = Connection::open(dir.path().join("store").join("blobd.sqlite")).unwrap();
             conn.pragma_update(None, "application_id", 0x1234_5678)
                 .unwrap();
         }
-        let err = match Store::open(dir.path(), options()) {
+        let err = match Store::open(dir.path().join("store"), options()) {
             Err(err) => err,
             Ok(_) => panic!("a wrong-magic blobd.sqlite must refuse to open"),
         };

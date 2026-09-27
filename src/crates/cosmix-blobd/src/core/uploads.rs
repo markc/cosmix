@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE upload_sessions (
@@ -27,8 +27,18 @@ CREATE INDEX upload_expiry ON upload_sessions(expires_at);
 CREATE INDEX upload_owner ON upload_sessions(owner, state);
 ";
 
+// Decimal TEXT preserves the entire unsigned dev/ino domain at SQLite's
+// signed-integer boundary. Legacy unfinished sessions cannot be backfilled
+// safely: the current path is not evidence of its create-time identity.
+pub(super) const INODE_SCHEMA: &str = "
+ALTER TABLE upload_sessions ADD COLUMN staging_dev TEXT;
+ALTER TABLE upload_sessions ADD COLUMN staging_ino TEXT;
+UPDATE upload_sessions SET state='failed',error='corrupt staging: no recorded create-time inode'
+WHERE state IN ('active','committing');
+";
+
 const SELECT: &str = "SELECT id,owner,upload_key,size,offset,expected_hash,mime,name,
-created_at,expires_at,state,actual_hash,result,error FROM upload_sessions";
+created_at,expires_at,state,actual_hash,result,error,staging_dev,staging_ino FROM upload_sessions";
 pub(super) const RECEIPT_TTL_MS: i64 = 86_400_000;
 
 /// Active sessions and terminal receipts have separate finite bounds. Receipts
@@ -91,6 +101,8 @@ pub struct UploadSession {
     pub actual_hash: Option<String>,
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
+    pub staging_dev: Option<String>,
+    pub staging_ino: Option<String>,
 }
 
 impl UploadSession {
@@ -137,6 +149,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UploadSession> {
         actual_hash: r.get(11)?,
         result,
         error: r.get(13)?,
+        staging_dev: r.get(14)?,
+        staging_ino: r.get(15)?,
     })
 }
 
@@ -337,11 +351,12 @@ impl Store {
             .open(&path)?;
         file.sync_all()?;
         sync_dir(&self.uploads_root())?;
+        let identity = file.metadata()?;
         let created = now_ms();
         tx.execute(
             "INSERT INTO upload_sessions
-            (id,owner,upload_key,size,expected_hash,mime,name,created_at,expires_at,state)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'active')",
+            (id,owner,upload_key,size,expected_hash,mime,name,created_at,expires_at,state,staging_dev,staging_ino)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'active',?10,?11)",
             params![
                 id,
                 opts.owner,
@@ -351,7 +366,9 @@ impl Store {
                 opts.mime,
                 opts.name,
                 created,
-                created + self.upload_limits.ttl_ms
+                created + self.upload_limits.ttl_ms,
+                identity.dev().to_string(),
+                identity.ino().to_string()
             ],
         )
         .map_err(db_err)?;
@@ -495,10 +512,24 @@ impl Store {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(self.upload_path(&s.id)?);
         match file {
-            Ok(f) if f.metadata()?.is_file() && f.metadata()?.len() >= s.offset => Ok(f),
-            Ok(_) => {
-                self.fail_upload(s, "staging is short or not regular")?;
-                Err(s.conflict("staging is short or not regular"))
+            Ok(f) => {
+                // fstat the descriptor before any truncate/write, including
+                // restore and commit preparation. Never modify an aliased CAS
+                // inode, even when a link was created outside the Bus API.
+                let md = f.metadata()?;
+                if !md.is_file()
+                    || md.len() < s.offset
+                    || md.nlink() != 1
+                    || s.staging_dev.as_deref() != Some(md.dev().to_string().as_str())
+                    || s.staging_ino.as_deref() != Some(md.ino().to_string().as_str())
+                {
+                    self.fail_upload(
+                        s,
+                        "corrupt staging: short, non-regular, linked or replaced inode",
+                    )?;
+                    return Err(s.conflict("corrupt staging inode"));
+                }
+                Ok(f)
             }
             Err(e)
                 if matches!(e.kind(), io::ErrorKind::NotFound)
@@ -655,7 +686,12 @@ impl Store {
         // boundary. A committing row protects this hash from blob.gc.
         let staged = self.upload_path(&s.id)?;
         match fs::symlink_metadata(&staged) {
-            Ok(md) if md.is_file() && md.len() == s.size => {
+            Ok(md)
+                if md.is_file()
+                    && md.len() == s.size
+                    && s.staging_dev.as_deref() == Some(md.dev().to_string().as_str())
+                    && s.staging_ino.as_deref() == Some(md.ino().to_string().as_str()) =>
+            {
                 blob::publish_staged_preserving_source(&self.blobs_root(), &staged, &hash)?;
             }
             Ok(_) => {
@@ -836,6 +872,57 @@ mod tests {
     }
 
     #[test]
+    fn external_staging_hardlink_fails_patch_without_mutating_published_bytes() {
+        let (dir, store) = store();
+        let (s, _) = store.upload_create(&create(2)).unwrap();
+        store.upload_append(&s.id, 0, 0, 2, &b"a"[..]).unwrap();
+        let alias = dir.path().join("external-link");
+        fs::hard_link(store.upload_path(&s.id).unwrap(), &alias).unwrap();
+        let mut opts = PutOptions::new("other");
+        opts.mode = PutMode::HardLink;
+        opts.immutable = true;
+        let published = store.put(&alias, &opts).unwrap();
+        assert!(matches!(
+            store.upload_append(&s.id, 1, 1, 2, &b"b"[..]),
+            Err(StoreError::UploadConflict { .. })
+        ));
+        assert_eq!(store.upload_status(&s.id).unwrap().state, "failed");
+        assert!(
+            store
+                .upload_status(&s.id)
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("corrupt staging")
+        );
+        assert_eq!(fs::read(&alias).unwrap(), b"a");
+        assert_eq!(
+            fs::read(store.path(&published.reference.hash).unwrap()).unwrap(),
+            b"a"
+        );
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
+    }
+
+    #[test]
+    fn replaced_staging_inode_fails_before_truncation_or_patch() {
+        let (_dir, store) = store();
+        let (s, _) = store.upload_create(&create(2)).unwrap();
+        let path = store.upload_path(&s.id).unwrap();
+        let md = fs::metadata(&path).unwrap();
+        assert_eq!(s.staging_dev, Some(md.dev().to_string()));
+        assert_eq!(s.staging_ino, Some(md.ino().to_string()));
+        fs::rename(&path, path.with_extension("original")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        let held = File::open(&path).unwrap();
+        assert!(matches!(
+            store.upload_append(&s.id, 0, 0, 2, &b"a"[..]),
+            Err(StoreError::UploadConflict { .. })
+        ));
+        assert_eq!(held.metadata().unwrap().len(), 11);
+        assert_eq!(store.upload_status(&s.id).unwrap().state, "failed");
+    }
+
+    #[test]
     fn negative_upload_integers_are_corruption_and_checks_remain() {
         let (_dir, store) = store();
         let (s, _) = store.upload_create(&create(0)).unwrap();
@@ -932,7 +1019,7 @@ mod tests {
         let orphan = store.uploads_root().join(uuid::Uuid::new_v4().to_string());
         fs::write(&orphan, b"orphan").unwrap();
         drop(store);
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         assert_eq!(store.upload_status(&s.id).unwrap().offset, 3);
         assert_eq!(fs::read(store.upload_path(&s.id).unwrap()).unwrap(), b"abc");
         assert!(!orphan.exists());
@@ -948,7 +1035,7 @@ mod tests {
         store.upload_append(&s.id, 0, 2, 3, &b"abc"[..]).unwrap();
         fs::write(store.upload_path(&s.id).unwrap(), b"a").unwrap();
         drop(store);
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         assert_eq!(store.upload_status(&s.id).unwrap().state, "failed");
         assert!(!store.upload_path(&s.id).unwrap().exists());
         assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
@@ -996,7 +1083,7 @@ mod tests {
             .unwrap();
         fs::remove_file(store.upload_path(&missing.id).unwrap()).unwrap();
         drop(store);
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         assert_eq!(store.upload_status(&missing.id).unwrap().state, "failed");
         assert_eq!(store.upload_status(&valid.id).unwrap().state, "active");
         assert_eq!(store.quota_report(None).unwrap().total.reserved, 3);
@@ -1012,10 +1099,10 @@ mod tests {
             quota_total_bytes: 100,
             ..options()
         };
-        let store = Store::open(dir.path(), opts.clone()).unwrap();
+        let store = Store::open(dir.path().join("store"), opts.clone()).unwrap();
         store.upload_create(&create(80)).unwrap();
         drop(store);
-        let store = Store::open(dir.path(), opts).unwrap();
+        let store = Store::open(dir.path().join("store"), opts).unwrap();
         assert!(matches!(
             store.reserve_upload("other", Some(30)),
             Err(StoreError::QuotaTotal { .. })
@@ -1031,7 +1118,7 @@ mod tests {
     fn upload_refusal_creates_no_staging_and_full_sync_is_enabled() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 quota_total_bytes: 2,
                 ..options()
@@ -1058,7 +1145,7 @@ mod tests {
     fn active_session_limit_counts_zero_byte_uploads() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open_with_uploads(
-            dir.path(),
+            dir.path().join("store"),
             options(),
             UploadLimits {
                 per_owner: 1,
@@ -1093,7 +1180,7 @@ mod tests {
         let s = complete_bytes(&store, b"recover");
         store.prepare_upload_commit(&s).unwrap();
         drop(store);
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         let (reference, new) = store.upload_commit(&s.id).unwrap();
         assert!(!new);
         assert_eq!(reference.hash, blob::hash_bytes(b"recover"));
@@ -1121,7 +1208,7 @@ mod tests {
         assert_eq!(store.gc(false).unwrap().skipped_pinned, 1);
         assert!(cas.exists());
         drop(store);
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         assert_eq!(store.upload_status(&s.id).unwrap().state, "complete");
         assert_eq!(store.stat(&hash).unwrap().pins, vec!["uploader"]);
     }
@@ -1138,7 +1225,7 @@ mod tests {
         )
         .unwrap();
         drop(store);
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         assert!(!store.upload_path(&s.id).unwrap().exists());
         assert_eq!(
             store.upload_commit(&s.id).unwrap(),

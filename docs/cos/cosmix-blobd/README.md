@@ -195,7 +195,19 @@ label, not an authenticated principal.
 
 ## Storage layout
 
-The durable upload core uses `blobd.sqlite` schema v3 and `blobs/.uploads/`.
+The durable upload core uses `blobd.sqlite` schema v4 and `blobs/.uploads/`.
+Each new session records the staging descriptor's device/inode as decimal
+text (no unsigned-to-SQLite integer narrowing). Before PATCH, restore truncation
+or commit preparation, fstat must match that identity and report one link.
+Linked or replaced staging fails the session as corrupt before any write.
+The v4 migration fails legacy unfinished sessions whose creation identity was
+never recorded; it preserves completed receipts. Callers must start new sessions
+for those failures. Migration DDL, invalidation and version marker are atomic.
+
+Local `blob.put` refuses sources canonicalised inside this instance's entire
+store root, including symlink aliases, `.uploads`, `.tmp`, and CAS shards, for
+every ingest mode: `invalid_arguments: source inside the store`. Stage caller
+inputs outside that root. Hard-link ingest still requires an immutable source.
 SQLite boundaries use checked signed 64-bit integers: negative stored sizes,
 offsets and timestamps report integer corruption; out-of-range unsigned
 inputs are refused before binding. The existing non-negative CHECK constraints
