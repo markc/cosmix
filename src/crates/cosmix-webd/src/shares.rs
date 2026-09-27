@@ -208,6 +208,7 @@ pub async fn create(
     let db = db.lock().await;
     let token = file_share::create(
         &db,
+        &vhost.fqdn,
         &request.account,
         "file",
         &target,
@@ -361,7 +362,7 @@ pub async fn list(
     limit: usize,
 ) -> Result<Value, String> {
     let db = vhost.db.as_ref().ok_or("not_found")?.lock().await;
-    let rows = file_share::list(&db, account, after, limit).map_err(catalogue_error)?;
+    let rows = file_share::list(&db, &vhost.fqdn, account, after, limit).map_err(catalogue_error)?;
     Ok(json!({"shares": rows, "next": rows.last().map(|r| &r.token)}))
 }
 pub async fn revoke(vhost: &VhostState, account: &str, token: &str) -> Result<Value, String> {
@@ -369,7 +370,7 @@ pub async fn revoke(vhost: &VhostState, account: &str, token: &str) -> Result<Va
         return Err("invalid_arguments: invalid account or token".into());
     }
     let db = vhost.db.as_ref().ok_or("not_found")?.lock().await;
-    let revoked = file_share::revoke(&db, account, token).map_err(catalogue_error)?;
+    let revoked = file_share::revoke(&db, &vhost.fqdn, account, token).map_err(catalogue_error)?;
     Ok(json!({"revoked": revoked}))
 }
 pub async fn http_revoke(
@@ -463,7 +464,7 @@ pub async fn serve(
     };
     let gate = {
         let db = db.lock().await;
-        match file_share::resolve(&db, &token, session::now_secs()) {
+        match file_share::resolve(&db, &vhost.fqdn, &token, session::now_secs()) {
             Ok(g) => g,
             Err(e) => return error(catalogue_error(e)),
         }
@@ -505,7 +506,7 @@ pub async fn serve(
     // Refresh after asynchronous password work; old snapshots confer no authority.
     let target = {
         let db = db.lock().await;
-        let gate = match file_share::resolve(&db, &token, session::now_secs()) {
+        let gate = match file_share::resolve(&db, &vhost.fqdn, &token, session::now_secs()) {
             Ok(g) => g,
             Err(e) => return error(catalogue_error(e)),
         };
@@ -749,7 +750,7 @@ pub(crate) mod tests {
         }
         let db = vhost.db.as_ref().unwrap().lock().await;
         assert_eq!(
-            file_share::resolve(&db, &token, session::now_secs())
+            file_share::resolve(&db, &vhost.fqdn, &token, session::now_secs())
                 .unwrap()
                 .share
                 .download_count,

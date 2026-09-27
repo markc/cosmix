@@ -15,6 +15,7 @@ use crate::blob_reference::Reference;
 const SCHEMA: &str = "
 CREATE TABLE file_shares (
     token TEXT PRIMARY KEY,
+    primary_fqdn TEXT,
     account TEXT,
     maild_account_id INTEGER,
     rel_path TEXT,
@@ -65,6 +66,14 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
+    let scoped: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('file_shares') WHERE name='primary_fqdn')",
+        [], |r| r.get(0),
+    )?;
+    if !scoped {
+        tx.execute_batch("ALTER TABLE file_shares ADD COLUMN primary_fqdn TEXT")?;
+    }
+    // Unowned legacy rows remain intact but cannot resolve on any primary.
     tx.execute_batch(INDEX)?;
     // Also fail on an incompatible pre-existing table, instead of claiming migration succeeded.
     tx.prepare(
@@ -198,8 +207,10 @@ pub fn valid_token(token: &str) -> bool {
 
 /// Caller checks path ownership or establishes the blob pin BEFORE publishing.
 /// Password hashing is performed outside the DB lock by the management layer.
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     conn: &Connection,
+    primary: &str,
     account: &str,
     kind: &str,
     target: &Target,
@@ -232,9 +243,9 @@ pub fn create(
     };
     conn.execute(
         "INSERT INTO file_shares
-         (token, account, rel_path, blob, kind, password_hash, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7)",
-        params![token, account, path, blob, password_hash, expires_at, now],
+         (token, account, rel_path, blob, kind, password_hash, expires_at, created_at, primary_fqdn)
+         VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8)",
+        params![token, account, path, blob, password_hash, expires_at, now, primary],
     )?;
     Ok(token)
 }
@@ -307,6 +318,7 @@ impl Row {
 /// Bounded, cursor-paginated management inventory. Password hashes never leave it.
 pub fn list(
     conn: &Connection,
+    primary: &str,
     account: &str,
     after: Option<&str>,
     limit: usize,
@@ -317,19 +329,19 @@ pub fn list(
         ));
     }
     let mut stmt = conn.prepare(
-        "SELECT * FROM file_shares WHERE account=?1 AND revoked=0 AND token>?2 ORDER BY token LIMIT ?3",
+        "SELECT * FROM file_shares WHERE account=?1 AND revoked=0 AND token>?2 AND primary_fqdn=?4 ORDER BY token LIMIT ?3",
     )?;
     let rows = stmt.query_map(
-        params![account, after.unwrap_or(""), limit as i64],
+        params![account, after.unwrap_or(""), limit as i64, primary],
         Row::read,
     )?;
     rows.map(|row| row.map_err(Error::from)?.share()).collect()
 }
 
-pub fn revoke(conn: &Connection, account: &str, token: &str) -> Result<bool, Error> {
+pub fn revoke(conn: &Connection, primary: &str, account: &str, token: &str) -> Result<bool, Error> {
     Ok(conn.execute(
-        "UPDATE file_shares SET revoked=1 WHERE token=?1 AND account=?2 AND revoked=0",
-        params![token, account],
+        "UPDATE file_shares SET revoked=1 WHERE token=?1 AND account=?2 AND revoked=0 AND primary_fqdn=?3",
+        params![token, account, primary],
     )? > 0)
 }
 
@@ -340,14 +352,14 @@ pub struct Gate {
     pub password_hash: Option<String>,
 }
 
-pub fn resolve(conn: &Connection, token: &str, now: i64) -> Result<Gate, Error> {
+pub fn resolve(conn: &Connection, primary: &str, token: &str, now: i64) -> Result<Gate, Error> {
     if !valid_token(token) {
         return Err(Error::NotFound);
     }
     let row = conn
         .query_row(
-            "SELECT * FROM file_shares WHERE token=?1",
-            [token],
+            "SELECT * FROM file_shares WHERE token=?1 AND primary_fqdn=?2",
+            params![token, primary],
             Row::read,
         )
         .optional()?
@@ -417,12 +429,22 @@ mod tests {
     }
 
     #[test]
+    fn shared_database_isolates_primary_tokens_and_management() {
+        let db = db();
+        let token = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
+        assert!(matches!(resolve(&db, "b.example", &token, 2), Err(Error::NotFound)));
+        assert!(list(&db, "b.example", ACCOUNT, None, 100).unwrap().is_empty());
+        assert!(!revoke(&db, "b.example", ACCOUNT, &token).unwrap());
+        assert!(resolve(&db, "a.example", &token, 2).is_ok());
+    }
+
+    #[test]
     fn fresh_schema_target_check_and_repeated_init() {
         let db = db();
         init_schema(&db).unwrap();
         for target in [path(), blob()] {
-            let token = create(&db, ACCOUNT, "file", &target, None, None, 1).unwrap();
-            assert_eq!(resolve(&db, &token, 2).unwrap().share.target, target);
+            let token = create(&db, "a.example",  ACCOUNT, "file", &target, None, None, 1).unwrap();
+            assert_eq!(resolve(&db, "a.example",  &token, 2).unwrap().share.target, target);
             assert!(
                 db.execute(
                     "UPDATE file_shares SET rel_path=NULL, blob=NULL WHERE token=?1",
@@ -475,13 +497,13 @@ mod tests {
             ),
             (Some(50), 1, false, 12)
         );
-        assert!(matches!(resolve(&db, &token, 2), Err(Error::NotFound)));
+        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
         db.execute(
-            "UPDATE file_shares SET account=?1 WHERE token=?2",
+            "UPDATE file_shares SET account=?1, primary_fqdn='a.example' WHERE token=?2",
             params![ACCOUNT, token],
         )
         .unwrap();
-        assert_eq!(resolve(&db, &token, 2).unwrap().share.account, ACCOUNT);
+        assert_eq!(resolve(&db, "a.example",  &token, 2).unwrap().share.account, ACCOUNT);
     }
 
     #[test]
@@ -513,45 +535,45 @@ mod tests {
     #[test]
     fn account_scope_gates_and_telemetry() {
         let db = db();
-        let token = create(&db, ACCOUNT, "file", &path(), Some("hash"), Some(10), 1).unwrap();
+        let token = create(&db, "a.example",  ACCOUNT, "file", &path(), Some("hash"), Some(10), 1).unwrap();
         assert!(
-            list(&db, "other@example.test", None, 100)
+            list(&db, "a.example",  "other@example.test", None, 100)
                 .unwrap()
                 .is_empty()
         );
-        assert!(!revoke(&db, "other@example.test", &token).unwrap());
-        let gate = resolve(&db, &token, 2).unwrap();
+        assert!(!revoke(&db, "a.example",  "other@example.test", &token).unwrap());
+        let gate = resolve(&db, "a.example",  &token, 2).unwrap();
         assert!(matches!(gate.authorize(None), Err(Error::Unauthorized)));
         assert!(gate.authorize(Some("hash")).is_ok());
-        assert!(matches!(resolve(&db, &token, 10), Err(Error::Expired)));
+        assert!(matches!(resolve(&db, "a.example",  &token, 10), Err(Error::Expired)));
         bump_download(&db, &token).unwrap();
-        assert_eq!(list(&db, ACCOUNT, None, 100).unwrap()[0].download_count, 1);
-        assert!(revoke(&db, ACCOUNT, &token).unwrap());
-        assert!(matches!(resolve(&db, &token, 2), Err(Error::Revoked)));
+        assert_eq!(list(&db, "a.example",  ACCOUNT, None, 100).unwrap()[0].download_count, 1);
+        assert!(revoke(&db, "a.example",  ACCOUNT, &token).unwrap());
+        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::Revoked)));
     }
 
     #[test]
     fn unsupported_or_corrupt_targets_fail_closed() {
         let db = db();
         for kind in ["dir", "drop", "garbage"] {
-            assert!(create(&db, ACCOUNT, kind, &path(), None, None, 1).is_err());
+            assert!(create(&db, "a.example",  ACCOUNT, kind, &path(), None, None, 1).is_err());
         }
         for rel_path in ["", "/etc/passwd", "../x", "a/../b", "a/./b", "a//b", "a\\b"] {
             assert!(!valid_relative_path(rel_path));
         }
-        let token = create(&db, ACCOUNT, "file", &blob(), None, None, 1).unwrap();
+        let token = create(&db, "a.example",  ACCOUNT, "file", &blob(), None, None, 1).unwrap();
         db.execute(
             "UPDATE file_shares SET kind='unknown' WHERE token=?1",
             [&token],
         )
         .unwrap();
-        assert!(matches!(resolve(&db, &token, 2), Err(Error::NotFound)));
+        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
         db.execute(
             "UPDATE file_shares SET kind='file',blob='{}' WHERE token=?1",
             [&token],
         )
         .unwrap();
-        assert!(matches!(resolve(&db, &token, 2), Err(Error::NotFound)));
+        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
     }
 
     #[test]

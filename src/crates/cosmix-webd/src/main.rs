@@ -5427,6 +5427,7 @@ struct DisabledVhost {
 
 fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
     let mut vhosts: HashMap<String, Arc<VhostState>> = HashMap::new();
+    let mut cms_paths = std::collections::HashSet::new();
     let mut identities: Vec<TlsIdentityConfig> = Vec::new();
     // B1 fail-soft — rows whose per-vhost validation failed. Populated
     // in the row loop below; the healthy subset still resolves.
@@ -5729,6 +5730,9 @@ fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
             let db = match &row.cms_db_path {
                 Some(p) => {
                     let path = PathBuf::from(p);
+                    if !cms_paths.insert(canonical_db_key(&path)) {
+                        anyhow::bail!("cms_db_path duplicates an earlier primary vhost");
+                    }
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent).with_context(|| {
                             format!(
@@ -5873,6 +5877,16 @@ fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
     // behaviour) so a plain-HTTP-with-tls_server_name deployment
     // still gets `/api/posts` working under the legacy host keys.
     let legacy_active = legacy_tls.is_some() || !inputs.webd.tls_server_name.is_empty();
+    let legacy_active = if legacy_active && !cms_paths.insert(canonical_db_key(&inputs.legacy_db_path)) {
+        let reason = "cms_db_path duplicates an earlier primary vhost".to_string();
+        tracing::warn!(%reason, "legacy vhost disabled");
+        disabled_vhosts.push(DisabledVhost {
+            host: inputs.webd.tls_server_name.first().cloned().unwrap_or_default(),
+            names: inputs.webd.tls_server_name.clone(),
+            reason,
+        });
+        false
+    } else { legacy_active };
     if legacy_active {
         // Both arms of legacy_active require tls_server_name to be
         // non-empty: the TLS arm needs it as the validator's SAN-list,
@@ -8673,6 +8687,26 @@ mod vhost_tests {
     // =========================================================
     // Bucket C — `[[webd.vhost]]` config parse + resolve
     // =========================================================
+
+    #[test]
+    fn duplicate_cms_path_disables_later_primary() {
+        let td = TempDir::new().unwrap();
+        let www = mkdir(&td, "www");
+        let mut webd = cosmix_config::node::WebdConfig::default();
+        webd.http_listen = Some("127.0.0.1:8080".into());
+        for host in ["a.example", "b.example"] {
+            webd.vhost.push(cosmix_config::node::WebdVhostConfig {
+                host: host.into(),
+                www_dir: www.to_string_lossy().into_owned(),
+                cms_db_path: Some(td.path().join("cms.db").to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        }
+        let resolved = resolve_node_state(base_inputs(&webd, &td)).unwrap();
+        assert!(resolved.vhosts.contains_key("a.example"));
+        assert!(!resolved.vhosts.contains_key("b.example"));
+        assert!(resolved.disabled_vhosts.iter().any(|v| v.host == "b.example" && v.reason.contains("duplicates")));
+    }
 
     #[test]
     fn vhost_block_parses_minimal() {
