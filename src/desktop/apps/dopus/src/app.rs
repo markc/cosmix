@@ -432,6 +432,7 @@ impl Dopus {
                 Task::none()
             }
             Msg::Split(ratio) => {
+                self.stop_editing();
                 // Law 7: persistence derives from core state only — the core
                 // settles the changed ratio through its own debounce.
                 self.core.set_split_ratio(ratio.clamp(view::panes::SPLIT_MIN, view::panes::SPLIT_MAX));
@@ -493,6 +494,7 @@ impl Dopus {
     /// Activate `pane`, then act on it (the core's pane verbs act on the
     /// active pane). Law 5: a sort-column switch passes `ascending: true`.
     fn on_pane_op(&mut self, pane: PaneId, op: PaneOp) -> Task<Msg> {
+        self.stop_editing();
         self.core.set_active_pane(pane);
         match op {
             PaneOp::NavBack => self.core.go_back(),
@@ -975,8 +977,8 @@ impl Dopus {
         let mut routed = keys::router(content, self.router.clone(), Msg::Actions).modal(self.dialog.is_some());
         if self.dialog.is_some() {
             routed = routed.on_modal_key(Msg::DialogKey);
-        } else if self.editing.is_some() {
-            routed = routed.on_edit_cancel(Msg::LocationCancel);
+        } else if let Some((pane, _)) = self.editing.as_ref() {
+            routed = routed.on_edit_cancel(view::location::location_id(*pane), Msg::LocationCancel);
         }
         routed.into()
     }
@@ -997,4 +999,57 @@ fn focus_prompt() -> Task<Msg> {
         iced::widget::operation::focus(dialogs::PROMPT_INPUT),
         iced::widget::operation::select_all(dialogs::PROMPT_INPUT),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_controls_and_split_changes_dismiss_location_editing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = DOpusConfig::default();
+        config.left.path = dir.path().to_owned();
+        config.right.path = dir.path().to_owned();
+        let (core, _events) = DopusCore::new(config, None);
+        let mut app = Dopus {
+            core,
+            rows: [Vec::new(), Vec::new()],
+            split_ratio: 0.5,
+            editing: None,
+            router: keys::initial(None).unwrap(),
+            icons: Icons::new(),
+            theme: theme::resolve_selection(&theme::Selection {
+                scheme: Scheme::default(),
+                mode: Mode::default(),
+                design_source: None,
+            }, Vec::new()),
+            theme_override: None,
+            status: None,
+            dialog: None,
+            modal_queue: dialogs::ModalQueue::default(),
+            bus: None,
+            action_table: Vec::new(),
+            dirs: None,
+            service: "dopus-test".into(),
+            tint: String::new(),
+            quitting: false,
+        };
+        for msg in [
+            Msg::Pane(PaneId::Right, PaneOp::Sort(SortColumn::Size)),
+            Msg::Pane(PaneId::Left, PaneOp::Refresh),
+            Msg::Pane(PaneId::Right, PaneOp::ToggleHidden),
+            Msg::Split(0.7),
+            Msg::LocationCancel, // outside press, including a stationary divider
+        ] {
+            let _ = app.begin_edit(PaneId::Left);
+            assert!(app.editing.is_some());
+            assert!(app.router.lock().unwrap().focus_editable);
+            let _ = app.update(msg);
+            assert!(app.editing.is_none());
+            assert!(!app.router.lock().unwrap().focus_editable);
+        }
+        assert_eq!(app.core.pane(PaneId::Right).sort, SortColumn::Size);
+        assert_eq!(app.core.config_snapshot().split_ratio, 0.7);
+    }
 }

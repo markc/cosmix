@@ -3,9 +3,13 @@
 ## 0.2.0
 
 - Add optional pane targets to dopus.v1 actions and open requests, preserving
-  existing default routing; expose matching pane state rows in info.
+  existing default routing; add `dopus.info.pane_states` with the same row
+  shape as `dopus.state.panes`, retaining the existing `info.panes` count.
 - Use TextField submission for location editing and add the canonical
-  location.focus action with Ctrl+L.
+  location.focus action with Ctrl+L, also added to `dopus.actions.list`.
+- Dismiss location editing on outside presses, pane controls and split
+  changes; resolve custom editable bindings before suppressing unhandled
+  modified Enter.
 - Render cached Places and support explicit refresh.
 - Document the app contract, Bus surface, keymap and schema-1 config.
 

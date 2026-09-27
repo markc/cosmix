@@ -304,6 +304,30 @@ pub fn raw_input(
 type ActionsFn<'a, Message> = Box<dyn Fn(Vec<ActionId>) -> Message + 'a>;
 type ModalKeyFn<'a, Message> = Box<dyn Fn(ModalKey) -> Message + 'a>;
 
+/// Query the actual editor bounds, without duplicating the pane layout.
+struct EditorHit {
+    id: iced::advanced::widget::Id,
+    cursor: mouse::Cursor,
+    inside: bool,
+}
+
+impl Operation for EditorHit {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn focusable(
+        &mut self,
+        id: Option<&iced::advanced::widget::Id>,
+        bounds: Rectangle,
+        _state: &mut dyn iced::advanced::widget::operation::Focusable,
+    ) {
+        if id == Some(&self.id) {
+            self.inside = self.cursor.is_over(bounds);
+        }
+    }
+}
+
 /// Wraps the whole window content; sees every key before its children.
 /// Resolved actions are published; everything else reaches the children.
 pub struct KeyRouter<'a, Message, Theme, Renderer> {
@@ -314,7 +338,7 @@ pub struct KeyRouter<'a, Message, Theme, Renderer> {
     /// [`ModalKey`] messages before the children see them.
     modal: bool,
     on_modal_key: Option<ModalKeyFn<'a, Message>>,
-    on_edit_cancel: Option<Message>,
+    on_edit_cancel: Option<(iced::advanced::widget::Id, Message)>,
 }
 
 pub fn router<'a, Message, Theme, Renderer>(
@@ -333,9 +357,9 @@ pub fn router<'a, Message, Theme, Renderer>(
 }
 
 impl<'a, Message, Theme, Renderer> KeyRouter<'a, Message, Theme, Renderer> {
-    /// Escape cancels the location editor; Enter stays with TextField.
-    pub fn on_edit_cancel(mut self, message: Message) -> Self {
-        self.on_edit_cancel = Some(message);
+    /// Escape and presses outside this editor cancel it; Enter stays with TextField.
+    pub fn on_edit_cancel(mut self, id: impl Into<iced::advanced::widget::Id>, message: Message) -> Self {
+        self.on_edit_cancel = Some((id.into(), message));
         self
     }
 
@@ -430,24 +454,14 @@ where
             return;
         }
         if !self.modal
-            && let Some(message) = &self.on_edit_cancel
+            && let Some((_, message)) = &self.on_edit_cancel
             && let Event::Keyboard(keyboard::Event::KeyPressed {
-                key, modifiers, ..
+                key: Key::Named(Named::Escape), ..
             }) = event
         {
-            if *key == Key::Named(Named::Escape) {
-                shell.publish(message.clone());
-                shell.capture_event();
-                return;
-            }
-            // Preserve the location editor's plain-Enter submission rule.
-            // iced's on_submit itself also accepts modified Enter.
-            if *key == Key::Named(Named::Enter)
-                && (modifiers.control() || modifiers.alt() || modifiers.logo())
-            {
-                shell.capture_event();
-                return;
-            }
+            shell.publish(message.clone());
+            shell.capture_event();
+            return;
         }
         if let Event::Keyboard(keyboard_event) = event
             && let Some(input) = key_input(keyboard_event)
@@ -485,6 +499,33 @@ where
                 // stroke as its own (P1: only matters with custom overlays).
                 shell.capture_event();
                 return;
+            }
+        }
+        // Custom editable bindings and pending chords get first refusal.
+        // Only an unhandled modified Enter is kept away from on_submit.
+        if !self.modal
+            && self.on_edit_cancel.is_some()
+            && let Event::Keyboard(keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Enter), modifiers, ..
+            }) = event
+            && (modifiers.control() || modifiers.alt() || modifiers.logo())
+        {
+            shell.capture_event();
+            return;
+        }
+        // Cancel BEFORE forwarding an outside press: the child may publish
+        // LocationEdit for the other pane, which must follow this dismissal.
+        // This also covers disabled controls, blank chrome and divider presses
+        // that never move far enough to publish Split.
+        if !self.modal
+            && let Some((id, message)) = &self.on_edit_cancel
+            && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                | Event::Touch(iced::touch::Event::FingerPressed { .. }))
+        {
+            let mut hit = EditorHit { id: id.clone(), cursor, inside: false };
+            self.content.as_widget_mut().operate(tree, layout, renderer, &mut hit);
+            if !hit.inside {
+                shell.publish(message.clone());
             }
         }
         self.content
@@ -680,5 +721,133 @@ mod tests {
         let resolved = resolve(input, &FocusContext::global(), &router.keymap, &mut state, tick());
         assert!(resolved.actions.is_empty());
         assert_eq!(resolved.outcome, cosmix_actions::ResolveOutcome::IgnoredRelease);
+    }
+}
+
+// Exercise the actual router/TextField event order without a window or GPU.
+#[cfg(all(test, debug_assertions))]
+mod widget_tests {
+    use super::*;
+    use iced::advanced::widget::operation::focusable;
+    use iced::keyboard::key::{NativeCode, Physical};
+    use cosmix_iced_widgets::TextField;
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Message {
+        Actions(Vec<ActionId>),
+        Input(String),
+        Submit,
+        Cancel,
+        OtherEdit,
+    }
+
+    type TestRouter = KeyRouter<'static, Message, iced::Theme, ()>;
+
+    fn fixture(custom: &str) -> (TestRouter, Tree) {
+        let shared = initial(None).unwrap();
+        {
+            let mut state = shared.lock().unwrap();
+            state.focus_editable = true;
+            state.keymap.custom = parse_keymap(custom).unwrap().custom;
+        }
+        let field = TextField::<Message, ()>::new("path", "/tmp")
+            .id("location")
+            .on_input(Message::Input)
+            .on_submit(Message::Submit);
+        let content = iced::widget::column![
+            field,
+            iced::widget::mouse_area(iced::widget::Space::new().width(300).height(40))
+                .on_press(Message::OtherEdit),
+        ];
+        let mut router = router(content, shared, Message::Actions)
+            .on_edit_cancel("location", Message::Cancel);
+        let mut tree = Tree::new(&router as &dyn Widget<Message, iced::Theme, ()>);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        let node = router.layout(&mut tree, &(), &limits);
+        router.operate(&mut tree, Layout::new(&node), &(), &mut focusable::focus::<()>("location".into()));
+        (router, tree)
+    }
+
+    fn send(router: &mut TestRouter, tree: &mut Tree, event: Event, cursor: mouse::Cursor) -> (Vec<Message>, bool) {
+        let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
+        let node = router.layout(tree, &(), &layout::Limits::new(Size::ZERO, bounds.size()));
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        router.update(tree, &event, Layout::new(&node), cursor, &(),
+            &mut iced::advanced::clipboard::Null, &mut shell, &bounds);
+        let captured = shell.is_event_captured();
+        (messages, captured)
+    }
+
+    fn enter(modifiers: keyboard::Modifiers) -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Enter),
+            modified_key: Key::Named(Named::Enter),
+            physical_key: Physical::Unidentified(NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    #[test]
+    fn editable_custom_modified_enter_runs_before_submit_guard() {
+        let (mut router, mut tree) = fixture(r#"{
+            version: 1, chord_timeout_ms: 1000, defaults: [],
+            custom: [{action: "theme.mode-toggle", chord: ["Ctrl+Enter"],
+                scope: "global", repeat: "ignore", allow_in_editable: true}]
+        }"#);
+        let (messages, captured) = send(&mut router, &mut tree,
+            enter(keyboard::Modifiers::CTRL), mouse::Cursor::Unavailable);
+        assert_eq!(messages, [Message::Actions(vec![cosmix_actions::theme::MODE_TOGGLE])]);
+        assert!(captured);
+    }
+
+    #[test]
+    fn only_unhandled_modified_enter_is_suppressed() {
+        let (mut router, mut tree) = fixture(r#"{
+            version: 1, chord_timeout_ms: 1000, defaults: [], custom: []
+        }"#);
+        let (messages, captured) = send(&mut router, &mut tree,
+            enter(keyboard::Modifiers::CTRL), mouse::Cursor::Unavailable);
+        assert!(messages.is_empty());
+        assert!(captured);
+        assert_eq!(send(&mut router, &mut tree,
+            enter(keyboard::Modifiers::empty()), mouse::Cursor::Unavailable).0,
+            [Message::Submit]);
+    }
+
+    #[test]
+    fn modified_enter_can_start_an_editable_custom_chord() {
+        let (mut router, mut tree) = fixture(r#"{
+            version: 1, chord_timeout_ms: 1000, defaults: [],
+            custom: [{action: "theme.mode-toggle", chord: ["Ctrl+Enter", "Ctrl+K"],
+                scope: "global", repeat: "ignore", allow_in_editable: true}]
+        }"#);
+        let (messages, captured) = send(&mut router, &mut tree,
+            enter(keyboard::Modifiers::CTRL), mouse::Cursor::Unavailable);
+        assert!(messages.is_empty());
+        assert!(captured);
+        assert!(router.shared.lock().unwrap().state.deadline().is_some());
+    }
+
+    #[test]
+    fn outside_press_cancels_before_child_messages_but_inside_press_does_not() {
+        let (mut router, mut tree) = fixture(r#"{
+            version: 1, chord_timeout_ms: 1000, defaults: [], custom: []
+        }"#);
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let inside = send(&mut router, &mut tree, press.clone(),
+            mouse::Cursor::Available(iced::Point::new(10.0, 10.0))).0;
+        assert!(!inside.contains(&Message::Cancel));
+        let node = router.layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)));
+        let other = Layout::new(&node).children().nth(1).unwrap().bounds().center();
+        assert_eq!(send(&mut router, &mut tree, press.clone(), mouse::Cursor::Available(other)).0,
+            [Message::Cancel, Message::OtherEdit]);
+        // A press on blank chrome/divider has no child action to dismiss for us.
+        assert_eq!(send(&mut router, &mut tree, press,
+            mouse::Cursor::Available(iced::Point::new(290.0, 99.0))).0,
+            [Message::Cancel]);
     }
 }
