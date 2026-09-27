@@ -196,6 +196,50 @@ fn check_upload_device(cas_device: u64, staging_device: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static UPLOAD_LINK_PROBE_EXDEV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn probe_upload_links(uploads: &Path, temporary: &Path) -> Result<()> {
+    let name = format!(".upload-link-probe-{}", uuid::Uuid::new_v4());
+    let source = uploads.join(&name);
+    let target = temporary.join(&name);
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&source)?;
+    drop(file);
+    let link = || -> io::Result<()> {
+        #[cfg(test)]
+        if UPLOAD_LINK_PROBE_EXDEV.with(|flag| flag.get()) {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        fs::hard_link(&source, &target)
+    };
+    let result = link();
+    // Always remove our source. Only remove the target if our atomic link
+    // created it; even a UUID collision must not delete somebody else's file.
+    let target_cleanup = if result.is_ok() {
+        fs::remove_file(&target)
+    } else {
+        Ok(())
+    };
+    let source_cleanup = fs::remove_file(&source);
+    if let Err(error) = result {
+        if error.raw_os_error() == Some(libc::EXDEV) {
+            return Err(StoreError::BadRequest(
+                "upload staging hard-link probe failed: blobs/.uploads and blobs/.tmp must share a link-compatible mount (EXDEV)".into(),
+            ));
+        }
+        return Err(error.into());
+    }
+    target_cleanup?;
+    source_cleanup?;
+    Ok(())
+}
+
 fn permanent_commit_error(error: &StoreError) -> bool {
     match error {
         StoreError::QuotaOwner { .. }
@@ -903,6 +947,7 @@ impl Store {
             fs::metadata(self.uploads_root())?.dev(),
         )?;
         fs::set_permissions(self.uploads_root(), fs::Permissions::from_mode(0o2700))?;
+        probe_upload_links(&self.uploads_root(), &self.blobs_root().join(".tmp"))?;
         sync_dir(&self.blobs_root())?;
         self.db
             .lock()
@@ -968,6 +1013,35 @@ mod tests {
             mime: "application/octet-stream".into(),
             name: None,
             key: Some("retry-key".into()),
+        }
+    }
+
+    #[test]
+    fn startup_link_probe_exdev_refuses_and_removes_both_probe_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        UPLOAD_LINK_PROBE_EXDEV.with(|flag| flag.set(true));
+        let result = Store::open(dir.path(), options());
+        UPLOAD_LINK_PROBE_EXDEV.with(|flag| flag.set(false));
+        assert!(
+            matches!(result, Err(StoreError::BadRequest(message)) if message.contains("hard-link probe") && message.contains("EXDEV"))
+        );
+        for child in [".uploads", ".tmp"] {
+            assert_eq!(
+                fs::read_dir(dir.path().join("blobs").join(child))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        // The successful startup probe also leaves no files behind.
+        let store = Store::open(dir.path(), options()).unwrap();
+        for child in [".uploads", ".tmp"] {
+            assert_eq!(
+                fs::read_dir(store.blobs_root().join(child))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
     }
 

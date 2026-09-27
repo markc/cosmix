@@ -657,7 +657,10 @@ publication. Aborting a completed session never removes its pin or object.</p>
 <p>At startup blobd removes everything under <code>blobs/.tmp</code>, restores durable sessions separately, and runs one directory-vs-database reconcile. Old CAS files with no mds row and no pin are logged as orphans but never deleted at startup — <code>blob.gc</code> owns deletion.</p>
 <p><code>blobs/.uploads</code> must reside on the same filesystem as <code>blobs/</code>: commit uses
 hard links for atomic publication. Startup compares their device IDs and
-refuses a cross-device staging mount with a clear configuration error.</p>
+also probes a real hard link from a unique temporary file under <code>.uploads</code>
+into <code>blobs/.tmp</code>, removing both probe paths afterwards. This detects bind
+mount boundaries that share a device ID but still return EXDEV. An incompatible
+staging mount refuses startup with a clear configuration error.</p>
 <h2 id="garbage-collection-and-quotas">Garbage collection and quotas</h2>
 <p><code>blob.gc</code> sweeps CAS files whose mds refcount is 0 (no row counts as 0 — every blobd put is rowless until a set references it), that carry no pin, and whose mtime is older than the 60-second grace window (<code>DEFAULT_GC_QUIESCENCE</code>). A dry run lists candidates; a live run unlinks, drops attributes and adjusts quota accounting. Pinned blobs are never candidates.</p>
 <p>Quotas are correctness, not authorisation: an upload (a <code>blob.put</code>, a lane body, a <code>blob.fetch</code> download) <strong>reserves</strong> the owner cap and the total cap at admission — the declared <code>Content-Length</code>, or the owner's whole remaining room when the length is unknown — so concurrent uploads cannot each spend the same headroom; the accounting settles to the real size when the pin lands, and an abort releases the reservation. <code>used</code> is the sum of distinct pinned blob sizes per owner; <code>blob.quota</code> reports <code>reserved</code> (the in-flight headroom) beside it; unpinning releases it. Idempotent re-puts of an already-pinned blob are refused at the cap like any other put (the quota check runs before the hash is known).</p>

@@ -272,7 +272,10 @@ At startup blobd removes everything under `blobs/.tmp`, restores durable session
 
 `blobs/.uploads` must reside on the same filesystem as `blobs/`: commit uses
 hard links for atomic publication. Startup compares their device IDs and
-refuses a cross-device staging mount with a clear configuration error.
+also probes a real hard link from a unique temporary file under `.uploads`
+into `blobs/.tmp`, removing both probe paths afterwards. This detects bind
+mount boundaries that share a device ID but still return EXDEV. An incompatible
+staging mount refuses startup with a clear configuration error.
 
 ## Garbage collection and quotas
 
