@@ -57,6 +57,32 @@ const RC_CALLER_ERROR: u8 = 10;
 /// (`cosmix-webd` → `webd`).
 const BUS_SERVICE: &str = "webd";
 
+fn spawn_busy_reply(reply: impl std::future::Future<Output = ()> + Send + 'static) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), reply).await;
+    })
+}
+
+#[cfg(test)]
+mod busy_reply_tests {
+    #[tokio::test]
+    async fn blocked_busy_sink_does_not_block_full_worker_loop() {
+        let mut workers = tokio::task::JoinSet::<()>::new();
+        for _ in 0..8 { workers.spawn(std::future::pending()); }
+        assert_eq!(workers.len(), 8);
+        let (started, seen) = tokio::sync::oneshot::channel();
+        let reply = super::spawn_busy_reply(async move {
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), seen).await.unwrap().unwrap();
+        assert!(!reply.is_finished());
+        // The receive loop remains free to process unrelated commands.
+        reply.abort();
+        workers.shutdown().await;
+    }
+}
+
 /// Read a string kwarg by name from either the JSON `args` object OR the
 /// Bus `header` map — **args first**, header only as a fallback.
 ///
@@ -281,15 +307,14 @@ pub async fn run(node: Arc<NodeState>) {
             }
             if share_verbs::handles(&cmd.command) {
                 if workers.len() >= 8 {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        client_arc.respond(
+                    let client = client_arc.clone();
+                    spawn_busy_reply(async move {
+                        let _ = client.respond(
                             &cmd,
                             10,
                             r#"{"error":"busy: webd transfer workers full (8)"}"#,
-                        ),
-                    )
-                    .await;
+                        ).await;
+                    });
                 } else {
                     let node = node.clone();
                     let client = client_arc.clone();
