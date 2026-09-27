@@ -170,19 +170,18 @@ try
   pane_is(0, $alpha, "extras left")
   pane_is(1, $beta, "extras right")
 
-  -- 4. F6 (nav.switch-pane) flips the active pane
   -- 3b. Explicit right-pane navigation while LEFT stays active. Restore
   -- beta before continuing the legacy default-active checks below.
   ok('dopus.action id="nav.parent" pane="right"', {})
   pane_is(1, $tmp .. "/work", "targeted parent right")
   $p0 = pane_is(0, $alpha, "targeted parent left untouched")
   check($p0.active and not pane(1).active, "targeted navigation stole focus")
-  ok('dopus.action id="nav.back" pane="right"', {})
+  ok('dopus.action id="nav.back" pane=1', {})
   pane_is(1, $beta, "targeted back right")
   ok('dopus.open paths=[$a.g] pane="right"', {g: $gamma})
   pane_is(1, $gamma, "targeted open right")
   check(pane_is(0, $alpha, "targeted open left untouched").active, "targeted open stole focus")
-  ok('dopus.open paths=[$a.b] pane="right"', {b: $beta})
+  ok('dopus.open paths=[$a.b] pane=1', {b: $beta})
   ok('dopus.action id="view.sort-size" pane="right"', {})
   check(pane(1).sort == "size" and pane(0).sort == "name", "targeted sort leaked")
   ok('dopus.action id="view.sort-name" pane="right"', {})
@@ -297,6 +296,16 @@ try
 
   -- 10. refusals stay honest
   refused('dopus.action id="no.such-action"', {}, "INVALID_ARGUMENT")
+  refused('dopus.action id="location.focus"', {}, "UNAVAILABLE")
+  $acts = ok('dopus.actions.list', {})
+  $location_rows = 0
+  for each $row in $acts.actions
+    if $row.id == "location.focus" then
+      $location_rows = $location_rows + 1
+      check(not $row.enabled, "headless location.focus must be disabled")
+    end
+  end
+  check($location_rows == 1, "actions.list must contain location.focus")
   refused('dopus.frobnicate', {}, "UNKNOWN_VERB")
   refused('dopus.theme.set mode="dark"', {}, "UNAVAILABLE")
   -- The theme.* actions share theme.set's posture: UNAVAILABLE (the

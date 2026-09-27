@@ -8,11 +8,23 @@ fn pane_request_defaults_and_validation() {
     assert_eq!(action.pane, PaneTarget::Active);
     let open: OpenReq = serde_json::from_str(r#"{"paths":[]}"#).unwrap();
     assert_eq!(open.pane, None);
-    for target in ["left", "right", "active"] {
-        let body = format!(r#"{{"id":"nav.parent","pane":"{target}"}}"#);
-        assert!(serde_json::from_str::<ActionReq>(&body).is_ok());
+    for (target, expected) in [
+        (r#""left""#, PaneTarget::Left), ("0", PaneTarget::Left),
+        (r#""right""#, PaneTarget::Right), ("1", PaneTarget::Right),
+        (r#""active""#, PaneTarget::Active),
+    ] {
+        let body = format!(r#"{{"id":"nav.parent","pane":{target}}}"#);
+        assert_eq!(serde_json::from_str::<ActionReq>(&body).unwrap().pane, expected);
+        let body = format!(r#"{{"paths":["/tmp"],"pane":{target}}}"#);
+        assert_eq!(serde_json::from_str::<OpenReq>(&body).unwrap().pane, Some(expected));
     }
-    assert!(serde_json::from_str::<ActionReq>(r#"{"id":"nav.parent","pane":"other"}"#).is_err());
+    for target in [r#""other""#, "2", "-1", "1.5", "true", r#""1""#] {
+        let body = format!(r#"{{"id":"nav.parent","pane":{target}}}"#);
+        assert!(serde_json::from_str::<ActionReq>(&body).is_err());
+        let body = format!(r#"{{"paths":[],"pane":{target}}}"#);
+        assert!(serde_json::from_str::<OpenReq>(&body).is_err());
+    }
+    assert_eq!(serde_json::to_string(&PaneTarget::Right).unwrap(), r#""right""#);
 }
 
 #[test]

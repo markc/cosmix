@@ -721,22 +721,29 @@ impl Dopus {
         }
     }
 
-    /// Answer one Bus command through the shared serving layer.
-    fn serve(&mut self, command: &bus::Command) -> Task<Msg> {
-        let Some(bus) = &self.bus else { return Task::none() };
-        let handle = bus.clone();
-        let meta = ServerMeta {
+    fn server_meta(&self) -> ServerMeta {
+        ServerMeta {
             service: self.service.clone(),
             headless: false,
+            location_focus_available: self.dialog.is_none() && !self.quitting,
             config_path: self.dirs.as_ref().map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
             theme_scheme: self.theme.scheme.name().to_owned(),
             theme_mode: self.theme.mode.name().to_owned(),
             actions: self.action_table.clone(),
-        };
+        }
+    }
+
+    /// Answer one Bus command through the shared serving layer.
+    fn serve(&mut self, command: &bus::Command) -> Task<Msg> {
+        let Some(bus) = &self.bus else { return Task::none() };
+        let handle = bus.clone();
+        let meta = self.server_meta();
         let info = cosmix_buildinfo::build_info!();
+        let mut tasks = Vec::new();
         for served in verbs::serve_command(command, &mut self.core, &meta, &info) {
             match served {
                 Served::Reply { id, rc, body } => handle.respond(id, rc, body),
+                Served::LocationFocus { id, pane } => tasks.push(self.serve_location_focus(id, pane)),
                 Served::ThemeSet { id, scheme, mode } => {
                     let result = self.select_theme(scheme.as_deref(), mode.as_deref());
                     self.theme_reply(id, result);
@@ -773,7 +780,20 @@ impl Dopus {
                 }
             }
         }
-        Task::none()
+        Task::batch(tasks)
+    }
+
+    /// Window performer for Bus location.focus; keyboard uses the same editor.
+    fn serve_location_focus(&mut self, id: u64, pane: PaneId) -> Task<Msg> {
+        let task = self.begin_edit(pane);
+        if let Some(bus) = &self.bus {
+            bus.respond(id, 0, serde_json::to_string(&verbs::ActionReply {
+                id: cosmix_actions::location::FOCUS.to_string(),
+                ok: true,
+                result: None,
+            }).unwrap_or_default());
+        }
+        task
     }
 
     /// The theme performer's reply, shared by the `dopus.theme.set` verb and
@@ -810,10 +830,6 @@ impl Dopus {
         let mut quit = false;
         let mut tasks = Vec::new();
         for action in actions {
-            if *action == cosmix_actions::location::FOCUS {
-                tasks.push(self.begin_edit(self.core.active()));
-                continue;
-            }
             if *action == cosmix_actions::theme::MODE_TOGGLE {
                 let mode = match self.theme_override.map(|(_, m)| m).unwrap_or(self.theme.mode) {
                     Mode::Dark => Mode::Light,
@@ -831,6 +847,7 @@ impl Dopus {
             }
             match verbs::apply_action(*action, &mut self.core) {
                 Ok(verbs::Applied::Done) => {}
+                Ok(verbs::Applied::LocationFocus(pane)) => tasks.push(self.begin_edit(pane)),
                 // Unreachable from this path (the theme pre-filter above
                 // consumed every theme id) but the shared layer must stay
                 // exhaustive: perform the selection the same way the Bus
@@ -1005,14 +1022,13 @@ fn focus_prompt() -> Task<Msg> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pane_controls_and_split_changes_dismiss_location_editing() {
+    fn fixture() -> (tempfile::TempDir, Dopus) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = DOpusConfig::default();
         config.left.path = dir.path().to_owned();
         config.right.path = dir.path().to_owned();
         let (core, _events) = DopusCore::new(config, None);
-        let mut app = Dopus {
+        let app = Dopus {
             core,
             rows: [Vec::new(), Vec::new()],
             split_ratio: 0.5,
@@ -1029,12 +1045,18 @@ mod tests {
             dialog: None,
             modal_queue: dialogs::ModalQueue::default(),
             bus: None,
-            action_table: Vec::new(),
+            action_table: verbs::action_table(&keys::load(None).unwrap()),
             dirs: None,
             service: "dopus-test".into(),
             tint: String::new(),
             quitting: false,
         };
+        (dir, app)
+    }
+
+    #[test]
+    fn pane_controls_and_split_changes_dismiss_location_editing() {
+        let (_dir, mut app) = fixture();
         for msg in [
             Msg::Pane(PaneId::Right, PaneOp::Sort(SortColumn::Size)),
             Msg::Pane(PaneId::Left, PaneOp::Refresh),
@@ -1051,5 +1073,55 @@ mod tests {
         }
         assert_eq!(app.core.pane(PaneId::Right).sort, SortColumn::Size);
         assert_eq!(app.core.config_snapshot().split_ratio, 0.7);
+    }
+
+    #[test]
+    fn bus_location_focus_reaches_the_window_editor_and_reports_availability() {
+        let (_dir, mut app) = fixture();
+        let command = bus::Command {
+            id: 42,
+            verb: "dopus.action".into(),
+            body: r#"{"id":"location.focus","pane":1}"#.into(),
+            caller_key: "mesh:caller@example".into(),
+        };
+        let info = cosmix_buildinfo::build_info!();
+        let meta = app.server_meta();
+        let served = verbs::serve_command(&command, &mut app.core, &meta, &info);
+        let [Served::LocationFocus { id, pane }] = served.as_slice() else {
+            panic!("windowed location.focus must reach its window performer");
+        };
+        assert_eq!(*id, 42);
+        assert_eq!(*pane, PaneId::Right);
+        let _ = app.serve_location_focus(*id, *pane);
+        assert_eq!(app.editing, Some((PaneId::Right, pane_path_text(&app.core, PaneId::Right))));
+        assert!(app.router.lock().unwrap().focus_editable);
+        assert_eq!(app.core.active(), PaneId::Right);
+
+        for (headless, available) in [(false, true), (false, false), (true, true)] {
+            let mut meta = app.server_meta();
+            meta.headless = headless;
+            meta.location_focus_available = available;
+            let listed = bus::Command { verb: "dopus.actions.list".into(), body: "{}".into(), ..command.clone() };
+            let served = verbs::serve_command(&listed, &mut app.core, &meta, &info);
+            let [Served::Reply { rc: 0, body, .. }] = served.as_slice() else {
+                panic!("actions.list must reply");
+            };
+            let reply: verbs::ActionsReply = serde_json::from_str(body).unwrap();
+            let row = reply.actions.iter().find(|row| row.id == "location.focus").unwrap();
+            assert_eq!(row.enabled, !headless && available);
+            if !row.enabled {
+                let served = verbs::serve_command(&command, &mut app.core, &meta, &info);
+                let [Served::Reply { rc: 10, body, .. }] = served.as_slice() else {
+                    panic!("unavailable location.focus must refuse");
+                };
+                let refusal: verbs::Refusal = serde_json::from_str(body).unwrap();
+                assert_eq!(refusal.error_code, verbs::code::UNAVAILABLE);
+            }
+        }
+        app.dialog = Some(dialogs::Dialog::Confirm { token: 1, message: "Confirm".into() });
+        assert!(!app.server_meta().location_focus_available);
+        app.dialog = None;
+        app.quitting = true;
+        assert!(!app.server_meta().location_focus_available);
     }
 }

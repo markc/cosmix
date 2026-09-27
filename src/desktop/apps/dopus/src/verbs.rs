@@ -6,7 +6,7 @@
 //! [`Refusal`] body.
 //!
 //! **Security posture (P3):** `dopus.action` serves the navigation, view,
-//! pane and theme actions (`nav.*`, `view.*`, `theme.*`, plus the selection
+//! pane and theme actions (`nav.*`, `view.*`, `theme.*`, `location.focus`, plus the selection
 //! actions, which are view-ish: they move the highlight). The file
 //! operations exist — keyboard + dialogs in the windowed app since P3
 //! (`file.open`, `file.new-folder`, `file.rename`, `file.copy-other-pane`,
@@ -135,7 +135,7 @@ pub struct ActionReq {
 }
 
 /// An omitted action target preserves active-pane behaviour.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PaneTarget {
     Left,
@@ -150,6 +150,28 @@ impl PaneTarget {
             Self::Left => PaneId::Left,
             Self::Right => PaneId::Right,
             Self::Active => core.active(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PaneTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Target {
+            Name(String),
+            Index(u8),
+        }
+        match Target::deserialize(deserializer)? {
+            Target::Name(name) => match name.as_str() {
+                "left" => Ok(Self::Left),
+                "right" => Ok(Self::Right),
+                "active" => Ok(Self::Active),
+                _ => Err(serde::de::Error::custom("pane must be left, right, active, 0 or 1")),
+            },
+            Target::Index(0) => Ok(Self::Left),
+            Target::Index(1) => Ok(Self::Right),
+            Target::Index(_) => Err(serde::de::Error::custom("pane index must be 0 or 1")),
         }
     }
 }
@@ -225,8 +247,8 @@ pub struct QuitReply {
 //
 // One place turns a Bus command into replies + effects, shared by the
 // windowed app ([`crate::app`]) and [`crate::headless`] so the two surfaces
-// cannot drift. Only [`crate::app`] applies `Served::ThemeSet` (it owns the
-// theme); everything else is answered here.
+// cannot drift. The window applies theme and location-focus effects;
+// headless refuses them because there is no window to act on.
 
 use cosmix_actions::filemgr;
 use cosmix_actions::ActionId;
@@ -236,6 +258,9 @@ use cosmix_dopus_core::{DopusCore, PaneId};
 pub struct ServerMeta {
     pub service: String,
     pub headless: bool,
+    /// The window can focus a location editor (no modal or shutdown).
+    /// Headless always refuses focus, regardless of this flag.
+    pub location_focus_available: bool,
     pub config_path: Option<String>,
     /// The RESOLVED scheme/mode names, reported by `dopus.state`. A headless
     /// caller paints nothing and resolves no theme: it passes empty strings
@@ -258,6 +283,8 @@ pub enum Served {
     /// windowed twin of [`Served::ThemeSet`] (mode-toggle resolves against
     /// the live selection; headless refuses UNAVAILABLE).
     ThemeAction { id: u64, action: ThemeAction },
+    /// Focus the requested location bar, then acknowledge the action.
+    LocationFocus { id: u64, pane: PaneId },
     /// Reply to `id`, then quit.
     Quit { id: u64 },
 }
@@ -354,6 +381,8 @@ fn theme_action(action: ActionId) -> Option<ThemeAction> {
 /// this: a `dopus.action` call is a keystroke a remote caller pressed.
 pub enum Applied {
     Done,
+    /// The window focuses this pane's location editor; headless refuses.
+    LocationFocus(PaneId),
     /// A `theme.*` action: the windowed app performs the selection
     /// ([`Served::ThemeAction`]); headless refuses it.
     Theme(ThemeAction),
@@ -406,6 +435,9 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
 /// target. Global actions (switch-pane, theme, quit) retain their meaning.
 pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> Result<Applied, Refusal> {
     let done = Ok(Applied::Done);
+    if action == cosmix_actions::location::FOCUS {
+        return Ok(Applied::LocationFocus(pane));
+    }
     let availability = core.availability();
     let busy = || gated("A file operation is still running");
     if action == filemgr::FILE_OPEN {
@@ -535,29 +567,24 @@ pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> 
         // takes), headless refuses it — no painter, no theme.
         return Ok(Applied::Theme(theme));
     }
-    // The fallthrough serves two different callers' mistakes: a KNOWN
-    // action nothing serves on this path (FORBIDDEN — since P3 every id in
-    // the vocabulary IS served by the keyboard and pre-refused on the Bus,
-    // so this arm is defensive) and an id nothing defines
-    // (INVALID_ARGUMENT — the caller misspelled it; "forbidden" would
-    // claim a vocabulary entry that does not exist).
+    // Every advertised ACTIONS entry is handled above (file.* is refused
+    // separately at Bus ingress). A shared FileMgr id not advertised by
+    // dopus is UNAVAILABLE here; an id nothing defines is INVALID_ARGUMENT.
     let known = filemgr::MENU_ACTION_IDS.contains(&action)
         || filemgr::DEFAULT_KEYMAP_ACTION_IDS.contains(&action)
         || ACTIONS.iter().any(|(known, _)| *known == action);
     Err(Refusal {
         error_code: if known {
-            code::FORBIDDEN.to_owned()
+            code::UNAVAILABLE.to_owned()
         } else {
             code::INVALID_ARGUMENT.to_owned()
         },
         message: if known {
-            format!("{action} is a local UI action")
+            format!("{action} is not implemented by dopus")
         } else {
             format!("{action} is not a dopus action")
         },
-        // Only a real, keyboard-served action is "keyboard_only"; an unknown
-        // id has no posture to name.
-        reason: known.then(|| "keyboard_only".to_owned()),
+        reason: known.then(|| "not_implemented".to_owned()),
     })
 }
 
@@ -565,9 +592,9 @@ pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> 
 /// (P3): a `file.*` row the current state cannot take reads as disabled —
 /// no selection, or an operation holding the single-flight slot — and the
 /// keyboard path agrees ([`apply_action`] refuses with the same verdict).
-/// Everything non-file stays enabled. Applied per `dopus.actions.list`
-/// call from [`serve_command`]; the windowed action table is built once at
-/// boot and renders nothing yet.
+/// Non-file rows are enabled here; [`serve_command`] additionally gates
+/// location.focus on window availability. The table is built once at boot
+/// and its flags are refreshed for every `dopus.actions.list` reply.
 pub fn apply_availability(actions: &mut [ActionRow], availability: &cosmix_dopus_core::AvailabilitySnapshot) {
     for row in actions {
         let selection = availability.has_selection;
@@ -730,6 +757,14 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                         format!("{action} is keyboard-only — the Bus never mutates the filesystem through a file manager"),
                     )],
                     Ok(action) => match apply_action_in(action, core, pane) {
+                        Ok(Applied::LocationFocus(_)) if meta.headless || !meta.location_focus_available => {
+                            vec![Served::refusal(command.id, Refusal {
+                                error_code: code::UNAVAILABLE.to_owned(),
+                                message: "location focus needs an available window editor".to_owned(),
+                                reason: Some(if meta.headless { "headless" } else { "window_busy" }.to_owned()),
+                            })]
+                        }
+                        Ok(Applied::LocationFocus(pane)) => vec![Served::LocationFocus { id: command.id, pane }],
                         Ok(Applied::Done) => vec![Served::reply_json(
                             command.id,
                             &ActionReply { id: req.id, ok: true, result: None },
@@ -763,6 +798,11 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
             // right now.
             let mut actions = meta.actions.clone();
             apply_availability(&mut actions, &core.availability());
+            for row in &mut actions {
+                if row.id == cosmix_actions::location::FOCUS.as_str() {
+                    row.enabled = !meta.headless && meta.location_focus_available;
+                }
+            }
             vec![Served::reply_json(command.id, &ActionsReply { actions })]
         }
         "dopus.theme.set" => match serde_json::from_str::<ThemeSetReq>(&command.body) {

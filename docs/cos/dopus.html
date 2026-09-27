@@ -524,7 +524,9 @@ or null, <code>sort</code> is <code>name</code>, <code>size</code> or <code>modi
 for display. <code>info.panes</code> remains a count for existing callers.
 Theme names are empty strings headless.</p>
 <p><strong>Pane targeting.</strong> <code>dopus.action</code> accepts <code>pane:"left"|"right"|"active"</code>,
-defaulting to active. Navigation (<code>nav.back/forward/parent/home</code>), refresh,
+defaulting to active. These names are the canonical request form; numeric
+<code>0</code> (left) and <code>1</code> (right) are also accepted by <code>action</code> and <code>open</code>, so a
+caller can echo <code>PaneState.pane</code> directly. Navigation (<code>nav.back/forward/parent/home</code>), refresh,
 hidden toggle, sort and selection actions affect only that pane, without
 changing the active pane. Global actions (<code>nav.switch-pane</code>, theme and quit)
 remain global. Unknown pane values are invalid.</p>
@@ -544,7 +546,10 @@ print($reply)
 <p>The action reply acknowledges the state change or listing request; listing
 workers finish later. There is no wait or tree-expansion verb in v1.
 Theme actions work windowed and return <code>UNAVAILABLE</code> headless.
-<code>location.focus</code> is a local UI action and returns <code>FORBIDDEN</code> over the Bus.
+<code>location.focus</code> focuses and selects the requested pane's location text in
+the window, activating that pane. It returns <code>UNAVAILABLE</code> headless or
+while the window has a modal open or is shutting down.
+<code>dopus.actions.list</code> enables it only when the window can perform it.
 <code>app.quit</code> is an action id; the direct quit verb is <code>dopus.quit</code>.</p>
 <h2 id="keymap-and-location-editing">Keymap and location editing</h2>
 <table><thead><tr><th>Binding</th><th>Action</th></tr></thead><tbody>

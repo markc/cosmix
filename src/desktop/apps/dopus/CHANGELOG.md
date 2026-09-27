@@ -7,6 +7,9 @@
   shape as `dopus.state.panes`, retaining the existing `info.panes` count.
 - Use TextField submission for location editing and add the canonical
   location.focus action with Ctrl+L, also added to `dopus.actions.list`.
+- Serve `location.focus` over the Bus in windowed mode; report UNAVAILABLE
+  and disable its action-list row headless or while the window is busy.
+- Accept numeric pane aliases 0/1 alongside canonical left/right/active names.
 - Dismiss location editing on outside presses, pane controls and split
   changes; resolve custom editable bindings before suppressing unhandled
   modified Enter.

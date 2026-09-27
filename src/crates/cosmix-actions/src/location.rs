@@ -2,5 +2,5 @@
 
 use crate::ActionId;
 
-/// Focus and select the active pane's location text (local UI only).
+/// Focus and select a pane's location text (requires an available window).
 pub const FOCUS: ActionId = ActionId::from_static("location.focus");

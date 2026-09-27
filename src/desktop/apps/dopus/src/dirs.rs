@@ -71,7 +71,7 @@ impl AppDirs {
     pub fn theme_override(&self) -> PathBuf {
         self.config().join("theme.conf.mix")
     }
-    /// Per-app keymap overlay over `cosmix-actions`' packaged filemgr defaults.
+    /// Per-app keymap overlay over `cosmix-actions`' packaged dopus defaults.
     pub fn keymap_file(&self) -> PathBuf {
         self.config().join("keymap.conf.mix")
     }

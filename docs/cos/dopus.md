@@ -98,7 +98,9 @@ for display. `info.panes` remains a count for existing callers.
 Theme names are empty strings headless.
 
 **Pane targeting.** `dopus.action` accepts `pane:"left"|"right"|"active"`,
-defaulting to active. Navigation (`nav.back/forward/parent/home`), refresh,
+defaulting to active. These names are the canonical request form; numeric
+`0` (left) and `1` (right) are also accepted by `action` and `open`, so a
+caller can echo `PaneState.pane` directly. Navigation (`nav.back/forward/parent/home`), refresh,
 hidden toggle, sort and selection actions affect only that pane, without
 changing the active pane. Global actions (`nav.switch-pane`, theme and quit)
 remain global. Unknown pane values are invalid.
@@ -122,7 +124,10 @@ print($reply)
 The action reply acknowledges the state change or listing request; listing
 workers finish later. There is no wait or tree-expansion verb in v1.
 Theme actions work windowed and return `UNAVAILABLE` headless.
-`location.focus` is a local UI action and returns `FORBIDDEN` over the Bus.
+`location.focus` focuses and selects the requested pane's location text in
+the window, activating that pane. It returns `UNAVAILABLE` headless or
+while the window has a modal open or is shutting down.
+`dopus.actions.list` enables it only when the window can perform it.
 `app.quit` is an action id; the direct quit verb is `dopus.quit`.
 
 ## Keymap and location editing

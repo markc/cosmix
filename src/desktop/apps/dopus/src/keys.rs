@@ -42,7 +42,7 @@ use cosmix_actions::{
 };
 use cosmix_actions::{DOPUS_DEFAULT_KEYMAP_MIX, load_keymap, parse_keymap};
 
-/// The effective keymap: packaged filemgr defaults + the user's overlay
+/// The effective keymap: packaged dopus defaults + the user's overlay
 /// (filemgr/src/action.rs `load_effective_keymap`, kept in step).
 pub fn load(custom_path: Option<&Path>) -> Result<Keymap, String> {
     let mut keymap = parse_keymap(DOPUS_DEFAULT_KEYMAP_MIX)

@@ -80,6 +80,7 @@ pub fn run(
     let meta = ServerMeta {
         service: service.to_owned(),
         headless: true,
+        location_focus_available: false,
         config_path: dirs.as_ref().map(|d| d.config_dir().join("config.conf.mix").display().to_string()),
         // A headless process paints nothing and resolves no theme, so
         // `dopus.state` reports empty theme_scheme/theme_mode on purpose;
@@ -149,6 +150,7 @@ pub fn run(
                     // refuses Applied::Theme UNAVAILABLE before this point
                     // (same posture as the theme.set pre-refusal above).
                     Served::ThemeAction { .. } => unreachable!("theme actions are refused for headless"),
+                    Served::LocationFocus { .. } => unreachable!("location focus is refused for headless"),
                     Served::Quit { id } => {
                         bus.respond(
                             id,
