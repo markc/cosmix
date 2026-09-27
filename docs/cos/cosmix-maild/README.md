@@ -290,10 +290,17 @@ limit exceeds it. Larger admitted messages project `hasAttachment: null`
 and omit `attachments`; attachment inspection/export returns `too_large:`.
 Diagnostic blob inputs still use the configured `max_message_size`.
 
+The vendored mail-parser 0.11.5 caps message ownership nesting at 64 across
+plain and encoded messages. At the cap it keeps an ordinary undecoded body
+instead of constructing another nested message. This is the hard parser bound;
+the preflight below is defence in depth, not the safety invariant.
+
 Before parsing, a linear header-aware scan permits at most 2,000 potential
 header blocks and 1,000 potential embedded messages (conservatively all `message/*`
 types). It removes whitespace in header names, conservatively accepts folded
-names, and recognises folded values and comments. These are count bounds, not
+names, and recognises folded values and comments. Every `--` occurrence is a
+potential block start, including mid-line and boundary-abutting headers.
+These are count bounds, not
 depth bounds: sibling attached messages and digest children do not add nesting
 depth, and digest body blank lines do not count as messages. Each nesting level
 needs a header block, bounding parser recursion before the walker checks true

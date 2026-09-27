@@ -226,7 +226,8 @@ pub fn inspect(
     // Callers join from spawn_blocking. Parse, walk AND recursive tree drop
     // stay on this stack, including all error paths; only owned projections leave.
     // A parser panic in any profile maps to unreadable:.
-    // Stack overflow is uncatchable: preflight is the only defence and must cover the parser's acceptance exactly.
+    // Stack overflow is uncatchable: the vendored parser caps ownership depth
+    // by construction; preflight is additional early refusal, not that invariant.
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("maild-mime".into())
@@ -242,9 +243,13 @@ pub fn inspect(
 // even INSIDE names; :73-75 delegates Content-Type values. Its value lexer in
 // parsers/fields/content_type.rs:282-389,430-499 accepts folds and nested
 // comments (our escape handling is conservative).
-// parsers/message.rs:140-166,214-236 constructs unencoded messages
-// without a depth guard (:59-60 also accepts message/global).
-// Scan potential blocks at start, after blanks and after boundary lines. Scan
+// Upstream parsers/message.rs:140-166,214-236 constructs unencoded messages
+// without a depth guard (:59-60 also accepts message/global); our vendor adds
+// the hard cap. This scan is defence in depth: cheap early refusal and useful
+// walker limits, not the ownership-depth invariant.
+// Scan potential blocks at start, after blanks and after every `--`, including
+// mid-line boundaries and headers immediately following the boundary name
+// (upstream parsers/mime.rs:12-30,153-166; message.rs:163-190). Scan
 // header-shaped lines elsewhere too: quoted body text may over-count. Unfold
 // values without allocating; the media lexer below deliberately accepts a
 // superset of the dependency's tokens, never fewer accepted message types.
@@ -269,30 +274,66 @@ struct Preflight {
     decoded_bytes: usize,
 }
 
+// Borrowed physical lines split additionally before every potential boundary.
+// No MIME boundary-name grammar is needed for this conservative early scan.
+struct PreflightLines<'a>(&'a [u8]);
+
+impl<'a> Iterator for PreflightLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let skip = if self.0.starts_with(b"--") { 2 } else { 0 };
+        let mut end = self.0.len();
+        for index in skip..self.0.len() {
+            if self.0[index..].starts_with(b"--") {
+                end = index;
+                break;
+            }
+            if self.0[index] == b'\n' {
+                end = index + 1;
+                break;
+            }
+        }
+        let (line, rest) = self.0.split_at(end);
+        self.0 = rest;
+        Some(line)
+    }
+}
+
 impl Preflight {
     fn scan(&mut self, data: &[u8], encoded_depth: usize) -> Result<(), Error> {
-        let mut lines = data.split_inclusive(|b| *b == b'\n').peekable();
+        // Count EVERY occurrence, including overlapping pairs in '---'.
+        // The iterator below processes non-overlapping candidate suffixes.
+        self.blocks += data.windows(2).filter(|w| *w == b"--").count();
+        if self.blocks > 2 * MAX_PARTS {
+            return Err(Error::TooLarge("MIME pre-parse structure limit"));
+        }
+        let mut lines = PreflightLines(data).peekable();
         let mut starts_block = true;
         let (mut has_type, mut message, mut base64, mut qp) = (false, false, false, false);
         // Conservatively retain digest context after its closing boundary. Only
         // encoded, untyped blocks use it; blank lines never increment messages.
         let mut digest_seen = false;
-        while let Some(line) = lines.next() {
-            if line.trim_ascii().is_empty() || line.starts_with(b"--") {
-                if line.trim_ascii().is_empty()
-                    && encoded_depth < 3
-                    && (message || (digest_seen && !has_type))
-                    && (base64 || qp)
-                {
+        while let Some(mut line) = lines.next() {
+            let after_boundary = line.starts_with(b"--");
+            if after_boundary {
+                (has_type, message, base64, qp) = (false, false, false, false);
+                starts_block = false; // counted above, including empty boundaries
+                line = &line[2..];
+            }
+            if !after_boundary && line.trim_ascii().is_empty() {
+                if encoded_depth < 3 && (message || (digest_seen && !has_type)) && (base64 || qp) {
                     // Every line borrows data. Take the body through the next
                     // potential boundary (or EOF), without copying the raw input.
                     let start = line.as_ptr() as usize - data.as_ptr() as usize + line.len();
                     let tail = &data[start..];
-                    let length: usize = tail
-                        .split_inclusive(|b| *b == b'\n')
-                        .take_while(|line| !line.starts_with(b"--"))
-                        .map(<[u8]>::len)
-                        .sum();
+                    let length = tail
+                        .windows(2)
+                        .position(|w| w == b"--")
+                        .unwrap_or(tail.len());
                     // Retain raw structural counts too. Our conservative
                     // header matching can recognise encodings the parser
                     // would instead treat as plain input. Disable decoding
@@ -321,7 +362,8 @@ impl Preflight {
                     return Err(Error::TooLarge("MIME pre-parse structure limit"));
                 }
             }
-            if let Some((is_type, value)) = preflight_header_value(line, &mut lines) {
+            if let Some((is_type, value)) = preflight_header_value(line, &mut lines, after_boundary)
+            {
                 let mut media = PreflightMedia::default();
                 let mut encoding = Vec::new();
                 if is_type {
@@ -409,9 +451,10 @@ impl Preflight {
 fn preflight_header_value<'a>(
     mut line: &'a [u8],
     lines: &mut std::iter::Peekable<impl Iterator<Item = &'a [u8]>>,
+    after_boundary: bool,
 ) -> Option<(bool, &'a [u8])> {
     let mut length = 0;
-    let (mut type_matches, mut encoding_matches) = (true, true);
+    let mut name = [0u8; 25];
     // header.rs:115-128 removes all ASCII whitespace within names. Its LF
     // branch (:112-113) actually rejects folded names; accept those here too
     // as a conservative superset, without allocating an unfolded header.
@@ -419,23 +462,37 @@ fn preflight_header_value<'a>(
         for (index, byte) in line.iter().copied().enumerate() {
             match byte {
                 b':' if length > 0 => {
-                    return if type_matches && length == 12 {
-                        Some((true, &line[index + 1..]))
-                    } else if encoding_matches && length == 25 {
-                        Some((false, &line[index + 1..]))
-                    } else {
-                        None
-                    };
+                    let suffix = &name[..length.min(name.len())];
+                    // The unknown boundary name may abut the header name.
+                    // Match a normalised suffix, also tolerating ':' in that
+                    // boundary prefix. Over-counting here is intentional.
+                    if (after_boundary || length == 12) && suffix.ends_with(b"content-type") {
+                        return Some((true, &line[index + 1..]));
+                    }
+                    if (after_boundary || length == 25)
+                        && suffix.ends_with(b"content-transfer-encoding")
+                    {
+                        return Some((false, &line[index + 1..]));
+                    }
+                    if !after_boundary {
+                        return None;
+                    }
+                    length = 0;
                 }
                 b':' => (), // parse_header_name ignores colons before the first token
                 b if b.is_ascii_whitespace() => (),
                 b => {
-                    type_matches &= b"content-type"
-                        .get(length)
-                        .is_some_and(|v| b.eq_ignore_ascii_case(v));
-                    encoding_matches &= b"content-transfer-encoding"
-                        .get(length)
-                        .is_some_and(|v| b.eq_ignore_ascii_case(v));
+                    if length < name.len() {
+                        name[length] = b.to_ascii_lowercase();
+                    } else {
+                        if !after_boundary {
+                            // Neither recognised header name can be this long;
+                            // avoid shifting through a whole base64 body line.
+                            return None;
+                        }
+                        name.rotate_left(1);
+                        name[24] = b.to_ascii_lowercase();
+                    }
                     length += 1;
                 }
             }
@@ -911,6 +968,75 @@ mod tests {
         // in 2000 multipart levels; the final root takes us over 2000 blocks.
         let mut raw = "Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n".repeat(2000);
         raw.push_str("Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: message/rfc822\r\n\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8=\r\n--x--\r\n");
+        assert_eq!(
+            inspect(raw.as_bytes(), None, false).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit")
+        );
+    }
+
+    #[test]
+    fn preflight_reads_headers_abutting_start_and_mid_line_boundaries() {
+        use base64::Engine;
+        let inner = format!(
+            "{}Content-Type: text/plain\n\nx",
+            "Content-Type: message/rfc822\n\n".repeat(5000)
+        );
+        for prefix in ["--b", "x--b"] {
+            for encoded in [false, true] {
+                let (encoding, body) = if encoded {
+                    (
+                        "Content-Transfer-Encoding: base64\n",
+                        base64::engine::general_purpose::STANDARD.encode(&inner),
+                    )
+                } else {
+                    ("", inner.clone())
+                };
+                let raw = format!(
+                    "Content-Type: multipart/mixed; boundary=b\n\n{prefix}Content-Type: message/rfc822\n{encoding}\n{body}"
+                );
+                assert_eq!(
+                    inspect(raw.as_bytes(), None, false).unwrap_err(),
+                    Error::TooLarge("MIME pre-parse structure limit")
+                );
+            }
+            // Small bodies prove header/CTE recognition and actual decoding;
+            // the large fixtures alone could also trip a raw block counter.
+            let raw = format!(
+                "Content-Type: multipart/mixed; boundary=b\n\n{prefix}Content-Type: message/rfc822\nContent-Transfer-Encoding: base64\n\nU3ViamVjdDogb2sKCng="
+            );
+            let mut scan = Preflight::default();
+            scan.scan(raw.as_bytes(), 0).unwrap();
+            assert_eq!(scan.messages, 1);
+            assert_eq!(scan.decoded_bytes, b"Subject: ok\n\nx".len());
+        }
+        // CTE can also begin immediately after a boundary, before Content-Type.
+        let raw = b"Content-Type: multipart/mixed; boundary=b\n\nx--bContent-Transfer-Encoding: base64\nContent-Type: message/rfc822\n\nU3ViamVjdDogb2sKCng=";
+        let mut scan = Preflight::default();
+        scan.scan(raw, 0).unwrap();
+        assert_eq!(scan.decoded_bytes, b"Subject: ok\n\nx".len());
+        let raw = "x--bX-Test: header".repeat(2 * MAX_PARTS + 1);
+        assert_eq!(
+            structure_preflight(raw.as_bytes()).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit")
+        );
+        let overlaps = "-".repeat(2 * MAX_PARTS + 2);
+        assert_eq!(
+            structure_preflight(overlaps.as_bytes()).unwrap_err(),
+            Error::TooLarge("MIME pre-parse structure limit")
+        );
+    }
+
+    #[test]
+    fn preflight_refuses_boundary_abutting_48_mib_encoded_nesting() {
+        use base64::Engine;
+        let header = "Content-Type: message/rfc822\n\n";
+        let mut inner = header.repeat(36 * 1024 * 1024 / header.len());
+        inner.push_str(&" ".repeat(36 * 1024 * 1024 - inner.len()));
+        let body = base64::engine::general_purpose::STANDARD.encode(&inner);
+        assert_eq!(body.len(), 48 * 1024 * 1024);
+        let raw = format!(
+            "Content-Type: multipart/mixed; boundary=b\n\n--bContent-Type: message/rfc822\nContent-Transfer-Encoding: base64\n\n{body}"
+        );
         assert_eq!(
             inspect(raw.as_bytes(), None, false).unwrap_err(),
             Error::TooLarge("MIME pre-parse structure limit")

@@ -341,7 +341,8 @@ The raw-message inspection cap is always 64 MiB, even when admission's
 `max_message_size` is larger (startup warns once). Over-cap messages have
 unknown attachment metadata and inspection/export returns `too_large:`;
 diagnostic inputs use the configured bound. The linear pre-parse header scanner
-includes quoted body text: at most 2,000 potential header blocks and 1,000
+includes quoted body text and every potential `--` boundary, including mid-line
+and boundary-abutting headers: at most 2,000 potential header blocks and 1,000
 potential embedded messages (conservatively all `message/*` types). It accepts
 case variations, whitespace anywhere in names (including conservative folded
 names), folded values and comments. These bound counts, not sibling count as
@@ -353,6 +354,10 @@ children, through three encoded layers using the same count limits. Its shared
 128 MiB decoded-byte budget returns `too_large: MIME pre-parse decoded-byte limit`
 when exceeded, before the parser can construct hidden plain nesting.
 False-positive refusals are possible.
+The vendored mail-parser 0.11.5 independently caps ownership nesting at 64,
+sharing the bound across plain and encoded ancestors. At that cap it retains
+an ordinary undecoded body. This parser cap is the hard invariant; preflight
+is defence in depth and the walker still enforces depth 32.
 The whole walk has a 128 MiB decoded-byte budget and allows two nested
 encoded re-parses beyond the parser's own limit. Bad individual parts instead
 carry `undecodable: true`, no download ID or exported blob, and export returns
