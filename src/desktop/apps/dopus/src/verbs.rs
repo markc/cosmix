@@ -93,6 +93,8 @@ pub struct InfoReply {
     pub build_time: String,
     pub headless: bool,
     pub panes: usize,
+    /// Same ordered rows as `dopus.state.panes`; retain the pane count above.
+    pub pane_states: Vec<PaneState>,
     pub config_path: Option<String>,
 }
 
@@ -127,7 +129,29 @@ pub struct StateReply {
 pub struct ActionReq {
     pub id: String,
     #[serde(default)]
+    pub pane: PaneTarget,
+    #[serde(default)]
     pub args: Option<serde_json::Value>,
+}
+
+/// An omitted action target preserves active-pane behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneTarget {
+    Left,
+    Right,
+    #[default]
+    Active,
+}
+
+impl PaneTarget {
+    fn resolve(self, core: &DopusCore) -> PaneId {
+        match self {
+            Self::Left => PaneId::Left,
+            Self::Right => PaneId::Right,
+            Self::Active => core.active(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +201,10 @@ pub struct ThemeSetReply {
 pub struct OpenReq {
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Omission preserves positional left/right forwarding. An explicit
+    /// target takes exactly one path and does not change the active pane.
+    #[serde(default)]
+    pub pane: Option<PaneTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,8 +385,7 @@ fn name_edit_pending(core: &DopusCore) -> bool {
     })
 }
 
-/// Apply one action to the core. Everything pane-targeted acts on the ACTIVE
-/// pane (the keyboard and the Bus are one keystroke each); the pane headers
+/// Apply one keyboard action to the core's active pane; the pane headers
 /// activate their pane first (the app calls `set_active_pane` before these).
 /// Law 5 is the core's (`set_sort` toggles a same-column sort itself); every
 /// column switch passes `ascending: true`.
@@ -370,8 +397,14 @@ fn name_edit_pending(core: &DopusCore) -> bool {
 /// (single-flight: "Another file operation is still running"; selection:
 /// nothing to act on).
 pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, Refusal> {
-    let done = Ok(Applied::Done);
     let pane = core.active();
+    apply_action_in(action, core, pane)
+}
+
+/// Apply pane-local navigation, view and selection actions directly to the
+/// target. Global actions (switch-pane, theme, quit) retain their meaning.
+pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> Result<Applied, Refusal> {
+    let done = Ok(Applied::Done);
     let availability = core.availability();
     let busy = || gated("A file operation is still running");
     if action == filemgr::FILE_OPEN {
@@ -437,19 +470,19 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
         return done;
     }
     if action == filemgr::NAV_BACK {
-        core.go_back();
+        core.go_back_in(pane);
         return done;
     }
     if action == filemgr::NAV_FORWARD {
-        core.go_forward();
+        core.go_forward_in(pane);
         return done;
     }
     if action == filemgr::NAV_PARENT {
-        core.go_parent();
+        core.go_parent_in(pane);
         return done;
     }
     if action == filemgr::NAV_HOME {
-        core.go_home();
+        core.go_home_in(pane);
         return done;
     }
     if action == filemgr::NAV_SWITCH_PANE {
@@ -457,23 +490,23 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
         return done;
     }
     if action == filemgr::VIEW_REFRESH {
-        core.refresh();
+        core.refresh_in(pane);
         return done;
     }
     if action == filemgr::VIEW_TOGGLE_HIDDEN {
-        core.toggle_hidden();
+        core.toggle_hidden_in(pane);
         return done;
     }
     if action == filemgr::VIEW_SORT_NAME {
-        core.set_sort(cosmix_dopus_core::SortColumn::Name, true);
+        core.set_sort_in(pane, cosmix_dopus_core::SortColumn::Name, true);
         return done;
     }
     if action == filemgr::VIEW_SORT_SIZE {
-        core.set_sort(cosmix_dopus_core::SortColumn::Size, true);
+        core.set_sort_in(pane, cosmix_dopus_core::SortColumn::Size, true);
         return done;
     }
     if action == filemgr::VIEW_SORT_MODIFIED {
-        core.set_sort(cosmix_dopus_core::SortColumn::Modified, true);
+        core.set_sort_in(pane, cosmix_dopus_core::SortColumn::Modified, true);
         return done;
     }
     if action == filemgr::SELECT_NEXT {
@@ -594,17 +627,21 @@ pub fn apply_open_paths(core: &mut DopusCore, paths: &[String]) {
                 continue;
             }
         };
-        let expanded = crate::dirs::expand_tilde(raw);
-        let absolute = if expanded.is_relative() {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(expanded),
-                Err(_) => expanded,
-            }
-        } else {
-            expanded
-        };
-        core.navigate(pane, navigable(absolute));
+        core.navigate(pane, open_path(raw));
     }
+}
+
+fn open_path(raw: &str) -> PathBuf {
+    let expanded = crate::dirs::expand_tilde(raw);
+    let absolute = if expanded.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(expanded),
+            Err(_) => expanded,
+        }
+    } else {
+        expanded
+    };
+    navigable(absolute)
 }
 
 /// One pane's `dopus.state` row.
@@ -664,6 +701,7 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                 build_time: info.build_time.to_owned(),
                 headless: meta.headless,
                 panes: 2,
+                pane_states: vec![pane_state(core, PaneId::Left), pane_state(core, PaneId::Right)],
                 config_path: meta.config_path.clone(),
             },
         )],
@@ -676,42 +714,45 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
             vec![Served::reply_json(command.id, &state)]
         }
         "dopus.action" => match serde_json::from_str::<ActionReq>(&command.body) {
-            Ok(req) => match ActionId::intern(&req.id) {
-                // The Bus never opens (or otherwise touches) files: `file.*`
-                // is keyboard-only, even though `apply_action` serves the
-                // keyboard arms (a directory in place, a file via `xdg-open`,
-                // the confirm/prompt dialogs). Matching filemgr's rule — a
-                // remote caller never mutates the filesystem through a file
-                // manager.
-                Ok(action) if action.as_str().starts_with("file.") => vec![Served::error(
-                    command.id,
-                    code::FORBIDDEN,
-                    format!("{action} is keyboard-only — the Bus never mutates the filesystem through a file manager"),
-                )],
-                Ok(action) => match apply_action(action, core) {
-                    Ok(Applied::Done) => vec![Served::reply_json(
+            Ok(req) => {
+                let pane = req.pane.resolve(core);
+                match ActionId::intern(&req.id) {
+                    // The Bus never opens (or otherwise touches) files: `file.*`
+                    // is keyboard-only, even though `apply_action` serves the
+                    // keyboard arms (a directory in place, a file via `xdg-open`,
+                    // the confirm/prompt dialogs). Matching filemgr's rule — a
+                    // remote caller never mutates the filesystem through a file
+                    // manager.
+                    Ok(action) if action.as_str().starts_with("file.") => vec![Served::error(
                         command.id,
-                        &ActionReply { id: req.id, ok: true, result: None },
+                        code::FORBIDDEN,
+                        format!("{action} is keyboard-only — the Bus never mutates the filesystem through a file manager"),
                     )],
-                    // The theme.* actions: UNAVAILABLE on headless (the
-                    // theme.set pre-refusal's wording — the vocabulary is
-                    // real, the painter is not), performed windowed.
-                    Ok(Applied::Theme(_)) if meta.headless => vec![Served::refusal(
-                        command.id,
-                        Refusal {
-                            error_code: code::UNAVAILABLE.to_owned(),
-                            message: "theme selection needs the windowed app (headless paints nothing)".to_owned(),
-                            reason: Some("headless".to_owned()),
-                        },
-                    )],
-                    Ok(Applied::Theme(theme)) => vec![Served::ThemeAction { id: command.id, action: theme }],
-                    Ok(Applied::Quit) => vec![
-                        Served::reply_json(command.id, &QuitReply { quitting: true }),
-                        Served::Quit { id: command.id },
-                    ],
-                    Err(refusal) => vec![Served::refusal(command.id, refusal)],
-                },
-                Err(error) => vec![Served::error(command.id, code::INVALID_ARGUMENT, format!("action id {:?}: {error}", req.id))],
+                    Ok(action) => match apply_action_in(action, core, pane) {
+                        Ok(Applied::Done) => vec![Served::reply_json(
+                            command.id,
+                            &ActionReply { id: req.id, ok: true, result: None },
+                        )],
+                        // The theme.* actions: UNAVAILABLE on headless (the
+                        // theme.set pre-refusal's wording — the vocabulary is
+                        // real, the painter is not), performed windowed.
+                        Ok(Applied::Theme(_)) if meta.headless => vec![Served::refusal(
+                            command.id,
+                            Refusal {
+                                error_code: code::UNAVAILABLE.to_owned(),
+                                message: "theme selection needs the windowed app (headless paints nothing)".to_owned(),
+                                reason: Some("headless".to_owned()),
+                            },
+                        )],
+                        Ok(Applied::Theme(theme)) => vec![Served::ThemeAction { id: command.id, action: theme }],
+                        Ok(Applied::Quit) => vec![
+                            Served::reply_json(command.id, &QuitReply { quitting: true }),
+                            Served::Quit { id: command.id },
+                        ],
+                        Err(refusal) => vec![Served::refusal(command.id, refusal)],
+                    },
+                    Err(error) => vec![Served::error(command.id, code::INVALID_ARGUMENT, format!("action id {:?}: {error}", req.id))],
+                }
             },
             Err(error) => vec![Served::error(command.id, code::INVALID_ARGUMENT, format!("body: {error}"))],
         },
@@ -729,7 +770,16 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
         },
         "dopus.open" => match serde_json::from_str::<OpenReq>(&command.body) {
             Ok(req) => {
-                apply_open_paths(core, &req.paths);
+                if let Some(target) = req.pane {
+                    if req.paths.len() != 1 {
+                        return vec![Served::error(command.id, code::INVALID_ARGUMENT,
+                            "pane-targeted open requires exactly one path".to_owned())];
+                    }
+                    let pane = target.resolve(core);
+                    core.navigate(pane, open_path(&req.paths[0]));
+                } else {
+                    apply_open_paths(core, &req.paths);
+                }
                 vec![Served::reply_json(
                     command.id,
                     &OpenReply { accepted: req.paths.len(), opened: !req.paths.is_empty() },

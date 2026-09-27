@@ -171,6 +171,30 @@ try
   pane_is(1, $beta, "extras right")
 
   -- 4. F6 (nav.switch-pane) flips the active pane
+  -- 3b. Explicit right-pane navigation while LEFT stays active. Restore
+  -- beta before continuing the legacy default-active checks below.
+  ok('dopus.action id="nav.parent" pane="right"', {})
+  pane_is(1, $tmp .. "/work", "targeted parent right")
+  $p0 = pane_is(0, $alpha, "targeted parent left untouched")
+  check($p0.active and not pane(1).active, "targeted navigation stole focus")
+  ok('dopus.action id="nav.back" pane="right"', {})
+  pane_is(1, $beta, "targeted back right")
+  ok('dopus.open paths=[$a.g] pane="right"', {g: $gamma})
+  pane_is(1, $gamma, "targeted open right")
+  check(pane_is(0, $alpha, "targeted open left untouched").active, "targeted open stole focus")
+  ok('dopus.open paths=[$a.b] pane="right"', {b: $beta})
+  ok('dopus.action id="view.sort-size" pane="right"', {})
+  check(pane(1).sort == "size" and pane(0).sort == "name", "targeted sort leaked")
+  ok('dopus.action id="view.sort-name" pane="right"', {})
+  refused('dopus.action id="nav.parent" pane="other"', {}, "INVALID_ARGUMENT")
+  refused('dopus.open paths=[] pane="right"', {}, "INVALID_ARGUMENT")
+  $info = ok('dopus.info', {})
+  check($info.panes == 2 and length($info.pane_states) == 2
+    and $info.pane_states[0].pane == 0 and $info.pane_states[0].active
+    and $info.pane_states[1].pane == 1 and not $info.pane_states[1].active,
+    "info pane state shape: " .. json_encode($info))
+
+  -- 4. F6 (nav.switch-pane) flips the active pane
   act("nav.switch-pane")
   $p1 = pane(1)
   check($p1.active and not pane(0).active, "F6 flipped active: " .. json_encode([$p0, $p1]))

@@ -389,7 +389,11 @@ impl DopusCore {
     }
 
     pub fn go_back(&mut self) {
-        let pane_id = self.active;
+        self.go_back_in(self.active);
+    }
+
+    /// Apply to a pane without changing keyboard focus.
+    pub fn go_back_in(&mut self, pane_id: PaneId) {
         let target = {
             let pane = &mut self.panes[pane_id.index()];
             match pane.history.back(&pane.path) {
@@ -402,7 +406,11 @@ impl DopusCore {
     }
 
     pub fn go_forward(&mut self) {
-        let pane_id = self.active;
+        self.go_forward_in(self.active);
+    }
+
+    /// Apply to a pane without changing keyboard focus.
+    pub fn go_forward_in(&mut self, pane_id: PaneId) {
         let target = {
             let pane = &mut self.panes[pane_id.index()];
             match pane.history.forward(&pane.path) {
@@ -417,14 +425,22 @@ impl DopusCore {
     /// Navigate to the parent of the active pane's directory, if any. The
     /// single source of truth for "go up" (browser.rs:3425-3438).
     pub fn go_parent(&mut self) {
-        let pane_id = self.active;
+        self.go_parent_in(self.active);
+    }
+
+    /// Apply to a pane without changing keyboard focus.
+    pub fn go_parent_in(&mut self, pane_id: PaneId) {
         if let Some(parent) = self.panes[pane_id.index()].path.parent().map(Path::to_path_buf) {
             self.navigate_new(pane_id, parent);
         }
     }
 
     pub fn go_home(&mut self) {
-        let pane_id = self.active;
+        self.go_home_in(self.active);
+    }
+
+    /// Apply to a pane without changing keyboard focus.
+    pub fn go_home_in(&mut self, pane_id: PaneId) {
         self.navigate_new(pane_id, home_directory());
     }
 
@@ -442,7 +458,12 @@ impl DopusCore {
     }
 
     pub fn refresh(&mut self) {
-        self.start_listing(self.active);
+        self.refresh_in(self.active);
+    }
+
+    /// Relist a pane without changing keyboard focus.
+    pub fn refresh_in(&mut self, pane: PaneId) {
+        self.start_listing(pane);
     }
 
     // -- view options -------------------------------------------------------
@@ -450,7 +471,11 @@ impl DopusCore {
     /// Flip the active pane's hidden-file visibility and re-list (browser.rs
     /// 3440-3452).
     pub fn toggle_hidden(&mut self) {
-        let pane_id = self.active;
+        self.toggle_hidden_in(self.active);
+    }
+
+    /// Toggle hidden files without changing keyboard focus.
+    pub fn toggle_hidden_in(&mut self, pane_id: PaneId) {
         self.panes[pane_id.index()].show_hidden = !self.panes[pane_id.index()].show_hidden;
         self.start_listing(pane_id);
     }
@@ -460,7 +485,11 @@ impl DopusCore {
     /// hardcoded ascending on switch; the flag keeps the core API explicit
     /// while the app passes `true` for identical behaviour).
     pub fn set_sort(&mut self, column: SortColumn, ascending: bool) {
-        let pane_id = self.active;
+        self.set_sort_in(self.active, column, ascending);
+    }
+
+    /// Sort a pane without changing keyboard focus.
+    pub fn set_sort_in(&mut self, pane_id: PaneId, column: SortColumn, ascending: bool) {
         let pane = &mut self.panes[pane_id.index()];
         if pane.sort == column {
             pane.ascending = !pane.ascending;
