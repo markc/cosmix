@@ -27,8 +27,7 @@
 //!
 //! 1. **Call `tick(now)` every frame** with a monotonic `Instant`. Count
 //!    dispatch recovery and the entire config debounce advance nowhere else.
-//!    (The frontend also re-formats relative modified times on its own clock —
-//!    filemgr's 60 s `ModifiedTimeRefresh` cycle has no core counterpart.)
+//!    Metadata timeouts also advance here; absolute timestamps need no refresh.
 //! 2. **Drain the channel and feed every event through `on_event`, exactly
 //!    once, on one thread.** The channel is unbounded; an app that stops
 //!    draining lets worker replies accumulate without bound.
@@ -58,7 +57,7 @@ pub mod ops;
 pub mod properties;
 mod worker;
 
-pub use config::{ConfigFile, DOpusConfig, PaneConfig, SortColumn, CURRENT_SCHEMA};
+pub use config::{CURRENT_SCHEMA, ConfigFile, DOpusConfig, PaneConfig, SortColumn};
 pub use events::{ConfirmAnswer, CoreEvent, PromptKind};
 pub use model::{
     AvailabilitySnapshot, DopusCore, DropAction, DropActionMask, DropModifiers, FileEntry,

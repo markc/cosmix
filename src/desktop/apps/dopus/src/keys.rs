@@ -273,6 +273,8 @@ fn named_key(named: Named) -> Option<AKey> {
         Named::F10 => AKey::Function(10),
         Named::F11 => AKey::Function(11),
         Named::F12 => AKey::Function(12),
+        Named::F13 => AKey::Function(13),
+        Named::F14 => AKey::Function(14),
         _ => return None,
     })
 }
@@ -687,12 +689,12 @@ mod tests {
                 Key::Named(Named::F5),
                 Physical::Unidentified(NativeCode::Unidentified),
             ),
-            "F9" => (
-                Key::Named(Named::F9),
+            "F13" => (
+                Key::Named(Named::F13),
                 Physical::Unidentified(NativeCode::Unidentified),
             ),
-            "F10" => (
-                Key::Named(Named::F10),
+            "F14" => (
+                Key::Named(Named::F14),
                 Physical::Unidentified(NativeCode::Unidentified),
             ),
             "ArrowDown" => (
@@ -747,8 +749,8 @@ mod tests {
             ("Ctrl+2", filemgr::VIEW_SORT_SIZE),
             ("Ctrl+3", filemgr::VIEW_SORT_MODIFIED),
             ("Ctrl+L", cosmix_actions::location::FOCUS),
-            ("F9", cosmix_actions::view::TOGGLE_PLACES),
-            ("F10", cosmix_actions::view::TOGGLE_PROPERTIES),
+            ("F13", cosmix_actions::view::TOGGLE_PLACES),
+            ("F14", cosmix_actions::view::TOGGLE_PROPERTIES),
         ] {
             let input = press(text).unwrap_or_else(|| panic!("{text}"));
             let resolved = resolve(

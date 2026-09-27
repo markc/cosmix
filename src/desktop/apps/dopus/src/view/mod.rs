@@ -170,7 +170,13 @@ pub fn root<'a>(
     let content = column![
         toolbar::navigation(look, icons, tint, active_pane),
         body,
-        status::bar(look, active_pane, info),
+        status::bar(
+            look,
+            active_pane,
+            info,
+            places_config.open,
+            properties_config.open
+        ),
     ]
     .width(Length::Fill)
     .height(Length::Fill);

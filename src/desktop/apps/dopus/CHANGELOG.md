@@ -3,7 +3,7 @@
 ## 0.3.0
 
 - Preserve a usable Name column in narrow panes by hiding Modified first,
-  shrinking/eliding Size, then hiding Size when necessary. Cap tree indentation
+  then hiding Size when necessary; never elide numeric cells. Cap tree indentation
   to the same name budget; keep header and row geometry in step.
 - Use advanced text shaping for filename measurement and drawing, including
   complex scripts and fallback fonts. Tint disabled navigation icons with the
@@ -20,16 +20,24 @@
   extension-preserving text. Share fixed right-aligned Size/Modified columns
   between headers and rows, reserve the absolute timestamp width and clip
   each column and the list viewport.
-- Use the desktop design's selection pair and a tinted active-pane header;
+- Use the desktop design's selection pair and a muted active-pane header;
   derive layout spacing from design tokens.
 - Add a plain Properties sidebar with asynchronous metadata, count-queue
   folder sizes and an unselected-folder summary matching the status bar.
-- Add F9/F10 and clickable Places/Properties toggles, draggable dividers,
+- Add F13/F14 and clickable Places/Properties toggles with open-state markers, draggable dividers,
   persisted open/width state and schema-1-to-2 migration.
 - Serve both toggle actions windowed, refuse headless/busy with UNAVAILABLE,
   and expose `places`/`properties` in `dopus.state`. Keep all `file.*` forbidden.
 - Add elision, column/divider geometry, metadata, migration, key and Bus
   availability regression coverage, plus headless Bus e2e assertions.
+- Use one actual Name text rectangle for shaping and drawing; only the last
+  path component has an extension. Use fixed-width absolute 24-hour timestamps.
+- Wrap long Properties values at glyph boundaries, default Properties to 22%
+  and Places to 15%, and size dialogs by a responsive 32-em text measure.
+- Preserve transient statuses on metadata arrival and use bounded metadata
+  retries with five-second UI timeouts. Fix map comparisons in the Bus e2e.
+- Avoid default global key conflicts: inputd claims F1–F12 and comp can claim
+  F9, so sidebar shortcuts use the nearest free keys, F13/F14.
 
 ## 0.2.0
 

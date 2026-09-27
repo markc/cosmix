@@ -46,7 +46,6 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
                         fields[0].1 = format!("{} bytes ({})", meta.size, format_size(meta.size));
                     }
                     fields.insert(0, ("Kind", meta.kind));
-                    let now = std::time::SystemTime::now();
                     for (label, time) in [
                         ("Modified", meta.modified),
                         ("Created", meta.created),
@@ -54,8 +53,7 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
                     ] {
                         fields.push((
                             label,
-                            time.map(|t| format_modified_at(t, now))
-                                .unwrap_or_else(|| "—".into()),
+                            time.map(format_modified_at).unwrap_or_else(|| "—".into()),
                         ));
                     }
                     fields.push(("Permissions", meta.permissions));
@@ -86,6 +84,8 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
                     .size(look.px)
                     .color(look.tokens.muted_text),
                 text(value)
+                    .wrapping(iced::advanced::text::Wrapping::WordOrGlyph)
+                    .shaping(iced::advanced::text::Shaping::Advanced)
                     .font(look.ui_font)
                     .size(look.px)
                     .color(look.tokens.text)

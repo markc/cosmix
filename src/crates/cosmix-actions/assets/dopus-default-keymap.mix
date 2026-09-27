@@ -2,8 +2,8 @@
   version: 1,
   chord_timeout_ms: 1000,
   defaults: [
-    { action: "view.toggle-places", chord: ["F9"], scope: "global", repeat: "ignore", allow_in_editable: false },
-    { action: "view.toggle-properties", chord: ["F10"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "view.toggle-places", chord: ["F13"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "view.toggle-properties", chord: ["F14"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "location.focus", chord: ["Ctrl+L"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "file.open", chord: ["Enter"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "file.new-folder", chord: ["Ctrl+Shift+N"], scope: "global", repeat: "ignore", allow_in_editable: false },

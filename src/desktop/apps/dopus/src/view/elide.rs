@@ -44,6 +44,7 @@ pub fn middle(text: &str, width: f32, mut measure: impl FnMut(&str) -> f32) -> S
     let extension = text
         .rfind('.')
         .filter(|i| *i > 0 && *i + 1 < text.len())
+        .filter(|i| text.rfind('/').is_none_or(|slash| *i > slash + 1))
         .and_then(|i| boundaries.iter().position(|b| *b == i));
     let stem = extension.unwrap_or(count - 1);
     let suffix = extension.map_or(1, |i| count - i);
@@ -162,6 +163,16 @@ mod tests {
         for name in ["a.txt", "Documents", ".profile", ""] {
             assert_eq!(middle(name, 40.0, width), name);
         }
+    }
+
+    #[test]
+    fn dots_in_parent_directories_are_not_extensions() {
+        let path = "/.config/a-very-long-directory-name";
+        let result = middle(path, 16.0, width);
+        assert!(result.starts_with("/.config/"), "{result}");
+        assert!(result.ends_with('e'));
+        let result = middle("/.config/long-filename.toml", 16.0, width);
+        assert!(result.ends_with(".toml"));
     }
     #[test]
     fn extensions_and_graphemes_survive_elision() {

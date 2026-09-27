@@ -8,8 +8,7 @@
 //! size and modified paragraphs are shaped once per row and cached in the
 //! widget's [`Tree`] state keyed by row path (a full re-shape every frame is
 //! what ced's P0 round just paid down); a cache entry is re-shaped when the
-//! text it was shaped from differs — which is also how the relative modified
-//! times refresh on the 200 ms tick (app contract, law 1). Shaping happens
+//! text it was shaped from differs. Absolute timestamps never age. Shaping happens
 //! in `update` (which owns `&mut Tree`); `draw` only reads the cache, so a
 //! row that scrolled in between update and draw waits one frame for its text
 //! — icons draw immediately.
@@ -22,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use iced::advanced::image::{self as aimage, Renderer as _};
 use iced::advanced::text::{self as atext, Paragraph as _};
@@ -55,7 +54,6 @@ pub enum RowsMsg {
 #[derive(Clone, Copy, Debug)]
 pub struct Columns {
     pub name_min: f32,
-    pub size_min: f32,
     pub size: f32,
     pub modified: f32,
     pub gap: f32,
@@ -70,13 +68,8 @@ impl Columns {
         };
         Self {
             name_min: look.chrome.icon * 2.0 + look.chrome.small + Self::name_measure(look),
-            size_min: measure("9.9 KiB").max(
-                FileList::shape("Size ↓", look.ui_font, look.small_px)
-                    .min_bounds()
-                    .width,
-            ),
             size: measure("999999 items"),
-            modified: measure("88/88/88 at 88:88 pm"),
+            modified: measure("88/88/88 88:88"),
             gap: look.chrome.gap,
             pad: look.chrome.pad,
         }
@@ -87,8 +80,8 @@ impl Columns {
             .width
     }
     /// Local x/width pairs shared by headers and rows. Preserve a usable
-    /// name before secondary columns: hide Modified, shrink Size, then hide
-    /// Size if even its compact form would consume the name budget.
+    /// name before secondary columns: hide Modified, then Size. Numeric
+    /// values are never shortened into an ambiguous number.
     pub fn cells(self, width: f32) -> [(f32, f32); 3] {
         let pad = self.pad.min(width.max(0.0) / 2.0);
         let available = (width - 2.0 * pad).max(0.0);
@@ -98,10 +91,8 @@ impl Columns {
             0.0
         };
         let size_budget = available - self.name_min - self.gap;
-        let size = if modified > 0.0 {
+        let size = if modified > 0.0 || size_budget >= self.size {
             self.size
-        } else if size_budget >= self.size_min {
-            self.size.min(size_budget)
         } else {
             0.0
         };
@@ -122,6 +113,14 @@ impl Columns {
     fn indentation(self, width: f32, depth: usize, icon: f32) -> f32 {
         (depth as f32 * icon).min((self.cells(width)[0].1 - self.name_min).max(0.0))
     }
+
+    /// The actual text rectangle inside Name, in pane-local coordinates.
+    /// Both shaping and drawing use this; decoration is subtracted once.
+    fn name_text(self, width: f32, depth: usize, icon: f32, padding: f32) -> (f32, f32) {
+        let (start, cell_width) = self.cells(width)[0];
+        let decoration = self.indentation(width, depth, icon) + 2.0 * icon + padding;
+        (start + decoration, (cell_width - decoration).max(0.0))
+    }
 }
 
 /// List rows per wheel notch.
@@ -138,7 +137,6 @@ struct Cached {
     name_width: u32,
     size: Para,
     size_of: String,
-    size_width: u32,
     modified: Para,
     modified_of: String,
 }
@@ -292,8 +290,8 @@ impl<'a> FileList<'a> {
     }
 
     /// Shape (or re-shape) a row's three columns. An entry whose source text
-    /// differs — the relative modified time aged, a size landed — re-shapes.
-    fn cache_row(&self, st: &mut RowState, row: &VisibleRow, now: SystemTime, width: f32) {
+    /// differs — a relist or size landed — re-shapes.
+    fn cache_row(&self, st: &mut RowState, row: &VisibleRow, width: f32) {
         if st.tint != self.tint {
             // A re-tint means a new theme: fonts and colours may all differ.
             st.tint = self.tint.to_owned();
@@ -311,22 +309,19 @@ impl<'a> FileList<'a> {
         let modified_text = row
             .entry
             .modified
-            .map(|m| cosmix_dopus_core::format_modified_at(m, now))
+            .map(cosmix_dopus_core::format_modified_at)
             .unwrap_or_else(|| "—".into());
         let name = row.entry.name.clone();
-        let size_width = self.columns.cells(width)[1].1;
-        let name_width = (self.columns.cells(width)[0].1
-            - self
-                .columns
-                .indentation(width, row.depth, self.look.chrome.icon)
-            - 2.0 * self.look.chrome.icon
-            - self.look.chrome.small)
-            .max(0.0);
+        let (_, name_width) = self.columns.name_text(
+            width,
+            row.depth,
+            self.look.chrome.icon,
+            self.look.chrome.small,
+        );
         if let Some(cached) = st.cache.get(&row.entry.path)
             && cached.name_of == name
             && cached.name_width == name_width.to_bits()
             && cached.size_of == size_text
-            && cached.size_width == size_width.to_bits()
             && cached.modified_of == modified_text
         {
             return;
@@ -340,17 +335,8 @@ impl<'a> FileList<'a> {
             name: Self::shape(&elided, self.look.ui_font, self.look.px),
             name_of: name,
             name_width: name_width.to_bits(),
-            size: Self::shape(
-                &super::elide::middle(&size_text, size_width, |s| {
-                    Self::shape(s, self.look.mono_font, self.look.small_px)
-                        .min_bounds()
-                        .width
-                }),
-                self.look.mono_font,
-                self.look.small_px,
-            ),
+            size: Self::shape(&size_text, self.look.mono_font, self.look.small_px),
             size_of: size_text,
-            size_width: size_width.to_bits(),
             modified: Self::shape(&modified_text, self.look.mono_font, self.look.small_px),
             modified_of: modified_text,
         };
@@ -401,13 +387,13 @@ impl<'a> FileList<'a> {
 
     /// Shape every row the viewport will draw (called from `update`, which
     /// owns the `&mut Tree` the cache lives in).
-    fn sync_cache(&self, st: &mut RowState, height: f32, now: SystemTime, width: f32) {
+    fn sync_cache(&self, st: &mut RowState, height: f32, width: f32) {
         let first = (st.offset / st.row_h).floor().max(0.0) as usize;
         for (index, row) in self.rows.iter().enumerate().skip(first) {
             if index > first && !st.is_visible(index, height) {
                 break;
             }
-            self.cache_row(st, row, now, width);
+            self.cache_row(st, row, width);
         }
     }
 }
@@ -454,7 +440,7 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         self.reset_on_relist(st);
         self.follow_selection(st, clip.height);
         st.clamp(self.rows.len(), clip.height);
-        self.sync_cache(st, clip.height, SystemTime::now(), bounds.width);
+        self.sync_cache(st, clip.height, bounds.width);
 
         match event {
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(clip) => {
@@ -567,7 +553,7 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                             bounds: clipped,
                             ..renderer::Quad::default()
                         },
-                        t.primary,
+                        t.selection,
                     );
                 }
             }
@@ -625,13 +611,25 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     // Name; secondary columns right-aligned, in the mono role.
                     if let Some(cached) = st.cache.get(&row.entry.path) {
                         let color = if self.selected == Some(row.entry.path.as_path()) {
-                            t.primary_text
+                            t.selection_text
                         } else {
                             t.text
                         };
                         renderer.fill_paragraph(
                             &cached.name,
-                            Point::new(x + 2.0 * icon_px + self.look.chrome.small, baseline),
+                            Point::new(
+                                bounds.x
+                                    + self
+                                        .columns
+                                        .name_text(
+                                            bounds.width,
+                                            row.depth,
+                                            icon_px,
+                                            self.look.chrome.small,
+                                        )
+                                        .0,
+                                baseline,
+                            ),
                             color,
                             name_clip,
                         );
@@ -643,7 +641,8 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 for (para, (start, width)) in
                     [(&cached.size, cells[1]), (&cached.modified, cells[2])]
                 {
-                    if width <= 0.0 {
+                    // Never show a clipped numeric prefix as a different value.
+                    if width <= 0.0 || para.min_bounds().width > width {
                         continue;
                     }
                     let cell = Rectangle {
@@ -653,7 +652,7 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                         height: clip.height,
                     };
                     let color = if self.selected == Some(row.entry.path.as_path()) {
-                        t.primary_text
+                        t.selection_text
                     } else {
                         t.muted_text
                     };
@@ -695,12 +694,37 @@ mod column_tests {
     fn columns() -> Columns {
         Columns {
             name_min: 90.0,
-            size_min: 50.0,
             size: 90.0,
             modified: 180.0,
             gap: 12.0,
             pad: 8.0,
         }
+    }
+
+    #[test]
+    fn a_shaped_name_that_fits_the_actual_name_cell_is_not_elided() {
+        let name = "ardour-session-Walthius_2009_Theme";
+        let measure = |s: &str| {
+            FileList::shape(s, iced::Font::DEFAULT, 14.0)
+                .min_bounds()
+                .width
+        };
+        let columns = columns();
+        let (icon, padding, depth) = (16.0, 4.0, 2);
+        assert!(measure(name) > 0.0);
+        let decoration = (depth as f32 + 2.0) * icon + padding;
+        let width = columns.pad * 2.0
+            + columns.size
+            + columns.modified
+            + columns.gap * 2.0
+            + decoration
+            + measure(name)
+            + 1.0;
+        let (x, budget) = columns.name_text(width, depth, icon, padding);
+        let cell = columns.cells(width)[0];
+        assert!((x + budget - (cell.0 + cell.1)).abs() < 0.01);
+        assert!(budget >= measure(name));
+        assert_eq!(super::super::elide::middle(name, budget, measure), name);
     }
 
     #[test]
@@ -718,15 +742,18 @@ mod column_tests {
     }
 
     #[test]
-    fn capped_sidebars_leave_a_name_and_compact_size_at_190_pixels() {
+    fn capped_sidebars_preserve_names_without_eliding_numeric_size_at_190_pixels() {
         let columns = columns();
         let [name, size, modified] = columns.cells(190.0);
         assert!(name.1 >= columns.name_min);
-        assert!(size.1 >= columns.size_min && size.1 < columns.size);
+        assert_eq!(size.1, 0.0);
         assert_eq!(modified.1, 0.0);
-        assert_eq!(size.0 + size.1 + columns.pad, 190.0);
+        assert_eq!(name.0 + name.1 + columns.pad, 190.0);
         // Deep tree rows keep the text budget; draw and hit-testing share this.
-        assert_eq!(columns.indentation(190.0, 20, 16.0), 0.0);
+        assert_eq!(
+            columns.indentation(190.0, 20, 16.0),
+            name.1 - columns.name_min
+        );
     }
 
     #[test]

@@ -261,9 +261,8 @@ pub struct DopusCore {
     split_ratio: f32,
     operation: OpState,
     confirms: ConfirmBook,
-    /// Information-panel text. Only clock-free strings live here (idle text,
-    /// operation results); the view formats selection details itself so the
-    /// relative modified time uses the app's clock.
+    /// Idle/status text and operation results. Selection metadata has its
+    /// own snapshot, independent of transient status messages.
     info: String,
     last_observed: Option<DOpusConfig>,
     pending_config: Option<DOpusConfig>,
@@ -427,21 +426,20 @@ impl DopusCore {
     /// Counts are read from the existing generation-checked count queue.
     pub fn properties(&self, pane: PaneId) -> crate::properties::Properties {
         let model = self.pane(pane);
-        let entry = model.selected.as_ref().and_then(|path| {
-            self.visible_rows(pane)
-                .into_iter()
-                .find(|row| row.entry.path == *path)
-        });
-        if let Some(row) = entry {
+        let entry = model
+            .selected
+            .as_ref()
+            .and_then(|path| find_entry(model, path));
+        if let Some(entry) = entry {
             let metadata = self.properties[pane.index()]
                 .cached
                 .as_ref()
                 .filter(|(generation, path, _)| {
-                    *generation == model.generation && *path == row.entry.path
+                    *generation == model.generation && *path == entry.path
                 })
                 .map(|(_, _, result)| result.clone().map(Box::new));
             crate::properties::Properties::Entry {
-                entry: row.entry,
+                entry: entry.clone(),
                 count_pending: model.pending_counts > 0,
                 metadata,
             }
@@ -453,7 +451,7 @@ impl DopusCore {
         }
     }
 
-    fn dispatch_properties(&mut self) {
+    fn dispatch_properties(&mut self, now: Instant) {
         for pane in [PaneId::Left, PaneId::Right] {
             let model = self.pane(pane);
             let Some(path) = model.selected.clone() else {
@@ -461,15 +459,35 @@ impl DopusCore {
             };
             let generation = model.generation;
             let slot = &mut self.properties[pane.index()];
-            if slot.in_flight.is_none()
-                && !slot
-                    .cached
-                    .as_ref()
-                    .is_some_and(|(g, p, _)| *g == generation && *p == path)
+            if slot
+                .cached
+                .as_ref()
+                .is_some_and(|(g, p, _)| *g == generation && *p == path)
             {
-                slot.in_flight = Some((generation, path.clone()));
-                self.workers.spawn_properties(pane, generation, path);
+                continue;
             }
+            if let Some((_, _, started)) = slot
+                .in_flight
+                .iter()
+                .find(|(g, p, _)| *g == generation && *p == path)
+            {
+                if now.saturating_duration_since(*started) >= Duration::from_secs(5) {
+                    slot.cached = Some((generation, path, Err("Metadata lookup timed out".into())));
+                }
+                continue;
+            }
+            // A stuck stat/NSS call cannot be killed safely. Allow selection
+            // changes to bypass it, but bound outstanding OS threads per pane.
+            if slot.in_flight.len() >= 4 {
+                slot.cached = Some((
+                    generation,
+                    path,
+                    Err("Metadata workers busy; select again to retry".into()),
+                ));
+                continue;
+            }
+            slot.in_flight.push((generation, path.clone(), now));
+            self.workers.spawn_properties(pane, generation, path);
         }
     }
 
@@ -671,6 +689,15 @@ impl DopusCore {
     /// Direct selection (the plain-state equivalent of `select_row`,
     /// browser.rs:2867-2873: selecting a row also activates its pane).
     pub fn select_path(&mut self, pane: PaneId, path: Option<PathBuf>) {
+        // An explicit selection retries a previous busy/error result. Any
+        // still-running request is reused, so retries cannot bypass the cap.
+        if self.properties[pane.index()]
+            .cached
+            .as_ref()
+            .is_some_and(|(_, _, result)| result.is_err())
+        {
+            self.properties[pane.index()].cached = None;
+        }
         self.panes[pane.index()].selected = path;
         self.active = pane;
         self.emit(CoreEvent::SelectionChanged { pane });
@@ -681,10 +708,7 @@ impl DopusCore {
         let Some(row) = rows.get(index) else {
             return;
         };
-        self.panes[pane.index()].selected = Some(row.entry.path.clone());
-        self.active = pane;
-        self.emit(CoreEvent::SelectionChanged { pane });
-        self.emit(CoreEvent::InfoChanged);
+        self.select_path(pane, Some(row.entry.path.clone()));
     }
 
     // -- tree ---------------------------------------------------------------
@@ -989,11 +1013,14 @@ impl DopusCore {
                 let current = self.pane(pane).generation == generation
                     && self.pane(pane).selected.as_ref() == Some(&path);
                 let slot = &mut self.properties[pane.index()];
-                if slot.in_flight.as_ref() == Some(&(generation, path.clone())) {
-                    slot.in_flight = None;
+                if let Some(index) = slot
+                    .in_flight
+                    .iter()
+                    .position(|(g, p, _)| *g == generation && *p == path)
+                {
+                    slot.in_flight.swap_remove(index);
                     if current {
                         slot.cached = Some((generation, path, result));
-                        self.emit(CoreEvent::InfoChanged);
                     }
                 }
             }
@@ -1228,7 +1255,7 @@ impl DopusCore {
     /// (browser.rs `persist_config`, 3564-3622). Returns the derived
     /// view-facing events queued so far.
     pub fn tick(&mut self, now: Instant) -> Vec<CoreEvent> {
-        self.dispatch_properties();
+        self.dispatch_properties(now);
         self.dispatch_counts();
         let snapshot = self.config_snapshot();
         if self.last_observed.as_ref() != Some(&snapshot) {
@@ -1618,7 +1645,7 @@ pub fn format_child_count(count: Option<usize>) -> String {
 
 /// `format_file_info` (browser.rs:3685-3708), restructured from the Bevy
 /// `FileRow` component to [`FileEntry`].
-pub fn format_file_info(entry: &FileEntry, now: SystemTime) -> String {
+pub fn format_file_info(entry: &FileEntry, _now: SystemTime) -> String {
     let (quantity_label, quantity) = if entry.is_dir {
         (
             "Contents",
@@ -1639,7 +1666,7 @@ pub fn format_file_info(entry: &FileEntry, now: SystemTime) -> String {
         if entry.is_dir { "Folder" } else { "File" },
         entry
             .modified
-            .map(|modified| format_modified_at(modified, now))
+            .map(format_modified_at)
             .unwrap_or_else(|| "—".into()),
         sanitise_display_path(&entry.path)
     )
@@ -1664,12 +1691,9 @@ pub fn pane_summary(entries: &[FileEntry]) -> String {
     )
 }
 
-/// `format_modified_at` (browser.rs:3728-3732): relative with an absolute
-/// fallback.
-pub fn format_modified_at(modified: SystemTime, now: SystemTime) -> String {
-    format_modified_at_with(modified, now, |modified| {
-        format_absolute_system_time(modified).unwrap_or_else(|| "—".into())
-    })
+/// Local absolute modification time, always dd/mm/yy HH:MM.
+pub fn format_modified_at(modified: SystemTime) -> String {
+    format_absolute_system_time(modified).unwrap_or_else(|| "—".into())
 }
 
 /// `format_absolute_system_time` (browser.rs:3734-3737).
@@ -1709,25 +1733,7 @@ where
     Tz: chrono::TimeZone,
     Tz::Offset: std::fmt::Display,
 {
-    modified.format("%d/%m/%y at %-I:%M %P").to_string()
-}
-
-/// `format_modified_at_with` (browser.rs:3770-3784): boundaries are injected
-/// through `now` and the absolute renderer is a parameter so tests can pin it.
-pub fn format_modified_at_with(
-    modified: SystemTime,
-    now: SystemTime,
-    absolute: impl FnOnce(SystemTime) -> String,
-) -> String {
-    match now.duration_since(modified) {
-        Ok(age) if age < Duration::from_secs(60) => "now".into(),
-        Ok(age) if age < Duration::from_secs(3600) => format!("{}m ago", age.as_secs() / 60),
-        Ok(age) if age < Duration::from_secs(86_400) => format!("{}h ago", age.as_secs() / 3600),
-        Ok(age) if age < Duration::from_secs(7 * 86_400) => {
-            format!("{}d ago", age.as_secs() / 86_400)
-        }
-        Ok(_) | Err(_) => absolute(modified),
-    }
+    modified.format("%d/%m/%y %H:%M").to_string()
 }
 
 // -- drop legality (browser.rs:2661-2732) ----------------------------------
@@ -1895,7 +1901,7 @@ mod tests {
         let second = PathBuf::from("second");
         core.panes[0].root = vec![entry("first", false), entry("second", true)];
         core.select_path(pane, Some(first.clone()));
-        core.properties[0].in_flight = Some((generation, first.clone()));
+        core.properties[0].in_flight = vec![(generation, first.clone(), Instant::now())];
         core.select_path(pane, Some(second.clone()));
         core.on_event(CoreEvent::PropertiesArrived {
             pane,
@@ -1903,12 +1909,12 @@ mod tests {
             path: first,
             result: Err("stale selection".into()),
         });
-        assert!(core.properties[0].in_flight.is_none());
+        assert!(core.properties[0].in_flight.is_empty());
         assert!(matches!(
             core.properties(pane),
             Properties::Entry { metadata: None, .. }
         ));
-        core.properties[0].in_flight = Some((generation - 1, second.clone()));
+        core.properties[0].in_flight = vec![(generation - 1, second.clone(), Instant::now())];
         core.on_event(CoreEvent::PropertiesArrived {
             pane,
             generation: generation - 1,
@@ -1919,13 +1925,19 @@ mod tests {
             core.properties(pane),
             Properties::Entry { metadata: None, .. }
         ));
-        core.properties[0].in_flight = Some((generation, second.clone()));
-        core.on_event(CoreEvent::PropertiesArrived {
+        core.properties[0].in_flight = vec![(generation, second.clone(), Instant::now())];
+        core.take_events();
+        let events = core.on_event(CoreEvent::PropertiesArrived {
             pane,
             generation,
             path: second,
             result: Err("permission denied".into()),
         });
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CoreEvent::InfoChanged))
+        );
         let Properties::Entry {
             entry,
             metadata: Some(Err(error)),
@@ -1969,6 +1981,69 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, CoreEvent::ConfigSettled(c) if c == &snapshot))
         );
+    }
+
+    #[test]
+    fn stuck_properties_time_out_and_new_selections_bypass_them_with_a_cap() {
+        let (_dir, mut core, _rx) = core_fixture();
+        let pane = PaneId::Left;
+        let now = Instant::now();
+        let generation = core.pane(pane).generation;
+        let first = core.pane(pane).path.join("stuck");
+        core.select_path(pane, Some(first.clone()));
+        core.properties[0]
+            .in_flight
+            .push((generation, first.clone(), now));
+        core.dispatch_properties(now + Duration::from_secs(6));
+        assert!(
+            core.properties[0]
+                .cached
+                .as_ref()
+                .unwrap()
+                .2
+                .as_ref()
+                .unwrap_err()
+                .contains("timed out")
+        );
+        let second = core.pane(pane).path.join("next");
+        core.select_path(pane, Some(second.clone()));
+        core.dispatch_properties(now + Duration::from_secs(6));
+        assert_eq!(core.properties[0].in_flight.len(), 2);
+        assert!(
+            core.properties[0]
+                .in_flight
+                .iter()
+                .any(|(_, path, _)| *path == second)
+        );
+        for name in ["stuck-2", "stuck-3"] {
+            core.properties[0]
+                .in_flight
+                .push((generation, PathBuf::from(name), now));
+        }
+        core.select_path(pane, Some(core.pane(pane).path.join("over-cap")));
+        core.dispatch_properties(now + Duration::from_secs(6));
+        assert_eq!(core.properties[0].in_flight.len(), 4);
+        assert!(
+            core.properties[0]
+                .cached
+                .as_ref()
+                .unwrap()
+                .2
+                .as_ref()
+                .unwrap_err()
+                .contains("busy")
+        );
+        core.on_event(CoreEvent::PropertiesArrived {
+            pane,
+            generation,
+            path: first,
+            result: Err("late".into()),
+        });
+        assert_eq!(core.properties[0].in_flight.len(), 3);
+        let selected = core.pane(pane).selected.clone();
+        core.select_path(pane, selected);
+        core.dispatch_properties(now + Duration::from_secs(7));
+        assert_eq!(core.properties[0].in_flight.len(), 4);
     }
 
     /// A core rooted at a temp directory with `left/` and `right/` panes.
@@ -2234,29 +2309,7 @@ mod tests {
     // -- chrono boundaries (browser.rs ~:5260-5306) ---------------------------
 
     #[test]
-    fn modified_time_boundaries_use_the_injected_clock() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let relative = |age| {
-            format_modified_at_with(now - Duration::from_secs(age), now, |_| "absolute".into())
-        };
-
-        assert_eq!(relative(0), "now");
-        assert_eq!(relative(59), "now");
-        assert_eq!(relative(60), "1m ago");
-        assert_eq!(relative(3_599), "59m ago");
-        assert_eq!(relative(3_600), "1h ago");
-        assert_eq!(relative(86_399), "23h ago");
-        assert_eq!(relative(86_400), "1d ago");
-        assert_eq!(relative(7 * 86_400 - 1), "6d ago");
-        assert_eq!(relative(7 * 86_400), "absolute");
-        assert_eq!(
-            format_modified_at_with(now + Duration::from_secs(1), now, |_| "absolute".into()),
-            "absolute"
-        );
-    }
-
-    #[test]
-    fn absolute_modified_time_uses_the_dolphin_style_local_format() {
+    fn absolute_modified_time_is_fixed_width_and_24_hour() {
         use chrono::TimeZone;
 
         let timezone = chrono::FixedOffset::east_opt(10 * 60 * 60).unwrap();
@@ -2265,7 +2318,21 @@ mod tests {
             .single()
             .unwrap();
 
-        assert_eq!(format_absolute_datetime(modified), "25/11/25 at 11:20 am");
+        assert_eq!(format_absolute_datetime(modified), "25/11/25 11:20");
+        for (hour, expected) in [(0, "25/11/25 00:05"), (15, "25/11/25 15:05")] {
+            let modified = timezone
+                .with_ymd_and_hms(2025, 11, 25, hour, 5, 0)
+                .single()
+                .unwrap();
+            assert_eq!(format_absolute_datetime(modified), expected);
+            assert_eq!(format_absolute_datetime(modified).len(), 14);
+        }
+        // Both recent and old values use the same absolute shape.
+        for age in [0, 60, 86_400, 8 * 86_400] {
+            let rendered = format_modified_at(SystemTime::now() - Duration::from_secs(age));
+            assert_eq!(rendered.len(), 14);
+            assert!(!rendered.contains("ago"));
+        }
     }
 
     #[test]
@@ -2278,7 +2345,7 @@ mod tests {
             .unwrap();
 
         assert!(system_time_to_utc(modified).is_none());
-        assert_eq!(format_modified_at(modified, UNIX_EPOCH), "—");
+        assert_eq!(format_modified_at(modified), "—");
     }
 
     // -- stale rejection + history (browser.rs ~:5309-5325) -------------------

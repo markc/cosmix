@@ -86,12 +86,12 @@ fn pane_header<'a>(
         .padding([look.chrome.small, look.chrome.pad])
         .style(look.strip(
             if active {
-                look.tokens.primary
+                look.tokens.muted_surface
             } else {
                 look.chrome.secondary
             },
             if active {
-                look.tokens.primary_text
+                look.tokens.text
             } else {
                 look.tokens.muted_text
             },
@@ -242,10 +242,7 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
                     st.last_click = None;
                     shell.publish(match self.target {
                         None => Msg::Split(0.5),
-                        Some(sidebar) => Msg::SidebarWidth(
-                            sidebar,
-                            cosmix_dopus_core::config::SidebarConfig::default().width,
-                        ),
+                        Some(sidebar) => Msg::SidebarWidth(sidebar, sidebar.default_config().width),
                     });
                 } else {
                     st.dragging = true;

@@ -50,6 +50,18 @@ pub enum Sidebar {
     Properties,
 }
 
+impl Sidebar {
+    pub fn default_config(self) -> SidebarConfig {
+        SidebarConfig {
+            width: match self {
+                Self::Places => 0.15,
+                Self::Properties => 0.22,
+            },
+            ..SidebarConfig::default()
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortColumn {
@@ -99,7 +111,7 @@ impl Default for DOpusConfig {
         Self {
             schema_version: CURRENT_SCHEMA,
             places: SidebarConfig::default(),
-            properties: SidebarConfig::default(),
+            properties: Sidebar::Properties.default_config(),
             left,
             right: default_right_pane(),
             active_pane: "left".into(),
@@ -139,7 +151,7 @@ impl ConfigFile {
                 Ok(mut config) if matches!(config.schema_version, 1 | CURRENT_SCHEMA) => {
                     if config.schema_version == 1 {
                         config.places = SidebarConfig::default();
-                        config.properties = SidebarConfig::default();
+                        config.properties = Sidebar::Properties.default_config();
                     }
                     config.schema_version = CURRENT_SCHEMA;
                     config.places = config.places.normalised();
@@ -251,7 +263,7 @@ mod tests {
         assert_eq!(config.active_pane, "right");
         assert_eq!(config.split_ratio, 0.7);
         assert_eq!(config.places, SidebarConfig::default());
-        assert_eq!(config.properties, SidebarConfig::default());
+        assert_eq!(config.properties, Sidebar::Properties.default_config());
         file.save(&config).unwrap();
         assert_eq!(ConfigFile::load(dir.path()).0, config);
     }

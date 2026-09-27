@@ -2,7 +2,7 @@
 use crate::model::{FileEntry, sanitise_display_path, sanitise_display_text};
 use std::{
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 
 #[derive(Clone, Debug)]
@@ -33,7 +33,8 @@ pub enum Properties {
 
 #[derive(Default)]
 pub(crate) struct Slot {
-    pub in_flight: Option<(u64, PathBuf)>,
+    /// Outstanding OS calls, including timed-out calls we cannot cancel.
+    pub in_flight: Vec<(u64, PathBuf, Instant)>,
     pub cached: Option<(u64, PathBuf, Result<Metadata, String>)>,
 }
 

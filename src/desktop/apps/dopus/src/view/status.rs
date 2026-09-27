@@ -1,9 +1,6 @@
 //! The status bar: the core's info line (what is selected) on the left; the
-//! pane's own status and the directory summary on the right. The relative
-//! modified times inside the info line are formatted by the core's helpers
-//! against the app's clock — the app re-renders on its 200 ms tick
-//! (app contract, law 1: the app's own clock, never a cached string that
-//! ages silently).
+//! pane's own status and the directory summary on the right. Panel buttons
+//! show open/closed state; timestamps use the core's absolute formatter.
 
 use iced::widget::{button, container, row, text};
 use iced::{Element, Length};
@@ -14,17 +11,33 @@ use crate::app::Msg;
 use crate::view::Look;
 
 /// The status bar strip.
-pub fn bar<'a>(look: Look, pane: &'a PaneModel, info: &'a str) -> Element<'a, Msg> {
+pub fn bar<'a>(
+    look: Look,
+    pane: &'a PaneModel,
+    info: &'a str,
+    places_open: bool,
+    properties_open: bool,
+) -> Element<'a, Msg> {
     let summary = cosmix_dopus_core::pane_summary(&pane.root);
     container(row![
-        button(text("Places (F9)").font(look.ui_font).size(look.px * 0.85))
-            .padding(look.chrome.small)
-            .style(super::button_look(&look))
-            .on_press(Msg::Actions(vec![cosmix_actions::view::TOGGLE_PLACES])),
         button(
-            text("Properties (F10)")
-                .font(look.ui_font)
-                .size(look.px * 0.85)
+            text(format!(
+                "{} Places (F13)",
+                if places_open { "●" } else { "○" }
+            ))
+            .font(look.ui_font)
+            .size(look.small_px)
+        )
+        .padding(look.chrome.small)
+        .style(super::button_look(&look))
+        .on_press(Msg::Actions(vec![cosmix_actions::view::TOGGLE_PLACES])),
+        button(
+            text(format!(
+                "{} Properties (F14)",
+                if properties_open { "●" } else { "○" }
+            ))
+            .font(look.ui_font)
+            .size(look.small_px)
         )
         .padding(look.chrome.small)
         .style(super::button_look(&look))

@@ -464,31 +464,43 @@ without changing keyboard bindings or Bus behaviour.</p>
 the final extension where space permits. Headers and rows share one column
 layout: Name uses the remaining space; Size and Modified align right in
 reserved columns. Narrow panes preserve room for icons and four measured name
-characters: Modified hides first, then Size shrinks to a compact width (eliding
-long values), then hides if necessary. Deep tree indentation also yields to
+characters: Modified hides first, then Size hides if necessary. Numeric cells
+never middle-elide or display clipped digits. Deep tree indentation also yields to
 that name budget. Headers and rows use identical responsive thresholds.
 Each column and the list viewport clip their contents. Name measurement and
 rendering both use advanced shaping for complex scripts and font fallback.
 Secondary columns use the desktop Small type size with the mono family,
 leaving a useful Name budget when both sidebars are open.
-Selection uses the design's selection pair, and a tinted header marks the
-active pane. Modified times follow filemgr's rule: relative below seven days,
-otherwise local <code>DD/MM/YY at h:mm am/pm</code>, refreshed by the frontend clock.</p>
+Selection uses the design's <code>selection</code>/<code>selection_text</code> pair, and a
+<code>muted_surface</code> header marks the active pane. Modified times are always local
+<code>dd/mm/yy HH:MM</code> in 24-hour format. There is no relative-time refresh.</p>
 <p>The plain <strong>Properties</strong> sidebar follows the active pane's single selection:
 name, kind and extension-based MIME guess, byte and human-readable size,
 modified/created/accessed times, Unix permissions (rwx and octal), resolved
 owner:group names, and symlink target. Account lookup runs in the metadata
 worker through the existing nix dependency's reentrant system lookups;
 missing names or lookup failures fall back independently to numeric IDs.
+Metadata reads time out in the UI after five seconds. Changing selection can
+start another read while an old one is stuck, with at most four outstanding
+reads per pane; exhausting that cap reports unavailable, rather than leaving
+every later selection loading forever. Select again to retry after a slot frees.
+Late replies release their slot and update only the matching selection/generation.
+Metadata arrival preserves transient error/status messages. Paths and link targets
+wrap at glyph boundaries when no word boundary fits.
 Unavailable timestamps display <code>—</code>.
 Folder sizes show the existing count queue's item count (<code>…</code> while pending),
 never a recursive byte walk. With no selection it shows the current path
 and the same folder/file counts and total file size as the status bar.
 Metadata runs on at most one worker per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.</p>
-<p><strong>F9</strong> toggles Places and <strong>F10</strong> toggles Properties; the status bar offers
+<p><strong>F13</strong> toggles Places and <strong>F14</strong> toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
-resize it; double-click restores 15%. Both open states and widths persist.
+resize it; double-click restores Places to 15% or Properties to 22%. Both
+panels default open, and the buttons show their open/closed state. Both open
+states and widths persist; existing saved widths are preserved.
+The compositor can reserve plain F9, and inputd's default grab keymap claims
+all plain F1–F12. F13/F14 are the nearest unclaimed function keys in both
+defaults. Use the clickable buttons or a keymap override on keyboards without them.
 Widths are fractions of the available window width, clamped to 10–30% each
 to leave room for the panes. Hidden panels and their dividers take no space.</p>
 <p>File operations are local keyboard/dialog actions: new folder, rename,
@@ -519,8 +531,8 @@ opening and has no theme painter. A duplicate headless service name fails.
 <p>The frontend must honour the contract in <code>cosmix-dopus-core/src/lib.rs</code>:</p>
 <ol>
 <li>Call <code>tick(now)</code> every frame with a monotonic clock. This advances count
-dispatch and config settling. Format relative modification times on the
-frontend's own clock.</li>
+dispatch, metadata timeouts and config settling. The idle heartbeat also
+polls chord deadlines; modification times need no clock-based refresh.</li>
 <li>Drain worker replies and feed every event through <code>on_event</code> exactly
 once, on one thread.</li>
 <li>Answer every confirmation and prompt token, including cancellation.
@@ -604,7 +616,7 @@ open/width values even headless; a refusal never changes them.
 <table><thead><tr><th>Binding</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+L</td><td><code>location.focus</code>: select the active location bar's text</td></tr>
 <tr><td>F6</td><td><code>nav.switch-pane</code></td></tr>
-<tr><td>F9 / F10</td><td><code>view.toggle-places</code> / <code>view.toggle-properties</code></td></tr>
+<tr><td>F13 / F14</td><td><code>view.toggle-places</code> / <code>view.toggle-properties</code></td></tr>
 <tr><td>Alt+Left / Alt+Right</td><td><code>nav.back</code> / <code>nav.forward</code></td></tr>
 <tr><td>Backspace / Alt+Home</td><td><code>nav.parent</code> / <code>nav.home</code></td></tr>
 <tr><td>F5 / Ctrl+H</td><td><code>view.refresh</code> / <code>view.toggle-hidden</code></td></tr>
@@ -639,7 +651,7 @@ reloads retain the current map. P2 had click-to-edit only; Ctrl+L is new.</p>
 <pre><code class="language-mix">{
   schema_version: 2,
   places: {open: true, width: 0.15},
-  properties: {open: true, width: 0.15},
+  properties: {open: true, width: 0.22},
   left: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   right: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   active_pane: "left",
@@ -653,7 +665,8 @@ Config snapshots come from core state and settle for 0.35 seconds before an
 atomic write. A malformed, unreadable or unsupported-schema config loads
 defaults and disables saving, preserving the original file.
 Schema 1 migrates to 2 in memory, preserving pane paths, sorting, hidden
-settings, active pane and split, and adding both panels open at 15%.
+settings, active pane and split, and adding both panels open (Places 15%,
+Properties 22%). Schema 2 saves retain their existing widths.
 The normal settled atomic write saves schema 2; no filemgr config is imported.
 <code>--print-config</code> prints the resolved config as JSON.
 Theme changes are session selections, not persisted config fields.</p>
@@ -676,7 +689,7 @@ test cannot drive operations through the deliberately forbidden <code>file.*</co
 <p>P4 tests also cover filename elision (including graphemes and tiny widths),
 shared column geometry, panel divider geometry with either/both panels hidden,
 schema migration and preservation, metadata permissions/symlinks/stale replies,
-F9/F10 resolution and toggle availability. The headless e2e asserts both panel
+F13/F14 resolution and toggle availability. The headless e2e asserts both panel
 state records, disabled toggle actions and <code>UNAVAILABLE</code> without state mutation.
 Windowed acceptance should check all four open/closed combinations, resizing,
 theme changes, long names and the last partially visible row, then restart
@@ -685,11 +698,12 @@ to confirm persisted widths and visibility.</p>
 <ul>
 <li>Keep its measured middle elision and final-extension rule (at most 12
 graphemes), but use iced shaping and clipping instead of Bevy text systems.</li>
-<li>Keep relative timestamps below seven days and the local absolute format
-otherwise. The existing frontend tick refreshes them; no Bevy timer is needed.</li>
+<li>Use absolute local 24-hour timestamps everywhere; do not port filemgr's
+relative-time branch or ModifiedTimeRefresh timer.</li>
 <li>Use measured secondary columns instead of filemgr's percentage widths,
-hiding Modified and shrinking/hiding Size as panes narrow to preserve names.</li>
-<li>Use plain sidebars, both open at filemgr's 15% default. Do not import its
+hiding Modified then Size as panes narrow to preserve names and intact numbers.</li>
+<li>Use plain sidebars, both open: Places keeps filemgr's 15% default, while
+Properties uses 22% to fit its content. Do not import its
 DCS pin/float/carousel state, preview or bookmark placeholders, or config.
 Limit widths to 30% each so the panes retain space.</li>
 <li>Name the RHS Properties and show a folder summary without a selection,

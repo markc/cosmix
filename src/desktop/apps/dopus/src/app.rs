@@ -10,8 +10,7 @@
 //! - worker replies arrive on the core's `mpsc::Receiver`; a pumper thread
 //!   forwards each into the futures channel the subscription drains, and the
 //!   UI thread feeds every one through `core.on_event` exactly once — law 2.
-//! - law 1's cadence is threefold: `Msg::Frame` ticks per redraw (which also
-//!   re-formats the rows' relative modified times), a 200 ms `Msg::Tick`
+//! - law 1's cadence is threefold: `Msg::Frame` ticks per redraw, a 200 ms `Msg::Tick`
 //!   heartbeat ticks when the window is idle (frames only fire on redraws),
 //!   and `quit` ticks once before exit so pending config persists.
 //! - derived `ConfirmRequested`/`PromptRequested` join the modal queue
@@ -473,8 +472,7 @@ impl Dopus {
             }
             Msg::Window(event) => self.on_window(event),
             Msg::Frame(now) => {
-                // Law 1: tick every frame. Also ages the status line's
-                // replacement cycle: nothing to do, the view re-renders.
+                // Law 1: advance core maintenance every frame.
                 let derived = self.core.tick(now);
                 self.on_derived(derived)
             }

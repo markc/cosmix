@@ -25,16 +25,16 @@ Names in listings and Places middle-elide to their measured width, preserving
 the final extension where space permits. Headers and rows share one column
 layout: Name uses the remaining space; Size and Modified align right in
 reserved columns. Narrow panes preserve room for icons and four measured name
-characters: Modified hides first, then Size shrinks to a compact width (eliding
-long values), then hides if necessary. Deep tree indentation also yields to
+characters: Modified hides first, then Size hides if necessary. Numeric cells
+never middle-elide or display clipped digits. Deep tree indentation also yields to
 that name budget. Headers and rows use identical responsive thresholds.
 Each column and the list viewport clip their contents. Name measurement and
 rendering both use advanced shaping for complex scripts and font fallback.
 Secondary columns use the desktop Small type size with the mono family,
 leaving a useful Name budget when both sidebars are open.
-Selection uses the design's selection pair, and a tinted header marks the
-active pane. Modified times follow filemgr's rule: relative below seven days,
-otherwise local `DD/MM/YY at h:mm am/pm`, refreshed by the frontend clock.
+Selection uses the design's `selection`/`selection_text` pair, and a
+`muted_surface` header marks the active pane. Modified times are always local
+`dd/mm/yy HH:MM` in 24-hour format. There is no relative-time refresh.
 
 The plain **Properties** sidebar follows the active pane's single selection:
 name, kind and extension-based MIME guess, byte and human-readable size,
@@ -42,6 +42,13 @@ modified/created/accessed times, Unix permissions (rwx and octal), resolved
 owner:group names, and symlink target. Account lookup runs in the metadata
 worker through the existing nix dependency's reentrant system lookups;
 missing names or lookup failures fall back independently to numeric IDs.
+Metadata reads time out in the UI after five seconds. Changing selection can
+start another read while an old one is stuck, with at most four outstanding
+reads per pane; exhausting that cap reports unavailable, rather than leaving
+every later selection loading forever. Select again to retry after a slot frees.
+Late replies release their slot and update only the matching selection/generation.
+Metadata arrival preserves transient error/status messages. Paths and link targets
+wrap at glyph boundaries when no word boundary fits.
 Unavailable timestamps display `—`.
 Folder sizes show the existing count queue's item count (`…` while pending),
 never a recursive byte walk. With no selection it shows the current path
@@ -49,9 +56,14 @@ and the same folder/file counts and total file size as the status bar.
 Metadata runs on at most one worker per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.
 
-**F9** toggles Places and **F10** toggles Properties; the status bar offers
+**F13** toggles Places and **F14** toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
-resize it; double-click restores 15%. Both open states and widths persist.
+resize it; double-click restores Places to 15% or Properties to 22%. Both
+panels default open, and the buttons show their open/closed state. Both open
+states and widths persist; existing saved widths are preserved.
+The compositor can reserve plain F9, and inputd's default grab keymap claims
+all plain F1–F12. F13/F14 are the nearest unclaimed function keys in both
+defaults. Use the clickable buttons or a keymap override on keyboards without them.
 Widths are fractions of the available window width, clamped to 10–30% each
 to leave room for the panes. Hidden panels and their dividers take no space.
 
@@ -91,8 +103,8 @@ opening and has no theme painter. A duplicate headless service name fails.
 The frontend must honour the contract in `cosmix-dopus-core/src/lib.rs`:
 
 1. Call `tick(now)` every frame with a monotonic clock. This advances count
-   dispatch and config settling. Format relative modification times on the
-   frontend's own clock.
+   dispatch, metadata timeouts and config settling. The idle heartbeat also
+   polls chord deadlines; modification times need no clock-based refresh.
 2. Drain worker replies and feed every event through `on_event` exactly
    once, on one thread.
 3. Answer every confirmation and prompt token, including cancellation.
@@ -189,7 +201,7 @@ open/width values even headless; a refusal never changes them.
 |---|---|
 | Ctrl+L | `location.focus`: select the active location bar's text |
 | F6 | `nav.switch-pane` |
-| F9 / F10 | `view.toggle-places` / `view.toggle-properties` |
+| F13 / F14 | `view.toggle-places` / `view.toggle-properties` |
 | Alt+Left / Alt+Right | `nav.back` / `nav.forward` |
 | Backspace / Alt+Home | `nav.parent` / `nav.home` |
 | F5 / Ctrl+H | `view.refresh` / `view.toggle-hidden` |
@@ -230,7 +242,7 @@ The app root is the first absolute path available from `$COSMIX_APP_HOME`,
 {
   schema_version: 2,
   places: {open: true, width: 0.15},
-  properties: {open: true, width: 0.15},
+  properties: {open: true, width: 0.22},
   left: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   right: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   active_pane: "left",
@@ -245,7 +257,8 @@ Config snapshots come from core state and settle for 0.35 seconds before an
 atomic write. A malformed, unreadable or unsupported-schema config loads
 defaults and disables saving, preserving the original file.
 Schema 1 migrates to 2 in memory, preserving pane paths, sorting, hidden
-settings, active pane and split, and adding both panels open at 15%.
+settings, active pane and split, and adding both panels open (Places 15%,
+Properties 22%). Schema 2 saves retain their existing widths.
 The normal settled atomic write saves schema 2; no filemgr config is imported.
 `--print-config` prints the resolved config as JSON.
 Theme changes are session selections, not persisted config fields.
@@ -272,7 +285,7 @@ test cannot drive operations through the deliberately forbidden `file.*` ids.
 P4 tests also cover filename elision (including graphemes and tiny widths),
 shared column geometry, panel divider geometry with either/both panels hidden,
 schema migration and preservation, metadata permissions/symlinks/stale replies,
-F9/F10 resolution and toggle availability. The headless e2e asserts both panel
+F13/F14 resolution and toggle availability. The headless e2e asserts both panel
 state records, disabled toggle actions and `UNAVAILABLE` without state mutation.
 Windowed acceptance should check all four open/closed combinations, resizing,
 theme changes, long names and the last partially visible row, then restart
@@ -282,11 +295,12 @@ to confirm persisted widths and visibility.
 
 - Keep its measured middle elision and final-extension rule (at most 12
   graphemes), but use iced shaping and clipping instead of Bevy text systems.
-- Keep relative timestamps below seven days and the local absolute format
-  otherwise. The existing frontend tick refreshes them; no Bevy timer is needed.
+- Use absolute local 24-hour timestamps everywhere; do not port filemgr's
+  relative-time branch or ModifiedTimeRefresh timer.
 - Use measured secondary columns instead of filemgr's percentage widths,
-  hiding Modified and shrinking/hiding Size as panes narrow to preserve names.
-- Use plain sidebars, both open at filemgr's 15% default. Do not import its
+  hiding Modified then Size as panes narrow to preserve names and intact numbers.
+- Use plain sidebars, both open: Places keeps filemgr's 15% default, while
+  Properties uses 22% to fit its content. Do not import its
   DCS pin/float/carousel state, preview or bookmark placeholders, or config.
   Limit widths to 30% each so the panes retain space.
 - Name the RHS Properties and show a folder summary without a selection,

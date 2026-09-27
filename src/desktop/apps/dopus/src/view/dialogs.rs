@@ -190,7 +190,6 @@ impl Dialog {
                         true,
                     ),
                 ],
-                look.chrome.icon * 28.0,
             ),
             Dialog::Prompt {
                 kind,
@@ -240,7 +239,6 @@ impl Dialog {
                             true,
                         ),
                     ],
-                    look.chrome.icon * 28.0,
                 )
             }
         }
@@ -348,7 +346,6 @@ pub fn frame<'a>(
     title: &'static str,
     body: Element<'a, Msg, iced::Theme, Renderer>,
     buttons: Vec<Element<'a, Msg, iced::Theme, Renderer>>,
-    width: f32,
 ) -> Element<'a, Msg, iced::Theme, Renderer> {
     let t = look.tokens;
     let mut actions = row![iced::widget::space().width(Length::Fill)]
@@ -368,11 +365,11 @@ pub fn frame<'a>(
         ]
         .spacing(look.chrome.gap),
     )
-    .padding(Padding::from([
-        look.chrome.icon,
-        look.chrome.icon + look.chrome.small,
-    ]))
-    .width(Length::Fixed(width))
+    .padding(Padding::from(look.chrome.pad))
+    // A readable 32-em text measure, plus the token-defined card padding.
+    // Fill up to this limit so a narrow window can still shrink the card.
+    .width(Length::Fill)
+    .max_width(look.px * 32.0 + 2.0 * look.chrome.pad)
     .style(move |_| container::Style {
         background: Some(Background::Color(t.popover)),
         text_color: Some(t.popover_text),

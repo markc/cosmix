@@ -312,8 +312,8 @@ try
   check($before_panels.places.open and $before_panels.properties.open,
     "both panels default open")
   check($before_panels.places.width > 0.149 and $before_panels.places.width < 0.151
-    and $before_panels.properties.width > 0.149 and $before_panels.properties.width < 0.151,
-    "both panel widths default to 15%")
+    and $before_panels.properties.width > 0.219 and $before_panels.properties.width < 0.221,
+    "panel defaults must be Places 15%, Properties 22%")
   for each $id in ["view.toggle-places", "view.toggle-properties"]
     $refusal = refused('dopus.action id=$a.id pane="right"', {id: $id}, "UNAVAILABLE")
     check($refusal.reason == "headless", $id .. " must report headless")
@@ -328,8 +328,8 @@ try
     check($found == 1, "missing or duplicate action " .. $id)
   end
   $after_panels = ok('dopus.state', {})
-  check($after_panels.places == $before_panels.places
-    and $after_panels.properties == $before_panels.properties,
+  check(deep_eq($after_panels.places, $before_panels.places)
+    and deep_eq($after_panels.properties, $before_panels.properties),
     "refused headless toggles changed panel state")
   refused('dopus.frobnicate', {}, "UNKNOWN_VERB")
   refused('dopus.theme.set mode="dark"', {}, "UNAVAILABLE")

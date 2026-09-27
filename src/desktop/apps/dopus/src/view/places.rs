@@ -66,7 +66,7 @@ pub fn sidebar<'a>(
             font: look.ui_font,
             px: look.px * 0.9,
             color: if selected {
-                look.tokens.primary_text
+                look.tokens.selection_text
             } else {
                 look.chrome.secondary_text
             },
@@ -98,9 +98,9 @@ fn place_look(
     selected: bool,
 ) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
     let (accent_bg, hover, text, muted, radius) = (
-        look.tokens.primary,
+        look.tokens.selection,
         look.tokens.muted_surface,
-        look.tokens.primary_text,
+        look.tokens.selection_text,
         look.tokens.muted_text,
         look.tokens.radius,
     );

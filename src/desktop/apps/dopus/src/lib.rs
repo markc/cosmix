@@ -9,7 +9,7 @@
 //! The behavioural spec lives in the core (`cosmix-dopus-core`'s "The app
 //! contract" — seven laws); this crate honours it:
 //!
-//! - law 1 (`tick` every frame + the app's own clock for relative times):
+//! - law 1 (`tick` every frame for core maintenance):
 //!   [`app`], [`view::rows`].
 //! - law 2 (drain the channel, feed every event through `on_event` once, on
 //!   one thread): [`app`] (the `STREAMS` bridge feeds `Msg::Core`).
