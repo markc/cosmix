@@ -6,15 +6,10 @@ use iced::widget::{column, container, scrollable, text};
 use iced::{Element, Length};
 
 pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
-    let mut content = column![
-        text("Properties")
-            .font(look.ui_font)
-            .size(look.sidebar_px())
-            .color(look.chrome.secondary_text)
-    ]
-    .spacing(look.chrome.gap)
-    .padding(look.chrome.pad)
-    .width(Length::Fill);
+    let mut content = column![]
+        .spacing(look.chrome.gap)
+        .padding([look.chrome.small, look.chrome.pad])
+        .width(Length::Fill);
     let mut fields = Vec::new();
     let title = match properties {
         Properties::Folder { path, summary } => {

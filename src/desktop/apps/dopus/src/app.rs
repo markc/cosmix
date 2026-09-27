@@ -88,8 +88,6 @@ pub enum Msg {
     LocationSubmit(PaneId),
     /// Escape in the editor: cancel.
     LocationCancel,
-    /// Recheck the Places sidebar's directory existence snapshot.
-    RefreshPlaces,
     /// The divider moved (ratio clamped 0.1–0.9) or double-clicked (0.5).
     Split(f32),
     SidebarWidth(cosmix_dopus_core::config::Sidebar, f32),
@@ -423,11 +421,6 @@ impl Dopus {
                 Task::none()
             }
             Msg::LocationEdit(pane) => self.begin_edit(pane),
-            Msg::RefreshPlaces => {
-                self.stop_editing();
-                self.core.refresh_places();
-                Task::none()
-            }
             Msg::LocationInput(text) => {
                 if let Some((_, current)) = &mut self.editing {
                     *current = text;

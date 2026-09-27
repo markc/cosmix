@@ -8,8 +8,10 @@ the shared design tokens. Only dopus consumes the extracted core.
 Each pane has its own directory, history, sort, hidden-file setting, lazy
 directory tree and single selection. Tab or F6 switches the active pane. Places is
 a plain sidebar, with Home, Filesystem and existing user directories.
-Click its heading to refresh Places; pane relists also invalidate its cached
-directory checks. The divider persists its position; double-click centres it.
+Pane relists invalidate its cached directory checks; Refresh rechecks Places.
+Both sidebars start directly with content, without Places or Properties headings,
+using the same top spacing token as the pane location headers.
+The divider persists its position; double-click centres it.
 
 One navigation icon strip is centred across the top of the window: Back,
 Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
@@ -320,6 +322,13 @@ Theme changes are session selections, not persisted config fields.
 DCS sidebars are excluded by design, including future versions.
 
 ## Verification
+
+P4b adds a unit test for distinct per-pane summaries across focus changes and
+an empty relist, and a shared widgets test for deterministic, opaque tooltip
+styling. The sidebar composition has no view snapshot harness: visually check
+that neither heading appears, the first content aligns with the pane headers,
+and Properties labels/values match Places text in both light and dark themes.
+Also check both footer boxes and the last list row at narrow pane widths.
 
 `src/desktop/apps/dopus/tests/dopus-bus-test.mix` starts an isolated noded
 and headless app. It covers pane targeting, navigation, sort, hidden files,

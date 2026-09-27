@@ -4,7 +4,7 @@
 //! browser.rs:1267-1284). A click navigates the active pane; the active
 //! pane's current directory highlights.
 
-use iced::widget::{Scrollable, Space, button, column, container, image, row, text};
+use iced::widget::{Scrollable, Space, button, column, container, image, row};
 use iced::{Border, Element, Length, Padding};
 
 use cosmix_dopus_core::{PaneId, PaneModel};
@@ -41,25 +41,15 @@ pub fn sidebar<'a>(
     places: &'a [(&'static str, std::path::PathBuf)],
     actions: &[crate::verbs::ActionRow],
 ) -> Element<'a, Msg> {
-    let mut list = column![
-        button(
-            text("Places")
-                .font(look.ui_font)
-                .size(look.px * 0.8)
-                .color(look.tokens.muted_text)
-        )
-        .on_press(Msg::RefreshPlaces)
-        .style(place_look(&look, false)),
-        Space::new().height(Length::Fixed(look.chrome.small)),
-    ]
-    .padding(Padding {
-        top: look.chrome.pad,
-        right: 0.0,
-        bottom: 0.0,
-        left: 0.0,
-    })
-    .spacing(look.chrome.edge * 2.0)
-    .width(Length::Fill);
+    let mut list = column![]
+        .padding(Padding {
+            top: look.chrome.small,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        })
+        .spacing(look.chrome.edge * 2.0)
+        .width(Length::Fill);
     for (name, path) in places {
         let selected = pane.path == *path;
         let label = super::elide::Label {

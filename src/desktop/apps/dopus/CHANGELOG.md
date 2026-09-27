@@ -2,6 +2,8 @@
 
 ## 0.3.1
 
+- Remove the Places and Properties headings; start with content using the
+  pane header's top spacing token. Places refreshes with pane relists.
 - Use the resolved Ui size for both Places entries and all Properties text;
   distinguish field names by muted colour. Remove Places' size multiplier.
 - Use the shared widgets tooltip style: opaque neutral popover background,
