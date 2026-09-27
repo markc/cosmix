@@ -840,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_socket_idle_timeout() {
+    fn upload_socket_read_idle_timeout() {
         let dir = Temp::new();
         let path = dir.0.join("source");
         std::fs::write(&path, b"a").unwrap();
@@ -861,6 +861,75 @@ mod tests {
         assert!(matches!(result["status"], Value::Number(0.0)));
         assert!(matches!(&result["error_code"],Value::String(s) if s == "HTTP_TIMEOUT"));
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_socket_idle_timeout() {
+        use std::os::fd::AsRawFd;
+        let dir = Temp::new();
+        let path = dir.0.join("source");
+        let length = 64 * 1024 * 1024;
+        File::create(&path).unwrap().set_len(length).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // Keep the receive window small enough that a sparse 64 MiB file
+            // cannot fit in kernel buffers after the server stops reading.
+            let size: libc::c_int = 4096;
+            // SAFETY: size is valid for the supplied pointer and socklen.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        (&size as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() < 65536);
+            }
+            socket.read_exact(&mut [0]).unwrap();
+            // No response and no more body reads. The bounded fallback makes
+            // removal of timeout_write fail the elapsed assertion, not hang.
+            let _ = stalled.recv_timeout(Duration::from_secs(5));
+        });
+        let opts = Value::map(IndexMap::from([(
+            "idle_timeout".into(),
+            Value::Number(0.03),
+        )]));
+        let started = Instant::now();
+        let result = map(put(vec![
+            Value::String(url),
+            Value::String(path.to_string_lossy().into()),
+            opts,
+        ])
+        .unwrap());
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        server.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "write did not time out: {elapsed:?}"
+        );
+        assert!(matches!(result["status"], Value::Number(0.0)));
+        assert!(matches!(&result["error_code"], Value::String(s) if s == "HTTP_TIMEOUT"));
+        assert!(
+            matches!(result["bytes_written"], Value::Number(n) if n > 0.0 && n < length as f64)
+        );
     }
 
     #[test]
