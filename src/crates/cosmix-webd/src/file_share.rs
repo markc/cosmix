@@ -161,7 +161,7 @@ pub fn valid_relative_path(rel: &str) -> bool {
 
 /// Validated operator roots, never request data. Handles pin their directory identity.
 #[derive(Default)]
-pub struct Roots(BTreeMap<String, std::sync::Arc<cosmix_files::rooted_read::ReadRoot>>);
+pub struct Roots(BTreeMap<String, (std::path::PathBuf, std::sync::Arc<cosmix_files::rooted_read::ReadRoot>)>);
 
 impl Roots {
     pub fn from_config(config: &cosmix_config::node::WebdSharesConfig) -> Self {
@@ -173,10 +173,10 @@ impl Roots {
             let canonical = safe
                 .then(|| path.canonicalize().ok())
                 .flatten()
-                .and_then(|p| cosmix_files::rooted_read::ReadRoot::open(&p).ok());
+                .and_then(|p| cosmix_files::rooted_read::ReadRoot::open(&p).ok().map(|r| (p, std::sync::Arc::new(r))));
             match canonical {
                 Some(path) => {
-                    roots.insert(account.clone(), std::sync::Arc::new(path));
+                    roots.insert(account.clone(), path);
                 }
                 None => tracing::warn!(account, "ignoring invalid webd.shares root"),
             }
@@ -184,12 +184,38 @@ impl Roots {
         Self(roots)
     }
 
+    #[cfg(test)]
     pub fn get(
         &self,
         account: &str,
     ) -> Option<&std::sync::Arc<cosmix_files::rooted_read::ReadRoot>> {
-        self.0.get(account)
+        self.0.get(account).map(|(_, root)| root)
     }
+
+    pub fn exclude_public(&mut self, public: &[std::path::PathBuf]) {
+        self.0.retain(|account, (path, _)| {
+            let safe = !public.iter().any(|p| path.starts_with(p));
+            if !safe { tracing::warn!(account, "ignoring share root beneath a public serving directory"); }
+            safe
+        });
+    }
+
+    pub fn checked_get(&self, account: &str, directory: &crate::vhost_directory::VhostDirectory)
+        -> Option<std::sync::Arc<cosmix_files::rooted_read::ReadRoot>> {
+        let (path, root) = self.0.get(account)?;
+        // Re-evaluate the current snapshot on every access, including after reload.
+        if public_roots(directory).iter().any(|p| path.starts_with(p)) {
+            tracing::warn!(account, "refusing share root beneath a public serving directory after reload");
+            return None;
+        }
+        Some(root.clone())
+    }
+}
+
+pub fn public_roots(directory: &crate::vhost_directory::VhostDirectory) -> Vec<std::path::PathBuf> {
+    directory.primaries.iter().flat_map(|p| {
+        std::iter::once(&p.state.www_dir).chain(p.state.docs_dir.iter())
+    }).filter_map(|p| p.canonicalize().ok()).collect()
 }
 
 pub fn mint_token() -> String {
@@ -574,6 +600,21 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn public_roots_exclude_equal_nested_and_symlinked_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let public = dir.path().join("www");
+        std::fs::create_dir_all(public.join("private")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&public, &link).unwrap();
+        for path in [public.clone(), public.join("private"), link.join("private")] {
+            let cfg = cosmix_config::node::WebdSharesConfig { roots: BTreeMap::from([(ACCOUNT.into(), path)]) };
+            let mut roots = Roots::from_config(&cfg);
+            roots.exclude_public(&[link.canonicalize().unwrap()]);
+            assert!(roots.get(ACCOUNT).is_none());
+        }
     }
 
     #[test]

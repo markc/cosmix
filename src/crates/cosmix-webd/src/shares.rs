@@ -172,7 +172,7 @@ pub async fn create(
             }
             let root = node
                 .share_roots
-                .get(&request.account)
+                .checked_get(&request.account, &node.vhosts.load())
                 .ok_or("unauthorized")?
                 .clone();
             let path = rel_path.clone();
@@ -533,7 +533,7 @@ pub async fn serve(
             }
             .await
         }
-        file_share::Target::Path { rel_path } => match node.share_roots.get(&target.0) {
+        file_share::Target::Path { rel_path } => match node.share_roots.checked_get(&target.0, &node.vhosts.load()) {
             Some(root) => path_download(root.clone(), &rel_path, &method, range.as_ref())
                 .await
                 .map(|d| (d, rel_path)),

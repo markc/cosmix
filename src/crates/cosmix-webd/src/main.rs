@@ -7969,7 +7969,11 @@ async fn async_main() -> Result<()> {
             let node = Arc::new(NodeState {
                 share_roots: node_cfg
                     .as_ref()
-                    .map(|c| file_share::Roots::from_config(&c.webd.shares))
+                    .map(|c| {
+                        let mut roots = file_share::Roots::from_config(&c.webd.shares);
+                        roots.exclude_public(&file_share::public_roots(&vhost_directory_handle.load()));
+                        roots
+                    })
                     .unwrap_or_default(),
                 share_runtime: shares::Runtime::default(),
                 media_runtime: crate::media::Runtime::default(),
