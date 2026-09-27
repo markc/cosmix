@@ -513,9 +513,15 @@ wrap at glyph boundaries when no word boundary fits.
 Unavailable timestamps display <code>—</code>.
 Folder sizes show the existing count queue's item count (<code>…</code> while pending),
 never a recursive byte walk. With no selection it shows the current path
-and the same folder/file counts and total file size as the status bar.
+and the same folder/file counts and total file size as that pane's footer.
 Metadata has at most four outstanding reads per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.</p>
+<p>Each pane has its own bottom-left summary box: <code>N folders, M files (total)</code>.
+It uses Small text on a muted surface and occupies a row below the clipped
+list, so the last file cannot overlap it. Totals cover that pane's root listing
+(not expanded descendants), using the existing singular/plural and byte formatting.
+Both remain visible regardless of focus. The shared status bar holds panel
+toggles and messages, with no directory summary.</p>
 <p><strong>Ctrl+B</strong> toggles Places and <strong>Ctrl+I</strong> toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
 resize it; double-click restores Places to 15% or Properties to 22%. Both
@@ -593,7 +599,8 @@ permission. No verb performs file operations or opens a confirmation dialog.</p>
 <code>INTERNAL</code> are reserved refusal codes; filesystem listing errors currently
 appear in pane status after an asynchronous navigation reply.</p>
 <p><code>PaneState</code> is identical in <code>info.pane_states</code> and <code>state.panes</code>:
-<code>{pane, path, active, show_hidden, sort, ascending, selected, rows, status}</code>.
+<code>{pane, path, active, show_hidden, sort, ascending, selected, rows, status, summary}</code>.
+<code>summary</code> is the pane footer text, added in 0.3.1; <code>status</code> keeps its existing meaning.
 Rows are ordered left then right; <code>pane</code> is 0 or 1, <code>selected</code> is a path
 or null, <code>sort</code> is <code>name</code>, <code>size</code> or <code>modified</code>, and paths are sanitised
 for display. <code>info.panes</code> remains a count for existing callers.

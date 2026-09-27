@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Give each pane a small muted summary box below its clipped list. Keep
+  panel toggles and messages in the shared status bar; expose the same
+  totals as an additive `summary` field in each Bus pane state.
+
 ## 0.3.0
 
 - Skip unchanged Size measurements with a cheap listing signature; shape the

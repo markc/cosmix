@@ -75,9 +75,16 @@ wrap at glyph boundaries when no word boundary fits.
 Unavailable timestamps display `—`.
 Folder sizes show the existing count queue's item count (`…` while pending),
 never a recursive byte walk. With no selection it shows the current path
-and the same folder/file counts and total file size as the status bar.
+and the same folder/file counts and total file size as that pane's footer.
 Metadata has at most four outstanding reads per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.
+
+Each pane has its own bottom-left summary box: `N folders, M files (total)`.
+It uses Small text on a muted surface and occupies a row below the clipped
+list, so the last file cannot overlap it. Totals cover that pane's root listing
+(not expanded descendants), using the existing singular/plural and byte formatting.
+Both remain visible regardless of focus. The shared status bar holds panel
+toggles and messages, with no directory summary.
 
 **Ctrl+B** toggles Places and **Ctrl+I** toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
@@ -170,7 +177,8 @@ Unknown verbs return `UNKNOWN_VERB`. `NOT_FOUND`, `CONFLICT` and
 appear in pane status after an asynchronous navigation reply.
 
 `PaneState` is identical in `info.pane_states` and `state.panes`:
-`{pane, path, active, show_hidden, sort, ascending, selected, rows, status}`.
+`{pane, path, active, show_hidden, sort, ascending, selected, rows, status, summary}`.
+`summary` is the pane footer text, added in 0.3.1; `status` keeps its existing meaning.
 Rows are ordered left then right; `pane` is 0 or 1, `selected` is a path
 or null, `sort` is `name`, `size` or `modified`, and paths are sanitised
 for display. `info.panes` remains a count for existing callers.

@@ -187,7 +187,6 @@ pub fn root<'a>(
         body,
         status::bar(
             look,
-            active_pane,
             info,
             places_config.open,
             properties_config.open,

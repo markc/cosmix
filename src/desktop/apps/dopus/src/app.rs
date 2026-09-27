@@ -615,7 +615,15 @@ impl Dopus {
                         }
                     }
                 }
-                CoreEvent::Status { text, .. } => self.status = Some(text),
+                CoreEvent::Status { pane, text } => {
+                    // Listing summaries live in the pane footers, including
+                    // replies for the inactive pane. Keep errors/messages here.
+                    if !pane.is_some_and(|id| {
+                        text == cosmix_dopus_core::pane_summary(&self.core.pane(id).root)
+                    }) {
+                        self.status = Some(text);
+                    }
+                }
                 // The core's info line (operation results among them) is
                 // authoritative again.
                 CoreEvent::InfoChanged => self.status = None,

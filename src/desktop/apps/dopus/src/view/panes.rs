@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
-use iced::widget::{column, container};
+use iced::widget::{column, container, text};
 use iced::{Element, Event, Length, Rectangle, Size};
 
 use cosmix_dopus_core::{PaneId, PaneModel, VisibleRow};
@@ -68,6 +68,13 @@ pub fn pane_column<'a>(
                 columns,
             ))
             .map(move |m| Msg::PaneRows(pane_id, m)),
+            container(
+                text(cosmix_dopus_core::pane_summary(&pane.root))
+                    .font(look.ui_font)
+                    .size(look.small_px),
+            )
+            .padding([look.chrome.small, look.chrome.pad])
+            .style(look.strip(look.tokens.muted_surface, look.tokens.muted_text)),
         ]
         .width(Length::Fill)
         .height(Length::Fill),

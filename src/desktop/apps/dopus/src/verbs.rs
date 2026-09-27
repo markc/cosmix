@@ -114,6 +114,9 @@ pub struct PaneState {
     pub rows: usize,
     /// Relative or absolute, as the status line renders it.
     pub status: String,
+    /// Root listing totals, identical to this pane's footer, independent of focus.
+    #[serde(default)]
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -743,6 +746,7 @@ fn pane_state(core: &DopusCore, pane_id: PaneId) -> PaneState {
             .map(|p| cosmix_dopus_core::sanitise_display_path(p)),
         rows: core.visible_rows(pane_id).len(),
         status: pane.status.clone(),
+        summary: cosmix_dopus_core::pane_summary(&pane.root),
     }
 }
 
@@ -903,5 +907,78 @@ pub fn serve_command(
             code::UNKNOWN_VERB,
             format!("{other} is not a dopus verb (schema {SCHEMA})"),
         )],
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use cosmix_dopus_core::{CoreEvent, DOpusConfig, FileEntry};
+
+    #[test]
+    fn pane_summaries_follow_their_root_listing_independent_of_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = DOpusConfig::default();
+        config.left.path = dir.path().to_owned();
+        config.right.path = dir.path().to_owned();
+        let (mut core, _rx) = DopusCore::new(config, None);
+        for (id, entries) in [
+            (
+                PaneId::Left,
+                vec![("folder", true, None), ("file", false, Some(1536))],
+            ),
+            (
+                PaneId::Right,
+                vec![("one", false, Some(1024)), ("two", false, Some(1024))],
+            ),
+        ] {
+            core.on_event(CoreEvent::ListingArrived {
+                pane: id,
+                generation: core.pane(id).generation,
+                path: dir.path().to_owned(),
+                root: true,
+                result: Ok(entries
+                    .into_iter()
+                    .map(|(name, is_dir, size)| FileEntry {
+                        path: dir.path().join(name),
+                        name: name.into(),
+                        is_dir,
+                        size,
+                        child_count: is_dir.then_some(99),
+                        modified: None,
+                    })
+                    .collect()),
+            });
+        }
+        for active in [PaneId::Left, PaneId::Right] {
+            core.set_active_pane(active);
+            for (id, expected) in [
+                (PaneId::Left, "1 folder, 1 file (1.5 KiB)"),
+                (PaneId::Right, "0 folders, 2 files (2.0 KiB)"),
+            ] {
+                let state = pane_state(&core, id);
+                assert_eq!(state.summary, expected);
+                assert_eq!(
+                    state.summary,
+                    cosmix_dopus_core::pane_summary(&core.pane(id).root)
+                );
+                assert_eq!(state.status, core.pane(id).status);
+            }
+        }
+        core.on_event(CoreEvent::ListingArrived {
+            pane: PaneId::Right,
+            generation: core.pane(PaneId::Right).generation,
+            path: dir.path().to_owned(),
+            root: true,
+            result: Ok(Vec::new()),
+        });
+        assert_eq!(
+            pane_state(&core, PaneId::Right).summary,
+            "0 folders, 0 files (0 B)"
+        );
+        assert_eq!(
+            pane_state(&core, PaneId::Left).summary,
+            "1 folder, 1 file (1.5 KiB)"
+        );
     }
 }
