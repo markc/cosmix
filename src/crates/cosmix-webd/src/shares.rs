@@ -843,7 +843,7 @@ pub(crate) mod tests {
         };
         Arc::get_mut(&mut node).unwrap().share_roots = file_share::Roots::from_config(&cfg);
         let vhost = node.vhost_for_host("pim.example").unwrap();
-        file_share::init_schema(&vhost.db.as_ref().unwrap().lock().await).unwrap();
+        file_share::init_schema(&*vhost.db.as_ref().unwrap().lock().await).unwrap();
         (tmp, node, vhost)
     }
     pub(crate) fn cookie(node: &NodeState, kind: &str, epoch: i64) -> String {
