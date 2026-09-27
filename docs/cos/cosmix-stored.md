@@ -13,7 +13,13 @@ cannot have conflicting sizes. Empty files and empty snapshots are valid.
 `mix/store_manifest.mix` beside blobd is the shared canonicaliser. It emits
 compact UTF-8 JSON, lexical field order (`files`, `schema_version`; `blob`,
 `path`, `size`), files sorted by UTF-8 byte order of the path, no trailing newline. String
-scalars use JSON escaping; identity is BLAKE3 of those exact encoded bytes.
+scalars use `json_encode`'s serde_json minimal escaping: quotes, backslashes
+and U+0000–U+001F are escaped (the short escapes where available); other
+characters use raw UTF-8, including U+2028, U+2029 and non-BMP characters.
+The scalar encoder also leaves DEL raw, but manifest paths reject it as Cc.
+These exact bytes are part of the format contract across Mix releases:
+a change to escaping is a manifest-format change and requires v3.
+Identity is BLAKE3 of those exact encoded bytes.
 Origin, instance, creation time and collection do not participate in identity.
 
 Limits: 1000 files, 128 KiB canonical UTF-8 bytes, 1024 UTF-8 bytes per path.
