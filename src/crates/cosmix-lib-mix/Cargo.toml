@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.96.1"
+version = "0.97.0"
 edition = "2024"
 license = "MIT"
 
@@ -29,7 +29,7 @@ url = ["dep:url"]
 # bcrypt for maild.accounts.password writes over the Bus (a raw props.set
 # stores the field verbatim; only the CLI hashed before this existed).
 crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt"]
-http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile"]
+http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile", "dep:blake3"]
 sqlite = ["dep:rusqlite"]
 # `tokio-sleep` is an alias-only feature kept for backwards
 # compatibility with consumers that still list

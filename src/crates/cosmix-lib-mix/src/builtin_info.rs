@@ -158,6 +158,8 @@ pub struct BuiltinContract {
     pub effects: EffectFlags,
     pub failure: OperationalFailure,
     pub cond_caps: &'static [CondCap],
+    /// Additional unconditional authority, alongside the entry's base class.
+    pub required_caps: &'static [crate::builtins::CapabilityClass],
     /// For builtins whose valid arities are NOT a contiguous range
     /// (e.g. `random()` takes exactly 0 or 2 arguments — never 1),
     /// the exact accepted argument counts. `None` = the min..=max
@@ -501,7 +503,8 @@ macro_rules! contract_args {
 /// Clauses after the return shape are optional but fixed-order:
 /// `arities[n, m]` (exact accepted argument counts, for non-contiguous
 /// arity like `random`'s 0-or-2), then `effects[...]`, then
-/// `failure[...]` (default `not_applicable`), then
+/// `failure[...]` (default `not_applicable`), then `caps[...]` (additional
+/// unconditional capabilities, beyond the builtin's primary class), then
 /// `cond_caps[option: CapabilityClass, ...]`.
 #[macro_export]
 macro_rules! contract {
@@ -510,6 +513,7 @@ macro_rules! contract {
         $(; arities[$($ar:literal),+ $(,)?] )?
         $(; effects[$($e:ident),* $(,)?] )?
         $(; failure[$f:ident] )?
+        $(; caps[$($cap:ident),* $(,)?] )?
         $(; cond_caps[$($cn:ident : $cc:ident),* $(,)?] )?
     ) => {
         $crate::builtin_info::BuiltinContract {
@@ -518,6 +522,7 @@ macro_rules! contract {
             effects: $crate::effect_flags!($( $($e),* )?),
             failure: $crate::op_failure!($( $f )?),
             cond_caps: $crate::cond_caps!($( $($cn : $cc),* )?),
+            required_caps: &[$($( $crate::builtins::CapabilityClass::$cap ),*)?],
             exact_arities: $crate::exact_arities!($( $($ar),+ )?),
         }
     };

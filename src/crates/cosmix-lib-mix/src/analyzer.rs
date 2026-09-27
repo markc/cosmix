@@ -3564,6 +3564,9 @@ fn collect_expr_caps(expr: &Expr, caps: &mut HashSet<&'static str>) {
         Expr::FunctionCall { name, args } => {
             if let Some(info) = builtins::builtin_info_of(name) {
                 caps.insert(info.capability.as_str());
+                for cap in info.contract.required_caps {
+                    caps.insert(cap.as_str());
+                }
                 for cc in info.contract.cond_caps {
                     if args.iter().any(
                         |arg| matches!(arg, Expr::MapLiteral(entries) if entries.iter().any(|(k, _)| k == cc.option)),

@@ -442,6 +442,34 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="mix/http.md"><div class="prose"><h1 id="http--http-client-builtins">http — HTTP client builtins</h1>
+<h2 id="streaming-file-upload-0970">Streaming file upload (0.97.0)</h2>
+<p><code>http_put_file(url, path[, opts]) -&gt; map&lt;http_file_response&gt;</code> streams a regular
+file with a fixed 64 KiB transfer buffer. Keep the source immutable during the
+call. <code>range: {start, end}</code> selects inclusive byte offsets; without it the
+whole file is sent, including an empty file. Content-Length is exact and an
+early EOF fails with <code>HTTP_SHORT_READ</code>. Sizes and offsets must be exact Mix
+integers (0 through 9007199254740991); invalid ranges raise <code>OPTION_INVALID</code>.</p>
+<p>Options are <code>method</code> (<code>PUT</code>, <code>POST</code>, or <code>PATCH</code>, default <code>PUT</code>), <code>range</code>,
+<code>headers</code>, <code>idle_timeout</code> (seconds, default 30, positive), <code>deadline</code> (seconds,
+default 0 = disabled), <code>ssl_verify</code>, <code>ca_file</code>, and <code>ca_pem</code>. TLS options have
+the same validation and trust roots as the buffered HTTP builtins below.
+Unknown options raise. The builtin owns Content-Length and Transfer-Encoding;
+setting either header raises. Redirects are disabled: a 3xx is returned.</p>
+<p><code>idle_timeout</code> bounds socket inactivity (and connection establishment).
+<code>deadline</code> is checked cooperatively around streaming IO. It is best-effort
+during blocking DNS/IO, <strong>not a hard whole-call bound</strong>. Both accept fractional
+seconds, up to one year.</p>
+<p>The distinct <code>http_file_response</code> has <code>status</code>, <code>headers</code>, <code>bytes_written</code>,
+<code>size</code>, <code>blake3</code>, <code>body</code>, <code>bytes</code>, <code>final_url</code>, <code>duration_ms</code>, <code>error_code</code>, and
+<code>error</code>. For uploads, <code>bytes_written</code> counts source bytes consumed, not a
+server's durable acknowledgement; <code>size</code> is the selected window size and
+<code>blake3</code> is its lowercase digest (nil on failure). Response bodies are capped
+at 64 MiB. HTTP failures retain their real status; IO/transport failures return
+status 0 and an error (<code>FILE_IO</code>, <code>HTTP_SHORT_READ</code>, or the HTTP codes below).
+Argument errors raise. Inspect the result even when the call does not raise.</p>
+<p>Network <strong>and FsRead are unconditional capabilities</strong>, including calls without
+options. Structured discovery and <code>mix lint</code> include both. The <code>http</code> Cargo
+feature itself enables BLAKE3; <code>crypto</code> is not required for these transfers.</p>
 <p>The HTTP client builtins — a small, blocking HTTP/1.1 client built on
 <a href="https://docs.rs/ureq"><code>ureq</code></a>. Three calls cover the whole surface:
 <code>http_get</code>, <code>http_post</code>, and the any-verb <code>http_request</code>. They are

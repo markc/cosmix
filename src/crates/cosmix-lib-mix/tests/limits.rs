@@ -32,6 +32,15 @@ fn limits(recursion_limit: usize) -> EvalLimits {
     }
 }
 
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn upload_requires_read_capability_even_without_options() {
+    let err = run("$r = http_put_file(\"http://invalid.invalid\", \"absent\")", |e| {
+        e.set_capability_policy(Rc::new(CategoryAllowList::new(&[CapabilityClass::Network])));
+    }).await.expect_err("FsRead must be checked before opening the source");
+    assert!(err.contains("fs-read"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // Knob B — recursion-depth cap (every native path)
 // ---------------------------------------------------------------------------

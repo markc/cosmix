@@ -221,6 +221,7 @@ fn row_json(row: &EntryRow) -> serde_json::Value {
         "name": row.name,
         "category": row.category,
         "capability": row.capability,
+        "required_capabilities": c.required_caps.iter().map(|cap| cap.as_str()).collect::<Vec<_>>(),
         "conditional_capabilities": c.cond_caps
             .iter()
             .map(|cc| serde_json::json!({

@@ -1,5 +1,39 @@
 # http — HTTP client builtins
 
+## Streaming file upload (0.97.0)
+
+`http_put_file(url, path[, opts]) -> map<http_file_response>` streams a regular
+file with a fixed 64 KiB transfer buffer. Keep the source immutable during the
+call. `range: {start, end}` selects inclusive byte offsets; without it the
+whole file is sent, including an empty file. Content-Length is exact and an
+early EOF fails with `HTTP_SHORT_READ`. Sizes and offsets must be exact Mix
+integers (0 through 9007199254740991); invalid ranges raise `OPTION_INVALID`.
+
+Options are `method` (`PUT`, `POST`, or `PATCH`, default `PUT`), `range`,
+`headers`, `idle_timeout` (seconds, default 30, positive), `deadline` (seconds,
+default 0 = disabled), `ssl_verify`, `ca_file`, and `ca_pem`. TLS options have
+the same validation and trust roots as the buffered HTTP builtins below.
+Unknown options raise. The builtin owns Content-Length and Transfer-Encoding;
+setting either header raises. Redirects are disabled: a 3xx is returned.
+
+`idle_timeout` bounds socket inactivity (and connection establishment).
+`deadline` is checked cooperatively around streaming IO. It is best-effort
+during blocking DNS/IO, **not a hard whole-call bound**. Both accept fractional
+seconds, up to one year.
+
+The distinct `http_file_response` has `status`, `headers`, `bytes_written`,
+`size`, `blake3`, `body`, `bytes`, `final_url`, `duration_ms`, `error_code`, and
+`error`. For uploads, `bytes_written` counts source bytes consumed, not a
+server's durable acknowledgement; `size` is the selected window size and
+`blake3` is its lowercase digest (nil on failure). Response bodies are capped
+at 64 MiB. HTTP failures retain their real status; IO/transport failures return
+status 0 and an error (`FILE_IO`, `HTTP_SHORT_READ`, or the HTTP codes below).
+Argument errors raise. Inspect the result even when the call does not raise.
+
+Network **and FsRead are unconditional capabilities**, including calls without
+options. Structured discovery and `mix lint` include both. The `http` Cargo
+feature itself enables BLAKE3; `crypto` is not required for these transfers.
+
 The HTTP client builtins — a small, blocking HTTP/1.1 client built on
 [`ureq`](https://docs.rs/ureq). Three calls cover the whole surface:
 `http_get`, `http_post`, and the any-verb `http_request`. They are
@@ -516,4 +550,3 @@ a browser and a script, not a load. The moment the words "certificate",
 - [Bus messaging](bus.md) — in-mesh RPC (`send`/`emit`); HTTP is for the world *outside* the mesh
 - [the manual index](README.md) — every page in this manual
 - `mix what http_get` · `mix what http_post` · `mix what http_request` · `mix builtins system` · the [mix repo](https://github.com/markc/cosmix)
-
