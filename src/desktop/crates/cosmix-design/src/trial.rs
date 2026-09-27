@@ -109,10 +109,11 @@ fn embedded_default_source_compiles_to_revision_one() {
 
 #[test]
 fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
-    const ROLE_NAMES: [&str; 7] = [
+    const ROLE_NAMES: [&str; 8] = [
         "palette.background.1",
         "palette.background.2",
         "palette.background.3",
+        "palette.background.muted",
         "palette.foreground.default",
         "palette.foreground.muted",
         "palette.accent.default",
@@ -126,6 +127,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.98, 0.008, 220.0],
                 [0.96, 0.012, 220.0],
                 [0.92, 0.018, 220.0],
+                [0.89, 0.012, 220.0],
                 [0.25, 0.06, 220.0],
                 [0.50, 0.06, 220.0],
                 [0.50, 0.12, 220.0],
@@ -139,6 +141,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.12, 0.015, 220.0],
                 [0.16, 0.02, 220.0],
                 [0.22, 0.025, 220.0],
+                [0.26, 0.02, 220.0],
                 [0.95, 0.02, 220.0],
                 [0.61, 0.04, 220.0],
                 [0.75, 0.12, 220.0],
@@ -152,6 +155,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.98, 0.008, 25.0],
                 [0.96, 0.012, 25.0],
                 [0.92, 0.018, 25.0],
+                [0.89, 0.012, 25.0],
                 [0.25, 0.04, 25.0],
                 [0.50, 0.04, 25.0],
                 [0.47, 0.20, 25.0],
@@ -165,6 +169,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.10, 0.015, 25.0],
                 [0.14, 0.02, 25.0],
                 [0.20, 0.025, 25.0],
+                [0.26, 0.02, 25.0],
                 [0.95, 0.02, 25.0],
                 [0.61, 0.03, 25.0],
                 [0.63, 0.23, 25.0],
@@ -178,6 +183,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.98, 0.005, 60.0],
                 [0.96, 0.008, 60.0],
                 [0.92, 0.012, 60.0],
+                [0.89, 0.008, 60.0],
                 [0.25, 0.02, 60.0],
                 [0.50, 0.015, 60.0],
                 [0.45, 0.05, 60.0],
@@ -191,6 +197,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.12, 0.01, 60.0],
                 [0.16, 0.012, 60.0],
                 [0.22, 0.015, 60.0],
+                [0.26, 0.012, 60.0],
                 [0.95, 0.01, 60.0],
                 [0.61, 0.015, 60.0],
                 [0.80, 0.03, 60.0],
@@ -204,6 +211,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.98, 0.008, 150.0],
                 [0.96, 0.012, 150.0],
                 [0.92, 0.018, 150.0],
+                [0.89, 0.012, 150.0],
                 [0.25, 0.06, 150.0],
                 [0.50, 0.06, 150.0],
                 [0.49, 0.12, 150.0],
@@ -217,6 +225,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.12, 0.015, 150.0],
                 [0.16, 0.02, 150.0],
                 [0.22, 0.025, 150.0],
+                [0.26, 0.02, 150.0],
                 [0.95, 0.02, 150.0],
                 [0.61, 0.04, 150.0],
                 [0.70, 0.12, 150.0],
@@ -230,6 +239,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.98, 0.01, 45.0],
                 [0.96, 0.015, 45.0],
                 [0.92, 0.02, 45.0],
+                [0.89, 0.015, 45.0],
                 [0.30, 0.08, 45.0],
                 [0.50, 0.08, 45.0],
                 [0.52, 0.16, 45.0],
@@ -243,6 +253,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.12, 0.02, 45.0],
                 [0.16, 0.025, 45.0],
                 [0.22, 0.03, 45.0],
+                [0.26, 0.025, 45.0],
                 [0.95, 0.025, 45.0],
                 [0.61, 0.05, 45.0],
                 [0.72, 0.14, 45.0],
@@ -256,6 +267,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.98, 0.0, 0.0],
                 [0.96, 0.0, 0.0],
                 [0.92, 0.0, 0.0],
+                [0.89, 0.0, 0.0],
                 [0.20, 0.0, 0.0],
                 [0.50, 0.0, 0.0],
                 [0.25, 0.0, 0.0],
@@ -269,6 +281,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.10, 0.0, 0.0],
                 [0.15, 0.0, 0.0],
                 [0.22, 0.0, 0.0],
+                [0.26, 0.0, 0.0],
                 [0.95, 0.0, 0.0],
                 [0.61, 0.0, 0.0],
                 [0.85, 0.0, 0.0],
@@ -292,6 +305,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
             "palette.background.1",
             "palette.background.2",
             "palette.background.3",
+            "palette.background.muted",
             "palette.foreground.default",
             "palette.foreground.muted",
             "status.danger",
@@ -374,7 +388,7 @@ fn embedded_semantics_use_role_anchors_and_registered_selection_pairs() {
         assert_eq!(pair.foreground, foreground);
         assert_eq!(pair.backdrop.as_deref(), backdrop);
     };
-    for name in ["base", "card", "popover"] {
+    for name in ["base", "popover"] {
         authored(
             name,
             "palette.background.1",
@@ -383,6 +397,12 @@ fn embedded_semantics_use_role_anchors_and_registered_selection_pairs() {
         );
     }
     authored(
+        "card",
+        "transparent",
+        "palette.foreground.muted",
+        Some("palette.background.1"),
+    );
+    authored(
         "secondary",
         "palette.background.2",
         "palette.foreground.default",
@@ -390,9 +410,9 @@ fn embedded_semantics_use_role_anchors_and_registered_selection_pairs() {
     );
     authored(
         "muted",
-        "transparent",
-        "palette.foreground.muted",
-        Some("palette.background.1"),
+        "palette.background.muted",
+        "palette.foreground.default",
+        None,
     );
     authored("destructive", "status.danger", "palette.background.1", None);
     let PairSource::Derived { derive: primary } = &document.v1.semantics.pairs["primary"] else {
@@ -572,7 +592,7 @@ fn shipped_fully_transparent_pair_cannot_fake_surface_toward_progress() {
     )
     .expect("Ocean / Light colour dictionary must compile")
     .value;
-    let base = &colours.pairs["muted"];
+    let base = &colours.pairs["card"];
     assert_eq!(base.surface.to_srgba8(), [0, 0, 0, 0]);
     assert_eq!(base.rendered_surface.to_srgba8(), [243, 250, 252, 255]);
     assert_eq!(base.rendered_foreground.to_srgba8(), [56, 107, 123, 255]);
@@ -580,7 +600,7 @@ fn shipped_fully_transparent_pair_cannot_fake_surface_toward_progress() {
         name: "contrast_safe_toward",
         bindings: vec![
             crate::RecipeBinding::Pair {
-                name: "muted".into(),
+                name: "card".into(),
             },
             crate::RecipeBinding::Ratio {
                 name: "probe.lift".into(),
@@ -600,7 +620,7 @@ fn shipped_fully_transparent_pair_cannot_fake_surface_toward_progress() {
     };
     let error =
         crate::colour_model::derivation::evaluate_pair_recipe(&recipe, &colours).unwrap_err();
-    assert!(error.contains("pair `muted`"), "{error}");
+    assert!(error.contains("pair `card`"), "{error}");
     assert!(error.contains("fully transparent surface"), "{error}");
     assert!(error.contains("foreground must move instead"), "{error}");
 }
@@ -1168,7 +1188,7 @@ fn artifact_query_distinguishes_unknown_direct_reexecution_and_unavailable_pairs
         PairOverrideDisposition::Available(PairOverrideRoute::Reexecute { .. })
     ));
     assert_eq!(
-        success.candidate.button_pair_override(hovered, "muted"),
+        success.candidate.button_pair_override(hovered, "card"),
         PairOverrideDisposition::Unavailable(&crate::PairRefExclusion::OutsideRecipeDomain {
             required: crate::RecipePairDomain::NonTransparentSurface,
         })
@@ -1185,14 +1205,14 @@ fn artifact_query_distinguishes_unknown_direct_reexecution_and_unavailable_pairs
 /// is where the answer came from. A query rewritten to re-derive admissibility
 /// from `substitution_domain_constraints` passes every other test in the crate.
 ///
-/// The technique is the walker test's: compile the policy while `muted` is
-/// transparent, then hand the query a dictionary in which `muted` is opaque.
+/// The technique is the walker test's: compile the policy while `card` is
+/// transparent, then hand the query a dictionary in which `card` is opaque.
 /// A stored-classification read still refuses; a re-derivation now admits.
 ///
 /// What this proves, exactly: no re-derivation that reads a *colour value*
 /// reachable from the query's arguments can survive, because the sweep below
 /// leaves no transparent alpha anywhere in them. What it does not reach: a
-/// re-derivation keyed on a *name* (`pair_name == "muted"`,
+/// re-derivation keyed on a *name* (`pair_name == "card"`,
 /// `surface_name == "transparent"`) reads no alpha at all, so no value
 /// mutation can falsify it; nor can the sweep cover a colour field added to
 /// these types after this test was written. Those rest on the compiled policy
@@ -1216,7 +1236,7 @@ fn artifact_query_obeys_the_compiled_decision_after_dictionary_values_change() {
         required: crate::RecipePairDomain::NonTransparentSurface,
     };
     assert_eq!(
-        success.candidate.button_pair_override(hovered, "muted"),
+        success.candidate.button_pair_override(hovered, "card"),
         PairOverrideDisposition::Unavailable(&excluded),
         "the compiled policy must exclude the transparent pair to begin with"
     );
@@ -1341,13 +1361,13 @@ fn artifact_query_obeys_the_compiled_decision_after_dictionary_values_change() {
     assert!(
         constraint
             .domain
-            .admits_surface_alpha(dictionary.colours.pairs["muted"].surface.alpha),
+            .admits_surface_alpha(dictionary.colours.pairs["card"].surface.alpha),
         "the swept dictionary must satisfy the recipe's domain, or a re-derivation would \
          reach the same `Unavailable` answer for the wrong reason"
     );
 
     assert_eq!(
-        crate::design_model::button_pair_override(&tables, &dictionary, hovered, "muted"),
+        crate::design_model::button_pair_override(&tables, &dictionary, hovered, "card"),
         PairOverrideDisposition::Unavailable(&excluded),
         "the query must answer from the compiled policy, not re-derive the domain"
     );
@@ -1602,7 +1622,7 @@ fn trial_ghost_sm_focus_visible_resolves_backdrop_ring_and_compact_typography() 
         size: ButtonSize::Sm,
         part: ButtonPart::Label,
     });
-    assert_eq!(cell.pair_name, "muted");
+    assert_eq!(cell.pair_name, "card");
     assert_eq!(rgba(cell.pair.surface), "#00000000");
     assert_eq!(rgba(cell.pair.rendered_surface), "#F3FAFCFF");
     assert_eq!(rgba(cell.pair.foreground), "#386B7BFF");

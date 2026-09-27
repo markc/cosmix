@@ -37,6 +37,7 @@ design: {
         "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.008, h: 220.0 },
         "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.012, h: 220.0 },
         "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.018, h: 220.0 },
+        "palette.background.muted": { color_space: "oklch", l: 0.89, c: 0.012, h: 220.0 },
         "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.06, h: 220.0 },
         "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.06, h: 220.0 },
         "palette.accent.default": { color_space: "oklch", l: 0.50, c: 0.12, h: 220.0 },
@@ -102,6 +103,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.015, h: 220.0 },
             "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.02, h: 220.0 },
             "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.025, h: 220.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.26, c: 0.02, h: 220.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 220.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.04, h: 220.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.75, c: 0.12, h: 220.0 },
@@ -116,6 +118,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.008, h: 25.0 },
             "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.012, h: 25.0 },
             "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.018, h: 25.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.89, c: 0.012, h: 25.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.04, h: 25.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.04, h: 25.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.47, c: 0.20, h: 25.0 },
@@ -130,6 +133,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.10, c: 0.015, h: 25.0 },
             "palette.background.2": { color_space: "oklch", l: 0.14, c: 0.02, h: 25.0 },
             "palette.background.3": { color_space: "oklch", l: 0.20, c: 0.025, h: 25.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.26, c: 0.02, h: 25.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 25.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.03, h: 25.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.63, c: 0.23, h: 25.0 },
@@ -144,6 +148,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.005, h: 60.0 },
             "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.008, h: 60.0 },
             "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.012, h: 60.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.89, c: 0.008, h: 60.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.02, h: 60.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.015, h: 60.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.45, c: 0.05, h: 60.0 },
@@ -158,6 +163,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.01, h: 60.0 },
             "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.012, h: 60.0 },
             "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.015, h: 60.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.26, c: 0.012, h: 60.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.01, h: 60.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.015, h: 60.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.80, c: 0.03, h: 60.0 },
@@ -172,6 +178,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.008, h: 150.0 },
             "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.012, h: 150.0 },
             "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.018, h: 150.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.89, c: 0.012, h: 150.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.06, h: 150.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.06, h: 150.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.49, c: 0.12, h: 150.0 },
@@ -186,6 +193,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.015, h: 150.0 },
             "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.02, h: 150.0 },
             "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.025, h: 150.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.26, c: 0.02, h: 150.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.02, h: 150.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.04, h: 150.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.70, c: 0.12, h: 150.0 },
@@ -200,6 +208,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.01, h: 45.0 },
             "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.015, h: 45.0 },
             "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.02, h: 45.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.89, c: 0.015, h: 45.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.30, c: 0.08, h: 45.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.08, h: 45.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.52, c: 0.16, h: 45.0 },
@@ -214,6 +223,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.12, c: 0.02, h: 45.0 },
             "palette.background.2": { color_space: "oklch", l: 0.16, c: 0.025, h: 45.0 },
             "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.03, h: 45.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.26, c: 0.025, h: 45.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.025, h: 45.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.05, h: 45.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.72, c: 0.14, h: 45.0 },
@@ -228,6 +238,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.98, c: 0.0, h: 0.0 },
             "palette.background.2": { color_space: "oklch", l: 0.96, c: 0.0, h: 0.0 },
             "palette.background.3": { color_space: "oklch", l: 0.92, c: 0.0, h: 0.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.89, c: 0.0, h: 0.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.20, c: 0.0, h: 0.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.0, h: 0.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.25, c: 0.0, h: 0.0 },
@@ -242,6 +253,7 @@ design: {
             "palette.background.1": { color_space: "oklch", l: 0.10, c: 0.0, h: 0.0 },
             "palette.background.2": { color_space: "oklch", l: 0.15, c: 0.0, h: 0.0 },
             "palette.background.3": { color_space: "oklch", l: 0.22, c: 0.0, h: 0.0 },
+            "palette.background.muted": { color_space: "oklch", l: 0.26, c: 0.0, h: 0.0 },
             "palette.foreground.default": { color_space: "oklch", l: 0.95, c: 0.0, h: 0.0 },
             "palette.foreground.muted": { color_space: "oklch", l: 0.61, c: 0.0, h: 0.0 },
             "palette.accent.default": { color_space: "oklch", l: 0.85, c: 0.0, h: 0.0 },
@@ -260,7 +272,7 @@ design: {
         },
         semantics: {
           pairs: {
-            muted: {
+            card: {
               surface: "transparent",
               foreground: "palette.foreground.default",
               backdrop: "palette.background.1"
@@ -272,7 +284,11 @@ design: {
     semantics: {
       pairs: {
         base: { surface: "palette.background.1", foreground: "palette.foreground.default" },
-        card: { surface: "palette.background.1", foreground: "palette.foreground.default" },
+        card: {
+          surface: "transparent",
+          foreground: "palette.foreground.muted",
+          backdrop: "palette.background.1"
+        },
         popover: { surface: "palette.background.1", foreground: "palette.foreground.default" },
         primary: {
           derive: {
@@ -284,11 +300,7 @@ design: {
           }
         },
         secondary: { surface: "palette.background.2", foreground: "palette.foreground.default" },
-        muted: {
-          surface: "transparent",
-          foreground: "palette.foreground.muted",
-          backdrop: "palette.background.1"
-        },
+        muted: { surface: "palette.background.muted", foreground: "palette.foreground.default" },
         accent: {
           derive: {
             name: "control_pair",
@@ -345,7 +357,7 @@ design: {
           {
             when: { variant: "ghost" },
             set: {
-              pair: { kind: "pair", value: "muted" },
+              pair: { kind: "pair", value: "card" },
               border: { kind: "token", value: "input" }
             }
           },
@@ -572,7 +584,7 @@ design: {
                 name: "focus_ring",
                 args: [
                   { kind: "colour", value: "ring" },
-                  { kind: "pair", value: "muted" }
+                  { kind: "pair", value: "card" }
                 ]
               }
             }

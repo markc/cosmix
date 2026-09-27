@@ -1528,7 +1528,7 @@ mod tests {
                             success.candidate.dictionary().colours.pairs.len()
                         );
                         assert_eq!(
-                            policy.decision("muted"),
+                            policy.decision("card"),
                             Some(&crate::PairRefDecision::Excluded(
                                 crate::PairRefExclusion::OutsideRecipeDomain {
                                     required: crate::RecipePairDomain::NonTransparentSurface,
@@ -1544,7 +1544,7 @@ mod tests {
                                 ))
                                 .map(|(name, _)| name)
                                 .collect::<Vec<_>>(),
-                            ["muted"]
+                            ["card"]
                         );
                         *actual
                             .entry((
