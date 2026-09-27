@@ -8,11 +8,11 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 use crate::events::CoreEvent;
-use crate::model::{count_directory_entries, read_directory, CountJob, PaneId};
+use crate::model::{CountJob, PaneId, count_directory_entries, read_directory};
 use crate::ops::FileOperation;
 
 #[derive(Clone)]
@@ -29,6 +29,18 @@ pub(crate) struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    pub(crate) fn spawn_properties(&self, pane: PaneId, generation: u64, path: PathBuf) {
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = crate::properties::read(&path);
+            let _ = tx.send(CoreEvent::PropertiesArrived {
+                pane,
+                generation,
+                path,
+                result,
+            });
+        });
+    }
     pub(crate) fn new(tx: mpsc::Sender<CoreEvent>) -> Self {
         Self {
             tx,

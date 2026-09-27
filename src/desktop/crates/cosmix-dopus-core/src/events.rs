@@ -20,6 +20,12 @@ use crate::ops::FileOpKind;
 /// validates them and derives the rest for the view.
 #[derive(Clone, Debug)]
 pub enum CoreEvent {
+    PropertiesArrived {
+        pane: PaneId,
+        generation: u64,
+        path: PathBuf,
+        result: Result<crate::properties::Metadata, String>,
+    },
     ListingArrived {
         pane: PaneId,
         generation: u64,

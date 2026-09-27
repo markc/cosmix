@@ -6,12 +6,13 @@
 //! everywhere except the list and the divider; every colour from the
 //! compiled tokens via [`Look`].
 
-pub mod dialogs;
 pub mod columns;
+pub mod dialogs;
 pub mod elide;
 pub mod location;
 pub mod panes;
 pub mod places;
+pub mod properties;
 pub mod rows;
 pub mod status;
 
@@ -83,6 +84,7 @@ pub fn root<'a>(
     info: &'a str,
     dialog: Option<&'a dialogs::Dialog>,
     places: &'a [(&'static str, std::path::PathBuf)],
+    properties: cosmix_dopus_core::properties::Properties,
 ) -> Element<'a, Msg> {
     let (left_edit, right_edit) = match editing {
         Some((PaneId::Left, text)) => (Some(text), None),
@@ -95,18 +97,41 @@ pub fn root<'a>(
     };
     // The ratio quantised to whole Fill portions out of 100 (the drag clamp
     // already keeps it in 0.1–0.9, so both sides get at least 10).
-    let left_portion = (split_ratio.clamp(panes::SPLIT_MIN, panes::SPLIT_MAX) * 100.0).round() as u16;
+    let left_portion =
+        (split_ratio.clamp(panes::SPLIT_MIN, panes::SPLIT_MAX) * 100.0).round() as u16;
     let content = column![
         row![
-            places::sidebar(look, icons, tint, active, active_pane, places),
-            panes::pane_column(
-                look, icons, tint, PaneId::Left, left, left_rows, left_portion, active == PaneId::Left, left_edit,
-            ),
-            panes::Divider::new(&look),
-            panes::pane_column(
-                look, icons, tint, PaneId::Right, right, right_rows, 100 - left_portion, active == PaneId::Right,
-                right_edit,
-            ),
+            row![
+                places::sidebar(look, icons, tint, active, active_pane, places),
+                panes::pane_column(
+                    look,
+                    icons,
+                    tint,
+                    PaneId::Left,
+                    left,
+                    left_rows,
+                    left_portion,
+                    active == PaneId::Left,
+                    left_edit,
+                ),
+                panes::Divider::new(&look),
+                panes::pane_column(
+                    look,
+                    icons,
+                    tint,
+                    PaneId::Right,
+                    right,
+                    right_rows,
+                    100 - left_portion,
+                    active == PaneId::Right,
+                    right_edit,
+                ),
+            ]
+            .width(Length::FillPortion(85))
+            .height(Length::Fill),
+            container(properties::sidebar(look, properties))
+                .width(Length::FillPortion(15))
+                .height(Length::Fill)
         ]
         .width(Length::Fill)
         .height(Length::Fill)
@@ -127,15 +152,26 @@ pub fn root<'a>(
 /// A ghost button style over the secondary strip: quiet until hovered. The
 /// colours are `Copy` tokens, so the closure captures values and is
 /// `'static` (the ced `chrome::Look::flat` shape).
-pub fn button_look(look: &Look) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style + 'static {
-    let (text, hover, radius) = (look.chrome.secondary_text, look.tokens.muted_surface, look.tokens.radius);
+pub fn button_look(
+    look: &Look,
+) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style + 'static {
+    let (text, hover, radius) = (
+        look.chrome.secondary_text,
+        look.tokens.muted_surface,
+        look.tokens.radius,
+    );
     move |_theme, status| iced::widget::button::Style {
         background: match status {
-            iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed => Some(hover.into()),
+            iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed => {
+                Some(hover.into())
+            }
             _ => None,
         },
         text_color: text,
-        border: iced::Border { radius: radius.into(), ..Default::default() },
+        border: iced::Border {
+            radius: radius.into(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

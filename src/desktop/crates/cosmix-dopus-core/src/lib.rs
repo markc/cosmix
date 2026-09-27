@@ -55,6 +55,7 @@ pub mod config;
 pub mod events;
 pub mod model;
 pub mod ops;
+pub mod properties;
 mod worker;
 
 pub use config::{ConfigFile, DOpusConfig, PaneConfig, SortColumn, CURRENT_SCHEMA};

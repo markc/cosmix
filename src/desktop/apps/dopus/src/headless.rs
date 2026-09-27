@@ -49,6 +49,7 @@ pub fn answer_derived(core: &mut DopusCore, events: Vec<CoreEvent>, log: impl Fn
             | CoreEvent::ListingStarted { .. }
             | CoreEvent::ListingArrived { .. }
             | CoreEvent::CountArrived { .. }
+            | CoreEvent::PropertiesArrived { .. }
             | CoreEvent::OperationArrived { .. }
             | CoreEvent::ConfigSettled(_)
             | CoreEvent::RefreshAll => {}

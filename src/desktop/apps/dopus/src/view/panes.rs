@@ -212,7 +212,7 @@ impl Divider {
     /// centre tracks the cursor at the clamp extremes too.
     fn ratio_at(x: f32, viewport: &Rectangle) -> f32 {
         let left = viewport.x + crate::view::places::PLACES_W;
-        let width = (viewport.width - crate::view::places::PLACES_W - DIVIDER_W).max(1.0);
+        let width = (viewport.width * 0.85 - crate::view::places::PLACES_W - DIVIDER_W).max(1.0);
         ((x - left) / width).clamp(SPLIT_MIN, SPLIT_MAX)
     }
 }

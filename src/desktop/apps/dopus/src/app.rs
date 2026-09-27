@@ -590,6 +590,7 @@ impl Dopus {
                 CoreEvent::ListingStarted { .. }
                 | CoreEvent::ListingArrived { .. }
                 | CoreEvent::CountArrived { .. }
+                | CoreEvent::PropertiesArrived { .. }
                 | CoreEvent::OperationArrived { .. }
                 // The view re-renders from the core after every message, so
                 // "config persisted" and "both panes stale" need no reaction.
@@ -991,6 +992,7 @@ impl Dopus {
             info,
             self.dialog.as_ref(),
             self.core.places(),
+            self.core.properties(self.core.active()),
         );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops

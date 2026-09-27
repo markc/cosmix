@@ -19,6 +19,16 @@ Selection uses the design's selection pair, and a tinted header marks the
 active pane. Modified times follow filemgr's rule: relative below seven days,
 otherwise local `DD/MM/YY at h:mm am/pm`, refreshed by the frontend clock.
 
+The plain **Properties** sidebar follows the active pane's single selection:
+name, kind and extension-based MIME guess, byte and human-readable size,
+modified/created/accessed times, Unix permissions (rwx and octal), numeric
+owner:group, and symlink target. Unavailable timestamps display `—`.
+Folder sizes show the existing count queue's item count (`…` while pending),
+never a recursive byte walk. With no selection it shows the current path
+and the same folder/file counts and total file size as the status bar.
+Metadata runs on at most one worker per pane; stale replies are discarded.
+Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.
+
 File operations are local keyboard/dialog actions: new folder, rename,
 copy or move to the other pane, and permanent delete with confirmation.
 Operations run one at a time, never overwrite a destination, and relist both

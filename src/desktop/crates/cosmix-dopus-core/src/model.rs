@@ -16,12 +16,12 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, Utc};
 
-use crate::config::{ConfigFile, DOpusConfig, PaneConfig, SortColumn, CURRENT_SCHEMA};
+use crate::config::{CURRENT_SCHEMA, ConfigFile, DOpusConfig, PaneConfig, SortColumn};
 use crate::events::{ConfirmAnswer, CoreEvent, PromptKind};
 use crate::ops::{FileOpKind, FileOperation};
 use crate::worker::WorkerHandle;
@@ -115,7 +115,6 @@ pub struct PaneModel {
     // The worker-side mirror of `generation` lives in `WorkerHandle::
     // generations` (worker.rs) — one array, updated only by
     // `store_generation`; panes hold no second copy to drift.
-
     pub listing: bool,
     pub root: Vec<FileEntry>,
     pub children: HashMap<PathBuf, Vec<FileEntry>>,
@@ -186,9 +185,18 @@ enum OpState {
 /// What a reserved token will launch when resolved (browser.rs `ConfirmedOp`
 /// 422-427 plus `NameEditKind` 454-457).
 enum Reservation {
-    Delete { source: PathBuf, source_pane: PaneId },
-    NewFolder { parent: PathBuf, pane: PaneId },
-    Rename { source: PathBuf, pane: PaneId },
+    Delete {
+        source: PathBuf,
+        source_pane: PaneId,
+    },
+    NewFolder {
+        parent: PathBuf,
+        pane: PaneId,
+    },
+    Rename {
+        source: PathBuf,
+        pane: PaneId,
+    },
 }
 
 /// The public face of an outstanding reservation, for
@@ -242,6 +250,7 @@ impl ConfirmBook {
 /// thread; filesystem work happens on detached worker threads that reply
 /// through the channel returned by [`DopusCore::new`].
 pub struct DopusCore {
+    properties: [crate::properties::Slot; 2],
     places_home: PathBuf,
     places_cache: std::cell::OnceCell<Vec<(&'static str, PathBuf)>>,
     #[cfg(test)]
@@ -273,13 +282,17 @@ impl DopusCore {
     /// Build the core from a startup config and optionally a persistence
     /// target. Both panes start listing immediately; their `ListingStarted`
     /// events are waiting in the queue for the first [`DopusCore::tick`].
-    pub fn new(config: DOpusConfig, config_file: Option<ConfigFile>) -> (Self, mpsc::Receiver<CoreEvent>) {
+    pub fn new(
+        config: DOpusConfig,
+        config_file: Option<ConfigFile>,
+    ) -> (Self, mpsc::Receiver<CoreEvent>) {
         let (tx, rx) = mpsc::channel();
         let workers = WorkerHandle::new(tx);
         let home = home_directory();
         let left_start = configured_directory(&config.left.path, &home);
         let right_start = configured_directory(&config.right.path, &home);
         let mut core = Self {
+            properties: Default::default(),
             places_home: home,
             places_cache: std::cell::OnceCell::new(),
             #[cfg(test)]
@@ -336,7 +349,8 @@ impl DopusCore {
     pub fn places(&self) -> &[(&'static str, PathBuf)] {
         self.places_cache.get_or_init(|| {
             #[cfg(test)]
-            self.places_stat_passes.set(self.places_stat_passes.get() + 1);
+            self.places_stat_passes
+                .set(self.places_stat_passes.get() + 1);
             places(&self.places_home)
         })
     }
@@ -405,6 +419,55 @@ impl DopusCore {
         }
     }
 
+    /// Pure snapshot: no stat or directory walk on the caller/UI thread.
+    /// Counts are read from the existing generation-checked count queue.
+    pub fn properties(&self, pane: PaneId) -> crate::properties::Properties {
+        let model = self.pane(pane);
+        let entry = model.selected.as_ref().and_then(|path| {
+            self.visible_rows(pane)
+                .into_iter()
+                .find(|row| row.entry.path == *path)
+        });
+        if let Some(row) = entry {
+            let metadata = self.properties[pane.index()]
+                .cached
+                .as_ref()
+                .filter(|(generation, path, _)| {
+                    *generation == model.generation && *path == row.entry.path
+                })
+                .map(|(_, _, result)| result.clone());
+            crate::properties::Properties::Entry {
+                entry: row.entry,
+                metadata,
+            }
+        } else {
+            crate::properties::Properties::Folder {
+                path: sanitise_display_path(&model.path),
+                summary: pane_summary(&model.root),
+            }
+        }
+    }
+
+    fn dispatch_properties(&mut self) {
+        for pane in [PaneId::Left, PaneId::Right] {
+            let model = self.pane(pane);
+            let Some(path) = model.selected.clone() else {
+                continue;
+            };
+            let generation = model.generation;
+            let slot = &mut self.properties[pane.index()];
+            if slot.in_flight.is_none()
+                && !slot
+                    .cached
+                    .as_ref()
+                    .is_some_and(|(g, p, _)| *g == generation && *p == path)
+            {
+                slot.in_flight = Some((generation, path.clone()));
+                self.workers.spawn_properties(pane, generation, path);
+            }
+        }
+    }
+
     // -- navigation ---------------------------------------------------------
 
     pub fn navigate(&mut self, pane: PaneId, path: PathBuf) {
@@ -453,7 +516,11 @@ impl DopusCore {
 
     /// Apply to a pane without changing keyboard focus.
     pub fn go_parent_in(&mut self, pane_id: PaneId) {
-        if let Some(parent) = self.panes[pane_id.index()].path.parent().map(Path::to_path_buf) {
+        if let Some(parent) = self.panes[pane_id.index()]
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+        {
             self.navigate_new(pane_id, parent);
         }
     }
@@ -689,9 +756,10 @@ impl DopusCore {
             "Permanently delete this item?\n\n{}\n\nThis cannot be undone.",
             sanitise_display_path(&source)
         );
-        let token = self
-            .confirms
-            .insert(Reservation::Delete { source, source_pane: pane_id });
+        let token = self.confirms.insert(Reservation::Delete {
+            source,
+            source_pane: pane_id,
+        });
         self.emit(CoreEvent::ConfirmRequested { token, message });
     }
 
@@ -706,7 +774,10 @@ impl DopusCore {
             Some(Reservation::Delete { .. }) => {}
             _ => return,
         }
-        let Some(Reservation::Delete { source, source_pane }) = self.confirms.entries.remove(&token)
+        let Some(Reservation::Delete {
+            source,
+            source_pane,
+        }) = self.confirms.entries.remove(&token)
         else {
             unreachable!("reservation kind guarded above");
         };
@@ -724,7 +795,9 @@ impl DopusCore {
         }
         let pane = self.active;
         let parent = self.panes[pane.index()].path.clone();
-        let token = self.confirms.insert(Reservation::NewFolder { parent, pane });
+        let token = self
+            .confirms
+            .insert(Reservation::NewFolder { parent, pane });
         self.emit(CoreEvent::PromptRequested {
             token,
             kind: PromptKind::NewFolder,
@@ -880,6 +953,23 @@ impl DopusCore {
     /// Stale replies are validated and dropped here.
     pub fn on_event(&mut self, event: CoreEvent) -> Vec<CoreEvent> {
         match event {
+            CoreEvent::PropertiesArrived {
+                pane,
+                generation,
+                path,
+                result,
+            } => {
+                let current = self.pane(pane).generation == generation
+                    && self.pane(pane).selected.as_ref() == Some(&path);
+                let slot = &mut self.properties[pane.index()];
+                if slot.in_flight.as_ref() == Some(&(generation, path.clone())) {
+                    slot.in_flight = None;
+                    if current {
+                        slot.cached = Some((generation, path, result));
+                        self.emit(CoreEvent::InfoChanged);
+                    }
+                }
+            }
             CoreEvent::ListingArrived {
                 pane,
                 generation,
@@ -915,8 +1005,14 @@ impl DopusCore {
         result: Result<Vec<FileEntry>, String>,
     ) {
         enum Listing {
-            Ok { jobs: Vec<CountJob>, status: String },
-            Err { selection_cleared: bool, status: String },
+            Ok {
+                jobs: Vec<CountJob>,
+                status: String,
+            },
+            Err {
+                selection_cleared: bool,
+                status: String,
+            },
         }
         // Stale rejection (browser.rs:1571-1573): a reply is accepted ONLY
         // when BOTH the pane's generation and — for root listings — its path
@@ -1085,7 +1181,8 @@ impl DopusCore {
     /// `dispatch_directory_counts` (browser.rs:1641-1673): fill the worker
     /// cap from the queue, re-checking the pane's live generation at dispatch.
     fn dispatch_counts(&mut self) {
-        while self.workers.count_in_flight.load(AtomicOrdering::Acquire) < DIRECTORY_COUNT_CONCURRENCY
+        while self.workers.count_in_flight.load(AtomicOrdering::Acquire)
+            < DIRECTORY_COUNT_CONCURRENCY
         {
             let Some(job) = self.count_queue.pop_front() else {
                 break;
@@ -1104,6 +1201,7 @@ impl DopusCore {
     /// (browser.rs `persist_config`, 3564-3622). Returns the derived
     /// view-facing events queued so far.
     pub fn tick(&mut self, now: Instant) -> Vec<CoreEvent> {
+        self.dispatch_properties();
         self.dispatch_counts();
         let snapshot = self.config_snapshot();
         if self.last_observed.as_ref() != Some(&snapshot) {
@@ -1173,8 +1271,7 @@ impl DopusCore {
             pane.count_sort_dirty = false;
             (pane.path.clone(), pane.show_hidden)
         };
-        self.workers
-            .store_generation(pane_id, generation);
+        self.workers.store_generation(pane_id, generation);
         self.workers
             .spawn_listing(pane_id, generation, path, true, show_hidden);
         self.emit(CoreEvent::ListingStarted { pane: pane_id });
@@ -1238,7 +1335,12 @@ fn find_entry<'a>(pane: &'a PaneModel, path: &Path) -> Option<&'a FileEntry> {
     pane.root
         .iter()
         .find(|entry| entry.path == path)
-        .or_else(|| pane.children.values().flatten().find(|entry| entry.path == path))
+        .or_else(|| {
+            pane.children
+                .values()
+                .flatten()
+                .find(|entry| entry.path == path)
+        })
 }
 
 /// `set_backing_child_count` (browser.rs:1761-1774): update the entry's child
@@ -1659,7 +1761,11 @@ pub fn file_drop_actions(source: &Path, destination: &Path, busy: bool) -> DropA
 }
 
 /// `file_drop_actions_batch` (browser.rs:2669-2679).
-pub fn file_drop_actions_batch(sources: &[PathBuf], destination: &Path, busy: bool) -> DropActionMask {
+pub fn file_drop_actions_batch(
+    sources: &[PathBuf],
+    destination: &Path,
+    busy: bool,
+) -> DropActionMask {
     if sources.is_empty()
         || sources
             .iter()
@@ -2417,7 +2523,9 @@ mod tests {
         let (token, initial) = events
             .iter()
             .find_map(|event| match event {
-                CoreEvent::PromptRequested { token, initial, .. } => Some((*token, initial.clone())),
+                CoreEvent::PromptRequested { token, initial, .. } => {
+                    Some((*token, initial.clone()))
+                }
                 _ => None,
             })
             .expect("begin_rename must raise a PromptRequested");
@@ -2479,7 +2587,11 @@ mod tests {
         // Single-flight (browser.rs:1792-1800): a second request produces a
         // status line, never a silent queue or a second running operation.
         core.copy_selection_to_other_pane();
-        assert!(core.pane(PaneId::Left).status.contains("Another file operation is still running"));
+        assert!(
+            core.pane(PaneId::Left)
+                .status
+                .contains("Another file operation is still running")
+        );
         assert!(core.availability().operation_running);
     }
 
@@ -2518,10 +2630,9 @@ mod tests {
         }
         let events = core.tick(now_instant());
         assert!(
-            events.iter().any(|event| matches!(
-                event,
-                CoreEvent::Status { pane: None, .. }
-            )),
+            events
+                .iter()
+                .any(|event| matches!(event, CoreEvent::Status { pane: None, .. })),
             "the validator's message reaches the status line"
         );
 
@@ -2554,7 +2665,9 @@ mod tests {
         let deadline = std::time::Duration::from_secs(5);
         let mut reply = rx.recv_timeout(deadline).expect("the workers must reply");
         while !matches!(reply, CoreEvent::OperationArrived { .. }) {
-            reply = rx.recv_timeout(deadline).expect("the rename reply must arrive");
+            reply = rx
+                .recv_timeout(deadline)
+                .expect("the rename reply must arrive");
         }
         let CoreEvent::OperationArrived { result, .. } = reply else {
             unreachable!("guarded by the loop")
@@ -2576,11 +2689,17 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(
             core.outstanding_reservations(),
-            vec![(first, ReservationKind::Delete), (second, ReservationKind::Delete)]
+            vec![
+                (first, ReservationKind::Delete),
+                (second, ReservationKind::Delete)
+            ]
         );
         // Withdrawing one leaves the other answerable.
         core.withdraw(second);
-        assert_eq!(core.outstanding_reservations(), vec![(first, ReservationKind::Delete)]);
+        assert_eq!(
+            core.outstanding_reservations(),
+            vec![(first, ReservationKind::Delete)]
+        );
     }
 
     #[test]
@@ -2596,10 +2715,12 @@ mod tests {
         core.copy_selection_to_other_pane();
         assert!(core.availability().operation_running);
         assert!(core.pane(PaneId::Left).status.contains("Copying"));
-        assert!(!core
-            .pane(PaneId::Left)
-            .status
-            .contains("Another file operation is still running"));
+        assert!(
+            !core
+                .pane(PaneId::Left)
+                .status
+                .contains("Another file operation is still running")
+        );
     }
 
     #[test]
@@ -2609,9 +2730,11 @@ mod tests {
         core.select_path(PaneId::Left, Some(PathBuf::from("/fixture/a.txt")));
         core.begin_rename();
         let events = core.tick(now_instant());
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, CoreEvent::PromptRequested { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CoreEvent::PromptRequested { .. }))
+        );
 
         // open_name_edit's own guard (browser.rs:3330): a second name edit
         // while one is pending is refused; the delete confirm still queues.
@@ -2657,7 +2780,11 @@ mod tests {
             path: selected.clone(),
             count: Some(3),
         });
-        assert!(events.iter().any(|event| matches!(event, CoreEvent::InfoChanged)));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CoreEvent::InfoChanged))
+        );
 
         // A foreign pane's count does not repaint.
         let events = core.on_event(CoreEvent::CountArrived {
@@ -2666,7 +2793,11 @@ mod tests {
             path: PathBuf::from("/fixture/right-row"),
             count: Some(1),
         });
-        assert!(!events.iter().any(|event| matches!(event, CoreEvent::InfoChanged)));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CoreEvent::InfoChanged))
+        );
 
         // Neither does the active pane's count for a different row.
         let events = core.on_event(CoreEvent::CountArrived {
@@ -2675,7 +2806,11 @@ mod tests {
             path: other,
             count: Some(1),
         });
-        assert!(!events.iter().any(|event| matches!(event, CoreEvent::InfoChanged)));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CoreEvent::InfoChanged))
+        );
     }
 
     #[test]
@@ -2687,10 +2822,11 @@ mod tests {
             source_pane: PaneId::Left,
             result: Err("mkdir /x: permission denied".into()),
         });
-        assert!(core
-            .pane(PaneId::Left)
-            .status
-            .contains("Create folder failed: mkdir /x: permission denied"));
+        assert!(
+            core.pane(PaneId::Left)
+                .status
+                .contains("Create folder failed: mkdir /x: permission denied")
+        );
     }
 
     #[test]
@@ -2777,8 +2913,11 @@ mod tests {
             });
             core.places();
             core.places();
-            assert_eq!(core.places_stat_passes.get(), before + 1,
-                "both relists coalesce into one Places stat pass");
+            assert_eq!(
+                core.places_stat_passes.get(),
+                before + 1,
+                "both relists coalesce into one Places stat pass"
+            );
         }
         let before = core.places_stat_passes.get();
         core.refresh();
@@ -2804,7 +2943,10 @@ mod tests {
         );
 
         let events = core.tick(t0 + Duration::from_millis(600));
-        match events.iter().find(|event| matches!(event, CoreEvent::ConfigSettled(_))) {
+        match events
+            .iter()
+            .find(|event| matches!(event, CoreEvent::ConfigSettled(_)))
+        {
             Some(CoreEvent::ConfigSettled(config)) => assert_eq!(config.split_ratio, 0.7),
             other => panic!("expected ConfigSettled, got {other:?}"),
         }
