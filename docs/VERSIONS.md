@@ -50,7 +50,7 @@ CoS — substrate libraries and daemon family
 |---|---|
 | `cosmix-actions` | 0.4.1 |
 | `cosmix-app-identity` | 0.2.0 |
-| `cosmix-blobd` | 0.6.0 |
+| `cosmix-blobd` | 0.6.1 |
 | `cosmix-dbusd` | 0.3.1 |
 | `cosmix-dnsd` | 0.3.3 |
 | `cosmix-edit-client` | 0.2.0 |
