@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.3.0
 -- Shared, byte-exact store manifest contract. No filesystem or Bus effects.
 fn fail($code, $message)
   raise($code, $message)
@@ -20,6 +20,13 @@ end
 fn collection($name)
   if type($name) != "string" then fail("STORE_COLLECTION", "expected collection name") end
   if not re_match($name, "^[A-Za-z0-9_-]{1,64}$") then fail("STORE_COLLECTION", "invalid collection name") end
+  return $name
+end
+
+fn service_name($name, $prefix)
+  if type($name) != "string" or byte_length($name) > 31 or not re_match($name, "^" .. $prefix .. "(-[a-z0-9-]+)?$") then
+    fail("STORE_CONFIG", $prefix .. " service name must be valid and at most 31 bytes")
+  end
   return $name
 end
 

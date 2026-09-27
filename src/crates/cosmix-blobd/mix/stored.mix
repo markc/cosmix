@@ -1,12 +1,14 @@
--- version: 0.4.0
+-- version: 0.5.0
 -- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
 $catalogue = require("store_catalogue.mix")
 $commit = require("store_commit.mix")
 $io = require("store_blob.mix")
 $worker = require("store_worker.mix")
+$manifest = require("store_manifest.mix")
+$manifest.service_name(serve_name() ?? "stored", "stored")
 $STATE = env("STORED_STATE_DIR", env("STATE_DIRECTORY", env("COSMIX_VAR", env("XDG_STATE_HOME", env("HOME") .. "/.local/state") .. "/cosmix") .. "/stored"))
 $BLOBD = env("STORED_BLOBD", "blobd")
-if not re_match($BLOBD, "^blobd(-[a-z0-9-]+)?$") then raise("STORE_CONFIG", "STORED_BLOBD must be a local blobd service") end
+$manifest.service_name($BLOBD, "blobd")
 mkdir($STATE)
 if not stat($STATE, {follow_symlinks: false}).is_dir then raise("STORE_CONFIG", "state must be a real directory") end
 if not flock($STATE .. "/.writer-lock") then raise("STORE_LOCKED", "another stored owns this state directory") end

@@ -1,4 +1,4 @@
--- version: 0.4.0
+-- version: 0.5.0
 $c = require("store_client.mix")
 $checks = buffer()
 $dir = env("TMPDIR", "/tmp") .. "/store-client-test-" .. uuid()
@@ -64,6 +64,14 @@ try
   check($c.inventory($dir .. "/excluded").file_count == 0, "EXCLUSIONS_DO_NOT_SPEND_WALK_LIMIT")
   $cfg = $c.configuration({node: "archive", instance: "two", "local-blobd": "blobd-fetch"})
   check($cfg.service == "stored-two.archive.bus" and $cfg.blobd == "blobd-two.archive.bus" and $cfg.local_blobd == "blobd-fetch", "EXPLICIT_ROUTING")
+  check(length($c.configuration({instance: repeat("x", 24)}).service) == 31, "MAX_SERVICE_NAME")
+  $caught = ""
+  try
+    $c.configuration({instance: repeat("x", 25)})
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_CONFIG", "OVERSIZE_SERVICE_REFUSED")
   $c.cache_lock($dir .. "/cache", nil)
   mkdir($dir .. "/existing-cache")
   chmod($dir .. "/existing-cache", 0o755)

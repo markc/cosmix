@@ -552,6 +552,10 @@ mix store.mix --node archive restore source b3:… ./new-restore
 <p>Without <code>--node</code>, the target is local. <code>--instance two</code> selects both
 <code>stored-two</code> and <code>blobd-two</code>; <code>--local-blobd</code> selects the restore receiver
 (default <code>blobd</code>). Discovery checks that stored is bound to that target.
+Registered service names are at most 31 ASCII bytes, so a stored instance
+suffix is at most 24 bytes. Client routing and citizen startup validate the
+resulting service names and return <code>STORE_CONFIG</code> for invalid/oversized names;
+the <code>.node.bus</code> routing suffix is not part of the registered local name.
 Restore resolves each reference's origin from the target's <code>blob.stat</code>,
 calls <code>blob_fetch_wait</code> sequentially with an explicit restore owner, then
 downloads from the local lane with <code>expect_blake3</code>, no-clobber publication,

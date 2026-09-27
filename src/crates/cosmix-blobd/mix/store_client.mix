@@ -1,4 +1,4 @@
--- version: 0.4.0
+-- version: 0.5.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -21,7 +21,9 @@ fn configuration($opts)
   $suffix = $instance == "" ? "" : "-" .. $instance
   $route = $node == "" ? "" : "." .. $node .. ".bus"
   $local = $opts["local-blobd"] ?? "blobd"
-  if not re_match($local, "^blobd(-[a-z0-9-]+)?$") then raise("STORE_CONFIG", "local-blobd must be local") end
+  $m.service_name("stored" .. $suffix, "stored")
+  $m.service_name("blobd" .. $suffix, "blobd")
+  $m.service_name($local, "blobd")
   $timeout = $m.uint(to_number($opts.timeout ?? "900"))
   $chunk = $m.uint(to_number($opts.chunk ?? "8388608"))
   if $timeout < 1 or $chunk < 1 or $chunk > 8388608 then raise("STORE_CONFIG", "positive timeout and chunk <=8MiB required") end
