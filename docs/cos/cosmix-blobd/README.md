@@ -327,9 +327,15 @@ PATCH sends inclusive windows with exact Content-Range and Content-Length.
 The library reads HEAD after success, 409, or a lost response, verifies session
 identity, and resumes from the durable offset. Three consecutive no-progress
 attempts return an error; call again with the same record. Empty files commit
-without PATCH. Commit accepts 201 or the replayed 200 receipt and retries a
-lost response, 409 or 503 up to three times. Receipts last 24 hours; the
-owner-pin check also resolves completion after receipt expiry.
+without PATCH. Commit accepts 201 or the replayed 200 receipt. After a lost
+response (status 0), 409 or 503 it polls HEAD with backoff (1 second doubling
+to 30 seconds), waiting while the state is committing, then replays commit
+to read the receipt. `opts.commit_timeout` bounds this recovery loop (positive
+integer seconds, default 900); individual calls use `control_timeout` (default
+30 seconds), capped by the remaining time. Blocking DNS/IO retains the HTTP
+client's best-effort timeout limitations. A timeout leaves the resume record
+available for another invocation. Receipts last 24 hours; the owner-pin check
+also resolves completion after receipt expiry.
 
 `blob_download_file(ref, path[, opts])` discovers the target lane and calls
 `http_get_file` with `expect_blake3` from the reference. It returns the verified

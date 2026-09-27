@@ -187,7 +187,7 @@ async fn blob_upload_lost_create_reply_persisted_key_409_head_and_commit_replay(
     let server = std::thread::spawn(move || {
         let mut key = String::new();
         let hash = blake3::hash(b"abcd").to_hex().to_string();
-        for step in 0..9 {
+        for step in 0..10 {
             let (mut socket, head, body) = request(&listener);
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&resume).unwrap()).unwrap();
@@ -235,6 +235,15 @@ async fn blob_upload_lost_create_reply_persisted_key_409_head_and_commit_replay(
                     assert!(head.starts_with(&format!("POST /blob/uploads/{ID}/commit ")));
                 } // lost commit response
                 8 => {
+                    assert!(head.starts_with("HEAD "));
+                    reply(
+                        &mut socket,
+                        200,
+                        &metadata(4).replace("State: active", "State: complete"),
+                        "",
+                    );
+                }
+                9 => {
                     assert!(head.starts_with(&format!("POST /blob/uploads/{ID}/commit ")));
                     reply(
                         &mut socket,
@@ -253,6 +262,72 @@ async fn blob_upload_lost_create_reply_persisted_key_409_head_and_commit_replay(
     server.join().unwrap();
     assert_eq!(second["ok"], true, "{second}");
     assert_eq!(second["result"]["size"], 4);
+}
+
+#[tokio::test]
+async fn blob_upload_polls_slow_commit_after_control_timeout_without_competing_posts() {
+    let dir = Temp::new();
+    std::fs::write(dir.0.join("source"), b"").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bus = Rc::new(Bus {
+        bind: listener.local_addr().unwrap().to_string(),
+        pinned: false,
+        discovery: Cell::new(0),
+    });
+    let resume = dir.0.join("resume.json");
+    let server = std::thread::spawn(move || {
+        let hash = blake3::hash(b"").to_hex().to_string();
+        for step in 0..6 {
+            let (mut socket, head, _) = request(&listener);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&resume).unwrap()).unwrap();
+            let key = saved["key"].as_str().unwrap();
+            match step {
+                0 => reply(&mut socket, 201, "", &format!("{{\"upload\":\"{ID}\"}}")),
+                1 | 3 | 4 => {
+                    assert!(
+                        head.starts_with("HEAD "),
+                        "must poll, not contend with commit: {head}"
+                    );
+                    let state = match step {
+                        1 => "active",
+                        3 => "committing",
+                        _ => "complete",
+                    };
+                    reply(
+                        &mut socket,
+                        200,
+                        &format!(
+                            "X-Cosmix-Offset: 0\r\nX-Cosmix-Size: 0\r\nX-Cosmix-Owner: tester\r\nX-Cosmix-Mime: application/octet-stream\r\nX-Cosmix-Expect: b3:{hash}\r\nX-Cosmix-Upload-Key: {key}\r\nX-Cosmix-State: {state}\r\n"
+                        ),
+                        "",
+                    );
+                }
+                2 => {
+                    assert!(head.starts_with(&format!("POST /blob/uploads/{ID}/commit ")));
+                    std::thread::sleep(Duration::from_millis(1500));
+                    // The client has timed out while the worker continues.
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                5 => {
+                    assert!(head.starts_with(&format!("POST /blob/uploads/{ID}/commit ")));
+                    reply(
+                        &mut socket,
+                        200,
+                        "",
+                        &format!("{{\"blob\":\"b3:{hash}\",\"size\":0}}"),
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    });
+    let result = execute(bus, &format!("$out = $b.blob_upload_file({}, {{service:\"blobd-test\", owner:\"tester\", resume_file:{}, control_timeout:1, commit_timeout:10}})", quoted(&dir.0.join("source")), quoted(&dir.0.join("resume.json")))).await;
+    server.join().unwrap();
+    assert_eq!(result["ok"], true, "{result}");
 }
 
 #[tokio::test]

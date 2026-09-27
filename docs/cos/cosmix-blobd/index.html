@@ -699,9 +699,15 @@ a regular file separate from the source; existing symlinks are refused.</p>
 The library reads HEAD after success, 409, or a lost response, verifies session
 identity, and resumes from the durable offset. Three consecutive no-progress
 attempts return an error; call again with the same record. Empty files commit
-without PATCH. Commit accepts 201 or the replayed 200 receipt and retries a
-lost response, 409 or 503 up to three times. Receipts last 24 hours; the
-owner-pin check also resolves completion after receipt expiry.</p>
+without PATCH. Commit accepts 201 or the replayed 200 receipt. After a lost
+response (status 0), 409 or 503 it polls HEAD with backoff (1 second doubling
+to 30 seconds), waiting while the state is committing, then replays commit
+to read the receipt. <code>opts.commit_timeout</code> bounds this recovery loop (positive
+integer seconds, default 900); individual calls use <code>control_timeout</code> (default
+30 seconds), capped by the remaining time. Blocking DNS/IO retains the HTTP
+client's best-effort timeout limitations. A timeout leaves the resume record
+available for another invocation. Receipts last 24 hours; the owner-pin check
+also resolves completion after receipt expiry.</p>
 <p><code>blob_download_file(ref, path[, opts])</code> discovers the target lane and calls
 <code>http_get_file</code> with <code>expect_blake3</code> from the reference. It returns the verified
 <code>http_file_response</code> under <code>result</code>. Options <code>append</code>, <code>overwrite</code>, and
