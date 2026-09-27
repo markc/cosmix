@@ -286,6 +286,7 @@ impl Served {
 /// `dopus.actions.list` only; their `enabled` flag is per-call from the
 /// core's availability ([`apply_availability`]).
 pub const ACTIONS: &[(ActionId, &str)] = &[
+    (cosmix_actions::location::FOCUS, "Focus the location bar"),
     (filemgr::FILE_OPEN, "Open the selection"),
     (filemgr::FILE_NEW_FOLDER, "New folder"),
     (filemgr::FILE_RENAME, "Rename the selection"),
@@ -550,7 +551,7 @@ pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> 
             code::INVALID_ARGUMENT.to_owned()
         },
         message: if known {
-            format!("{action} is keyboard-only (the Bus never mutates the filesystem)")
+            format!("{action} is a local UI action")
         } else {
             format!("{action} is not a dopus action")
         },

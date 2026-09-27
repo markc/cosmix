@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- Add canonical location.focus and a dopus default keymap with Ctrl+L.
+  FileMgr's existing keymap is unchanged.
+
 ## 0.3.0 — 2026-07-24
 
 - Rename the public `fusion` and `fable` action modules to `studio` and

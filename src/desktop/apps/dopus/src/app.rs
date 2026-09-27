@@ -799,7 +799,12 @@ impl Dopus {
     /// shared [`verbs::apply_action`].
     fn on_actions(&mut self, actions: &[ActionId]) -> Task<Msg> {
         let mut quit = false;
+        let mut tasks = Vec::new();
         for action in actions {
+            if *action == cosmix_actions::location::FOCUS {
+                tasks.push(self.begin_edit(self.core.active()));
+                continue;
+            }
             if *action == cosmix_actions::theme::MODE_TOGGLE {
                 let mode = match self.theme_override.map(|(_, m)| m).unwrap_or(self.theme.mode) {
                     Mode::Dark => Mode::Light,
@@ -840,7 +845,7 @@ impl Dopus {
         if quit {
             return self.quit();
         }
-        Task::none()
+        Task::batch(tasks)
     }
 
     /// An in-session theme selection, expressed as names (the Bus path).

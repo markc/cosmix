@@ -4,7 +4,7 @@
 //! engine-independent keymap filemgr uses, so a `keymap.conf.mix` written for
 //! one drives the other.
 //!
-//! - Keymap: the packaged filemgr defaults ([`FILEMGR_DEFAULT_KEYMAP_MIX`])
+//! - Keymap: the packaged dopus defaults ([`DOPUS_DEFAULT_KEYMAP_MIX`])
 //!   layered with the user's `<config>/keymap.conf.mix` overlay —
 //!   [`load`] is filemgr's `load_effective_keymap` verbatim. Invalid overlays
 //!   keep the current keymap.
@@ -40,13 +40,13 @@ use cosmix_actions::{
     ActionId, FocusContext, Key as AKey, Keymap, Modifiers as AModifiers, RawInput, RawInputState,
     ResolveState, Tick, resolve,
 };
-use cosmix_actions::{FILEMGR_DEFAULT_KEYMAP_MIX, load_keymap, parse_keymap};
+use cosmix_actions::{DOPUS_DEFAULT_KEYMAP_MIX, load_keymap, parse_keymap};
 
 /// The effective keymap: packaged filemgr defaults + the user's overlay
 /// (filemgr/src/action.rs `load_effective_keymap`, kept in step).
 pub fn load(custom_path: Option<&Path>) -> Result<Keymap, String> {
-    let mut keymap = parse_keymap(FILEMGR_DEFAULT_KEYMAP_MIX)
-        .expect("checked-in FileMgr keymap must stay valid");
+    let mut keymap = parse_keymap(DOPUS_DEFAULT_KEYMAP_MIX)
+        .expect("checked-in dopus keymap must stay valid");
     let Some(path) = custom_path else {
         return Ok(keymap);
     };
@@ -574,14 +574,14 @@ mod tests {
     fn the_packaged_defaults_load() {
         let shared = initial(None).unwrap();
         let router = shared.lock().unwrap();
-        assert_eq!(router.keymap.defaults.len(), 28);
+        assert_eq!(router.keymap.defaults.len(), 29);
         assert!(router.keymap.custom.is_empty());
     }
 
     #[test]
     fn missing_overlay_is_the_packaged_defaults() {
         let keymap = load(Some(Path::new("/nonexistent/keymap.conf.mix"))).unwrap();
-        assert_eq!(keymap.defaults.len(), 28);
+        assert_eq!(keymap.defaults.len(), 29);
     }
 
     #[test]
@@ -597,6 +597,7 @@ mod tests {
             ("Ctrl+1", filemgr::VIEW_SORT_NAME),
             ("Ctrl+2", filemgr::VIEW_SORT_SIZE),
             ("Ctrl+3", filemgr::VIEW_SORT_MODIFIED),
+            ("Ctrl+L", cosmix_actions::location::FOCUS),
         ] {
             let input = press(text).unwrap_or_else(|| panic!("{text}"));
             let resolved = resolve(input, &FocusContext::global(), &router.keymap, &mut state, tick());

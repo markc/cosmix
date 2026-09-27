@@ -22,6 +22,7 @@ mod action;
 pub mod filemgr;
 mod input;
 mod keymap;
+pub mod location;
 mod registry;
 mod resolve;
 pub mod studio;
@@ -54,6 +55,9 @@ pub const STUDIO_DEFAULT_KEYMAP_MIX: &str = include_str!("../assets/studio-defau
 
 /// FileMgr's checked-in built-in keymap, suitable for [`parse_keymap`].
 pub const FILEMGR_DEFAULT_KEYMAP_MIX: &str = include_str!("../assets/filemgr-default-keymap.mix");
+
+/// Dopus defaults: FileMgr's bindings plus Ctrl+L for location focus.
+pub const DOPUS_DEFAULT_KEYMAP_MIX: &str = include_str!("../assets/dopus-default-keymap.mix");
 
 #[cfg(test)]
 mod tests;
