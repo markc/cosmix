@@ -167,7 +167,15 @@ web-published and the verbatim claim does not cover them, but they
 stand on the same wire-contract footing, and they exist because §3.6's
 distinctness floor cannot be met from the seven web anchors alone —
 revision-1's one-step backgrounds clear barely 1.05:1 against
-`background.1`. The names are a source-format wire contract on the same
+`background.1`. A third desktop-only anchor, the light-only
+`palette.foreground.quiet`, carries the muted pair's light text half:
+the web `foreground.muted` anchor measures 4.24:1 on
+`palette.background.muted`, so hierarchy text that must clear AA on the
+quiet surface needs a quieter dedicated foreground in light contexts
+(dark keeps the default foreground; re-tiering dark's already-flat ramp
+is a later decision).
+
+The names are a source-format wire contract on the same
 footing as §2.4's semantic vocabulary: an authored theme references them
 by string, so renaming one is a format break. A later source revision
 MAY introduce Radix-model 12-step hue ramps with semantically assigned
@@ -319,7 +327,10 @@ escapes. Text AA is the wrong measure for a focus ring, and a clause
 that demanded it of one would be failed by every conforming
 implementation. Failure is fatal per §11.5 — there
 is no silent substitution; the diagnostic *suggests* the guaranteed-AA
-black/white pair, and a human or agent applies it to the source. A
+black/white pair, and a human or agent applies it to the source. The
+one standing exception is the `elevated` role's text half, which is a
+derivation with a warned fallback, not a substitution — §3.6 states the
+rule. A
 declared §9.3 exclusion is not a failed contrast check, because the
 resolver cannot select it.
 
@@ -352,7 +363,8 @@ at an adjacency set no author could satisfy.
 3.5.2 **Derived focus indicators.** One lone `ring` value cannot satisfy
 §3.5 across the shipped contexts. A button family draws focus on at
 least four surfaces — secondary/control, primary, destructive, and the
-Ghost's transparent composite — and in every dark context the luminance window that
+transparent `card` composite the Ghost rests on — and in every dark
+context the luminance window that
 clears 3:1 against the near-black background is disjoint from the one
 that clears it against the light accent: the requirement is infeasible,
 not merely unauthored, and no choice of hue changes that because
@@ -525,14 +537,18 @@ just above the boundary, and not only through the revision-1 counts
 the palette; a test that asserts "0.300 is silent and 0.301 warns" is a
 test of the gate.
 
-3.6 **Role surfaces must be visibly distinct from the page.** `muted`
-and `elevated` are chrome roles, not page colours: a tooltip, menu,
-popover, active-pane header or status strip painted on a surface equal
-to `base` renders as whatever it covers. Each role's **rendered**
-surface MUST therefore differ from `base`'s rendered surface by at
-least **1.25:1 luminance contrast** in the §3.2 pipeline, and failure
+3.6 **Role surfaces must be visibly distinct from the page.** `muted`,
+`elevated` and `popover` are chrome roles, not page colours: a tooltip,
+menu, popover, active-pane header or status strip painted on a surface
+equal to `base` renders as whatever it covers. Each role's **rendered**
+surface MUST therefore differ from `base`'s rendered surface by at least
+**1.25:1 luminance contrast** in the §3.2 pipeline, and failure
 is fatal per §11.5 with the diagnostic naming the role
-(`surface-not-distinct-from-base`). The gate is on the rendered
+(`surface-not-distinct-from-base`). The gate names `popover` even
+though the §2.4 alias only fills the unauthored half: a source that
+authors `popover` on `base` while keeping a distinct `elevated` commits
+the same invisible-menu fault, so authoring both confers no exemption
+for either. The gate is on the rendered
 surface, so a transparent surface composited over a `base`-coloured
 backdrop is caught as surely as an authored equal colour. Nothing
 comparable is demanded of the other roles: they sit inside page
@@ -544,6 +560,20 @@ legibility, is the claim; near-black and near-white bases make OKLCH
 lightness steps cheap and luminance contrast expensive, which is why
 the revision-1 muted and elevated surfaces are dedicated anchors (§2.2)
 rather than palette steps.
+
+The `elevated` role's **text half** is likewise a compiler guarantee
+rather than an authored liberty — the surface-distinctness sibling of
+this clause. The authored foreground (revision-1's default foreground)
+is the *preferred candidate*; when it misses AA on the pair's rendered
+surface, the compiler derives the text half to the §3.4 guaranteed
+knockout — the opaque black or white extreme the rendered surface
+contrasts more with, which is never below √21:1 ≈ 4.58:1 on an opaque
+surface — and records the derivation in an `elevated-text-fallback`
+*warning* rather than refusing the design. A tooltip, menu or popover
+floats over everything and must stay readable on whatever the palette
+does; `popover` receives the same derivation through the alias. No
+other pair shares this repair: for every other role the text half is
+an authored choice, and §3.4's fatal gate stands unchanged.
 
 ## §4 Component mapping algebra
 
@@ -1175,7 +1205,19 @@ un-authored `popover` delivers the authored `elevated` pair exactly;
 `elevated` rendered surface sits below 1.25:1 against `base` is
 refused with the diagnostic naming the role in both its path and
 message, and the revision-1 palette clears the floor for `muted`,
-`elevated` and the aliased `popover` in all twelve contexts; §4.2
+`elevated` and the aliased `popover` in all twelve contexts; the §3.6
+popover refusal — an explicitly authored `popover` equal to `base` is
+refused by name even beside a distinct `elevated`; the §3.6 elevated
+text-half derivation — a source whose authored `elevated` (or
+`popover`) foreground misses AA on its rendered surface compiles with
+the guaranteed-knockout foreground and an `elevated-text-fallback`
+warning naming the pair, while any other pair's failing text half
+stays fatal, and the revision-1 elevated foreground clears AA unaided
+in all twelve contexts so the fallback never fires on the shipped
+design; the revision-1 light quiet foreground — the `muted` pair's
+light text half rides the desktop-only `palette.foreground.quiet`
+anchor, differs from the default foreground, and clears AA on the
+muted, base and elevated surfaces in all six light schemes; §4.2
 forbidden-construct rejection (component
 names / selectors / expressions / undeclared axes in data); §4.3
 ambiguity rejection; §4.4 mandatory-base rejection; §4.6 coverage

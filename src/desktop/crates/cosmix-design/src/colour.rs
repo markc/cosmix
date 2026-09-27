@@ -122,6 +122,49 @@ pub(crate) fn compile_colour_tokens_with_registry(
             continue;
         }
         let ratio = contrast_ratio(rendered_foreground, rendered_surface);
+        // §3.6: the text half of the elevated role — and of `popover`, its
+        // §2.4 alias — is a compiler derivation, not an authored liberty:
+        // a tooltip, menu or popover must stay readable on whatever surface
+        // the palette floats it over. The authored foreground (the default
+        // foreground in the shipped design) is the preferred candidate; when
+        // it misses AA on the pair's rendered surface the compiler delivers
+        // the §3.4 guaranteed knockout — the opaque black or white extreme
+        // the surface contrasts more with, always at least √21:1 — and says
+        // so in a warning. Every other authored pair keeps the hard gate
+        // below: a failing text half is fatal, not repaired.
+        let (foreground, rendered_foreground, ratio, foreground_name) =
+            if ratio < 4.5 && matches!(name.as_str(), "elevated" | "popover") {
+                let knockout = guaranteed_knockout(rendered_surface);
+                let knockout_ratio = contrast_ratio(knockout, rendered_surface);
+                warnings.push(DesignDiagnostic::warning(
+                    "elevated-text-fallback",
+                    format!("design.v1.semantics.pairs.{name}"),
+                    format!(
+                        "authored foreground `{}` renders at {ratio:.3}:1 on the `{name}` \
+                         surface, below WCAG AA 4.5:1; the text half is derived to opaque \
+                         {} ({knockout_ratio:.3}:1) instead",
+                        pair.foreground,
+                        if knockout == LinearRgba::BLACK {
+                            "black"
+                        } else {
+                            "white"
+                        },
+                    ),
+                ));
+                (
+                    knockout,
+                    knockout,
+                    knockout_ratio,
+                    format!("derive:{name}.foreground"),
+                )
+            } else {
+                (
+                    foreground,
+                    rendered_foreground,
+                    ratio,
+                    pair.foreground.clone(),
+                )
+            };
         if ratio < 4.5 {
             let knockout = guaranteed_knockout(rendered_surface);
             errors.push(
@@ -147,7 +190,7 @@ pub(crate) fn compile_colour_tokens_with_registry(
             ResolvedPair {
                 surface_name: pair.surface.clone(),
                 surface,
-                foreground_name: pair.foreground.clone(),
+                foreground_name,
                 foreground,
                 backdrop_name: pair.backdrop.clone(),
                 backdrop,
@@ -250,9 +293,12 @@ pub(crate) fn compile_colour_tokens_with_registry(
     }
 }
 
-/// The §3.6 distinctness floor for quiet and elevated chrome: the `muted` and
-/// `elevated` surfaces must each sit at least this far off `base` in luminance
-/// contrast, or they collapse onto the page and paint as whatever they cover.
+/// The §3.6 distinctness floor for quiet and elevated chrome: the `muted`,
+/// `elevated` and `popover` surfaces must each sit at least this far off
+/// `base` in luminance contrast, or they collapse onto the page and paint as
+/// whatever they cover. `popover` is named even though the shipped design
+/// only receives it as `elevated`'s §2.4 alias: a source authoring it
+/// explicitly on `base` is the same invisible-menu fault.
 const SURFACE_DISTINCTION_CONTRAST: f64 = 1.25;
 
 fn enforce_surface_distinction_from_base(
@@ -262,7 +308,7 @@ fn enforce_surface_distinction_from_base(
     let Some(base) = pairs.get("base") else {
         return;
     };
-    for role in ["muted", "elevated"] {
+    for role in ["muted", "elevated", "popover"] {
         let Some(pair) = pairs.get(role) else {
             continue;
         };
@@ -540,7 +586,7 @@ mod tests {
         ColourSpace, DerivationCallSource, NonTextColourSource, OklchSource, PairSource,
         PrimitiveSource, RecipeArgumentSource, SemanticSource, SourceKind,
     };
-    use crate::{Mode, RecipeImplicitBinding};
+    use crate::{Mode, RecipeImplicitBinding, Scheme};
 
     fn fixture_source() -> DesignV1Source {
         let mut colors = BTreeMap::new();
@@ -554,7 +600,10 @@ mod tests {
             .map(|name| {
                 let surface = match name {
                     "muted" => "mutedbg",
-                    "elevated" => "elevbg",
+                    // popover is elevated's §2.4 alias and §3.6 refuses either
+                    // role collapsing onto base, so the fixture seats both on
+                    // the dedicated elevated grey.
+                    "elevated" | "popover" => "elevbg",
                     _ => "dark",
                 };
                 (name.to_owned(), PairSource::authored(surface, "light", None))
@@ -793,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn muted_or_elevated_collapsing_onto_base_is_refused_by_name() {
+    fn muted_elevated_or_popover_collapsing_onto_base_is_refused_by_name() {
         let mut source = fixture_source();
         source.semantics.pairs.insert(
             "muted".into(),
@@ -821,6 +870,23 @@ mod tests {
             .unwrap();
         assert!(diagnostic.path.ends_with("pairs.elevated"));
         assert!(diagnostic.message.contains("`elevated`"), "{}", diagnostic.message);
+
+        // An explicitly authored popover equal to base is the same fault even
+        // with a distinct elevated pair: the alias only fills the unauthored
+        // half, so a design authoring both keeps both.
+        let mut source = fixture_source();
+        source.semantics.pairs.insert(
+            "popover".into(),
+            PairSource::authored("dark", "light", None),
+        );
+        let failure = compile(&source).unwrap_err();
+        let diagnostic = failure
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "surface-not-distinct-from-base")
+            .unwrap();
+        assert!(diagnostic.path.ends_with("pairs.popover"));
+        assert!(diagnostic.message.contains("`popover`"), "{}", diagnostic.message);
     }
 
     #[test]
@@ -852,6 +918,46 @@ mod tests {
                         mode.name()
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn light_muted_text_is_the_quiet_foreground_and_clears_aa_on_every_chrome_surface() {
+        let document = crate::parse_design_source(
+            crate::SourceIdentity::new("embedded:quiet-foreground"),
+            crate::EMBEDDED_DEFAULT_SOURCE,
+        )
+        .expect("the embedded default parses");
+        for scheme in Scheme::ALL {
+            let result = crate::compile_design(
+                &document,
+                DesignContext {
+                    scheme,
+                    mode: Mode::Light,
+                    ..Default::default()
+                },
+            );
+            let crate::DesignCompileResult::Success(success) = result else {
+                panic!("{} / light did not compile: {result:#?}", scheme.name())
+            };
+            let colours = &success.candidate.dictionary().colours;
+            let muted_text = colours.pairs["muted"].rendered_foreground;
+            assert_ne!(
+                muted_text,
+                colours.pairs["base"].rendered_foreground,
+                "{}: light muted text must not collapse onto the default foreground",
+                scheme.name(),
+            );
+            // Hierarchy text lands on quiet chrome, the page and tooltips
+            // alike, so the one foreground owes AA on all three surfaces.
+            for role in ["muted", "base", "elevated"] {
+                let ratio = contrast_ratio(muted_text, colours.pairs[role].rendered_surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{} / light muted text on {role}: {ratio:.3}:1",
+                    scheme.name()
+                );
             }
         }
     }

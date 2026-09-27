@@ -318,6 +318,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
             "palette.background.1",
             "palette.background.2",
             "palette.background.3",
+            "palette.background.elevated",
             "palette.background.muted",
             "palette.foreground.default",
             "palette.foreground.muted",
@@ -427,6 +428,10 @@ fn embedded_semantics_use_role_anchors_and_registered_selection_pairs() {
         "palette.foreground.default",
         None,
     );
+    // The base form carries the default foreground; every light modifier
+    // block re-authors the muted pair on the light-only
+    // `palette.foreground.quiet` anchor (see the quiet-foreground test in
+    // colour.rs), and dark keeps the default foreground.
     authored(
         "muted",
         "palette.background.muted",

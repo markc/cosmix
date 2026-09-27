@@ -185,7 +185,10 @@ pub fn view<'a>(look: Look, infos: Vec<Info>) -> Element<'a, Msg> {
                 .width(Length::Fill)
                 .style(move |_| container::Style {
                     background: Some(Background::Color(fill)),
-                    text_color: Some(t.card_text),
+                    // The infobar fills with `card`, whose rendered surface is
+                    // the base page colour, so its message text is primary
+                    // text, not the card pair's muted foreground.
+                    text_color: Some(t.text),
                     border: Border { color: edge, width: 1.0, radius: 0.0.into() },
                     ..container::Style::default()
                 }),

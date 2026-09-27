@@ -123,7 +123,10 @@ impl Look {
                 button::Status::Hovered | button::Status::Pressed => t.muted_surface,
                 _ => t.card,
             })),
-            text_color: if matches!(status, button::Status::Disabled) { t.muted_text } else { t.card_text },
+            // The resting surface is `card`, which renders as the base page
+            // colour, so an enabled label is primary text; only the disabled
+            // label takes the muted hierarchy foreground.
+            text_color: if matches!(status, button::Status::Disabled) { t.muted_text } else { t.text },
             border: Border { radius: t.radius.into(), width: 1.0, color: t.border },
             ..button::Style::default()
         }

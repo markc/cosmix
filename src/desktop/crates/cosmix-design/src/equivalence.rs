@@ -1001,21 +1001,25 @@ mod tests {
         assert_fatal_code(&declared, "v0-equivalence-drift");
     }
 
-    /// The same rule for a directly named pair. `muted` is authored as a
+    /// The same rule for a directly named pair. `card` is authored as a
     /// transparent surface over `palette.background.1`, so its declared and
     /// rendered members are the two different colours this asserts between.
+    /// (The reshuffle that gave `muted` its own quiet surface moved the
+    /// transparent-over-page pair to `card` unchanged — d481855d — so the
+    /// v0 oracle, the composited page colour, is the same colour it always
+    /// was; only the pair carrying it was renamed.)
     #[test]
     fn a_transparent_pair_is_compared_by_what_it_renders_not_what_it_declares() {
-        let muted_surface = V0CrosswalkExpressionSource::Pair {
-            value: "muted".to_owned(),
+        let card_surface = V0CrosswalkExpressionSource::Pair {
+            value: "card".to_owned(),
             member: V0PairMember::Surface,
         };
 
-        let mut rendered = document("equivalence:muted-rendered");
+        let mut rendered = document("equivalence:card-rendered");
         rendered
             .v1
             .v0_crosswalk
-            .insert("track".to_owned(), muted_surface.clone());
+            .insert("track".to_owned(), card_surface.clone());
         rendered.legacy.track = Some("#f3fafc".to_owned());
         let result = compile_design(&rendered, DesignContext::default());
         assert!(
@@ -1024,11 +1028,11 @@ mod tests {
             diagnostics(&result)
         );
 
-        let mut declared = document("equivalence:muted-declared");
+        let mut declared = document("equivalence:card-declared");
         declared
             .v1
             .v0_crosswalk
-            .insert("track".to_owned(), muted_surface);
+            .insert("track".to_owned(), card_surface);
         declared.legacy.track = Some("#00000000".to_owned());
         assert_fatal_code(&declared, "v0-equivalence-drift");
     }
