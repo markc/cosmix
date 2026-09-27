@@ -167,7 +167,12 @@ impl Roots {
     pub fn from_config(config: &cosmix_config::node::WebdSharesConfig) -> Self {
         let mut roots = BTreeMap::new();
         for (account, path) in &config.roots {
-            let safe = valid_account(account)
+            let safe_key = match account.split_once('|') {
+                Some((primary, email)) => cosmix_daemon::http_host::parse_request_host(primary).is_some_and(|p| p == primary)
+                    && valid_account(email),
+                None => valid_account(account),
+            };
+            let safe = safe_key
                 && path.is_absolute()
                 && !path.components().any(|c| matches!(c, Component::ParentDir));
             let canonical = safe
@@ -200,15 +205,23 @@ impl Roots {
         });
     }
 
-    pub fn checked_get(&self, account: &str, directory: &crate::vhost_directory::VhostDirectory)
+    pub fn checked_get(&self, primary: &str, account: &str, directory: &crate::vhost_directory::VhostDirectory)
         -> Option<std::sync::Arc<cosmix_files::rooted_read::ReadRoot>> {
-        let (path, root) = self.0.get(account)?;
+        let (path, root) = self.0.get(&format!("{primary}|{account}")).or_else(|| self.0.get(account))?;
         // Re-evaluate the current snapshot on every access, including after reload.
         if public_roots(directory).iter().any(|p| path.starts_with(p)) {
             tracing::warn!(account, "refusing share root beneath a public serving directory after reload");
             return None;
         }
         Some(root.clone())
+    }
+
+    pub fn warn_identity_providers(&self, directory: &crate::vhost_directory::VhostDirectory) {
+        let providers: std::collections::BTreeSet<_> = directory.primaries.iter()
+            .map(|p| p.state.jmap_upstream.as_deref()).collect();
+        if providers.len() > 1 && self.0.keys().any(|key| !key.contains('|')) {
+            tracing::warn!("share roots contain unscoped emails with different jmap_upstream providers; use primary-fqdn|email keys");
+        }
     }
 }
 
@@ -600,6 +613,22 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn scoped_root_precedes_unscoped_and_does_not_cross_primaries() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("a"), b"a").unwrap();
+        std::fs::write(b.path().join("b"), b"b").unwrap();
+        let roots = Roots::from_config(&cosmix_config::node::WebdSharesConfig {
+            roots: BTreeMap::from([(ACCOUNT.into(), a.path().into()), (format!("b.example|{ACCOUNT}"), b.path().into())])
+        });
+        let directory = crate::vhost_directory::VhostDirectory::empty();
+        assert!(roots.checked_get("a.example", ACCOUNT, &directory).unwrap().open_regular("a").is_ok());
+        let b = roots.checked_get("b.example", ACCOUNT, &directory).unwrap();
+        assert!(b.open_regular("b").is_ok());
+        assert!(b.open_regular("a").is_err());
     }
 
     #[test]

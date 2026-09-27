@@ -42,6 +42,11 @@ with a five-second telemetry deadline; HEAD, 416 and empty files do not count.
 
 ## Management
 
+Root keys may be `"primary.example|user@example.test"` to bind an identity to
+one primary vhost. Scoped keys take precedence over email-only keys. Startup
+warns when unscoped roots coexist with different `jmap_upstream` providers;
+use scoped keys in that configuration.
+
 Mesh-open Bus verbs use JSON arguments (no capability check):
 
 - `webd.share.create {vhost, account, rel_path?, blob?, kind?, name?, password?, expires?}`

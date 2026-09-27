@@ -475,6 +475,10 @@ and lane admission even when the client stops reading. It buffers one chunk.
 The best-effort counter increments once as the first non-empty body chunk emits,
 with a five-second telemetry deadline; HEAD, 416 and empty files do not count.</p>
 <h2 id="management">Management</h2>
+<p>Root keys may be <code>"primary.example|user@example.test"</code> to bind an identity to
+one primary vhost. Scoped keys take precedence over email-only keys. Startup
+warns when unscoped roots coexist with different <code>jmap_upstream</code> providers;
+use scoped keys in that configuration.</p>
 <p>Mesh-open Bus verbs use JSON arguments (no capability check):</p>
 <ul>
 <li><code>webd.share.create {vhost, account, rel_path?, blob?, kind?, name?, password?, expires?}</code>
