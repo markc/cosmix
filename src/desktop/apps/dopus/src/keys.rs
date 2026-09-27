@@ -725,6 +725,10 @@ mod tests {
 }
 
 // Exercise the actual router/TextField event order without a window or GPU.
+// The () renderer and its text/paragraph implementations come from
+// iced_core 0.14's renderer/null.rs, whose module is cfg(debug_assertions).
+// Release builds therefore cannot compile this fixture; keep this gate in
+// step with iced's renderer support (the resolver tests above run in both).
 #[cfg(all(test, debug_assertions))]
 mod widget_tests {
     use super::*;

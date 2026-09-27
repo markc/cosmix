@@ -785,7 +785,13 @@ impl Dopus {
 
     /// Window performer for Bus location.focus; keyboard uses the same editor.
     fn serve_location_focus(&mut self, id: u64, pane: PaneId) -> Task<Msg> {
-        let task = self.begin_edit(pane);
+        // Repeated Bus focus must not replace the human's unfinished draft.
+        // Switching panes still starts an editor seeded from the new path.
+        let task = if self.editing.as_ref().is_some_and(|(editing_pane, _)| *editing_pane == pane) {
+            Task::none()
+        } else {
+            self.begin_edit(pane)
+        };
         if let Some(bus) = &self.bus {
             bus.respond(id, 0, serde_json::to_string(&verbs::ActionReply {
                 id: cosmix_actions::location::FOCUS.to_string(),
@@ -1076,6 +1082,32 @@ mod tests {
     }
 
     #[test]
+    fn bus_location_focus_preserves_a_same_pane_draft() {
+        let (_dir, mut app) = fixture();
+        let _ = app.begin_edit(PaneId::Left);
+        let draft = "~/unfinished draft".to_owned();
+        let _ = app.update(Msg::LocationInput(draft.clone()));
+        let _ = app.serve_location_focus(1, PaneId::Left);
+        assert_eq!(app.editing, Some((PaneId::Left, draft)));
+        assert_eq!(app.core.active(), PaneId::Left);
+        assert!(app.router.lock().unwrap().focus_editable);
+    }
+
+    #[test]
+    fn bus_location_focus_switches_from_another_panes_draft() {
+        let (dir, mut app) = fixture();
+        let right = dir.path().join("right");
+        std::fs::create_dir(&right).unwrap();
+        app.core.navigate(PaneId::Right, right);
+        let _ = app.begin_edit(PaneId::Left);
+        let _ = app.update(Msg::LocationInput("~/unfinished draft".into()));
+        let _ = app.serve_location_focus(1, PaneId::Right);
+        assert_eq!(app.editing, Some((PaneId::Right, pane_path_text(&app.core, PaneId::Right))));
+        assert_eq!(app.core.active(), PaneId::Right);
+        assert!(app.router.lock().unwrap().focus_editable);
+    }
+
+    #[test]
     fn bus_location_focus_reaches_the_window_editor_and_reports_availability() {
         let (_dir, mut app) = fixture();
         let command = bus::Command {
@@ -1116,6 +1148,7 @@ mod tests {
                 };
                 let refusal: verbs::Refusal = serde_json::from_str(body).unwrap();
                 assert_eq!(refusal.error_code, verbs::code::UNAVAILABLE);
+                assert_eq!(refusal.reason.as_deref(), Some(if headless { "headless" } else { "window_busy" }));
             }
         }
         app.dialog = Some(dialogs::Dialog::Confirm { token: 1, message: "Confirm".into() });

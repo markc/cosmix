@@ -80,7 +80,7 @@ permission. No verb performs file operations or opens a confirmation dialog.
 | `dopus.describe` | — | `{contract:"ctk-app-control.v0", app:"dopus", title, view, engine:"iced", version, description, controls, verbs}` | — |
 | `dopus.info` | — | `{version, git_sha, build_time, headless, panes:2, pane_states:[PaneState, PaneState], config_path}` | — |
 | `dopus.state` | — | `{panes:[PaneState, PaneState], theme_scheme, theme_mode}` | — |
-| `dopus.action` | `id`, optional `pane`, optional `args` (currently unused) | `{id, ok:true, result:null}`; quit instead returns `{quitting:true}` | `INVALID_ARGUMENT`, `FORBIDDEN`, `UNAVAILABLE` |
+| `dopus.action` | `id`, optional `pane`, optional `args` (currently unused) | `{id, ok:true, result:null}`; quit instead returns `{quitting:true}` | `INVALID_ARGUMENT`, `FORBIDDEN`, `UNAVAILABLE`; for `location.focus`, reason `"headless"` means no window, `"window_busy"` means a modal is open or shutdown is underway |
 | `dopus.actions.list` | — | `{actions:[{id, label, keys, enabled}]}` | — |
 | `dopus.theme.set` | optional `scheme`, `mode`; null leaves unchanged | `{scheme, mode}` | `INVALID_ARGUMENT`; `UNAVAILABLE` headless |
 | `dopus.open` | `paths:[…]`, optional `pane` | `{accepted, opened}` | `INVALID_ARGUMENT` |
@@ -127,6 +127,9 @@ Theme actions work windowed and return `UNAVAILABLE` headless.
 `location.focus` focuses and selects the requested pane's location text in
 the window, activating that pane. It returns `UNAVAILABLE` headless or
 while the window has a modal open or is shutting down.
+If that pane's location editor is already open, the request succeeds as a
+no-op, preserving the draft. Targeting the other pane switches editors and
+seeds the new editor from that pane's path.
 `dopus.actions.list` enables it only when the window can perform it.
 `app.quit` is an action id; the direct quit verb is `dopus.quit`.
 

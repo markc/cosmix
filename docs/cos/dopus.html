@@ -508,7 +508,7 @@ permission. No verb performs file operations or opens a confirmation dialog.</p>
 <tr><td><code>dopus.describe</code></td><td>—</td><td><code>{contract:"ctk-app-control.v0", app:"dopus", title, view, engine:"iced", version, description, controls, verbs}</code></td><td>—</td></tr>
 <tr><td><code>dopus.info</code></td><td>—</td><td><code>{version, git_sha, build_time, headless, panes:2, pane_states:[PaneState, PaneState], config_path}</code></td><td>—</td></tr>
 <tr><td><code>dopus.state</code></td><td>—</td><td><code>{panes:[PaneState, PaneState], theme_scheme, theme_mode}</code></td><td>—</td></tr>
-<tr><td><code>dopus.action</code></td><td><code>id</code>, optional <code>pane</code>, optional <code>args</code> (currently unused)</td><td><code>{id, ok:true, result:null}</code>; quit instead returns <code>{quitting:true}</code></td><td><code>INVALID_ARGUMENT</code>, <code>FORBIDDEN</code>, <code>UNAVAILABLE</code></td></tr>
+<tr><td><code>dopus.action</code></td><td><code>id</code>, optional <code>pane</code>, optional <code>args</code> (currently unused)</td><td><code>{id, ok:true, result:null}</code>; quit instead returns <code>{quitting:true}</code></td><td><code>INVALID_ARGUMENT</code>, <code>FORBIDDEN</code>, <code>UNAVAILABLE</code>; for <code>location.focus</code>, reason <code>"headless"</code> means no window, <code>"window_busy"</code> means a modal is open or shutdown is underway</td></tr>
 <tr><td><code>dopus.actions.list</code></td><td>—</td><td><code>{actions:[{id, label, keys, enabled}]}</code></td><td>—</td></tr>
 <tr><td><code>dopus.theme.set</code></td><td>optional <code>scheme</code>, <code>mode</code>; null leaves unchanged</td><td><code>{scheme, mode}</code></td><td><code>INVALID_ARGUMENT</code>; <code>UNAVAILABLE</code> headless</td></tr>
 <tr><td><code>dopus.open</code></td><td><code>paths:[…]</code>, optional <code>pane</code></td><td><code>{accepted, opened}</code></td><td><code>INVALID_ARGUMENT</code></td></tr>
@@ -549,6 +549,9 @@ Theme actions work windowed and return <code>UNAVAILABLE</code> headless.
 <code>location.focus</code> focuses and selects the requested pane's location text in
 the window, activating that pane. It returns <code>UNAVAILABLE</code> headless or
 while the window has a modal open or is shutting down.
+If that pane's location editor is already open, the request succeeds as a
+no-op, preserving the draft. Targeting the other pane switches editors and
+seeds the new editor from that pane's path.
 <code>dopus.actions.list</code> enables it only when the window can perform it.
 <code>app.quit</code> is an action id; the direct quit verb is <code>dopus.quit</code>.</p>
 <h2 id="keymap-and-location-editing">Keymap and location editing</h2>
