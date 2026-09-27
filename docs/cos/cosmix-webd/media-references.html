@@ -444,7 +444,8 @@
         <div id="content-doc" data-prerendered="cos/cosmix-webd/media-references.md"><div class="prose"><h1 id="media-blob-references">Media blob references</h1>
 <p>CMS images remain served from their existing <code>img/YYYY/MM/&lt;hash-prefix&gt;.&lt;ext&gt;</code>
 files. Upload writes the file atomically and commits the media row first, then
-attempts an optional local blob write. A blob outage, quota refusal or saturated
+spawns an optional local blob write with admission acquired before spawning.
+The HTTP redirect never waits for the lane. A blob outage, quota refusal or saturated
 pool leaves the upload successful with <code>blob=NULL</code>; the existing 303 redirect
 to <code>/admin/media</code> is unchanged. No file is replaced by a blob URL this arc.</p>
 <p><code>webd.media.ref {vhost, id}</code> returns the complete reference object directly:
@@ -466,13 +467,16 @@ reference, webd rechecks the row: deletion returns <code>not_found</code>; a cha
 returns <code>conflict:</code>. The blob pin remains in either case. Delete also retains
 pins; release belongs to later reconciliation.</p>
 <p>Both native <code>ensure_media_schema</code> and Mix <code>cms_init</code> add <code>blob TEXT NULL</code> while
-preserving legacy rows. Existing columns are detected explicitly; other schema
+preserving legacy rows. Mix catches only duplicate-column ALTER errors through
+the existing DB authoriser, without PRAGMA access; other schema
 failures propagate. The column holds validated reference JSON, not a hash-only
 string or a separate origin column.</p>
 <p>Atomic writes use unique temporary files in the destination directory. Upload,
 rollback, reference reads/attachment and deletion coordinate by physical path,
 including aliases of one document root. Deletion checks references in active
-vhost catalogues before unlinking; ambiguous database state retains the file.
+vhost catalogues by device/inode before unlinking, including symlinked image
+directories and hard-linked files; ambiguous database or filesystem state retains
+the file.
 Eight write operations are admitted. A cancelled blocking file write keeps its
 path lock and admission until it finishes. Process death between file publication
 and row insertion can still leave an orphan file for later reconciliation.</p>

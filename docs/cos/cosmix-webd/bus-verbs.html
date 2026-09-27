@@ -584,7 +584,7 @@ Arguments are a JSON object. Transport headers are not argument fallbacks.
 Unknown fields and wrong types are refused with rc=10 <code>invalid_arguments:</code>.</p>
 <table><thead><tr><th>Verb</th><th>Required arguments</th><th>Optional arguments</th><th>Success (rc=0)</th></tr></thead><tbody>
 <tr><td><code>webd.share.create</code></td><td><code>vhost: string</code>, <code>account: string</code>, exactly one of <code>rel_path: string</code> or <code>blob: reference object</code></td><td><code>kind: "file"</code> (default), <code>name: string</code> (blob only), <code>password: string</code>, <code>expires: integer</code></td><td><code>{token, url}</code>; URL is relative <code>/s/{token}</code></td></tr>
-<tr><td><code>webd.share.list</code></td><td><code>vhost: string</code>, <code>account: string</code></td><td><code>after: token string</code>, <code>limit: integer</code> (1..100, default 100)</td><td><code>{shares: [...], next: token-or-null}</code></td></tr>
+<tr><td><code>webd.share.list</code></td><td><code>vhost: string</code>, <code>account: string</code></td><td><code>after: token string</code>, <code>limit: integer</code> (1..100, default 100)</td><td><code>{shares: [...], next: token-or-null, skipped: integer}</code></td></tr>
 <tr><td><code>webd.share.revoke</code></td><td><code>vhost: string</code>, <code>account: string</code>, <code>token: string</code></td><td>None</td><td><code>{revoked: boolean}</code></td></tr>
 <tr><td><code>webd.media.ref</code></td><td><code>vhost: string</code>, <code>id: integer</code> (&gt;0)</td><td>None</td><td>Reference object directly: <code>{blob, size, mime, name?, origin}</code></td></tr>
 </tbody></table>
@@ -597,10 +597,13 @@ an operator-configured root for that account, even over the Bus.</p>
 creation pins before token publication. Revoke is account-scoped and idempotent:
 false means absent, already revoked, or another account's token. Lists omit
 revoked rows and password hashes, retain expired rows, and paginate by token;
-an empty page returns <code>next=null</code>.</p>
+unservable rows contribute to <code>skipped</code>. The cursor advances over skipped rows;
+<code>next=null</code> means no rows were scanned.</p>
 <p>All four operations run on at most eight workers owned by the current broker
-session. Reconnect aborts that session's workers; a separate four-worker bcrypt
-pool keeps admission until blocking work actually ends. Worker saturation is
+session. Reconnect aborts that session's workers. Password verification has four
+bcrypt workers and creation has one separate worker; admission lasts until
+blocking work ends. Busy replies run outside the receive loop with a 30-second
+timeout. Worker saturation is
 rc=10 <code>{"error":"busy: webd transfer workers full (8)"}</code>. All other failures
 also return rc=10 with <code>{"error":"&lt;token&gt;[: details]"}</code>; no new payload bytes
 travel in Bus frames.</p>

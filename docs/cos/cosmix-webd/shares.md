@@ -3,6 +3,22 @@
 Public file shares are available through explicit revocable tokens. Catalogue
 management is available over the Bus and authenticated HTTP.
 
+Compatibility: `/s/…` and `/api/shares*` are reserved on every vhost, ahead of
+static files and Mix handlers. Existing applications must move conflicting routes.
+
+Account roots must not be equal to or beneath any vhost's canonical `www_dir`
+or `docs_dir`, including symlink aliases. Startup skips and logs conflicting
+roots; access rechecks the current routing snapshot after reload. These checks
+do not make an already public directory private: move private bytes out of it.
+The service's `ProtectHome=yes` makes roots under `/home` unavailable. Provision
+roots in a service-accessible directory. The host is assumed to enforce
+`fs.protected_hardlinks`; descriptor confinement cannot distinguish hard links.
+
+Rows carry `primary_fqdn`; resolve, list and revoke require that primary.
+Duplicate canonical CMS database paths disable the later primary at startup.
+Rows predating this ownership column remain intact with NULL ownership and
+cannot be served until explicitly mapped to their correct primary.
+
 ## Public downloads
 
 `GET/HEAD /s/{token}` is a per-vhost route ahead of static serving. Unknown,
@@ -35,6 +51,8 @@ Content-Security-Policy: sandbox
 File responses also carry `Accept-Ranges: bytes`, exact `Content-Length`, and
 `Content-Disposition: attachment; filename*=UTF-8''<percent-encoded-name>`.
 Paths use `application/octet-stream`; blobs use the validated reference MIME.
+With `If-Range` present, Range is ignored and the full representation is returned:
+there is no ETag or Last-Modified validation contract for shares.
 Blob headers are allowlisted; no upstream cache, cookies or redirects propagate.
 At most eight public bodies are admitted, with no waiting queue (503 `busy:`).
 File reads use bounded 64 KiB buffers. A timer-driven body pump aborts after
@@ -78,8 +96,8 @@ list/revoke return 200. Missing identity returns 401, CSRF failure 403, invalid
 arguments 400, missing catalogue 404, resource saturation 503. Extractor errors
 use axum's 400/413/415/422 statuses. All management responses are private/no-store.
 
-Passwords contain 1..72 UTF-8 bytes and hash with bcrypt cost 12 on at most four
-blocking workers. Verification permits stored costs 4..14; malformed or more
+Passwords contain 1..72 UTF-8 bytes and hash with bcrypt cost 12 on one creation
+worker. Verification has four blocking workers and permits stored costs 4..14; malformed or more
 expensive hashes fail closed. Cancellation retains worker admission until the
 blocking computation ends. Passwords are never accepted in a query string.
 
@@ -153,7 +171,10 @@ released this arc, including on revoke or expiry. Reconciliation is deferred.
 
 Share error tokens are `not_found`, `expired`, `revoked`, `unauthorized` and
 `invalid_arguments:`. Public responses collapse missing/revoked/expired to 404
-and password failures to 401. Database faults remain internal failures.
+and password failures to 401. All public denial bodies use `not_found` (416
+remains empty); management keeps detailed tokens. Public lane errors expose
+only the fixed prefix token, with diagnostic details written to the log.
+Database faults remain internal failures.
 
 ## Local lane adapter
 

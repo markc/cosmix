@@ -444,6 +444,19 @@
         <div id="content-doc" data-prerendered="cos/cosmix-webd/shares.md"><div class="prose"><h1 id="public-shares">Public shares</h1>
 <p>Public file shares are available through explicit revocable tokens. Catalogue
 management is available over the Bus and authenticated HTTP.</p>
+<p>Compatibility: <code>/s/…</code> and <code>/api/shares*</code> are reserved on every vhost, ahead of
+static files and Mix handlers. Existing applications must move conflicting routes.</p>
+<p>Account roots must not be equal to or beneath any vhost's canonical <code>www_dir</code>
+or <code>docs_dir</code>, including symlink aliases. Startup skips and logs conflicting
+roots; access rechecks the current routing snapshot after reload. These checks
+do not make an already public directory private: move private bytes out of it.
+The service's <code>ProtectHome=yes</code> makes roots under <code>/home</code> unavailable. Provision
+roots in a service-accessible directory. The host is assumed to enforce
+<code>fs.protected_hardlinks</code>; descriptor confinement cannot distinguish hard links.</p>
+<p>Rows carry <code>primary_fqdn</code>; resolve, list and revoke require that primary.
+Duplicate canonical CMS database paths disable the later primary at startup.
+Rows predating this ownership column remain intact with NULL ownership and
+cannot be served until explicitly mapped to their correct primary.</p>
 <h2 id="public-downloads">Public downloads</h2>
 <p><code>GET/HEAD /s/{token}</code> is a per-vhost route ahead of static serving. Unknown,
 revoked, expired, unmapped legacy or unsupported-kind tokens terminate with 404;
@@ -470,6 +483,8 @@ Content-Security-Policy: sandbox
 <p>File responses also carry <code>Accept-Ranges: bytes</code>, exact <code>Content-Length</code>, and
 <code>Content-Disposition: attachment; filename*=UTF-8''&lt;percent-encoded-name&gt;</code>.
 Paths use <code>application/octet-stream</code>; blobs use the validated reference MIME.
+With <code>If-Range</code> present, Range is ignored and the full representation is returned:
+there is no ETag or Last-Modified validation contract for shares.
 Blob headers are allowlisted; no upstream cache, cookies or redirects propagate.
 At most eight public bodies are admitted, with no waiting queue (503 <code>busy:</code>).
 File reads use bounded 64 KiB buffers. A timer-driven body pump aborts after
@@ -508,8 +523,8 @@ the sealed token and reject a mismatched Origin/Referer. Create returns 201;
 list/revoke return 200. Missing identity returns 401, CSRF failure 403, invalid
 arguments 400, missing catalogue 404, resource saturation 503. Extractor errors
 use axum's 400/413/415/422 statuses. All management responses are private/no-store.</p>
-<p>Passwords contain 1..72 UTF-8 bytes and hash with bcrypt cost 12 on at most four
-blocking workers. Verification permits stored costs 4..14; malformed or more
+<p>Passwords contain 1..72 UTF-8 bytes and hash with bcrypt cost 12 on one creation
+worker. Verification has four blocking workers and permits stored costs 4..14; malformed or more
 expensive hashes fail closed. Cancellation retains worker admission until the
 blocking computation ends. Passwords are never accepted in a query string.</p>
 <h2 id="identity-and-roots">Identity and roots</h2>
@@ -567,7 +582,10 @@ The owner is <code>webd:share:&lt;first-16-hex-of-BLAKE3(primary-fqdn)&gt;</code
 released this arc, including on revoke or expiry. Reconciliation is deferred.</p>
 <p>Share error tokens are <code>not_found</code>, <code>expired</code>, <code>revoked</code>, <code>unauthorized</code> and
 <code>invalid_arguments:</code>. Public responses collapse missing/revoked/expired to 404
-and password failures to 401. Database faults remain internal failures.</p>
+and password failures to 401. All public denial bodies use <code>not_found</code> (416
+remains empty); management keeps detailed tokens. Public lane errors expose
+only the fixed prefix token, with diagnostic details written to the log.
+Database faults remain internal failures.</p>
 <h2 id="local-lane-adapter">Local lane adapter</h2>
 <p><code>blob_lane::local</code> loads the current <code>node.broker_handle</code> for each operation.
 Discovery calls the local <code>blobd</code> citizen's <code>blob.props.get {path: "lane"}</code>;

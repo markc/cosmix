@@ -196,7 +196,7 @@ Unknown fields and wrong types are refused with rc=10 `invalid_arguments:`.
 | Verb | Required arguments | Optional arguments | Success (rc=0) |
 |---|---|---|---|
 | `webd.share.create` | `vhost: string`, `account: string`, exactly one of `rel_path: string` or `blob: reference object` | `kind: "file"` (default), `name: string` (blob only), `password: string`, `expires: integer` | `{token, url}`; URL is relative `/s/{token}` |
-| `webd.share.list` | `vhost: string`, `account: string` | `after: token string`, `limit: integer` (1..100, default 100) | `{shares: [...], next: token-or-null}` |
+| `webd.share.list` | `vhost: string`, `account: string` | `after: token string`, `limit: integer` (1..100, default 100) | `{shares: [...], next: token-or-null, skipped: integer}` |
 | `webd.share.revoke` | `vhost: string`, `account: string`, `token: string` | None | `{revoked: boolean}` |
 | `webd.media.ref` | `vhost: string`, `id: integer` (>0) | None | Reference object directly: `{blob, size, mime, name?, origin}` |
 
@@ -211,11 +211,14 @@ Vhost aliases resolve to their primary's catalogue and hashed blob owner. Share
 creation pins before token publication. Revoke is account-scoped and idempotent:
 false means absent, already revoked, or another account's token. Lists omit
 revoked rows and password hashes, retain expired rows, and paginate by token;
-an empty page returns `next=null`.
+unservable rows contribute to `skipped`. The cursor advances over skipped rows;
+`next=null` means no rows were scanned.
 
 All four operations run on at most eight workers owned by the current broker
-session. Reconnect aborts that session's workers; a separate four-worker bcrypt
-pool keeps admission until blocking work actually ends. Worker saturation is
+session. Reconnect aborts that session's workers. Password verification has four
+bcrypt workers and creation has one separate worker; admission lasts until
+blocking work ends. Busy replies run outside the receive loop with a 30-second
+timeout. Worker saturation is
 rc=10 `{"error":"busy: webd transfer workers full (8)"}`. All other failures
 also return rc=10 with `{"error":"<token>[: details]"}`; no new payload bytes
 travel in Bus frames.

@@ -15,7 +15,9 @@ pub struct ReadRoot {
 
 impl ReadRoot {
     /// Open once at startup. The supplied root is operator configuration, never
-    /// request data. All components must be real directories, not symlinks.
+    /// request data. Callers canonicalise configured roots first; this helper
+    /// rejects symlinks in the supplied canonical path. Relative file reads
+    /// beneath the pinned descriptor also reject symlinks.
     pub fn open(path: &Path) -> io::Result<Self> {
         if !path.is_absolute()
             || path
