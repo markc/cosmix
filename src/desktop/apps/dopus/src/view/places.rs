@@ -65,7 +65,7 @@ pub fn sidebar<'a>(
         let label = super::elide::Label {
             text: (*name).to_owned(),
             font: look.ui_font,
-            px: look.px * 0.9,
+            px: look.sidebar_px(),
             color: if selected {
                 look.tokens.selection_text
             } else {

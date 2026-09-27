@@ -500,6 +500,9 @@ room for names.
 Selection uses the design's <code>selection</code>/<code>selection_text</code> pair, and a
 <code>muted_surface</code> header marks the active pane. Modified times are always local
 <code>dd/mm/yy HH:MM</code> in 24-hour format. There is no relative-time refresh.</p>
+<p>Places entries and every Properties label, value and path share the resolved
+Ui font and size, without a panel-specific size multiplier. Properties field
+names use muted text; values use the on-surface text colour.</p>
 <p>The plain <strong>Properties</strong> sidebar follows the active pane's single selection:
 name, kind and extension-based MIME guess, byte and human-readable size,
 modified/created/accessed times, Unix permissions (rwx and octal), resolved

@@ -43,6 +43,12 @@ pub struct Look {
 }
 
 impl Look {
+    /// Places entries and every Properties label/value share the Ui role.
+    /// Use the resolved size directly, without a panel-specific multiplier.
+    pub fn sidebar_px(&self) -> f32 {
+        self.px
+    }
+
     /// A full-width strip (headers, status bar) in the given token colours.
     pub fn strip(
         &self,

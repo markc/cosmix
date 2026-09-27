@@ -9,7 +9,7 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
     let mut content = column![
         text("Properties")
             .font(look.ui_font)
-            .size(look.px)
+            .size(look.sidebar_px())
             .color(look.chrome.secondary_text)
     ]
     .spacing(look.chrome.gap)
@@ -73,7 +73,7 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
     content = content.push(Label {
         text: title,
         font: look.ui_font,
-        px: look.px,
+        px: look.sidebar_px(),
         color: look.tokens.text,
     });
     for (label, value) in fields {
@@ -81,13 +81,13 @@ pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
             column![
                 text(label)
                     .font(look.ui_font)
-                    .size(look.px)
+                    .size(look.sidebar_px())
                     .color(look.tokens.muted_text),
                 text(value)
                     .wrapping(iced::advanced::text::Wrapping::WordOrGlyph)
                     .shaping(iced::advanced::text::Shaping::Advanced)
                     .font(look.ui_font)
-                    .size(look.px)
+                    .size(look.sidebar_px())
                     .color(look.tokens.text)
                     .width(Length::Fill),
             ]

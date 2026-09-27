@@ -2,6 +2,8 @@
 
 ## 0.3.1
 
+- Use the resolved Ui size for both Places entries and all Properties text;
+  distinguish field names by muted colour. Remove Places' size multiplier.
 - Use the shared widgets tooltip style: opaque neutral popover background,
   matching text, muted token border and rounded corners with token padding.
 - Give each pane a small muted summary box below its clipped list. Keep
