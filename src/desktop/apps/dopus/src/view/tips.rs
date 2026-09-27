@@ -111,7 +111,7 @@ mod tests {
     fn labels_use_effective_remaps_and_omit_unbound_keys() {
         let mut keymap = crate::keys::load(None).unwrap();
         keymap.custom = cosmix_actions::parse_keymap(r#"{
-          version: 1, defaults: [], custom: [
+          version: 1, chord_timeout_ms: 1000, defaults: [], custom: [
             {action: "nav.back", chord: ["Ctrl+J"], scope: "global", repeat: "ignore", allow_in_editable: false},
             {action: "nav.forward", chord: nil, scope: "global"}
           ]
