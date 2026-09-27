@@ -14,7 +14,7 @@ See [commands and configuration](commands-and-configuration.md) for the full com
 
 See [Bus verbs](bus-verbs.md) for the daemon's Bus service and SPEC 12 property namespaces.
 
-See [public shares](shares.md) for the P5 catalogue contract and delivery status.
+Version 0.12.0 adds [public shares](shares.md) and [media blob references](media-references.md).
 
 ## What it provides
 
@@ -38,6 +38,9 @@ Known hosts receive the per-vhost router. Unknown hosts return `404`; missing or
 |---|---|---|
 | `/api/posts` | `GET`, `POST` | List or create CMS posts |
 | `/api/posts/{id}` | `GET`, `PUT`, `DELETE` | Read, update, or delete one post |
+| `/api/shares` | `GET`, `POST` | List own shares or create an account-root path share |
+| `/api/shares/{token}/revoke` | `POST` | Revoke an own share |
+| `/s/{token}` | `GET`, `HEAD` | Gated public file or local blob download |
 | `/jmap` | Any | Proxy a JMAP request to the vhost upstream |
 | `/jmap/{path}` | Any | Proxy a JMAP sub-path |
 | `/.well-known/jmap` | Any | Proxy JMAP session discovery |
@@ -88,6 +91,10 @@ Evaluation has a 1 MiB request-body cap, a five-second deadline, the Mix default
 
 - `posts`, the CMS post table.
 - `session_epochs`, per-account counters used to invalidate sealed session cookies.
+- `file_shares`, the preserving, email-keyed token catalogue with exclusive path/blob targets.
+
+The native and Mix CMS schema entry points also preserve media rows while adding
+nullable reference JSON in `media.blob`. Files remain the served image source.
 
 Production serving also stores SPEC 12 property rows in the configured web database. Per-vhost CMS databases are optional and may attach named auxiliary databases.
 
@@ -111,7 +118,7 @@ Manual-PEM deployments can reload certificate contents without restarting throug
 
 The daemon registers the Bus service name `webd`. Broker connection failures and mid-session disconnects enter an exponential reconnect loop capped at 60 seconds. HTTP serving and ACME renewal continue while the Bus surface is offline.
 
-The service exposes read-only snapshots, ergonomic lifecycle verbs, listener controls, session revocation, TLS reload, and the generic `webd.props.*` family. Property changes publish on `webd.props.records.changed`; watch grants are refreshed after broker reconnection.
+The service exposes read-only snapshots, ergonomic lifecycle verbs, listener controls, session revocation, TLS reload, share management, media-reference recovery, and the generic `webd.props.*` family. Property changes publish on `webd.props.records.changed`; watch grants are refreshed after broker reconnection.
 
 ## Cargo features
 

@@ -1,5 +1,4 @@
 //! Validated local-lane reference shared by the share catalogue and media.
-#![allow(dead_code)] // P5 foundations; routes/Bus consumers follow the checkpoint.
 
 use serde::{Deserialize, Serialize};
 

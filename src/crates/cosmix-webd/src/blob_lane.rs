@@ -1,6 +1,5 @@
 //! Local blobd adapter. No reference origin is ever used as a routing target.
-//! Foundations only until the P5 cluster checkpoint: consumers follow in slices 4–6.
-#![allow(dead_code)]
+//! Shared by public shares and recoverable media dual-write.
 
 use std::{future::Future, sync::Arc, time::Duration};
 

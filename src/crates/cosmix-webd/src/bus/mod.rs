@@ -319,9 +319,9 @@ pub async fn run(node: Arc<NodeState>) {
                 // of those five suffixes; `None` for anything else
                 // (e.g. `webd.routes.list`, typo, unknown action),
                 // which falls through to the synchronous `dispatch`
-                // below so the read-only-by-construction shape +
-                // `rc=10` unknown-action sentinel keep working
-                // unchanged for the non-vhost verbs.
+                // below for the remaining snapshot verbs and the
+                // `rc=10` unknown-action sentinel. Share/media operations
+                // already entered the bounded worker branch above.
                 // Try the vhost verbs, then the P3 listener verbs
                 // (`listener.{enable,disable,status}`); fall through to
                 // the synchronous `dispatch` for anything else.

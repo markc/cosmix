@@ -12,7 +12,8 @@ they never fall through to a similarly named static file. Other methods return
 
 Password-protected shares require HTTPS Basic authentication: any username,
 password in the password part, `WWW-Authenticate: Basic realm="share"` on 401.
-Plain HTTP returns 403 without a challenge. No query-string password is read.
+Plain requests reaching this handler return 403 without a challenge; the existing
+redirect-only HTTP listener still redirects to HTTPS. No query-string password is read.
 Before bcrypt, five attempts per (token, actual socket peer IP) per 60 seconds
 are allowed. The table holds at most 4096 live pairs and refuses new pairs when
 full. Refusal returns 429 with `Retry-After: 60`. Forwarded IP headers are ignored.
@@ -134,7 +135,7 @@ verified hash. New tokens carry 160 random bits. Management lists are bounded to
 body bytes first emit, never for HEAD, denial or an empty body. It does not prove
 receipt of a complete file.
 
-Blob-share creation will be Bus-only and must pin before publishing a token.
+Blob-share creation is Bus-only and pins before publishing a token.
 The owner is `webd:share:<first-16-hex-of-BLAKE3(primary-fqdn)>`; no share pins are
 released this arc, including on revoke or expiry. Reconciliation is deferred.
 
@@ -142,7 +143,7 @@ Share error tokens are `not_found`, `expired`, `revoked`, `unauthorized` and
 `invalid_arguments:`. Public responses collapse missing/revoked/expired to 404
 and password failures to 401. Database faults remain internal failures.
 
-## Local lane adapter (checkpoint foundation)
+## Local lane adapter
 
 `blob_lane::local` loads the current `node.broker_handle` for each operation.
 Discovery calls the local `blobd` citizen's `blob.props.get {path: "lane"}`;
@@ -156,8 +157,8 @@ queue. GET bodies retain admission through completion or drop. Bus calls have
 a 10-second deadline; lane headers and each pending upstream body read have a
 30-second deadline. Backpressure from a slow downstream keeps its permit: this
 is an upstream I/O idle deadline, not a total public download lifetime. Public
-connection deadlines and admission of catalogue/password work are wired with
-the HTTP handler in later slices.
+connection limits remain owned by the listener. Catalogue and password work have
+their own bounded admission pools. Revocation does not cancel an already-authorised body.
 
 GET/HEAD forward Range and check 200/206/416 against the reference size and the
 requested extent. Single ranges follow blobd's semantics: malformed/multiple
@@ -167,19 +168,24 @@ responses, and aborts a body that is short or exceeds the declared extent.
 416 diagnostics are discarded and replaced by an empty body with validated
 Content-Range. Only Content-Type (from the validated reference), Content-Length,
 Content-Range and Accept-Ranges leave this adapter; public attachment/security
-headers are added by the later share route.
+headers are added by the share route.
 
-The media-reference foundation hashes the complete bytes with BLAKE3, checks
+The media-reference adapter hashes the complete bytes with BLAKE3, checks
 `blob.stat` first, and recovers or adds an owner pin without uploading existing
 bytes. `blob.stat` has no name field today, so recovered references omit the
 optional name. Missing content uses hash-addressed PUT with advisory quota
 preflight, bounded upload chunks and an upload progress watchdog. Both 201 and
 the present-hash early 200 are accepted, but the returned hash and size must
 match. Reference replies are capped at 64 KiB and 30 seconds. Pin publication
-is separate from catalogue publication; these foundations do not yet dual-write
-media or expose a `webd.media.ref` verb.
+is separate from catalogue publication. See [media references](media-references.md)
+for row-first dual-write and the `webd.media.ref` retry verb.
 
 Lane errors retain `lane_unavailable:`, `quota:`, `lane:`, `not_present:` and
 `verify_failed:`. Saturation is `lane: transfer pool full (8)`; invalid caller
 references are `invalid_arguments:`. An error after response headers aborts
 the body stream rather than attempting a second HTTP status.
+
+The public handler maps lane failures to 502, except `lane_unavailable:` (503).
+Its own resource saturation is 503 `busy:`; database failures are 500 `internal:`.
+`not_present:` therefore means 502 for an existing token whose local bytes are
+missing, distinct from the 404 for an unknown/revoked/expired token.

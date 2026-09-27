@@ -1,9 +1,7 @@
-//! Token catalogue for public file shares. P5 slices 1–3 are foundations only:
-//! HTTP/Bus routes are wired after the cluster checkpoint.
+//! Token catalogue for public file shares, managed and served by shares.rs.
 //!
 //! Account identity is the exact canonical email in the unified session. Legacy
 //! numeric rows survive migration but cannot resolve until explicitly mapped.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
