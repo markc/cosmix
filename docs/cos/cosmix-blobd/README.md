@@ -125,6 +125,16 @@ A `blob.fetch` interrupted by a restart leaves at most staging residue under `bl
 
 ## Storage layout
 
+The durable upload core uses `blobd.sqlite` schema v3 and `blobs/.uploads/`.
+Active sessions reserve their whole declared size across daemon restarts.
+SQLite uses WAL with `synchronous=FULL`; a chunk is acknowledged only after
+its staging file is synced and its offset update commits. Startup truncates
+uncommitted tails to that offset, records missing or short staging as a failed
+session (never extends it), and removes orphan staging. The v1 `.tmp` wipe
+remains separate. Session and receipt counts are bounded independently of
+active HTTP transfer concurrency. The mds blob-index schema remains v1.
+
+
 ```text
 /var/lib/cosmix/blobd/
 ├── blobs/<h2>/<h2>/<hash64>   mds CAS: immutable, sharded, BLAKE3-named

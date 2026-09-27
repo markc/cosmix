@@ -46,6 +46,8 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 # flock on <root>/.blobd.lock — one GC owner per root (D4).
 libc = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
 anyhow = { workspace = true, optional = true }
 # The byte lane: GET/HEAD/PUT/POST /blob on the WireGuard address.
 axum = { workspace = true, optional = true }

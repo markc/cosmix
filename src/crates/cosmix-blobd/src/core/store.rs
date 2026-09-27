@@ -35,6 +35,10 @@ use super::config::Config;
 use super::mime;
 use super::reference::Reference;
 
+#[path = "uploads.rs"]
+mod uploads;
+pub use uploads::{UploadCreate, UploadLimits, UploadSession};
+
 /// Name of the exclusive instance lock inside the mds root.
 pub const LOCK_FILE: &str = ".blobd.lock";
 /// mds's `DEFAULT_GC_QUIESCENCE` (60 s): the grace a CAS file's mtime
@@ -44,7 +48,7 @@ pub const LOCK_FILE: &str = ".blobd.lock";
 pub const DEFAULT_GC_GRACE_SECS: u64 = 60;
 
 const BLOBD_APPLICATION_ID: i32 = 0x626C_6F62; // 'blob'
-const BLOBD_LATEST: u32 = 2;
+const BLOBD_LATEST: u32 = 3;
 const BLOBD_V1_SQL: &str = "\
 PRAGMA application_id = 0x626C6F62;        -- 'blob'
 PRAGMA user_version   = 1;
@@ -111,6 +115,13 @@ pub enum StoreError {
     /// <why>` — the `blob.fetch` queue is full (`fetch_queue_max`), or
     /// another `blob.gc` is already sweeping (one GC owner, M2b).
     Busy(&'static str),
+    UploadMissing,
+    UploadConflict {
+        offset: u64,
+        reason: String,
+    },
+    UploadLimit,
+    UploadVerify,
 }
 
 impl std::fmt::Display for StoreError {
@@ -143,6 +154,12 @@ impl std::fmt::Display for StoreError {
             }
             Self::BadRequest(s) => write!(f, "bad request: {s}"),
             Self::Busy(why) => write!(f, "busy: {why}; retry later"),
+            Self::UploadMissing => write!(f, "upload unknown or expired"),
+            Self::UploadConflict { offset, reason } => {
+                write!(f, "upload conflict at {offset}: {reason}")
+            }
+            Self::UploadLimit => write!(f, "upload session or receipt limit reached"),
+            Self::UploadVerify => write!(f, "upload hash verification failed; session discarded"),
         }
     }
 }
@@ -372,6 +389,8 @@ pub struct Store {
     /// not yet pinned. Lock order is always reserved → db — a path
     /// holding the db mutex never takes this one.
     reserved: Arc<Mutex<Reservations>>,
+    upload_limits: UploadLimits,
+    upload_writers: Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// Holds the root `flock` for the store's lifetime. Never read:
     /// closing it on drop is what releases the lock.
     _lock_file: File,
@@ -396,6 +415,15 @@ impl Store {
     /// root, `blobd.sqlite` migrations, then startup housekeeping
     /// (`.tmp` sweep + orphan reconcile).
     pub fn open(root: impl Into<PathBuf>, options: StoreOptions) -> Result<Self> {
+        Self::open_with_uploads(root, options, UploadLimits::default())
+    }
+
+    pub fn open_with_uploads(
+        root: impl Into<PathBuf>,
+        options: StoreOptions,
+        upload_limits: UploadLimits,
+    ) -> Result<Self> {
+        upload_limits.validate()?;
         let root = root.into();
 
         // One GC owner per root. flock locks are per open file
@@ -439,6 +467,8 @@ impl Store {
             db: Mutex::new(db),
             index: Mutex::new(index),
             reserved: Arc::new(Mutex::new(Reservations::default())),
+            upload_limits,
+            upload_writers: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             _lock_file: lock_file,
             options,
             startup: StartupReport::default(),
@@ -475,6 +505,7 @@ impl Store {
             );
         }
 
+        self.restore_uploads()?;
         let grace = Duration::from_secs(DEFAULT_GC_GRACE_SECS);
         for file in self.cas_scan()? {
             let has_row = blob_index::blob_row(&self.index.lock().unwrap(), &file.hash)?.is_some();
@@ -534,7 +565,7 @@ impl Store {
             ));
         }
         let mut reserved = self.reserved.lock().unwrap();
-        let totals = reserved.totals(None);
+        let totals = self.reservation_totals(&self.db.lock().unwrap(), &reserved, None, None)?;
         let owner_reserved = totals.get(owner).copied().unwrap_or(0);
         let total_reserved = sum_reserved(&totals);
         let owner_used = self.owner_used(owner)?;
@@ -668,8 +699,8 @@ impl Store {
         if reservation.is_some_and(|r| r.owner != owner) {
             return Err(StoreError::BadRequest("reservation owner mismatch".into()));
         }
-        let totals = reserved.totals(credit);
         let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &reserved, credit, None)?;
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
         }
@@ -766,8 +797,8 @@ impl Store {
         }
         let mut reserved = self.reserved.lock().unwrap();
         let credit = self.reservation_credit(&reserved, reservation, size)?;
-        let totals = reserved.totals(credit);
         let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &reserved, credit, None)?;
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
         }
@@ -914,8 +945,8 @@ impl Store {
         }
         let size = blob::size(&self.blobs_root(), hash)?;
         let reserved = self.reserved.lock().unwrap();
-        let totals = reserved.totals(None);
         let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &reserved, None, None)?;
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
         }
@@ -1145,9 +1176,9 @@ impl Store {
     pub fn quota_report(&self, owner: Option<&str>) -> Result<QuotaReport> {
         // One consistent snapshot, with the admission/settlement lock order.
         let reserved = self.reserved.lock().unwrap();
-        let reserved_map = reserved.totals(None);
-        let total_reserved = sum_reserved(&reserved_map);
         let db = self.db.lock().unwrap();
+        let reserved_map = self.reservation_totals(&db, &reserved, None, None)?;
+        let total_reserved = sum_reserved(&reserved_map);
         let mut owners = BTreeMap::new();
         match owner {
             Some(one) => {
@@ -1388,7 +1419,7 @@ impl Store {
         for shard in top {
             let shard = shard?;
             let shard_name = shard.file_name();
-            if shard_name == ".tmp" || !shard.file_type()?.is_dir() {
+            if shard_name == ".tmp" || shard_name == ".uploads" || !shard.file_type()?.is_dir() {
                 continue;
             }
             for mid in fs::read_dir(shard.path())? {
@@ -1646,7 +1677,7 @@ fn open_blobd_db(root: &Path) -> Result<Connection> {
         Connection::open(root.join("blobd.sqlite")).map_err(|e| StoreError::Db(e.to_string()))?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;\
-         PRAGMA synchronous  = NORMAL;\
+         PRAGMA synchronous  = FULL;\
          PRAGMA busy_timeout = 5000;\
          PRAGMA foreign_keys = ON;",
     )
@@ -1676,6 +1707,7 @@ fn apply_blobd_migrations(conn: &mut Connection) -> Result<()> {
         let sql = match v {
             1 => BLOBD_V1_SQL,
             2 => BLOBD_V2_SQL,
+            3 => uploads::SCHEMA,
             _ => {
                 return Err(StoreError::Db(format!(
                     "blobd.sqlite: missing migration v{v}"
@@ -1687,12 +1719,11 @@ fn apply_blobd_migrations(conn: &mut Connection) -> Result<()> {
             .map_err(|e| StoreError::Db(format!("begin v{v}: {e}")))?;
         tx.execute_batch(sql)
             .map_err(|e| StoreError::Db(format!("apply v{v}: {e}")))?;
+        tx.pragma_update(None, "user_version", v).map_err(db_err)?;
+        tx.pragma_update(None, "application_id", BLOBD_APPLICATION_ID)
+            .map_err(db_err)?;
         tx.commit()
             .map_err(|e| StoreError::Db(format!("commit v{v}: {e}")))?;
-        conn.pragma_update(None, "user_version", v)
-            .map_err(db_err)?;
-        conn.pragma_update(None, "application_id", BLOBD_APPLICATION_ID)
-            .map_err(db_err)?;
     }
     Ok(())
 }
@@ -1717,7 +1748,7 @@ mod tests {
 
     use super::super::config::{DEFAULT_QUOTA_OWNER_BYTES, DEFAULT_QUOTA_TOTAL_BYTES};
 
-    fn options() -> StoreOptions {
+    pub(super) fn options() -> StoreOptions {
         StoreOptions {
             origin: "testnode".into(),
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
@@ -1727,7 +1758,7 @@ mod tests {
         }
     }
 
-    fn store() -> (TempDir, Store) {
+    pub(super) fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
         let s = Store::open(dir.path(), options()).unwrap();
         (dir, s)
@@ -2519,14 +2550,14 @@ mod tests {
     }
 
     #[test]
-    fn blobd_sqlite_schema_is_v2_with_expected_tables() {
+    fn blobd_sqlite_schema_is_v3_with_expected_tables() {
         let (dir, store) = store();
         let conn = Connection::open(dir.path().join("blobd.sqlite")).unwrap();
         let v: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
-        for tbl in ["blob_attrs", "pins", "quota"] {
+        assert_eq!(v, 3);
+        for tbl in ["blob_attrs", "pins", "quota", "upload_sessions"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1;",

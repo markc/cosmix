@@ -1071,6 +1071,7 @@ version = "0.5.2"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
@@ -1089,6 +1090,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
