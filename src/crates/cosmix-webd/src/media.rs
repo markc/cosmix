@@ -687,8 +687,10 @@ async fn path_in_use(node: &NodeState, path: &Path) -> bool {
             let Some(path) = safe_disk_path(&vhost.www_dir, &url) else {
                 return true;
             };
-            let Ok(other) = std::fs::metadata(path) else {
-                return true;
+            let other = match std::fs::metadata(path) {
+                Ok(other) => other,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
             };
             if (candidate.dev(), candidate.ino()) == (other.dev(), other.ino()) {
                 return true;
@@ -701,6 +703,25 @@ async fn path_in_use(node: &NodeState, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dangling_media_row_does_not_block_reclamation_but_other_errors_do() {
+        let (_tmp, node, vhost) = crate::shares::tests::fixture().await;
+        std::fs::create_dir_all(vhost.www_dir.join("img")).unwrap();
+        let candidate = vhost.www_dir.join("img/candidate");
+        std::fs::write(&candidate, b"bytes").unwrap();
+        {
+            let db = vhost.db.as_ref().unwrap().lock().await;
+            ensure_media_schema(&db).unwrap();
+            db.execute("INSERT INTO media(filename,mime,storage,url_path) VALUES('missing','image/png','disk','/img/missing')", []).unwrap();
+        }
+        assert!(!path_in_use(&node, &candidate).await);
+        std::os::unix::fs::symlink("missing", vhost.www_dir.join("img/missing")).unwrap();
+        assert!(
+            path_in_use(&node, &candidate).await,
+            "a symlink loop is not evidence of absence"
+        );
+    }
 
     #[tokio::test]
     async fn concurrent_media_refs_upload_once_and_upload_reply_does_not_wait() {
