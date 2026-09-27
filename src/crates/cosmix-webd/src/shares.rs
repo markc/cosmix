@@ -640,12 +640,53 @@ fn counted_body(
     vhost: Arc<VhostState>,
     token: String,
 ) -> axum::body::Body {
+    counted_body_with_deadlines(body, permit, vhost, token, Duration::from_secs(30), Duration::from_secs(3600))
+}
+
+fn counted_body_with_deadlines(
+    body: axum::body::Body,
+    permit: OwnedSemaphorePermit,
+    vhost: Arc<VhostState>,
+    token: String,
+    idle: Duration,
+    lifetime: Duration,
+) -> axum::body::Body {
     use futures_util::StreamExt;
-    let state = (body.into_data_stream(), permit, vhost, token, false);
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = aborted.clone();
+    // This task owns BOTH the public permit and the upstream body (and its lane
+    // permit). Its timers run even when hyper never polls the response again.
+    tokio::spawn(async move {
+        let _permit = permit;
+        let mut stream = body.into_data_stream();
+        let transfer = async {
+            loop {
+                let step = async {
+                    let Some(chunk) = stream.next().await else { return false; };
+                    tx.send(chunk.map_err(std::io::Error::other)).await.is_ok()
+                };
+                match tokio::time::timeout(idle, step).await {
+                    Ok(true) => (),
+                    Ok(false) => return,
+                    Err(_) => { flag.store(true, std::sync::atomic::Ordering::Release); return; }
+                }
+            }
+        };
+        if tokio::time::timeout(lifetime, transfer).await.is_err() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+    let state = (rx, aborted, vhost, token, false);
     axum::body::Body::from_stream(futures_util::stream::unfold(
         state,
-        |(mut stream, permit, vhost, token, mut counted)| async move {
-            let chunk = stream.next().await?;
+        |(mut rx, aborted, vhost, token, mut counted)| async move {
+            let chunk = rx.recv().await?;
+            if aborted.load(std::sync::atomic::Ordering::Acquire) {
+                rx.close();
+                while rx.try_recv().is_ok() {}
+                return Some((Err(std::io::Error::other("download deadline exceeded")), (rx, aborted, vhost, token, counted)));
+            }
             if chunk.as_ref().is_ok_and(|b| !b.is_empty()) && !counted {
                 counted = true;
                 if let Some(db) = &vhost.db {
@@ -658,13 +699,31 @@ fn counted_body(
                     .await;
                 }
             }
-            Some((chunk, (stream, permit, vhost, token, counted)))
+            Some((chunk, (rx, aborted, vhost, token, counted)))
         },
     ))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn stalled_reader_releases_public_and_upstream_permits() {
+        let (_tmp, _node, vhost) = fixture().await;
+        for (idle, lifetime) in [(20, 1000), (1000, 20)] {
+            let public = Arc::new(Semaphore::new(1));
+            let lane = Arc::new(Semaphore::new(1));
+            let upstream_permit = lane.clone().acquire_owned().await.unwrap();
+            let upstream = axum::body::Body::from_stream(futures_util::stream::unfold(upstream_permit, |permit| async move {
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x")), permit))
+            }));
+            let _unpolled = counted_body_with_deadlines(upstream, public.clone().acquire_owned().await.unwrap(),
+                vhost.clone(), "unused".into(), Duration::from_millis(idle), Duration::from_millis(lifetime));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let _public = public.acquire().await.unwrap();
+                let _lane = lane.acquire().await.unwrap();
+            }).await.unwrap();
+        }
+    }
     use super::*;
     async fn path_token(node: &NodeState, vhost: &VhostState, password: Option<String>) -> String {
         create(

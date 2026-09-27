@@ -34,7 +34,9 @@ File responses also carry `Accept-Ranges: bytes`, exact `Content-Length`, and
 Paths use `application/octet-stream`; blobs use the validated reference MIME.
 Blob headers are allowlisted; no upstream cache, cookies or redirects propagate.
 At most eight public bodies are admitted, with no waiting queue (503 `busy:`).
-File reads use bounded 64 KiB buffers and 30-second pending-read deadlines.
+File reads use bounded 64 KiB buffers. A timer-driven body pump aborts after
+30 seconds without downstream progress or one hour total, releasing both public
+and lane admission even when the client stops reading. It buffers one chunk.
 The best-effort counter increments once as the first non-empty body chunk emits,
 with a five-second telemetry deadline; HEAD, 416 and empty files do not count.
 
@@ -155,8 +157,8 @@ does not trigger a cross-node fetch.
 One shared `Lane` instance admits at most eight operations, without a waiting
 queue. GET bodies retain admission through completion or drop. Bus calls have
 a 10-second deadline; lane headers and each pending upstream body read have a
-30-second deadline. Backpressure from a slow downstream keeps its permit: this
-is an upstream I/O idle deadline, not a total public download lifetime. Public
+30-second deadline. Public downloads additionally enforce the timer-driven
+30-second progress deadline and one-hour lifetime described above. Public
 connection limits remain owned by the listener. Catalogue and password work have
 their own bounded admission pools. Revocation does not cancel an already-authorised body.
 
