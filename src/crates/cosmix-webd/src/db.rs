@@ -264,13 +264,19 @@ mod tests {
         use cosmix_mix::{evaluator::Evaluator, lexer::Lexer, parser::Parser};
         use std::rc::Rc;
         let conn = mem_db();
+        // Deployment's shared/ tree is vhosts/ in the repository. Absolute
+        // includes bypass set_file, so relocate only their prefix in this test
+        // and use the handler's script-relative include mechanism below.
+        let library = include_str!("../vhosts/lib/lib.mix")
+            .replace("include \"/opt/cosmix/vhosts/shared/", "include \"../");
         let source = format!(
             "{}\n$SITE = {{title: \"Test\", tagline: \"\", footer: \"\"}}\ncms_init()\ncms_init()\nensure_col(\"media\", \"blob TEXT NULL\")\n",
-            include_str!("../vhosts/lib/lib.mix")
+            library
         );
         let tokens = Lexer::new(&source).tokenize().unwrap();
         let ast = Parser::new(tokens, &source).parse_program().unwrap();
         let mut eval = Evaluator::with_output(Box::new(Vec::new()), Box::new(Vec::new()));
+        eval.set_file(concat!(env!("CARGO_MANIFEST_DIR"), "/vhosts/lib/lib.mix"));
         eval.set_db_handler(Rc::new(handler(conn.clone())));
         eval.execute(&ast).await.unwrap();
         let h = handler(conn);
