@@ -57,23 +57,50 @@ const RC_CALLER_ERROR: u8 = 10;
 /// (`cosmix-webd` → `webd`).
 const BUS_SERVICE: &str = "webd";
 
+struct BusyReplies {
+    slots: Arc<tokio::sync::Semaphore>,
+    warned: std::sync::atomic::AtomicBool,
+}
+impl Default for BusyReplies {
+    fn default() -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
 fn spawn_busy_reply(
+    pool: &BusyReplies,
     reply: impl std::future::Future<Output = ()> + Send + 'static,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Option<tokio::task::JoinHandle<()>> {
+    let permit = match pool.slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if !pool.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "busy reply pool full (32); dropping excess replies so callers time out"
+                );
+            }
+            return None;
+        }
+    };
+    Some(tokio::spawn(async move {
+        let _permit = permit;
         let _ = tokio::time::timeout(Duration::from_secs(30), reply).await;
-    })
+    }))
 }
 
 fn spawn_transfer<F>(
     workers: &mut tokio::task::JoinSet<()>,
+    busy_replies: &BusyReplies,
     task: impl FnOnce(bool) -> F,
 ) -> Option<tokio::task::JoinHandle<()>>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     if workers.len() >= 8 {
-        Some(spawn_busy_reply(task(true)))
+        spawn_busy_reply(busy_replies, task(true))
     } else {
         workers.spawn(task(false));
         None
@@ -185,6 +212,8 @@ const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(30);
 /// and immediately drops us therefore keeps growing the delay rather
 /// than driving a tight reconnect/log loop.
 pub async fn run(node: Arc<NodeState>) {
+    // One pool across reconnects: old slow sinks cannot multiply capacity.
+    let busy_replies = BusyReplies::default();
     // Built ONCE so started_at is the true process start and survives the
     // reconnect loop (re-sent on every register). Version-discovery contract.
     let bi = cosmix_buildinfo::build_info!();
@@ -305,7 +334,7 @@ pub async fn run(node: Arc<NodeState>) {
             if share_verbs::handles(&cmd.command) {
                 let node = node.clone();
                 let client = client_arc.clone();
-                let _ = spawn_transfer(&mut workers, |busy| async move {
+                let _ = spawn_transfer(&mut workers, &busy_replies, |busy| async move {
                     if busy {
                         let _ = client
                             .respond(
@@ -587,13 +616,52 @@ mod tests {
     use tokio::sync::RwLock;
 
     #[tokio::test]
+    async fn busy_replies_are_bounded_and_capacity_returns_after_abort() {
+        let pool = BusyReplies::default();
+        let mut workers = tokio::task::JoinSet::<()>::new();
+        for _ in 0..8 {
+            workers.spawn(std::future::pending());
+        }
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            replies.push(
+                spawn_transfer(&mut workers, &pool, |busy| async move {
+                    assert!(busy);
+                    std::future::pending::<()>().await;
+                })
+                .unwrap(),
+            );
+        }
+        for _ in 0..100 {
+            assert!(
+                spawn_transfer(&mut workers, &pool, |_| async {
+                    panic!("excess reply polled");
+                })
+                .is_none()
+            );
+        }
+        assert_eq!(pool.slots.available_permits(), 0);
+        assert!(pool.warned.load(std::sync::atomic::Ordering::Relaxed));
+        for reply in replies {
+            reply.abort();
+            let _ = reply.await;
+        }
+        assert_eq!(pool.slots.available_permits(), 32);
+        let reply = spawn_busy_reply(&pool, async {}).unwrap();
+        reply.await.unwrap();
+        assert_eq!(pool.slots.available_permits(), 32);
+        workers.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn blocked_busy_sink_does_not_block_full_worker_loop() {
+        let busy_replies = BusyReplies::default();
         let mut workers = tokio::task::JoinSet::<()>::new();
         for _ in 0..8 {
             workers.spawn(std::future::pending());
         }
         let (started, seen) = tokio::sync::oneshot::channel();
-        let reply = spawn_transfer(&mut workers, |busy| async move {
+        let reply = spawn_transfer(&mut workers, &busy_replies, |busy| async move {
             assert!(busy);
             let _ = started.send(());
             std::future::pending::<()>().await;

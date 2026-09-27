@@ -218,7 +218,8 @@ All four operations run on at most eight workers owned by the current broker
 session. Reconnect aborts that session's workers. Password verification has four
 bcrypt workers and creation has one separate worker; admission lasts until
 blocking work ends. Busy replies run outside the receive loop with a 30-second
-timeout. Worker saturation is
+timeout. At most 32 busy replies may be pending across reconnects; excess replies
+are dropped with one warning, leaving the caller to time out. Worker saturation is
 rc=10 `{"error":"busy: webd transfer workers full (8)"}`. All other failures
 also return rc=10 with `{"error":"<token>[: details]"}`; no new payload bytes
 travel in Bus frames.
