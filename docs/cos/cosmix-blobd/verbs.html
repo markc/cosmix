@@ -454,7 +454,7 @@
 <pre><code class="language-json">{"error":"message"}
 </code></pre>
 <p>Error tokens worth matching on: <code>not_present</code> (blob not held), <code>invalid blob id</code> (malformed <code>b3:</code> reference), <code>quota:</code> (an owner or total cap refusal — the message carries the numbers), <code>busy</code> (the <code>blob.fetch</code> queue is full — retry later), <code>vanished:</code> (the bytes disappeared while the pin was landing — a <code>blob.gc</code> race; retry the put).</p>
-<p>Verbs dispatch concurrently. The data-scaled verbs — <code>blob.put</code>, <code>blob.gc</code>, <code>blob.list</code>, <code>blob.pin</code>, <code>blob.unpin</code> — are bounded by <code>verb_max_concurrent</code> (default 8): each holds one slot, not the connection, and beyond the bound it queues; its reply is late, never lost. Every other verb (<code>blob.fetch</code>'s immediate reply, <code>stat</code>, <code>has</code>, <code>path</code>, <code>url</code>, <code>info</code>, <code>quota</code>, <code>props.*</code>) takes no slot, so eight slow verbs never starve them. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.</p>
+<p>Verbs dispatch concurrently. The data-scaled verbs — <code>blob.put</code>, <code>blob.gc</code>, <code>blob.list</code>, <code>blob.pin</code>, <code>blob.unpin</code>, <code>blob.upload.list</code>, <code>blob.upload.abort</code> — are bounded by <code>verb_max_concurrent</code> (default 8): each holds one slot, not the connection, and beyond the bound it queues; its reply is late, never lost. Every other verb (<code>blob.fetch</code>'s immediate reply, <code>stat</code>, <code>has</code>, <code>path</code>, <code>url</code>, <code>info</code>, <code>quota</code>, <code>props.*</code>) takes no slot, so eight slow verbs never starve them. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.</p>
 <p>A blob reference is <code>{"blob":"b3:&lt;64 hex&gt;","size":N,"mime":"…","name":"…"?, "origin":"&lt;node name&gt;"}</code> (<code>name</code> present only when the ingester knew one; <code>origin</code> is a node name, never an IP).</p>
 <h2 id="verbs">Verbs</h2>
 <h3 id="blobput"><code>blob.put</code></h3>
@@ -505,14 +505,30 @@
 <table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>owner</code></td><td>unset (all owners)</td></tr>
 </tbody></table>
-<p>The response contains <code>owners</code> (<code>&lt;owner&gt;: {used, limit, reserved}</code>) and <code>total: {used, limit, reserved}</code>. <code>used</code> sums distinct pinned blob sizes per owner; <code>reserved</code> is the in-flight upload headroom — bytes admitted to running uploads (lane <code>POST</code>/<code>PUT</code> bodies, <code>blob.fetch</code> downloads) whose pins have not landed yet. A fresh upload is refused against <code>used + reserved</code>, so concurrent uploads cannot each spend the same cap room, and the reservation releases when the pin settles or the upload aborts.</p>
+<p>The response contains <code>owners</code> (<code>&lt;owner&gt;: {used, limit, reserved}</code>) and <code>total: {used, limit, reserved}</code>. <code>used</code> sums distinct pinned blob sizes per owner; <code>total.used</code> is the sum of those owner charges, not unique disk bytes. <code>reserved</code> sums whole declared sizes of durable active/committing sessions and identified ephemeral holds for local puts, v1 lane uploads and fetches. Every pin path checks <code>used + reserved</code>, including existing-hash pins and fetch joiners. Settlement credits only its own hold; abort/failure releases it. Durable reservations survive daemon restart.</p>
+<h3 id="blobuploadlist--blobuploadabort"><code>blob.upload.list</code> / <code>blob.upload.abort</code></h3>
+<p><code>blob.upload.list {owner?}</code> returns <code>{uploads:[session…]}</code>, optionally filtered
+by an owner string. Each session includes <code>upload</code> (UUID), <code>owner</code>, <code>key</code>,
+<code>size</code>, <code>offset</code>, <code>expect</code>, <code>mime</code>, <code>name</code>, <code>created_at</code>, <code>expires_at</code>, <code>state</code>,
+<code>result</code> and <code>error</code>; times are epoch milliseconds and optional values are
+null. The list includes retained terminal receipts, excludes expired sessions
+and is bounded by the session table's count limits.</p>
+<p><code>blob.upload.abort {upload}</code> takes a UUID string and returns
+<code>{aborted:true,upload}</code>. It releases active staging/reservation, is idempotent
+for an aborted or completed session, and never unpins a completed object.
+Unknown/expired sessions, a concurrent mutation and a pending commit return
+rc 10 with an error message. Creation, PATCH, HEAD and commit use the lane;
+neither Bus verb carries file bytes. See the README's durable upload contract.</p>
 <h3 id="blobgc"><code>blob.gc</code></h3>
 <table><thead><tr><th>Argument</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>dry_run</code></td><td><code>false</code></td></tr>
 </tbody></table>
 <p>Candidates are CAS files with mds refcount 0 (no row counts as 0), no pin, and an mtime older than the 60-second grace window. A dry run lists; a live run unlinks, drops attributes, adjusts quota and emits <code>blob.swept {count}</code>. One sweep at a time: a <code>blob.gc</code> arriving while another runs answers rc 10 <code>busy</code> at once. The response contains <code>dry_run</code>, <code>count</code>, <code>bytes_freed</code>, the swept blob ids, and <code>skipped</code> (<code>referenced</code>, <code>pinned</code>, <code>young</code>).</p>
 <h3 id="blobinfo"><code>blob.info</code></h3>
-<p>No arguments. Version, git sha, build time, <code>root</code>, <code>instance</code>, <code>lane_bind</code> and <code>counts</code> (<code>blobs</code>, <code>pins</code>).</p>
+<p>No arguments. Version, git sha, build time, <code>root</code>, <code>instance</code>, <code>lane_bind</code>,
+<code>counts</code> (<code>blobs</code>, <code>pins</code>) and <code>uploads</code> (<code>active</code>, <code>reserved_bytes</code>). The latter
+counts active plus committing durable sessions and their whole declared sizes;
+it excludes ephemeral transfer holds (use <code>blob.quota</code> for the combined sum).</p>
 <h3 id="blobfetch"><code>blob.fetch</code></h3>
 <p>Cross-node pull over the origin's byte lane. <strong>Replies immediately</strong> — never a deferred reply (the mesh response timeout is 30 s; a multi-GiB pull outlives it).</p>
 <table><thead><tr><th>Argument</th><th>Requirement</th><th>Notes</th></tr></thead><tbody>

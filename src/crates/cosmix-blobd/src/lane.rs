@@ -11,12 +11,13 @@
 //! never unspecified, never loopback, never another interface. A
 //! mismatch is exit 2 before any socket is opened.
 //!
-//! **Bounded, restart-only:** uploads stream into mds staging under a
+//! **Bounded v1 uploads:** uploads stream into mds staging under a
 //! byte counter that aborts at the lane owner's remaining quota or the
 //! total cap (413, staging deleted); an idle body (30 s) and the
 //! concurrent-upload bound (`lane_max_uploads`, 503 beyond it, no
 //! queue) bound the lane's resources. A dropped upload starts again —
-//! v1 has no resume.
+//! v1 has no resume. `/blob/uploads` adds durable strict-offset sessions;
+//! its HTTP adapter is in `lane_uploads.rs`, recovery in the store core.
 
 use std::io::{self, Read};
 use std::net::SocketAddr;
@@ -42,6 +43,9 @@ use tracing::debug;
 use crate::core::mime;
 use crate::core::reference::Reference;
 use crate::core::store::{PutOutcome, Store, StoreError};
+
+#[path = "lane_uploads.rs"]
+mod uploads;
 
 /// Idle request-body timeout: no data frame for this long aborts the
 /// upload (staging deleted) and answers 408.
@@ -115,7 +119,8 @@ pub fn bind_is_wg(bind: &str, wg_ip: &str) -> bool {
 /// single-flight test asserts exactly one download per hash).
 pub struct Lane {
     store: Arc<Store>,
-    uploads: Semaphore,
+    uploads: Arc<Semaphore>,
+    controls: Arc<Semaphore>,
     gets: AtomicU64,
     /// Total per-upload deadline (F8): the idle timeout bounds
     /// inter-frame gaps only, so this bounds the whole body.
@@ -126,7 +131,8 @@ impl Lane {
     fn new(store: Arc<Store>, max_uploads: usize, upload_deadline: Duration) -> Self {
         Self {
             store,
-            uploads: Semaphore::new(max_uploads),
+            uploads: Arc::new(Semaphore::new(max_uploads)),
+            controls: Arc::new(Semaphore::new(16)),
             gets: AtomicU64::new(0),
             upload_deadline,
         }
@@ -147,6 +153,14 @@ fn lane_router(lane: Arc<Lane>) -> Router {
             get(get_blob).put(put_upload).post(post_upload),
         )
         .route("/blob", post(post_upload))
+        .route("/blob/uploads", post(uploads::create))
+        .route(
+            "/blob/uploads/{id}",
+            axum::routing::head(uploads::head)
+                .patch(uploads::patch)
+                .delete(uploads::abort),
+        )
+        .route("/blob/uploads/{id}/commit", post(uploads::commit))
         .with_state(lane)
 }
 
@@ -523,7 +537,7 @@ impl Lane {
 
         // Admission: a bounded number of concurrent uploads, no queue —
         // beyond the bound the lane refuses immediately.
-        let _permit = match self.uploads.try_acquire() {
+        let permit = match Arc::clone(&self.uploads).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 return lane_error(
@@ -552,6 +566,9 @@ impl Lane {
         let pump = tokio::spawn(pump_body(body, tx, cap, deadline));
         let store = Arc::clone(&self.store);
         let landed = tokio::task::spawn_blocking(move || {
+            // Cancellation of the handler must not admit a replacement while
+            // its blocking writer still owns a transfer and quota hold.
+            let _permit = permit;
             stream_into_store(&store, rx, expected, mime, name, owner, reservation)
         })
         .await;
@@ -640,17 +657,23 @@ impl Lane {
 /// closed channel signals the reader explicitly (`Eof` or `Abort`);
 /// on a cap, idle or deadline abort the CAS writer's error path
 /// deletes the staging file before the handler answers.
-async fn pump_body(
+async fn pump_body(body: Body, tx: mpsc::Sender<Frame>, cap: u64, deadline: tokio::time::Instant) {
+    pump_body_with_idle(body, tx, cap, deadline, IDLE_TIMEOUT).await;
+}
+
+async fn pump_body_with_idle(
     mut body: Body,
     tx: mpsc::Sender<Frame>,
     cap: u64,
     deadline: tokio::time::Instant,
+    idle: Duration,
 ) {
     let mut count: u64 = 0;
+    let mut progress = tokio::time::Instant::now();
     loop {
         let frame = match tokio::time::timeout_at(
             deadline,
-            tokio::time::timeout(IDLE_TIMEOUT, body.frame()),
+            tokio::time::timeout_at(progress + idle, body.frame()),
         )
         .await
         {
@@ -670,7 +693,10 @@ async fn pump_body(
             }
             Ok(Ok(Some(Err(e)))) => {
                 let _ = tx
-                    .send(Frame::Abort(io::Error::other(format!("request body: {e}"))))
+                    .send(Frame::Abort(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("request body: {e}"),
+                    )))
                     .await;
                 return;
             }
@@ -682,6 +708,7 @@ async fn pump_body(
         if bytes.is_empty() {
             continue;
         }
+        progress = tokio::time::Instant::now();
         count += bytes.len() as u64;
         if count > cap {
             let _ = tx.send(Frame::Abort(abort_error(LaneAbort::Cap))).await;

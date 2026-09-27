@@ -466,7 +466,8 @@ quota_owner: capture=2GiB
 <tr><td><code>name</code></td><td>unset (service <code>blobd</code>)</td><td>Instance name; Bus service becomes <code>blobd-&lt;name&gt;</code></td></tr>
 <tr><td><code>lane_bind</code></td><td>unset (no lane)</td><td>Byte-lane bind <code>&lt;ip&gt;:&lt;port&gt;</code>; the IP must be this node's <code>wg_ip</code> (see <a href="/cos/cosmix-blobd/#byte-lane">Byte lane</a>)</td></tr>
 <tr><td><code>lane_max_uploads</code></td><td><code>4</code></td><td>Concurrent lane uploads admitted; beyond it the lane answers <code>503</code> — no queueing</td></tr>
-<tr><td><code>lane_upload_deadline_secs</code></td><td><code>3600</code></td><td>Total per-upload deadline; a drip-feed body is aborted (staging deleted) with <code>408</code> when it passes — the 30 s idle timeout bounds inter-frame gaps only</td></tr>
+<tr><td><code>lane_upload_deadline_secs</code></td><td><code>3600</code></td><td>Body-transfer deadline per v1 upload or session PATCH; timeout answers <code>408</code>. A failed PATCH rolls back to its durable offset; a failed v1 upload discards staging. Filesystem sync and settlement can outlast the body deadline</td></tr>
+<tr><td><code>upload_ttl</code></td><td><code>86400</code></td><td>Durable session lifetime in seconds, 1–31536000; absolute expiry is exposed in epoch milliseconds. Completed receipts have a separate fixed 24-hour lifetime</td></tr>
 <tr><td><code>fetch_max_concurrent</code></td><td><code>2</code></td><td>Concurrent <code>blob.fetch</code> downloads; beyond it a fetch queues (see <a href="/cos/cosmix-blobd/#fetching">Fetching</a>)</td></tr>
 <tr><td><code>fetch_queue_max</code></td><td><code>32</code></td><td>In-process fetch queue depth; beyond it the verb replies rc 10 <code>busy</code></td></tr>
 <tr><td><code>fetch_deadline_secs</code></td><td><code>3600</code></td><td>Total per-download deadline for <code>blob.fetch</code>; a drip-feed body is aborted (staging deleted, slot and reservation released) when it passes — outcome <code>origin_unreachable</code> naming the deadline if nothing else serves</td></tr>
@@ -509,8 +510,69 @@ for producers such as maild (P4), with paths visible to blobd itself.</p>
 <p>Every successful upload records attributes (<code>origin</code> = this node) and a pin, so <code>blob.stat</code>/<code>blob.list</code> see it immediately and quota accounts it.</p>
 <h3 id="caps-and-bounds">Caps and bounds</h3>
 <p>The total cap and the lane owner's remaining quota are enforced <strong>mid-stream</strong> by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers <code>413</code>; a declared <code>Content-Length</code> over the cap is refused <code>413</code> before any byte is read. Quota is reserved at admission (the declared length, or the whole remaining room when absent), so concurrent uploads cannot each spend the same cap room — the mid-stream counter enforces the reservation. An idle request body (no data for 30 s) aborts with <code>408</code>. At most <code>lane_max_uploads</code> (default 4) uploads run concurrently; beyond that the lane answers <code>503</code> immediately — there is no queue (the no-poll/no-flood law).</p>
-<p>Uploads are <strong>restart-only</strong> in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction. A slow client holds an upload permit and a quota reservation for at most <code>lane_upload_deadline_secs</code> (default 3600) in total: a body that is still dribbling when the deadline passes is aborted (staging deleted) with <code>408</code> — the idle timeout bounds inter-frame gaps, the deadline bounds the whole upload.</p>
+<p><code>PUT /blob/&lt;hex&gt;</code> and <code>POST /blob</code> remain <strong>restart-only</strong>: a dropped or failed upload starts again from zero. Their body pump aborts with <code>408</code> after <code>lane_upload_deadline_secs</code> (default 3600), even if bytes keep arriving. The deadline bounds body reception, not blocking filesystem sync or metadata settlement. Resumable clients use the session routes below.</p>
 <p>A <code>blob.fetch</code> interrupted by a restart leaves at most staging residue under <code>blobs/.tmp</code>, which startup cleanup removes — the same crash-safety the lane's uploads have.</p>
+<h3 id="durable-upload-sessions-060">Durable upload sessions (0.6.0)</h3>
+<table><thead><tr><th>Route</th><th>Success</th><th>Contract</th></tr></thead><tbody>
+<tr><td><code>POST /blob/uploads</code></td><td><code>201</code> new; <code>200</code> key replay</td><td>Create from headers, no body; return session JSON and <code>Location: /blob/uploads/&lt;uuid&gt;</code></td></tr>
+<tr><td><code>HEAD /blob/uploads/&lt;uuid&gt;</code></td><td><code>200</code></td><td>Durable offset and identity headers, no body, including on error</td></tr>
+<tr><td><code>PATCH /blob/uploads/&lt;uuid&gt;</code></td><td><code>200</code></td><td>Append exactly at the durable offset; return <code>{"offset":N}</code> and session headers</td></tr>
+<tr><td><code>POST /blob/uploads/&lt;uuid&gt;/commit</code></td><td><code>201</code> first completion; <code>200</code> receipt replay</td><td>Verify the complete object, publish and pin; return the same blob reference on replay</td></tr>
+<tr><td><code>DELETE /blob/uploads/&lt;uuid&gt;</code></td><td><code>204</code></td><td>Abort and release the reservation; repeated abort is harmless. Completed objects and pins are untouched</td></tr>
+</tbody></table>
+<p>Create requires <code>X-Cosmix-Owner</code> and <code>X-Cosmix-Size</code> (decimal bytes, including
+zero, at most 9007199254740991). Optional headers are <code>X-Cosmix-Expect</code>
+(<code>b3:&lt;64 hex&gt;</code>), <code>X-Cosmix-Mime</code>, <code>X-Cosmix-Name</code> and <code>X-Cosmix-Upload-Key</code>.
+The key is scoped to the owner: replay returns the existing session only if
+size, expected hash, mime and name also match; otherwise <code>409</code>. Owner and key
+are at most 128 bytes, mime 256 and name 1024; control characters are refused.
+Header values must be valid HTTP text. Mime defaults as for v1 uploads.</p>
+<p>PATCH requires <code>Content-Range: bytes &lt;start&gt;-&lt;inclusive end&gt;/&lt;whole size&gt;</code>
+and <code>Content-Length: &lt;end-start+1&gt;</code>. Wildcards, multiple ranges and
+<code>Transfer-Encoding</code> are refused. Optional <code>Content-Type</code> must be
+<code>application/octet-stream</code>; optional <code>Content-Encoding</code> must be <code>identity</code>.
+The start must equal the committed offset: there is <strong>no exact-chunk replay</strong>.
+After a lost response or <code>409</code>, HEAD determines where to resume. Empty objects
+commit immediately without a PATCH. Short, excess, disconnected or timed-out
+bodies roll back under the writer guard before another mutation can start.
+An ambiguous database error is resolved against the persisted offset before
+rollback. A <code>500</code> therefore requires HEAD before retrying.</p>
+<p>Successful create, HEAD and PATCH include <code>X-Cosmix-Offset</code>, <code>X-Cosmix-Size</code>,
+<code>X-Cosmix-Expires</code> (epoch ms), <code>X-Cosmix-State</code>, <code>X-Cosmix-Owner</code> and
+<code>X-Cosmix-Mime</code>; optional identity fields are <code>X-Cosmix-Expect</code>,
+<code>X-Cosmix-Name</code>, <code>X-Cosmix-Upload-Key</code> and, once known, <code>X-Cosmix-Blob</code>.
+States are <code>active</code>, <code>committing</code>, <code>complete</code>, <code>failed</code>, <code>aborted</code>.
+Every session response has <code>Cache-Control: no-store</code>. A <code>409</code> also carries
+<code>X-Cosmix-Offset</code> (and an <code>offset</code> JSON member unless HEAD).</p>
+<table><thead><tr><th>Error</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>400</code></td><td>Invalid creation identity, range/length mismatch, duplicate contract header, short/excess/disconnected body</td></tr>
+<tr><td><code>404</code></td><td>Unknown, malformed UUID or expired session</td></tr>
+<tr><td><code>408</code></td><td>PATCH body idle for 30 seconds, or body deadline reached</td></tr>
+<tr><td><code>409</code></td><td>Offset, state or creation-key identity conflict; incomplete commit; concurrent mutation; invalid staging</td></tr>
+<tr><td><code>411</code></td><td>PATCH lacks Content-Length</td></tr>
+<tr><td><code>413</code></td><td>Owner or total reservation/settlement quota refused</td></tr>
+<tr><td><code>415</code></td><td>Unsupported PATCH content type or encoding</td></tr>
+<tr><td><code>422</code></td><td>Complete bytes do not match the expected BLAKE3; session becomes failed</td></tr>
+<tr><td><code>429</code></td><td>Session/receipt count bound reached</td></tr>
+<tr><td><code>503</code></td><td>Transfer or control-worker admission full</td></tr>
+<tr><td><code>500</code></td><td>Filesystem, database or internal worker failure</td></tr>
+</tbody></table>
+<p>Mutation admission is nonblocking per session. PATCH and commit share the
+<code>lane_max_uploads</code> pool with v1 uploads; create, HEAD and abort use a separate
+16-worker control pool. Under global overload <code>503</code> can precede the session
+conflict check. Default active bounds are 16 per owner and 64 total, including
+<code>committing</code>. Total retained rows are bounded at 272 per owner and 1088 total;
+receipts are never evicted early to admit another session. Zero-byte sessions
+count against these bounds.</p>
+<p>Expiry is enforced on operations and by a 30-second sweep, independent of the
+Bus connection. Expired resources are unavailable even if a current writer
+delays physical cleanup and reservation release. <code>committing</code> rows do not
+expire: restart attempts recovery; a transient publication or settlement
+failure retains the reservation and GC protection for a client commit retry.
+Successful completion starts the 24-hour receipt lifetime. When it expires,
+the session/key is forgotten; the completed object and owner pin remain.
+These are mesh-open routes like the existing lane; owner is an accounting
+label, not an authenticated principal.</p>
 <h2 id="fetching">Fetching</h2>
 <p><code>blob.fetch</code> pulls bytes from another node over its byte lane. The verb <strong>replies immediately</strong> — never a deferred reply, because the mesh response timeout is 30 s and a multi-GiB pull outlives it: <code>{accepted:true, blob, origin, in_flight, queued, present}</code>. If the CAS already holds the blob it is pinned to the caller (<code>present:true</code>) and the reply is the completion. Otherwise completion is the <code>blob.fetched</code> event (<code>retain: false</code>) plus the <code>blob.stat</code> transition <code>present:false → true</code>.</p>
 <p><strong>Single-flight per hash.</strong> A second <code>blob.fetch</code> for an in-flight hash joins it (<code>in_flight:true</code>), adds its pin on completion, and never starts a second download. <code>in_flight</code> is <code>true</code> exactly when this call joined an existing fetch; <code>queued</code> is <code>true</code> when the fetch it admitted or joined is waiting for a concurrency slot. A new fetch takes its slot at admission, so <code>queued:false</code> on a new fetch means its download is running.</p>
@@ -546,22 +608,27 @@ first response was lost. A hash mismatch fails and discards the session before
 publication. Aborting a completed session never removes its pin or object.</p>
 <pre><code class="language-text">/var/lib/cosmix/blobd/
 ├── blobs/&lt;h2&gt;/&lt;h2&gt;/&lt;hash64&gt;   mds CAS: immutable, sharded, BLAKE3-named
-├── blobs/.tmp/                staging (emptied at every startup)
+├── blobs/.tmp/                v1/fetch staging (emptied at every startup)
+├── blobs/.uploads/&lt;uuid&gt;      durable session staging (excluded from CAS scans)
 ├── blobs.sqlite               mds's box-wide blob index (schema v1, untouched)
-├── blobd.sqlite               blobd-owned: blob_attrs, pins, quota
+├── blobd.sqlite               blobd-owned: blob_attrs, pins, quota, upload_sessions
 └── .blobd.lock                exclusive instance flock
 </code></pre>
-<p>mds's <code>blobs.sqlite</code> schema is never touched (<code>BLOBS_LATEST</code> stays 1 — ADR D4): blobd holds a read-only connection to it for refcount truth and joins it against its own pin table. Attributes (mime, name hint, origin, first_put), owner pins and quota accounting live in <code>blobd.sqlite</code> beside it. Folding them into mds as a schema v2 is P4 work.</p>
-<p>At startup blobd removes everything under <code>blobs/.tmp</code> (nothing in-flight can survive its own restart) and runs one directory-vs-database reconcile: CAS files with no mds row and no pin, older than the 60-second grace window, are logged as orphans but never deleted at startup — <code>blob.gc</code> owns deletion.</p>
+<p>mds's <code>blobs.sqlite</code> schema is never touched (<code>BLOBS_LATEST</code> stays 1 — ADR D4): blobd reads it for refcount truth and joins it against its own pin table. Attributes (mime, name hint, origin, first_put), owner pins, quota accounting and sessions live in <code>blobd.sqlite</code> beside it. Each blobd migration commits its DDL and version marker in the same transaction.</p>
+<p>At startup blobd removes everything under <code>blobs/.tmp</code>, restores durable sessions separately, and runs one directory-vs-database reconcile. Old CAS files with no mds row and no pin are logged as orphans but never deleted at startup — <code>blob.gc</code> owns deletion.</p>
 <h2 id="garbage-collection-and-quotas">Garbage collection and quotas</h2>
 <p><code>blob.gc</code> sweeps CAS files whose mds refcount is 0 (no row counts as 0 — every blobd put is rowless until a set references it), that carry no pin, and whose mtime is older than the 60-second grace window (<code>DEFAULT_GC_QUIESCENCE</code>). A dry run lists candidates; a live run unlinks, drops attributes and adjusts quota accounting. Pinned blobs are never candidates.</p>
 <p>Quotas are correctness, not authorisation: an upload (a <code>blob.put</code>, a lane body, a <code>blob.fetch</code> download) <strong>reserves</strong> the owner cap and the total cap at admission — the declared <code>Content-Length</code>, or the owner's whole remaining room when the length is unknown — so concurrent uploads cannot each spend the same headroom; the accounting settles to the real size when the pin lands, and an abort releases the reservation. <code>used</code> is the sum of distinct pinned blob sizes per owner; <code>blob.quota</code> reports <code>reserved</code> (the in-flight headroom) beside it; unpinning releases it. Idempotent re-puts of an already-pinned blob are refused at the cap like any other put (the quota check runs before the hash is known).</p>
-<h2 id="permissions">Permissions</h2>
 <p>Quota admission includes all outstanding reservations on every pin path,
 including existing-hash puts and fetch joiners. Each transfer has an
 identifiable hold; settlement credits only that hold while charging the pin.
 <code>total.used</code> sums owner charges (the same object pinned by two owners is
-charged twice). It is not unique CAS disk usage or a free-space guarantee.</p>
+charged twice). It is not unique CAS disk usage or a free-space guarantee.
+<code>reserved</code> sums whole declared sizes from durable active/committing rows plus
+identified ephemeral holds for local puts, v1 uploads and fetches. Sessions
+continue reserving their full size after each successful PATCH. GC also treats
+committing hashes as pinned until settlement or explicit failure.</p>
+<h2 id="permissions">Permissions</h2>
 <p>Registry UID 521 (<code>cosmix-blobd</code>), shared-credential group 522 (<code>cosmix-blob</code>, SPEC 10a v1.4.7). <code>blob.put {path}</code> is daemon-local ingest: processes that share the <code>cosmix-blob</code> group (such as maild). At open blobd chgrps its state root and CAS root to <code>cosmix-blob</code> (<code>cas_group</code>, default <code>cosmix-blob</code>) and sets the setgid bit — mode 2750 — so every shard directory mds creates and every CAS file inherits the group; same-node readers of <code>blob.path</code> traverse the tree as group members (the unit's <code>SupplementaryGroups=cosmix-blob</code> is what allows the chown; the <code>StateDirectoryMode=0750</code> tree alone would be group <code>cosmix-blobd</code> and untraversable). An absent group or a refused chown is logged and skipped — a private CAS still serves verbs, it just has no same-node zero-copy readers. <code>blob.put</code> <code>mode: hardlink</code> is the exception: a hard-linked CAS entry keeps the producer's owner, group and mode, so <code>blob.path</code> readers see it only if the producer's file was readable by <code>cosmix-blob</code>; <code>copy</code>/<code>reflink</code> entries always inherit the CAS group. User-side and remote producers (capture, filesd fs mode, webd, Thunderbird) push bytes through the byte lane — no cross-user path read exists or is needed. Under the 2026-09-15 full-mesh-access law the verbs are mesh-open with no authorisation gates; <code>blob.put</code>'s path argument is on record as the first verb to jail if a lock is ever opted in.</p>
 <h2 id="events">Events</h2>
 <p>All publishes are <code>retain: false</code> (noded's <code>topic.publish</code> defaults to <code>retain: true</code>, which would replay the last event to any late subscriber):</p>

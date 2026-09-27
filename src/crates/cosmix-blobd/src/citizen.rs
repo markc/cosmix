@@ -113,6 +113,36 @@ impl Citizen {
             "blob.gc" => self.verb_gc(args.as_ref()),
             "blob.info" => Ok(self.verb_info()),
             "blob.fetch" => self.verb_fetch(command, args.as_ref()),
+            "blob.upload.list" => {
+                let owner = args
+                    .as_ref()
+                    .and_then(|a| a.get("owner"))
+                    .map(|v| {
+                        v.as_str()
+                            .ok_or_else(|| StoreError::BadRequest("owner must be a string".into()))
+                    })
+                    .transpose()?;
+                let uploads = self
+                    .store
+                    .upload_list(owner)?
+                    .iter()
+                    .map(|s| s.to_json())
+                    .collect::<Vec<_>>();
+                Ok((0, json!({"uploads": uploads}).to_string(), Vec::new()))
+            }
+            "blob.upload.abort" => {
+                let id = args
+                    .as_ref()
+                    .and_then(|a| a.get("upload"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| StoreError::BadRequest("upload string is required".into()))?;
+                self.store.upload_abort(id)?;
+                Ok((
+                    0,
+                    json!({"aborted": true, "upload": id}).to_string(),
+                    Vec::new(),
+                ))
+            }
             other => Err(StoreError::BadRequest(format!(
                 "unknown blob verb: {other}"
             ))),
@@ -467,6 +497,8 @@ impl Citizen {
             "instance": self.instance,
             "lane_bind": self.lane_bind.map(|a| a.to_string()),
             "counts": counts,
+            "uploads": self.store.upload_counts().map(|(active,reserved)|
+                json!({"active": active, "reserved_bytes": reserved})).unwrap_or(Value::Null),
         });
         (0, body.to_string(), Vec::new())
     }
@@ -751,7 +783,13 @@ async fn run_connection_inner(
 fn takes_verb_permit(verb: &str) -> bool {
     matches!(
         verb,
-        "blob.put" | "blob.gc" | "blob.list" | "blob.pin" | "blob.unpin"
+        "blob.put"
+            | "blob.gc"
+            | "blob.list"
+            | "blob.pin"
+            | "blob.unpin"
+            | "blob.upload.list"
+            | "blob.upload.abort"
     )
 }
 
@@ -796,7 +834,10 @@ async fn serve_commands<S: ReplySink>(
                         )
                     });
             if let Err(error) = sink.respond(&command, rc, &body).await {
-                warn!("Bus response for {} failed; reply dropped: {error}", command.command);
+                warn!(
+                    "Bus response for {} failed; reply dropped: {error}",
+                    command.command
+                );
                 return;
             }
             for event in events {
@@ -805,10 +846,7 @@ async fn serve_commands<S: ReplySink>(
                         debug!(topic = event.topic, retain = false, "published");
                     }
                     Err(error) => {
-                        warn!(
-                            "publish on {} failed (continuing): {error}",
-                            event.topic
-                        );
+                        warn!("publish on {} failed (continuing): {error}", event.topic);
                     }
                 }
             }
@@ -915,6 +953,50 @@ mod tests {
             body: String::new(),
             headers,
         }
+    }
+
+    #[test]
+    fn upload_list_abort_info_and_quota_dispatch() {
+        let (_dir, c) = citizen();
+        let (s, _) = c
+            .store
+            .upload_create(&crate::core::store::UploadCreate {
+                owner: "tester".into(),
+                size: 3,
+                expected_hash: None,
+                mime: "application/octet-stream".into(),
+                name: None,
+                key: None,
+            })
+            .unwrap();
+        let (rc, body, _) = c.dispatch(&command(
+            "blob.upload.list",
+            "tester",
+            json!({"owner":"tester"}),
+        ));
+        assert_eq!(rc, 0);
+        let list: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list["uploads"][0]["upload"], s.id);
+        let (rc, _, _) = c.dispatch(&command("blob.upload.list", "tester", json!({"owner":42})));
+        assert_eq!(rc, 10);
+        let (rc, body, _) = c.dispatch(&command("blob.info", "tester", Value::Null));
+        assert_eq!(rc, 0);
+        let info: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["uploads"], json!({"active":1,"reserved_bytes":3}));
+        let (rc, body, _) = c.dispatch(&command("blob.quota", "tester", Value::Null));
+        assert_eq!(rc, 0);
+        let quota: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(quota["total"]["reserved"], 3);
+        let (rc, _, _) = c.dispatch(&command(
+            "blob.upload.abort",
+            "tester",
+            json!({"upload":s.id}),
+        ));
+        assert_eq!(rc, 0);
+        assert_eq!(c.store.quota_report(None).unwrap().total.reserved, 0);
+        assert_eq!(c.store.upload_status(&s.id).unwrap().state, "aborted");
+        assert!(takes_verb_permit("blob.upload.list"));
+        assert!(takes_verb_permit("blob.upload.abort"));
     }
 
     #[test]

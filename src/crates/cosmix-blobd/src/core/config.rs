@@ -6,7 +6,7 @@
 //!
 //! Keys: `root`, `name`, `lane_bind`, `lane_max_uploads`,
 //! `fetch_max_concurrent`, `fetch_queue_max`, `fetch_deadline_secs`,
-//! `verb_max_concurrent`, `cas_group`, `lane_upload_deadline_secs`,
+//! `verb_max_concurrent`, `cas_group`, `lane_upload_deadline_secs`, `upload_ttl`,
 //! `quota_total_bytes`, `quota_owner_default_bytes`,
 //! `quota_owner: <owner>=<bytes>` (repeatable). The byte values accept
 //! plain integers or a `KiB` family suffix.
@@ -84,6 +84,8 @@ pub struct Config {
     /// Total per-upload deadline on the lane; expiry aborts the
     /// upload (staging deleted) with `408` (F8).
     pub lane_upload_deadline_secs: u64,
+    /// Durable upload lifetime in seconds; wire expiry is epoch milliseconds.
+    pub upload_ttl: u64,
     /// Total per-download deadline for `blob.fetch`; expiry aborts the
     /// download (staging deleted) — outcome `origin_unreachable`
     /// naming the deadline if no other source serves (m6).
@@ -107,6 +109,7 @@ impl Default for Config {
             verb_max_concurrent: DEFAULT_VERB_MAX_CONCURRENT,
             cas_group: DEFAULT_CAS_GROUP.to_string(),
             lane_upload_deadline_secs: DEFAULT_LANE_UPLOAD_DEADLINE_SECS,
+            upload_ttl: 86_400,
             fetch_deadline_secs: DEFAULT_FETCH_DEADLINE_SECS,
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
@@ -224,6 +227,15 @@ impl Config {
                         );
                     }
                     cfg.lane_upload_deadline_secs = n;
+                }
+                "upload_ttl" => {
+                    let n: u64 = v
+                        .parse()
+                        .map_err(|e| format!("upload_ttl: bad seconds {v:?}: {e}"))?;
+                    if !(1..=31_536_000).contains(&n) {
+                        return Err("upload_ttl: expected 1..31536000 seconds".into());
+                    }
+                    cfg.upload_ttl = n;
                 }
                 "fetch_deadline_secs" => {
                     let n: u64 = v
@@ -402,6 +414,15 @@ mod tests {
         let cfg = Config::parse("").unwrap();
         assert_eq!(cfg.fetch_max_concurrent, DEFAULT_FETCH_MAX_CONCURRENT);
         assert_eq!(cfg.fetch_queue_max, DEFAULT_FETCH_QUEUE_MAX);
+    }
+
+    #[test]
+    fn upload_ttl_is_bounded_seconds() {
+        assert_eq!(Config::default().upload_ttl, 86_400);
+        assert_eq!(Config::parse("upload_ttl: 60\n").unwrap().upload_ttl, 60);
+        for value in ["0", "31536001", "-1", "tomorrow"] {
+            assert!(Config::parse(&format!("upload_ttl: {value}\n")).is_err());
+        }
     }
 
     #[test]

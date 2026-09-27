@@ -2551,6 +2551,55 @@ mod tests {
     }
 
     #[test]
+    fn v3_migration_rolls_back_ddl_and_marker_together_then_retries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(BLOBD_V1_SQL).unwrap();
+        conn.execute_batch(BLOBD_V2_SQL).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "application_id", BLOBD_APPLICATION_ID)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO quota(owner,used_bytes) VALUES ('tester',7)",
+            [],
+        )
+        .unwrap();
+        // Inject an error after CREATE TABLE but before the version marker.
+        conn.execute_batch("CREATE INDEX upload_expiry ON quota(owner)")
+            .unwrap();
+        assert!(apply_blobd_migrations(&mut conn).is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='upload_sessions'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("DROP INDEX upload_expiry").unwrap();
+        apply_blobd_migrations(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT used_bytes FROM quota WHERE owner='tester'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            7
+        );
+    }
+
+    #[test]
     fn blobd_sqlite_schema_is_v3_with_expected_tables() {
         let (dir, store) = store();
         let conn = Connection::open(dir.path().join("blobd.sqlite")).unwrap();

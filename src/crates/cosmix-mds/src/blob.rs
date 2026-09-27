@@ -576,14 +576,15 @@ mod tests {
         let other = hash_bytes(b"other");
         let src = d.path().join(".tmp/session-other");
         fs::write(&src, b"other").unwrap();
-        let blocker = blob_path(d.path(), &other)
+        let blocked = root();
+        let blocker = blob_path(blocked.path(), &other)
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .to_path_buf();
         fs::write(&blocker, b"not a directory").unwrap();
-        assert!(publish_staged_preserving_source(d.path(), &src, &other).is_err());
+        assert!(publish_staged_preserving_source(blocked.path(), &src, &other).is_err());
         assert!(src.exists());
     }
 

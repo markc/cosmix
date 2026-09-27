@@ -140,7 +140,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UploadSession> {
     })
 }
 
-pub(super) struct UploadGuard {
+pub(crate) struct UploadGuard {
     id: String,
     writers: Arc<Mutex<BTreeSet<String>>>,
 }
@@ -182,7 +182,7 @@ impl Store {
             .ok_or(StoreError::UploadMissing)
     }
 
-    pub(super) fn upload_guard(&self, id: &str) -> Result<UploadGuard> {
+    pub(crate) fn upload_guard(&self, id: &str) -> Result<UploadGuard> {
         let session = self.upload_row(id)?;
         if !self.upload_writers.lock().unwrap().insert(id.into()) {
             return Err(session.conflict("another mutation is running"));
@@ -385,11 +385,37 @@ impl Store {
         total: u64,
         reader: impl Read,
     ) -> Result<UploadSession> {
-        let guard = self.upload_guard(id)?;
+        let guard = self.upload_begin_patch(id, start, end, total)?;
         self.upload_append_guarded(&guard, start, end, total, reader)
     }
 
-    pub(super) fn upload_append_guarded(
+    /// Acquire and validate before the lane starts consuming its body.
+    pub(crate) fn upload_begin_patch(
+        &self,
+        id: &str,
+        start: u64,
+        end: u64,
+        total: u64,
+    ) -> Result<UploadGuard> {
+        let guard = self.upload_guard(id)?;
+        let s = self.upload_row(id)?;
+        if s.expires_at <= now_ms() && s.state != "committing" {
+            self.expire_upload(&s)?;
+            return Err(StoreError::UploadMissing);
+        }
+        if s.state != "active" {
+            return Err(s.conflict("session is not active"));
+        }
+        if s.offset != start {
+            return Err(s.conflict("offset mismatch"));
+        }
+        if total != s.size || start > end || end >= total {
+            return Err(StoreError::BadRequest("invalid Content-Range".into()));
+        }
+        Ok(guard)
+    }
+
+    pub(crate) fn upload_append_guarded(
         &self,
         guard: &UploadGuard,
         start: u64,
@@ -457,7 +483,8 @@ impl Store {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // A damaged staging entry must not block startup on a FIFO.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(self.upload_path(&s.id)?);
         match file {
             Ok(f) if f.metadata()?.is_file() && f.metadata()?.len() >= s.offset => Ok(f),
@@ -467,10 +494,10 @@ impl Store {
             }
             Err(e)
                 if matches!(e.kind(), io::ErrorKind::NotFound)
-                    || e.raw_os_error() == Some(libc::ELOOP) =>
+                    || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::EISDIR)) =>
             {
-                self.fail_upload(s, "staging is missing or a symlink")?;
-                Err(s.conflict("staging is missing or a symlink"))
+                self.fail_upload(s, "staging is missing or not regular")?;
+                Err(s.conflict("staging is missing or not regular"))
             }
             Err(e) => Err(e.into()),
         }
@@ -481,7 +508,9 @@ impl Store {
         match fs::symlink_metadata(&path) {
             Ok(md) if md.is_dir() => fs::remove_dir_all(path)?,
             Ok(_) => fs::remove_file(path)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // Retained receipts are swept repeatedly; an already absent
+            // source needs no directory sync on every sweep or create.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         }
         sync_dir(&self.uploads_root())
@@ -546,11 +575,11 @@ impl Store {
     pub fn upload_commit(&self, id: &str) -> Result<(Reference, bool)> {
         let _guard = self.upload_guard(id)?;
         let s = self.upload_row(id)?;
+        if s.expires_at <= now_ms() && s.state != "committing" {
+            self.expire_upload(&s)?;
+            return Err(StoreError::UploadMissing);
+        }
         if s.state == "complete" {
-            if s.expires_at <= now_ms() {
-                self.expire_upload(&s)?;
-                return Err(StoreError::UploadMissing);
-            }
             let reference = s
                 .result
                 .as_ref()
@@ -559,10 +588,6 @@ impl Store {
             return Ok((reference, false));
         }
         let prepared = if s.state == "active" {
-            if s.expires_at <= now_ms() {
-                self.expire_upload(&s)?;
-                return Err(StoreError::UploadMissing);
-            }
             self.prepare_upload_commit(&s)?
         } else if s.state == "committing" {
             s
@@ -821,6 +846,7 @@ mod tests {
             Err(StoreError::UploadConflict { offset: 3, .. })
         ));
         assert!(store.upload_append(&s.id, 3, 5, 6, &b"d"[..]).is_err());
+        assert!(store.upload_append(&s.id, 3, 5, 6, &b"defg"[..]).is_err());
         assert_eq!(
             fs::metadata(store.upload_path(&s.id).unwrap())
                 .unwrap()
@@ -904,6 +930,27 @@ mod tests {
             Err(StoreError::UploadMissing)
         ));
         assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
+    }
+
+    #[test]
+    fn missing_staging_fails_only_its_session_on_restart() {
+        let (dir, store) = store();
+        let (missing, _) = store.upload_create(&create(3)).unwrap();
+        let (valid, _) = store
+            .upload_create(&UploadCreate {
+                key: None,
+                ..create(3)
+            })
+            .unwrap();
+        fs::remove_file(store.upload_path(&missing.id).unwrap()).unwrap();
+        drop(store);
+        let store = Store::open(dir.path(), options()).unwrap();
+        assert_eq!(store.upload_status(&missing.id).unwrap().state, "failed");
+        assert_eq!(store.upload_status(&valid.id).unwrap().state, "active");
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 3);
+        store
+            .upload_append(&valid.id, 0, 2, 3, &b"abc"[..])
+            .unwrap();
     }
 
     #[test]
