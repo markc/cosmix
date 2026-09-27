@@ -37,6 +37,8 @@ quota_owner: capture=2GiB
 | `lane_max_uploads` | `4` | Concurrent lane uploads admitted; beyond it the lane answers `503` — no queueing |
 | `lane_upload_deadline_secs` | `3600` | Body-transfer deadline per v1 upload or session PATCH; timeout answers `408`. A failed PATCH rolls back to its durable offset; a failed v1 upload discards staging. Filesystem sync and settlement can outlast the body deadline |
 | `upload_ttl` | `86400` | Durable session lifetime in seconds, 1–31536000; absolute expiry is exposed in epoch milliseconds. Completed receipts have a separate fixed 24-hour lifetime |
+| `upload_per_owner` | `16` | Active/committing sessions per owner, 1–4096 and no greater than `upload_total` |
+| `upload_total` | `64` | Active/committing sessions globally, 1–4096; the separate receipt budget also applies |
 | `fetch_max_concurrent` | `2` | Concurrent `blob.fetch` downloads; beyond it a fetch queues (see [Fetching](#fetching)) |
 | `fetch_queue_max` | `32` | In-process fetch queue depth; beyond it the verb replies rc 10 `busy` |
 | `fetch_deadline_secs` | `3600` | Total per-download deadline for `blob.fetch`; a drip-feed body is aborted (staging deleted, slot and reservation released) when it passes — outcome `origin_unreachable` naming the deadline if nothing else serves |
@@ -159,9 +161,12 @@ Mutation admission is nonblocking per session. PATCH and commit share the
 `lane_max_uploads` pool with v1 uploads; create, HEAD and abort use a separate
 16-worker control pool. Under global overload `503` can precede the session
 conflict check. Default active bounds are 16 per owner and 64 total, including
-`committing`. Total retained rows are bounded at 272 per owner and 1088 total;
-receipts are never evicted early to admit another session. Zero-byte sessions
-count against these bounds.
+`committing`; configure these with `upload_per_owner` and `upload_total`.
+Terminal rows do not consume these slots. A separate global budget of 1024
+receipts reserves one future receipt slot for each admitted live session;
+creation returns 429 when that budget is full. Receipts are never evicted
+before their TTL. Aborts delete the row and free the owner/key immediately;
+failed rows remain visible for at most 24 hours. Zero-byte sessions count too.
 
 Expiry is enforced on operations and by a 30-second sweep, independent of the
 Bus connection. Expired resources are unavailable even if a current writer

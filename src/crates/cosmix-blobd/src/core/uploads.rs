@@ -40,6 +40,7 @@ WHERE state IN ('active','committing');
 const SELECT: &str = "SELECT id,owner,upload_key,size,offset,expected_hash,mime,name,
 created_at,expires_at,state,actual_hash,result,error,staging_dev,staging_ino FROM upload_sessions";
 pub(super) const RECEIPT_TTL_MS: i64 = 86_400_000;
+const RECEIPT_LIMIT: u64 = 1024;
 
 /// Active sessions and terminal receipts have separate finite bounds. Receipts
 /// are never evicted early to admit a new upload (commit replay lasts 24 h).
@@ -61,6 +62,22 @@ impl Default for UploadLimits {
 }
 
 impl UploadLimits {
+    pub fn from_config(cfg: &Config) -> Result<Self> {
+        let limits = Self {
+            ttl_ms: cfg
+                .upload_ttl
+                .checked_mul(1000)
+                .and_then(|n| i64::try_from(n).ok())
+                .ok_or_else(|| {
+                    StoreError::BadRequest("upload_ttl overflows milliseconds".into())
+                })?,
+            per_owner: cfg.upload_per_owner,
+            total: cfg.upload_total,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         if self.ttl_ms <= 0
             || self.ttl_ms > 365 * RECEIPT_TTL_MS
@@ -301,27 +318,20 @@ impl Store {
                 return Ok((s, false));
             }
         }
-        let (active, owner_active, count, owner_count): (u64, u64, u64, u64) = tx
+        let (active, owner_active, receipts): (u64, u64, u64) = tx
             .query_row(
                 "SELECT COALESCE(SUM(state IN ('active','committing')),0),
-            COALESCE(SUM(owner=?1 AND state IN ('active','committing')),0), COUNT(*),
-            COALESCE(SUM(owner=?1),0) FROM upload_sessions",
+            COALESCE(SUM(owner=?1 AND state IN ('active','committing')),0),
+            COALESCE(SUM(state IN ('complete','failed')),0) FROM upload_sessions",
                 [&opts.owner],
-                |r| {
-                    Ok((
-                        sql_u64(r, 0)?,
-                        sql_u64(r, 1)?,
-                        sql_u64(r, 2)?,
-                        sql_u64(r, 3)?,
-                    ))
-                },
+                |r| Ok((sql_u64(r, 0)?, sql_u64(r, 1)?, sql_u64(r, 2)?)),
             )
             .map_err(db_err)?;
-        // A full receipt budget refuses creation instead of dropping a promise.
+        // Reserve one future receipt slot per live session. Never evict an
+        // unexpired receipt, and never charge terminal rows to an owner slot.
         if active >= self.upload_limits.total as u64
             || owner_active >= self.upload_limits.per_owner as u64
-            || count >= self.upload_limits.total as u64 + 1024
-            || owner_count >= self.upload_limits.per_owner as u64 + 256
+            || receipts.saturating_add(active) >= RECEIPT_LIMIT
         {
             return Err(StoreError::UploadLimit);
         }
@@ -580,8 +590,8 @@ impl Store {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
         tx.execute(
-            "UPDATE upload_sessions SET state='failed',error=?1 WHERE id=?2",
-            params![why, s.id],
+            "UPDATE upload_sessions SET state='failed',error=?1,expires_at=?3 WHERE id=?2",
+            params![why, s.id, now_ms() + RECEIPT_TTL_MS],
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
@@ -625,10 +635,7 @@ impl Store {
         self.db
             .lock()
             .unwrap()
-            .execute(
-                "UPDATE upload_sessions SET state='aborted' WHERE id=?1",
-                [id],
-            )
+            .execute("DELETE FROM upload_sessions WHERE id=?1", [id])
             .map_err(db_err)?;
         self.bump_generation();
         Ok(())
@@ -884,8 +891,18 @@ impl Store {
         fs::create_dir_all(self.uploads_root())?;
         fs::set_permissions(self.uploads_root(), fs::Permissions::from_mode(0o2700))?;
         sync_dir(&self.blobs_root())?;
+        self.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE upload_sessions SET expires_at=MIN(expires_at,?1) WHERE state='failed'",
+                [now_ms() + RECEIPT_TTL_MS],
+            )
+            .map_err(db_err)?;
         for s in self.all_uploads(None)? {
-            if s.state == "committing" {
+            if s.state == "aborted" {
+                self.expire_upload(&s)?;
+            } else if s.state == "committing" {
                 // Recover publication and settlement before expiry/reconcile.
                 // A transient disk error leaves the protected row for a
                 // client commit retry; one damaged session never blocks open.
@@ -1347,6 +1364,84 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn terminal_rows_do_not_consume_owner_slots_and_abort_frees_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open_with_uploads(
+            dir.path(),
+            options(),
+            UploadLimits {
+                per_owner: 1,
+                total: 1,
+                ttl_ms: 365 * RECEIPT_TTL_MS,
+            },
+        )
+        .unwrap();
+        let (first, _) = store.upload_create(&create(0)).unwrap();
+        store.upload_abort(&first.id).unwrap();
+        assert!(matches!(
+            store.upload_status(&first.id),
+            Err(StoreError::UploadMissing)
+        ));
+        let (second, new) = store.upload_create(&create(0)).unwrap();
+        assert!(new);
+        assert_ne!(first.id, second.id);
+        let before = now_ms();
+        store.fail_upload(&second, "test failure").unwrap();
+        assert!(store.upload_status(&second.id).unwrap().expires_at <= now_ms() + RECEIPT_TTL_MS);
+        assert!(store.upload_status(&second.id).unwrap().expires_at >= before + RECEIPT_TTL_MS);
+        // More receipts than the former active limit remain replayable.
+        for _ in 0..3 {
+            let (s, _) = store
+                .upload_create(&UploadCreate {
+                    key: None,
+                    ..create(0)
+                })
+                .unwrap();
+            store.upload_commit(&s.id).unwrap();
+            assert_eq!(store.upload_status(&s.id).unwrap().state, "complete");
+        }
+        assert_eq!(store.upload_list(None).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn receipt_budget_never_evicts_early_and_reclaims_expired_rows() {
+        let (_dir, store) = store();
+        let (seed, _) = store.upload_create(&create(0)).unwrap();
+        store.upload_commit(&seed.id).unwrap();
+        {
+            let db = store.db.lock().unwrap();
+            for _ in 1..RECEIPT_LIMIT {
+                db.execute("INSERT INTO upload_sessions(id,owner,size,mime,created_at,expires_at,state,result)
+                    SELECT ?1,owner,size,mime,created_at,expires_at,state,result FROM upload_sessions WHERE id=?2",
+                    params![uuid::Uuid::new_v4().to_string(), seed.id]).unwrap();
+            }
+        }
+        let next = UploadCreate {
+            key: None,
+            ..create(0)
+        };
+        assert!(matches!(
+            store.upload_create(&next),
+            Err(StoreError::UploadLimit)
+        ));
+        assert_eq!(store.upload_status(&seed.id).unwrap().state, "complete");
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE upload_sessions SET expires_at=0 WHERE id=?1",
+                [&seed.id],
+            )
+            .unwrap();
+        store.upload_create(&next).unwrap();
+        assert!(matches!(
+            store.upload_status(&seed.id),
+            Err(StoreError::UploadMissing)
+        ));
     }
 
     #[test]

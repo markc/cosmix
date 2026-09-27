@@ -995,7 +995,7 @@ mod tests {
         ));
         assert_eq!(rc, 0);
         assert_eq!(c.store.quota_report(None).unwrap().total.reserved, 0);
-        assert_eq!(c.store.upload_status(&s.id).unwrap().state, "aborted");
+        assert!(matches!(c.store.upload_status(&s.id), Err(StoreError::UploadMissing)));
         assert!(takes_verb_permit("blob.upload.list"));
         assert!(takes_verb_permit("blob.upload.abort"));
     }

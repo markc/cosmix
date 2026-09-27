@@ -86,6 +86,8 @@ pub struct Config {
     pub lane_upload_deadline_secs: u64,
     /// Durable upload lifetime in seconds; wire expiry is epoch milliseconds.
     pub upload_ttl: u64,
+    pub upload_per_owner: usize,
+    pub upload_total: usize,
     /// Total per-download deadline for `blob.fetch`; expiry aborts the
     /// download (staging deleted) — outcome `origin_unreachable`
     /// naming the deadline if no other source serves (m6).
@@ -110,6 +112,8 @@ impl Default for Config {
             cas_group: DEFAULT_CAS_GROUP.to_string(),
             lane_upload_deadline_secs: DEFAULT_LANE_UPLOAD_DEADLINE_SECS,
             upload_ttl: 86_400,
+            upload_per_owner: 16,
+            upload_total: 64,
             fetch_deadline_secs: DEFAULT_FETCH_DEADLINE_SECS,
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
             quota_owner_default_bytes: DEFAULT_QUOTA_OWNER_BYTES,
@@ -228,6 +232,19 @@ impl Config {
                     }
                     cfg.lane_upload_deadline_secs = n;
                 }
+                "upload_per_owner" | "upload_total" => {
+                    let n: usize = v
+                        .parse()
+                        .map_err(|e| format!("{k}: bad count {v:?}: {e}"))?;
+                    if !(1..=4096).contains(&n) {
+                        return Err(format!("{k}: expected 1..4096"));
+                    }
+                    if k == "upload_per_owner" {
+                        cfg.upload_per_owner = n;
+                    } else {
+                        cfg.upload_total = n;
+                    }
+                }
                 "upload_ttl" => {
                     let n: u64 = v
                         .parse()
@@ -260,6 +277,9 @@ impl Config {
                 }
                 _ => {}
             }
+        }
+        if cfg.upload_per_owner > cfg.upload_total {
+            return Err("upload_per_owner must not exceed upload_total".into());
         }
         Ok(cfg)
     }
@@ -423,6 +443,30 @@ mod tests {
         for value in ["0", "31536001", "-1", "tomorrow"] {
             assert!(Config::parse(&format!("upload_ttl: {value}\n")).is_err());
         }
+    }
+
+    #[test]
+    fn upload_limits_config_reaches_store_with_checked_units() {
+        let cfg = Config::parse("upload_per_owner: 2\nupload_total: 5\nupload_ttl: 60\n").unwrap();
+        let limits = crate::core::store::UploadLimits::from_config(&cfg).unwrap();
+        assert_eq!(
+            (limits.per_owner, limits.total, limits.ttl_ms),
+            (2, 5, 60_000)
+        );
+        for text in [
+            "upload_per_owner: 0",
+            "upload_total: 4097",
+            "upload_total: -1",
+            "upload_per_owner: 65",
+            "upload_ttl: 18446744073709551615",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text}");
+        }
+        let invalid = Config {
+            upload_ttl: u64::MAX,
+            ..Config::default()
+        };
+        assert!(crate::core::store::UploadLimits::from_config(&invalid).is_err());
     }
 
     #[test]

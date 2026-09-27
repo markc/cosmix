@@ -85,10 +85,7 @@ async fn async_main() -> anyhow::Result<()> {
     let store = match Store::open_with_uploads(
         &root,
         StoreOptions::from_config(&cfg, origin),
-        cosmix_blobd::core::store::UploadLimits {
-            ttl_ms: (cfg.upload_ttl * 1000) as i64,
-            ..Default::default()
-        },
+        cosmix_blobd::core::store::UploadLimits::from_config(&cfg)?,
     ) {
         Ok(store) => Arc::new(store),
         Err(StoreError::Locked(path)) => {

@@ -468,6 +468,8 @@ quota_owner: capture=2GiB
 <tr><td><code>lane_max_uploads</code></td><td><code>4</code></td><td>Concurrent lane uploads admitted; beyond it the lane answers <code>503</code> — no queueing</td></tr>
 <tr><td><code>lane_upload_deadline_secs</code></td><td><code>3600</code></td><td>Body-transfer deadline per v1 upload or session PATCH; timeout answers <code>408</code>. A failed PATCH rolls back to its durable offset; a failed v1 upload discards staging. Filesystem sync and settlement can outlast the body deadline</td></tr>
 <tr><td><code>upload_ttl</code></td><td><code>86400</code></td><td>Durable session lifetime in seconds, 1–31536000; absolute expiry is exposed in epoch milliseconds. Completed receipts have a separate fixed 24-hour lifetime</td></tr>
+<tr><td><code>upload_per_owner</code></td><td><code>16</code></td><td>Active/committing sessions per owner, 1–4096 and no greater than <code>upload_total</code></td></tr>
+<tr><td><code>upload_total</code></td><td><code>64</code></td><td>Active/committing sessions globally, 1–4096; the separate receipt budget also applies</td></tr>
 <tr><td><code>fetch_max_concurrent</code></td><td><code>2</code></td><td>Concurrent <code>blob.fetch</code> downloads; beyond it a fetch queues (see <a href="/cos/cosmix-blobd/#fetching">Fetching</a>)</td></tr>
 <tr><td><code>fetch_queue_max</code></td><td><code>32</code></td><td>In-process fetch queue depth; beyond it the verb replies rc 10 <code>busy</code></td></tr>
 <tr><td><code>fetch_deadline_secs</code></td><td><code>3600</code></td><td>Total per-download deadline for <code>blob.fetch</code>; a drip-feed body is aborted (staging deleted, slot and reservation released) when it passes — outcome <code>origin_unreachable</code> naming the deadline if nothing else serves</td></tr>
@@ -563,9 +565,12 @@ Every session response has <code>Cache-Control: no-store</code>. A <code>409</co
 <code>lane_max_uploads</code> pool with v1 uploads; create, HEAD and abort use a separate
 16-worker control pool. Under global overload <code>503</code> can precede the session
 conflict check. Default active bounds are 16 per owner and 64 total, including
-<code>committing</code>. Total retained rows are bounded at 272 per owner and 1088 total;
-receipts are never evicted early to admit another session. Zero-byte sessions
-count against these bounds.</p>
+<code>committing</code>; configure these with <code>upload_per_owner</code> and <code>upload_total</code>.
+Terminal rows do not consume these slots. A separate global budget of 1024
+receipts reserves one future receipt slot for each admitted live session;
+creation returns 429 when that budget is full. Receipts are never evicted
+before their TTL. Aborts delete the row and free the owner/key immediately;
+failed rows remain visible for at most 24 hours. Zero-byte sessions count too.</p>
 <p>Expiry is enforced on operations and by a 30-second sweep, independent of the
 Bus connection. Expired resources are unavailable even if a current writer
 delays physical cleanup and reservation release. <code>committing</code> rows do not
