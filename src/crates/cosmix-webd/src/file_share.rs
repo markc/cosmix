@@ -429,19 +429,17 @@ pub fn list(
     let mut stmt = conn.prepare(
         "SELECT * FROM file_shares WHERE account=?1 AND revoked=0 AND token>?2 AND primary_fqdn=?4 ORDER BY token LIMIT ?3",
     )?;
-    let rows = stmt.query_map(
-        params![account, after.unwrap_or(""), limit as i64, primary],
-        Row::read,
-    )?;
+    let mut rows = stmt.query(params![account, after.unwrap_or(""), limit as i64, primary])?;
     let mut inventory = Inventory {
         shares: Vec::new(),
         skipped: 0,
         next: None,
     };
-    for row in rows {
-        let row = row?;
-        inventory.next = Some(row.token.clone());
-        match row.share() {
+    while let Some(row) = rows.next()? {
+        // Read the pagination key independently: a corrupt typed field must
+        // not prevent advancing past this row.
+        inventory.next = Some(row.get("token")?);
+        match Row::read(row).map_err(Error::from).and_then(Row::share) {
             Ok(share) => inventory.shares.push(share),
             Err(_) => inventory.skipped += 1,
         }
@@ -565,6 +563,24 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn inventory_skips_decode_errors_without_stalling_cursor() {
+        let db = db();
+        let token = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
+        db.execute(
+            "UPDATE file_shares SET expires_at='corrupt' WHERE token=?1",
+            [&token],
+        )
+        .unwrap();
+        let page = list(&db, "a.example", ACCOUNT, None, 1).unwrap();
+        assert!(page.shares.is_empty());
+        assert_eq!(page.skipped, 1);
+        assert_eq!(page.next.as_deref(), Some(token.as_str()));
+        let next = list(&db, "a.example", ACCOUNT, page.next.as_deref(), 1).unwrap();
+        assert_eq!(next.next, None);
+        assert_eq!(next.skipped, 0);
     }
 
     #[test]
