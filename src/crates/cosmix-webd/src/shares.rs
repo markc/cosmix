@@ -413,6 +413,11 @@ pub async fn public_headers(
 ) -> Response {
     let head = *request.method() == axum::http::Method::HEAD;
     let mut response = next.run(request).await;
+    if response.status().is_client_error() && response.status() != StatusCode::RANGE_NOT_SATISFIABLE {
+        *response.body_mut() = axum::body::Body::from(r#"{"error":"not_found"}"#);
+        response.headers_mut().remove("content-length");
+        response.headers_mut().insert("content-type", "application/json".parse().unwrap());
+    }
     let headers = response.headers_mut();
     headers.insert("cache-control", "private, no-store".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
@@ -736,6 +741,19 @@ fn counted_body_with_deadlines(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn public_denials_hide_catalogue_state() {
+        use tower::ServiceExt;
+        let (_tmp, node, vhost) = fixture().await;
+        let token = path_token(&node, &vhost, None).await;
+        for update in ["UPDATE file_shares SET revoked=1", "UPDATE file_shares SET revoked=0, expires_at=1"] {
+            vhost.db.as_ref().unwrap().lock().await.execute_batch(update).unwrap();
+            let response = crate::build_per_vhost_router(node.clone()).oneshot(download_request(&token, "GET", None, None, true)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), 100).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({"error":"not_found"}));
+        }
+    }
     #[tokio::test]
     async fn unverifiable_if_range_returns_full_representation() {
         use tower::ServiceExt;
