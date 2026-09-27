@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.3.0
 -- Durable orchestration; only the injected io boundary talks to blobd.
 $c = require("store_catalogue.mix")
 $m = require("store_manifest.mix")
@@ -40,7 +40,7 @@ fn admit($path, $collection, $manifest)
     sqlexec($db, "COMMIT")
     return {collection: $collection, id: $v.id, accepted: true, state: $state, replay: length($rows) > 0}
   catch $message, $error
-    sqlexec($db, "ROLLBACK")
+    $c.rollback($db)
     raise($error.code, $message)
   finally
     sqlclose($db)
@@ -87,7 +87,7 @@ fn run_pending($path, $state_dir, $epoch, $io)
       sqlexec($db, "UPDATE commit_intents SET state='committed',error=NULL,updated_at=? WHERE collection=? AND id=? AND state='pending'", [floor(time()), $job.collection, $job.id])
       sqlexec($db, "COMMIT")
     catch $message, $error
-      sqlexec($db, "ROLLBACK")
+      $c.rollback($db)
       raise($error.code, $message)
     end
     return {collection: $job.collection, id: $job.id, state: "committed"}

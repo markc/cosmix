@@ -1,6 +1,7 @@
--- version: 0.1.0
+-- version: 0.2.0
 $c = require("store_catalogue.mix")
 $m = require("store_manifest.mix")
+$protocol = require("store_commit.mix")
 $dir = env("TMPDIR", "/tmp") .. "/store-catalogue-test-" .. uuid()
 mkdir($dir)
 $path = $dir .. "/catalogue.sqlite"
@@ -48,6 +49,18 @@ try
   end
   check($caught == "STORE_DB", "WRONG_INSTANCE")
   check(sqlexec($db, "PRAGMA integrity_check")[0].integrity_check == "ok", "INTEGRITY")
+  sqlexec($db, "BEGIN IMMEDIATE")
+  for each $case in ["initialise", "admit"]
+    $caught = ""
+    try
+      if $case == "initialise" then $c.initialise($path, "blobd-two")
+      else $protocol.admit($path, "alpha", {schema_version: 2, files: []}) end
+    catch $message
+      $caught = $message
+    end
+    check(contains($caught, "locked") and not contains($caught, "no transaction"), "ORIGINAL_BEGIN_ERROR_" .. $case .. ": " .. $caught)
+  end
+  sqlexec($db, "ROLLBACK")
 finally
   if $db != nil then sqlclose($db) end
   remove_dir($dir)

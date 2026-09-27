@@ -61,6 +61,8 @@ lock prevents another process owning the same catalogue.
 SQLite schema 1 uses WAL, synchronous FULL, foreign keys, short transactions
 and explicit handle closure. Manifest JSON is TEXT, never a SQL BLOB. It
 records collections, snapshots, snapshot-object membership and commit intents.
+Rollback is best-effort on an error path so a failed BEGIN or I/O operation
+reports its original error rather than a secondary rollback error.
 The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.
 
 | Verb | Arguments | Result |
