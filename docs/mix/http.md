@@ -1,5 +1,98 @@
 # http — HTTP client builtins
 
+## Streaming file download (0.97.0)
+
+`http_get_file(url, path[, opts]) -> map<http_file_response>` streams GET to a
+unique sibling created exclusively. For a new destination it uses mode 0666
+under the process umask, matching `write_atomic`. When the destination exists,
+staging starts at 0600, before any append prefix or incoming body is copied;
+the target's permission bits are applied through the open descriptor only
+after verification, just before publication. It hashes while writing,
+syncs the completed file, publishes atomically, then syncs the directory.
+The parent directory must exist. Defaults refuse an existing destination:
+Linux uses `renameat2(RENAME_NOREPLACE)`, with atomic hard-link creation as
+the fallback. Unsupported filesystems fail; there is no check-then-rename
+fallback. `overwrite: true` permits atomic replacement of a regular file,
+preserving its current permission bits. Symlink replacement is refused.
+
+Options are `overwrite`, `append`, `expect_blake3` (64 lowercase hex digits),
+`max_bytes`, `headers`, and the upload timeout/TLS options below. Redirects
+are returned. Only a 200 or 204 installs a fresh file. HTTP error bodies may
+be returned in `body`/`bytes` (64 MiB cap), but never become the destination.
+Successful file bodies stay on disk; `body` is nil and `bytes` empty.
+From 0.97.0, 200/206 downloads require identity framing with Content-Length.
+Missing length or non-identity encoding returns status 0 with
+`HTTP_IDENTITY_FRAMING` and leaves the destination untouched. This also rejects
+ureq's transparent gzip decoding, which removes both Content-Encoding and
+Content-Length. Chunked/close-delimited 200/206 bodies are deliberately refused;
+blobd's lane supplies Content-Length. A body-free 204 remains supported.
+
+`append: true` requires `expect_blake3` for the **whole final file** and an
+existing regular prefix file. It copies and hashes the prefix into staging,
+requests `Range: bytes=<prefix-size>-`, and accepts only a 206 with one
+Content-Range starting at that size and ending at the representation's final
+byte. An ignored Range, wrong range, short read or hash mismatch leaves the
+prefix unchanged. Append and overwrite are mutually exclusive; append itself
+authorises replacing the prefix after verification. Keep the destination
+exclusive to this caller during append/overwrite. The builtin owns Range and
+Accept-Encoding (requests identity); these headers cannot be overridden.
+
+`max_bytes` applies to the final size, including the prefix, and defaults to
+9007199254740991 (the exact integer limit). `bytes_written` counts downloaded
+bytes written to staging; `size` includes the copied prefix. `blake3` is the
+verified final digest, or nil on failure. The extra `published` boolean is
+true once publication succeeds, including the rare status-0 directory-sync
+failure after publication; callers must not interpret that failure as rollback.
+All earlier failures remove staging and preserve the destination.
+
+Operational failures return status 0 with `FILE_IO`, `FILE_EXISTS`,
+`HTTP_RANGE`, `HTTP_HASH_MISMATCH`, `HTTP_SHORT_READ`, `HTTP_BODY_LIMIT`, or
+the HTTP transport/body codes. Invalid options raise. Network and FsWrite
+are unconditional; append:true or ca_file additionally requires FsRead.
+The same socket inactivity and cooperative deadline limitations apply as for
+uploads. Memory use for successful downloads stays bounded by a 64 KiB buffer.
+
+## Streaming file upload (0.97.0)
+
+`http_put_file(url, path[, opts]) -> map<http_file_response>` streams a regular
+file with a fixed 64 KiB transfer buffer. Keep the source immutable during the
+call. `range: {start, end}` selects inclusive byte offsets; without it the
+whole file is sent, including an empty file. Content-Length is exact and an
+early EOF fails with `HTTP_SHORT_READ`. Sizes and offsets must be exact Mix
+integers (0 through 9007199254740991); invalid ranges raise `OPTION_INVALID`.
+
+Options are `method` (`PUT`, `POST`, or `PATCH`, default `PUT`), `range`,
+`headers`, `idle_timeout` (seconds, default 30, positive), `deadline` (seconds,
+default 0 = disabled), `ssl_verify`, `ca_file`, and `ca_pem`. TLS options have
+the same validation and trust roots as the buffered HTTP builtins below.
+Unknown options raise. The builtin owns Content-Length and Transfer-Encoding;
+setting either header raises. Redirects are disabled: a 3xx is returned.
+
+`idle_timeout` bounds socket inactivity (and connection establishment).
+`deadline` is checked cooperatively around streaming IO. It is best-effort
+during blocking DNS/IO, **not a hard whole-call bound**. Both accept fractional
+seconds, up to one year.
+
+The distinct `http_file_response` has `status`, `headers`, `bytes_written`,
+`size`, `blake3`, `body`, `bytes`, `final_url`, `duration_ms`, `error_code`, and
+`error`, and `published` (false for uploads). For uploads, `bytes_written` counts source bytes consumed, not a
+server's durable acknowledgement; `size` is the selected window size and
+`blake3` is its lowercase digest (nil on failure). Response bodies are capped
+at 64 MiB. Received HTTP responses retain their real status; IO/transport failures return
+status 0 and an error (`FILE_IO`, `HTTP_SHORT_READ`, or the HTTP codes below).
+Argument errors raise. Inspect the result even when the call does not raise.
+
+A server can reject a large PUT/PATCH before consuming its body. If the socket
+fails while ureq is still writing, the caller can receive status 0 and lose the
+server's status and diagnostic body. For resumable blob uploads, recover via
+HEAD and its durable offset/state rather than assuming the chunk was accepted.
+Downloads refuse close-delimited 200/206 bodies without Content-Length, as
+required by the identity-framing contract above.
+
+Network **and FsRead are unconditional capabilities**, including calls without
+options. Structured discovery and `mix lint` include both. The `http` Cargo
+feature itself enables BLAKE3; `crypto` is not required for these transfers.
+
 The HTTP client builtins — a small, blocking HTTP/1.1 client built on
 [`ureq`](https://docs.rs/ureq). Three calls cover the whole surface:
 `http_get`, `http_post`, and the any-verb `http_request`. They are
@@ -516,4 +609,3 @@ a browser and a script, not a load. The moment the words "certificate",
 - [Bus messaging](bus.md) — in-mesh RPC (`send`/`emit`); HTTP is for the world *outside* the mesh
 - [the manual index](README.md) — every page in this manual
 - `mix what http_get` · `mix what http_post` · `mix what http_request` · `mix builtins system` · the [mix repo](https://github.com/markc/cosmix)
-

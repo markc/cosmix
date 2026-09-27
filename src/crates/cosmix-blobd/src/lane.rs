@@ -11,12 +11,13 @@
 //! never unspecified, never loopback, never another interface. A
 //! mismatch is exit 2 before any socket is opened.
 //!
-//! **Bounded, restart-only:** uploads stream into mds staging under a
+//! **Bounded v1 uploads:** uploads stream into mds staging under a
 //! byte counter that aborts at the lane owner's remaining quota or the
 //! total cap (413, staging deleted); an idle body (30 s) and the
 //! concurrent-upload bound (`lane_max_uploads`, 503 beyond it, no
 //! queue) bound the lane's resources. A dropped upload starts again —
-//! v1 has no resume.
+//! v1 has no resume. `/blob/uploads` adds durable strict-offset sessions;
+//! its HTTP adapter is in `lane_uploads.rs`, recovery in the store core.
 
 use std::io::{self, Read};
 use std::net::SocketAddr;
@@ -42,6 +43,9 @@ use tracing::debug;
 use crate::core::mime;
 use crate::core::reference::Reference;
 use crate::core::store::{PutOutcome, Store, StoreError};
+
+#[path = "lane_uploads.rs"]
+mod uploads;
 
 /// Idle request-body timeout: no data frame for this long aborts the
 /// upload (staging deleted) and answers 408.
@@ -115,7 +119,8 @@ pub fn bind_is_wg(bind: &str, wg_ip: &str) -> bool {
 /// single-flight test asserts exactly one download per hash).
 pub struct Lane {
     store: Arc<Store>,
-    uploads: Semaphore,
+    uploads: Arc<Semaphore>,
+    controls: Arc<Semaphore>,
     gets: AtomicU64,
     /// Total per-upload deadline (F8): the idle timeout bounds
     /// inter-frame gaps only, so this bounds the whole body.
@@ -126,7 +131,8 @@ impl Lane {
     fn new(store: Arc<Store>, max_uploads: usize, upload_deadline: Duration) -> Self {
         Self {
             store,
-            uploads: Semaphore::new(max_uploads),
+            uploads: Arc::new(Semaphore::new(max_uploads)),
+            controls: Arc::new(Semaphore::new(16)),
             gets: AtomicU64::new(0),
             upload_deadline,
         }
@@ -141,12 +147,24 @@ impl Lane {
 /// The lane's route table, shared by [`serve_lane`] and the test
 /// constructor.
 fn lane_router(lane: Arc<Lane>) -> Router {
-    Router::new()
+    let sessions = Router::new()
+        .route("/blob/uploads", post(uploads::create))
         .route(
-            "/blob/{hex}",
-            get(get_blob).put(put_upload).post(post_upload),
+            "/blob/uploads/{id}",
+            axum::routing::head(uploads::head)
+                .patch(uploads::patch)
+                .delete(uploads::abort),
         )
+        .route("/blob/uploads/{id}/commit", post(uploads::commit))
+        // Layer the router (including method fallbacks), not just handler
+        // responses: generated 405s and extractor refusals must not be cached.
+        .layer(axum::middleware::map_response(|response: Response| async move {
+            uploads::no_store(response)
+        }));
+    Router::new()
+        .route("/blob/{hex}", get(get_blob).put(put_upload).post(post_upload))
         .route("/blob", post(post_upload))
+        .merge(sessions)
         .with_state(lane)
 }
 
@@ -485,9 +503,14 @@ impl Lane {
         body: Body,
     ) -> Response {
         let owner = lane_owner(headers, peer);
-        // TODO: decode percent-encoded X-Cosmix-Name; filesd P3 encodes; raise the 128-byte cap.
-        let name = string_header(headers, "x-cosmix-name");
-        let mime = string_header(headers, "x-cosmix-mime")
+        let name = match string_header(headers, "x-cosmix-name") {
+            Ok(name) => name,
+            Err(error) => return lane_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+        let mime = match string_header(headers, "x-cosmix-mime") {
+            Ok(mime) => mime,
+            Err(error) => return lane_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        }
             .or_else(|| name.as_deref().map(mime::sniff).map(str::to_string))
             .unwrap_or_else(|| "application/octet-stream".to_string());
         let expected_hex = expected.map(|h| blob::hex(&h));
@@ -523,7 +546,7 @@ impl Lane {
 
         // Admission: a bounded number of concurrent uploads, no queue —
         // beyond the bound the lane refuses immediately.
-        let _permit = match self.uploads.try_acquire() {
+        let permit = match Arc::clone(&self.uploads).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 return lane_error(
@@ -552,6 +575,9 @@ impl Lane {
         let pump = tokio::spawn(pump_body(body, tx, cap, deadline));
         let store = Arc::clone(&self.store);
         let landed = tokio::task::spawn_blocking(move || {
+            // Cancellation of the handler must not admit a replacement while
+            // its blocking writer still owns a transfer and quota hold.
+            let _permit = permit;
             stream_into_store(&store, rx, expected, mime, name, owner, reservation)
         })
         .await;
@@ -640,17 +666,23 @@ impl Lane {
 /// closed channel signals the reader explicitly (`Eof` or `Abort`);
 /// on a cap, idle or deadline abort the CAS writer's error path
 /// deletes the staging file before the handler answers.
-async fn pump_body(
+async fn pump_body(body: Body, tx: mpsc::Sender<Frame>, cap: u64, deadline: tokio::time::Instant) {
+    pump_body_with_idle(body, tx, cap, deadline, IDLE_TIMEOUT).await;
+}
+
+async fn pump_body_with_idle(
     mut body: Body,
     tx: mpsc::Sender<Frame>,
     cap: u64,
     deadline: tokio::time::Instant,
+    idle: Duration,
 ) {
     let mut count: u64 = 0;
+    let mut progress = tokio::time::Instant::now();
     loop {
         let frame = match tokio::time::timeout_at(
             deadline,
-            tokio::time::timeout(IDLE_TIMEOUT, body.frame()),
+            tokio::time::timeout_at(progress + idle, body.frame()),
         )
         .await
         {
@@ -670,7 +702,10 @@ async fn pump_body(
             }
             Ok(Ok(Some(Err(e)))) => {
                 let _ = tx
-                    .send(Frame::Abort(io::Error::other(format!("request body: {e}"))))
+                    .send(Frame::Abort(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("request body: {e}"),
+                    )))
                     .await;
                 return;
             }
@@ -682,6 +717,7 @@ async fn pump_body(
         if bytes.is_empty() {
             continue;
         }
+        progress = tokio::time::Instant::now();
         count += bytes.len() as u64;
         if count > cap {
             let _ = tx.send(Frame::Abort(abort_error(LaneAbort::Cap))).await;
@@ -740,7 +776,14 @@ fn stream_into_store(
     };
 
     let outcome = store
-        .record_upload(&landed, size, &mime, name.as_deref(), &owner)
+        .record_upload_reserved(
+            &landed,
+            size,
+            &mime,
+            name.as_deref(),
+            &owner,
+            Some(&reservation),
+        )
         .map_err(UploadError::Store)?;
     // Settle: the pin now accounts the real size; the admission's
     // headroom releases (on the error paths above, the `?` dropped it).
@@ -762,12 +805,40 @@ fn lane_owner(headers: &HeaderMap, peer: SocketAddr) -> String {
         .unwrap_or_else(|| format!("lane:{}", peer.ip()))
 }
 
-fn string_header(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty() && s.len() <= MAX_OWNER_HEADER)
-        .map(str::to_string)
+fn string_header(headers: &HeaderMap, name: &str) -> std::result::Result<Option<String>, StoreError> {
+    let invalid = || StoreError::BadRequest(format!("invalid {name}"));
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else { return Ok(None); };
+    if values.next().is_some() { return Err(invalid()); }
+    let value = value.to_str().map_err(|_| invalid())?;
+    let decoded = if name == "x-cosmix-name" {
+        // RFC 3986: '+' is literal, never form-encoded whitespace.
+        let mut bytes = value.bytes();
+        let mut out = Vec::with_capacity(value.len());
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                let hi = bytes.next().and_then(|b| (b as char).to_digit(16)).ok_or_else(invalid)?;
+                let lo = bytes.next().and_then(|b| (b as char).to_digit(16)).ok_or_else(invalid)?;
+                out.push((hi * 16 + lo) as u8);
+            } else { out.push(byte); }
+        }
+        String::from_utf8(out).map_err(|_| invalid())?
+    } else { value.to_owned() };
+    let limit = if name == "x-cosmix-name" { 1024 } else { 256 };
+    if decoded.is_empty() || decoded.len() > limit || decoded.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    Ok(Some(decoded))
+}
+
+fn encoded_name(name: &str) -> String {
+    let mut out = String::new();
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else { out.push_str(&format!("%{byte:02X}")); }
+    }
+    out
 }
 
 fn content_length(headers: &HeaderMap) -> Option<u64> {
@@ -865,7 +936,12 @@ pub(crate) mod test_support {
         upload_deadline: Duration,
     ) -> (TempDir, Arc<Store>, SocketAddr, Arc<Lane>) {
         let dir = TempDir::new().unwrap();
-        let store = Arc::new(Store::open(dir.path(), options).unwrap());
+        let store = Arc::new(Store::open(dir.path().join("store"), options).unwrap());
+        let (addr, lane) = serve_store(Arc::clone(&store), upload_deadline).await;
+        (dir, store, addr, lane)
+    }
+
+    pub(crate) async fn serve_store(store: Arc<Store>, upload_deadline: Duration) -> (SocketAddr, Arc<Lane>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let lane = Arc::new(Lane::new(Arc::clone(&store), 4, upload_deadline));
@@ -880,7 +956,7 @@ pub(crate) mod test_support {
                 eprintln!("test lane stopped: {error}");
             }
         });
-        (dir, store, addr, lane)
+        (addr, lane)
     }
 
     /// A loopback lane without the counter handle.

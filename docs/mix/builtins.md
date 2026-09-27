@@ -6,6 +6,11 @@ Some builtins are feature-gated on the `cosmix-lib-mix` crate (`json`, `regex`, 
 
 ## Machine-readable discovery (metadata_schema 1)
 
+From 0.97.0, `required_capabilities` lists additional unconditional capability
+classes beyond `capability`. File transfers use this to require filesystem
+access even without an options map. Evaluator policy checks and `mix lint`
+enforce the combined set; `conditional_capabilities` remains option-dependent.
+
 Since 0.29.0 every builtin carries a structured contract — per-argument names/kinds/optionality, derived min/max arity, a return shape, effect flags, an operational-failure mode, and any conditional capabilities. The human signature shown by `mix builtins <name>` is derived from the same contract, so it can never drift from the machine metadata.
 
 - `mix builtins --json` — the full table as a JSON array; each entry carries `metadata_schema` (1), `kind` (`builtin` or `statement` for print/eprint), `name`, `category`, `capability` (kebab class, or `statement`), `conditional_capabilities` (`[{option, capability}]`), `description`, `signature`, `arity` (`{min, max, exact}` — `max: null` = variadic; `exact` is normally `null`, but when a builtin's accepted argument counts are NOT a contiguous range it lists them exhaustively, e.g. `random` has `exact: [0, 2]` — an arity checker must use `exact` when present), `args` (`[{name, required, variadic, kind}]`), `returns`, `effects`, and `operational_failure`.

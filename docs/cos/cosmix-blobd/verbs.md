@@ -18,7 +18,7 @@ Success uses result code `0`. Errors use result code `10` and a body shaped as:
 
 Error tokens worth matching on: `not_present` (blob not held), `invalid blob id` (malformed `b3:` reference), `quota:` (an owner or total cap refusal — the message carries the numbers), `busy` (the `blob.fetch` queue is full — retry later), `vanished:` (the bytes disappeared while the pin was landing — a `blob.gc` race; retry the put).
 
-Verbs dispatch concurrently. The data-scaled verbs — `blob.put`, `blob.gc`, `blob.list`, `blob.pin`, `blob.unpin` — are bounded by `verb_max_concurrent` (default 8): each holds one slot, not the connection, and beyond the bound it queues; its reply is late, never lost. Every other verb (`blob.fetch`'s immediate reply, `stat`, `has`, `path`, `url`, `info`, `quota`, `props.*`) takes no slot, so eight slow verbs never starve them. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.
+Verbs dispatch concurrently. The data-scaled verbs — `blob.put`, `blob.gc`, `blob.list`, `blob.pin`, `blob.unpin`, `blob.upload.list`, `blob.upload.abort` — are bounded by `verb_max_concurrent` (default 8): each holds one slot, not the connection, and beyond the bound it queues; its reply is late, never lost. Every other verb (`blob.fetch`'s immediate reply, `stat`, `has`, `path`, `url`, `info`, `quota`, `props.*`) takes no slot, so eight slow verbs never starve them. Replies may arrive out of arrival order; they correlate by command id, like any Bus reply.
 
 A blob reference is `{"blob":"b3:<64 hex>","size":N,"mime":"…","name":"…"?, "origin":"<node name>"}` (`name` present only when the ingester knew one; `origin` is a node name, never an IP).
 
@@ -96,7 +96,23 @@ Inventory of blobs blobd knows (attributes or pins — an orphan file with neith
 |---|---|
 | `owner` | unset (all owners) |
 
-The response contains `owners` (`<owner>: {used, limit, reserved}`) and `total: {used, limit, reserved}`. `used` sums distinct pinned blob sizes per owner; `reserved` is the in-flight upload headroom — bytes admitted to running uploads (lane `POST`/`PUT` bodies, `blob.fetch` downloads) whose pins have not landed yet. A fresh upload is refused against `used + reserved`, so concurrent uploads cannot each spend the same cap room, and the reservation releases when the pin settles or the upload aborts.
+The response contains `owners` (`<owner>: {used, limit, reserved}`) and `total: {used, limit, reserved}`. `used` sums distinct pinned blob sizes per owner; `total.used` is the sum of those owner charges, not unique disk bytes. `reserved` sums whole declared sizes of durable active/committing sessions and identified ephemeral holds for local puts, v1 lane uploads and fetches. Every pin path checks `used + reserved`, including existing-hash pins and fetch joiners. Settlement credits only its own hold; abort/failure releases it. Durable reservations survive daemon restart.
+
+### `blob.upload.list` / `blob.upload.abort`
+
+`blob.upload.list {owner?}` returns `{uploads:[session…]}`, optionally filtered
+by an owner string. Each session includes `upload` (UUID), `owner`, `key`,
+`size`, `offset`, `expect`, `mime`, `name`, `created_at`, `expires_at`, `state`,
+`result` and `error`; times are epoch milliseconds and optional values are
+null. The list includes retained terminal receipts, excludes expired sessions
+and is bounded by the session table's count limits.
+
+`blob.upload.abort {upload}` takes a UUID string and returns
+`{aborted:true,upload}`. It releases active staging/reservation, is idempotent
+for an aborted or completed session, and never unpins a completed object.
+Unknown/expired sessions, a concurrent mutation and a pending commit return
+rc 10 with an error message. Creation, PATCH, HEAD and commit use the lane;
+neither Bus verb carries file bytes. See the README's durable upload contract.
 
 ### `blob.gc`
 
@@ -108,7 +124,10 @@ Candidates are CAS files with mds refcount 0 (no row counts as 0), no pin, and a
 
 ### `blob.info`
 
-No arguments. Version, git sha, build time, `root`, `instance`, `lane_bind` and `counts` (`blobs`, `pins`).
+No arguments. Version, git sha, build time, `root`, `instance`, `lane_bind`,
+`counts` (`blobs`, `pins`) and `uploads` (`active`, `reserved_bytes`). The latter
+counts active plus committing durable sessions and their whole declared sizes;
+it excludes ephemeral transfer holds (use `blob.quota` for the combined sum).
 
 ### `blob.fetch`
 

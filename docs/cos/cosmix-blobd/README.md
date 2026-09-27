@@ -35,7 +35,10 @@ quota_owner: capture=2GiB
 | `name` | unset (service `blobd`) | Instance name; Bus service becomes `blobd-<name>` |
 | `lane_bind` | unset (no lane) | Byte-lane bind `<ip>:<port>`; the IP must be this node's `wg_ip` (see [Byte lane](#byte-lane)) |
 | `lane_max_uploads` | `4` | Concurrent lane uploads admitted; beyond it the lane answers `503` — no queueing |
-| `lane_upload_deadline_secs` | `3600` | Total per-upload deadline; a drip-feed body is aborted (staging deleted) with `408` when it passes — the 30 s idle timeout bounds inter-frame gaps only |
+| `lane_upload_deadline_secs` | `3600` | Body-transfer deadline per v1 upload or session PATCH; timeout answers `408`. A failed PATCH rolls back to its durable offset; a failed v1 upload discards staging. Filesystem sync and settlement can outlast the body deadline |
+| `upload_ttl` | `86400` | Durable session lifetime in seconds, 1–31536000; absolute expiry is exposed in epoch milliseconds. Completed receipts have a separate fixed 24-hour lifetime |
+| `upload_per_owner` | `16` | Active/committing sessions per owner, 1–4096 and no greater than `upload_total` |
+| `upload_total` | `64` | Active/committing sessions globally, 1–4096; the separate receipt budget also applies |
 | `fetch_max_concurrent` | `2` | Concurrent `blob.fetch` downloads; beyond it a fetch queues (see [Fetching](#fetching)) |
 | `fetch_queue_max` | `32` | In-process fetch queue depth; beyond it the verb replies rc 10 `busy` |
 | `fetch_deadline_secs` | `3600` | Total per-download deadline for `blob.fetch`; a drip-feed body is aborted (staging deleted, slot and reservation released) when it passes — outcome `origin_unreachable` naming the deadline if nothing else serves |
@@ -96,9 +99,90 @@ Every successful upload records attributes (`origin` = this node) and a pin, so 
 
 The total cap and the lane owner's remaining quota are enforced **mid-stream** by a byte counter on the staging write: exceeding either aborts the upload, deletes the staging file and answers `413`; a declared `Content-Length` over the cap is refused `413` before any byte is read. Quota is reserved at admission (the declared length, or the whole remaining room when absent), so concurrent uploads cannot each spend the same cap room — the mid-stream counter enforces the reservation. An idle request body (no data for 30 s) aborts with `408`. At most `lane_max_uploads` (default 4) uploads run concurrently; beyond that the lane answers `503` immediately — there is no queue (the no-poll/no-flood law).
 
-Uploads are **restart-only** in v1: a dropped or failed upload starts again from zero. Resumable upload (offset tickets) is a named P5 requirement precisely because the offsite branch it replaces was resumable by construction. A slow client holds an upload permit and a quota reservation for at most `lane_upload_deadline_secs` (default 3600) in total: a body that is still dribbling when the deadline passes is aborted (staging deleted) with `408` — the idle timeout bounds inter-frame gaps, the deadline bounds the whole upload.
+`PUT /blob/<hex>` and `POST /blob` remain **restart-only**: a dropped or failed upload starts again from zero. Their body pump aborts with `408` after `lane_upload_deadline_secs` (default 3600), even if bytes keep arriving. The deadline bounds body reception, not blocking filesystem sync or metadata settlement. Resumable clients use the session routes below.
 
 A `blob.fetch` interrupted by a restart leaves at most staging residue under `blobs/.tmp`, which startup cleanup removes — the same crash-safety the lane's uploads have.
+
+### Durable upload sessions (0.6.0)
+
+Every session-route response carries `Cache-Control: no-store`, including
+axum-generated method errors (405) and extractor rejections before a handler.
+
+| Route | Success | Contract |
+|---|---|---|
+| `POST /blob/uploads` | `201` new; `200` key replay | Create from headers, no body; return session JSON and `Location: /blob/uploads/<uuid>` |
+| `HEAD /blob/uploads/<uuid>` | `200` | Durable offset and identity headers, no body, including on error |
+| `PATCH /blob/uploads/<uuid>` | `200` | Append exactly at the durable offset; return `{"offset":N}` and session headers |
+| `POST /blob/uploads/<uuid>/commit` | `201` first completion; `200` receipt replay | Verify the complete object, publish and pin; return the same blob reference on replay |
+| `DELETE /blob/uploads/<uuid>` | `204` | Abort, delete the row and free the owner/key; a repeated abort is `404`. Completed receipts and owner pins are untouched |
+
+Create requires `X-Cosmix-Owner` and `X-Cosmix-Size` (decimal bytes, including
+zero, at most 9007199254740991). Optional headers are `X-Cosmix-Expect`
+(`b3:<64 hex>`), `X-Cosmix-Mime`, `X-Cosmix-Name` and `X-Cosmix-Upload-Key`.
+The key is scoped to the owner: replay returns the existing session only if
+size, expected hash, mime and name also match; otherwise `409`. Owner and key
+are at most 128 bytes, mime 256 and name 1024; control characters are refused.
+Name uses RFC 3986 percent-encoded UTF-8 on both v1 and session routes;
+`+` stays literal, `%HH` decodes bytes, and malformed escapes, invalid UTF-8
+and decoded control characters are 400. The 1024-byte limit applies after
+decoding. JSON/references store the decoded name; HEAD percent-encodes it
+again. Other headers, including Mime, must be ASCII HTTP text; Mime is not
+percent-decoded and defaults as for v1 uploads.
+
+PATCH requires `Content-Range: bytes <start>-<inclusive end>/<whole size>`
+and `Content-Length: <end-start+1>`. Wildcards, multiple ranges and
+`Transfer-Encoding` are refused. Optional `Content-Type` must be
+`application/octet-stream`; optional `Content-Encoding` must be `identity`.
+The start must equal the committed offset: there is **no exact-chunk replay**.
+After a lost response or `409`, HEAD determines where to resume. Empty objects
+commit immediately without a PATCH. Short, excess, disconnected or timed-out
+bodies roll back under the writer guard before another mutation can start.
+An ambiguous database error is resolved against the persisted offset before
+rollback. A `500` therefore requires HEAD before retrying.
+
+Successful create, HEAD and PATCH include `X-Cosmix-Offset`, `X-Cosmix-Size`,
+`X-Cosmix-Expires` (epoch ms), `X-Cosmix-State`, `X-Cosmix-Owner` and
+`X-Cosmix-Mime`; optional identity fields are `X-Cosmix-Expect`,
+`X-Cosmix-Name`, `X-Cosmix-Upload-Key` and, once known, `X-Cosmix-Blob`.
+States are `active`, `committing`, `complete`, `failed`, `aborted`.
+Every session response has `Cache-Control: no-store`. A `409` also carries
+`X-Cosmix-Offset` (and an `offset` JSON member unless HEAD).
+
+| Error | Meaning |
+|---|---|
+| `400` | Invalid creation identity, range/length mismatch, duplicate contract header, short/excess/disconnected body |
+| `404` | Unknown, malformed UUID or expired session |
+| `408` | PATCH body idle for 30 seconds, or body deadline reached |
+| `409` | Offset, state or creation-key identity conflict; incomplete commit; concurrent mutation; invalid staging |
+| `411` | PATCH lacks Content-Length |
+| `413` | Owner or total reservation/settlement quota refused |
+| `415` | Unsupported PATCH content type or encoding |
+| `422` | Complete bytes do not match the expected BLAKE3; session becomes failed |
+| `429` | Session/receipt count bound reached |
+| `503` | Transfer or control-worker admission full |
+| `500` | Filesystem, database or internal worker failure |
+
+Mutation admission is nonblocking per session. PATCH and commit share the
+`lane_max_uploads` pool with v1 uploads; create, HEAD and abort use a separate
+16-worker control pool. Under global overload `503` can precede the session
+conflict check. Default active bounds are 16 per owner and 64 total, including
+`committing`; configure these with `upload_per_owner` and `upload_total`.
+Terminal rows do not consume these slots. A separate global receipt budget of
+`max(1024, 2 × upload_total)` (1024 by default, 8192 at the maximum configuration)
+reserves one future receipt slot for each admitted live session;
+creation returns 429 when that budget is full. Receipts are never evicted
+before their TTL. Aborts delete the row and free the owner/key immediately;
+failed rows remain visible for at most 24 hours. Zero-byte sessions count too.
+
+Expiry is enforced on operations and by a 30-second sweep, independent of the
+Bus connection. Expired resources are unavailable even if a current writer
+delays physical cleanup and reservation release. `committing` rows do not
+expire: restart attempts recovery; a transient publication or settlement
+failure retains the reservation and GC protection for a client commit retry.
+Successful completion starts the 24-hour receipt lifetime. When it expires,
+the session/key is forgotten; the completed object and owner pin remain.
+These are mesh-open routes like the existing lane; owner is an accounting
+label, not an authenticated principal.
 
 ## Fetching
 
@@ -125,24 +209,99 @@ A `blob.fetch` interrupted by a restart leaves at most staging residue under `bl
 
 ## Storage layout
 
+The durable upload core uses `blobd.sqlite` schema v4 and `blobs/.uploads/`.
+Each new session records the staging descriptor's device/inode as decimal
+text (no unsigned-to-SQLite integer narrowing). Before PATCH, restore truncation
+or commit preparation, fstat must match that identity and report one link.
+Linked or replaced staging fails the session as corrupt before any write.
+The v4 migration fails legacy unfinished sessions whose creation identity was
+never recorded; it preserves completed receipts. Callers must start new sessions
+for those failures. Migration DDL, invalidation and version marker are atomic.
+
+Local `blob.put` refuses sources canonicalised inside this instance's entire
+store root, including symlink aliases, `.uploads`, `.tmp`, and CAS shards, for
+every ingest mode: `invalid_arguments: source inside the store`. Store database
+and sidecar identities are pinned at open and checked again during admission.
+Canonical ancestors are opened relative to pinned directory descriptors with
+no symlink following; comparing their device/inode identities also refuses
+bind-mounted root aliases. Source descriptors use O_RDONLY, O_NOFOLLOW and
+O_NONBLOCK, with fstat refusing non-regular files. Copy/reflink reads and hard
+links use that exact descriptor, never a reopened source path. Hard-link
+staging must produce exactly two links to the checked inode or fail before
+publication. The independent session PATCH inode guard remains in place. Stage caller
+inputs outside that root. Hard-link ingest still requires an immutable source.
+MIME inference uses the caller's filename (or explicit name hint), even when
+a symlink resolves to a differently named source. Resolved paths and descriptors
+are used for admission and reading only.
+SQLite boundaries use checked signed 64-bit integers: negative stored sizes,
+offsets and timestamps report integer corruption; out-of-range unsigned
+inputs are refused before binding. The existing non-negative CHECK constraints
+remain in place. The additive mds publication helper ships in mds **0.3.5**;
+mds **0.4.0** is reserved for blob-index schema v2 and its lazy migration.
+Active sessions reserve their whole declared size across daemon restarts.
+SQLite uses WAL with `synchronous=FULL`; a chunk is acknowledged only after
+its staging file is synced and its offset update commits. Startup truncates
+uncommitted tails to that offset, records missing or short staging as a failed
+session (never extends it), and removes orphan staging. The v1 `.tmp` wipe
+remains separate. Session and receipt counts are bounded independently of
+active HTTP transfer concurrency. The mds blob-index schema remains v1.
+
+Session commit persists a `committing` row and actual hash before publishing
+the verified file with mds's preserve-source, no-replace hard-link helper.
+GC treats that pending hash as pinned. One blobd transaction then settles
+the reservation, attributes, owner pin and completion receipt; only afterwards
+is staging unlinked. Restart replays pending commits before ordinary expiry
+and CAS reconciliation. Completed receipts last 24 hours: repeating commit
+returns the same reference without charging or pinning again, even if its
+first response was lost. A hash mismatch fails and discards the session before
+publication. Aborting a completed session never removes its pin or object.
+
+
 ```text
 /var/lib/cosmix/blobd/
 ├── blobs/<h2>/<h2>/<hash64>   mds CAS: immutable, sharded, BLAKE3-named
-├── blobs/.tmp/                staging (emptied at every startup)
+├── blobs/.tmp/                v1/fetch staging (emptied at every startup)
+├── blobs/.uploads/<uuid>      durable session staging (excluded from CAS scans)
 ├── blobs.sqlite               mds's box-wide blob index (schema v1, untouched)
-├── blobd.sqlite               blobd-owned: blob_attrs, pins, quota
+├── blobd.sqlite               blobd-owned: blob_attrs, pins, quota, upload_sessions
 └── .blobd.lock                exclusive instance flock
 ```
 
-mds's `blobs.sqlite` schema is never touched (`BLOBS_LATEST` stays 1 — ADR D4): blobd holds a read-only connection to it for refcount truth and joins it against its own pin table. Attributes (mime, name hint, origin, first_put), owner pins and quota accounting live in `blobd.sqlite` beside it. Folding them into mds as a schema v2 is P4 work.
+mds's `blobs.sqlite` schema is never touched (`BLOBS_LATEST` stays 1 — ADR D4): blobd reads it for refcount truth and joins it against its own pin table. Attributes (mime, name hint, origin, first_put), owner pins, quota accounting and sessions live in `blobd.sqlite` beside it. Each blobd migration commits its DDL and version marker in the same transaction.
 
-At startup blobd removes everything under `blobs/.tmp` (nothing in-flight can survive its own restart) and runs one directory-vs-database reconcile: CAS files with no mds row and no pin, older than the 60-second grace window, are logged as orphans but never deleted at startup — `blob.gc` owns deletion.
+At startup blobd removes everything under `blobs/.tmp`, restores durable sessions separately, and runs one directory-vs-database reconcile. Old CAS files with no mds row and no pin are logged as orphans but never deleted at startup — `blob.gc` owns deletion.
+
+`blobs/.uploads` must reside on the same filesystem as `blobs/`: commit uses
+hard links for atomic publication. Startup compares their device IDs and
+also probes a real hard link from a unique temporary file under `.uploads`
+into `blobs/.tmp`, removing both probe paths afterwards. This detects bind
+mount boundaries that share a device ID but still return EXDEV. An incompatible
+staging mount refuses startup with a clear configuration error.
 
 ## Garbage collection and quotas
 
 `blob.gc` sweeps CAS files whose mds refcount is 0 (no row counts as 0 — every blobd put is rowless until a set references it), that carry no pin, and whose mtime is older than the 60-second grace window (`DEFAULT_GC_QUIESCENCE`). A dry run lists candidates; a live run unlinks, drops attributes and adjusts quota accounting. Pinned blobs are never candidates.
 
 Quotas are correctness, not authorisation: an upload (a `blob.put`, a lane body, a `blob.fetch` download) **reserves** the owner cap and the total cap at admission — the declared `Content-Length`, or the owner's whole remaining room when the length is unknown — so concurrent uploads cannot each spend the same headroom; the accounting settles to the real size when the pin lands, and an abort releases the reservation. `used` is the sum of distinct pinned blob sizes per owner; `blob.quota` reports `reserved` (the in-flight headroom) beside it; unpinning releases it. Idempotent re-puts of an already-pinned blob are refused at the cap like any other put (the quota check runs before the hash is known).
+
+Quota admission includes all outstanding reservations on every pin path,
+including existing-hash puts and fetch joiners. Each transfer has an
+identifiable hold; settlement credits only that hold while charging the pin.
+`total.used` sums owner charges (the same object pinned by two owners is
+charged twice). It is not unique CAS disk usage or a free-space guarantee.
+`reserved` sums whole declared sizes from durable active/committing rows plus
+identified ephemeral holds for local puts, v1 uploads and fetches. Sessions
+continue reserving their full size after each successful PATCH. GC also treats
+committing hashes as pinned until settlement or explicit failure.
+
+Commit checks settlement quota under the reservation/database locks before
+recording intent. Permanent failures (quota, corrupt CAS/staging, EXDEV or
+permission refusal during publication) mark the session failed and release its
+reservation and GC protection atomically; `blob.upload.list` retains the error.
+Transient I/O failures keep the committing row for recovery. An existing readable
+producer-owned CAS entry may refuse timestamp refresh: this is logged and ignored,
+because the committing row and settled pin protect it. Failed publication leaves
+any unpinned CAS entry to normal GC grace handling.
 
 ## Permissions
 
@@ -159,6 +318,82 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 - `blob.props.changed` (SPEC-07 shape; `lifecycle.generation` is transient)
 
 ## Mix
+
+### Caller-local file transfer (blob.mix 0.2.0, Mix 0.97.0)
+
+`blob_upload_file(path, opts)` streams a caller-local file through durable
+sessions. Required options are `owner` and `resume_file`; `service` defaults to
+`blobd`, and `chunk` defaults to 8 MiB. Optional `mime` defaults to
+`application/octet-stream`; `name` is optional. Keep the source immutable and
+the resume record exclusive to one caller. Sizes/chunks must be exact Mix
+integers through 9007199254740991; chunk must be positive.
+
+The library hashes the source, then checks `blob.stat` on the target service.
+`blob.stat` includes the stored `name` (explicit null when absent), alongside
+size, mime and origin. Presence **and this owner's pin** return a reference
+using those stored fields, including name, without another upload. If a matching
+resume record still names an upload, the shortcut discovers the lane and sends
+DELETE to release that stale session. Cleanup is best-effort; 204/404 clears
+the recorded upload ID, while other failures retain it for retry. Without a
+recorded upload, no lane discovery is needed. Otherwise `blob.props.get path="lane.bind"` discovers
+the target's HTTP lane over the Bus. There is no hard-coded lane address or
+alternate control transport.
+
+The caller-owned JSON record contains `service`, `owner`, `size`, `blake3`
+(bare lowercase digest), `upload` (UUID or initially null), `key`, `mime`, and
+`name`. It is written atomically with file+directory sync and mode 0600 before
+create, then updated with the upload ID before the first byte. A lost create
+response therefore retains the idempotency key. Re-entry verifies the record's
+identity, replays create with that key, and takes its offset from HEAD. A swept
+session can start again under the same key. Failed sessions remain explicit
+failures: abort/remove the caller's record deliberately to start afresh.
+The record is never removed implicitly, including after success. It must be
+a regular file separate from the source; existing symlinks are refused.
+
+PATCH sends inclusive windows with exact Content-Range and Content-Length.
+The library reads HEAD after success, 409, or a lost response, verifies session
+identity, and resumes from the durable offset. Three consecutive no-progress
+attempts return an error; an early rejection during a large PUT/PATCH can be
+reported as transport status 0 with the server diagnostic lost, so HEAD is
+authoritative for recovery. Call again with the same record. Empty files commit
+without PATCH. Commit accepts 201 or the replayed 200 receipt. After a lost
+response (status 0), 409 or 503 it polls HEAD with backoff (1 second doubling
+to 30 seconds). While the state remains committing it replays commit at most
+every 30 seconds: a live worker returns 409, while a stranded intent restarts
+publication/settlement. Once complete it replays commit to read the receipt;
+failed state exits immediately. `opts.commit_timeout` bounds this recovery loop (positive
+integer seconds, default 900); individual calls use `control_timeout` (default
+30 whole seconds), capped by the remaining whole seconds; recovery stops
+when less than a second remains, never passing zero as an unlimited timeout.
+Blocking DNS/IO retains the HTTP
+client's best-effort timeout limitations. A timeout leaves the resume record
+available for another invocation. Receipts last 24 hours; the owner-pin check
+also resolves completion after receipt expiry.
+
+`blob_download_file(ref, path[, opts])` discovers the target lane and calls
+`http_get_file` with `expect_blake3` from the reference. It returns the verified
+`http_file_response` under `result`. Options `append`, `overwrite`, and
+`max_bytes` follow the [Mix HTTP contract](../../mix/http.md). `service` selects
+the target explicitly; the reference's origin does not silently change routing.
+
+Both helpers retain `{ok, rc, result}`. Bus failures keep their rc; local,
+protocol and transfer failures use rc 10 with a message or HTTP response under
+`result`. Upload success returns the blob reference. They catch argument/IO
+errors into this envelope. Transfer options `idle_timeout`, `deadline`,
+`ssl_verify`, `ca_file`, and `ca_pem` are forwarded. The deadline applies per
+PATCH/GET and is cooperative, best-effort during blocking DNS/IO, not a hard
+bound on the library call. Body-free HEAD/create/commit calls use buffered
+`http_request` with `control_timeout` (default 30 seconds) and the TLS options.
+
+```mix
+$b = require("/path/to/cosmix-blobd/mix/blob.mix")
+$up = $b.blob_upload_file("capture.png", {owner: "capture", resume_file: "capture.upload.json"})
+if not $up.ok then die to_string($up.result) end
+$down = $b.blob_download_file($up.result, "verified.png", {})
+if not $down.ok then die to_string($down.result) end
+```
+
+### Bus verb wrappers
 
 `mix/blob.mix` (shipped beside the daemon) is the script surface: a `require()` library, not builtins — thin wrappers over `send` that inherit its non-fatal failure bands for free instead of re-encoding them. Load it beside the crate or from an install:
 

@@ -11901,6 +11901,11 @@ impl Evaluator {
                         // gated on policy presence so the unsandboxed hot
                         // path pays nothing.
                         if self.globals.borrow().capability_policy.is_some() {
+                            if let Some(info) = builtins::builtin_info_of(name) {
+                                for cap in info.contract.required_caps {
+                                    self.check_capability_class(*cap, name)?;
+                                }
+                            }
                             for cc in builtins::conditional_capabilities(name) {
                                 if builtins::conditional_cap_engaged(name, &eval_args, cc.option) {
                                     self.check_capability_class(cc.capability, name)?;

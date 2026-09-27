@@ -82,7 +82,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
-    let store = match Store::open(&root, StoreOptions::from_config(&cfg, origin)) {
+    let store = match Store::open_with_uploads(
+        &root,
+        StoreOptions::from_config(&cfg, origin),
+        cosmix_blobd::core::store::UploadLimits::from_config(&cfg)?,
+    ) {
         Ok(store) => Arc::new(store),
         Err(StoreError::Locked(path)) => {
             refusal::fatal(&refusal::root_locked(&path));
@@ -96,6 +100,22 @@ async fn async_main() -> anyhow::Result<()> {
             report.orphans.len()
         );
     }
+
+    // Lifecycle maintenance is independent of broker connectivity and whether
+    // a byte lane is configured. Never overlap sweeps or block the executor.
+    let sweep_store = Arc::clone(&store);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let store = Arc::clone(&sweep_store);
+            match tokio::task::spawn_blocking(move || store.sweep_uploads()).await {
+                Ok(Ok(())) => {}
+                other => warn!("upload expiry sweep: {other:?}"),
+            }
+        }
+    });
 
     // The byte lane. The bind proof runs before any socket is opened —
     // fail closed: the bind IP must be this node's own wg_ip, never

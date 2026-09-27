@@ -14,6 +14,10 @@ use std::rc::Rc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+#[cfg(feature = "http")]
+#[path = "http_files.rs"]
+mod http_files;
+
 /// Magnitude of a negative signed index, saturated to `usize`. The one
 /// safe spelling: `(-idx)` overflows at `i64::MIN` (debug panic, release
 /// wraparound — reachable from script via any bound that saturates the
@@ -370,6 +374,8 @@ builtin_table! {
     ("http_get", CapabilityClass::Network,        "system",  "HTTP GET. http_get(url, [headers], [{timeout, ssl_verify, ca_file, ca_pem}] — timeout default 30, 0 disables; ssl_verify default true, false skips TLS cert/hostname checks like curl -k; ca_file/ca_pem ADD a private CA to the default roots — mutually exclusive with each other and with ssl_verify:false, 4 MiB cap, bad PEM raises HTTP_TLS, v0.29.0) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). `body` is the response decoded as UTF-8 (nil if not valid UTF-8); `bytes` is the raw byte buffer. Response bodies are capped at 64 MiB (over-cap → {status:0, error}).", contract!((url: string, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
     ("http_post", CapabilityClass::Network,       "system",  "HTTP POST. http_post(url, body, [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((url: string, body: any, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
     ("http_request", CapabilityClass::Network,    "system",  "HTTP any-verb. http_request(method, url, [body], [headers], [{timeout, ssl_verify, ca_file, ca_pem}]) → {status, body, bytes, headers, final_url, duration_ms, error_code, error} (headers lowercase-name→list; final_url after redirects; transport failure = status:0 + HTTP_* error_code; v0.30.0). Opts (incl. ssl_verify: false → skip TLS verification like curl -k) and `body`/`bytes` semantics (incl. the 64 MiB body cap) match http_get.", contract!((method: string, url: string, body?: any, headers?: map, opts?: map) -> map("http_response", {status: number, body: any, bytes: bytes, headers: map, final_url: string, duration_ms: number, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result]; cond_caps[ca_file: FsRead])),
+    ("http_put_file", CapabilityClass::Network, "system", "Stream a regular file or inclusive range with exact Content-Length. Opts: method PUT/POST/PATCH (default PUT), range:{start,end}, headers, idle_timeout (seconds, default 30), deadline (seconds, default 0), ssl_verify, ca_file, ca_pem. Redirects disabled; 3xx returned. Deadline is cooperative and best-effort during blocking DNS/IO. Fixed 64 KiB transfer buffer; response capped at 64 MiB. Operational errors return status:0; invalid options raise. bytes_written counts source bytes consumed, size is window size, blake3 hashes that window (nil on failure). published is false (no local publication).", contract!((url: string, path: string, opts?: map("http_put_file_options", {method: string, range: map, headers: map, idle_timeout: number, deadline: number, ssl_verify: bool, ca_file: string, ca_pem: any})) -> map("http_file_response", {status: number, headers: map, bytes_written: number, size: number, blake3: any, body: any, bytes: bytes, final_url: string, duration_ms: number, error_code: any, error: any, published: bool}); effects[must_use, blocking]; failure[returns_result]; caps[FsRead])),
+    ("http_get_file", CapabilityClass::Network, "system", "Stream GET through a unique temp sibling and publish atomically. Opts: overwrite (default false), append (default false; requires expect_blake3 and matching 206 Content-Range), expect_blake3 (64 lowercase hex), max_bytes (final size), headers, idle_timeout (seconds, default 30), deadline (seconds, default 0), ssl_verify, ca_file, ca_pem. 200/206 require identity framing and Content-Length; missing length or encoded responses return HTTP_IDENTITY_FRAMING. Append copies and hashes the existing prefix. Redirects returned; error bodies never installed. No-replace is atomic. Deadline is cooperative and best-effort during blocking DNS/IO. bytes_written counts downloaded bytes, size includes prefix, blake3 hashes the final file. published records publication even if directory fsync fails. Operational errors return status:0; invalid options raise.", contract!((url: string, path: string, opts?: map("http_get_file_options", {overwrite: bool, append: bool, expect_blake3: string, max_bytes: number, headers: map, idle_timeout: number, deadline: number, ssl_verify: bool, ca_file: string, ca_pem: any})) -> map("http_file_response", {status: number, headers: map, bytes_written: number, size: number, blake3: any, body: any, bytes: bytes, final_url: string, duration_ms: number, error_code: any, error: any, published: bool}); effects[must_use, blocking]; failure[returns_result]; caps[FsWrite]; cond_caps[append: FsRead, ca_file: FsRead])),
     ("bytes_len", CapabilityClass::Pure,       "system",  "Length of a Value::Bytes buffer in bytes (v0.3.1)", contract!((b: any_of(bytes, buffer)) -> number)),
     ("string_to_bytes", CapabilityClass::Pure, "system",  "Convert a string to its UTF-8 byte representation (v0.3.1)", contract!((s: string) -> bytes)),
     ("bytes_to_string", CapabilityClass::Pure, "system",  "Convert a bytes buffer to a string; strict UTF-8, or pass {lossy:true} for a from_utf8_lossy decode (v0.17.2). Also accepts a Buffer.", contract!((b: any_of(bytes, buffer), opts?: map) -> string)),
@@ -817,6 +823,10 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         #[cfg(feature = "http")]
         "http_get" => builtin_http_get(args),
         #[cfg(feature = "http")]
+        "http_put_file" => http_files::put(args),
+        #[cfg(feature = "http")]
+        "http_get_file" => http_files::get(args),
+        #[cfg(feature = "http")]
         "http_post" => builtin_http_post(args),
         #[cfg(feature = "http")]
         "http_request" => builtin_http_request(args),
@@ -1159,6 +1169,12 @@ pub fn conditional_cap_engaged(name: &str, args: &[Value], option: &str) -> bool
             map_has(opts)
         };
         match name {
+            "http_get_file" => {
+                if option == "append" {
+                    return matches!(args.get(2), Some(Value::Map(m)) if matches!(m.get("append"), Some(Value::Bool(true))));
+                }
+                return map_has(args.get(2));
+            }
             "http_get" => return opts_in_slots(args.get(1), args.get(2)),
             "http_post" => return opts_in_slots(args.get(2), args.get(3)),
             "http_request" => {
@@ -19525,7 +19541,7 @@ fn http_body_from(value: &Value) -> (Option<String>, Option<Vec<u8>>) {
 #[cfg(feature = "http")]
 const HTTP_DEFAULT_TIMEOUT_S: u64 = 30;
 
-/// A cached ureq agent that skips TLS certificate + hostname verification,
+/// A cached TLS configuration that skips certificate + hostname verification,
 /// for `http_*(..., {ssl_verify: false})`. The TLS handshake still runs —
 /// signatures are checked against the ring provider's algorithms — only the
 /// certificate-chain / hostname trust decision is bypassed, exactly like
@@ -19533,7 +19549,7 @@ const HTTP_DEFAULT_TIMEOUT_S: u64 = 30;
 /// self-signed internal endpoints (e.g. Proxmox/PBS APIs) where pinning a CA
 /// is impractical; never the default.
 #[cfg(feature = "http")]
-fn insecure_http_agent() -> ureq::Agent {
+fn insecure_http_config() -> std::sync::Arc<ureq::rustls::ClientConfig> {
     use std::sync::{Arc, OnceLock};
     use ureq::rustls;
 
@@ -19577,7 +19593,7 @@ fn insecure_http_agent() -> ureq::Agent {
         }
     }
 
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    static AGENT: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     AGENT
         .get_or_init(|| {
             let provider = rustls::crypto::ring::default_provider();
@@ -19588,7 +19604,7 @@ fn insecure_http_agent() -> ureq::Agent {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoCertVerify { algs }))
                 .with_no_client_auth();
-            ureq::builder().tls_config(Arc::new(config)).build()
+            Arc::new(config)
         })
         .clone()
 }
@@ -19611,7 +19627,7 @@ const HTTP_CA_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// ADDITIVE (D8): normal chain building and hostname verification
 /// still run; this never weakens verification for public hosts.
 #[cfg(feature = "http")]
-fn ca_http_agent(name: &str, pem: &[u8]) -> MixResult<ureq::Agent> {
+fn ca_http_agent(name: &str, pem: &[u8]) -> MixResult<std::sync::Arc<ureq::rustls::ClientConfig>> {
     use std::sync::Arc;
     use ureq::rustls;
 
@@ -19637,7 +19653,21 @@ fn ca_http_agent(name: &str, pem: &[u8]) -> MixResult<ureq::Agent> {
         .expect("ring provider supports rustls default protocol versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(ureq::builder().tls_config(Arc::new(config)).build())
+    Ok(Arc::new(config))
+}
+
+/// Shared TLS selection; callers configure socket timeouts and redirects
+/// on this builder before constructing an agent.
+#[cfg(feature = "http")]
+fn http_agent_builder(insecure: bool, ca: Option<&std::sync::Arc<ureq::rustls::ClientConfig>>) -> ureq::AgentBuilder {
+    let builder = ureq::builder();
+    if insecure {
+        builder.tls_config(insecure_http_config())
+    } else if let Some(config) = ca {
+        builder.tls_config(std::sync::Arc::clone(config))
+    } else {
+        builder
+    }
 }
 
 #[cfg(feature = "http")]
@@ -19648,7 +19678,7 @@ fn http_dispatch(
     headers: &[(String, String)],
     timeout_s: u64,
     insecure: bool,
-    ca_agent: Option<&ureq::Agent>,
+    ca_agent: Option<&std::sync::Arc<ureq::rustls::ClientConfig>>,
 ) -> Value {
     if !is_http_token(method) {
         let mut map = indexmap::IndexMap::new();
@@ -19665,13 +19695,7 @@ fn http_dispatch(
         map.insert("duration_ms".into(), Value::Number(0.0));
         return Value::map(map);
     }
-    let mut req = if insecure {
-        insecure_http_agent().request(method, url)
-    } else if let Some(agent) = ca_agent {
-        agent.request(method, url)
-    } else {
-        ureq::request(method, url)
-    };
+    let mut req = http_agent_builder(insecure, ca_agent).build().request(method, url);
     if timeout_s > 0 {
         // Total-request deadline (connect + transfer), like ssh_run's
         // wall-clock bound.
@@ -19745,9 +19769,8 @@ fn http_response_meta_into_map(resp: &ureq::Response, map: &mut indexmap::IndexM
 /// Classify a ureq transport error into a stable HTTP_* code (D8) from
 /// the TYPED `ErrorKind` rather than display text — a ureq/rustls
 /// wording change can't silently reclassify a failure (codex 0.30
-/// review, MAJOR). Only the TLS-vs-generic-Io split falls back to the
-/// source chain, because ureq wraps rustls errors inside `Io` with no
-/// dedicated kind.
+/// review, MAJOR). Socket timeouts, closed connections and TLS failures
+/// inspect typed sources because ureq wraps them in transport errors.
 #[cfg(feature = "http")]
 fn http_transport_error_code(e: &ureq::Error) -> &'static str {
     use ureq::ErrorKind;
@@ -19757,6 +19780,12 @@ fn http_transport_error_code(e: &ureq::Error) -> &'static str {
     // consult these (codex convergence review, MAJOR).
     if source_is_timeout(e) {
         return "HTTP_TIMEOUT";
+    }
+    if source_has_io_kind(
+        e,
+        &[std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::ConnectionReset],
+    ) {
+        return "HTTP_TRANSPORT";
     }
     if source_is_tls(e) {
         return "HTTP_TLS";
@@ -19788,15 +19817,30 @@ fn source_is_tls(e: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Walk the error source chain for a TimedOut io error.
+/// Socket inactivity can surface as TimedOut or WouldBlock, depending on
+/// the platform and which socket operation stalled.
 #[cfg(feature = "http")]
 fn source_is_timeout(e: &(dyn std::error::Error + 'static)) -> bool {
+    source_has_io_kind(
+        e,
+        &[std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock],
+    )
+}
+
+#[cfg(feature = "http")]
+fn source_has_io_kind(e: &(dyn std::error::Error + 'static), kinds: &[std::io::ErrorKind]) -> bool {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = cur {
-        if let Some(io) = err.downcast_ref::<std::io::Error>()
-            && io.kind() == std::io::ErrorKind::TimedOut
-        {
-            return true;
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if kinds.contains(&io.kind()) {
+                return true;
+            }
+            // io::Error::source delegates to its payload's source, which
+            // can skip a nested io::Error. Inspect the payload itself first.
+            if let Some(inner) = io.get_ref() {
+                cur = Some(inner);
+                continue;
+            }
         }
         cur = err.source();
     }
@@ -19829,7 +19873,7 @@ fn http_map_is_opts(m: &indexmap::IndexMap<String, Value>) -> bool {
 struct HttpOpts {
     timeout_s: u64,
     insecure: bool,
-    ca_agent: Option<ureq::Agent>,
+    ca_agent: Option<std::sync::Arc<ureq::rustls::ClientConfig>>,
 }
 
 /// Parse the http opts map `{timeout, ssl_verify, ca_file, ca_pem}`.

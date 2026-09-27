@@ -1067,10 +1067,11 @@ version = "0.2.0"
 
 [[package]]
 name = "cosmix-blobd"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
@@ -1089,6 +1090,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1515,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.96.1"
+version = "0.97.0"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1784,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mds"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "assert_cmd",
  "blake3",
@@ -1840,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.96.2"
+version = "0.97.0"
 dependencies = [
  "blake3",
  "chrono",

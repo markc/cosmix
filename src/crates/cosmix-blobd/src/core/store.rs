@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use cosmix_mds::Mds;
 use cosmix_mds::SqliteCasMds;
 use cosmix_mds::blob::{self, PutMode};
 use cosmix_mds::blob_index;
@@ -35,6 +34,12 @@ use super::config::Config;
 use super::mime;
 use super::reference::Reference;
 
+#[path = "uploads.rs"]
+mod uploads;
+#[path = "ingest.rs"]
+mod ingest;
+pub use uploads::{UploadCreate, UploadLimits, UploadSession};
+
 /// Name of the exclusive instance lock inside the mds root.
 pub const LOCK_FILE: &str = ".blobd.lock";
 /// mds's `DEFAULT_GC_QUIESCENCE` (60 s): the grace a CAS file's mtime
@@ -44,7 +49,7 @@ pub const LOCK_FILE: &str = ".blobd.lock";
 pub const DEFAULT_GC_GRACE_SECS: u64 = 60;
 
 const BLOBD_APPLICATION_ID: i32 = 0x626C_6F62; // 'blob'
-const BLOBD_LATEST: u32 = 2;
+const BLOBD_LATEST: u32 = 4;
 const BLOBD_V1_SQL: &str = "\
 PRAGMA application_id = 0x626C6F62;        -- 'blob'
 PRAGMA user_version   = 1;
@@ -85,6 +90,11 @@ pub enum StoreError {
     Locked(PathBuf),
     Mds(cosmix_mds::Error),
     Db(String),
+    /// A persisted integer cannot represent its non-negative domain value.
+    CorruptInteger {
+        column: usize,
+        value: i64,
+    },
     Io(io::Error),
     /// The `b3:` blob id did not parse.
     InvalidBlob(String),
@@ -107,10 +117,18 @@ pub enum StoreError {
     },
     /// Bad request (e.g. `mode: hardlink` without `immutable: true`).
     BadRequest(String),
+    SourceInsideStore,
     /// A bounded resource is taken; the verb replies rc 10 `busy:
     /// <why>` — the `blob.fetch` queue is full (`fetch_queue_max`), or
     /// another `blob.gc` is already sweeping (one GC owner, M2b).
     Busy(&'static str),
+    UploadMissing,
+    UploadConflict {
+        offset: u64,
+        reason: String,
+    },
+    UploadLimit,
+    UploadVerify,
 }
 
 impl std::fmt::Display for StoreError {
@@ -123,6 +141,10 @@ impl std::fmt::Display for StoreError {
             ),
             Self::Mds(e) => write!(f, "mds: {e}"),
             Self::Db(e) => write!(f, "blobd.sqlite: {e}"),
+            Self::CorruptInteger { column, value } => write!(
+                f,
+                "SQLite integer corruption: column {column} contains {value}"
+            ),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::InvalidBlob(s) => write!(f, "invalid blob id: {s:?}"),
             Self::NotPresent(s) => write!(f, "not_present: {s}"),
@@ -142,7 +164,14 @@ impl std::fmt::Display for StoreError {
                 write!(f, "quota: total would use {would_use} over the cap {limit}")
             }
             Self::BadRequest(s) => write!(f, "bad request: {s}"),
+            Self::SourceInsideStore => write!(f, "invalid_arguments: source inside the store"),
             Self::Busy(why) => write!(f, "busy: {why}; retry later"),
+            Self::UploadMissing => write!(f, "upload unknown or expired"),
+            Self::UploadConflict { offset, reason } => {
+                write!(f, "upload conflict at {offset}: {reason}")
+            }
+            Self::UploadLimit => write!(f, "upload session or receipt limit reached"),
+            Self::UploadVerify => write!(f, "upload hash verification failed; session discarded"),
         }
     }
 }
@@ -225,6 +254,7 @@ pub struct StatInfo {
     pub present: bool,
     pub size: Option<u64>,
     pub mime: Option<String>,
+    pub name: Option<String>,
     pub pins: Vec<String>,
     pub origin: Option<String>,
     pub first_put: Option<i64>,
@@ -255,9 +285,29 @@ pub struct OwnerQuota {
 /// size.
 #[derive(Debug)]
 pub struct Reservation {
-    reserved: Arc<Mutex<BTreeMap<String, u64>>>,
+    reserved: Arc<Mutex<Reservations>>,
+    id: u64,
     owner: String,
     amount: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Reservations {
+    next: u64,
+    holds: BTreeMap<u64, (String, u64)>,
+}
+
+impl Reservations {
+    fn totals(&self, exclude: Option<u64>) -> BTreeMap<String, u64> {
+        let mut totals = BTreeMap::<String, u64>::new();
+        for (id, (owner, amount)) in &self.holds {
+            if Some(*id) != exclude {
+                let value = totals.entry(owner.clone()).or_default();
+                *value = value.saturating_add(*amount);
+            }
+        }
+        totals
+    }
 }
 
 impl Reservation {
@@ -271,17 +321,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut reserved = self.reserved.lock().unwrap();
-        let left = reserved
-            .get(&self.owner)
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(self.amount);
-        if left == 0 {
-            reserved.remove(&self.owner);
-        } else {
-            reserved.insert(self.owner.clone(), left);
-        }
+        self.reserved.lock().unwrap().holds.remove(&self.id);
     }
 }
 
@@ -352,6 +392,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 /// The blobd store. `Send + Sync`: both connections live behind mutexes.
 pub struct Store {
     root: PathBuf,
+    ingest_root: ingest::IngestRoot,
     mds: SqliteCasMds,
     /// blobd-owned `blobd.sqlite`: attrs, pins, quotas.
     db: Mutex<Connection>,
@@ -361,7 +402,9 @@ pub struct Store {
     /// In-flight upload reservations (M3): owner → bytes admitted but
     /// not yet pinned. Lock order is always reserved → db — a path
     /// holding the db mutex never takes this one.
-    reserved: Arc<Mutex<BTreeMap<String, u64>>>,
+    reserved: Arc<Mutex<Reservations>>,
+    upload_limits: UploadLimits,
+    upload_writers: Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// Holds the root `flock` for the store's lifetime. Never read:
     /// closing it on drop is what releases the lock.
     _lock_file: File,
@@ -386,6 +429,15 @@ impl Store {
     /// root, `blobd.sqlite` migrations, then startup housekeeping
     /// (`.tmp` sweep + orphan reconcile).
     pub fn open(root: impl Into<PathBuf>, options: StoreOptions) -> Result<Self> {
+        Self::open_with_uploads(root, options, UploadLimits::default())
+    }
+
+    pub fn open_with_uploads(
+        root: impl Into<PathBuf>,
+        options: StoreOptions,
+        upload_limits: UploadLimits,
+    ) -> Result<Self> {
+        upload_limits.validate()?;
         let root = root.into();
 
         // One GC owner per root. flock locks are per open file
@@ -424,11 +476,14 @@ impl Store {
         apply_cas_group(&root, &mds.blobs_root(), &options.cas_group);
 
         let mut store = Self {
+            ingest_root: ingest::IngestRoot::open(&root)?,
             root,
             mds,
             db: Mutex::new(db),
             index: Mutex::new(index),
-            reserved: Arc::new(Mutex::new(BTreeMap::new())),
+            reserved: Arc::new(Mutex::new(Reservations::default())),
+            upload_limits,
+            upload_writers: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             _lock_file: lock_file,
             options,
             startup: StartupReport::default(),
@@ -465,6 +520,7 @@ impl Store {
             );
         }
 
+        self.restore_uploads()?;
         let grace = Duration::from_secs(DEFAULT_GC_GRACE_SECS);
         for file in self.cas_scan()? {
             let has_row = blob_index::blob_row(&self.index.lock().unwrap(), &file.hash)?.is_some();
@@ -518,9 +574,15 @@ impl Store {
     /// can no longer each spend the full headroom — the old
     /// check-then-act read the cap once and never reserved.
     pub fn reserve_upload(&self, owner: &str, declared: Option<u64>) -> Result<Reservation> {
+        if declared.is_some_and(|n| n > i64::MAX as u64) {
+            return Err(StoreError::BadRequest(
+                "size exceeds SQLite integer range".into(),
+            ));
+        }
         let mut reserved = self.reserved.lock().unwrap();
-        let owner_reserved = reserved.get(owner).copied().unwrap_or(0);
-        let total_reserved: u64 = reserved.values().copied().sum();
+        let totals = self.reservation_totals(&self.db.lock().unwrap(), &reserved, None, None)?;
+        let owner_reserved = totals.get(owner).copied().unwrap_or(0);
+        let total_reserved = sum_reserved(&totals);
         let owner_used = self.owner_used(owner)?;
         let total_used = self.total_used()?;
         // Owner cap first — the order Store::put has always checked.
@@ -555,11 +617,17 @@ impl Store {
                 .options
                 .quota_total_bytes
                 .saturating_sub(total_used.saturating_add(total_reserved));
-            owner_room.min(total_room)
+            owner_room.min(total_room).min(i64::MAX as u64)
         });
-        *reserved.entry(owner.to_string()).or_insert(0) += amount;
+        reserved.next = reserved
+            .next
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Db("reservation identifier exhausted".into()))?;
+        let id = reserved.next;
+        reserved.holds.insert(id, (owner.to_string(), amount));
         Ok(Reservation {
             reserved: Arc::clone(&self.reserved),
+            id,
             owner: owner.to_string(),
             amount,
         })
@@ -572,6 +640,11 @@ impl Store {
     /// Idempotent: a re-put returns the same reference and pins
     /// nothing new.
     pub fn put(&self, src: &Path, opts: &PutOptions<'_>) -> Result<PutOutcome> {
+        self.put_after_canonical(src, opts, |_| {})
+    }
+
+    fn put_after_canonical(&self, src: &Path, opts: &PutOptions<'_>, after_canonical: impl FnOnce(&Path)) -> Result<PutOutcome> {
+        let (mut file, _resolved) = self.ingest_root.source(src, after_canonical)?;
         if opts.mode == PutMode::HardLink && !opts.immutable {
             return Err(StoreError::BadRequest(
                 "mode \"hardlink\" requires \"immutable\": true — only a publisher that \
@@ -579,7 +652,7 @@ impl Store {
                     .into(),
             ));
         }
-        let md = fs::metadata(src)?;
+        let md = file.metadata()?;
         if !md.is_file() {
             return Err(StoreError::BadRequest(format!(
                 "path {} is not a regular file",
@@ -590,16 +663,23 @@ impl Store {
         // Quota reserved for the copy's duration; the mid-copy race
         // that read the cap once is closed.
         let size = md.len();
-        let _reservation = self.reserve_upload(opts.owner, Some(size))?;
+        let reservation = self.reserve_upload(opts.owner, Some(size))?;
 
-        let hash = self.mds.put_blob_path(src, opts.mode)?;
+        let (hash, _) = blob::put_file(&self.blobs_root(), &mut file, opts.mode)?;
         let size = blob::size(&self.blobs_root(), &hash)?;
 
         let mime = opts
             .mime
             .map(str::to_string)
             .unwrap_or_else(|| mime::sniff(&os_str_lossy(opts.name, src)).to_string());
-        self.record_upload(&hash, size, &mime, opts.name, opts.owner)
+        self.record_upload_reserved(
+            &hash,
+            size,
+            &mime,
+            opts.name,
+            opts.owner,
+            Some(&reservation),
+        )
     }
 
     /// Post-stream ingest bookkeeping, shared by `blob.put` and the
@@ -620,7 +700,27 @@ impl Store {
         name: Option<&str>,
         owner: &str,
     ) -> Result<PutOutcome> {
+        self.record_upload_reserved(hash, size, mime, name, owner, None)
+    }
+
+    /// Settle this upload's identifiable hold in the same critical section
+    /// as its pin. Other uploads' holds remain unavailable to every pin path.
+    pub fn record_upload_reserved(
+        &self,
+        hash: &BlobHash,
+        size: u64,
+        mime: &str,
+        name: Option<&str>,
+        owner: &str,
+        reservation: Option<&Reservation>,
+    ) -> Result<PutOutcome> {
+        let mut reserved = self.reserved.lock().unwrap();
+        let credit = self.reservation_credit(&reserved, reservation, size)?;
+        if reservation.is_some_and(|r| r.owner != owner) {
+            return Err(StoreError::BadRequest("reservation owner mismatch".into()));
+        }
         let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &reserved, credit, None)?;
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
         }
@@ -650,8 +750,12 @@ impl Store {
             size,
             self.options.owner_limit(owner),
             self.options.quota_total_bytes,
+            &totals,
         )?;
         tx.commit().map_err(db_err)?;
+        if let Some(id) = credit {
+            reserved.holds.remove(&id);
+        }
         drop(db);
         if pinned {
             self.bump_generation();
@@ -691,13 +795,30 @@ impl Store {
         source_node: &str,
         owners: &[String],
     ) -> Result<FetchPins> {
+        self.record_fetch_reserved(hash, size, mime, source_node, owners, None)
+    }
+
+    /// Fetch settlement credits only the initiating transfer's hold; joiners
+    /// pay separately and cannot spend another transfer's reservation.
+    pub fn record_fetch_reserved(
+        &self,
+        hash: &BlobHash,
+        size: u64,
+        mime: &str,
+        source_node: &str,
+        owners: &[String],
+        reservation: Option<&Reservation>,
+    ) -> Result<FetchPins> {
         #[cfg(test)]
         if self.fail_record_fetch.load(Ordering::Relaxed) {
             return Err(StoreError::Db(
                 "injected record_fetch failure (test)".to_string(),
             ));
         }
+        let mut reserved = self.reserved.lock().unwrap();
+        let credit = self.reservation_credit(&reserved, reservation, size)?;
         let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &reserved, credit, None)?;
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
         }
@@ -711,7 +832,9 @@ impl Store {
         )
         .map_err(db_err)?;
         let mut pins = FetchPins::default();
-        for owner in owners {
+        let mut ordered = owners.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|owner| !reservation.is_some_and(|r| &r.owner == *owner));
+        for owner in ordered {
             match pin_with_cap(
                 &tx,
                 &blob::hex(hash),
@@ -719,6 +842,7 @@ impl Store {
                 size,
                 self.options.owner_limit(owner),
                 self.options.quota_total_bytes,
+                &totals,
             ) {
                 Ok(true) => pins.pinned.push(owner.clone()),
                 Ok(false) => pins.held.push(owner.clone()),
@@ -731,11 +855,34 @@ impl Store {
             }
         }
         tx.commit().map_err(db_err)?;
+        if let Some(id) = credit {
+            reserved.holds.remove(&id);
+        }
         drop(db);
         if !pins.pinned.is_empty() {
             self.bump_generation();
         }
         Ok(pins)
+    }
+
+    fn reservation_credit(
+        &self,
+        holds: &Reservations,
+        reservation: Option<&Reservation>,
+        size: u64,
+    ) -> Result<Option<u64>> {
+        let Some(r) = reservation else {
+            return Ok(None);
+        };
+        if !Arc::ptr_eq(&self.reserved, &r.reserved)
+            || !holds.holds.contains_key(&r.id)
+            || size > r.amount
+        {
+            return Err(StoreError::BadRequest(
+                "invalid or insufficient reservation".into(),
+            ));
+        }
+        Ok(Some(r.id))
     }
 
     // ---- Reads ----
@@ -751,28 +898,28 @@ impl Store {
                 .query_row(
                     "SELECT size_bytes FROM blob WHERE hash = ?1",
                     params![blob::hex(hash)],
-                    |r| r.get::<_, i64>(0),
+                    |r| sql_u64(r, 0),
                 )
                 .optional()
                 .map_err(db_err)?
-                .map(|n| n as u64)
         };
-        let (mime, origin, first_put): (Option<String>, Option<String>, Option<i64>) = self
+        let (mime, origin, first_put, name): (Option<String>, Option<String>, Option<i64>, Option<String>) = self
             .db
             .lock()
             .unwrap()
             .query_row(
-                "SELECT mime, origin, first_put FROM blob_attrs WHERE hash = ?1",
+                "SELECT mime, origin, first_put, name_hint FROM blob_attrs WHERE hash = ?1",
                 params![blob::hex(hash)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, Some(sql_timestamp(r, 2)?), r.get(3)?)),
             )
             .optional()
             .map_err(db_err)?
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, None));
         Ok(StatInfo {
             present,
             size,
             mime,
+            name,
             pins: self.pin_owners(hash)?,
             origin,
             first_put,
@@ -817,7 +964,9 @@ impl Store {
             return Err(StoreError::NotPresent(blob::hex(hash)));
         }
         let size = blob::size(&self.blobs_root(), hash)?;
+        let reserved = self.reserved.lock().unwrap();
         let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &reserved, None, None)?;
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
         }
@@ -831,6 +980,7 @@ impl Store {
             size,
             self.options.owner_limit(owner),
             self.options.quota_total_bytes,
+            &totals,
         )?;
         tx.commit().map_err(db_err)?;
         drop(db);
@@ -857,20 +1007,19 @@ impl Store {
             .query_row(
                 "SELECT size_bytes FROM blob WHERE hash = ?1",
                 params![blob::hex(hash)],
-                |r| r.get::<_, i64>(0),
+                |r| sql_u64(r, 0),
             )
             .optional()
-            .map_err(db_err)?
-            .map(|n| n as u64);
+            .map_err(db_err)?;
         let mut db = self.db.lock().unwrap();
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
-        let recorded: Option<i64> = tx
+        let recorded: Option<u64> = tx
             .query_row(
                 "SELECT size_bytes FROM pins WHERE hash = ?1 AND owner = ?2",
                 params![blob::hex(hash), owner],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .optional()
             .map_err(db_err)?;
@@ -884,7 +1033,7 @@ impl Store {
         if removed {
             let delta = match recorded {
                 // A v2 row: release exactly what the pin paid.
-                Some(bytes) if bytes > 0 => bytes as u64,
+                Some(bytes) if bytes > 0 => bytes,
                 // A pre-v2 row (or an empty blob): the legacy read.
                 _ => index_size.unwrap_or_else(|| {
                     fs::metadata(blob::blob_path(&self.blobs_root(), hash))
@@ -929,7 +1078,8 @@ impl Store {
         limit: usize,
         cursor: Option<&BlobHash>,
     ) -> Result<Vec<ListEntry>> {
-        let limit = limit.clamp(1, 1000);
+        let limit = i64::try_from(limit.clamp(1, 1000))
+            .map_err(|_| StoreError::BadRequest("list limit exceeds SQLite i64 range".into()))?;
         let hashes: Vec<String> = {
             let db = self.db.lock().unwrap();
             let mut out = Vec::new();
@@ -942,7 +1092,7 @@ impl Store {
                     )
                     .map_err(db_err)?;
                 let rows = stmt
-                    .query_map(params![owner, cursor.map(blob::hex), limit as i64], |r| {
+                    .query_map(params![owner, cursor.map(blob::hex), limit], |r| {
                         r.get::<_, String>(0)
                     })
                     .map_err(db_err)?;
@@ -957,7 +1107,7 @@ impl Store {
                     )
                     .map_err(db_err)?;
                 let rows = stmt
-                    .query_map(params![cursor.map(blob::hex), limit as i64], |r| {
+                    .query_map(params![cursor.map(blob::hex), limit], |r| {
                         r.get::<_, String>(0)
                     })
                     .map_err(db_err)?;
@@ -987,7 +1137,7 @@ impl Store {
                             r.get::<_, String>(0)?,
                             r.get::<_, Option<String>>(1)?,
                             r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
+                            sql_timestamp(r, 3)?,
                         ))
                     },
                 )
@@ -995,23 +1145,21 @@ impl Store {
                 .map_err(db_err)?
                 .map(|(m, n, o, f)| (Some(m), n, Some(o), Some(f)))
                 .unwrap_or((None, None, None, None));
-            let size = blob::size(&self.blobs_root(), &hash)
-                .ok()
-                .or_else(|| {
-                    self.index
-                        .lock()
-                        .unwrap()
-                        .query_row(
-                            "SELECT size_bytes FROM blob WHERE hash = ?1",
-                            params![blob::hex(&hash)],
-                            |r| r.get::<_, i64>(0),
-                        )
-                        .optional()
-                        .ok()
-                        .flatten()
-                        .map(|n| n as u64)
-                })
-                .unwrap_or(0);
+            let size = match blob::size(&self.blobs_root(), &hash) {
+                Ok(size) => size,
+                Err(_) => self
+                    .index
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT size_bytes FROM blob WHERE hash = ?1",
+                        params![blob::hex(&hash)],
+                        |r| sql_u64(r, 0),
+                    )
+                    .optional()
+                    .map_err(db_err)?
+                    .unwrap_or(0),
+            };
             entries.push(ListEntry {
                 hash,
                 size,
@@ -1028,35 +1176,35 @@ impl Store {
     /// `(blobs known to blobd, pin rows)`.
     pub fn counts(&self) -> Result<(u64, u64)> {
         let db = self.db.lock().unwrap();
-        let blobs: i64 = db
+        let blobs = db
             .query_row(
                 "SELECT COUNT(*) FROM (SELECT hash FROM blob_attrs UNION SELECT hash FROM pins)",
                 params![],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .map_err(db_err)?;
-        let pins: i64 = db
-            .query_row("SELECT COUNT(*) FROM pins", params![], |r| r.get(0))
+        let pins = db
+            .query_row("SELECT COUNT(*) FROM pins", params![], |r| sql_u64(r, 0))
             .map_err(db_err)?;
-        Ok((blobs as u64, pins as u64))
+        Ok((blobs, pins))
     }
 
     // ---- Quota ----
 
     pub fn quota_report(&self, owner: Option<&str>) -> Result<QuotaReport> {
-        // The reservation snapshot first, never nested with the db
-        // lock (lock order is reserved → db everywhere else).
-        let reserved_map: BTreeMap<String, u64> = self.reserved.lock().unwrap().clone();
-        let total_reserved: u64 = reserved_map.values().copied().sum();
+        // One consistent snapshot, with the admission/settlement lock order.
+        let reserved = self.reserved.lock().unwrap();
         let db = self.db.lock().unwrap();
+        let reserved_map = self.reservation_totals(&db, &reserved, None, None)?;
+        let total_reserved = sum_reserved(&reserved_map);
         let mut owners = BTreeMap::new();
         match owner {
             Some(one) => {
-                let used: i64 = db
+                let used = db
                     .query_row(
                         "SELECT used_bytes FROM quota WHERE owner = ?1",
                         params![one],
-                        |r| r.get(0),
+                        |r| sql_u64(r, 0),
                     )
                     .optional()
                     .map_err(db_err)?
@@ -1064,7 +1212,7 @@ impl Store {
                 owners.insert(
                     one.to_string(),
                     OwnerQuota {
-                        used: used as u64,
+                        used,
                         limit: self.options.owner_limit(one),
                         reserved: reserved_map.get(one).copied().unwrap_or(0),
                     },
@@ -1075,16 +1223,14 @@ impl Store {
                     .prepare("SELECT owner, used_bytes FROM quota ORDER BY owner")
                     .map_err(db_err)?;
                 let rows = stmt
-                    .query_map(params![], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                    })
+                    .query_map(params![], |r| Ok((r.get::<_, String>(0)?, sql_u64(r, 1)?)))
                     .map_err(db_err)?;
                 for row in rows {
                     let (o, used) = row.map_err(db_err)?;
                     owners.insert(
                         o.clone(),
                         OwnerQuota {
-                            used: used as u64,
+                            used,
                             limit: self.options.owner_limit(&o),
                             reserved: reserved_map.get(&o).copied().unwrap_or(0),
                         },
@@ -1097,19 +1243,26 @@ impl Store {
                         reserved: reserved_map.get(o).copied().unwrap_or(0),
                     });
                 }
+                for (o, amount) in &reserved_map {
+                    owners.entry(o.clone()).or_insert(OwnerQuota {
+                        used: 0,
+                        limit: self.options.owner_limit(o),
+                        reserved: *amount,
+                    });
+                }
             }
         }
-        let total_used: i64 = db
+        let total_used = db
             .query_row(
                 "SELECT COALESCE(SUM(used_bytes), 0) FROM quota",
                 params![],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .map_err(db_err)?;
         Ok(QuotaReport {
             owners,
             total: OwnerQuota {
-                used: total_used as u64,
+                used: total_used,
                 limit: self.options.quota_total_bytes,
                 reserved: total_reserved,
             },
@@ -1117,32 +1270,32 @@ impl Store {
     }
 
     fn owner_used(&self, owner: &str) -> Result<u64> {
-        let used: Option<i64> = self
+        let used = self
             .db
             .lock()
             .unwrap()
             .query_row(
                 "SELECT used_bytes FROM quota WHERE owner = ?1",
                 params![owner],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .optional()
             .map_err(db_err)?;
-        Ok(used.map(|n| n as u64).unwrap_or(0))
+        Ok(used.unwrap_or(0))
     }
 
     fn total_used(&self) -> Result<u64> {
-        let used: i64 = self
+        let used = self
             .db
             .lock()
             .unwrap()
             .query_row(
                 "SELECT COALESCE(SUM(used_bytes), 0) FROM quota",
                 params![],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .map_err(db_err)?;
-        Ok(used as u64)
+        Ok(used)
     }
 
     // ---- GC ----
@@ -1193,7 +1346,8 @@ impl Store {
             // keeps quota from drifting if a row raced in anyway).
             let pinned: bool = db
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1)",
+                    "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1)
+                     OR EXISTS(SELECT 1 FROM upload_sessions WHERE state='committing' AND actual_hash=?1)",
                     params![file.hash_hex()],
                     |r| r.get::<_, i64>(0),
                 )
@@ -1282,7 +1436,7 @@ impl Store {
         for shard in top {
             let shard = shard?;
             let shard_name = shard.file_name();
-            if shard_name == ".tmp" || !shard.file_type()?.is_dir() {
+            if shard_name == ".tmp" || shard_name == ".uploads" || !shard.file_type()?.is_dir() {
                 continue;
             }
             for mid in fs::read_dir(shard.path())? {
@@ -1356,14 +1510,37 @@ fn now_ms() -> i64 {
 }
 
 fn db_err(e: rusqlite::Error) -> StoreError {
-    StoreError::Db(e.to_string())
+    match e {
+        rusqlite::Error::IntegralValueOutOfRange(column, value) => {
+            StoreError::CorruptInteger { column, value }
+        }
+        other => StoreError::Db(other.to_string()),
+    }
+}
+
+/// SQLite INTEGER is signed, even when the Rust domain value is unsigned.
+fn sql_u64(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(column)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+fn sql_timestamp(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<i64> {
+    let value: i64 = row.get(column)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))?;
+    Ok(value)
+}
+
+fn sql_int(value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::BadRequest("integer exceeds SQLite i64 range".into()))
 }
 
 fn bump_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) -> Result<()> {
+    let delta = sql_int(delta)?;
     tx.execute(
         "INSERT INTO quota (owner, used_bytes) VALUES (?1, ?2) \
          ON CONFLICT(owner) DO UPDATE SET used_bytes = used_bytes + excluded.used_bytes",
-        params![owner, delta as i64],
+        params![owner, delta],
     )
     .map_err(db_err)?;
     Ok(())
@@ -1381,7 +1558,32 @@ fn pin_with_cap(
     size: u64,
     owner_limit: u64,
     total_limit: u64,
+    reserved: &BTreeMap<String, u64>,
 ) -> Result<bool> {
+    if !check_pin_capacity(tx, hash_hex, owner, size, owner_limit, total_limit, reserved)? {
+        return Ok(false);
+    }
+    let sql_size = sql_int(size)?;
+    tx.execute(
+        "INSERT INTO pins (hash, owner, created, size_bytes) VALUES (?1, ?2, ?3, ?4)",
+        params![hash_hex, owner, now_ms(), sql_size],
+    )
+    .map_err(db_err)?;
+    bump_owner_used(tx, owner, size)?;
+    Ok(true)
+}
+
+/// Check settlement without charging or publishing a pin.
+fn check_pin_capacity(
+    tx: &rusqlite::Transaction<'_>,
+    hash_hex: &str,
+    owner: &str,
+    size: u64,
+    owner_limit: u64,
+    total_limit: u64,
+    reserved: &BTreeMap<String, u64>,
+) -> Result<bool> {
+    sql_int(size)?;
     let already: i64 = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1 AND owner = ?2)",
@@ -1392,14 +1594,16 @@ fn pin_with_cap(
     if already != 0 {
         return Ok(false);
     }
-    let owner_used: i64 = tx
+    let owner_used = tx
         .query_row(
             "SELECT COALESCE((SELECT used_bytes FROM quota WHERE owner = ?1), 0)",
             params![owner],
-            |r| r.get(0),
+            |r| sql_u64(r, 0),
         )
         .map_err(db_err)?;
-    let would_use = owner_used as u64 + size;
+    let would_use = owner_used
+        .saturating_add(size)
+        .saturating_add(reserved.get(owner).copied().unwrap_or(0));
     if would_use > owner_limit {
         return Err(StoreError::QuotaOwner {
             owner: owner.to_string(),
@@ -1407,33 +1611,40 @@ fn pin_with_cap(
             limit: owner_limit,
         });
     }
-    let total_used: i64 = tx
+    let total_used = tx
         .query_row(
             "SELECT COALESCE(SUM(used_bytes), 0) FROM quota",
             params![],
-            |r| r.get(0),
+            |r| sql_u64(r, 0),
         )
         .map_err(db_err)?;
-    let total_would = total_used as u64 + size;
+    let total_would = total_used
+        .saturating_add(size)
+        .saturating_add(sum_reserved(reserved));
     if total_would > total_limit {
         return Err(StoreError::QuotaTotal {
             would_use: total_would,
             limit: total_limit,
         });
     }
-    tx.execute(
-        "INSERT INTO pins (hash, owner, created, size_bytes) VALUES (?1, ?2, ?3, ?4)",
-        params![hash_hex, owner, now_ms(), size as i64],
-    )
-    .map_err(db_err)?;
-    bump_owner_used(tx, owner, size)?;
+    // Keep SQLite's aggregate/accounting arithmetic in INTEGER range too;
+    // otherwise an addition can silently promote used_bytes to REAL.
+    sql_int(owner_used.saturating_add(size))?;
+    sql_int(total_used.saturating_add(size))?;
     Ok(true)
 }
 
+fn sum_reserved(reserved: &BTreeMap<String, u64>) -> u64 {
+    reserved
+        .values()
+        .fold(0u64, |sum, n| sum.saturating_add(*n))
+}
+
 fn shrink_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) -> Result<()> {
+    let delta = sql_int(delta)?;
     tx.execute(
         "UPDATE quota SET used_bytes = MAX(0, used_bytes - ?2) WHERE owner = ?1",
-        params![owner, delta as i64],
+        params![owner, delta],
     )
     .map_err(db_err)?;
     Ok(())
@@ -1529,7 +1740,7 @@ fn open_blobd_db(root: &Path) -> Result<Connection> {
         Connection::open(root.join("blobd.sqlite")).map_err(|e| StoreError::Db(e.to_string()))?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;\
-         PRAGMA synchronous  = NORMAL;\
+         PRAGMA synchronous  = FULL;\
          PRAGMA busy_timeout = 5000;\
          PRAGMA foreign_keys = ON;",
     )
@@ -1559,6 +1770,8 @@ fn apply_blobd_migrations(conn: &mut Connection) -> Result<()> {
         let sql = match v {
             1 => BLOBD_V1_SQL,
             2 => BLOBD_V2_SQL,
+            3 => uploads::SCHEMA,
+            4 => uploads::INODE_SCHEMA,
             _ => {
                 return Err(StoreError::Db(format!(
                     "blobd.sqlite: missing migration v{v}"
@@ -1570,12 +1783,11 @@ fn apply_blobd_migrations(conn: &mut Connection) -> Result<()> {
             .map_err(|e| StoreError::Db(format!("begin v{v}: {e}")))?;
         tx.execute_batch(sql)
             .map_err(|e| StoreError::Db(format!("apply v{v}: {e}")))?;
+        tx.pragma_update(None, "user_version", v).map_err(db_err)?;
+        tx.pragma_update(None, "application_id", BLOBD_APPLICATION_ID)
+            .map_err(db_err)?;
         tx.commit()
             .map_err(|e| StoreError::Db(format!("commit v{v}: {e}")))?;
-        conn.pragma_update(None, "user_version", v)
-            .map_err(db_err)?;
-        conn.pragma_update(None, "application_id", BLOBD_APPLICATION_ID)
-            .map_err(db_err)?;
     }
     Ok(())
 }
@@ -1594,13 +1806,94 @@ fn open_index_conn(root: &Path) -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_integer_boundaries_refuse_negative_and_overflow() {
+        let conn = Connection::open_in_memory().unwrap();
+        for value in [0_i64, i64::MAX] {
+            let read = conn
+                .query_row("SELECT ?1", [value], |r| sql_u64(r, 0))
+                .unwrap();
+            assert_eq!(sql_int(read).unwrap(), value);
+        }
+        for value in [-1_i64, i64::MIN] {
+            let error = conn
+                .query_row("SELECT ?1", [value], |r| sql_u64(r, 0))
+                .unwrap_err();
+            assert!(
+                matches!(db_err(error), StoreError::CorruptInteger { column: 0, value: n } if n == value)
+            );
+            assert!(
+                conn.query_row("SELECT ?1", [value], |r| sql_timestamp(r, 0))
+                    .is_err()
+            );
+        }
+        for value in [i64::MAX as u64 + 1, u64::MAX] {
+            assert!(matches!(sql_int(value), Err(StoreError::BadRequest(_))));
+        }
+        let (_dir, store) = store();
+        let mut db = store.db.lock().unwrap();
+        let tx = db.transaction().unwrap();
+        assert!(matches!(
+            pin_with_cap(
+                &tx,
+                "test",
+                "owner",
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                &BTreeMap::new()
+            ),
+            Err(StoreError::BadRequest(_))
+        ));
+        assert!(matches!(
+            bump_owner_used(&tx, "owner", u64::MAX),
+            Err(StoreError::BadRequest(_))
+        ));
+        assert!(matches!(
+            shrink_owner_used(&tx, "owner", u64::MAX),
+            Err(StoreError::BadRequest(_))
+        ));
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM pins", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM quota", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn negative_quota_is_typed_corruption() {
+        let (_dir, store) = store();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO quota(owner,used_bytes) VALUES ('broken',-1)",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.quota_report(None),
+            Err(StoreError::CorruptInteger { value: -1, .. })
+        ));
+        assert!(matches!(
+            store.reserve_upload("broken", Some(1)),
+            Err(StoreError::CorruptInteger { value: -1, .. })
+        ));
+    }
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use tempfile::TempDir;
 
     use super::super::config::{DEFAULT_QUOTA_OWNER_BYTES, DEFAULT_QUOTA_TOTAL_BYTES};
 
-    fn options() -> StoreOptions {
+    pub(super) fn options() -> StoreOptions {
         StoreOptions {
             origin: "testnode".into(),
             quota_total_bytes: DEFAULT_QUOTA_TOTAL_BYTES,
@@ -1610,9 +1903,9 @@ mod tests {
         }
     }
 
-    fn store() -> (TempDir, Store) {
+    pub(super) fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
-        let s = Store::open(dir.path(), options()).unwrap();
+        let s = Store::open(dir.path().join("store"), options()).unwrap();
         (dir, s)
     }
 
@@ -1733,7 +2026,7 @@ mod tests {
             owner_limits: BTreeMap::from([("small".into(), 10u64), ("other".into(), 1000u64)]),
             cas_group: "cosmix-blob".into(),
         };
-        let store = Store::open(dir.path(), opts).unwrap();
+        let store = Store::open(dir.path().join("store"), opts).unwrap();
         let big = write_src(&dir, "big.bin", &[7u8; 80]);
         let small = write_src(&dir, "small.bin", &[7u8; 16]);
 
@@ -1859,11 +2152,11 @@ mod tests {
         let bytes = b"row with refcount zero";
         let hash = cosmix_mds::blob::put(&store.blobs_root(), bytes).unwrap();
         {
-            let conn = Connection::open(dir.path().join("blobs.sqlite")).unwrap();
+            let conn = Connection::open(dir.path().join("store").join("blobs.sqlite")).unwrap();
             conn.execute(
                 "INSERT INTO blob (hash, size_bytes, first_seen, last_seen, refcount) \
                  VALUES (?1, ?2, 0, 0, 0)",
-                params![blob::hex(&hash), bytes.len() as i64],
+                params![blob::hex(&hash), i64::try_from(bytes.len()).unwrap()],
             )
             .unwrap();
         }
@@ -1921,7 +2214,7 @@ mod tests {
             owner_limits: BTreeMap::from([("tiny".to_string(), 10)]),
             ..options()
         };
-        let store = Store::open(dir.path(), options).unwrap();
+        let store = Store::open(dir.path().join("store"), options).unwrap();
         let hash = blob::put(&store.blobs_root(), &[7u8; 50]).unwrap();
         let owners = ["maild".to_string(), "tiny".to_string()];
         let pins = store
@@ -2028,7 +2321,7 @@ mod tests {
     fn reservations_bound_concurrent_admissions_and_report() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 origin: "testnode".into(),
                 quota_total_bytes: 2 * 1024 * 1024,
@@ -2070,6 +2363,97 @@ mod tests {
     // ---- M4: the CAS carries the shared-read group, setgid ----
 
     #[test]
+    fn all_pin_paths_respect_other_transfer_holds() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path().join("store"),
+            StoreOptions {
+                quota_total_bytes: 100,
+                quota_owner_default_bytes: 100,
+                ..options()
+            },
+        )
+        .unwrap();
+        let hold = store.reserve_upload("upload", Some(80)).unwrap();
+        let hash = blob::put(&store.blobs_root(), &[7; 30]).unwrap();
+        assert!(matches!(
+            store.pin(&hash, "pin"),
+            Err(StoreError::QuotaTotal { .. })
+        ));
+        assert!(matches!(
+            store.record_upload(&hash, 30, "x", None, "put"),
+            Err(StoreError::QuotaTotal { .. })
+        ));
+        let result = store
+            .record_fetch(&hash, 30, "x", "remote", &["joiner".into()])
+            .unwrap();
+        assert_eq!(result.refused, vec!["joiner"]);
+        assert_eq!(
+            store.quota_report(None).unwrap().owners["upload"].reserved,
+            80
+        );
+        drop(hold);
+        assert!(store.pin(&hash, "pin").unwrap());
+    }
+
+    #[test]
+    fn settlement_consumes_only_its_identified_hold() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path().join("store"),
+            StoreOptions {
+                quota_total_bytes: 100,
+                quota_owner_default_bytes: 100,
+                ..options()
+            },
+        )
+        .unwrap();
+        let one = store.reserve_upload("owner", Some(60)).unwrap();
+        let two = store.reserve_upload("owner", Some(40)).unwrap();
+        let hash = blob::put(&store.blobs_root(), &[1; 60]).unwrap();
+        store
+            .record_upload_reserved(&hash, 60, "x", None, "owner", Some(&one))
+            .unwrap();
+        let q = store.quota_report(None).unwrap();
+        assert_eq!((q.total.used, q.total.reserved), (60, 40));
+        drop(one); // Consumed guard cannot release the other hold.
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 40);
+        drop(two);
+    }
+
+    #[test]
+    fn fetch_settlement_prioritises_its_hold_and_refuses_joiner() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path().join("store"),
+            StoreOptions {
+                quota_total_bytes: 100,
+                quota_owner_default_bytes: 100,
+                ..options()
+            },
+        )
+        .unwrap();
+        let hold = store.reserve_upload("z-first", Some(60)).unwrap();
+        let other = store.reserve_upload("other", Some(40)).unwrap();
+        let hash = blob::put(&store.blobs_root(), &[9; 60]).unwrap();
+        let pins = store
+            .record_fetch_reserved(
+                &hash,
+                60,
+                "x",
+                "remote",
+                &["a-joiner".into(), "z-first".into()],
+                Some(&hold),
+            )
+            .unwrap();
+        assert_eq!(pins.pinned, vec!["z-first"]);
+        assert_eq!(pins.refused, vec!["a-joiner"]);
+        let q = store.quota_report(None).unwrap();
+        assert_eq!((q.total.used, q.total.reserved), (60, 40));
+        drop(other);
+    }
+
+    #[test]
     fn cas_roots_and_shard_dirs_carry_the_group_and_setgid() {
         // The test host may not have cosmix-blob, so drive the fix with
         // this process's own primary group — the mechanics under test
@@ -2088,7 +2472,7 @@ mod tests {
         };
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 cas_group: group.clone(),
                 ..options()
@@ -2112,7 +2496,7 @@ mod tests {
                 path.display()
             );
         };
-        assert_grouped(dir.path());
+        assert_grouped(&dir.path().join("store"));
         assert_grouped(&store.blobs_root());
         let cas = store.path(&out.reference.hash).unwrap();
         // Both shard dirs inherit the setgid bit and the group; the CAS
@@ -2136,7 +2520,7 @@ mod tests {
         // daemon-owned, and the store still serves verbs.
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 cas_group: "cosmix-blob-definitely-not-on-any-host".into(),
                 ..options()
@@ -2153,7 +2537,7 @@ mod tests {
     fn pin_beyond_the_owner_cap_is_refused() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(
-            dir.path(),
+            dir.path().join("store"),
             StoreOptions {
                 origin: "testnode".into(),
                 owner_limits: BTreeMap::from([(("tightside").to_string(), 16u64)]),
@@ -2200,14 +2584,14 @@ mod tests {
     fn second_open_of_same_root_fails_on_flock() {
         let (dir, store) = store();
         // The live store holds the flock; a second open must refuse.
-        let err = match Store::open(dir.path(), options()) {
+        let err = match Store::open(dir.path().join("store"), options()) {
             Err(err) => err,
             Ok(_) => panic!("second open of a locked root must fail"),
         };
         assert!(matches!(err, StoreError::Locked(_)), "got {err:?}");
         // Dropping the holder releases it (fd closed).
         drop(store);
-        assert!(Store::open(dir.path(), options()).is_ok());
+        assert!(Store::open(dir.path().join("store"), options()).is_ok());
     }
 
     #[test]
@@ -2232,16 +2616,16 @@ mod tests {
             out
         }
         let (dir, _store) = store();
-        fs::remove_dir(dir.path().join("containers")).unwrap();
-        let before = snapshot(dir.path());
+        fs::remove_dir(dir.path().join("store").join("containers")).unwrap();
+        let before = snapshot(&dir.path().join("store"));
         std::thread::sleep(Duration::from_millis(20));
-        let err = match Store::open(dir.path(), options()) {
+        let err = match Store::open(dir.path().join("store"), options()) {
             Err(err) => err,
             Ok(_) => panic!("second open of a locked root must fail"),
         };
         assert!(matches!(err, StoreError::Locked(_)), "got {err:?}");
         assert_eq!(
-            snapshot(dir.path()),
+            snapshot(&dir.path().join("store")),
             before,
             "the refused open touched the root"
         );
@@ -2253,7 +2637,7 @@ mod tests {
         {
             // Pre-create the root via mds, drop staging junk plus an
             // aged orphan CAS file, then open the store.
-            let mds = SqliteCasMds::open(dir.path()).unwrap();
+            let mds = SqliteCasMds::open(dir.path().join("store")).unwrap();
             let tmp = mds.blobs_root().join(".tmp");
             std::fs::write(tmp.join("junk1"), b"x").unwrap();
             std::fs::write(tmp.join("junk2"), b"y").unwrap();
@@ -2261,7 +2645,7 @@ mod tests {
             let orphan_path = cosmix_mds::blob::blob_path(&mds.blobs_root(), &orphan_hash);
             age_file(&orphan_path);
         }
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         let report = store.startup_report();
         assert_eq!(report.tmp_removed, 2);
         assert!(
@@ -2289,10 +2673,10 @@ mod tests {
     fn young_orphan_is_not_reported_at_startup() {
         let dir = TempDir::new().unwrap();
         {
-            let mds = SqliteCasMds::open(dir.path()).unwrap();
+            let mds = SqliteCasMds::open(dir.path().join("store")).unwrap();
             cosmix_mds::blob::put(&mds.blobs_root(), b"fresh bytes").unwrap();
         }
-        let store = Store::open(dir.path(), options()).unwrap();
+        let store = Store::open(dir.path().join("store"), options()).unwrap();
         assert!(store.startup_report().orphans.is_empty());
     }
 
@@ -2311,14 +2695,112 @@ mod tests {
     }
 
     #[test]
-    fn blobd_sqlite_schema_is_v2_with_expected_tables() {
+    fn v3_migration_rolls_back_ddl_and_marker_together_then_retries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(BLOBD_V1_SQL).unwrap();
+        conn.execute_batch(BLOBD_V2_SQL).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "application_id", BLOBD_APPLICATION_ID)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO quota(owner,used_bytes) VALUES ('tester',7)",
+            [],
+        )
+        .unwrap();
+        // Inject an error after CREATE TABLE but before the version marker.
+        conn.execute_batch("CREATE INDEX upload_expiry ON quota(owner)")
+            .unwrap();
+        assert!(apply_blobd_migrations(&mut conn).is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='upload_sessions'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("DROP INDEX upload_expiry").unwrap();
+        apply_blobd_migrations(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT used_bytes FROM quota WHERE owner='tester'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn v4_migration_fails_legacy_unfinished_sessions_without_inventing_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(BLOBD_V1_SQL).unwrap();
+        conn.execute_batch(BLOBD_V2_SQL).unwrap();
+        conn.execute_batch(uploads::SCHEMA).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        for state in ["active", "committing", "complete"] {
+            conn.execute("INSERT INTO upload_sessions(id,owner,size,mime,created_at,expires_at,state) VALUES (?1,'test',0,'text/plain',0,1,?1)", [state]).unwrap();
+        }
+        apply_blobd_migrations(&mut conn).unwrap();
+        for id in ["active", "committing", "complete"] {
+            let (state, dev, ino): (String, Option<String>, Option<String>) = conn.query_row(
+                "SELECT state,staging_dev,staging_ino FROM upload_sessions WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).unwrap();
+            assert_eq!(state, if id == "complete" { "complete" } else { "failed" });
+            assert!(dev.is_none() && ino.is_none());
+        }
+    }
+
+    #[test]
+    fn copy_ingest_infers_mime_from_caller_alias_filename() {
         let (dir, store) = store();
-        let conn = Connection::open(dir.path().join("blobd.sqlite")).unwrap();
+        let target = write_src(&dir, "content.bin", b"PDF bytes");
+        let alias = dir.path().join("report.pdf");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let outcome = store.put(&alias, &PutOptions::new("tester")).unwrap();
+        assert_eq!(outcome.reference.mime, "application/pdf");
+        assert_eq!(blob::get(&store.blobs_root(), &outcome.reference.hash).unwrap(), b"PDF bytes");
+    }
+
+    #[test]
+    fn local_ingest_refuses_all_store_sources_and_symlink_aliases_in_every_mode() {
+        let (dir, store) = store();
+        let hash = blob::put(&store.blobs_root(), b"cas").unwrap();
+        let staging = store.blobs_root().join(".tmp/input");
+        fs::write(&staging, b"staged").unwrap();
+        let alias = dir.path().join("root-alias");
+        std::os::unix::fs::symlink(store.root(), &alias).unwrap();
+        for source in [store.root().join("blobd.sqlite"), staging, blob::blob_path(&store.blobs_root(), &hash), alias.join("blobd.sqlite")] {
+            for mode in [PutMode::Copy, PutMode::Reflink, PutMode::HardLink] {
+                let mut opts = PutOptions::new("tester");
+                opts.mode = mode;
+                opts.immutable = true;
+                assert!(matches!(store.put(&source, &opts), Err(StoreError::SourceInsideStore)));
+            }
+        }
+    }
+
+    #[test]
+    fn blobd_sqlite_schema_is_v4_with_expected_tables() {
+        let (dir, store) = store();
+        let conn = Connection::open(dir.path().join("store").join("blobd.sqlite")).unwrap();
         let v: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
-        for tbl in ["blob_attrs", "pins", "quota"] {
+        assert_eq!(v, 4);
+        for tbl in ["blob_attrs", "pins", "quota", "upload_sessions"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1;",
@@ -2338,7 +2820,7 @@ mod tests {
             .unwrap();
         assert_eq!(cols, 1, "pins.size_bytes missing");
         // mds's blobs.sqlite is untouched: still BLOBS_LATEST = 1.
-        let blobs = Connection::open(dir.path().join("blobs.sqlite")).unwrap();
+        let blobs = Connection::open(dir.path().join("store").join("blobs.sqlite")).unwrap();
         let bv: u32 = blobs
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
@@ -2349,13 +2831,13 @@ mod tests {
     #[test]
     fn open_refuses_wrong_magic_db() {
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.path().join("store")).unwrap();
         {
-            let conn = Connection::open(dir.path().join("blobd.sqlite")).unwrap();
+            let conn = Connection::open(dir.path().join("store").join("blobd.sqlite")).unwrap();
             conn.pragma_update(None, "application_id", 0x1234_5678)
                 .unwrap();
         }
-        let err = match Store::open(dir.path(), options()) {
+        let err = match Store::open(dir.path().join("store"), options()) {
             Err(err) => err,
             Ok(_) => panic!("a wrong-magic blobd.sqlite must refuse to open"),
         };

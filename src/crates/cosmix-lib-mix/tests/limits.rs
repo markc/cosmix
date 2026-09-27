@@ -32,6 +32,57 @@ fn limits(recursion_limit: usize) -> EvalLimits {
     }
 }
 
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn upload_requires_read_capability_even_without_options() {
+    let err = run("$r = http_put_file(\"http://invalid.invalid\", \"absent\")", |e| {
+        e.set_capability_policy(Rc::new(CategoryAllowList::new(&[CapabilityClass::Network])));
+    }).await.expect_err("FsRead must be checked before opening the source");
+    // Policy diagnostics use the enum's Debug name, not metadata's kebab case.
+    assert!(err.contains("capability denied"), "{err}");
+    assert!(err.contains("FsRead capability not allowed"), "{err}");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn download_requires_write_and_append_requires_read() {
+    for (src,caps,want) in [
+        ("$r = http_get_file(\"http://invalid.invalid\", \"absent\")", vec![CapabilityClass::Network], "FsWrite capability not allowed"),
+        ("$r = http_get_file(\"http://invalid.invalid\", \"absent\", {append:true})", vec![CapabilityClass::Network,CapabilityClass::FsWrite], "FsRead capability not allowed"),
+        ("$r = http_get_file(\"http://invalid.invalid\", \"absent\", {ca_file:\"absent.pem\"})", vec![CapabilityClass::Network,CapabilityClass::FsWrite], "FsRead capability not allowed"),
+    ] {
+        let err = run(src, |e| e.set_capability_policy(Rc::new(CategoryAllowList::new(&caps))))
+            .await.expect_err("capability must be checked before IO");
+        assert!(err.contains("capability denied"), "{err}");
+        assert!(err.contains(want),"{err}");
+    }
+}
+
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn file_transfer_documented_grants_pass_capability_gate() {
+    use CapabilityClass::{FsRead, FsWrite, Network};
+
+    // As with include_allowed_with_fsread_passes_gate, reaching the builtin's
+    // own error proves admission. Invalid headers stop before file/network IO.
+    for (name, opts, caps) in [
+        ("http_put_file", "{headers:false}", vec![Network, FsRead]),
+        ("http_get_file", "{headers:false}", vec![Network, FsWrite]),
+        ("http_get_file", "{headers:false, append:false}", vec![Network, FsWrite]),
+        ("http_get_file", "{headers:false, append:true}", vec![Network, FsWrite, FsRead]),
+        ("http_get_file", "{headers:false, ca_file:\"absent.pem\"}", vec![Network, FsWrite, FsRead]),
+    ] {
+        let src = format!("$r = {name}(\"http://invalid.invalid\", \"absent\", {opts})");
+        let err = run(&src, |e| {
+            e.set_capability_policy(Rc::new(CategoryAllowList::new(&caps)));
+        })
+        .await
+        .expect_err("invalid headers must reach builtin option validation");
+        assert!(!err.contains("capability denied"), "{name} {opts}: {err}");
+        assert!(err.contains("headers must be a map"), "{name} {opts}: {err}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Knob B — recursion-depth cap (every native path)
 // ---------------------------------------------------------------------------
