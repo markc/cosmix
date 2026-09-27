@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use cosmix_mds::Mds;
 use cosmix_mds::SqliteCasMds;
 use cosmix_mds::blob::{self, PutMode};
 use cosmix_mds::blob_index;
