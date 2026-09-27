@@ -953,7 +953,7 @@ rounds half away from zero on both sides of the origin.
 
 ### Input injection
 
-**0.71.1 (unreleased):** Bus input and sequences now default to the agent seat;
+**0.72.0 (unreleased):** Bus input and sequences now default to the agent seat;
 callers needing human focus, bindings, chrome or idle activity must pass
 `seat:"human"`. Bare `release_all {}` still clears both seats' injected holds.
 
@@ -966,7 +966,8 @@ notification per seat: `PROBE seat "cosmix" idled` / `resumed` (likewise for
 flag the probe retains its existing bindings and output. The flags do not
 change the compositor's input default.
 
-**0.71.0 (unreleased):** `cosmix-agent` now has a delivery path, with its own
+The former 0.71.0/0.71.1 development versions were never installed; their seat
+delivery and probe changes ship together in 0.72.0. `cosmix-agent` has its own
 keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
 hidden from Xwayland. Every `comp.input.*` verb accepts `seat:"human"` or
 `seat:"agent"`; there are no caller authorisation gates on either choice.
@@ -1154,6 +1155,11 @@ run on compositor timers, before the step, defaulting to `interval_ms` (default
 0), and total at most 60 seconds. It yields after 256 injected events; runs can
 interleave at delays and yields. The reply is
 `{seat,steps:[<each step's reply, including its seat>],elapsed_ms}`.
+An explicitly seated sequence reports that seat at the top level. An unseated
+sequence reports `human`, `agent` or `mixed` from the steps reached, including
+the refusing step for `step_failed`; bare both-seat cleanup counts as `mixed`.
+An empty unseated capability probe reports the default (`agent`). Per-step
+seats are unchanged.
 On a failed step, it returns `step_failed` with `index`, `verb`, `step`,
 `completed` and `released:true`, and gives up its holds on **both** seats.
 Other owners' holds remain. Caller cancellation also releases the run's holds.

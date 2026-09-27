@@ -2755,12 +2755,6 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
     let mut args = args.clone();
     if let Some(object) = args.as_object_mut() {
         object.remove("seat");
-        if seat == SeatKind::Agent && object.contains_key("raise")
-            && bool_arg(object, "raise", false)? {
-            return Err(ControlReply::refused("invalid_argument", json!({
-                "field":"raise", "seat":"agent", "message":"agent input never raises a window",
-            })));
-        }
     }
     let op = parse_seated_input_op(verb, &args, seat)?;
     // Bare cleanup always releases both seats' injected holds, regardless of
@@ -2815,10 +2809,16 @@ fn parse_seated_input_op(verb: &str, args: &Value, seat: crate::protocol::SeatKi
         .ok_or_else(|| invalid_argument("window.id", "unsigned integer", "required"))?;
     let generation = window_arg(window, "generation")?
         .ok_or_else(|| invalid_argument("window.generation", "unsigned integer", "required"))?;
+    let raise = bool_arg(object, "raise", seat == crate::protocol::SeatKind::Human)?;
+    if seat == crate::protocol::SeatKind::Agent && raise {
+        return Err(ControlReply::refused("invalid_argument", json!({
+            "field":"raise", "seat":"agent", "message":"agent input never raises a window",
+        })));
+    }
     Ok(InputOp::Targeted {
         id,
         generation,
-        raise: bool_arg(object, "raise", seat == crate::protocol::SeatKind::Human)?,
+        raise,
         op: Box::new(op),
     })
 }
@@ -3324,6 +3324,10 @@ mod agent_seat_parse_tests {
 
     #[test]
     fn seat_defaults_raise_policy_and_release_all_are_explicit() {
+        let bare = parse_input_op("comp.input.key", &json!({"key":"a","raise":true})).unwrap_err().wire_json();
+        let human = parse_input_op("comp.input.key", &json!({"seat":"human","key":"a","raise":true})).unwrap_err().wire_json();
+        assert_eq!(bare, human);
+        assert_eq!(bare["range"], "requires window");
         let window = json!({"id":1,"generation":2});
         assert!(matches!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"human"})).unwrap(), InputOp::Targeted { raise:true, .. }));
         let InputOp::OnSeat { seat, op } = parse_input_op("comp.input.key", &json!({"window":window,"key":"a"})).unwrap() else { panic!("default agent wrapper") };

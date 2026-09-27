@@ -335,6 +335,7 @@ fn run() -> Result<(), String> {
     let shm = probe.shm.clone().ok_or("wl_shm unavailable")?;
     let wm_base = probe.wm_base.clone().ok_or("xdg_wm_base unavailable")?;
     if probe.all_seats {
+        if let Some(error) = probe.seat_error.take() { return Err(error); }
         if probe.seats.is_empty() { return Err("wl_seat unavailable".into()); }
         if probe.idle_timeout_ms.is_some() && probe.idle_notifier.is_none() {
             return Err("--idle-timeout-ms requires ext_idle_notifier_v1".into());

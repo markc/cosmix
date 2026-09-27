@@ -147,7 +147,8 @@ impl Default for InjectionState {
 }
 
 pub(super) struct SequenceRun {
-    seat: SeatKind,
+    seat: Option<SeatKind>,
+    driven_seat: Option<&'static str>,
     uses_agent: bool,
     steps: VecDeque<SequenceStep>,
     index: usize,
@@ -156,6 +157,13 @@ pub(super) struct SequenceRun {
     replies: Vec<Value>,
     started: Instant,
     reply: tokio::sync::oneshot::Sender<ControlReply>,
+}
+
+impl SequenceRun {
+    fn reply_seat(&self) -> &'static str {
+        self.seat.map(SeatKind::name).or(self.driven_seat)
+            .unwrap_or(crate::port::DEFAULT_INPUT_SEAT.name())
+    }
 }
 
 /// Keysym and character lookups against the live seat keymap, each
@@ -1053,8 +1061,8 @@ impl WaylandState {
         initial_burst: bool,
     ) {
         let (op, sequence_seat) = match op {
-            LongOp::SeatedSequence { seat, steps } => (LongOp::Sequence(steps), seat),
-            op => (op, crate::port::DEFAULT_INPUT_SEAT),
+            LongOp::SeatedSequence { seat, steps } => (LongOp::Sequence(steps), Some(seat)),
+            op => (op, None),
         };
         match op {
             LongOp::SeatedSequence { .. } => unreachable!("normalised above"),
@@ -1065,6 +1073,7 @@ impl WaylandState {
                     id,
                     SequenceRun {
                         seat: sequence_seat,
+                        driven_seat: None,
                         uses_agent: steps.iter().any(|step| matches!(step.op, InputOp::OnSeat { seat: SeatKind::Agent, .. })),
                         steps: steps.into(),
                         index: 0,
@@ -1183,8 +1192,9 @@ impl WaylandState {
                     .expect("sequence run present");
                 let elapsed_ms =
                     u64::try_from(run.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let seat = run.reply_seat();
                 let _ = run.reply.send(ControlReply::Body(json!({
-                    "seat": run.seat.name(),
+                    "seat": seat,
                     "steps": run.replies,
                     "elapsed_ms": elapsed_ms,
                 })));
@@ -1221,6 +1231,17 @@ impl WaylandState {
                 coalesced += 1;
             }
             steps_this_turn += coalesced;
+            let driven = match &step.op {
+                InputOp::OnSeat { seat, .. } => seat.name(),
+                InputOp::ReleaseAll => "mixed",
+                _ => "human",
+            };
+            let run = self.injection.sequences.get_mut(&id).expect("sequence present");
+            run.driven_seat = Some(match run.driven_seat {
+                None => driven,
+                Some(previous) if previous == driven => previous,
+                Some(_) => "mixed",
+            });
             self.injection.current_run = Some(id);
             let reply = self.service_input_op(&step.op);
             self.injection.current_run = None;
@@ -1233,10 +1254,11 @@ impl WaylandState {
                 }
                 refusal => {
                     let Some(run) = self.abort_sequence(id) else { return };
+                    let seat = run.reply_seat();
                     let _ = run.reply.send(ControlReply::refused(
                         "step_failed",
                         json!({
-                            "seat": run.seat.name(),
+                            "seat": seat,
                             "index": index,
                             "verb": step.verb,
                             "step": refusal.wire_json(),

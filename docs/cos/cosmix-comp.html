@@ -1336,7 +1336,7 @@ origin.</li>
 the left or top output edge, can still project one pixel short. The renderer
 rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
-<p><strong>0.71.1 (unreleased):</strong> Bus input and sequences now default to the agent seat;
+<p><strong>0.72.0 (unreleased):</strong> Bus input and sequences now default to the agent seat;
 callers needing human focus, bindings, chrome or idle activity must pass
 <code>seat:"human"</code>. Bare <code>release_all {}</code> still clears both seats' injected holds.</p>
 <p><code>cosmix-input-probe --seats</code> binds each advertised
@@ -1347,7 +1347,8 @@ notification per seat: <code>PROBE seat "cosmix" idled</code> / <code>resumed</c
 <code>PROBE seats_done</code> follows the final event-draining roundtrip. With neither
 flag the probe retains its existing bindings and output. The flags do not
 change the compositor's input default.</p>
-<p><strong>0.71.0 (unreleased):</strong> <code>cosmix-agent</code> now has a delivery path, with its own
+<p>The former 0.71.0/0.71.1 development versions were never installed; their seat
+delivery and probe changes ship together in 0.72.0. <code>cosmix-agent</code> has its own
 keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
 hidden from Xwayland. Every <code>comp.input.*</code> verb accepts <code>seat:"human"</code> or
 <code>seat:"agent"</code>; there are no caller authorisation gates on either choice.
@@ -1511,6 +1512,11 @@ run on compositor timers, before the step, defaulting to <code>interval_ms</code
 0), and total at most 60 seconds. It yields after 256 injected events; runs can
 interleave at delays and yields. The reply is
 <code>{seat,steps:[&lt;each step's reply, including its seat&gt;],elapsed_ms}</code>.
+An explicitly seated sequence reports that seat at the top level. An unseated
+sequence reports <code>human</code>, <code>agent</code> or <code>mixed</code> from the steps reached, including
+the refusing step for <code>step_failed</code>; bare both-seat cleanup counts as <code>mixed</code>.
+An empty unseated capability probe reports the default (<code>agent</code>). Per-step
+seats are unchanged.
 On a failed step, it returns <code>step_failed</code> with <code>index</code>, <code>verb</code>, <code>step</code>,
 <code>completed</code> and <code>released:true</code>, and gives up its holds on <strong>both</strong> seats.
 Other owners' holds remain. Caller cancellation also releases the run's holds.
