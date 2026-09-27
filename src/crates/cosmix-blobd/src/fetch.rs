@@ -334,7 +334,9 @@ impl Resolver for NodedResolver {
             }
             .await;
             match &result {
-                Ok(url) => debug!(to = %to, verb = RESOLVER_PROPS_VERB, rc = 0, url = %url, "lane resolved"),
+                Ok(url) => {
+                    debug!(to = %to, verb = RESOLVER_PROPS_VERB, rc = 0, url = %url, "lane resolved")
+                }
                 Err(message) => {
                     debug!(to = %to, verb = RESOLVER_PROPS_VERB, rc = 10, message = %message, "lane resolution failed")
                 }
@@ -472,10 +474,7 @@ async fn publish_event_via(client: &Arc<NodedClient>, event: &BusEvent) {
             "fetch publish on {} failed (continuing): {error}",
             event.topic
         ),
-        Err(_) => warn!(
-            "fetch publish on {} timed out (continuing)",
-            event.topic
-        ),
+        Err(_) => warn!("fetch publish on {} timed out (continuing)", event.topic),
     }
 }
 
@@ -1094,7 +1093,7 @@ impl Inner {
             // already dropped with the attempt's failure.
             let reservation = attempt.reservation.take();
             let before = self.props_input();
-            let pin_result = match self.store.record_fetch(
+            let pin_result = match self.store.record_fetch_reserved(
                 &hash,
                 attempt.size.unwrap_or(0),
                 attempt
@@ -1103,13 +1102,14 @@ impl Inner {
                     .unwrap_or("application/octet-stream"),
                 attempt.origin_used.as_deref().unwrap_or("unknown"),
                 &owners,
+                reservation.as_ref(),
             ) {
                 Ok(pinned) => Ok(pinned),
                 Err(first) => {
                     warn!("record_fetch for {id} failed ({first}); retrying once");
                     tokio::time::sleep(PIN_RETRY_DELAY).await;
                     self.store
-                        .record_fetch(
+                        .record_fetch_reserved(
                             &hash,
                             attempt.size.unwrap_or(0),
                             attempt
@@ -1118,6 +1118,7 @@ impl Inner {
                                 .unwrap_or("application/octet-stream"),
                             attempt.origin_used.as_deref().unwrap_or("unknown"),
                             &owners,
+                            reservation.as_ref(),
                         )
                         .map_err(|second| format!("{first}; retry: {second}"))
                 }
@@ -1743,12 +1744,8 @@ mod tests {
         // buffers before any client exists must land in the very slot
         // `set_client` writes.
         let (_dir, store) = bare_store("P");
-        let fetcher = Fetcher::production(
-            store,
-            &crate::core::config::Config::default(),
-            None,
-            "p",
-        );
+        let fetcher =
+            Fetcher::production(store, &crate::core::config::Config::default(), None, "p");
         fetcher
             .0
             .sink

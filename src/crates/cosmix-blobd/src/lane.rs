@@ -740,7 +740,14 @@ fn stream_into_store(
     };
 
     let outcome = store
-        .record_upload(&landed, size, &mime, name.as_deref(), &owner)
+        .record_upload_reserved(
+            &landed,
+            size,
+            &mime,
+            name.as_deref(),
+            &owner,
+            Some(&reservation),
+        )
         .map_err(UploadError::Store)?;
     // Settle: the pin now accounts the real size; the admission's
     // headroom releases (on the error paths above, the `?` dropped it).

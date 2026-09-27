@@ -255,9 +255,29 @@ pub struct OwnerQuota {
 /// size.
 #[derive(Debug)]
 pub struct Reservation {
-    reserved: Arc<Mutex<BTreeMap<String, u64>>>,
+    reserved: Arc<Mutex<Reservations>>,
+    id: u64,
     owner: String,
     amount: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Reservations {
+    next: u64,
+    holds: BTreeMap<u64, (String, u64)>,
+}
+
+impl Reservations {
+    fn totals(&self, exclude: Option<u64>) -> BTreeMap<String, u64> {
+        let mut totals = BTreeMap::<String, u64>::new();
+        for (id, (owner, amount)) in &self.holds {
+            if Some(*id) != exclude {
+                let value = totals.entry(owner.clone()).or_default();
+                *value = value.saturating_add(*amount);
+            }
+        }
+        totals
+    }
 }
 
 impl Reservation {
@@ -271,17 +291,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut reserved = self.reserved.lock().unwrap();
-        let left = reserved
-            .get(&self.owner)
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(self.amount);
-        if left == 0 {
-            reserved.remove(&self.owner);
-        } else {
-            reserved.insert(self.owner.clone(), left);
-        }
+        self.reserved.lock().unwrap().holds.remove(&self.id);
     }
 }
 
@@ -361,7 +371,7 @@ pub struct Store {
     /// In-flight upload reservations (M3): owner → bytes admitted but
     /// not yet pinned. Lock order is always reserved → db — a path
     /// holding the db mutex never takes this one.
-    reserved: Arc<Mutex<BTreeMap<String, u64>>>,
+    reserved: Arc<Mutex<Reservations>>,
     /// Holds the root `flock` for the store's lifetime. Never read:
     /// closing it on drop is what releases the lock.
     _lock_file: File,
@@ -428,7 +438,7 @@ impl Store {
             mds,
             db: Mutex::new(db),
             index: Mutex::new(index),
-            reserved: Arc::new(Mutex::new(BTreeMap::new())),
+            reserved: Arc::new(Mutex::new(Reservations::default())),
             _lock_file: lock_file,
             options,
             startup: StartupReport::default(),
@@ -518,9 +528,15 @@ impl Store {
     /// can no longer each spend the full headroom — the old
     /// check-then-act read the cap once and never reserved.
     pub fn reserve_upload(&self, owner: &str, declared: Option<u64>) -> Result<Reservation> {
+        if declared.is_some_and(|n| n > i64::MAX as u64) {
+            return Err(StoreError::BadRequest(
+                "size exceeds SQLite integer range".into(),
+            ));
+        }
         let mut reserved = self.reserved.lock().unwrap();
-        let owner_reserved = reserved.get(owner).copied().unwrap_or(0);
-        let total_reserved: u64 = reserved.values().copied().sum();
+        let totals = reserved.totals(None);
+        let owner_reserved = totals.get(owner).copied().unwrap_or(0);
+        let total_reserved = sum_reserved(&totals);
         let owner_used = self.owner_used(owner)?;
         let total_used = self.total_used()?;
         // Owner cap first — the order Store::put has always checked.
@@ -555,11 +571,17 @@ impl Store {
                 .options
                 .quota_total_bytes
                 .saturating_sub(total_used.saturating_add(total_reserved));
-            owner_room.min(total_room)
+            owner_room.min(total_room).min(i64::MAX as u64)
         });
-        *reserved.entry(owner.to_string()).or_insert(0) += amount;
+        reserved.next = reserved
+            .next
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Db("reservation identifier exhausted".into()))?;
+        let id = reserved.next;
+        reserved.holds.insert(id, (owner.to_string(), amount));
         Ok(Reservation {
             reserved: Arc::clone(&self.reserved),
+            id,
             owner: owner.to_string(),
             amount,
         })
@@ -590,7 +612,7 @@ impl Store {
         // Quota reserved for the copy's duration; the mid-copy race
         // that read the cap once is closed.
         let size = md.len();
-        let _reservation = self.reserve_upload(opts.owner, Some(size))?;
+        let reservation = self.reserve_upload(opts.owner, Some(size))?;
 
         let hash = self.mds.put_blob_path(src, opts.mode)?;
         let size = blob::size(&self.blobs_root(), &hash)?;
@@ -599,7 +621,14 @@ impl Store {
             .mime
             .map(str::to_string)
             .unwrap_or_else(|| mime::sniff(&os_str_lossy(opts.name, src)).to_string());
-        self.record_upload(&hash, size, &mime, opts.name, opts.owner)
+        self.record_upload_reserved(
+            &hash,
+            size,
+            &mime,
+            opts.name,
+            opts.owner,
+            Some(&reservation),
+        )
     }
 
     /// Post-stream ingest bookkeeping, shared by `blob.put` and the
@@ -620,6 +649,26 @@ impl Store {
         name: Option<&str>,
         owner: &str,
     ) -> Result<PutOutcome> {
+        self.record_upload_reserved(hash, size, mime, name, owner, None)
+    }
+
+    /// Settle this upload's identifiable hold in the same critical section
+    /// as its pin. Other uploads' holds remain unavailable to every pin path.
+    pub fn record_upload_reserved(
+        &self,
+        hash: &BlobHash,
+        size: u64,
+        mime: &str,
+        name: Option<&str>,
+        owner: &str,
+        reservation: Option<&Reservation>,
+    ) -> Result<PutOutcome> {
+        let mut reserved = self.reserved.lock().unwrap();
+        let credit = self.reservation_credit(&reserved, reservation, size)?;
+        if reservation.is_some_and(|r| r.owner != owner) {
+            return Err(StoreError::BadRequest("reservation owner mismatch".into()));
+        }
+        let totals = reserved.totals(credit);
         let mut db = self.db.lock().unwrap();
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
@@ -650,8 +699,12 @@ impl Store {
             size,
             self.options.owner_limit(owner),
             self.options.quota_total_bytes,
+            &totals,
         )?;
         tx.commit().map_err(db_err)?;
+        if let Some(id) = credit {
+            reserved.holds.remove(&id);
+        }
         drop(db);
         if pinned {
             self.bump_generation();
@@ -691,12 +744,29 @@ impl Store {
         source_node: &str,
         owners: &[String],
     ) -> Result<FetchPins> {
+        self.record_fetch_reserved(hash, size, mime, source_node, owners, None)
+    }
+
+    /// Fetch settlement credits only the initiating transfer's hold; joiners
+    /// pay separately and cannot spend another transfer's reservation.
+    pub fn record_fetch_reserved(
+        &self,
+        hash: &BlobHash,
+        size: u64,
+        mime: &str,
+        source_node: &str,
+        owners: &[String],
+        reservation: Option<&Reservation>,
+    ) -> Result<FetchPins> {
         #[cfg(test)]
         if self.fail_record_fetch.load(Ordering::Relaxed) {
             return Err(StoreError::Db(
                 "injected record_fetch failure (test)".to_string(),
             ));
         }
+        let mut reserved = self.reserved.lock().unwrap();
+        let credit = self.reservation_credit(&reserved, reservation, size)?;
+        let totals = reserved.totals(credit);
         let mut db = self.db.lock().unwrap();
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
@@ -711,7 +781,9 @@ impl Store {
         )
         .map_err(db_err)?;
         let mut pins = FetchPins::default();
-        for owner in owners {
+        let mut ordered = owners.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|owner| !reservation.is_some_and(|r| &r.owner == *owner));
+        for owner in ordered {
             match pin_with_cap(
                 &tx,
                 &blob::hex(hash),
@@ -719,6 +791,7 @@ impl Store {
                 size,
                 self.options.owner_limit(owner),
                 self.options.quota_total_bytes,
+                &totals,
             ) {
                 Ok(true) => pins.pinned.push(owner.clone()),
                 Ok(false) => pins.held.push(owner.clone()),
@@ -731,11 +804,34 @@ impl Store {
             }
         }
         tx.commit().map_err(db_err)?;
+        if let Some(id) = credit {
+            reserved.holds.remove(&id);
+        }
         drop(db);
         if !pins.pinned.is_empty() {
             self.bump_generation();
         }
         Ok(pins)
+    }
+
+    fn reservation_credit(
+        &self,
+        holds: &Reservations,
+        reservation: Option<&Reservation>,
+        size: u64,
+    ) -> Result<Option<u64>> {
+        let Some(r) = reservation else {
+            return Ok(None);
+        };
+        if !Arc::ptr_eq(&self.reserved, &r.reserved)
+            || !holds.holds.contains_key(&r.id)
+            || size > r.amount
+        {
+            return Err(StoreError::BadRequest(
+                "invalid or insufficient reservation".into(),
+            ));
+        }
+        Ok(Some(r.id))
     }
 
     // ---- Reads ----
@@ -817,6 +913,8 @@ impl Store {
             return Err(StoreError::NotPresent(blob::hex(hash)));
         }
         let size = blob::size(&self.blobs_root(), hash)?;
+        let reserved = self.reserved.lock().unwrap();
+        let totals = reserved.totals(None);
         let mut db = self.db.lock().unwrap();
         if !blob::blob_path(&self.blobs_root(), hash).exists() {
             return Err(StoreError::Vanished(blob::hex(hash)));
@@ -831,6 +929,7 @@ impl Store {
             size,
             self.options.owner_limit(owner),
             self.options.quota_total_bytes,
+            &totals,
         )?;
         tx.commit().map_err(db_err)?;
         drop(db);
@@ -1044,10 +1143,10 @@ impl Store {
     // ---- Quota ----
 
     pub fn quota_report(&self, owner: Option<&str>) -> Result<QuotaReport> {
-        // The reservation snapshot first, never nested with the db
-        // lock (lock order is reserved → db everywhere else).
-        let reserved_map: BTreeMap<String, u64> = self.reserved.lock().unwrap().clone();
-        let total_reserved: u64 = reserved_map.values().copied().sum();
+        // One consistent snapshot, with the admission/settlement lock order.
+        let reserved = self.reserved.lock().unwrap();
+        let reserved_map = reserved.totals(None);
+        let total_reserved = sum_reserved(&reserved_map);
         let db = self.db.lock().unwrap();
         let mut owners = BTreeMap::new();
         match owner {
@@ -1095,6 +1194,13 @@ impl Store {
                         used: 0,
                         limit: *limit,
                         reserved: reserved_map.get(o).copied().unwrap_or(0),
+                    });
+                }
+                for (o, amount) in &reserved_map {
+                    owners.entry(o.clone()).or_insert(OwnerQuota {
+                        used: 0,
+                        limit: self.options.owner_limit(o),
+                        reserved: *amount,
                     });
                 }
             }
@@ -1381,6 +1487,7 @@ fn pin_with_cap(
     size: u64,
     owner_limit: u64,
     total_limit: u64,
+    reserved: &BTreeMap<String, u64>,
 ) -> Result<bool> {
     let already: i64 = tx
         .query_row(
@@ -1399,7 +1506,9 @@ fn pin_with_cap(
             |r| r.get(0),
         )
         .map_err(db_err)?;
-    let would_use = owner_used as u64 + size;
+    let would_use = (owner_used as u64)
+        .saturating_add(size)
+        .saturating_add(reserved.get(owner).copied().unwrap_or(0));
     if would_use > owner_limit {
         return Err(StoreError::QuotaOwner {
             owner: owner.to_string(),
@@ -1414,7 +1523,9 @@ fn pin_with_cap(
             |r| r.get(0),
         )
         .map_err(db_err)?;
-    let total_would = total_used as u64 + size;
+    let total_would = (total_used as u64)
+        .saturating_add(size)
+        .saturating_add(sum_reserved(reserved));
     if total_would > total_limit {
         return Err(StoreError::QuotaTotal {
             would_use: total_would,
@@ -1428,6 +1539,12 @@ fn pin_with_cap(
     .map_err(db_err)?;
     bump_owner_used(tx, owner, size)?;
     Ok(true)
+}
+
+fn sum_reserved(reserved: &BTreeMap<String, u64>) -> u64 {
+    reserved
+        .values()
+        .fold(0u64, |sum, n| sum.saturating_add(*n))
 }
 
 fn shrink_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) -> Result<()> {
@@ -2068,6 +2185,97 @@ mod tests {
     }
 
     // ---- M4: the CAS carries the shared-read group, setgid ----
+
+    #[test]
+    fn all_pin_paths_respect_other_transfer_holds() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                quota_total_bytes: 100,
+                quota_owner_default_bytes: 100,
+                ..options()
+            },
+        )
+        .unwrap();
+        let hold = store.reserve_upload("upload", Some(80)).unwrap();
+        let hash = blob::put(&store.blobs_root(), &[7; 30]).unwrap();
+        assert!(matches!(
+            store.pin(&hash, "pin"),
+            Err(StoreError::QuotaTotal { .. })
+        ));
+        assert!(matches!(
+            store.record_upload(&hash, 30, "x", None, "put"),
+            Err(StoreError::QuotaTotal { .. })
+        ));
+        let result = store
+            .record_fetch(&hash, 30, "x", "remote", &["joiner".into()])
+            .unwrap();
+        assert_eq!(result.refused, vec!["joiner"]);
+        assert_eq!(
+            store.quota_report(None).unwrap().owners["upload"].reserved,
+            80
+        );
+        drop(hold);
+        assert!(store.pin(&hash, "pin").unwrap());
+    }
+
+    #[test]
+    fn settlement_consumes_only_its_identified_hold() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                quota_total_bytes: 100,
+                quota_owner_default_bytes: 100,
+                ..options()
+            },
+        )
+        .unwrap();
+        let one = store.reserve_upload("owner", Some(60)).unwrap();
+        let two = store.reserve_upload("owner", Some(40)).unwrap();
+        let hash = blob::put(&store.blobs_root(), &[1; 60]).unwrap();
+        store
+            .record_upload_reserved(&hash, 60, "x", None, "owner", Some(&one))
+            .unwrap();
+        let q = store.quota_report(None).unwrap();
+        assert_eq!((q.total.used, q.total.reserved), (60, 40));
+        drop(one); // Consumed guard cannot release the other hold.
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 40);
+        drop(two);
+    }
+
+    #[test]
+    fn fetch_settlement_prioritises_its_hold_and_refuses_joiner() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                quota_total_bytes: 100,
+                quota_owner_default_bytes: 100,
+                ..options()
+            },
+        )
+        .unwrap();
+        let hold = store.reserve_upload("z-first", Some(60)).unwrap();
+        let other = store.reserve_upload("other", Some(40)).unwrap();
+        let hash = blob::put(&store.blobs_root(), &[9; 60]).unwrap();
+        let pins = store
+            .record_fetch_reserved(
+                &hash,
+                60,
+                "x",
+                "remote",
+                &["a-joiner".into(), "z-first".into()],
+                Some(&hold),
+            )
+            .unwrap();
+        assert_eq!(pins.pinned, vec!["z-first"]);
+        assert_eq!(pins.refused, vec!["a-joiner"]);
+        let q = store.quota_report(None).unwrap();
+        assert_eq!((q.total.used, q.total.reserved), (60, 40));
+        drop(other);
+    }
 
     #[test]
     fn cas_roots_and_shard_dirs_carry_the_group_and_setgid() {
