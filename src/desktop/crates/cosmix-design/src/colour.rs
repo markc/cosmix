@@ -929,7 +929,7 @@ mod tests {
     fn the_elevated_text_fallback_warns_once_on_the_authored_donor() {
         // The fixture's light foreground cannot clear AA on the L 0.62
         // elevated grey, so both roles take the §3.4 knockout.
-        let mut source = fixture_source();
+        let source = fixture_source();
         let resolved = compile(&source).expect("the fallback repairs, not refuses");
         let warnings = resolved
             .diagnostics

@@ -1668,7 +1668,8 @@ mod tests {
         // which measures 3.7:1 (light) and 3.1:1 (dark) on the elevated grey,
         // so the §3.6 derivation delivers the knockout through the
         // authored-pair path in every context.
-        let crate::PairSource::Authored(elevated) = &mut document.v1.semantics.pairs["elevated"]
+        let Some(crate::PairSource::Authored(elevated)) =
+            document.v1.semantics.pairs.get_mut("elevated")
         else {
             panic!("the embedded elevated pair is authored");
         };
