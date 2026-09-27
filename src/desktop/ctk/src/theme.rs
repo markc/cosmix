@@ -3388,14 +3388,32 @@ mod tests {
                             alpha: 1.0,
                         },
                     ),
+                    (
+                        "web-anchor-verbatim.grey".to_owned(),
+                        cosmix_design::OklchSource {
+                            color_space: cosmix_design::ColourSpace::Oklch,
+                            l: 0.5,
+                            c: 0.0,
+                            h: 0.0,
+                            alpha: 1.0,
+                        },
+                    ),
                 ]);
                 ctk_source.semantics.pairs = cosmix_design::TEXT_PAIR_NAMES
                     .into_iter()
                     .map(|name| {
+                        // `muted` and `elevated` must stay visibly off the
+                        // black `base` or the surface-distinction rule refuses
+                        // the synthesized source this test only uses as a
+                        // pipeline vehicle for its anchors.
+                        let surface = match name {
+                            "muted" | "elevated" => "web-anchor-verbatim.grey",
+                            _ => "web-anchor-verbatim.black",
+                        };
                         (
                             name.to_owned(),
                             cosmix_design::PairSource::authored(
-                                "web-anchor-verbatim.black",
+                                surface,
                                 "web-anchor-verbatim.white",
                                 None,
                             ),

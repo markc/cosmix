@@ -169,6 +169,7 @@ pub(crate) fn compile_colour_tokens_with_registry(
         &mut errors,
         registry,
     );
+    enforce_surface_distinction_from_base(&pairs, &mut errors);
     if errors.is_empty() {
         finalize_semantic_override_products(&primitives, &mut pairs, &mut warnings, &mut errors);
     }
@@ -244,6 +245,37 @@ pub(crate) fn compile_colour_tokens_with_registry(
         Err(ColourCompileFailure {
             diagnostics: warnings,
         })
+    }
+}
+
+/// The §3.4 distinctness floor for quiet and elevated chrome: the `muted` and
+/// `elevated` surfaces must each sit at least this far off `base` in luminance
+/// contrast, or they collapse onto the page and paint as whatever they cover.
+const SURFACE_DISTINCTION_CONTRAST: f64 = 1.25;
+
+fn enforce_surface_distinction_from_base(
+    pairs: &BTreeMap<String, ResolvedPair>,
+    errors: &mut Vec<DesignDiagnostic>,
+) {
+    let Some(base) = pairs.get("base") else {
+        return;
+    };
+    for role in ["muted", "elevated"] {
+        let Some(pair) = pairs.get(role) else {
+            continue;
+        };
+        let ratio = contrast_ratio(pair.rendered_surface, base.rendered_surface);
+        if !ratio.is_finite() || ratio < SURFACE_DISTINCTION_CONTRAST {
+            errors.push(DesignDiagnostic::error(
+                "surface-not-distinct-from-base",
+                format!("design.v1.semantics.pairs.{role}"),
+                format!(
+                    "`{role}` surface contrast against `base` is {ratio:.3}:1, below the \
+                     {SURFACE_DISTINCTION_CONTRAST}:1 floor, so `{role}` chrome collapses \
+                     onto the page it covers"
+                ),
+            ));
+        }
     }
 }
 
@@ -502,10 +534,19 @@ mod tests {
         let mut colors = BTreeMap::new();
         colors.insert("dark".into(), colour(0.2, 0.02, 250.0));
         colors.insert("light".into(), colour(0.95, 0.01, 250.0));
+        colors.insert("mutedbg".into(), colour(0.42, 0.02, 250.0));
+        colors.insert("elevbg".into(), colour(0.62, 0.02, 250.0));
         colors.insert("ring".into(), colour(0.72, 0.18, 240.0));
         let pairs = TEXT_PAIR_NAMES
             .into_iter()
-            .map(|name| (name.to_owned(), PairSource::authored("dark", "light", None)))
+            .map(|name| {
+                let surface = match name {
+                    "muted" => "mutedbg",
+                    "elevated" => "elevbg",
+                    _ => "dark",
+                };
+                (name.to_owned(), PairSource::authored(surface, "light", None))
+            })
             .collect();
         let non_text = NON_TEXT_NAMES
             .into_iter()
@@ -641,6 +682,10 @@ mod tests {
     #[test]
     fn popover_and_elevated_alias_whichever_half_is_unauthored() {
         let mut source = fixture_source();
+        source.semantics.pairs.insert(
+            "popover".into(),
+            PairSource::authored("elevbg", "light", None),
+        );
         source.semantics.pairs.remove("elevated");
         let resolved =
             compile(&source).expect("a popover-only source compiles with elevated aliased");
@@ -733,6 +778,70 @@ mod tests {
             .find(|diagnostic| diagnostic.code == "text-contrast")
             .unwrap();
         assert!(diagnostic.suggestion.is_some());
+    }
+
+    #[test]
+    fn muted_or_elevated_collapsing_onto_base_is_refused_by_name() {
+        let mut source = fixture_source();
+        source.semantics.pairs.insert(
+            "muted".into(),
+            PairSource::authored("dark", "light", None),
+        );
+        let failure = compile(&source).unwrap_err();
+        let diagnostic = failure
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "surface-not-distinct-from-base")
+            .unwrap();
+        assert!(diagnostic.path.ends_with("pairs.muted"));
+        assert!(diagnostic.message.contains("`muted`"), "{}", diagnostic.message);
+
+        let mut source = fixture_source();
+        source.semantics.pairs.insert(
+            "elevated".into(),
+            PairSource::authored("dark", "light", None),
+        );
+        let failure = compile(&source).unwrap_err();
+        let diagnostic = failure
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "surface-not-distinct-from-base")
+            .unwrap();
+        assert!(diagnostic.path.ends_with("pairs.elevated"));
+        assert!(diagnostic.message.contains("`elevated`"), "{}", diagnostic.message);
+    }
+
+    #[test]
+    fn the_embedded_default_clears_the_surface_distinction_floor_everywhere() {
+        let document = crate::parse_design_source(
+            crate::SourceIdentity::new("embedded:distinction-gate"),
+            crate::EMBEDDED_DEFAULT_SOURCE,
+        )
+        .expect("the embedded default parses");
+        for scheme in crate::Scheme::ALL {
+            for mode in crate::Mode::ALL {
+                let context = DesignContext {
+                    scheme,
+                    mode,
+                    ..Default::default()
+                };
+                let colours = compile_colour_tokens(&document.v1, context)
+                    .expect("the embedded default clears the distinction floor");
+                let base = &colours.value.pairs["base"];
+                for role in ["muted", "elevated", "popover"] {
+                    let ratio = contrast_ratio(
+                        colours.value.pairs[role].rendered_surface,
+                        base.rendered_surface,
+                    );
+                    assert!(
+                        ratio >= SURFACE_DISTINCTION_CONTRAST,
+                        "{} / {} / {role}: {ratio:.3}:1",
+                        scheme.name(),
+                        mode.name()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
