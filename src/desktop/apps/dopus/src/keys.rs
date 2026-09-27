@@ -23,7 +23,7 @@
 //!   and which are refused.
 //! - Modal capture: while a dialog is up the router turns Enter and Escape
 //!   into [`ModalKey`] messages BEFORE its children see them (the
-//!   [`crate::view::location::Capture`] shape, generalised): the dialog owns
+//!   modal capture): the dialog owns
 //!   them (Enter = confirm/submit, Escape = dismiss) and the prompt's text
 //!   field receives every other keystroke untouched.
 
@@ -314,6 +314,7 @@ pub struct KeyRouter<'a, Message, Theme, Renderer> {
     /// [`ModalKey`] messages before the children see them.
     modal: bool,
     on_modal_key: Option<ModalKeyFn<'a, Message>>,
+    on_edit_cancel: Option<Message>,
 }
 
 pub fn router<'a, Message, Theme, Renderer>(
@@ -327,10 +328,17 @@ pub fn router<'a, Message, Theme, Renderer>(
         on_actions: Box::new(on_actions),
         modal: false,
         on_modal_key: None,
+        on_edit_cancel: None,
     }
 }
 
 impl<'a, Message, Theme, Renderer> KeyRouter<'a, Message, Theme, Renderer> {
+    /// Escape cancels the location editor; Enter stays with TextField.
+    pub fn on_edit_cancel(mut self, message: Message) -> Self {
+        self.on_edit_cancel = Some(message);
+        self
+    }
+
     /// A modal dialog is up (mirrors [`Router::modal`], which the resolver
     /// sees through the [`FocusContext`]).
     pub fn modal(mut self, modal: bool) -> Self {
@@ -402,8 +410,7 @@ where
         if let Event::InputMethod(ime) = event {
             note_ime(&self.shared, ime);
         }
-        // A dialog owns Enter and Escape outright (location.rs's `Capture`
-        // rule, dialog-wide): publish them before any child — the prompt's
+        // A dialog owns Enter and Escape outright: publish them before any child — the prompt's
         // text field included — can react, and let every other keystroke
         // through to whoever holds focus. OS repeats never capture: a held
         // Enter must not confirm the dialog (cosmix-actions'
@@ -421,6 +428,26 @@ where
             shell.publish(on_modal_key(modal_key));
             shell.capture_event();
             return;
+        }
+        if !self.modal
+            && let Some(message) = &self.on_edit_cancel
+            && let Event::Keyboard(keyboard::Event::KeyPressed {
+                key, modifiers, ..
+            }) = event
+        {
+            if *key == Key::Named(Named::Escape) {
+                shell.publish(message.clone());
+                shell.capture_event();
+                return;
+            }
+            // Preserve the location editor's plain-Enter submission rule.
+            // iced's on_submit itself also accepts modified Enter.
+            if *key == Key::Named(Named::Enter)
+                && (modifiers.control() || modifiers.alt() || modifiers.logo())
+            {
+                shell.capture_event();
+                return;
+            }
         }
         if let Event::Keyboard(keyboard_event) = event
             && let Some(input) = key_input(keyboard_event)

@@ -9,6 +9,12 @@ use iced_widget::text_input::{self, TextInput};
 
 type Selection = text_input::cursor::State;
 
+#[derive(Clone)]
+enum InputMessage {
+    Changed(String),
+    Submit,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Snapshot {
     value: String,
@@ -80,9 +86,10 @@ impl History {
 /// movement, paste, composition, whitespace and deletion end the group. Up to
 /// 100 groups are retained; an external value replacement clears history.
 pub struct TextField<'a, Message, Renderer: text::Renderer> {
-    input: TextInput<'a, String, Theme, Renderer>,
+    input: TextInput<'a, InputMessage, Theme, Renderer>,
     value: String,
     on_input: Option<Box<dyn Fn(String) -> Message + 'a>>,
+    on_submit: Option<Box<dyn Fn() -> Message + 'a>>,
     config: Config<'a>,
 }
 
@@ -106,6 +113,7 @@ impl<'a, Message, Renderer: text::Renderer> TextField<'a, Message, Renderer> {
             input: TextInput::new(placeholder, value),
             value: value.into(),
             on_input: None,
+            on_submit: None,
             config: Config {
                 placeholder: placeholder.into(),
                 ..Config::default()
@@ -115,8 +123,18 @@ impl<'a, Message, Renderer: text::Renderer> TextField<'a, Message, Renderer> {
 
     /// Enables editing and maps new values into application messages.
     pub fn on_input(mut self, callback: impl Fn(String) -> Message + 'a) -> Self {
-        self.input = self.input.on_input(std::convert::identity);
+        self.input = self.input.on_input(InputMessage::Changed);
         self.on_input = Some(Box::new(callback));
+        self
+    }
+
+    /// Publishes a message when iced submits the focused input with Enter.
+    pub fn on_submit(mut self, message: Message) -> Self
+    where
+        Message: Clone + 'a,
+    {
+        self.input = self.input.on_submit(InputMessage::Submit);
+        self.on_submit = Some(Box::new(move || message.clone()));
         self
     }
 
@@ -178,7 +196,10 @@ impl<'a, Message, Renderer: text::Renderer> TextField<'a, Message, Renderer> {
         let config = &self.config;
         let mut input = TextInput::new(&config.placeholder, &self.value).secure(config.secure);
         if self.on_input.is_some() {
-            input = input.on_input(std::convert::identity);
+            input = input.on_input(InputMessage::Changed);
+        }
+        if self.on_submit.is_some() {
+            input = input.on_submit(InputMessage::Submit);
         }
         if let Some(id) = &config.id {
             input = input.id(id.clone());
@@ -216,7 +237,7 @@ impl<Message, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
 
     fn children(&self) -> Vec<widget::Tree> {
         vec![widget::Tree::new(
-            &self.input as &dyn Widget<String, Theme, Renderer>,
+            &self.input as &dyn Widget<InputMessage, Theme, Renderer>,
         )]
     }
 
@@ -368,6 +389,10 @@ impl<Message, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
         let history = RefCell::new(history);
         let value = RefCell::new(&mut self.value);
         shell.merge(inner_shell, |next| {
+            let next = match next {
+                InputMessage::Changed(next) => next,
+                InputMessage::Submit => return self.on_submit.as_ref().expect("submit enabled")(),
+            };
             let after = Snapshot {
                 selection: input_state.cursor().state(&text_input::Value::new(&next)),
                 value: next.clone(),
@@ -563,6 +588,24 @@ mod widget_tests {
             text: (!modifiers.control()).then(|| character.into()),
             repeat: false,
         })
+    }
+
+    #[test]
+    fn submit_is_distinct_from_edits_and_survives_undo() {
+        let (field, mut tree) = field("path");
+        let mut field = field.on_submit("submitted".to_owned());
+        send(&mut field, &mut tree, key("a", keyboard::Modifiers::empty()));
+        send(&mut field, &mut tree, key("z", keyboard::Modifiers::CTRL));
+        let mut enter = key("", keyboard::Modifiers::empty());
+        if let Event::Keyboard(keyboard::Event::KeyPressed { key, modified_key, text, .. }) = &mut enter {
+            *key = keyboard::Key::Named(keyboard::key::Named::Enter);
+            *modified_key = key.clone();
+            *text = None;
+        }
+        assert_eq!(send(&mut field, &mut tree, enter.clone()).0, ["submitted"]);
+        assert_eq!(field.value, "path");
+        tree.children[0].state.downcast_mut::<text_input::State<()>>().unfocus();
+        assert!(send(&mut field, &mut tree, enter).0.is_empty());
     }
 
     #[test]

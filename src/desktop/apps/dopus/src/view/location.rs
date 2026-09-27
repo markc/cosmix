@@ -11,19 +11,13 @@
 //! Enter IS a keymap binding (it is file.open in the packaged keymap), but
 //! every default is `allow_in_editable: false`, so the router suppresses it
 //! while an editor holds focus and the keystroke reaches the field.
-//! [`Capture`] is still load-bearing for Escape — no keymap entry owns it —
-//! and turns Enter into a message before the field sees it (no new keymap
-//! ids — a `location.focus` id plus a Ctrl+L chord would need a
-//! cosmix-actions keymap addition: reported, not invented locally).
+//! The field owns Enter submission; KeyRouter cancels editing on Escape.
 
-use iced::advanced::widget::{Operation, Tree, tree};
-use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, renderer};
 use iced::widget::{button, container};
-use iced::{Border, Element, Event, Length, Rectangle, Size};
+use iced::{Border, Element, Length};
 
 use cosmix_dopus_core::{PaneId, PaneModel};
 use cosmix_iced_widgets::TextField;
-use iced_tiny_skia::Renderer;
 
 use crate::app::Msg;
 use crate::view::Look;
@@ -68,17 +62,17 @@ fn display(look: Look, pane: &PaneModel, pane_id: PaneId) -> Element<'static, Ms
     .into()
 }
 
-/// Editing: the real path text in a token-styled field, wrapped in
-/// [`Capture`] for Enter/Escape.
+/// Editing: the real path text in a token-styled field.
 fn editor(look: Look, pane_id: PaneId, text: &str) -> Element<'_, Msg> {
     let field = TextField::new("path", text)
         .id(location_id(pane_id))
         .on_input(Msg::LocationInput)
+        .on_submit(Msg::LocationSubmit(pane_id))
         .width(Length::Fill)
         .padding(iced::Padding::from([2, 6]))
         .size(look.mono_px * 0.9)
         .style(field_look(&look));
-    Capture { content: field.into(), pane_id }.into()
+    field.into()
 }
 
 /// The at-rest bar, styled as a button that reads like the editor it opens:
@@ -136,125 +130,5 @@ fn field_look(
         placeholder: muted,
         value: text_color,
         selection,
-    }
-}
-
-/// Enter/Escape capture around an editing field (the `keys::KeyRouter`
-/// shape, cut down): intercepts the two keys the keymap does not own,
-/// publishes them, and forwards everything else to the field.
-pub struct Capture<'a> {
-    content: Element<'a, Msg, iced::Theme, Renderer>,
-    pane_id: PaneId,
-}
-
-impl Widget<Msg, iced::Theme, Renderer> for Capture<'_> {
-    fn tag(&self) -> tree::Tag {
-        self.content.as_widget().tag()
-    }
-
-    fn state(&self) -> tree::State {
-        self.content.as_widget().state()
-    }
-
-    fn children(&self) -> Vec<Tree> {
-        self.content.as_widget().children()
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        self.content.as_widget().diff(tree);
-    }
-
-    fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
-    }
-
-    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
-        self.content.as_widget_mut().layout(tree, renderer, limits)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        self.content.as_widget_mut().operate(tree, layout, renderer, operation);
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Msg>,
-        viewport: &Rectangle,
-    ) {
-        // The editor only exists while it is being edited, so these are
-        // unconditional: Enter submits, Escape cancels.
-        if let Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
-            match key {
-                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
-                    if !modifiers.control() && !modifiers.alt() && !modifiers.logo() =>
-                {
-                    shell.publish(Msg::LocationSubmit(self.pane_id));
-                    shell.capture_event();
-                    return;
-                }
-                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
-                    shell.publish(Msg::LocationCancel);
-                    shell.capture_event();
-                    return;
-                }
-                _ => {}
-            }
-        }
-        self.content
-            .as_widget_mut()
-            .update(tree, event, layout, cursor, renderer, clipboard, shell, viewport);
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut Renderer,
-        theme: &iced::Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.content.as_widget().draw(tree, renderer, theme, style, layout, cursor, viewport);
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &Renderer,
-    ) -> mouse::Interaction {
-        self.content.as_widget().mouse_interaction(tree, layout, cursor, viewport, renderer)
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut Tree,
-        layout: Layout<'b>,
-        renderer: &Renderer,
-        viewport: &Rectangle,
-        translation: iced::Vector,
-    ) -> Option<iced::advanced::overlay::Element<'b, Msg, iced::Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(tree, layout, renderer, viewport, translation)
-    }
-}
-
-impl<'a> From<Capture<'a>> for Element<'a, Msg, iced::Theme, Renderer> {
-    fn from(capture: Capture<'a>) -> Self {
-        Element::new(capture)
     }
 }

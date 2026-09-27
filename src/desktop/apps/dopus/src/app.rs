@@ -962,6 +962,8 @@ impl Dopus {
         let mut routed = keys::router(content, self.router.clone(), Msg::Actions).modal(self.dialog.is_some());
         if self.dialog.is_some() {
             routed = routed.on_modal_key(Msg::DialogKey);
+        } else if self.editing.is_some() {
+            routed = routed.on_edit_cancel(Msg::LocationCancel);
         }
         routed.into()
     }
