@@ -337,6 +337,9 @@ impl Runtime {
             .try_acquire_owned()
             .map_err(|_| "busy: media write pool full (8)".into())
     }
+    fn ref_admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        self.refs.clone().try_acquire_owned().map_err(|_| "busy: media reference pool full (8)".into())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -380,13 +383,16 @@ pub(crate) async fn media_ref(
     if id <= 0 {
         return Err("invalid_arguments: positive media id required".into());
     }
-    let admission = Arc::new(
-        node.media_runtime
-            .refs
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "busy: media reference pool full (8)")?,
-    );
+    media_ref_admitted(node, vhost, id, node.media_runtime.ref_admit()?).await
+}
+
+async fn media_ref_admitted(
+    node: &NodeState,
+    vhost: &VhostState,
+    id: i64,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<crate::blob_reference::Reference, String> {
+    let admission = Arc::new(permit);
     let lock = slot(&node.media_runtime.rows, (vhost.fqdn.clone(), id));
     let _row_guard = lock.lock().await;
     let db = vhost.db.as_ref().ok_or("not_found")?;
@@ -547,8 +553,15 @@ pub(crate) async fn media_upload(
     drop(guard);
     drop(admission);
     // Durable row/file first. Optional blob failure is explicitly non-fatal.
-    if let Err(reason) = media_ref(&node, &vhost, id).await {
-        tracing::warn!(%reason, id, vhost=%vhost.fqdn, "media saved without blob reference; retry webd.media.ref");
+    match node.media_runtime.ref_admit() {
+        Ok(permit) => {
+            tokio::spawn(async move {
+                if let Err(reason) = media_ref_admitted(&node, &vhost, id, permit).await {
+                    tracing::warn!(%reason, id, vhost=%vhost.fqdn, "media saved without blob reference; retry webd.media.ref");
+                }
+            });
+        }
+        Err(reason) => tracing::warn!(%reason, id, "media saved; reference admission full, retry webd.media.ref"),
     }
     redirect("/admin/media")
 }
@@ -760,7 +773,11 @@ mod tests {
             .unwrap(),
         );
         let png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1];
-        let response = media_upload(
+        // Stall the optional worker before it reaches the lane. The HTTP reply
+        // must finish even though reference creation cannot make any progress.
+        let ref_lock = slot(&node.media_runtime.rows, (vhost.fqdn.clone(), 1));
+        let stalled = ref_lock.lock().await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), media_upload(
             State(node.clone()),
             Extension(vhost.clone()),
             headers,
@@ -768,8 +785,8 @@ mod tests {
                 data: base64::engine::general_purpose::STANDARD.encode(png),
                 filename: "image.png".into(),
             }),
-        )
-        .await;
+        )).await.unwrap();
+        drop(stalled);
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()["location"], "/admin/media");
         let source = {
