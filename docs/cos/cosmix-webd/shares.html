@@ -453,9 +453,12 @@ they never fall through to a similarly named static file. Other methods return
 password in the password part, <code>WWW-Authenticate: Basic realm="share"</code> on 401.
 Plain requests reaching this handler return 403 without a challenge; the existing
 redirect-only HTTP listener still redirects to HTTPS. No query-string password is read.
-Before bcrypt, five attempts per (token, actual socket peer IP) per 60 seconds
-are allowed. The table holds at most 4096 live pairs and refuses new pairs when
-full. Refusal returns 429 with <code>Retry-After: 60</code>. Forwarded IP headers are ignored.
+Before bcrypt, five failed verifications per (token, socket peer IPv4 or IPv6 /64)
+per 60 seconds are allowed. Missing credentials and successful checks do not count.
+The table holds at most 4096 pairs; insertion evicts the oldest entry for that
+token, or the oldest global entry when the token has none. Refusal returns 429
+with <code>Retry-After: 60</code>. Forwarded IP headers are ignored. Creation has a separate
+one-slot bcrypt worker; verification has four workers.
 The catalogue gate is reloaded after password verification and before target access.</p>
 <p>Successful reads return 200 or single-range 206; unsatisfiable ranges return
 416 with <code>Content-Range: bytes */&lt;size&gt;</code> and an empty body. HEAD mirrors GET's

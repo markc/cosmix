@@ -25,6 +25,7 @@ pub struct Peer {
 
 pub struct Runtime {
     crypto: Arc<Semaphore>,
+    creation_crypto: Arc<Semaphore>,
     management: Arc<Semaphore>,
     downloads: Arc<Semaphore>,
     attempts: Mutex<Attempts>,
@@ -34,6 +35,7 @@ impl Default for Runtime {
     fn default() -> Self {
         Self {
             crypto: Arc::new(Semaphore::new(4)),
+            creation_crypto: Arc::new(Semaphore::new(1)),
             management: Arc::new(Semaphore::new(8)),
             downloads: Arc::new(Semaphore::new(8)),
             attempts: Mutex::new(Attempts::default()),
@@ -65,10 +67,10 @@ impl Runtime {
         };
         valid_password(&password)?;
         let permit = self
-            .crypto
+            .creation_crypto
             .clone()
             .try_acquire_owned()
-            .map_err(|_| "busy: password workers full (4)")?;
+            .map_err(|_| "busy: password creation worker full (1)")?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit; // cancellation cannot free admission while bcrypt still runs
             bcrypt::hash(password, 12)
@@ -102,16 +104,29 @@ impl Attempts {
     fn allow(&mut self, token: &str, ip: IpAddr, now: Instant) -> bool {
         self.0
             .retain(|_, (start, _)| now.duration_since(*start) < Duration::from_secs(60));
-        let key = (token.to_owned(), ip);
+        self.0.get(&(token.to_owned(), attempt_ip(ip))).is_none_or(|row| row.1 < 5)
+    }
+    fn failed(&mut self, token: &str, ip: IpAddr, now: Instant) {
+        self.allow(token, ip, now); // expire stale entries before admission
+        let key = (token.to_owned(), attempt_ip(ip));
         if !self.0.contains_key(&key) && self.0.len() >= 4096 {
-            return false;
+            let oldest = self.0.iter().filter(|((t, _), _)| t == token)
+                .min_by_key(|(_, (start, _))| *start)
+                .or_else(|| self.0.iter().min_by_key(|(_, (start, _))| *start))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest { self.0.remove(&oldest); }
         }
         let row = self.0.entry(key).or_insert((now, 0));
-        if row.1 >= 5 {
-            return false;
-        }
-        row.1 += 1;
-        true
+        row.1 = row.1.saturating_add(1);
+    }
+}
+fn attempt_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => IpAddr::V4(ip),
+            None => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
+        },
+        ip => ip,
     }
 }
 fn valid_password(password: &str) -> Result<(), String> {
@@ -484,6 +499,9 @@ pub async fn serve(
             )
                 .into_response();
         }
+        let Some(password) = basic_password(&headers) else {
+            return challenge();
+        };
         if !node.share_runtime.attempt(&token, peer.ip) {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -492,12 +510,13 @@ pub async fn serve(
             )
                 .into_response();
         }
-        let Some(password) = basic_password(&headers) else {
-            return challenge();
-        };
         match node.share_runtime.verify(password, hash.clone()).await {
             Ok(true) => Some(hash),
-            Ok(false) => return challenge(),
+            Ok(false) => {
+                node.share_runtime.attempts.lock().unwrap_or_else(|e| e.into_inner())
+                    .failed(&token, peer.ip, Instant::now());
+                return challenge();
+            },
             Err(e) => return error(e),
         }
     } else {
@@ -979,20 +998,31 @@ pub(crate) mod tests {
         assert!(body.contains("invalid_arguments:"));
     }
     #[test]
-    fn attempts_are_pair_scoped_expire_and_fail_closed_at_capacity() {
+    fn attempts_count_failures_group_ipv6_and_admit_at_capacity() {
         let mut attempts = Attempts::default();
         let now = Instant::now();
         let ip = "192.0.2.1".parse().unwrap();
         for _ in 0..5 {
             assert!(attempts.allow("a", ip, now));
+            attempts.failed("a", ip, now);
         }
         assert!(!attempts.allow("a", ip, now));
         assert!(attempts.allow("a", "192.0.2.2".parse().unwrap(), now));
-        for n in 0..4094 {
+        for n in 0..4095 {
             assert!(attempts.allow(&format!("t{n}"), ip, now));
+            attempts.failed(&format!("t{n}"), ip, now);
         }
-        assert!(!attempts.allow("new", ip, now));
+        assert_eq!(attempts.0.len(), 4096);
+        assert!(attempts.allow("a", "192.0.2.2".parse().unwrap(), now));
+        attempts.failed("a", "192.0.2.2".parse().unwrap(), now);
+        assert_eq!(attempts.0.len(), 4096);
+        assert!(!attempts.0.contains_key(&("a".into(), ip)));
+        assert!(attempts.allow("new", ip, now));
         assert!(attempts.allow("a", ip, now + Duration::from_secs(60)));
+        let v6 = "2001:db8:1:2::1".parse().unwrap();
+        for _ in 0..5 { attempts.failed("v6", v6, now); }
+        assert!(!attempts.allow("v6", "2001:db8:1:2::abcd".parse().unwrap(), now));
+        assert!(attempts.allow("v6", "2001:db8:1:3::1".parse().unwrap(), now));
     }
     #[test]
     fn http_rejects_blob_account_and_unknown_fields() {
