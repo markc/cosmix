@@ -57,10 +57,10 @@ pub(crate) fn compile_colour_tokens_with_registry(
     // check, so a source naming neither is reported as missing both.
     let mut pairs_source = source.semantics.pairs.clone();
     for (missing, donor) in [("elevated", "popover"), ("popover", "elevated")] {
-        if !pairs_source.contains_key(missing) {
-            if let Some(donor_source) = source.semantics.pairs.get(donor).cloned() {
-                pairs_source.insert(missing.to_owned(), donor_source);
-            }
+        if !pairs_source.contains_key(missing)
+            && let Some(donor_source) = source.semantics.pairs.get(donor).cloned()
+        {
+            pairs_source.insert(missing.to_owned(), donor_source);
         }
     }
 
@@ -160,14 +160,16 @@ pub(crate) fn compile_colour_tokens_with_registry(
     }
 
     compile_derived_pairs(
-        source,
-        &pairs_source,
-        context,
-        &primitives,
+        &DerivedPairInputs {
+            source,
+            pairs_source: &pairs_source,
+            context,
+            primitives: &primitives,
+            registry,
+        },
         &mut pairs,
         &mut warnings,
         &mut errors,
-        registry,
     );
     enforce_surface_distinction_from_base(&pairs, &mut errors);
     if errors.is_empty() {
@@ -319,23 +321,33 @@ fn finalize_semantic_override_products(
     }
 }
 
-fn compile_derived_pairs(
-    source: &DesignV1Source,
-    pairs_source: &BTreeMap<String, PairSource>,
+/// The read-only inputs of derived-pair compilation: the authored source
+/// ratio metrics are resolved against, the declared pairs with the §2.4 alias
+/// already applied, the flattening context, the resolved primitives and the
+/// recipe registry. The accumulators the fixpoint loop writes into stay
+/// separate arguments.
+struct DerivedPairInputs<'a> {
+    source: &'a DesignV1Source,
+    pairs_source: &'a BTreeMap<String, PairSource>,
     context: DesignContext,
-    primitives: &BTreeMap<String, LinearRgba>,
+    primitives: &'a BTreeMap<String, LinearRgba>,
+    registry: &'a [RecipeSignature],
+}
+
+fn compile_derived_pairs(
+    inputs: &DerivedPairInputs,
     pairs: &mut BTreeMap<String, ResolvedPair>,
     warnings: &mut Vec<DesignDiagnostic>,
     errors: &mut Vec<DesignDiagnostic>,
-    registry: &[RecipeSignature],
 ) {
     let mut pending = BTreeMap::new();
-    for (name, pair) in pairs_source {
+    for (name, pair) in inputs.pairs_source {
         let PairSource::Derived { derive } = pair else {
             continue;
         };
         let path = format!("design.v1.semantics.pairs.{name}");
-        if validate_pair_recipe_call(&derive.name, &derive.args, registry, &path, errors).is_some()
+        if validate_pair_recipe_call(&derive.name, &derive.args, inputs.registry, &path, errors)
+            .is_some()
         {
             pending.insert(name.clone(), derive);
         }
@@ -343,7 +355,7 @@ fn compile_derived_pairs(
     while !pending.is_empty() {
         let ready = pending
             .iter()
-            .filter(|(_, call)| pair_dependencies_ready(&call.args, pairs_source, pairs))
+            .filter(|(_, call)| pair_dependencies_ready(&call.args, inputs.pairs_source, pairs))
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         if ready.is_empty() {
@@ -375,18 +387,18 @@ fn compile_derived_pairs(
                 .expect("ready derived pair remains pending");
             let path = format!("design.v1.semantics.pairs.{name}");
             let colours = ResolvedColours {
-                primitives: primitives.clone(),
+                primitives: inputs.primitives.clone(),
                 pairs: pairs.clone(),
                 non_text: BTreeMap::new(),
             };
             let Some(recipe) = compile_pair_recipe_call(
                 &call.name,
                 &call.args,
-                context.clone(),
+                inputs.context.clone(),
                 &colours,
-                registry,
+                inputs.registry,
                 &path,
-                |ratio_name| resolve_source_ratio(source, ratio_name),
+                |ratio_name| resolve_source_ratio(inputs.source, ratio_name),
                 errors,
             ) else {
                 continue;

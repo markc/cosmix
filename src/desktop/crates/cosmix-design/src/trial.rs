@@ -1470,12 +1470,12 @@ fn embedded_default_compiles_without_errors_in_all_twelve_contexts() {
                 (
                     popover.rendered_surface,
                     popover.rendered_foreground,
-                    popover.surface_name,
+                    popover.surface_name.clone(),
                 ),
                 (
                     elevated.rendered_surface,
                     elevated.rendered_foreground,
-                    elevated.surface_name,
+                    elevated.surface_name.clone(),
                 ),
                 "{} / {}: compiled `popover` must alias `elevated`",
                 scheme.name(),
