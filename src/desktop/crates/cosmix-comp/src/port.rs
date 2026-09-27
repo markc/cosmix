@@ -2763,14 +2763,20 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
         }
     }
     let op = parse_seated_input_op(verb, &args, seat)?;
+    // Bare cleanup always releases both seats' injected holds, regardless of
+    // the delivery default. An explicit (including inherited) seat scopes it.
+    if verb == "comp.input.release_all" && explicit_seat.is_none() {
+        return Ok(op);
+    }
     // Keep the internal human operation shape stable for existing call sites.
     Ok(if seat == SeatKind::Human && !(verb == "comp.input.release_all" && explicit_seat.is_some()) {
         op
     } else { InputOp::OnSeat { seat, op: Box::new(op) } })
 }
 
-// Flip only in the release that also migrates the hub's human-input gates.
-pub(crate) const DEFAULT_INPUT_SEAT: crate::protocol::SeatKind = crate::protocol::SeatKind::Human;
+// Human-semantic callers must select human explicitly; the hub gates migrate
+// with this release. Bare release_all remains both-seat cleanup above.
+pub(crate) const DEFAULT_INPUT_SEAT: crate::protocol::SeatKind = crate::protocol::SeatKind::Agent;
 
 fn parse_input_seat(value: Option<&Value>) -> Result<Option<crate::protocol::SeatKind>, ControlReply> {
     use crate::protocol::SeatKind;
@@ -3167,6 +3173,7 @@ mod agent_control_argument_tests {
             ("comp.input.key", json!({"text":"hello"})),
             ("comp.input.pointer.button", json!({"button":"left"})),
         ] {
+            args["seat"] = json!("human");
             args["window"] = json!({"id":7,"generation":3});
             assert!(matches!(parse_input_op(verb, &args), Ok(InputOp::Targeted {
                 id:7, generation:3, raise:true, ..
@@ -3318,7 +3325,11 @@ mod agent_seat_parse_tests {
     #[test]
     fn seat_defaults_raise_policy_and_release_all_are_explicit() {
         let window = json!({"id":1,"generation":2});
-        assert!(matches!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a"})).unwrap(), InputOp::Targeted { raise:true, .. }));
+        assert!(matches!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"human"})).unwrap(), InputOp::Targeted { raise:true, .. }));
+        let InputOp::OnSeat { seat, op } = parse_input_op("comp.input.key", &json!({"window":window,"key":"a"})).unwrap() else { panic!("default agent wrapper") };
+        assert_eq!(seat, SeatKind::Agent);
+        assert!(matches!(*op, InputOp::Targeted { raise:false, .. }));
+        assert!(parse_input_op("comp.input.key", &json!({"window":window,"key":"a","raise":true})).is_err());
         let InputOp::OnSeat { seat, op } = parse_input_op("comp.input.key", &json!({"window":window,"key":"a","seat":"agent"})).unwrap() else { panic!("agent wrapper") };
         assert_eq!(seat, SeatKind::Agent);
         assert!(matches!(*op, InputOp::Targeted { raise:false, .. }));
@@ -3328,6 +3339,30 @@ mod agent_seat_parse_tests {
         }
         assert_eq!(parse_input_op("comp.input.release_all", &json!({})).unwrap(), InputOp::ReleaseAll);
         assert_eq!(parse_input_op("comp.input.release_all", &json!({"seat":"human"})).unwrap(), InputOp::OnSeat { seat: SeatKind::Human, op: Box::new(InputOp::ReleaseAll) });
+        assert_eq!(parse_input_op("comp.input.release_all", &json!({"seat":"agent"})).unwrap(), InputOp::OnSeat { seat: SeatKind::Agent, op: Box::new(InputOp::ReleaseAll) });
+        assert_eq!(parse_input_op("comp.input.release_all", &Value::Null).unwrap(), InputOp::ReleaseAll);
+    }
+
+    #[test]
+    fn every_delivery_verb_defaults_to_agent_and_bare_sequence_cleanup_stays_both() {
+        assert_eq!(DEFAULT_INPUT_SEAT, SeatKind::Agent);
+        for (verb, args) in [
+            ("comp.input.key", json!({"key":"a"})),
+            ("comp.input.key", json!({"text":"a"})),
+            ("comp.input.pointer.move", json!({"x":1,"y":2})),
+            ("comp.input.pointer.button", Value::Null),
+            ("comp.input.pointer.scroll", json!({"dy":15})),
+        ] {
+            assert!(matches!(parse_input_op(verb, &args).unwrap(), InputOp::OnSeat { seat: SeatKind::Agent, .. }), "{verb}");
+        }
+        let LongOp::Sequence(steps) = parse_sequence(&json!({"steps":[
+            {"verb":"comp.input.key","args":{"text":"a"}},
+            {"verb":"comp.input.key","args":{"text":"b","seat":"human"}},
+            {"verb":"comp.input.release_all"}
+        ]})).unwrap() else { panic!("default sequence") };
+        assert!(matches!(steps[0].op, InputOp::OnSeat { seat: SeatKind::Agent, .. }));
+        assert_eq!(steps[1].op, InputOp::Text("b".into()));
+        assert_eq!(steps[2].op, InputOp::ReleaseAll);
     }
 
     #[test]
@@ -5361,7 +5396,7 @@ mod tests {
     #[test]
     fn input_verbs_parse_every_documented_form() {
         assert_eq!(
-            parse_input_op("comp.input.pointer.move", &json!({"x": 40, "y": 30.5})),
+            parse_input_op("comp.input.pointer.move", &json!({"seat": "human", "x": 40, "y": 30.5})),
             Ok(move_op(PointerMoveTarget::Output {
                 output: None,
                 x: 40.0,
@@ -5371,7 +5406,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.move",
-                &json!({"output": "o_nested", "x": 1, "y": 2})
+                &json!({"seat": "human", "output": "o_nested", "x": 1, "y": 2})
             ),
             Ok(move_op(PointerMoveTarget::Output {
                 output: Some("o_nested".into()),
@@ -5380,13 +5415,13 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_input_op("comp.input.pointer.move", &json!({"dx": -3})),
+            parse_input_op("comp.input.pointer.move", &json!({"seat": "human", "dx": -3})),
             Ok(move_op(PointerMoveTarget::Relative { dx: -3.0, dy: 0.0 }))
         );
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.move",
-                &json!({"window": {"id": 7, "generation": 3}, "x": 4, "y": 5, "require_hit": true})
+                &json!({"seat": "human", "window": {"id": 7, "generation": 3}, "x": 4, "y": 5, "require_hit": true})
             ),
             Ok(move_op(PointerMoveTarget::Window {
                 id: 7,
@@ -5397,7 +5432,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            parse_input_op("comp.input.pointer.button", &Value::Null),
+            parse_input_op("comp.input.pointer.button", &json!({"seat": "human"})),
             Ok(InputOp::PointerButton {
                 button: BTN_LEFT,
                 action: PressAction::Both
@@ -5406,7 +5441,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.button",
-                &json!({"button": "right", "action": "press"})
+                &json!({"seat": "human", "button": "right", "action": "press"})
             ),
             Ok(InputOp::PointerButton {
                 button: BTN_RIGHT,
@@ -5416,7 +5451,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.button",
-                &json!({"button": 0x113, "action": "release"})
+                &json!({"seat": "human", "button": 0x113, "action": "release"})
             ),
             Ok(InputOp::PointerButton {
                 button: 0x113,
@@ -5426,7 +5461,7 @@ mod tests {
         // A wheel derives detents (15 units = 120); a finger has none and a
         // missing axis stays missing.
         assert_eq!(
-            parse_input_op("comp.input.pointer.scroll", &json!({"dy": 15})),
+            parse_input_op("comp.input.pointer.scroll", &json!({"seat": "human", "dy": 15})),
             Ok(InputOp::PointerScroll {
                 dx: None,
                 dy: Some(15.0),
@@ -5437,7 +5472,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.scroll",
-                &json!({"dx": 0, "source": "finger"})
+                &json!({"seat": "human", "dx": 0, "source": "finger"})
             ),
             Ok(InputOp::PointerScroll {
                 dx: Some(0.0),
@@ -5449,7 +5484,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.scroll",
-                &json!({"dy": 10, "v120": {"dy": -240}})
+                &json!({"seat": "human", "dy": 10, "v120": {"dy": -240}})
             ),
             Ok(InputOp::PointerScroll {
                 dx: None,
@@ -5461,7 +5496,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.key",
-                &json!({"key": "q", "modifiers": ["super", "shift"]})
+                &json!({"seat": "human", "key": "q", "modifiers": ["super", "shift"]})
             ),
             Ok(InputOp::Key {
                 key: KeySpec::Name("q".into()),
@@ -5473,7 +5508,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_input_op("comp.input.key", &json!({"key": 28, "action": "press"})),
+            parse_input_op("comp.input.key", &json!({"seat": "human", "key": 28, "action": "press"})),
             Ok(InputOp::Key {
                 key: KeySpec::Evdev(28),
                 action: PressAction::Press,
@@ -5481,7 +5516,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_input_op("comp.input.key", &json!({"text": "ok\n"})),
+            parse_input_op("comp.input.key", &json!({"seat": "human", "text": "ok\n"})),
             Ok(InputOp::Text("ok\n".into()))
         );
         assert_eq!(
@@ -5714,7 +5749,10 @@ mod tests {
             panic!("text admitted");
         };
         assert!(first.order < second.order && second.order < third.order);
-        assert_eq!(third.op, InputOp::Text("ok".into()));
+        assert_eq!(third.op, InputOp::OnSeat {
+            seat: crate::protocol::SeatKind::Agent,
+            op: Box::new(InputOp::Text("ok".into())),
+        });
         assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert_eq!(depth.load(Ordering::Acquire), 3);
         // Taking the long request off the queue frees its slot while the
@@ -5778,7 +5816,7 @@ mod tests {
         assert_eq!(
             parse_input_op(
                 "comp.input.pointer.move",
-                &json!({"dx": 1, "corners": false})
+                &json!({"seat": "human", "dx": 1, "corners": false})
             ),
             Ok(InputOp::PointerMove {
                 target: PointerMoveTarget::Relative { dx: 1.0, dy: 0.0 },

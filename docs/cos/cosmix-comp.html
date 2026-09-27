@@ -1336,7 +1336,10 @@ origin.</li>
 the left or top output edge, can still project one pixel short. The renderer
 rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
-<p><strong>0.71.1 (unreleased):</strong> <code>cosmix-input-probe --seats</code> binds each advertised
+<p><strong>0.71.1 (unreleased):</strong> Bus input and sequences now default to the agent seat;
+callers needing human focus, bindings, chrome or idle activity must pass
+<code>seat:"human"</code>. Bare <code>release_all {}</code> still clears both seats' injected holds.</p>
+<p><code>cosmix-input-probe --seats</code> binds each advertised
 seat's keyboard and pointer and labels their events by the quoted seat name.
 <code>--idle-timeout-ms N</code> enables the same mode and adds one ext-idle-notify-v1
 notification per seat: <code>PROBE seat "cosmix" idled</code> / <code>resumed</code> (likewise for
@@ -1352,8 +1355,8 @@ Clipboard and primary selections now relay between the two seats with source
 provenance. Consecutive compatible agent motions coalesce, and agent delivery
 runs in bounded batches after ready human input. Full-click menu switching
 preserves the next menu's press serial; unmapping a menu's root retires its grabs.</p>
-<p>The default is still <strong>human</strong> (<code>cosmix</code>). It changes to agent only in the
-release that also migrates the hub's human-input gates. The deliberate exception
+<p>The default is <strong>agent</strong> (<code>cosmix-agent</code>). Select <code>seat:"human"</code> explicitly for
+human input semantics (including X11 targets). The deliberate exception
 is <code>release_all</code>: without a seat it releases <strong>both seats' injected holds</strong>. A sequence's
 explicit <code>seat</code> is inherited by its steps; <code>args.seat</code> overrides it for a step.
 Without a sequence-level seat, each verb uses its own default.</p>
@@ -1366,7 +1369,8 @@ Without a sequence-level seat, each verb uses its own default.</p>
 <tr><td>Pointer</td><td>Device path, including chrome, corners and constraints</td><td>Client surfaces only; independent position; human cursor image/position unchanged</td></tr>
 <tr><td>Clipboard and primary</td><td>Shared selection, including the XWM bridge</td><td>Shared selection, with the source seat and generation tracked explicitly</td></tr>
 </tbody></table>
-<p>Successful agent delivery updates <code>input.seats.agent.last_input_us</code> and
+<p>Bus injection now records agent origin unless <code>seat:"human"</code> is selected.
+Successful agent delivery updates <code>input.seats.agent.last_input_us</code> and
 <code>input.last_origin:"agent"</code>. Human delivery updates the human leaves and reports
 <code>last_origin:"human"</code>. The existing focus/pointer leaves retain their human
 meaning. Human Bus injection still follows <code>inject → handle_host_input → notify_idle_activity(Human)</code>; agent delivery uses the agent Smithay handles.</p>

@@ -133,6 +133,27 @@ fn agent_coordinates_refuse_embedded_panel_but_implicit_drag_crosses_it() {
 }
 
 #[test]
+fn default_bus_key_delivers_to_agent_without_moving_human_focus() {
+    let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
+    raise(&mut h, &beta);
+    let (_, keyboard, _) = bind_agent_devices(&mut h);
+    let human = focused_object(&h);
+    assert_ne!(human, Some(alpha.clone()));
+    let (id, generation) = window_id_and_generation(&h, &alpha);
+    let op = crate::port::parse_input_op("comp.input.key", &json!({
+        "window":{"id":id,"generation":generation}, "key":"a",
+    })).unwrap();
+    let (rc, body) = inject(&mut h, &ingress, &runtime, op);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["seat"], "agent");
+    assert_eq!(focused_object(&h), human);
+    let traffic = h.sync();
+    assert_eq!(device_key_events(&traffic, keyboard), [(KEY_A, 1), (KEY_A, 0)]);
+    assert!(keyboard_key_events(&traffic).is_empty());
+    assert!(toplevel_configure_states(&traffic, TEST_TOPLEVEL_ID).is_empty());
+}
+
+#[test]
 fn agent_targeted_key_preserves_human_focus_activation_and_stack() {
     let (mut h, ingress, runtime, _, alpha, beta) = two_windows();
     let (_, keyboard, _) = bind_agent_devices(&mut h);

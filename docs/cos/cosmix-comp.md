@@ -953,7 +953,11 @@ rounds half away from zero on both sides of the origin.
 
 ### Input injection
 
-**0.71.1 (unreleased):** `cosmix-input-probe --seats` binds each advertised
+**0.71.1 (unreleased):** Bus input and sequences now default to the agent seat;
+callers needing human focus, bindings, chrome or idle activity must pass
+`seat:"human"`. Bare `release_all {}` still clears both seats' injected holds.
+
+`cosmix-input-probe --seats` binds each advertised
 seat's keyboard and pointer and labels their events by the quoted seat name.
 `--idle-timeout-ms N` enables the same mode and adds one ext-idle-notify-v1
 notification per seat: `PROBE seat "cosmix" idled` / `resumed` (likewise for
@@ -971,8 +975,8 @@ provenance. Consecutive compatible agent motions coalesce, and agent delivery
 runs in bounded batches after ready human input. Full-click menu switching
 preserves the next menu's press serial; unmapping a menu's root retires its grabs.
 
-The default is still **human** (`cosmix`). It changes to agent only in the
-release that also migrates the hub's human-input gates. The deliberate exception
+The default is **agent** (`cosmix-agent`). Select `seat:"human"` explicitly for
+human input semantics (including X11 targets). The deliberate exception
 is `release_all`: without a seat it releases **both seats' injected holds**. A sequence's
 explicit `seat` is inherited by its steps; `args.seat` overrides it for a step.
 Without a sequence-level seat, each verb uses its own default.
@@ -987,6 +991,7 @@ Without a sequence-level seat, each verb uses its own default.
 | Pointer | Device path, including chrome, corners and constraints | Client surfaces only; independent position; human cursor image/position unchanged |
 | Clipboard and primary | Shared selection, including the XWM bridge | Shared selection, with the source seat and generation tracked explicitly |
 
+Bus injection now records agent origin unless `seat:"human"` is selected.
 Successful agent delivery updates `input.seats.agent.last_input_us` and
 `input.last_origin:"agent"`. Human delivery updates the human leaves and reports
 `last_origin:"human"`. The existing focus/pointer leaves retain their human

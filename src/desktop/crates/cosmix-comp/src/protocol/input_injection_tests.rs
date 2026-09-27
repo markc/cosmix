@@ -436,7 +436,7 @@ fn targeted_key_and_button_focus_without_raising_when_requested() {
     let op = crate::port::parse_input_op(
         "comp.input.key",
         &json!({
-            "key":"a", "window":{"id":id,"generation":generation},
+            "seat":"human", "key":"a", "window":{"id":id,"generation":generation},
         }),
     )
     .unwrap();
