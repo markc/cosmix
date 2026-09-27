@@ -31,10 +31,12 @@ Password-protected shares require HTTPS Basic authentication: any username,
 password in the password part, `WWW-Authenticate: Basic realm="share"` on 401.
 Plain requests reaching this handler return 403 without a challenge; the existing
 redirect-only HTTP listener still redirects to HTTPS. No query-string password is read.
-Before bcrypt, five failed verifications per (token, socket peer IPv4 or IPv6 /64)
+Before bcrypt, five failed-or-pending verifications per (token, socket peer IPv4 or IPv6 /64)
 per 60 seconds are allowed. Missing credentials and successful checks do not count.
-The table holds at most 4096 pairs; insertion evicts the oldest entry for that
-token, or the oldest global entry when the token has none. Refusal returns 429
+Admission reserves a slot atomically; success, worker refusal and cancellation
+release it. Blocking bcrypt retains its reservation until it finishes.
+The table holds at most 4096 pairs; insertion evicts the oldest non-pending entry
+for that token, or the oldest non-pending global entry. Refusal returns 429
 with `Retry-After: 60`. Forwarded IP headers are ignored. Creation has a separate
 one-slot bcrypt worker; verification has four workers.
 The catalogue gate is reloaded after password verification and before target access.

@@ -603,7 +603,8 @@ unservable rows contribute to <code>skipped</code>. The cursor advances over ski
 session. Reconnect aborts that session's workers. Password verification has four
 bcrypt workers and creation has one separate worker; admission lasts until
 blocking work ends. Busy replies run outside the receive loop with a 30-second
-timeout. Worker saturation is
+timeout. At most 32 busy replies may be pending across reconnects; excess replies
+are dropped with one warning, leaving the caller to time out. Worker saturation is
 rc=10 <code>{"error":"busy: webd transfer workers full (8)"}</code>. All other failures
 also return rc=10 with <code>{"error":"&lt;token&gt;[: details]"}</code>; no new payload bytes
 travel in Bus frames.</p>

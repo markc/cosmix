@@ -28,7 +28,7 @@ pub struct Runtime {
     creation_crypto: Arc<Semaphore>,
     management: Arc<Semaphore>,
     downloads: Arc<Semaphore>,
-    attempts: Mutex<Attempts>,
+    attempts: Arc<Mutex<Attempts>>,
     lane: OnceLock<Result<Arc<blob_lane::Lane>, String>>,
 }
 impl Default for Runtime {
@@ -38,7 +38,7 @@ impl Default for Runtime {
             creation_crypto: Arc::new(Semaphore::new(1)),
             management: Arc::new(Semaphore::new(8)),
             downloads: Arc::new(Semaphore::new(8)),
-            attempts: Mutex::new(Attempts::default()),
+            attempts: Arc::new(Mutex::new(Attempts::default())),
             lane: OnceLock::new(),
         }
     }
@@ -55,11 +55,17 @@ impl Runtime {
             .try_acquire_owned()
             .map_err(|_| "busy: share management pool full (8)".into())
     }
-    pub fn attempt(&self, token: &str, ip: IpAddr) -> bool {
-        self.attempts
+    fn attempt(&self, token: &str, ip: IpAddr) -> Option<Attempt> {
+        let allowed = self
+            .attempts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .allow(token, ip, Instant::now())
+            .allow(token, ip, Instant::now());
+        allowed.then(|| Attempt {
+            attempts: self.attempts.clone(),
+            key: (token.to_owned(), attempt_ip(ip)),
+            failed: false,
+        })
     }
     pub async fn hash(&self, password: Option<String>) -> Result<Option<String>, String> {
         let Some(password) = password else {
@@ -80,8 +86,20 @@ impl Runtime {
         .await
         .map_err(|_| "internal: password worker failed")?
     }
-    pub async fn verify(&self, password: String, hash: String) -> Result<bool, String> {
+    #[cfg(test)]
+    async fn verify(&self, password: String, hash: String) -> Result<bool, String> {
+        self.verify_reserved(password, hash, None).await
+    }
+    async fn verify_reserved(
+        &self,
+        password: String,
+        hash: String,
+        attempt: Option<Attempt>,
+    ) -> Result<bool, String> {
         if valid_password(&password).is_err() || !bounded_hash(&hash) {
+            if let Some(mut attempt) = attempt {
+                attempt.failed = true;
+            }
             return Ok(false);
         }
         let permit = self
@@ -91,7 +109,11 @@ impl Runtime {
             .map_err(|_| "busy: password workers full (4)")?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            bcrypt::verify(password, &hash).unwrap_or(false)
+            let verified = bcrypt::verify(password, &hash).unwrap_or(false);
+            if let Some(mut attempt) = attempt {
+                attempt.failed = !verified;
+            }
+            verified
         })
         .await
         .map_err(|_| "internal: password worker failed".into())
@@ -99,32 +121,78 @@ impl Runtime {
 }
 
 #[derive(Default)]
-struct Attempts(HashMap<(String, IpAddr), (Instant, u8)>);
+struct Attempts(HashMap<(String, IpAddr), AttemptCount>);
+struct AttemptCount {
+    start: Instant,
+    failed: u8,
+    pending: u8,
+}
+struct Attempt {
+    attempts: Arc<Mutex<Attempts>>,
+    key: (String, IpAddr),
+    failed: bool,
+}
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settle(&self.key, self.failed);
+    }
+}
 impl Attempts {
     fn allow(&mut self, token: &str, ip: IpAddr, now: Instant) -> bool {
-        self.0
-            .retain(|_, (start, _)| now.duration_since(*start) < Duration::from_secs(60));
-        self.0
-            .get(&(token.to_owned(), attempt_ip(ip)))
-            .is_none_or(|row| row.1 < 5)
-    }
-    fn failed(&mut self, token: &str, ip: IpAddr, now: Instant) {
-        self.allow(token, ip, now); // expire stale entries before admission
+        self.0.retain(|_, row| {
+            row.pending > 0 || now.duration_since(row.start) < Duration::from_secs(60)
+        });
         let key = (token.to_owned(), attempt_ip(ip));
         if !self.0.contains_key(&key) && self.0.len() >= 4096 {
             let oldest = self
                 .0
                 .iter()
-                .filter(|((t, _), _)| t == token)
-                .min_by_key(|(_, (start, _))| *start)
-                .or_else(|| self.0.iter().min_by_key(|(_, (start, _))| *start))
+                .filter(|((t, _), row)| t == token && row.pending == 0)
+                .min_by_key(|(_, row)| row.start)
+                .or_else(|| {
+                    self.0
+                        .iter()
+                        .filter(|(_, row)| row.pending == 0)
+                        .min_by_key(|(_, row)| row.start)
+                })
                 .map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
                 self.0.remove(&oldest);
+            } else {
+                return false;
             }
         }
-        let row = self.0.entry(key).or_insert((now, 0));
-        row.1 = row.1.saturating_add(1);
+        let row = self.0.entry(key).or_insert(AttemptCount {
+            start: now,
+            failed: 0,
+            pending: 0,
+        });
+        if now.duration_since(row.start) >= Duration::from_secs(60) {
+            row.start = now;
+            row.failed = 0;
+        }
+        if row.failed + row.pending >= 5 {
+            return false;
+        }
+        row.pending += 1;
+        true
+    }
+    fn settle(&mut self, key: &(String, IpAddr), failed: bool) {
+        if let Some(row) = self.0.get_mut(key) {
+            row.pending -= 1;
+            row.failed += u8::from(failed);
+            if row.pending == 0 && row.failed == 0 {
+                self.0.remove(key);
+            }
+        }
+    }
+    #[cfg(test)]
+    fn failed(&mut self, token: &str, ip: IpAddr, now: Instant) {
+        assert!(self.allow(token, ip, now));
+        self.settle(&(token.to_owned(), attempt_ip(ip)), true);
     }
 }
 fn attempt_ip(ip: IpAddr) -> IpAddr {
@@ -529,22 +597,21 @@ pub async fn serve(
         let Some(password) = basic_password(&headers) else {
             return challenge();
         };
-        if !node.share_runtime.attempt(&token, peer.ip) {
+        let Some(attempt) = node.share_runtime.attempt(&token, peer.ip) else {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [("retry-after", "60")],
                 "unauthorized",
             )
                 .into_response();
-        }
-        match node.share_runtime.verify(password, hash.clone()).await {
+        };
+        match node
+            .share_runtime
+            .verify_reserved(password, hash.clone(), Some(attempt))
+            .await
+        {
             Ok(true) => Some(hash),
             Ok(false) => {
-                node.share_runtime
-                    .attempts
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .failed(&token, peer.ip, Instant::now());
                 return challenge();
             }
             Err(e) => return public_error(e),
@@ -1452,22 +1519,21 @@ pub(crate) mod tests {
         let now = Instant::now();
         let ip = "192.0.2.1".parse().unwrap();
         for _ in 0..5 {
-            assert!(attempts.allow("a", ip, now));
             attempts.failed("a", ip, now);
         }
         assert!(!attempts.allow("a", ip, now));
         assert!(attempts.allow("a", "192.0.2.2".parse().unwrap(), now));
+        attempts.settle(&("a".into(), "192.0.2.2".parse().unwrap()), false);
         for n in 0..4095 {
-            assert!(attempts.allow(&format!("t{n}"), ip, now));
             attempts.failed(&format!("t{n}"), ip, now);
         }
         assert_eq!(attempts.0.len(), 4096);
-        assert!(attempts.allow("a", "192.0.2.2".parse().unwrap(), now));
         attempts.failed("a", "192.0.2.2".parse().unwrap(), now);
         assert_eq!(attempts.0.len(), 4096);
         assert!(!attempts.0.contains_key(&("a".into(), ip)));
         assert!(attempts.allow("new", ip, now));
         assert!(attempts.allow("a", ip, now + Duration::from_secs(60)));
+        attempts.settle(&("a".into(), ip), false);
         let v6 = "2001:db8:1:2::1".parse().unwrap();
         for _ in 0..5 {
             attempts.failed("v6", v6, now);
@@ -1517,7 +1583,68 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(node.share_runtime.attempts.lock().unwrap().0.len(), 4096);
+        assert_eq!(node.share_runtime.attempts.lock().unwrap().0.len(), 4095);
+    }
+
+    #[tokio::test]
+    async fn parallel_guesses_reserve_exactly_five_slots_and_release_non_failures() {
+        let runtime = Arc::new(Runtime::default());
+        let barrier = Arc::new(tokio::sync::Barrier::new(12));
+        let mut workers = tokio::task::JoinSet::new();
+        for suffix in 1..=12 {
+            let runtime = runtime.clone();
+            let barrier = barrier.clone();
+            workers.spawn(async move {
+                let attempt =
+                    runtime.attempt("token", format!("2001:db8::{}", suffix).parse().unwrap());
+                barrier.wait().await;
+                if let Some(mut attempt) = attempt {
+                    attempt.failed = true;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        let mut accepted = 0;
+        while let Some(result) = workers.join_next().await {
+            accepted += usize::from(result.unwrap());
+        }
+        assert_eq!(accepted, 5);
+        assert!(
+            runtime
+                .attempt("token", "2001:db8::ffff".parse().unwrap())
+                .is_none()
+        );
+        let ip = "192.0.2.1".parse().unwrap();
+        drop(runtime.attempt("cancelled", ip).unwrap());
+        assert!(
+            !runtime
+                .attempts
+                .lock()
+                .unwrap()
+                .0
+                .contains_key(&("cancelled".into(), ip))
+        );
+        let held = runtime.crypto.clone().acquire_many_owned(4).await.unwrap();
+        let attempt = runtime.attempt("busy", ip).unwrap();
+        let hash = bcrypt::hash("secret", 4).unwrap();
+        assert!(
+            runtime
+                .verify_reserved("wrong".into(), hash, Some(attempt))
+                .await
+                .unwrap_err()
+                .starts_with("busy:")
+        );
+        assert!(
+            !runtime
+                .attempts
+                .lock()
+                .unwrap()
+                .0
+                .contains_key(&("busy".into(), ip))
+        );
+        drop(held);
     }
 
     #[tokio::test]
