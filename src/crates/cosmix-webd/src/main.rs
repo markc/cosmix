@@ -2325,13 +2325,13 @@ fn canonical_db_key(path: &std::path::Path) -> PathBuf {
 /// interpolated.
 fn open_db(path: &std::path::Path, aux: &[(String, std::path::PathBuf)]) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    file_share::init_schema(&conn)?;
     // busy_timeout mirrors the props-substrate connection: the vhost
     // connection is shared across concurrent request tasks, so a brief lock
     // wait must retry rather than fail the request.
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;",
     )?;
+    file_share::init_schema(&conn)?;
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (name, aux_path) in aux {
         if !is_valid_schema_name(name) {
