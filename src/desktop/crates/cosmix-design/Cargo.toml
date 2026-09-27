@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-design"
-version = "0.17.0"
+version = "0.17.1"
 description = "Headless compiler and closed family-schema registry for the Cosmix Design System"
 edition = "2024"
 rust-version = "1.95"

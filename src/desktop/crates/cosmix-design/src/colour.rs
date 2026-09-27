@@ -54,13 +54,18 @@ pub(crate) fn compile_colour_tokens_with_registry(
     // that authors only one of the two compiles with the other taking the same
     // authored or derived form; a source that authors both keeps both. The
     // alias is resolved on the flattened pair map, before the closed-vocabulary
-    // check, so a source naming neither is reported as missing both.
+    // check, so a source naming neither is reported as missing both. A filled
+    // copy is diagnosed in its donor's name below: the author wrote the donor,
+    // and an alias copy renders identical bytes, so a second diagnostic on the
+    // copy's path would name a pair that is not in the source.
     let mut pairs_source = source.semantics.pairs.clone();
+    let mut alias_donors = BTreeMap::new();
     for (missing, donor) in [("elevated", "popover"), ("popover", "elevated")] {
         if !pairs_source.contains_key(missing)
             && let Some(donor_source) = source.semantics.pairs.get(donor).cloned()
         {
             pairs_source.insert(missing.to_owned(), donor_source);
+            alias_donors.insert(missing.to_owned(), donor.to_owned());
         }
     }
 
@@ -131,31 +136,36 @@ pub(crate) fn compile_colour_tokens_with_registry(
         // the §3.4 guaranteed knockout — the opaque black or white extreme
         // the surface contrasts more with, always at least √21:1 — and says
         // so in a warning. Every other authored pair keeps the hard gate
-        // below: a failing text half is fatal, not repaired.
+        // below: a failing text half is fatal, not repaired. An alias-filled
+        // copy takes the same derived values but no warning of its own: its
+        // donor, authored in the source, is warned once.
         let (foreground, rendered_foreground, ratio, foreground_name) =
             if ratio < 4.5 && matches!(name.as_str(), "elevated" | "popover") {
                 let knockout = guaranteed_knockout(rendered_surface);
                 let knockout_ratio = contrast_ratio(knockout, rendered_surface);
-                warnings.push(DesignDiagnostic::warning(
-                    "elevated-text-fallback",
-                    format!("design.v1.semantics.pairs.{name}"),
-                    format!(
-                        "authored foreground `{}` renders at {ratio:.3}:1 on the `{name}` \
-                         surface, below WCAG AA 4.5:1; the text half is derived to opaque \
-                         {} ({knockout_ratio:.3}:1) instead",
-                        pair.foreground,
-                        if knockout == LinearRgba::BLACK {
-                            "black"
-                        } else {
-                            "white"
-                        },
-                    ),
-                ));
+                let donor = alias_donors.get(name).map_or(name.as_str(), String::as_str);
+                if donor == name.as_str() {
+                    warnings.push(DesignDiagnostic::warning(
+                        "elevated-text-fallback",
+                        format!("design.v1.semantics.pairs.{name}"),
+                        format!(
+                            "authored foreground `{}` renders at {ratio:.3}:1 on the `{name}` \
+                             surface, below WCAG AA 4.5:1; the text half is derived to opaque \
+                             {} ({knockout_ratio:.3}:1) instead",
+                            pair.foreground,
+                            if knockout == LinearRgba::BLACK {
+                                "black"
+                            } else {
+                                "white"
+                            },
+                        ),
+                    ));
+                }
                 (
                     knockout,
                     knockout,
                     knockout_ratio,
-                    format!("derive:{name}.foreground"),
+                    format!("derive:{donor}.foreground"),
                 )
             } else {
                 (
@@ -214,7 +224,7 @@ pub(crate) fn compile_colour_tokens_with_registry(
         &mut warnings,
         &mut errors,
     );
-    enforce_surface_distinction_from_base(&pairs, &mut errors);
+    enforce_surface_distinction_from_base(&pairs, &alias_donors, &mut errors);
     if errors.is_empty() {
         finalize_semantic_override_products(&primitives, &mut pairs, &mut warnings, &mut errors);
     }
@@ -303,6 +313,7 @@ const SURFACE_DISTINCTION_CONTRAST: f64 = 1.25;
 
 fn enforce_surface_distinction_from_base(
     pairs: &BTreeMap<String, ResolvedPair>,
+    alias_donors: &BTreeMap<String, String>,
     errors: &mut Vec<DesignDiagnostic>,
 ) {
     let Some(base) = pairs.get("base") else {
@@ -312,6 +323,12 @@ fn enforce_surface_distinction_from_base(
         let Some(pair) = pairs.get(role) else {
             continue;
         };
+        // An alias-filled copy renders the donor's exact surface bytes, so the
+        // donor's own check already covers it; diagnosing the copy too would
+        // name a pair the source never authored.
+        if alias_donors.contains_key(role) {
+            continue;
+        }
         let ratio = contrast_ratio(pair.rendered_surface, base.rendered_surface);
         if !ratio.is_finite() || ratio < SURFACE_DISTINCTION_CONTRAST {
             errors.push(DesignDiagnostic::error(
@@ -887,6 +904,67 @@ mod tests {
             .unwrap();
         assert!(diagnostic.path.ends_with("pairs.popover"));
         assert!(diagnostic.message.contains("`popover`"), "{}", diagnostic.message);
+
+        // A popover-only source is refused once, on the authored path: the
+        // alias-filled `elevated` copy renders the same surface bytes and must
+        // not add a second diagnostic naming a pair absent from the source.
+        let mut source = fixture_source();
+        source.semantics.pairs.insert(
+            "popover".into(),
+            PairSource::authored("dark", "light", None),
+        );
+        source.semantics.pairs.remove("elevated");
+        let failure = compile(&source).unwrap_err();
+        let refusals = failure
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "surface-not-distinct-from-base")
+            .collect::<Vec<_>>();
+        assert_eq!(refusals.len(), 1, "{:?}", failure.diagnostics);
+        assert!(refusals[0].path.ends_with("pairs.popover"));
+        assert!(refusals[0].message.contains("`popover`"), "{}", refusals[0].message);
+    }
+
+    #[test]
+    fn the_elevated_text_fallback_warns_once_on_the_authored_donor() {
+        // The fixture's light foreground cannot clear AA on the L 0.62
+        // elevated grey, so both roles take the §3.4 knockout.
+        let mut source = fixture_source();
+        let resolved = compile(&source).expect("the fallback repairs, not refuses");
+        let warnings = resolved
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "elevated-text-fallback")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2, "{:?}", resolved.diagnostics);
+        assert!(warnings
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("pairs.elevated")));
+        assert!(warnings
+            .iter()
+            .any(|diagnostic| diagnostic.path.ends_with("pairs.popover")));
+
+        // A popover-only source is warned once, on the authored path; the
+        // alias-filled `elevated` copy still delivers the same derived pair.
+        let mut source = fixture_source();
+        source.semantics.pairs.remove("elevated");
+        let resolved = compile(&source).expect("the fallback repairs, not refuses");
+        let warnings = resolved
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "elevated-text-fallback")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{:?}", resolved.diagnostics);
+        assert!(warnings[0].path.ends_with("pairs.popover"), "{:?}", warnings[0]);
+        let elevated = &resolved.value.pairs["elevated"];
+        let popover = &resolved.value.pairs["popover"];
+        assert_eq!(elevated.rendered_foreground, popover.rendered_foreground);
+        assert_eq!(
+            elevated.foreground_name, popover.foreground_name,
+            "the alias copy's derivation is named for its donor"
+        );
+        assert_eq!(popover.foreground_name, "derive:popover.foreground");
+        assert!(popover.contrast_ratio >= 4.5);
     }
 
     #[test]

@@ -1064,8 +1064,18 @@ fn dictionary_provenance(
             || {
                 let mut path = vec![
                     format!("dictionary.colours.primitives.{}", pair.surface_name),
-                    format!("dictionary.colours.primitives.{}", pair.foreground_name),
                 ];
+                // A `derive:` foreground names no dictionary primitive: the
+                // §3.6 elevated/popover knockout is derived from the pair's
+                // rendered surface, which the surface dependency above already
+                // names. Listing it as a primitive would point provenance at a
+                // token that cannot resolve.
+                if !pair.foreground_name.starts_with("derive:") {
+                    path.push(format!(
+                        "dictionary.colours.primitives.{}",
+                        pair.foreground_name
+                    ));
+                }
                 if let Some(backdrop) = &pair.backdrop_name {
                     path.push(format!("dictionary.colours.primitives.{backdrop}"));
                 }
@@ -1645,6 +1655,88 @@ mod tests {
         ]);
         assert_eq!(actual, expected);
         assert_eq!(actual.values().sum::<usize>(), 144);
+    }
+
+    #[test]
+    fn elevated_text_fallback_provenance_names_resolvable_tokens_only() {
+        let mut document = parse_design_source(
+            SourceIdentity::new("embedded:fallback-provenance"),
+            EMBEDDED_DEFAULT_SOURCE,
+        )
+        .expect("embedded fixture parses");
+        // Seat the authored elevated foreground on `palette.foreground.muted`,
+        // which measures 3.7:1 (light) and 3.1:1 (dark) on the elevated grey,
+        // so the §3.6 derivation delivers the knockout through the
+        // authored-pair path in every context.
+        let crate::PairSource::Authored(elevated) = &mut document.v1.semantics.pairs["elevated"]
+        else {
+            panic!("the embedded elevated pair is authored");
+        };
+        elevated.foreground = "palette.foreground.muted".into();
+
+        let result = compile_design(&document, DesignContext::default());
+        let DesignCompileResult::Success(success) = &result else {
+            panic!("the fallback repairs rather than refuses: {result:#?}")
+        };
+        // The fallback warns once for the authored donor; the alias-filled
+        // popover copy is attributed to it, and the warning is invariant
+        // across every reachable context.
+        let fallbacks = success
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "elevated-text-fallback")
+            .collect::<Vec<_>>();
+        assert_eq!(fallbacks.len(), 1, "{:?}", success.diagnostics);
+        assert!(fallbacks[0].path.ends_with("pairs.elevated"));
+
+        let dictionary = success.candidate.dictionary();
+        assert_eq!(
+            dictionary.colours.pairs["elevated"].foreground_name,
+            "derive:elevated.foreground"
+        );
+        let mut resolvable = BTreeSet::new();
+        for name in dictionary.colours.primitives.keys() {
+            resolvable.insert(format!("dictionary.colours.primitives.{name}"));
+        }
+        for name in dictionary.colours.pairs.keys() {
+            resolvable.insert(format!("dictionary.colours.pairs.{name}"));
+        }
+        for name in dictionary.colours.non_text.keys() {
+            resolvable.insert(format!("dictionary.colours.non_text.{name}"));
+        }
+        for name in dictionary.metrics.keys() {
+            resolvable.insert(format!("dictionary.metrics.{name}"));
+        }
+        for (scale, values) in &dictionary.scales {
+            for index in 0..values.len() {
+                resolvable.insert(format!("dictionary.scales.{scale}[{index}]"));
+            }
+        }
+        for (id, provenance) in success.candidate.provenance().entries() {
+            for token in &provenance.token_path {
+                assert!(
+                    resolvable.contains(token),
+                    "{id:?} names token {token}, which the dictionary cannot resolve"
+                );
+            }
+        }
+        let elevated = success
+            .candidate
+            .provenance()
+            .value(&crate::DesignValueId::ColourPair("elevated".into()))
+            .expect("the elevated pair records provenance");
+        assert!(
+            elevated.token_path.contains(
+                &"dictionary.colours.primitives.palette.background.elevated".to_owned()
+            ),
+            "{:?}",
+            elevated.token_path
+        );
+        assert!(
+            elevated.token_path.iter().all(|token| !token.contains("derive:")),
+            "the derived foreground must not be listed as a primitive: {:?}",
+            elevated.token_path
+        );
     }
 
     fn compound_block(when: &[(ModifierAxis, &str)]) -> ModifierBlockSource {

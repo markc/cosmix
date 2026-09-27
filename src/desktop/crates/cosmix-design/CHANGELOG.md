@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.17.1
+
+- The embedded revision-1 default failed to compile through the public
+  `compile_design` entry point: every light modifier block introduced
+  `palette.foreground.quiet`, a path the base document never declared,
+  and the modifier-path law (`modifier-introduces-unknown-path`) is
+  fatal before any flattening. The anchor is now authored in the base
+  (the ocean light value) and overridden by the five non-ocean light
+  blocks; the ocean light block drops its now-identical override.
+  Consumers observe the repair: ced's embedded-design compile — and with
+  it the compiled palette — is restored (ced 0.1.4).
+- An alias-filled `elevated`/`popover` copy is now diagnosed on its
+  donor's authored path, once: a popover-only design collapsing onto
+  `base` is refused with exactly one `surface-not-distinct-from-base`
+  diagnostic naming `pairs.popover`, and the `elevated-text-fallback`
+  warning likewise fires once for the authored donor instead of twice.
+  The copy's derived foreground is named for its donor
+  (`derive:popover.foreground`).
+- The elevated-text fallback's provenance no longer lists the derived
+  foreground as a dictionary primitive: the authored-pair token path
+  names the surface (and backdrop) primitives only, so every recorded
+  token path resolves.
+
 ## 0.17.0
 
 - The text half of the `elevated` pair — and of `popover`, its alias — is

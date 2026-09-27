@@ -109,7 +109,7 @@ fn embedded_default_source_compiles_to_revision_one() {
 
 #[test]
 fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
-    const ROLE_NAMES: [&str; 9] = [
+    const ROLE_NAMES: [&str; 10] = [
         "palette.background.1",
         "palette.background.2",
         "palette.background.3",
@@ -117,6 +117,9 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
         "palette.background.elevated",
         "palette.foreground.default",
         "palette.foreground.muted",
+        // Declared in the base so the light blocks may override it; dark
+        // keeps the base (ocean light) authoring and simply never reads it.
+        "palette.foreground.quiet",
         "palette.accent.default",
         "palette.accent.hover",
     ];
@@ -132,6 +135,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.85, 0.018, 220.0],
                 [0.25, 0.06, 220.0],
                 [0.50, 0.06, 220.0],
+                [0.45, 0.06, 220.0],
                 [0.50, 0.12, 220.0],
                 [0.45, 0.14, 220.0],
             ],
@@ -147,6 +151,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.34, 0.025, 220.0],
                 [0.95, 0.02, 220.0],
                 [0.61, 0.04, 220.0],
+                [0.45, 0.06, 220.0],
                 [0.75, 0.12, 220.0],
                 [0.85, 0.10, 220.0],
             ],
@@ -162,6 +167,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.85, 0.018, 25.0],
                 [0.25, 0.04, 25.0],
                 [0.50, 0.04, 25.0],
+                [0.45, 0.04, 25.0],
                 [0.47, 0.20, 25.0],
                 [0.42, 0.22, 25.0],
             ],
@@ -177,6 +183,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.34, 0.025, 25.0],
                 [0.95, 0.02, 25.0],
                 [0.61, 0.03, 25.0],
+                [0.45, 0.06, 220.0],
                 [0.63, 0.23, 25.0],
                 [0.70, 0.25, 25.0],
             ],
@@ -192,6 +199,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.85, 0.012, 60.0],
                 [0.25, 0.02, 60.0],
                 [0.50, 0.015, 60.0],
+                [0.45, 0.015, 60.0],
                 [0.45, 0.05, 60.0],
                 [0.35, 0.06, 60.0],
             ],
@@ -207,6 +215,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.34, 0.015, 60.0],
                 [0.95, 0.01, 60.0],
                 [0.61, 0.015, 60.0],
+                [0.45, 0.06, 220.0],
                 [0.80, 0.03, 60.0],
                 [0.90, 0.02, 60.0],
             ],
@@ -222,6 +231,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.85, 0.018, 150.0],
                 [0.25, 0.06, 150.0],
                 [0.50, 0.06, 150.0],
+                [0.45, 0.06, 150.0],
                 [0.49, 0.12, 150.0],
                 [0.44, 0.14, 150.0],
             ],
@@ -237,6 +247,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.34, 0.025, 150.0],
                 [0.95, 0.02, 150.0],
                 [0.61, 0.04, 150.0],
+                [0.45, 0.06, 220.0],
                 [0.70, 0.12, 150.0],
                 [0.80, 0.10, 150.0],
             ],
@@ -252,6 +263,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.85, 0.02, 45.0],
                 [0.30, 0.08, 45.0],
                 [0.50, 0.08, 45.0],
+                [0.45, 0.08, 45.0],
                 [0.52, 0.16, 45.0],
                 [0.46, 0.18, 45.0],
             ],
@@ -267,6 +279,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.34, 0.03, 45.0],
                 [0.95, 0.025, 45.0],
                 [0.61, 0.05, 45.0],
+                [0.45, 0.06, 220.0],
                 [0.72, 0.14, 45.0],
                 [0.82, 0.12, 45.0],
             ],
@@ -282,6 +295,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.85, 0.0, 0.0],
                 [0.20, 0.0, 0.0],
                 [0.50, 0.0, 0.0],
+                [0.45, 0.0, 0.0],
                 [0.25, 0.0, 0.0],
                 [0.35, 0.0, 0.0],
             ],
@@ -297,6 +311,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.34, 0.0, 0.0],
                 [0.95, 0.0, 0.0],
                 [0.61, 0.0, 0.0],
+                [0.45, 0.06, 220.0],
                 [0.85, 0.0, 0.0],
                 [0.92, 0.0, 0.0],
             ],
@@ -322,6 +337,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
             "palette.background.muted",
             "palette.foreground.default",
             "palette.foreground.muted",
+            "palette.foreground.quiet",
             "status.danger",
             "status.success",
             "status.warning",
@@ -429,9 +445,10 @@ fn embedded_semantics_use_role_anchors_and_registered_selection_pairs() {
         None,
     );
     // The base form carries the default foreground; every light modifier
-    // block re-authors the muted pair on the light-only
-    // `palette.foreground.quiet` anchor (see the quiet-foreground test in
-    // colour.rs), and dark keeps the default foreground.
+    // block re-authors the muted pair on the `palette.foreground.quiet`
+    // anchor (declared in the base, overridden per light scheme — see the
+    // quiet-foreground test in colour.rs), and dark keeps the default
+    // foreground.
     authored(
         "muted",
         "palette.background.muted",

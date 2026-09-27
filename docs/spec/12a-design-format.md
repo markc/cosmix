@@ -167,13 +167,17 @@ web-published and the verbatim claim does not cover them, but they
 stand on the same wire-contract footing, and they exist because §3.6's
 distinctness floor cannot be met from the seven web anchors alone —
 revision-1's one-step backgrounds clear barely 1.05:1 against
-`background.1`. A third desktop-only anchor, the light-only
-`palette.foreground.quiet`, carries the muted pair's light text half:
-the web `foreground.muted` anchor measures 4.24:1 on
-`palette.background.muted`, so hierarchy text that must clear AA on the
-quiet surface needs a quieter dedicated foreground in light contexts
-(dark keeps the default foreground; re-tiering dark's already-flat ramp
-is a later decision).
+`background.1`. A third desktop-only anchor, `palette.foreground.quiet`,
+carries the muted pair's light text half: the web `foreground.muted`
+anchor measures 4.24:1 on `palette.background.muted`, so hierarchy text
+that must clear AA on the quiet surface needs a quieter dedicated
+foreground in light contexts (dark keeps the default foreground;
+re-tiering dark's already-flat ramp is a later decision). The anchor is
+**declared in the base document** — at revision-1's ocean light value —
+and overridden by every light scheme block; a modifier block carries
+only token paths the base already authored (§1.6), so a quiet anchor
+living only in the light blocks is a compile error, not a light
+mode detail. Dark contexts keep the base authoring and never read it.
 
 The names are a source-format wire contract on the same
 footing as §2.4's semantic vocabulary: an authored theme references them
@@ -548,7 +552,12 @@ is fatal per §11.5 with the diagnostic naming the role
 though the §2.4 alias only fills the unauthored half: a source that
 authors `popover` on `base` while keeping a distinct `elevated` commits
 the same invisible-menu fault, so authoring both confers no exemption
-for either. The gate is on the rendered
+for either. An **alias-filled copy is diagnosed on its donor's
+authored path, once**: the copy renders the donor's exact surface bytes,
+so a second diagnostic on the copy's path would name a pair that is
+not in the source — a popover-only design collapsing onto `base` is
+refused with exactly one `surface-not-distinct-from-base` diagnostic,
+and it names `pairs.popover`. The gate is on the rendered
 surface, so a transparent surface composited over a `base`-coloured
 backdrop is caught as surely as an authored equal colour. Nothing
 comparable is demanded of the other roles: they sit inside page
@@ -571,7 +580,13 @@ contrasts more with, which is never below √21:1 ≈ 4.58:1 on an opaque
 surface — and records the derivation in an `elevated-text-fallback`
 *warning* rather than refusing the design. A tooltip, menu or popover
 floats over everything and must stay readable on whatever the palette
-does; `popover` receives the same derivation through the alias. No
+does; `popover` receives the same derivation through the alias, and the
+alias-filled copy is warned on its donor's authored path, once, by the
+same rule as the distinctness gate. The derived foreground records no
+primitive dependency: its provenance names the pair's surface
+primitive, because the knockout is derived *from* the rendered surface
+— listing the `derive:` name as a primitive would point provenance at a
+token that cannot resolve. No
 other pair shares this repair: for every other role the text half is
 an authored choice, and §3.4's fatal gate stands unchanged.
 
@@ -1207,16 +1222,25 @@ refused with the diagnostic naming the role in both its path and
 message, and the revision-1 palette clears the floor for `muted`,
 `elevated` and the aliased `popover` in all twelve contexts; the §3.6
 popover refusal — an explicitly authored `popover` equal to `base` is
-refused by name even beside a distinct `elevated`; the §3.6 elevated
+refused by name even beside a distinct `elevated`, and a popover-only
+design is refused exactly once, with the one diagnostic naming the
+authored `pairs.popover` path while the alias-filled `elevated` copy
+adds none of its own; the §3.6 elevated
 text-half derivation — a source whose authored `elevated` (or
 `popover`) foreground misses AA on its rendered surface compiles with
 the guaranteed-knockout foreground and an `elevated-text-fallback`
-warning naming the pair, while any other pair's failing text half
+warning naming the pair — once, on the authored donor, when the other
+half is alias-filled — while any other pair's failing text half
 stays fatal, and the revision-1 elevated foreground clears AA unaided
 in all twelve contexts so the fallback never fires on the shipped
-design; the revision-1 light quiet foreground — the `muted` pair's
+design, and the derived foreground's provenance names only tokens the
+dictionary resolves (the surface primitive, never the `derive:` name);
+the revision-1 light quiet foreground — the `muted` pair's
 light text half rides the desktop-only `palette.foreground.quiet`
-anchor, differs from the default foreground, and clears AA on the
+anchor (declared in the base document, overridden per light scheme —
+so the embedded default compiles through the full `compile_design`
+entry point, modifiers validated, not only through the stage-level
+compilers), differs from the default foreground, and clears AA on the
 muted, base and elevated surfaces in all six light schemes; §4.2
 forbidden-construct rejection (component
 names / selectors / expressions / undeclared axes in data); §4.3

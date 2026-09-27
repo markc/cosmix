@@ -41,6 +41,10 @@ design: {
         "palette.background.elevated": { color_space: "oklch", l: 0.85, c: 0.018, h: 220.0 },
         "palette.foreground.default": { color_space: "oklch", l: 0.25, c: 0.06, h: 220.0 },
         "palette.foreground.muted": { color_space: "oklch", l: 0.50, c: 0.06, h: 220.0 },
+        # Declared in the base so the light modifier blocks may override it:
+        # a modifier cannot introduce a path the base never authored. The base
+        # value is the ocean light anchor; dark never reads it.
+        "palette.foreground.quiet": { color_space: "oklch", l: 0.45, c: 0.06, h: 220.0 },
         "palette.accent.default": { color_space: "oklch", l: 0.50, c: 0.12, h: 220.0 },
         "palette.accent.hover": { color_space: "oklch", l: 0.45, c: 0.14, h: 220.0 },
         "status.success": { color_space: "oklch", l: 0.45, c: 0.15, h: 145.0 },
@@ -96,18 +100,15 @@ design: {
     modifiers: [
       {
         when: { scheme: "ocean", mode: "light" },
-        primitives: {
-          colors: {
-            "palette.foreground.quiet": { color_space: "oklch", l: 0.45, c: 0.06, h: 220.0 }
-          }
-        },
         semantics: {
           pairs: {
             # The muted pair's light text half rides the quiet anchor: at
             # full default weight, hierarchy text (disabled controls,
             # secondary labels) reads as enabled on the light quiet
             # surface. Dark keeps the default foreground — dark's ramp was
-            # already flat, and re-tiering it is a later decision.
+            # already flat, and re-tiering it is a later decision. The
+            # quiet anchor itself needs no override here: the base carries
+            # the ocean light value verbatim.
             muted: {
               surface: "palette.background.muted",
               foreground: "palette.foreground.quiet"

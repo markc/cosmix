@@ -264,6 +264,13 @@ impl DesignProvenance {
     pub(crate) fn extend(&mut self, other: Self) {
         self.values.extend(other.values);
     }
+
+    /// Entry-level iteration for in-crate assertions — chiefly that every
+    /// recorded token path names a value the dictionary can resolve.
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&DesignValueId, &ValueProvenance)> {
+        self.values.iter()
+    }
 }
 
 /// A successfully compiled design before an apply assigns its revision.

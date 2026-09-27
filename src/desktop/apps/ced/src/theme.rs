@@ -19,8 +19,8 @@
 use std::path::{Path, PathBuf};
 
 use cosmix_design::{
-    DesignCompileResult, DesignContext, LinearRgba, Mode, ResolvedDictionary, ResolvedTypeRecord, Scheme,
-    SourceIdentity, TypographyRole,
+    DesignCompileResult, DesignContext, DiagnosticSeverity, LinearRgba, Mode, ResolvedDictionary,
+    ResolvedTypeRecord, Scheme, SourceIdentity, TypographyRole,
 };
 use cosmix_edit_client::highlight::HlClass;
 use cosmix_iced_widgets::Tokens;
@@ -208,7 +208,29 @@ fn compile(selection: &Selection) -> Result<Compiled, String> {
             dictionary: success.candidate.dictionary().clone(),
             typography: success.candidate.typography().clone(),
         }),
-        DesignCompileResult::Fatal(_) => Err(format!("design {identity} does not compile")),
+        // "does not compile" alone hides which rule fired; the diagnostics
+        // name it, and every consumer of this string surfaces it verbatim.
+        DesignCompileResult::Fatal(failure) => Err(format!(
+            "design {identity} does not compile: {}",
+            failure
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    format!(
+                        "{} {} {}: {}",
+                        if diagnostic.severity == DiagnosticSeverity::Error {
+                            "error"
+                        } else {
+                            "warning"
+                        },
+                        diagnostic.code,
+                        diagnostic.path,
+                        diagnostic.message,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        )),
     }
 }
 
