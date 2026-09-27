@@ -953,6 +953,15 @@ rounds half away from zero on both sides of the origin.
 
 ### Input injection
 
+**0.71.1 (unreleased):** `cosmix-input-probe --seats` binds each advertised
+seat's keyboard and pointer and labels their events by the quoted seat name.
+`--idle-timeout-ms N` enables the same mode and adds one ext-idle-notify-v1
+notification per seat: `PROBE seat "cosmix" idled` / `resumed` (likewise for
+`cosmix-agent`). `PROBE seats_ready` follows a roundtrip confirming setup;
+`PROBE seats_done` follows the final event-draining roundtrip. With neither
+flag the probe retains its existing bindings and output. The flags do not
+change the compositor's input default.
+
 **0.71.0 (unreleased):** `cosmix-agent` now has a delivery path, with its own
 keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
 hidden from Xwayland. Every `comp.input.*` verb accepts `seat:"human"` or

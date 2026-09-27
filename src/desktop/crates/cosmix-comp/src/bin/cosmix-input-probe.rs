@@ -19,7 +19,16 @@
 //! (`PROBE remapped`).
 //! `--translucent` uses premultiplied half-alpha ARGB with no opaque region;
 //! the default XRGB buffer is opaque. `--ssd` requests server decorations.
+//! `--seats` lists and labels every seat's keyboard/pointer events.
+//! `--idle-timeout-ms N` also enables this mode and subscribes to one
+//! ext-idle-notify notification per seat. Names are quoted/escaped; e.g.
+//! `PROBE seat "cosmix-agent" idled`. `PROBE seats_ready` follows a sync
+//! after device/notification creation; `PROBE seats_done` follows the final
+//! sync. Without either flag, the legacy bindings and output are unchanged.
 
+use smithay::reexports::wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1, ext_idle_notifier_v1,
+};
 use smithay::reexports::wayland_protocols::wp::presentation_time::client::{
     wp_presentation, wp_presentation_feedback,
 };
@@ -30,6 +39,7 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use std::{
+    collections::BTreeMap,
     env,
     ffi::CString,
     fs::File,
@@ -42,7 +52,7 @@ use std::{
     time::{Duration, Instant},
 };
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, WEnum,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
     protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat,
         wl_shm, wl_shm_pool, wl_surface,
@@ -51,6 +61,11 @@ use wayland_client::{
 
 #[derive(Default)]
 struct Probe {
+    all_seats: bool,
+    idle_timeout_ms: Option<u32>,
+    idle_notifier: Option<ext_idle_notifier_v1::ExtIdleNotifierV1>,
+    seats: BTreeMap<u32, SeatProbe>,
+    seat_error: Option<String>,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
@@ -68,6 +83,73 @@ struct Probe {
     closed: bool,
 }
 
+#[derive(Default)]
+struct SeatEvents {
+    name: Option<String>,
+    pending: Vec<String>,
+}
+
+impl SeatEvents {
+    fn event(&mut self, event: String) -> Vec<String> {
+        if let Some(name) = &self.name {
+            vec![format!("seat {name:?} {event}")]
+        } else {
+            self.pending.push(event);
+            Vec::new()
+        }
+    }
+
+    fn named(&mut self, name: String) -> Vec<String> {
+        self.name = Some(name);
+        let pending = std::mem::take(&mut self.pending);
+        pending.into_iter().flat_map(|event| self.event(event)).collect()
+    }
+}
+
+struct SeatProbe {
+    seat: wl_seat::WlSeat,
+    events: SeatEvents,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    notification: Option<ext_idle_notification_v1::ExtIdleNotificationV1>,
+    pointer_at: (f64, f64),
+    capabilities_received: bool,
+    listed: bool,
+}
+
+impl SeatProbe {
+    fn emit(&mut self, event: String) {
+        for line in self.events.event(event) { say(&line); }
+    }
+
+    fn release(self) {
+        if let Some(notification) = self.notification { notification.destroy(); }
+        if let Some(keyboard) = self.keyboard
+            && keyboard.version() >= 3 { keyboard.release(); }
+        if let Some(pointer) = self.pointer
+            && pointer.version() >= 3 { pointer.release(); }
+        if self.seat.version() >= 5 { self.seat.release(); }
+    }
+}
+
+impl Probe {
+    fn prepare_seats(&mut self, qh: &QueueHandle<Self>) {
+        for (id, seat) in &mut self.seats {
+            if seat.notification.is_none()
+                && let (Some(manager), Some(timeout)) = (&self.idle_notifier, self.idle_timeout_ms) {
+                seat.notification = Some(manager.get_idle_notification(timeout, &seat.seat, qh, *id));
+            }
+            if !seat.listed && seat.capabilities_received && seat.events.name.is_some()
+                && (self.idle_timeout_ms.is_none() || seat.notification.is_some()) {
+                seat.emit(format!("bound keyboard={} pointer={} idle_timeout_ms={}",
+                    u8::from(seat.keyboard.is_some()), u8::from(seat.pointer.is_some()),
+                    self.idle_timeout_ms.map_or_else(|| "none".into(), |ms| ms.to_string())));
+                seat.listed = true;
+            }
+        }
+    }
+}
+
 fn say(line: &str) {
     let mut stdout = std::io::stdout().lock();
     let _ = writeln!(stdout, "PROBE {line}");
@@ -75,6 +157,8 @@ fn say(line: &str) {
 }
 
 struct Options {
+    seats: bool,
+    idle_timeout_ms: Option<u32>,
     title: String,
     app_id: String,
     width: i32,
@@ -87,7 +171,13 @@ struct Options {
 }
 
 fn options() -> Result<Options, String> {
+    parse_options(env::args().skip(1))
+}
+
+fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut options = Options {
+        seats: false,
+        idle_timeout_ms: None,
         title: "cosmix-input-probe".into(),
         app_id: "dev.cosmix.InputProbe".into(),
         width: 320,
@@ -98,7 +188,6 @@ fn options() -> Result<Options, String> {
         translucent: false,
         ssd: false,
     };
-    let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut value = || {
             arguments
@@ -106,6 +195,11 @@ fn options() -> Result<Options, String> {
                 .ok_or_else(|| format!("{argument} requires a value"))
         };
         match argument.as_str() {
+            "--seats" => options.seats = true,
+            "--idle-timeout-ms" => {
+                options.idle_timeout_ms = Some(value()?.parse::<u32>()
+                    .map_err(|error| format!("--idle-timeout-ms: {error}"))?);
+            }
             "--title" => options.title = value()?,
             "--app-id" => options.app_id = value()?,
             "--size" => {
@@ -226,7 +320,11 @@ fn run() -> Result<(), String> {
     let mut queue = connection.new_event_queue();
     let qh = queue.handle();
     let _registry = connection.display().get_registry(&qh, ());
-    let mut probe = Probe::default();
+    let mut probe = Probe {
+        all_seats: options.seats || options.idle_timeout_ms.is_some(),
+        idle_timeout_ms: options.idle_timeout_ms,
+        ..Probe::default()
+    };
     queue
         .roundtrip(&mut probe)
         .map_err(|error| format!("registry roundtrip failed: {error}"))?;
@@ -236,10 +334,27 @@ fn run() -> Result<(), String> {
         .ok_or("wl_compositor unavailable")?;
     let shm = probe.shm.clone().ok_or("wl_shm unavailable")?;
     let wm_base = probe.wm_base.clone().ok_or("xdg_wm_base unavailable")?;
-    probe.seat.as_ref().ok_or("wl_seat unavailable")?;
+    if probe.all_seats {
+        if probe.seats.is_empty() { return Err("wl_seat unavailable".into()); }
+        if probe.idle_timeout_ms.is_some() && probe.idle_notifier.is_none() {
+            return Err("--idle-timeout-ms requires ext_idle_notifier_v1".into());
+        }
+    } else {
+        probe.seat.as_ref().ok_or("wl_seat unavailable")?;
+    }
     queue
         .roundtrip(&mut probe)
         .map_err(|error| format!("seat roundtrip failed: {error}"))?;
+    if probe.all_seats {
+        // Device and idle-notification requests were emitted by the seat
+        // callbacks. Sync those requests before announcing readiness.
+        queue.roundtrip(&mut probe).map_err(|error| format!("seat setup sync failed: {error}"))?;
+        if let Some(error) = probe.seat_error.take() { return Err(error); }
+        if probe.seats.values().any(|seat| !seat.listed) {
+            return Err("seat missing name or capabilities".into());
+        }
+        say("seats_ready");
+    }
 
     let surface = compositor.create_surface(&qh, ());
     let xdg = wm_base.get_xdg_surface(&surface, &qh, ());
@@ -270,6 +385,7 @@ fn run() -> Result<(), String> {
     let mut remap_at: Option<Instant> = None;
     let mut remap_left = options.remap_once;
     while Instant::now() < deadline && (!probe.closed || options.hide_on_close) {
+        if let Some(error) = probe.seat_error.take() { return Err(error); }
         if probe.closed && !hidden {
             probe.closed = false;
             hidden = true;
@@ -340,6 +456,10 @@ fn run() -> Result<(), String> {
         }
         wait_readable(&mut queue, Duration::from_millis(50))?;
     }
+    if probe.all_seats {
+        queue.roundtrip(&mut probe).map_err(|error| format!("final seat sync failed: {error}"))?;
+        say("seats_done");
+    }
     if probe.closed {
         say("close");
     }
@@ -373,6 +493,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Probe {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        if let wl_registry::Event::GlobalRemove { name } = &event
+            && state.all_seats
+            && let Some(mut seat) = state.seats.remove(name) {
+            seat.emit("removed".into());
+            seat.release();
+            return;
+        }
         let wl_registry::Event::Global {
             name,
             interface,
@@ -390,10 +517,106 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Probe {
             "zxdg_decoration_manager_v1" => {
                 state.decoration_manager = Some(registry.bind(name, 1, qh, ()));
             }
+            "wl_seat" if state.all_seats => {
+                if version < 2 {
+                    state.seat_error = Some("--seats requires wl_seat v2 names".into());
+                    return;
+                }
+                state.seats.insert(name, SeatProbe {
+                    seat: registry.bind(name, version.min(7), qh, name),
+                    events: SeatEvents::default(), keyboard: None, pointer: None,
+                    notification: None, pointer_at: (0.0, 0.0),
+                    capabilities_received: false, listed: false,
+                });
+                state.prepare_seats(qh);
+            }
             "wl_seat" => state.seat = Some(registry.bind(name, version.min(7), qh, ())),
+            "ext_idle_notifier_v1" if state.idle_timeout_ms.is_some() => {
+                state.idle_notifier = Some(registry.bind(name, 1, qh, ()));
+                state.prepare_seats(qh);
+            }
             "wp_presentation" => {
                 state.presentation = Some(registry.bind(name, version.min(2), qh, ()));
             }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, u32> for Probe {
+    fn event(state: &mut Self, _: &wl_seat::WlSeat, event: wl_seat::Event,
+        id: &u32, _: &Connection, qh: &QueueHandle<Self>) {
+        let Some(seat) = state.seats.get_mut(id) else { return; };
+        match event {
+            wl_seat::Event::Name { name } => {
+                for line in seat.events.named(name) { say(&line); }
+            }
+            wl_seat::Event::Capabilities { capabilities: WEnum::Value(capabilities) } => {
+                seat.capabilities_received = true;
+                if capabilities.contains(wl_seat::Capability::Keyboard) {
+                    if seat.keyboard.is_none() { seat.keyboard = Some(seat.seat.get_keyboard(qh, *id)); }
+                } else if let Some(keyboard) = seat.keyboard.take()
+                    && keyboard.version() >= 3 { keyboard.release(); }
+                if capabilities.contains(wl_seat::Capability::Pointer) {
+                    if seat.pointer.is_none() { seat.pointer = Some(seat.seat.get_pointer(qh, *id)); }
+                } else if let Some(pointer) = seat.pointer.take()
+                    && pointer.version() >= 3 { pointer.release(); }
+                seat.listed = false;
+            }
+            _ => {}
+        }
+        state.prepare_seats(qh);
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, u32> for Probe {
+    fn event(state: &mut Self, _: &wl_pointer::WlPointer, event: wl_pointer::Event,
+        id: &u32, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(seat) = state.seats.get_mut(id) else { return; };
+        let line = match event {
+            wl_pointer::Event::Enter { surface_x, surface_y, .. } => {
+                seat.pointer_at = (surface_x, surface_y);
+                format!("enter {surface_x} {surface_y}")
+            }
+            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+                seat.pointer_at = (surface_x, surface_y);
+                format!("motion {surface_x} {surface_y}")
+            }
+            wl_pointer::Event::Leave { .. } => "leave".into(),
+            wl_pointer::Event::Button { button, state: pressed, .. } => {
+                let pressed = matches!(pressed, WEnum::Value(wl_pointer::ButtonState::Pressed));
+                format!("button {button} {} {} {}", u8::from(pressed), seat.pointer_at.0, seat.pointer_at.1)
+            }
+            _ => return,
+        };
+        seat.emit(line);
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, u32> for Probe {
+    fn event(state: &mut Self, _: &wl_keyboard::WlKeyboard, event: wl_keyboard::Event,
+        id: &u32, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(seat) = state.seats.get_mut(id) else { return; };
+        let line = match event {
+            wl_keyboard::Event::Enter { .. } => "keyboard_enter".into(),
+            wl_keyboard::Event::Leave { .. } => "keyboard_leave".into(),
+            wl_keyboard::Event::Key { key, state: pressed, .. } => {
+                let pressed = matches!(pressed, WEnum::Value(wl_keyboard::KeyState::Pressed));
+                format!("key {key} {}", u8::from(pressed))
+            }
+            _ => return,
+        };
+        seat.emit(line);
+    }
+}
+
+impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, u32> for Probe {
+    fn event(state: &mut Self, _: &ext_idle_notification_v1::ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event, id: &u32, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(seat) = state.seats.get_mut(id) else { return; };
+        match event {
+            ext_idle_notification_v1::Event::Idled => seat.emit("idled".into()),
+            ext_idle_notification_v1::Event::Resumed => seat.emit("resumed".into()),
             _ => {}
         }
     }
@@ -595,6 +818,7 @@ macro_rules! ignore_events {
 }
 
 ignore_events!(
+    ext_idle_notifier_v1::ExtIdleNotifierV1,
     wl_compositor::WlCompositor,
     wl_shm::WlShm,
     wl_shm_pool::WlShmPool,
@@ -604,3 +828,48 @@ ignore_events!(
     zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
     zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_options_do_not_enable_seat_observation() {
+        let options = parse_options(std::iter::empty()).unwrap();
+        assert!(!options.seats);
+        assert_eq!(options.idle_timeout_ms, None);
+        assert_eq!(options.duration, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn seat_and_idle_options_are_independent_and_validate_u32_timeout() {
+        let parse = |args: &[&str]| parse_options(args.iter().map(|s| (*s).to_string()));
+        assert!(parse(&["--seats"]).unwrap().seats);
+        assert_eq!(parse(&["--idle-timeout-ms", "3000"]).unwrap().idle_timeout_ms, Some(3000));
+        assert_eq!(parse(&["--idle-timeout-ms", "0"]).unwrap().idle_timeout_ms, Some(0));
+        for args in [vec!["--idle-timeout-ms"], vec!["--idle-timeout-ms", "-1"],
+            vec!["--idle-timeout-ms", "4294967296"], vec!["--idle-timeout-ms", "invalid"]] {
+            assert!(parse(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn early_events_wait_for_their_own_seat_name_in_order() {
+        let mut human = SeatEvents::default();
+        let mut agent = SeatEvents::default();
+        assert!(human.event("key 30 1".into()).is_empty());
+        assert!(agent.event("idled".into()).is_empty());
+        assert!(agent.event("resumed".into()).is_empty());
+        assert_eq!(agent.named("cosmix-agent".into()), [
+            "seat \"cosmix-agent\" idled", "seat \"cosmix-agent\" resumed"]);
+        assert_eq!(human.named("cosmix".into()), ["seat \"cosmix\" key 30 1"]);
+        assert_eq!(human.event("idled".into()), ["seat \"cosmix\" idled"]);
+    }
+
+    #[test]
+    fn seat_names_cannot_inject_extra_output_lines() {
+        let mut events = SeatEvents::default();
+        let _ = events.named("name\n\"other\"".into());
+        assert_eq!(events.event("idled".into()), ["seat \"name\\n\\\"other\\\"\" idled"]);
+    }
+}

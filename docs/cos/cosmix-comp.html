@@ -1336,6 +1336,14 @@ origin.</li>
 the left or top output edge, can still project one pixel short. The renderer
 rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
+<p><strong>0.71.1 (unreleased):</strong> <code>cosmix-input-probe --seats</code> binds each advertised
+seat's keyboard and pointer and labels their events by the quoted seat name.
+<code>--idle-timeout-ms N</code> enables the same mode and adds one ext-idle-notify-v1
+notification per seat: <code>PROBE seat "cosmix" idled</code> / <code>resumed</code> (likewise for
+<code>cosmix-agent</code>). <code>PROBE seats_ready</code> follows a roundtrip confirming setup;
+<code>PROBE seats_done</code> follows the final event-draining roundtrip. With neither
+flag the probe retains its existing bindings and output. The flags do not
+change the compositor's input default.</p>
 <p><strong>0.71.0 (unreleased):</strong> <code>cosmix-agent</code> now has a delivery path, with its own
 keyboard, XKB modifiers, pointer, focus and injected holds. Its global remains
 hidden from Xwayland. Every <code>comp.input.*</code> verb accepts <code>seat:"human"</code> or
