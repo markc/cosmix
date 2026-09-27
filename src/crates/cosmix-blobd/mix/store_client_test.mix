@@ -1,6 +1,17 @@
--- version: 0.5.0
+-- version: 0.6.0
 $c = require("store_client.mix")
 $checks = buffer()
+$clock = buffer()
+$status_times = buffer()
+$wait_events = buffer()
+$wait_io = {
+  now: fn() = length(freeze($clock)) / 20,
+  pause: fn($seconds) = buffer_push($clock, 1),
+  status: fn($ctx)
+    buffer_push($status_times, floor(length(freeze($clock)) / 20));
+    return {state: length(freeze($status_times)) == 3 ? "committed" : "pending"}
+  end
+}
 $dir = env("TMPDIR", "/tmp") .. "/store-client-test-" .. uuid()
 mkdir($dir)
 fn check($condition, $token)
@@ -8,6 +19,26 @@ fn check($condition, $token)
   buffer_push($checks, 1)
 end
 try
+  check($c.wait_status({collection: "test", id: "id", timeout: 30}, $wait_events, 0, $wait_io).state == "committed", "REMOTE_WITHOUT_EVENT_COMPLETES")
+  check(deep_eq(freeze($status_times), bytes_from([2, 6, 14])), "STATUS_BACKOFF_2_4_8")
+  $clock = buffer()
+  $status_times = buffer()
+  $wait_io = {now: fn() = length(freeze($clock)) / 20, pause: fn($seconds) = buffer_push($clock, 1), status: fn($ctx)
+    buffer_push($status_times, floor(length(freeze($clock)) / 20));
+    return {state: "pending"}
+  end}
+  $caught = ""
+  try
+    $c.wait_status({collection: "test", id: "id", timeout: 200}, $wait_events, 0, $wait_io)
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_COMMIT" and deep_eq(freeze($status_times), bytes_from([2, 6, 14, 30, 62, 122, 182, 200])), "BOUNDED_BACKOFF_CAP_AND_TIMEOUT")
+  $clock = buffer()
+  $status_times = buffer()
+  buffer_push($wait_events, json_encode({collection: "test", id: "id"}) .. "\n")
+  $wait_io = {now: fn() = 0, pause: fn($seconds) = raise("TEST", "EVENT_SHOULD_NOT_SLEEP"), status: fn($ctx) = {state: "committed"}}
+  check($c.wait_status({collection: "test", id: "id", timeout: 30}, $wait_events, 0, $wait_io).state == "committed", "EVENT_FIRST")
   $destination = $c.restore_begin($dir .. "/restored")
   write_file($destination.root .. "/verified", "bytes")
   check(not exists($destination.requested) and contains($destination.root, ".restored.partial-"), "INCOMPLETE_RESTORE_IS_DISTINCT")

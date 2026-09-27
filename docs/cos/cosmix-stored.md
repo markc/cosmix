@@ -180,8 +180,15 @@ bytes get a different record; old receipts/reservations are retained until
 blobd expiry or explicit operator abort. Transfers are sequential; `--chunk`
 accepts 1..8388608 bytes and `--timeout` defaults to 900 seconds.
 
-The client subscribes before commit, then checks durable status once after
-completion or timeout. Pending is never reported as committed. `list` follows
+The client subscribes before commit. Events trigger immediate durable status
+checks, with a bounded backstop: first check after 2 s, then double the delay
+to at most 60 s until `--timeout`. Transient status errors retain that schedule.
+Noded does not federate this local subscription automatically: Mix subscribes
+on its local serve connection (`cosmix-mix/src/bus.rs`, `subscribe_topic`), and
+`cosmix-noded/src/subscription.rs` fans out to that broker's subscriptions.
+Blob fetch completion is local to the receiving blobd; cross-node byte fetch
+does not imply cross-node topic forwarding. Final status reads have at most
+one second of grace after the deadline. Pending is never reported as committed. `list` follows
 all pages; `status` exposes the durable job including failure or tombstone.
 One-shot event users finish with `quit()`; failures exit nonzero.
 

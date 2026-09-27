@@ -1,4 +1,4 @@
--- version: 0.5.0
+-- version: 0.6.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -114,6 +114,37 @@ fn target($cfg)
   if $info.blobd != $cfg.local_target then raise("STORE_CONFIG", "stored uses a different blobd target") end
 end
 
+fn wait_status($context, $events, $base, $io)
+  $deadline = $io.now() + $context.timeout
+  $delay = 2
+  $next_check = $io.now() + $delay
+  $last = {collection: $context.collection, id: $context.id, state: "unknown"}
+  while true
+    $matched = false
+    $bytes = freeze($events)
+    for each $line in lines(bytes_to_string(slice($bytes, $base)))
+      if $line == "" then continue end
+      $event = json_parse($line)
+      if $event.collection == $context.collection and $event.id == $context.id then $matched = true end
+    end
+    $base = length($bytes)
+    $expired = $io.now() >= $deadline
+    if $matched or $io.now() >= $next_check or $expired then
+      $context.rpc_timeout = min(30, max(1, ceil($deadline - $io.now())))
+      try
+        $last = $io.status($context)
+      catch $message, $error
+        $last = {collection: $context.collection, id: $context.id, state: "unknown", error: $error.code .. ": " .. $message}
+      end
+      if $last.state == "committed" then return $last end
+      if $last.state == "failed" or $expired then raise("STORE_COMMIT", json_encode($last)) end
+      $delay = min($delay * 2, 60)
+      $next_check = $io.now() + $delay
+    end
+    $io.pause(min(0.05, max(0, $deadline - $io.now())))
+  end
+end
+
 fn commit_wait($cfg, $collection, $v, $events)
   subscribe("store.commit.finished")
   try
@@ -121,23 +152,14 @@ fn commit_wait($cfg, $collection, $v, $events)
     $accepted = rpc($cfg.service, "store.snapshot.commit", {collection: $collection, manifest: $v.manifest})
     if $accepted.id != $v.id then raise("STORE_IDENTITY", "commit identity differs") end
     if $accepted.state == "committed" then return $accepted end
-    $deadline = monotonic() + $cfg.timeout
-    $matched = false
-    while monotonic() < $deadline and not $matched
-      $bytes = freeze($events)
-      $recent = bytes_to_string(slice($bytes, $base))
-      for each $line in lines($recent)
-        if $line == "" then continue end
-        $event = json_parse($line)
-        if $event.collection == $collection and $event.id == $v.id then $matched = true end
-      end
-      if not $matched then sleep(0.05) end
+    $status_request = fn($ctx)
+      $service = $ctx.service
+      $result = send $service store.commit.status body=json_encode({collection: $ctx.collection, id: $ctx.id}) timeout=$ctx.rpc_timeout
+      if $rc != 0 then raise("STORE_REMOTE", json_encode({rc: $rc, result: $result})) end
+      return $result
     end
-    -- Events are hints (another store can publish the same identity). One
-    -- authoritative status read on completion/timeout; no status polling.
-    $status = rpc($cfg.service, "store.commit.status", {collection: $collection, id: $v.id})
-    if $status.state != "committed" then raise("STORE_COMMIT", json_encode($status)) end
-    return $status
+    $io = {now: fn() = monotonic(), pause: fn($seconds) = sleep($seconds), status: $status_request}
+    return wait_status({service: $cfg.service, collection: $collection, id: $v.id, timeout: $cfg.timeout}, $events, $base, $io)
   finally
     unsubscribe("store.commit.finished")
   end
