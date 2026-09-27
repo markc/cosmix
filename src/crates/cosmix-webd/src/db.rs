@@ -260,6 +260,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cms_init_and_ensure_col_use_real_authorizer() {
+        use cosmix_mix::{evaluator::Evaluator, lexer::Lexer, parser::Parser};
+        use std::rc::Rc;
+        let conn = mem_db();
+        let source = format!(
+            "{}\n$SITE = {{title: \"Test\", tagline: \"\", footer: \"\"}}\ncms_init()\ncms_init()\nensure_col(\"media\", \"blob TEXT NULL\")\n",
+            include_str!("../vhosts/lib/lib.mix")
+        );
+        let tokens = Lexer::new(&source).tokenize().unwrap();
+        let ast = Parser::new(tokens, &source).parse_program().unwrap();
+        let mut eval = Evaluator::with_output(Box::new(Vec::new()), Box::new(Vec::new()));
+        eval.set_db_handler(Rc::new(handler(conn.clone())));
+        eval.execute(&ast).await.unwrap();
+        let h = handler(conn);
+        h.query("SELECT blob FROM media", &[]).await.unwrap();
+        assert!(h.query("SELECT * FROM pragma_table_info('media')", &[]).await.is_err());
+        let source = "ensure_col(\"missing_table\", \"blob TEXT NULL\")";
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        let ast = Parser::new(tokens, source).parse_program().unwrap();
+        assert!(eval.execute(&ast).await.is_err());
+    }
+
+    #[tokio::test]
     async fn exec_then_query_roundtrips() {
         let h = handler(mem_db());
         let r = h

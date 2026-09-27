@@ -112,17 +112,13 @@ end
 
 -- Add a column if it isn't already there (SQLite has no ADD COLUMN IF NOT
 -- EXISTS). `$table`/`$coldef` are fixed literals from cms_init, never client
--- input. Check the schema before ALTER, then recheck after a racing ALTER.
--- A missing column after failure is a genuine error, never silently swallowed.
+-- input. Only a duplicate-column error is harmless. PRAGMA (including its
+-- table-valued functions) is deliberately denied by WebdDbHandler.
 function ensure_col($table, $coldef)
-  $name = split($coldef, " ")[0]
-  $found = db_query("SELECT name FROM pragma_table_info(?1) WHERE name = ?2", [$table, $name])
-  if length($found) > 0 then return end
   try
     db_exec("ALTER TABLE " .. $table .. " ADD COLUMN " .. $coldef, [])
   catch $e
-    $found = db_query("SELECT name FROM pragma_table_info(?1) WHERE name = ?2", [$table, $name])
-    if length($found) == 0 then
+    if not contains("" .. $e, "duplicate column name:") then
       raise("SCHEMA_MIGRATION_FAILED", $e)
     end
   end
