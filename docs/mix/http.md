@@ -3,7 +3,8 @@
 ## Streaming file download (0.97.0)
 
 `http_get_file(url, path[, opts]) -> map<http_file_response>` streams GET to a
-unique sibling created exclusively with mode 0600. It hashes while writing,
+unique sibling created exclusively with mode 0666 under the process umask,
+matching `write_atomic` for a new destination. It hashes while writing,
 syncs the completed file, publishes atomically, then syncs the directory.
 The parent directory must exist. Defaults refuse an existing destination:
 Linux uses `renameat2(RENAME_NOREPLACE)`, with atomic hard-link creation as
@@ -74,9 +75,16 @@ The distinct `http_file_response` has `status`, `headers`, `bytes_written`,
 `error`, and `published` (false for uploads). For uploads, `bytes_written` counts source bytes consumed, not a
 server's durable acknowledgement; `size` is the selected window size and
 `blake3` is its lowercase digest (nil on failure). Response bodies are capped
-at 64 MiB. HTTP failures retain their real status; IO/transport failures return
+at 64 MiB. Received HTTP responses retain their real status; IO/transport failures return
 status 0 and an error (`FILE_IO`, `HTTP_SHORT_READ`, or the HTTP codes below).
 Argument errors raise. Inspect the result even when the call does not raise.
+
+A server can reject a large PUT/PATCH before consuming its body. If the socket
+fails while ureq is still writing, the caller can receive status 0 and lose the
+server's status and diagnostic body. For resumable blob uploads, recover via
+HEAD and its durable offset/state rather than assuming the chunk was accepted.
+Downloads refuse close-delimited 200/206 bodies without Content-Length, as
+required by the identity-framing contract above.
 
 Network **and FsRead are unconditional capabilities**, including calls without
 options. Structured discovery and `mix lint` include both. The `http` Cargo

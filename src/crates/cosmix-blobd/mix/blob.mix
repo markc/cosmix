@@ -258,7 +258,9 @@ end
 
 fn _file_status_response($h, $record)
   if $h.status != 200 then return _file_error($h) end
-  if _file_header($h, "x-cosmix-owner") != $record.owner or _file_header_uint($h, "x-cosmix-size") != $record.size or _file_header($h, "x-cosmix-expect") != "b3:" .. $record.blake3 or _file_header($h, "x-cosmix-upload-key") != $record.key or _file_header($h, "x-cosmix-mime") != $record.mime or _file_header($h, "x-cosmix-name") != $record.name then
+  $name = _file_header($h, "x-cosmix-name")
+  if $name != nil then $name = url_decode(replace($name, "+", "%2B")) end
+  if _file_header($h, "x-cosmix-owner") != $record.owner or _file_header_uint($h, "x-cosmix-size") != $record.size or _file_header($h, "x-cosmix-expect") != "b3:" .. $record.blake3 or _file_header($h, "x-cosmix-upload-key") != $record.key or _file_header($h, "x-cosmix-mime") != $record.mime or $name != $record.name then
     return _file_error("session identity differs from resume record")
   end
   $offset = _file_header_uint($h, "x-cosmix-offset")
@@ -266,6 +268,30 @@ fn _file_status_response($h, $record)
   $state = _file_header($h, "x-cosmix-state")
   if not contains(["active", "committing", "complete"], $state) then return _file_error("session is " .. to_string($state)) end
   return {ok: true, rc: 0, result: {offset: $offset, state: $state}}
+end
+
+fn _file_cleanup_completed($resume, $identity, $opts)
+  -- Completion is already proven by the owner pin. Cleanup is best-effort;
+  -- retain the record on any refusal so another invocation can retry it.
+  try
+    if not exists($resume, {follow_symlinks: false}) then return nil end
+    $saved = json_parse(read_file($resume))
+    if type($saved) != "map" then return nil end
+    for each $key in ["service", "owner", "size", "blake3"]
+      if $saved[$key] != $identity[$key] then return nil end
+    end
+    if type($saved.upload) != "string" or not re_match($saved.upload, "^[0-9a-f-]{36}$") then return nil end
+    $lane = _file_lane($opts)
+    if not $lane.ok then return nil end
+    $deleted = http_request("DELETE", $lane.result .. "/blob/uploads/" .. $saved.upload, nil, {}, _file_options($opts, true))
+    if $deleted.status == 204 or $deleted.status == 404 then
+      $saved.upload = nil
+      _file_save($resume, $saved)
+    end
+  catch $msg
+    return nil
+  end
+  return nil
 end
 
 fn _blob_upload_file($path, $opts)
@@ -289,11 +315,13 @@ fn _blob_upload_file($path, $opts)
     return _file_error("source changed while hashing")
   end
   $identity = {service: _svc($opts), owner: $owner, size: $size, blake3: $hash, mime: _opt($opts, "mime") ?? "application/octet-stream", name: _opt($opts, "name")}
-  -- A completed owner pin avoids discovery, reservation and all HTTP traffic.
+  -- A completed owner pin avoids another upload; a recorded stale session
+  -- is best-effort aborted so its reservation/key can be reclaimed.
   $present = blob_stat("b3:" .. $hash, $opts)
   if not $present.ok then return $present end
   if $present.result.present == true and contains($present.result.pins, $owner) then
     if $present.result.size != $size then return _file_error("stored size differs from source") end
+    _file_cleanup_completed($resume, $identity, $opts)
     return {ok: true, rc: 0, result: {blob: "b3:" .. $hash, size: $present.result.size, mime: $present.result.mime, name: $present.result.name, origin: $present.result.origin}}
   end
   $record = $identity
@@ -310,7 +338,7 @@ fn _blob_upload_file($path, $opts)
   -- Replaying create is safe, including a lost create reply, an old upload ID,
   -- or a swept expiry. Same owner/key returns the durable matching session.
   $headers = {"X-Cosmix-Owner": $owner, "X-Cosmix-Size": to_string($size), "X-Cosmix-Expect": "b3:" .. $hash, "X-Cosmix-Upload-Key": $record.key, "X-Cosmix-Mime": $record.mime}
-  if $record.name != nil then $headers["X-Cosmix-Name"] = $record.name end
+  if $record.name != nil then $headers["X-Cosmix-Name"] = url_encode($record.name) end
   $created = http_request("POST", $lane.result .. "/blob/uploads", nil, $headers, _file_options($opts, true))
   if $created.status != 200 and $created.status != 201 then return _file_error($created) end
   $session = json_parse($created.body)

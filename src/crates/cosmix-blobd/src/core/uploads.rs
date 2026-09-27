@@ -187,6 +187,15 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn check_upload_device(cas_device: u64, staging_device: u64) -> Result<()> {
+    if cas_device != staging_device {
+        return Err(StoreError::BadRequest(
+            "blobs/.uploads must be on the CAS filesystem (hard-link publication requires the same device)".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn permanent_commit_error(error: &StoreError) -> bool {
     match error {
         StoreError::QuotaOwner { .. }
@@ -889,6 +898,10 @@ impl Store {
 
     pub(super) fn restore_uploads(&self) -> Result<()> {
         fs::create_dir_all(self.uploads_root())?;
+        check_upload_device(
+            fs::metadata(self.blobs_root())?.dev(),
+            fs::metadata(self.uploads_root())?.dev(),
+        )?;
         fs::set_permissions(self.uploads_root(), fs::Permissions::from_mode(0o2700))?;
         sync_dir(&self.blobs_root())?;
         self.db
@@ -956,6 +969,27 @@ mod tests {
             name: None,
             key: Some("retry-key".into()),
         }
+    }
+
+    #[test]
+    fn staging_device_mismatch_is_a_clear_startup_refusal() {
+        assert!(check_upload_device(1, 1).is_ok());
+        assert!(
+            matches!(check_upload_device(1, 2), Err(StoreError::BadRequest(message)) if message.contains("CAS filesystem"))
+        );
+        // Exercise actual startup when the host supplies a second filesystem.
+        let Ok(other) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        if fs::metadata(dir.path()).unwrap().dev() == fs::metadata(other.path()).unwrap().dev() {
+            return;
+        }
+        fs::create_dir_all(dir.path().join("blobs")).unwrap();
+        std::os::unix::fs::symlink(other.path(), dir.path().join("blobs/.uploads")).unwrap();
+        assert!(
+            matches!(Store::open(dir.path(), options()), Err(StoreError::BadRequest(message)) if message.contains("CAS filesystem"))
+        );
     }
 
     #[test]

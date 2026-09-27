@@ -67,8 +67,8 @@ fn create_options(headers: &HeaderMap) -> Result<UploadCreate> {
                 .ok_or_else(|| StoreError::BadRequest("invalid X-Cosmix-Expect".into()))
         })
         .transpose()?;
-    let name = text_header(headers, "x-cosmix-name", false)?;
-    let mime = text_header(headers, "x-cosmix-mime", false)?.unwrap_or_else(|| {
+    let name = string_header(headers, "x-cosmix-name")?;
+    let mime = string_header(headers, "x-cosmix-mime")?.unwrap_or_else(|| {
         name.as_deref()
             .map(mime::sniff)
             .unwrap_or("application/octet-stream")
@@ -103,7 +103,7 @@ fn metadata_headers(mut response: Response, s: &UploadSession) -> Response {
         headers.push(("x-cosmix-upload-key", key.clone()));
     }
     if let Some(name) = &s.name {
-        headers.push(("x-cosmix-name", name.clone()));
+        headers.push(("x-cosmix-name", encoded_name(name)));
     }
     for (name, value) in headers {
         if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
@@ -343,6 +343,46 @@ pub(super) async fn patch(
 mod tests {
     use super::super::test_support::{options, test_lane};
     use super::*;
+
+    #[test]
+    fn names_decode_rfc3986_and_reject_controls_and_bad_utf8() {
+        let mut h = HeaderMap::new();
+        h.insert("x-cosmix-name", "caf%C3%A9+%20100%25.txt".parse().unwrap());
+        assert_eq!(string_header(&h, "x-cosmix-name").unwrap().as_deref(), Some("café+ 100%.txt"));
+        for value in ["%", "%GG", "%FF", "%00", "%0A", "%7F", "%C2%85"] {
+            h.insert("x-cosmix-name", value.parse().unwrap());
+            assert!(string_header(&h, "x-cosmix-name").is_err(), "{value}");
+        }
+        h.insert("x-cosmix-mime", axum::http::HeaderValue::from_bytes("text/café".as_bytes()).unwrap());
+        assert!(string_header(&h, "x-cosmix-mime").is_err());
+    }
+
+    #[tokio::test]
+    async fn encoded_names_roundtrip_on_v1_session_head_and_commit() {
+        let (_dir, store, addr) = test_lane(options()).await;
+        let client = reqwest::Client::new();
+        let name = "café+ 100%.txt";
+        let encoded = encoded_name(name);
+        let response = client.post(format!("http://{addr}/blob")).header("X-Cosmix-Name", &encoded).body("v1").send().await.unwrap();
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap()["name"], name);
+        let base = format!("http://{addr}/blob/uploads");
+        let response = client.post(&base).header("X-Cosmix-Owner", "tester").header("X-Cosmix-Size", "0").header("X-Cosmix-Name", &encoded).send().await.unwrap();
+        assert_eq!(response.status(), 201);
+        let session: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(session["name"], name);
+        let id = session["upload"].as_str().unwrap();
+        let head = client.head(format!("{base}/{id}")).send().await.unwrap();
+        assert_eq!(head.headers()["x-cosmix-name"], encoded);
+        let committed = client.post(format!("{base}/{id}/commit")).send().await.unwrap();
+        assert_eq!(committed.status(), 201);
+        assert_eq!(committed.json::<serde_json::Value>().await.unwrap()["name"], name);
+        assert_eq!(store.upload_status(id).unwrap().name.as_deref(), Some(name));
+        for route in [format!("http://{addr}/blob"), base] {
+            let response = client.post(route).header("X-Cosmix-Owner", "tester").header("X-Cosmix-Size", "0").header("X-Cosmix-Name", "%0A").body("").send().await.unwrap();
+            assert_eq!(response.status(), 400);
+        }
+    }
 
     #[test]
     fn strict_upload_range_grammar() {

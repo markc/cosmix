@@ -114,7 +114,7 @@ axum-generated method errors (405) and extractor rejections before a handler.
 | `HEAD /blob/uploads/<uuid>` | `200` | Durable offset and identity headers, no body, including on error |
 | `PATCH /blob/uploads/<uuid>` | `200` | Append exactly at the durable offset; return `{"offset":N}` and session headers |
 | `POST /blob/uploads/<uuid>/commit` | `201` first completion; `200` receipt replay | Verify the complete object, publish and pin; return the same blob reference on replay |
-| `DELETE /blob/uploads/<uuid>` | `204` | Abort and release the reservation; repeated abort is harmless. Completed objects and pins are untouched |
+| `DELETE /blob/uploads/<uuid>` | `204` | Abort, delete the row and free the owner/key; a repeated abort is `404`. Completed receipts and owner pins are untouched |
 
 Create requires `X-Cosmix-Owner` and `X-Cosmix-Size` (decimal bytes, including
 zero, at most 9007199254740991). Optional headers are `X-Cosmix-Expect`
@@ -122,7 +122,12 @@ zero, at most 9007199254740991). Optional headers are `X-Cosmix-Expect`
 The key is scoped to the owner: replay returns the existing session only if
 size, expected hash, mime and name also match; otherwise `409`. Owner and key
 are at most 128 bytes, mime 256 and name 1024; control characters are refused.
-Header values must be valid HTTP text. Mime defaults as for v1 uploads.
+Name uses RFC 3986 percent-encoded UTF-8 on both v1 and session routes;
+`+` stays literal, `%HH` decodes bytes, and malformed escapes, invalid UTF-8
+and decoded control characters are 400. The 1024-byte limit applies after
+decoding. JSON/references store the decoded name; HEAD percent-encodes it
+again. Other headers, including Mime, must be ASCII HTTP text; Mime is not
+percent-decoded and defaults as for v1 uploads.
 
 PATCH requires `Content-Range: bytes <start>-<inclusive end>/<whole size>`
 and `Content-Length: <end-start+1>`. Wildcards, multiple ranges and
@@ -254,6 +259,10 @@ mds's `blobs.sqlite` schema is never touched (`BLOBS_LATEST` stays 1 — ADR D4)
 
 At startup blobd removes everything under `blobs/.tmp`, restores durable sessions separately, and runs one directory-vs-database reconcile. Old CAS files with no mds row and no pin are logged as orphans but never deleted at startup — `blob.gc` owns deletion.
 
+`blobs/.uploads` must reside on the same filesystem as `blobs/`: commit uses
+hard links for atomic publication. Startup compares their device IDs and
+refuses a cross-device staging mount with a clear configuration error.
+
 ## Garbage collection and quotas
 
 `blob.gc` sweeps CAS files whose mds refcount is 0 (no row counts as 0 — every blobd put is rowless until a set references it), that carry no pin, and whose mtime is older than the 60-second grace window (`DEFAULT_GC_QUIESCENCE`). A dry run lists candidates; a live run unlinks, drops attributes and adjusts quota accounting. Pinned blobs are never candidates.
@@ -307,8 +316,11 @@ integers through 9007199254740991; chunk must be positive.
 The library hashes the source, then checks `blob.stat` on the target service.
 `blob.stat` includes the stored `name` (explicit null when absent), alongside
 size, mime and origin. Presence **and this owner's pin** return a reference
-using those stored fields, including name, rather than the caller's hints, without an
-upload or lane discovery. Otherwise `blob.props.get path="lane.bind"` discovers
+using those stored fields, including name, without another upload. If a matching
+resume record still names an upload, the shortcut discovers the lane and sends
+DELETE to release that stale session. Cleanup is best-effort; 204/404 clears
+the recorded upload ID, while other failures retain it for retry. Without a
+recorded upload, no lane discovery is needed. Otherwise `blob.props.get path="lane.bind"` discovers
 the target's HTTP lane over the Bus. There is no hard-coded lane address or
 alternate control transport.
 
@@ -326,13 +338,17 @@ a regular file separate from the source; existing symlinks are refused.
 PATCH sends inclusive windows with exact Content-Range and Content-Length.
 The library reads HEAD after success, 409, or a lost response, verifies session
 identity, and resumes from the durable offset. Three consecutive no-progress
-attempts return an error; call again with the same record. Empty files commit
+attempts return an error; an early rejection during a large PUT/PATCH can be
+reported as transport status 0 with the server diagnostic lost, so HEAD is
+authoritative for recovery. Call again with the same record. Empty files commit
 without PATCH. Commit accepts 201 or the replayed 200 receipt. After a lost
 response (status 0), 409 or 503 it polls HEAD with backoff (1 second doubling
 to 30 seconds), waiting while the state is committing, then replays commit
 to read the receipt. `opts.commit_timeout` bounds this recovery loop (positive
 integer seconds, default 900); individual calls use `control_timeout` (default
-30 seconds), capped by the remaining time. Blocking DNS/IO retains the HTTP
+30 whole seconds), capped by the remaining whole seconds; recovery stops
+when less than a second remains, never passing zero as an unlimited timeout.
+Blocking DNS/IO retains the HTTP
 client's best-effort timeout limitations. A timeout leaves the resume record
 available for another invocation. Receipts last 24 hours; the owner-pin check
 also resolves completion after receipt expiry.

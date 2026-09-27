@@ -440,7 +440,7 @@ fn staging(path: &Path) -> io::Result<(File, Staging)> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o666);
         }
         match options.open(&tmp) {
             Ok(file) => return Ok((file, Staging(tmp))),
@@ -958,6 +958,44 @@ mod tests {
             "expect_blake3".into(),
             Value::String(blake3::hash(bytes).to_hex().to_string()),
         )])
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn download_new_file_uses_creation_umask_and_overwrite_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Temp::new();
+        let baseline = dir.0.join("normal-create");
+        File::create(&baseline).unwrap();
+        let expected = std::fs::metadata(&baseline).unwrap().permissions().mode() & 0o777;
+        let path = dir.0.join("download");
+        let (url, server) = server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na",
+            Duration::ZERO,
+        );
+        let result = download(url, &path, IndexMap::new());
+        server.join().unwrap();
+        assert!(matches!(result["published"], Value::Bool(true)));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            expected
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let (url, worker) = self::server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+            Duration::ZERO,
+        );
+        let result = download(
+            url,
+            &path,
+            IndexMap::from([("overwrite".into(), Value::Bool(true))]),
+        );
+        worker.join().unwrap();
+        assert!(matches!(result["published"], Value::Bool(true)));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[test]

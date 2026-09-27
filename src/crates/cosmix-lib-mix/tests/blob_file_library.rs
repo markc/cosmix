@@ -173,6 +173,37 @@ async fn blob_upload_owner_pin_short_circuits_before_lane_and_record() {
 }
 
 #[tokio::test]
+async fn blob_upload_owner_pin_aborts_recorded_stale_session() {
+    let dir = Temp::new();
+    std::fs::write(dir.0.join("source"), b"abcd").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bus = Rc::new(Bus {
+        bind: listener.local_addr().unwrap().to_string(),
+        pinned: true,
+        discovery: Cell::new(0),
+    });
+    let saved = serde_json::json!({"service":"blobd-test", "owner":"tester", "size":4,
+        "blake3":blake3::hash(b"abcd").to_hex().to_string(), "upload":ID, "key":ID,
+        "mime":"application/octet-stream", "name":null});
+    std::fs::write(dir.0.join("resume.json"), saved.to_string()).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, head, body) = request(&listener);
+        assert!(head.starts_with(&format!("DELETE /blob/uploads/{ID} ")));
+        assert!(body.is_empty());
+        reply(&mut socket, 204, "", "");
+    });
+    let result = upload(Rc::clone(&bus), &dir.0).await;
+    server.join().unwrap();
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["result"]["name"], "stored.bin");
+    assert_eq!(bus.discovery.get(), 1);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.0.join("resume.json")).unwrap()).unwrap();
+    assert!(saved["upload"].is_null());
+}
+
+#[tokio::test]
 async fn blob_upload_lost_create_reply_persisted_key_409_head_and_commit_replay() {
     let dir = Temp::new();
     std::fs::write(dir.0.join("source"), b"abcd").unwrap();
@@ -362,7 +393,7 @@ async fn blob_download_discovers_target_lane_and_verifies_reference_hash() {
 }
 
 #[tokio::test]
-async fn blob_upload_empty_commits_without_patch() {
+async fn blob_upload_empty_unicode_name_commits_without_patch() {
     let dir = Temp::new();
     std::fs::write(dir.0.join("source"), b"").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -384,6 +415,10 @@ async fn blob_upload_empty_commits_without_patch() {
             match step {
                 0 => {
                     assert!(head.starts_with("POST /blob/uploads "));
+                    assert!(
+                        head.to_ascii_lowercase()
+                            .contains("x-cosmix-name: caf%c3%a9%2b%20%25.txt")
+                    );
                     reply(&mut socket, 201, "", &format!("{{\"upload\":\"{ID}\"}}"));
                 }
                 1 => {
@@ -392,7 +427,7 @@ async fn blob_upload_empty_commits_without_patch() {
                         &mut socket,
                         200,
                         &format!(
-                            "X-Cosmix-Offset: 0\r\nX-Cosmix-Size: 0\r\nX-Cosmix-Owner: tester\r\nX-Cosmix-Mime: application/octet-stream\r\nX-Cosmix-Expect: b3:{hash}\r\nX-Cosmix-Upload-Key: {key}\r\nX-Cosmix-State: active\r\n"
+                            "X-Cosmix-Offset: 0\r\nX-Cosmix-Size: 0\r\nX-Cosmix-Owner: tester\r\nX-Cosmix-Mime: application/octet-stream\r\nX-Cosmix-Expect: b3:{hash}\r\nX-Cosmix-Upload-Key: {key}\r\nX-Cosmix-State: active\r\nX-Cosmix-Name: caf%C3%A9+%20%25.txt\r\n"
                         ),
                         "",
                     );
@@ -410,7 +445,7 @@ async fn blob_upload_empty_commits_without_patch() {
             }
         }
     });
-    let result = upload(bus, &dir.0).await;
+    let result = execute(bus, &format!("$out = $b.blob_upload_file({}, {{service:\"blobd-test\", owner:\"tester\", resume_file:{}, name:\"café+ %.txt\"}})", quoted(&dir.0.join("source")), quoted(&dir.0.join("resume.json")))).await;
     server.join().unwrap();
     assert_eq!(result["ok"], true, "{result}");
 }

@@ -503,9 +503,14 @@ impl Lane {
         body: Body,
     ) -> Response {
         let owner = lane_owner(headers, peer);
-        // TODO: decode percent-encoded X-Cosmix-Name; filesd P3 encodes; raise the 128-byte cap.
-        let name = string_header(headers, "x-cosmix-name");
-        let mime = string_header(headers, "x-cosmix-mime")
+        let name = match string_header(headers, "x-cosmix-name") {
+            Ok(name) => name,
+            Err(error) => return lane_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+        let mime = match string_header(headers, "x-cosmix-mime") {
+            Ok(mime) => mime,
+            Err(error) => return lane_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        }
             .or_else(|| name.as_deref().map(mime::sniff).map(str::to_string))
             .unwrap_or_else(|| "application/octet-stream".to_string());
         let expected_hex = expected.map(|h| blob::hex(&h));
@@ -800,12 +805,40 @@ fn lane_owner(headers: &HeaderMap, peer: SocketAddr) -> String {
         .unwrap_or_else(|| format!("lane:{}", peer.ip()))
 }
 
-fn string_header(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty() && s.len() <= MAX_OWNER_HEADER)
-        .map(str::to_string)
+fn string_header(headers: &HeaderMap, name: &str) -> std::result::Result<Option<String>, StoreError> {
+    let invalid = || StoreError::BadRequest(format!("invalid {name}"));
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else { return Ok(None); };
+    if values.next().is_some() { return Err(invalid()); }
+    let value = value.to_str().map_err(|_| invalid())?;
+    let decoded = if name == "x-cosmix-name" {
+        // RFC 3986: '+' is literal, never form-encoded whitespace.
+        let mut bytes = value.bytes();
+        let mut out = Vec::with_capacity(value.len());
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                let hi = bytes.next().and_then(|b| (b as char).to_digit(16)).ok_or_else(invalid)?;
+                let lo = bytes.next().and_then(|b| (b as char).to_digit(16)).ok_or_else(invalid)?;
+                out.push((hi * 16 + lo) as u8);
+            } else { out.push(byte); }
+        }
+        String::from_utf8(out).map_err(|_| invalid())?
+    } else { value.to_owned() };
+    let limit = if name == "x-cosmix-name" { 1024 } else { 256 };
+    if decoded.is_empty() || decoded.len() > limit || decoded.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    Ok(Some(decoded))
+}
+
+fn encoded_name(name: &str) -> String {
+    let mut out = String::new();
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else { out.push_str(&format!("%{byte:02X}")); }
+    }
+    out
 }
 
 fn content_length(headers: &HeaderMap) -> Option<u64> {

@@ -444,7 +444,8 @@
         <div id="content-doc" data-prerendered="mix/http.md"><div class="prose"><h1 id="http--http-client-builtins">http — HTTP client builtins</h1>
 <h2 id="streaming-file-download-0970">Streaming file download (0.97.0)</h2>
 <p><code>http_get_file(url, path[, opts]) -&gt; map&lt;http_file_response&gt;</code> streams GET to a
-unique sibling created exclusively with mode 0600. It hashes while writing,
+unique sibling created exclusively with mode 0666 under the process umask,
+matching <code>write_atomic</code> for a new destination. It hashes while writing,
 syncs the completed file, publishes atomically, then syncs the directory.
 The parent directory must exist. Defaults refuse an existing destination:
 Linux uses <code>renameat2(RENAME_NOREPLACE)</code>, with atomic hard-link creation as
@@ -506,9 +507,15 @@ seconds, up to one year.</p>
 <code>error</code>, and <code>published</code> (false for uploads). For uploads, <code>bytes_written</code> counts source bytes consumed, not a
 server's durable acknowledgement; <code>size</code> is the selected window size and
 <code>blake3</code> is its lowercase digest (nil on failure). Response bodies are capped
-at 64 MiB. HTTP failures retain their real status; IO/transport failures return
+at 64 MiB. Received HTTP responses retain their real status; IO/transport failures return
 status 0 and an error (<code>FILE_IO</code>, <code>HTTP_SHORT_READ</code>, or the HTTP codes below).
 Argument errors raise. Inspect the result even when the call does not raise.</p>
+<p>A server can reject a large PUT/PATCH before consuming its body. If the socket
+fails while ureq is still writing, the caller can receive status 0 and lose the
+server's status and diagnostic body. For resumable blob uploads, recover via
+HEAD and its durable offset/state rather than assuming the chunk was accepted.
+Downloads refuse close-delimited 200/206 bodies without Content-Length, as
+required by the identity-framing contract above.</p>
 <p>Network <strong>and FsRead are unconditional capabilities</strong>, including calls without
 options. Structured discovery and <code>mix lint</code> include both. The <code>http</code> Cargo
 feature itself enables BLAKE3; <code>crypto</code> is not required for these transfers.</p>
