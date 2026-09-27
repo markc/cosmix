@@ -1,4 +1,4 @@
--- version: 0.8.0
+-- version: 0.9.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -101,14 +101,39 @@ fn inventory($directory)
   return $v
 end
 
+fn outside_source($canonical, $source_root)
+  if $canonical == nil then raise("STORE_CACHE", "cache path cannot be resolved") end
+  if $source_root != nil and ($canonical == $source_root or $source_root == "/" or starts_with($canonical, $source_root .. "/")) then raise("STORE_CACHE", "resume cache cannot be inside the source tree") end
+end
+
+fn cache_before_mkdir($path, $source_root)
+  $absolute = starts_with($path, "/") ? $path : realpath(".") .. "/" .. $path
+  $ancestor = $absolute
+  while not exists($ancestor, {follow_symlinks: false})
+    $ancestor = dirname($ancestor)
+  end
+  $canonical = realpath($ancestor)
+  outside_source($canonical, $source_root)
+  -- Resolve the missing suffix without writing. A '..' can lead back into
+  -- existing paths, including aliases of the source, so inspect each step.
+  for each $part in split(slice($absolute, length($ancestor)), "/")
+    if $part == "" or $part == "." then continue end
+    if $part == ".." then $canonical = dirname($canonical)
+    else $canonical = ($canonical == "/" ? "" : $canonical) .. "/" .. $part end
+    if exists($canonical, {follow_symlinks: false}) then $canonical = realpath($canonical) end
+    outside_source($canonical, $source_root)
+  end
+end
+
 fn cache_lock($path, $source_root)
+  cache_before_mkdir($path, $source_root)
   if not exists($path, {follow_symlinks: false}) then
     mkdir($path)
     chmod($path, 0o700)
   end
   if not stat($path, {follow_symlinks: false}).is_dir then raise("STORE_CACHE", "cache must be a real directory") end
   $canonical = realpath($path)
-  if $source_root != nil and ($canonical == $source_root or $source_root == "/" or starts_with($canonical, $source_root .. "/")) then raise("STORE_CACHE", "resume cache cannot be inside the source tree") end
+  outside_source($canonical, $source_root)
   if not flock($path .. "/.lock") then raise("STORE_LOCKED", "another store client owns this cache") end
 end
 
@@ -140,7 +165,7 @@ fn wait_status($context, $events, $base, $io)
         $last = {collection: $context.collection, id: $context.id, state: "unknown", error: $error.code .. ": " .. $message}
       end
       if $last.state == "committed" then return $last end
-      if $last.state == "failed" or $expired then raise("STORE_COMMIT", json_encode($last)) end
+      if $last.state == "failed" or $io.now() >= $deadline then raise("STORE_COMMIT", json_encode($last)) end
       $delay = min($delay * 2, 60)
       $next_check = $io.now() + $delay
     end

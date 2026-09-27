@@ -142,7 +142,9 @@ receive rc 0 and `{}` after draining, or immediately if a worker is already
 active. Local `task_start` continuations have no request context and never
 call `reply()`. A long drain can outlast the requester's timeout; use durable
 commit status to determine the outcome. A retired worker clears its busy flag only if it
-still owns that epoch. Escaping infrastructure failures (including connection
+still owns that epoch. `STORE_SUPERSEDED` terminates the drain immediately,
+including when raised during failure handling; it never sleeps or retries,
+and a request kick still receives its reply. Escaping infrastructure failures (including connection
 or failed-state-write errors) get at most three retries, separated by 60 s.
 This is an error backstop, not a poll. After exhaustion, fix the underlying
 fault and kick `stored.work` or restart to recover the pending intent.
@@ -257,8 +259,11 @@ exclusive process lock covers it (`STORE_LOCKED` on contention); it cannot
 live inside the source tree. An empty `--cache` or an empty `HOME` when using
 the default cache is refused with `STORE_CONFIG` before filesystem writes.
 Only newly created cache directories are chmodded to 0700; existing directory
-modes are preserved. Canonical paths are compared before creating `.lock`,
-including aliases of the source root.
+modes are preserved. Before creating any directories or `.lock`, containment
+is checked against the realpath of the nearest existing ancestor and the
+resolved missing suffix, including aliases of the source root. Refused cache
+paths leave no new directories inside the source. The check is repeated after
+creation; keep the namespace quiescent because these checks are not atomic.
 Target, collection and source root isolate resume records; object identity
 names each record. Atomic mode-0600 records retain B0's session key, identity
 and server receipt across a killed push. Retry the same command. Changed
@@ -274,7 +279,9 @@ on its local serve connection (`cosmix-mix/src/bus.rs`, `subscribe_topic`), and
 `cosmix-noded/src/subscription.rs` fans out to that broker's subscriptions.
 Blob fetch completion is local to the receiving blobd; cross-node byte fetch
 does not imply cross-node topic forwarding. Final status reads have at most
-one second of grace after the deadline. Pending is never reported as committed. `list` follows
+one second of grace after the deadline. Expiry is checked again after each
+status read, including an error: a read that crosses the deadline is never
+followed by a second expired read. Pending is never reported as committed. `list` follows
 all pages; `status` exposes the durable job including failure or tombstone.
 One-shot event users finish with `quit()`; failures exit nonzero.
 

@@ -1,4 +1,4 @@
--- version: 0.8.0
+-- version: 0.9.0
 $c = require("store_client.mix")
 $checks = buffer()
 $clock = buffer()
@@ -34,6 +34,23 @@ try
     $caught = $error.code
   end
   check($caught == "STORE_COMMIT" and deep_eq(freeze($status_times), bytes_from([2, 6, 14, 30, 62, 122, 182, 200])), "BOUNDED_BACKOFF_CAP_AND_TIMEOUT")
+  for each $result in ["pending", "error"]
+    $clock = buffer()
+    $status_times = buffer()
+    $wait_io = {now: fn() = length(freeze($clock)) / 20, pause: fn($seconds) = buffer_push($clock, 1), status: fn($ctx)
+      buffer_push($status_times, 1);
+      buffer_push($clock, repeat("x", $ctx.rpc_timeout * 20));
+      if $ctx.inject_error then raise("INJECT_TIMEOUT", "status read timed out") end;
+      return {state: "pending"}
+    end}
+    $caught = ""
+    try
+      $c.wait_status({collection: "test", id: "id", timeout: 2.1, inject_error: $result == "error"}, $wait_events, 0, $wait_io)
+    catch $message, $error
+      $caught = $error.code
+    end
+    check($caught == "STORE_COMMIT" and length(freeze($status_times)) == 1 and length(freeze($clock)) == 60, "NO_SECOND_EXPIRED_READ_" .. $result)
+  end
   $clock = buffer()
   $status_times = buffer()
   buffer_push($wait_events, json_encode({collection: "test", id: "id"}) .. "\n")
@@ -130,7 +147,8 @@ try
   chmod($dir .. "/existing-cache", 0o755)
   $c.cache_lock($dir .. "/existing-cache", nil)
   check(stat($dir .. "/existing-cache").perm == 0o755, "EXISTING_CACHE_MODE_PRESERVED")
-  for each $cache in [$dir .. "/tree/.", $dir .. "/tree/child-cache"]
+  symlink($dir .. "/tree", $dir .. "/tree-alias")
+  for each $cache in [$dir .. "/tree/.", $dir .. "/tree/child-cache", $dir .. "/tree/new-parent/child-cache", $dir .. "/tree-alias/alias-child", $dir .. "/outside-parent/../tree-alias/alias-child"]
     $caught = ""
     try
       $c.cache_lock($cache, realpath($dir .. "/tree"))
@@ -139,6 +157,9 @@ try
     end
     check($caught == "STORE_CACHE" and not exists($cache .. "/.lock"), "INSIDE_SOURCE_REFUSED_BEFORE_LOCK")
   end
+  check(not exists($dir .. "/tree/child-cache") and not exists($dir .. "/tree/new-parent") and not exists($dir .. "/tree/alias-child") and not exists($dir .. "/outside-parent"), "INSIDE_SOURCE_REFUSED_BEFORE_MKDIR")
+  $c.cache_lock($dir .. "/outside-cache/nested", realpath($dir .. "/tree"))
+  check(is_file($dir .. "/outside-cache/nested/.lock"), "OUTSIDE_CACHE_PARENTS_ALLOWED")
   $probe = "if flock(" .. json_encode($dir .. "/cache/.lock") .. ") then exit(1) end"
   check(run_argv(["/opt/cosmix/bin/mix", "-c", $probe]).ok, "SECOND_PROCESS_LOCK_REFUSED")
   check(stat($dir .. "/cache").perm == 0o700, "PRIVATE_CACHE")

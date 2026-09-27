@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 $w = require("store_worker.mix")
 $calls = buffer()
 $delays = buffer()
@@ -36,4 +36,6 @@ end
 check($caught == "INJECT_DISK_FULL", "BOUNDED_ERROR_PRESERVED")
 check(length(freeze($delays)) == 5, "THREE_RETRIES_MAXIMUM")
 check(length(freeze($events)) == 1, "NO_FALSE_COMPLETION")
+$w.drain(fn($context) = raise("STORE_SUPERSEDED", "retired generation"), $finish, fn($seconds) = raise("TEST", "SUPERSEDED_MUST_NOT_SLEEP"), {})
+check(length(freeze($events)) == 1, "SUPERSEDED_TERMINAL_WITHOUT_COMPLETION")
 print("store_worker_test: PASS " .. to_string(length(freeze($checks))))
