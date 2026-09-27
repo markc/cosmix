@@ -1,7 +1,41 @@
 # Public shares
 
-P5 is being delivered in slices. Catalogue management is available over the Bus
-and HTTP; public download routing follows in slice 5.
+Public file shares are available through explicit revocable tokens. Catalogue
+management is available over the Bus and authenticated HTTP.
+
+## Public downloads
+
+`GET/HEAD /s/{token}` is a per-vhost route ahead of static serving. Unknown,
+revoked, expired, unmapped legacy or unsupported-kind tokens terminate with 404;
+they never fall through to a similarly named static file. Other methods return
+405 with `Allow: GET, HEAD`. A missing trusted connection context returns 503.
+
+Password-protected shares require HTTPS Basic authentication: any username,
+password in the password part, `WWW-Authenticate: Basic realm="share"` on 401.
+Plain HTTP returns 403 without a challenge. No query-string password is read.
+Before bcrypt, five attempts per (token, actual socket peer IP) per 60 seconds
+are allowed. The table holds at most 4096 live pairs and refuses new pairs when
+full. Refusal returns 429 with `Retry-After: 60`. Forwarded IP headers are ignored.
+The catalogue gate is reloaded after password verification and before target access.
+
+Successful reads return 200 or single-range 206; unsatisfiable ranges return
+416 with `Content-Range: bytes */<size>` and an empty body. HEAD mirrors GET's
+headers without body bytes. All token-route responses carry:
+
+```http
+Cache-Control: private, no-store
+X-Content-Type-Options: nosniff
+Content-Security-Policy: sandbox
+```
+
+File responses also carry `Accept-Ranges: bytes`, exact `Content-Length`, and
+`Content-Disposition: attachment; filename*=UTF-8''<percent-encoded-name>`.
+Paths use `application/octet-stream`; blobs use the validated reference MIME.
+Blob headers are allowlisted; no upstream cache, cookies or redirects propagate.
+At most eight public bodies are admitted, with no waiting queue (503 `busy:`).
+File reads use bounded 64 KiB buffers and 30-second pending-read deadlines.
+The best-effort counter increments once as the first non-empty body chunk emits,
+with a five-second telemetry deadline; HEAD, 416 and empty files do not count.
 
 ## Management
 

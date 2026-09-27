@@ -26,6 +26,7 @@ pub struct Peer {
 pub struct Runtime {
     crypto: Arc<Semaphore>,
     management: Arc<Semaphore>,
+    downloads: Arc<Semaphore>,
     attempts: Mutex<Attempts>,
     lane: OnceLock<Result<Arc<blob_lane::Lane>, String>>,
 }
@@ -34,6 +35,7 @@ impl Default for Runtime {
         Self {
             crypto: Arc::new(Semaphore::new(4)),
             management: Arc::new(Semaphore::new(8)),
+            downloads: Arc::new(Semaphore::new(8)),
             attempts: Mutex::new(Attempts::default()),
             lane: OnceLock::new(),
         }
@@ -388,9 +390,450 @@ pub async fn http_revoke(
     }
 }
 
+/// Every response on the token route, including errors/method refusals, bypasses caches.
+pub async fn public_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let head = *request.method() == axum::http::Method::HEAD;
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("cache-control", "private, no-store".parse().unwrap());
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("content-security-policy", "sandbox".parse().unwrap());
+    if head {
+        *response.body_mut() = axum::body::Body::empty();
+    }
+    response
+}
+
+fn basic_password(headers: &HeaderMap) -> Option<String> {
+    use base64::Engine;
+    let value = headers.get("authorization")?.to_str().ok()?;
+    if value.len() > 512 {
+        return None;
+    }
+    let (scheme, credentials) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(credentials)
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (_, password) = decoded.split_once(':')?;
+    valid_password(password).ok()?;
+    Some(password.into())
+}
+fn challenge() -> Response {
+    let mut response = error("unauthorized".into());
+    response
+        .headers_mut()
+        .insert("www-authenticate", "Basic realm=\"share\"".parse().unwrap());
+    response
+}
+fn attachment(name: &str) -> String {
+    let name = name.rsplit(['/', '\\']).next().unwrap_or("download");
+    let name: String = name.chars().filter(|c| !c.is_control()).take(200).collect();
+    let mut out = String::from("attachment; filename*=UTF-8''");
+    for byte in if name.is_empty() { "download" } else { &name }.bytes() {
+        if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+pub async fn serve(
+    State(node): State<Arc<NodeState>>,
+    Extension(vhost): Extension<Arc<VhostState>>,
+    Path(token): Path<String>,
+    peer: Option<Extension<Peer>>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+) -> Response {
+    use axum::http::Method;
+    if method != Method::GET && method != Method::HEAD {
+        return (StatusCode::METHOD_NOT_ALLOWED, [("allow", "GET, HEAD")]).into_response();
+    }
+    let Some(db) = &vhost.db else {
+        return error("not_found".into());
+    };
+    let gate = {
+        let db = db.lock().await;
+        match file_share::resolve(&db, &token, session::now_secs()) {
+            Ok(g) => g,
+            Err(e) => return error(catalogue_error(e)),
+        }
+    };
+    let Some(Extension(peer)) = peer else {
+        return error("busy: peer context unavailable".into());
+    };
+    let permit = match node.share_runtime.downloads.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return error("busy: public download pool full (8)".into()),
+    };
+    let verified = if let Some(hash) = gate.password_hash {
+        if !peer.tls {
+            return (
+                StatusCode::FORBIDDEN,
+                "unauthorized: password shares require HTTPS",
+            )
+                .into_response();
+        }
+        if !node.share_runtime.attempt(&token, peer.ip) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "60")],
+                "unauthorized",
+            )
+                .into_response();
+        }
+        let Some(password) = basic_password(&headers) else {
+            return challenge();
+        };
+        match node.share_runtime.verify(password, hash.clone()).await {
+            Ok(true) => Some(hash),
+            Ok(false) => return challenge(),
+            Err(e) => return error(e),
+        }
+    } else {
+        None
+    };
+    // Refresh after asynchronous password work; old snapshots confer no authority.
+    let target = {
+        let db = db.lock().await;
+        let gate = match file_share::resolve(&db, &token, session::now_secs()) {
+            Ok(g) => g,
+            Err(e) => return error(catalogue_error(e)),
+        };
+        match gate.authorize(verified.as_deref()) {
+            Ok(t) => (gate.share.account.clone(), t.clone()),
+            Err(_) => return challenge(),
+        }
+    };
+    let range = headers.get("range").cloned();
+    if range.as_ref().is_some_and(|r| r.as_bytes().len() > 1024) {
+        return error("invalid_arguments: Range too long".into());
+    }
+    let result = match target.1 {
+        file_share::Target::Blob { reference } => {
+            let name = reference.name.clone().unwrap_or_else(|| "download".into());
+            async {
+                let client = blob_lane::local(&node.broker_handle)?;
+                let download = node
+                    .share_runtime
+                    .lane()?
+                    .download(&*client, &reference, method.clone(), range)
+                    .await?;
+                Ok::<_, String>((download, name))
+            }
+            .await
+        }
+        file_share::Target::Path { rel_path } => match node.share_roots.get(&target.0) {
+            Some(root) => path_download(root.clone(), &rel_path, &method, range.as_ref())
+                .await
+                .map(|d| (d, rel_path)),
+            None => Err("not_found".into()),
+        },
+    };
+    let (download, name) = match result {
+        Ok(value) => value,
+        Err(e) => return error(e),
+    };
+    let mut response = Response::new(
+        if method == Method::HEAD || download.status == StatusCode::RANGE_NOT_SATISFIABLE {
+            drop(permit);
+            axum::body::Body::empty()
+        } else {
+            counted_body(download.body, permit, vhost, token)
+        },
+    );
+    *response.status_mut() = download.status;
+    *response.headers_mut() = download.headers;
+    response
+        .headers_mut()
+        .insert("content-disposition", attachment(&name).parse().unwrap());
+    response
+}
+
+async fn path_download(
+    root: Arc<cosmix_files::rooted_read::ReadRoot>,
+    path: &str,
+    method: &axum::http::Method,
+    range: Option<&axum::http::HeaderValue>,
+) -> Result<blob_lane::Download, String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let path = path.to_owned();
+    let (file, size) = tokio::task::spawn_blocking(move || {
+        let file = root.open_regular(&path)?;
+        let size = file.metadata()?.len();
+        Ok::<_, std::io::Error>((file, size))
+    })
+    .await
+    .map_err(|_| "internal: file worker failed")?
+    .map_err(|_| "not_found")?;
+    let extent = blob_lane::expected_range(range.and_then(|r| r.to_str().ok()), size);
+    let (status, start, length, content_range) = match extent {
+        blob_lane::Range::Full => (StatusCode::OK, 0, size, None),
+        blob_lane::Range::Partial(start, length) => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            length,
+            Some(format!("bytes {start}-{}/{size}", start + length - 1)),
+        ),
+        blob_lane::Range::Unsatisfiable => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            0,
+            0,
+            Some(format!("bytes */{size}")),
+        ),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("content-length", length.into());
+    headers.insert("content-type", "application/octet-stream".parse().unwrap());
+    headers.insert("accept-ranges", "bytes".parse().unwrap());
+    if let Some(range) = content_range {
+        headers.insert("content-range", range.parse().unwrap());
+    }
+    let body = if *method == axum::http::Method::HEAD || length == 0 {
+        axum::body::Body::empty()
+    } else {
+        let mut file = tokio::fs::File::from_std(file);
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|_| "internal: file seek failed")?;
+        axum::body::Body::from_stream(futures_util::stream::try_unfold(
+            (file, length),
+            |(mut file, remaining)| async move {
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                let mut bytes = vec![0u8; remaining.min(64 * 1024) as usize];
+                let n = tokio::time::timeout(Duration::from_secs(30), file.read(&mut bytes))
+                    .await
+                    .map_err(|_| std::io::Error::other("file read idle timeout"))??;
+                if n == 0 {
+                    return Err(std::io::Error::other("file shorter than declared length"));
+                }
+                bytes.truncate(n);
+                Ok(Some((
+                    axum::body::Bytes::from(bytes),
+                    (file, remaining - n as u64),
+                )))
+            },
+        ))
+    };
+    Ok(blob_lane::Download {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn counted_body(
+    body: axum::body::Body,
+    permit: OwnedSemaphorePermit,
+    vhost: Arc<VhostState>,
+    token: String,
+) -> axum::body::Body {
+    use futures_util::StreamExt;
+    let state = (body.into_data_stream(), permit, vhost, token, false);
+    axum::body::Body::from_stream(futures_util::stream::unfold(
+        state,
+        |(mut stream, permit, vhost, token, mut counted)| async move {
+            let chunk = stream.next().await?;
+            if chunk.as_ref().is_ok_and(|b| !b.is_empty()) && !counted {
+                counted = true;
+                if let Some(db) = &vhost.db {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        let db = db.lock().await;
+                        if let Err(error) = file_share::bump_download(&db, &token) {
+                            tracing::warn!(%error, "share download counter failed");
+                        }
+                    })
+                    .await;
+                }
+            }
+            Some((chunk, (stream, permit, vhost, token, counted)))
+        },
+    ))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    async fn path_token(node: &NodeState, vhost: &VhostState, password: Option<String>) -> String {
+        create(
+            node,
+            vhost,
+            Create {
+                account: "user@example.test".into(),
+                kind: "file".into(),
+                rel_path: Some("file".into()),
+                blob: None,
+                name: None,
+                password,
+                expires: None,
+            },
+        )
+        .await
+        .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    fn download_request(
+        token: &str,
+        method: &str,
+        range: Option<&str>,
+        auth: Option<&str>,
+        tls: bool,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(format!("/s/{token}"))
+            .header("host", "pim.example")
+            .extension(Peer {
+                ip: "192.0.2.1".parse().unwrap(),
+                tls,
+            });
+        if let Some(range) = range {
+            request = request.header("range", range);
+        }
+        if let Some(auth) = auth {
+            request = request.header("authorization", auth);
+        }
+        request.body(axum::body::Body::empty()).unwrap()
+    }
+    #[tokio::test]
+    async fn public_path_ranges_headers_and_download_start_counting() {
+        use tower::ServiceExt;
+        let (_tmp, node, vhost) = fixture().await;
+        let token = path_token(&node, &vhost, None).await;
+        let app = crate::build_per_vhost_router(node.clone());
+        for (method, range, status, expected, content_range) in [
+            ("HEAD", None, 200, "", None),
+            ("GET", Some("bytes=6-"), 206, "world", Some("bytes 6-10/11")),
+            ("GET", Some("bytes=11-"), 416, "", Some("bytes */11")),
+            ("GET", None, 200, "hello world", None),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(download_request(&token, method, range, None, true))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            for (key, value) in [
+                ("cache-control", "private, no-store"),
+                ("x-content-type-options", "nosniff"),
+                ("content-security-policy", "sandbox"),
+                ("accept-ranges", "bytes"),
+                ("content-disposition", "attachment; filename*=UTF-8''file"),
+            ] {
+                assert_eq!(response.headers()[key], value);
+            }
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-range")
+                    .map(|h| h.to_str().unwrap()),
+                content_range
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_bytes());
+        }
+        let db = vhost.db.as_ref().unwrap().lock().await;
+        assert_eq!(
+            file_share::resolve(&db, &token, session::now_secs())
+                .unwrap()
+                .share
+                .download_count,
+            2
+        );
+        assert_eq!(node.share_runtime.downloads.available_permits(), 8);
+    }
+    #[tokio::test]
+    async fn public_password_revocation_and_unknown_token_do_not_fall_through() {
+        use tower::ServiceExt;
+        let (_tmp, node, vhost) = fixture().await;
+        let token = path_token(&node, &vhost, Some("secret".into())).await;
+        let app = crate::build_per_vhost_router(node.clone());
+        let plain = app
+            .clone()
+            .oneshot(download_request(&token, "GET", None, None, false))
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), StatusCode::FORBIDDEN);
+        assert!(!plain.headers().contains_key("www-authenticate"));
+        for _ in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(download_request(&token, "HEAD", None, None, true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()["www-authenticate"],
+                "Basic realm=\"share\""
+            );
+            assert!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(download_request(&token, "GET", None, None, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // A separate peer gets its own budget; Basic's username is ignored.
+        let mut request =
+            download_request(&token, "GET", None, Some("Basic dXNlcjpzZWNyZXQ="), true);
+        request.extensions_mut().insert(Peer {
+            ip: "192.0.2.2".parse().unwrap(),
+            tls: true,
+        });
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        revoke(&vhost, "user@example.test", &token).await.unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(download_request(&token, "GET", None, None, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        std::fs::create_dir_all(vhost.www_dir.join("s")).unwrap();
+        std::fs::write(vhost.www_dir.join("s/unknown"), b"must not serve").unwrap();
+        assert_eq!(
+            app.oneshot(download_request("unknown", "GET", None, None, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    #[test]
+    fn attachment_encodes_untrusted_unicode_and_separators() {
+        assert_eq!(
+            attachment("dir/é\".txt"),
+            "attachment; filename*=UTF-8''%C3%A9%22.txt"
+        );
+        assert_eq!(attachment("\r\n"), "attachment; filename*=UTF-8''download");
+    }
     pub(crate) async fn fixture() -> (tempfile::TempDir, Arc<NodeState>, Arc<VhostState>) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("file"), b"hello world").unwrap();

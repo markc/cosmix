@@ -442,8 +442,35 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/cosmix-webd/shares.md"><div class="prose"><h1 id="public-shares">Public shares</h1>
-<p>P5 is being delivered in slices. Catalogue management is available over the Bus
-and HTTP; public download routing follows in slice 5.</p>
+<p>Public file shares are available through explicit revocable tokens. Catalogue
+management is available over the Bus and authenticated HTTP.</p>
+<h2 id="public-downloads">Public downloads</h2>
+<p><code>GET/HEAD /s/{token}</code> is a per-vhost route ahead of static serving. Unknown,
+revoked, expired, unmapped legacy or unsupported-kind tokens terminate with 404;
+they never fall through to a similarly named static file. Other methods return
+405 with <code>Allow: GET, HEAD</code>. A missing trusted connection context returns 503.</p>
+<p>Password-protected shares require HTTPS Basic authentication: any username,
+password in the password part, <code>WWW-Authenticate: Basic realm="share"</code> on 401.
+Plain HTTP returns 403 without a challenge. No query-string password is read.
+Before bcrypt, five attempts per (token, actual socket peer IP) per 60 seconds
+are allowed. The table holds at most 4096 live pairs and refuses new pairs when
+full. Refusal returns 429 with <code>Retry-After: 60</code>. Forwarded IP headers are ignored.
+The catalogue gate is reloaded after password verification and before target access.</p>
+<p>Successful reads return 200 or single-range 206; unsatisfiable ranges return
+416 with <code>Content-Range: bytes */&lt;size&gt;</code> and an empty body. HEAD mirrors GET's
+headers without body bytes. All token-route responses carry:</p>
+<pre><code class="language-http">Cache-Control: private, no-store
+X-Content-Type-Options: nosniff
+Content-Security-Policy: sandbox
+</code></pre>
+<p>File responses also carry <code>Accept-Ranges: bytes</code>, exact <code>Content-Length</code>, and
+<code>Content-Disposition: attachment; filename*=UTF-8''&lt;percent-encoded-name&gt;</code>.
+Paths use <code>application/octet-stream</code>; blobs use the validated reference MIME.
+Blob headers are allowlisted; no upstream cache, cookies or redirects propagate.
+At most eight public bodies are admitted, with no waiting queue (503 <code>busy:</code>).
+File reads use bounded 64 KiB buffers and 30-second pending-read deadlines.
+The best-effort counter increments once as the first non-empty body chunk emits,
+with a five-second telemetry deadline; HEAD, 416 and empty files do not count.</p>
 <h2 id="management">Management</h2>
 <p>Mesh-open Bus verbs use JSON arguments (no capability check):</p>
 <ul>

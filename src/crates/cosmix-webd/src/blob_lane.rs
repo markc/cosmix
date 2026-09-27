@@ -473,14 +473,14 @@ async fn upload_response(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Range {
+pub(crate) enum Range {
     Full,
     Partial(u64, u64),
     Unsatisfiable,
 }
 
 /// Match blobd's single-range semantics, including ignoring malformed/multi ranges.
-fn expected_range(spec: Option<&str>, size: u64) -> Range {
+pub(crate) fn expected_range(spec: Option<&str>, size: u64) -> Range {
     let Some(spec) = spec.and_then(|s| s.trim().strip_prefix("bytes=")) else {
         return Range::Full;
     };

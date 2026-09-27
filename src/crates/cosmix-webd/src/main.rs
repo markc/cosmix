@@ -6040,6 +6040,11 @@ fn build_per_vhost_router(node: Arc<NodeState>) -> Router {
                 .layer(axum::middleware::from_fn(shares::private_response)),
         )
         .route(
+            "/s/{token}",
+            axum::routing::any(shares::serve)
+                .layer(axum::middleware::from_fn(shares::public_headers)),
+        )
+        .route(
             "/api/shares/{token}/revoke",
             axum::routing::post(shares::http_revoke)
                 .layer(axum::middleware::from_fn(shares::private_response)),
