@@ -1,0 +1,67 @@
+-- version: 0.1.0
+$m = require("store_manifest.mix")
+$checks = buffer()
+fn check($condition, $token)
+  if not $condition then raise("TEST", $token) end
+  buffer_push($checks, 1)
+end
+fn refuses($value, $token)
+  $caught = ""
+  try
+    $m.canonicalise($value)
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == $token, $token .. ": got " .. $caught)
+end
+$hash = "b3:" .. repeat("a", 64)
+$entry = {blob: $hash, path: "a", size: 0}
+$empty = "{\"files\":[],\"schema_version\":2}"
+check($m.canonicalise({schema_version: 2, files: []}).canonical == $empty, "EMPTY_BYTES")
+$expected = "{\"files\":[{\"blob\":\"" .. $hash .. "\",\"path\":\"a\",\"size\":0}],\"schema_version\":2}"
+$one = $m.canonicalise({schema_version: 2, files: [$entry]})
+check($one.canonical == $expected and $one.id == "b3:" .. hash_blake3($expected), "EXACT_BYTES")
+$other = {size: 0, path: "é/quote\"", blob: $hash}
+$first = $m.canonicalise({files: [$other, $entry], schema_version: 2})
+$second = $m.canonicalise({schema_version: 2, files: [$entry, $other]})
+check($first.canonical == $second.canonical and $first.manifest.files[0].path == "a", "ORDER")
+check($first.file_count == 2 and length(keys($first.objects)) == 1, "DISTINCT_OBJECTS")
+for each $bad in ["", "/a", "../a", "a/..", "a/./b", "a//b", "a/", "a\\b", "C:a", "a\n", "a\u{0085}", repeat("é", 513)]
+  refuses({schema_version: 2, files: [{blob: $hash, path: $bad, size: 0}]}, "STORE_PATH")
+end
+refuses({schema_version: 2, files: [$entry, $entry]}, "STORE_PATH")
+refuses({schema_version: 2, files: [$entry, {blob: $hash, path: "a/b", size: 0}]}, "STORE_PATH")
+refuses({schema_version: 1, files: []}, "STORE_SCHEMA")
+refuses({schema_version: 2, files: [], extra: true}, "STORE_SCHEMA")
+refuses({schema_version: 2, files: [{blob: $hash, path: "a", size: 0, mime: "text/plain"}]}, "STORE_SCHEMA")
+for each $size in [-1, 0.5, "1", 9007199254740992]
+  refuses({schema_version: 2, files: [{blob: $hash, path: "a", size: $size}]}, "STORE_INTEGER")
+end
+refuses({schema_version: 2, files: [$entry, {blob: $hash, path: "b", size: 1}]}, "STORE_SIZE")
+$many = []
+for $i = 1 to 1001
+  push($many, {blob: $hash, path: to_string($i), size: 0})
+end
+refuses({schema_version: 2, files: $many}, "STORE_LIMIT")
+$many = []
+for $i = 1 to 140
+  push($many, {blob: $hash, path: repeat("é", 480) .. to_string($i), size: 0})
+end
+refuses({schema_version: 2, files: $many}, "STORE_LIMIT")
+$old = "{\"files\":[],\"schema_version\":1}"
+check($m.verify_legacy($old, hash_sha256($old)).schema_version == 1, "LEGACY_RAW")
+$caught = ""
+try
+  $m.verify_legacy($old .. "\n", hash_sha256($old))
+catch $message, $error
+  $caught = $error.code
+end
+check($caught == "STORE_LEGACY_HASH", "LEGACY_HASH_BEFORE_PARSE")
+$caught = ""
+try
+  $m.verify_legacy($old .. "\n", hash_sha256($old .. "\n"))
+catch $message, $error
+  $caught = $error.code
+end
+check($caught == "STORE_LEGACY_CANONICAL", "LEGACY_NO_NORMALISATION")
+print("store_manifest_test: PASS " .. to_string(length(freeze($checks))))

@@ -1,0 +1,117 @@
+-- version: 0.1.0
+-- Shared, byte-exact store manifest contract. No filesystem or Bus effects.
+fn fail($code, $message)
+  raise($code, $message)
+end
+
+fn exact_fields($value, $names)
+  if type($value) != "map" then fail("STORE_SCHEMA", "expected object") end
+  if not deep_eq(sort(keys($value)), sort($names)) then fail("STORE_SCHEMA", "unexpected or missing fields") end
+end
+
+fn uint($value)
+  if type($value) != "number" then fail("STORE_INTEGER", "expected integer") end
+  if not ($value >= 0 and $value <= 9007199254740991 and floor($value) == $value) then
+    fail("STORE_INTEGER", "integer outside exact nonnegative range")
+  end
+  return $value
+end
+
+fn collection($name)
+  if type($name) != "string" then fail("STORE_COLLECTION", "expected collection name") end
+  if not re_match($name, "^[A-Za-z0-9_-]{1,64}$") then fail("STORE_COLLECTION", "invalid collection name") end
+  return $name
+end
+
+fn blob($id)
+  if type($id) != "string" then fail("STORE_BLOB", "expected blob id") end
+  if not re_match($id, "^b3:[0-9a-f]{64}$") then fail("STORE_BLOB", "invalid BLAKE3 id") end
+  return $id
+end
+
+fn path($value)
+  if type($value) != "string" then fail("STORE_PATH", "expected relative path") end
+  if $value == "" or length(string_to_bytes($value)) > 1024 or contains($value, "\\") or contains($value, ":") or re_match($value, "[\\p{Cc}]") then
+    fail("STORE_PATH", "unsafe relative path")
+  end
+  for each $part in split($value, "/")
+    if $part == "" or $part == "." or $part == ".." then fail("STORE_PATH", "unsafe path component") end
+  end
+  return $value
+end
+
+fn _encode($manifest, $legacy)
+  exact_fields($manifest, ["schema_version", "files"])
+  $version = $legacy ? 1 : 2
+  if $manifest.schema_version != $version or type($manifest.files) != "list" then fail("STORE_SCHEMA", "unsupported manifest") end
+  if length($manifest.files) > 1000 then fail("STORE_LIMIT", "more than 1000 files") end
+  $by_path = {}
+  $paths = []
+  $total = 0
+  $objects = {}
+  for each $entry in $manifest.files
+    exact_fields($entry, $legacy ? ["path", "sha256", "size"] : ["blob", "path", "size"])
+    $p = path($entry.path)
+    if has_key($by_path, $p) then fail("STORE_PATH", "duplicate path") end
+    $size = uint($entry.size)
+    $total = uint($total + $size)
+    if $legacy then
+      if type($entry.sha256) != "string" then fail("STORE_BLOB", "expected SHA-256") end
+      if not re_match($entry.sha256, "^[0-9a-f]{64}$") then fail("STORE_BLOB", "invalid SHA-256") end
+    else
+      $id = blob($entry.blob)
+      if has_key($objects, $id) and $objects[$id] != $size then fail("STORE_SIZE", "one blob has conflicting sizes") end
+      $objects[$id] = $size
+    end
+    $by_path[$p] = $entry
+    push($paths, $p)
+  end
+  for each $p in $paths
+    $prefix = ""
+    $parts = split($p, "/")
+    $index = 0
+    while $index < length($parts) - 1
+      $prefix = $prefix == "" ? $parts[$index] : $prefix .. "/" .. $parts[$index]
+      if has_key($by_path, $prefix) then fail("STORE_PATH", "file/directory collision") end
+      $index = $index + 1
+    end
+  end
+  -- Old identities preserve ARRAY order; v2 normalises to path order.
+  if not $legacy then $paths = sort($paths) end
+  $encoded = []
+  for each $p in $paths
+    $entry = $by_path[$p]
+    if $legacy then
+      push($encoded, "{\"path\":" .. json_encode($p) .. ",\"sha256\":" .. json_encode($entry.sha256) .. ",\"size\":" .. json_encode($entry.size) .. "}")
+    else
+      push($encoded, "{\"blob\":" .. json_encode($entry.blob) .. ",\"path\":" .. json_encode($p) .. ",\"size\":" .. json_encode($entry.size) .. "}")
+    end
+  end
+  $canonical = "{\"files\":[" .. join($encoded, ",") .. "],\"schema_version\":" .. to_string($version) .. "}"
+  if length(string_to_bytes($canonical)) > 131072 then fail("STORE_LIMIT", "manifest exceeds 128 KiB") end
+  return {canonical: $canonical, size: $total, file_count: length($paths), objects: $objects}
+end
+
+fn canonicalise($manifest)
+  $out = _encode($manifest, false)
+  $out.id = "b3:" .. hash_blake3($out.canonical)
+  $out.manifest = json_parse($out.canonical)
+  return $out
+end
+
+fn verify($manifest, $id)
+  blob($id)
+  $out = canonicalise($manifest)
+  if $out.id != $id then fail("STORE_IDENTITY", "manifest hash differs from requested snapshot") end
+  return $out
+end
+
+fn verify_legacy($raw, $sha256)
+  if type($raw) != "string" or length(string_to_bytes($raw)) > 131072 then fail("STORE_LIMIT", "old manifest exceeds 128 KiB") end
+  -- Hash the ORIGINAL bytes before parsing or changing array/key order.
+  if hash_sha256($raw) != $sha256 then fail("STORE_LEGACY_HASH", "old raw-byte SHA-256 mismatch") end
+  $manifest = json_parse($raw)
+  $out = _encode($manifest, true)
+  if $raw != $out.canonical then fail("STORE_LEGACY_CANONICAL", "old manifest is not canonical") end
+  return $manifest
+end
