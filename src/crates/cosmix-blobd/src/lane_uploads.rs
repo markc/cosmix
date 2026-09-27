@@ -221,9 +221,8 @@ pub(super) async fn commit(
     State(lane): State<Arc<Lane>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let permit = match Arc::clone(&lane.uploads).try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return error(StoreError::Busy("lane transfer workers")),
+    let Ok(permit) = Arc::clone(&lane.uploads).try_acquire_owned() else {
+        return error(StoreError::Busy("lane transfer workers"));
     };
     let store = Arc::clone(&lane.store);
     match blocking(move || {
@@ -307,9 +306,8 @@ pub(super) async fn patch(
         Ok(r) => r,
         Err(e) => return error(e),
     };
-    let permit = match Arc::clone(&lane.uploads).try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => return error(StoreError::Busy("lane transfer workers")),
+    let Ok(permit) = Arc::clone(&lane.uploads).try_acquire_owned() else {
+        return error(StoreError::Busy("lane transfer workers"));
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

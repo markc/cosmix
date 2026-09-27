@@ -753,10 +753,10 @@ impl Store {
 
     pub fn sweep_uploads(&self) -> Result<()> {
         for s in self.all_uploads(None)? {
-            if matches!(s.state.as_str(), "complete" | "failed" | "aborted") {
-                if let Ok(_guard) = self.upload_guard(&s.id) {
-                    self.remove_staging(&s.id)?;
-                }
+            if matches!(s.state.as_str(), "complete" | "failed" | "aborted")
+                && let Ok(_guard) = self.upload_guard(&s.id)
+            {
+                self.remove_staging(&s.id)?;
             }
             if s.expires_at <= now_ms() && s.state != "committing" {
                 match self.upload_guard(&s.id) {
