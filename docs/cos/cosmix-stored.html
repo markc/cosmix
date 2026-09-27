@@ -464,7 +464,15 @@ Collection names match <code>[A-Za-z0-9_-]{1,64}</code>; owners are <code>store:
 validates schema 1 and requires exact canonical-byte equality. The pilot's
 file-array order is significant and MUST NOT be sorted before verification.
 Only afterwards may a v2 manifest be constructed. Rewritten manifests must
-pass the new byte limit; migration must never truncate or omit entries.</p>
+pass the new byte limit; migration must never truncate or omit entries.
+The pilot already used the same 1024-byte path grammar, 1000-file limit and
+128 KiB canonical-byte limit; its sizes were u64 with no v2 aggregate bound.
+Legacy validation preserves decimal u64 tokens before Mix's floating-point
+JSON conversion. <code>assess_legacy(raw,sha256)</code> first verifies raw identity and
+pilot validity, then reports <code>identity_verified:true,migratable:false,reason</code>
+when a v2 rewrite would exceed its limits. <code>verify_legacy</code> exposes that outcome
+as <code>STORE_NOT_MIGRATABLE: identity verified, not migratable: …</code>. No old integer
+is rounded into a new manifest, and old array order remains significant.</p>
 <h2 id="tests">Tests</h2>
 <p>From the checkout, without root or a broker:</p>
 <pre><code class="language-text">mix src/crates/cosmix-blobd/mix/store_manifest_test.mix

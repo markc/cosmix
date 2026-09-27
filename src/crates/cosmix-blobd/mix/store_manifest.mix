@@ -1,4 +1,4 @@
--- version: 0.1.0
+-- version: 0.2.0
 -- Shared, byte-exact store manifest contract. No filesystem or Bus effects.
 fn fail($code, $message)
   raise($code, $message)
@@ -40,9 +40,9 @@ fn path($value)
   return $value
 end
 
-fn _encode($manifest, $legacy)
+fn _encode($manifest)
   exact_fields($manifest, ["schema_version", "files"])
-  $version = $legacy ? 1 : 2
+  $version = 2
   if $manifest.schema_version != $version or type($manifest.files) != "list" then fail("STORE_SCHEMA", "unsupported manifest") end
   if length($manifest.files) > 1000 then fail("STORE_LIMIT", "more than 1000 files") end
   $by_path = {}
@@ -50,19 +50,14 @@ fn _encode($manifest, $legacy)
   $total = 0
   $objects = {}
   for each $entry in $manifest.files
-    exact_fields($entry, $legacy ? ["path", "sha256", "size"] : ["blob", "path", "size"])
+    exact_fields($entry, ["blob", "path", "size"])
     $p = path($entry.path)
     if has_key($by_path, $p) then fail("STORE_PATH", "duplicate path") end
     $size = uint($entry.size)
     $total = uint($total + $size)
-    if $legacy then
-      if type($entry.sha256) != "string" then fail("STORE_BLOB", "expected SHA-256") end
-      if not re_match($entry.sha256, "^[0-9a-f]{64}$") then fail("STORE_BLOB", "invalid SHA-256") end
-    else
-      $id = blob($entry.blob)
-      if has_key($objects, $id) and $objects[$id] != $size then fail("STORE_SIZE", "one blob has conflicting sizes") end
-      $objects[$id] = $size
-    end
+    $id = blob($entry.blob)
+    if has_key($objects, $id) and $objects[$id] != $size then fail("STORE_SIZE", "one blob has conflicting sizes") end
+    $objects[$id] = $size
     $by_path[$p] = $entry
     push($paths, $p)
   end
@@ -76,16 +71,11 @@ fn _encode($manifest, $legacy)
       $index = $index + 1
     end
   end
-  -- Old identities preserve ARRAY order; v2 normalises to path order.
-  if not $legacy then $paths = sort($paths) end
+  $paths = sort($paths)
   $encoded = []
   for each $p in $paths
     $entry = $by_path[$p]
-    if $legacy then
-      push($encoded, "{\"path\":" .. json_encode($p) .. ",\"sha256\":" .. json_encode($entry.sha256) .. ",\"size\":" .. json_encode($entry.size) .. "}")
-    else
-      push($encoded, "{\"blob\":" .. json_encode($entry.blob) .. ",\"path\":" .. json_encode($p) .. ",\"size\":" .. json_encode($entry.size) .. "}")
-    end
+    push($encoded, "{\"blob\":" .. json_encode($entry.blob) .. ",\"path\":" .. json_encode($p) .. ",\"size\":" .. json_encode($entry.size) .. "}")
   end
   $canonical = "{\"files\":[" .. join($encoded, ",") .. "],\"schema_version\":" .. to_string($version) .. "}"
   if length(string_to_bytes($canonical)) > 131072 then fail("STORE_LIMIT", "manifest exceeds 128 KiB") end
@@ -93,7 +83,7 @@ fn _encode($manifest, $legacy)
 end
 
 fn canonicalise($manifest)
-  $out = _encode($manifest, false)
+  $out = _encode($manifest)
   $out.id = "b3:" .. hash_blake3($out.canonical)
   $out.manifest = json_parse($out.canonical)
   return $out
@@ -106,12 +96,96 @@ fn verify($manifest, $id)
   return $out
 end
 
-fn verify_legacy($raw, $sha256)
-  if type($raw) != "string" or length(string_to_bytes($raw)) > 131072 then fail("STORE_LIMIT", "old manifest exceeds 128 KiB") end
-  -- Hash the ORIGINAL bytes before parsing or changing array/key order.
+fn legacy_path($value)
+  -- Pilot object_store.rs grammar, deliberately independent of future v2 rules.
+  if type($value) != "string" then fail("STORE_PATH", "expected pilot path") end
+  if $value == "" or byte_length($value) > 1024 or contains($value, "\\") or contains($value, ":") or re_match($value, "[\\p{Cc}]") then fail("STORE_PATH", "unsafe pilot path") end
+  for each $part in split($value, "/")
+    if contains(["", ".", ".."], $part) then fail("STORE_PATH", "unsafe pilot component") end
+  end
+  return $value
+end
+
+fn legacy_number_strings($raw)
+  -- Preserve u64 decimal tokens before Mix's f64 JSON conversion. Quoted
+  -- strings stay untouched; the exact canonical comparison rejects any
+  -- originally quoted integer, noncanonical number or malformed JSON.
+  $out = buffer()
+  $quoted = false
+  $escaped = false
+  $characters = chars($raw)
+  $i = 0
+  while $i < length($characters)
+    $ch = $characters[$i]
+    if not $quoted and contains("-0123456789", $ch) then
+      $number = ""
+      while $i < length($characters) and contains("0123456789.eE+-", $characters[$i])
+        $number = $number .. $characters[$i]
+        $i = $i + 1
+      end
+      buffer_push($out, json_encode($number))
+      continue
+    end
+    buffer_push($out, $ch)
+    if $quoted then
+      if $escaped then $escaped = false
+      elif $ch == "\\" then $escaped = true
+      elif $ch == "\"" then $quoted = false end
+    elif $ch == "\"" then $quoted = true end
+    $i = $i + 1
+  end
+  return bytes_to_string(freeze($out))
+end
+
+fn assess_legacy($raw, $sha256)
+  if type($raw) != "string" then fail("STORE_SCHEMA", "old manifest must be raw UTF-8 text") end
   if hash_sha256($raw) != $sha256 then fail("STORE_LEGACY_HASH", "old raw-byte SHA-256 mismatch") end
+  if byte_length($raw) > 131072 then fail("STORE_LIMIT", "pilot manifest exceeds 128 KiB") end
+  $old = json_parse(legacy_number_strings($raw))
+  exact_fields($old, ["schema_version", "files"])
+  if $old.schema_version != "1" or type($old.files) != "list" then fail("STORE_SCHEMA", "expected pilot schema 1") end
+  if length($old.files) > 1000 then fail("STORE_LIMIT", "pilot exceeds 1000 files") end
+  $paths = {}
+  $encoded = []
+  $safe = true
+  for each $entry in $old.files
+    exact_fields($entry, ["path", "sha256", "size"])
+    $p = legacy_path($entry.path)
+    if has_key($paths, $p) then fail("STORE_PATH", "duplicate pilot path") end
+    $paths[$p] = true
+    if type($entry.sha256) != "string" or not re_match($entry.sha256, "^[0-9a-f]{64}$") then fail("STORE_BLOB", "invalid pilot SHA-256") end
+    $n = $entry.size
+    if type($n) != "string" or not re_match($n, "^(0|[1-9][0-9]*)$") or length($n) > 20 or (length($n) == 20 and $n > "18446744073709551615") then fail("STORE_INTEGER", "pilot size must be u64") end
+    if length($n) > 16 or (length($n) == 16 and $n > "9007199254740991") then $safe = false end
+    push($encoded, "{\"path\":" .. json_encode($p) .. ",\"sha256\":" .. json_encode($entry.sha256) .. ",\"size\":" .. $n .. "}")
+  end
+  for each $p in keys($paths)
+    $prefix = ""
+    $parts = split($p, "/")
+    for each $part in slice($parts, 0, length($parts)-1)
+      $prefix = $prefix == "" ? $part : $prefix .. "/" .. $part
+      if has_key($paths, $prefix) then fail("STORE_PATH", "pilot path collision") end
+    end
+  end
+  $canonical = "{\"files\":[" .. join($encoded, ",") .. "],\"schema_version\":1}"
+  if $raw != $canonical then fail("STORE_LEGACY_CANONICAL", "old manifest is not canonical") end
+  if not $safe then return {identity_verified: true, migratable: false, reason: "pilot u64 exceeds v2 exact integer range"} end
   $manifest = json_parse($raw)
-  $out = _encode($manifest, true)
-  if $raw != $out.canonical then fail("STORE_LEGACY_CANONICAL", "old manifest is not canonical") end
-  return $manifest
+  $preview = []
+  for each $entry in $manifest.files
+    -- Length/grammar check only, NOT a BLAKE3 conversion of the old digest.
+    push($preview, {blob: "b3:" .. $entry.sha256, path: $entry.path, size: $entry.size})
+  end
+  try
+    canonicalise({schema_version: 2, files: $preview})
+  catch $message, $error
+    return {identity_verified: true, migratable: false, reason: $error.code .. ": " .. $message}
+  end
+  return {identity_verified: true, migratable: true, manifest: $manifest}
+end
+
+fn verify_legacy($raw, $sha256)
+  $assessment = assess_legacy($raw, $sha256)
+  if not $assessment.migratable then fail("STORE_NOT_MIGRATABLE", "identity verified, not migratable: " .. $assessment.reason) end
+  return $assessment.manifest
 end

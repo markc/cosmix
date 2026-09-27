@@ -29,6 +29,14 @@ validates schema 1 and requires exact canonical-byte equality. The pilot's
 file-array order is significant and MUST NOT be sorted before verification.
 Only afterwards may a v2 manifest be constructed. Rewritten manifests must
 pass the new byte limit; migration must never truncate or omit entries.
+The pilot already used the same 1024-byte path grammar, 1000-file limit and
+128 KiB canonical-byte limit; its sizes were u64 with no v2 aggregate bound.
+Legacy validation preserves decimal u64 tokens before Mix's floating-point
+JSON conversion. `assess_legacy(raw,sha256)` first verifies raw identity and
+pilot validity, then reports `identity_verified:true,migratable:false,reason`
+when a v2 rewrite would exceed its limits. `verify_legacy` exposes that outcome
+as `STORE_NOT_MIGRATABLE: identity verified, not migratable: …`. No old integer
+is rounded into a new manifest, and old array order remains significant.
 
 ## Tests
 

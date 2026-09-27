@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.3.0
 $m = require("store_manifest.mix")
 $checks = buffer()
 fn check($condition, $token)
@@ -18,6 +18,8 @@ $hash = "b3:" .. repeat("a", 64)
 $entry = {blob: $hash, path: "a", size: 0}
 $empty = "{\"files\":[],\"schema_version\":2}"
 check($m.canonicalise({schema_version: 2, files: []}).canonical == $empty, "EMPTY_BYTES")
+-- Computed independently by blobd 0.6.1 descriptor ingest, without Mix hashing.
+check($m.canonicalise({schema_version: 2, files: []}).id == "b3:32794492e915c92ddd564c3fce5e11ec65b40b6d68a1a2dffcca2c113a96c8a3", "LITERAL_BLAKE3_VECTOR")
 $expected = "{\"files\":[{\"blob\":\"" .. $hash .. "\",\"path\":\"a\",\"size\":0}],\"schema_version\":2}"
 $one = $m.canonicalise({schema_version: 2, files: [$entry]})
 check($one.canonical == $expected and $one.id == "b3:" .. hash_blake3($expected), "EXACT_BYTES")
@@ -68,4 +70,37 @@ catch $message, $error
   $caught = $error.code
 end
 check($caught == "STORE_LEGACY_CANONICAL", "LEGACY_NO_NORMALISATION")
+$u64 = "{\"files\":[{\"path\":\"u64\",\"sha256\":\"" .. repeat("a", 64) .. "\",\"size\":18446744073709551615}],\"schema_version\":1}"
+$assessment = $m.assess_legacy($u64, hash_sha256($u64))
+check($assessment.identity_verified and not $assessment.migratable, "PILOT_U64_IDENTITY_WITHOUT_ROUNDING")
+$caught = ""
+try
+  $m.verify_legacy($u64, hash_sha256($u64))
+catch $message, $error
+  $caught = $error.code
+end
+check($caught == "STORE_NOT_MIGRATABLE", "DISTINCT_MIGRATION_OUTCOME")
+$oversize = repeat(" ", 131073)
+$caught = ""
+try
+  $m.verify_legacy($oversize, repeat("0", 64))
+catch $message, $error
+  $caught = $error.code
+end
+check($caught == "STORE_LEGACY_HASH", "HASH_PRECEDES_PILOT_LIMITS")
+$many = []
+for $i = 1 to 1000
+  push($many, {path: repeat("x", 25) .. to_string($i), sha256: repeat("a", 64), size: 0})
+end
+$raw = json_encode({files: $many, schema_version: 1})
+$per_file = floor((131072 - byte_length($raw)) / 1000)
+for $i = 0 to 999
+  $many[$i].path = repeat("x", $per_file) .. $many[$i].path
+end
+$remaining = 131072 - byte_length(json_encode({files: $many, schema_version: 1}))
+$many[0].path = repeat("x", floor($remaining / 2)) .. $many[0].path
+$many[1].path = repeat("x", $remaining - floor($remaining / 2)) .. $many[1].path
+$raw = json_encode({files: $many, schema_version: 1})
+$assessment = $m.assess_legacy($raw, hash_sha256($raw))
+check(byte_length($raw) == 131072 and $assessment.identity_verified and not $assessment.migratable and starts_with($assessment.reason, "STORE_LIMIT:"), "VALID_PILOT_TOO_LARGE_AFTER_REWRITE")
 print("store_manifest_test: PASS " .. to_string(length(freeze($checks))))
