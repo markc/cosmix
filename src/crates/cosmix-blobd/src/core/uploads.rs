@@ -170,6 +170,22 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn permanent_commit_error(error: &StoreError) -> bool {
+    match error {
+        StoreError::QuotaOwner { .. }
+        | StoreError::QuotaTotal { .. }
+        | StoreError::UploadVerify
+        | StoreError::Mds(cosmix_mds::Error::BlobCorrupt(_)) => true,
+        StoreError::Io(e) | StoreError::Mds(cosmix_mds::Error::Io(e)) => {
+            matches!(
+                e.raw_os_error(),
+                Some(libc::EXDEV | libc::EACCES | libc::EPERM)
+            )
+        }
+        _ => false,
+    }
+}
+
 impl Store {
     pub(super) fn uploads_root(&self) -> PathBuf {
         self.blobs_root().join(".uploads")
@@ -556,15 +572,24 @@ impl Store {
     }
 
     fn fail_upload(&self, s: &UploadSession, why: &str) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE upload_sessions SET state='failed',error=?1 WHERE id=?2",
-                params![why, s.id],
-            )
+        // The durable reservation is the active/committing row itself. This
+        // transaction drops both its charge and GC protection atomically.
+        let holds = self.reserved.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
-        self.remove_staging(&s.id)?;
+        tx.execute(
+            "UPDATE upload_sessions SET state='failed',error=?1 WHERE id=?2",
+            params![why, s.id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        drop(db);
+        drop(holds);
+        if let Err(error) = self.remove_staging(&s.id) {
+            tracing::warn!("failed upload staging cleanup deferred: {error}");
+        }
         self.bump_generation();
         Ok(())
     }
@@ -664,19 +689,64 @@ impl Store {
             self.expire_upload(s)?;
             return Err(StoreError::UploadMissing);
         }
-        self.db
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE upload_sessions SET state='committing',actual_hash=?1
-            WHERE id=?2 AND state='active'",
-                params![hash, s.id],
-            )
+        let holds = self.reserved.lock().unwrap();
+        let mut db = self.db.lock().unwrap();
+        let totals = self.reservation_totals(&db, &holds, None, Some(&s.id))?;
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
+        if let Err(error) = check_pin_capacity(
+            &tx,
+            &hash,
+            &s.owner,
+            s.size,
+            self.options.owner_limit(&s.owner),
+            self.options.quota_total_bytes,
+            &totals,
+        ) {
+            drop(tx);
+            drop(db);
+            drop(holds);
+            if permanent_commit_error(&error) {
+                self.fail_upload(s, &error.to_string())?;
+            }
+            return Err(error);
+        }
+        tx.execute(
+            "UPDATE upload_sessions SET state='committing',actual_hash=?1
+            WHERE id=?2 AND state='active'",
+            params![hash, s.id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        drop(db);
+        drop(holds);
         self.upload_row(&s.id)
     }
 
     fn finish_upload_commit(&self, s: &UploadSession) -> Result<Reference> {
+        self.finish_upload_commit_using(s, blob::publish_staged_preserving_source)
+    }
+
+    fn finish_upload_commit_using(
+        &self,
+        s: &UploadSession,
+        publish: impl FnOnce(&Path, &Path, &BlobHash) -> cosmix_mds::Result<u64>,
+    ) -> Result<Reference> {
+        let result = self.finish_upload_commit_inner(s, publish);
+        if let Err(error) = &result
+            && permanent_commit_error(error)
+        {
+            self.fail_upload(s, &error.to_string())?;
+        }
+        result
+    }
+
+    fn finish_upload_commit_inner(
+        &self,
+        s: &UploadSession,
+        publish: impl FnOnce(&Path, &Path, &BlobHash) -> cosmix_mds::Result<u64>,
+    ) -> Result<Reference> {
         let hash = s
             .actual_hash
             .as_deref()
@@ -692,7 +762,7 @@ impl Store {
                     && s.staging_dev.as_deref() == Some(md.dev().to_string().as_str())
                     && s.staging_ino.as_deref() == Some(md.ino().to_string().as_str()) =>
             {
-                blob::publish_staged_preserving_source(&self.blobs_root(), &staged, &hash)?;
+                publish(&self.blobs_root(), &staged, &hash)?;
             }
             Ok(_) => {
                 self.fail_upload(s, "committing staging is short or not regular")?;
@@ -817,7 +887,7 @@ impl Store {
         for s in self.all_uploads(None)? {
             if s.state == "committing" {
                 // Recover publication and settlement before expiry/reconcile.
-                // A transient disk/quota error leaves the protected row for a
+                // A transient disk error leaves the protected row for a
                 // client commit retry; one damaged session never blocks open.
                 if let Err(error) = self.finish_upload_commit(&s) {
                     tracing::warn!("upload commit recovery deferred: {error}");
@@ -869,6 +939,95 @@ mod tests {
             name: None,
             key: Some("retry-key".into()),
         }
+    }
+
+    #[test]
+    fn permanent_commit_publish_errors_release_reservation_and_list_failure() {
+        for errno in [libc::EXDEV, libc::EACCES, libc::EPERM] {
+            let (_dir, store) = store();
+            let s = complete_bytes(&store, b"upload");
+            let s = store.prepare_upload_commit(&s).unwrap();
+            assert!(
+                store
+                    .finish_upload_commit_using(&s, |_, _, _| {
+                        Err(cosmix_mds::Error::Io(io::Error::from_raw_os_error(errno)))
+                    })
+                    .is_err()
+            );
+            assert_failed_and_released(&store, &s.id);
+        }
+    }
+
+    fn assert_failed_and_released(store: &Store, id: &str) {
+        let rows = store.upload_list(Some("uploader")).unwrap();
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.state, "failed");
+        assert!(!row.to_json()["error"].as_str().unwrap().is_empty());
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
+        assert_eq!(store.upload_counts().unwrap().0, 0);
+    }
+
+    #[test]
+    fn lowered_quota_fails_before_intent_and_during_recovery() {
+        for committing in [false, true] {
+            let (_dir, mut store) = store();
+            let s = complete_bytes(&store, b"upload");
+            if committing {
+                store.prepare_upload_commit(&s).unwrap();
+            }
+            store.options.quota_total_bytes = 1;
+            assert!(matches!(
+                store.upload_commit(&s.id),
+                Err(StoreError::QuotaTotal { .. })
+            ));
+            assert_failed_and_released(&store, &s.id);
+            if !committing {
+                assert!(store.upload_row(&s.id).unwrap().actual_hash.is_none());
+                assert!(
+                    !blob::blob_path(&store.blobs_root(), &blob::hash_bytes(b"upload")).exists()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_existing_cas_and_staging_bitrot_fail_permanently() {
+        for existing in [false, true] {
+            let (_dir, store) = store();
+            let s = complete_bytes(&store, b"upload");
+            let s = store.prepare_upload_commit(&s).unwrap();
+            if existing {
+                let path = blob::blob_path(&store.blobs_root(), &blob::hash_bytes(b"upload"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"broken").unwrap();
+            } else {
+                fs::write(store.upload_path(&s.id).unwrap(), b"broken").unwrap();
+            }
+            assert!(matches!(
+                store.upload_commit(&s.id),
+                Err(StoreError::Mds(cosmix_mds::Error::BlobCorrupt(_)))
+            ));
+            assert_failed_and_released(&store, &s.id);
+        }
+    }
+
+    #[test]
+    fn transient_commit_error_keeps_reservation_for_retry() {
+        let (_dir, store) = store();
+        let s = complete_bytes(&store, b"upload");
+        let s = store.prepare_upload_commit(&s).unwrap();
+        assert!(
+            store
+                .finish_upload_commit_using(&s, |_, _, _| {
+                    Err(cosmix_mds::Error::Io(io::Error::from_raw_os_error(
+                        libc::EIO,
+                    )))
+                })
+                .is_err()
+        );
+        assert_eq!(store.upload_row(&s.id).unwrap().state, "committing");
+        assert_eq!(store.quota_report(None).unwrap().total.reserved, 6);
+        store.upload_commit(&s.id).unwrap();
     }
 
     #[test]

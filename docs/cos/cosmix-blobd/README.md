@@ -265,6 +265,15 @@ identified ephemeral holds for local puts, v1 uploads and fetches. Sessions
 continue reserving their full size after each successful PATCH. GC also treats
 committing hashes as pinned until settlement or explicit failure.
 
+Commit checks settlement quota under the reservation/database locks before
+recording intent. Permanent failures (quota, corrupt CAS/staging, EXDEV or
+permission refusal during publication) mark the session failed and release its
+reservation and GC protection atomically; `blob.upload.list` retains the error.
+Transient I/O failures keep the committing row for recovery. An existing readable
+producer-owned CAS entry may refuse timestamp refresh: this is logged and ignored,
+because the committing row and settled pin protect it. Failed publication leaves
+any unpinned CAS entry to normal GC grace handling.
+
 ## Permissions
 
 Registry UID 521 (`cosmix-blobd`), shared-credential group 522 (`cosmix-blob`, SPEC 10a v1.4.7). `blob.put {path}` is daemon-local ingest: processes that share the `cosmix-blob` group (such as maild). At open blobd chgrps its state root and CAS root to `cosmix-blob` (`cas_group`, default `cosmix-blob`) and sets the setgid bit — mode 2750 — so every shard directory mds creates and every CAS file inherits the group; same-node readers of `blob.path` traverse the tree as group members (the unit's `SupplementaryGroups=cosmix-blob` is what allows the chown; the `StateDirectoryMode=0750` tree alone would be group `cosmix-blobd` and untraversable). An absent group or a refused chown is logged and skipped — a private CAS still serves verbs, it just has no same-node zero-copy readers. `blob.put` `mode: hardlink` is the exception: a hard-linked CAS entry keeps the producer's owner, group and mode, so `blob.path` readers see it only if the producer's file was readable by `cosmix-blob`; `copy`/`reflink` entries always inherit the CAS group. User-side and remote producers (capture, filesd fs mode, webd, Thunderbird) push bytes through the byte lane — no cross-user path read exists or is needed. Under the 2026-09-15 full-mesh-access law the verbs are mesh-open with no authorisation gates; `blob.put`'s path argument is on record as the first verb to jail if a lock is ever opted in.

@@ -255,6 +255,15 @@ pub fn publish_staged_preserving_source(
 /// Shared no-replace publication protocol. Callers prove the hash before
 /// entering; source cleanup is deliberately outside this function.
 fn publish_hashed_staging(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -> Result<()> {
+    publish_hashed_staging_with_touch(blobs_root, tmp_path, hash, touch_path)
+}
+
+fn publish_hashed_staging_with_touch(
+    blobs_root: &Path,
+    tmp_path: &Path,
+    hash: &BlobHash,
+    touch: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     // 2. fsync temp. Opened read-only: fsync flushes the inode, not
     // the fd's write mode.
     File::open(tmp_path)?.sync_all()?;
@@ -268,8 +277,8 @@ fn publish_hashed_staging(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -
     let upper = parent.parent().expect("CAS shard has parent");
     fsync_dir(upper)?;
     fsync_dir(blobs_root)?;
-    match fs::hard_link(tmp_path, &final_path) {
-        Ok(_) => {}
+    let existing = match fs::hard_link(tmp_path, &final_path) {
+        Ok(_) => false,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Do not acknowledge a corrupt existing entry as an idempotent
             // success, and never overwrite it with the staged inode.
@@ -278,11 +287,19 @@ fn publish_hashed_staging(blobs_root: &Path, tmp_path: &Path, hash: &BlobHash) -
                     "existing CAS entry hash mismatch".into(),
                 ));
             }
+            true
         }
         Err(e) => return Err(Error::Io(e)),
-    }
+    };
 
-    touch_path(&final_path)?;
+    if let Err(error) = touch(&final_path) {
+        if !existing {
+            return Err(error);
+        }
+        // A producer-owned hard link can be readable but not touchable by
+        // blobd. Its committing row and subsequent pin protect the object.
+        tracing::warn!("existing CAS timestamp refresh refused: {error}");
+    }
     File::open(&final_path)?.sync_all()?;
     // 4. fsync the parent directory so the link survives a crash.
     fsync_dir(parent)?;
@@ -544,6 +561,26 @@ mod tests {
         let d = TempDir::new().unwrap();
         std::fs::create_dir_all(d.path().join(".tmp")).unwrap();
         d
+    }
+
+    #[test]
+    fn readonly_existing_cas_touch_eacces_is_best_effort() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = root();
+        let hash = put(d.path(), b"existing").unwrap();
+        let final_path = blob_path(d.path(), &hash);
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let source = d.path().join(".tmp/session");
+        fs::write(&source, b"existing").unwrap();
+        // Ownership, not just mode, controls utimensat. Inject the producer-
+        // owned file's EACCES deterministically, even when tests run as root.
+        publish_hashed_staging_with_touch(d.path(), &source, &hash, |path| {
+            assert_eq!(path, final_path);
+            Err(Error::Io(std::io::Error::from_raw_os_error(libc::EACCES)))
+        })
+        .unwrap();
+        assert_eq!(fs::read(&final_path).unwrap(), b"existing");
+        assert!(source.exists());
     }
 
     #[test]

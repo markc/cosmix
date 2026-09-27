@@ -1559,7 +1559,30 @@ fn pin_with_cap(
     total_limit: u64,
     reserved: &BTreeMap<String, u64>,
 ) -> Result<bool> {
+    if !check_pin_capacity(tx, hash_hex, owner, size, owner_limit, total_limit, reserved)? {
+        return Ok(false);
+    }
     let sql_size = sql_int(size)?;
+    tx.execute(
+        "INSERT INTO pins (hash, owner, created, size_bytes) VALUES (?1, ?2, ?3, ?4)",
+        params![hash_hex, owner, now_ms(), sql_size],
+    )
+    .map_err(db_err)?;
+    bump_owner_used(tx, owner, size)?;
+    Ok(true)
+}
+
+/// Check settlement without charging or publishing a pin.
+fn check_pin_capacity(
+    tx: &rusqlite::Transaction<'_>,
+    hash_hex: &str,
+    owner: &str,
+    size: u64,
+    owner_limit: u64,
+    total_limit: u64,
+    reserved: &BTreeMap<String, u64>,
+) -> Result<bool> {
+    sql_int(size)?;
     let already: i64 = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1 AND owner = ?2)",
@@ -1607,12 +1630,6 @@ fn pin_with_cap(
     // otherwise an addition can silently promote used_bytes to REAL.
     sql_int(owner_used.saturating_add(size))?;
     sql_int(total_used.saturating_add(size))?;
-    tx.execute(
-        "INSERT INTO pins (hash, owner, created, size_bytes) VALUES (?1, ?2, ?3, ?4)",
-        params![hash_hex, owner, now_ms(), sql_size],
-    )
-    .map_err(db_err)?;
-    bump_owner_used(tx, owner, size)?;
     Ok(true)
 }
 

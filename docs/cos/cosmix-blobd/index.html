@@ -646,6 +646,14 @@ charged twice). It is not unique CAS disk usage or a free-space guarantee.
 identified ephemeral holds for local puts, v1 uploads and fetches. Sessions
 continue reserving their full size after each successful PATCH. GC also treats
 committing hashes as pinned until settlement or explicit failure.</p>
+<p>Commit checks settlement quota under the reservation/database locks before
+recording intent. Permanent failures (quota, corrupt CAS/staging, EXDEV or
+permission refusal during publication) mark the session failed and release its
+reservation and GC protection atomically; <code>blob.upload.list</code> retains the error.
+Transient I/O failures keep the committing row for recovery. An existing readable
+producer-owned CAS entry may refuse timestamp refresh: this is logged and ignored,
+because the committing row and settled pin protect it. Failed publication leaves
+any unpinned CAS entry to normal GC grace handling.</p>
 <h2 id="permissions">Permissions</h2>
 <p>Registry UID 521 (<code>cosmix-blobd</code>), shared-credential group 522 (<code>cosmix-blob</code>, SPEC 10a v1.4.7). <code>blob.put {path}</code> is daemon-local ingest: processes that share the <code>cosmix-blob</code> group (such as maild). At open blobd chgrps its state root and CAS root to <code>cosmix-blob</code> (<code>cas_group</code>, default <code>cosmix-blob</code>) and sets the setgid bit — mode 2750 — so every shard directory mds creates and every CAS file inherits the group; same-node readers of <code>blob.path</code> traverse the tree as group members (the unit's <code>SupplementaryGroups=cosmix-blob</code> is what allows the chown; the <code>StateDirectoryMode=0750</code> tree alone would be group <code>cosmix-blobd</code> and untraversable). An absent group or a refused chown is logged and skipped — a private CAS still serves verbs, it just has no same-node zero-copy readers. <code>blob.put</code> <code>mode: hardlink</code> is the exception: a hard-linked CAS entry keeps the producer's owner, group and mode, so <code>blob.path</code> readers see it only if the producer's file was readable by <code>cosmix-blob</code>; <code>copy</code>/<code>reflink</code> entries always inherit the CAS group. User-side and remote producers (capture, filesd fs mode, webd, Thunderbird) push bytes through the byte lane — no cross-user path read exists or is needed. Under the 2026-09-15 full-mesh-access law the verbs are mesh-open with no authorisation gates; <code>blob.put</code>'s path argument is on record as the first verb to jail if a lock is ever opted in.</p>
 <h2 id="events">Events</h2>
