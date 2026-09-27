@@ -130,12 +130,6 @@ pub enum DialogMsg {
 /// A pane-local control, applied after activating its pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneOp {
-    NavBack,
-    NavForward,
-    NavParent,
-    NavHome,
-    Refresh,
-    ToggleHidden,
     Sort(SortColumn),
 }
 
@@ -530,12 +524,6 @@ impl Dopus {
         self.stop_editing();
         self.core.set_active_pane(pane);
         match op {
-            PaneOp::NavBack => self.core.go_back(),
-            PaneOp::NavForward => self.core.go_forward(),
-            PaneOp::NavParent => self.core.go_parent(),
-            PaneOp::NavHome => self.core.go_home(),
-            PaneOp::Refresh => self.core.refresh(),
-            PaneOp::ToggleHidden => self.core.toggle_hidden(),
             PaneOp::Sort(column) => self.core.set_sort(column, true),
         }
         Task::none()
@@ -1239,8 +1227,6 @@ mod tests {
         let (_dir, mut app) = fixture();
         for msg in [
             Msg::Pane(PaneId::Right, PaneOp::Sort(SortColumn::Size)),
-            Msg::Pane(PaneId::Left, PaneOp::Refresh),
-            Msg::Pane(PaneId::Right, PaneOp::ToggleHidden),
             Msg::Split(0.7),
             Msg::LocationCancel, // outside press, including a stationary divider
         ] {
@@ -1253,6 +1239,25 @@ mod tests {
         }
         assert_eq!(app.core.pane(PaneId::Right).sort, SortColumn::Size);
         assert_eq!(app.core.config_snapshot().split_ratio, 0.7);
+    }
+
+    #[test]
+    fn toolbar_actions_follow_the_active_pane() {
+        let (_dir, mut app) = fixture();
+        let left_hidden = app.core.pane(PaneId::Left).show_hidden;
+        let right_hidden = app.core.pane(PaneId::Right).show_hidden;
+        app.core.set_active_pane(PaneId::Right);
+        let _ = app.update(Msg::Actions(vec![
+            cosmix_actions::filemgr::VIEW_TOGGLE_HIDDEN,
+        ]));
+        assert_eq!(app.core.pane(PaneId::Left).show_hidden, left_hidden);
+        assert_eq!(app.core.pane(PaneId::Right).show_hidden, !right_hidden);
+        app.core.switch_pane();
+        let _ = app.update(Msg::Actions(vec![
+            cosmix_actions::filemgr::VIEW_TOGGLE_HIDDEN,
+        ]));
+        assert_eq!(app.core.pane(PaneId::Left).show_hidden, !left_hidden);
+        assert_eq!(app.core.pane(PaneId::Right).show_hidden, !right_hidden);
     }
 
     #[test]

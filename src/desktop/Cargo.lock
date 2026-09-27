@@ -3165,6 +3165,7 @@ dependencies = [
  "chrono",
  "cosmix-lib-config",
  "cosmix-lib-files",
+ "nix 0.31.3",
  "serde",
  "tempfile",
 ]

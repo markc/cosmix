@@ -15,6 +15,7 @@ pub mod places;
 pub mod properties;
 pub mod rows;
 pub mod status;
+pub mod toolbar;
 
 use iced::widget::{column, container, row};
 use iced::{Element, Length};
@@ -166,9 +167,13 @@ pub fn root<'a>(
                     .height(Length::Fill),
             );
     }
-    let content = column![body, status::bar(look, active_pane, info),]
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let content = column![
+        toolbar::navigation(look, icons, tint, active_pane),
+        body,
+        status::bar(look, active_pane, info),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
     match dialog {
         // The modal card is stacked OVER the window; the scrim takes every
         // click not on the card, and the router's modal scope takes every

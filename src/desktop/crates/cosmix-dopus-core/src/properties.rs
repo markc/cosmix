@@ -13,7 +13,7 @@ pub struct Metadata {
     pub created: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
     pub permissions: String,
-    /// Numeric identities remain meaningful when no name service is available.
+    /// Resolved names, with numeric fallback independently for either identity.
     pub owner_group: String,
     pub symlink_target: Option<String>,
 }
@@ -55,7 +55,7 @@ pub(crate) fn read(path: &Path) -> Result<Metadata, String> {
         use std::os::unix::fs::MetadataExt;
         (
             permissions(metadata.mode()),
-            format!("{}:{}", metadata.uid(), metadata.gid()),
+            owner_group(metadata.uid(), metadata.gid()),
         )
     };
     #[cfg(not(unix))]
@@ -88,6 +88,28 @@ pub(crate) fn read(path: &Path) -> Result<Metadata, String> {
             None
         },
     })
+}
+
+/// NSS can block: called only by `read` in the existing metadata worker.
+#[cfg(unix)]
+fn owner_group(uid: u32, gid: u32) -> String {
+    use nix::unistd::{Gid, Group, Uid, User};
+    let user = User::from_uid(Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name);
+    let group = Group::from_gid(Gid::from_raw(gid))
+        .ok()
+        .flatten()
+        .map(|g| g.name);
+    format!("{}:{}", identity_name(uid, user), identity_name(gid, group))
+}
+
+#[cfg(unix)]
+fn identity_name(id: u32, name: Option<String>) -> String {
+    name.filter(|name| !name.is_empty())
+        .map(|name| sanitise_display_text(&name))
+        .unwrap_or_else(|| id.to_string())
 }
 
 pub fn permissions(mode: u32) -> String {
@@ -165,6 +187,14 @@ pub fn file_kind(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn owner_names_are_sanitised_and_missing_names_keep_ids() {
+        assert_eq!(identity_name(1001, Some("alice".into())), "alice");
+        assert_eq!(identity_name(1001, None), "1001");
+        assert_eq!(identity_name(1002, Some(String::new())), "1002");
+        assert!(!identity_name(1001, Some("bad\nname".into())).contains('\n'));
+    }
     #[test]
     fn permission_special_bits_are_not_lost() {
         assert_eq!(permissions(0o100644), "rw-r--r-- (0644)");

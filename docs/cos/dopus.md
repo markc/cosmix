@@ -11,6 +11,15 @@ a plain sidebar, with Home, Filesystem and existing user directories.
 Click its heading to refresh Places; pane relists also invalidate its cached
 directory checks. The divider persists its position; double-click centres it.
 
+One navigation icon strip is centred across the top of the window: Back,
+Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
+active pane and follows F6 or a pane click; Back/Forward are disabled when
+that pane's corresponding history is empty, and Up is disabled at the root.
+Each pane shows only its editable location bar above the column headers;
+there is no duplicate path beside the toolbar. Ctrl+L and `location.focus`
+keep their existing behaviour. Toolbar clicks invoke the existing actions,
+without changing keyboard bindings or Bus behaviour.
+
 Names in listings and Places middle-elide to their measured width, preserving
 the final extension where space permits. Headers and rows share one column
 layout: Name uses the remaining space; Size and Modified align right in
@@ -23,8 +32,11 @@ otherwise local `DD/MM/YY at h:mm am/pm`, refreshed by the frontend clock.
 
 The plain **Properties** sidebar follows the active pane's single selection:
 name, kind and extension-based MIME guess, byte and human-readable size,
-modified/created/accessed times, Unix permissions (rwx and octal), numeric
-owner:group, and symlink target. Unavailable timestamps display `—`.
+modified/created/accessed times, Unix permissions (rwx and octal), resolved
+owner:group names, and symlink target. Account lookup runs in the metadata
+worker through the existing nix dependency's reentrant system lookups;
+missing names or lookup failures fall back independently to numeric IDs.
+Unavailable timestamps display `—`.
 Folder sizes show the existing count queue's item count (`…` while pending),
 never a recursive byte walk. With no selection it shows the current path
 and the same folder/file counts and total file size as the status bar.
@@ -272,6 +284,6 @@ to confirm persisted widths and visibility.
   Limit widths to 30% each so the panes retain space.
 - Name the RHS Properties and show a folder summary without a selection,
   instead of the old Information title and idle selection prompt.
-- Display numeric owner/group IDs; do not resolve accounts through a name
-  service. MIME hints use common extensions and fall back to
+- Resolve owner/group names off the UI thread, retaining numeric IDs when
+  lookup fails. MIME hints use common extensions and fall back to
   `application/octet-stream`; they never inspect file contents.

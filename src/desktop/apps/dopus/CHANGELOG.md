@@ -2,6 +2,12 @@
 
 ## 0.3.0
 
+- Consolidate navigation into one window-centred icon strip acting on the
+  active pane through existing actions. Disable Back/Forward for empty
+  histories and Up at the root; retain only each pane's editable location bar.
+- Resolve Properties owner/group names in the metadata worker using the
+  existing nix dependency, with independent numeric fallbacks on failure.
+
 - Middle-elide listing and Places names with measured, grapheme-safe,
   extension-preserving text. Share fixed right-aligned Size/Modified columns
   between headers and rows, reserve the absolute timestamp width and clip

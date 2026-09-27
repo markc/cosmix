@@ -19,5 +19,9 @@ cosmix-files = { package = "cosmix-lib-files", path = "../../../crates/cosmix-li
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 
+[target.'cfg(unix)'.dependencies]
+# Already in the desktop lockfile; user enables safe reentrant NSS lookups.
+nix = { version = "0.31", default-features = false, features = ["user"] }
+
 [dev-dependencies]
 tempfile = "3"

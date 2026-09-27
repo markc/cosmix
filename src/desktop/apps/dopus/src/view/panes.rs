@@ -1,12 +1,12 @@
-//! The twin panes: one column per [`PaneId`] — pane header (nav buttons +
-//! location bar) · sort header · [`rows::FileList`] — split by a draggable
+//! The twin panes: one column per [`PaneId`] — editable location bar · sort
+//! header · [`rows::FileList`] — split by a draggable
 //! [`Divider`]. Pane widths come from the core's live `split_ratio` (Fill
 //! portions, so the core stays the single source of truth: persistence
 //! derives from core state only, the app-contract law 7); the active pane
-//! carries the accent border and the stronger header text.
+//! carries a tinted location header.
 //!
 //! The pane controls publish [`Msg::Pane`] (activate-then-act: the core's
-//! `go_back`/`set_sort`/… act on the active pane, so clicking an inactive
+//! `set_sort` acts on the active pane, so clicking an inactive
 //! pane's button first activates that pane — one code path, no pane-targeted
 //! duplicates of core verbs). The listing is pane-agnostic: its messages are
 //! mapped onto [`Msg::PaneRows`] with the pane id riding the message.
@@ -15,14 +15,14 @@ use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
-use iced::widget::{button, column, container, row};
+use iced::widget::{column, container};
 use iced::{Element, Event, Length, Rectangle, Size};
 
 use cosmix_dopus_core::{PaneId, PaneModel, VisibleRow};
 use iced_tiny_skia::Renderer;
 
-use crate::app::{Msg, PaneOp};
-use crate::icons::{Icon, Icons};
+use crate::app::Msg;
+use crate::icons::Icons;
 use crate::view::{Look, location, rows};
 
 /// A second press on the divider inside this window is a double-click
@@ -52,7 +52,7 @@ pub fn pane_column<'a>(
 ) -> Element<'a, Msg> {
     container(
         column![
-            pane_header(look, icons, tint, pane, pane_id, active, editing),
+            pane_header(look, pane, pane_id, active, editing),
             sort_header(look, pane, pane_id),
             Element::new(rows::FileList::new(
                 pane_rows,
@@ -73,82 +73,30 @@ pub fn pane_column<'a>(
     .into()
 }
 
-/// The pane's header strip: back / forward / parent / home / refresh /
-/// toggle-hidden icon buttons, then the location bar. An inactive pane's
-/// buttons still work (they activate the pane first) but its caption is
-/// muted.
+/// Each pane keeps only its editable location bar above the sort header.
 fn pane_header<'a>(
     look: Look,
-    icons: &'a Icons,
-    tint: &'a str,
     pane: &'a PaneModel,
     pane_id: PaneId,
     active: bool,
     editing: Option<&'a str>,
 ) -> Element<'a, Msg> {
-    let icon_button = |icon: Icon, op: PaneOp| {
-        let style = crate::view::button_look(&look);
-        button(crate::view::image_widget(look, icons, tint, icon))
-            .padding(look.chrome.small)
-            .on_press_maybe(availability(pane, &op).then_some(Msg::Pane(pane_id, op)))
-            .style(style)
-    };
-    let caption_color = if active {
-        look.tokens.primary_text
-    } else {
-        look.tokens.muted_text
-    };
-    container(
-        column![
-            row![
-                icon_button(Icon::ArrowLeft, PaneOp::NavBack),
-                icon_button(Icon::ArrowRight, PaneOp::NavForward),
-                icon_button(Icon::ArrowUp, PaneOp::NavParent),
-                icon_button(Icon::House, PaneOp::NavHome),
-                icon_button(Icon::Refresh, PaneOp::Refresh),
-                icon_button(
-                    if pane.show_hidden {
-                        Icon::EyeOff
-                    } else {
-                        Icon::Eye
-                    },
-                    PaneOp::ToggleHidden
-                ),
-                super::elide::Label {
-                    text: cosmix_dopus_core::sanitise_display_path(&pane.path),
-                    font: look.mono_font,
-                    px: look.mono_px * 0.9,
-                    color: caption_color
-                },
-            ]
-            .spacing(look.chrome.small)
-            .align_y(iced::Alignment::Center),
-            location::bar(look, pane, pane_id, editing),
-        ]
-        .spacing(look.chrome.edge * 2.0),
-    )
-    .width(Length::Fill)
-    .padding([look.chrome.small, look.chrome.pad])
-    .align_y(iced::Alignment::Center)
-    .style(look.strip(
-        if active {
-            look.tokens.primary
-        } else {
-            look.chrome.secondary
-        },
-        caption_color,
-    ))
-    .into()
-}
-
-/// A pane-local control can only be offered when the core could act: a
-/// directory can only be left when there is somewhere to go; the rest are
-/// always offered (the core re-checks and status-lines the no-ops).
-fn availability(pane: &PaneModel, op: &PaneOp) -> bool {
-    if matches!(op, PaneOp::NavParent) {
-        return pane.path.parent().is_some();
-    }
-    true
+    container(location::bar(look, pane, pane_id, editing))
+        .width(Length::Fill)
+        .padding([look.chrome.small, look.chrome.pad])
+        .style(look.strip(
+            if active {
+                look.tokens.primary
+            } else {
+                look.chrome.secondary
+            },
+            if active {
+                look.tokens.primary_text
+            } else {
+                look.tokens.muted_text
+            },
+        ))
+        .into()
 }
 
 /// The pane's sort headers: the three columns as buttons; the pane's active

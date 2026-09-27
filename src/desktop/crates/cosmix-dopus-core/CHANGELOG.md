@@ -4,7 +4,8 @@
 
 - Add non-blocking `properties(pane)` snapshots with bounded metadata
   workers and stale generation/selection reply rejection. Preserve symlink
-  metadata and targets; expose timestamps, Unix mode and numeric owner/group.
+  metadata and targets; expose timestamps, Unix mode and resolved owner/group
+  names via worker-side reentrant lookups, falling back to numeric IDs.
 - Reuse the count queue for folder item counts and status-bar totals for
   unselected-folder summaries. MIME descriptions are extension-based hints.
 - Persist plain Places/Properties open states and widths in schema 2;
