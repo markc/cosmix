@@ -89,6 +89,11 @@ pub enum StoreError {
     Locked(PathBuf),
     Mds(cosmix_mds::Error),
     Db(String),
+    /// A persisted integer cannot represent its non-negative domain value.
+    CorruptInteger {
+        column: usize,
+        value: i64,
+    },
     Io(io::Error),
     /// The `b3:` blob id did not parse.
     InvalidBlob(String),
@@ -134,6 +139,10 @@ impl std::fmt::Display for StoreError {
             ),
             Self::Mds(e) => write!(f, "mds: {e}"),
             Self::Db(e) => write!(f, "blobd.sqlite: {e}"),
+            Self::CorruptInteger { column, value } => write!(
+                f,
+                "SQLite integer corruption: column {column} contains {value}"
+            ),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::InvalidBlob(s) => write!(f, "invalid blob id: {s:?}"),
             Self::NotPresent(s) => write!(f, "not_present: {s}"),
@@ -878,11 +887,10 @@ impl Store {
                 .query_row(
                     "SELECT size_bytes FROM blob WHERE hash = ?1",
                     params![blob::hex(hash)],
-                    |r| r.get::<_, i64>(0),
+                    |r| sql_u64(r, 0),
                 )
                 .optional()
                 .map_err(db_err)?
-                .map(|n| n as u64)
         };
         let (mime, origin, first_put): (Option<String>, Option<String>, Option<i64>) = self
             .db
@@ -891,7 +899,7 @@ impl Store {
             .query_row(
                 "SELECT mime, origin, first_put FROM blob_attrs WHERE hash = ?1",
                 params![blob::hex(hash)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, Some(sql_timestamp(r, 2)?))),
             )
             .optional()
             .map_err(db_err)?
@@ -987,20 +995,19 @@ impl Store {
             .query_row(
                 "SELECT size_bytes FROM blob WHERE hash = ?1",
                 params![blob::hex(hash)],
-                |r| r.get::<_, i64>(0),
+                |r| sql_u64(r, 0),
             )
             .optional()
-            .map_err(db_err)?
-            .map(|n| n as u64);
+            .map_err(db_err)?;
         let mut db = self.db.lock().unwrap();
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(db_err)?;
-        let recorded: Option<i64> = tx
+        let recorded: Option<u64> = tx
             .query_row(
                 "SELECT size_bytes FROM pins WHERE hash = ?1 AND owner = ?2",
                 params![blob::hex(hash), owner],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .optional()
             .map_err(db_err)?;
@@ -1014,7 +1021,7 @@ impl Store {
         if removed {
             let delta = match recorded {
                 // A v2 row: release exactly what the pin paid.
-                Some(bytes) if bytes > 0 => bytes as u64,
+                Some(bytes) if bytes > 0 => bytes,
                 // A pre-v2 row (or an empty blob): the legacy read.
                 _ => index_size.unwrap_or_else(|| {
                     fs::metadata(blob::blob_path(&self.blobs_root(), hash))
@@ -1059,7 +1066,8 @@ impl Store {
         limit: usize,
         cursor: Option<&BlobHash>,
     ) -> Result<Vec<ListEntry>> {
-        let limit = limit.clamp(1, 1000);
+        let limit = i64::try_from(limit.clamp(1, 1000))
+            .map_err(|_| StoreError::BadRequest("list limit exceeds SQLite i64 range".into()))?;
         let hashes: Vec<String> = {
             let db = self.db.lock().unwrap();
             let mut out = Vec::new();
@@ -1072,7 +1080,7 @@ impl Store {
                     )
                     .map_err(db_err)?;
                 let rows = stmt
-                    .query_map(params![owner, cursor.map(blob::hex), limit as i64], |r| {
+                    .query_map(params![owner, cursor.map(blob::hex), limit], |r| {
                         r.get::<_, String>(0)
                     })
                     .map_err(db_err)?;
@@ -1087,7 +1095,7 @@ impl Store {
                     )
                     .map_err(db_err)?;
                 let rows = stmt
-                    .query_map(params![cursor.map(blob::hex), limit as i64], |r| {
+                    .query_map(params![cursor.map(blob::hex), limit], |r| {
                         r.get::<_, String>(0)
                     })
                     .map_err(db_err)?;
@@ -1117,7 +1125,7 @@ impl Store {
                             r.get::<_, String>(0)?,
                             r.get::<_, Option<String>>(1)?,
                             r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
+                            sql_timestamp(r, 3)?,
                         ))
                     },
                 )
@@ -1125,23 +1133,21 @@ impl Store {
                 .map_err(db_err)?
                 .map(|(m, n, o, f)| (Some(m), n, Some(o), Some(f)))
                 .unwrap_or((None, None, None, None));
-            let size = blob::size(&self.blobs_root(), &hash)
-                .ok()
-                .or_else(|| {
-                    self.index
-                        .lock()
-                        .unwrap()
-                        .query_row(
-                            "SELECT size_bytes FROM blob WHERE hash = ?1",
-                            params![blob::hex(&hash)],
-                            |r| r.get::<_, i64>(0),
-                        )
-                        .optional()
-                        .ok()
-                        .flatten()
-                        .map(|n| n as u64)
-                })
-                .unwrap_or(0);
+            let size = match blob::size(&self.blobs_root(), &hash) {
+                Ok(size) => size,
+                Err(_) => self
+                    .index
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT size_bytes FROM blob WHERE hash = ?1",
+                        params![blob::hex(&hash)],
+                        |r| sql_u64(r, 0),
+                    )
+                    .optional()
+                    .map_err(db_err)?
+                    .unwrap_or(0),
+            };
             entries.push(ListEntry {
                 hash,
                 size,
@@ -1158,17 +1164,17 @@ impl Store {
     /// `(blobs known to blobd, pin rows)`.
     pub fn counts(&self) -> Result<(u64, u64)> {
         let db = self.db.lock().unwrap();
-        let blobs: i64 = db
+        let blobs = db
             .query_row(
                 "SELECT COUNT(*) FROM (SELECT hash FROM blob_attrs UNION SELECT hash FROM pins)",
                 params![],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .map_err(db_err)?;
-        let pins: i64 = db
-            .query_row("SELECT COUNT(*) FROM pins", params![], |r| r.get(0))
+        let pins = db
+            .query_row("SELECT COUNT(*) FROM pins", params![], |r| sql_u64(r, 0))
             .map_err(db_err)?;
-        Ok((blobs as u64, pins as u64))
+        Ok((blobs, pins))
     }
 
     // ---- Quota ----
@@ -1182,11 +1188,11 @@ impl Store {
         let mut owners = BTreeMap::new();
         match owner {
             Some(one) => {
-                let used: i64 = db
+                let used = db
                     .query_row(
                         "SELECT used_bytes FROM quota WHERE owner = ?1",
                         params![one],
-                        |r| r.get(0),
+                        |r| sql_u64(r, 0),
                     )
                     .optional()
                     .map_err(db_err)?
@@ -1194,7 +1200,7 @@ impl Store {
                 owners.insert(
                     one.to_string(),
                     OwnerQuota {
-                        used: used as u64,
+                        used,
                         limit: self.options.owner_limit(one),
                         reserved: reserved_map.get(one).copied().unwrap_or(0),
                     },
@@ -1205,16 +1211,14 @@ impl Store {
                     .prepare("SELECT owner, used_bytes FROM quota ORDER BY owner")
                     .map_err(db_err)?;
                 let rows = stmt
-                    .query_map(params![], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                    })
+                    .query_map(params![], |r| Ok((r.get::<_, String>(0)?, sql_u64(r, 1)?)))
                     .map_err(db_err)?;
                 for row in rows {
                     let (o, used) = row.map_err(db_err)?;
                     owners.insert(
                         o.clone(),
                         OwnerQuota {
-                            used: used as u64,
+                            used,
                             limit: self.options.owner_limit(&o),
                             reserved: reserved_map.get(&o).copied().unwrap_or(0),
                         },
@@ -1236,17 +1240,17 @@ impl Store {
                 }
             }
         }
-        let total_used: i64 = db
+        let total_used = db
             .query_row(
                 "SELECT COALESCE(SUM(used_bytes), 0) FROM quota",
                 params![],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .map_err(db_err)?;
         Ok(QuotaReport {
             owners,
             total: OwnerQuota {
-                used: total_used as u64,
+                used: total_used,
                 limit: self.options.quota_total_bytes,
                 reserved: total_reserved,
             },
@@ -1254,32 +1258,32 @@ impl Store {
     }
 
     fn owner_used(&self, owner: &str) -> Result<u64> {
-        let used: Option<i64> = self
+        let used = self
             .db
             .lock()
             .unwrap()
             .query_row(
                 "SELECT used_bytes FROM quota WHERE owner = ?1",
                 params![owner],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .optional()
             .map_err(db_err)?;
-        Ok(used.map(|n| n as u64).unwrap_or(0))
+        Ok(used.unwrap_or(0))
     }
 
     fn total_used(&self) -> Result<u64> {
-        let used: i64 = self
+        let used = self
             .db
             .lock()
             .unwrap()
             .query_row(
                 "SELECT COALESCE(SUM(used_bytes), 0) FROM quota",
                 params![],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .map_err(db_err)?;
-        Ok(used as u64)
+        Ok(used)
     }
 
     // ---- GC ----
@@ -1494,14 +1498,37 @@ fn now_ms() -> i64 {
 }
 
 fn db_err(e: rusqlite::Error) -> StoreError {
-    StoreError::Db(e.to_string())
+    match e {
+        rusqlite::Error::IntegralValueOutOfRange(column, value) => {
+            StoreError::CorruptInteger { column, value }
+        }
+        other => StoreError::Db(other.to_string()),
+    }
+}
+
+/// SQLite INTEGER is signed, even when the Rust domain value is unsigned.
+fn sql_u64(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(column)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+fn sql_timestamp(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<i64> {
+    let value: i64 = row.get(column)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))?;
+    Ok(value)
+}
+
+fn sql_int(value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::BadRequest("integer exceeds SQLite i64 range".into()))
 }
 
 fn bump_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) -> Result<()> {
+    let delta = sql_int(delta)?;
     tx.execute(
         "INSERT INTO quota (owner, used_bytes) VALUES (?1, ?2) \
          ON CONFLICT(owner) DO UPDATE SET used_bytes = used_bytes + excluded.used_bytes",
-        params![owner, delta as i64],
+        params![owner, delta],
     )
     .map_err(db_err)?;
     Ok(())
@@ -1521,6 +1548,7 @@ fn pin_with_cap(
     total_limit: u64,
     reserved: &BTreeMap<String, u64>,
 ) -> Result<bool> {
+    let sql_size = sql_int(size)?;
     let already: i64 = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pins WHERE hash = ?1 AND owner = ?2)",
@@ -1531,14 +1559,14 @@ fn pin_with_cap(
     if already != 0 {
         return Ok(false);
     }
-    let owner_used: i64 = tx
+    let owner_used = tx
         .query_row(
             "SELECT COALESCE((SELECT used_bytes FROM quota WHERE owner = ?1), 0)",
             params![owner],
-            |r| r.get(0),
+            |r| sql_u64(r, 0),
         )
         .map_err(db_err)?;
-    let would_use = (owner_used as u64)
+    let would_use = owner_used
         .saturating_add(size)
         .saturating_add(reserved.get(owner).copied().unwrap_or(0));
     if would_use > owner_limit {
@@ -1548,14 +1576,14 @@ fn pin_with_cap(
             limit: owner_limit,
         });
     }
-    let total_used: i64 = tx
+    let total_used = tx
         .query_row(
             "SELECT COALESCE(SUM(used_bytes), 0) FROM quota",
             params![],
-            |r| r.get(0),
+            |r| sql_u64(r, 0),
         )
         .map_err(db_err)?;
-    let total_would = (total_used as u64)
+    let total_would = total_used
         .saturating_add(size)
         .saturating_add(sum_reserved(reserved));
     if total_would > total_limit {
@@ -1564,9 +1592,13 @@ fn pin_with_cap(
             limit: total_limit,
         });
     }
+    // Keep SQLite's aggregate/accounting arithmetic in INTEGER range too;
+    // otherwise an addition can silently promote used_bytes to REAL.
+    sql_int(owner_used.saturating_add(size))?;
+    sql_int(total_used.saturating_add(size))?;
     tx.execute(
         "INSERT INTO pins (hash, owner, created, size_bytes) VALUES (?1, ?2, ?3, ?4)",
-        params![hash_hex, owner, now_ms(), size as i64],
+        params![hash_hex, owner, now_ms(), sql_size],
     )
     .map_err(db_err)?;
     bump_owner_used(tx, owner, size)?;
@@ -1580,9 +1612,10 @@ fn sum_reserved(reserved: &BTreeMap<String, u64>) -> u64 {
 }
 
 fn shrink_owner_used(tx: &rusqlite::Transaction<'_>, owner: &str, delta: u64) -> Result<()> {
+    let delta = sql_int(delta)?;
     tx.execute(
         "UPDATE quota SET used_bytes = MAX(0, used_bytes - ?2) WHERE owner = ?1",
-        params![owner, delta as i64],
+        params![owner, delta],
     )
     .map_err(db_err)?;
     Ok(())
@@ -1743,6 +1776,87 @@ fn open_index_conn(root: &Path) -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_integer_boundaries_refuse_negative_and_overflow() {
+        let conn = Connection::open_in_memory().unwrap();
+        for value in [0_i64, i64::MAX] {
+            let read = conn
+                .query_row("SELECT ?1", [value], |r| sql_u64(r, 0))
+                .unwrap();
+            assert_eq!(sql_int(read).unwrap(), value);
+        }
+        for value in [-1_i64, i64::MIN] {
+            let error = conn
+                .query_row("SELECT ?1", [value], |r| sql_u64(r, 0))
+                .unwrap_err();
+            assert!(
+                matches!(db_err(error), StoreError::CorruptInteger { column: 0, value: n } if n == value)
+            );
+            assert!(
+                conn.query_row("SELECT ?1", [value], |r| sql_timestamp(r, 0))
+                    .is_err()
+            );
+        }
+        for value in [i64::MAX as u64 + 1, u64::MAX] {
+            assert!(matches!(sql_int(value), Err(StoreError::BadRequest(_))));
+        }
+        let (_dir, store) = store();
+        let mut db = store.db.lock().unwrap();
+        let tx = db.transaction().unwrap();
+        assert!(matches!(
+            pin_with_cap(
+                &tx,
+                "test",
+                "owner",
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                &BTreeMap::new()
+            ),
+            Err(StoreError::BadRequest(_))
+        ));
+        assert!(matches!(
+            bump_owner_used(&tx, "owner", u64::MAX),
+            Err(StoreError::BadRequest(_))
+        ));
+        assert!(matches!(
+            shrink_owner_used(&tx, "owner", u64::MAX),
+            Err(StoreError::BadRequest(_))
+        ));
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM pins", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM quota", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn negative_quota_is_typed_corruption() {
+        let (_dir, store) = store();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO quota(owner,used_bytes) VALUES ('broken',-1)",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.quota_report(None),
+            Err(StoreError::CorruptInteger { value: -1, .. })
+        ));
+        assert!(matches!(
+            store.reserve_upload("broken", Some(1)),
+            Err(StoreError::CorruptInteger { value: -1, .. })
+        ));
+    }
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2012,7 +2126,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO blob (hash, size_bytes, first_seen, last_seen, refcount) \
                  VALUES (?1, ?2, 0, 0, 0)",
-                params![blob::hex(&hash), bytes.len() as i64],
+                params![blob::hex(&hash), i64::try_from(bytes.len()).unwrap()],
             )
             .unwrap();
         }

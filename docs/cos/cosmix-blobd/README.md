@@ -196,6 +196,11 @@ label, not an authenticated principal.
 ## Storage layout
 
 The durable upload core uses `blobd.sqlite` schema v3 and `blobs/.uploads/`.
+SQLite boundaries use checked signed 64-bit integers: negative stored sizes,
+offsets and timestamps report integer corruption; out-of-range unsigned
+inputs are refused before binding. The existing non-negative CHECK constraints
+remain in place. The additive mds publication helper ships in mds **0.3.5**;
+mds **0.4.0** is reserved for blob-index schema v2 and its lazy migration.
 Active sessions reserve their whole declared size across daemon restarts.
 SQLite uses WAL with `synchronous=FULL`; a chunk is acknowledged only after
 its staging file is synced and its offset update commits. Startup truncates

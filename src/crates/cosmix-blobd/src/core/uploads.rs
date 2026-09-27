@@ -126,13 +126,13 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UploadSession> {
         id: r.get(0)?,
         owner: r.get(1)?,
         key: r.get(2)?,
-        size: r.get(3)?,
-        offset: r.get(4)?,
+        size: sql_u64(r, 3)?,
+        offset: sql_u64(r, 4)?,
         expected_hash: r.get(5)?,
         mime: r.get(6)?,
         name: r.get(7)?,
-        created_at: r.get(8)?,
-        expires_at: r.get(9)?,
+        created_at: sql_timestamp(r, 8)?,
+        expires_at: sql_timestamp(r, 9)?,
         state: r.get(10)?,
         actual_hash: r.get(11)?,
         result,
@@ -208,9 +208,7 @@ impl Store {
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map([session], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
-            })
+            .query_map([session], |r| Ok((r.get::<_, String>(0)?, sql_u64(r, 1)?)))
             .map_err(db_err)?;
         for row in rows {
             let (owner, size) = row.map_err(db_err)?;
@@ -223,6 +221,7 @@ impl Store {
     /// Create or retrieve an owner+key session. No body bytes are read here.
     /// A key replay must agree on the entire immutable creation identity.
     pub fn upload_create(&self, opts: &UploadCreate) -> Result<(UploadSession, bool)> {
+        let sql_size = sql_int(opts.size)?;
         if opts.owner.is_empty()
             || opts.owner.len() > 128
             || opts.owner.chars().any(char::is_control)
@@ -278,7 +277,14 @@ impl Store {
             COALESCE(SUM(owner=?1 AND state IN ('active','committing')),0), COUNT(*),
             COALESCE(SUM(owner=?1),0) FROM upload_sessions",
                 [&opts.owner],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        sql_u64(r, 0)?,
+                        sql_u64(r, 1)?,
+                        sql_u64(r, 2)?,
+                        sql_u64(r, 3)?,
+                    ))
+                },
             )
             .map_err(db_err)?;
         // A full receipt budget refuses creation instead of dropping a promise.
@@ -294,12 +300,12 @@ impl Store {
             .query_row(
                 "SELECT COALESCE((SELECT used_bytes FROM quota WHERE owner=?1),0)",
                 [&opts.owner],
-                |r| r.get(0),
+                |r| sql_u64(r, 0),
             )
             .map_err(db_err)?;
         let total: u64 = tx
             .query_row("SELECT COALESCE(SUM(used_bytes),0) FROM quota", [], |r| {
-                r.get(0)
+                sql_u64(r, 0)
             })
             .map_err(db_err)?;
         let would_use = used
@@ -340,7 +346,7 @@ impl Store {
                 id,
                 opts.owner,
                 opts.key,
-                opts.size,
+                sql_size,
                 opts.expected_hash.as_ref().map(blob::hex),
                 opts.mime,
                 opts.name,
@@ -460,9 +466,11 @@ impl Store {
             }
             f.sync_all()?;
             let db = self.db.lock().unwrap();
+            let next_offset = sql_int(end + 1)?;
+            let old_offset = sql_int(s.offset)?;
             db.execute(
                 "UPDATE upload_sessions SET offset=?1 WHERE id=?2 AND offset=?3 AND state='active'",
-                params![end + 1, s.id, s.offset],
+                params![next_offset, s.id, old_offset],
             )
             .map_err(db_err)?;
             Ok(())
@@ -738,7 +746,7 @@ impl Store {
                 "SELECT COUNT(*),COALESCE(SUM(size),0) FROM upload_sessions
             WHERE state IN ('active','committing')",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((sql_u64(r, 0)?, sql_u64(r, 1)?)),
             )
             .map_err(db_err)
     }
@@ -825,6 +833,50 @@ mod tests {
             name: None,
             key: Some("retry-key".into()),
         }
+    }
+
+    #[test]
+    fn negative_upload_integers_are_corruption_and_checks_remain() {
+        let (_dir, store) = store();
+        let (s, _) = store.upload_create(&create(0)).unwrap();
+        for (column, original) in [
+            ("size", 0_i64),
+            ("offset", 0_i64),
+            ("created_at", s.created_at),
+            ("expires_at", s.expires_at),
+        ] {
+            let update = format!("UPDATE upload_sessions SET {column}=?1 WHERE id=?2");
+            {
+                let db = store.db.lock().unwrap();
+                db.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                db.execute(&update, params![-1_i64, s.id]).unwrap();
+                db.execute_batch("PRAGMA ignore_check_constraints=OFF")
+                    .unwrap();
+            }
+            assert!(
+                matches!(
+                    store.upload_status(&s.id),
+                    Err(StoreError::CorruptInteger { value: -1, .. })
+                ),
+                "{column}"
+            );
+            store
+                .db
+                .lock()
+                .unwrap()
+                .execute(&update, params![original, s.id])
+                .unwrap();
+        }
+        let db = store.db.lock().unwrap();
+        assert!(
+            db.execute("UPDATE upload_sessions SET size=-1 WHERE id=?1", [&s.id])
+                .is_err()
+        );
+        assert!(
+            db.execute("UPDATE upload_sessions SET offset=-1 WHERE id=?1", [&s.id])
+                .is_err()
+        );
     }
 
     #[test]
