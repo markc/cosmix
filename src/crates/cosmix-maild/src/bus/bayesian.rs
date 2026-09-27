@@ -57,6 +57,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
 use base64::Engine as _;
 use cosmix_client::IncomingCommand;
 use cosmix_maild_bayesian::{
@@ -149,11 +150,19 @@ pub async fn dispatch(
     db: &db::Db,
     mailstore: &Arc<SqliteMailStore>,
     state: &BayesianBusState,
+    input: &impl super::diagnostics::MessageLoader,
 ) -> (u8, String) {
-    let args = super::resolve_args(cmd);
+    let args = if action == "classify" {
+        match super::try_resolve_args(cmd) {
+            Ok(args) => args,
+            Err(e) => return (RC_ERROR, err_body(&format!("invalid_arguments: {e}"))),
+        }
+    } else {
+        super::resolve_args(cmd)
+    };
     match action {
         "stats" => handle_stats(classifier, db, &args).await,
-        "classify" => handle_classify(classifier, &args).await,
+        "classify" => handle_classify(classifier, &args, input).await,
         "train" => handle_train(classifier, db, mailstore, &args).await,
         "untrain" => handle_untrain(classifier, db, mailstore, &args).await,
         "rebuild" => {
@@ -522,10 +531,13 @@ async fn handle_untrain(
 #[derive(serde::Deserialize)]
 struct ClassifyRequest {
     account_id: serde_json::Value,
-    message_b64: String,
 }
 
-async fn handle_classify(classifier: &DefaultClassifier, args: &serde_json::Value) -> (u8, String) {
+async fn handle_classify(
+    classifier: &DefaultClassifier,
+    args: &serde_json::Value,
+    input: &impl super::diagnostics::MessageLoader,
+) -> (u8, String) {
     let req: ClassifyRequest = match serde_json::from_value(args.clone()) {
         Ok(r) => r,
         Err(e) => {
@@ -536,14 +548,12 @@ async fn handle_classify(classifier: &DefaultClassifier, args: &serde_json::Valu
         }
     };
 
-    let message = match base64::engine::general_purpose::STANDARD.decode(req.message_b64.as_bytes())
-    {
-        Ok(b) => b,
-        Err(e) => return (RC_ERROR, err_body(&format!("message_b64 decode: {e}"))),
-    };
-
     let account = match parse_account_id(&req.account_id) {
         Ok(id) => AccountId::new(id.to_string()),
+        Err(e) => return (RC_ERROR, err_body(&e)),
+    };
+    let message = match input.load(args).await {
+        Ok(b) => b,
         Err(e) => return (RC_ERROR, err_body(&e)),
     };
     let ctx = ClassifyContext {
@@ -1826,6 +1836,7 @@ mod tests {
         }
         db::Db {
             conn: Arc::new(Mutex::new(conn)),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
             blob_dir: std::env::temp_dir(),
         }
     }
@@ -2303,7 +2314,8 @@ mod tests {
             "account_id": 7,
             "message_b64": b64,
         });
-        let (rc, body) = handle_classify(&cls, &args).await;
+        let (rc, body) =
+            handle_classify(&cls, &args, &super::super::diagnostics::Legacy::default()).await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         // Shape contract from the spec.
@@ -2316,13 +2328,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classify_blob_matches_legacy_and_enforces_exactly_one_and_configured_cap() {
+        use super::super::diagnostics::{Input, Legacy, TestLane};
+        let classifier = classifier_with_corpus(10, 10).await;
+        let raw = b"From: sender@example.test\r\nSubject: BUY\r\n\r\nviagra discount\r\n";
+        let mut args = serde_json::json!({"account_id": 7, "message_b64": base64::engine::general_purpose::STANDARD.encode(raw)});
+        let (rc, legacy) = handle_classify(&classifier, &args, &Legacy::default()).await;
+        assert_eq!(rc, 0, "{legacy}");
+        args.as_object_mut().unwrap().remove("message_b64");
+        args["blob"] = serde_json::json!(format!("b3:{}", blake3::hash(raw).to_hex()));
+        for (status, cap, token) in [
+            (200, raw.len(), None),
+            (200, raw.len() - 1, Some("too_large:")),
+            (404, raw.len(), Some("not_present:")),
+        ] {
+            let lane = TestLane::new(raw, status).await;
+            let input = Input {
+                discovery: &lane,
+                max_message_size: cap,
+            };
+            let (rc, body) = handle_classify(&classifier, &args, &input).await;
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(token) = token {
+                assert_eq!(rc, 10);
+                assert!(body["error"].as_str().unwrap().starts_with(token), "{body}");
+            } else {
+                assert_eq!(rc, 0, "{body}");
+                let legacy: serde_json::Value = serde_json::from_str(&legacy).unwrap();
+                assert_eq!(body["label"], legacy["label"]);
+                assert_eq!(body["score"], legacy["score"]);
+            }
+            lane.finish().await;
+        }
+        args["message_b64"] = serde_json::json!("");
+        let (rc, body) = handle_classify(&classifier, &args, &Legacy::default()).await;
+        assert_eq!(rc, 10);
+        assert!(body.contains("exactly one"));
+        args.as_object_mut().unwrap().remove("message_b64");
+        args.as_object_mut().unwrap().remove("blob");
+        assert_eq!(
+            handle_classify(&classifier, &args, &Legacy::default())
+                .await
+                .0,
+            10
+        );
+        args["message_b64"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(raw));
+        let (rc, body) = handle_classify(&classifier, &args, &Legacy { cap: 1 }).await;
+        assert_eq!(rc, 10);
+        assert!(body.contains("too_large:"));
+    }
+
+    #[tokio::test]
     async fn classify_rejects_bad_base64() {
         let cls = empty_classifier();
         let args = serde_json::json!({
             "account_id": 7,
             "message_b64": "***not base64***",
         });
-        let (rc, body) = handle_classify(&cls, &args).await;
+        let (rc, body) =
+            handle_classify(&cls, &args, &super::super::diagnostics::Legacy::default()).await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("decode"));
@@ -2335,7 +2400,16 @@ mod tests {
         let database = database_with_accounts(&[]);
         let state = BayesianBusState::default();
         let cmd = cmd_with_args(serde_json::json!({}));
-        let (rc, body) = dispatch("bogus", &cmd, &cls, &database, &store, &state).await;
+        let (rc, body) = dispatch(
+            "bogus",
+            &cmd,
+            &cls,
+            &database,
+            &store,
+            &state,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
@@ -2364,7 +2438,16 @@ mod tests {
             body: body_json,
             headers,
         };
-        let (rc, body) = dispatch("stats", &cmd, &cls, &database, &store, &state).await;
+        let (rc, body) = dispatch(
+            "stats",
+            &cmd,
+            &cls,
+            &database,
+            &store,
+            &state,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
     }
 
@@ -2390,7 +2473,16 @@ mod tests {
         };
 
         let open_state = BayesianBusState::default();
-        let (rc, body) = dispatch("rebuild", &command, &cls, &database, &store, &open_state).await;
+        let (rc, body) = dispatch(
+            "rebuild",
+            &command,
+            &cls,
+            &database,
+            &store,
+            &open_state,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "empty allowlist refused peer: {body}");
 
         let restricted_state = BayesianBusState::new(vec!["operator-one".to_string()]);
@@ -2401,6 +2493,7 @@ mod tests {
             &database,
             &store,
             &restricted_state,
+            &super::super::diagnostics::Legacy::default(),
         )
         .await;
         assert_eq!(rc, RC_ERROR);

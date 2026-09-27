@@ -348,19 +348,16 @@ async fn dispatch(
 
 /// GET /jmap/blob/{blob_id} — Download a blob.
 ///
-/// `blob_id` can be either:
+/// `blob_id` can be:
+///   - an `mp1_` part identifier bound to an account-owned item and message hash,
 ///   - a legacy per-account UUID (issued by `db::blob::store` when
 ///     pre-migration uploads / inbound delivery created the row), or
 ///   - a 64-character lowercase-hex CAS `BlobHash` (the post-
 ///     migration form returned by `Email/get` — see
 ///     `jmap/email.rs:record_to_jmap`).
 ///
-/// The handler tries UUID first; on parse failure it falls back to
-/// `cosmix_mds::blob::from_hex` for the CAS form. This dual-path
-/// matching is the bridge while the upload path migrates off
-/// `db::blob` (Task 3.3a, `_doc/planned/jmap-mds-migration.md`);
-/// once that lands, both upload and download share the mds CAS
-/// surface and the legacy UUID branch can be retired.
+/// Part IDs are resolved before UUIDs and raw hashes. Legacy aliases remain
+/// account-scoped during migration; global CAS existence never authorises a read.
 pub async fn blob_download(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -369,6 +366,68 @@ pub async fn blob_download(
     let Some(account_id) = auth::authenticate(&state.db, &headers).await else {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     };
+
+    if blob_id.starts_with("mp1_") {
+        let Some(id) = crate::attachments::PartBlobId::parse(&blob_id) else {
+            return (StatusCode::BAD_REQUEST, "invalid blob id").into_response();
+        };
+        let ms = state.mailstore.clone();
+        return match tokio::task::spawn_blocking(move || {
+            crate::attachments::download(&ms, account_id, &id)
+        })
+        .await
+        {
+            Ok(Ok((part, bytes))) => {
+                let mut disposition = String::from("attachment; filename*=UTF-8''");
+                for byte in part.name.as_deref().unwrap_or("part").bytes() {
+                    if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                        disposition.push(char::from(byte));
+                    } else {
+                        disposition.push_str(&format!("%{byte:02X}"));
+                    }
+                }
+                let content_type =
+                    axum::http::HeaderValue::from_str(&part.mime).unwrap_or_else(|_| {
+                        axum::http::HeaderValue::from_static("application/octet-stream")
+                    });
+                (
+                    StatusCode::OK,
+                    [
+                        (axum::http::header::CONTENT_TYPE, content_type),
+                        (
+                            axum::http::header::CONTENT_DISPOSITION,
+                            axum::http::HeaderValue::from_str(&disposition)
+                                .expect("ASCII RFC 5987 value"),
+                        ),
+                        (
+                            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                            axum::http::HeaderValue::from_static("nosniff"),
+                        ),
+                        (
+                            axum::http::header::CONTENT_SECURITY_POLICY,
+                            axum::http::HeaderValue::from_static("sandbox"),
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response()
+            }
+            Ok(Err(crate::attachments::Error::NotFound)) => {
+                (StatusCode::NOT_FOUND, "blob not found").into_response()
+            }
+            Ok(Err(e @ crate::attachments::Error::TooLarge(_))) => {
+                (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response()
+            }
+            Ok(Err(e @ crate::attachments::Error::Unreadable(_))) => {
+                tracing::warn!(error = %e, "part download failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "unreadable: message").into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "part download worker failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        };
+    }
 
     if let Ok(id) = blob_id.parse::<uuid::Uuid>() {
         // UUID can be either a post-Task-3.3a JMAP `BlobId` alias
@@ -458,19 +517,13 @@ pub async fn blob_download(
         };
     }
 
-    let Some(hash) = cosmix_mds::blob::from_hex(&blob_id) else {
+    let Some(hash) = crate::mailstore::parse_hash(&blob_id) else {
         return (StatusCode::BAD_REQUEST, "invalid blob id").into_response();
     };
 
-    // Account ownership gate. CAS hashes are deduplicated across
-    // accounts in the mds blob store, so a global `mds.get_blob(&hash)`
-    // would let any authenticated user retrieve bytes by hash
-    // regardless of mailbox membership. We require a `blobs` row
-    // binding `(account_id, hash)` — written when this account either
-    // uploaded the bytes (`/upload`) or received them via SMTP. A
-    // missing row returns 404 (not 403) to avoid confirming that the
-    // hash exists somewhere on the server.
-    match db::blob::hash_owned_by_account(&state.db.conn, account_id, &blob_id).await {
+    // Prefer live mail / upload ownership in MDS. Old uploads retain an
+    // account-scoped legacy fallback until the legacy store is retired.
+    match hash_owned_by_account(&state.db, &state.mailstore, account_id, hash).await {
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "blob not found").into_response(),
         Err(e) => {
@@ -506,6 +559,19 @@ pub async fn blob_download(
     }
 }
 
+async fn hash_owned_by_account(
+    db: &Db,
+    mailstore: &Arc<SqliteMailStore>,
+    account: i32,
+    hash: cosmix_mds::BlobHash,
+) -> Result<bool> {
+    let ms = mailstore.clone();
+    if tokio::task::spawn_blocking(move || ms.owns_blob_hash(account, &hash)).await?? {
+        return Ok(true);
+    }
+    db::blob::hash_owned_by_account(&db.conn, account, &cosmix_mds::blob::hex(&hash)).await
+}
+
 /// POST /jmap/upload/{account_id} — Upload a blob.
 ///
 /// Migrated to MailStore CAS in Task 3.3a:
@@ -516,13 +582,8 @@ pub async fn blob_download(
 ///      `__upload_staging__` container with `expires_at = now + 1h`
 ///      (per `mailstore::expiry` v1.1 §1).
 ///
-/// Migration-window dual-write: a `db::blob` row is also inserted so
-/// the legacy `blob_download` CAS-hex gate (`hash_owned_by_account`)
-/// keeps working unchanged. Per
-/// `_doc/planned/jmap-mds-migration.md` §3.3a option (a), this is
-/// the lower-risk path while the legacy `/download` UUID branch is
-/// still serving traffic. The dual-write retires when the gate
-/// migrates to an mds-side ownership oracle.
+/// Uploads no longer write the legacy store. Downloads authorise hashes
+/// through live account-owned MDS items or valid upload aliases.
 pub async fn blob_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -538,11 +599,10 @@ pub async fn blob_upload(
     };
 
     let size = body.len();
-    let bytes = body.to_vec();
 
     // Step 1: write to MDS CAS (idempotent on hash). Sync API; spawn_blocking.
     let mds = state.mailstore.mds().clone();
-    let bytes_for_mds = bytes.clone();
+    let bytes_for_mds = body.to_vec();
     let blob_hash = match tokio::task::spawn_blocking(move || mds.put_blob(&bytes_for_mds)).await {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
@@ -593,24 +653,6 @@ pub async fn blob_upload(
                 .into_response();
         }
     };
-
-    // Step 3: dual-write a `db::blob` row binding `(account_id,
-    // hash)` so the legacy `/download` CAS-hex gate
-    // (`db::blob::hash_owned_by_account`) keeps resolving for blobs
-    // uploaded via this path. The UUID returned by `db::blob::store`
-    // is intentionally discarded — it is not exposed to the client;
-    // only the new MailStore `BlobId` is returned. This dual-write
-    // retires when the `/download` gate migrates to an mds-side
-    // ownership oracle (`_doc/planned/jmap-mds-migration.md` §3.3a
-    // option (b)).
-    if let Err(e) = db::blob::store(&state.db.conn, &state.db.blob_dir, account_id, &bytes).await {
-        tracing::error!(error = %e, "blob upload: db::blob dual-write failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "upload failed"})),
-        )
-            .into_response();
-    }
 
     let resp = serde_json::json!({
         "accountId": account_id.to_string(),

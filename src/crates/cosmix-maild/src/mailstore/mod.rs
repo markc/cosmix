@@ -15,6 +15,8 @@
 //! public surface are expected.
 #![allow(dead_code, unused_imports)]
 
+mod blobs;
+pub(crate) use blobs::parse_hash;
 pub mod expiry;
 pub mod retrain;
 mod search;

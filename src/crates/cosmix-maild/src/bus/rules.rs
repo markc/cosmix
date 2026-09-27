@@ -25,6 +25,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+#[cfg(test)]
 use base64::Engine as _;
 use cosmix_client::IncomingCommand;
 use cosmix_maild_rules::{AccountId, AccountOverrides, DefaultRuleEngine, RuleContext, RuleEngine};
@@ -44,6 +45,7 @@ const RC_ERROR: u8 = 10;
 /// Action arguments are resolved via `super::resolve_args` so the
 /// `args:` header takes precedence over the body — see that helper
 /// for the full ordering rationale.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     action: &str,
     cmd: &IncomingCommand,
@@ -52,6 +54,7 @@ pub async fn dispatch(
     hostname: &str,
     overrides_runtime: &Arc<Runtime>,
     db: &db::Db,
+    input: &impl super::diagnostics::MessageLoader,
 ) -> (u8, String) {
     match action {
         "reload" => handle_reload(rule_engine).await,
@@ -65,8 +68,11 @@ pub async fn dispatch(
             Err(e) => (RC_ERROR, err_body(&format!("malformed stats request: {e}"))),
         },
         "explain" => {
-            let args = super::resolve_args(cmd);
-            handle_explain(rule_engine, &args, hostname, overrides_runtime, db).await
+            let args = match super::try_resolve_args(cmd) {
+                Ok(args) => args,
+                Err(e) => return (RC_ERROR, err_body(&format!("invalid_arguments: {e}"))),
+            };
+            handle_explain(rule_engine, &args, hostname, overrides_runtime, db, input).await
         }
         other => (
             RC_ERROR,
@@ -223,7 +229,6 @@ struct ExplainRequest {
     envelope_from: String,
     envelope_to: Vec<String>,
     peer_ip: String,
-    message_b64: String,
     /// Explain the message as if it arrived on a SASL-authenticated
     /// submission session (`RuleContext::sender_authenticated`): the
     /// mail-auth hard-fail rules and the auth half of the structural
@@ -244,6 +249,7 @@ async fn handle_explain(
     hostname: &str,
     overrides_runtime: &Arc<Runtime>,
     db: &db::Db,
+    input: &impl super::diagnostics::MessageLoader,
 ) -> (u8, String) {
     let req: ExplainRequest = match serde_json::from_value(args.clone()) {
         Ok(r) => r,
@@ -269,10 +275,9 @@ async fn handle_explain(
         Err(e) => return (RC_ERROR, err_body(&format!("peer_ip parse: {e}"))),
     };
 
-    let message = match base64::engine::general_purpose::STANDARD.decode(req.message_b64.as_bytes())
-    {
+    let message = match input.load(args).await {
         Ok(b) => b,
-        Err(e) => return (RC_ERROR, err_body(&format!("message_b64 decode: {e}"))),
+        Err(e) => return (RC_ERROR, err_body(&e)),
     };
 
     let account_id_str = req
@@ -530,6 +535,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let db_handle = db::Db {
             conn: Arc::new(Mutex::new(conn)),
+            migration: Arc::new(tokio::sync::Semaphore::new(1)),
             blob_dir: tmp.path().to_path_buf(),
         };
         (overrides_runtime, db_handle, tmp)
@@ -743,7 +749,15 @@ mod tests {
             "message_b64": b64,
             "mail_auth": null,
         });
-        let (rc, body) = handle_explain(&e, &args, "test.example", &orx, &db).await;
+        let (rc, body) = handle_explain(
+            &e,
+            &args,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["rules"].is_array());
@@ -761,6 +775,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explain_blob_matches_legacy_and_enforces_exactly_one_and_configured_cap() {
+        use super::super::diagnostics::{Input, Legacy, TestLane};
+        let engine = engine();
+        let (runtime, db, _tmp) = explain_fixtures();
+        let raw = b"From: sender@example.test\r\nSubject: hello\r\n\r\nhello";
+        let mut args = serde_json::json!({"envelope_from": "sender@example.test", "envelope_to": ["user@example.test"],
+            "peer_ip": "192.0.2.1", "message_b64": base64::engine::general_purpose::STANDARD.encode(raw)});
+        let (rc, legacy) = handle_explain(
+            &engine,
+            &args,
+            "test.example",
+            &runtime,
+            &db,
+            &Legacy::default(),
+        )
+        .await;
+        assert_eq!(rc, 0, "{legacy}");
+        args.as_object_mut().unwrap().remove("message_b64");
+        args["blob"] = serde_json::json!({"blob": format!("b3:{}", blake3::hash(raw).to_hex()), "origin": "beta"});
+        for (status, cap, token) in [
+            (200, raw.len(), None),
+            (200, raw.len() - 1, Some("too_large:")),
+            (404, raw.len(), Some("not_present:")),
+        ] {
+            let lane = TestLane::new(raw, status).await;
+            let input = Input {
+                discovery: &lane,
+                max_message_size: cap,
+            };
+            let (rc, body) =
+                handle_explain(&engine, &args, "test.example", &runtime, &db, &input).await;
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(token) = token {
+                assert_eq!(rc, 10);
+                assert!(body["error"].as_str().unwrap().starts_with(token), "{body}");
+            } else {
+                assert_eq!(rc, 0, "{body}");
+                let legacy: serde_json::Value = serde_json::from_str(&legacy).unwrap();
+                assert_eq!(body["verdict"], legacy["verdict"]);
+                assert_eq!(body["rules"], legacy["rules"]);
+            }
+            lane.finish().await;
+        }
+        args["message_b64"] = serde_json::json!("");
+        let (rc, body) = handle_explain(
+            &engine,
+            &args,
+            "test.example",
+            &runtime,
+            &db,
+            &Legacy::default(),
+        )
+        .await;
+        assert_eq!(rc, 10);
+        assert!(body.contains("exactly one"));
+        args.as_object_mut().unwrap().remove("message_b64");
+        args.as_object_mut().unwrap().remove("blob");
+        assert_eq!(
+            handle_explain(
+                &engine,
+                &args,
+                "test.example",
+                &runtime,
+                &db,
+                &Legacy::default()
+            )
+            .await
+            .0,
+            10
+        );
+        args["message_b64"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(raw));
+        let (rc, body) = handle_explain(
+            &engine,
+            &args,
+            "test.example",
+            &runtime,
+            &db,
+            &Legacy { cap: 1 },
+        )
+        .await;
+        assert_eq!(rc, 10);
+        assert!(body.contains("too_large:"));
+    }
+
+    #[tokio::test]
     async fn explain_without_account_id_uses_engine_defaults_without_db_lookup() {
         // C4: omitting `account_id` skips the substrate lookup entirely
         // — the note reflects "no account_id supplied", not a DB miss.
@@ -775,7 +875,15 @@ mod tests {
             "message_b64": b64,
             "mail_auth": null,
         });
-        let (rc, body) = handle_explain(&e, &args, "test.example", &orx, &db).await;
+        let (rc, body) = handle_explain(
+            &e,
+            &args,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["overrides_resolved"], serde_json::Value::Bool(false));
@@ -840,7 +948,15 @@ mod tests {
             "message_b64": b64,
             "mail_auth": null,
         });
-        let (rc, body) = handle_explain(&e, &args, "test.example", &orx, &db).await;
+        let (rc, body) = handle_explain(
+            &e,
+            &args,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["overrides_resolved"], serde_json::Value::Bool(true));
@@ -886,7 +1002,15 @@ mod tests {
             "message_b64": b64,
             "mail_auth": null,
         });
-        let (rc, body) = handle_explain(&e, &args, "test.example", &orx, &db).await;
+        let (rc, body) = handle_explain(
+            &e,
+            &args,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["overrides_resolved"], serde_json::Value::Bool(true));
@@ -914,7 +1038,15 @@ mod tests {
             "message_b64": "***not base64***",
             "mail_auth": null,
         });
-        let (rc, body) = handle_explain(&e, &args, "test.example", &orx, &db).await;
+        let (rc, body) = handle_explain(
+            &e,
+            &args,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("decode"));
@@ -931,7 +1063,15 @@ mod tests {
             "message_b64": base64::engine::general_purpose::STANDARD.encode(b""),
             "mail_auth": null,
         });
-        let (rc, body) = handle_explain(&e, &args, "test.example", &orx, &db).await;
+        let (rc, body) = handle_explain(
+            &e,
+            &args,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("peer_ip"));
@@ -948,7 +1088,15 @@ mod tests {
             "message_b64": base64::engine::general_purpose::STANDARD.encode(b""),
             "mail_auth": {"some": "object"},
         });
-        let (rc, body) = handle_explain(&e, &args, "test.example", &orx, &db).await;
+        let (rc, body) = handle_explain(
+            &e,
+            &args,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("Phase 2"));
@@ -979,7 +1127,17 @@ mod tests {
         let s = Arc::new(RuleStats::new());
         let (orx, db, _tmp) = explain_fixtures();
         let cmd = cmd_with("", None, serde_json::Value::Null);
-        let (rc, body) = dispatch("bogus", &cmd, &e, &s, "h", &orx, &db).await;
+        let (rc, body) = dispatch(
+            "bogus",
+            &cmd,
+            &e,
+            &s,
+            "h",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
@@ -1009,7 +1167,17 @@ mod tests {
         .to_string();
         let (orx, db, _tmp) = explain_fixtures();
         let cmd = cmd_with("", Some(&args_json), serde_json::Value::Null);
-        let (rc, body) = dispatch("explain", &cmd, &e, &s, "test.example", &orx, &db).await;
+        let (rc, body) = dispatch(
+            "explain",
+            &cmd,
+            &e,
+            &s,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["rules"].is_array());
@@ -1035,7 +1203,17 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body_json).unwrap();
         let (orx, db, _tmp) = explain_fixtures();
         let cmd = cmd_with(&body_json, None, parsed);
-        let (rc, _) = dispatch("explain", &cmd, &e, &s, "test.example", &orx, &db).await;
+        let (rc, _) = dispatch(
+            "explain",
+            &cmd,
+            &e,
+            &s,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0);
     }
 
@@ -1067,7 +1245,17 @@ mod tests {
         .to_string();
         let (orx, db, _tmp) = explain_fixtures();
         let cmd = cmd_with(&bad_body, Some(&header_args), serde_json::Value::Null);
-        let (rc, body) = dispatch("explain", &cmd, &e, &s, "test.example", &orx, &db).await;
+        let (rc, body) = dispatch(
+            "explain",
+            &cmd,
+            &e,
+            &s,
+            "test.example",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
     }
 
@@ -1082,7 +1270,17 @@ mod tests {
         let s = Arc::new(RuleStats::new());
         let (orx, db, _tmp) = explain_fixtures();
         let cmd = cmd_with("", Some("{not json"), serde_json::Value::Null);
-        let (rc, body) = dispatch("stats", &cmd, &e, &s, "h", &orx, &db).await;
+        let (rc, body) = dispatch(
+            "stats",
+            &cmd,
+            &e,
+            &s,
+            "h",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, RC_ERROR, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let err = v["error"].as_str().unwrap();
@@ -1102,7 +1300,17 @@ mod tests {
         let s = Arc::new(RuleStats::new());
         let (orx, db, _tmp) = explain_fixtures();
         let cmd = cmd_with("{not json", None, serde_json::Value::Null);
-        let (rc, body) = dispatch("stats", &cmd, &e, &s, "h", &orx, &db).await;
+        let (rc, body) = dispatch(
+            "stats",
+            &cmd,
+            &e,
+            &s,
+            "h",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, RC_ERROR, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let err = v["error"].as_str().unwrap();
@@ -1119,7 +1327,17 @@ mod tests {
         let s = Arc::new(RuleStats::new());
         let (orx, db, _tmp) = explain_fixtures();
         let cmd = cmd_with("", None, serde_json::Value::Null);
-        let (rc, body) = dispatch("stats", &cmd, &e, &s, "h", &orx, &db).await;
+        let (rc, body) = dispatch(
+            "stats",
+            &cmd,
+            &e,
+            &s,
+            "h",
+            &orx,
+            &db,
+            &super::super::diagnostics::Legacy::default(),
+        )
+        .await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["per_rule"].is_object());

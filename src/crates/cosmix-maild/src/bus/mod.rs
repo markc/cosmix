@@ -14,7 +14,10 @@
 //! do not leave maild permanently invisible to Bus until process restart.
 
 pub mod accounts;
+pub mod attachments;
 pub mod bayesian;
+pub mod blobs;
+pub mod diagnostics;
 pub mod dkim;
 pub mod props_publisher;
 pub mod retention;
@@ -150,6 +153,7 @@ pub async fn run(
     retention_state: retention::RetentionBusState,
     vtoken_state: vtoken::VtokenBusState,
     bayesian_state: bayesian::BayesianBusState,
+    max_message_size: usize,
 ) {
     let bi = cosmix_buildinfo::build_info!();
     let prov = cosmix_bus::RegisterProvenance::from_parts(
@@ -273,6 +277,7 @@ pub async fn run(
             retention_state.clone(),
             vtoken_state.clone(),
             bayesian_state.clone(),
+            max_message_size,
         )
         .await
         {
@@ -353,6 +358,30 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new("maild.rules.reload", &[], "Reload mail rules", false),
         VerbDescriptor::new(
+            "maild.attachment.list",
+            &["account_id", "email_id"],
+            "Inspect message MIME parts",
+            true,
+        ),
+        VerbDescriptor::new(
+            "maild.attachment.ref",
+            &["account_id", "email_id", "part", "name"],
+            "Export and pin a MIME part",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.message.ref",
+            &["account_id", "email_id"],
+            "Export and pin a whole message",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.blob.migrate",
+            &["apply", "account_id", "cursor", "limit"],
+            "Migrate a bounded page of legacy blobs (dry-run by default)",
+            false,
+        ),
+        VerbDescriptor::new(
             "maild.rules.stats",
             &["top_n"],
             "Read mail rule statistics",
@@ -366,6 +395,7 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
                 "envelope_to",
                 "peer_ip",
                 "message_b64",
+                "blob",
                 "sender_authenticated",
                 "mail_auth",
             ],
@@ -380,7 +410,7 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new(
             "maild.bayesian.classify",
-            &["account_id", "message_b64"],
+            &["account_id", "message_b64", "blob"],
             "Classify a message without training",
             true,
         ),
@@ -594,6 +624,7 @@ async fn dispatch_loop(
     retention_state: retention::RetentionBusState,
     vtoken_state: vtoken::VtokenBusState,
     bayesian_state: bayesian::BayesianBusState,
+    max_message_size: usize,
 ) -> DispatchLoopExit {
     let mut rx = match client.incoming_async().await {
         Some(rx) => rx,
@@ -602,7 +633,95 @@ async fn dispatch_loop(
         }
     };
 
+    let mut transfers = crate::blob_lane::Transfers::default();
+    let mut maintenance = tokio::task::JoinSet::new();
     while let Some(cmd) = rx.recv().await {
+        if !client.is_connected() {
+            break;
+        }
+        while let Some(result) = maintenance.try_join_next() {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "migration task failed");
+            }
+        }
+        if cmd.command == "maild.blob.migrate" {
+            let Ok(permit) = db.migration.clone().try_acquire_owned() else {
+                let body =
+                    serde_json::json!({"error": "busy: migration already running"}).to_string();
+                crate::blob_lane::bounded_response(client.respond(&cmd, 10, &body)).await;
+                continue;
+            };
+            let permit = Arc::new(permit);
+            let client = client.clone();
+            let db = db.clone();
+            let mailstore = mailstore.clone();
+            maintenance.spawn(async move {
+                let (rc, body) = blobs::dispatch(&cmd, &db, &mailstore, permit.clone()).await;
+                crate::blob_lane::bounded_response(client.respond(&cmd, rc, &body)).await;
+                drop(permit);
+            });
+            continue;
+        }
+        if is_transfer(&cmd.command) || is_blob_diagnostic(&cmd) {
+            if transfers.is_full() {
+                let body =
+                    serde_json::json!({"error": "busy: maild blob transfer pool is full (8)"})
+                        .to_string();
+                crate::blob_lane::bounded_response(client.respond(&cmd, 10, &body)).await;
+                continue;
+            }
+            let client = client.clone();
+            let db = db.clone();
+            let mailstore = mailstore.clone();
+            let rule_engine = rule_engine.clone();
+            let rule_stats = rule_stats.clone();
+            let classifier = classifier.clone();
+            let hostname = hostname.clone();
+            let overrides_runtime = overrides_runtime.clone();
+            let bayesian_state = bayesian_state.clone();
+            transfers
+                .spawn(async move {
+                    let input = diagnostics::Input {
+                        discovery: client.as_ref(),
+                        max_message_size,
+                    };
+                    let (rc, body) = match cmd.command.as_str() {
+                        "maild.rules.explain" => {
+                            rules::dispatch(
+                                "explain",
+                                &cmd,
+                                &rule_engine,
+                                &rule_stats,
+                                &hostname,
+                                &overrides_runtime,
+                                &db,
+                                &input,
+                            )
+                            .await
+                        }
+                        "maild.bayesian.classify" => {
+                            bayesian::dispatch(
+                                "classify",
+                                &cmd,
+                                &classifier,
+                                &db,
+                                &mailstore,
+                                &bayesian_state,
+                                &input,
+                            )
+                            .await
+                        }
+                        _ => dispatch_attachment(&cmd, &db, &mailstore, &client).await,
+                    };
+                    crate::blob_lane::bounded_response(client.respond(&cmd, rc, &body)).await;
+                })
+                .expect("slot checked without yielding or sharing the task set");
+            continue;
+        }
+        let input = diagnostics::Input {
+            discovery: client.as_ref(),
+            max_message_size,
+        };
         let (rc, body) = if let Some(action) = cmd.command.strip_prefix("maild.rules.") {
             rules::dispatch(
                 action,
@@ -612,10 +731,20 @@ async fn dispatch_loop(
                 &hostname,
                 &overrides_runtime,
                 &db,
+                &input,
             )
             .await
         } else if let Some(action) = cmd.command.strip_prefix("maild.bayesian.") {
-            bayesian::dispatch(action, &cmd, &classifier, &db, &mailstore, &bayesian_state).await
+            bayesian::dispatch(
+                action,
+                &cmd,
+                &classifier,
+                &db,
+                &mailstore,
+                &bayesian_state,
+                &input,
+            )
+            .await
         } else if let Some(action) = cmd.command.strip_prefix("maild.accounts.") {
             accounts::dispatch(action, &cmd, &db, &mailstore, &accounts_runtime).await
         } else if let Some(action) = cmd.command.strip_prefix("maild.search.") {
@@ -639,7 +768,45 @@ async fn dispatch_loop(
             tracing::warn!(error = %e, command = %cmd.command, "Bus response send failed");
         }
     }
+    transfers.shutdown().await;
+    maintenance.shutdown().await;
     DispatchLoopExit::StreamEnded
+}
+
+fn is_transfer(command: &str) -> bool {
+    matches!(
+        command,
+        "maild.attachment.list" | "maild.attachment.ref" | "maild.message.ref"
+    )
+}
+
+fn is_blob_diagnostic(cmd: &IncomingCommand) -> bool {
+    matches!(
+        cmd.command.as_str(),
+        "maild.rules.explain" | "maild.bayesian.classify"
+    ) && try_resolve_args(cmd).is_ok_and(|args| args.get("blob").is_some())
+}
+
+async fn dispatch_attachment(
+    cmd: &IncomingCommand,
+    db: &db::Db,
+    ms: &Arc<SqliteMailStore>,
+    client: &NodedClient,
+) -> (u8, String) {
+    let args = match try_resolve_args(cmd) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                10,
+                serde_json::json!({"error": format!("invalid_arguments: {e}")}).to_string(),
+            );
+        }
+    };
+    let lane = match crate::blob_lane::Lane::new() {
+        Ok(lane) => lane,
+        Err(e) => return (10, serde_json::json!({"error": e}).to_string()),
+    };
+    attachments::dispatch(&cmd.command, args, db, ms, &lane, client).await
 }
 
 /// Bridge an [`IncomingCommand`] into the [`PropsRouter`]'s
@@ -681,6 +848,61 @@ fn unknown_action_body(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_manifest_and_transfer_admission_match_the_wire_contract() {
+        let manifest = verb_manifest();
+        for (name, args, read_only) in [
+            (
+                "maild.attachment.list",
+                vec!["account_id", "email_id"],
+                true,
+            ),
+            (
+                "maild.attachment.ref",
+                vec!["account_id", "email_id", "part", "name"],
+                false,
+            ),
+            ("maild.message.ref", vec!["account_id", "email_id"], false),
+            (
+                "maild.blob.migrate",
+                vec!["apply", "account_id", "cursor", "limit"],
+                false,
+            ),
+        ] {
+            let verb = manifest.iter().find(|v| v.name == name).unwrap();
+            assert_eq!(verb.args, args);
+            assert_eq!(verb.read_only, read_only);
+        }
+        assert!(is_transfer("maild.attachment.ref"));
+        assert!(is_transfer("maild.message.ref"));
+        assert!(!is_transfer("maild.rules.explain"));
+        assert!(!is_transfer("maild.bayesian.classify"));
+        for name in ["maild.rules.explain", "maild.bayesian.classify"] {
+            let verb = manifest.iter().find(|v| v.name == name).unwrap();
+            assert!(verb.args.iter().any(|a| a == "blob"));
+            assert!(verb.args.iter().any(|a| a == "message_b64"));
+            assert!(verb.read_only);
+            let mut cmd = IncomingCommand {
+                from: "test".into(),
+                command: name.into(),
+                id: None,
+                args: serde_json::json!({"message_b64": ""}),
+                body: String::new(),
+                headers: Default::default(),
+            };
+            assert!(!is_blob_diagnostic(&cmd));
+            cmd.headers.insert(
+                "args".into(),
+                serde_json::json!({"blob": "b3:test"}).to_string(),
+            );
+            assert!(is_blob_diagnostic(&cmd));
+            cmd.headers.insert("args".into(), "invalid JSON".into());
+            assert!(!is_blob_diagnostic(&cmd)); // strict dispatcher refuses it
+        }
+        assert!(is_transfer("maild.attachment.list"));
+        assert!(!is_transfer("maild.blob.migrate"));
+    }
 
     #[test]
     fn unknown_action_rc_is_in_error_range() {
