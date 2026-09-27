@@ -1,0 +1,47 @@
+-- version: 0.1.0
+-- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
+$catalogue = require("store_catalogue.mix")
+$STATE = env("STORED_STATE_DIR", env("STATE_DIRECTORY", env("COSMIX_VAR", env("XDG_STATE_HOME", env("HOME") .. "/.local/state") .. "/cosmix") .. "/stored"))
+$BLOBD = env("STORED_BLOBD", "blobd")
+if not re_match($BLOBD, "^blobd(-[a-z0-9-]+)?$") then raise("STORE_CONFIG", "STORED_BLOBD must be a local blobd service") end
+mkdir($STATE)
+if not stat($STATE, {follow_symlinks: false}).is_dir then raise("STORE_CONFIG", "state must be a real directory") end
+if not flock($STATE .. "/.writer-lock") then raise("STORE_LOCKED", "another stored owns this state directory") end
+$DB_PATH = $STATE .. "/catalogue.sqlite"
+$catalogue.initialise($DB_PATH, $BLOBD)
+
+fn answer($verb, $args)
+  $db = nil
+  try
+    $db = $catalogue.connect($DB_PATH)
+    $result = $catalogue.request($db, $verb, $args ?? {})
+    reply(0, json_encode($result))
+  catch $message, $error
+    reply(10, json_encode({error_code: $error.code, message: $message}))
+  finally
+    if $db != nil then sqlclose($db) end
+  end
+end
+
+on store.collection.list desc "List collections {after?,limit?}"
+  answer("store.collection.list", $event.args)
+end
+on store.collection.create desc "Idempotently create collection {name}"
+  answer("store.collection.create", $event.args)
+end
+on store.snapshot.list desc "List live snapshots {collection,after?,limit?}"
+  answer("store.snapshot.list", $event.args)
+end
+on store.snapshot.get desc "Read and verify manifest {collection,id}"
+  answer("store.snapshot.get", $event.args)
+end
+on store.snapshot.forget desc "Tombstone snapshot, retaining all pins {collection,id}"
+  answer("store.snapshot.forget", $event.args)
+end
+on store.commit.status desc "Durable commit status {collection,id}"
+  answer("store.commit.status", $event.args)
+end
+on store.info desc "Catalogue counts, schema, local blobd and retention policy"
+  answer("store.info", $event.args)
+end
+print("stored: catalogue ready")

@@ -1,0 +1,117 @@
+-- version: 0.1.0
+-- Short SQL transactions only. Handles belong to each caller, never globals.
+$m = require("store_manifest.mix")
+
+fn connect($path)
+  $db = sqlopen($path, "rw")
+  try
+    sqlexec($db, "PRAGMA synchronous=FULL")
+    sqlexec($db, "PRAGMA foreign_keys=ON")
+    if sqlexec($db, "PRAGMA synchronous")[0].synchronous != 2 or sqlexec($db, "PRAGMA foreign_keys")[0].foreign_keys != 1 then
+      raise("STORE_DB", "required durability pragmas unavailable")
+    end
+    return $db
+  catch $message
+    sqlclose($db)
+    raise("STORE_DB", $message)
+  end
+end
+
+fn initialise($path, $blobd)
+  $db = connect($path)
+  try
+    sqlexec($db, "BEGIN IMMEDIATE")
+    $version = sqlexec($db, "PRAGMA user_version")[0].user_version
+    $app = sqlexec($db, "PRAGMA application_id")[0].application_id
+    if $version == 0 and $app == 0 then
+      if length(sqlexec($db, "SELECT name FROM sqlite_master WHERE type='table'")) != 0 then raise("STORE_DB", "refusing foreign database") end
+      sqlexec($db, "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+      sqlexec($db, "CREATE TABLE collections(name TEXT PRIMARY KEY, created_at INTEGER NOT NULL, owner_label TEXT NOT NULL UNIQUE)")
+      sqlexec($db, "CREATE TABLE snapshots(collection TEXT NOT NULL REFERENCES collections(name), id TEXT NOT NULL, canonical_json TEXT NOT NULL, manifest_blob TEXT NOT NULL, created_at INTEGER NOT NULL, size INTEGER NOT NULL CHECK(size>=0), file_count INTEGER NOT NULL CHECK(file_count BETWEEN 0 AND 1000), tombstoned_at INTEGER, PRIMARY KEY(collection,id))")
+      sqlexec($db, "CREATE TABLE snapshot_objects(collection TEXT NOT NULL, snapshot TEXT NOT NULL, blob TEXT NOT NULL, size INTEGER NOT NULL CHECK(size>=0), PRIMARY KEY(collection,snapshot,blob), FOREIGN KEY(collection,snapshot) REFERENCES snapshots(collection,id))")
+      sqlexec($db, "CREATE TABLE commit_intents(collection TEXT NOT NULL REFERENCES collections(name), id TEXT NOT NULL, canonical_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','failed','committed')), error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(collection,id))")
+      sqlexec($db, "CREATE UNIQUE INDEX one_pending_commit ON commit_intents((1)) WHERE state='pending'")
+      sqlexec($db, "INSERT INTO settings VALUES('blobd',?)", [$blobd])
+      sqlexec($db, "PRAGMA application_id=1129534546")
+      sqlexec($db, "PRAGMA user_version=1")
+    elif $version != 1 or $app != 1129534546 then
+      raise("STORE_DB", "unsupported catalogue schema or application")
+    end
+    if sqlexec($db, "SELECT value FROM settings WHERE key='blobd'")[0].value != $blobd then
+      raise("STORE_DB", "catalogue belongs to a different local blobd instance")
+    end
+    sqlexec($db, "COMMIT")
+  catch $message, $error
+    sqlexec($db, "ROLLBACK")
+    raise($error.code, $message)
+  finally
+    sqlclose($db)
+  end
+end
+
+fn require_collection($db, $name)
+  $m.collection($name)
+  $rows = sqlexec($db, "SELECT * FROM collections WHERE name=?", [$name])
+  if length($rows) == 0 then raise("STORE_NOT_FOUND", "collection not found") end
+  return $rows[0]
+end
+
+fn page($args)
+  $limit = $m.uint($args.limit ?? 100)
+  if $limit < 1 or $limit > 100 then raise("STORE_LIMIT", "list limit must be 1..100") end
+  $after = $args.after ?? ""
+  if type($after) != "string" then raise("STORE_CURSOR", "cursor must be text") end
+  return {limit: $limit, after: $after}
+end
+
+fn snapshot($db, $collection, $id)
+  require_collection($db, $collection)
+  $m.blob($id)
+  $rows = sqlexec($db, "SELECT * FROM snapshots WHERE collection=? AND id=?", [$collection, $id])
+  if length($rows) == 0 then raise("STORE_NOT_FOUND", "snapshot not found") end
+  return $rows[0]
+end
+
+fn request($db, $verb, $args)
+  if type($args) != "map" then raise("STORE_SCHEMA", "request must be an object") end
+  if $verb == "store.collection.create" then
+    $name = $m.collection($args.name)
+    sqlexec($db, "INSERT OR IGNORE INTO collections VALUES(?,?,?)", [$name, floor(time()), "store:" .. $name])
+    return require_collection($db, $name)
+  elif $verb == "store.collection.list" then
+    $p = page($args)
+    $rows = sqlexec($db, "SELECT * FROM collections WHERE name>? ORDER BY name LIMIT ?", [$p.after, $p.limit])
+    return {collections: $rows, next: length($rows) == $p.limit ? $rows[length($rows)-1].name : nil}
+  elif $verb == "store.snapshot.list" then
+    require_collection($db, $args.collection)
+    $p = page($args)
+    if $p.after != "" then $m.blob($p.after) end
+    $rows = sqlexec($db, "SELECT id,created_at,size,file_count FROM snapshots WHERE collection=? AND id>? AND tombstoned_at IS NULL ORDER BY id LIMIT ?", [$args.collection, $p.after, $p.limit])
+    return {snapshots: $rows, next: length($rows) == $p.limit ? $rows[length($rows)-1].id : nil}
+  elif $verb == "store.snapshot.get" then
+    $row = snapshot($db, $args.collection, $args.id)
+    if $row.tombstoned_at != nil then raise("STORE_FORGOTTEN", "snapshot is tombstoned") end
+    $verified = $m.verify(json_parse($row.canonical_json), $row.id)
+    if $verified.canonical != $row.canonical_json then raise("STORE_DB", "noncanonical catalogue manifest") end
+    return {id: $row.id, manifest: $verified.manifest, manifest_blob: $row.manifest_blob}
+  elif $verb == "store.snapshot.forget" then
+    snapshot($db, $args.collection, $args.id)
+    sqlexec($db, "UPDATE snapshots SET tombstoned_at=COALESCE(tombstoned_at,?) WHERE collection=? AND id=?", [floor(time()), $args.collection, $args.id])
+    return {id: $args.id, forgotten: true, pins_retained: true}
+  elif $verb == "store.commit.status" then
+    require_collection($db, $args.collection)
+    $m.blob($args.id)
+    $rows = sqlexec($db, "SELECT collection,id,state,error,created_at,updated_at FROM commit_intents WHERE collection=? AND id=?", [$args.collection, $args.id])
+    if length($rows) == 0 then raise("STORE_NOT_FOUND", "commit not found") end
+    $out = $rows[0]
+    $forgotten = sqlexec($db, "SELECT tombstoned_at FROM snapshots WHERE collection=? AND id=?", [$args.collection, $args.id])
+    $out.forgotten = length($forgotten) > 0 and $forgotten[0].tombstoned_at != nil
+    return $out
+  elif $verb == "store.info" then
+    return {schema_version: 1, collections: sqlexec($db, "SELECT COUNT(*) AS n FROM collections")[0].n,
+      snapshots: sqlexec($db, "SELECT COUNT(*) AS n FROM snapshots WHERE tombstoned_at IS NULL")[0].n,
+      pending: sqlexec($db, "SELECT COUNT(*) AS n FROM commit_intents WHERE state='pending'")[0].n,
+      blobd: sqlexec($db, "SELECT value FROM settings WHERE key='blobd'")[0].value, release_policy: "retain"}
+  end
+  raise("STORE_VERB", "unknown store verb")
+end

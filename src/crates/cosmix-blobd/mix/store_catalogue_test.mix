@@ -1,0 +1,55 @@
+-- version: 0.1.0
+$c = require("store_catalogue.mix")
+$m = require("store_manifest.mix")
+$dir = env("TMPDIR", "/tmp") .. "/store-catalogue-test-" .. uuid()
+mkdir($dir)
+$path = $dir .. "/catalogue.sqlite"
+$db = nil
+$checks = buffer()
+fn check($condition, $token)
+  if not $condition then raise("TEST", $token) end
+  buffer_push($checks, 1)
+end
+try
+  $c.initialise($path, "blobd-two")
+  $c.initialise($path, "blobd-two")
+  $db = $c.connect($path)
+  $a = $c.request($db, "store.collection.create", {name: "alpha"})
+  $b = $c.request($db, "store.collection.create", {name: "alpha"})
+  check(deep_eq($a, $b) and $a.owner_label == "store:alpha", "CREATE_REPLAY")
+  $c.request($db, "store.collection.create", {name: "beta"})
+  $p = $c.request($db, "store.collection.list", {limit: 1})
+  check(length($p.collections) == 1 and $p.next == "alpha", "PAGE_ONE")
+  check($c.request($db, "store.collection.list", {after: $p.next}).collections[0].name == "beta", "PAGE_TWO")
+  $v = $m.canonicalise({schema_version: 2, files: []})
+  -- Seed a committed fixture; production publication is tested by commit tests.
+  sqlexec($db, "INSERT INTO snapshots VALUES(?,?,?,?,?,?,?,NULL)", ["alpha", $v.id, $v.canonical, $v.id, 1, 0, 0])
+  sqlexec($db, "INSERT INTO commit_intents VALUES(?,?,?,'committed',NULL,1,1)", ["alpha", $v.id, $v.canonical])
+  check($c.request($db, "store.snapshot.get", {collection: "alpha", id: $v.id}).id == $v.id, "GET")
+  check($c.request($db, "store.snapshot.forget", {collection: "alpha", id: $v.id}).pins_retained, "FORGET")
+  $c.request($db, "store.snapshot.forget", {collection: "alpha", id: $v.id})
+  check(length($c.request($db, "store.snapshot.list", {collection: "alpha"}).snapshots) == 0, "HIDDEN")
+  check($c.request($db, "store.commit.status", {collection: "alpha", id: $v.id}).forgotten, "STATUS_TOMBSTONE")
+  $caught = ""
+  try
+    $c.request($db, "store.snapshot.get", {collection: "alpha", id: $v.id})
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_FORGOTTEN", "TOMBSTONE_TOKEN")
+  sqlclose($db)
+  $db = $c.connect($path)
+  check($c.request($db, "store.commit.status", {collection: "alpha", id: $v.id}).state == "committed", "REOPEN")
+  $caught = ""
+  try
+    $c.initialise($path, "blobd")
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_DB", "WRONG_INSTANCE")
+  check(sqlexec($db, "PRAGMA integrity_check")[0].integrity_check == "ok", "INTEGRITY")
+finally
+  if $db != nil then sqlclose($db) end
+  remove_dir($dir)
+end
+print("store_catalogue_test: PASS " .. to_string(length(freeze($checks))))

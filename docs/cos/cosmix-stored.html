@@ -468,7 +468,32 @@ pass the new byte limit; migration must never truncate or omit entries.</p>
 <h2 id="tests">Tests</h2>
 <p>From the checkout, without root or a broker:</p>
 <pre><code class="language-text">mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
-</code></pre></div></div>
+mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
+</code></pre>
+<h2 id="catalogue-citizen">Catalogue citizen</h2>
+<p>Run <code>mix --serve stored.mix --name stored</code>. <code>STORED_STATE_DIR</code> overrides the
+state root; otherwise <code>STATE_DIRECTORY</code>, then the Cosmix/XDG state root is
+used. <code>STORED_BLOBD</code> selects a <strong>local</strong> instance (default <code>blobd</code>). A catalogue
+is bound to that instance and refuses accidental rebinding. An exclusive root
+lock prevents another process owning the same catalogue.</p>
+<p>SQLite schema 1 uses WAL, synchronous FULL, foreign keys, short transactions
+and explicit handle closure. Manifest JSON is TEXT, never a SQL BLOB. It
+records collections, snapshots, snapshot-object membership and commit intents.
+The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.</p>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>store.collection.create</code></td><td><code>name</code></td><td>Idempotent collection record</td></tr>
+<tr><td><code>store.collection.list</code></td><td><code>after?</code>, <code>limit?</code></td><td><code>collections</code>, <code>next</code></td></tr>
+<tr><td><code>store.snapshot.list</code></td><td><code>collection</code>, <code>after?</code>, <code>limit?</code></td><td>Live <code>snapshots</code>, <code>next</code></td></tr>
+<tr><td><code>store.snapshot.get</code></td><td><code>collection</code>, <code>id</code></td><td>Verified <code>id</code>, <code>manifest</code>, <code>manifest_blob</code></td></tr>
+<tr><td><code>store.snapshot.forget</code></td><td><code>collection</code>, <code>id</code></td><td>Tombstone; <code>pins_retained:true</code></td></tr>
+<tr><td><code>store.commit.status</code></td><td><code>collection</code>, <code>id</code></td><td>Durable state, error, times, forgotten flag</td></tr>
+<tr><td><code>store.info</code></td><td>none</td><td>Counts, schema, blobd target and release policy</td></tr>
+</tbody></table>
+<p>Lists default to 100, accept 1..100, use exclusive lexical cursors. An exact
+full final page can require one extra empty read. Unknown records return
+<code>STORE_NOT_FOUND</code>; tombstoned gets return <code>STORE_FORGOTTEN</code>. Errors use rc 10
+with <code>error_code</code> and <code>message</code>. All verbs are mesh-open: owner labels account
+bytes and are not authenticated principals. Forget never releases blob pins.</p></div></div>
     </div>
 
 </main>

@@ -36,4 +36,34 @@ From the checkout, without root or a broker:
 
 ```text
 mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
+mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
 ```
+
+## Catalogue citizen
+
+Run `mix --serve stored.mix --name stored`. `STORED_STATE_DIR` overrides the
+state root; otherwise `STATE_DIRECTORY`, then the Cosmix/XDG state root is
+used. `STORED_BLOBD` selects a **local** instance (default `blobd`). A catalogue
+is bound to that instance and refuses accidental rebinding. An exclusive root
+lock prevents another process owning the same catalogue.
+
+SQLite schema 1 uses WAL, synchronous FULL, foreign keys, short transactions
+and explicit handle closure. Manifest JSON is TEXT, never a SQL BLOB. It
+records collections, snapshots, snapshot-object membership and commit intents.
+The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.
+
+| Verb | Arguments | Result |
+|---|---|---|
+| `store.collection.create` | `name` | Idempotent collection record |
+| `store.collection.list` | `after?`, `limit?` | `collections`, `next` |
+| `store.snapshot.list` | `collection`, `after?`, `limit?` | Live `snapshots`, `next` |
+| `store.snapshot.get` | `collection`, `id` | Verified `id`, `manifest`, `manifest_blob` |
+| `store.snapshot.forget` | `collection`, `id` | Tombstone; `pins_retained:true` |
+| `store.commit.status` | `collection`, `id` | Durable state, error, times, forgotten flag |
+| `store.info` | none | Counts, schema, blobd target and release policy |
+
+Lists default to 100, accept 1..100, use exclusive lexical cursors. An exact
+full final page can require one extra empty read. Unknown records return
+`STORE_NOT_FOUND`; tombstoned gets return `STORE_FORGOTTEN`. Errors use rc 10
+with `error_code` and `message`. All verbs are mesh-open: owner labels account
+bytes and are not authenticated principals. Forget never releases blob pins.
