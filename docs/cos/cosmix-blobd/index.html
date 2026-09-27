@@ -621,6 +621,9 @@ links use that exact descriptor, never a reopened source path. Hard-link
 staging must produce exactly two links to the checked inode or fail before
 publication. The independent session PATCH inode guard remains in place. Stage caller
 inputs outside that root. Hard-link ingest still requires an immutable source.
+MIME inference uses the caller's filename (or explicit name hint), even when
+a symlink resolves to a differently named source. Resolved paths and descriptors
+are used for admission and reading only.
 SQLite boundaries use checked signed 64-bit integers: negative stored sizes,
 offsets and timestamps report integer corruption; out-of-range unsigned
 inputs are refused before binding. The existing non-negative CHECK constraints

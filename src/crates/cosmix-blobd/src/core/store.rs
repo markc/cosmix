@@ -645,8 +645,7 @@ impl Store {
     }
 
     fn put_after_canonical(&self, src: &Path, opts: &PutOptions<'_>, after_canonical: impl FnOnce(&Path)) -> Result<PutOutcome> {
-        let (mut file, source) = self.ingest_root.source(src, after_canonical)?;
-        let src = source.as_path();
+        let (mut file, _resolved) = self.ingest_root.source(src, after_canonical)?;
         if opts.mode == PutMode::HardLink && !opts.immutable {
             return Err(StoreError::BadRequest(
                 "mode \"hardlink\" requires \"immutable\": true — only a publisher that \
@@ -2763,6 +2762,17 @@ mod tests {
             assert_eq!(state, if id == "complete" { "complete" } else { "failed" });
             assert!(dev.is_none() && ino.is_none());
         }
+    }
+
+    #[test]
+    fn copy_ingest_infers_mime_from_caller_alias_filename() {
+        let (dir, store) = store();
+        let target = write_src(&dir, "content.bin", b"PDF bytes");
+        let alias = dir.path().join("report.pdf");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let outcome = store.put(&alias, &PutOptions::new("tester")).unwrap();
+        assert_eq!(outcome.reference.mime, "application/pdf");
+        assert_eq!(blob::get(&store.blobs_root(), &outcome.reference.hash).unwrap(), b"PDF bytes");
     }
 
     #[test]
