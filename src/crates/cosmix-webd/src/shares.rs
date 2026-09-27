@@ -720,6 +720,7 @@ fn counted_body_with_deadlines(
 ) -> axum::body::Body {
     use futures_util::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (ack, mut acknowledgements) = tokio::sync::mpsc::channel(1);
     let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = aborted.clone();
     // This task owns BOTH the public permit and the upstream body (and its lane
@@ -733,7 +734,14 @@ fn counted_body_with_deadlines(
                     let Some(chunk) = stream.next().await else {
                         return false;
                     };
-                    tx.send(chunk.map_err(std::io::Error::other)).await.is_ok()
+                    if tx.send(chunk.map_err(std::io::Error::other)).await.is_err() {
+                        return false;
+                    }
+                    // Do not poll upstream again (including EOF) until the
+                    // downstream asks for its NEXT frame. The upstream stream
+                    // still owns its lane permit while the last chunk is queued
+                    // or delivered but downstream completion is not observed.
+                    acknowledgements.recv().await.is_some()
                 };
                 match tokio::time::timeout(idle, step).await {
                     Ok(true) => (),
@@ -745,23 +753,35 @@ fn counted_body_with_deadlines(
                 }
             }
         };
-        if tokio::time::timeout(lifetime, transfer).await.is_err() {
-            flag.store(true, std::sync::atomic::Ordering::Release);
+        tokio::select! {
+            result = tokio::time::timeout(lifetime, transfer) => {
+                if result.is_err() {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            _ = tx.closed() => (),
         }
     });
-    let state = (rx, aborted, vhost, token, false);
+    let state = (rx, ack, aborted, vhost, token, false, false, false);
     axum::body::Body::from_stream(futures_util::stream::unfold(
         state,
-        |(mut rx, aborted, vhost, token, mut counted)| async move {
-            let chunk = rx.recv().await?;
+        |(mut rx, ack, aborted, vhost, token, mut counted, ack_pending, ended)| async move {
+            if ended {
+                return None;
+            }
+            if ack_pending {
+                let _ = ack.try_send(());
+            }
+            let chunk = rx.recv().await;
             if aborted.load(std::sync::atomic::Ordering::Acquire) {
                 rx.close();
                 while rx.try_recv().is_ok() {}
                 return Some((
                     Err(std::io::Error::other("download deadline exceeded")),
-                    (rx, aborted, vhost, token, counted),
+                    (rx, ack, aborted, vhost, token, counted, false, true),
                 ));
             }
+            let chunk = chunk?;
             if chunk.as_ref().is_ok_and(|b| !b.is_empty()) && !counted {
                 counted = true;
                 if let Some(db) = &vhost.db {
@@ -774,13 +794,94 @@ fn counted_body_with_deadlines(
                     .await;
                 }
             }
-            Some((chunk, (rx, aborted, vhost, token, counted)))
+            Some((
+                chunk,
+                (rx, ack, aborted, vhost, token, counted, true, false),
+            ))
         },
     ))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn finite_unpolled_body_holds_admission_until_drop() {
+        let (_tmp, _node, vhost) = fixture().await;
+        let public = Arc::new(Semaphore::new(1));
+        let lane = Arc::new(Semaphore::new(1));
+        let upstream = axum::body::Body::from_stream(futures_util::stream::unfold(
+            (Some(lane.clone().acquire_owned().await.unwrap()), false),
+            |(permit, sent)| async move {
+                if sent {
+                    None
+                } else {
+                    Some((
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"one")),
+                        (permit, true),
+                    ))
+                }
+            },
+        ));
+        let body = counted_body(
+            upstream,
+            public.clone().acquire_owned().await.unwrap(),
+            vhost,
+            "unused".into(),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(public.available_permits(), 0);
+        assert_eq!(lane.available_permits(), 0);
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let _public = public.acquire().await.unwrap();
+            let _lane = lane.acquire().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn progressing_reader_survives_and_empty_abort_emits_one_error() {
+        use http_body_util::BodyExt;
+        let (_tmp, _node, vhost) = fixture().await;
+        let public = Arc::new(Semaphore::new(1));
+        let chunks = futures_util::stream::iter(
+            (0..5).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x"))),
+        );
+        let mut body = counted_body_with_deadlines(
+            axum::body::Body::from_stream(chunks),
+            public.clone().acquire_owned().await.unwrap(),
+            vhost.clone(),
+            "unused".into(),
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        );
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(body.frame().await.unwrap().is_ok());
+        }
+        assert!(body.frame().await.is_none());
+        let upstream = axum::body::Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let mut body = counted_body_with_deadlines(
+            upstream,
+            public.clone().acquire_owned().await.unwrap(),
+            vhost,
+            "unused".into(),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(body.frame().await.is_none());
+        assert_eq!(public.available_permits(), 1);
+    }
     #[tokio::test]
     async fn cross_primary_router_and_management_isolation_with_shared_db() {
         use tower::ServiceExt;
