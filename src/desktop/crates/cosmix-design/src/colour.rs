@@ -248,7 +248,7 @@ pub(crate) fn compile_colour_tokens_with_registry(
     }
 }
 
-/// The §3.4 distinctness floor for quiet and elevated chrome: the `muted` and
+/// The §3.6 distinctness floor for quiet and elevated chrome: the `muted` and
 /// `elevated` surfaces must each sit at least this far off `base` in luminance
 /// contrast, or they collapse onto the page and paint as whatever they cover.
 const SURFACE_DISTINCTION_CONTRAST: f64 = 1.25;

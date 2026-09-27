@@ -1458,9 +1458,10 @@ fn embedded_default_compiles_without_errors_in_all_twelve_contexts() {
             let ring = colours.non_text["ring"].value;
             assert!(contrast_ratio(ring, colours.pairs["muted"].rendered_surface) >= 3.0);
             assert!(contrast_ratio(ring, accent.rendered_surface) >= 3.0);
-            // `popover` ships unaliased-never: the compiled alias of the
-            // authored `elevated` pair must deliver its exact resolved values,
-            // and both quiet and elevated chrome must sit visibly off `base`.
+            // The shipped design never authors `popover`: the compiled alias
+            // of the authored `elevated` pair must deliver its exact resolved
+            // values, and quiet and elevated chrome must sit visibly off
+            // `base`.
             let base = &colours.pairs["base"];
             let muted = &colours.pairs["muted"];
             let elevated = &colours.pairs["elevated"];
