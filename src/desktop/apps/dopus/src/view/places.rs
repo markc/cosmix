@@ -43,7 +43,7 @@ pub fn sidebar<'a>(
 ) -> Element<'a, Msg> {
     let mut list = column![]
         .padding(Padding {
-            top: look.chrome.small,
+            top: super::alignment::FirstRow::new(look).places_top,
             right: 0.0,
             bottom: 0.0,
             left: 0.0,

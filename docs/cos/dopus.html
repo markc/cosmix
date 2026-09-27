@@ -451,7 +451,8 @@ directory tree and single selection. Tab or F6 switches the active pane. Places 
 a plain sidebar, with Home, Filesystem and existing user directories.
 Pane relists invalidate its cached directory checks; Refresh rechecks Places.
 Both sidebars start directly with content, without Places or Properties headings,
-using the same top spacing token as the pane location headers.
+aligning their first text baselines with the pane location headers. Insets
+account for button padding, icon centring and the shaped UI/mono font metrics.
 The divider persists its position; double-click centres it.</p>
 <p>One navigation icon strip is centred across the top of the window: Back,
 Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
@@ -502,9 +503,10 @@ room for names.
 Selection uses the design's <code>selection</code>/<code>selection_text</code> pair, and a
 <code>muted_surface</code> header marks the active pane. Modified times are always local
 <code>dd/mm/yy HH:MM</code> in 24-hour format. There is no relative-time refresh.</p>
-<p>Places entries and every Properties label, value and path share the resolved
-Ui font and size, without a panel-specific size multiplier. Properties field
-names use muted text; values use the on-surface text colour.</p>
+<p>Places entries and every Properties label, value and path share one resolved
+sidebar typography token: 90% of the Ui size, preserving the original Places
+size (13.2 px with embedded typography). Properties field names use muted
+text; values use the on-surface text colour.</p>
 <p>The plain <strong>Properties</strong> sidebar follows the active pane's single selection:
 name, kind and extension-based MIME guess, byte and human-readable size,
 modified/created/accessed times, Unix permissions (rwx and octal), resolved
@@ -528,8 +530,10 @@ Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.<
 It uses Small text on a muted surface and occupies a row below the clipped
 list, so the last file cannot overlap it. Totals cover that pane's root listing
 (not expanded descendants), using the existing singular/plural and byte formatting.
-Both remain visible regardless of focus. The shared status bar holds panel
-toggles and messages, with no directory summary.</p>
+The summary middle-elides to the available width and its container clips,
+including at the minimum window size and split. The box grows only to the
+summary's natural width. Both remain visible regardless of focus. The shared
+status bar holds panel toggles and messages, with no directory summary.</p>
 <p><strong>Ctrl+B</strong> toggles Places and <strong>Ctrl+I</strong> toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
 resize it; double-click restores Places to 15% or Properties to 22%. Both
@@ -728,9 +732,11 @@ Theme changes are session selections, not persisted config fields.</p>
 <h2 id="verification">Verification</h2>
 <p>P4b adds a unit test for distinct per-pane summaries across focus changes and
 an empty relist, and a shared widgets test for deterministic, opaque tooltip
-styling. The sidebar composition has no view snapshot harness: visually check
-that neither heading appears, the first content aligns with the pane headers,
-and Properties labels/values match Places text in both light and dark themes.
+styling. Layout tests compute the three first-content baselines from actual
+widget bounds and shaped paragraphs, including a larger font/icon combination.
+Footer layout tests cover widths down to zero, including a 25-px pane.
+There is no rendered view snapshot harness: visually check that neither heading
+appears and Properties labels/values match Places in light and dark themes.
 Also check both footer boxes and the last list row at narrow pane widths.</p>
 <p><code>src/desktop/apps/dopus/tests/dopus-bus-test.mix</code> starts an isolated noded
 and headless app. It covers pane targeting, navigation, sort, hidden files,

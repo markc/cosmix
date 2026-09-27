@@ -1075,6 +1075,7 @@ impl Dopus {
 
     fn look(&self) -> Look {
         Look {
+            sidebar_px: self.theme.sidebar_px,
             small_px: self.theme.small_px,
             tokens: self.theme.tokens,
             chrome: self.theme.chrome,

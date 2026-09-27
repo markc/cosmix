@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
-use iced::widget::{column, container, text};
+use iced::widget::{column, container};
 use iced::{Element, Event, Length, Rectangle, Size};
 
 use cosmix_dopus_core::{PaneId, PaneModel, VisibleRow};
@@ -68,13 +68,7 @@ pub fn pane_column<'a>(
                 columns,
             ))
             .map(move |m| Msg::PaneRows(pane_id, m)),
-            container(
-                text(cosmix_dopus_core::pane_summary(&pane.root))
-                    .font(look.ui_font)
-                    .size(look.small_px),
-            )
-            .padding([look.chrome.small, look.chrome.pad])
-            .style(look.strip(look.tokens.muted_surface, look.tokens.muted_text)),
+            summary_footer(look, cosmix_dopus_core::pane_summary(&pane.root)),
         ]
         .width(Length::Fill)
         .height(Length::Fill),
@@ -85,7 +79,7 @@ pub fn pane_column<'a>(
 }
 
 /// Each pane keeps only its editable location bar above the sort header.
-fn pane_header<'a>(
+pub(super) fn pane_header<'a>(
     look: Look,
     pane: &'a PaneModel,
     pane_id: PaneId,
@@ -94,7 +88,12 @@ fn pane_header<'a>(
 ) -> Element<'a, Msg> {
     container(location::bar(look, pane, pane_id, editing))
         .width(Length::Fill)
-        .padding([look.chrome.small, look.chrome.pad])
+        .padding(iced::Padding {
+            top: super::alignment::FirstRow::new(look).pane_top,
+            right: look.chrome.pad,
+            bottom: look.chrome.small,
+            left: look.chrome.pad,
+        })
         .style(look.strip(
             if active {
                 look.tokens.muted_surface
@@ -108,6 +107,27 @@ fn pane_header<'a>(
             },
         ))
         .into()
+}
+
+/// A compact box when space permits, constrained and clipped in narrow panes.
+pub(super) fn summary_footer(look: Look, summary: String) -> Element<'static, Msg> {
+    use iced::advanced::text::Paragraph as _;
+    let width = super::elide::shape(&summary, look.ui_font, look.small_px)
+        .min_bounds()
+        .width
+        + 2.0 * look.chrome.pad;
+    container(super::elide::Label {
+        text: summary,
+        font: look.ui_font,
+        px: look.small_px,
+        color: look.tokens.muted_text,
+    })
+    .width(Length::Fill)
+    .max_width(width)
+    .padding([look.chrome.small, look.chrome.pad])
+    .clip(true)
+    .style(look.strip(look.tokens.muted_surface, look.tokens.muted_text))
+    .into()
 }
 
 /// The pane's sort headers: the three columns as buttons; the pane's active

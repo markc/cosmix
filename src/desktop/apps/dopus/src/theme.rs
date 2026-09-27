@@ -27,6 +27,8 @@ use iced::Color;
 const APP: &str = "dopus";
 
 pub struct Theme {
+    /// Shared sidebar typography: the original Places size, derived from Ui.
+    pub sidebar_px: f32,
     /// Small role size for dense secondary columns, retaining the mono family.
     pub small_px: f32,
     /// Chrome colours (rows, headers, status bar, stock widgets).
@@ -200,6 +202,7 @@ pub fn resolve_selection(selection: &Selection, mut notes: Vec<String>) -> Theme
     let mono_font = font_for(&mono, true);
     let ui_font = font_for(&ui, false);
     Theme {
+        sidebar_px: ui.font_size as f32 * 0.9,
         small_px: role(TypographyRole::Small).font_size as f32,
         tokens,
         chrome,

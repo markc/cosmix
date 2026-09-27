@@ -10,7 +10,8 @@ directory tree and single selection. Tab or F6 switches the active pane. Places 
 a plain sidebar, with Home, Filesystem and existing user directories.
 Pane relists invalidate its cached directory checks; Refresh rechecks Places.
 Both sidebars start directly with content, without Places or Properties headings,
-using the same top spacing token as the pane location headers.
+aligning their first text baselines with the pane location headers. Insets
+account for button padding, icon centring and the shaped UI/mono font metrics.
 The divider persists its position; double-click centres it.
 
 One navigation icon strip is centred across the top of the window: Back,
@@ -64,9 +65,10 @@ Selection uses the design's `selection`/`selection_text` pair, and a
 `muted_surface` header marks the active pane. Modified times are always local
 `dd/mm/yy HH:MM` in 24-hour format. There is no relative-time refresh.
 
-Places entries and every Properties label, value and path share the resolved
-Ui font and size, without a panel-specific size multiplier. Properties field
-names use muted text; values use the on-surface text colour.
+Places entries and every Properties label, value and path share one resolved
+sidebar typography token: 90% of the Ui size, preserving the original Places
+size (13.2 px with embedded typography). Properties field names use muted
+text; values use the on-surface text colour.
 
 The plain **Properties** sidebar follows the active pane's single selection:
 name, kind and extension-based MIME guess, byte and human-readable size,
@@ -92,8 +94,10 @@ Each pane has its own bottom-left summary box: `N folders, M files (total)`.
 It uses Small text on a muted surface and occupies a row below the clipped
 list, so the last file cannot overlap it. Totals cover that pane's root listing
 (not expanded descendants), using the existing singular/plural and byte formatting.
-Both remain visible regardless of focus. The shared status bar holds panel
-toggles and messages, with no directory summary.
+The summary middle-elides to the available width and its container clips,
+including at the minimum window size and split. The box grows only to the
+summary's natural width. Both remain visible regardless of focus. The shared
+status bar holds panel toggles and messages, with no directory summary.
 
 **Ctrl+B** toggles Places and **Ctrl+I** toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
@@ -325,9 +329,11 @@ DCS sidebars are excluded by design, including future versions.
 
 P4b adds a unit test for distinct per-pane summaries across focus changes and
 an empty relist, and a shared widgets test for deterministic, opaque tooltip
-styling. The sidebar composition has no view snapshot harness: visually check
-that neither heading appears, the first content aligns with the pane headers,
-and Properties labels/values match Places text in both light and dark themes.
+styling. Layout tests compute the three first-content baselines from actual
+widget bounds and shaped paragraphs, including a larger font/icon combination.
+Footer layout tests cover widths down to zero, including a 25-px pane.
+There is no rendered view snapshot harness: visually check that neither heading
+appears and Properties labels/values match Places in light and dark themes.
 Also check both footer boxes and the last list row at narrow pane widths.
 
 `src/desktop/apps/dopus/tests/dopus-bus-test.mix` starts an isolated noded

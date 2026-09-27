@@ -2,10 +2,14 @@
 
 ## 0.3.1
 
-- Remove the Places and Properties headings; start with content using the
-  pane header's top spacing token. Places refreshes with pane relists.
-- Use the resolved Ui size for both Places entries and all Properties text;
-  distinguish field names by muted colour. Remove Places' size multiplier.
+- Remove the Places and Properties headings; align first-content baselines
+  using complete button/icon/font geometry, covered by layout tests.
+  Places refreshes with pane relists.
+- Resolve one sidebar typography token at the original Places size (Ui × 0.9,
+  13.2 px in the embedded design) for both panels; Properties becomes smaller.
+  Distinguish field names by muted colour.
+- Elide and clip pane summary footers, including at 25-px pane widths; keep
+  their boxes capped at the summary's natural width. Add narrow-layout coverage.
 - Use the shared widgets tooltip style: opaque neutral popover background,
   matching text, muted token border and rounded corners with token padding.
 - Give each pane a small muted summary box below its clipped list. Keep

@@ -26,6 +26,19 @@ use crate::view::Look;
 pub const LOCATION_LEFT: &str = "dopus-location-left";
 pub const LOCATION_RIGHT: &str = "dopus-location-right";
 
+/// Shared by the display/editor and the first-row baseline calculation.
+pub(super) fn text_px(look: Look) -> f32 {
+    look.mono_px * 0.9
+}
+
+pub(super) fn padding(look: Look) -> iced::Padding {
+    [
+        look.chrome.edge * 2.0,
+        look.chrome.small + look.chrome.edge * 2.0,
+    ]
+    .into()
+}
+
 /// The editor id for a pane (handed to `iced::widget::operation::focus`).
 pub fn location_id(pane: PaneId) -> &'static str {
     match pane {
@@ -55,13 +68,10 @@ fn display(look: Look, pane: &PaneModel, pane_id: PaneId) -> Element<'static, Ms
         button(super::elide::Label {
             text: path,
             font: look.mono_font,
-            px: look.mono_px * 0.9,
+            px: text_px(look),
             color: look.chrome.secondary_text,
         })
-        .padding([
-            look.chrome.edge * 2.0,
-            look.chrome.small + look.chrome.edge * 2.0,
-        ])
+        .padding(padding(look))
         .width(Length::Fill)
         .on_press(Msg::LocationEdit(pane_id))
         .style(bar_look(&look)),
@@ -77,11 +87,8 @@ fn editor(look: Look, pane_id: PaneId, text: &str) -> Element<'_, Msg> {
         .on_input(Msg::LocationInput)
         .on_submit(Msg::LocationSubmit(pane_id))
         .width(Length::Fill)
-        .padding(iced::Padding::from([
-            look.chrome.edge * 2.0,
-            look.chrome.small + look.chrome.edge * 2.0,
-        ]))
-        .size(look.mono_px * 0.9)
+        .padding(padding(look))
+        .size(text_px(look))
         .style(field_look(&look));
     field.into()
 }

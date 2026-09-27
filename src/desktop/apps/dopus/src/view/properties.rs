@@ -8,7 +8,12 @@ use iced::{Element, Length};
 pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
     let mut content = column![]
         .spacing(look.chrome.gap)
-        .padding([look.chrome.small, look.chrome.pad])
+        .padding(iced::Padding {
+            top: super::alignment::FirstRow::new(look).properties_top,
+            right: look.chrome.pad,
+            bottom: look.chrome.small,
+            left: look.chrome.pad,
+        })
         .width(Length::Fill);
     let mut fields = Vec::new();
     let title = match properties {

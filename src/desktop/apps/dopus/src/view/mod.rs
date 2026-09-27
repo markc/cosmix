@@ -6,6 +6,7 @@
 //! everywhere except the list and the divider; every colour from the
 //! compiled tokens via [`Look`].
 
+mod alignment;
 pub mod columns;
 pub mod dialogs;
 pub mod elide;
@@ -33,6 +34,7 @@ use crate::theme::Chrome;
 /// `'static` instead of borrowing a local `Look`).
 #[derive(Debug, Clone, Copy)]
 pub struct Look {
+    pub sidebar_px: f32,
     pub small_px: f32,
     pub tokens: cosmix_iced_widgets::Tokens,
     pub chrome: Chrome,
@@ -43,10 +45,9 @@ pub struct Look {
 }
 
 impl Look {
-    /// Places entries and every Properties label/value share the Ui role.
-    /// Use the resolved size directly, without a panel-specific multiplier.
+    /// One resolved typography token for Places and all Properties text.
     pub fn sidebar_px(&self) -> f32 {
-        self.px
+        self.sidebar_px
     }
 
     /// A full-width strip (headers, status bar) in the given token colours.
