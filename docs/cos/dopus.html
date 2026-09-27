@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/overview</title>
+    <title>CosMix — cos/dopus</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,77 +441,178 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/overview.md"><div class="prose"><h1 id="cos--overview">cos — overview</h1>
-<p><strong>cos</strong> is the cosmix daemon family: every Rust crate that runs a node in a
-cosmix mesh, plus the substrate libraries they share. Where
-<a href="https://github.com/markc/cosmix">mix</a> is the language you drive the mesh <em>with</em>,
-cos is what actually <em>runs</em> on each node — a set of long-running daemons that
-speak the Bus mesh protocol, expose their state as typed property namespaces,
-and are operable from the outside by agents and scripts.</p>
-<p>This page is the orientation: what cos is, how the workspace is laid out, how it
-fits with its sibling repos, and where to go next.</p>
-<h2 id="what-cos-is">What cos is</h2>
-<p>A single Cargo workspace of ~33 crates, split three ways:</p>
-<ul>
-<li><strong>Daemons</strong> — the long-running services: an Bus broker, a mail server, a web server, an authoritative DNS server, a knowledge indexer, and an agent supervisor — with the Wayland compositor and native apps in the sibling <code>src/desktop/</code> workspace.</li>
-<li><strong>Helpers &amp; adapters</strong> — CLI subcrates and integration shims the daemons lean on (the MCP bridge, the Claude SDK adapter, the mail data store, the mail auth / rules / spam subcrates).</li>
-<li><strong>Libraries</strong> — the shared substrate (<code>cosmix-lib-*</code>): property store, mesh peering, node identity, WireGuard config, logging, agent runtime pieces, and protocol codecs.</li>
-</ul>
-<p>Every daemon is built to be <strong>legible</strong> (query its state as structured data),
-<strong>modifiable</strong> (write its config through structured channels, not ad-hoc file
-edits), and <strong>reconstructible</strong> (build and run it from a clean clone). Those
-three criteria are the substrate's design filter — the point of cos is a system
-an AI agent can observe, change, and rebuild.</p>
-<h2 id="the-components">The components</h2>
-<p>Pick any component in the sidebar for its own page.</p>
-<h3 id="daemons">Daemons</h3>
-<ul>
-<li><strong><a href="/cos/noded">noded</a></strong> — the Bus broker. Every mesh node runs one; it routes <code>service.node.bus</code> addresses across the mesh.</li>
-<li><strong><a href="/cos/maild">maild</a></strong> — JMAP-native mail daemon (SMTP + IMAP + JMAP, Bayesian spam classifier, Sieve-style rules).</li>
-<li><strong><a href="/cos/webd">webd</a></strong> — multi-vhost HTTPS with automatic ACME certificates; server-rendered web UI over Datastar SSE.</li>
-<li><strong><a href="/cos/dnsd">dnsd</a></strong> — authoritative WireGuard-mesh DNS, zones generated from the mesh inventory.</li>
-<li><strong><a href="/cos/indexd">indexd</a></strong> — vector knowledge base; auto-indexes workspaces on commit and powers agent recall.</li>
-<li><strong><a href="/cos/desktop">desktop</a></strong> — the CosMix desktop: <code>cosmix-comp</code> (Smithay + Bevy Wayland compositor), the <code>ctk</code> toolkit and the native apps; protocol coverage on <a href="/cos/cosmix-comp">cosmix-comp</a>.</li>
-<li><strong><a href="/cos/agentd">agentd</a></strong> — agent supervision.</li>
-<li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power-source state.</li>
-<li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
-<li><strong><a href="/cos/dbusd">dbusd</a></strong> — the D-Bus boundary daemon; per-domain adapters translate D-Bus to Bus verbs/props in both directions.</li>
-<li><strong><a href="/cos/edit">edit</a></strong> — the <code>edit</code> Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo, crash-recovery files); the core of ced.</li>
-<li><strong><a href="/cos/ced">ced</a></strong> — the CosMix Editor: an iced desktop editor over <code>edit</code> with live agent edits, per-origin undo, lsh/Mix highlighting and the <code>ced.*</code> Bus verbs.</li>
-<li><strong><a href="/cos/dopus">dopus</a></strong> — the iced twin-pane file manager replacing filemgr: navigation, Places, local file operations and the <code>dopus.v1</code> Bus port.</li>
-</ul>
-<h3 id="bridge--libraries">Bridge &amp; libraries</h3>
-<ul>
-<li><strong><a href="/cos/mcp">mcp</a></strong> — the Claude Code MCP bridge; exposes cosmix surfaces as MCP tools plus a knowledge / skill-learning loop.</li>
-<li><strong><a href="/cos/libraries">libraries</a></strong> — the shared <code>cosmix-lib-*</code> substrate crates.</li>
-</ul>
-<h2 id="how-it-fits--bus--mix--cos">How it fits — bus ← mix ← cos</h2>
-<p>cos is one of three public sibling repos with a one-way dependency order:</p>
-<ul>
-<li><strong><a href="https://github.com/markc/cosmix">bus</a></strong> — the Bus protocol family. Depends on nothing.</li>
-<li><strong><a href="https://github.com/markc/cosmix">mix</a></strong> — the language. Depends on bus.</li>
-<li><strong>cos</strong> — the daemon family. Depends on both: its config, DNS, mail, and agent crates consume the mix strict-data parser, and every daemon speaks Bus.</li>
-</ul>
-<p>Neither sibling depends on cos. Build bus and mix first (see
-<a href="/cos/overview#build">Build &amp; install</a>); the workspace clones expect sibling checkouts at
-<code>$COSMIX</code> and <code>$COSMIX</code>.</p>
-<h2 id="building">Building</h2>
-<pre><code class="language-sh"># cos depends on two sibling checkouts under $HOME
-git clone https://github.com/markc/cosmix $COSMIX
-git clone https://github.com/markc/cosmix $COSMIX
-git clone https://github.com/markc/cosmix $COSMIX
-
-# build the whole daemon family (release)
-cd $COSMIX/src &amp;&amp; cargo build --workspace --release
+        <div id="content-doc" data-prerendered="cos/dopus.md"><div class="prose"><h1 id="dopus--the-cosmix-twin-pane-file-manager">dopus — the CosMix twin-pane file manager</h1>
+<p><strong>dopus is an iced file manager over the headless <code>cosmix-dopus-core</code>.</strong>
+It replaces the deprecated Bevy filemgr; retirement of that app is separate.
+The window is a Wayland client (<code>dev.cosmix.dopus</code>) drawn with tiny-skia and
+the shared design tokens. Only dopus consumes the extracted core.</p>
+<p>Each pane has its own directory, history, sort, hidden-file setting, lazy
+directory tree and single selection. F6 switches the active pane. Places is
+a plain sidebar, with Home, Filesystem and existing user directories.
+Click its heading to refresh Places; pane relists also invalidate its cached
+directory checks. The divider persists its position; double-click centres it.</p>
+<p>File operations are local keyboard/dialog actions: new folder, rename,
+copy or move to the other pane, and permanent delete with confirmation.
+Operations run one at a time, never overwrite a destination, and relist both
+panes exactly once after every operation reply, including failures.
+Opening a directory navigates; opening a file spawns <code>xdg-open</code>.</p>
+<h2 id="running-it">Running it</h2>
+<p>From Mix:</p>
+<pre><code class="language-mix">run_argv(["cosmix-dopus"])
+run_argv(["cosmix-dopus", "/tmp/source", "/tmp/destination"])
+run_argv(["cosmix-dopus", "--headless", "--service", "dopus-test"])
+run_argv(["cosmix-dopus", "--print-config"])
+run_argv(["cosmix-dopus", "--version"])
 </code></pre>
-<p>Each daemon reads a small root-owned bootstrap config
-(<code>/etc/cosmix/&lt;daemon&gt;/config.toml</code>) before it contacts the mesh, then joins the
-Bus broker and exposes its runtime state through property namespaces.</p>
-<h2 id="see-also">See also</h2>
+<p>The first path goes left, the second right; extras are ignored. A file path
+navigates to its parent. A second windowed launch forwards its paths to the
+running service and exits; argv paths are made absolute in the calling
+process. Use <code>--</code> before paths that resemble flags.</p>
+<p><code>--service NAME</code> changes the default Bus name <code>dopus</code>.
+<code>--noded-url ws://127.0.0.1:4200/ws</code> overrides broker discovery.
+Windowed dopus can run without a broker. <code>--headless</code> requires a broker,
+serves the same core and verbs, cancels any dialog requests, refuses file
+opening and has no theme painter. A duplicate headless service name fails.
+<code>--version</code> / <code>-V</code> report build provenance before other side effects;
+<code>--version --json</code> gives the structured form.</p>
+<h2 id="the-seven-law-app-contract">The seven-law app contract</h2>
+<p>The frontend must honour the contract in <code>cosmix-dopus-core/src/lib.rs</code>:</p>
+<ol>
+<li>Call <code>tick(now)</code> every frame with a monotonic clock. This advances count
+dispatch and config settling. Format relative modification times on the
+frontend's own clock.</li>
+<li>Drain worker replies and feed every event through <code>on_event</code> exactly
+once, on one thread.</li>
+<li>Answer every confirmation and prompt token, including cancellation.
+Recover lost dialogs using <code>outstanding_reservations</code> and <code>withdraw</code>.</li>
+<li>Spawn the handler for <code>OpenFile</code> and show spawn failures in the status line.</li>
+<li>Pass <code>ascending: true</code> on a sort-column change. Repeating the same column
+toggles direction.</li>
+<li>Pre-validate prompt fields with <code>validate_filename</code> for immediate
+feedback; the core validates again before accepting a name.</li>
+<li>Drive <code>set_split_ratio</code> from divider drags, because persistence derives
+from core state.</li>
+</ol>
+<p>The core also rejects stale listing/count replies by pane generation and
+path, limits count concurrency, and owns single-flight operations and
+token-correlated reservations. Headless mode applies the same contract,
+with timed ticks, fail-closed dialog answers and refused file launches.</p>
+<h2 id="the-bus-port-dopusv1">The Bus port: <code>dopus.v1</code></h2>
+<p>The app serves local and mesh callers through noded. Success is <code>rc 0</code>;
+refusal is <code>rc 10</code> with <code>{error_code, message, reason}</code> (<code>reason</code> may be null).
+<strong>Every <code>file.*</code> action is permanently Bus-forbidden</strong>, including
+<code>file.open</code>. The action list describes keyboard availability, not Bus
+permission. No verb performs file operations or opens a confirmation dialog.</p>
+<table><thead><tr><th>Verb</th><th>Args</th><th>Reply</th><th>Refusals</th></tr></thead><tbody>
+<tr><td><code>dopus.ping</code></td><td>—</td><td><code>{pong, service, schema:"dopus.v1", pid, headless}</code></td><td>—</td></tr>
+<tr><td><code>dopus.describe</code></td><td>—</td><td><code>{contract:"ctk-app-control.v0", app:"dopus", title, view, engine:"iced", version, description, controls, verbs}</code></td><td>—</td></tr>
+<tr><td><code>dopus.info</code></td><td>—</td><td><code>{version, git_sha, build_time, headless, panes:2, pane_states:[PaneState, PaneState], config_path}</code></td><td>—</td></tr>
+<tr><td><code>dopus.state</code></td><td>—</td><td><code>{panes:[PaneState, PaneState], theme_scheme, theme_mode}</code></td><td>—</td></tr>
+<tr><td><code>dopus.action</code></td><td><code>id</code>, optional <code>pane</code>, optional <code>args</code> (currently unused)</td><td><code>{id, ok:true, result:null}</code>; quit instead returns <code>{quitting:true}</code></td><td><code>INVALID_ARGUMENT</code>, <code>FORBIDDEN</code>, <code>UNAVAILABLE</code></td></tr>
+<tr><td><code>dopus.actions.list</code></td><td>—</td><td><code>{actions:[{id, label, keys, enabled}]}</code></td><td>—</td></tr>
+<tr><td><code>dopus.theme.set</code></td><td>optional <code>scheme</code>, <code>mode</code>; null leaves unchanged</td><td><code>{scheme, mode}</code></td><td><code>INVALID_ARGUMENT</code>; <code>UNAVAILABLE</code> headless</td></tr>
+<tr><td><code>dopus.open</code></td><td><code>paths:[…]</code>, optional <code>pane</code></td><td><code>{accepted, opened}</code></td><td><code>INVALID_ARGUMENT</code></td></tr>
+<tr><td><code>dopus.quit</code></td><td>—</td><td><code>{quitting:true}</code>, then exit after replying</td><td>—</td></tr>
+</tbody></table>
+<p>Unknown verbs return <code>UNKNOWN_VERB</code>. <code>NOT_FOUND</code>, <code>CONFLICT</code> and
+<code>INTERNAL</code> are reserved refusal codes; filesystem listing errors currently
+appear in pane status after an asynchronous navigation reply.</p>
+<p><code>PaneState</code> is identical in <code>info.pane_states</code> and <code>state.panes</code>:
+<code>{pane, path, active, show_hidden, sort, ascending, selected, rows, status}</code>.
+Rows are ordered left then right; <code>pane</code> is 0 or 1, <code>selected</code> is a path
+or null, <code>sort</code> is <code>name</code>, <code>size</code> or <code>modified</code>, and paths are sanitised
+for display. <code>info.panes</code> remains a count for existing callers.
+Theme names are empty strings headless.</p>
+<p><strong>Pane targeting.</strong> <code>dopus.action</code> accepts <code>pane:"left"|"right"|"active"</code>,
+defaulting to active. Navigation (<code>nav.back/forward/parent/home</code>), refresh,
+hidden toggle, sort and selection actions affect only that pane, without
+changing the active pane. Global actions (<code>nav.switch-pane</code>, theme and quit)
+remain global. Unknown pane values are invalid.</p>
+<p><code>dopus.open</code> preserves positional routing when <code>pane</code> is omitted:
+first path left, second right, extras ignored. With an explicit pane,
+exactly one path is required and focus stays where it was.
+<code>accepted</code> counts supplied paths, including ignored extras; <code>opened</code>
+means at least one navigation was requested, not that its listing succeeded.
+Leading <code>~</code> is expanded. Relative Bus paths resolve against dopus's
+working directory, so callers should send absolute paths.</p>
+<pre><code class="language-mix">send dopus dopus.open paths=["/tmp"] pane="right"
+send dopus dopus.action id="nav.parent" pane="right"
+send dopus dopus.action id="view.sort-size" pane="right"
+send dopus dopus.state
+print($reply)
+</code></pre>
+<p>The action reply acknowledges the state change or listing request; listing
+workers finish later. There is no wait or tree-expansion verb in v1.
+Theme actions work windowed and return <code>UNAVAILABLE</code> headless.
+<code>location.focus</code> is a local UI action and returns <code>FORBIDDEN</code> over the Bus.
+<code>app.quit</code> is an action id; the direct quit verb is <code>dopus.quit</code>.</p>
+<h2 id="keymap-and-location-editing">Keymap and location editing</h2>
+<table><thead><tr><th>Binding</th><th>Action</th></tr></thead><tbody>
+<tr><td>Ctrl+L</td><td><code>location.focus</code>: select the active location bar's text</td></tr>
+<tr><td>F6</td><td><code>nav.switch-pane</code></td></tr>
+<tr><td>Alt+Left / Alt+Right</td><td><code>nav.back</code> / <code>nav.forward</code></td></tr>
+<tr><td>Backspace / Alt+Home</td><td><code>nav.parent</code> / <code>nav.home</code></td></tr>
+<tr><td>F5 / Ctrl+H</td><td><code>view.refresh</code> / <code>view.toggle-hidden</code></td></tr>
+<tr><td>Ctrl+1 / Ctrl+2 / Ctrl+3</td><td><code>view.sort-name</code> / <code>view.sort-size</code> / <code>view.sort-modified</code></td></tr>
+<tr><td>Down / Up / Home / End</td><td><code>selection.next</code> / <code>previous</code> / <code>first</code> / <code>last</code></td></tr>
+<tr><td>Enter</td><td><code>file.open</code></td></tr>
+<tr><td>Ctrl+Shift+N / F2</td><td><code>file.new-folder</code> / <code>file.rename</code></td></tr>
+<tr><td>Ctrl+C / Ctrl+X</td><td><code>file.copy-other-pane</code> / <code>file.move-other-pane</code></td></tr>
+<tr><td>Delete</td><td><code>file.delete</code> (permanent deletion after confirmation)</td></tr>
+<tr><td>Ctrl+Q</td><td><code>app.quit</code></td></tr>
+<tr><td>Ctrl+Alt+D</td><td><code>theme.mode-toggle</code></td></tr>
+<tr><td>Ctrl+Alt+1 through 6</td><td><code>theme.scheme-ocean/crimson/stone/forest/sunset/mono</code></td></tr>
+</tbody></table>
+<p>Clicking a location bar also edits it. Enter submits the real path text,
+Escape cancels, and clicking a listing or another control dismisses the
+edit. While editing, default browse/file shortcuts are suppressed by
+<code>FocusContext</code>; clipboard and undo keys belong to the field.
+Dialogs own Enter/Escape and suppress browse actions.</p>
+<p>Defaults live in <code>cosmix-actions</code>' <code>DOPUS_DEFAULT_KEYMAP_MIX</code>.
+The per-app <code>config/keymap.conf.mix</code> supplies <code>custom</code> overrides and
+<code>chord_timeout_ms</code> (default 1000). It reloads on window focus; invalid
+reloads retain the current map. P2 had click-to-edit only; Ctrl+L is new.</p>
+<h2 id="configuration-schema-1">Configuration: schema 1</h2>
+<p>The app root is the first absolute path available from <code>$COSMIX_APP_HOME</code>,
+<code>$COSMIX_APPS_HOME/dopus</code>, <code>$XDG_STATE_HOME/cosmix/apps/dopus</code>, or
+<code>$HOME/.local/state/cosmix/apps/dopus</code>.</p>
+<table><thead><tr><th>File under the app root</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>config/config.conf.mix</code></td><td>Pane and split state, schema 1</td></tr>
+<tr><td><code>config/keymap.conf.mix</code></td><td>Optional keymap overlay</td></tr>
+<tr><td><code>config/theme.conf.mix</code></td><td>Optional theme override over shared design settings</td></tr>
+</tbody></table>
+<pre><code class="language-mix">{
+  schema_version: 1,
+  left: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
+  right: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
+  active_pane: "left",
+  split_ratio: 0.5
+}
+</code></pre>
+<p>Defaults: left at Home, right at Downloads if it exists (otherwise Home),
+hidden files off, name ascending, left active, equal split. The window clamps
+the split to 0.1–0.9. Invalid startup directories fall back to Home.
+Config snapshots come from core state and settle for 0.35 seconds before an
+atomic write. A malformed, unreadable or unsupported-schema config loads
+defaults and disables saving, preserving the original file.
+<code>--print-config</code> prints the resolved config as JSON.
+Theme changes are session selections, not persisted config fields.</p>
+<h2 id="not-in-v1">Not in v1</h2>
 <ul>
-<li><strong><a href="/cos/">the component index</a></strong> — every page in this manual.</li>
-<li>Repos: <a href="https://github.com/markc/cosmix">markc/cos</a> · <a href="https://github.com/markc/cosmix">markc/mix</a> · <a href="https://github.com/markc/cosmix">markc/bus</a>.</li>
-</ul></div></div>
+<li>Drag and drop, internal or OS.</li>
+<li>Multi-selection.</li>
+<li>Previews.</li>
+<li>Listing virtualisation (drawing is limited to visible rows).</li>
+<li>Filemgr config import.</li>
+</ul>
+<p>DCS sidebars are excluded by design, including future versions.</p>
+<h2 id="verification">Verification</h2>
+<p><code>src/desktop/apps/dopus/tests/dopus-bus-test.mix</code> starts an isolated noded
+and headless app. It covers pane targeting, navigation, sort, hidden files,
+selection, availability, refusals, single-instance registration and
+reply-before-exit. Core tests cover operations and their relist law.
+File-operation dialogs and keyboard focus need a windowed gate: the Bus
+test cannot drive operations through the deliberately forbidden <code>file.*</code> ids.</p></div></div>
     </div>
 
 </main>

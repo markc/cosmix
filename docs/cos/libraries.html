@@ -464,6 +464,9 @@ are the cos-side substrate.</p>
 <tr><td><code>cosmix-edit-client</code></td><td>The frontend half of an <code>edit</code> client, with no UI toolkit and no running async runtime: the mirror (local echo, one request in flight, single-authority OT rebase, deadline/history reconciliation, recovery and reattach), the editor model (selection, motions, commands), highlighting state and lint diagnostics, and a fake <code>edit</code> daemon for tests (<code>fake</code> feature). Mix-lexer highlighting is the default <code>mix</code> feature (it links <code>cosmix-lib-mix</code>); without it the crate is tokio-free. Used by ced and, later, the scene editor's text widget.</td></tr>
 <tr><td><code>cosmix-lsh</code></td><td>Syntax highlighting for ced: a vendored copy of msedit's <strong>lsh</strong> (MIT, Copyright (c) Microsoft Corporation) — the definition compiler and line-oriented bytecode runtime, as the path crates <code>cosmix-msedit-lsh</code> and <code>cosmix-msedit-stdext</code> under <code>vendor/</code> — with the bytecode for 26 languages pre-generated into <code>src/defs.rs</code> (a freshness test regenerates and compares it), a chunk-source highlighter and a checkpoint cache every 1,024 lines. Provenance and licence in <code>vendor/</code>.</td></tr>
 </tbody></table>
+<p>The desktop's <code>cosmix-dopus-core</code> provides the headless twin-pane model,
+filesystem operations and config schema for <a href="/cos/dopus">dopus</a>. It has no
+iced or Bevy dependency and is consumed only by dopus.</p>
 <h2 id="mesh--identity">Mesh &amp; identity</h2>
 <table><thead><tr><th>Crate</th><th>What it is</th></tr></thead><tbody>
 <tr><td><code>cosmix-lib-mesh</code></td><td>Bus mesh networking over a WireGuard overlay — peer management, WebSocket bridge connections to remote hubs, and interface-status queries.</td></tr>

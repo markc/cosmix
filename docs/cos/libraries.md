@@ -26,6 +26,10 @@ are the cos-side substrate.
 | `cosmix-edit-client` | The frontend half of an `edit` client, with no UI toolkit and no running async runtime: the mirror (local echo, one request in flight, single-authority OT rebase, deadline/history reconciliation, recovery and reattach), the editor model (selection, motions, commands), highlighting state and lint diagnostics, and a fake `edit` daemon for tests (`fake` feature). Mix-lexer highlighting is the default `mix` feature (it links `cosmix-lib-mix`); without it the crate is tokio-free. Used by ced and, later, the scene editor's text widget. |
 | `cosmix-lsh` | Syntax highlighting for ced: a vendored copy of msedit's **lsh** (MIT, Copyright (c) Microsoft Corporation) — the definition compiler and line-oriented bytecode runtime, as the path crates `cosmix-msedit-lsh` and `cosmix-msedit-stdext` under `vendor/` — with the bytecode for 26 languages pre-generated into `src/defs.rs` (a freshness test regenerates and compares it), a chunk-source highlighter and a checkpoint cache every 1,024 lines. Provenance and licence in `vendor/`. |
 
+The desktop's `cosmix-dopus-core` provides the headless twin-pane model,
+filesystem operations and config schema for [dopus](dopus.md). It has no
+iced or Bevy dependency and is consumed only by dopus.
+
 ## Mesh & identity
 
 | Crate | What it is |

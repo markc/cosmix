@@ -40,6 +40,7 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[dbusd](dbusd.md)** — the D-Bus boundary daemon: hosts the per-domain D-Bus adapters.
 - **[edit](edit.md)** — the `edit` Bus citizen: shared text buffers for humans and agents (revisions, anchors, per-origin undo, crash-recovery files); the core of ced.
 - **[ced](ced.md)** — the CosMix Editor: an iced desktop editor over `edit` with live agent edits, per-origin undo, lsh/Mix highlighting and the `ced.*` Bus verbs.
+- **[dopus](dopus.md)** — the iced twin-pane file manager replacing filemgr: navigation, Places, local file operations and the `dopus.v1` Bus port.
 
 ## Bridge & libraries
 
