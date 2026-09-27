@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 — 2026-09-27
+
+- Add `view.toggle-places` and `view.toggle-properties`, with F9/F10 dopus defaults.
+
 ## 0.4.1
 
 - Add canonical location.focus and a dopus default keymap with Ctrl+L.

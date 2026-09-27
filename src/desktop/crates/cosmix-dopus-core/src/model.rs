@@ -250,6 +250,7 @@ impl ConfirmBook {
 /// thread; filesystem work happens on detached worker threads that reply
 /// through the channel returned by [`DopusCore::new`].
 pub struct DopusCore {
+    sidebars: [crate::config::SidebarConfig; 2],
     properties: [crate::properties::Slot; 2],
     places_home: PathBuf,
     places_cache: std::cell::OnceCell<Vec<(&'static str, PathBuf)>>,
@@ -292,6 +293,7 @@ impl DopusCore {
         let left_start = configured_directory(&config.left.path, &home);
         let right_start = configured_directory(&config.right.path, &home);
         let mut core = Self {
+            sidebars: [config.places.normalised(), config.properties.normalised()],
             properties: Default::default(),
             places_home: home,
             places_cache: std::cell::OnceCell::new(),
@@ -408,6 +410,8 @@ impl DopusCore {
         };
         DOpusConfig {
             schema_version: CURRENT_SCHEMA,
+            places: self.sidebars[0],
+            properties: self.sidebars[1],
             left: pane_config(&self.panes[PaneId::Left.index()]),
             right: pane_config(&self.panes[PaneId::Right.index()]),
             active_pane: match self.active {
@@ -602,6 +606,19 @@ impl DopusCore {
 
     pub fn set_split_ratio(&mut self, ratio: f32) {
         self.split_ratio = ratio;
+    }
+
+    pub fn sidebar(&self, sidebar: crate::config::Sidebar) -> crate::config::SidebarConfig {
+        self.sidebars[match sidebar { crate::config::Sidebar::Places => 0, crate::config::Sidebar::Properties => 1 }]
+    }
+    pub fn toggle_sidebar(&mut self, sidebar: crate::config::Sidebar) {
+        let index = match sidebar { crate::config::Sidebar::Places => 0, crate::config::Sidebar::Properties => 1 };
+        self.sidebars[index].open = !self.sidebars[index].open;
+    }
+    pub fn set_sidebar_width(&mut self, sidebar: crate::config::Sidebar, width: f32) {
+        let index = match sidebar { crate::config::Sidebar::Places => 0, crate::config::Sidebar::Properties => 1 };
+        self.sidebars[index].width = width;
+        self.sidebars[index] = self.sidebars[index].normalised();
     }
 
     // -- selection ----------------------------------------------------------

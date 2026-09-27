@@ -23,6 +23,7 @@ pub mod filemgr;
 mod input;
 mod keymap;
 pub mod location;
+pub mod view;
 mod registry;
 mod resolve;
 pub mod studio;

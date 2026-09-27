@@ -152,6 +152,7 @@ pub fn run(
                     // (same posture as the theme.set pre-refusal above).
                     Served::ThemeAction { .. } => unreachable!("theme actions are refused for headless"),
                     Served::LocationFocus { .. } => unreachable!("location focus is refused for headless"),
+                    Served::ToggleSidebar { .. } => unreachable!("sidebar toggles are refused for headless"),
                     Served::Quit { id } => {
                         bus.respond(
                             id,

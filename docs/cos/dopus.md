@@ -29,6 +29,12 @@ and the same folder/file counts and total file size as the status bar.
 Metadata runs on at most one worker per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.
 
+**F9** toggles Places and **F10** toggles Properties; the status bar offers
+both controls even when the panels are hidden. Drag a panel's divider to
+resize it; double-click restores 15%. Both open states and widths persist.
+Widths are fractions of the available window width, clamped to 10–30% each
+to leave room for the panes. Hidden panels and their dividers take no space.
+
 File operations are local keyboard/dialog actions: new folder, rename,
 copy or move to the other pane, and permanent delete with confirmation.
 Operations run one at a time, never overwrite a destination, and relist both
@@ -97,7 +103,7 @@ permission. No verb performs file operations or opens a confirmation dialog.
 | `dopus.ping` | — | `{pong, service, schema:"dopus.v1", pid, headless}` | — |
 | `dopus.describe` | — | `{contract:"ctk-app-control.v0", app:"dopus", title, view, engine:"iced", version, description, controls, verbs}` | — |
 | `dopus.info` | — | `{version, git_sha, build_time, headless, panes:2, pane_states:[PaneState, PaneState], config_path}` | — |
-| `dopus.state` | — | `{panes:[PaneState, PaneState], theme_scheme, theme_mode}` | — |
+| `dopus.state` | — | `{panes:[PaneState, PaneState], places:{open,width}, properties:{open,width}, theme_scheme, theme_mode}` | — |
 | `dopus.action` | `id`, optional `pane`, optional `args` (currently unused) | `{id, ok:true, result:null}`; quit instead returns `{quitting:true}` | `INVALID_ARGUMENT`, `FORBIDDEN`, `UNAVAILABLE`; for `location.focus`, reason `"headless"` means no window, `"window_busy"` means a modal is open or shutdown is underway |
 | `dopus.actions.list` | — | `{actions:[{id, label, keys, enabled}]}` | — |
 | `dopus.theme.set` | optional `scheme`, `mode`; null leaves unchanged | `{scheme, mode}` | `INVALID_ARGUMENT`; `UNAVAILABLE` headless |
@@ -149,6 +155,12 @@ If that pane's location editor is already open, the request succeeds as a
 no-op, preserving the draft. Targeting the other pane switches editors and
 seeds the new editor from that pane's path.
 `dopus.actions.list` enables it only when the window can perform it.
+`view.toggle-places` and `view.toggle-properties` are global window actions
+served through `dopus.action`. They ignore pane targeting, return the usual
+action acknowledgement after changing the layout, and return `UNAVAILABLE`
+with reason `headless` or `window_busy` under the same gate as `location.focus`.
+Their actions-list availability reflects that gate. State reports configured
+open/width values even headless; a refusal never changes them.
 `app.quit` is an action id; the direct quit verb is `dopus.quit`.
 
 ## Keymap and location editing
@@ -157,6 +169,7 @@ seeds the new editor from that pane's path.
 |---|---|
 | Ctrl+L | `location.focus`: select the active location bar's text |
 | F6 | `nav.switch-pane` |
+| F9 / F10 | `view.toggle-places` / `view.toggle-properties` |
 | Alt+Left / Alt+Right | `nav.back` / `nav.forward` |
 | Backspace / Alt+Home | `nav.parent` / `nav.home` |
 | F5 / Ctrl+H | `view.refresh` / `view.toggle-hidden` |
@@ -181,7 +194,7 @@ The per-app `config/keymap.conf.mix` supplies `custom` overrides and
 `chord_timeout_ms` (default 1000). It reloads on window focus; invalid
 reloads retain the current map. P2 had click-to-edit only; Ctrl+L is new.
 
-## Configuration: schema 1
+## Configuration: schema 2
 
 The app root is the first absolute path available from `$COSMIX_APP_HOME`,
 `$COSMIX_APPS_HOME/dopus`, `$XDG_STATE_HOME/cosmix/apps/dopus`, or
@@ -189,13 +202,15 @@ The app root is the first absolute path available from `$COSMIX_APP_HOME`,
 
 | File under the app root | Purpose |
 |---|---|
-| `config/config.conf.mix` | Pane and split state, schema 1 |
+| `config/config.conf.mix` | Pane, split and sidebar state, schema 2 |
 | `config/keymap.conf.mix` | Optional keymap overlay |
 | `config/theme.conf.mix` | Optional theme override over shared design settings |
 
 ```mix
 {
-  schema_version: 1,
+  schema_version: 2,
+  places: {open: true, width: 0.15},
+  properties: {open: true, width: 0.15},
   left: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   right: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   active_pane: "left",
@@ -209,6 +224,9 @@ the split to 0.1–0.9. Invalid startup directories fall back to Home.
 Config snapshots come from core state and settle for 0.35 seconds before an
 atomic write. A malformed, unreadable or unsupported-schema config loads
 defaults and disables saving, preserving the original file.
+Schema 1 migrates to 2 in memory, preserving pane paths, sorting, hidden
+settings, active pane and split, and adding both panels open at 15%.
+The normal settled atomic write saves schema 2; no filemgr config is imported.
 `--print-config` prints the resolved config as JSON.
 Theme changes are session selections, not persisted config fields.
 

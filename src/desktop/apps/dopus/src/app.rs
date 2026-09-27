@@ -91,6 +91,7 @@ pub enum Msg {
     RefreshPlaces,
     /// The divider moved (ratio clamped 0.1–0.9) or double-clicked (0.5).
     Split(f32),
+    SidebarWidth(cosmix_dopus_core::config::Sidebar, f32),
     /// A raw core event, back from the pumper (law 2's feed).
     Core(CoreEvent),
     /// Window edges (focus reloads the keymap; close quits).
@@ -438,6 +439,11 @@ impl Dopus {
                 self.core.set_split_ratio(ratio.clamp(view::panes::SPLIT_MIN, view::panes::SPLIT_MAX));
                 Task::none()
             }
+            Msg::SidebarWidth(sidebar, width) => {
+                self.stop_editing();
+                self.core.set_sidebar_width(sidebar, width);
+                Task::none()
+            }
             Msg::Core(event) => {
                 // Law 2: every raw event through on_event exactly once.
                 let derived = self.core.on_event(event);
@@ -743,6 +749,11 @@ impl Dopus {
         let mut tasks = Vec::new();
         for served in verbs::serve_command(command, &mut self.core, &meta, &info) {
             match served {
+                Served::ToggleSidebar { id, sidebar, action } => {
+                    self.stop_editing();
+                    self.core.toggle_sidebar(sidebar);
+                    handle.respond(id, 0, serde_json::to_string(&verbs::ActionReply { id: action, ok: true, result: None }).unwrap_or_default());
+                }
                 Served::Reply { id, rc, body } => handle.respond(id, rc, body),
                 Served::LocationFocus { id, pane } => tasks.push(self.serve_location_focus(id, pane)),
                 Served::ThemeSet { id, scheme, mode } => {
@@ -854,6 +865,7 @@ impl Dopus {
             }
             match verbs::apply_action(*action, &mut self.core) {
                 Ok(verbs::Applied::Done) => {}
+                Ok(verbs::Applied::ToggleSidebar(sidebar)) => { self.stop_editing(); self.core.toggle_sidebar(sidebar); }
                 Ok(verbs::Applied::LocationFocus(pane)) => tasks.push(self.begin_edit(pane)),
                 // Unreachable from this path (the theme pre-filter above
                 // consumed every theme id) but the shared layer must stay
@@ -993,6 +1005,8 @@ impl Dopus {
             self.dialog.as_ref(),
             self.core.places(),
             self.core.properties(self.core.active()),
+            self.core.sidebar(cosmix_dopus_core::config::Sidebar::Places),
+            self.core.sidebar(cosmix_dopus_core::config::Sidebar::Properties),
         );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops

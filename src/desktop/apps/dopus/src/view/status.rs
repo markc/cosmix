@@ -5,7 +5,7 @@
 //! (app contract, law 1: the app's own clock, never a cached string that
 //! ages silently).
 
-use iced::widget::{container, row, text, Space};
+use iced::widget::{button, container, row, text};
 use iced::{Element, Length};
 
 use cosmix_dopus_core::PaneModel;
@@ -16,16 +16,32 @@ use crate::view::Look;
 /// The status bar strip.
 pub fn bar<'a>(look: Look, pane: &'a PaneModel, info: &'a str) -> Element<'a, Msg> {
     let summary = cosmix_dopus_core::pane_summary(&pane.root);
-    container(
-        row![
-            text(info).font(look.ui_font).size(look.px * 0.85).color(look.chrome.secondary_text),
-            container(Space::new()).width(Length::Fill),
-            text(summary).font(look.mono_font).size(look.mono_px * 0.85).color(look.tokens.muted_text),
-        ],
-    )
+    container(row![
+        button(text("Places (F9)").font(look.ui_font).size(look.px * 0.85))
+            .padding(look.chrome.small)
+            .style(super::button_look(&look))
+            .on_press(Msg::Actions(vec![cosmix_actions::view::TOGGLE_PLACES])),
+        button(
+            text("Properties (F10)")
+                .font(look.ui_font)
+                .size(look.px * 0.85)
+        )
+        .padding(look.chrome.small)
+        .style(super::button_look(&look))
+        .on_press(Msg::Actions(vec![cosmix_actions::view::TOGGLE_PROPERTIES])),
+        super::elide::Label {
+            text: info.into(),
+            font: look.ui_font,
+            px: look.px * 0.85,
+            color: look.chrome.secondary_text
+        },
+        text(summary)
+            .font(look.mono_font)
+            .size(look.mono_px * 0.85)
+            .color(look.tokens.muted_text),
+    ])
     .width(Length::Fill)
-    .height(Length::Fixed(crate::view::STATUS_H))
-    .padding([0, 8])
+    .padding([0.0, look.chrome.pad])
     .align_y(iced::Alignment::Center)
     .style(look.strip(look.chrome.secondary, look.chrome.secondary_text))
     .into()

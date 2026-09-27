@@ -116,8 +116,10 @@ pub struct PaneState {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateReply {
+    pub places: cosmix_dopus_core::config::SidebarConfig,
+    pub properties: cosmix_dopus_core::config::SidebarConfig,
     pub panes: Vec<PaneState>,
     pub theme_scheme: String,
     pub theme_mode: String,
@@ -274,6 +276,7 @@ pub struct ServerMeta {
 
 /// One served command's answer.
 pub enum Served {
+    ToggleSidebar { id: u64, sidebar: cosmix_dopus_core::config::Sidebar, action: String },
     /// Reply `(rc, body)` to command `id`.
     Reply { id: u64, rc: u8, body: String },
     /// Apply the theme selection, then reply to `id` with the resolved
@@ -313,6 +316,8 @@ impl Served {
 /// `dopus.actions.list` only; their `enabled` flag is per-call from the
 /// core's availability ([`apply_availability`]).
 pub const ACTIONS: &[(ActionId, &str)] = &[
+    (cosmix_actions::view::TOGGLE_PLACES, "Show or hide Places"),
+    (cosmix_actions::view::TOGGLE_PROPERTIES, "Show or hide Properties"),
     (cosmix_actions::location::FOCUS, "Focus the location bar"),
     (filemgr::FILE_OPEN, "Open the selection"),
     (filemgr::FILE_NEW_FOLDER, "New folder"),
@@ -380,6 +385,7 @@ fn theme_action(action: ActionId) -> Option<ThemeAction> {
 /// What applying one action does. The Bus layer and the keyboard layer share
 /// this: a `dopus.action` call is a keystroke a remote caller pressed.
 pub enum Applied {
+    ToggleSidebar(cosmix_dopus_core::config::Sidebar),
     Done,
     /// The window focuses this pane's location editor; headless refuses.
     LocationFocus(PaneId),
@@ -434,6 +440,8 @@ pub fn apply_action(action: ActionId, core: &mut DopusCore) -> Result<Applied, R
 /// Apply pane-local navigation, view and selection actions directly to the
 /// target. Global actions (switch-pane, theme, quit) retain their meaning.
 pub fn apply_action_in(action: ActionId, core: &mut DopusCore, pane: PaneId) -> Result<Applied, Refusal> {
+    if action == cosmix_actions::view::TOGGLE_PLACES { return Ok(Applied::ToggleSidebar(cosmix_dopus_core::config::Sidebar::Places)); }
+    if action == cosmix_actions::view::TOGGLE_PROPERTIES { return Ok(Applied::ToggleSidebar(cosmix_dopus_core::config::Sidebar::Properties)); }
     let done = Ok(Applied::Done);
     if action == cosmix_actions::location::FOCUS {
         return Ok(Applied::LocationFocus(pane));
@@ -735,6 +743,8 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
         )],
         "dopus.state" => {
             let state = StateReply {
+                places: core.sidebar(cosmix_dopus_core::config::Sidebar::Places),
+                properties: core.sidebar(cosmix_dopus_core::config::Sidebar::Properties),
                 panes: vec![pane_state(core, PaneId::Left), pane_state(core, PaneId::Right)],
                 theme_scheme: meta.theme_scheme.clone(),
                 theme_mode: meta.theme_mode.clone(),
@@ -757,6 +767,12 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
                         format!("{action} is keyboard-only — the Bus never mutates the filesystem through a file manager"),
                     )],
                     Ok(action) => match apply_action_in(action, core, pane) {
+                        Ok(Applied::ToggleSidebar(_)) if meta.headless || !meta.location_focus_available => vec![Served::refusal(command.id, Refusal {
+                            error_code: code::UNAVAILABLE.to_owned(),
+                            message: "sidebar toggles need an available window".to_owned(),
+                            reason: Some(if meta.headless { "headless" } else { "window_busy" }.to_owned()),
+                        })],
+                        Ok(Applied::ToggleSidebar(sidebar)) => vec![Served::ToggleSidebar { id: command.id, sidebar, action: req.id }],
                         Ok(Applied::LocationFocus(_)) if meta.headless || !meta.location_focus_available => {
                             vec![Served::refusal(command.id, Refusal {
                                 error_code: code::UNAVAILABLE.to_owned(),
@@ -799,7 +815,7 @@ pub fn serve_command(command: &crate::bus::Command, core: &mut DopusCore, meta: 
             let mut actions = meta.actions.clone();
             apply_availability(&mut actions, &core.availability());
             for row in &mut actions {
-                if row.id == cosmix_actions::location::FOCUS.as_str() {
+                if [cosmix_actions::location::FOCUS.as_str(), cosmix_actions::view::TOGGLE_PLACES.as_str(), cosmix_actions::view::TOGGLE_PROPERTIES.as_str()].contains(&row.id.as_str()) {
                     row.enabled = !meta.headless && meta.location_focus_available;
                 }
             }

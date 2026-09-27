@@ -349,6 +349,7 @@ impl<'a> FileList<'a> {
 }
 
 impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<RowState>() }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Fill)
     }

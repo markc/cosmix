@@ -85,6 +85,8 @@ pub fn root<'a>(
     dialog: Option<&'a dialogs::Dialog>,
     places: &'a [(&'static str, std::path::PathBuf)],
     properties: cosmix_dopus_core::properties::Properties,
+    places_config: cosmix_dopus_core::config::SidebarConfig,
+    properties_config: cosmix_dopus_core::config::SidebarConfig,
 ) -> Element<'a, Msg> {
     let (left_edit, right_edit) = match editing {
         Some((PaneId::Left, text)) => (Some(text), None),
@@ -99,47 +101,80 @@ pub fn root<'a>(
     // already keeps it in 0.1–0.9, so both sides get at least 10).
     let left_portion =
         (split_ratio.clamp(panes::SPLIT_MIN, panes::SPLIT_MAX) * 100.0).round() as u16;
-    let content = column![
+    let portion = |config: cosmix_dopus_core::config::SidebarConfig| {
+        if config.open {
+            (config.normalised().width * 1000.0).round() as u16
+        } else {
+            0
+        }
+    };
+    let sides = [portion(places_config), portion(properties_config)];
+    let mut body = row![].width(Length::Fill).height(Length::Fill);
+    if places_config.open {
+        body = body
+            .push(
+                container(places::sidebar(
+                    look,
+                    icons,
+                    tint,
+                    active,
+                    active_pane,
+                    places,
+                ))
+                .width(Length::FillPortion(sides[0]))
+                .height(Length::Fill),
+            )
+            .push(panes::Divider::new(
+                &look,
+                Some(cosmix_dopus_core::config::Sidebar::Places),
+                sides,
+            ));
+    }
+    body = body.push(
         row![
-            row![
-                places::sidebar(look, icons, tint, active, active_pane, places),
-                panes::pane_column(
-                    look,
-                    icons,
-                    tint,
-                    PaneId::Left,
-                    left,
-                    left_rows,
-                    left_portion,
-                    active == PaneId::Left,
-                    left_edit,
-                ),
-                panes::Divider::new(&look),
-                panes::pane_column(
-                    look,
-                    icons,
-                    tint,
-                    PaneId::Right,
-                    right,
-                    right_rows,
-                    100 - left_portion,
-                    active == PaneId::Right,
-                    right_edit,
-                ),
-            ]
-            .width(Length::FillPortion(85))
-            .height(Length::Fill),
-            container(properties::sidebar(look, properties))
-                .width(Length::FillPortion(15))
-                .height(Length::Fill)
+            panes::pane_column(
+                look,
+                icons,
+                tint,
+                PaneId::Left,
+                left,
+                left_rows,
+                left_portion,
+                active == PaneId::Left,
+                left_edit
+            ),
+            panes::Divider::new(&look, None, sides),
+            panes::pane_column(
+                look,
+                icons,
+                tint,
+                PaneId::Right,
+                right,
+                right_rows,
+                100 - left_portion,
+                active == PaneId::Right,
+                right_edit
+            ),
         ]
+        .width(Length::FillPortion(1000 - sides[0] - sides[1]))
+        .height(Length::Fill),
+    );
+    if properties_config.open {
+        body = body
+            .push(panes::Divider::new(
+                &look,
+                Some(cosmix_dopus_core::config::Sidebar::Properties),
+                sides,
+            ))
+            .push(
+                container(properties::sidebar(look, properties))
+                    .width(Length::FillPortion(sides[1]))
+                    .height(Length::Fill),
+            );
+    }
+    let content = column![body, status::bar(look, active_pane, info),]
         .width(Length::Fill)
-        .height(Length::Fill)
-        .align_y(iced::Alignment::Start),
-        status::bar(look, active_pane, info),
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
+        .height(Length::Fill);
     match dialog {
         // The modal card is stacked OVER the window; the scrim takes every
         // click not on the card, and the router's modal scope takes every
@@ -178,6 +213,11 @@ pub fn button_look(
 
 /// A cached icon handle as an iced image widget, at the header's 16 px; a
 /// blank 16 px filler while the rasterisation is still in flight.
-pub fn image_widget(icons: &Icons, tint: &str, icon: crate::icons::Icon) -> Element<'static, Msg> {
-    places::image_widget(icons, tint, icon)
+pub fn image_widget(
+    look: Look,
+    icons: &Icons,
+    tint: &str,
+    icon: crate::icons::Icon,
+) -> Element<'static, Msg> {
+    places::image_widget(look, icons, tint, icon)
 }

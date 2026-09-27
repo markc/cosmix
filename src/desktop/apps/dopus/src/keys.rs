@@ -615,14 +615,14 @@ mod tests {
     fn the_packaged_defaults_load() {
         let shared = initial(None).unwrap();
         let router = shared.lock().unwrap();
-        assert_eq!(router.keymap.defaults.len(), 29);
+        assert_eq!(router.keymap.defaults.len(), 31);
         assert!(router.keymap.custom.is_empty());
     }
 
     #[test]
     fn missing_overlay_is_the_packaged_defaults() {
         let keymap = load(Some(Path::new("/nonexistent/keymap.conf.mix"))).unwrap();
-        assert_eq!(keymap.defaults.len(), 29);
+        assert_eq!(keymap.defaults.len(), 31);
     }
 
     #[test]

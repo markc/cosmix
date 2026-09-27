@@ -1,9 +1,9 @@
 //! Native `.conf.mix` persistence for dopus's local UI/session state.
 //!
 //! Ported from src/desktop/apps/filemgr/src/config.rs (Bevy/ctk); filemgr
-//! stays untouched until retirement. Schema is fresh at 1: the v1→v2 sidebar
-//! migration is dropped (dopus has no DCS sidebars) but the rejection law is
-//! kept — a malformed or unsupported-schema file loads defaults and is never
+//! stays untouched until retirement. Schema 2 adds plain sidebar state and
+//! migrates dopus schema 1. The rejection law is kept: a malformed or
+//! unsupported-schema file loads defaults and is never
 //! overwritten. Runtime directories are injected by the caller (no ctk
 //! AppDirs); the file name stays `config.conf.mix`.
 
@@ -14,7 +14,41 @@ use serde::{Deserialize, Serialize};
 use cosmix_config::{from_conf_mix_str, to_conf_mix_string};
 use cosmix_files::atomic::write_atomic;
 
-pub const CURRENT_SCHEMA: u32 = 1;
+pub const CURRENT_SCHEMA: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct SidebarConfig {
+    pub open: bool,
+    /// Fraction of available window width, matching filemgr's default.
+    pub width: f32,
+}
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            open: true,
+            width: 0.15,
+        }
+    }
+}
+impl SidebarConfig {
+    pub fn normalised(self) -> Self {
+        Self {
+            width: if self.width.is_finite() {
+                self.width.clamp(0.1, 0.3)
+            } else {
+                Self::default().width
+            },
+            ..self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sidebar {
+    Places,
+    Properties,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +82,8 @@ impl Default for PaneConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct DOpusConfig {
+    pub places: SidebarConfig,
+    pub properties: SidebarConfig,
     pub schema_version: u32,
     pub left: PaneConfig,
     #[serde(default = "default_right_pane")]
@@ -62,6 +98,8 @@ impl Default for DOpusConfig {
         let left = PaneConfig::default();
         Self {
             schema_version: CURRENT_SCHEMA,
+            places: SidebarConfig::default(),
+            properties: SidebarConfig::default(),
             left,
             right: default_right_pane(),
             active_pane: "left".into(),
@@ -98,16 +136,23 @@ impl ConfigFile {
         let path = dir.join("config.conf.mix");
         match std::fs::read_to_string(&path) {
             Ok(raw) => match from_conf_mix_str::<DOpusConfig>(&raw) {
-                Ok(config) if config.schema_version == CURRENT_SCHEMA => (
-                    config,
-                    Self {
-                        path,
-                        allow_save: true,
-                    },
-                ),
-                // No migration: schema is fresh at 1. Anything else on disk was
-                // written by something this build does not understand, so the
-                // defaults load but the file is never overwritten.
+                Ok(mut config) if matches!(config.schema_version, 1 | CURRENT_SCHEMA) => {
+                    if config.schema_version == 1 {
+                        config.places = SidebarConfig::default();
+                        config.properties = SidebarConfig::default();
+                    }
+                    config.schema_version = CURRENT_SCHEMA;
+                    config.places = config.places.normalised();
+                    config.properties = config.properties.normalised();
+                    (
+                        config,
+                        Self {
+                            path,
+                            allow_save: true,
+                        },
+                    )
+                }
+                // Unknown schemas load defaults without overwriting the file.
                 Ok(config) => {
                     eprintln!(
                         "dopus: refusing to overwrite unsupported config schema {} in {}",
@@ -163,8 +208,8 @@ impl ConfigFile {
         if !self.allow_save {
             return Ok(false);
         }
-        let content =
-            to_conf_mix_string(config).map_err(|error| format!("serialising dopus config: {error}"))?;
+        let content = to_conf_mix_string(config)
+            .map_err(|error| format!("serialising dopus config: {error}"))?;
         // `write_atomic` returns the typed cosmix-files error; this layer
         // speaks `String` (filemgr's convention, kept throughout the core).
         write_atomic(&self.path, content.as_bytes())

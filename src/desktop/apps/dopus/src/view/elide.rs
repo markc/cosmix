@@ -94,6 +94,7 @@ pub struct Label {
     pub color: iced::Color,
 }
 impl<M> iced::advanced::Widget<M, iced::Theme, Renderer> for Label {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag { iced::advanced::widget::tree::Tag::of::<Para>() }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Shrink)
     }

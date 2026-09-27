@@ -467,6 +467,11 @@ never a recursive byte walk. With no selection it shows the current path
 and the same folder/file counts and total file size as the status bar.
 Metadata runs on at most one worker per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.</p>
+<p><strong>F9</strong> toggles Places and <strong>F10</strong> toggles Properties; the status bar offers
+both controls even when the panels are hidden. Drag a panel's divider to
+resize it; double-click restores 15%. Both open states and widths persist.
+Widths are fractions of the available window width, clamped to 10–30% each
+to leave room for the panes. Hidden panels and their dividers take no space.</p>
 <p>File operations are local keyboard/dialog actions: new folder, rename,
 copy or move to the other pane, and permanent delete with confirmation.
 Operations run one at a time, never overwrite a destination, and relist both
@@ -523,7 +528,7 @@ permission. No verb performs file operations or opens a confirmation dialog.</p>
 <tr><td><code>dopus.ping</code></td><td>—</td><td><code>{pong, service, schema:"dopus.v1", pid, headless}</code></td><td>—</td></tr>
 <tr><td><code>dopus.describe</code></td><td>—</td><td><code>{contract:"ctk-app-control.v0", app:"dopus", title, view, engine:"iced", version, description, controls, verbs}</code></td><td>—</td></tr>
 <tr><td><code>dopus.info</code></td><td>—</td><td><code>{version, git_sha, build_time, headless, panes:2, pane_states:[PaneState, PaneState], config_path}</code></td><td>—</td></tr>
-<tr><td><code>dopus.state</code></td><td>—</td><td><code>{panes:[PaneState, PaneState], theme_scheme, theme_mode}</code></td><td>—</td></tr>
+<tr><td><code>dopus.state</code></td><td>—</td><td><code>{panes:[PaneState, PaneState], places:{open,width}, properties:{open,width}, theme_scheme, theme_mode}</code></td><td>—</td></tr>
 <tr><td><code>dopus.action</code></td><td><code>id</code>, optional <code>pane</code>, optional <code>args</code> (currently unused)</td><td><code>{id, ok:true, result:null}</code>; quit instead returns <code>{quitting:true}</code></td><td><code>INVALID_ARGUMENT</code>, <code>FORBIDDEN</code>, <code>UNAVAILABLE</code>; for <code>location.focus</code>, reason <code>"headless"</code> means no window, <code>"window_busy"</code> means a modal is open or shutdown is underway</td></tr>
 <tr><td><code>dopus.actions.list</code></td><td>—</td><td><code>{actions:[{id, label, keys, enabled}]}</code></td><td>—</td></tr>
 <tr><td><code>dopus.theme.set</code></td><td>optional <code>scheme</code>, <code>mode</code>; null leaves unchanged</td><td><code>{scheme, mode}</code></td><td><code>INVALID_ARGUMENT</code>; <code>UNAVAILABLE</code> headless</td></tr>
@@ -569,11 +574,18 @@ If that pane's location editor is already open, the request succeeds as a
 no-op, preserving the draft. Targeting the other pane switches editors and
 seeds the new editor from that pane's path.
 <code>dopus.actions.list</code> enables it only when the window can perform it.
+<code>view.toggle-places</code> and <code>view.toggle-properties</code> are global window actions
+served through <code>dopus.action</code>. They ignore pane targeting, return the usual
+action acknowledgement after changing the layout, and return <code>UNAVAILABLE</code>
+with reason <code>headless</code> or <code>window_busy</code> under the same gate as <code>location.focus</code>.
+Their actions-list availability reflects that gate. State reports configured
+open/width values even headless; a refusal never changes them.
 <code>app.quit</code> is an action id; the direct quit verb is <code>dopus.quit</code>.</p>
 <h2 id="keymap-and-location-editing">Keymap and location editing</h2>
 <table><thead><tr><th>Binding</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+L</td><td><code>location.focus</code>: select the active location bar's text</td></tr>
 <tr><td>F6</td><td><code>nav.switch-pane</code></td></tr>
+<tr><td>F9 / F10</td><td><code>view.toggle-places</code> / <code>view.toggle-properties</code></td></tr>
 <tr><td>Alt+Left / Alt+Right</td><td><code>nav.back</code> / <code>nav.forward</code></td></tr>
 <tr><td>Backspace / Alt+Home</td><td><code>nav.parent</code> / <code>nav.home</code></td></tr>
 <tr><td>F5 / Ctrl+H</td><td><code>view.refresh</code> / <code>view.toggle-hidden</code></td></tr>
@@ -596,17 +608,19 @@ Dialogs own Enter/Escape and suppress browse actions.</p>
 The per-app <code>config/keymap.conf.mix</code> supplies <code>custom</code> overrides and
 <code>chord_timeout_ms</code> (default 1000). It reloads on window focus; invalid
 reloads retain the current map. P2 had click-to-edit only; Ctrl+L is new.</p>
-<h2 id="configuration-schema-1">Configuration: schema 1</h2>
+<h2 id="configuration-schema-2">Configuration: schema 2</h2>
 <p>The app root is the first absolute path available from <code>$COSMIX_APP_HOME</code>,
 <code>$COSMIX_APPS_HOME/dopus</code>, <code>$XDG_STATE_HOME/cosmix/apps/dopus</code>, or
 <code>$HOME/.local/state/cosmix/apps/dopus</code>.</p>
 <table><thead><tr><th>File under the app root</th><th>Purpose</th></tr></thead><tbody>
-<tr><td><code>config/config.conf.mix</code></td><td>Pane and split state, schema 1</td></tr>
+<tr><td><code>config/config.conf.mix</code></td><td>Pane, split and sidebar state, schema 2</td></tr>
 <tr><td><code>config/keymap.conf.mix</code></td><td>Optional keymap overlay</td></tr>
 <tr><td><code>config/theme.conf.mix</code></td><td>Optional theme override over shared design settings</td></tr>
 </tbody></table>
 <pre><code class="language-mix">{
-  schema_version: 1,
+  schema_version: 2,
+  places: {open: true, width: 0.15},
+  properties: {open: true, width: 0.15},
   left: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   right: {path: "/tmp", show_hidden: false, sort: "name", ascending: true},
   active_pane: "left",
@@ -619,6 +633,9 @@ the split to 0.1–0.9. Invalid startup directories fall back to Home.
 Config snapshots come from core state and settle for 0.35 seconds before an
 atomic write. A malformed, unreadable or unsupported-schema config loads
 defaults and disables saving, preserving the original file.
+Schema 1 migrates to 2 in memory, preserving pane paths, sorting, hidden
+settings, active pane and split, and adding both panels open at 15%.
+The normal settled atomic write saves schema 2; no filemgr config is imported.
 <code>--print-config</code> prints the resolved config as JSON.
 Theme changes are session selections, not persisted config fields.</p>
 <h2 id="not-in-v1">Not in v1</h2>

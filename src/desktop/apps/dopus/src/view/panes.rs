@@ -25,8 +25,6 @@ use crate::app::{Msg, PaneOp};
 use crate::icons::{Icon, Icons};
 use crate::view::{Look, location, rows};
 
-/// Divider width, logical px: the drag handle between the panes.
-pub const DIVIDER_W: f32 = 6.0;
 /// A second press on the divider inside this window is a double-click
 /// (reset to exactly 0.5).
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -90,8 +88,8 @@ fn pane_header<'a>(
 ) -> Element<'a, Msg> {
     let icon_button = |icon: Icon, op: PaneOp| {
         let style = crate::view::button_look(&look);
-        button(crate::view::image_widget(icons, tint, icon))
-            .padding(4)
+        button(crate::view::image_widget(look, icons, tint, icon))
+            .padding(look.chrome.small)
             .on_press_maybe(availability(pane, &op).then_some(Msg::Pane(pane_id, op)))
             .style(style)
     };
@@ -121,15 +119,14 @@ fn pane_header<'a>(
                     .size(look.mono_px * 0.9)
                     .color(caption_color),
             ]
-            .spacing(4)
+            .spacing(look.chrome.small)
             .align_y(iced::Alignment::Center),
             location::bar(look, pane, pane_id, editing),
         ]
-        .spacing(2),
+        .spacing(look.chrome.edge * 2.0),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(crate::view::HEADER_H * 2.0))
-    .padding([0, 8])
+    .padding([look.chrome.small, look.chrome.pad])
     .align_y(iced::Alignment::Center)
     .style(look.strip(
         if active {
@@ -186,12 +183,13 @@ struct DividerState {
 /// [`SPLIT_MIN`]–[`SPLIT_MAX`]), double-click to restore 0.5. The cursor is
 /// col-resize over the handle.
 ///
-/// Geometry: the handle computes the ratio from the cursor position inside
-/// the panes ROW, which spans `viewport.x + places::PLACES_W` …
-/// `viewport.x + viewport.width`. That holds because nothing between the
-/// root column and this widget clips (no scrollable ancestors) — the root
-/// composition and [`crate::view::places::PLACES_W`] are the contract.
+/// Geometry uses the root viewport and the same sidebar portions as root's
+/// layout, subtracting all open sidebar handles and the pane handle.
 pub struct Divider {
+    width: f32,
+    edge: f32,
+    target: Option<cosmix_dopus_core::config::Sidebar>,
+    sides: [u16; 2],
     /// The grip colours (tokens; a hover/drag lights the handle with the
     /// active pane's accent).
     border: iced::Color,
@@ -199,8 +197,16 @@ pub struct Divider {
 }
 
 impl Divider {
-    pub fn new(look: &Look) -> Self {
+    pub fn new(
+        look: &Look,
+        target: Option<cosmix_dopus_core::config::Sidebar>,
+        sides: [u16; 2],
+    ) -> Self {
         Self {
+            width: look.chrome.small + 2.0 * look.chrome.edge,
+            edge: look.chrome.edge,
+            target,
+            sides,
             border: look.tokens.border,
             accent: look.chrome.accent,
         }
@@ -210,16 +216,38 @@ impl Divider {
     /// The denominator is the panes row MINUS the divider — the exact space
     /// the two FillPortion panes share in `view::root` — so the grip's
     /// centre tracks the cursor at the clamp extremes too.
-    fn ratio_at(x: f32, viewport: &Rectangle) -> f32 {
-        let left = viewport.x + crate::view::places::PLACES_W;
-        let width = (viewport.width * 0.85 - crate::view::places::PLACES_W - DIVIDER_W).max(1.0);
-        ((x - left) / width).clamp(SPLIT_MIN, SPLIT_MAX)
+    fn message_at(&self, x: f32, viewport: &Rectangle) -> Msg {
+        use cosmix_dopus_core::config::Sidebar;
+        let handles = self.sides.iter().filter(|p| **p > 0).count() as f32;
+        let available = (viewport.width - handles * self.width).max(1.0);
+        match self.target {
+            Some(Sidebar::Places) => Msg::SidebarWidth(
+                Sidebar::Places,
+                ((x - viewport.x - self.width / 2.0) / available).clamp(0.1, 0.3),
+            ),
+            Some(Sidebar::Properties) => Msg::SidebarWidth(
+                Sidebar::Properties,
+                ((viewport.x + viewport.width - x - self.width / 2.0) / available).clamp(0.1, 0.3),
+            ),
+            None => {
+                let left = viewport.x
+                    + available * self.sides[0] as f32 / 1000.0
+                    + if self.sides[0] > 0 { self.width } else { 0.0 };
+                let width = (available * (1000 - self.sides[0] - self.sides[1]) as f32 / 1000.0
+                    - self.width)
+                    .max(1.0);
+                Msg::Split(((x - left - self.width / 2.0) / width).clamp(SPLIT_MIN, SPLIT_MAX))
+            }
+        }
     }
 }
 
 impl Widget<Msg, iced::Theme, Renderer> for Divider {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<DividerState>()
+    }
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Fixed(DIVIDER_W), Length::Fill)
+        Size::new(Length::Fixed(self.width), Length::Fill)
     }
 
     fn state(&self) -> tree::State {
@@ -232,7 +260,7 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
         _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        layout::Node::new(limits.resolve(Length::Fixed(DIVIDER_W), Length::Fill, Size::ZERO))
+        layout::Node::new(limits.resolve(Length::Fixed(self.width), Length::Fill, Size::ZERO))
     }
 
     fn update(
@@ -262,7 +290,13 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
                     // Double-click: exactly half; this press does not start
                     // a drag.
                     st.last_click = None;
-                    shell.publish(Msg::Split(0.5));
+                    shell.publish(match self.target {
+                        None => Msg::Split(0.5),
+                        Some(sidebar) => Msg::SidebarWidth(
+                            sidebar,
+                            cosmix_dopus_core::config::SidebarConfig::default().width,
+                        ),
+                    });
                 } else {
                     st.dragging = true;
                     st.moved = false;
@@ -280,7 +314,7 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if st.dragging => {
                 st.moved = true;
-                shell.publish(Msg::Split(Self::ratio_at(position.x, viewport)));
+                shell.publish(self.message_at(position.x, viewport));
                 shell.capture_event();
             }
             // A release outside the window never arrives, and iced's
@@ -314,9 +348,9 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
         let active = st.dragging || cursor.is_over(clip);
         let color = if active { self.accent } else { self.border };
         let grip = Rectangle {
-            x: bounds.center_x() - 1.0,
+            x: bounds.center_x() - self.edge / 2.0,
             y: bounds.y,
-            width: 2.0,
+            width: self.edge,
             height: bounds.height,
         };
         if let Some(clipped) = grip.intersection(&clip) {

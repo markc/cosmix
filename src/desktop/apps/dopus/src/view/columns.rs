@@ -35,6 +35,7 @@ impl Header {
     }
 }
 impl Widget<Msg, iced::Theme, Renderer> for Header {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<[Para; 3]>() }
     fn size(&self) -> Size<Length> {
         Size::new(Length::Fill, Length::Shrink)
     }

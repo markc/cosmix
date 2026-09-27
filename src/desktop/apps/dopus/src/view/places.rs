@@ -13,10 +13,6 @@ use crate::app::Msg;
 use crate::icons::{self, Icon, Icons};
 use crate::view::Look;
 
-/// Sidebar width, logical px. The panes row starts here — the divider's
-/// drag geometry depends on this constant (see `panes::Divider`).
-pub const PLACES_W: f32 = 150.0;
-
 /// An icon per place name. The core's names are fixed (`places`), so the
 /// mapping is exhaustive over what it can produce; an unknown name falls
 /// back to the folder icon.
@@ -53,15 +49,15 @@ pub fn sidebar<'a>(
         )
         .on_press(Msg::RefreshPlaces)
         .style(place_look(&look, false)),
-        Space::new().height(Length::Fixed(4.0)),
+        Space::new().height(Length::Fixed(look.chrome.small)),
     ]
     .padding(Padding {
-        top: 8.0,
+        top: look.chrome.pad,
         right: 0.0,
         bottom: 0.0,
         left: 0.0,
     })
-    .spacing(2)
+    .spacing(look.chrome.edge * 2.0)
     .width(Length::Fill);
     for (name, path) in places {
         let selected = pane.path == *path;
@@ -78,18 +74,18 @@ pub fn sidebar<'a>(
         let style = place_look(&look, selected);
         list = list.push(
             button(
-                row![image_widget(icons, tint, place_icon(name)), label]
-                    .spacing(8)
+                row![image_widget(look, icons, tint, place_icon(name)), label]
+                    .spacing(look.chrome.pad)
                     .align_y(iced::Alignment::Center),
             )
-            .padding([4, 10])
+            .padding([look.chrome.small, look.chrome.pad])
             .width(Length::Fill)
             .on_press(Msg::Go(active, path.clone()))
             .style(style),
         );
     }
     container(Scrollable::new(list))
-        .width(Length::Fixed(PLACES_W))
+        .width(Length::Fill)
         .height(Length::Fill)
         .style(look.strip(look.chrome.secondary, look.chrome.secondary_text))
         .into()
@@ -125,15 +121,15 @@ fn place_look(
 
 /// A cached icon handle as an iced image widget, 16 px (the header's shape;
 /// `view::mod` shares this one — kept here so the sidebar is self-contained).
-pub fn image_widget(icons: &Icons, tint: &str, icon: Icon) -> Element<'static, Msg> {
+pub fn image_widget(look: Look, icons: &Icons, tint: &str, icon: Icon) -> Element<'static, Msg> {
     match icons.get(icon, tint, icons::RASTER_PX) {
         Some(handle) => image(handle)
-            .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0))
+            .width(Length::Fixed(look.chrome.icon))
+            .height(Length::Fixed(look.chrome.icon))
             .into(),
         None => container(Space::new())
-            .width(Length::Fixed(16.0))
-            .height(Length::Fixed(16.0))
+            .width(Length::Fixed(look.chrome.icon))
+            .height(Length::Fixed(look.chrome.icon))
             .into(),
     }
 }

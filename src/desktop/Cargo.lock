@@ -2969,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-actions"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cosmix-lib-config",
  "serde",
