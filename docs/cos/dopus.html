@@ -451,6 +451,13 @@ directory tree and single selection. F6 switches the active pane. Places is
 a plain sidebar, with Home, Filesystem and existing user directories.
 Click its heading to refresh Places; pane relists also invalidate its cached
 directory checks. The divider persists its position; double-click centres it.</p>
+<p>Names in listings and Places middle-elide to their measured width, preserving
+the final extension where space permits. Headers and rows share one column
+layout: Name uses the remaining space; Size and Modified align right in
+reserved columns. Each column and the list viewport clip their contents.
+Selection uses the design's selection pair, and a tinted header marks the
+active pane. Modified times follow filemgr's rule: relative below seven days,
+otherwise local <code>DD/MM/YY at h:mm am/pm</code>, refreshed by the frontend clock.</p>
 <p>File operations are local keyboard/dialog actions: new folder, rename,
 copy or move to the other pane, and permanent delete with confirmation.
 Operations run one at a time, never overwrite a destination, and relist both

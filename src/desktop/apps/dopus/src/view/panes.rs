@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
-use iced::widget::{button, column, container, row, text, Space};
-use iced::{Border, Element, Event, Length, Rectangle, Size};
+use iced::widget::{button, column, container, row, text};
+use iced::{Element, Event, Length, Rectangle, Size};
 
-use cosmix_dopus_core::{PaneId, PaneModel, SortColumn, VisibleRow};
+use cosmix_dopus_core::{PaneId, PaneModel, VisibleRow};
 use iced_tiny_skia::Renderer;
 
 use crate::app::{Msg, PaneOp};
@@ -52,7 +52,6 @@ pub fn pane_column<'a>(
     active: bool,
     editing: Option<&'a str>,
 ) -> Element<'a, Msg> {
-    let border = if active { look.chrome.accent } else { look.tokens.border };
     container(
         column![
             pane_header(look, icons, tint, pane, pane_id, active, editing),
@@ -73,10 +72,6 @@ pub fn pane_column<'a>(
     )
     .width(Length::FillPortion(portion))
     .height(Length::Fill)
-    .style(move |_| container::Style {
-        border: Border { color: border, width: if active { 1.0 } else { 0.0 }, ..Default::default() },
-        ..Default::default()
-    })
     .into()
 }
 
@@ -100,7 +95,11 @@ fn pane_header<'a>(
             .on_press_maybe(availability(pane, &op).then_some(Msg::Pane(pane_id, op)))
             .style(style)
     };
-    let caption_color = if active { look.chrome.secondary_text } else { look.tokens.muted_text };
+    let caption_color = if active {
+        look.tokens.primary_text
+    } else {
+        look.tokens.muted_text
+    };
     container(
         column![
             row![
@@ -109,7 +108,14 @@ fn pane_header<'a>(
                 icon_button(Icon::ArrowUp, PaneOp::NavParent),
                 icon_button(Icon::House, PaneOp::NavHome),
                 icon_button(Icon::Refresh, PaneOp::Refresh),
-                icon_button(if pane.show_hidden { Icon::EyeOff } else { Icon::Eye }, PaneOp::ToggleHidden),
+                icon_button(
+                    if pane.show_hidden {
+                        Icon::EyeOff
+                    } else {
+                        Icon::Eye
+                    },
+                    PaneOp::ToggleHidden
+                ),
                 text(cosmix_dopus_core::sanitise_display_path(&pane.path))
                     .font(look.mono_font)
                     .size(look.mono_px * 0.9)
@@ -125,7 +131,14 @@ fn pane_header<'a>(
     .height(Length::Fixed(crate::view::HEADER_H * 2.0))
     .padding([0, 8])
     .align_y(iced::Alignment::Center)
-    .style(look.strip(look.chrome.secondary, caption_color))
+    .style(look.strip(
+        if active {
+            look.tokens.primary
+        } else {
+            look.chrome.secondary
+        },
+        caption_color,
+    ))
     .into()
 }
 
@@ -144,41 +157,12 @@ fn availability(pane: &PaneModel, op: &PaneOp) -> bool {
 /// (`Msg::Pane`; law 5 — the core adopts a new column ascending and toggles
 /// a same-column repeat itself).
 fn sort_header<'a>(look: Look, pane: &'a PaneModel, pane_id: PaneId) -> Element<'a, Msg> {
-    let header_button = |label: &str, op: PaneOp, column_sort: SortColumn| {
-        let style = crate::view::button_look(&look);
-        let active = pane.sort == column_sort;
-        let label = if active {
-            format!("{label} {}", if pane.ascending { "↑" } else { "↓" })
-        } else {
-            label.to_owned()
-        };
-        button(
-            text(label)
-                .font(look.ui_font)
-                .size(look.px * 0.85)
-                .color(if active { look.chrome.secondary_text } else { look.tokens.muted_text }),
-        )
-        .padding([2, 6])
-        .on_press(Msg::Pane(pane_id, op))
-        .style(style)
-    };
-    container(
-        row![
-            header_button("Name", PaneOp::Sort(SortColumn::Name), SortColumn::Name),
-            container(Space::new()).width(Length::Fill).height(Length::Fixed(0.0)),
-            header_button("Size", PaneOp::Sort(SortColumn::Size), SortColumn::Size)
-                .width(Length::Fixed(rows::SIZE_W)),
-            container(Space::new()).width(Length::Fixed(rows::GAP)).height(Length::Fixed(0.0)),
-            header_button("Modified", PaneOp::Sort(SortColumn::Modified), SortColumn::Modified)
-                .width(Length::Fixed(rows::MODIFIED_W + 4.0)),
-        ]
-        .align_y(iced::Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(crate::view::SORT_H))
-    .padding([0, 8])
-    .align_y(iced::Alignment::Center)
-    .style(look.strip(look.chrome.secondary, look.chrome.secondary_text))
+    super::columns::Header {
+        look,
+        pane: pane_id,
+        sort: pane.sort,
+        ascending: pane.ascending,
+    }
     .into()
 }
 
@@ -216,7 +200,10 @@ pub struct Divider {
 
 impl Divider {
     pub fn new(look: &Look) -> Self {
-        Self { border: look.tokens.border, accent: look.chrome.accent }
+        Self {
+            border: look.tokens.border,
+            accent: look.chrome.accent,
+        }
     }
 
     /// The ratio under an absolute cursor x, clamped to the drag contract.
@@ -239,7 +226,12 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
         tree::State::new(DividerState::default())
     }
 
-    fn layout(&mut self, _tree: &mut Tree, _renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
         layout::Node::new(limits.resolve(Length::Fixed(DIVIDER_W), Length::Fill, Size::ZERO))
     }
 
@@ -255,11 +247,18 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let Some(clip) = bounds.intersection(viewport) else { return };
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
         let st = tree.state.downcast_mut::<DividerState>();
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(clip) => {
-                if st.last_click.is_some_and(|when| when.elapsed() < DOUBLE_CLICK) {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if cursor.is_over(clip) =>
+            {
+                if st
+                    .last_click
+                    .is_some_and(|when| when.elapsed() < DOUBLE_CLICK)
+                {
                     // Double-click: exactly half; this press does not start
                     // a drag.
                     st.last_click = None;
@@ -306,7 +305,9 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let Some(clip) = bounds.intersection(viewport) else { return };
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
         let st = tree.state.downcast_ref::<DividerState>();
         // The grip: a 2 px hairline centred in the 6 px strip. Hovering or
         // dragging lights it with the accent (tokens, zero literals).
@@ -319,7 +320,13 @@ impl Widget<Msg, iced::Theme, Renderer> for Divider {
             height: bounds.height,
         };
         if let Some(clipped) = grip.intersection(&clip) {
-            renderer.fill_quad(renderer::Quad { bounds: clipped, ..renderer::Quad::default() }, color);
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: clipped,
+                    ..renderer::Quad::default()
+                },
+                color,
+            );
         }
     }
 

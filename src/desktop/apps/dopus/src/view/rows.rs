@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use iced::advanced::image::{self as aimage, Renderer as _};
-use iced::advanced::text::{Paragraph as _, self as atext};
+use iced::advanced::text::{self as atext, Paragraph as _};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mouse, renderer};
 use iced::{Element, Event, Length, Point, Rectangle, Size, alignment};
@@ -50,20 +50,43 @@ pub enum RowsMsg {
     Toggle(PathBuf),
 }
 
-/// The icon size, logical px (rasterised at ×2 and drawn downscaled).
-const ICON_PX: f32 = 16.0;
-/// Vertical padding around each row's line.
-const ROW_PAD: f32 = 3.0;
-/// Pixels of indent per tree depth level.
-const DEPTH_INDENT: f32 = 16.0;
-/// Width of a directory row's toggle zone (the chevron), before the icon.
-const TOGGLE_W: f32 = 16.0;
-/// The secondary columns, right-aligned at the row's right edge (the sort
-/// headers mirror these widths).
-pub const SIZE_W: f32 = 90.0;
-pub const MODIFIED_W: f32 = 150.0;
-/// Column gap.
-pub const GAP: f32 = 12.0;
+/// One column contract for headers and rows. Secondary widths are measured
+/// in the resolved mono role, including the widest absolute time form.
+#[derive(Clone, Copy, Debug)]
+pub struct Columns {
+    pub size: f32,
+    pub modified: f32,
+    pub gap: f32,
+    pub pad: f32,
+}
+impl Columns {
+    pub fn new(look: Look) -> Self {
+        let measure = |s| {
+            FileList::shape(s, look.mono_font, look.mono_px)
+                .min_bounds()
+                .width
+        };
+        Self {
+            size: measure("999999 items"),
+            modified: measure("88/88/88 at 88:88 pm"),
+            gap: look.chrome.gap,
+            pad: look.chrome.pad,
+        }
+    }
+    /// Local x/width pairs in display order. Modified is reserved first,
+    /// including at narrow widths; the remaining name budget may be zero.
+    pub fn cells(self, width: f32) -> [(f32, f32); 3] {
+        let end = (width - self.pad).max(0.0);
+        let modified = (end - self.modified).max(0.0);
+        let size_end = (modified - self.gap).max(0.0);
+        let size = (size_end - self.size).max(0.0);
+        [
+            (self.pad, (size - self.gap - self.pad).max(0.0)),
+            (size, size_end - size),
+            (modified, end - modified),
+        ]
+    }
+}
 /// List rows per wheel notch.
 const WHEEL_ROWS: f32 = 3.0;
 /// A second press on the same row inside this window is a double-click.
@@ -75,6 +98,7 @@ const CLICK_SLOP: f32 = 5.0;
 struct Cached {
     name: Para,
     name_of: String,
+    name_width: u32,
     size: Para,
     size_of: String,
     modified: Para,
@@ -160,7 +184,15 @@ impl<'a> FileList<'a> {
         tint: &'a str,
         look: Look,
     ) -> Self {
-        Self { rows, selected, root, expanded, icons, tint, look }
+        Self {
+            rows,
+            selected,
+            root,
+            expanded,
+            icons,
+            tint,
+            look,
+        }
     }
 
     fn is_expanded(&self, path: &Path) -> bool {
@@ -191,7 +223,7 @@ impl<'a> FileList<'a> {
             shaping: atext::Shaping::Basic,
             wrapping: atext::Wrapping::None,
         });
-        st.row_h = sample.min_bounds().height.max(line_h) + 2.0 * ROW_PAD;
+        st.row_h = sample.min_bounds().height.max(line_h) + 2.0 * self.look.chrome.small;
         st.metrics_key = Some(key);
     }
 
@@ -211,7 +243,7 @@ impl<'a> FileList<'a> {
 
     /// Shape (or re-shape) a row's three columns. An entry whose source text
     /// differs — the relative modified time aged, a size landed — re-shapes.
-    fn cache_row(&self, st: &mut RowState, row: &VisibleRow, now: SystemTime) {
+    fn cache_row(&self, st: &mut RowState, row: &VisibleRow, now: SystemTime, width: f32) {
         if st.tint != self.tint {
             // A re-tint means a new theme: fonts and colours may all differ.
             st.tint = self.tint.to_owned();
@@ -221,21 +253,38 @@ impl<'a> FileList<'a> {
         let size_text = if row.entry.is_dir {
             cosmix_dopus_core::format_child_count(row.entry.child_count)
         } else {
-            row.entry.size.map(cosmix_dopus_core::format_size).unwrap_or_else(|| "—".into())
+            row.entry
+                .size
+                .map(cosmix_dopus_core::format_size)
+                .unwrap_or_else(|| "—".into())
         };
-        let modified_text =
-            row.entry.modified.map(|m| cosmix_dopus_core::format_modified_at(m, now)).unwrap_or_else(|| "—".into());
+        let modified_text = row
+            .entry
+            .modified
+            .map(|m| cosmix_dopus_core::format_modified_at(m, now))
+            .unwrap_or_else(|| "—".into());
         let name = row.entry.name.clone();
+        let name_width = (Columns::new(self.look).cells(width)[0].1
+            - (row.depth as f32 + 2.0) * self.look.chrome.icon
+            - self.look.chrome.small)
+            .max(0.0);
         if let Some(cached) = st.cache.get(&row.entry.path)
             && cached.name_of == name
+            && cached.name_width == name_width.to_bits()
             && cached.size_of == size_text
             && cached.modified_of == modified_text
         {
             return;
         }
+        let elided = super::elide::middle(&name, name_width, |s| {
+            Self::shape(s, self.look.ui_font, self.look.px)
+                .min_bounds()
+                .width
+        });
         let shaped = Cached {
-            name: Self::shape(&name, self.look.ui_font, self.look.px),
+            name: Self::shape(&elided, self.look.ui_font, self.look.px),
             name_of: name,
+            name_width: name_width.to_bits(),
             size: Self::shape(&size_text, self.look.mono_font, self.look.mono_px),
             size_of: size_text,
             modified: Self::shape(&modified_text, self.look.mono_font, self.look.mono_px),
@@ -264,12 +313,18 @@ impl<'a> FileList<'a> {
 
     /// Follow the selection when it changes: keep the selected row visible.
     fn follow_selection(&self, st: &mut RowState, height: f32) {
-        let Some(selected) = self.selected else { return };
+        let Some(selected) = self.selected else {
+            return;
+        };
         if st.last_selected.as_deref() == Some(selected) {
             return;
         }
         st.last_selected = Some(selected.to_path_buf());
-        if let Some(index) = self.rows.iter().position(|row| row.entry.path.as_path() == selected) {
+        if let Some(index) = self
+            .rows
+            .iter()
+            .position(|row| row.entry.path.as_path() == selected)
+        {
             let top = index as f32 * st.row_h;
             let bottom = top + st.row_h;
             if top < st.offset {
@@ -282,13 +337,13 @@ impl<'a> FileList<'a> {
 
     /// Shape every row the viewport will draw (called from `update`, which
     /// owns the `&mut Tree` the cache lives in).
-    fn sync_cache(&self, st: &mut RowState, height: f32, now: SystemTime) {
+    fn sync_cache(&self, st: &mut RowState, height: f32, now: SystemTime, width: f32) {
         let first = (st.offset / st.row_h).floor().max(0.0) as usize;
         for (index, row) in self.rows.iter().enumerate().skip(first) {
             if index > first && !st.is_visible(index, height) {
                 break;
             }
-            self.cache_row(st, row, now);
+            self.cache_row(st, row, now, width);
         }
     }
 }
@@ -302,7 +357,12 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         tree::State::new(RowState::new())
     }
 
-    fn layout(&mut self, _tree: &mut Tree, _renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
         // O(1): rows hang off the scroll offset; nothing is laid out.
         layout::Node::new(limits.resolve(Length::Fill, Length::Fill, Size::ZERO))
     }
@@ -319,13 +379,15 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let Some(clip) = bounds.intersection(viewport) else { return };
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
         let st = tree.state.downcast_mut::<RowState>();
         self.ensure_metrics(st);
         self.reset_on_relist(st);
         self.follow_selection(st, clip.height);
         st.clamp(self.rows.len(), clip.height);
-        self.sync_cache(st, clip.height, SystemTime::now());
+        self.sync_cache(st, clip.height, SystemTime::now(), bounds.width);
 
         match event {
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(clip) => {
@@ -339,7 +401,9 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     shell.capture_event();
                 }
             }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(clip) => {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if cursor.is_over(clip) =>
+            {
                 // Any press in the listing activates the pane it belongs to
                 // (the caller maps this onto `set_active_pane`), then the
                 // press starts the row-click tracker.
@@ -349,10 +413,17 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                     st.press = Some((position, index));
                 }
             }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if cursor.is_over(clip) => {
-                let Some((pressed_at, index)) = st.press.take() else { return };
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if cursor.is_over(clip) =>
+            {
+                let Some((pressed_at, index)) = st.press.take() else {
+                    return;
+                };
                 let position = cursor.position().unwrap_or_default();
-                let moved = ((position.x - pressed_at.x).powi(2) + (position.y - pressed_at.y).powi(2)).sqrt() > CLICK_SLOP;
+                let moved = ((position.x - pressed_at.x).powi(2)
+                    + (position.y - pressed_at.y).powi(2))
+                .sqrt()
+                    > CLICK_SLOP;
                 if moved || index >= self.rows.len() {
                     return;
                 }
@@ -361,14 +432,18 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
                 // directory — click it to expand. A toggle is not a row
                 // click: it stays out of the double-click tracker, so a fast
                 // double-click in the chevron zone toggles once.
-                let row_x = position.x - bounds.x - row.depth as f32 * DEPTH_INDENT;
-                let in_toggle = row.entry.is_dir && row_x < TOGGLE_W;
+                let row_x = position.x
+                    - bounds.x
+                    - self.look.chrome.pad
+                    - row.depth as f32 * self.look.chrome.icon;
+                let in_toggle = row.entry.is_dir && row_x >= 0.0 && row_x < self.look.chrome.icon;
                 if in_toggle {
                     st.last_click = None;
                     shell.publish(RowsMsg::Toggle(row.entry.path.clone()));
                 } else {
-                    let double =
-                        st.last_click.is_some_and(|(when, at)| when.elapsed() < DOUBLE_CLICK && at == index);
+                    let double = st
+                        .last_click
+                        .is_some_and(|(when, at)| when.elapsed() < DOUBLE_CLICK && at == index);
                     st.last_click = Some((Instant::now(), index));
                     if double && row.entry.is_dir {
                         shell.publish(RowsMsg::Toggle(row.entry.path.clone()));
@@ -394,73 +469,131 @@ impl Widget<RowsMsg, iced::Theme, Renderer> for FileList<'_> {
     ) {
         use iced::advanced::text::Renderer as _;
         let bounds = layout.bounds();
-        let Some(clip) = bounds.intersection(viewport) else { return };
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
         let st = tree.state.downcast_ref::<RowState>();
         let t = self.look.tokens;
-
-        // The selected row's full-width background, under everything.
-        if let Some(selected) = self.selected
-            && let Some(index) = self.rows.iter().position(|row| row.entry.path.as_path() == selected)
-            && st.is_visible(index, clip.height)
-        {
-            let rect = Rectangle {
-                x: bounds.x,
-                y: bounds.y + index as f32 * st.row_h - st.offset,
-                width: bounds.width,
-                height: st.row_h,
-            };
-            if let Some(clipped) = rect.intersection(&clip) {
-                renderer.fill_quad(renderer::Quad { bounds: clipped, ..renderer::Quad::default() }, t.selection);
-            }
-        }
-
-        let first = (st.offset / st.row_h).floor().max(0.0) as usize;
-        for (index, row) in self.rows.iter().enumerate().skip(first) {
-            let y = bounds.y + index as f32 * st.row_h - st.offset;
-            if y > clip.y + clip.height {
-                break;
-            }
-            if y + st.row_h < clip.y {
-                continue;
-            }
-            let baseline = y + ROW_PAD;
-            let x = bounds.x + row.depth as f32 * DEPTH_INDENT;
-
-            // Directories paint the chevron in their toggle zone; every row
-            // paints its file icon (open when the directory is expanded).
-            if row.entry.is_dir {
-                let chevron_bounds = Rectangle {
-                    x,
-                    y: baseline + (st.row_h - 2.0 * ROW_PAD - TOGGLE_W) / 2.0,
-                    width: TOGGLE_W,
-                    height: TOGGLE_W,
+        let cells = Columns::new(self.look).cells(bounds.width);
+        let icon_px = self.look.chrome.icon;
+        let row_pad = self.look.chrome.small;
+        renderer.with_layer(clip, |renderer| {
+            // The selected row's full-width background, under everything.
+            if let Some(selected) = self.selected
+                && let Some(index) = self
+                    .rows
+                    .iter()
+                    .position(|row| row.entry.path.as_path() == selected)
+                && st.is_visible(index, clip.height)
+            {
+                let rect = Rectangle {
+                    x: bounds.x,
+                    y: bounds.y + index as f32 * st.row_h - st.offset,
+                    width: bounds.width,
+                    height: st.row_h,
                 };
-                let chevron =
-                    if self.is_expanded(&row.entry.path) { icons::Icon::ChevronDown } else { icons::Icon::ChevronRight };
-                if let Some(handle) = self.icons.get(chevron, self.tint, icons::RASTER_PX) {
-                    renderer.draw_image(aimage::Image::new(handle), chevron_bounds, clip);
+                if let Some(clipped) = rect.intersection(&clip) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: clipped,
+                            ..renderer::Quad::default()
+                        },
+                        t.primary,
+                    );
                 }
             }
-            let icon_bounds = Rectangle {
-                x: x + TOGGLE_W,
-                y: baseline + (st.row_h - 2.0 * ROW_PAD - ICON_PX) / 2.0,
-                width: ICON_PX,
-                height: ICON_PX,
-            };
-            let expanded = self.is_expanded(&row.entry.path);
-            let file_icon = icons::file_icon(&row.entry.path, row.entry.is_dir, expanded);
-            if let Some(handle) = self.icons.get(file_icon, self.tint, icons::RASTER_PX) {
-                renderer.draw_image(aimage::Image::new(handle), icon_bounds, clip);
-            }
 
-            // Name; secondary columns right-aligned, in the mono role.
-            let Some(cached) = st.cache.get(&row.entry.path) else { continue };
-            renderer.fill_paragraph(&cached.name, Point::new(x + TOGGLE_W + ICON_PX + 6.0, baseline), t.text, clip);
-            let modified_x = bounds.x + bounds.width - MODIFIED_W - 4.0;
-            let size_x = modified_x - SIZE_W - GAP;
-            renderer.fill_paragraph(&cached.size, Point::new(size_x, baseline), t.muted_text, clip);
-            renderer.fill_paragraph(&cached.modified, Point::new(modified_x, baseline), t.muted_text, clip);
-        }
+            let first = (st.offset / st.row_h).floor().max(0.0) as usize;
+            for (index, row) in self.rows.iter().enumerate().skip(first) {
+                let y = bounds.y + index as f32 * st.row_h - st.offset;
+                if y > clip.y + clip.height {
+                    break;
+                }
+                if y + st.row_h < clip.y {
+                    continue;
+                }
+                let baseline = y + row_pad;
+                let x = bounds.x + cells[0].0 + row.depth as f32 * icon_px;
+                let name_clip = Rectangle {
+                    x: bounds.x + cells[0].0,
+                    y: clip.y,
+                    width: cells[0].1,
+                    height: clip.height,
+                };
+                renderer.with_layer(name_clip, |renderer| {
+                    // Directories paint the chevron in their toggle zone; every row
+                    // paints its file icon (open when the directory is expanded).
+                    if row.entry.is_dir {
+                        let chevron_bounds = Rectangle {
+                            x,
+                            y: baseline + (st.row_h - 2.0 * row_pad - icon_px) / 2.0,
+                            width: icon_px,
+                            height: icon_px,
+                        };
+                        let chevron = if self.is_expanded(&row.entry.path) {
+                            icons::Icon::ChevronDown
+                        } else {
+                            icons::Icon::ChevronRight
+                        };
+                        if let Some(handle) = self.icons.get(chevron, self.tint, icons::RASTER_PX) {
+                            renderer.draw_image(aimage::Image::new(handle), chevron_bounds, clip);
+                        }
+                    }
+                    let icon_bounds = Rectangle {
+                        x: x + icon_px,
+                        y: baseline + (st.row_h - 2.0 * row_pad - icon_px) / 2.0,
+                        width: icon_px,
+                        height: icon_px,
+                    };
+                    let expanded = self.is_expanded(&row.entry.path);
+                    let file_icon = icons::file_icon(&row.entry.path, row.entry.is_dir, expanded);
+                    if let Some(handle) = self.icons.get(file_icon, self.tint, icons::RASTER_PX) {
+                        renderer.draw_image(aimage::Image::new(handle), icon_bounds, clip);
+                    }
+
+                    // Name; secondary columns right-aligned, in the mono role.
+                    if let Some(cached) = st.cache.get(&row.entry.path) {
+                        let color = if self.selected == Some(row.entry.path.as_path()) {
+                            t.primary_text
+                        } else {
+                            t.text
+                        };
+                        renderer.fill_paragraph(
+                            &cached.name,
+                            Point::new(x + 2.0 * icon_px + self.look.chrome.small, baseline),
+                            color,
+                            name_clip,
+                        );
+                    }
+                });
+                let Some(cached) = st.cache.get(&row.entry.path) else {
+                    continue;
+                };
+                for (para, (start, width)) in
+                    [(&cached.size, cells[1]), (&cached.modified, cells[2])]
+                {
+                    let cell = Rectangle {
+                        x: bounds.x + start,
+                        y: clip.y,
+                        width,
+                        height: clip.height,
+                    };
+                    let color = if self.selected == Some(row.entry.path.as_path()) {
+                        t.primary_text
+                    } else {
+                        t.muted_text
+                    };
+                    renderer.with_layer(cell, |renderer| {
+                        renderer.fill_paragraph(
+                            para,
+                            Point::new(cell.x + width - para.min_bounds().width, baseline),
+                            color,
+                            cell,
+                        )
+                    });
+                }
+            }
+        });
     }
 
     fn mouse_interaction(

@@ -48,6 +48,11 @@ pub struct Theme {
 /// Extra chrome colours, all tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Chrome {
+    pub gap: f32,
+    pub pad: f32,
+    pub small: f32,
+    pub icon: f32,
+    pub edge: f32,
     /// `secondary` surface: the header strip, status bar, inactive pane.
     pub secondary: Color,
     pub secondary_text: Color,
@@ -84,10 +89,20 @@ pub fn shared_theme_path() -> PathBuf {
 /// Read `shared ← app` selections. Missing files are skipped; malformed ones
 /// are skipped with a note, exactly as ctk does — a broken theme never bricks
 /// the app.
-pub fn read_selection(shared: Option<&Path>, app: Option<&Path>, notes: &mut Vec<String>) -> Selection {
-    let mut selection = Selection { scheme: Scheme::default(), mode: Mode::default(), design_source: None };
+pub fn read_selection(
+    shared: Option<&Path>,
+    app: Option<&Path>,
+    notes: &mut Vec<String>,
+) -> Selection {
+    let mut selection = Selection {
+        scheme: Scheme::default(),
+        mode: Mode::default(),
+        design_source: None,
+    };
     for (layer, path) in [("shared", shared), ("app", app)] {
-        let Some(path) = path.filter(|p| p.exists()) else { continue };
+        let Some(path) = path.filter(|p| p.exists()) else {
+            continue;
+        };
         match cosmix_config::store::load_conf_mix_path::<ThemeFileSelection>(path) {
             Ok(file) => {
                 if let Some(name) = file.scheme {
@@ -118,7 +133,10 @@ pub fn read_selection(shared: Option<&Path>, app: Option<&Path>, notes: &mut Vec
 /// Resolve from the theme files, with an in-session `(scheme, mode)` override
 /// (the `theme.*` actions and `dopus.theme.set`; P1 does not persist it —
 /// filemgr's shared-file write arrives with P2's config work).
-pub fn resolve_selected(override_selection: Option<(Scheme, Mode)>, app_override: Option<&Path>) -> Theme {
+pub fn resolve_selected(
+    override_selection: Option<(Scheme, Mode)>,
+    app_override: Option<&Path>,
+) -> Theme {
     let mut notes = Vec::new();
     let shared = shared_theme_path();
     let mut selection = read_selection(Some(&shared), app_override, &mut notes);
@@ -138,13 +156,22 @@ pub fn resolve_selection(selection: &Selection, mut notes: Vec<String>) -> Theme
     let compiled = compile(selection).or_else(|error| {
         if selection.design_source.is_some() {
             notes.push(format!("{error}; using the embedded design"));
-            compile(&Selection { design_source: None, ..selection.clone() })
+            compile(&Selection {
+                design_source: None,
+                ..selection.clone()
+            })
         } else {
             Err(error)
         }
     });
     let (tokens, chrome, typography) = match compiled {
-        Ok(Compiled { dictionary, typography }) => match (Tokens::from_dictionary(&dictionary), build_chrome(&dictionary)) {
+        Ok(Compiled {
+            dictionary,
+            typography,
+        }) => match (
+            Tokens::from_dictionary(&dictionary),
+            build_chrome(&dictionary),
+        ) {
             (Ok(tokens), Ok(chrome)) => (tokens, chrome, Some(typography)),
             (Err(error), _) => {
                 notes.push(format!("design dictionary: {error}"));
@@ -191,10 +218,14 @@ struct Compiled {
 fn compile(selection: &Selection) -> Result<Compiled, String> {
     let (identity, source) = match &selection.design_source {
         Some((path, text)) => (format!("file:{}", path.display()), text.as_str()),
-        None => ("embedded:cosmix-design-default".to_owned(), cosmix_design::EMBEDDED_DEFAULT_SOURCE),
+        None => (
+            "embedded:cosmix-design-default".to_owned(),
+            cosmix_design::EMBEDDED_DEFAULT_SOURCE,
+        ),
     };
-    let document = cosmix_design::parse_design_source(SourceIdentity::new(identity.clone()), source)
-        .map_err(|error| format!("design source {identity}: {error}"))?;
+    let document =
+        cosmix_design::parse_design_source(SourceIdentity::new(identity.clone()), source)
+            .map_err(|error| format!("design source {identity}: {error}"))?;
     let context = DesignContext {
         scheme: selection.scheme,
         mode: selection.mode,
@@ -219,16 +250,48 @@ fn fallback() -> (Tokens, Chrome, Option<cosmix_design::ResolvedTypography>) {
         accent: t.ring,
         success: t.primary,
         warning: t.primary,
+        ..build_chrome(
+            &compile(&Selection {
+                scheme: Scheme::default(),
+                mode: Mode::default(),
+                design_source: None,
+            })
+            .expect("embedded design")
+            .dictionary,
+        )
+        .expect("embedded metrics")
     };
     (t, chrome, None)
 }
 
 /// The extra chrome colours; `Err(name)` names the first missing token.
 pub fn build_chrome(d: &ResolvedDictionary) -> Result<Chrome, String> {
-    let prim = |name: &str| d.colours.primitives.get(name).copied().ok_or_else(|| name.to_owned());
-    let pair = |name: &str| d.colours.pairs.get(name).ok_or_else(|| format!("pair {name}"));
+    let prim = |name: &str| {
+        d.colours
+            .primitives
+            .get(name)
+            .copied()
+            .ok_or_else(|| name.to_owned())
+    };
+    let pair = |name: &str| {
+        d.colours
+            .pairs
+            .get(name)
+            .ok_or_else(|| format!("pair {name}"))
+    };
     let secondary = pair("secondary")?;
+    let spacing = |index: usize| d.scales.get("spacing").and_then(|s| s.get(index)).copied()
+        .filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as f32)
+        .ok_or_else(|| format!("spacing[{index}]"));
+    let edge = d.metrics.get("button.border_width")
+        .filter(|m| m.kind == cosmix_design::ResolvedMetricKind::Px && m.value.is_finite() && m.value >= 0.0)
+        .ok_or_else(|| "button.border_width".to_owned())?.value as f32;
     Ok(Chrome {
+        gap: spacing(6)?,
+        pad: spacing(4)?,
+        small: spacing(2)?,
+        icon: spacing(7)?,
+        edge,
         secondary: colour(secondary.rendered_surface),
         secondary_text: colour(secondary.rendered_foreground),
         accent: colour(prim("palette.accent.default")?),
@@ -242,16 +305,26 @@ pub fn build_chrome(d: &ResolvedDictionary) -> Result<Chrome, String> {
 /// process: iced fonts name families with `&'static str`.
 fn font_for(record: &ResolvedTypeRecord, monospace: bool) -> iced::Font {
     use iced::advanced::graphics::text::font_system;
-    let names: Vec<String> = std::iter::once(record.family.clone()).chain(record.fallbacks.iter().cloned()).collect();
+    let names: Vec<String> = std::iter::once(record.family.clone())
+        .chain(record.fallbacks.iter().cloned())
+        .collect();
     let (installed, has_light) = {
         let mut system = font_system().write().expect("font system");
         let db = system.raw().db();
         let found = names.iter().find(|name| {
-            db.faces().any(|face| face.families.iter().any(|(family, _)| family.eq_ignore_ascii_case(name)))
+            db.faces().any(|face| {
+                face.families
+                    .iter()
+                    .any(|(family, _)| family.eq_ignore_ascii_case(name))
+            })
         });
         let light = found.is_some_and(|name| {
             db.faces().any(|face| {
-                face.weight.0 == 300 && face.families.iter().any(|(family, _)| family.eq_ignore_ascii_case(name))
+                face.weight.0 == 300
+                    && face
+                        .families
+                        .iter()
+                        .any(|(family, _)| family.eq_ignore_ascii_case(name))
             })
         });
         (found.cloned(), light)
@@ -272,7 +345,11 @@ fn font_for(record: &ResolvedTypeRecord, monospace: bool) -> iced::Font {
         751..=850 => iced::font::Weight::ExtraBold,
         _ => iced::font::Weight::Black,
     };
-    iced::Font { family, weight, ..iced::Font::DEFAULT }
+    iced::Font {
+        family,
+        weight,
+        ..iced::Font::DEFAULT
+    }
 }
 
 fn family_name(font: &iced::Font) -> String {
@@ -287,7 +364,10 @@ fn intern(name: &str) -> &'static str {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut names = NAMES.get_or_init(Default::default).lock().expect("font names");
+    let mut names = NAMES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("font names");
     if let Some(existing) = names.get(name) {
         return existing;
     }
@@ -325,10 +405,25 @@ mod tests {
 
     #[test]
     fn the_embedded_design_resolves_for_dopus() {
-        let theme = resolve_selection(&Selection { scheme: Scheme::Ocean, mode: Mode::Dark, design_source: None }, Vec::new());
+        let theme = resolve_selection(
+            &Selection {
+                scheme: Scheme::Ocean,
+                mode: Mode::Dark,
+                design_source: None,
+            },
+            Vec::new(),
+        );
         assert!(theme.notes.is_none(), "{:?}", theme.notes);
-        assert_ne!(theme.tokens.surface, Tokens::default().surface, "not the fallback palette");
-        assert!((theme.mono.1 - 16.0).abs() < 0.01, "Mono role is 16 px: {}", theme.mono.1);
+        assert_ne!(
+            theme.tokens.surface,
+            Tokens::default().surface,
+            "not the fallback palette"
+        );
+        assert!(
+            (theme.mono.1 - 16.0).abs() < 0.01,
+            "Mono role is 16 px: {}",
+            theme.mono.1
+        );
     }
 
     #[test]

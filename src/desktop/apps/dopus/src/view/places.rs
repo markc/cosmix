@@ -4,7 +4,7 @@
 //! browser.rs:1267-1284). A click navigates the active pane; the active
 //! pane's current directory highlights.
 
-use iced::widget::{Scrollable, button, column, container, image, row, text, Space};
+use iced::widget::{Scrollable, Space, button, column, container, image, row, text};
 use iced::{Border, Element, Length, Padding};
 
 use cosmix_dopus_core::{PaneId, PaneModel};
@@ -45,23 +45,36 @@ pub fn sidebar<'a>(
     places: &'a [(&'static str, std::path::PathBuf)],
 ) -> Element<'a, Msg> {
     let mut list = column![
-        button(text("Places")
-            .font(look.ui_font)
-            .size(look.px * 0.8)
-            .color(look.tokens.muted_text))
-            .on_press(Msg::RefreshPlaces)
-            .style(place_look(&look, false)),
+        button(
+            text("Places")
+                .font(look.ui_font)
+                .size(look.px * 0.8)
+                .color(look.tokens.muted_text)
+        )
+        .on_press(Msg::RefreshPlaces)
+        .style(place_look(&look, false)),
         Space::new().height(Length::Fixed(4.0)),
     ]
-    .padding(Padding { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 })
+    .padding(Padding {
+        top: 8.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+    })
     .spacing(2)
     .width(Length::Fill);
     for (name, path) in places {
         let selected = pane.path == *path;
-        let label = text((*name).to_owned())
-            .font(look.ui_font)
-            .size(look.px * 0.9)
-            .color(if selected { look.chrome.accent } else { look.chrome.secondary_text });
+        let label = super::elide::Label {
+            text: (*name).to_owned(),
+            font: look.ui_font,
+            px: look.px * 0.9,
+            color: if selected {
+                look.tokens.primary_text
+            } else {
+                look.chrome.secondary_text
+            },
+        };
         let style = place_look(&look, selected);
         list = list.push(
             button(
@@ -84,11 +97,14 @@ pub fn sidebar<'a>(
 
 /// A quiet sidebar entry; the selected place stays legible against the
 /// secondary strip. Colours are `Copy` tokens (the ced `Look::flat` shape).
-fn place_look(look: &Look, selected: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
+fn place_look(
+    look: &Look,
+    selected: bool,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
     let (accent_bg, hover, text, muted, radius) = (
-        look.tokens.selection,
+        look.tokens.primary,
         look.tokens.muted_surface,
-        look.chrome.secondary_text,
+        look.tokens.primary_text,
         look.tokens.muted_text,
         look.tokens.radius,
     );
@@ -99,7 +115,10 @@ fn place_look(look: &Look, selected: bool) -> impl Fn(&iced::Theme, button::Stat
             (false, _) => None,
         },
         text_color: if selected { text } else { muted },
-        border: Border { radius: radius.into(), ..Default::default() },
+        border: Border {
+            radius: radius.into(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -108,7 +127,10 @@ fn place_look(look: &Look, selected: bool) -> impl Fn(&iced::Theme, button::Stat
 /// `view::mod` shares this one — kept here so the sidebar is self-contained).
 pub fn image_widget(icons: &Icons, tint: &str, icon: Icon) -> Element<'static, Msg> {
     match icons.get(icon, tint, icons::RASTER_PX) {
-        Some(handle) => image(handle).width(Length::Fixed(16.0)).height(Length::Fixed(16.0)).into(),
+        Some(handle) => image(handle)
+            .width(Length::Fixed(16.0))
+            .height(Length::Fixed(16.0))
+            .into(),
         None => container(Space::new())
             .width(Length::Fixed(16.0))
             .height(Length::Fixed(16.0))

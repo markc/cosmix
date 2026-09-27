@@ -7,6 +7,8 @@
 //! compiled tokens via [`Look`].
 
 pub mod dialogs;
+pub mod columns;
+pub mod elide;
 pub mod location;
 pub mod panes;
 pub mod places;
