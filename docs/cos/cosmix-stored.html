@@ -451,13 +451,18 @@ their sum are exact nonnegative integers through 9007199254740991. One blob
 cannot have conflicting sizes. Empty files and empty snapshots are valid.</p>
 <p><code>mix/store_manifest.mix</code> beside blobd is the shared canonicaliser. It emits
 compact UTF-8 JSON, lexical field order (<code>files</code>, <code>schema_version</code>; <code>blob</code>,
-<code>path</code>, <code>size</code>), files sorted lexically by path, no trailing newline. String
+<code>path</code>, <code>size</code>), files sorted by UTF-8 byte order of the path, no trailing newline. String
 scalars use JSON escaping; identity is BLAKE3 of those exact encoded bytes.
 Origin, instance, creation time and collection do not participate in identity.</p>
 <p>Limits: 1000 files, 128 KiB canonical UTF-8 bytes, 1024 UTF-8 bytes per path.
 Paths reject Unicode control characters, backslashes, colons, empty components,
 absolute paths, <code>.</code>/<code>..</code>, duplicates and file/directory prefix collisions.
 No MIME, times, permissions, xattrs, links or empty directory preservation.
+Case variants and NFC/NFD spellings are distinct paths; there is no Unicode
+normalisation or case folding. Format characters (Unicode Cf) are allowed;
+control characters (Cc) are not. Components over 255 UTF-8 bytes can pass
+manifest validation but fail during creation on Linux restore filesystems;
+that leaves only the partial directory, never a published complete restore.
 Collection names match <code>[A-Za-z0-9_-]{1,64}</code>; owners are <code>store:&lt;collection&gt;</code>.</p>
 <h2 id="old-pilot-identity">Old pilot identity</h2>
 <p>Migration first verifies SHA-256 of the <strong>original raw manifest bytes</strong>, then
@@ -531,7 +536,13 @@ the result. A restart resumes pending intent. Reload replaces a durable
 generation fence so an old worker cannot publish catalogue rows. Manifest
 upload resume records are generation-specific to avoid concurrent writers
 during reload. Async Bus waits yield; the bounded manifest HTTP transfer is
-currently a blocking Mix builtin.</p>
+currently a blocking Mix builtin.
+Manifest upload blocks the whole citizen during each HTTP call. Buffered
+control calls have a 30 s total timeout; streaming calls default to a 30 s
+<strong>idle</strong> timeout and no client total deadline, so continuing progress can block
+longer. The store client's 30 s RPC timeout bounds its wait for a reply, not
+the citizen's work or a streaming transfer. A timed-out caller must use the
+durable status/recovery protocol rather than infer failure or cancellation.</p>
 <p>Any mesh caller may kick <code>stored.work</code>; it is fenced and only one worker
 owns the current epoch. A retired worker clears its busy flag only if it
 still owns that epoch. Escaping infrastructure failures (including connection
@@ -542,6 +553,44 @@ fault and kick <code>stored.work</code> or restart to recover the pending intent
 until a separate release policy is designed. Blobd quota counts unique bytes
 per owner, including manifest bytes, and pending upload reservations; it is
 not the old pilot's logical snapshot quota. This is an explicit policy change.</p>
+<h2 id="errors">Errors</h2>
+<p>Citizen refusals use rc 10 and <code>{error_code,message}</code>. A failed durable job
+stores and emits an <code>error</code> string in <code>CODE: message</code> form; the client prints
+the same form on stderr and exits nonzero. Wrapped Bus/blob failures retain
+their upstream reply in the message. Filesystem, JSON, SQLite and transport
+builtins may also surface their own native error codes.</p>
+<table><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>STORE_MISSING</code></td><td>A referenced object is absent before pinning</td></tr>
+<tr><td><code>STORE_SIZE</code></td><td>Object/reference sizes disagree</td></tr>
+<tr><td><code>STORE_IDENTITY</code></td><td>Manifest, upload or restored bytes differ from the requested identity</td></tr>
+<tr><td><code>STORE_DB</code></td><td>Catalogue schema, binding, durability or canonical-data error</td></tr>
+<tr><td><code>STORE_SCHEMA</code></td><td>Wrong version, field set, or object/list shape</td></tr>
+<tr><td><code>STORE_INTEGER</code></td><td>Invalid integer or value outside the format's exact range</td></tr>
+<tr><td><code>STORE_PATH</code></td><td>Unsafe, duplicate or conflicting manifest path</td></tr>
+<tr><td><code>STORE_LIMIT</code></td><td>File count, byte, paging or walk limit exceeded</td></tr>
+<tr><td><code>STORE_CURSOR</code></td><td>Invalid paging cursor type</td></tr>
+<tr><td><code>STORE_VERB</code></td><td>Unknown catalogue operation</td></tr>
+<tr><td><code>STORE_COLLECTION</code></td><td>Invalid collection name</td></tr>
+<tr><td><code>STORE_BLOB</code></td><td>Invalid blob identifier or wrapped blobd failure</td></tr>
+<tr><td><code>STORE_NOT_FOUND</code></td><td>Collection, snapshot or commit does not exist</td></tr>
+<tr><td><code>STORE_FORGOTTEN</code></td><td>Tombstoned snapshot cannot be read or resurrected</td></tr>
+<tr><td><code>STORE_BUSY</code></td><td>A different commit is pending</td></tr>
+<tr><td><code>STORE_SUPERSEDED</code></td><td>Internal worker generation fence; retired work stops silently</td></tr>
+<tr><td><code>STORE_LOCKED</code></td><td>Another process owns this catalogue/cache lock</td></tr>
+<tr><td><code>STORE_CONFIG</code></td><td>Invalid target, service name, timeout, chunk or state directory</td></tr>
+<tr><td><code>STORE_SOURCE</code></td><td>Missing/nonregular source or symlink/special file</td></tr>
+<tr><td><code>STORE_CHANGED</code></td><td>Source changed while hashing or transferring</td></tr>
+<tr><td><code>STORE_IGNORE</code></td><td>Structurally invalid ignore rule</td></tr>
+<tr><td><code>STORE_CACHE</code></td><td>Cache is not a real directory or lies inside the source</td></tr>
+<tr><td><code>STORE_REMOTE</code></td><td>Wrapped catalogue Bus failure</td></tr>
+<tr><td><code>STORE_COMMIT</code></td><td>Commit failed or did not finish within the client's wait</td></tr>
+<tr><td><code>STORE_DESTINATION</code></td><td>Restore destination already exists or its namespace changed</td></tr>
+<tr><td><code>STORE_LEGACY_HASH</code></td><td>Original pilot bytes do not match their SHA-256</td></tr>
+<tr><td><code>STORE_LEGACY_CANONICAL</code></td><td>Hash-verified pilot bytes are not canonical</td></tr>
+<tr><td><code>STORE_NOT_MIGRATABLE</code></td><td>Valid pilot identity cannot fit the v2 contract</td></tr>
+<tr><td><code>STORE_USAGE</code></td><td>Invalid client/package arguments</td></tr>
+<tr><td><code>STORE_PACKAGE</code></td><td>Package source is not a checkout</td></tr>
+</tbody></table>
 <h2 id="client">Client</h2>
 <p>Run the shipped <code>mix/store.mix</code> beside the libraries:</p>
 <pre><code class="language-text">mix store.mix --node archive push source ./source
@@ -626,7 +675,18 @@ enables the unit in a separately authorised deployment. Systemd creates
 No <code>cosmix-blob</code> membership or CAS filesystem access is needed: even manifest
 bytes go through the lane. Named instances need a separate unit/drop-in with
 distinct state, <code>--name stored-&lt;instance&gt;</code> and <code>STORED_BLOBD=blobd-&lt;instance&gt;</code>.
-The unit uses Wants/After dependencies so broker reconnect remains native.</p>
+The unit uses Wants/After dependencies so broker reconnect remains native.
+It pins the same runtime <code>RUST_LOG</code> targets as the statecache citizen.</p>
+<p>Owners <code>store:&lt;collection&gt;</code> and <code>store-restore:&lt;collection&gt;</code> inherit blobd's
+<code>quota_owner_default_bytes</code> unless an operator configures explicit
+<code>quota_owner: store:example=10GiB</code> and
+<code>quota_owner: store-restore:example=10GiB</code> lines on their respective blobd
+instances. Set real collection limits during the separately authorised
+migration/deployment; creating a collection does not create quota policy.</p>
+<p>Nothing in B1 prunes client resume records, <code>STATE/manifests</code> or
+<code>STATE/uploads</code>. Their reconciliation, along with retained pins, belongs to
+the deferred retention reconciler. Blobd session expiry is a separate policy
+and does not remove these catalogue/client files.</p>
 <p>The maintainer's private <code>stored_gate.mix</code> is intentionally outside this
 public repository. It starts isolated named citizens on the workstation,
 round-trips generated binary/empty/duplicate files through a separate fetch

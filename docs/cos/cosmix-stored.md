@@ -12,7 +12,7 @@ cannot have conflicting sizes. Empty files and empty snapshots are valid.
 
 `mix/store_manifest.mix` beside blobd is the shared canonicaliser. It emits
 compact UTF-8 JSON, lexical field order (`files`, `schema_version`; `blob`,
-`path`, `size`), files sorted lexically by path, no trailing newline. String
+`path`, `size`), files sorted by UTF-8 byte order of the path, no trailing newline. String
 scalars use JSON escaping; identity is BLAKE3 of those exact encoded bytes.
 Origin, instance, creation time and collection do not participate in identity.
 
@@ -20,6 +20,11 @@ Limits: 1000 files, 128 KiB canonical UTF-8 bytes, 1024 UTF-8 bytes per path.
 Paths reject Unicode control characters, backslashes, colons, empty components,
 absolute paths, `.`/`..`, duplicates and file/directory prefix collisions.
 No MIME, times, permissions, xattrs, links or empty directory preservation.
+Case variants and NFC/NFD spellings are distinct paths; there is no Unicode
+normalisation or case folding. Format characters (Unicode Cf) are allowed;
+control characters (Cc) are not. Components over 255 UTF-8 bytes can pass
+manifest validation but fail during creation on Linux restore filesystems;
+that leaves only the partial directory, never a published complete restore.
 Collection names match `[A-Za-z0-9_-]{1,64}`; owners are `store:<collection>`.
 
 ## Old pilot identity
@@ -109,6 +114,12 @@ generation fence so an old worker cannot publish catalogue rows. Manifest
 upload resume records are generation-specific to avoid concurrent writers
 during reload. Async Bus waits yield; the bounded manifest HTTP transfer is
 currently a blocking Mix builtin.
+Manifest upload blocks the whole citizen during each HTTP call. Buffered
+control calls have a 30 s total timeout; streaming calls default to a 30 s
+**idle** timeout and no client total deadline, so continuing progress can block
+longer. The store client's 30 s RPC timeout bounds its wait for a reply, not
+the citizen's work or a streaming transfer. A timed-out caller must use the
+durable status/recovery protocol rather than infer failure or cancellation.
 
 Any mesh caller may kick `stored.work`; it is fenced and only one worker
 owns the current epoch. A retired worker clears its busy flag only if it
@@ -121,6 +132,47 @@ Failed work may retain partial pins and upload receipts. This is intentional
 until a separate release policy is designed. Blobd quota counts unique bytes
 per owner, including manifest bytes, and pending upload reservations; it is
 not the old pilot's logical snapshot quota. This is an explicit policy change.
+
+## Errors
+
+Citizen refusals use rc 10 and `{error_code,message}`. A failed durable job
+stores and emits an `error` string in `CODE: message` form; the client prints
+the same form on stderr and exits nonzero. Wrapped Bus/blob failures retain
+their upstream reply in the message. Filesystem, JSON, SQLite and transport
+builtins may also surface their own native error codes.
+
+| Code | Meaning |
+|---|---|
+| `STORE_MISSING` | A referenced object is absent before pinning |
+| `STORE_SIZE` | Object/reference sizes disagree |
+| `STORE_IDENTITY` | Manifest, upload or restored bytes differ from the requested identity |
+| `STORE_DB` | Catalogue schema, binding, durability or canonical-data error |
+| `STORE_SCHEMA` | Wrong version, field set, or object/list shape |
+| `STORE_INTEGER` | Invalid integer or value outside the format's exact range |
+| `STORE_PATH` | Unsafe, duplicate or conflicting manifest path |
+| `STORE_LIMIT` | File count, byte, paging or walk limit exceeded |
+| `STORE_CURSOR` | Invalid paging cursor type |
+| `STORE_VERB` | Unknown catalogue operation |
+| `STORE_COLLECTION` | Invalid collection name |
+| `STORE_BLOB` | Invalid blob identifier or wrapped blobd failure |
+| `STORE_NOT_FOUND` | Collection, snapshot or commit does not exist |
+| `STORE_FORGOTTEN` | Tombstoned snapshot cannot be read or resurrected |
+| `STORE_BUSY` | A different commit is pending |
+| `STORE_SUPERSEDED` | Internal worker generation fence; retired work stops silently |
+| `STORE_LOCKED` | Another process owns this catalogue/cache lock |
+| `STORE_CONFIG` | Invalid target, service name, timeout, chunk or state directory |
+| `STORE_SOURCE` | Missing/nonregular source or symlink/special file |
+| `STORE_CHANGED` | Source changed while hashing or transferring |
+| `STORE_IGNORE` | Structurally invalid ignore rule |
+| `STORE_CACHE` | Cache is not a real directory or lies inside the source |
+| `STORE_REMOTE` | Wrapped catalogue Bus failure |
+| `STORE_COMMIT` | Commit failed or did not finish within the client's wait |
+| `STORE_DESTINATION` | Restore destination already exists or its namespace changed |
+| `STORE_LEGACY_HASH` | Original pilot bytes do not match their SHA-256 |
+| `STORE_LEGACY_CANONICAL` | Hash-verified pilot bytes are not canonical |
+| `STORE_NOT_MIGRATABLE` | Valid pilot identity cannot fit the v2 contract |
+| `STORE_USAGE` | Invalid client/package arguments |
+| `STORE_PACKAGE` | Package source is not a checkout |
 
 ## Client
 
@@ -222,6 +274,19 @@ No `cosmix-blob` membership or CAS filesystem access is needed: even manifest
 bytes go through the lane. Named instances need a separate unit/drop-in with
 distinct state, `--name stored-<instance>` and `STORED_BLOBD=blobd-<instance>`.
 The unit uses Wants/After dependencies so broker reconnect remains native.
+It pins the same runtime `RUST_LOG` targets as the statecache citizen.
+
+Owners `store:<collection>` and `store-restore:<collection>` inherit blobd's
+`quota_owner_default_bytes` unless an operator configures explicit
+`quota_owner: store:example=10GiB` and
+`quota_owner: store-restore:example=10GiB` lines on their respective blobd
+instances. Set real collection limits during the separately authorised
+migration/deployment; creating a collection does not create quota policy.
+
+Nothing in B1 prunes client resume records, `STATE/manifests` or
+`STATE/uploads`. Their reconciliation, along with retained pins, belongs to
+the deferred retention reconciler. Blobd session expiry is a separate policy
+and does not remove these catalogue/client files.
 
 The maintainer's private `stored_gate.mix` is intentionally outside this
 public repository. It starts isolated named citizens on the workstation,

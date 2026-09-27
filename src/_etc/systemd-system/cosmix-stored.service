@@ -19,6 +19,7 @@ WorkingDirectory=%S/cosmix/stored
 ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/cosmix/stored/stored.mix --name stored
 Environment=COSMIX_NODE_CONFIG=%E/cosmix/node.conf.mix
 Environment=STORED_BLOBD=blobd
+Environment=RUST_LOG=mix=info,cosmix_mix=info,cosmix_client=info,cosmix_bus=info
 Restart=on-failure
 RestartSec=30s
 StandardOutput=journal
