@@ -43,6 +43,7 @@ function cms_init()
   ensure_col("media", "storage TEXT NOT NULL DEFAULT 'inline'")
   ensure_col("media", "url_path TEXT NOT NULL DEFAULT ''")
   ensure_col("media", "hash TEXT NOT NULL DEFAULT ''")
+  ensure_col("media", "blob TEXT NULL")
   -- `updated` on media + users so every non-PIM datatable can default-sort on it (the
   -- uniform datatable contract). SQLite ALTER ADD COLUMN needs a CONSTANT default, so add
   -- DEFAULT '' then backfill from `created` (the row's only timestamp). media rows are
@@ -111,12 +112,19 @@ end
 
 -- Add a column if it isn't already there (SQLite has no ADD COLUMN IF NOT
 -- EXISTS). `$table`/`$coldef` are fixed literals from cms_init, never client
--- input. A duplicate-column ALTER raises; swallow it.
+-- input. Check the schema before ALTER, then recheck after a racing ALTER.
+-- A missing column after failure is a genuine error, never silently swallowed.
 function ensure_col($table, $coldef)
+  $name = split($coldef, " ")[0]
+  $found = db_query("SELECT name FROM pragma_table_info(?1) WHERE name = ?2", [$table, $name])
+  if length($found) > 0 then return end
   try
     db_exec("ALTER TABLE " .. $table .. " ADD COLUMN " .. $coldef, [])
   catch $e
-    -- column already exists — nothing to do
+    $found = db_query("SELECT name FROM pragma_table_info(?1) WHERE name = ?2", [$table, $name])
+    if length($found) == 0 then
+      raise("SCHEMA_MIGRATION_FAILED", $e)
+    end
   end
 end
 

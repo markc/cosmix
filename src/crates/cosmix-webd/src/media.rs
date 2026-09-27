@@ -211,17 +211,15 @@ fn safe_disk_path(www_dir: &Path, url_path: &str) -> Option<PathBuf> {
 /// Atomic write: temp file in the same directory, then rename, so a reader
 /// never sees a partially-written image.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("image path has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    let fname = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| std::io::Error::other("image path has no file name"))?;
-    let tmp = parent.join(format!(".tmp-{fname}"));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.persist(path).map(|_| ()).map_err(|e| e.error)
 }
 
 /// Display-label hygiene for the original filename (Mix `esc()`s it on
@@ -240,27 +238,244 @@ fn sanitize_label(s: &str) -> String {
     }
 }
 
-/// Idempotently ensure the `media` table and its disk-storage columns
-/// exist, so a native upload doesn't depend on a Mix handler (`cms_init`)
-/// having run first. ALTER on an existing column errors — ignored.
-fn ensure_media_schema(conn: &Connection) {
-    let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY AUTOINCREMENT, \
-         filename TEXT NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL DEFAULT '', \
-         bytes INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT (datetime('now')))",
-        [],
-    );
-    for col in [
-        "storage TEXT NOT NULL DEFAULT 'inline'",
-        "url_path TEXT NOT NULL DEFAULT ''",
-        "hash TEXT NOT NULL DEFAULT ''",
+/// Both this and cms_init preserve legacy rows and distinguish existing columns
+/// from genuine schema failures. The per-vhost DB mutex serialises each Rust call.
+pub(crate) fn ensure_media_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS media (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT NOT NULL, mime TEXT NOT NULL, data TEXT NOT NULL DEFAULT '',
+        bytes INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT (datetime('now')))",
+    )?;
+    for (name, definition) in [
+        ("storage", "storage TEXT NOT NULL DEFAULT 'inline'"),
+        ("url_path", "url_path TEXT NOT NULL DEFAULT ''"),
+        ("hash", "hash TEXT NOT NULL DEFAULT ''"),
+        ("blob", "blob TEXT NULL"),
     ] {
-        let _ = conn.execute(&format!("ALTER TABLE media ADD COLUMN {col}"), []);
+        let exists = |conn: &Connection| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('media') WHERE name=?1)",
+                [name],
+                |r| r.get::<_, bool>(0),
+            )
+        };
+        if !exists(conn)?
+            && let Err(error) =
+                conn.execute_batch(&format!("ALTER TABLE media ADD COLUMN {definition}"))
+            && !exists(conn)?
+        {
+            return Err(error);
+        }
+    }
+    conn.prepare(
+        "SELECT id, filename, mime, bytes, storage, url_path, hash, blob FROM media LIMIT 0",
+    )?;
+    Ok(())
+}
+
+type KeyLocks<K> =
+    std::sync::Mutex<std::collections::HashMap<K, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+pub struct Runtime {
+    paths: KeyLocks<PathBuf>,
+    rows: KeyLocks<(String, i64)>,
+    writes: Arc<tokio::sync::Semaphore>,
+    refs: Arc<tokio::sync::Semaphore>,
+}
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            paths: Default::default(),
+            rows: Default::default(),
+            writes: Arc::new(tokio::sync::Semaphore::new(8)),
+            refs: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
+}
+fn slot<K: Eq + std::hash::Hash>(map: &KeyLocks<K>, key: K) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|_, value| value.strong_count() > 0);
+    if let Some(lock) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(key, Arc::downgrade(&lock));
+    lock
+}
+/// Canonicalise the nearest existing parent, preserving missing date directories.
+/// Different vhost roots/aliases for the same physical image share one lock.
+fn physical_key(path: &Path) -> PathBuf {
+    let mut parent = path.parent().unwrap_or(path);
+    let mut missing = Vec::new();
+    let mut root = loop {
+        if let Ok(real) = parent.canonicalize() {
+            break real;
+        }
+        let Some(name) = parent.file_name() else {
+            return path.to_owned();
+        };
+        missing.push(name.to_owned());
+        let Some(next) = parent.parent() else {
+            return path.to_owned();
+        };
+        parent = next;
+    };
+    for name in missing.into_iter().rev() {
+        root.push(name);
+    }
+    if let Some(name) = path.file_name() {
+        root.push(name);
+    }
+    root
+}
+impl Runtime {
+    fn path(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        slot(&self.paths, physical_key(path))
+    }
+    fn write_admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        self.writes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "busy: media write pool full (8)".into())
     }
 }
 
-/// `POST /admin/media/upload` — store an uploaded image as a file on disk
-/// and record its metadata row.
+#[derive(Debug, PartialEq, Eq)]
+struct MediaRow {
+    filename: String,
+    mime: String,
+    bytes: i64,
+    storage: String,
+    url_path: String,
+    hash: String,
+    blob: Option<String>,
+}
+fn row(conn: &Connection, id: i64) -> Result<MediaRow, String> {
+    conn.query_row(
+        "SELECT filename,mime,bytes,storage,url_path,hash,blob FROM media WHERE id=?1",
+        [id],
+        |r| {
+            Ok(MediaRow {
+                filename: r.get(0)?,
+                mime: r.get(1)?,
+                bytes: r.get(2)?,
+                storage: r.get(3)?,
+                url_path: r.get(4)?,
+                hash: r.get(5)?,
+                blob: r.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|_| "internal: media catalogue read failed")?
+    .ok_or_else(|| "not_found".into())
+}
+
+/// Retry from the served file, coalesced per primary-vhost/media-id. No lane call
+/// holds the DB lock. A concurrent delete/replacement prevents reference attachment.
+pub(crate) async fn media_ref(
+    node: &NodeState,
+    vhost: &VhostState,
+    id: i64,
+) -> Result<crate::blob_reference::Reference, String> {
+    if id <= 0 {
+        return Err("invalid_arguments: positive media id required".into());
+    }
+    let admission = Arc::new(
+        node.media_runtime
+            .refs
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "busy: media reference pool full (8)")?,
+    );
+    let lock = slot(&node.media_runtime.rows, (vhost.fqdn.clone(), id));
+    let _row_guard = lock.lock().await;
+    let db = vhost.db.as_ref().ok_or("not_found")?;
+    let source = {
+        let db = db.lock().await;
+        ensure_media_schema(&db).map_err(|_| "internal: media schema migration failed")?;
+        row(&db, id)?
+    };
+    if source.storage != "disk" {
+        return Err("unsupported_storage: only disk media can produce a blob reference".into());
+    }
+    if let Some(blob) = &source.blob {
+        let value = serde_json::from_str(blob)
+            .map_err(|_| "verify_failed: invalid stored media reference JSON")?;
+        return crate::blob_reference::Reference::from_json(&value)
+            .map_err(|_| "verify_failed: invalid stored media reference".into());
+    }
+    let path = safe_disk_path(&vhost.www_dir, &source.url_path)
+        .ok_or("verify_failed: unsafe media path")?;
+    let file_lock = node.media_runtime.path(&path);
+    let file_guard = Arc::new(file_lock.lock_owned().await);
+    let root = vhost.www_dir.clone();
+    let relative = source.url_path.trim_start_matches('/').to_owned();
+    let read_guard = file_guard.clone();
+    let read_admission = admission.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let (_guard, _admission) = (read_guard, read_admission);
+        let root = cosmix_files::rooted_read::ReadRoot::open(
+            &root.canonicalize().map_err(|_| "not_found")?,
+        )
+        .map_err(|_| "not_found")?;
+        let file = root.open_regular(&relative).map_err(|_| "not_found")?;
+        if file.metadata().map_err(|_| "not_found")?.len() > MAX_IMAGE_BYTES as u64 {
+            return Err("too_large: media exceeds 10 MiB".to_string());
+        }
+        let mut bytes = Vec::new();
+        file.take((MAX_IMAGE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "internal: media read failed")?;
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err("too_large: media exceeds 10 MiB".to_string());
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| "internal: media read worker failed")??;
+    drop(file_guard);
+    let hash = blake3::hash(&bytes).to_hex();
+    if source.bytes != bytes.len() as i64 || source.hash != hash[..32] {
+        return Err("verify_failed: served file differs from media row".into());
+    }
+    let client = crate::blob_lane::local(&node.broker_handle)?;
+    let reference = node
+        .share_runtime
+        .lane()?
+        .reference(
+            &*client,
+            &crate::blob_reference::owner("media", &vhost.fqdn),
+            bytes,
+            &source.mime,
+            Some(&source.filename),
+        )
+        .await?;
+    let _guard = node.media_runtime.path(&path).lock_owned().await;
+    let db = db.lock().await;
+    attach_reference(&db, id, &source, &reference)?;
+    Ok(reference)
+}
+fn attach_reference(
+    db: &Connection,
+    id: i64,
+    source: &MediaRow,
+    reference: &crate::blob_reference::Reference,
+) -> Result<(), String> {
+    reference.validate()?;
+    if row(db, id)? != *source {
+        return Err("conflict: media row changed during blob write".into());
+    }
+    let blob =
+        serde_json::to_string(reference).map_err(|_| "internal: reference serialisation failed")?;
+    db.execute(
+        "UPDATE media SET blob=?1 WHERE id=?2 AND blob IS NULL",
+        rusqlite::params![blob, id],
+    )
+    .map_err(|_| "internal: media reference attach failed")?;
+    Ok(())
+}
+
 pub(crate) async fn media_upload(
     State(node): State<Arc<NodeState>>,
     Extension(vhost): Extension<Arc<VhostState>>,
@@ -273,23 +488,19 @@ pub(crate) async fn media_upload(
     if !same_origin(&headers, &vhost.fqdn) {
         return redirect("/admin/media?err=csrf");
     }
-
-    // Auth FIRST — an unauthenticated request does no decode or filesystem
-    // work (avoids the base64-decode/IO DoS surface). Brief lock just for
-    // the session check + schema ensure.
+    let Ok(admission) = node.media_runtime.write_admit() else {
+        return redirect("/admin/media?err=busy");
+    };
+    let admission = Arc::new(admission);
     {
         let db = db_mtx.lock().await;
-        let authed = tokio::task::block_in_place(|| {
-            ensure_media_schema(&db);
-            cms_author(&node.session, &vhost.fqdn, &db, &headers)
-        });
-        drop(db);
-        if !authed {
+        if !cms_author(&node.session, &vhost.fqdn, &db, &headers) {
             return redirect("/auth/login");
         }
+        if ensure_media_schema(&db).is_err() {
+            return redirect("/admin/media?err=dberr");
+        }
     }
-
-    // Decode + validate (no lock held).
     let raw = match base64::engine::general_purpose::STANDARD.decode(form.data.trim()) {
         Ok(b) => b,
         Err(_) => return redirect("/admin/media?err=baddata"),
@@ -303,62 +514,45 @@ pub(crate) async fn media_upload(
     let Some((mime, ext)) = sniff_image(&raw) else {
         return redirect("/admin/media?err=badtype");
     };
-
     let hash_full = blake3::hash(&raw).to_hex();
-    let hash = &hash_full[..32]; // 128-bit prefix — ample for a filename
+    let hash = &hash_full[..32];
     let (disk_path, url_path) = image_paths(&vhost.www_dir, hash, ext);
     let label = sanitize_label(&form.filename);
     let bytes_len = raw.len() as i64;
-
-    // Write the file WITHOUT holding the DB lock (filesystem latency must
-    // not serialize unrelated CMS DB work). There is a narrow window between
-    // this write and the insert below where a process kill would leave a
-    // row-less file under public/img — an accepted residual: it's a valid,
-    // admin-uploaded image at an unguessable hashed URL (no security impact,
-    // just disk cruft a future reconcile sweep can GC). A normal insert
-    // failure is rolled back just below.
-    if tokio::task::block_in_place(|| write_atomic(&disk_path, &raw)).is_err() {
+    let guard = Arc::new(node.media_runtime.path(&disk_path).lock_owned().await);
+    let (write_guard, write_admission, write_path) =
+        (guard.clone(), admission.clone(), disk_path.clone());
+    let written = tokio::task::spawn_blocking(move || {
+        let (_guard, _admission) = (write_guard, write_admission);
+        write_atomic(&write_path, &raw)
+    })
+    .await;
+    if !matches!(written, Ok(Ok(()))) {
         return redirect("/admin/media?err=writeerr");
     }
-
-    // Record the row. If the insert fails, roll back the file we just
-    // wrote — but ONLY if no other row still references that exact path
-    // (a prior identical upload in the same month shares the file).
-    let db = db_mtx.lock().await;
-    let inserted = tokio::task::block_in_place(|| {
-        db.execute(
-            "INSERT INTO media (filename, mime, data, bytes, storage, url_path, hash) \
-             VALUES (?1, ?2, '', ?3, 'disk', ?4, ?5)",
-            rusqlite::params![label, mime, bytes_len, url_path, hash],
-        )
-    });
-    if inserted.is_err() {
-        let still: i64 = tokio::task::block_in_place(|| {
-            db.query_row(
-                "SELECT count(*) FROM media WHERE url_path = ?1",
-                rusqlite::params![url_path],
-                |r| r.get(0),
-            )
-            .unwrap_or(1)
-        });
-        if still == 0 {
-            let _ = std::fs::remove_file(&disk_path);
+    let inserted = {
+        let db = db_mtx.lock().await;
+        db.execute("INSERT INTO media (filename,mime,data,bytes,storage,url_path,hash) VALUES (?1,?2,'',?3,'disk',?4,?5)", rusqlite::params![label,mime,bytes_len,url_path,hash])
+            .map(|_| db.last_insert_rowid())
+    };
+    let id = match inserted {
+        Ok(id) => id,
+        Err(_) => {
+            if !path_in_use(&node, &disk_path).await {
+                let _ = std::fs::remove_file(&disk_path);
+            }
+            return redirect("/admin/media?err=dberr");
         }
+    };
+    drop(guard);
+    drop(admission);
+    // Durable row/file first. Optional blob failure is explicitly non-fatal.
+    if let Err(reason) = media_ref(&node, &vhost, id).await {
+        tracing::warn!(%reason, id, vhost=%vhost.fqdn, "media saved without blob reference; retry webd.media.ref");
     }
-    drop(db);
-
-    if inserted.is_ok() {
-        redirect("/admin/media")
-    } else {
-        redirect("/admin/media?err=dberr")
-    }
+    redirect("/admin/media")
 }
 
-/// `POST /admin/media/delete` — delete one OR many media rows; for each disk row
-/// whose content no other row still references, unlink the file too. Accepts a
-/// single `id` (the per-row right-click delete) AND/OR the shared datatable
-/// multi-select convention `sel_<id>=1` (bulk delete) — both POST here so the file
-/// unlink stays server-side (the Mix handler is sandboxed from unlinking files).
 pub(crate) async fn media_delete(
     State(node): State<Arc<NodeState>>,
     Extension(vhost): Extension<Arc<VhostState>>,
@@ -371,82 +565,264 @@ pub(crate) async fn media_delete(
     if !same_origin(&headers, &vhost.fqdn) {
         return redirect("/admin/media?err=csrf");
     }
-
-    // Collect every id to delete: a lone `id` (single delete) + each checked
-    // `sel_<id>` (datatable bulk). Dedup so an id sent both ways deletes once.
-    let mut ids: Vec<i64> = Vec::new();
-    if let Some(v) = form.get("id")
-        && let Ok(n) = v.parse::<i64>()
+    let Ok(_admission) = node.media_runtime.write_admit() else {
+        return redirect("/admin/media?err=busy");
+    };
     {
-        ids.push(n);
+        let db = db_mtx.lock().await;
+        if !cms_author(&node.session, &vhost.fqdn, &db, &headers) {
+            return redirect("/auth/login");
+        }
+        if ensure_media_schema(&db).is_err() {
+            return redirect("/admin/media?err=dberr");
+        }
     }
-    for (k, v) in &form {
-        if v == "1"
-            && let Some(rest) = k.strip_prefix("sel_")
-            && let Ok(n) = rest.parse::<i64>()
+    let mut ids = Vec::new();
+    if let Some(id) = form.get("id").and_then(|s| s.parse::<i64>().ok()) {
+        ids.push(id);
+    }
+    for (key, value) in form {
+        if value == "1"
+            && let Some(id) = key.strip_prefix("sel_").and_then(|s| s.parse::<i64>().ok())
         {
-            ids.push(n);
+            ids.push(id);
         }
     }
     ids.sort_unstable();
     ids.dedup();
-    // Bound the per-request work under the DB lock: a malformed (but authed + same-origin)
-    // POST could otherwise send an unbounded sel_* set. The datatable's max page size is the
-    // realistic ceiling for a real bulk action; ignore any excess.
-    const MAX_BULK_DELETE: usize = 1000;
-    ids.truncate(MAX_BULK_DELETE);
-
-    let db = db_mtx.lock().await;
-    let authed = tokio::task::block_in_place(|| {
-        ensure_media_schema(&db);
-        if !cms_author(&node.session, &vhost.fqdn, &db, &headers) {
-            return false;
+    ids.truncate(1000);
+    for id in ids {
+        let source = {
+            let db = db_mtx.lock().await;
+            row(&db, id)
+        };
+        let source = match source {
+            Ok(source) => source,
+            Err(e) if e == "not_found" => continue,
+            Err(_) => return redirect("/admin/media?err=dberr"),
+        };
+        let path = (source.storage == "disk")
+            .then(|| safe_disk_path(&vhost.www_dir, &source.url_path))
+            .flatten();
+        let _guard = match &path {
+            Some(path) => Some(node.media_runtime.path(path).lock_owned().await),
+            None => None,
+        };
+        let db = db_mtx.lock().await;
+        let current = match row(&db, id) {
+            Ok(row) => row,
+            Err(e) if e == "not_found" => continue,
+            Err(_) => return redirect("/admin/media?err=dberr"),
+        };
+        if current.storage != source.storage || current.url_path != source.url_path {
+            return redirect("/admin/media?err=conflict");
         }
-        for id in &ids {
-            let row: Option<(String, String)> = db
-                .query_row(
-                    "SELECT storage, url_path FROM media WHERE id = ?1",
-                    rusqlite::params![id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .ok()
-                .flatten();
-            let _ = db.execute("DELETE FROM media WHERE id = ?1", rusqlite::params![id]);
-            // Refcount by the PHYSICAL path (url_path), not the content hash:
-            // identical bytes uploaded in different months are separate files,
-            // so a hash-based refcount would orphan one of them.
-            if let Some((storage, url_path)) = row
-                && storage == "disk"
-            {
-                let still: i64 = db
-                    .query_row(
-                        "SELECT count(*) FROM media WHERE url_path = ?1 AND storage = 'disk'",
-                        rusqlite::params![url_path],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                if still == 0
-                    && let Some(p) = safe_disk_path(&vhost.www_dir, &url_path)
-                {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
+        if db.execute("DELETE FROM media WHERE id=?1", [id]).is_err() {
+            return redirect("/admin/media?err=dberr");
         }
-        true
-    });
-    drop(db);
-
-    if authed {
-        redirect("/admin/media")
-    } else {
-        redirect("/auth/login")
+        drop(db);
+        if let Some(path) = path
+            && !path_in_use(&node, &path).await
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        // Blob pins deliberately survive deletion; reconciliation owns release.
     }
+    redirect("/admin/media")
+}
+
+/// Called under the physical-path lock, with NO database lock held. Shared
+/// document roots across active vhosts must not unlink one another's media.
+async fn path_in_use(node: &NodeState, path: &Path) -> bool {
+    let key = physical_key(path);
+    let directory = node.vhosts.load_full();
+    for primary in &directory.primaries {
+        let vhost = &primary.state;
+        let Some(db) = &vhost.db else {
+            continue;
+        };
+        let Ok(root) = vhost.www_dir.canonicalize() else {
+            return true;
+        };
+        let Ok(relative) = key.strip_prefix(&root) else {
+            continue;
+        };
+        let url = format!("/{}", relative.to_string_lossy());
+        let db = db.lock().await;
+        // A vhost with no media table cannot reference the file. Other schema or
+        // query failures retain it conservatively for later reconciliation.
+        match db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='media')",
+            [],
+            |r| r.get::<_, bool>(0),
+        ) {
+            Ok(false) => continue,
+            Ok(true) => (),
+            Err(_) => return true,
+        }
+        let used = db
+            .query_row(
+                "SELECT count(*) FROM media WHERE storage='disk' AND url_path=?1",
+                [url],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(1);
+        if used != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_migration_preserves_inline_rows_and_propagates_real_failures() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE media(id INTEGER PRIMARY KEY, filename TEXT, mime TEXT, data TEXT, bytes INTEGER, created TEXT);
+            INSERT INTO media VALUES(1,'old','image/png','base64',6,'old-date')").unwrap();
+        ensure_media_schema(&db).unwrap();
+        ensure_media_schema(&db).unwrap();
+        let source = row(&db, 1).unwrap();
+        assert_eq!(source.storage, "inline");
+        assert_eq!(source.blob, None);
+        assert_eq!(
+            db.query_row("SELECT data FROM media WHERE id=1", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "base64"
+        );
+        let readonly = Connection::open_in_memory().unwrap();
+        readonly.execute_batch("PRAGMA query_only=ON").unwrap();
+        assert!(ensure_media_schema(&readonly).is_err());
+    }
+    #[test]
+    fn attach_refuses_deleted_or_changed_rows() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_media_schema(&db).unwrap();
+        db.execute("INSERT INTO media(filename,mime,bytes,storage,url_path,hash) VALUES('x','image/png',3,'disk','/img/x','prefix')", []).unwrap();
+        let source = row(&db, 1).unwrap();
+        let reference = crate::blob_reference::Reference {
+            blob: format!("b3:{}", blake3::hash(b"abc").to_hex()),
+            size: 3,
+            mime: "image/png".into(),
+            name: None,
+            origin: "alpha".into(),
+        };
+        db.execute("UPDATE media SET url_path='/img/changed' WHERE id=1", [])
+            .unwrap();
+        assert!(
+            attach_reference(&db, 1, &source, &reference)
+                .unwrap_err()
+                .starts_with("conflict:")
+        );
+        db.execute("DELETE FROM media WHERE id=1", []).unwrap();
+        assert_eq!(
+            attach_reference(&db, 1, &source, &reference).unwrap_err(),
+            "not_found"
+        );
+    }
+    #[tokio::test]
+    async fn row_first_upload_survives_lane_outage_and_ref_rejects_inline() {
+        let (_tmp, node, vhost) = crate::shares::tests::fixture().await;
+        {
+            let db = vhost.db.as_ref().unwrap().lock().await;
+            db.execute_batch("CREATE TABLE users(username TEXT,role TEXT); INSERT INTO users VALUES('user@example.test','author')").unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!(
+                "cosmix_session={}",
+                crate::shares::tests::cookie(&node, "maild", 0)
+            )
+            .parse()
+            .unwrap(),
+        );
+        let png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1];
+        let response = media_upload(
+            State(node.clone()),
+            Extension(vhost.clone()),
+            headers,
+            Form(UploadForm {
+                data: base64::engine::general_purpose::STANDARD.encode(png),
+                filename: "image.png".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()["location"], "/admin/media");
+        let source = {
+            let db = vhost.db.as_ref().unwrap().lock().await;
+            row(&db, 1).unwrap()
+        };
+        assert_eq!(source.blob, None);
+        assert_eq!(
+            std::fs::read(safe_disk_path(&vhost.www_dir, &source.url_path).unwrap()).unwrap(),
+            png
+        );
+        assert!(
+            media_ref(&node, &vhost, 1)
+                .await
+                .unwrap_err()
+                .starts_with("lane_unavailable:")
+        );
+        {
+            let db = vhost.db.as_ref().unwrap().lock().await;
+            db.execute(
+                "INSERT INTO media(filename,mime,data) VALUES('old','image/png','legacy')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            media_ref(&node, &vhost, 2)
+                .await
+                .unwrap_err()
+                .starts_with("unsupported_storage:")
+        );
+    }
+    #[tokio::test]
+    async fn path_and_row_slots_coalesce_and_prune() {
+        let runtime = Runtime::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let first = runtime.path(&tmp.path().join("img/x"));
+        assert!(Arc::ptr_eq(
+            &first,
+            &runtime.path(&tmp.path().join("img/x"))
+        ));
+        let key = ("pim.example".into(), 1);
+        let row = slot(&runtime.rows, key.clone());
+        assert!(Arc::ptr_eq(&row, &slot(&runtime.rows, key)));
+        let held = row.clone().lock_owned().await;
+        assert!(row.try_lock().is_err());
+        drop(held);
+        assert!(row.try_lock().is_ok());
+        drop(first);
+        runtime.path(&tmp.path().join("img/y"));
+        assert_eq!(runtime.paths.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn unique_atomic_temps_never_publish_partial_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("image");
+        let mut workers = Vec::new();
+        for byte in 0..8u8 {
+            let path = path.clone();
+            workers.push(std::thread::spawn(move || {
+                write_atomic(&path, &vec![byte; 65536]).unwrap()
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 65536);
+        assert!(bytes.iter().all(|b| *b == bytes[0]));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn sniff_recognises_each_allowed_type_and_rejects_others() {

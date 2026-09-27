@@ -846,7 +846,7 @@ pub(crate) mod tests {
         file_share::init_schema(&vhost.db.as_ref().unwrap().lock().await).unwrap();
         (tmp, node, vhost)
     }
-    fn cookie(node: &NodeState, kind: &str, epoch: i64) -> String {
+    pub(crate) fn cookie(node: &NodeState, kind: &str, epoch: i64) -> String {
         let now = session::now_secs();
         node.session
             .seal(&session::SessionPayload {

@@ -897,6 +897,7 @@ mod tests {
         Arc::new(NodeState {
             share_roots: crate::file_share::Roots::default(),
             share_runtime: crate::shares::Runtime::default(),
+            media_runtime: crate::media::Runtime::default(),
             service_jmap_tokens: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
@@ -1629,6 +1630,7 @@ mod tests {
             Arc::new(NodeState {
                 share_roots: crate::file_share::Roots::default(),
                 share_runtime: crate::shares::Runtime::default(),
+                media_runtime: crate::media::Runtime::default(),
                 service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),

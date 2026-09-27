@@ -7,7 +7,7 @@ use std::sync::Arc;
 pub fn handles(command: &str) -> bool {
     matches!(
         command,
-        "webd.share.create" | "webd.share.list" | "webd.share.revoke"
+        "webd.share.create" | "webd.share.list" | "webd.share.revoke" | "webd.media.ref"
     )
 }
 pub fn vhost(node: &NodeState, args: &Value) -> Result<Arc<VhostState>, String> {
@@ -65,6 +65,18 @@ async fn execute(node: &NodeState, command: &str, mut args: Value) -> Result<Val
             let args: Args = serde_json::from_value(args)
                 .map_err(|_| "invalid_arguments: invalid share.revoke arguments")?;
             shares::revoke(&vhost, &args.account, &args.token).await
+        }
+        "webd.media.ref" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Args {
+                id: i64,
+            }
+            let args: Args = serde_json::from_value(args)
+                .map_err(|_| "invalid_arguments: media.ref requires integer id")?;
+            let reference = crate::media::media_ref(node, &vhost, args.id).await?;
+            serde_json::to_value(reference)
+                .map_err(|_| "internal: reference serialisation failed".into())
         }
         _ => Err("invalid_arguments: unknown share verb".into()),
     }

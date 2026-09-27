@@ -826,6 +826,7 @@ struct NodeState {
     /// Startup-validated operator roots; never sourced from a request.
     share_roots: file_share::Roots,
     share_runtime: shares::Runtime,
+    media_runtime: media::Runtime,
     /// Hot-swappable host-routing snapshot (C3b). Carries every
     /// host-derived view — lookup by Host, plain-HTTP admit set,
     /// per-primary group with aliases — behind a single `ArcSwap`
@@ -6438,6 +6439,7 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
     let node = Arc::new(NodeState {
         share_roots: file_share::Roots::default(),
         share_runtime: crate::shares::Runtime::default(),
+        media_runtime: crate::media::Runtime::default(),
         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7303,6 +7305,7 @@ async fn async_main() -> Result<()> {
                     let bootstrap_node = Arc::new(NodeState {
                         share_roots: file_share::Roots::default(),
                         share_runtime: crate::shares::Runtime::default(),
+                        media_runtime: crate::media::Runtime::default(),
                         service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                         login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -7955,6 +7958,7 @@ async fn async_main() -> Result<()> {
                     .map(|c| file_share::Roots::from_config(&c.webd.shares))
                     .unwrap_or_default(),
                 share_runtime: shares::Runtime::default(),
+                media_runtime: crate::media::Runtime::default(),
                 service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -8992,6 +8996,7 @@ vhost: [
         Arc::new(NodeState {
             share_roots: file_share::Roots::default(),
             share_runtime: crate::shares::Runtime::default(),
+            media_runtime: crate::media::Runtime::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -10259,6 +10264,7 @@ mod session_login_tests {
         Arc::new(NodeState {
             share_roots: file_share::Roots::default(),
             share_runtime: crate::shares::Runtime::default(),
+            media_runtime: crate::media::Runtime::default(),
             service_jmap_tokens: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_throttle: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

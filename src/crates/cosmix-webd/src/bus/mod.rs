@@ -464,6 +464,12 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new("webd.tls.reload", &[], "Reload TLS identities", false),
         VerbDescriptor::new(
+            "webd.media.ref",
+            &["vhost", "id"],
+            "Return or retry a disk media blob reference",
+            false,
+        ),
+        VerbDescriptor::new(
             "webd.share.create",
             &["vhost", "account"],
             "Create a path or pinned local blob share",
@@ -747,6 +753,7 @@ mod tests {
         Arc::new(NodeState {
             share_roots: crate::file_share::Roots::default(),
             share_runtime: crate::shares::Runtime::default(),
+            media_runtime: crate::media::Runtime::default(),
             service_jmap_tokens: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
