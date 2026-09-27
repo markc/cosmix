@@ -689,6 +689,14 @@ mod tests {
                 Key::Named(Named::F5),
                 Physical::Unidentified(NativeCode::Unidentified),
             ),
+            "F6" => (
+                Key::Named(Named::F6),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
+            "Tab" => (
+                Key::Named(Named::Tab),
+                Physical::Unidentified(NativeCode::Unidentified),
+            ),
             "ArrowDown" => (
                 Key::Named(Named::ArrowDown),
                 Physical::Unidentified(NativeCode::Unidentified),
@@ -717,14 +725,14 @@ mod tests {
     fn the_packaged_defaults_load() {
         let shared = initial(None).unwrap();
         let router = shared.lock().unwrap();
-        assert_eq!(router.keymap.defaults.len(), 31);
+        assert_eq!(router.keymap.defaults.len(), 34);
         assert!(router.keymap.custom.is_empty());
     }
 
     #[test]
     fn missing_overlay_is_the_packaged_defaults() {
         let keymap = load(Some(Path::new("/nonexistent/keymap.conf.mix"))).unwrap();
-        assert_eq!(keymap.defaults.len(), 31);
+        assert_eq!(keymap.defaults.len(), 34);
     }
 
     #[test]
@@ -736,6 +744,11 @@ mod tests {
             ("ArrowDown", filemgr::SELECT_NEXT),
             ("ArrowUp", filemgr::SELECT_PREVIOUS),
             ("F5", filemgr::VIEW_REFRESH),
+            ("Ctrl+R", filemgr::VIEW_REFRESH),
+            ("F2", filemgr::FILE_RENAME),
+            ("Ctrl+E", filemgr::FILE_RENAME),
+            ("F6", filemgr::NAV_SWITCH_PANE),
+            ("Tab", filemgr::NAV_SWITCH_PANE),
             ("Ctrl+H", filemgr::VIEW_TOGGLE_HIDDEN),
             ("Ctrl+1", filemgr::VIEW_SORT_NAME),
             ("Ctrl+2", filemgr::VIEW_SORT_SIZE),
@@ -784,6 +797,25 @@ mod tests {
     }
 
     #[test]
+    fn alternates_pass_through_in_editable_fields() {
+        let shared = initial(None).unwrap();
+        let mut router = shared.lock().unwrap();
+        router.focus_editable = true;
+        let context = focus_context(&router);
+        let mut state = ResolveState::default();
+        for text in ["Tab", "Ctrl+R", "Ctrl+E"] {
+            let resolved = resolve(
+                press(text).unwrap(),
+                &context,
+                &router.keymap,
+                &mut state,
+                tick(),
+            );
+            assert!(resolved.actions.is_empty(), "{text} fired while editing");
+        }
+    }
+
+    #[test]
     fn a_modal_suppresses_every_chord_and_the_router_owns_enter_escape() {
         let shared = initial(None).unwrap();
         let mut router = shared.lock().unwrap();
@@ -798,6 +830,9 @@ mod tests {
             "Enter",
             "Escape",
             "F5",
+            "Tab",
+            "Ctrl+R",
+            "Ctrl+E",
             "Delete",
             "Ctrl+C",
             "Ctrl+B",

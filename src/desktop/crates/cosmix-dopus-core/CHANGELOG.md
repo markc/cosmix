@@ -2,6 +2,8 @@
 
 ## 0.3.0
 
+- Retry pending Properties reads automatically when metadata worker capacity
+  frees; never cache a transient busy result. Retain timeout error caching.
 - Apply the Properties-specific 22% width default to partial schema-2
   records, preserving explicit widths and open state.
 - Add non-blocking `properties(pane)` snapshots with bounded metadata

@@ -79,6 +79,35 @@ pub fn regions<M: 'static>(
 mod tests {
     use super::*;
     #[test]
+    fn labels_include_function_keys_and_desktop_alternates() {
+        let actions = crate::verbs::action_table(&crate::keys::load(None).unwrap());
+        for (action, label, original, alternate) in [
+            (
+                cosmix_actions::filemgr::VIEW_REFRESH,
+                "Refresh",
+                "F5",
+                "Ctrl+R",
+            ),
+            (
+                cosmix_actions::filemgr::FILE_RENAME,
+                "Rename",
+                "F2",
+                "Ctrl+E",
+            ),
+            (
+                cosmix_actions::filemgr::NAV_SWITCH_PANE,
+                "Switch pane",
+                "F6",
+                "Tab",
+            ),
+        ] {
+            let tip = action_label(&actions, action, label);
+            assert!(tip.contains(original), "{tip}");
+            assert!(tip.contains(alternate), "{tip}");
+        }
+    }
+
+    #[test]
     fn labels_use_effective_remaps_and_omit_unbound_keys() {
         let mut keymap = crate::keys::load(None).unwrap();
         keymap.custom = cosmix_actions::parse_keymap(r#"{

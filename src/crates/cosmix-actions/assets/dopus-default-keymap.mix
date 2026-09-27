@@ -8,6 +8,7 @@
     { action: "file.open", chord: ["Enter"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "file.new-folder", chord: ["Ctrl+Shift+N"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "file.rename", chord: ["F2"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "file.rename", chord: ["Ctrl+E"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "file.copy-other-pane", chord: ["Ctrl+C"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "file.move-other-pane", chord: ["Ctrl+X"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "file.delete", chord: ["Delete"], scope: "global", repeat: "ignore", allow_in_editable: false },
@@ -18,8 +19,10 @@
     { action: "nav.parent", chord: ["Backspace"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "nav.home", chord: ["Alt+Home"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "nav.switch-pane", chord: ["F6"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "nav.switch-pane", chord: ["Tab"], scope: "global", repeat: "ignore", allow_in_editable: false },
 
     { action: "view.refresh", chord: ["F5"], scope: "global", repeat: "ignore", allow_in_editable: false },
+    { action: "view.refresh", chord: ["Ctrl+R"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "view.toggle-hidden", chord: ["Ctrl+H"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "view.sort-name", chord: ["Ctrl+1"], scope: "global", repeat: "ignore", allow_in_editable: false },
     { action: "view.sort-size", chord: ["Ctrl+2"], scope: "global", repeat: "ignore", allow_in_editable: false },

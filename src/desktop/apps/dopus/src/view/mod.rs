@@ -84,6 +84,7 @@ pub fn root<'a>(
     places_config: cosmix_dopus_core::config::SidebarConfig,
     properties_config: cosmix_dopus_core::config::SidebarConfig,
     actions: &'a [crate::verbs::ActionRow],
+    columns: [rows::Columns; 2],
 ) -> Element<'a, Msg> {
     let (left_edit, right_edit) = match editing {
         Some((PaneId::Left, text)) => (Some(text), None),
@@ -140,7 +141,8 @@ pub fn root<'a>(
                 left_portion,
                 active == PaneId::Left,
                 left_edit,
-                actions
+                actions,
+                columns[0]
             ),
             panes::Divider::new(&look, None, sides),
             panes::pane_column(
@@ -153,7 +155,8 @@ pub fn root<'a>(
                 100 - left_portion,
                 active == PaneId::Right,
                 right_edit,
-                actions
+                actions,
+                columns[1]
             ),
         ]
         .width(Length::FillPortion(1000 - sides[0] - sides[1]))

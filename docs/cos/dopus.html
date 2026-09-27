@@ -447,13 +447,13 @@ It replaces the deprecated Bevy filemgr; retirement of that app is separate.
 The window is a Wayland client (<code>dev.cosmix.dopus</code>) drawn with tiny-skia and
 the shared design tokens. Only dopus consumes the extracted core.</p>
 <p>Each pane has its own directory, history, sort, hidden-file setting, lazy
-directory tree and single selection. F6 switches the active pane. Places is
+directory tree and single selection. Tab or F6 switches the active pane. Places is
 a plain sidebar, with Home, Filesystem and existing user directories.
 Click its heading to refresh Places; pane relists also invalidate its cached
 directory checks. The divider persists its position; double-click centres it.</p>
 <p>One navigation icon strip is centred across the top of the window: Back,
 Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
-active pane and follows F6 or a pane click; Back/Forward are disabled when
+active pane and follows Tab, F6 or a pane click; Back/Forward are disabled when
 that pane's corresponding history is empty, and Up is disabled at the root.
 Disabled icons use the theme's muted foreground, matching disabled dialog buttons.
 Lucide <code>panel-left</code> and <code>panel-right</code> buttons sit at the far left and right of
@@ -481,6 +481,10 @@ Each column and the list viewport clip their contents. Name measurement and
 rendering both use advanced shaping for complex scripts and font fallback.
 Secondary columns use the desktop Small type size with the mono family,
 leaving a useful Name budget when both sidebars are open.
+Size reserves the widest shaped size/count value in that pane's listing, with
+a <code>99.9 MiB</code> floor and <code>999999 items</code> ceiling plus token padding. The cached
+width updates on relists, count replies and typography changes; headers and
+rows receive the same layout. Small-file listings leave more room for names.
 Selection uses the design's <code>selection</code>/<code>selection_text</code> pair, and a
 <code>muted_surface</code> header marks the active pane. Modified times are always local
 <code>dd/mm/yy HH:MM</code> in 24-hour format. There is no relative-time refresh.</p>
@@ -492,8 +496,8 @@ worker through the existing nix dependency's reentrant system lookups;
 missing names or lookup failures fall back independently to numeric IDs.
 Metadata reads time out in the UI after five seconds. Changing selection can
 start another read while an old one is stuck, with at most four outstanding
-reads per pane; exhausting that cap reports unavailable, rather than leaving
-every later selection loading forever. Select again to retry after a slot frees.
+reads per pane. At capacity the selection stays pending and retries automatically
+on the next tick after a slot frees; only timed-out reads cache an error.
 Late replies release their slot and update only the matching selection/generation.
 Metadata arrival preserves transient error/status messages. Paths and link targets
 wrap at glyph boundaries when no word boundary fits.
@@ -625,15 +629,17 @@ open/width values even headless; a refusal never changes them.
 <h2 id="keymap-and-location-editing">Keymap and location editing</h2>
 <table><thead><tr><th>Binding</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+L</td><td><code>location.focus</code>: select the active location bar's text</td></tr>
-<tr><td>F6</td><td><code>nav.switch-pane</code></td></tr>
+<tr><td>Tab / F6</td><td><code>nav.switch-pane</code></td></tr>
 <tr><td>Ctrl+B / Ctrl+I</td><td><code>view.toggle-places</code> / <code>view.toggle-properties</code></td></tr>
 <tr><td>Alt+Left / Alt+Right</td><td><code>nav.back</code> / <code>nav.forward</code></td></tr>
 <tr><td>Backspace / Alt+Home</td><td><code>nav.parent</code> / <code>nav.home</code></td></tr>
-<tr><td>F5 / Ctrl+H</td><td><code>view.refresh</code> / <code>view.toggle-hidden</code></td></tr>
+<tr><td>Ctrl+R / F5</td><td><code>view.refresh</code></td></tr>
+<tr><td>Ctrl+H</td><td><code>view.toggle-hidden</code></td></tr>
 <tr><td>Ctrl+1 / Ctrl+2 / Ctrl+3</td><td><code>view.sort-name</code> / <code>view.sort-size</code> / <code>view.sort-modified</code></td></tr>
 <tr><td>Down / Up / Home / End</td><td><code>selection.next</code> / <code>previous</code> / <code>first</code> / <code>last</code></td></tr>
 <tr><td>Enter</td><td><code>file.open</code></td></tr>
-<tr><td>Ctrl+Shift+N / F2</td><td><code>file.new-folder</code> / <code>file.rename</code></td></tr>
+<tr><td>Ctrl+Shift+N</td><td><code>file.new-folder</code></td></tr>
+<tr><td>Ctrl+E / F2</td><td><code>file.rename</code></td></tr>
 <tr><td>Ctrl+C / Ctrl+X</td><td><code>file.copy-other-pane</code> / <code>file.move-other-pane</code></td></tr>
 <tr><td>Delete</td><td><code>file.delete</code> (permanent deletion after confirmation)</td></tr>
 <tr><td>Ctrl+Q</td><td><code>app.quit</code></td></tr>
@@ -644,7 +650,11 @@ open/width values even headless; a refusal never changes them.
 Escape cancels, and clicking a listing or another control dismisses the
 edit. While editing, default browse/file shortcuts are suppressed by
 <code>FocusContext</code>; clipboard and undo keys belong to the field.
-Dialogs own Enter/Escape and suppress browse actions.</p>
+Dialogs own Enter/Escape and suppress browse actions. Tab passes through to
+editors and dialogs instead of switching panes. Ctrl+R and Ctrl+E also remain
+suppressed there. These alternates avoid desktop grabs of plain function keys;
+tooltips include all effective bindings. Location bars use the quiet <code>input</code>
+border role at rest and the accent <code>ring</code> only while the editor is focused.</p>
 <p>Defaults live in <code>cosmix-actions</code>' <code>DOPUS_DEFAULT_KEYMAP_MIX</code>.
 The per-app <code>config/keymap.conf.mix</code> supplies <code>custom</code> overrides and
 <code>chord_timeout_ms</code> (default 1000). It reloads on window focus; invalid

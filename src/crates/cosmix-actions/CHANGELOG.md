@@ -2,7 +2,9 @@
 
 ## 0.4.2 — 2026-09-27
 
-- Add `view.toggle-places` and `view.toggle-properties`, with F9/F10 dopus defaults.
+- Add `view.toggle-places` and `view.toggle-properties`, with Ctrl+B/Ctrl+I dopus defaults.
+- Add dopus alternates: Tab switches panes, Ctrl+R refreshes and Ctrl+E renames;
+  retain F6/F5/F2 where the desktop passes them through.
 
 ## 0.4.1
 

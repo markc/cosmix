@@ -18,6 +18,7 @@ pub struct Header {
     pub ascending: bool,
     labels: [String; 3],
     tips: Vec<Element<'static, Msg>>,
+    columns: Columns,
 }
 impl Header {
     pub fn new(
@@ -26,6 +27,7 @@ impl Header {
         sort: SortColumn,
         ascending: bool,
         actions: &[crate::verbs::ActionRow],
+        columns: Columns,
     ) -> Self {
         use cosmix_actions::filemgr;
         Self {
@@ -34,6 +36,7 @@ impl Header {
             sort,
             ascending,
             tips: Vec::new(),
+            columns,
             labels: [
                 (filemgr::VIEW_SORT_NAME, "Sort by name"),
                 (filemgr::VIEW_SORT_SIZE, "Sort by size"),
@@ -81,7 +84,8 @@ impl Widget<Msg, iced::Theme, Renderer> for Header {
         let height = labels[0].min_bounds().height + self.look.chrome.small * 2.0;
         *tree.state.downcast_mut::<[Para; 3]>() = labels;
         let size = limits.resolve(Length::Fill, Length::Shrink, Size::new(0.0, height));
-        let regions = Columns::new(self.look)
+        let regions = self
+            .columns
             .cells(size.width)
             .into_iter()
             .zip(&self.labels)
@@ -138,7 +142,8 @@ impl Widget<Msg, iced::Theme, Renderer> for Header {
             .is_some_and(|clip| cursor.is_over(clip))
         {
             let x = cursor.position().unwrap_or_default().x - bounds.x;
-            if let Some(i) = Columns::new(self.look)
+            if let Some(i) = self
+                .columns
                 .cells(bounds.width)
                 .iter()
                 .position(|(start, width)| x >= *start && x < start + width)
@@ -173,7 +178,8 @@ impl Widget<Msg, iced::Theme, Renderer> for Header {
                 },
                 self.look.chrome.secondary,
             );
-            for (i, ((start, width), para)) in Columns::new(self.look)
+            for (i, ((start, width), para)) in self
+                .columns
                 .cells(bounds.width)
                 .into_iter()
                 .zip(tree.state.downcast_ref::<[Para; 3]>())

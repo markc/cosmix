@@ -2,6 +2,11 @@
 
 ## 0.3.0
 
+- Measure Size from each listing's actual values, bounded by a readable floor
+  and count ceiling; share the cached layout between headers and rows.
+- Use quiet input borders on location bars, reserving the ring for focused editing.
+- Add Tab, Ctrl+R and Ctrl+E alternatives to F6, F5 and F2 for pane switching,
+  refresh and rename. Preserve editor/dialog handling and show all bindings in tooltips.
 - Add Lucide panel-left/panel-right toolbar buttons at the window edges,
   with docked/hidden state styling and the existing sidebar actions.
 - Add token-styled iced tooltips to navigation, panel toggles, Places,

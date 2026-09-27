@@ -30,7 +30,7 @@ use iced::advanced::{Clipboard, Layout, Renderer as _, Shell, Widget, layout, mo
 use iced::{Element, Event, Length, Point, Rectangle, Size, alignment};
 use iced_tiny_skia::Renderer;
 
-use cosmix_dopus_core::VisibleRow;
+use cosmix_dopus_core::{FileEntry, VisibleRow};
 
 use crate::icons::{self, Icons};
 use crate::view::Look;
@@ -60,7 +60,7 @@ pub struct Columns {
     pub pad: f32,
 }
 impl Columns {
-    pub fn new(look: Look) -> Self {
+    fn new(look: Look, values: &HashSet<String>) -> Self {
         let measure = |s| {
             FileList::shape(s, look.mono_font, look.small_px)
                 .min_bounds()
@@ -68,7 +68,11 @@ impl Columns {
         };
         Self {
             name_min: look.chrome.icon * 2.0 + look.chrome.small + Self::name_measure(look),
-            size: measure("999999 items"),
+            size: listing_size_width(
+                values.iter().map(String::as_str),
+                look.chrome.small,
+                measure,
+            ),
             modified: measure("88/88/88 88:88"),
             gap: look.chrome.gap,
             pad: look.chrome.pad,
@@ -120,6 +124,63 @@ impl Columns {
         let (start, cell_width) = self.cells(width)[0];
         let decoration = self.indentation(width, depth, icon) + 2.0 * icon + padding;
         (start + decoration, (cell_width - decoration).max(0.0))
+    }
+}
+
+fn size_text(entry: &FileEntry) -> String {
+    if entry.is_dir {
+        cosmix_dopus_core::format_child_count(entry.child_count)
+    } else {
+        entry
+            .size
+            .map(cosmix_dopus_core::format_size)
+            .unwrap_or_else(|| "—".into())
+    }
+}
+
+fn listing_size_width<'a>(
+    values: impl Iterator<Item = &'a str>,
+    padding: f32,
+    measure: impl Fn(&str) -> f32,
+) -> f32 {
+    let floor = measure("99.9 MiB");
+    let ceiling = measure("999999 items").max(floor);
+    values.map(&measure).fold(floor, f32::max).min(ceiling) + 2.0 * padding
+}
+
+type ColumnMetrics = (iced::Font, u32, iced::Font, u32, crate::theme::Chrome);
+
+/// Per-listing measurements shared by the header and all rows. Values are
+/// deduplicated; only a relist/count change or theme change shapes them again.
+#[derive(Default)]
+pub struct ColumnCache {
+    values: HashSet<String>,
+    metrics: Option<ColumnMetrics>,
+    columns: Option<Columns>,
+}
+impl ColumnCache {
+    pub fn refresh(&mut self, look: Look, rows: &[VisibleRow]) {
+        let values = rows.iter().map(|row| size_text(&row.entry)).collect();
+        let metrics = (
+            look.ui_font,
+            look.px.to_bits(),
+            look.mono_font,
+            look.small_px.to_bits(),
+            look.chrome,
+        );
+        if self.columns.is_none()
+            || self.metrics.as_ref() != Some(&metrics)
+            || self.values != values
+        {
+            self.columns = Some(Columns::new(look, &values));
+            self.values = values;
+            self.metrics = Some(metrics);
+        }
+    }
+
+    pub fn get(&self, look: Look) -> Columns {
+        self.columns
+            .unwrap_or_else(|| Columns::new(look, &HashSet::new()))
     }
 }
 
@@ -224,9 +285,10 @@ impl<'a> FileList<'a> {
         tint: &'a str,
         look: Look,
         actions: &[crate::verbs::ActionRow],
+        columns: Columns,
     ) -> Self {
         Self {
-            columns: Columns::new(look),
+            columns,
             rows,
             selected,
             root,
@@ -308,14 +370,7 @@ impl<'a> FileList<'a> {
             st.cache.clear();
             st.metrics_key = None;
         }
-        let size_text = if row.entry.is_dir {
-            cosmix_dopus_core::format_child_count(row.entry.child_count)
-        } else {
-            row.entry
-                .size
-                .map(cosmix_dopus_core::format_size)
-                .unwrap_or_else(|| "—".into())
-        };
+        let size_text = size_text(&row.entry);
         let modified_text = row
             .entry
             .modified
@@ -799,6 +854,7 @@ impl<'a> From<FileList<'a>> for Element<'a, RowsMsg, iced::Theme, Renderer> {
 #[cfg(test)]
 mod column_tests {
     use super::*;
+    use cosmix_dopus_core::format_size;
 
     fn columns() -> Columns {
         Columns {
@@ -808,6 +864,33 @@ mod column_tests {
             gap: 12.0,
             pad: 8.0,
         }
+    }
+
+    #[test]
+    fn small_file_listings_leave_most_width_for_names() {
+        let measure = |s: &str| {
+            FileList::shape(s, iced::Font::MONOSPACE, 11.0)
+                .min_bounds()
+                .width
+        };
+        let small = [format_size(12), format_size(512), format_size(2048)];
+        let width = listing_size_width(small.iter().map(String::as_str), 4.0, measure);
+        assert_eq!(width, measure("99.9 MiB") + 8.0);
+        let crowded = listing_size_width(["999999 items"].into_iter(), 4.0, measure);
+        assert!(width < crowded);
+        let columns = Columns {
+            size: width,
+            modified: measure("88/88/88 88:88"),
+            ..columns()
+        };
+        let cells = columns.cells(500.0);
+        assert!(cells[0].1 > 250.0);
+        assert_eq!(cells[1].1, width);
+        assert!(cells[2].1 > 0.0);
+        assert_eq!(
+            listing_size_width(["999999999999 items"].into_iter(), 4.0, measure),
+            crowded
+        );
     }
 
     #[test]

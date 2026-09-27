@@ -6,14 +6,14 @@ The window is a Wayland client (`dev.cosmix.dopus`) drawn with tiny-skia and
 the shared design tokens. Only dopus consumes the extracted core.
 
 Each pane has its own directory, history, sort, hidden-file setting, lazy
-directory tree and single selection. F6 switches the active pane. Places is
+directory tree and single selection. Tab or F6 switches the active pane. Places is
 a plain sidebar, with Home, Filesystem and existing user directories.
 Click its heading to refresh Places; pane relists also invalidate its cached
 directory checks. The divider persists its position; double-click centres it.
 
 One navigation icon strip is centred across the top of the window: Back,
 Forward, Up, Home, Refresh and Show/Hide hidden files. It always acts on the
-active pane and follows F6 or a pane click; Back/Forward are disabled when
+active pane and follows Tab, F6 or a pane click; Back/Forward are disabled when
 that pane's corresponding history is empty, and Up is disabled at the root.
 Disabled icons use the theme's muted foreground, matching disabled dialog buttons.
 Lucide `panel-left` and `panel-right` buttons sit at the far left and right of
@@ -42,6 +42,10 @@ Each column and the list viewport clip their contents. Name measurement and
 rendering both use advanced shaping for complex scripts and font fallback.
 Secondary columns use the desktop Small type size with the mono family,
 leaving a useful Name budget when both sidebars are open.
+Size reserves the widest shaped size/count value in that pane's listing, with
+a `99.9 MiB` floor and `999999 items` ceiling plus token padding. The cached
+width updates on relists, count replies and typography changes; headers and
+rows receive the same layout. Small-file listings leave more room for names.
 Selection uses the design's `selection`/`selection_text` pair, and a
 `muted_surface` header marks the active pane. Modified times are always local
 `dd/mm/yy HH:MM` in 24-hour format. There is no relative-time refresh.
@@ -54,8 +58,8 @@ worker through the existing nix dependency's reentrant system lookups;
 missing names or lookup failures fall back independently to numeric IDs.
 Metadata reads time out in the UI after five seconds. Changing selection can
 start another read while an old one is stuck, with at most four outstanding
-reads per pane; exhausting that cap reports unavailable, rather than leaving
-every later selection loading forever. Select again to retry after a slot frees.
+reads per pane. At capacity the selection stays pending and retries automatically
+on the next tick after a slot frees; only timed-out reads cache an error.
 Late replies release their slot and update only the matching selection/generation.
 Metadata arrival preserves transient error/status messages. Paths and link targets
 wrap at glyph boundaries when no word boundary fits.
@@ -210,15 +214,17 @@ open/width values even headless; a refusal never changes them.
 | Binding | Action |
 |---|---|
 | Ctrl+L | `location.focus`: select the active location bar's text |
-| F6 | `nav.switch-pane` |
+| Tab / F6 | `nav.switch-pane` |
 | Ctrl+B / Ctrl+I | `view.toggle-places` / `view.toggle-properties` |
 | Alt+Left / Alt+Right | `nav.back` / `nav.forward` |
 | Backspace / Alt+Home | `nav.parent` / `nav.home` |
-| F5 / Ctrl+H | `view.refresh` / `view.toggle-hidden` |
+| Ctrl+R / F5 | `view.refresh` |
+| Ctrl+H | `view.toggle-hidden` |
 | Ctrl+1 / Ctrl+2 / Ctrl+3 | `view.sort-name` / `view.sort-size` / `view.sort-modified` |
 | Down / Up / Home / End | `selection.next` / `previous` / `first` / `last` |
 | Enter | `file.open` |
-| Ctrl+Shift+N / F2 | `file.new-folder` / `file.rename` |
+| Ctrl+Shift+N | `file.new-folder` |
+| Ctrl+E / F2 | `file.rename` |
 | Ctrl+C / Ctrl+X | `file.copy-other-pane` / `file.move-other-pane` |
 | Delete | `file.delete` (permanent deletion after confirmation) |
 | Ctrl+Q | `app.quit` |
@@ -229,7 +235,11 @@ Clicking a location bar also edits it. Enter submits the real path text,
 Escape cancels, and clicking a listing or another control dismisses the
 edit. While editing, default browse/file shortcuts are suppressed by
 `FocusContext`; clipboard and undo keys belong to the field.
-Dialogs own Enter/Escape and suppress browse actions.
+Dialogs own Enter/Escape and suppress browse actions. Tab passes through to
+editors and dialogs instead of switching panes. Ctrl+R and Ctrl+E also remain
+suppressed there. These alternates avoid desktop grabs of plain function keys;
+tooltips include all effective bindings. Location bars use the quiet `input`
+border role at rest and the accent `ring` only while the editor is focused.
 
 Defaults live in `cosmix-actions`' `DOPUS_DEFAULT_KEYMAP_MIX`.
 The per-app `config/keymap.conf.mix` supplies `custom` overrides and

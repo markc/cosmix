@@ -137,6 +137,7 @@ pub struct Dopus {
     /// The per-pane listing snapshot `view` draws; refreshed after every
     /// update so no core mutation can be drawn stale.
     rows: [Vec<VisibleRow>; 2],
+    column_cache: [rows::ColumnCache; 2],
     /// The core's live split ratio, cached for the view (the core owns it;
     /// the divider writes through `set_split_ratio` — law 7).
     split_ratio: f32,
@@ -228,6 +229,7 @@ pub fn run(
     let mut app = Dopus {
         core,
         rows: [Vec::new(), Vec::new()],
+        column_cache: Default::default(),
         split_ratio,
         editing: None,
         router,
@@ -505,6 +507,10 @@ impl Dopus {
             self.core.visible_rows(PaneId::Left),
             self.core.visible_rows(PaneId::Right),
         ];
+        let look = self.look();
+        for (cache, rows) in self.column_cache.iter_mut().zip(&self.rows) {
+            cache.refresh(look, rows);
+        }
         self.split_ratio = self.core.config_snapshot().split_ratio;
     }
 
@@ -1109,6 +1115,10 @@ impl Dopus {
             self.core
                 .sidebar(cosmix_dopus_core::config::Sidebar::Properties),
             &self.action_table,
+            [
+                self.column_cache[0].get(self.look()),
+                self.column_cache[1].get(self.look()),
+            ],
         );
         // The router wraps everything: it sees every key before its children
         // and publishes resolved actions (never `event::listen`, which drops
@@ -1211,6 +1221,7 @@ mod tests {
         let app = Dopus {
             core,
             rows: [Vec::new(), Vec::new()],
+            column_cache: Default::default(),
             split_ratio: 0.5,
             editing: None,
             router: keys::initial(None).unwrap(),

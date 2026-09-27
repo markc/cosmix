@@ -479,11 +479,8 @@ impl DopusCore {
             // A stuck stat/NSS call cannot be killed safely. Allow selection
             // changes to bypass it, but bound outstanding OS threads per pane.
             if slot.in_flight.len() >= 4 {
-                slot.cached = Some((
-                    generation,
-                    path,
-                    Err("Metadata workers busy; select again to retry".into()),
-                ));
+                // Capacity is transient, not a metadata result. Leave this
+                // selection pending so the next tick retries after a drain.
                 continue;
             }
             slot.in_flight.push((generation, path.clone(), now));
@@ -689,7 +686,7 @@ impl DopusCore {
     /// Direct selection (the plain-state equivalent of `select_row`,
     /// browser.rs:2867-2873: selecting a row also activates its pane).
     pub fn select_path(&mut self, pane: PaneId, path: Option<PathBuf>) {
-        // An explicit selection retries a previous busy/error result. Any
+        // An explicit selection retries a previous metadata error. Any
         // still-running request is reused, so retries cannot bypass the cap.
         if self.properties[pane.index()]
             .cached
@@ -2023,16 +2020,8 @@ mod tests {
         core.select_path(pane, Some(core.pane(pane).path.join("over-cap")));
         core.dispatch_properties(now + Duration::from_secs(6));
         assert_eq!(core.properties[0].in_flight.len(), 4);
-        assert!(
-            core.properties[0]
-                .cached
-                .as_ref()
-                .unwrap()
-                .2
-                .as_ref()
-                .unwrap_err()
-                .contains("busy")
-        );
+        assert!(core.properties[0].cached.is_none());
+        let selected = core.pane(pane).selected.clone().unwrap();
         core.on_event(CoreEvent::PropertiesArrived {
             pane,
             generation,
@@ -2040,10 +2029,15 @@ mod tests {
             result: Err("late".into()),
         });
         assert_eq!(core.properties[0].in_flight.len(), 3);
-        let selected = core.pane(pane).selected.clone();
-        core.select_path(pane, selected);
+        // No click or selection change: capacity becoming free is enough.
         core.dispatch_properties(now + Duration::from_secs(7));
         assert_eq!(core.properties[0].in_flight.len(), 4);
+        assert!(
+            core.properties[0]
+                .in_flight
+                .iter()
+                .any(|(_, path, _)| *path == selected)
+        );
     }
 
     /// A core rooted at a temp directory with `left/` and `right/` panes.

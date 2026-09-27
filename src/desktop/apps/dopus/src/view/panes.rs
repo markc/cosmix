@@ -50,11 +50,12 @@ pub fn pane_column<'a>(
     active: bool,
     editing: Option<&'a str>,
     actions: &'a [crate::verbs::ActionRow],
+    columns: rows::Columns,
 ) -> Element<'a, Msg> {
     container(
         column![
             pane_header(look, pane, pane_id, active, editing),
-            sort_header(look, pane, pane_id, actions),
+            sort_header(look, pane, pane_id, actions, columns),
             Element::new(rows::FileList::new(
                 pane_rows,
                 pane.selected.as_deref(),
@@ -64,6 +65,7 @@ pub fn pane_column<'a>(
                 tint,
                 look,
                 actions,
+                columns,
             ))
             .map(move |m| Msg::PaneRows(pane_id, m)),
         ]
@@ -110,8 +112,9 @@ fn sort_header<'a>(
     pane: &'a PaneModel,
     pane_id: PaneId,
     actions: &[crate::verbs::ActionRow],
+    columns: rows::Columns,
 ) -> Element<'a, Msg> {
-    super::columns::Header::new(look, pane_id, pane.sort, pane.ascending, actions).into()
+    super::columns::Header::new(look, pane_id, pane.sort, pane.ascending, actions, columns).into()
 }
 
 // -- the divider --------------------------------------------------------------

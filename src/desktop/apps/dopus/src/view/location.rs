@@ -87,24 +87,20 @@ fn editor(look: Look, pane_id: PaneId, text: &str) -> Element<'_, Msg> {
 }
 
 /// The at-rest bar, styled as a button that reads like the editor it opens:
-/// the same `input` background and `border`, hovered.
+/// the same quiet `input` edge role ced uses for an unfocused text field.
 fn bar_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::Style + 'static {
     let edge = look.chrome.edge;
-    let (background, border, text_color, ring, radius) = (
+    let (background, border, text_color, radius) = (
         look.tokens.input,
-        look.tokens.border,
+        look.tokens.input,
         look.chrome.secondary_text,
-        look.tokens.ring,
         look.tokens.radius,
     );
-    move |_theme, status| button::Style {
+    move |_theme, _status| button::Style {
         background: Some(background.into()),
         text_color,
         border: Border {
-            color: match status {
-                button::Status::Hovered | button::Status::Pressed => ring,
-                _ => border,
-            },
+            color: border,
             width: edge,
             radius: radius.into(),
         },
@@ -112,10 +108,9 @@ fn bar_look(look: &Look) -> impl Fn(&iced::Theme, button::Status) -> button::Sty
     }
 }
 
-/// The field's style, from tokens only (`input` background, `border`,
+/// The field's style, from tokens only (`input` background and resting edge,
 /// `ring` focus) — the [`Tokens::text_input`](cosmix_iced_widgets::Tokens)
-/// shape, at rest using the quieter `border` instead of `input` so the bar
-/// reads as a button until clicked.
+/// shape; only focused editing uses the accent ring.
 fn field_look(
     look: &Look,
 ) -> impl Fn(&iced::Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style + 'static
@@ -123,7 +118,7 @@ fn field_look(
     let edge = look.chrome.edge;
     let (background, border, text_color, muted, ring, selection, radius) = (
         look.tokens.input,
-        look.tokens.border,
+        look.tokens.input,
         look.chrome.secondary_text,
         look.tokens.muted_text,
         look.tokens.ring,
