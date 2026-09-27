@@ -1,4 +1,4 @@
--- version: 0.5.0
+-- version: 0.6.0
 -- Shared, byte-exact store manifest contract. No filesystem or Bus effects.
 fn fail($code, $message)
   raise($code, $message)
@@ -152,6 +152,20 @@ end
 fn assess_legacy($raw, $sha256)
   if type($raw) != "string" then fail("STORE_SCHEMA", "old manifest must be raw UTF-8 text") end
   if hash_sha256($raw) != $sha256 then fail("STORE_LEGACY_HASH", "old raw-byte SHA-256 mismatch") end
+  try
+    return _assess_verified_legacy($raw)
+  catch $message, $error
+    return {identity_verified: true, migratable: false, reason: $error.code .. ": " .. $message}
+  end
+end
+
+fn decimal_exceeds($digits, $limit)
+  -- Relational operators coerce numeric strings to numbers. Sort compares
+  -- strings lexically, preserving adjacent u64 values above the exact range.
+  return length($digits) > length($limit) or (length($digits) == length($limit) and sort([$digits, $limit])[0] != $digits)
+end
+
+fn _assess_verified_legacy($raw)
   if byte_length($raw) > 131072 then fail("STORE_LIMIT", "pilot manifest exceeds 128 KiB") end
   $old = json_parse(legacy_number_strings($raw))
   exact_fields($old, ["schema_version", "files"])
@@ -167,8 +181,8 @@ fn assess_legacy($raw, $sha256)
     $paths[$p] = true
     if type($entry.sha256) != "string" or not re_match($entry.sha256, "^[0-9a-f]{64}$") then fail("STORE_BLOB", "invalid pilot SHA-256") end
     $n = $entry.size
-    if type($n) != "string" or not re_match($n, "^(0|[1-9][0-9]*)$") or length($n) > 20 or (length($n) == 20 and $n > "18446744073709551615") then fail("STORE_INTEGER", "pilot size must be u64") end
-    if length($n) > 16 or (length($n) == 16 and $n > "9007199254740991") then $safe = false end
+    if type($n) != "string" or not re_match($n, "^(0|[1-9][0-9]*)$") or decimal_exceeds($n, "18446744073709551615") then fail("STORE_INTEGER", "pilot size must be u64") end
+    if decimal_exceeds($n, "9007199254740991") then $safe = false end
     push($encoded, "{\"path\":" .. json_encode($p) .. ",\"sha256\":" .. json_encode($entry.sha256) .. ",\"size\":" .. $n .. "}")
   end
   for each $p in keys($paths)

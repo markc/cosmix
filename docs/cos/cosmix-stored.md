@@ -37,11 +37,16 @@ pass the new byte limit; migration must never truncate or omit entries.
 The pilot already used the same 1024-byte path grammar, 1000-file limit and
 128 KiB canonical-byte limit; its sizes were u64 with no v2 aggregate bound.
 Legacy validation preserves decimal u64 tokens before Mix's floating-point
-JSON conversion. `assess_legacy(raw,sha256)` first verifies raw identity and
-pilot validity, then reports `identity_verified:true,migratable:false,reason`
-when a v2 rewrite would exceed its limits. `verify_legacy` exposes that outcome
+JSON conversion. After the raw identity check, a legacy manifest must satisfy
+the v1 grammar, canonical encoding and limits, then the v2 rewrite limits.
+Otherwise `assess_legacy(raw,sha256)` reports
+`identity_verified:true,migratable:false,reason`: identity verified, not
+migratable. Its reason preserves the underlying validation code.
+`verify_legacy` exposes that outcome
 as `STORE_NOT_MIGRATABLE: identity verified, not migratable: …`. No old integer
 is rounded into a new manifest, and old array order remains significant.
+The real pilot manifest fixture is frozen by the private migration slice;
+pilot data is mesh-private and does not belong in this tree.
 
 ## Tests
 
@@ -177,8 +182,8 @@ builtins may also surface their own native error codes.
 | `STORE_COMMIT` | Commit failed or did not finish within the client's wait |
 | `STORE_DESTINATION` | Restore destination already exists or its namespace changed |
 | `STORE_LEGACY_HASH` | Original pilot bytes do not match their SHA-256 |
-| `STORE_LEGACY_CANONICAL` | Hash-verified pilot bytes are not canonical |
-| `STORE_NOT_MIGRATABLE` | Valid pilot identity cannot fit the v2 contract |
+| `STORE_LEGACY_CANONICAL` | Assessment reason: hash-verified pilot bytes are not canonical |
+| `STORE_NOT_MIGRATABLE` | Raw pilot identity verified, but v1 validation or v2 rewrite failed |
 | `STORE_USAGE` | Invalid client/package arguments |
 | `STORE_PACKAGE` | Package source is not a checkout |
 

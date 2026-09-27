@@ -1,4 +1,4 @@
--- version: 0.3.0
+-- version: 0.4.0
 $m = require("store_manifest.mix")
 $checks = buffer()
 fn check($condition, $token)
@@ -69,7 +69,16 @@ try
 catch $message, $error
   $caught = $error.code
 end
-check($caught == "STORE_LEGACY_CANONICAL", "LEGACY_NO_NORMALISATION")
+check($caught == "STORE_NOT_MIGRATABLE" and starts_with($m.assess_legacy($old .. "\n", hash_sha256($old .. "\n")).reason, "STORE_LEGACY_CANONICAL:"), "LEGACY_NO_NORMALISATION")
+for each $fixture in [
+  {raw: "{\"files\":[],\"schema_version\":2}", code: "STORE_SCHEMA"},
+  {raw: repeat(" ", 131073), code: "STORE_LIMIT"},
+  {raw: "{\"files\":[{\"path\":\"../escape\",\"sha256\":\"" .. repeat("a", 64) .. "\",\"size\":0}],\"schema_version\":1}", code: "STORE_PATH"},
+  {raw: "{\"files\":[{\"path\":\"a\",\"sha256\":\"" .. repeat("a", 64) .. "\",\"size\":18446744073709551616}],\"schema_version\":1}", code: "STORE_INTEGER"}
+]
+  $assessment = $m.assess_legacy($fixture.raw, hash_sha256($fixture.raw))
+  check($assessment.identity_verified and not $assessment.migratable and starts_with($assessment.reason, $fixture.code .. ":"), "HASH_VERIFIED_V1_REFUSAL_" .. $fixture.code)
+end
 $u64 = "{\"files\":[{\"path\":\"u64\",\"sha256\":\"" .. repeat("a", 64) .. "\",\"size\":18446744073709551615}],\"schema_version\":1}"
 $assessment = $m.assess_legacy($u64, hash_sha256($u64))
 check($assessment.identity_verified and not $assessment.migratable, "PILOT_U64_IDENTITY_WITHOUT_ROUNDING")

@@ -473,11 +473,16 @@ pass the new byte limit; migration must never truncate or omit entries.
 The pilot already used the same 1024-byte path grammar, 1000-file limit and
 128 KiB canonical-byte limit; its sizes were u64 with no v2 aggregate bound.
 Legacy validation preserves decimal u64 tokens before Mix's floating-point
-JSON conversion. <code>assess_legacy(raw,sha256)</code> first verifies raw identity and
-pilot validity, then reports <code>identity_verified:true,migratable:false,reason</code>
-when a v2 rewrite would exceed its limits. <code>verify_legacy</code> exposes that outcome
+JSON conversion. After the raw identity check, a legacy manifest must satisfy
+the v1 grammar, canonical encoding and limits, then the v2 rewrite limits.
+Otherwise <code>assess_legacy(raw,sha256)</code> reports
+<code>identity_verified:true,migratable:false,reason</code>: identity verified, not
+migratable. Its reason preserves the underlying validation code.
+<code>verify_legacy</code> exposes that outcome
 as <code>STORE_NOT_MIGRATABLE: identity verified, not migratable: …</code>. No old integer
-is rounded into a new manifest, and old array order remains significant.</p>
+is rounded into a new manifest, and old array order remains significant.
+The real pilot manifest fixture is frozen by the private migration slice;
+pilot data is mesh-private and does not belong in this tree.</p>
 <h2 id="tests">Tests</h2>
 <p>From the checkout, without root or a broker:</p>
 <pre><code class="language-text">mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
@@ -594,8 +599,8 @@ builtins may also surface their own native error codes.</p>
 <tr><td><code>STORE_COMMIT</code></td><td>Commit failed or did not finish within the client's wait</td></tr>
 <tr><td><code>STORE_DESTINATION</code></td><td>Restore destination already exists or its namespace changed</td></tr>
 <tr><td><code>STORE_LEGACY_HASH</code></td><td>Original pilot bytes do not match their SHA-256</td></tr>
-<tr><td><code>STORE_LEGACY_CANONICAL</code></td><td>Hash-verified pilot bytes are not canonical</td></tr>
-<tr><td><code>STORE_NOT_MIGRATABLE</code></td><td>Valid pilot identity cannot fit the v2 contract</td></tr>
+<tr><td><code>STORE_LEGACY_CANONICAL</code></td><td>Assessment reason: hash-verified pilot bytes are not canonical</td></tr>
+<tr><td><code>STORE_NOT_MIGRATABLE</code></td><td>Raw pilot identity verified, but v1 validation or v2 rewrite failed</td></tr>
 <tr><td><code>STORE_USAGE</code></td><td>Invalid client/package arguments</td></tr>
 <tr><td><code>STORE_PACKAGE</code></td><td>Package source is not a checkout</td></tr>
 </tbody></table>
