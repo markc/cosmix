@@ -281,7 +281,7 @@ All publishes are `retain: false` (noded's `topic.publish` defaults to `retain: 
 
 ## Mix
 
-### Caller-local file transfer (blob.mix 0.2.1, Mix 0.97.1)
+### Caller-local file transfer (blob.mix 0.2.0, Mix 0.97.0)
 
 `blob_upload_file(path, opts)` streams a caller-local file through durable
 sessions. Required options are `owner` and `resume_file`; `service` defaults to

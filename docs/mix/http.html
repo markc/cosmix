@@ -456,7 +456,7 @@ preserving its current permission bits. Symlink replacement is refused.</p>
 are returned. Only a 200 or 204 installs a fresh file. HTTP error bodies may
 be returned in <code>body</code>/<code>bytes</code> (64 MiB cap), but never become the destination.
 Successful file bodies stay on disk; <code>body</code> is nil and <code>bytes</code> empty.
-From 0.97.1, 200/206 downloads require identity framing with Content-Length.
+From 0.97.0, 200/206 downloads require identity framing with Content-Length.
 Missing length or non-identity encoding returns status 0 with
 <code>HTTP_IDENTITY_FRAMING</code> and leaves the destination untouched. This also rejects
 ureq's transparent gzip decoding, which removes both Content-Encoding and

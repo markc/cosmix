@@ -1,4 +1,4 @@
--- version: 0.2.1
+-- version: 0.2.0
 -- mix/blob.mix — the Mix surface over cosmix-blobd's blob.* verbs (the
 -- design's §4.4: a require() library, not builtins). Bus verbs wrap send;
 -- caller-local file transfers use the discovered HTTP lane. Both answer
