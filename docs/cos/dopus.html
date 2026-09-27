@@ -493,14 +493,14 @@ never a recursive byte walk. With no selection it shows the current path
 and the same folder/file counts and total file size as the status bar.
 Metadata runs on at most one worker per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.</p>
-<p><strong>F13</strong> toggles Places and <strong>F14</strong> toggles Properties; the status bar offers
+<p><strong>Ctrl+B</strong> toggles Places and <strong>Ctrl+I</strong> toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
 resize it; double-click restores Places to 15% or Properties to 22%. Both
 panels default open, and the buttons show their open/closed state. Both open
 states and widths persist; existing saved widths are preserved.
 The compositor can reserve plain F9, and inputd's default grab keymap claims
-all plain F1–F12. F13/F14 are the nearest unclaimed function keys in both
-defaults. Use the clickable buttons or a keymap override on keyboards without them.
+all plain F1–F12. The sidebar shortcuts use ordinary Ctrl chords, free in
+dopus, ced and inputd's defaults, and work on standard keyboards.
 Widths are fractions of the available window width, clamped to 10–30% each
 to leave room for the panes. Hidden panels and their dividers take no space.</p>
 <p>File operations are local keyboard/dialog actions: new folder, rename,
@@ -616,7 +616,7 @@ open/width values even headless; a refusal never changes them.
 <table><thead><tr><th>Binding</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+L</td><td><code>location.focus</code>: select the active location bar's text</td></tr>
 <tr><td>F6</td><td><code>nav.switch-pane</code></td></tr>
-<tr><td>F13 / F14</td><td><code>view.toggle-places</code> / <code>view.toggle-properties</code></td></tr>
+<tr><td>Ctrl+B / Ctrl+I</td><td><code>view.toggle-places</code> / <code>view.toggle-properties</code></td></tr>
 <tr><td>Alt+Left / Alt+Right</td><td><code>nav.back</code> / <code>nav.forward</code></td></tr>
 <tr><td>Backspace / Alt+Home</td><td><code>nav.parent</code> / <code>nav.home</code></td></tr>
 <tr><td>F5 / Ctrl+H</td><td><code>view.refresh</code> / <code>view.toggle-hidden</code></td></tr>
@@ -689,7 +689,7 @@ test cannot drive operations through the deliberately forbidden <code>file.*</co
 <p>P4 tests also cover filename elision (including graphemes and tiny widths),
 shared column geometry, panel divider geometry with either/both panels hidden,
 schema migration and preservation, metadata permissions/symlinks/stale replies,
-F13/F14 resolution and toggle availability. The headless e2e asserts both panel
+Ctrl+B/Ctrl+I resolution and toggle availability. The headless e2e asserts both panel
 state records, disabled toggle actions and <code>UNAVAILABLE</code> without state mutation.
 Windowed acceptance should check all four open/closed combinations, resizing,
 theme changes, long names and the last partially visible row, then restart

@@ -689,14 +689,6 @@ mod tests {
                 Key::Named(Named::F5),
                 Physical::Unidentified(NativeCode::Unidentified),
             ),
-            "F13" => (
-                Key::Named(Named::F13),
-                Physical::Unidentified(NativeCode::Unidentified),
-            ),
-            "F14" => (
-                Key::Named(Named::F14),
-                Physical::Unidentified(NativeCode::Unidentified),
-            ),
             "ArrowDown" => (
                 Key::Named(Named::ArrowDown),
                 Physical::Unidentified(NativeCode::Unidentified),
@@ -749,8 +741,8 @@ mod tests {
             ("Ctrl+2", filemgr::VIEW_SORT_SIZE),
             ("Ctrl+3", filemgr::VIEW_SORT_MODIFIED),
             ("Ctrl+L", cosmix_actions::location::FOCUS),
-            ("F13", cosmix_actions::view::TOGGLE_PLACES),
-            ("F14", cosmix_actions::view::TOGGLE_PROPERTIES),
+            ("Ctrl+B", cosmix_actions::view::TOGGLE_PLACES),
+            ("Ctrl+I", cosmix_actions::view::TOGGLE_PROPERTIES),
         ] {
             let input = press(text).unwrap_or_else(|| panic!("{text}"));
             let resolved = resolve(
@@ -808,6 +800,8 @@ mod tests {
             "F5",
             "Delete",
             "Ctrl+C",
+            "Ctrl+B",
+            "Ctrl+I",
             "F2",
             "Ctrl+Shift+N",
         ] {

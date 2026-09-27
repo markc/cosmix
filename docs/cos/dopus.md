@@ -56,14 +56,14 @@ and the same folder/file counts and total file size as the status bar.
 Metadata runs on at most one worker per pane; stale replies are discarded.
 Refresh relists and invalidates metadata. MIME is a hint, not content sniffing.
 
-**F13** toggles Places and **F14** toggles Properties; the status bar offers
+**Ctrl+B** toggles Places and **Ctrl+I** toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to
 resize it; double-click restores Places to 15% or Properties to 22%. Both
 panels default open, and the buttons show their open/closed state. Both open
 states and widths persist; existing saved widths are preserved.
 The compositor can reserve plain F9, and inputd's default grab keymap claims
-all plain F1–F12. F13/F14 are the nearest unclaimed function keys in both
-defaults. Use the clickable buttons or a keymap override on keyboards without them.
+all plain F1–F12. The sidebar shortcuts use ordinary Ctrl chords, free in
+dopus, ced and inputd's defaults, and work on standard keyboards.
 Widths are fractions of the available window width, clamped to 10–30% each
 to leave room for the panes. Hidden panels and their dividers take no space.
 
@@ -201,7 +201,7 @@ open/width values even headless; a refusal never changes them.
 |---|---|
 | Ctrl+L | `location.focus`: select the active location bar's text |
 | F6 | `nav.switch-pane` |
-| F13 / F14 | `view.toggle-places` / `view.toggle-properties` |
+| Ctrl+B / Ctrl+I | `view.toggle-places` / `view.toggle-properties` |
 | Alt+Left / Alt+Right | `nav.back` / `nav.forward` |
 | Backspace / Alt+Home | `nav.parent` / `nav.home` |
 | F5 / Ctrl+H | `view.refresh` / `view.toggle-hidden` |
@@ -285,7 +285,7 @@ test cannot drive operations through the deliberately forbidden `file.*` ids.
 P4 tests also cover filename elision (including graphemes and tiny widths),
 shared column geometry, panel divider geometry with either/both panels hidden,
 schema migration and preservation, metadata permissions/symlinks/stale replies,
-F13/F14 resolution and toggle availability. The headless e2e asserts both panel
+Ctrl+B/Ctrl+I resolution and toggle availability. The headless e2e asserts both panel
 state records, disabled toggle actions and `UNAVAILABLE` without state mutation.
 Windowed acceptance should check all four open/closed combinations, resizing,
 theme changes, long names and the last partially visible row, then restart

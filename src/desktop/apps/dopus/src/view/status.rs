@@ -22,7 +22,7 @@ pub fn bar<'a>(
     container(row![
         button(
             text(format!(
-                "{} Places (F13)",
+                "{} Places (Ctrl+B)",
                 if places_open { "●" } else { "○" }
             ))
             .font(look.ui_font)
@@ -33,7 +33,7 @@ pub fn bar<'a>(
         .on_press(Msg::Actions(vec![cosmix_actions::view::TOGGLE_PLACES])),
         button(
             text(format!(
-                "{} Properties (F14)",
+                "{} Properties (Ctrl+I)",
                 if properties_open { "●" } else { "○" }
             ))
             .font(look.ui_font)
