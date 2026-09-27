@@ -421,6 +421,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_tooltips_use_opaque_contrast_checked_muted_pairs() {
+        for scheme in Scheme::ALL {
+            for mode in Mode::ALL {
+                let compiled = compile(&Selection {
+                    scheme,
+                    mode,
+                    design_source: None,
+                })
+                .unwrap();
+                let dictionary = &compiled.dictionary;
+                let tokens = Tokens::from_dictionary(dictionary).unwrap();
+                let style =
+                    tokens.tooltip_style(dictionary.metrics["button.border_width"].value as f32);
+                assert_eq!(style.background, Some(tokens.muted_surface.into()));
+                assert_eq!(style.text_color, Some(tokens.muted_text));
+                assert_eq!(tokens.muted_surface.a, 1.0);
+                assert!(dictionary.colours.pairs["muted"].contrast_ratio >= 4.5);
+            }
+        }
+    }
+
+    #[test]
     fn the_embedded_design_resolves_for_dopus() {
         let theme = resolve_selection(
             &Selection {

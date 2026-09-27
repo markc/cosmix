@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Local, Utc};
 
 use crate::config::{CURRENT_SCHEMA, ConfigFile, DOpusConfig, PaneConfig, SortColumn};
-use crate::events::{ConfirmAnswer, CoreEvent, PromptKind};
+use crate::events::{ConfirmAnswer, CoreEvent, PromptKind, StatusKind};
 use crate::ops::{FileOpKind, FileOperation};
 use crate::worker::WorkerHandle;
 
@@ -119,6 +119,8 @@ pub struct PaneModel {
     /// cache key that cannot miss replies batched into one UI update.
     pub listing_revision: u64,
     pub listing: bool,
+    /// The last root listing failed; an empty result must not look successful.
+    listing_failed: bool,
     pub root: Vec<FileEntry>,
     pub children: HashMap<PathBuf, Vec<FileEntry>>,
     pub expanded: HashSet<PathBuf>,
@@ -138,12 +140,24 @@ pub struct PaneModel {
 }
 
 impl PaneModel {
+    /// Footer text, shared by the window and Bus snapshots.
+    pub fn footer_summary(&self) -> String {
+        if self.listing {
+            "…".into()
+        } else if self.listing_failed {
+            self.status.clone()
+        } else {
+            pane_summary(&self.root)
+        }
+    }
+
     fn new(path: PathBuf, show_hidden: bool, sort: SortColumn, ascending: bool) -> Self {
         Self {
             path,
             generation: 0,
             listing_revision: 0,
             listing: false,
+            listing_failed: false,
             root: Vec::new(),
             children: HashMap::new(),
             expanded: HashSet::new(),
@@ -1081,6 +1095,7 @@ impl DopusCore {
             pane.pending_children.remove(&path);
             if root {
                 pane.listing = false;
+                pane.listing_failed = result.is_err();
             }
             match result {
                 Ok(mut entries) => {
@@ -1137,6 +1152,7 @@ impl DopusCore {
             Listing::Ok { jobs, status } => {
                 self.count_queue.extend(jobs);
                 events.push(CoreEvent::Status {
+                    kind: StatusKind::Summary,
                     pane: Some(pane_id),
                     text: status,
                 });
@@ -1149,6 +1165,7 @@ impl DopusCore {
                     events.push(CoreEvent::SelectionChanged { pane: pane_id });
                 }
                 events.push(CoreEvent::Status {
+                    kind: StatusKind::Message,
                     pane: Some(pane_id),
                     text: status,
                 });
@@ -1320,6 +1337,7 @@ impl DopusCore {
             // clear_pane_rows (browser.rs:1352-1357).
             pane.selected = None;
             pane.listing = true;
+            pane.listing_failed = false;
             pane.root.clear();
             pane.children.clear();
             pane.expanded.clear();
@@ -1343,7 +1361,11 @@ impl DopusCore {
         if let Some(pane) = pane {
             self.panes[pane.index()].status = text.clone();
         }
-        self.emit(CoreEvent::Status { pane, text });
+        self.emit(CoreEvent::Status {
+            kind: StatusKind::Message,
+            pane,
+            text,
+        });
     }
 
     fn emit(&mut self, event: CoreEvent) {
@@ -2244,6 +2266,40 @@ mod tests {
         file.size = Some(1536);
         let entries = vec![folder, file];
         assert_eq!(pane_summary(&entries), "1 folder, 1 file (1.5 KiB)");
+    }
+
+    #[test]
+    fn footer_distinguishes_loading_failure_and_success_and_status_is_typed() {
+        let (_dir, mut core, _rx) = core_fixture();
+        let pane = PaneId::Left;
+        assert_eq!(core.pane(pane).footer_summary(), "…");
+        let reply = |core: &DopusCore, result| CoreEvent::ListingArrived {
+            pane,
+            generation: core.pane(pane).generation,
+            path: core.pane(pane).path.clone(),
+            root: true,
+            result,
+        };
+        let events = core.on_event(reply(&core, Err("Permission denied".into())));
+        assert_eq!(core.pane(pane).footer_summary(), "Permission denied");
+        assert!(events.iter().any(|event| matches!(event,
+            CoreEvent::Status { kind: StatusKind::Message, text, .. } if text == "Permission denied"
+        )));
+        core.start_listing(pane);
+        assert_eq!(core.pane(pane).footer_summary(), "…");
+        let events = core.on_event(reply(&core, Ok(Vec::new())));
+        let summary = core.pane(pane).footer_summary();
+        assert_eq!(summary, "0 folders, 0 files (0 B)");
+        assert!(events.iter().any(|event| matches!(event,
+            CoreEvent::Status { kind: StatusKind::Summary, text, .. } if text == &summary
+        )));
+        // A message with exactly the same text must still be a message.
+        core.set_status(Some(pane), &summary);
+        assert!(core.take_events().iter().any(|event| matches!(event,
+            CoreEvent::Status { kind: StatusKind::Message, text, .. } if text == &summary
+        )));
+        core.start_listing(pane);
+        assert_eq!(core.pane(pane).footer_summary(), "…");
     }
 
     // -- visibility, counts, sanitisation (browser.rs ~:5209-5258) -----------

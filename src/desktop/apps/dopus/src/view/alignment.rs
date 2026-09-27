@@ -2,24 +2,25 @@
 use super::{Look, elide, location};
 use iced::advanced::text::Paragraph as _;
 
-pub(super) struct FirstRow {
+#[derive(Debug, Clone, Copy)]
+pub struct FirstRow {
     pub places_top: f32,
     pub pane_top: f32,
     pub properties_top: f32,
+}
+
+fn baseline(paragraph: &iced::advanced::graphics::text::Paragraph) -> f32 {
+    paragraph
+        .buffer()
+        .layout_runs()
+        .next()
+        .map_or(0.0, |line| line.line_y)
 }
 
 impl FirstRow {
     pub fn new(look: Look) -> Self {
         let sidebar = elide::shape("Ag", look.ui_font, look.sidebar_px());
         let location = elide::shape("Ag", look.mono_font, location::text_px(look));
-        let baseline = |paragraph: &iced::advanced::graphics::text::Paragraph| {
-            paragraph
-                .buffer()
-                .layout_runs()
-                .next()
-                .expect("Ag line")
-                .line_y
-        };
         let sidebar_baseline = baseline(&sidebar);
         let location_baseline = baseline(&location);
         // Home's label is centred beside an icon inside a padded button.
@@ -115,9 +116,11 @@ mod tests {
         larger.sidebar_px *= 1.5;
         larger.chrome.icon *= 2.0;
         for look in [base, larger] {
+            let first_row = FirstRow::new(look);
             let elements = [
                 super::super::places::sidebar(
                     look,
+                    first_row,
                     &icons,
                     "",
                     PaneId::Left,
@@ -127,6 +130,7 @@ mod tests {
                 ),
                 super::super::panes::pane_header(
                     look,
+                    first_row,
                     core.pane(PaneId::Left),
                     PaneId::Left,
                     true,
@@ -134,6 +138,7 @@ mod tests {
                 ),
                 super::super::properties::sidebar(
                     look,
+                    first_row,
                     Properties::Folder {
                         path: "Home".into(),
                         summary: String::new(),
@@ -162,9 +167,13 @@ mod tests {
     fn summary_footer_elides_inside_even_a_twenty_five_pixel_pane() {
         let look = look();
         let summary = "123456789 folders, 987654321 files (999.9 GiB)";
+        let mut measurements = super::super::Measurements::default();
         for width in [0.0, 8.0, 25.0, 240.0, 800.0] {
             let (tree, node) = layout(
-                super::super::panes::summary_footer(look, summary.into()),
+                super::super::panes::summary_footer(
+                    look,
+                    measurements.footer(look, PaneId::Left, summary.into()),
+                ),
                 look,
                 width,
             );
@@ -182,5 +191,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn measurements_reuse_unchanged_look_and_summary() {
+        super::super::Measurements::assert_cache_invalidation(look());
+    }
+
+    #[test]
+    fn missing_baseline_is_zero() {
+        assert_eq!(baseline(&Paragraph::new()), 0.0);
     }
 }

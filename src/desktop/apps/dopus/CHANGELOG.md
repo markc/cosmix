@@ -10,8 +10,12 @@
   Distinguish field names by muted colour.
 - Elide and clip pane summary footers, including at 25-px pane widths; keep
   their boxes capped at the summary's natural width. Add narrow-layout coverage.
-- Use the shared widgets tooltip style: opaque neutral popover background,
-  matching text, muted token border and rounded corners with token padding.
+- Use the shared widgets tooltip style: neutral `muted` surface/text,
+  `border` token outline and rounded corners with token padding.
+- Cache first-row geometry by look and footer widths by look/text per pane;
+  invalidate on theme reload and tolerate missing baseline metrics.
+- Match typed summary/message events; show an ellipsis while listing and the
+  pane status on root listing failure. Check the Bus summary field in the e2e.
 - Give each pane a small muted summary box below its clipped list. Keep
   panel toggles and messages in the shared status bar; expose the same
   totals as an additive `summary` field in each Bus pane state.

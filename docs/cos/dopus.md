@@ -29,9 +29,12 @@ icons and expansion chevrons. Action tooltips and status-bar shortcut labels
 read the effective keymap, including custom remaps and unbindings, and update
 when the keymap reloads. Ctrl alternatives appear before function keys in
 tooltip labels. Tooltips reuse `cosmix-iced-widgets`' `Tokens::tooltip_style`:
-an opaque neutral popover surface and its on-surface text, a muted border
-(the default design's 1-px border metric), token radius and spacing-scale padding.
-Even a translucent custom popover colour is made opaque. The design
+the neutral `muted` pair (`muted_surface` / `muted_text`), with the
+`border` token outline (the default design's 1-px border metric), token radius
+and spacing-scale padding. The compiler guarantees opaque, contrast-checked
+text pairs. The embedded muted surface currently composites transparent over
+the base background; a distinct elevated fill needs a separate design pair.
+The design
 currently has no timing token, so iced's default delay applies.
 Each pane shows only its editable location bar above the column headers;
 there is no duplicate path beside the toolbar. Ctrl+L and `location.focus`
@@ -98,6 +101,12 @@ The summary middle-elides to the available width and its container clips,
 including at the minimum window size and split. The box grows only to the
 summary's natural width. Both remain visible regardless of focus. The shared
 status bar holds panel toggles and messages, with no directory summary.
+While a root listing is pending the footer shows `…`; on failure it shows
+the pane status rather than empty totals. The Bus `summary` matches this text.
+Core status events distinguish summaries from messages by kind, not text.
+First-row geometry is cached by look; natural footer widths are cached by
+look and text per pane. Theme reload clears both caches. Missing font baseline
+metrics fall back to zero instead of interrupting the view.
 
 **Ctrl+B** toggles Places and **Ctrl+I** toggles Properties; the status bar offers
 both controls even when the panels are hidden. Drag a panel's divider to

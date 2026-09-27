@@ -5,11 +5,15 @@ use cosmix_dopus_core::{format_modified_at, format_size, properties::Properties}
 use iced::widget::{column, container, scrollable, text};
 use iced::{Element, Length};
 
-pub fn sidebar<'a>(look: Look, properties: Properties) -> Element<'a, Msg> {
+pub fn sidebar<'a>(
+    look: Look,
+    first_row: super::FirstRow,
+    properties: Properties,
+) -> Element<'a, Msg> {
     let mut content = column![]
         .spacing(look.chrome.gap)
         .padding(iced::Padding {
-            top: super::alignment::FirstRow::new(look).properties_top,
+            top: first_row.properties_top,
             right: look.chrome.pad,
             bottom: look.chrome.small,
             left: look.chrome.pad,

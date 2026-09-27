@@ -154,20 +154,14 @@ impl Tokens {
         }
     }
 
-    /// Opaque tooltip chrome using the same neutral popover pair as menus.
+    /// Tooltip chrome using the compiled neutral muted pair.
     /// Pass the resolved `button.border_width` metric (1 px in the default
     /// design); padding belongs to the tooltip's spacing-scale configuration.
-    /// Opacity is enforced even for custom designs and preview palettes.
+    /// The compiler guarantees an opaque surface and contrast for this pair.
     pub fn tooltip_style(self, border_width: f32) -> container::Style {
         container::Style {
-            background: Some(
-                Color {
-                    a: 1.0,
-                    ..self.popover
-                }
-                .into(),
-            ),
-            text_color: Some(self.popover_text),
+            background: Some(self.muted_surface.into()),
+            text_color: Some(self.muted_text),
             border: Border {
                 color: self.border,
                 width: border_width,
@@ -324,31 +318,16 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_style_is_pure_token_chrome_and_always_opaque() {
+    fn tooltip_style_is_pure_and_uses_the_muted_pair() {
         for tokens in [
             Tokens::default(),
             Tokens::from_dictionary(&dictionary()).unwrap(),
         ] {
-            let tokens = Tokens {
-                popover: Color {
-                    a: 0.25,
-                    ..tokens.popover
-                },
-                ..tokens
-            };
             let style = tokens.tooltip_style(1.0);
             assert_eq!(style, tokens.tooltip_style(1.0));
-            assert_eq!(
-                style.background,
-                Some(
-                    Color {
-                        a: 1.0,
-                        ..tokens.popover
-                    }
-                    .into()
-                )
-            );
-            assert_eq!(style.text_color, Some(tokens.popover_text));
+            assert_eq!(style.background, Some(tokens.muted_surface.into()));
+            assert_eq!(style.text_color, Some(tokens.muted_text));
+            assert_eq!(tokens.muted_surface.a, 1.0);
             assert_eq!(style.border.color, tokens.border);
             assert_eq!(style.border.width, 1.0);
             assert_eq!(style.border.radius, tokens.radius.into());

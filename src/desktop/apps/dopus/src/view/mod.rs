@@ -7,6 +7,9 @@
 //! compiled tokens via [`Look`].
 
 mod alignment;
+mod measurements;
+pub use alignment::FirstRow;
+pub use measurements::Measurements;
 pub mod columns;
 pub mod dialogs;
 pub mod elide;
@@ -32,7 +35,7 @@ use crate::theme::Chrome;
 /// Passed by value through every view fn (the ced `chrome::Look` shape —
 /// everything is `Copy`, so styling closures capture copies and stay
 /// `'static` instead of borrowing a local `Look`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
     pub sidebar_px: f32,
     pub small_px: f32,
@@ -75,6 +78,7 @@ impl Look {
 #[allow(clippy::too_many_arguments)]
 pub fn root<'a>(
     look: Look,
+    measurements: &std::cell::RefCell<Measurements>,
     icons: &'a Icons,
     tint: &'a str,
     active: PaneId,
@@ -93,6 +97,16 @@ pub fn root<'a>(
     actions: &'a [crate::verbs::ActionRow],
     columns: [rows::Columns; 2],
 ) -> Element<'a, Msg> {
+    let (first_row, [left_footer, right_footer]) = {
+        let mut measurements = measurements.borrow_mut();
+        (
+            measurements.first_row(look),
+            [
+                measurements.footer(look, PaneId::Left, left.footer_summary()),
+                measurements.footer(look, PaneId::Right, right.footer_summary()),
+            ],
+        )
+    };
     let (left_edit, right_edit) = match editing {
         Some((PaneId::Left, text)) => (Some(text), None),
         Some((PaneId::Right, text)) => (None, Some(text)),
@@ -120,6 +134,7 @@ pub fn root<'a>(
             .push(
                 container(places::sidebar(
                     look,
+                    first_row,
                     icons,
                     tint,
                     active,
@@ -140,6 +155,8 @@ pub fn root<'a>(
         row![
             panes::pane_column(
                 look,
+                first_row,
+                left_footer,
                 icons,
                 tint,
                 PaneId::Left,
@@ -154,6 +171,8 @@ pub fn root<'a>(
             panes::Divider::new(&look, None, sides),
             panes::pane_column(
                 look,
+                first_row,
+                right_footer,
                 icons,
                 tint,
                 PaneId::Right,
@@ -177,7 +196,7 @@ pub fn root<'a>(
                 sides,
             ))
             .push(
-                container(properties::sidebar(look, properties))
+                container(properties::sidebar(look, first_row, properties))
                     .width(Length::FillPortion(sides[1]))
                     .height(Length::Fill),
             );

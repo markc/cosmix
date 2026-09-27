@@ -136,6 +136,7 @@ pub struct Dopus {
     /// update so no core mutation can be drawn stale.
     rows: [Vec<VisibleRow>; 2],
     column_cache: [rows::ColumnCache; 2],
+    measurements: std::cell::RefCell<view::Measurements>,
     /// The core's live split ratio, cached for the view (the core owns it;
     /// the divider writes through `set_split_ratio` — law 7).
     split_ratio: f32,
@@ -228,6 +229,7 @@ pub fn run(
         core,
         rows: [Vec::new(), Vec::new()],
         column_cache: Default::default(),
+        measurements: Default::default(),
         split_ratio,
         editing: None,
         router,
@@ -608,15 +610,10 @@ impl Dopus {
                         }
                     }
                 }
-                CoreEvent::Status { pane, text } => {
-                    // Listing summaries live in the pane footers, including
-                    // replies for the inactive pane. Keep errors/messages here.
-                    if !pane.is_some_and(|id| {
-                        text == cosmix_dopus_core::pane_summary(&self.core.pane(id).root)
-                    }) {
-                        self.status = Some(text);
-                    }
+                CoreEvent::Status { kind: cosmix_dopus_core::StatusKind::Message, text, .. } => {
+                    self.status = Some(text);
                 }
+                CoreEvent::Status { kind: cosmix_dopus_core::StatusKind::Summary, .. } => {}
                 // The core's info line (operation results among them) is
                 // authoritative again.
                 CoreEvent::InfoChanged => self.status = None,
@@ -997,6 +994,7 @@ impl Dopus {
     /// Re-resolve the theme from the files plus the in-session override, and
     /// re-tint the icons to the new text token.
     fn reload_theme(&mut self) {
+        *self.measurements.get_mut() = Default::default();
         self.theme = theme::resolve_selected(
             self.theme_override,
             app_theme_override(self.dirs.as_ref()).as_deref(),
@@ -1099,6 +1097,7 @@ impl Dopus {
             .map(|(pane, text)| (*pane, text.as_str()));
         let content = view::root(
             self.look(),
+            &self.measurements,
             &self.icons,
             &self.tint,
             self.core.active(),
@@ -1224,6 +1223,7 @@ mod tests {
             core,
             rows: [Vec::new(), Vec::new()],
             column_cache: Default::default(),
+            measurements: Default::default(),
             split_ratio: 0.5,
             editing: None,
             router: keys::initial(None).unwrap(),

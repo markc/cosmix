@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Distinguish summary and message Status events by a typed kind.
+- Expose footer summaries that show an ellipsis during root listing and the
+  pane status after a root listing error, rather than misleading empty totals.
+
 ## 0.3.0
 
 - Expose a per-pane listing/count reply revision for inexpensive UI cache

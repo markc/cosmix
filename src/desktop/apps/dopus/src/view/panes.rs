@@ -41,6 +41,8 @@ pub const SPLIT_MAX: f32 = 0.9;
 #[allow(clippy::too_many_arguments)]
 pub fn pane_column<'a>(
     look: Look,
+    first_row: super::FirstRow,
+    footer: super::measurements::Footer,
     icons: &'a Icons,
     tint: &'a str,
     pane_id: PaneId,
@@ -54,7 +56,7 @@ pub fn pane_column<'a>(
 ) -> Element<'a, Msg> {
     container(
         column![
-            pane_header(look, pane, pane_id, active, editing),
+            pane_header(look, first_row, pane, pane_id, active, editing),
             sort_header(look, pane, pane_id, actions, columns),
             Element::new(rows::FileList::new(
                 pane_rows,
@@ -68,7 +70,7 @@ pub fn pane_column<'a>(
                 columns,
             ))
             .map(move |m| Msg::PaneRows(pane_id, m)),
-            summary_footer(look, cosmix_dopus_core::pane_summary(&pane.root)),
+            summary_footer(look, footer),
         ]
         .width(Length::Fill)
         .height(Length::Fill),
@@ -81,6 +83,7 @@ pub fn pane_column<'a>(
 /// Each pane keeps only its editable location bar above the sort header.
 pub(super) fn pane_header<'a>(
     look: Look,
+    first_row: super::FirstRow,
     pane: &'a PaneModel,
     pane_id: PaneId,
     active: bool,
@@ -89,7 +92,7 @@ pub(super) fn pane_header<'a>(
     container(location::bar(look, pane, pane_id, editing))
         .width(Length::Fill)
         .padding(iced::Padding {
-            top: super::alignment::FirstRow::new(look).pane_top,
+            top: first_row.pane_top,
             right: look.chrome.pad,
             bottom: look.chrome.small,
             left: look.chrome.pad,
@@ -110,20 +113,18 @@ pub(super) fn pane_header<'a>(
 }
 
 /// A compact box when space permits, constrained and clipped in narrow panes.
-pub(super) fn summary_footer(look: Look, summary: String) -> Element<'static, Msg> {
-    use iced::advanced::text::Paragraph as _;
-    let width = super::elide::shape(&summary, look.ui_font, look.small_px)
-        .min_bounds()
-        .width
-        + 2.0 * look.chrome.pad;
+pub(super) fn summary_footer(
+    look: Look,
+    footer: super::measurements::Footer,
+) -> Element<'static, Msg> {
     container(super::elide::Label {
-        text: summary,
+        text: footer.text,
         font: look.ui_font,
         px: look.small_px,
         color: look.tokens.muted_text,
     })
     .width(Length::Fill)
-    .max_width(width)
+    .max_width(footer.width)
     .padding([look.chrome.small, look.chrome.pad])
     .clip(true)
     .style(look.strip(look.tokens.muted_surface, look.tokens.muted_text))

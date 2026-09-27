@@ -114,7 +114,7 @@ pub struct PaneState {
     pub rows: usize,
     /// Relative or absolute, as the status line renders it.
     pub status: String,
-    /// Root listing totals, identical to this pane's footer, independent of focus.
+    /// Footer text: root totals, a loading ellipsis or a root listing error.
     #[serde(default)]
     pub summary: String,
 }
@@ -746,7 +746,7 @@ fn pane_state(core: &DopusCore, pane_id: PaneId) -> PaneState {
             .map(|p| cosmix_dopus_core::sanitise_display_path(p)),
         rows: core.visible_rows(pane_id).len(),
         status: pane.status.clone(),
-        summary: cosmix_dopus_core::pane_summary(&pane.root),
+        summary: pane.footer_summary(),
     }
 }
 

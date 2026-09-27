@@ -15,6 +15,13 @@ use crate::config::DOpusConfig;
 use crate::model::{FileEntry, PaneId};
 use crate::ops::FileOpKind;
 
+/// Distinguishes listing totals from transient messages without comparing text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusKind {
+    Summary,
+    Message,
+}
+
 /// An event flowing through the core. Worker threads send the `*Arrived`
 /// variants on the channel the app holds; [`crate::model::DopusCore::on_event`]
 /// validates them and derives the rest for the view.
@@ -51,6 +58,7 @@ pub enum CoreEvent {
         pane: PaneId,
     },
     Status {
+        kind: StatusKind,
         pane: Option<PaneId>,
         text: String,
     },

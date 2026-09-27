@@ -366,6 +366,7 @@ try
   $p = $st.panes[0]
   check($p.pane == 0 and $p.path != nil and $p.active != nil and $p.show_hidden != nil
     and $p.sort != nil and $p.ascending != nil and $p.rows != nil and $p.status != nil
+    and $p.summary != nil
     and $st.theme_scheme != nil and $st.theme_mode != nil,
     "dopus.state shape: " .. json_encode($st))
   -- actions.list: the six file.* rows are listed with a per-frame enabled

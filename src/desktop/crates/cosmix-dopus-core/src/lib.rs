@@ -58,7 +58,7 @@ pub mod properties;
 mod worker;
 
 pub use config::{CURRENT_SCHEMA, ConfigFile, DOpusConfig, PaneConfig, SortColumn};
-pub use events::{ConfirmAnswer, CoreEvent, PromptKind};
+pub use events::{ConfirmAnswer, CoreEvent, PromptKind, StatusKind};
 pub use model::{
     AvailabilitySnapshot, DopusCore, DropAction, DropActionMask, DropModifiers, FileEntry,
     NavigationHistory, PaneId, PaneModel, ReservationKind, VisibleRow, format_child_count,

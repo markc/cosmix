@@ -32,8 +32,10 @@ fn place_icon(name: &str) -> Icon {
 
 /// The sidebar strip. `active` is the pane a click navigates; its current
 /// directory (and only its) highlights when it matches a place.
+#[allow(clippy::too_many_arguments)] // shared measured geometry plus the existing pane inputs
 pub fn sidebar<'a>(
     look: Look,
+    first_row: super::FirstRow,
     icons: &'a Icons,
     tint: &'a str,
     active: PaneId,
@@ -43,7 +45,7 @@ pub fn sidebar<'a>(
 ) -> Element<'a, Msg> {
     let mut list = column![]
         .padding(Padding {
-            top: super::alignment::FirstRow::new(look).places_top,
+            top: first_row.places_top,
             right: 0.0,
             bottom: 0.0,
             left: 0.0,
