@@ -275,7 +275,11 @@ mod tests {
         eval.execute(&ast).await.unwrap();
         let h = handler(conn);
         h.query("SELECT blob FROM media", &[]).await.unwrap();
-        assert!(h.query("SELECT * FROM pragma_table_info('media')", &[]).await.is_err());
+        assert!(
+            h.query("SELECT * FROM pragma_table_info('media')", &[])
+                .await
+                .is_err()
+        );
         let source = "ensure_col(\"missing_table\", \"blob TEXT NULL\")";
         let tokens = Lexer::new(source).tokenize().unwrap();
         let ast = Parser::new(tokens, source).parse_program().unwrap();

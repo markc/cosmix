@@ -106,6 +106,10 @@ fn open_at(
     flags: libc::c_int,
     resolve: u64,
 ) -> io::Result<File> {
+    #[cfg(test)]
+    if FORCE_UNSUPPORTED.with(|flag| flag.get()) {
+        return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+    }
     use std::{ffi::CString, os::fd::FromRawFd};
     // Linux UAPI open_how: three __u64 fields, zero mode without O_CREAT.
     #[repr(C)]
@@ -140,6 +144,11 @@ fn open_at(
 }
 
 #[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
@@ -170,6 +179,19 @@ mod tests {
         let mut text = String::new();
         file.read_to_string(&mut text).unwrap();
         text
+    }
+
+    #[test]
+    fn unsupported_openat2_refuses_without_path_fallback() {
+        let tmp = Scratch::new();
+        fs::write(tmp.0.join("file"), b"must not read").unwrap();
+        let root = ReadRoot::open(&tmp.0).unwrap();
+        FORCE_UNSUPPORTED.with(|flag| flag.set(true));
+        let read = root.open_regular("file");
+        let open = ReadRoot::open(&tmp.0);
+        FORCE_UNSUPPORTED.with(|flag| flag.set(false));
+        assert_eq!(read.unwrap_err().raw_os_error(), Some(libc::ENOSYS));
+        assert_eq!(open.unwrap_err().raw_os_error(), Some(libc::ENOSYS));
     }
 
     #[test]

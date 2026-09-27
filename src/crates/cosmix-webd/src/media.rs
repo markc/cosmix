@@ -338,7 +338,10 @@ impl Runtime {
             .map_err(|_| "busy: media write pool full (8)".into())
     }
     fn ref_admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-        self.refs.clone().try_acquire_owned().map_err(|_| "busy: media reference pool full (8)".into())
+        self.refs
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "busy: media reference pool full (8)".into())
     }
 }
 
@@ -561,7 +564,9 @@ pub(crate) async fn media_upload(
                 }
             });
         }
-        Err(reason) => tracing::warn!(%reason, id, "media saved; reference admission full, retry webd.media.ref"),
+        Err(reason) => {
+            tracing::warn!(%reason, id, "media saved; reference admission full, retry webd.media.ref")
+        }
     }
     redirect("/admin/media")
 }
@@ -648,7 +653,9 @@ pub(crate) async fn media_delete(
 /// document roots across active vhosts must not unlink one another's media.
 async fn path_in_use(node: &NodeState, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let Ok(candidate) = std::fs::metadata(path) else { return true; };
+    let Ok(candidate) = std::fs::metadata(path) else {
+        return true;
+    };
     let directory = node.vhosts.load_full();
     for primary in &directory.primaries {
         let vhost = &primary.state;
@@ -667,12 +674,22 @@ async fn path_in_use(node: &NodeState, path: &Path) -> bool {
             Ok(true) => (),
             Err(_) => return true,
         }
-        let Ok(mut stmt) = db.prepare("SELECT url_path FROM media WHERE storage='disk'") else { return true; };
-        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else { return true; };
+        let Ok(mut stmt) = db.prepare("SELECT url_path FROM media WHERE storage='disk'") else {
+            return true;
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+            return true;
+        };
         for url in rows {
-            let Ok(url) = url else { return true; };
-            let Some(path) = safe_disk_path(&vhost.www_dir, &url) else { return true; };
-            let Ok(other) = std::fs::metadata(path) else { return true; };
+            let Ok(url) = url else {
+                return true;
+            };
+            let Some(path) = safe_disk_path(&vhost.www_dir, &url) else {
+                return true;
+            };
+            let Ok(other) = std::fs::metadata(path) else {
+                return true;
+            };
             if (candidate.dev(), candidate.ino()) == (other.dev(), other.ino()) {
                 return true;
             }
@@ -684,6 +701,67 @@ async fn path_in_use(node: &NodeState, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_media_refs_upload_once_and_upload_reply_does_not_wait() {
+        use std::sync::atomic::Ordering;
+        let (_tmp, node, vhost) = crate::shares::tests::fixture().await;
+        let png = b"\x89PNG\r\n\x1a\nimage";
+        let lane = crate::transfer_tests::FakeLane::start(png, false, true).await;
+        node.broker_handle.store(Some(lane.client.clone()));
+        {
+            let db = vhost.db.as_ref().unwrap().lock().await;
+            db.execute_batch("CREATE TABLE users(username TEXT,role TEXT); INSERT INTO users VALUES('user@example.test','author')").unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!(
+                "cosmix_session={}",
+                crate::shares::tests::cookie(&node, "maild", 0)
+            )
+            .parse()
+            .unwrap(),
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            media_upload(
+                State(node.clone()),
+                Extension(vhost.clone()),
+                headers,
+                Form(UploadForm {
+                    data: base64::engine::general_purpose::STANDARD.encode(png),
+                    filename: "image.png".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        tokio::time::timeout(std::time::Duration::from_secs(2), lane.started.notified())
+            .await
+            .unwrap();
+        let a = {
+            let node = node.clone();
+            let vhost = vhost.clone();
+            tokio::spawn(async move { media_ref(&node, &vhost, 1).await })
+        };
+        let b = {
+            let node = node.clone();
+            let vhost = vhost.clone();
+            tokio::spawn(async move { media_ref(&node, &vhost, 1).await })
+        };
+        tokio::task::yield_now().await;
+        lane.release.add_permits(1);
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(a, b)
+        })
+        .await
+        .unwrap();
+        assert_eq!(a.unwrap().unwrap(), b.unwrap().unwrap());
+        assert_eq!(lane.uploads.load(Ordering::SeqCst), 1);
+        lane.client.close().await;
+    }
 
     #[test]
     fn schema_migration_preserves_inline_rows_and_propagates_real_failures() {
@@ -745,9 +823,22 @@ mod tests {
                 INSERT INTO media(filename,mime,storage,url_path) VALUES('x','image/png','disk','/img/x.png'),('y','image/png','disk','/img/x.png');").unwrap();
         }
         let mut headers = HeaderMap::new();
-        headers.insert("cookie", format!("cosmix_session={}", crate::shares::tests::cookie(&node, "maild", 0)).parse().unwrap());
-        let response = media_delete(State(node.clone()), Extension(vhost.clone()), headers,
-            Form(std::collections::HashMap::from([("id".into(), "1".into())]))).await;
+        headers.insert(
+            "cookie",
+            format!(
+                "cosmix_session={}",
+                crate::shares::tests::cookie(&node, "maild", 0)
+            )
+            .parse()
+            .unwrap(),
+        );
+        let response = media_delete(
+            State(node.clone()),
+            Extension(vhost.clone()),
+            headers,
+            Form(std::collections::HashMap::from([("id".into(), "1".into())])),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(std::fs::read(outside.join("x.png")).unwrap(), b"image");
         let db = vhost.db.as_ref().unwrap().lock().await;
@@ -777,15 +868,20 @@ mod tests {
         // must finish even though reference creation cannot make any progress.
         let ref_lock = slot(&node.media_runtime.rows, (vhost.fqdn.clone(), 1));
         let stalled = ref_lock.lock().await;
-        let response = tokio::time::timeout(std::time::Duration::from_secs(1), media_upload(
-            State(node.clone()),
-            Extension(vhost.clone()),
-            headers,
-            Form(UploadForm {
-                data: base64::engine::general_purpose::STANDARD.encode(png),
-                filename: "image.png".into(),
-            }),
-        )).await.unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            media_upload(
+                State(node.clone()),
+                Extension(vhost.clone()),
+                headers,
+                Form(UploadForm {
+                    data: base64::engine::general_purpose::STANDARD.encode(png),
+                    filename: "image.png".into(),
+                }),
+            ),
+        )
+        .await
+        .unwrap();
         drop(stalled);
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()["location"], "/admin/media");

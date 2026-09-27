@@ -68,7 +68,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     }
     let scoped: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('file_shares') WHERE name='primary_fqdn')",
-        [], |r| r.get(0),
+        [],
+        |r| r.get(0),
     )?;
     if !scoped {
         tx.execute_batch("ALTER TABLE file_shares ADD COLUMN primary_fqdn TEXT")?;
@@ -161,15 +162,26 @@ pub fn valid_relative_path(rel: &str) -> bool {
 
 /// Validated operator roots, never request data. Handles pin their directory identity.
 #[derive(Default)]
-pub struct Roots(BTreeMap<String, (std::path::PathBuf, std::sync::Arc<cosmix_files::rooted_read::ReadRoot>)>);
+pub struct Roots(
+    BTreeMap<
+        String,
+        (
+            std::path::PathBuf,
+            std::sync::Arc<cosmix_files::rooted_read::ReadRoot>,
+        ),
+    >,
+);
 
 impl Roots {
     pub fn from_config(config: &cosmix_config::node::WebdSharesConfig) -> Self {
         let mut roots = BTreeMap::new();
         for (account, path) in &config.roots {
             let safe_key = match account.split_once('|') {
-                Some((primary, email)) => cosmix_daemon::http_host::parse_request_host(primary).is_some_and(|p| p == primary)
-                    && valid_account(email),
+                Some((primary, email)) => {
+                    cosmix_daemon::http_host::parse_request_host(primary)
+                        .is_some_and(|p| p == primary)
+                        && valid_account(email)
+                }
                 None => valid_account(account),
             };
             let safe = safe_key
@@ -178,7 +190,11 @@ impl Roots {
             let canonical = safe
                 .then(|| path.canonicalize().ok())
                 .flatten()
-                .and_then(|p| cosmix_files::rooted_read::ReadRoot::open(&p).ok().map(|r| (p, std::sync::Arc::new(r))));
+                .and_then(|p| {
+                    cosmix_files::rooted_read::ReadRoot::open(&p)
+                        .ok()
+                        .map(|r| (p, std::sync::Arc::new(r)))
+                });
             match canonical {
                 Some(path) => {
                     roots.insert(account.clone(), path);
@@ -200,35 +216,58 @@ impl Roots {
     pub fn exclude_public(&mut self, public: &[std::path::PathBuf]) {
         self.0.retain(|account, (path, _)| {
             let safe = !public.iter().any(|p| path.starts_with(p));
-            if !safe { tracing::warn!(account, "ignoring share root beneath a public serving directory"); }
+            if !safe {
+                tracing::warn!(
+                    account,
+                    "ignoring share root beneath a public serving directory"
+                );
+            }
             safe
         });
     }
 
-    pub fn checked_get(&self, primary: &str, account: &str, directory: &crate::vhost_directory::VhostDirectory)
-        -> Option<std::sync::Arc<cosmix_files::rooted_read::ReadRoot>> {
-        let (path, root) = self.0.get(&format!("{primary}|{account}")).or_else(|| self.0.get(account))?;
+    pub fn checked_get(
+        &self,
+        primary: &str,
+        account: &str,
+        directory: &crate::vhost_directory::VhostDirectory,
+    ) -> Option<std::sync::Arc<cosmix_files::rooted_read::ReadRoot>> {
+        let (path, root) = self
+            .0
+            .get(&format!("{primary}|{account}"))
+            .or_else(|| self.0.get(account))?;
         // Re-evaluate the current snapshot on every access, including after reload.
         if public_roots(directory).iter().any(|p| path.starts_with(p)) {
-            tracing::warn!(account, "refusing share root beneath a public serving directory after reload");
+            tracing::warn!(
+                account,
+                "refusing share root beneath a public serving directory after reload"
+            );
             return None;
         }
         Some(root.clone())
     }
 
     pub fn warn_identity_providers(&self, directory: &crate::vhost_directory::VhostDirectory) {
-        let providers: std::collections::BTreeSet<_> = directory.primaries.iter()
-            .map(|p| p.state.jmap_upstream.as_deref()).collect();
+        let providers: std::collections::BTreeSet<_> = directory
+            .primaries
+            .iter()
+            .map(|p| p.state.jmap_upstream.as_deref())
+            .collect();
         if providers.len() > 1 && self.0.keys().any(|key| !key.contains('|')) {
-            tracing::warn!("share roots contain unscoped emails with different jmap_upstream providers; use primary-fqdn|email keys");
+            tracing::warn!(
+                "share roots contain unscoped emails with different jmap_upstream providers; use primary-fqdn|email keys"
+            );
         }
     }
 }
 
 pub fn public_roots(directory: &crate::vhost_directory::VhostDirectory) -> Vec<std::path::PathBuf> {
-    directory.primaries.iter().flat_map(|p| {
-        std::iter::once(&p.state.www_dir).chain(p.state.docs_dir.iter())
-    }).filter_map(|p| p.canonicalize().ok()).collect()
+    directory
+        .primaries
+        .iter()
+        .flat_map(|p| std::iter::once(&p.state.www_dir).chain(p.state.docs_dir.iter()))
+        .filter_map(|p| p.canonicalize().ok())
+        .collect()
 }
 
 pub fn mint_token() -> String {
@@ -284,7 +323,16 @@ pub fn create(
         "INSERT INTO file_shares
          (token, account, rel_path, blob, kind, password_hash, expires_at, created_at, primary_fqdn)
          VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6, ?7, ?8)",
-        params![token, account, path, blob, password_hash, expires_at, now, primary],
+        params![
+            token,
+            account,
+            path,
+            blob,
+            password_hash,
+            expires_at,
+            now,
+            primary
+        ],
     )?;
     Ok(token)
 }
@@ -380,7 +428,11 @@ pub fn list(
         params![account, after.unwrap_or(""), limit as i64, primary],
         Row::read,
     )?;
-    let mut inventory = Inventory { shares: Vec::new(), skipped: 0, next: None };
+    let mut inventory = Inventory {
+        shares: Vec::new(),
+        skipped: 0,
+        next: None,
+    };
     for row in rows {
         let row = row?;
         inventory.next = Some(row.token.clone());
@@ -483,13 +535,46 @@ mod tests {
     }
 
     #[test]
+    fn unscoped_p5_rows_survive_migration_but_require_explicit_owner() {
+        let db = db();
+        let token = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
+        db.execute_batch("ALTER TABLE file_shares DROP COLUMN primary_fqdn")
+            .unwrap();
+        init_schema(&db).unwrap();
+        init_schema(&db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT token FROM file_shares", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            token
+        );
+        for primary in ["a.example", "b.example"] {
+            assert!(matches!(
+                resolve(&db, primary, &token, 2),
+                Err(Error::NotFound)
+            ));
+            assert!(
+                list(&db, primary, ACCOUNT, None, 100)
+                    .unwrap()
+                    .shares
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn inventory_skips_bad_rows_and_advances_cursor() {
         let db = db();
         let good = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
         let bad = create(&db, "a.example", ACCOUNT, "file", &blob(), None, None, 1).unwrap();
-        db.execute("UPDATE file_shares SET blob='{}' WHERE token=?1", [&bad]).unwrap();
+        db.execute("UPDATE file_shares SET blob='{}' WHERE token=?1", [&bad])
+            .unwrap();
         let legacy = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
-        db.execute("UPDATE file_shares SET kind='dir' WHERE token=?1", [&legacy]).unwrap();
+        db.execute(
+            "UPDATE file_shares SET kind='dir' WHERE token=?1",
+            [&legacy],
+        )
+        .unwrap();
         let page = list(&db, "a.example", ACCOUNT, None, 100).unwrap();
         assert_eq!(page.shares.len(), 1);
         assert_eq!(page.shares[0].token, good);
@@ -501,8 +586,16 @@ mod tests {
     fn shared_database_isolates_primary_tokens_and_management() {
         let db = db();
         let token = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
-        assert!(matches!(resolve(&db, "b.example", &token, 2), Err(Error::NotFound)));
-        assert!(list(&db, "b.example", ACCOUNT, None, 100).unwrap().shares.is_empty());
+        assert!(matches!(
+            resolve(&db, "b.example", &token, 2),
+            Err(Error::NotFound)
+        ));
+        assert!(
+            list(&db, "b.example", ACCOUNT, None, 100)
+                .unwrap()
+                .shares
+                .is_empty()
+        );
         assert!(!revoke(&db, "b.example", ACCOUNT, &token).unwrap());
         assert!(resolve(&db, "a.example", &token, 2).is_ok());
     }
@@ -512,8 +605,11 @@ mod tests {
         let db = db();
         init_schema(&db).unwrap();
         for target in [path(), blob()] {
-            let token = create(&db, "a.example",  ACCOUNT, "file", &target, None, None, 1).unwrap();
-            assert_eq!(resolve(&db, "a.example",  &token, 2).unwrap().share.target, target);
+            let token = create(&db, "a.example", ACCOUNT, "file", &target, None, None, 1).unwrap();
+            assert_eq!(
+                resolve(&db, "a.example", &token, 2).unwrap().share.target,
+                target
+            );
             assert!(
                 db.execute(
                     "UPDATE file_shares SET rel_path=NULL, blob=NULL WHERE token=?1",
@@ -566,13 +662,19 @@ mod tests {
             ),
             (Some(50), 1, false, 12)
         );
-        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
+        assert!(matches!(
+            resolve(&db, "a.example", &token, 2),
+            Err(Error::NotFound)
+        ));
         db.execute(
             "UPDATE file_shares SET account=?1, primary_fqdn='a.example' WHERE token=?2",
             params![ACCOUNT, token],
         )
         .unwrap();
-        assert_eq!(resolve(&db, "a.example",  &token, 2).unwrap().share.account, ACCOUNT);
+        assert_eq!(
+            resolve(&db, "a.example", &token, 2).unwrap().share.account,
+            ACCOUNT
+        );
     }
 
     #[test]
@@ -604,45 +706,71 @@ mod tests {
     #[test]
     fn account_scope_gates_and_telemetry() {
         let db = db();
-        let token = create(&db, "a.example",  ACCOUNT, "file", &path(), Some("hash"), Some(10), 1).unwrap();
+        let token = create(
+            &db,
+            "a.example",
+            ACCOUNT,
+            "file",
+            &path(),
+            Some("hash"),
+            Some(10),
+            1,
+        )
+        .unwrap();
         assert!(
-            list(&db, "a.example",  "other@example.test", None, 100)
+            list(&db, "a.example", "other@example.test", None, 100)
                 .unwrap()
-                .shares.is_empty()
+                .shares
+                .is_empty()
         );
-        assert!(!revoke(&db, "a.example",  "other@example.test", &token).unwrap());
-        let gate = resolve(&db, "a.example",  &token, 2).unwrap();
+        assert!(!revoke(&db, "a.example", "other@example.test", &token).unwrap());
+        let gate = resolve(&db, "a.example", &token, 2).unwrap();
         assert!(matches!(gate.authorize(None), Err(Error::Unauthorized)));
         assert!(gate.authorize(Some("hash")).is_ok());
-        assert!(matches!(resolve(&db, "a.example",  &token, 10), Err(Error::Expired)));
+        assert!(matches!(
+            resolve(&db, "a.example", &token, 10),
+            Err(Error::Expired)
+        ));
         bump_download(&db, &token).unwrap();
-        assert_eq!(list(&db, "a.example",  ACCOUNT, None, 100).unwrap().shares[0].download_count, 1);
-        assert!(revoke(&db, "a.example",  ACCOUNT, &token).unwrap());
-        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::Revoked)));
+        assert_eq!(
+            list(&db, "a.example", ACCOUNT, None, 100).unwrap().shares[0].download_count,
+            1
+        );
+        assert!(revoke(&db, "a.example", ACCOUNT, &token).unwrap());
+        assert!(matches!(
+            resolve(&db, "a.example", &token, 2),
+            Err(Error::Revoked)
+        ));
     }
 
     #[test]
     fn unsupported_or_corrupt_targets_fail_closed() {
         let db = db();
         for kind in ["dir", "drop", "garbage"] {
-            assert!(create(&db, "a.example",  ACCOUNT, kind, &path(), None, None, 1).is_err());
+            assert!(create(&db, "a.example", ACCOUNT, kind, &path(), None, None, 1).is_err());
         }
         for rel_path in ["", "/etc/passwd", "../x", "a/../b", "a/./b", "a//b", "a\\b"] {
             assert!(!valid_relative_path(rel_path));
         }
-        let token = create(&db, "a.example",  ACCOUNT, "file", &blob(), None, None, 1).unwrap();
+        let token = create(&db, "a.example", ACCOUNT, "file", &blob(), None, None, 1).unwrap();
         db.execute(
             "UPDATE file_shares SET kind='unknown' WHERE token=?1",
             [&token],
         )
         .unwrap();
-        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
+        assert!(matches!(
+            resolve(&db, "a.example", &token, 2),
+            Err(Error::NotFound)
+        ));
         db.execute(
             "UPDATE file_shares SET kind='file',blob='{}' WHERE token=?1",
             [&token],
         )
         .unwrap();
-        assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::NotFound)));
+        assert!(matches!(
+            resolve(&db, "a.example", &token, 2),
+            Err(Error::NotFound)
+        ));
     }
 
     #[test]
@@ -652,10 +780,19 @@ mod tests {
         std::fs::write(a.path().join("a"), b"a").unwrap();
         std::fs::write(b.path().join("b"), b"b").unwrap();
         let roots = Roots::from_config(&cosmix_config::node::WebdSharesConfig {
-            roots: BTreeMap::from([(ACCOUNT.into(), a.path().into()), (format!("b.example|{ACCOUNT}"), b.path().into())])
+            roots: BTreeMap::from([
+                (ACCOUNT.into(), a.path().into()),
+                (format!("b.example|{ACCOUNT}"), b.path().into()),
+            ]),
         });
         let directory = crate::vhost_directory::VhostDirectory::empty();
-        assert!(roots.checked_get("a.example", ACCOUNT, &directory).unwrap().open_regular("a").is_ok());
+        assert!(
+            roots
+                .checked_get("a.example", ACCOUNT, &directory)
+                .unwrap()
+                .open_regular("a")
+                .is_ok()
+        );
         let b = roots.checked_get("b.example", ACCOUNT, &directory).unwrap();
         assert!(b.open_regular("b").is_ok());
         assert!(b.open_regular("a").is_err());
@@ -669,7 +806,9 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&public, &link).unwrap();
         for path in [public.clone(), public.join("private"), link.join("private")] {
-            let cfg = cosmix_config::node::WebdSharesConfig { roots: BTreeMap::from([(ACCOUNT.into(), path)]) };
+            let cfg = cosmix_config::node::WebdSharesConfig {
+                roots: BTreeMap::from([(ACCOUNT.into(), path)]),
+            };
             let mut roots = Roots::from_config(&cfg);
             roots.exclude_public(&[link.canonicalize().unwrap()]);
             assert!(roots.get(ACCOUNT).is_none());

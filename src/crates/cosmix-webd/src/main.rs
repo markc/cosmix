@@ -22,6 +22,8 @@ mod session;
 mod shares;
 mod stats;
 mod tls_status;
+#[cfg(test)]
+mod transfer_tests;
 mod vhost_directory;
 mod vhosts_bootstrap;
 mod vhosts_namespace;
@@ -5877,16 +5879,24 @@ fn resolve_node_state(inputs: ResolveInputs<'_>) -> Result<ResolvedNodeState> {
     // behaviour) so a plain-HTTP-with-tls_server_name deployment
     // still gets `/api/posts` working under the legacy host keys.
     let legacy_active = legacy_tls.is_some() || !inputs.webd.tls_server_name.is_empty();
-    let legacy_active = if legacy_active && !cms_paths.insert(canonical_db_key(&inputs.legacy_db_path)) {
-        let reason = "cms_db_path duplicates an earlier primary vhost".to_string();
-        tracing::warn!(%reason, "legacy vhost disabled");
-        disabled_vhosts.push(DisabledVhost {
-            host: inputs.webd.tls_server_name.first().cloned().unwrap_or_default(),
-            names: inputs.webd.tls_server_name.clone(),
-            reason,
-        });
-        false
-    } else { legacy_active };
+    let legacy_active =
+        if legacy_active && !cms_paths.insert(canonical_db_key(&inputs.legacy_db_path)) {
+            let reason = "cms_db_path duplicates an earlier primary vhost".to_string();
+            tracing::warn!(%reason, "legacy vhost disabled");
+            disabled_vhosts.push(DisabledVhost {
+                host: inputs
+                    .webd
+                    .tls_server_name
+                    .first()
+                    .cloned()
+                    .unwrap_or_default(),
+                names: inputs.webd.tls_server_name.clone(),
+                reason,
+            });
+            false
+        } else {
+            legacy_active
+        };
     if legacy_active {
         // Both arms of legacy_active require tls_server_name to be
         // non-empty: the TLS arm needs it as the validator's SAN-list,
@@ -7971,7 +7981,9 @@ async fn async_main() -> Result<()> {
                     .as_ref()
                     .map(|c| {
                         let mut roots = file_share::Roots::from_config(&c.webd.shares);
-                        roots.exclude_public(&file_share::public_roots(&vhost_directory_handle.load()));
+                        roots.exclude_public(&file_share::public_roots(
+                            &vhost_directory_handle.load(),
+                        ));
                         roots.warn_identity_providers(&vhost_directory_handle.load());
                         roots
                     })
@@ -8694,23 +8706,56 @@ mod vhost_tests {
     // =========================================================
 
     #[test]
+    fn cms_open_configures_pragmas_and_catalogue() {
+        let td = TempDir::new().unwrap();
+        let conn = open_db(&td.path().join("cms.db"), &[]).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5000
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        conn.prepare("SELECT primary_fqdn FROM file_shares")
+            .unwrap();
+    }
+
+    #[test]
     fn duplicate_cms_path_disables_later_primary() {
         let td = TempDir::new().unwrap();
         let www = mkdir(&td, "www");
         let mut webd = cosmix_config::node::WebdConfig::default();
-        webd.http_listen = Some("127.0.0.1:8080".into());
+        webd.http_listen = Some("0.0.0.0:80".into());
         for host in ["a.example", "b.example"] {
             webd.vhost.push(cosmix_config::node::WebdVhostConfig {
                 host: host.into(),
                 www_dir: www.to_string_lossy().into_owned(),
                 cms_db_path: Some(td.path().join("cms.db").to_string_lossy().into_owned()),
+                acme: Some(cosmix_config::node::WebdVhostAcmeConfig {
+                    provider: cosmix_config::node::WebdAcmeProvider::LetsEncryptStaging,
+                    challenge: cosmix_config::node::WebdAcmeChallenge::Http01,
+                    contact_email: "ops@example.com".into(),
+                }),
                 ..Default::default()
             });
         }
         let resolved = resolve_node_state(base_inputs(&webd, &td)).unwrap();
         assert!(resolved.vhosts.contains_key("a.example"));
         assert!(!resolved.vhosts.contains_key("b.example"));
-        assert!(resolved.disabled_vhosts.iter().any(|v| v.host == "b.example" && v.reason.contains("duplicates")));
+        assert!(
+            resolved
+                .disabled_vhosts
+                .iter()
+                .any(|v| v.host == "b.example" && v.reason.contains("duplicates"))
+        );
     }
 
     #[test]

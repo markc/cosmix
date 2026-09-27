@@ -104,17 +104,24 @@ impl Attempts {
     fn allow(&mut self, token: &str, ip: IpAddr, now: Instant) -> bool {
         self.0
             .retain(|_, (start, _)| now.duration_since(*start) < Duration::from_secs(60));
-        self.0.get(&(token.to_owned(), attempt_ip(ip))).is_none_or(|row| row.1 < 5)
+        self.0
+            .get(&(token.to_owned(), attempt_ip(ip)))
+            .is_none_or(|row| row.1 < 5)
     }
     fn failed(&mut self, token: &str, ip: IpAddr, now: Instant) {
         self.allow(token, ip, now); // expire stale entries before admission
         let key = (token.to_owned(), attempt_ip(ip));
         if !self.0.contains_key(&key) && self.0.len() >= 4096 {
-            let oldest = self.0.iter().filter(|((t, _), _)| t == token)
+            let oldest = self
+                .0
+                .iter()
+                .filter(|((t, _), _)| t == token)
                 .min_by_key(|(_, (start, _))| *start)
                 .or_else(|| self.0.iter().min_by_key(|(_, (start, _))| *start))
                 .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest { self.0.remove(&oldest); }
+            if let Some(oldest) = oldest {
+                self.0.remove(&oldest);
+            }
         }
         let row = self.0.entry(key).or_insert((now, 0));
         row.1 = row.1.saturating_add(1);
@@ -377,7 +384,8 @@ pub async fn list(
     limit: usize,
 ) -> Result<Value, String> {
     let db = vhost.db.as_ref().ok_or("not_found")?.lock().await;
-    let rows = file_share::list(&db, &vhost.fqdn, account, after, limit).map_err(catalogue_error)?;
+    let rows =
+        file_share::list(&db, &vhost.fqdn, account, after, limit).map_err(catalogue_error)?;
     Ok(json!(rows))
 }
 pub async fn revoke(vhost: &VhostState, account: &str, token: &str) -> Result<Value, String> {
@@ -413,10 +421,13 @@ pub async fn public_headers(
 ) -> Response {
     let head = *request.method() == axum::http::Method::HEAD;
     let mut response = next.run(request).await;
-    if response.status().is_client_error() && response.status() != StatusCode::RANGE_NOT_SATISFIABLE {
+    if response.status().is_client_error() && response.status() != StatusCode::RANGE_NOT_SATISFIABLE
+    {
         *response.body_mut() = axum::body::Body::from(r#"{"error":"not_found"}"#);
         response.headers_mut().remove("content-length");
-        response.headers_mut().insert("content-type", "application/json".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
     }
     let headers = response.headers_mut();
     headers.insert("cache-control", "private, no-store".parse().unwrap());
@@ -454,7 +465,9 @@ fn challenge() -> Response {
     response
 }
 fn public_error(reason: String) -> Response {
-    let token = reason.split_once(':').map(|(prefix, _)| format!("{prefix}:"));
+    let token = reason
+        .split_once(':')
+        .map(|(prefix, _)| format!("{prefix}:"));
     if let Some(token) = token {
         tracing::warn!(%reason, "public share request failed");
         error(token)
@@ -527,10 +540,13 @@ pub async fn serve(
         match node.share_runtime.verify(password, hash.clone()).await {
             Ok(true) => Some(hash),
             Ok(false) => {
-                node.share_runtime.attempts.lock().unwrap_or_else(|e| e.into_inner())
+                node.share_runtime
+                    .attempts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
                     .failed(&token, peer.ip, Instant::now());
                 return challenge();
-            },
+            }
             Err(e) => return public_error(e),
         }
     } else {
@@ -550,7 +566,11 @@ pub async fn serve(
     };
     // We expose no validator contract. An unverifiable If-Range requires the
     // complete representation, not a potentially stale partial response.
-    let range = if headers.contains_key("if-range") { None } else { headers.get("range").cloned() };
+    let range = if headers.contains_key("if-range") {
+        None
+    } else {
+        headers.get("range").cloned()
+    };
     if range.as_ref().is_some_and(|r| r.as_bytes().len() > 1024) {
         return public_error("invalid_arguments: Range too long".into());
     }
@@ -568,12 +588,17 @@ pub async fn serve(
             }
             .await
         }
-        file_share::Target::Path { rel_path } => match node.share_roots.checked_get(&vhost.fqdn, &target.0, &node.vhosts.load()) {
-            Some(root) => path_download(root.clone(), &rel_path, &method, range.as_ref())
-                .await
-                .map(|d| (d, rel_path)),
-            None => Err("not_found".into()),
-        },
+        file_share::Target::Path { rel_path } => {
+            match node
+                .share_roots
+                .checked_get(&vhost.fqdn, &target.0, &node.vhosts.load())
+            {
+                Some(root) => path_download(root.clone(), &rel_path, &method, range.as_ref())
+                    .await
+                    .map(|d| (d, rel_path)),
+                None => Err("not_found".into()),
+            }
+        }
     };
     let (download, name) = match result {
         Ok(value) => value,
@@ -675,7 +700,14 @@ fn counted_body(
     vhost: Arc<VhostState>,
     token: String,
 ) -> axum::body::Body {
-    counted_body_with_deadlines(body, permit, vhost, token, Duration::from_secs(30), Duration::from_secs(3600))
+    counted_body_with_deadlines(
+        body,
+        permit,
+        vhost,
+        token,
+        Duration::from_secs(30),
+        Duration::from_secs(3600),
+    )
 }
 
 fn counted_body_with_deadlines(
@@ -698,13 +730,18 @@ fn counted_body_with_deadlines(
         let transfer = async {
             loop {
                 let step = async {
-                    let Some(chunk) = stream.next().await else { return false; };
+                    let Some(chunk) = stream.next().await else {
+                        return false;
+                    };
                     tx.send(chunk.map_err(std::io::Error::other)).await.is_ok()
                 };
                 match tokio::time::timeout(idle, step).await {
                     Ok(true) => (),
                     Ok(false) => return,
-                    Err(_) => { flag.store(true, std::sync::atomic::Ordering::Release); return; }
+                    Err(_) => {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
                 }
             }
         };
@@ -720,7 +757,10 @@ fn counted_body_with_deadlines(
             if aborted.load(std::sync::atomic::Ordering::Acquire) {
                 rx.close();
                 while rx.try_recv().is_ok() {}
-                return Some((Err(std::io::Error::other("download deadline exceeded")), (rx, aborted, vhost, token, counted)));
+                return Some((
+                    Err(std::io::Error::other("download deadline exceeded")),
+                    (rx, aborted, vhost, token, counted),
+                ));
             }
             if chunk.as_ref().is_ok_and(|b| !b.is_empty()) && !counted {
                 counted = true;
@@ -742,16 +782,182 @@ fn counted_body_with_deadlines(
 #[cfg(test)]
 pub(crate) mod tests {
     #[tokio::test]
+    async fn cross_primary_router_and_management_isolation_with_shared_db() {
+        use tower::ServiceExt;
+        let (_tmp, node, a) = fixture().await;
+        let (_tmp_b, node_b, b) = fixture().await;
+        node_b
+            .vhosts
+            .store(Arc::new(crate::vhost_directory::VhostDirectory::empty()));
+        let mut b = Arc::try_unwrap(b).unwrap();
+        b.fqdn = "other.example".into();
+        b.db = a.db.clone();
+        let b = Arc::new(b);
+        let directory = crate::vhost_directory::VhostDirectory::build(vec![
+            crate::vhost_directory::VhostDirectoryEntry {
+                state: a.clone(),
+                aliases: vec![],
+            },
+            crate::vhost_directory::VhostDirectoryEntry {
+                state: b.clone(),
+                aliases: vec![],
+            },
+        ])
+        .unwrap();
+        node.vhosts.store(Arc::new(directory));
+        let token = path_token(&node, &a, None).await;
+        let mut request = download_request(&token, "GET", None, None, true);
+        request
+            .headers_mut()
+            .insert("host", "other.example".parse().unwrap());
+        let response = crate::build_per_vhost_router(node.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            list(&b, "user@example.test", None, 100).await.unwrap()["shares"],
+            json!([])
+        );
+        assert_eq!(
+            revoke(&b, "user@example.test", &token).await.unwrap()["revoked"],
+            false
+        );
+        assert_eq!(
+            crate::build_per_vhost_router(node.clone())
+                .oneshot(download_request(&token, "HEAD", None, None, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn reloaded_public_root_is_refused_for_existing_share() {
+        use tower::ServiceExt;
+        let (tmp, node, vhost) = fixture().await;
+        let token = path_token(&node, &vhost, None).await;
+        node.vhosts
+            .store(Arc::new(crate::vhost_directory::VhostDirectory::empty()));
+        let mut vhost = Arc::try_unwrap(vhost).unwrap();
+        vhost.docs_dir = Some(tmp.path().to_owned());
+        let directory = crate::vhost_directory::VhostDirectory::build(vec![
+            crate::vhost_directory::VhostDirectoryEntry {
+                state: Arc::new(vhost),
+                aliases: vec![],
+            },
+        ])
+        .unwrap();
+        node.vhosts.store(Arc::new(directory));
+        let response = crate::build_per_vhost_router(node.clone())
+            .oneshot(download_request(&token, "GET", None, None, true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    #[tokio::test]
+    async fn blob_share_serves_through_router_and_real_local_lane() {
+        use tower::ServiceExt;
+        let (_tmp, node, vhost) = fixture().await;
+        let lane = crate::transfer_tests::FakeLane::start(b"hello world", true, false).await;
+        node.broker_handle.store(Some(lane.client.clone()));
+        let reference = blob_reference::Reference {
+            blob: format!("b3:{}", blake3::hash(b"hello world").to_hex()),
+            size: 11,
+            mime: "text/plain".into(),
+            name: Some("note.txt".into()),
+            origin: "alpha".into(),
+        };
+        let created = create(
+            &node,
+            &vhost,
+            Create {
+                account: "user@example.test".into(),
+                kind: "file".into(),
+                rel_path: None,
+                blob: Some(reference),
+                name: None,
+                password: None,
+                expires: None,
+            },
+        )
+        .await
+        .unwrap();
+        let token = created["token"].as_str().unwrap();
+        for (method, range, status, expected) in [
+            ("GET", None, 200, "hello world"),
+            ("HEAD", None, 200, ""),
+            ("GET", Some("bytes=6-"), 206, "world"),
+            ("GET", Some("bytes=11-"), 416, ""),
+        ] {
+            let response = crate::build_per_vhost_router(node.clone())
+                .oneshot(download_request(token, method, range, None, true))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["cache-control"], "private, no-store");
+            assert_eq!(
+                response.headers()["content-disposition"],
+                "attachment; filename*=UTF-8''note.txt"
+            );
+            assert!(!response.headers().contains_key("set-cookie"));
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 100)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.as_bytes()
+            );
+        }
+        let mut request = download_request(token, "GET", Some("bytes=6-"), None, true);
+        request
+            .headers_mut()
+            .insert("if-range", "\"old\"".parse().unwrap());
+        let response = crate::build_per_vhost_router(node.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"hello world"
+        );
+        lane.client.close().await;
+    }
+
+    #[tokio::test]
     async fn public_denials_hide_catalogue_state() {
         use tower::ServiceExt;
         let (_tmp, node, vhost) = fixture().await;
         let token = path_token(&node, &vhost, None).await;
-        for update in ["UPDATE file_shares SET revoked=1", "UPDATE file_shares SET revoked=0, expires_at=1"] {
-            vhost.db.as_ref().unwrap().lock().await.execute_batch(update).unwrap();
-            let response = crate::build_per_vhost_router(node.clone()).oneshot(download_request(&token, "GET", None, None, true)).await.unwrap();
+        for update in [
+            "UPDATE file_shares SET revoked=1",
+            "UPDATE file_shares SET revoked=0, expires_at=1",
+        ] {
+            vhost
+                .db
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .execute_batch(update)
+                .unwrap();
+            let response = crate::build_per_vhost_router(node.clone())
+                .oneshot(download_request(&token, "GET", None, None, true))
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            let body = axum::body::to_bytes(response.into_body(), 100).await.unwrap();
-            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({"error":"not_found"}));
+            let body = axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"error":"not_found"})
+            );
         }
     }
     #[tokio::test]
@@ -761,21 +967,40 @@ pub(crate) mod tests {
         let token = path_token(&node, &vhost, None).await;
         for method in ["GET", "HEAD"] {
             let mut request = download_request(&token, method, Some("bytes=6-"), None, true);
-            request.headers_mut().insert("if-range", "\"old\"".parse().unwrap());
-            let response = crate::build_per_vhost_router(node.clone()).oneshot(request).await.unwrap();
+            request
+                .headers_mut()
+                .insert("if-range", "\"old\"".parse().unwrap());
+            let response = crate::build_per_vhost_router(node.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()["content-length"], "11");
             assert!(!response.headers().contains_key("content-range"));
-            let bytes = axum::body::to_bytes(response.into_body(), 100).await.unwrap();
-            assert_eq!(bytes.as_ref(), if method == "GET" { b"hello world".as_slice() } else { b"" });
+            let bytes = axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                bytes.as_ref(),
+                if method == "GET" {
+                    b"hello world".as_slice()
+                } else {
+                    b""
+                }
+            );
         }
     }
     #[tokio::test]
     async fn public_lane_errors_do_not_disclose_upstream_details() {
         let response = public_error("lane: http://127.0.0.1:9999/blob secret upstream body".into());
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({"error":"lane:"}));
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"error":"lane:"})
+        );
     }
     #[tokio::test]
     async fn stalled_reader_releases_public_and_upstream_permits() {
@@ -784,15 +1009,29 @@ pub(crate) mod tests {
             let public = Arc::new(Semaphore::new(1));
             let lane = Arc::new(Semaphore::new(1));
             let upstream_permit = lane.clone().acquire_owned().await.unwrap();
-            let upstream = axum::body::Body::from_stream(futures_util::stream::unfold(upstream_permit, |permit| async move {
-                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x")), permit))
-            }));
-            let _unpolled = counted_body_with_deadlines(upstream, public.clone().acquire_owned().await.unwrap(),
-                vhost.clone(), "unused".into(), Duration::from_millis(idle), Duration::from_millis(lifetime));
+            let upstream = axum::body::Body::from_stream(futures_util::stream::unfold(
+                upstream_permit,
+                |permit| async move {
+                    Some((
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x")),
+                        permit,
+                    ))
+                },
+            ));
+            let _unpolled = counted_body_with_deadlines(
+                upstream,
+                public.clone().acquire_owned().await.unwrap(),
+                vhost.clone(),
+                "unused".into(),
+                Duration::from_millis(idle),
+                Duration::from_millis(lifetime),
+            );
             tokio::time::timeout(Duration::from_secs(1), async {
                 let _public = public.acquire().await.unwrap();
                 let _lane = lane.acquire().await.unwrap();
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
     }
     use super::*;
@@ -922,6 +1161,58 @@ pub(crate) mod tests {
         assert_eq!(
             app.clone()
                 .oneshot(download_request(&token, "GET", None, None, true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            node.share_runtime.attempts.lock().unwrap().0.is_empty(),
+            "missing credentials do not consume attempts"
+        );
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(download_request(
+                    &token,
+                    "HEAD",
+                    None,
+                    Some("Basic dXNlcjpzZWNyZXQ="),
+                    true,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            node.share_runtime.attempts.lock().unwrap().0.is_empty(),
+            "success does not consume attempts"
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                app.clone()
+                    .oneshot(download_request(
+                        &token,
+                        "HEAD",
+                        None,
+                        Some("Basic dXNlcjp3cm9uZw=="),
+                        true
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(download_request(
+                    &token,
+                    "HEAD",
+                    None,
+                    Some("Basic dXNlcjp3cm9uZw=="),
+                    true
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -1072,7 +1363,9 @@ pub(crate) mod tests {
         assert!(attempts.allow("new", ip, now));
         assert!(attempts.allow("a", ip, now + Duration::from_secs(60)));
         let v6 = "2001:db8:1:2::1".parse().unwrap();
-        for _ in 0..5 { attempts.failed("v6", v6, now); }
+        for _ in 0..5 {
+            attempts.failed("v6", v6, now);
+        }
         assert!(!attempts.allow("v6", "2001:db8:1:2::abcd".parse().unwrap(), now));
         assert!(attempts.allow("v6", "2001:db8:1:3::1".parse().unwrap(), now));
     }
@@ -1087,6 +1380,40 @@ pub(crate) mod tests {
         assert!(valid_password("").is_err());
         assert!(!bounded_hash(&format!("$2b$31${}", "a".repeat(53))));
     }
+    #[tokio::test]
+    async fn legitimate_password_still_works_with_full_attempt_table_and_creation_is_separate() {
+        use tower::ServiceExt;
+        let (_tmp, node, vhost) = fixture().await;
+        let held = node
+            .share_runtime
+            .crypto
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let token = path_token(&node, &vhost, Some("secret".into())).await;
+        drop(held);
+        {
+            let mut attempts = node.share_runtime.attempts.lock().unwrap();
+            let now = Instant::now();
+            for n in 0..4096 {
+                attempts.failed(&format!("other-{n}"), "192.0.2.1".parse().unwrap(), now);
+            }
+        }
+        let response = crate::build_per_vhost_router(node.clone())
+            .oneshot(download_request(
+                &token,
+                "HEAD",
+                None,
+                Some("Basic dXNlcjpzZWNyZXQ="),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(node.share_runtime.attempts.lock().unwrap().0.len(), 4096);
+    }
+
     #[tokio::test]
     async fn bcrypt_roundtrip_and_cost_bound() {
         let runtime = Runtime::default();

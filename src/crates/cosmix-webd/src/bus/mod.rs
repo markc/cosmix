@@ -57,29 +57,26 @@ const RC_CALLER_ERROR: u8 = 10;
 /// (`cosmix-webd` → `webd`).
 const BUS_SERVICE: &str = "webd";
 
-fn spawn_busy_reply(reply: impl std::future::Future<Output = ()> + Send + 'static) -> tokio::task::JoinHandle<()> {
+fn spawn_busy_reply(
+    reply: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(30), reply).await;
     })
 }
 
-#[cfg(test)]
-mod busy_reply_tests {
-    #[tokio::test]
-    async fn blocked_busy_sink_does_not_block_full_worker_loop() {
-        let mut workers = tokio::task::JoinSet::<()>::new();
-        for _ in 0..8 { workers.spawn(std::future::pending()); }
-        assert_eq!(workers.len(), 8);
-        let (started, seen) = tokio::sync::oneshot::channel();
-        let reply = super::spawn_busy_reply(async move {
-            let _ = started.send(());
-            std::future::pending::<()>().await;
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), seen).await.unwrap().unwrap();
-        assert!(!reply.is_finished());
-        // The receive loop remains free to process unrelated commands.
-        reply.abort();
-        workers.shutdown().await;
+fn spawn_transfer<F>(
+    workers: &mut tokio::task::JoinSet<()>,
+    task: impl FnOnce(bool) -> F,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if workers.len() >= 8 {
+        Some(spawn_busy_reply(task(true)))
+    } else {
+        workers.spawn(task(false));
+        None
     }
 }
 
@@ -306,27 +303,26 @@ pub async fn run(node: Arc<NodeState>) {
                 }
             }
             if share_verbs::handles(&cmd.command) {
-                if workers.len() >= 8 {
-                    let client = client_arc.clone();
-                    spawn_busy_reply(async move {
-                        let _ = client.respond(
-                            &cmd,
-                            10,
-                            r#"{"error":"busy: webd transfer workers full (8)"}"#,
-                        ).await;
-                    });
-                } else {
-                    let node = node.clone();
-                    let client = client_arc.clone();
-                    workers.spawn(async move {
+                let node = node.clone();
+                let client = client_arc.clone();
+                let _ = spawn_transfer(&mut workers, |busy| async move {
+                    if busy {
+                        let _ = client
+                            .respond(
+                                &cmd,
+                                10,
+                                r#"{"error":"busy: webd transfer workers full (8)"}"#,
+                            )
+                            .await;
+                    } else {
                         let (rc, body) = share_verbs::dispatch(&node, &cmd).await;
                         let _ = tokio::time::timeout(
                             Duration::from_secs(10),
                             client.respond(&cmd, rc, &body),
                         )
                         .await;
-                    });
-                }
+                    }
+                });
                 continue;
             }
             let (rc, body) = if let Some(suffix) = cmd.command.strip_prefix("webd.props.") {
@@ -589,6 +585,29 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn blocked_busy_sink_does_not_block_full_worker_loop() {
+        let mut workers = tokio::task::JoinSet::<()>::new();
+        for _ in 0..8 {
+            workers.spawn(std::future::pending());
+        }
+        let (started, seen) = tokio::sync::oneshot::channel();
+        let reply = spawn_transfer(&mut workers, |busy| async move {
+            assert!(busy);
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), seen)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workers.len(), 8);
+        assert!(!reply.is_finished());
+        reply.abort();
+        workers.shutdown().await;
+    }
 
     fn cmd(command: &str) -> IncomingCommand {
         IncomingCommand {
