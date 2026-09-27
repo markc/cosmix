@@ -6,10 +6,11 @@ use crate::recipe::DerivationRecipe;
 /// internals: they are the exact keys of [`ResolvedColours::pairs`] and
 /// [`ResolvedColours::non_text`], so a consumer indexing a resolved
 /// artifact needs them as much as the compiler that fills it does.
-pub const TEXT_PAIR_NAMES: [&str; 8] = [
+pub const TEXT_PAIR_NAMES: [&str; 9] = [
     "base",
     "card",
     "popover",
+    "elevated",
     "primary",
     "secondary",
     "muted",

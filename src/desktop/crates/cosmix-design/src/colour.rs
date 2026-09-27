@@ -50,8 +50,22 @@ pub(crate) fn compile_colour_tokens_with_registry(
     validate_recipe_registry(registry, "compiler.derivations", &mut errors);
     let primitives = compile_primitives(source, &mut errors);
 
+    // §2.4 alias: `popover` is the compatibility name for `elevated`. A source
+    // that authors only one of the two compiles with the other taking the same
+    // authored or derived form; a source that authors both keeps both. The
+    // alias is resolved on the flattened pair map, before the closed-vocabulary
+    // check, so a source naming neither is reported as missing both.
+    let mut pairs_source = source.semantics.pairs.clone();
+    for (missing, donor) in [("elevated", "popover"), ("popover", "elevated")] {
+        if !pairs_source.contains_key(missing) {
+            if let Some(donor_source) = source.semantics.pairs.get(donor).cloned() {
+                pairs_source.insert(missing.to_owned(), donor_source);
+            }
+        }
+    }
+
     validate_closed_vocabulary(
-        source.semantics.pairs.keys().map(String::as_str),
+        pairs_source.keys().map(String::as_str),
         &TEXT_PAIR_NAMES,
         "design.v1.semantics.pairs",
         &mut errors,
@@ -64,7 +78,7 @@ pub(crate) fn compile_colour_tokens_with_registry(
     );
 
     let mut pairs = BTreeMap::new();
-    for (name, pair) in &source.semantics.pairs {
+    for (name, pair) in &pairs_source {
         let PairSource::Authored(pair) = pair else {
             continue;
         };
@@ -147,6 +161,7 @@ pub(crate) fn compile_colour_tokens_with_registry(
 
     compile_derived_pairs(
         source,
+        &pairs_source,
         context,
         &primitives,
         &mut pairs,
@@ -274,6 +289,7 @@ fn finalize_semantic_override_products(
 
 fn compile_derived_pairs(
     source: &DesignV1Source,
+    pairs_source: &BTreeMap<String, PairSource>,
     context: DesignContext,
     primitives: &BTreeMap<String, LinearRgba>,
     pairs: &mut BTreeMap<String, ResolvedPair>,
@@ -282,7 +298,7 @@ fn compile_derived_pairs(
     registry: &[RecipeSignature],
 ) {
     let mut pending = BTreeMap::new();
-    for (name, pair) in &source.semantics.pairs {
+    for (name, pair) in pairs_source {
         let PairSource::Derived { derive } = pair else {
             continue;
         };
@@ -295,7 +311,7 @@ fn compile_derived_pairs(
     while !pending.is_empty() {
         let ready = pending
             .iter()
-            .filter(|(_, call)| pair_dependencies_ready(&call.args, &source.semantics.pairs, pairs))
+            .filter(|(_, call)| pair_dependencies_ready(&call.args, pairs_source, pairs))
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         if ready.is_empty() {
@@ -602,6 +618,7 @@ mod tests {
     fn closed_semantic_vocabulary_is_enforced() {
         let mut source = fixture_source();
         source.semantics.pairs.remove("popover");
+        source.semantics.pairs.remove("elevated");
         source.semantics.pairs.insert(
             "background".into(),
             PairSource::authored("dark", "light", None),
@@ -618,6 +635,56 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "unknown-semantic-token")
+        );
+    }
+
+    #[test]
+    fn popover_and_elevated_alias_whichever_half_is_unauthored() {
+        let mut source = fixture_source();
+        source.semantics.pairs.remove("elevated");
+        let resolved =
+            compile(&source).expect("a popover-only source compiles with elevated aliased");
+        let elevated = &resolved.value.pairs["elevated"];
+        let popover = &resolved.value.pairs["popover"];
+        assert_eq!(elevated.rendered_surface, popover.rendered_surface);
+        assert_eq!(elevated.rendered_foreground, popover.rendered_foreground);
+        assert_eq!(elevated.surface_name, popover.surface_name);
+
+        let mut source = fixture_source();
+        source.semantics.pairs.remove("popover");
+        let resolved =
+            compile(&source).expect("an elevated-only source compiles with popover aliased");
+        let elevated = &resolved.value.pairs["elevated"];
+        let popover = &resolved.value.pairs["popover"];
+        assert_eq!(popover.rendered_surface, elevated.rendered_surface);
+        assert_eq!(popover.surface_name, elevated.surface_name);
+    }
+
+    #[test]
+    fn a_source_authoring_neither_elevated_nor_popover_is_missing_both() {
+        let mut source = fixture_source();
+        source.semantics.pairs.remove("elevated");
+        source.semantics.pairs.remove("popover");
+        let failure = compile(&source).unwrap_err();
+        let missing = failure
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "missing-semantic-token")
+            .map(|diagnostic| diagnostic.path.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            failure.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "missing-semantic-token"
+                    && diagnostic.message.contains("`elevated` is missing")
+            }),
+            "{missing:?}"
+        );
+        assert!(
+            failure.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "missing-semantic-token"
+                    && diagnostic.message.contains("`popover` is missing")
+            }),
+            "{missing:?}"
         );
     }
 

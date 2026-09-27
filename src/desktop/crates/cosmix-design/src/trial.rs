@@ -98,7 +98,7 @@ fn assert_oklch(actual: crate::OklchSource, expected: [f64; 3]) {
 fn embedded_default_source_compiles_to_revision_one() {
     let artifact = compile_trial();
     assert_eq!(artifact.revision(), crate::EMBEDDED_DEFAULT_REVISION);
-    assert_eq!(artifact.dictionary().colours.pairs.len(), 8);
+    assert_eq!(artifact.dictionary().colours.pairs.len(), 9);
     assert_eq!(artifact.dictionary().colours.non_text.len(), 3);
     assert_eq!(artifact.tables().button.len(), crate::BUTTON_CELL_COUNT);
     assert_eq!(
@@ -109,11 +109,12 @@ fn embedded_default_source_compiles_to_revision_one() {
 
 #[test]
 fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
-    const ROLE_NAMES: [&str; 8] = [
+    const ROLE_NAMES: [&str; 9] = [
         "palette.background.1",
         "palette.background.2",
         "palette.background.3",
         "palette.background.muted",
+        "palette.background.elevated",
         "palette.foreground.default",
         "palette.foreground.muted",
         "palette.accent.default",
@@ -128,6 +129,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.96, 0.012, 220.0],
                 [0.92, 0.018, 220.0],
                 [0.89, 0.012, 220.0],
+                [0.85, 0.018, 220.0],
                 [0.25, 0.06, 220.0],
                 [0.50, 0.06, 220.0],
                 [0.50, 0.12, 220.0],
@@ -142,6 +144,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.16, 0.02, 220.0],
                 [0.22, 0.025, 220.0],
                 [0.26, 0.02, 220.0],
+                [0.34, 0.025, 220.0],
                 [0.95, 0.02, 220.0],
                 [0.61, 0.04, 220.0],
                 [0.75, 0.12, 220.0],
@@ -156,6 +159,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.96, 0.012, 25.0],
                 [0.92, 0.018, 25.0],
                 [0.89, 0.012, 25.0],
+                [0.85, 0.018, 25.0],
                 [0.25, 0.04, 25.0],
                 [0.50, 0.04, 25.0],
                 [0.47, 0.20, 25.0],
@@ -170,6 +174,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.14, 0.02, 25.0],
                 [0.20, 0.025, 25.0],
                 [0.26, 0.02, 25.0],
+                [0.34, 0.025, 25.0],
                 [0.95, 0.02, 25.0],
                 [0.61, 0.03, 25.0],
                 [0.63, 0.23, 25.0],
@@ -184,6 +189,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.96, 0.008, 60.0],
                 [0.92, 0.012, 60.0],
                 [0.89, 0.008, 60.0],
+                [0.85, 0.012, 60.0],
                 [0.25, 0.02, 60.0],
                 [0.50, 0.015, 60.0],
                 [0.45, 0.05, 60.0],
@@ -198,6 +204,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.16, 0.012, 60.0],
                 [0.22, 0.015, 60.0],
                 [0.26, 0.012, 60.0],
+                [0.34, 0.015, 60.0],
                 [0.95, 0.01, 60.0],
                 [0.61, 0.015, 60.0],
                 [0.80, 0.03, 60.0],
@@ -212,6 +219,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.96, 0.012, 150.0],
                 [0.92, 0.018, 150.0],
                 [0.89, 0.012, 150.0],
+                [0.85, 0.018, 150.0],
                 [0.25, 0.06, 150.0],
                 [0.50, 0.06, 150.0],
                 [0.49, 0.12, 150.0],
@@ -226,6 +234,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.16, 0.02, 150.0],
                 [0.22, 0.025, 150.0],
                 [0.26, 0.02, 150.0],
+                [0.34, 0.025, 150.0],
                 [0.95, 0.02, 150.0],
                 [0.61, 0.04, 150.0],
                 [0.70, 0.12, 150.0],
@@ -240,6 +249,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.96, 0.015, 45.0],
                 [0.92, 0.02, 45.0],
                 [0.89, 0.015, 45.0],
+                [0.85, 0.02, 45.0],
                 [0.30, 0.08, 45.0],
                 [0.50, 0.08, 45.0],
                 [0.52, 0.16, 45.0],
@@ -254,6 +264,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.16, 0.025, 45.0],
                 [0.22, 0.03, 45.0],
                 [0.26, 0.025, 45.0],
+                [0.34, 0.03, 45.0],
                 [0.95, 0.025, 45.0],
                 [0.61, 0.05, 45.0],
                 [0.72, 0.14, 45.0],
@@ -268,6 +279,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.96, 0.0, 0.0],
                 [0.92, 0.0, 0.0],
                 [0.89, 0.0, 0.0],
+                [0.85, 0.0, 0.0],
                 [0.20, 0.0, 0.0],
                 [0.50, 0.0, 0.0],
                 [0.25, 0.0, 0.0],
@@ -282,6 +294,7 @@ fn embedded_authored_role_anchors_match_revision_one_in_all_twelve_contexts() {
                 [0.15, 0.0, 0.0],
                 [0.22, 0.0, 0.0],
                 [0.26, 0.0, 0.0],
+                [0.34, 0.0, 0.0],
                 [0.95, 0.0, 0.0],
                 [0.61, 0.0, 0.0],
                 [0.85, 0.0, 0.0],
@@ -388,19 +401,25 @@ fn embedded_semantics_use_role_anchors_and_registered_selection_pairs() {
         assert_eq!(pair.foreground, foreground);
         assert_eq!(pair.backdrop.as_deref(), backdrop);
     };
-    for name in ["base", "popover"] {
-        authored(
-            name,
-            "palette.background.1",
-            "palette.foreground.default",
-            None,
-        );
-    }
+    authored(
+        "base",
+        "palette.background.1",
+        "palette.foreground.default",
+        None,
+    );
     authored(
         "card",
         "transparent",
         "palette.foreground.muted",
         Some("palette.background.1"),
+    );
+    // `popover` is not authored: it aliases `elevated` at compile time.
+    assert!(!document.v1.semantics.pairs.contains_key("popover"));
+    authored(
+        "elevated",
+        "palette.background.elevated",
+        "palette.foreground.default",
+        None,
     );
     authored(
         "secondary",
@@ -1439,6 +1458,37 @@ fn embedded_default_compiles_without_errors_in_all_twelve_contexts() {
             let ring = colours.non_text["ring"].value;
             assert!(contrast_ratio(ring, colours.pairs["muted"].rendered_surface) >= 3.0);
             assert!(contrast_ratio(ring, accent.rendered_surface) >= 3.0);
+            // `popover` ships unaliased-never: the compiled alias of the
+            // authored `elevated` pair must deliver its exact resolved values,
+            // and both quiet and elevated chrome must sit visibly off `base`.
+            let base = &colours.pairs["base"];
+            let muted = &colours.pairs["muted"];
+            let elevated = &colours.pairs["elevated"];
+            let popover = &colours.pairs["popover"];
+            assert_eq!(
+                (
+                    popover.rendered_surface,
+                    popover.rendered_foreground,
+                    popover.surface_name,
+                ),
+                (
+                    elevated.rendered_surface,
+                    elevated.rendered_foreground,
+                    elevated.surface_name,
+                ),
+                "{} / {}: compiled `popover` must alias `elevated`",
+                scheme.name(),
+                mode.name()
+            );
+            for (role, pair) in [("muted", muted), ("elevated", elevated)] {
+                let ratio = contrast_ratio(pair.rendered_surface, base.rendered_surface);
+                assert!(
+                    ratio >= 1.25,
+                    "{} / {}: `{role}` surface contrast against `base` is {ratio:.3}:1",
+                    scheme.name(),
+                    mode.name()
+                );
+            }
             let web_accent_ratio = contrast_ratio(
                 colours.primitives["palette.accent.default"],
                 colours.primitives["palette.background.1"],
@@ -1778,8 +1828,8 @@ fn focus_ring_covers_every_reachable_cell_and_pins_revision_one_walks() {
             }
         }
     }
-    assert_eq!(measured, 96);
-    assert_eq!((zero, routine, above.len()), (72, 21, 3), "{above:?}");
+    assert_eq!(measured, 108);
+    assert_eq!((zero, routine, above.len()), (84, 21, 3), "{above:?}");
     for ((scheme, mode, pair, delta), expected) in above.iter().zip([
         ("ocean", "dark", "destructive", 0.342),
         ("stone", "dark", "destructive", 0.385),
