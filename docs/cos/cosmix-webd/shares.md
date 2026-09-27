@@ -6,8 +6,9 @@ management is available over the Bus and authenticated HTTP.
 Compatibility: `/s/…` and `/api/shares*` are reserved on every vhost, ahead of
 static files and Mix handlers. Existing applications must move conflicting routes.
 
-Account roots must not be equal to or beneath any vhost's canonical `www_dir`
-or `docs_dir`, including symlink aliases. Startup skips and logs conflicting
+Account roots must not overlap any vhost's canonical `www_dir` or `docs_dir`
+in either direction (equal, beneath, or containing it), including symlink aliases.
+Startup skips and logs conflicting
 roots; access rechecks the current routing snapshot after reload. These checks
 do not make an already public directory private: move private bytes out of it.
 The service's `ProtectHome=yes` makes roots under `/home` unavailable. Provision

@@ -446,8 +446,9 @@
 management is available over the Bus and authenticated HTTP.</p>
 <p>Compatibility: <code>/s/…</code> and <code>/api/shares*</code> are reserved on every vhost, ahead of
 static files and Mix handlers. Existing applications must move conflicting routes.</p>
-<p>Account roots must not be equal to or beneath any vhost's canonical <code>www_dir</code>
-or <code>docs_dir</code>, including symlink aliases. Startup skips and logs conflicting
+<p>Account roots must not overlap any vhost's canonical <code>www_dir</code> or <code>docs_dir</code>
+in either direction (equal, beneath, or containing it), including symlink aliases.
+Startup skips and logs conflicting
 roots; access rechecks the current routing snapshot after reload. These checks
 do not make an already public directory private: move private bytes out of it.
 The service's <code>ProtectHome=yes</code> makes roots under <code>/home</code> unavailable. Provision

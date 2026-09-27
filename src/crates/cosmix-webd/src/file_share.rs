@@ -215,11 +215,13 @@ impl Roots {
 
     pub fn exclude_public(&mut self, public: &[std::path::PathBuf]) {
         self.0.retain(|account, (path, _)| {
-            let safe = !public.iter().any(|p| path.starts_with(p));
+            let safe = !public
+                .iter()
+                .any(|p| path.starts_with(p) || p.starts_with(&*path));
             if !safe {
                 tracing::warn!(
                     account,
-                    "ignoring share root beneath a public serving directory"
+                    "ignoring share root overlapping a public serving directory"
                 );
             }
             safe
@@ -237,10 +239,13 @@ impl Roots {
             .get(&format!("{primary}|{account}"))
             .or_else(|| self.0.get(account))?;
         // Re-evaluate the current snapshot on every access, including after reload.
-        if public_roots(directory).iter().any(|p| path.starts_with(p)) {
+        if public_roots(directory)
+            .iter()
+            .any(|p| path.starts_with(p) || p.starts_with(path))
+        {
             tracing::warn!(
                 account,
-                "refusing share root beneath a public serving directory after reload"
+                "refusing share root overlapping a public serving directory after reload"
             );
             return None;
         }
@@ -251,7 +256,7 @@ impl Roots {
         let providers: std::collections::BTreeSet<_> = directory
             .primaries
             .iter()
-            .map(|p| p.state.jmap_upstream.as_deref())
+            .filter_map(|p| p.state.jmap_upstream.as_deref())
             .collect();
         if providers.len() > 1 && self.0.keys().any(|key| !key.contains('|')) {
             tracing::warn!(
@@ -805,7 +810,12 @@ mod tests {
         std::fs::create_dir_all(public.join("private")).unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&public, &link).unwrap();
-        for path in [public.clone(), public.join("private"), link.join("private")] {
+        for path in [
+            dir.path().to_owned(),
+            public.clone(),
+            public.join("private"),
+            link.join("private"),
+        ] {
             let cfg = cosmix_config::node::WebdSharesConfig {
                 roots: BTreeMap::from([(ACCOUNT.into(), path)]),
             };

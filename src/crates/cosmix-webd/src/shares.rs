@@ -937,25 +937,29 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reloaded_public_root_is_refused_for_existing_share() {
         use tower::ServiceExt;
-        let (tmp, node, vhost) = fixture().await;
-        let token = path_token(&node, &vhost, None).await;
-        node.vhosts
-            .store(Arc::new(crate::vhost_directory::VhostDirectory::empty()));
-        let mut vhost = Arc::try_unwrap(vhost).unwrap();
-        vhost.docs_dir = Some(tmp.path().to_owned());
-        let directory = crate::vhost_directory::VhostDirectory::build(vec![
-            crate::vhost_directory::VhostDirectoryEntry {
-                state: Arc::new(vhost),
-                aliases: vec![],
-            },
-        ])
-        .unwrap();
-        node.vhosts.store(Arc::new(directory));
-        let response = crate::build_per_vhost_router(node.clone())
-            .oneshot(download_request(&token, "GET", None, None, true))
-            .await
+        for relative in ["", "private", "private/public"] {
+            let (tmp, node, vhost) = fixture().await;
+            let token = path_token(&node, &vhost, None).await;
+            node.vhosts
+                .store(Arc::new(crate::vhost_directory::VhostDirectory::empty()));
+            let mut vhost = Arc::try_unwrap(vhost).unwrap();
+            let public = tmp.path().join(relative);
+            std::fs::create_dir_all(&public).unwrap();
+            vhost.docs_dir = Some(public);
+            let directory = crate::vhost_directory::VhostDirectory::build(vec![
+                crate::vhost_directory::VhostDirectoryEntry {
+                    state: Arc::new(vhost),
+                    aliases: vec![],
+                },
+            ])
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            node.vhosts.store(Arc::new(directory));
+            let response = crate::build_per_vhost_router(node.clone())
+                .oneshot(download_request(&token, "GET", None, None, true))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
     #[tokio::test]
     async fn blob_share_serves_through_router_and_real_local_lane() {
@@ -1359,10 +1363,11 @@ pub(crate) mod tests {
     }
     pub(crate) async fn fixture() -> (tempfile::TempDir, Arc<NodeState>, Arc<VhostState>) {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("file"), b"hello world").unwrap();
+        std::fs::create_dir(tmp.path().join("private")).unwrap();
+        std::fs::write(tmp.path().join("private/file"), b"hello world").unwrap();
         let mut node = crate::session_login_tests::synth_jmap_node(&tmp, "http://127.0.0.1:1");
         let cfg = cosmix_config::node::WebdSharesConfig {
-            roots: [("user@example.test".into(), tmp.path().to_owned())].into(),
+            roots: [("user@example.test".into(), tmp.path().join("private"))].into(),
         };
         Arc::get_mut(&mut node).unwrap().share_roots = file_share::Roots::from_config(&cfg);
         let vhost = node.vhost_for_host("pim.example").unwrap();
