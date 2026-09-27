@@ -488,7 +488,9 @@ use scoped keys in that configuration.</p>
 requires exactly one target; <code>kind</code> defaults to <code>file</code>. <code>blob</code> is the complete
 reference object, not an ID string. <code>name</code> overrides its optional name and is
 refused for path targets. Returns <code>{token, url}</code> (relative <code>/s/...</code> URL).</li>
-<li><code>webd.share.list {vhost, account, after?, limit?}</code> returns <code>{shares, next}</code>.
+<li><code>webd.share.list {vhost, account, after?, limit?}</code> returns <code>{shares, next, skipped}</code>.
+Unservable rows are skipped and counted; <code>next</code> advances past all scanned rows,
+including skipped ones. The HTTP list returns the same shape.
 Limit defaults to 100 (range 1..100); <code>next</code> is the last token or null.</li>
 <li><code>webd.share.revoke {vhost, account, token}</code> returns <code>{revoked: bool}</code>; false
 includes an absent, already revoked or differently owned token.</li>

@@ -355,13 +355,19 @@ impl Row {
 }
 
 /// Bounded, cursor-paginated management inventory. Password hashes never leave it.
+#[derive(Serialize)]
+pub struct Inventory {
+    pub shares: Vec<Share>,
+    pub skipped: usize,
+    pub next: Option<String>,
+}
 pub fn list(
     conn: &Connection,
     primary: &str,
     account: &str,
     after: Option<&str>,
     limit: usize,
-) -> Result<Vec<Share>, Error> {
+) -> Result<Inventory, Error> {
     if !valid_account(account) || !(1..=100).contains(&limit) {
         return Err(Error::InvalidArguments(
             "invalid account or list limit (1..100)",
@@ -374,7 +380,16 @@ pub fn list(
         params![account, after.unwrap_or(""), limit as i64, primary],
         Row::read,
     )?;
-    rows.map(|row| row.map_err(Error::from)?.share()).collect()
+    let mut inventory = Inventory { shares: Vec::new(), skipped: 0, next: None };
+    for row in rows {
+        let row = row?;
+        inventory.next = Some(row.token.clone());
+        match row.share() {
+            Ok(share) => inventory.shares.push(share),
+            Err(_) => inventory.skipped += 1,
+        }
+    }
+    Ok(inventory)
 }
 
 pub fn revoke(conn: &Connection, primary: &str, account: &str, token: &str) -> Result<bool, Error> {
@@ -468,11 +483,26 @@ mod tests {
     }
 
     #[test]
+    fn inventory_skips_bad_rows_and_advances_cursor() {
+        let db = db();
+        let good = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
+        let bad = create(&db, "a.example", ACCOUNT, "file", &blob(), None, None, 1).unwrap();
+        db.execute("UPDATE file_shares SET blob='{}' WHERE token=?1", [&bad]).unwrap();
+        let legacy = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
+        db.execute("UPDATE file_shares SET kind='dir' WHERE token=?1", [&legacy]).unwrap();
+        let page = list(&db, "a.example", ACCOUNT, None, 100).unwrap();
+        assert_eq!(page.shares.len(), 1);
+        assert_eq!(page.shares[0].token, good);
+        assert_eq!(page.skipped, 2);
+        assert_eq!(page.next, [good, bad, legacy].into_iter().max());
+    }
+
+    #[test]
     fn shared_database_isolates_primary_tokens_and_management() {
         let db = db();
         let token = create(&db, "a.example", ACCOUNT, "file", &path(), None, None, 1).unwrap();
         assert!(matches!(resolve(&db, "b.example", &token, 2), Err(Error::NotFound)));
-        assert!(list(&db, "b.example", ACCOUNT, None, 100).unwrap().is_empty());
+        assert!(list(&db, "b.example", ACCOUNT, None, 100).unwrap().shares.is_empty());
         assert!(!revoke(&db, "b.example", ACCOUNT, &token).unwrap());
         assert!(resolve(&db, "a.example", &token, 2).is_ok());
     }
@@ -578,7 +608,7 @@ mod tests {
         assert!(
             list(&db, "a.example",  "other@example.test", None, 100)
                 .unwrap()
-                .is_empty()
+                .shares.is_empty()
         );
         assert!(!revoke(&db, "a.example",  "other@example.test", &token).unwrap());
         let gate = resolve(&db, "a.example",  &token, 2).unwrap();
@@ -586,7 +616,7 @@ mod tests {
         assert!(gate.authorize(Some("hash")).is_ok());
         assert!(matches!(resolve(&db, "a.example",  &token, 10), Err(Error::Expired)));
         bump_download(&db, &token).unwrap();
-        assert_eq!(list(&db, "a.example",  ACCOUNT, None, 100).unwrap()[0].download_count, 1);
+        assert_eq!(list(&db, "a.example",  ACCOUNT, None, 100).unwrap().shares[0].download_count, 1);
         assert!(revoke(&db, "a.example",  ACCOUNT, &token).unwrap());
         assert!(matches!(resolve(&db, "a.example",  &token, 2), Err(Error::Revoked)));
     }

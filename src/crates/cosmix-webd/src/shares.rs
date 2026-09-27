@@ -378,7 +378,7 @@ pub async fn list(
 ) -> Result<Value, String> {
     let db = vhost.db.as_ref().ok_or("not_found")?.lock().await;
     let rows = file_share::list(&db, &vhost.fqdn, account, after, limit).map_err(catalogue_error)?;
-    Ok(json!({"shares": rows, "next": rows.last().map(|r| &r.token)}))
+    Ok(json!(rows))
 }
 pub async fn revoke(vhost: &VhostState, account: &str, token: &str) -> Result<Value, String> {
     if !file_share::valid_account(account) || !file_share::valid_token(token) {

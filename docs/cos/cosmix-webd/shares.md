@@ -56,7 +56,9 @@ Mesh-open Bus verbs use JSON arguments (no capability check):
   requires exactly one target; `kind` defaults to `file`. `blob` is the complete
   reference object, not an ID string. `name` overrides its optional name and is
   refused for path targets. Returns `{token, url}` (relative `/s/...` URL).
-- `webd.share.list {vhost, account, after?, limit?}` returns `{shares, next}`.
+- `webd.share.list {vhost, account, after?, limit?}` returns `{shares, next, skipped}`.
+  Unservable rows are skipped and counted; `next` advances past all scanned rows,
+  including skipped ones. The HTTP list returns the same shape.
   Limit defaults to 100 (range 1..100); `next` is the last token or null.
 - `webd.share.revoke {vhost, account, token}` returns `{revoked: bool}`; false
   includes an absent, already revoked or differently owned token.
