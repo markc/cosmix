@@ -1091,7 +1091,12 @@ mod tests {
         let mut opts = PutOptions::new("other");
         opts.mode = PutMode::HardLink;
         opts.immutable = true;
-        let published = store.put(&alias, &opts).unwrap();
+        assert!(store.put(&alias, &opts).is_err());
+        // A process with filesystem access can still create a CAS link itself;
+        // PATCH's independent inode guard must protect that externally linked file.
+        let cas = blob::blob_path(&store.blobs_root(), &blob::hash_bytes(b"a"));
+        fs::create_dir_all(cas.parent().unwrap()).unwrap();
+        fs::hard_link(&alias, &cas).unwrap();
         assert!(matches!(
             store.upload_append(&s.id, 1, 1, 2, &b"b"[..]),
             Err(StoreError::UploadConflict { .. })
@@ -1106,10 +1111,7 @@ mod tests {
                 .contains("corrupt staging")
         );
         assert_eq!(fs::read(&alias).unwrap(), b"a");
-        assert_eq!(
-            fs::read(store.path(&published.reference.hash).unwrap()).unwrap(),
-            b"a"
-        );
+        assert_eq!(fs::read(cas).unwrap(), b"a");
         assert_eq!(store.quota_report(None).unwrap().total.reserved, 0);
     }
 

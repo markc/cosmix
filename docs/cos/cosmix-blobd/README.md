@@ -219,7 +219,15 @@ for those failures. Migration DDL, invalidation and version marker are atomic.
 
 Local `blob.put` refuses sources canonicalised inside this instance's entire
 store root, including symlink aliases, `.uploads`, `.tmp`, and CAS shards, for
-every ingest mode: `invalid_arguments: source inside the store`. Stage caller
+every ingest mode: `invalid_arguments: source inside the store`. Store database
+and sidecar identities are pinned at open and checked again during admission.
+Canonical ancestors are opened relative to pinned directory descriptors with
+no symlink following; comparing their device/inode identities also refuses
+bind-mounted root aliases. Source descriptors use O_RDONLY, O_NOFOLLOW and
+O_NONBLOCK, with fstat refusing non-regular files. Copy/reflink reads and hard
+links use that exact descriptor, never a reopened source path. Hard-link
+staging must produce exactly two links to the checked inode or fail before
+publication. The independent session PATCH inode guard remains in place. Stage caller
 inputs outside that root. Hard-link ingest still requires an immutable source.
 SQLite boundaries use checked signed 64-bit integers: negative stored sizes,
 offsets and timestamps report integer corruption; out-of-range unsigned

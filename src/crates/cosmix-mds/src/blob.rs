@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::types::BlobHash;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -343,7 +343,26 @@ fn stream_to_tmp(
 /// [`touch_path`]) so the GC grace window covers the re-acknowledged
 /// bytes.
 pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHash, u64)> {
-    let (hash, size) = hash_file(src)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(src)?;
+    put_file(blobs_root, &mut file, mode)
+}
+
+/// Ingest from this exact open descriptor; never reopen the source pathname.
+/// The descriptor must be a regular readable file. Its cursor is rewound for
+/// hashing and copying. HardLink requires an immutable, singly linked source
+/// before staging (an already-published hash remains an idempotent no-op).
+pub fn put_file(blobs_root: &Path, src: &mut File, mode: PutMode) -> Result<(BlobHash, u64)> {
+    if !src.metadata()?.is_file() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ingest source is not a regular file",
+        )));
+    }
+    src.rewind()?;
+    let (hash, size) = hash_reader(src)?;
     if blob_path(blobs_root, &hash).exists() {
         let _ = touch_path(&blob_path(blobs_root, &hash));
         return Ok((hash, size));
@@ -357,7 +376,8 @@ pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHas
     // every failure below — the copy, the staged re-hash, the commit —
     // removes the staged file before the error surfaces, exactly like
     // stage() does for the streaming paths.
-    let staged = put_path_staged(blobs_root, src, mode, &hash, &tmp_path);
+    src.rewind()?;
+    let staged = put_file_staged(blobs_root, src, mode, &hash, &tmp_path);
     if staged.is_err() {
         let _ = fs::remove_file(&tmp_path);
     }
@@ -367,35 +387,33 @@ pub fn put_path(blobs_root: &Path, src: &Path, mode: PutMode) -> Result<(BlobHas
 /// The post-staging half of [`put_path`]: land the bytes under `mode`,
 /// re-hash them at the staging point, and commit. Only called with a
 /// fresh `tmp_path`; the caller owns the remove-on-error guard.
-fn put_path_staged(
+fn put_file_staged(
     blobs_root: &Path,
-    src: &Path,
+    src: &mut File,
     mode: PutMode,
     hash: &BlobHash,
     tmp_path: &Path,
 ) -> Result<()> {
     match mode {
         PutMode::Copy => {
-            let mut src_f = File::open(src)?;
             let mut tmp_f = File::create(tmp_path)?;
-            std::io::copy(&mut src_f, &mut tmp_f)?;
+            std::io::copy(src, &mut tmp_f)?;
         }
         PutMode::Reflink => {
-            let mut src_f = File::open(src)?;
             let mut tmp_f = File::create(tmp_path)?;
-            if !try_kernel_copy(&mut src_f, &mut tmp_f)? {
+            if !try_kernel_copy(src, &mut tmp_f)? {
                 // Soft fall-through: both fds sit at offset 0 with an
                 // empty staging file (FICLONE is atomic; a mid-copy
                 // fall-through rewinds itself), so the userspace copy
                 // starts clean.
-                std::io::copy(&mut src_f, &mut tmp_f)?;
+                std::io::copy(src, &mut tmp_f)?;
             }
         }
         PutMode::HardLink => {
             // Stage a link to the source inode; commit_staged then
             // fsyncs it, links it into the CAS, and drops the staging
             // link. The caller has promised the source immutable.
-            fs::hard_link(src, tmp_path)?;
+            link_open_file(src, tmp_path)?;
             // The staged link shares the source's inode, so without
             // this the CAS file would carry the *source's* mtime — a
             // months-old file is "old" the instant it commits, and a
@@ -425,6 +443,10 @@ fn put_path_staged(
 /// buffer in memory. Returns the hash and the byte count.
 fn hash_file(p: &Path) -> Result<(BlobHash, u64)> {
     let mut f = File::open(p)?;
+    hash_reader(&mut f)
+}
+
+fn hash_reader(f: &mut File) -> Result<(BlobHash, u64)> {
     let mut hasher = blake3::Hasher::new();
     let mut buf = [0u8; 128 * 1024];
     let mut size: u64 = 0;
@@ -437,6 +459,55 @@ fn hash_file(p: &Path) -> Result<(BlobHash, u64)> {
         size += n as u64;
     }
     Ok((BlobHash(hasher.finalize().into()), size))
+}
+
+/// Link the checked inode, not a source path that can be replaced. Linux's
+/// AT_EMPTY_PATH may require CAP_DAC_READ_SEARCH; procfs is the fd-bound
+/// fallback documented by linkat(2), never the original source pathname.
+fn link_open_file(src: &File, dst: &Path) -> Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let before = src.metadata()?;
+    let dst_c = CString::new(dst.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in staging path")
+    })?;
+    // SAFETY: live descriptor and NUL-terminated paths; no fd ownership moves.
+    let mut rc = unsafe {
+        libc::linkat(
+            src.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_FDCWD,
+            dst_c.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if rc != 0 {
+        let proc_fd = CString::new(format!("/proc/self/fd/{}", src.as_raw_fd())).unwrap();
+        // SAFETY: proc_fd refers to the still-open source descriptor. Following
+        // this kernel-owned magic link binds the operation to that descriptor.
+        rc = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                proc_fd.as_ptr(),
+                libc::AT_FDCWD,
+                dst_c.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+    }
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let after = src.metadata()?;
+    let landed = fs::symlink_metadata(dst)?;
+    if after.nlink() != 2
+        || (after.dev(), after.ino()) != (before.dev(), before.ino())
+        || (landed.dev(), landed.ino()) != (before.dev(), before.ino())
+    {
+        return Err(Error::BlobCorrupt(
+            "hardlink source is aliased or changed identity".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Kernel-side copy for [`PutMode::Reflink`]: `FICLONE` reflink
@@ -825,6 +896,42 @@ mod tests {
         let tmp: Vec<_> = std::fs::read_dir(d.path().join(".tmp")).unwrap().collect();
         assert!(tmp.is_empty(), "tmp leftovers: {:?}", tmp);
         assert_eq!(cas_file_count(d.path()), 1);
+    }
+
+    #[test]
+    fn put_file_remains_bound_when_source_path_is_replaced() {
+        for mode in [PutMode::Copy, PutMode::Reflink, PutMode::HardLink] {
+            let d = root();
+            let path = d.path().join("source");
+            fs::write(&path, b"checked inode").unwrap();
+            let mut source = File::open(&path).unwrap();
+            let original = source.metadata().unwrap();
+            fs::rename(&path, d.path().join("moved")).unwrap();
+            fs::write(&path, b"replacement").unwrap();
+            let (hash, _) = put_file(d.path(), &mut source, mode).unwrap();
+            assert_eq!(get(d.path(), &hash).unwrap(), b"checked inode");
+            if mode == PutMode::HardLink {
+                let landed = fs::metadata(blob_path(d.path(), &hash)).unwrap();
+                assert_eq!(
+                    (landed.dev(), landed.ino(), landed.nlink()),
+                    (original.dev(), original.ino(), 2)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hardlink_ingest_refuses_preexisting_alias_and_cleans_staging() {
+        let d = root();
+        let path = d.path().join("source");
+        fs::write(&path, b"aliased").unwrap();
+        fs::hard_link(&path, d.path().join("alias")).unwrap();
+        assert!(matches!(
+            put_path(d.path(), &path, PutMode::HardLink),
+            Err(Error::BlobCorrupt(_))
+        ));
+        assert_eq!(fs::read_dir(d.path().join(".tmp")).unwrap().count(), 0);
+        assert!(!blob_path(d.path(), &hash_bytes(b"aliased")).exists());
     }
 
     #[test]

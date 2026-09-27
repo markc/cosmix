@@ -37,6 +37,8 @@ use super::reference::Reference;
 
 #[path = "uploads.rs"]
 mod uploads;
+#[path = "ingest.rs"]
+mod ingest;
 pub use uploads::{UploadCreate, UploadLimits, UploadSession};
 
 /// Name of the exclusive instance lock inside the mds root.
@@ -391,6 +393,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 /// The blobd store. `Send + Sync`: both connections live behind mutexes.
 pub struct Store {
     root: PathBuf,
+    ingest_root: ingest::IngestRoot,
     mds: SqliteCasMds,
     /// blobd-owned `blobd.sqlite`: attrs, pins, quotas.
     db: Mutex<Connection>,
@@ -474,6 +477,7 @@ impl Store {
         apply_cas_group(&root, &mds.blobs_root(), &options.cas_group);
 
         let mut store = Self {
+            ingest_root: ingest::IngestRoot::open(&root)?,
             root,
             mds,
             db: Mutex::new(db),
@@ -637,12 +641,11 @@ impl Store {
     /// Idempotent: a re-put returns the same reference and pins
     /// nothing new.
     pub fn put(&self, src: &Path, opts: &PutOptions<'_>) -> Result<PutOutcome> {
-        // Resolve symlink aliases before admitting any mode, including copies.
-        // Pass the resolved source onwards instead of reusing the alias.
-        let source = fs::canonicalize(src)?;
-        if source.starts_with(fs::canonicalize(self.root())?) {
-            return Err(StoreError::SourceInsideStore);
-        }
+        self.put_after_canonical(src, opts, |_| {})
+    }
+
+    fn put_after_canonical(&self, src: &Path, opts: &PutOptions<'_>, after_canonical: impl FnOnce(&Path)) -> Result<PutOutcome> {
+        let (mut file, source) = self.ingest_root.source(src, after_canonical)?;
         let src = source.as_path();
         if opts.mode == PutMode::HardLink && !opts.immutable {
             return Err(StoreError::BadRequest(
@@ -651,7 +654,7 @@ impl Store {
                     .into(),
             ));
         }
-        let md = fs::metadata(src)?;
+        let md = file.metadata()?;
         if !md.is_file() {
             return Err(StoreError::BadRequest(format!(
                 "path {} is not a regular file",
@@ -664,7 +667,7 @@ impl Store {
         let size = md.len();
         let reservation = self.reserve_upload(opts.owner, Some(size))?;
 
-        let hash = self.mds.put_blob_path(src, opts.mode)?;
+        let (hash, _) = blob::put_file(&self.blobs_root(), &mut file, opts.mode)?;
         let size = blob::size(&self.blobs_root(), &hash)?;
 
         let mime = opts
