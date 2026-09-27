@@ -543,7 +543,9 @@ pub async fn serve(
             Err(_) => return challenge(),
         }
     };
-    let range = headers.get("range").cloned();
+    // We expose no validator contract. An unverifiable If-Range requires the
+    // complete representation, not a potentially stale partial response.
+    let range = if headers.contains_key("if-range") { None } else { headers.get("range").cloned() };
     if range.as_ref().is_some_and(|r| r.as_bytes().len() > 1024) {
         return public_error("invalid_arguments: Range too long".into());
     }
@@ -734,6 +736,22 @@ fn counted_body_with_deadlines(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn unverifiable_if_range_returns_full_representation() {
+        use tower::ServiceExt;
+        let (_tmp, node, vhost) = fixture().await;
+        let token = path_token(&node, &vhost, None).await;
+        for method in ["GET", "HEAD"] {
+            let mut request = download_request(&token, method, Some("bytes=6-"), None, true);
+            request.headers_mut().insert("if-range", "\"old\"".parse().unwrap());
+            let response = crate::build_per_vhost_router(node.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-length"], "11");
+            assert!(!response.headers().contains_key("content-range"));
+            let bytes = axum::body::to_bytes(response.into_body(), 100).await.unwrap();
+            assert_eq!(bytes.as_ref(), if method == "GET" { b"hello world".as_slice() } else { b"" });
+        }
+    }
     #[tokio::test]
     async fn public_lane_errors_do_not_disclose_upstream_details() {
         let response = public_error("lane: http://127.0.0.1:9999/blob secret upstream body".into());
