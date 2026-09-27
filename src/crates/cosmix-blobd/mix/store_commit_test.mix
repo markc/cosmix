@@ -1,0 +1,93 @@
+-- version: 0.1.0
+$c = require("store_catalogue.mix")
+$p = require("store_commit.mix")
+$m = require("store_manifest.mix")
+$checks = buffer()
+$calls = buffer()
+$fault = buffer()
+$dir = env("TMPDIR", "/tmp") .. "/store-commit-test-" .. uuid()
+mkdir($dir)
+$path = $dir .. "/catalogue.sqlite"
+$db = nil
+fn check($condition, $token)
+  if not $condition then raise("TEST", $token) end
+  buffer_push($checks, 1)
+end
+fn mode()
+  $modes = split(bytes_to_string(freeze($fault)), "|")
+  return $modes[length($modes)-1]
+end
+fn inspect_blob($id)
+  buffer_push($calls, 1)
+  return {present: mode() != "missing", size: mode() == "size" ? 4 : 3}
+end
+fn pin_blob($id, $owner)
+  buffer_push($calls, 1)
+  if mode() == "quota" then raise("QUOTA", "refused") end
+  return {pinned: false}
+end
+fn upload_manifest($file, $owner, $resume)
+  buffer_push($calls, 1)
+  if mode() == "upload" then raise("UPLOAD", "lost completion") end
+  if mode() == "fence" then $p.epoch($path) end
+  return {blob: "b3:" .. hash_file($file, "blake3"), size: stat($file).size}
+end
+$io = {inspect_blob: fn($id) = inspect_blob($id), pin: fn($id, $owner) = pin_blob($id, $owner), upload: fn($file, $owner, $resume) = upload_manifest($file, $owner, $resume)}
+try
+  $c.initialise($path, "blobd-two")
+  $db = $c.connect($path)
+  $c.request($db, "store.collection.create", {name: "test"})
+  $epoch = $p.epoch($path)
+  $id = "b3:" .. hash_blake3("abc")
+  $manifest = {schema_version: 2, files: [{path: "a", blob: $id, size: 3}, {path: "b", blob: $id, size: 3}]}
+  $a = $p.admit($path, "test", $manifest)
+  check($a.state == "pending" and not $a.replay, "ACCEPTED_NOT_COMMITTED")
+  check($p.admit($path, "test", $manifest).replay, "PENDING_REPLAY")
+  $caught = ""
+  try
+    $p.admit($path, "test", {schema_version: 2, files: []})
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_BUSY", "ONE_PENDING")
+  for each $case in ["missing", "size", "quota", "upload"]
+    buffer_push($fault, "|" .. $case)
+    $r = $p.run_pending($path, $dir, $epoch, $io)
+    check($r.state == "failed", "FAILED_" .. $case)
+    $tokens = {missing: "STORE_MISSING:", size: "STORE_SIZE:", quota: "QUOTA:", upload: "UPLOAD:"}
+    check(starts_with($r.error, $tokens[$case]), "EXACT_ERROR_" .. $case)
+    check(length(sqlexec($db, "SELECT id FROM snapshots")) == 0, "NO_PUBLICATION_" .. $case)
+    check($c.request($db, "store.commit.status", {collection: "test", id: $a.id}).state == "failed", "DURABLE_FAILURE_" .. $case)
+    $p.admit($path, "test", $manifest)
+  end
+  buffer_push($fault, "|fence")
+  $fenced = $p.run_pending($path, $dir, $epoch, $io)
+  check($fenced == nil, "OLD_GENERATION_FENCED")
+  check($c.request($db, "store.commit.status", {collection: "test", id: $a.id}).state == "pending", "FENCED_STAYS_RECOVERABLE")
+  -- Close/reopen models a restarted process: the only job input is SQLite.
+  sqlclose($db)
+  $db = $c.connect($path)
+  $epoch = $p.epoch($path)
+  buffer_push($fault, "|")
+  $before = length(freeze($calls))
+  check($p.run_pending($path, $dir, $epoch, $io).state == "committed", "RECOVER_COMMITTED")
+  check(length(freeze($calls)) - $before == 3, "DISTINCT_OBJECT_PIN_AND_EXISTING_PIN_SUCCESS")
+  check(length(sqlexec($db, "SELECT * FROM snapshot_objects")) == 1, "DISTINCT_MEMBERSHIP")
+  check($c.request($db, "store.snapshot.get", {collection: "test", id: $a.id}).id == $m.canonicalise($manifest).id, "GET_VERIFIED")
+  check($p.admit($path, "test", $manifest).state == "committed", "COMMITTED_REPLAY")
+  check($p.run_pending($path, $dir, $epoch, $io) == nil, "REPLAY_NO_IO")
+  $c.request($db, "store.snapshot.forget", {collection: "test", id: $a.id})
+  $caught = ""
+  try
+    $p.admit($path, "test", $manifest)
+  catch $message, $error
+    $caught = $error.code
+  end
+  check($caught == "STORE_FORGOTTEN", "NO_RESURRECTION")
+  check(length(sqlexec($db, "SELECT * FROM snapshot_objects")) == 1, "FORGET_RETAINS_MEMBERSHIP")
+  check(sqlexec($db, "PRAGMA integrity_check")[0].integrity_check == "ok", "INTEGRITY")
+finally
+  if $db != nil then sqlclose($db) end
+  remove_dir($dir)
+end
+print("store_commit_test: PASS " .. to_string(length(freeze($checks))))

@@ -469,6 +469,7 @@ pass the new byte limit; migration must never truncate or omit entries.</p>
 <p>From the checkout, without root or a broker:</p>
 <pre><code class="language-text">mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
 mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
+mix src/crates/cosmix-blobd/mix/store_commit_test.mix
 </code></pre>
 <h2 id="catalogue-citizen">Catalogue citizen</h2>
 <p>Run <code>mix --serve stored.mix --name stored</code>. <code>STORED_STATE_DIR</code> overrides the
@@ -493,7 +494,35 @@ The runtime supplies lifecycle props, HELP, INFO, QUIT and RELOAD.</p>
 full final page can require one extra empty read. Unknown records return
 <code>STORE_NOT_FOUND</code>; tombstoned gets return <code>STORE_FORGOTTEN</code>. Errors use rc 10
 with <code>error_code</code> and <code>message</code>. All verbs are mesh-open: owner labels account
-bytes and are not authenticated principals. Forget never releases blob pins.</p></div></div>
+bytes and are not authenticated principals. Forget never releases blob pins.</p>
+<h2 id="commit-protocol">Commit protocol</h2>
+<p><code>store.snapshot.commit {collection,manifest}</code> validates and canonicalises v2,
+then durably records a pending intent before replying
+<code>{accepted:true,state:"pending",collection,id,replay}</code>. Acceptance is <strong>not</strong>
+publication. Only one pending commit is admitted across the catalogue;
+another identity gets <code>STORE_BUSY</code>. Replaying the same collection/manifest
+returns its pending or committed state. Replaying a failed job retries it;
+a tombstoned snapshot refuses with <code>STORE_FORGOTTEN</code>.</p>
+<p>A local asynchronous worker checks size and pins each distinct data object
+under <code>store:&lt;collection&gt;</code>. It treats rc success with <code>pinned:false</code> as an
+existing successful pin. <code>blob.pin</code> rechecks presence under blobd's GC lock;
+<code>blob.has</code> alone cannot establish retention. The worker uploads the exact
+canonical manifest through the local blobd lane with the same owner, verifies
+the returned identity and size, then inserts the snapshot, distinct membership
+and committed status in <strong>one FULL SQLite transaction</strong>. No transaction spans
+Bus or lane I/O. No failure, retry or forget unpins anything.</p>
+<p>After completion it publishes non-retained <code>store.commit.finished</code> with
+<code>collection,id,state</code> and an <code>error</code> on failure. Subscribe before submission;
+the authoritative fallback is <code>store.commit.status</code>. Lost events cannot lose
+the result. A restart resumes pending intent. Reload replaces a durable
+generation fence so an old worker cannot publish catalogue rows. Manifest
+upload resume records are generation-specific to avoid concurrent writers
+during reload. Async Bus waits yield; the bounded manifest HTTP transfer is
+currently a blocking Mix builtin.</p>
+<p>Failed work may retain partial pins and upload receipts. This is intentional
+until a separate release policy is designed. Blobd quota counts unique bytes
+per owner, including manifest bytes, and pending upload reservations; it is
+not the old pilot's logical snapshot quota. This is an explicit policy change.</p></div></div>
     </div>
 
 </main>

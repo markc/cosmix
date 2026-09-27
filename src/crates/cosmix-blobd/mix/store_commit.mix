@@ -1,0 +1,104 @@
+-- version: 0.1.0
+-- Durable orchestration; only the injected io boundary talks to blobd.
+$c = require("store_catalogue.mix")
+$m = require("store_manifest.mix")
+
+fn epoch($path)
+  $db = $c.connect($path)
+  try
+    $value = uuid()
+    sqlexec($db, "INSERT OR REPLACE INTO settings VALUES('worker_epoch',?)", [$value])
+    return $value
+  finally
+    sqlclose($db)
+  end
+end
+
+fn fence($db, $epoch)
+  if sqlexec($db, "SELECT value FROM settings WHERE key='worker_epoch'")[0].value != $epoch then
+    raise("STORE_SUPERSEDED", "worker belongs to an earlier citizen generation")
+  end
+end
+
+fn admit($path, $collection, $manifest)
+  $v = $m.canonicalise($manifest)
+  $db = $c.connect($path)
+  try
+    sqlexec($db, "BEGIN IMMEDIATE")
+    $c.require_collection($db, $collection)
+    $snap = sqlexec($db, "SELECT tombstoned_at FROM snapshots WHERE collection=? AND id=?", [$collection, $v.id])
+    if length($snap) > 0 and $snap[0].tombstoned_at != nil then raise("STORE_FORGOTTEN", "replay cannot resurrect a tombstone") end
+    $rows = sqlexec($db, "SELECT state,canonical_json FROM commit_intents WHERE collection=? AND id=?", [$collection, $v.id])
+    $state = length($rows) > 0 ? $rows[0].state : "new"
+    if length($rows) > 0 and $rows[0].canonical_json != $v.canonical then raise("STORE_DB", "identity collision") end
+    if $state == "new" or $state == "failed" then
+      if length(sqlexec($db, "SELECT id FROM commit_intents WHERE state='pending'")) != 0 then raise("STORE_BUSY", "one commit is already pending") end
+      $now = floor(time())
+      sqlexec($db, "INSERT INTO commit_intents VALUES(?,?,?,'pending',NULL,?,?) ON CONFLICT(collection,id) DO UPDATE SET state='pending',error=NULL,updated_at=excluded.updated_at", [$collection, $v.id, $v.canonical, $now, $now])
+      $state = "pending"
+    end
+    sqlexec($db, "COMMIT")
+    return {collection: $collection, id: $v.id, accepted: true, state: $state, replay: length($rows) > 0}
+  catch $message, $error
+    sqlexec($db, "ROLLBACK")
+    raise($error.code, $message)
+  finally
+    sqlclose($db)
+  end
+end
+
+fn run_pending($path, $state_dir, $epoch, $io)
+  $db = $c.connect($path)
+  $job = nil
+  try
+    fence($db, $epoch)
+    $rows = sqlexec($db, "SELECT * FROM commit_intents WHERE state='pending'")
+    if length($rows) == 0 then return nil end
+    $job = $rows[0]
+    $v = $m.verify(json_parse($job.canonical_json), $job.id)
+    if $v.canonical != $job.canonical_json then raise("STORE_DB", "noncanonical intent") end
+    $owner = $c.require_collection($db, $job.collection).owner_label
+    for each $id in sort(keys($v.objects))
+      -- Presence is advisory; pin rechecks existence under blobd's GC lock.
+      $s = $io.inspect_blob($id)
+      fence($db, $epoch)
+      if $s.present != true then raise("STORE_MISSING", "missing " .. $id) end
+      if $s.size != $v.objects[$id] then raise("STORE_SIZE", "stored size differs for " .. $id) end
+      $io.pin($id, $owner)
+      fence($db, $epoch)
+    end
+    mkdir($state_dir .. "/manifests")
+    mkdir($state_dir .. "/uploads")
+    $file = $state_dir .. "/manifests/" .. slice($job.id, 3) .. ".json"
+    write_atomic($file, $v.canonical, {durability: "full", mode: 0o600})
+    -- A reload can cancel an old upload after a yield: generations never share
+    -- a resume record. Both use the same immutable bytes and idempotent pin.
+    $resume = $state_dir .. "/uploads/" .. $job.collection .. "-" .. slice($job.id, 3) .. "-" .. $epoch .. ".json"
+    $ref = $io.upload($file, $owner, $resume)
+    fence($db, $epoch)
+    if $ref.blob != $v.id or $ref.size != length(string_to_bytes($v.canonical)) then raise("STORE_IDENTITY", "manifest upload returned different bytes") end
+    sqlexec($db, "BEGIN IMMEDIATE")
+    try
+      fence($db, $epoch)
+      sqlexec($db, "INSERT INTO snapshots VALUES(?,?,?,?,?,?,?,NULL)", [$job.collection, $job.id, $v.canonical, $ref.blob, floor(time()), $v.size, $v.file_count])
+      for each $id in sort(keys($v.objects))
+        sqlexec($db, "INSERT INTO snapshot_objects VALUES(?,?,?,?)", [$job.collection, $job.id, $id, $v.objects[$id]])
+      end
+      sqlexec($db, "UPDATE commit_intents SET state='committed',error=NULL,updated_at=? WHERE collection=? AND id=? AND state='pending'", [floor(time()), $job.collection, $job.id])
+      sqlexec($db, "COMMIT")
+    catch $message, $error
+      sqlexec($db, "ROLLBACK")
+      raise($error.code, $message)
+    end
+    return {collection: $job.collection, id: $job.id, state: "committed"}
+  catch $message, $error
+    if $error.code == "STORE_SUPERSEDED" then return nil end
+    if $job == nil then raise($error.code, $message) end
+    fence($db, $epoch)
+    $reason = $error.code .. ": " .. $message
+    sqlexec($db, "UPDATE commit_intents SET state='failed',error=?,updated_at=? WHERE collection=? AND id=? AND state='pending'", [$reason, floor(time()), $job.collection, $job.id])
+    return {collection: $job.collection, id: $job.id, state: "failed", error: $reason}
+  finally
+    sqlclose($db)
+  end
+end

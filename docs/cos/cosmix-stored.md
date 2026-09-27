@@ -37,6 +37,7 @@ From the checkout, without root or a broker:
 ```text
 mix src/crates/cosmix-blobd/mix/store_manifest_test.mix
 mix src/crates/cosmix-blobd/mix/store_catalogue_test.mix
+mix src/crates/cosmix-blobd/mix/store_commit_test.mix
 ```
 
 ## Catalogue citizen
@@ -67,3 +68,36 @@ full final page can require one extra empty read. Unknown records return
 `STORE_NOT_FOUND`; tombstoned gets return `STORE_FORGOTTEN`. Errors use rc 10
 with `error_code` and `message`. All verbs are mesh-open: owner labels account
 bytes and are not authenticated principals. Forget never releases blob pins.
+
+## Commit protocol
+
+`store.snapshot.commit {collection,manifest}` validates and canonicalises v2,
+then durably records a pending intent before replying
+`{accepted:true,state:"pending",collection,id,replay}`. Acceptance is **not**
+publication. Only one pending commit is admitted across the catalogue;
+another identity gets `STORE_BUSY`. Replaying the same collection/manifest
+returns its pending or committed state. Replaying a failed job retries it;
+a tombstoned snapshot refuses with `STORE_FORGOTTEN`.
+
+A local asynchronous worker checks size and pins each distinct data object
+under `store:<collection>`. It treats rc success with `pinned:false` as an
+existing successful pin. `blob.pin` rechecks presence under blobd's GC lock;
+`blob.has` alone cannot establish retention. The worker uploads the exact
+canonical manifest through the local blobd lane with the same owner, verifies
+the returned identity and size, then inserts the snapshot, distinct membership
+and committed status in **one FULL SQLite transaction**. No transaction spans
+Bus or lane I/O. No failure, retry or forget unpins anything.
+
+After completion it publishes non-retained `store.commit.finished` with
+`collection,id,state` and an `error` on failure. Subscribe before submission;
+the authoritative fallback is `store.commit.status`. Lost events cannot lose
+the result. A restart resumes pending intent. Reload replaces a durable
+generation fence so an old worker cannot publish catalogue rows. Manifest
+upload resume records are generation-specific to avoid concurrent writers
+during reload. Async Bus waits yield; the bounded manifest HTTP transfer is
+currently a blocking Mix builtin.
+
+Failed work may retain partial pins and upload receipts. This is intentional
+until a separate release policy is designed. Blobd quota counts unique bytes
+per owner, including manifest bytes, and pending upload reservations; it is
+not the old pilot's logical snapshot quota. This is an explicit policy change.

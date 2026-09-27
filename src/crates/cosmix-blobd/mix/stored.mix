@@ -1,6 +1,8 @@
--- version: 0.1.0
+-- version: 0.2.0
 -- Mesh-open catalogue citizen. Runtime owns HELP/INFO/QUIT/RELOAD and props.
 $catalogue = require("store_catalogue.mix")
+$commit = require("store_commit.mix")
+$io = require("store_blob.mix")
 $STATE = env("STORED_STATE_DIR", env("STATE_DIRECTORY", env("COSMIX_VAR", env("XDG_STATE_HOME", env("HOME") .. "/.local/state") .. "/cosmix") .. "/stored"))
 $BLOBD = env("STORED_BLOBD", "blobd")
 if not re_match($BLOBD, "^blobd(-[a-z0-9-]+)?$") then raise("STORE_CONFIG", "STORED_BLOBD must be a local blobd service") end
@@ -9,6 +11,8 @@ if not stat($STATE, {follow_symlinks: false}).is_dir then raise("STORE_CONFIG", 
 if not flock($STATE .. "/.writer-lock") then raise("STORE_LOCKED", "another stored owns this state directory") end
 $DB_PATH = $STATE .. "/catalogue.sqlite"
 $catalogue.initialise($DB_PATH, $BLOBD)
+$EPOCH = $commit.epoch($DB_PATH)
+$WORKER_BUSY = false
 
 fn answer($verb, $args)
   $db = nil
@@ -44,4 +48,27 @@ end
 on store.info desc "Catalogue counts, schema, local blobd and retention policy"
   answer("store.info", $event.args)
 end
+on store.snapshot.commit desc "Accept durable commit {collection,manifest}; completion is store.commit.finished"
+  try
+    $accepted = $commit.admit($DB_PATH, $event.args.collection, $event.args.manifest)
+    if $accepted.state == "pending" then task_start("stored.work", "{}") end
+    reply(0, json_encode($accepted))
+  catch $message, $error
+    reply(10, json_encode({error_code: $error.code, message: $message}))
+  end
+end
+on stored.work async
+  -- Only task_start's local continuation; there is no caller authorisation gate.
+  if length(keys($event.headers)) != 0 or $WORKER_BUSY then return end
+  $WORKER_BUSY = true
+  try
+    $finished = $commit.run_pending($DB_PATH, $STATE, $EPOCH, $io)
+    if $finished != nil then publish("store.commit.finished", json_encode($finished), {retain: false}) end
+  catch $message
+    eprint("stored worker: " .. $message)
+  finally
+    $WORKER_BUSY = false
+  end
+end
+task_start("stored.work", "{}")
 print("stored: catalogue ready")
