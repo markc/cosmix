@@ -560,10 +560,13 @@ Keep the source quiescent: this detects changes, but is not a filesystem
 snapshot or protection against hostile concurrent namespace replacement.
 Empty directories and file metadata are not archived.</p>
 <p><code>.storeignore</code> contains literal root-relative paths or trailing-slash subtree
-rules, one per line; blank lines and <code>#</code> comments are ignored. Globs and
-negations are refused. The file itself is included unless <code>.storeignore</code> is
+rules, one per line; blank lines and <code>#</code> comments are ignored. Glob and
+negation characters are literal, never operators. Rules require only relative
+nonempty components without <code>.</code> or <code>..</code>, so an otherwise unrepresentable
+filename can be excluded before manifest path validation.
+The file itself is included unless <code>.storeignore</code> is
 listed. Excluded entries are not inspected. The control file is at most
-64 KiB and a walk visits at most 10000 entries, besides manifest limits.</p>
+64 KiB and a walk inspects at most 10000 non-excluded entries, besides manifest limits.</p>
 <p>The default cache is <code>~/.cache/cosmix/store/</code> (override <code>--cache</code>). One
 exclusive process lock covers it; it cannot live inside the source tree.
 Target, collection and source root isolate resume records; object identity

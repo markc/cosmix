@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.3.0
 $c = require("store_client.mix")
 $checks = buffer()
 $dir = env("TMPDIR", "/tmp") .. "/store-client-test-" .. uuid()
@@ -41,14 +41,27 @@ try
   write_file($dir .. "/tree/.storeignore", "# literal rules\nlink\nnested/\n.storeignore\n")
   $ignored = $c.inventory($dir .. "/tree")
   check($ignored.file_count == 2, "LITERAL_AND_SUBTREE_IGNORE")
-  write_file($dir .. "/tree/.storeignore", "*.tmp\n")
+  write_file($dir .. "/tree/notes:2026.txt", "not representable")
+  write_file($dir .. "/tree/*.tmp", "literal star")
+  write_file($dir .. "/tree/.storeignore", "link\nnotes:2026.txt\n*.tmp\n.storeignore\n")
+  check($c.inventory($dir .. "/tree").file_count == 3, "EXCLUDE_BEFORE_PATH_VALIDATION_AND_LITERAL_STAR")
+  write_file($dir .. "/tree/.storeignore", "../escape\n")
   $caught = ""
   try
     $c.inventory($dir .. "/tree")
   catch $message, $error
     $caught = $error.code
   end
-  check($caught == "STORE_IGNORE", "NO_SILENT_GLOB_INTERPRETATION")
+  check($caught == "STORE_IGNORE", "STRUCTURAL_IGNORE_VALIDATION")
+  mkdir($dir .. "/excluded")
+  $rules = ".storeignore\n"
+  for $i = 0 to 10000
+    $name = "e" .. to_string($i)
+    write_file($dir .. "/excluded/" .. $name, "")
+    $rules = $rules .. $name .. "\n"
+  end
+  write_file($dir .. "/excluded/.storeignore", $rules)
+  check($c.inventory($dir .. "/excluded").file_count == 0, "EXCLUSIONS_DO_NOT_SPEND_WALK_LIMIT")
   $cfg = $c.configuration({node: "archive", instance: "two", "local-blobd": "blobd-fetch"})
   check($cfg.service == "stored-two.archive.bus" and $cfg.blobd == "blobd-two.archive.bus" and $cfg.local_blobd == "blobd-fetch", "EXPLICIT_ROUTING")
   $c.cache_lock($dir .. "/cache")

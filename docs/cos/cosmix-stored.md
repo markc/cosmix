@@ -146,10 +146,13 @@ snapshot or protection against hostile concurrent namespace replacement.
 Empty directories and file metadata are not archived.
 
 `.storeignore` contains literal root-relative paths or trailing-slash subtree
-rules, one per line; blank lines and `#` comments are ignored. Globs and
-negations are refused. The file itself is included unless `.storeignore` is
+rules, one per line; blank lines and `#` comments are ignored. Glob and
+negation characters are literal, never operators. Rules require only relative
+nonempty components without `.` or `..`, so an otherwise unrepresentable
+filename can be excluded before manifest path validation.
+The file itself is included unless `.storeignore` is
 listed. Excluded entries are not inspected. The control file is at most
-64 KiB and a walk visits at most 10000 entries, besides manifest limits.
+64 KiB and a walk inspects at most 10000 non-excluded entries, besides manifest limits.
 
 The default cache is `~/.cache/cosmix/store/` (override `--cache`). One
 exclusive process lock covers it; it cannot live inside the source tree.

@@ -1,4 +1,4 @@
--- version: 0.2.0
+-- version: 0.3.0
 $m = require("store_manifest.mix")
 $b = require("blob.mix")
 
@@ -32,25 +32,29 @@ end
 
 fn ignores($root)
   $path = $root .. "/.storeignore"
-  if not exists($path, {follow_symlinks: false}) then return [] end
+  if not exists($path, {follow_symlinks: false}) then return {exact: {}, subtrees: {}} end
   if not stat($path, {follow_symlinks: false}).is_file then raise("STORE_SOURCE", ".storeignore must be regular") end
   if stat($path).size > 65536 then raise("STORE_LIMIT", ".storeignore exceeds 64KiB") end
-  $out = []
+  $out = {exact: {}, subtrees: {}}
   for each $line in lines(read_file($path))
     $rule = trim($line)
     if $rule == "" or starts_with($rule, "#") then continue end
-    if contains($rule, "*") or contains($rule, "?") or contains($rule, "[") or starts_with($rule, "!") then raise("STORE_IGNORE", "only literal relative paths and directory/ rules are supported") end
     $bare = ends_with($rule, "/") ? slice($rule, 0, length($rule)-1) : $rule
-    $m.path($bare)
-    push($out, $rule)
+    for each $part in split($bare, "/")
+      if contains(["", ".", ".."], $part) then raise("STORE_IGNORE", "ignore rules must be structurally relative") end
+    end
+    if ends_with($rule, "/") then $out.subtrees[$bare] = true
+    else $out.exact[$bare] = true end
   end
   return $out
 end
 
 fn excluded($relative, $rules)
-  for each $rule in $rules
-    if $relative == $rule then return true end
-    if ends_with($rule, "/") and ($relative == slice($rule, 0, length($rule)-1) or starts_with($relative, $rule)) then return true end
+  if has_key($rules.exact, $relative) then return true end
+  $prefix = ""
+  for each $part in split($relative, "/")
+    $prefix = $prefix == "" ? $part : $prefix .. "/" .. $part
+    if has_key($rules.subtrees, $prefix) then return true end
   end
   return false
 end
@@ -68,10 +72,10 @@ fn inventory($directory)
     if not stat($dir, {follow_symlinks: false}).is_dir then raise("STORE_CHANGED", "source directory changed") end
     for each $name in sort(ls($dir))
       $relative = $parent == "" ? $name : $parent .. "/" .. $name
+      if excluded($relative, $rules) then continue end
       $m.path($relative)
       $visited = $visited + 1
       if $visited > 10000 then raise("STORE_LIMIT", "walk exceeds 10000 entries") end
-      if excluded($relative, $rules) then continue end
       $file = $root .. "/" .. $relative
       $s = stat($file, {follow_symlinks: false})
       if $s.is_dir then
