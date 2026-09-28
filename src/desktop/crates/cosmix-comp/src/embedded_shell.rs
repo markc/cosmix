@@ -40,7 +40,14 @@ fn forward_output_icon_scale(
     scale: Option<Res<crate::compositor_scene::RendererOutputScale120>>,
     mut icon: ResMut<EmbeddedIconScale>,
 ) {
-    let value = scale.map(|s| f32::from(s.0) / 120.0);
+    // An injected 1.0 carries nothing the window heuristic lacks (under
+    // kms-live the heuristic also reads 1.0), while in a nested winit host
+    // a default 120 output scale sits next to a real HiDPI window scale —
+    // pinning 1.0 there would regress dev-mode icons. `None` defers to the
+    // heuristic wherever the KMS scale says 1:1.
+    let value = scale
+        .map(|s| f32::from(s.0) / 120.0)
+        .filter(|scale| *scale != 1.0);
     if icon.0 != value {
         icon.0 = value;
     }
