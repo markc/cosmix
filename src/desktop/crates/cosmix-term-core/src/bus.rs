@@ -96,7 +96,11 @@ pub(crate) fn start_at(
             // as "unavailable or connection timed out", sending the reader
             // to check noded for a terminal that was merely second. Try the
             // base name; on a registration refusal — and only that — retry
-            // once as `<base>-<pid>`, which names the one process that can
+            // once as `<base>-<pid>`. noded shares rc 10 between a name
+            // collision and an admission-policy refusal, so an admission
+            // refusal also earns this one extra attempt; harmless — the
+            // second refusal prints the broker's own words. `<base>-<pid>`
+            // names the one process that can
             // own it. The suffixed instance is a fully working terminal
             // serving the same surface under its own name; any other
             // failure, including a refusal of the suffixed name too, leaves
@@ -335,7 +339,18 @@ async fn serve(
                 let command = match event {
                     Some(BoundedIncomingEvent::Command(c)) => c,
                     Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("{service} Bus incoming overflow"); continue; },
-                    None => break,
+                    None => {
+                        // The lane closes when the supervisor gives up — with
+                        // fatal_on_registration_rejection(true) that includes a
+                        // reconnect refused because a rival re-registered this
+                        // name while we were in backoff. The supervisor logs
+                        // that at debug only and no tracing subscriber runs
+                        // here, so without this line the window would keep
+                        // running Bus-less in silence — the T10 shape, one
+                        // indirection deeper.
+                        eprintln!("{service} Bus connection lost; this window is graphics-only until restarted");
+                        break;
+                    },
                 };
                 let guarded = guard(terminal, std::panic::AssertUnwindSafe(|| dispatch(
                     crate::control::mesh_open(),
