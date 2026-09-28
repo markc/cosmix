@@ -1,5 +1,5 @@
 use crate::tabs::{Change, Cleanup, CompletionNote, Outcome, TabSet};
-use cosmix_client::{BoundedIncomingEvent, IncomingCommand, SupervisedClient};
+use cosmix_client::{BoundedIncomingEvent, IncomingCommand, SupervisedClient, SupervisedError};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -90,11 +90,44 @@ pub(crate) fn start_at(
     std::thread::Builder::new().name(format!("{service}-bus")).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("Bus runtime");
         runtime.block_on(async move {
-            let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options(service, &url).bounded_incoming(16).connect()).await;
-            let client = match result { Ok(Ok(client)) => Arc::new(client), _ => { eprintln!("{service} Bus unavailable or connection timed out"); return; } };
+            // T10 (2026-09-28): the desktop's first term holds the global
+            // name, so a second terminal window's registration is refused
+            // (noded rc=10) — and the pre-fix code reported every failure
+            // as "unavailable or connection timed out", sending the reader
+            // to check noded for a terminal that was merely second. Try the
+            // base name; on a registration refusal — and only that — retry
+            // once as `<base>-<pid>`, which names the one process that can
+            // own it. The suffixed instance is a fully working terminal
+            // serving the same surface under its own name; any other
+            // failure, including a refusal of the suffixed name too, leaves
+            // a graphics-only terminal, saying which.
+            let mut name = service.to_string();
+            let client = loop {
+                match connect_within(&name, &url).await {
+                    Ok(client) => break client,
+                    Err(ConnectFailure::TimedOut) => {
+                        eprintln!("{}", timed_out(&name));
+                        return;
+                    }
+                    Err(ConnectFailure::Refused(error)) => {
+                        let fallback = error
+                            .registration_rejection()
+                            .and_then(|_| next_name(service, &name));
+                        let Some(fallback) = fallback else {
+                            eprintln!("{}", unavailable(&name, &error));
+                            return;
+                        };
+                        name = fallback;
+                    }
+                }
+            };
+            if name != service {
+                eprintln!("{service} Bus name in use; serving this terminal as {name}");
+            }
+            let client = Arc::new(client);
             let Some(mut incoming) = client.incoming_bounded() else { return; };
             let mut notifications = tokio::task::JoinSet::new();
-            serve(service, &terminal, &cleanup, &mut notify_rx, &mut notifications, &mut incoming, &client).await;
+            serve(&name, &terminal, &cleanup, &mut notify_rx, &mut notifications, &mut incoming, &client).await;
             // The final reap can queue notes just after the TabSet becomes
             // empty. Wait for channel closure and outstanding sends together,
             // under one total deadline (not two seconds per pane).
@@ -105,6 +138,63 @@ pub(crate) fn start_at(
             let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
         });
     }).expect("Bus thread")
+}
+
+/// Why an initial Bus connect produced no client (T10): the supervisor
+/// answered with an error — a registration refusal of the attempted name,
+/// or its connect budget spent — or the lane's 2 s deadline passed first.
+/// The two arms print differently; the pre-fix single message is exactly
+/// the bug, and collapsing them again would restore it.
+enum ConnectFailure {
+    Refused(SupervisedError),
+    TimedOut,
+}
+
+/// One supervised registration as `name`, inside the lane's 2 s budget.
+///
+/// `fatal_on_registration_rejection(true)` makes the supervisor treat a
+/// broker refusal of THIS name as terminal on the spot: by default a
+/// refusal is retried like any failed attempt — five tries with full
+/// jitter, seconds — during which the 2 s timeout usually fires and hides
+/// the refusal (the T10 bug's other half). A duplicate `term` never comes
+/// free, so the immediate error is the useful one. Reconnects inherit the
+/// flag: a name lost to a rival while disconnected is terminal too.
+async fn connect_within(name: &str, url: &str) -> Result<SupervisedClient, ConnectFailure> {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        SupervisedClient::connect_options(name, url)
+            .bounded_incoming(16)
+            .fatal_on_registration_rejection(true)
+            .connect(),
+    )
+    .await
+    .map_err(|_| ConnectFailure::TimedOut)?
+    .map_err(ConnectFailure::Refused)
+}
+
+/// The message for a connect that answered with an error (T10): the
+/// actual error IS the message — a duplicate `term` names the collision,
+/// an unreachable noded names the transport failure. The pre-fix wording
+/// ("unavailable or connection timed out") sent every reader to check
+/// noded, whatever the cause.
+fn unavailable(service: &str, error: &SupervisedError) -> String {
+    format!("{service} Bus unavailable: {error}")
+}
+
+/// The message for a connect that never answered within the budget (T10):
+/// only this cause points at noded, so only this message names the
+/// timeout instead of quoting an error there is not one of.
+fn timed_out(service: &str) -> String {
+    format!("{service} Bus connection timed out")
+}
+
+/// T10's fallback ladder, one rung: only the BASE name's refusal earns a
+/// retry, as `<base>-<pid>` — the pid names the one process that can own
+/// the name, so no other live process can claim the result. A refusal of
+/// the suffixed name answers None: final, never a third name, so the
+/// caller stops and prints the actual error.
+fn next_name(base: &str, refused: &str) -> Option<String> {
+    (refused == base).then(|| format!("{base}-{}", std::process::id()))
 }
 
 /// Where the serving loop's commands come from. The broker's bounded lane in
@@ -2642,5 +2732,35 @@ mod tests {
                 assert!(rendered.contains(arg), "HELP missing {arg}");
             }
         }
+    }
+
+    /// T10: a Bus absence says which of the two causes it was. The refusal
+    /// arm quotes the underlying error verbatim; the timeout arm names the
+    /// timeout. The pre-fix single message ("unavailable or connection
+    /// timed out") did both jobs badly — a refused second instance read as
+    /// a noded problem.
+    #[test]
+    fn bus_absence_distinguishes_a_refusal_from_a_timeout() {
+        // Any constructible variant pins the property: the message embeds
+        // the error's own Display text.
+        let refused = unavailable("term", &SupervisedError::Disconnected);
+        assert!(refused.starts_with("term Bus unavailable: "), "{refused}");
+        assert!(refused.contains(&SupervisedError::Disconnected.to_string()));
+        let timed = timed_out("term");
+        assert!(timed.starts_with("term Bus connection timed out"), "{timed}");
+        assert_ne!(refused, timed);
+    }
+
+    /// T10: the fallback ladder — the base name's refusal earns exactly one
+    /// retry as `term-<pid>`, distinct from the base; the suffixed name's
+    /// refusal earns none, so a second-instance terminal never loops over
+    /// names.
+    #[test]
+    fn a_refused_base_name_gets_exactly_one_pid_suffixed_retry() {
+        let base = "term";
+        let fallback = next_name(base, base).expect("the base name retries once");
+        assert_eq!(fallback, format!("{base}-{}", std::process::id()));
+        assert_ne!(fallback, base);
+        assert_eq!(next_name(base, &fallback), None);
     }
 }
