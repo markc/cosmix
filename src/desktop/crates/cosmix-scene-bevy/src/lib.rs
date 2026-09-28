@@ -2,7 +2,9 @@
 #[cfg(feature = "gate")]
 mod gate;
 mod render;
-pub use render::{Events as SceneEvents, reconcile as reconcile_scene_mounts};
+pub use render::{
+    Events as SceneEvents, HostIconScale, reconcile as reconcile_scene_mounts,
+};
 
 use bevy::prelude::*;
 use cosmix_scene::{ResolvedScene, SceneDocument, Severity};

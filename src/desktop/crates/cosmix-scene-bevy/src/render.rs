@@ -41,6 +41,17 @@ use icons::IconCache;
 #[derive(Resource)]
 struct IconScale(f32);
 
+/// The host's canvas rasterisation scale for icon textures, injected when the
+/// host knows it and the generic heuristic cannot. Under kms-live the
+/// embedded shell renders straight to the KMS canvas: there is no winit
+/// window, `Window::scale_factor` reads 1.0, and the canvas really draws at
+/// the compositor's `--scale` (`RendererOutputScale120`) — so without this
+/// every icon rasterised at logical size and was linear-upscaled onto the
+/// canvas (soft panel icons at any source resolution). `None` keeps the
+/// window heuristic.
+#[derive(Resource, Default)]
+pub struct HostIconScale(pub Option<f32>);
+
 #[derive(Component, Clone)]
 struct Binding {
     scene: String,
@@ -277,7 +288,11 @@ struct SceneLayoutBase(Node);
 /// selection remain explicit shell actions, including on scene revisions.
 pub fn reconcile(world: &mut World) {
     remove_unseated_scenes(world);
-    let scale = icons::effective_scale(world);
+    world.init_resource::<HostIconScale>();
+    let scale = world
+        .get_resource::<HostIconScale>()
+        .and_then(|host| host.0)
+        .unwrap_or_else(|| icons::effective_scale(world));
     let scale_changed = world
         .get_resource::<IconScale>()
         .is_none_or(|old| old.0 != scale);

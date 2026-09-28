@@ -42,6 +42,18 @@ pub struct EmbeddedOutput {
     pub pointer: Option<Vec2>,
 }
 
+/// The host's canvas rasterisation scale for scene icon textures, forwarded
+/// by the embedding compositor (kms-live reads it from `--scale`; a winit
+/// host leaves it `None` and the renderer's window heuristic applies).
+#[derive(Resource, Default, Clone, Copy)]
+pub struct EmbeddedIconScale(pub Option<f32>);
+
+fn forward_icon_scale(mut host: ResMut<cosmix_scene_bevy::HostIconScale>, scale: Res<EmbeddedIconScale>) {
+    if host.0 != scale.0 {
+        host.0 = scale.0;
+    }
+}
+
 /// Visible panel rectangles, including the chrome animation offset. Hosts use
 /// these for input ownership, never the full invisible mount rectangles.
 #[derive(Resource, Default)]
@@ -158,6 +170,15 @@ impl EmbeddedQuoinPlugin {
                 .in_set(ShellRuntimeSet::Input)
                 .before(crate::bus_service::ShellBusDispatch),
         )
+            // The icon rasteriser must see the host scale before reconcile
+            // re-applies: reconcile runs after the Input set, so a forward
+            // inside the set lands one system ahead of the re-apply.
+            .init_resource::<EmbeddedIconScale>()
+            .init_resource::<cosmix_scene_bevy::HostIconScale>()
+            .add_systems(
+                Update,
+                forward_icon_scale.in_set(ShellRuntimeSet::Input),
+            )
             .add_systems(
                 Update,
                 (present, present_dialog).chain().in_set(ShellRuntimeSet::Host),

@@ -9,7 +9,7 @@ use bevy::{
     prelude::*,
 };
 use cosmix_quoin::embedded::{
-    EmbeddedOutput, EmbeddedPanelRegions, EmbeddedQuoinPlugin, EmbeddedWorkArea,
+    EmbeddedIconScale, EmbeddedOutput, EmbeddedPanelRegions, EmbeddedQuoinPlugin, EmbeddedWorkArea,
 };
 use cosmix_shell::{host::PanelRect, runtime::ShellRuntimeSet};
 use std::{
@@ -29,6 +29,22 @@ struct InputState {
 
 #[derive(Resource, Clone, Default)]
 pub(crate) struct EmbeddedShellBridge(Arc<Mutex<InputState>>);
+
+/// Forward the KMS output scale to the embedded shell's icon rasteriser.
+/// Under kms-live there is no winit window, so the scene renderer's own
+/// heuristic (`Window::scale_factor`) reads 1.0 while this canvas really
+/// draws at `--scale` — without the forward, every panel icon rasterised at
+/// logical size and drew linear-upscaled (soft icons at any source
+/// resolution). Runs in PreUpdate, ahead of the shell's Input-set forward.
+fn forward_output_icon_scale(
+    scale: Option<Res<crate::compositor_scene::RendererOutputScale120>>,
+    mut icon: ResMut<EmbeddedIconScale>,
+) {
+    let value = scale.map(|s| f32::from(s.0) / 120.0);
+    if icon.0 != value {
+        icon.0 = value;
+    }
+}
 
 impl EmbeddedShellBridge {
     #[cfg(test)]
@@ -119,10 +135,11 @@ pub(crate) fn install(app: &mut App, comp_service: &str) {
     let bridge = EmbeddedShellBridge::default();
     app.insert_resource(bridge)
         .add_plugins(EmbeddedQuoinPlugin::new().with_comp_service(comp_service))
+        .init_resource::<EmbeddedIconScale>()
         .add_systems(Startup, attach_protocol)
         .add_systems(
             PreUpdate,
-            pointer_input.before(PickingSystems::ProcessInput),
+            (forward_output_icon_scale, pointer_input.before(PickingSystems::ProcessInput)),
         )
         .add_systems(Update, publish_regions.after(ShellRuntimeSet::Host));
 }

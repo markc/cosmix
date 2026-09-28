@@ -51,7 +51,15 @@ pub(super) fn effective_scale(world: &mut World) -> f32 {
 }
 
 pub(super) fn load(world: &mut World, path: &str, w: f32, h: f32) -> Option<Handle<Image>> {
-    let factor = effective_scale(world);
+    // The host's canvas scale wins when injected (see HostIconScale): under
+    // kms-live the window heuristic reads 1.0 while the canvas draws at the
+    // compositor's output scale, and a heuristic-rasterised texture then
+    // draws linear-upscaled — visibly soft icons at any source resolution.
+    world.init_resource::<super::HostIconScale>();
+    let factor = world
+        .resource::<super::HostIconScale>()
+        .0
+        .unwrap_or_else(|| effective_scale(world));
     let w = (w * factor).ceil();
     let h = (h * factor).ceil();
     world.init_resource::<IconCache>();
@@ -415,6 +423,38 @@ mod tests {
                 .unwrap()
                 .width(),
             30
+        );
+    }
+
+    #[test]
+    fn host_icon_scale_overrides_the_window_heuristic() {
+        // The kms-live case: the primary window reads 1.0 (there is no winit
+        // window at all) while the canvas draws at the compositor's output
+        // scale. The injected host scale must win over the heuristic, and a
+        // changed injection must re-key the cache.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.svg");
+        std::fs::write(&path, SVG).unwrap();
+        let mut world = World::new();
+        let mut window = Window::default();
+        window.resolution.set_scale_factor_override(Some(1.0));
+        world.spawn((window, PrimaryWindow));
+        world.init_resource::<super::super::HostIconScale>();
+        let base = load(&mut world, path.to_str().unwrap(), 10.0, 10.0).unwrap();
+        assert_eq!(
+            world.resource::<Assets<Image>>().get(&base).unwrap().width(),
+            10
+        );
+        world.resource_mut::<super::super::HostIconScale>().0 = Some(2.5);
+        let scaled = load(&mut world, path.to_str().unwrap(), 10.0, 10.0).unwrap();
+        assert_ne!(base, scaled);
+        assert_eq!(
+            world
+                .resource::<Assets<Image>>()
+                .get(&scaled)
+                .unwrap()
+                .width(),
+            25
         );
     }
 }
