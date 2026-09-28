@@ -146,7 +146,35 @@ pub fn run_layer_host() -> AppExit {
     config::install(&mut app, smoke_all_panels || smoke_hidden);
     keyboard::install(&mut app);
     corner_menu::install(&mut app);
+    // The icon rasteriser must see the host's canvas scale before reconcile
+    // re-applies (the standalone twin of the embedded host's forward in
+    // `embedded.rs`): reconcile runs after the Input set, so a forward inside
+    // the set lands one system ahead of the re-apply. Without it the layer
+    // host's windowless-anchor shape leaves the renderer's window heuristic
+    // reading 1.0 while the canvas draws at the output scale — every icon
+    // rasterises at logical size and draws linear-upscaled.
+    app.init_resource::<cosmix_scene_bevy::HostIconScale>().add_systems(
+        Update,
+        forward_layer_host_icon_scale
+            .in_set(ShellRuntimeSet::Input)
+            .before(bus_service::ShellBusDispatch),
+    );
     app.run()
+}
+
+/// Forwards the layer host's applied canvas scale into the scene icon
+/// rasteriser. A `1.0` plan defers to the window heuristic (same rule as the
+/// embedded forward): it carries nothing the heuristic doesn't already read.
+fn forward_layer_host_icon_scale(
+    mut host: ResMut<cosmix_scene_bevy::HostIconScale>,
+    scale: Option<Res<cosmix_shell_host::HostCanvasScale>>,
+) {
+    let applied = scale
+        .map(|scale| scale.0)
+        .filter(|scale| *scale > 0.0 && (scale - 1.0).abs() > f32::EPSILON);
+    if host.0 != applied {
+        host.0 = applied;
+    }
 }
 
 fn configure_content(
@@ -449,5 +477,45 @@ mod tests {
             parse_cli(["--help".to_owned()]),
             Ok(CliAction::Help)
         ));
+    }
+
+    /// The layer host publishes the scale its surface plans draw at; the
+    /// rasteriser must see it, because the host's windowless-anchor shape
+    /// leaves the window heuristic reading 1.0 at any output scale.
+    #[test]
+    fn layer_host_scale_forwards_into_icon_rasteriser() {
+        let mut app = App::new();
+        app.init_resource::<cosmix_scene_bevy::HostIconScale>()
+            .insert_resource(cosmix_shell_host::HostCanvasScale(2.5))
+            .add_systems(Update, forward_layer_host_icon_scale);
+        assert_eq!(app.world().resource::<cosmix_scene_bevy::HostIconScale>().0, None);
+
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<cosmix_scene_bevy::HostIconScale>().0,
+            Some(2.5)
+        );
+    }
+
+    /// A `1.0` plan defers to the window heuristic, matching the embedded
+    /// host's rule, and a re-plan updates the rasteriser on change.
+    #[test]
+    fn layer_host_scale_one_defers_and_replans_flow_through() {
+        let mut app = App::new();
+        app.init_resource::<cosmix_scene_bevy::HostIconScale>()
+            .insert_resource(cosmix_shell_host::HostCanvasScale(1.0))
+            .add_systems(Update, forward_layer_host_icon_scale);
+
+        app.update();
+        assert_eq!(app.world().resource::<cosmix_scene_bevy::HostIconScale>().0, None);
+
+        app.world_mut()
+            .insert_resource(cosmix_shell_host::HostCanvasScale(2.0));
+        app.update();
+        assert_eq!(
+            app.world().resource::<cosmix_scene_bevy::HostIconScale>().0,
+            Some(2.0)
+        );
     }
 }

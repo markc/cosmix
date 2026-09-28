@@ -23,3 +23,4 @@ pub use runner::{
     CornerMenuHook, LayerHostConfig, LayerHostDeadline, LayerHostError, LayerHostWake,
     LayerPanelMounts, configure_layer_host,
 };
+pub use surface::HostCanvasScale;

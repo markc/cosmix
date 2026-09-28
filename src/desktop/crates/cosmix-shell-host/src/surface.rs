@@ -348,6 +348,20 @@ pub(crate) struct SurfaceScalePlan {
     pub viewport_destination: Option<(i32, i32)>,
 }
 
+/// The canvas rasterisation scale of the surface scale plan the host last
+/// applied (fractional preferred scale, else the output's integer scale).
+///
+/// Scene renderers rasterise logical-size assets (SVG icons) at this factor.
+/// They cannot read it from the windows: the layer host has no primary
+/// window — the `PrimaryWindow` focus anchor carries no `Window` — so a
+/// window-scale heuristic sees 1.0 while the canvas really draws at the plan
+/// scale, and heuristic-rasterised icons draw linear-upscaled, visibly soft.
+/// A consumer forwards this into its own rasteriser (quoin → scene-bevy's
+/// `HostIconScale`); `1.0` carries nothing the heuristic lacks, so consumers
+/// treat it as "defer to the heuristic".
+#[derive(Clone, Copy, Debug, PartialEq, Resource)]
+pub struct HostCanvasScale(pub f32);
+
 pub(crate) fn surface_scale_plan(
     logical: (u32, u32),
     integer_scale: i32,
@@ -1077,6 +1091,13 @@ impl PanelSurface {
                 .resolution
                 .set_physical_resolution(physical.0, physical.1);
         }
+        // The layer host has no primary window (the `PrimaryWindow` anchor
+        // carries no `Window`), so window-scale heuristics in scene renderers
+        // read 1.0 and rasterise logical-size assets at logical size. Publish
+        // the applied plan scale so the renderer can forward the real factor
+        // into its icon rasteriser. Last applied surface plan wins; surfaces
+        // share the host's single output (`LayerHostConfig::output`).
+        app.insert_resource(HostCanvasScale(scale as f32));
     }
 
     fn window_scale_plan_changed(&self, app: &App, plan: &SurfaceScalePlan) -> bool {
@@ -1176,6 +1197,23 @@ mod tests {
         run_teardown(&mut probe);
 
         assert_eq!(recorded(&sequence), TEARDOWN_ORDER);
+    }
+
+    /// The applied plan scale must reach scene renderers even when the window
+    /// entity carries no `Window` component (the anchor shape the real host
+    /// runs): heuristic readers would otherwise rasterise at 1.0.
+    #[test]
+    fn update_bevy_window_publishes_host_canvas_scale() {
+        let mut app = App::new();
+        let panel =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, teardown_sequence());
+
+        panel.update_bevy_window(&mut app, (3840, 130), 2.5);
+
+        assert_eq!(
+            app.world().get_resource::<HostCanvasScale>(),
+            Some(&HostCanvasScale(2.5))
+        );
     }
 
     #[test]
