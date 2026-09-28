@@ -322,9 +322,21 @@ impl Listener {
         Ok(())
     }
 }
+/// The catch-all's message (T11): the event's Debug name, which is stable
+/// across rio-vt's compiled feature sets. The discriminant index it
+/// replaced shifts when variants compile out — without the `graphics`
+/// feature `Discriminant(28)` was MouseCursorDirty — so the number named
+/// nothing a reader could look up.
+fn dropped_event(event: &RioEvent) -> String {
+    format!("term unsupported VT event dropped: {event:?}")
+}
+
 impl EventListener for Listener {
     fn send_event(&self, event: RioEvent, _: WindowId) {
         match event {
+            // Expected and frequent (T11): OSC 0/2 titles, most shell
+            // prompts — consumed here as the pane title, which is what
+            // feeds tab titles; the tab-title follow-up is TODO-term T3.
             RioEvent::Title(title) | RioEvent::TitleWithSubtitle(title, _) => self.set_title(title),
             RioEvent::ResetTitle => self.set_title(String::new()),
             RioEvent::PtyWrite(_, text) => {
@@ -347,10 +359,11 @@ impl EventListener for Listener {
                 self.quit.store(true, Ordering::Release);
                 self.wake();
             }
-            other => eprintln!(
-                "term unsupported VT event dropped: {:?}",
-                std::mem::discriminant(&other)
-            ),
+            // Expected and harmless (T11): the grid asks the host to
+            // re-decide the mouse-cursor shape on every scroll and
+            // mouse-mode DECSET, and this frontend has no host cursor.
+            RioEvent::MouseCursorDirty => {}
+            other => eprintln!("{}", dropped_event(&other)),
         }
     }
 }
@@ -2012,5 +2025,34 @@ mod tests {
             );
         }
         assert!(encode(Key::Control('1')).is_empty());
+    }
+
+    /// T11: the events a shell session fires by the hundred — Title (OSC
+    /// 0/2, most prompts) and MouseCursorDirty (every scroll, mouse-mode
+    /// DECSET) — must stay off the unsupported-event log, and a variant
+    /// that genuinely survives the match is reported by its Debug NAME,
+    /// stable across rio-vt's compiled feature sets, not the discriminant
+    /// index that shifts with them (without `graphics`, 28 was
+    /// MouseCursorDirty and 29 was Title — pre-C6, when Title still fell
+    /// through, that was the log's most frequent line).
+    #[test]
+    fn expected_vt_noise_stays_silent_and_survivors_log_their_names() {
+        let terminal = Terminal::from_test_vt(8, 3, b"");
+        let window = WindowId::from(0);
+        // Title is consumed as the pane title (TODO-term T3: the tab-title
+        // follow-up), never logged.
+        terminal
+            .listener
+            .send_event(RioEvent::Title("prompt".into()), window);
+        assert_eq!(terminal.listener.title(), "prompt");
+        // MouseCursorDirty is dropped silently: no damage token, no title
+        // change, nothing for the frontend to do.
+        terminal.listener.send_event(RioEvent::MouseCursorDirty, window);
+        assert!(terminal.damage.lock().unwrap().try_recv().is_err());
+        assert_eq!(terminal.listener.title(), "prompt");
+        // A survivor names itself.
+        let message = dropped_event(&RioEvent::Paste);
+        assert_eq!(message, "term unsupported VT event dropped: Paste");
+        assert!(!message.contains("Discriminant"), "names, not shifted indices");
     }
 }
