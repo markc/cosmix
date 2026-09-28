@@ -177,7 +177,12 @@ impl EmbeddedQuoinPlugin {
             .init_resource::<cosmix_scene_bevy::HostIconScale>()
             .add_systems(
                 Update,
-                forward_icon_scale.in_set(ShellRuntimeSet::Input),
+                // Ordered against `prepare` (exclusive) so the Input set has
+                // no ambiguity pair; the order itself is semantically free —
+                // nothing in `prepare` reads HostIconScale.
+                forward_icon_scale
+                    .in_set(ShellRuntimeSet::Input)
+                    .after(prepare),
             )
             .add_systems(
                 Update,
