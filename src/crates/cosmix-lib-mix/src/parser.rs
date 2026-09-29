@@ -360,8 +360,26 @@ impl Parser {
     /// `data_encode` quotes it automatically).
     fn expect_field_name(&mut self) -> MixResult<String> {
         if matches!(self.peek(), Token::Function) {
+            // C8 (TODO-mix 2026-09-24): `fn`/`function` share one token, and
+            // this used to return "function" unconditionally — so `.fn`
+            // READ the "function" key (`{"fn":1,"function":2}.fn` -> 2).
+            // Read the SOURCE spelling instead (same rule as the Bus-name
+            // segments), so `.fn` and `.function` each read their own key.
+            let offset = self.tokens[self.pos].offset;
             self.advance();
-            return Ok("function".to_string());
+            let spelling = ["fn", "function"]
+                .into_iter()
+                .find(|kw| {
+                    let end = offset + kw.len();
+                    end <= self.source.len()
+                        && self.source[offset..end].iter().copied().eq(kw.chars())
+                        && !self
+                            .source
+                            .get(end)
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                })
+                .unwrap_or("function");
+            return Ok(spelling.to_string());
         }
         self.expect_name_or_keyword()
     }
