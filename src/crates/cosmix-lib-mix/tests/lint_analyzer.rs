@@ -1098,3 +1098,18 @@ fn push_assign_back_is_an_error() {
     let out = codes("$l = [1]\npush($l, 2)\nprint($l)\n");
     assert!(!out.contains(&"MIX-E1508".to_string()), "got: {out:?}");
 }
+
+#[test]
+fn reflex_surplus_arity_gets_the_mix_form_hint() {
+    // A5: remove(map, key) — a surplus argument that is a Python hand —
+    // carries the Mix-form hint on the E1201 diagnostic.
+    let diags = lint_full("$m = {a: 1}\nremove($m, \"a\")\n");
+    let e1201 = diags
+        .iter()
+        .find(|(c, _)| c == "MIX-E1201")
+        .expect("E1201 fires");
+    assert!(
+        e1201.1.as_deref().is_some_and(|h| h.contains("delete(map, key)")),
+        "reflex hint missing: {diags:?}"
+    );
+}

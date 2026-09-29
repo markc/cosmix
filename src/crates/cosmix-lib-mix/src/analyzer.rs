@@ -1672,6 +1672,13 @@ fn check_expr(
             if let Some(info) = builtins::builtin_info_of(name)
                 && !info.contract.accepts_arity(args.len())
             {
+                // A5 (TODO-mix 2026-09-24): a surplus argument that matches
+                // a known reflex shape gets the Mix form named — the
+                // reflex-call table, so a Python/JS/bash hand learns the
+                // Mix spelling at the exact site it guessed wrong.
+                let reflex = REFLEX_SURPLUS_HINTS.iter().find(|(n, count, _)| {
+                    *n == name.as_str() && args.len() == *count
+                });
                 a.diagnostics.push(diag(
                     ctx,
                     "MIX-E1201",
@@ -1682,7 +1689,7 @@ fn check_expr(
                         args.len(),
                         info.signature()
                     ),
-                    None,
+                    reflex.map(|(_, _, hint)| (*hint).to_string()),
                 ));
             }
             // E1202: user-function arity when uniquely defined and not
@@ -2047,6 +2054,30 @@ fn check_shell_command_statements(stmts: &[Stmt], ctx: &FileContext, a: &mut Ana
         }
     }
 }
+
+/// A5 (TODO-mix 2026-09-24): the reflex-call table — a SURPLUS argument
+/// on these builtins is a Python/JS/bash hand, so the E1201 hint names
+/// the Mix form at the exact call site. (The doc-shout rows — `range`
+/// inclusivity, `sort` comparator order, `filter` list-first — live in
+/// the manual; the get/set/find did-you-mean lives with the undefined-
+/// name suggester, whose targets must be real builtins.)
+const REFLEX_SURPLUS_HINTS: &[(&str, usize, &str)] = &[
+    (
+        "remove",
+        2,
+        "remove(path) deletes a FILE — delete(map, key) removes a map key; filter(list, pred) drops list items",
+    ),
+    ("replace", 4, "replace() replaces ALL — replace_first() is the count-1 form"),
+    ("split", 3, "split() takes no limit — split_once() splits at the first occurrence"),
+    ("push", 3, "push() takes one value — call it twice, or concat(list, [a, b])"),
+    ("pop", 2, "pop() takes no index — shift() removes the FIRST element"),
+    ("sort", 2, "sort() takes no comparator — sort_by(fn) compares; sort + reverse for descending"),
+    ("zip", 3, "zip() takes two lists — chain zip() calls"),
+    ("merge", 3, "merge() takes two maps — chain merge() calls"),
+    ("path_join", 3, "path_join() takes two parts — nest it, or join(parts, \"/\")"),
+    ("basename", 2, "basename() takes one arg — strip_suffix(name, suffix)"),
+    ("dkim_keygen", 2, "dkim_keygen() takes no bit length"),
+];
 
 /// Whether `head` names an executable on this host's PATH — the B2 gate:
 /// only a real shell reflex fires, a prose string never does.
