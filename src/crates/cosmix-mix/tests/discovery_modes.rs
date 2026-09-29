@@ -116,7 +116,7 @@ fn agent_profile_adds_rules_and_promotes() {
         "E1505 must fire once (the string condition), not on while true: {out}"
     );
     assert!(
-        out.contains("MIX-D3015") && out.contains("\"severity\":\"error\""),
+        out.contains("MIX-D3015") && out.contains("\"severity\": \"error\""),
         "D3015 must promote to error under --agent: {out}"
     );
     std::fs::remove_dir_all(&dir).ok();
