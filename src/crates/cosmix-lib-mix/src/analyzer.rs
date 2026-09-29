@@ -1941,6 +1941,77 @@ fn check_recurring_silent_bugs(stmts: &[Stmt], ctx: &FileContext, a: &mut Analys
     check_shell_command_statements(stmts, ctx, a);
     check_send_rc_reads(stmts, ctx, a);
     check_push_assign_back(stmts, ctx, a);
+    check_collection_literal_traps(stmts, ctx, a);
+}
+
+/// C9/C10 (TODO-mix 2026-09-24): collection-literal traps the lint can
+/// PROVE — a builtin call whose first argument is a map literal holding a
+/// Function member of the SAME name (the member is unreachable; the
+/// builtin runs), a literal field absent from its literal map (nil at
+/// runtime), and a literal index out of range of its literal list.
+fn check_collection_literal_traps(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    for stmt in stmts {
+        walk_stmt_exprs(stmt, &mut |expr| match expr {
+            Expr::FunctionCall { name, args } => {
+                if crate::builtins::is_builtin(name) || crate::builtins_hof::lookup(name).is_some() {
+                    if let Some(Expr::MapLiteral(entries)) = args.first()
+                        && entries
+                            .iter()
+                            .any(|(k, v)| k == name && matches!(v, Expr::FunctionCall { .. }))
+                    {
+                        // C9: `$m = {len: fn() = 99}; $m.len()` runs the
+                        // BUILTIN len on the map — the member fn is dead.
+                        a.diagnostics.push(diag(
+                            ctx,
+                            "MIX-W2309",
+                            Severity::Warning,
+                            stmt.line,
+                            format!(
+                                "{name}() here runs the BUILTIN, not the map's member function \
+                                 — builtin-named members are unreachable via dot-call"
+                            ),
+                            Some(format!("call it through the index: $m[\"{name}\"]()")),
+                        ));
+                    }
+                }
+            }
+            Expr::FieldAccess {
+                object: box Expr::MapLiteral(entries),
+                field,
+            } => {
+                if !entries.iter().any(|(k, _)| k == field) {
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-W2310",
+                        Severity::Warning,
+                        stmt.line,
+                        format!("'{field}' is not a key of this literal map — the read is nil at runtime"),
+                        Some(format!("known keys: {}", entries.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", "))),
+                    ));
+                }
+            }
+            Expr::Index {
+                object: box Expr::ListLiteral(items),
+                index: box Expr::NumberLiteral(n),
+            } => {
+                if *n >= 0.0 && (*n as usize) >= items.len() {
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-W2310",
+                        Severity::Warning,
+                        stmt.line,
+                        format!(
+                            "index {} is out of range of this literal list ({} items) — the read is nil at runtime",
+                            *n as usize,
+                            items.len()
+                        ),
+                        None,
+                    ));
+                }
+            }
+            _ => {}
+        });
+    }
 }
 
 /// B2 (TODO-mix 2026-09-24): a shell command written inside a `.mix` file

@@ -15592,6 +15592,13 @@ impl Evaluator {
     }
 
     fn exec_parse(&mut self, source: &str, parts: &[ParsePart]) {
+        // C6 (TODO-mix 2026-09-24): `parse … with` silently bound "" when a
+        // delimiter was missing and ignored a trailing delimiter — a
+        // template mismatch read as success. A match-status variable makes
+        // the mismatch visible without changing binding behaviour:
+        // `$parse_ok` is true iff every delimiter in the template was
+        // found in the source, in order.
+        let mut parse_ok = true;
         // Collect variable names and delimiters in order
         let mut vars: Vec<&str> = Vec::new();
         let mut delimiters: Vec<Option<&str>> = Vec::new(); // delimiter BEFORE each variable
@@ -15609,6 +15616,9 @@ impl Evaluator {
                 }
             }
         }
+        // A trailing delimiter (pending_delim left over) is part of the
+        // template and must match too.
+        let trailing_delim = pending_delim;
 
         if vars.is_empty() {
             return;
@@ -15636,6 +15646,8 @@ impl Evaluator {
                     // Skip past the delimiter
                     if let Some(pos) = remaining.find(delim) {
                         remaining = &remaining[pos + delim.len()..];
+                    } else {
+                        parse_ok = false;
                     }
                 }
 
@@ -15655,6 +15667,7 @@ impl Evaluator {
                         // Delimiter not found, give remainder to this var
                         self.bind_scoped(var, Value::String(remaining.to_string()));
                         remaining = "";
+                        parse_ok = false;
                     }
                 } else {
                     // No next delimiter; split on whitespace to next word
@@ -15669,7 +15682,15 @@ impl Evaluator {
                     }
                 }
             }
+            // A trailing delimiter in the template must match at the end
+            // of the source.
+            if let Some(delim) = trailing_delim {
+                if !remaining.trim_end().ends_with(delim) {
+                    parse_ok = false;
+                }
+            }
         }
+        self.bind_scoped("parse_ok", Value::Bool(parse_ok));
     }
 
     fn ensure_map(&mut self, name: &str) {
