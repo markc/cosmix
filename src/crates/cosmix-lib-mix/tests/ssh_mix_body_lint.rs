@@ -164,7 +164,7 @@ $probe = <<END
 $n = length($base)
 print($n)
 END
-for $h in [\"alpha\", \"beta\"] do
+for $h in [\"alpha\", \"beta\"]
   $r = ssh_mix($h, $probe, {bindings: {base: $base}})
   print($r.ok)
 end
@@ -198,7 +198,7 @@ fn a_heredoc_bound_once_is_analysed_at_its_own_lines() {
 
 #[test]
 fn a_shared_heredoc_reports_each_finding_once() {
-    let src = "$probe = <<END\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\nEND\nfor $h in [\"a\", \"b\"] do\n  $r = ssh_mix($h, $probe)\nend\n$s = ssh_mix(\"c\", $probe)\n";
+    let src = "$probe = <<END\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\nEND\nfor $h in [\"a\", \"b\"]\n  $r = ssh_mix($h, $probe)\nend\n$s = ssh_mix(\"c\", $probe)\n";
     let n = codes(src).iter().filter(|c| *c == "MIX-E1501").count();
     assert_eq!(n, 1, "{:?}", codes(src));
 }
@@ -350,7 +350,7 @@ fn an_undefined_function_in_the_body_is_reported_with_its_suggestion() {
 fn a_call_inside_a_loop_is_linted() {
     // The loop-over-hosts shape. The 0.69.0 pass searched top-level
     // statements only, so exactly this was invisible.
-    let src = "for $h in [\"a\"] do\n  $r = ssh_mix($h, '\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\n')\nend\n";
+    let src = "for $h in [\"a\"]\n  $r = ssh_mix($h, '\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\n')\nend\n";
     assert!(codes(src).iter().any(|c| c == "MIX-E1501"), "{:?}", codes(src));
 }
 

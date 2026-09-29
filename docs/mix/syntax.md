@@ -267,8 +267,8 @@ other operator; no other binary operator gains this newline rule.
 
 Every compound form (`if`, `for`, `while`, `function`/`fn`, `on`, `try`) is closed
 by `end`. There is **no `do` keyword**: since 0.98.0 `do` is reserved and
-**refused with a parse error** (`unexpected `do` — Mix has no `do` keyword;
-blocks close with `end``). Before 0.98.0 a stray `do` was silently absorbed
+**refused with a parse error** — `unexpected do — Mix has no do keyword;
+blocks close with end`. Before 0.98.0 a stray `do` was silently absorbed
 as a bare-identifier no-op — the bash reflex ran, and meant nothing. (A few
 legacy terminators — `next` for loops, `done` for `while`/`loop`/`on` — still
 parse with a deprecation warning; `if` and `function`/`fn` accept **only** `end`.

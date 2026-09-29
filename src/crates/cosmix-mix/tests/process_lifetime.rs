@@ -103,7 +103,7 @@ fn owned_spawn_group_is_terminated_when_mix_exits_normally() {
     let source = format!(
         "$pid = spawn({}, {{die_with_parent: true}})\n\
          $n = 0\n\
-         while !exists(\"{d}/desc\") and $n < 250 do\n  sleep(0.02)\n  $n = $n + 1\nend\n\
+         while !exists(\"{d}/desc\") and $n < 250\n  sleep(0.02)\n  $n = $n + 1\nend\n\
          print($pid)\n",
         helper_argv(&dir)
     );
@@ -145,7 +145,7 @@ fn owned_spawn_leader_dies_when_mix_is_killed() {
     let source = format!(
         "spawn({}, {{die_with_parent: true}})\n\
          $n = 0\n\
-         while !exists(\"{d}/desc\") and $n < 250 do\n  sleep(0.02)\n  $n = $n + 1\nend\n\
+         while !exists(\"{d}/desc\") and $n < 250\n  sleep(0.02)\n  $n = $n + 1\nend\n\
          print(\"ready\")\n\
          sleep(60)\n",
         helper_argv(&dir)
@@ -183,7 +183,7 @@ fn plain_spawn_child_survives_mix_exit() {
     let source = format!(
         "spawn([\"sh\", \"-c\", \"echo $$ > {d}/leader; exec sleep 60\"])\n\
          $n = 0\n\
-         while !exists(\"{d}/leader\") and $n < 250 do\n  sleep(0.02)\n  $n = $n + 1\nend\n"
+         while !exists(\"{d}/leader\") and $n < 250\n  sleep(0.02)\n  $n = $n + 1\nend\n"
     );
     let script = write_script(&dir, &source);
     let status = Command::new(env!("CARGO_BIN_EXE_mix"))
