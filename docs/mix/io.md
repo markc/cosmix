@@ -1196,12 +1196,12 @@ The contract is `print`'s, minus the newline and the separator:
   output policy; a program that must reach the process descriptor regardless is
   not a Mix script.
 
-### A failed write RAISES — the one difference from `print`
+### A failed write RAISES — `print` included since 0.99.0
 
-`print` and `printf` discard write errors. This family must not: its whole
-contract is that the named bytes reached the consumer, so a dropped write
-reported as success is the single failure mode it cannot have. The error is
-catchable and code-distinguished:
+Since 0.99.0 (B9) `print`, `eprint`, `printf` and `eprintf` raise the same
+write errors as this family: a dropped write reported as success was the
+one failure mode an agent reading rc could not see, on every output path.
+The error is catchable and code-distinguished:
 
 | code | meaning |
 |---|---|

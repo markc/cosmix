@@ -1405,11 +1405,11 @@ to the real descriptor. There is deliberately no way to bypass the host's
 output policy; a program that must reach the process descriptor regardless is
 not a Mix script.</li>
 </ul>
-<h3 id="a-failed-write-raises--the-one-difference-from-print">A failed write RAISES — the one difference from <code>print</code></h3>
-<p><code>print</code> and <code>printf</code> discard write errors. This family must not: its whole
-contract is that the named bytes reached the consumer, so a dropped write
-reported as success is the single failure mode it cannot have. The error is
-catchable and code-distinguished:</p>
+<h3 id="a-failed-write-raises--print-included-since-0990">A failed write RAISES — <code>print</code> included since 0.99.0</h3>
+<p>Since 0.99.0 (B9) <code>print</code>, <code>eprint</code>, <code>printf</code> and <code>eprintf</code> raise the same
+write errors as this family: a dropped write reported as success was the
+one failure mode an agent reading rc could not see, on every output path.
+The error is catchable and code-distinguished:</p>
 <table><thead><tr><th>code</th><th>meaning</th></tr></thead><tbody>
 <tr><td><code>IO_BROKEN_PIPE</code></td><td>the consumer closed the pipe (<code>| head -1</code>, a reader that exited)</td></tr>
 <tr><td><code>IO_WRITE_FAILED</code></td><td>anything else — a full disk, a closed descriptor</td></tr>
