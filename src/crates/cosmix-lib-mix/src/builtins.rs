@@ -4098,6 +4098,10 @@ pub(crate) fn spawn_argv_native(args: Vec<Value>, mut native: Option<&mut crate:
     let mut tag = String::new();
     let mut cwd: Option<String> = None;
     let mut env: Vec<(String, String)> = Vec::new();
+    // 09-24 entry: a nil env value REMOVES the variable from the child
+    // (the `env -u` form). Collected separately so the set-then-unset
+    // order below is deliberate: a key both set and unset ends unset.
+    let mut env_unset: Vec<String> = Vec::new();
     let mut clear_env = false;
     let mut stdout = RunArgvOutput::Null;
     let mut stderr = RunArgvStderr::Null;
@@ -4185,6 +4189,13 @@ pub(crate) fn spawn_argv_native(args: Vec<Value>, mut native: Option<&mut crate:
                         let sval = match ev {
                             Value::String(s) => s.clone(),
                             Value::Number(_) | Value::Bool(_) => ev.to_mix_string(),
+                            // 09-24 entry: nil REMOVES the variable from the
+                            // child environment (the `env -u` form) instead
+                            // of raising OPTION_INVALID.
+                            Value::Nil => {
+                                env_unset.push(ek.clone());
+                                continue;
+                            }
                             other => {
                                 return Err(opt_invalid(
                                     caller,
@@ -4318,6 +4329,11 @@ pub(crate) fn spawn_argv_native(args: Vec<Value>, mut native: Option<&mut crate:
     }
     for (k, v) in &env {
         command.env(k, v);
+    }
+    // 09-24 entry: unset runs AFTER set so a key both set and unset ends
+    // unset — the deliberate order, documented.
+    for k in &env_unset {
+        command.env_remove(k);
     }
     // Open output routes BEFORE spawning; a file-open failure means the
     // child is never started (like run_argv's PROCESS_STDIO). stderr:stdout
@@ -5885,6 +5901,9 @@ struct RunArgvOpts {
     stdin: RunArgvStdin,
     cwd: Option<String>,
     env: Vec<(String, String)>,
+    /// 09-24 entry: nil env values become removals — applied AFTER `env`
+    /// so a key both set and unset ends unset.
+    env_unset: Vec<String>,
     clear_env: bool,
     max_output: Option<usize>,
     stream: bool,
@@ -6197,6 +6216,7 @@ fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts
         stdin: RunArgvStdin::Null,
         cwd: None,
         env: Vec::new(),
+        env_unset: Vec::new(),
         clear_env: false,
         max_output: Some(RUN_ARGV_DEFAULT_MAX_OUTPUT),
         stream: false,
@@ -6294,6 +6314,12 @@ fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts
                     let sval = match ev {
                         Value::String(s) => s.clone(),
                         Value::Number(_) | Value::Bool(_) => ev.to_mix_string(),
+                        // 09-24 entry: nil REMOVES the variable from the
+                        // child environment (the `env -u` form).
+                        Value::Nil => {
+                            opts.env_unset.push(ek.clone());
+                            continue;
+                        }
                         other => {
                             return Err(opt_invalid(
                                 caller,
@@ -7402,6 +7428,11 @@ fn builtin_run_stream(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
     for (k, v) in opts.env.iter() {
         cmd.env(k, v);
+    }
+    // 09-24 entry: removals run AFTER sets — a key both set and unset
+    // ends unset (the deliberate order).
+    for k in opts.env_unset.iter() {
+        cmd.env_remove(k);
     }
     if let Some(dir) = opts.cwd.as_deref() {
         cmd.current_dir(dir);
@@ -13773,7 +13804,18 @@ fn builtin_read_link(args: Vec<Value>) -> MixResult<Option<Value>> {
 
 fn builtin_remove(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("remove", &args, 1)?;
-    let path = args[0].to_mix_string();
+    // 09-24 entry: the fs delete accepts a non-string silently — a map or
+    // number was rendered to a path and REMOVED (or no-opped). The type
+    // check names the expected string path before any filesystem effect.
+    let path = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(MixError::Structured(Box::new(crate::error::ErrorInfo::new(
+                "TYPE_MISMATCH",
+                format!("remove(): path must be a string, got {}", other.type_name()),
+            ))));
+        }
+    };
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(Some(Value::Nil)),
         // rm -f semantics: a path that is already gone is a no-op, not an error.
@@ -13787,7 +13829,17 @@ fn builtin_remove(args: Vec<Value>) -> MixResult<Option<Value>> {
 
 fn builtin_remove_dir(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("remove_dir", &args, 1)?;
-    let path = args[0].to_mix_string();
+    // Same type discipline as remove() — a non-string path must raise
+    // before remove_dir_all runs (that call is destructive).
+    let path = match &args[0] {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(MixError::Structured(Box::new(crate::error::ErrorInfo::new(
+                "TYPE_MISMATCH",
+                format!("remove_dir(): path must be a string, got {}", other.type_name()),
+            ))));
+        }
+    };
     match std::fs::remove_dir_all(&path) {
         Ok(()) => Ok(Some(Value::Nil)),
         // rm -rf semantics: already gone is a no-op.

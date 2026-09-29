@@ -563,8 +563,10 @@ no-deadline contract, and the writer is not detached as a leaked thread.</p>
 </li>
 <li>
 <p><code>cwd</code>, <code>env</code> (map overlaid on the inherited environment; keys
-<code>[A-Za-z_][A-Za-z0-9_]*</code>, values string/number/bool), and <code>clear_env</code> (bool —
-start from an empty environment) retain their existing meanings.</p>
+<code>[A-Za-z_][A-Za-z0-9_]*</code>, values string/number/bool — a <strong>nil</strong> value
+REMOVES the variable from the child, the <code>env -u</code> form), and <code>clear_env</code>
+(bool — start from an empty environment) retain their existing meanings.
+Removals apply AFTER sets, so a key both set and unset ends unset.</p>
 </li>
 <li>
 <p><code>max_output</code>: bytes <strong>per captured stream</strong>, default 8 MiB, <code>0</code> disables.

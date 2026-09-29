@@ -127,8 +127,10 @@ Options (unknown keys are a hard `OPTION_INVALID` error):
 - `stderr`: `"capture"` (default), `"inherit"`, `"null"`, `"stdout"`
   (the `2>&1` merge), or the same file map.
 - `cwd`, `env` (map overlaid on the inherited environment; keys
-  `[A-Za-z_][A-Za-z0-9_]*`, values string/number/bool), and `clear_env` (bool —
-  start from an empty environment) retain their existing meanings.
+  `[A-Za-z_][A-Za-z0-9_]*`, values string/number/bool — a **nil** value
+  REMOVES the variable from the child, the `env -u` form), and `clear_env`
+  (bool — start from an empty environment) retain their existing meanings.
+  Removals apply AFTER sets, so a key both set and unset ends unset.
 - `max_output`: bytes **per captured stream**, default 8 MiB, `0` disables.
   Excess is drained and discarded — the child is never blocked or killed by the
   cap, and the captured stream's truncation flag is set. The same flag is true
