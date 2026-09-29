@@ -6659,8 +6659,8 @@ impl Evaluator {
                                         .map(|i| l[i].clone())
                                         .unwrap_or(Value::Nil)
                                 }
-                                (Some(Value::Map(ref m)), Value::String(s)) => m
-                                    .get(&s)
+                                (Some(Value::Map(ref m)), Value::String(ref s)) => m
+                                    .get(s)
                                     .cloned()
                                     .unwrap_or(Value::Nil),
                                 (Some(Value::Bytes(ref b)), Value::Number(n)) => {
