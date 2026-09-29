@@ -6654,16 +6654,16 @@ impl Evaluator {
                         InterpSuffix::Index(expr_src) => {
                             let idx = self.eval_interp_fragment(expr_src).await?;
                             match (cur.take(), idx) {
-                                (Some(Value::List(l)), Value::Number(n)) => {
+                                (Some(Value::List(ref l)), Value::Number(n)) => {
                                     crate::builtins::resolve_signed_index(n as i64, l.len())
                                         .map(|i| l[i].clone())
                                         .unwrap_or(Value::Nil)
                                 }
-                                (Some(Value::Map(m)), Value::String(s)) => m
+                                (Some(Value::Map(ref m)), Value::String(s)) => m
                                     .get(&s)
                                     .cloned()
                                     .unwrap_or(Value::Nil),
-                                (Some(Value::Bytes(b)), Value::Number(n)) => {
+                                (Some(Value::Bytes(ref b)), Value::Number(n)) => {
                                     crate::builtins::resolve_signed_index(n as i64, b.len())
                                         .map(|i| Value::Number(b[i] as f64))
                                         .unwrap_or(Value::Nil)
@@ -6684,7 +6684,8 @@ impl Evaluator {
                         InterpSuffix::Call(args_src) => {
                             let args = self.eval_interp_args(args_src).await?;
                             match cur.take() {
-                                Some(Value::Function(rc)) => {
+                                Some(Value::Function(ref rc)) => {
+                                    let rc = Rc::clone(rc);
                                     self.call_function(&rc, &args).await?
                                 }
                                 Some(other) => {
