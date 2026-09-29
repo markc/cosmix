@@ -549,8 +549,31 @@ fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
                 }
                 StmtKind::For { body, .. }
                 | StmtKind::ForEach { body, .. }
-                | StmtKind::Address { body, .. }
-                | StmtKind::On { body, .. } => walk(body, ctx, a, known, outer_vars),
+                | StmtKind::Address { body, .. } => walk(body, ctx, a, known, outer_vars),
+                StmtKind::On { body, .. } => {
+                    // B5 lint half: a request handler with no reply() on any
+                    // path leaves its caller to time out (the runtime now
+                    // answers NO_REPLY rc 17, but the author should know at
+                    // lint time). Topic handlers may legitimately never
+                    // reply, so this is --agent-only and worded for both.
+                    if !body_contains_call(body, "reply") {
+                        a.diagnostics.push(diag(
+                            ctx,
+                            "MIX-W2308",
+                            Severity::Warning,
+                            stmt.line,
+                            "handler has no reply() — a request caller waits out its full timeout \
+                             (the runtime answers rc 17 NO_REPLY, but the caller wanted an answer)"
+                                .to_string(),
+                            Some(
+                                "add reply($value) on every request path (topic-only handlers may \
+                                 ignore this)"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+                    walk(body, ctx, a, known, outer_vars);
+                }
                 StmtKind::FunctionDef { name, params, body, .. } => {
                     // R4: an assignment to a name that exists as an OUTER
                     // VARIABLE (and is not one of this fn's params) creates
@@ -656,6 +679,22 @@ fn body_stmt_list(body: &FunctionBody) -> &[Stmt] {
         FunctionBody::Block(s) => s,
         FunctionBody::Expression(_) => &[],
     }
+}
+
+/// Whether any statement in these bodies calls `name` (one level, enough
+/// for the B5 handler check).
+fn body_contains_call(stmts: &[Stmt], name: &str) -> bool {
+    let mut found = false;
+    for stmt in stmts {
+        walk_stmt_exprs(stmt, &mut |expr| {
+            if let Expr::FunctionCall { name: n, .. } = expr
+                && n == name
+            {
+                found = true;
+            }
+        });
+    }
+    found
 }
 
 /// Every `$var = …` written inside these statements, one nesting level

@@ -214,6 +214,11 @@ pub const LINT_DOCS: &[LintDoc] = &[
         detail: "A `send` whose `$rc` (or `$result`/`$reply`) is never READ before the next send or the end of the block — send failures are non-fatal, so a script whose sends all fail still exits 0 and reads as success (B4). Read the status after the send, or use a checked form. The opt-in `--strict-send` execution gate is the deferred half.",
     },
     LintDoc {
+        code: "MIX-W2308",
+        summary: "on handler never replies (--agent)",
+        detail: "A handler with no `reply()` on any path leaves a request caller waiting out its full timeout; the serve runtime now answers rc 17 NO_REPLY, but the author should fix the omission at lint time. Topic-only handlers may legitimately never reply, so this is emitted only under `--agent` / `MIX_LINT=agent` and worded for both cases.",
+    },
+    LintDoc {
         code: "MIX-W2401",
         summary: "source/include defeats analysis",
         detail: "One `source`/`include` anywhere disables the undefined-name checks for the whole file (the loaded file can define anything) — reported once so you know analysis is degraded. Prefer `require()`: it is isolated, statically resolvable, and MIX-E1401/E1402 verify literal-path modules parse.",

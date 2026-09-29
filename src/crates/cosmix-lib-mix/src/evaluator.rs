@@ -1365,6 +1365,10 @@ pub const CLASSC_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_se
 /// distinguishable from an author's own `reply(10, …)` refusal by rc
 /// alone; the `error_code` in the body is the authoritative signal.
 pub const HANDLER_FAULT_RC: u8 = 15;
+pub const HANDLER_CANCELLED_RC: u8 = 16;
+/// B5: a request handler that RETURNS without `reply()` is answered with
+/// this rc so the caller fails fast instead of waiting out its timeout.
+pub const NO_REPLY_RC: u8 = 17;
 
 /// SPEC 18 §3.4 — body of the synthetic handler-fault reply.
 ///
@@ -1375,6 +1379,13 @@ pub const HANDLER_FAULT_RC: u8 = 15;
 /// the Bus (it can carry request data or Trojan-Source bytes).
 pub const HANDLER_FAULT_BODY: &str =
     r#"{"error":"internal handler error","error_code":"HANDLER_FAULT"}"#;
+
+/// B5 — body of the synthetic no-reply answer: a handler that completed
+/// without `reply()`. Fixed and non-sensitive, same shape as
+/// [`HANDLER_FAULT_BODY`] so `$result`/`$reply.error_code` work on every
+/// route.
+pub const NO_REPLY_BODY: &str =
+    r#"{"error":"handler completed without reply()","error_code":"NO_REPLY"}"#;
 
 /// SPEC 18 Phase 2 WS3-C.7f — `rc` value for synth'd shutdown replies.
 ///
@@ -5616,7 +5627,19 @@ impl Evaluator {
         // the server-side log and never crosses the Bus boundary (it can
         // carry request data or Trojan-Source bytes; the WG trust domain
         // does not make peers non-adversarial).
-        if faulted && handle.is_unanswered_request() {
+        //
+        // B5 (TODO-mix 2026-09-24): the SAME synthesis now covers a clean
+        // return without `reply()` — rc 17 NO_REPLY, body "handler
+        // completed without reply()" — so a request handler that simply
+        // forgot its answer fails fast instead of leaving the caller to
+        // wait out its full timeout and read a mesh failure that is
+        // really a missing reply.
+        if handle.is_unanswered_request() {
+            let (rc, body) = if faulted {
+                (HANDLER_FAULT_RC, HANDLER_FAULT_BODY)
+            } else {
+                (NO_REPLY_RC, NO_REPLY_BODY)
+            };
             // SPEC 18 §3.4 + WS3-C.7c: route the synthetic reply
             // through the reply handle's reply-once CAS so the
             // shutdown drain (C.7f) cannot race this path and produce
@@ -5624,7 +5647,7 @@ impl Evaluator {
             // fault edge. `reply_once` itself releases its
             // `RefCell`-free `Rc<dyn BusHandler>` clone across the
             // `.await` — no globals borrow survives.
-            match handle.reply_once(HANDLER_FAULT_RC, HANDLER_FAULT_BODY).await {
+            match handle.reply_once(rc, body).await {
                 Ok(_) => {}
                 Err(e) => tracing::error!(
                     command = %event.command,
