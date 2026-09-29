@@ -42,6 +42,24 @@ pub struct Lexer {
     data_mode: bool,
 }
 
+/// The complete reserved-word set, one name per lexer keyword token.
+///
+/// `mix keywords` and `mix what` read this through the lib, so it must
+/// mirror the `match` arms in [`Lexer::lex_identifier`]
+/// character-for-character. The drift test at the bottom of this module
+/// (`keyword_set_matches_lexer`) fails the build when the two disagree —
+/// a new keyword token added to the match without an entry here (or vice
+/// versa) cannot ship silently. The manual page `docs/mix/keywords.md` is
+/// held to the same set by `cosmix-mix/tests/man_pages.rs`.
+pub const KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "end", "for", "each", "in", "to", "step",
+    "next", "while", "done", "loop", "break", "continue", "function", "fn",
+    "return", "select", "when", "otherwise", "and", "or", "not", "true",
+    "false", "nil", "parse", "with", "send", "address", "emit", "on", "try",
+    "catch", "finally", "die", "export", "alias", "print", "eprint", "source",
+    "include", "label", "sh", "eq", "ne",
+];
+
 impl Lexer {
     pub fn new(source: &str) -> Self {
         let (continuation_sites, continuation_error) = match continuation_sites(source) {
@@ -1243,24 +1261,6 @@ impl Lexer {
         }
         Ok(self.spanned(Token::CommandSub(cmd), line, col))
     }
-
-    /// The complete reserved-word set, one name per lexer keyword token.
-    ///
-    /// `mix keywords` and `mix what` read this through the lib, so it must
-    /// mirror the `match` arms in [`lex_identifier`] character-for-character.
-    /// The drift test at the bottom of this module (`keyword_set_matches_lexer`)
-    /// fails the build when the two disagree — a new keyword token added to
-    /// the match without an entry here (or vice versa) cannot ship silently.
-    /// The manual page `docs/mix/keywords.md` is held to the same set by
-    /// `cosmix-mix/tests/man_pages.rs`.
-    pub const KEYWORDS: &[&str] = &[
-        "if", "then", "else", "elif", "end", "for", "each", "in", "to", "step",
-        "next", "while", "done", "loop", "break", "continue", "function", "fn",
-        "return", "select", "when", "otherwise", "and", "or", "not", "true",
-        "false", "nil", "parse", "with", "send", "address", "emit", "on", "try",
-        "catch", "finally", "die", "export", "alias", "print", "eprint",
-        "source", "include", "label", "sh", "eq", "ne",
-    ];
 
     fn lex_identifier(&mut self, line: usize, col: usize) -> MixResult<SpannedToken> {
         let mut name = String::new();
