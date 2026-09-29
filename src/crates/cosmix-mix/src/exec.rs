@@ -447,9 +447,44 @@ fn head_word(piece: &str) -> &str {
         .unwrap_or("")
 }
 
-/// Byte offset of a bare (quote-aware: NOT inside single quotes) `$?`.
-fn bare_dollar_question(piece: &str) -> Option<usize> {
+/// Whether the line carries an UNQUOTED `&&`, `||` or `;` — the classifier's
+/// shell-fallback criterion. Deliberately NOT the newline rule (B1): a
+/// `$`-headed multi-line program that fails the Mix parse must keep its Mix
+/// refusal verbatim, not fall into the shell path just because B1 made
+/// newlines split points (send_hyphenated_target pins the verbatim refusal).
+pub fn has_unquoted_control_op(line: &str) -> bool {
     let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match bytes[i] as char {
+            '\\' => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ';' if !in_single && !in_double => return true,
+            '&' | '|'
+                if !in_single
+                    && !in_double
+                    && bytes.get(i + 1) == Some(&bytes[i]) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Byte offset of a bare (quote-aware: NOT inside single quotes) `$?`.
+fn bare_dollar_question(piece: &str) -> Option<usize> {    let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
     for (i, ch) in piece.char_indices() {

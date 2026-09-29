@@ -520,7 +520,7 @@ fn try_mix_then_external(work: &str) -> InputKind {
                 return InputKind::ParseError(msg);
             }
             if let Ok(list) = exec::parse_command_list(work, &exec::NoVars)
-                && list.len() > 1
+                && exec::has_unquoted_control_op(work)
             {
                 return InputKind::ExternalCommand(work.to_string());
             }
