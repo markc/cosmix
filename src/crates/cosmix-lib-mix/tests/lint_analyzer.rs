@@ -1086,8 +1086,8 @@ fn shell_command_as_bare_string_is_an_error() {
 fn send_result_never_checked_warns() {
     let out = codes("send svc ping\nsend svc ping\n");
     assert!(out.contains(&"MIX-W2307".to_string()), "got: {out:?}");
-    // Reading $rc between sends satisfies the check.
-    let out = codes("send svc ping\nprint($rc)\nsend svc ping\n");
+    // Reading $rc after EACH send satisfies the check.
+    let out = codes("send svc ping\nprint($rc)\nsend svc ping\nprint($rc)\n");
     assert!(!out.contains(&"MIX-W2307".to_string()), "got: {out:?}");
 }
 
