@@ -38,8 +38,8 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.98.0 |
-| `cosmix-mix` | 0.98.0 |
+| `cosmix-lib-mix` | 0.98.1 |
+| `cosmix-mix` | 0.98.1 |
 | `mix-bench` | 0.1.1 |
 
 ## cos
