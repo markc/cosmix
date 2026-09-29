@@ -527,7 +527,7 @@ async fn index_reads_stay_lenient() {
         .expect("slice clamps");
     assert_eq!(out.trim(), "2");
     let out = run(
-        "print(length(take([1,2], 1000000000000000000000000000000)))\n",
+        "print(length(take([1,2], to_number(\"1000000000000000000000000000000\"))))\n",
         |_| {},
     )
     .await
