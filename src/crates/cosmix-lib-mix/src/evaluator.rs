@@ -12653,7 +12653,8 @@ impl Evaluator {
                     // script, the AI helpers (ai, ai_diagnose, context)
                     // shadowed module exports; a map member holding a
                     // Function now wins there).
-                    let serve_extensions_first = self.serve_runtime.is_some();
+                    let serve_extensions_first =
+                        self.globals.borrow().serve_runtime.is_some();
                     if serve_extensions_first
                         && let Some(ext_fn) = { self.globals.borrow().extensions.get(field).cloned() }
                     {
