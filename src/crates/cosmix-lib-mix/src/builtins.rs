@@ -19226,7 +19226,7 @@ fn builtin_password_hash(args: Vec<Value>) -> MixResult<Option<Value>> {
                     span: None,
                     msg: format!("password_hash(): {e}"),
                 })?;
-                let hasher = ShaCrypt::new(sha_crypt::Algorithm::Sha512, params);
+                let hasher = ShaCrypt::new(sha_crypt::Algorithm::Sha512Crypt, params);
                 match hasher.hash_password(plaintext.as_bytes()) {
                     Ok(h) => Ok(Some(Value::String(h.to_string()))),
                     Err(e) => Err(MixError::RuntimeError {
@@ -19323,9 +19323,9 @@ fn builtin_password_verify(args: Vec<Value>) -> MixResult<Option<Value>> {
     {
         let body = &hash[14..];
         if body.starts_with("$6$") {
-            return verify_sha_crypt(&plaintext, body, sha_crypt::Algorithm::Sha512);
+            return verify_sha_crypt(&plaintext, body, sha_crypt::Algorithm::Sha512Crypt);
         } else if body.starts_with("$5$") {
-            return verify_sha_crypt(&plaintext, body, sha_crypt::Algorithm::Sha256);
+            return verify_sha_crypt(&plaintext, body, sha_crypt::Algorithm::Sha256Crypt);
         } else {
             return Err(MixError::RuntimeError {
                 span: None,
@@ -19336,10 +19336,10 @@ fn builtin_password_verify(args: Vec<Value>) -> MixResult<Option<Value>> {
         }
     }
     if hash.starts_with("$6$") {
-        return verify_sha_crypt(&plaintext, &hash, sha_crypt::Algorithm::Sha512);
+        return verify_sha_crypt(&plaintext, &hash, sha_crypt::Algorithm::Sha512Crypt);
     }
     if hash.starts_with("$5$") {
-        return verify_sha_crypt(&plaintext, &hash, sha_crypt::Algorithm::Sha256);
+        return verify_sha_crypt(&plaintext, &hash, sha_crypt::Algorithm::Sha256Crypt);
     }
     match bcrypt::verify(&plaintext, &hash) {
         Ok(ok) => Ok(Some(Value::Bool(ok))),
@@ -19360,7 +19360,7 @@ fn verify_sha_crypt(plaintext: &str, hash: &str, algorithm: sha_crypt::Algorithm
     let verifier = ShaCrypt::new(algorithm, sha_crypt::Params::RECOMMENDED);
     match verifier.verify_password(plaintext.as_bytes(), hash) {
         Ok(()) => Ok(Some(Value::Bool(true))),
-        Err(sha_crypt::Error::Password) => Ok(Some(Value::Bool(false))),
+        Err(sha_crypt::password_hash::Error::Password) => Ok(Some(Value::Bool(false))),
         Err(e) => Err(MixError::RuntimeError {
             span: None,
             msg: format!("password_verify(): invalid sha-crypt hash: {e}"),
