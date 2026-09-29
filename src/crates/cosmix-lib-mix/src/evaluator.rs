@@ -6047,10 +6047,11 @@ impl Evaluator {
     /// distinguished in the message ("override failed" vs "no override").
     pub async fn load_prelude(&mut self) -> MixResult<()> {
         const BUILTIN_PRELUDE: &str = include_str!("../std/prelude.mix");
-        // Record for exec_require: modules see the prelude iff the
-        // program loaded it (a --no-prelude run stays prelude-free in
-        // modules too).
-        self.globals.borrow_mut().prelude_loaded = true;
+        // NOTE: prelude_loaded is set only AFTER a successful load (F3,
+        // review 2026-09-29). Setting it up front meant a failed prelude
+        // left the flag true — exec_require would then believe modules
+        // could see prelude functions that never loaded, failing deep
+        // inside requests instead of at the surface.
 
         // Check for user override
         let (source, override_path) = if let Some(home) = dirs_home() {
@@ -6105,6 +6106,11 @@ impl Evaluator {
                         format!("prelude ({origin}) failed: {e}"),
                     ));
                 }
+                // Record for exec_require: modules see the prelude iff the
+                // program loaded it (a --no-prelude run stays prelude-free
+                // in modules too). Set only on success — see the note at
+                // the top of this fn.
+                self.globals.borrow_mut().prelude_loaded = true;
                 Ok(())
             }
             Err(e) => {

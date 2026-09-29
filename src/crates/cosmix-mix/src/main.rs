@@ -886,12 +886,16 @@ fn run_command_line(
                     }
                 }
                 match res {
-                    // Only the framed caller's exit code changes. A plain
-                    // `mix -c` stopped by Ctrl-C or systemd has always been a
-                    // clean 0 and scripts depend on it; a task's shell is the
-                    // one that must not exit 0 after being killed.
+                    // B6/D8: a killed run must not read as success. Framed
+                    // callers always got 128+sig; the plain arm now does
+                    // too, with the one historical carve-out — SIGINT on an
+                    // interactive terminal (Ctrl-C at a TTY is the
+                    // operator, not a cancellation).
                     Err(signal) => {
-                        if framed {
+                        if framed
+                            || signal != libc::SIGINT
+                            || !std::io::stdin().is_terminal()
+                        {
                             128 + signal
                         } else {
                             0
@@ -915,7 +919,13 @@ fn run_command_line(
                 // carry the real command status, exactly as a paren call would).
                 let res: Result<(), cosmix_mix::error::MixError> = tokio::select! {
                     biased;
-                    _ = shutdown_signal() => Ok(()),
+                    // B6: the signal number travels in a structured error so
+                    // the exit-code match below can apply the same TTY
+                    // carve-out as every other path.
+                    sig = shutdown_signal() => Err(cosmix_mix::error::MixError::structured(
+                        "SIGNAL_INTERRUPT",
+                        sig.to_string(),
+                    )),
                     r = async {
                         eval.call_function_by_name_with_args(&name, &args).await?;
                         if eval.handler_count() > 0 {
@@ -927,6 +937,16 @@ fn run_command_line(
                 match res {
                     Ok(_) => 0,
                     Err(cosmix_mix::error::MixError::ExitRequest { code }) => code,
+                    Err(cosmix_mix::error::MixError::Structured(info))
+                        if info.code == "SIGNAL_INTERRUPT" =>
+                    {
+                        let sig: i32 = info.message.parse().unwrap_or(libc::SIGTERM);
+                        if sig == libc::SIGINT && std::io::stdin().is_terminal() {
+                            0
+                        } else {
+                            128 + sig
+                        }
+                    }
                     Err(e) if format!("{e}").contains("interrupted") => 0,
                     Err(e) => {
                         print_uncaught(&e);
