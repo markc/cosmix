@@ -275,7 +275,7 @@ async fn range_at_i64_extremes_no_overflow() {
 print(length($r) .. ":" .. $r[0])"#,
     )
     .await;
-    assert_eq!(out, "1:to_number("9223372036854774784")");
+    assert_eq!(out, "1:9223372036854774784");
     let out =
         run_ok(r#"print(length(range(-to_number("9223372036854774784"), -to_number("9223372036854774784"), -1)))"#).await;
     assert_eq!(out, "1");
@@ -403,7 +403,7 @@ async fn json_encode_i64_boundary_takes_real_path() {
     // The largest exactly-representable f64 BELOW 2^63 still takes the
     // integer path, as does -2^63 (exactly representable, inclusive bound).
     let out = run_ok(r#"print(json_encode(to_number("9223372036854774784")))"#).await;
-    assert_eq!(out, "to_number("9223372036854774784")");
+    assert_eq!(out, "9223372036854774784");
     let out = run_ok(r#"print(json_encode(0 - 9223372036854775808))"#).await;
     assert_eq!(out, "-9223372036854775808");
 }
