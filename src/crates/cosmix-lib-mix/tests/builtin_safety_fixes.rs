@@ -45,7 +45,7 @@ async fn run_err(source: &str) -> String {
 /// past usize::MAX into a start>end slice panic.
 #[tokio::test]
 async fn substr_huge_len_no_panic() {
-    let out = run_ok(r#"print(substr("hello world abc foo", 10, 100000000000000000000))"#).await;
+    let out = run_ok(r#"print(substr("hello world abc foo", 10, to_number("100000000000000000000")))"#).await;
     assert_eq!(out, "d abc foo");
 }
 
@@ -76,7 +76,7 @@ async fn substr_negative_args() {
 #[tokio::test]
 async fn substr_huge_start_and_len() {
     let out =
-        run_ok(r#"print("[" .. substr("abc", 9999999999999999999999999999999999, 9999999999999999999999999999999999) .. "]")"#).await;
+        run_ok(r#"print("[" .. substr("abc", to_number("9999999999999999999999999999999999"), to_number("9999999999999999999999999999999999")) .. "]")"#).await;
     assert_eq!(out, "[]");
 }
 
@@ -135,7 +135,7 @@ async fn repeat_over_cap_errors() {
 /// the cap error too (checked_mul, no wrap).
 #[tokio::test]
 async fn repeat_astronomical_count_errors() {
-    let err = run_err(r#"$x = repeat("ab", 999999999999999999999999999999999999)"#).await;
+    let err = run_err(r#"$x = repeat("ab", to_number("999999999999999999999999999999999999"))"#).await;
     assert!(err.contains("256 MiB cap"), "got: {err}");
 }
 
@@ -148,7 +148,7 @@ async fn repeat_normal_and_edge_ok() {
     assert_eq!(out, "[]");
     // Empty string repeated a huge number of times is still empty (0 bytes).
     let out =
-        run_ok(r#"print("[" .. repeat("", 999999999999999999999999999999999999) .. "]")"#).await;
+        run_ok(r#"print("[" .. repeat("", to_number("999999999999999999999999999999999999")) .. "]")"#).await;
     assert_eq!(out, "[]");
 }
 
@@ -173,19 +173,19 @@ async fn lpad_rpad_over_cap_error() {
 /// while panicking on this one line (0.59.0 review round 2).
 #[tokio::test]
 async fn saturating_negative_bounds_clamp_without_panic() {
-    let out = run_ok(r#"print(length(take([1,2,3], -10000000000000000000000000)))"#).await;
+    let out = run_ok(r#"print(length(take([1,2,3], -to_number("10000000000000000000000000"))))"#).await;
     assert_eq!(out, "3");
-    let out = run_ok(r#"print(length(drop([1,2,3], -10000000000000000000000000)))"#).await;
+    let out = run_ok(r#"print(length(drop([1,2,3], -to_number("10000000000000000000000000"))))"#).await;
     assert_eq!(out, "0");
     let out = run_ok(
-        r#"print(length(slice([1,2,3], -10000000000000000000000000, 10000000000000000000000000)))"#,
+        r#"print(length(slice([1,2,3], -to_number("10000000000000000000000000"), to_number("10000000000000000000000000"))))"#,
     )
     .await;
     assert_eq!(out, "3");
     // String arms share the same negation sites.
-    let out = run_ok(r#"print("[" .. take("abc", -10000000000000000000000000) .. "]")"#).await;
+    let out = run_ok(r#"print("[" .. take("abc", -to_number("10000000000000000000000000")) .. "]")"#).await;
     assert_eq!(out, "[abc]");
-    let out = run_ok(r#"print("[" .. drop("abc", -10000000000000000000000000) .. "]")"#).await;
+    let out = run_ok(r#"print("[" .. drop("abc", -to_number("10000000000000000000000000")) .. "]")"#).await;
     assert_eq!(out, "[]");
 }
 
@@ -220,10 +220,10 @@ async fn lpad_rpad_normal_ok() {
 
 #[tokio::test]
 async fn range_over_cap_errors() {
-    let err = run_err(r#"$x = range(0, 1000000000000000000)"#).await;
+    let err = run_err(r#"$x = range(0, to_number("1000000000000000000"))"#).await;
     assert!(err.contains("cap 10000000"), "got: {err}");
     // Descending direction hits the same cap.
-    let err = run_err(r#"$x = range(1000000000000000000, 0, -1)"#).await;
+    let err = run_err(r#"$x = range(to_number("1000000000000000000"), 0, -1)"#).await;
     assert!(err.contains("cap 10000000"), "got: {err}");
 }
 
