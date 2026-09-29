@@ -1070,3 +1070,31 @@ fn d3015_parameter_visibility_is_scoped_to_the_function() {
             .contains(&"MIX-D3015".to_string())
     );
 }
+
+#[test]
+fn shell_command_as_bare_string_is_an_error() {
+    // B2: `hostname` on PATH as a bare string statement is the shell
+    // reflex — nothing runs, exit 0, lint used to print 0/0/0.
+    let out = codes("hostname\n");
+    assert!(out.contains(&"MIX-E1507".to_string()), "got: {out:?}");
+    // A bare string whose head is NOT on PATH stays silent (prose/value).
+    let out = codes("not-a-command-anywhere-xyz\n");
+    assert!(!out.contains(&"MIX-E1507".to_string()), "got: {out:?}");
+}
+
+#[test]
+fn send_result_never_checked_warns() {
+    let out = codes("send svc ping\nsend svc ping\n");
+    assert!(out.contains(&"MIX-W2307".to_string()), "got: {out:?}");
+    // Reading $rc between sends satisfies the check.
+    let out = codes("send svc ping\nprint($rc)\nsend svc ping\n");
+    assert!(!out.contains(&"MIX-W2307".to_string()), "got: {out:?}");
+}
+
+#[test]
+fn push_assign_back_is_an_error() {
+    let out = codes("$l = [1]\n$l = push($l, 2)\nprint($l)\n");
+    assert!(out.contains(&"MIX-E1508".to_string()), "got: {out:?}");
+    let out = codes("$l = [1]\npush($l, 2)\nprint($l)\n");
+    assert!(!out.contains(&"MIX-E1508".to_string()), "got: {out:?}");
+}

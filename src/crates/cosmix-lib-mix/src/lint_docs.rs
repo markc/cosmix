@@ -157,6 +157,16 @@ pub const LINT_DOCS: &[LintDoc] = &[
         summary: "write to an outer variable inside fn (--agent)",
         detail: "A `fn` body assigns a name that already exists as an outer $variable (and is not one of its params) — the assignment silently creates a NEW local, and the outer variable is unchanged. Pass it in, return it, or rename the local. Compares against variables, not callables, so a `$sum = 0` local never fires on the prelude's `sum` function. Emitted only under `--agent` / `MIX_LINT=agent`.",
     },
+    LintDoc {
+        code: "MIX-E1507",
+        summary: "shell command written as a bare string",
+        detail: "A bare-string statement whose head word resolves on PATH — `hostname` or `systemctl --user daemon-reload` inside a `.mix` file parse as a string, run NOTHING, exit 0, and used to lint clean (B2). Mix is whole-file; run it with `run_argv([\"head\", ...])`, or drop the string. A bare string whose head is NOT on PATH stays silent.",
+    },
+    LintDoc {
+        code: "MIX-E1508",
+        summary: "assign-back of an in-place mutator",
+        detail: "`$x = push($x, v)` binds nil — push mutates in place and returns nil, so the assign-back empties the list; `$x = pop($x)` / `$x = shift($x)` bind the REMOVED ELEMENT, not the list. Drop the assignment for push; bind the element separately for pop/shift.",
+    },
     // ---- Warnings (MIX-W2xxx) ----
     LintDoc {
         code: "MIX-W2101",
@@ -197,6 +207,11 @@ pub const LINT_DOCS: &[LintDoc] = &[
         code: "MIX-W2306",
         summary: "escaped quotes in ssh command source",
         detail: "A literal command passed to `ssh_run`/`ssh_must` whose source spelling contains `\\\"` — the high-signal mark of nested Mix source the remote shell will parse again. Ship the source verbatim with `ssh_mix` + a heredoc. Simple command strings, computed commands, `ssh_exec`, `ssh_mix`, and single-quoted strings containing ordinary `\"` stay quiet.",
+    },
+    LintDoc {
+        code: "MIX-W2307",
+        summary: "send result never checked",
+        detail: "A `send` whose `$rc` (or `$result`/`$reply`) is never READ before the next send or the end of the block — send failures are non-fatal, so a script whose sends all fail still exits 0 and reads as success (B4). Read the status after the send, or use a checked form. The opt-in `--strict-send` execution gate is the deferred half.",
     },
     LintDoc {
         code: "MIX-W2401",
