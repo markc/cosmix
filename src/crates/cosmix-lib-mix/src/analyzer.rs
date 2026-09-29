@@ -1953,26 +1953,25 @@ fn check_collection_literal_traps(stmts: &[Stmt], ctx: &FileContext, a: &mut Ana
     for stmt in stmts {
         walk_stmt_exprs(stmt, &mut |expr| match expr {
             Expr::FunctionCall { name, args } => {
-                if crate::builtins::is_builtin(name) || crate::builtins_hof::lookup(name).is_some() {
-                    if let Some(Expr::MapLiteral(entries)) = args.first()
-                        && entries
-                            .iter()
-                            .any(|(k, v)| k == name && matches!(v, Expr::FunctionCall { .. }))
-                    {
-                        // C9: `$m = {len: fn() = 99}; $m.len()` runs the
-                        // BUILTIN len on the map — the member fn is dead.
-                        a.diagnostics.push(diag(
-                            ctx,
-                            "MIX-W2309",
-                            Severity::Warning,
-                            stmt.line,
-                            format!(
-                                "{name}() here runs the BUILTIN, not the map's member function \
-                                 — builtin-named members are unreachable via dot-call"
-                            ),
-                            Some(format!("call it through the index: $m[\"{name}\"]()")),
-                        ));
-                    }
+                if (crate::builtins::is_builtin(name) || crate::builtins_hof::lookup(name).is_some())
+                    && let Some(Expr::MapLiteral(entries)) = args.first()
+                    && entries
+                        .iter()
+                        .any(|(k, v)| k == name && matches!(v, Expr::FunctionCall { .. }))
+                {
+                    // C9: `$m = {len: fn() = 99}; $m.len()` runs the
+                    // BUILTIN len on the map — the member fn is dead.
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-W2309",
+                        Severity::Warning,
+                        stmt.line,
+                        format!(
+                            "{name}() here runs the BUILTIN, not the map's member function \
+                             — builtin-named members are unreachable via dot-call"
+                        ),
+                        Some(format!("call it through the index: $m[\"{name}\"]()")),
+                    ));
                 }
             }
             Expr::FieldAccess { object, field } => {
