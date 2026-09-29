@@ -19,7 +19,7 @@ use cosmix_mix::analyzer::{self, Analysis, AnalyzerConfig, Diagnostic, Severity}
 use cosmix_mix::error::MixError;
 use cosmix_mix::token::Token;
 
-const USAGE: &str = "Usage: mix lint [--json | --data] [--deny-warnings] \
+const USAGE: &str = "Usage: mix lint [--json | --data] [--deny-warnings] [--agent] \
 [--require-version] [--allow-global NAME]... [--allow-function NAME]... FILE...";
 
 /// Line/column pair lifted from a lexer/parser span.
@@ -52,6 +52,10 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
     let mut format = Format::Human;
     let mut format_set = false;
     let mut deny_warnings = false;
+    let mut agent = matches!(
+        std::env::var("MIX_LINT").as_deref(),
+        Ok("agent") | Ok("error")
+    );
     let mut require_version = false;
     let mut cfg = AnalyzerConfig::default();
     let mut files: Vec<String> = Vec::new();
@@ -73,6 +77,7 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
                 format_set = true;
             }
             "--deny-warnings" => deny_warnings = true,
+            "--agent" => agent = true,
             "--require-version" => require_version = true,
             "--allow-global" | "--allow-function" => {
                 let Some(name) = args.get(i + 1) else {
@@ -107,6 +112,8 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
         eprintln!("{USAGE}");
         return 2;
     }
+
+    cfg.agent = agent;
 
     let mut all_diags: Vec<Diagnostic> = Vec::new();
     let mut capabilities: Vec<&'static str> = Vec::new();

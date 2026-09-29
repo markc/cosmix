@@ -117,6 +117,16 @@ pub struct AnalyzerConfig {
     /// unaffected, so an embedder that does not set it loses nothing it
     /// had before.
     pub source: Option<String>,
+    /// `--agent` (or `MIX_LINT=agent`): the agentic-first lint profile
+    /// (D2, TODO-mix 2026-09-24). Promotes D3015/W2201/W2302 to errors
+    /// and enables the agent-only rules in [`check_agent_rules`] — the
+    /// failure classes a model driving Mix as an actuator must see at
+    /// error strength: constant-truthy conditions, a function name used
+    /// as a value, an assignment from a nil-returning mutator, and a
+    /// write to an outer variable inside `fn` (which silently binds a
+    /// local). Off by default: the fleet's `--deny-warnings` gates run
+    /// the ordinary profile.
+    pub agent: bool,
 }
 
 /// The result of one file's analysis.
@@ -426,8 +436,255 @@ fn analyze_at(
     if !remote_body && !cfg.suppress_name_checks {
         check_ssh_mix_bodies(stmts, &ctx, &mut a, cfg);
     }
+    if cfg.agent {
+        promote_agent_diagnostics(&mut a);
+        check_agent_rules(stmts, &ctx, &mut a);
+    }
     collect_capabilities(stmts, &mut a);
     a
+}
+
+/// The `--agent` profile (D2): diagnostics an agent MUST see at error
+/// strength. D3015/W2201/W2302 are notes/warnings in the ordinary
+/// profile — a human filters them; an agent's `lint && run` loop should
+/// not. Promotion happens AFTER every check, so it cannot be undone by
+/// emission order.
+const AGENT_PROMOTED: &[&str] = &["MIX-D3015", "MIX-W2201", "MIX-W2302"];
+
+fn promote_agent_diagnostics(a: &mut Analysis) {
+    for d in &mut a.diagnostics {
+        if AGENT_PROMOTED.contains(&d.code) {
+            d.severity = Severity::Error;
+        }
+    }
+}
+
+/// The agent-only rules (D2): failure classes a model driving Mix as an
+/// actuator trips, all errors under `--agent` and silent in the ordinary
+/// profile (the fleet's `--deny-warnings` gates must not change meaning
+/// until these have been triaged against real scripts).
+fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    let known: HashSet<String> = ctx.known_callables.clone();
+
+    fn walk(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis, known: &HashSet<String>) {
+        for stmt in stmts {
+            match &stmt.kind {
+                StmtKind::Assignment { name, value } => {
+                    // R2: `$f = upper` stores the STRING "upper" — Mix has
+                    // no first-class function values.
+                    if let Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) = value
+                        && (known.contains(s)
+                            || crate::builtins::builtin_info_of(s).is_some()
+                            || crate::builtins_hof::HOF_NAMES.contains(&s.as_str()))
+                    {
+                        a.diagnostics.push(diag(
+                            ctx,
+                            "MIX-E1503",
+                            Severity::Error,
+                            stmt.line,
+                            format!(
+                                "stores the STRING \"{s}\", not the function — Mix has no first-class \
+                                 function values; call it instead: {s}(...)"
+                            ),
+                            None,
+                        ));
+                    }
+                    // R3: `$n = write_file(...)` binds nil — the mutator
+                    // returns nothing.
+                    if let Expr::FunctionCall { name, .. } = value
+                        && let Some(info) = crate::builtins::builtin_info_of(name)
+                        && matches!(info.contract.returns, TypeShape::Nil)
+                    {
+                        a.diagnostics.push(diag(
+                            ctx,
+                            "MIX-E1504",
+                            Severity::Error,
+                            stmt.line,
+                            format!(
+                                "{name}() returns nil — this assignment binds nil; drop the $var or \
+                                 use a value-returning form"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+                StmtKind::If {
+                    condition,
+                    then_body,
+                    else_ifs,
+                    else_body,
+                } => {
+                    check_truthy(condition, stmt.line, ctx, a);
+                    for (cond, _) in else_ifs {
+                        check_truthy(cond, stmt.line, ctx, a);
+                    }
+                    walk(then_body, ctx, a, known);
+                    for (_, body) in else_ifs {
+                        walk(body, ctx, a, known);
+                    }
+                    if let Some(els) = else_body {
+                        walk(els, ctx, a, known);
+                    }
+                }
+                StmtKind::While { condition, body, .. } => {
+                    check_truthy(condition, stmt.line, ctx, a);
+                    walk(body, ctx, a, known);
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::ForEach { body, .. }
+                | StmtKind::Address { body, .. }
+                | StmtKind::On { body, .. } => walk(body, ctx, a, known),
+                StmtKind::FunctionDef { name, params, body, .. } => {
+                    // R4: an assignment to a name that exists OUTSIDE this
+                    // fn (and is not one of its params) creates a new local
+                    // — the outer variable is unchanged.
+                    let param_names: HashSet<&str> =
+                        params.iter().map(|p| p.name.as_str()).collect();
+                    let mut written: HashSet<String> = HashSet::new();
+                    collect_written(body_stmt_list(body), &mut written);
+                    for w in &written {
+                        if known.contains(w) && !param_names.contains(w.as_str()) {
+                            a.diagnostics.push(diag(
+                                ctx,
+                                "MIX-E1506",
+                                Severity::Error,
+                                stmt.line,
+                                format!(
+                                    "fn {name}() assigns ${w}, which exists in the outer scope — \
+                                     the assignment silently creates a NEW local and the outer ${w} \
+                                     is unchanged"
+                                ),
+                                Some("pass it in, return it, or rename the local".to_string()),
+                            ));
+                        }
+                    }
+                    walk(body_stmt_list(body), ctx, a, known);
+                }
+                StmtKind::TryCatch {
+                    try_body,
+                    catch,
+                    finally_body,
+                } => {
+                    walk(try_body, ctx, a, known);
+                    if let Some(clause) = catch {
+                        walk(&clause.body, ctx, a, known);
+                    }
+                    if let Some(fb) = finally_body {
+                        walk(fb, ctx, a, known);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(stmts, ctx, a, &known);
+}
+
+/// R1: a condition that is a literal (string/bool/nil/map) or a
+/// process-result map is constant-truthy — `if "false"` and
+/// `if {ok: false}` are always true, and a result map is always a map.
+fn check_truthy(cond: &Expr, line: usize, ctx: &FileContext, a: &mut Analysis) {
+    match cond {
+        Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) => {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-E1505",
+                Severity::Error,
+                line,
+                format!(
+                    "condition is the string \"{s}\" — every non-empty string is truthy; compare \
+                     explicitly"
+                ),
+                None,
+            ));
+        }
+        Expr::BoolLiteral(_) | Expr::NilLiteral | Expr::MapLiteral(_) => {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-E1505",
+                Severity::Error,
+                line,
+                "condition is a constant — it never varies".to_string(),
+                None,
+            ));
+        }
+        Expr::FunctionCall { name, .. } => {
+            if let Some(info) = crate::builtins::builtin_info_of(name)
+                && info.contract.effects.must_use
+                && matches!(
+                    info.contract.returns,
+                    TypeShape::Map { .. } | TypeShape::List(_)
+                )
+            {
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-E1505",
+                    Severity::Error,
+                    line,
+                    format!(
+                        "condition is the result of {name}() — a map/list is always truthy; test \
+                         {name}(...).ok"
+                    ),
+                    None,
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn body_stmt_list(body: &FunctionBody) -> &[Stmt] {
+    match body {
+        FunctionBody::Block(s) => s,
+        FunctionBody::Expression(_) => &[],
+    }
+}
+
+/// Every `$var = …` written inside these statements, one nesting level
+/// deep — enough to catch the shadowing R4 warns about (an assignment in
+/// a nested if/loop still binds a NEW local at the fn's scope).
+fn collect_written(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Assignment { name, .. } => {
+                out.insert(name.clone());
+            }
+            StmtKind::If {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_written(then_body, out);
+                for (_, body) in else_ifs {
+                    collect_written(body, out);
+                }
+                if let Some(els) = else_body {
+                    collect_written(els, out);
+                }
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::For { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::Address { body, .. }
+            | StmtKind::On { body, .. } => collect_written(body, out),
+            StmtKind::TryCatch {
+                try_body,
+                catch,
+                finally_body,
+            } => {
+                collect_written(try_body, out);
+                if let Some(clause) = catch {
+                    collect_written(&clause.body, out);
+                }
+                if let Some(fb) = finally_body {
+                    collect_written(fb, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// MIX-D3015 + MIX-W2405 (0.90.0) — the two rules about how a

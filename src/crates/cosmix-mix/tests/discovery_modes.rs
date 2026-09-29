@@ -70,3 +70,44 @@ fn discarded_pure_transform_is_a_visible_warning() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn agent_profile_adds_rules_and_promotes() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("mix-agent-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let file = dir.join("agent.mix");
+    let mut f = std::fs::File::create(&file).expect("write probe");
+    writeln!(f, "$x = 1").unwrap();
+    writeln!(f, "function f($a)").unwrap();
+    writeln!(f, "  $x = 2").unwrap();
+    writeln!(f, "  return $a").unwrap();
+    writeln!(f, "end").unwrap();
+    writeln!(f, "$l = [1]").unwrap();
+    writeln!(f, "$n = push($l, 2)").unwrap();
+    writeln!(f, "$f = upper").unwrap();
+    writeln!(f, "if \"false\" then").unwrap();
+    writeln!(f, "  print(\"never\")").unwrap();
+    writeln!(f, "end").unwrap();
+    writeln!(f, "print(\"$x\")").unwrap();
+    drop(f);
+    let path = file.to_str().unwrap();
+
+    // Ordinary profile: no agent-only rules; D3015 stays a note.
+    let (out, _) = mix(&["lint", path]);
+    for code in ["MIX-E1503", "MIX-E1504", "MIX-E1505", "MIX-E1506"] {
+        assert!(!out.contains(code), "ordinary profile must not emit {code}: {out}");
+    }
+
+    // Agent profile: all four rules fire as errors, and D3015 promotes
+    // from note to error.
+    let (out, _) = mix(&["lint", "--agent", "--json", path]);
+    for code in ["MIX-E1503", "MIX-E1504", "MIX-E1505", "MIX-E1506"] {
+        assert!(out.contains(code), "--agent must emit {code}: {out}");
+    }
+    assert!(
+        out.contains("MIX-D3015") && out.contains("\"severity\":\"error\""),
+        "D3015 must promote to error under --agent: {out}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
