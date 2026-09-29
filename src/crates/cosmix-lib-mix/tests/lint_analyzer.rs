@@ -65,9 +65,12 @@ fn undefined_variable_including_nested_expressions() {
 fn undefined_function_and_arities() {
     let out =
         codes("function f($a)\n  return $a\nend\nf(1, 2)\nsubstr(\"abc\")\nnope()\nrandom(1)\n");
+    // W2201: `substr("abc")` alone is a discarded pure transform — it
+    // returns a value and mutates nothing, so the statement is a no-op
+    // (D3's must_use half, 2026-09-29).
     assert_eq!(
         out,
-        vec!["MIX-E1202", "MIX-E1201", "MIX-E1102", "MIX-E1201"]
+        vec!["MIX-E1202", "MIX-W2201", "MIX-E1201", "MIX-E1102", "MIX-E1201"]
     );
 }
 

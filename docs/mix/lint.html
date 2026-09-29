@@ -496,6 +496,10 @@ MIX-E1101  undefined variable               MIX-E1401  require() target missing/
 MIX-E1102  undefined function               MIX-E1402  require() target invalid Mix
 MIX-E1201  builtin arity mismatch           MIX-E1501  dead mutation (write is lost)
 MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
+                                            MIX-E1503  fn name stored as a value (--agent)
+                                            MIX-E1504  assignment from nil-returning builtin (--agent)
+                                            MIX-E1505  constant-truthy condition (--agent)
+                                            MIX-E1506  write to an outer variable in fn (--agent)
                                             MIX-W2101  unreachable statement
                                             MIX-W2201  discarded must-use result
                                             MIX-W2301  `+` on a proven list/map raises
@@ -533,6 +537,9 @@ content; the suffix is only a tiebreak when neither grammar succeeds.</p>
 </li>
 <li>
 <p><strong>MIX-E1502</strong> flags a discarded <code>delete</code> / <code>merge</code> — both are <strong>pure</strong> (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: <code>$m = delete($m, "k")</code>.</p>
+</li>
+<li>
+<p><strong>MIX-E1503–E1506</strong> are the <code>--agent</code> profile (run <code>mix lint --agent</code>, or <code>MIX_LINT=agent</code>): a function name stored as a value (<code>$f = bump</code> binds the <em>string</em>), an assignment from a nil-returning builtin (<code>$n = write_file(...)</code> binds nil), a constant-truthy condition (<code>if "false"</code>, a bare process-result map — <code>while true</code> is exempt), and a <code>fn</code> body writing an outer variable (which silently creates a local). Ordinary lint and the fleet's <code>--deny-warnings</code> gates run without them.</p>
 </li>
 <li>
 <p><strong>MIX-W2201</strong> fires when an operation whose failure signal lives in its RETURN VALUE (<code>effects.must_use</code>: <code>run_rc</code>, <code>run_argv</code>, <code>run_pipeline</code>, <code>run_parallel</code>, <code>ssh_run</code>, <code>ssh_exec</code>, <code>ssh_mix</code>, <code>http_*</code>, <code>kill</code>, <code>run_stream</code>) is a bare expression statement — the bug class where a failed remote step silently vanishes. Bind the result and branch on it; some have a fail-fast twin that raises (<code>run_argv</code>→<code>run_argv_must</code>, <code>run_pipeline</code>→<code>run_pipeline_must</code>, <code>ssh_run</code>→<code>ssh_must</code>). The last statement of a block is exempt (it may be the block's value).</p>

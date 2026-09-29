@@ -46,6 +46,7 @@ struct ExtraStatement {
     name: &'static str,
     category: &'static str,
     description: &'static str,
+    capability: &'static str,
     contract: BuiltinContract,
 }
 
@@ -54,13 +55,92 @@ const EXTRA_STATEMENTS: &[ExtraStatement] = &[
         name: "print",
         category: "io",
         description: "Print values to stdout with newline (statement, not a builtin call); bare `print` emits a blank line",
+        capability: "statement",
         contract: cosmix_mix::contract!((values: ...any) -> nil),
     },
     ExtraStatement {
         name: "eprint",
         category: "io",
         description: "Print values to stderr with newline (statement, not a builtin call); bare `eprint` emits a blank line",
+        capability: "statement",
         contract: cosmix_mix::contract!((values: ...any) -> nil),
+    },
+    // The Bus surface is reserved to the evaluator (lexer keywords + six
+    // evaluator-reserved builtins), so it had no rows in the BUILTINS
+    // table and `mix builtins send` answered "unknown builtin" (D3,
+    // filed 2026-09-24). These rows give the discovery surface the same
+    // first-class view it has of every builtin — kind "statement",
+    // category bus, capability bus. The rc bands below are bus.md's
+    // "Reading $rc" table, kept in one line each.
+    ExtraStatement {
+        name: "send",
+        category: "bus",
+        description: "Send a request to a Bus port: send PORT VERB [ARGS...]. Reply bands in $rc: 0 delivered+accepted; 1..9 delivered with a warning (still success); >=10 peer application error (kept in $rc, details in $reply); -1 transport failure; -2 per-send timeout; -3 Bus unavailable. $result holds the reply body",
+        capability: "bus",
+        contract: cosmix_mix::contract!((target: string, verb: string, args: ...any) -> nil),
+    },
+    ExtraStatement {
+        name: "emit",
+        category: "bus",
+        description: "Fire-and-forget Bus message (no reply is waited for): emit PORT VERB [ARGS...]",
+        capability: "bus",
+        contract: cosmix_mix::contract!((target: string, verb: string, args: ...any) -> nil),
+    },
+    ExtraStatement {
+        name: "address",
+        category: "bus",
+        description: "Set the default Bus target for a block: address PORT ... end (bare send lines inside go to PORT)",
+        capability: "bus",
+        contract: cosmix_mix::contract!((target: string) -> nil),
+    },
+    ExtraStatement {
+        name: "on",
+        category: "bus",
+        description: "Register a Bus handler: on VERB ... end. A serve citizen answers VERB calls; reply() sends the answer. Topic subscribers match on the inner command",
+        capability: "bus",
+        contract: cosmix_mix::contract!((verb: string) -> nil),
+    },
+    ExtraStatement {
+        name: "reply",
+        category: "bus",
+        description: "Answer the in-flight request the serve pump is dispatching (only inside an on handler); payload becomes the caller's $result",
+        capability: "bus",
+        contract: cosmix_mix::contract!((payload?: any) -> nil),
+    },
+    ExtraStatement {
+        name: "subscribe",
+        category: "bus",
+        description: "Register interest in a Bus topic so deliveries reach a matching on handler: subscribe(\"topic.name\")",
+        capability: "bus",
+        contract: cosmix_mix::contract!((topic?: string) -> nil),
+    },
+    ExtraStatement {
+        name: "unsubscribe",
+        category: "bus",
+        description: "Drop interest in a Bus topic: unsubscribe(\"topic.name\")",
+        capability: "bus",
+        contract: cosmix_mix::contract!((topic?: string) -> nil),
+    },
+    ExtraStatement {
+        name: "port_exists",
+        category: "bus",
+        description: "True when a Bus port exists on the broker",
+        capability: "bus",
+        contract: cosmix_mix::contract!((port: string) -> bool),
+    },
+    ExtraStatement {
+        name: "bus_reconnect",
+        category: "bus",
+        description: "Reconnect the Bus broker session",
+        capability: "bus",
+        contract: cosmix_mix::contract!(() -> nil),
+    },
+    ExtraStatement {
+        name: "noded_register",
+        category: "bus",
+        description: "Register this node with noded (identity/bootstrap)",
+        capability: "bus",
+        contract: cosmix_mix::contract!(() -> nil),
     },
 ];
 
@@ -130,7 +210,7 @@ fn all_builtin_rows() -> impl Iterator<Item = EntryRow> {
         name: e.name,
         category: e.category,
         description: e.description,
-        capability: "statement",
+        capability: e.capability,
         contract: &e.contract,
     });
     core.chain(hofs).chain(extras)
@@ -901,6 +981,21 @@ fn cmd_doctor(eval: &Evaluator, version: &str) -> i32 {
             "  ⚠ prelude    not loaded (this session ran with --no-prelude; the prelude is fine)"
         );
     }
+    // B14: a /opt/cosmix binary whose prelude resolved OUTSIDE the install
+    // tier is a mixed-tier installation (an exported COSMIX pointing at a
+    // dev checkout shadows the shipped prelude). Warn, never fail — a dev
+    // box doing this deliberately is a choice, not a fault.
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_path = exe.to_string_lossy().into_owned();
+        if exe_path.starts_with("/opt/cosmix/") {
+            let prelude_src = cosmix_src_str();
+            if !prelude_src.starts_with("/opt/cosmix/") {
+                println!(
+                    "  ⚠ prelude    resolved outside the install tier: {prelude_src} (binary is {exe_path}) — COSMIX points the /opt binary at a dev checkout"
+                );
+            }
+        }
+    }
 
     // 4. Manual — count readable pages across the checkout docs dir and the
     //    `mix man` cache (a deployed node has only the latter, populated lazily).
@@ -1176,12 +1271,32 @@ fn cmd_config(version: &str) {
         cosmix_src_str()
     );
     match &home {
-        Some(h) => println!("rc file:  {}/.mixrc", h),
+        Some(h) => {
+            let rc = format!("{}/.mixrc", h);
+            let state = if Path::new(&rc).is_file() { "exists" } else { "missing" };
+            println!("rc file:  {} ({state})", rc);
+        }
         None => println!("rc file:  <unavailable: HOME unset>"),
     }
     println!("os:       {}", os_id);
     println!("arch:     {}", arch);
     println!("pid:      {}", pid);
+    // Agent-relevant modes (B14): the truthful state of the gates a
+    // script run would meet. The env/rc knobs for strict arity and
+    // strict send land with the strict-arity sweep (TODO-mix A1/B4);
+    // until then the per-invocation flag is the whole story, and saying
+    // so beats printing a knob that does not exist.
+    let argv0 = std::env::args().next().unwrap_or_default();
+    // A login shell is signalled by a '-' prefix on the basename
+    // (`-mix`); a full path like /opt/cosmix/bin/-mix still ends in the
+    // prefixed name, so check the file name, not the whole argv[0].
+    let login = Path::new(&argv0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('-'));
+    println!("arity:    compat (default) — --strict-arity per invocation (env/rc knobs land with the sweep)");
+    println!("lint:     opt-in per invocation — mix lint --deny-warnings gates deploys (no env gate yet)");
+    println!("login shell: {}", if login { "yes ('-'-prefixed basename)" } else { "no" });
 }
 
 /// `mix build`: cargo build --release, strip, install to $COSMIX_BIN/

@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, ChainOp, Expr, FunctionBody, Param, PathSeg, Stmt, StmtKind, UnaryOp};
 use crate::builtin_info::{FieldInfo, TypeShape};
-use crate::builtins;
+use crate::builtins::{self, CapabilityClass};
 use crate::evaluator::INLINE_SPECIAL_FORMS;
 use crate::scope::param_arity;
 use crate::token::StringPart;
@@ -117,6 +117,16 @@ pub struct AnalyzerConfig {
     /// unaffected, so an embedder that does not set it loses nothing it
     /// had before.
     pub source: Option<String>,
+    /// `--agent` (or `MIX_LINT=agent`): the agentic-first lint profile
+    /// (D2, TODO-mix 2026-09-24). Promotes D3015/W2201/W2302 to errors
+    /// and enables the agent-only rules in [`check_agent_rules`] — the
+    /// failure classes a model driving Mix as an actuator must see at
+    /// error strength: constant-truthy conditions, a function name used
+    /// as a value, an assignment from a nil-returning mutator, and a
+    /// write to an outer variable inside `fn` (which silently binds a
+    /// local). Off by default: the fleet's `--deny-warnings` gates run
+    /// the ordinary profile.
+    pub agent: bool,
 }
 
 /// The result of one file's analysis.
@@ -426,8 +436,272 @@ fn analyze_at(
     if !remote_body && !cfg.suppress_name_checks {
         check_ssh_mix_bodies(stmts, &ctx, &mut a, cfg);
     }
+    if cfg.agent {
+        promote_agent_diagnostics(&mut a);
+        check_agent_rules(stmts, &ctx, &mut a);
+    }
     collect_capabilities(stmts, &mut a);
     a
+}
+
+/// The `--agent` profile (D2): diagnostics an agent MUST see at error
+/// strength. D3015/W2201/W2302 are notes/warnings in the ordinary
+/// profile — a human filters them; an agent's `lint && run` loop should
+/// not. Promotion happens AFTER every check, so it cannot be undone by
+/// emission order.
+const AGENT_PROMOTED: &[&str] = &["MIX-D3015", "MIX-W2201", "MIX-W2302"];
+
+fn promote_agent_diagnostics(a: &mut Analysis) {
+    for d in &mut a.diagnostics {
+        if AGENT_PROMOTED.contains(&d.code) {
+            d.severity = Severity::Error;
+        }
+    }
+}
+
+/// The agent-only rules (D2): failure classes a model driving Mix as an
+/// actuator trips, all errors under `--agent` and silent in the ordinary
+/// profile (the fleet's `--deny-warnings` gates must not change meaning
+/// until these have been triaged against real scripts).
+fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    let known: HashSet<String> = ctx.known_callables.clone();
+    // R4 compares against OUTER VARIABLES, not callables: `$sum = 0` in a
+    // fn must not fire because the prelude defines a `sum` FUNCTION (review
+    // F3.1/F3.4). Only a top-level $variable of the same name is shadowed.
+    let outer_vars: HashSet<String> = ctx.top_level_names.clone();
+
+    fn walk(
+        stmts: &[Stmt],
+        ctx: &FileContext,
+        a: &mut Analysis,
+        known: &HashSet<String>,
+        outer_vars: &HashSet<String>,
+    ) {
+        for stmt in stmts {
+            match &stmt.kind {
+                StmtKind::Assignment { name: _, value } => {
+                    // R2: `$f = bump` stores the STRING "bump" — Mix has
+                    // no first-class function values. Scoped to USER-DEFINED
+                    // names only (file functions, prelude, allow-list):
+                    // builtin names are ordinary string values in config
+                    // (`$mode = "json"`, `$action = "print"` — review F3.1),
+                    // while naming a script's own function is almost always
+                    // the store-then-call bug.
+                    if let Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) = value
+                        && known.contains(s)
+                    {
+                        a.diagnostics.push(diag(
+                            ctx,
+                            "MIX-E1503",
+                            Severity::Error,
+                            stmt.line,
+                            format!(
+                                "stores the STRING \"{s}\", not the function — Mix has no first-class \
+                                 function values; call it instead: {s}(...)"
+                            ),
+                            None,
+                        ));
+                    }
+                    // R3: `$n = write_file(...)` binds nil — the mutator
+                    // returns nothing.
+                    if let Expr::FunctionCall { name, .. } = value
+                        && let Some(info) = crate::builtins::builtin_info_of(name)
+                        && matches!(info.contract.returns, TypeShape::Nil)
+                    {
+                        a.diagnostics.push(diag(
+                            ctx,
+                            "MIX-E1504",
+                            Severity::Error,
+                            stmt.line,
+                            format!(
+                                "{name}() returns nil — this assignment binds nil; drop the $var or \
+                                 use a value-returning form"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+                StmtKind::If {
+                    condition,
+                    then_body,
+                    else_ifs,
+                    else_body,
+                } => {
+                    check_truthy(condition, stmt.line, ctx, a);
+                    for (cond, _) in else_ifs {
+                        check_truthy(cond, stmt.line, ctx, a);
+                    }
+                    walk(then_body, ctx, a, known, outer_vars);
+                    for (_, body) in else_ifs {
+                        walk(body, ctx, a, known, outer_vars);
+                    }
+                    if let Some(els) = else_body {
+                        walk(els, ctx, a, known, outer_vars);
+                    }
+                }
+                StmtKind::While { condition, body, .. } => {
+                    // `while true` is the canonical event-pump idiom (review
+                    // F3.3) — exempt it; a `while false` is still flagged.
+                    if !matches!(condition, Expr::BoolLiteral(true)) {
+                        check_truthy(condition, stmt.line, ctx, a);
+                    }
+                    walk(body, ctx, a, known, outer_vars);
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::ForEach { body, .. }
+                | StmtKind::Address { body, .. }
+                | StmtKind::On { body, .. } => walk(body, ctx, a, known, outer_vars),
+                StmtKind::FunctionDef { name, params, body, .. } => {
+                    // R4: an assignment to a name that exists as an OUTER
+                    // VARIABLE (and is not one of this fn's params) creates
+                    // a new local — the outer variable is unchanged.
+                    let param_names: HashSet<&str> =
+                        params.iter().map(|p| p.name.as_str()).collect();
+                    let mut written: HashSet<String> = HashSet::new();
+                    collect_written(body_stmt_list(body), &mut written);
+                    for w in &written {
+                        if outer_vars.contains(w) && !param_names.contains(w.as_str()) {
+                            a.diagnostics.push(diag(
+                                ctx,
+                                "MIX-E1506",
+                                Severity::Error,
+                                stmt.line,
+                                format!(
+                                    "fn {name}() assigns ${w}, which exists in the outer scope — \
+                                     the assignment silently creates a NEW local and the outer ${w} \
+                                     is unchanged"
+                                ),
+                                Some("pass it in, return it, or rename the local".to_string()),
+                            ));
+                        }
+                    }
+                    walk(body_stmt_list(body), ctx, a, known, outer_vars);
+                }
+                StmtKind::TryCatch {
+                    try_body,
+                    catch,
+                    finally_body,
+                } => {
+                    walk(try_body, ctx, a, known, outer_vars);
+                    if let Some(clause) = catch {
+                        walk(&clause.body, ctx, a, known, outer_vars);
+                    }
+                    if let Some(fb) = finally_body {
+                        walk(fb, ctx, a, known, outer_vars);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(stmts, ctx, a, &known, &outer_vars);
+}
+
+/// R1: a condition that is a literal (string/bool/nil/map) or a
+/// process-result map is constant-truthy — `if "false"` and
+/// `if {ok: false}` are always true, and a result map is always a map.
+fn check_truthy(cond: &Expr, line: usize, ctx: &FileContext, a: &mut Analysis) {
+    match cond {
+        Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) => {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-E1505",
+                Severity::Error,
+                line,
+                format!(
+                    "condition is the string \"{s}\" — every non-empty string is truthy; compare \
+                     explicitly"
+                ),
+                None,
+            ));
+        }
+        Expr::BoolLiteral(_) | Expr::NilLiteral | Expr::MapLiteral(_) => {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-E1505",
+                Severity::Error,
+                line,
+                "condition is a constant — it never varies".to_string(),
+                None,
+            ));
+        }
+        Expr::FunctionCall { name, .. } => {
+            if let Some(info) = crate::builtins::builtin_info_of(name)
+                && info.contract.effects.must_use
+                && matches!(
+                    info.contract.returns,
+                    TypeShape::Map { .. } | TypeShape::List(_)
+                )
+            {
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-E1505",
+                    Severity::Error,
+                    line,
+                    format!(
+                        "condition is the result of {name}() — a map/list is always truthy; test \
+                         {name}(...).ok"
+                    ),
+                    None,
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn body_stmt_list(body: &FunctionBody) -> &[Stmt] {
+    match body {
+        FunctionBody::Block(s) => s,
+        FunctionBody::Expression(_) => &[],
+    }
+}
+
+/// Every `$var = …` written inside these statements, one nesting level
+/// deep — enough to catch the shadowing R4 warns about (an assignment in
+/// a nested if/loop still binds a NEW local at the fn's scope).
+fn collect_written(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Assignment { name, .. } => {
+                out.insert(name.clone());
+            }
+            StmtKind::If {
+                then_body,
+                else_ifs,
+                else_body,
+                ..
+            } => {
+                collect_written(then_body, out);
+                for (_, body) in else_ifs {
+                    collect_written(body, out);
+                }
+                if let Some(els) = else_body {
+                    collect_written(els, out);
+                }
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::For { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::Address { body, .. }
+            | StmtKind::On { body, .. } => collect_written(body, out),
+            StmtKind::TryCatch {
+                try_body,
+                catch,
+                finally_body,
+            } => {
+                collect_written(try_body, out);
+                if let Some(clause) = catch {
+                    collect_written(&clause.body, out);
+                }
+                if let Some(fb) = finally_body {
+                    collect_written(fb, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// MIX-D3015 + MIX-W2405 (0.90.0) — the two rules about how a
@@ -1085,24 +1359,44 @@ fn check_scope(
         let result_consumed = last_in_block && block_is_value;
         // W2201: a discarded must-use operation as a bare expression
         // statement (skip the last statement of a block — it may be the
-        // block's value).
+        // block's value). Also covers a discarded PURE transform: a
+        // CapabilityClass::Pure builtin that returns a value and mutates
+        // nothing does nothing at all when its result is dropped
+        // (`upper($s)` alone is a no-op) — D3, TODO-mix 2026-09-24.
         if let StmtKind::Expression(Expr::FunctionCall { name, .. }) = &stmt.kind
             && !last_in_block
             && let Some(info) = builtins::builtin_info_of(name)
-            && info.contract.effects.must_use
         {
-            a.diagnostics.push(diag(
-                ctx,
-                "MIX-W2201",
-                Severity::Warning,
-                stmt.line,
-                format!(
-                    "result of {name}() is discarded — its failure signal is in the returned value"
-                ),
-                Some(format!(
-                    "bind it: $r = {name}(...) and branch on the result"
-                )),
-            ));
+            let pure_transform_discarded = info.capability == CapabilityClass::Pure
+                && !info.contract.effects.mutates_args
+                && !matches!(info.contract.returns, TypeShape::Nil | TypeShape::Any);
+            if info.contract.effects.must_use || pure_transform_discarded {
+                let (msg, hint) = if pure_transform_discarded
+                    && !info.contract.effects.must_use
+                {
+                    (
+                        format!(
+                            "result of {name}() is discarded — it is a pure transform: it returns a new value and mutates nothing, so this statement does nothing"
+                        ),
+                        format!("bind or use it: $r = {name}(...)"),
+                    )
+                } else {
+                    (
+                        format!(
+                            "result of {name}() is discarded — its failure signal is in the returned value"
+                        ),
+                        format!("bind it: $r = {name}(...) and branch on the result"),
+                    )
+                };
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-W2201",
+                    Severity::Warning,
+                    stmt.line,
+                    msg,
+                    Some(hint),
+                ));
+            }
         }
 
         // E1501 / E1502: a statement whose whole effect is provably lost.
@@ -2674,6 +2968,9 @@ fn analyse_remote_body(
         // rules must read the source they are reporting lines against.
         // Lint is the only gate this remote program ever passes through.
         source: Some(src.to_string()),
+        // The agent profile propagates into remote bodies: an agent
+        // linting its ssh_mix programs wants the same error strength there.
+        agent: cfg.agent,
     };
     let nested = analyze_at(&inner, None, &inner_cfg, true);
     for mut d in nested.diagnostics {

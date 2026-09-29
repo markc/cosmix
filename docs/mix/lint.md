@@ -64,6 +64,10 @@ MIX-E1101  undefined variable               MIX-E1401  require() target missing/
 MIX-E1102  undefined function               MIX-E1402  require() target invalid Mix
 MIX-E1201  builtin arity mismatch           MIX-E1501  dead mutation (write is lost)
 MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
+                                            MIX-E1503  fn name stored as a value (--agent)
+                                            MIX-E1504  assignment from nil-returning builtin (--agent)
+                                            MIX-E1505  constant-truthy condition (--agent)
+                                            MIX-E1506  write to an outer variable in fn (--agent)
                                             MIX-W2101  unreachable statement
                                             MIX-W2201  discarded must-use result
                                             MIX-W2301  `+` on a proven list/map raises
@@ -91,6 +95,7 @@ move, since a code's letter fixes its severity permanently. It is now
 - **MIX-E1201** checks calls against the structured contract metadata (`mix builtins --json`), including non-contiguous exact-arity sets — `random(1)` is an error, `random()`/`random(min, max)` are not. The contract is the documented surface; some older builtins tolerate surplus arguments at runtime, and lint is deliberately stricter (`mix --strict-arity` makes the runtime agree).
 - **MIX-E1501** flags a discarded `push`/`pop`/`shift` whose first argument is **not a bare variable** — `push($m["a"], $v)`, `push($m.a, $v)`, `$m["a"].push($v)`. These builtins mutate through the variable slot, so given any other expression they append to a temporary copy and the write is **lost in silence**. It is an ERROR, not a warning: the statement does nothing while reading as though it did. The fix **differs by builtin**: `push` returns the appended list, so assign it back (`$m["a"] = push($m["a"], $v)`); `pop`/`shift` return the **removed element**, not the list, so assigning that back replaces the list with the element (data corruption) — hoist first instead (`$l = $m[$k]; $x = pop($l); $m[$k] = $l`). For maps of maps, write the [nested assignment](collections.md) directly. A by-value **parameter** is a bare variable, so that case stays with its own definition-time dead-push warning and is not double-reported.
 - **MIX-E1502** flags a discarded `delete` / `merge` — both are **pure** (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: `$m = delete($m, "k")`.
+- **MIX-E1503–E1506** are the `--agent` profile (run `mix lint --agent`, or `MIX_LINT=agent`): a function name stored as a value (`$f = bump` binds the *string*), an assignment from a nil-returning builtin (`$n = write_file(...)` binds nil), a constant-truthy condition (`if "false"`, a bare process-result map — `while true` is exempt), and a `fn` body writing an outer variable (which silently creates a local). Ordinary lint and the fleet's `--deny-warnings` gates run without them.
 - **MIX-W2201** fires when an operation whose failure signal lives in its RETURN VALUE (`effects.must_use`: `run_rc`, `run_argv`, `run_pipeline`, `run_parallel`, `ssh_run`, `ssh_exec`, `ssh_mix`, `http_*`, `kill`, `run_stream`) is a bare expression statement — the bug class where a failed remote step silently vanishes. Bind the result and branch on it; some have a fail-fast twin that raises (`run_argv`→`run_argv_must`, `run_pipeline`→`run_pipeline_must`, `ssh_run`→`ssh_must`). The last statement of a block is exempt (it may be the block's value).
 - **MIX-W2301** warns that `+` is not defined for lists or maps. Since 0.90.0
   the runtime **raises** `TYPE_ERROR` there rather than silently stringifying,

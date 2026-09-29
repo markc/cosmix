@@ -137,6 +137,26 @@ pub const LINT_DOCS: &[LintDoc] = &[
         summary: "discarded pure transform",
         detail: "A discarded `delete`/`merge` — both are PURE (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: `$m = delete($m, \"k\")`.",
     },
+    LintDoc {
+        code: "MIX-E1503",
+        summary: "function name stored as a value (--agent)",
+        detail: "`$f = bump` stores the STRING \"bump\" — Mix has no first-class function values, so the assignment binds text, not the function. Call it instead: `bump(...)`. Scoped to USER-DEFINED names (file functions, prelude, allow-list) so an ordinary config string that happens to match a builtin (`$mode = \"json\"`) stays silent. Emitted only under `--agent` / `MIX_LINT=agent`.",
+    },
+    LintDoc {
+        code: "MIX-E1504",
+        summary: "assignment from a nil-returning builtin (--agent)",
+        detail: "`$n = write_file(...)`, `$x = push($x, v)` — the builtin's contract returns nil, so the assignment binds nil and the script reads as though it captured a result. Drop the `$var`, or use a value-returning form. Emitted only under `--agent` / `MIX_LINT=agent`.",
+    },
+    LintDoc {
+        code: "MIX-E1505",
+        summary: "constant-truthy condition (--agent)",
+        detail: "A condition that never varies: a string literal (`if \"false\"` — every non-empty string is truthy), a bool/nil/map literal, or a process-result map used bare (a map is always truthy — test `.ok`). `while true` is exempt: it is the canonical event-pump idiom. Emitted only under `--agent` / `MIX_LINT=agent`.",
+    },
+    LintDoc {
+        code: "MIX-E1506",
+        summary: "write to an outer variable inside fn (--agent)",
+        detail: "A `fn` body assigns a name that already exists as an outer $variable (and is not one of its params) — the assignment silently creates a NEW local, and the outer variable is unchanged. Pass it in, return it, or rename the local. Compares against variables, not callables, so a `$sum = 0` local never fires on the prelude's `sum` function. Emitted only under `--agent` / `MIX_LINT=agent`.",
+    },
     // ---- Warnings (MIX-W2xxx) ----
     LintDoc {
         code: "MIX-W2101",

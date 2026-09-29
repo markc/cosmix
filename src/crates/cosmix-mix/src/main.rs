@@ -462,6 +462,9 @@ fn run_stats_subcommand(sub_args: &[String]) -> i32 {
 /// results, which is the correct behaviour: there IS no session.
 fn run_meta_subcommand(sub_args: &[String]) -> i32 {
     let rt = build_runtime();
+    // `mix status` reports uptime from START_TIME; the meta one-shot path
+    // never went through the main-line init, so it printed "uptime: ?".
+    meta::init_start_time();
 
     rt.block_on(async {
         let mut eval = Evaluator::new();
