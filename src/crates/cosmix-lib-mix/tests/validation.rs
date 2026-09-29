@@ -74,9 +74,13 @@ async fn expect_type_matrix() {
     // Unknown type name is a SPEC error, not a value error.
     let out = run_ok("try\n  expect_type(1, \"int\")\ncatch $m, $e\n  print($e.code)\nend\n").await;
     assert_eq!(out, "VALIDATION_SPEC\n");
-    // Whole-but-huge numbers are not safe integers.
+    // Whole-but-huge numbers are not safe integers — but since C5
+    // (2026-09-30) a non-round-tripping integer LITERAL is refused at the
+    // lexer, so the validator's safe-integer check is now reached via a
+    // runtime-produced value (a computed or string-parsed number). The
+    // lexer refusal is the authoring-time gate; this is the runtime one.
     assert_eq!(
-        catch_code("expect_type(9007199254740993, \"integer\")").await,
+        catch_code("expect_type(to_number(\"1e17\"), \"integer\")").await,
         "VALIDATION_TYPE path=value expected=integer actual=number\n"
     );
 }

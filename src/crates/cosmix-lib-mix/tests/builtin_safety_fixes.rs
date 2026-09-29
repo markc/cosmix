@@ -394,7 +394,7 @@ async fn json_encode_i64_boundary_takes_real_path() {
     // 2^63 == i64::MAX as f64 (rounds UP one past i64::MAX): the integer
     // fast path must NOT claim it — `as` would saturate to i64::MAX and
     // silently emit 9223372036854775807. It encodes as a real instead.
-    let out = run_ok(r#"print(json_encode(9223372036854775808))"#).await;
+    let out = run_ok(r#"print(json_encode(to_number("9223372036854775808")))"#).await;
     assert_ne!(out, "9223372036854775807");
     assert!(
         out.contains("e") || out.contains("."),

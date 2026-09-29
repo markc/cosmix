@@ -512,7 +512,7 @@ async fn nan_index_write_errors_not_corrupts() {
 #[tokio::test]
 async fn index_reads_stay_lenient() {
     let out = run(
-        "$l = [1,2,3]\nprint(\"[\" .. $l[1000000000000000000000000000000] .. \"]\")\n",
+        "$l = [1,2,3]\nprint(\"[\" .. $l[to_number(\"1000000000000000000000000000000\")] .. \"]\")\n",
         |_| {},
     )
     .await
