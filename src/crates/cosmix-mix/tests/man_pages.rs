@@ -190,7 +190,10 @@ fn keyword_table_matches_the_binary() {
 #[test]
 fn no_stale_version_stamps_or_banned_citations() {
     let this_version = env!("CARGO_PKG_VERSION");
-    let banned = ["docs/_man/", "markc/mix", "markc.github.io"];
+    // Precise needles: "github.com/markc/mix" (the archived repo, in link
+    // form) rather than the bare "markc/mix" substring, which also occurs
+    // in api.github.com/repos/... example URLs.
+    let banned = ["docs/_man/", "github.com/markc/mix", "markc.github.io"];
 
     for page in pages() {
         let content = read_page(&page);
@@ -201,8 +204,7 @@ fn no_stale_version_stamps_or_banned_citations() {
             );
         }
         for line in content.lines() {
-            if let Some(pos) = line.find("Verified against") {
-                // A numeric stamp has the shape "**mix X.Y.Z**" — it must
+            if let Some(pos) = line.find("Verified against") {                // A numeric stamp has the shape "**mix X.Y.Z**" — it must
                 // not trail the binary. (Pages may instead name this suite,
                 // which is the preferred form.)
                 let rest = &line[pos..];
