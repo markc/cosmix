@@ -191,21 +191,22 @@ async fn a_failed_write_raises_under_every_name() {
 }
 
 #[tokio::test]
-async fn print_still_swallows_what_this_family_raises() {
-    // The stated contrast, made a test: `print` and `printf` discard a write
-    // error and carry on. If someone "fixes" that for consistency, this goes
-    // red and the docs get revisited deliberately rather than by accident.
-    let mut lexer = Lexer::new("print(\"a\")\nprintf(\"%s\", \"b\")\n$ok = 1\n");
-    let tokens = lexer.tokenize().expect("lex");
-    let mut parser = Parser::new(tokens, "");
-    let stmts = parser.parse_program().expect("parse");
-    let mut eval = Evaluator::with_output(
-        Box::new(FailingSink(std::io::ErrorKind::BrokenPipe)),
-        Box::new(FailingSink(std::io::ErrorKind::BrokenPipe)),
-    );
+async fn print_and_printf_raise_like_the_raw_family() {
+    // B9 (TODO-mix 2026-09-24): `print`/`printf` used to swallow a write
+    // error and carry on — a full/broken destination reported success.
+    // They now raise the same IO_BROKEN_PIPE / IO_WRITE_FAILED codes as
+    // write_stdout, so an agent reading rc sees the delivery failure.
+    let src = "try\n  print(\"a\")\ncatch $m, $e\n  die(\"CODE=\" .. $e.code)\nend\n";
+    let err = run_failing(src, std::io::ErrorKind::BrokenPipe).await;
     assert!(
-        eval.execute(&stmts).await.is_ok(),
-        "print/printf must still swallow write errors"
+        err.contains("CODE=IO_BROKEN_PIPE"),
+        "print must raise IO_BROKEN_PIPE, got: {err}"
+    );
+    let src = "try\n  printf(\"%s\", \"b\")\ncatch $m, $e\n  die(\"CODE=\" .. $e.code)\nend\n";
+    let err = run_failing(src, std::io::ErrorKind::PermissionDenied).await;
+    assert!(
+        err.contains("CODE=IO_WRITE_FAILED"),
+        "printf must raise IO_WRITE_FAILED, got: {err}"
     );
 }
 

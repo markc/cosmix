@@ -50,7 +50,7 @@ mod stats_io;
 
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process;
 
@@ -470,7 +470,10 @@ fn run_meta_subcommand(sub_args: &[String]) -> i32 {
         let mut eval = Evaluator::new();
         eval.set_bus_handler(std::rc::Rc::new(bus::MixBusHandler::new()));
         cosmix_mix::interrupt::init(eval.interrupt_flag());
-        eval.load_prelude().await;
+        if let Err(e) = eval.load_prelude().await {
+            eprintln!("{e}");
+            return 1;
+        }
 
         // `mix doctor` one-shot: return its health exit code (0/1) so it can
         // gate `mix doctor && …`. Handled here rather than in `dispatch`, which
@@ -480,6 +483,12 @@ fn run_meta_subcommand(sub_args: &[String]) -> i32 {
         }
         let args_slice: Vec<&str> = sub_args.iter().map(String::as_str).collect();
         let _exec_hint = meta::dispatch(&args_slice, &eval, VERSION);
+        // B12: a lookup miss (man/builtins/type/explain/unknown) exits 1
+        // so `mix type X && …` cannot lie about a name that resolves
+        // nowhere.
+        if meta::meta_missed() {
+            return 1;
+        }
         // `dispatch` returns Some(path) only for REPL-exec-chain
         // commands like `build` that restart the REPL into a new
         // binary. In one-shot mode there's no REPL to exec back
@@ -497,6 +506,15 @@ fn run_meta_subcommand(sub_args: &[String]) -> i32 {
 /// Kept as an explicit allowlist rather than "try meta first, fall
 /// back to script" so dispatch is deterministic and future meta
 /// commands are opt-in visible at this layer.
+/// B6: how a script run ended — either it ran (with its own result), or
+/// the process received a termination signal while racing the run. The
+/// signal number is what becomes the exit code (128+sig), so it must be
+/// carried distinctly instead of flattened into `Ok(())`.
+enum ScriptOutcome {
+    Ran(Result<(), cosmix_mix::error::MixError>),
+    Signal(i32),
+}
+
 const META_CLI_COMMANDS: &[&str] = &[
     "vars",
     "aliases",
@@ -594,8 +612,11 @@ fn run_source(
         repl::register_ai_extensions(&mut eval);
 
         // Load prelude
-        if !no_prelude {
-            eval.load_prelude().await;
+        if !no_prelude
+            && let Err(e) = eval.load_prelude().await
+        {
+            eprintln!("{e}");
+            return (ScriptOutcome::Ran(Err(e)), eval.take_stats());
         }
 
         if stats_io::stats_enabled() {
@@ -628,17 +649,14 @@ fn run_source(
         // approach cannot guarantee on current_thread.
         let outcome = tokio::select! {
             biased;
-            _ = shutdown_signal() => {
-                // First Ctrl-C — exit cleanly
-                Ok(())
-            }
+            sig = shutdown_signal() => ScriptOutcome::Signal(sig),
             res = async {
                 eval.execute_script_source(source).await?;
                 if eval.handler_count() > 0 {
                     eval.run_event_pump().await?;
                 }
                 Ok::<_, cosmix_mix::error::MixError>(())
-            } => res,
+            } => ScriptOutcome::Ran(res),
         };
         (outcome, eval.take_stats())
     }));
@@ -646,9 +664,21 @@ fn run_source(
         stats_io::flush_batch(stats);
     }
     match outcome {
-        Ok(_) => 0,
-        Err(cosmix_mix::error::MixError::ExitRequest { code }) => code,
-        Err(e) => {
+        // B6/D8 (TODO-mix 2026-09-24): a script killed by a signal exits
+        // 128+signal, so a cancelled job can never read as success. The
+        // one historical carve-out: SIGINT on an interactive terminal
+        // keeps the clean 0 (Ctrl-C at a TTY is the operator, not a
+        // cancellation).
+        ScriptOutcome::Signal(sig) => {
+            if sig == libc::SIGINT && std::io::stdin().is_terminal() {
+                0
+            } else {
+                128 + sig
+            }
+        }
+        ScriptOutcome::Ran(Ok(_)) => 0,
+        ScriptOutcome::Ran(Err(cosmix_mix::error::MixError::ExitRequest { code })) => code,
+        ScriptOutcome::Ran(Err(e)) => {
             let msg = format!("{e}");
             if msg.contains("interrupted") {
                 // Clean exit on interrupt
@@ -699,8 +729,11 @@ fn run_command_line(
         eval.set_shell_handler(std::rc::Rc::new(shell_handler::ReplShellHandler::new()));
         cosmix_mix::interrupt::init(eval.interrupt_flag());
         repl::register_ai_extensions(&mut eval);
-        if !no_prelude {
-            eval.load_prelude().await;
+        if !no_prelude
+            && let Err(e) = eval.load_prelude().await
+        {
+            eprintln!("{e}");
+            return (1, eval.take_stats());
         }
         for (idx, arg) in script_args.iter().enumerate() {
             eval.set_global(&(idx + 1).to_string(), Value::String(arg.clone()));
@@ -853,12 +886,16 @@ fn run_command_line(
                     }
                 }
                 match res {
-                    // Only the framed caller's exit code changes. A plain
-                    // `mix -c` stopped by Ctrl-C or systemd has always been a
-                    // clean 0 and scripts depend on it; a task's shell is the
-                    // one that must not exit 0 after being killed.
+                    // B6/D8: a killed run must not read as success. Framed
+                    // callers always got 128+sig; the plain arm now does
+                    // too, with the one historical carve-out — SIGINT on an
+                    // interactive terminal (Ctrl-C at a TTY is the
+                    // operator, not a cancellation).
                     Err(signal) => {
-                        if framed {
+                        if framed
+                            || signal != libc::SIGINT
+                            || !std::io::stdin().is_terminal()
+                        {
                             128 + signal
                         } else {
                             0
@@ -882,7 +919,13 @@ fn run_command_line(
                 // carry the real command status, exactly as a paren call would).
                 let res: Result<(), cosmix_mix::error::MixError> = tokio::select! {
                     biased;
-                    _ = shutdown_signal() => Ok(()),
+                    // B6: the signal number travels in a structured error so
+                    // the exit-code match below can apply the same TTY
+                    // carve-out as every other path.
+                    sig = shutdown_signal() => Err(cosmix_mix::error::MixError::structured(
+                        "SIGNAL_INTERRUPT",
+                        sig.to_string(),
+                    )),
                     r = async {
                         eval.call_function_by_name_with_args(&name, &args).await?;
                         if eval.handler_count() > 0 {
@@ -894,6 +937,16 @@ fn run_command_line(
                 match res {
                     Ok(_) => 0,
                     Err(cosmix_mix::error::MixError::ExitRequest { code }) => code,
+                    Err(cosmix_mix::error::MixError::Structured(info))
+                        if info.code == "SIGNAL_INTERRUPT" =>
+                    {
+                        let sig: i32 = info.message.parse().unwrap_or(libc::SIGTERM);
+                        if sig == libc::SIGINT && std::io::stdin().is_terminal() {
+                            0
+                        } else {
+                            128 + sig
+                        }
+                    }
                     Err(e) if format!("{e}").contains("interrupted") => 0,
                     Err(e) => {
                         print_uncaught(&e);
@@ -1361,7 +1414,14 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             ));
             repl::register_ai_extensions(&mut eval);
             if !no_prelude {
-                eval.load_prelude().await;
+                // The serve-evaluator builder returns an Evaluator, not a
+                // result: a failed prelude here prints loudly and the
+                // citizen starts on the partially-loaded state (pre-B10
+                // behaviour for this one path, kept visible rather than
+                // silent).
+                if let Err(e) = eval.load_prelude().await {
+                    eprintln!("{e}");
+                }
             }
             if stats_io::stats_enabled() {
                 eval.attach_stats(UsageStats::for_execution(StatsContext::new(

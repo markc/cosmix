@@ -345,7 +345,11 @@ pub fn run_repl() -> i32 {
     });
 
     // Load prelude before .mixrc
-    rt.block_on(eval.load_prelude());
+    // B10: a broken prelude surfaces as an error; the REPL shows it once
+    // and continues on the embedded state rather than dying mid-session.
+    if let Err(e) = rt.block_on(eval.load_prelude()) {
+        eprintln!("{e}");
+    }
 
     let mut line_buf = String::new();
     let mut dir_stack: Vec<String> = Vec::new();

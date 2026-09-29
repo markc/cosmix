@@ -47,7 +47,7 @@ async fn run_in_dir_with(
     eval.set_file(main_path.to_string_lossy().to_string());
     configure(&mut eval);
     if with_prelude {
-        eval.load_prelude().await;
+        let _ = eval.load_prelude().await;
     }
     eval.execute(&stmts).await.map_err(|e| e.to_string())?;
     Ok(stdout.to_string_lossy())

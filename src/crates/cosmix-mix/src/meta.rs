@@ -28,6 +28,23 @@ pub fn init_start_time() {
     START_TIME.get_or_init(Instant::now);
 }
 
+/// B12 (TODO-mix 2026-09-24): a meta-command MISS used to exit 0 —
+/// `mix type nosuch && deploy` lied. The four lookup commands (`man`,
+/// `builtins`, `type`, `explain`) and the unknown-meta fallback set this
+/// flag on a miss; the one-shot CLI reads-and-resets it after dispatch
+/// and returns exit 1. The REPL ignores it (a miss at the prompt is a
+/// message, not a session failure).
+static META_MISSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True iff the just-dispatched meta command missed; resets for the next.
+pub fn meta_missed() -> bool {
+    META_MISSED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn mark_missed() {
+    META_MISSED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 // Mix language keywords — the complete reserved-word set, read from the
 // lexer itself (`cosmix_mix::lexer::KEYWORDS`) so the discovery surface
 // can never drift from the grammar. `mix keywords`, `mix what` and
@@ -889,6 +906,7 @@ pub fn dispatch(args: &[&str], eval: &Evaluator, version: &str) -> Option<String
             }
         }
         unknown => {
+            mark_missed();
             eprintln!("mix: unknown meta-command '{}' (and no such file)", unknown);
             cmd_help_overview();
         }
@@ -1250,6 +1268,7 @@ fn cmd_type(name: &str, eval: &Evaluator) {
     }
 
     println!("{}: not found", name);
+    mark_missed();
 }
 
 /// `mix config`: runtime configuration info
@@ -2795,6 +2814,7 @@ fn available_man_topics(man_dir: &Path) -> Vec<String> {
 }
 
 fn print_man_not_found(topic: Option<&str>, base_url: &str) {
+    mark_missed();
     eprintln!("mix man: no manual page for '{}'", topic.unwrap_or("index"));
     eprintln!();
 
@@ -2912,6 +2932,7 @@ pub fn cmd_builtins(args: &[&str], version: &str) {
                 print!("{}", builtins_report_string(Some(token)));
             } else {
                 eprintln!("mix builtins: unknown builtin or category '{}'", token);
+                mark_missed();
                 eprintln!("Categories: {}", builtin_categories().join(", "));
                 eprintln!("Run 'mix builtins' for the full list, or 'mix builtins --names'.");
             }
@@ -2972,6 +2993,7 @@ fn cmd_explain_code(code: &str) {
             println!("\n(see the full rules: mix man lint)");
         }
         None => {
+            mark_missed();
             eprintln!(
                 "mix explain: unknown lint code '{code}'. Codes are MIX-E1xxx (errors), \
                  MIX-W2xxx (warnings), MIX-D3xxx (deprecation notes)."
