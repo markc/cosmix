@@ -412,7 +412,14 @@ pub fn execute_command_list_outcome(
     execute_command_list_with_policy(items, vars, jobs, &policy)
 }
 
-/// B3: the bash keywords a shell line must refuse, each with its Mix form.
+/// B3: the bash RESERVED WORDS a shell line must refuse, each with its Mix
+/// form. Deliberately only the words that can never BE a command — the
+/// builtin-shaped names (`export`, `set`, `local`, `declare`, `unset`,
+/// `trap`, `eval`, `command`, `source`, `.`) stay shell-path commands:
+/// `FOO=bar export x || fallback` is a working shell line (semicolon_
+/// process pins it), and a bare `set -e` still fails visibly at 127
+/// instead of silently at 0. The builtin traps get their Mix forms with
+/// the shell-compatibility helpers (P7).
 const BASH_KEYWORDS: &[(&str, &str)] = &[
     ("for", "write `for $i = 1 to N … end`"),
     ("do", "drop it — blocks close with `end`"),
@@ -430,16 +437,6 @@ const BASH_KEYWORDS: &[(&str, &str)] = &[
     ("{", "drop it — block grouping is not a Mix form"),
     ("}", "drop it — blocks close with `end`"),
     ("[[", "write the condition as a Mix expression (no [[ ]])"),
-    ("set", "drop it — Mix needs no `set`"),
-    ("export", "write `export $VAR`"),
-    ("local", "drop it — fn bodies bind locals by assignment"),
-    ("declare", "drop it — see local"),
-    ("unset", "assign nil or re-scope; there is no unset"),
-    ("trap", "use try/catch/finally"),
-    ("eval", "call the program directly, or eval_expr_string"),
-    ("command", "call the program directly"),
-    ("source", "write `source \"file.mix\"`"),
-    (".", "write `source \"file.mix\"`"),
 ];
 
 /// The first non-env-prefix word of a shell piece.
