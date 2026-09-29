@@ -12798,13 +12798,31 @@ impl Evaluator {
             // `+` has no such idiom, and the mixed shapes (`[1] + 2`,
             // `1 + [2]`) are exactly the accidents worth catching.
             //
-            // Nil stays a scalar: `nil + 1` is "nil1" today, which is its own
-            // footgun but not this one, and changing it would break the
-            // absent-key-into-a-message shape data-dependently.
+            // Nil raises (C1, 2026-09-24): `nil + 1` became "nil1", a
+            // missing numeric field silently becoming text. The
+            // absent-key-into-a-message shape the 0.90.0 note protected is
+            // a `== nil` comparison, not arithmetic.
             //
             // `+` is NOT being made to mean list concatenation. `concat()`
             // and `merge()` already exist; one spelling per operation is what
             // keeps the language learnable, so the diagnostic names them.
+            // C1 (TODO-mix 2026-09-24): nil is NOT a scalar for arithmetic
+            // — `nil + 1` used to become the string "nil1", so a missing
+            // numeric field silently became text and flowed far from the
+            // cause. The absent-key idiom the 0.90.0 note protected is the
+            // `$map[$key] == nil` COMPARISON shape, which this arithmetic
+            // arm never sees; `==` keeps its own nil rule below.
+            BinOp::Add if matches!(left, Value::Nil) || matches!(right, Value::Nil) => {
+                Err(MixError::structured(
+                    "TYPE_ERROR",
+                    format!(
+                        "`+` is not defined for {} and {} — nil is not a number or string; \
+                         guard the nil with `??` (e.g. ($n ?? 0) + 1) or use `..` to build text",
+                        left.type_name(),
+                        right.type_name()
+                    ),
+                ))
+            }
             BinOp::Add if !add_is_scalar(left) || !add_is_scalar(right) => {
                 Err(add_operand_error(left, right))
             }

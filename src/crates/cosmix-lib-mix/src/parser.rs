@@ -2278,6 +2278,7 @@ impl Parser {
         if !self.check(&Token::RBrace) {
             loop {
                 self.skip_newlines();
+                let key_span = self.peek_span();
                 let key = match self.peek().clone() {
                     Token::String(s) => {
                         self.advance();
@@ -2289,6 +2290,17 @@ impl Parser {
                 };
                 self.expect(&Token::Colon)?;
                 let value = self.parse_expression()?;
+                // C4 (TODO-mix 2026-09-24): a duplicate LITERAL key silently
+                // overwrote (`{ok: false, ok: true}` -> {ok: true}) and lint
+                // said nothing. Refuse at parse time — a duplicate literal
+                // key is never intent; a computed duplicate belongs to a
+                // merge() where the last-wins order is deliberate.
+                if entries.iter().any(|(k, _)| k == &key) {
+                    return Err(MixError::ParseError {
+                        msg: format!("duplicate map key '{key}' — the second literal overwrites the first; use merge(a, b) for deliberate last-wins"),
+                        span: key_span,
+                    });
+                }
                 entries.push((key, value));
                 self.skip_newlines();
                 if !self.match_token(&Token::Comma) {
