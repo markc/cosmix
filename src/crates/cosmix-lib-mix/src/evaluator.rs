@@ -66,6 +66,85 @@ fn split_interp_coalesce(spec: &str) -> (&str, Option<(InterpCoalesce, &str)>) {
     (spec, None)
 }
 
+/// One interpolation suffix on a path segment: `[expr]` index or `(args)`
+/// call (09-25 entry — ${a[0]}, ${f()}).
+enum InterpSuffix<'a> {
+    Index(&'a str),
+    Call(&'a str),
+}
+
+/// Split an interpolation path on dots that are OUTSIDE `[...]`/`(...)` —
+/// so `m.k[1].x` yields ["m", "k[1]", "x"], not a bogus `k[1` segment.
+fn split_interp_segments(path: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, ch) in path.char_indices() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            '.' if depth == 0 => {
+                out.push(&path[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&path[start..]);
+    out
+}
+
+/// Split one segment into its bare base plus trailing `[...]`/`(...)`
+/// suffixes. The segment text inside the delimiters is handed back for
+/// nested evaluation.
+fn split_segment_suffixes(segment: &str) -> (&str, Vec<InterpSuffix<'_>>) {
+    let mut suffixes = Vec::new();
+    let mut base_end = segment.len();
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    // Walk to the first top-level '[' or '('.
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' | b'(' => {
+                base_end = i;
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let base = &segment[..base_end];
+    // Parse the suffix chain.
+    let mut rest = &segment[base_end..];
+    while !rest.is_empty() {
+        let open = rest.as_bytes()[0];
+        let close = if open == b'[' { b']' } else { b')' };
+        let mut depth = 0i32;
+        let mut end = None;
+        for (j, ch) in rest.char_indices() {
+            match ch {
+                c if c as u8 == open => depth += 1,
+                c if c as u8 == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(j) = end else { break };
+        let inner = &rest[1..j];
+        suffixes.push(if open == b'[' {
+            InterpSuffix::Index(inner)
+        } else {
+            InterpSuffix::Call(inner)
+        });
+        rest = &rest[j + 1..];
+    }
+    (base, suffixes)
+}
+
 /// The dotted-path head of an interpolation spec, ignoring any coalescing
 /// default — `${a.b ?? c}` → `"a"`. Used by slot-cache collection so a spec
 /// with a default doesn't register the whole `"a.b ?? c"` string as a name.
@@ -6504,39 +6583,128 @@ impl Evaluator {
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
             let (path, coalesce) = split_interp_coalesce(spec);
-            let mut parts_iter = path.split('.');
-            let head = parts_iter.next().unwrap_or("");
-            // SPEC 18 Phase 2 WS3-C.7b — γ-aware read, then env fallback.
-            let resolved = self
-                .scope
-                .get_value(head)
-                .map(|v| v.into_value())
-                .or_else(|| std::env::var(head).ok().map(Value::String));
-            let mut val = match resolved {
-                None => match coalesce {
-                    Some((_, src)) => return self.eval_interp_default(src).await,
-                    None => {
-                        return Err(MixError::RuntimeError {
-                            span: None,
-                            msg: format!(
-                                "undefined variable '${head}' in interpolation \
-                                 (use ${{{head} ?? default}} for a fallback)"
-                            ),
-                        });
+            // 09-25 entry: the path may carry `[index]` and `(args)`
+            // suffixes (${a[0]}, ${f()}, ${m.k[1]}) — split on dots at
+            // depth 0 so a dot inside brackets/parens is not a field
+            // boundary, then parse each segment's suffixes.
+            let segments = split_interp_segments(path);
+            let mut val: Option<Value> = None;
+            for (i, seg) in segments.iter().enumerate() {
+                let (base, suffixes) = split_segment_suffixes(seg);
+                let mut cur: Option<Value> = if i == 0 {
+                    // Head: function call when it has a `(args)` suffix,
+                    // else a variable (scope → env).
+                    let call_suffix = suffixes
+                        .iter()
+                        .find(|s| matches!(s, InterpSuffix::Call(_)))
+                        .is_some();
+                    if call_suffix {
+                        let func = self.resolve_interp_callable(base);
+                        match func {
+                            Some(f) => Some(Value::Function(f)),
+                            None => match coalesce {
+                                Some((_, src)) => return self.eval_interp_default(src).await,
+                                None => {
+                                    return Err(MixError::RuntimeError {
+                                        span: None,
+                                        msg: format!(
+                                            "undefined function '{base}' in interpolation \
+                                             (use ${{{base} ?? default}} for a fallback)"
+                                        ),
+                                    })
+                                }
+                            },
+                        }
+                    } else {
+                        match self
+                            .scope
+                            .get_value(base)
+                            .map(|v| v.into_value())
+                            .or_else(|| std::env::var(base).ok().map(Value::String))
+                        {
+                            Some(v) => Some(v),
+                            None => match coalesce {
+                                Some((_, src)) => return self.eval_interp_default(src).await,
+                                None => {
+                                    return Err(MixError::RuntimeError {
+                                        span: None,
+                                        msg: format!(
+                                            "undefined variable '${base}' in interpolation \
+                                             (use ${{{base} ?? default}} for a fallback)"
+                                        ),
+                                    })
+                                }
+                            },
+                        }
                     }
-                },
-                Some(v) => v,
-            };
-            for field in parts_iter {
-                val = match &val {
-                    Value::Map(m) => m
-                        .get(field)
-                        .or_else(|| m.get("*"))
-                        .cloned()
-                        .unwrap_or(Value::Nil),
-                    _ => Value::Nil,
+                } else {
+                    // Field on the running value.
+                    match val.as_ref() {
+                        Some(Value::Map(m)) => Some(
+                            m.get(base)
+                                .or_else(|| m.get("*"))
+                                .cloned()
+                                .unwrap_or(Value::Nil),
+                        ),
+                        _ => Some(Value::Nil),
+                    }
                 };
+                for suffix in suffixes {
+                    cur = Some(match suffix {
+                        InterpSuffix::Index(expr_src) => {
+                            let idx = self.eval_interp_fragment(expr_src).await?;
+                            match (cur.take(), idx) {
+                                (Some(Value::List(ref l)), Value::Number(n)) => {
+                                    crate::builtins::resolve_signed_index(n as i64, l.len())
+                                        .map(|i| l[i].clone())
+                                        .unwrap_or(Value::Nil)
+                                }
+                                (Some(Value::Map(ref m)), Value::String(ref s)) => m
+                                    .get(s)
+                                    .cloned()
+                                    .unwrap_or(Value::Nil),
+                                (Some(Value::Bytes(ref b)), Value::Number(n)) => {
+                                    crate::builtins::resolve_signed_index(n as i64, b.len())
+                                        .map(|i| Value::Number(b[i] as f64))
+                                        .unwrap_or(Value::Nil)
+                                }
+                                (Some(other), idx) => {
+                                    return Err(MixError::RuntimeError {
+                                        span: None,
+                                        msg: format!(
+                                            "cannot index {} with {} in interpolation",
+                                            other.type_name(),
+                                            idx.type_name()
+                                        ),
+                                    })
+                                }
+                                (None, _) => Value::Nil,
+                            }
+                        }
+                        InterpSuffix::Call(args_src) => {
+                            let args = self.eval_interp_args(args_src).await?;
+                            match cur.take() {
+                                Some(Value::Function(ref rc)) => {
+                                    let rc = Rc::clone(rc);
+                                    self.call_function(&rc, &args).await?
+                                }
+                                Some(other) => {
+                                    return Err(MixError::RuntimeError {
+                                        span: None,
+                                        msg: format!(
+                                            "cannot call {} as a function in interpolation",
+                                            other.type_name()
+                                        ),
+                                    })
+                                }
+                                None => Value::Nil,
+                            }
+                        }
+                    });
+                }
+                val = cur;
             }
+            let val = val.unwrap_or(Value::Nil);
             let fire = match coalesce {
                 Some((InterpCoalesce::Nil, _)) => matches!(val, Value::Nil),
                 Some((InterpCoalesce::Falsy, _)) => !val.is_truthy(),
@@ -6547,6 +6715,83 @@ impl Evaluator {
             } else {
                 Ok(val)
             }
+        })
+    }
+
+    /// Resolve a bareword CALLABLE for interpolation (${f()}): the same
+    /// order as the FunctionCall dispatch — module siblings, then frame
+    /// function-valued variables, then the registry.
+    fn resolve_interp_callable(&self, name: &str) -> Option<Rc<MixFunction>> {
+        if let Some(fns) = self.ctx.module_fn_frames.last()
+            && let Some(f) = fns.get(name)
+        {
+            return Some(Rc::clone(f));
+        }
+        if let Some(f) = self.scope.get_function_var_in_function_frames(name) {
+            return Some(f);
+        }
+        self.scope.get_function_owned(name)
+    }
+
+    /// Evaluate one fragment of an interpolation suffix (`[expr]` body or
+    /// a call argument) against the LIVE scope.
+    fn eval_interp_fragment<'a>(
+        &'a mut self,
+        src: &'a str,
+    ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
+        Box::pin(async move {
+            let mut lexer = crate::lexer::Lexer::new(src);
+            let tokens = lexer.tokenize()?;
+            let mut parser = crate::parser::Parser::new(tokens, src);
+            let stmts = parser.parse_program()?;
+            match stmts.len() {
+                1 => match &stmts[0].kind {
+                    StmtKind::Expression(e) => {
+                        let e = e.clone();
+                        self.eval_expr(&e).await
+                    }
+                    _ => Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!("interpolation suffix '{src}' is not an expression"),
+                    }),
+                },
+                _ => Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!("interpolation suffix '{src}' must be one expression"),
+                }),
+            }
+        })
+    }
+
+    /// Evaluate a `(args)` suffix's comma-separated argument expressions.
+    fn eval_interp_args<'a>(
+        &'a mut self,
+        src: &'a str,
+    ) -> Pin<Box<dyn Future<Output = MixResult<Vec<Value>>> + 'a>> {
+        Box::pin(async move {
+            if src.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut lexer = crate::lexer::Lexer::new(src);
+            let tokens = lexer.tokenize()?;
+            let mut parser = crate::parser::Parser::new(tokens, src);
+            let stmts = parser.parse_program()?;
+            let mut out = Vec::new();
+            for stmt in stmts {
+                match &stmt.kind {
+                    StmtKind::Expression(e) => {
+                        let e = e.clone();
+                        out.push(self.eval_expr(&e).await?);
+                    }
+                    _ => {
+                        return Err(MixError::RuntimeError {
+                            span: None,
+                            msg: format!("interpolation call argument '{src}' is not an expression"),
+                        })
+                    }
+                }
+            }
+            Ok(out)
         })
     }
 
