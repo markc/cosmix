@@ -126,8 +126,8 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-shell` | 0.19.0 |
 | `cosmix-shell-host` | 0.11.2 |
 | `cosmix-studio` | 0.4.8 |
-| `cosmix-term` | 0.3.1 |
-| `cosmix-term-core` | 0.8.2 |
+| `cosmix-term` | 0.3.2 |
+| `cosmix-term-core` | 0.8.3 |
 | `cosmix-tower` | 0.5.5 |
 | `cosmix-tray` | 0.3.2 |
 | `cosmix-trayd` | 0.6.3 |
