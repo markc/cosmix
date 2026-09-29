@@ -68,6 +68,8 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
                                             MIX-E1504  assignment from nil-returning builtin (--agent)
                                             MIX-E1505  constant-truthy condition (--agent)
                                             MIX-E1506  write to an outer variable in fn (--agent)
+                                            MIX-E1507  shell command written as a bare string
+                                            MIX-E1508  assign-back of an in-place mutator
                                             MIX-W2101  unreachable statement
                                             MIX-W2201  discarded must-use result
                                             MIX-W2301  `+` on a proven list/map raises
@@ -76,6 +78,7 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
                                             MIX-W2304  unknown builtin-result key
                                             MIX-W2305  -1-sentinel builtin as a truth value
                                             MIX-W2306  escaped quotes in ssh command source
+                                            MIX-W2307  send result never checked
                                             MIX-W2401  source/include defeats analysis
                                             MIX-W2402  bare bound variable in heredoc
                                             MIX-W2405  unknown escape kept literally

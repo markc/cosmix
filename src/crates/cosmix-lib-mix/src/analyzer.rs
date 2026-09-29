@@ -1899,6 +1899,133 @@ fn check_recurring_silent_bugs(stmts: &[Stmt], ctx: &FileContext, a: &mut Analys
     check_truthiness_traps(stmts, ctx, a);
     check_ssh_escaped_quotes(stmts, ctx, a);
     check_unguarded_edit_chain(stmts, ctx, a);
+    check_shell_command_statements(stmts, ctx, a);
+    check_send_rc_reads(stmts, ctx, a);
+    check_push_assign_back(stmts, ctx, a);
+}
+
+/// B2 (TODO-mix 2026-09-24): a shell command written inside a `.mix` file
+/// is a silent no-op — `hostname` or `systemctl --user daemon-reload`
+/// parse as a bare string, run nothing, exit 0, and lint prints 0/0/0.
+/// A bare-string statement whose head word resolves on PATH is the
+/// shell reflex; flag it as an error naming the Mix form. (A bare string
+/// whose head is NOT on PATH stays silent — it may be a deliberate value
+/// or a typo'd Mix name, which E1101/E1102 cover.)
+fn check_shell_command_statements(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    for stmt in stmts {
+        if let StmtKind::Expression(Expr::StringLiteral(s))
+        | StmtKind::Expression(Expr::EscapedQuoteStringLiteral(s)) = &stmt.kind
+            && let Some(head) = s.split_whitespace().next()
+            && !head.is_empty()
+            && on_path(head)
+        {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-E1507",
+                Severity::Error,
+                stmt.line,
+                format!(
+                    "shell command written as a bare string — .mix files are whole-file Mix, so \
+                     \"{s}\" runs nothing. '{head}' IS on PATH"
+                ),
+                Some(format!(
+                    "run it with run_argv([\"{head}\", ...]) — or drop the string if it is not \
+                     meant to run"
+                )),
+            ));
+        }
+    }
+}
+
+/// Whether `head` names an executable on this host's PATH — the B2 gate:
+/// only a real shell reflex fires, a prose string never does.
+fn on_path(head: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    path.split(':').any(|dir| {
+        let candidate = std::path::Path::new(dir).join(head);
+        candidate.is_file()
+    })
+}
+
+/// B4 (TODO-mix 2026-09-24): `send` failures never touch the exit code —
+/// a script whose sends all fail exits 0. The lint half: a `send` whose
+/// `$rc` (or `$result`/`$reply`) is never READ before the next send or the
+/// end of the block warns. (The opt-in `--strict-send` / `MIX_STRICT_SEND`
+/// execution gate is the deferred half, tracked in the arc ledger.)
+fn check_send_rc_reads(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if !matches!(stmt.kind, StmtKind::Send { .. }) {
+            continue;
+        }
+        // Scan the statements AFTER this send, up to the next send or the
+        // end of the block, for a read of $rc / $result / $reply.
+        let read_before_next = stmts[idx + 1..].iter().take_while(|s| {
+            !matches!(s.kind, StmtKind::Send { .. })
+        }).any(stmt_reads_send_status);
+        if !read_before_next {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-W2307",
+                Severity::Warning,
+                stmt.line,
+                "result of send is never checked — a failed send (rc -2, >=10) exits 0 and the \
+                 script reads as success"
+                    .to_string(),
+                Some("read $rc (or $result/$reply) after the send, or use a checked form".to_string()),
+            ));
+        }
+    }
+}
+
+/// Whether a statement READS `$rc`, `$result` or `$reply` anywhere.
+fn stmt_reads_send_status(stmt: &Stmt) -> bool {
+    let mut reads = false;
+    walk_stmt_exprs(stmt, &mut |expr| {
+        if let Expr::Variable(name) = expr
+            && matches!(name.as_str(), "rc" | "result" | "reply")
+        {
+            reads = true;
+        }
+    });
+    reads
+}
+
+/// 09-24 entry: `$x = push($x, v)` sets `$x` to nil — push mutates in
+/// place and returns nil, so the assign-back form empties the list, and
+/// lint said nothing while E1501's hint actively taught the shape for the
+/// non-variable case. Flag the exact self-assign shape, and reword the
+/// E1501 hint to distinguish the two forms.
+fn check_push_assign_back(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    for stmt in stmts {
+        if let StmtKind::Assignment { name, value } = &stmt.kind
+            && let Expr::FunctionCall {
+                name: call,
+                args,
+            } = value
+            && matches!(call.as_str(), "push" | "pop" | "shift")
+            && let Some(Expr::Variable(target)) = args.first()
+            && target == name
+        {
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-E1508",
+                Severity::Error,
+                stmt.line,
+                format!(
+                    "${name} = {call}(${name}, ...) — {call} mutates in place and returns nil \
+                     (push) / the removed element (pop/shift), so this assignment binds the \
+                     WRONG value"
+                ),
+                Some(if call == "push" {
+                    format!("drop the assignment: {call}(${name}, ...) alone already appends")
+                } else {
+                    format!("bind the removed element instead: $x = {call}(${name})")
+                }),
+            ));
+        }
+    }
 }
 
 /// Deep-walk an expression and every descendant (lambda bodies excluded,
