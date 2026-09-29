@@ -50,7 +50,7 @@ mod stats_io;
 
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process;
 
@@ -615,7 +615,7 @@ fn run_source(
         if !no_prelude {
             if let Err(e) = eval.load_prelude().await {
                 eprintln!("{e}");
-                return 1;
+                return (ScriptOutcome::Ran(Err(e)), eval.take_stats());
             }
         }
 
@@ -732,7 +732,7 @@ fn run_command_line(
         if !no_prelude {
             if let Err(e) = eval.load_prelude().await {
                 eprintln!("{e}");
-                return 1;
+                return (1, eval.take_stats());
             }
         }
         for (idx, arg) in script_args.iter().enumerate() {
@@ -1394,9 +1394,13 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             ));
             repl::register_ai_extensions(&mut eval);
             if !no_prelude {
+                // The serve-evaluator builder returns an Evaluator, not a
+                // result: a failed prelude here prints loudly and the
+                // citizen starts on the partially-loaded state (pre-B10
+                // behaviour for this one path, kept visible rather than
+                // silent).
                 if let Err(e) = eval.load_prelude().await {
                     eprintln!("{e}");
-                    return 1;
                 }
             }
             if stats_io::stats_enabled() {

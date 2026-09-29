@@ -147,7 +147,7 @@ async fn local_def_shadows_prelude_from_the_first_statement() {
     let stdout = SharedBuf::new();
     let stderr = SharedBuf::new();
     let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(stderr.clone()));
-    eval.load_prelude().await;
+    let _ = eval.load_prelude().await;
     eval.execute(&stmts).await.expect("eval");
     // Prelude sum([1,2]) would give 3; the shadowing def gives 0.
     assert_eq!(stdout.to_string_lossy(), "0\n");
