@@ -475,6 +475,31 @@ fn bare_dollar_question(piece: &str) -> Option<usize> {
     None
 }
 
+/// B3 (TODO-mix 2026-09-24) + 09-29 #1: the whole-list refusal, run on the
+/// STRUCTURAL items before anything spawns (both the lone-command `-c` path
+/// and the multi-piece executor call this, so no shape can skip it).
+pub fn refuse_bash_keywords(items: &[(Connector, &str)]) -> Result<(), String> {
+    for (_, piece) in items {
+        // A literal `$?` is bash's last-status — Mix has `$rc` and
+        // `.exit_code`. Quote-aware: inside single quotes `$?` is literal
+        // text, so it stays.
+        if let Some(pos) = bare_dollar_question(piece) {
+            return Err(format!(
+                "`$?` at byte {pos} is bash syntax — in Mix read `$rc` (or a run result's \
+                 `.exit_code`); the whole command list was refused"
+            ));
+        }
+        let head = head_word(piece);
+        if let Some((kw, equivalent)) = BASH_KEYWORDS.iter().find(|(k, _)| *k == head) {
+            return Err(format!(
+                "`{kw}` is bash, not Mix — {equivalent}. The whole command list was refused; \
+                 write the Mix form instead."
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn execute_command_list_with_policy(
     items: &[(Connector, &str)],
     vars: &dyn ShellVarResolver,
@@ -484,40 +509,15 @@ pub fn execute_command_list_with_policy(
     // Up-front structural validation (no resolver → never spawns a `$(...)`),
     // matching the old behavior where parsing the whole list preceded running
     // any of it. A bad pipeline in ANY branch (even a skipped one) aborts.
-    //
-    // B3 (TODO-mix 2026-09-24): a bash keyword written as a shell command
-    // used to fail per piece with rc 127 and the chain CARRIED ON —
-    // `for x in 1; do echo hi; done; echo END` printed three "No such
-    // file" lines, then END, rc 0. Refuse the WHOLE list up front, naming
-    // the Mix equivalent, so a login-shell command that is really Mix
-    // fails once and legibly instead of piecemeal at exit 0.
+    if let Err(msg) = refuse_bash_keywords(items) {
+        eprintln!("mix: {msg}");
+        return ListOutcome {
+            code: 2,
+            backgrounded: false,
+            commands: Vec::new(),
+        };
+    }
     for (_, piece) in items {
-        // 09-29 #1 sibling: a literal `$?` is bash's last-status — Mix has
-        // `$rc` and `.exit_code`. Quote-aware: inside single quotes `$?`
-        // is literal text, so it stays.
-        if let Some(pos) = bare_dollar_question(piece) {
-            eprintln!(
-                "mix: `$?` at byte {pos} is bash syntax — in Mix read `$rc` (or a run result's \
-                 `.exit_code`); the whole command list was refused"
-            );
-            return ListOutcome {
-                code: 2,
-                backgrounded: false,
-                commands: Vec::new(),
-            };
-        }
-        let head = head_word(piece);
-        if let Some((kw, equivalent)) = BASH_KEYWORDS.iter().find(|(k, _)| *k == head) {
-            eprintln!(
-                "mix: `{kw}` is bash, not Mix — {equivalent}. The whole command list was \
-                 refused; write the Mix form instead."
-            );
-            return ListOutcome {
-                code: 2,
-                backgrounded: false,
-                commands: Vec::new(),
-            };
-        }
         if let Err(e) = parse_pipeline(piece, &NoVars) {
             eprintln!("mix: {}", e);
             return ListOutcome {

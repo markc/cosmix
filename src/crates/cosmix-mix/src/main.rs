@@ -966,6 +966,12 @@ fn run_command_line(
                         return 1;
                     }
                 };
+                // B3/$?-refusal runs on EVERY path — the lone-command
+                // interception below would otherwise skip it.
+                if let Err(msg) = exec::refuse_bash_keywords(&items) {
+                    eprintln!("mix: {msg}");
+                    return 2;
+                }
                 // A LONE command is parsed+expanded once (running any `$(...)`
                 // exactly once) so the in-process builtins below can intercept
                 // it: `exit`/`cd` and the REPL-launching bare `mix`. (REPL-only
