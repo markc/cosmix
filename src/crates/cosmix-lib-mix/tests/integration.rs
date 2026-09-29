@@ -2698,8 +2698,11 @@ async fn die_in_request_handler_synthesizes_error_reply() {
 }
 
 /// A handler that catches its own `die` with `try/catch` and completes
-/// normally has NOT faulted — no synthetic error-reply is fired (the
-/// fault boundary must not fire on a body that recovered).
+/// normally has NOT faulted — the FAULT boundary (rc 15) must not fire on
+/// a body that recovered. It still completed WITHOUT `reply()`, so the B5
+/// NO_REPLY boundary (rc 17, added 0.100.x) answers the caller instead of
+/// leaving it to wait out its timeout — the distinction between the two
+/// boundaries is exactly what this test pins.
 #[tokio::test]
 async fn caught_die_in_request_handler_does_not_synthesize_reply() {
     let replies = dispatch_with_boom(
@@ -2711,10 +2714,17 @@ async fn caught_die_in_request_handler_does_not_synthesize_reply() {
         )],
     )
     .await;
-    assert!(
-        replies.is_empty(),
-        "a handler that recovered from its own die has not faulted, \
-         got {replies:?}"
+    assert_eq!(
+        replies,
+        vec![(
+            "caller".to_string(),
+            "q".to_string(),
+            Some("4".to_string()),
+            17u8,
+            crate::evaluator::NO_REPLY_BODY.to_string(),
+        )],
+        "a recovered-but-unanswered request handler gets the NO_REPLY boundary (17), \
+         never the FAULT boundary (15)"
     );
 }
 
