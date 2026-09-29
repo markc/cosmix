@@ -65,8 +65,12 @@ fn index_topics(index: &str) -> BTreeSet<String> {
             let target = &rest[target_start..];
             if let Some(end) = target.find(')') {
                 let target = &target[..end];
-                if let Some(name) = target.strip_suffix(".md") {
-                    out.insert(name.to_string());
+                // Only relative `topic.md` links name a manual page; skip
+                // external URLs (e.g. the AGENTS.md GitHub link).
+                if !target.contains("://") {
+                    if let Some(name) = target.strip_suffix(".md") {
+                        out.insert(name.to_string());
+                    }
                 }
                 rest = &target[end..];
             } else {
