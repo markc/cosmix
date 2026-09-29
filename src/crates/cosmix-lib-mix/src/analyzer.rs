@@ -469,7 +469,7 @@ fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     fn walk(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis, known: &HashSet<String>) {
         for stmt in stmts {
             match &stmt.kind {
-                StmtKind::Assignment { name, value } => {
+                StmtKind::Assignment { name: _, value } => {
                     // R2: `$f = upper` stores the STRING "upper" — Mix has
                     // no first-class function values.
                     if let Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) = value
@@ -2951,6 +2951,9 @@ fn analyse_remote_body(
         // rules must read the source they are reporting lines against.
         // Lint is the only gate this remote program ever passes through.
         source: Some(src.to_string()),
+        // The agent profile propagates into remote bodies: an agent
+        // linting its ssh_mix programs wants the same error strength there.
+        agent: cfg.agent,
     };
     let nested = analyze_at(&inner, None, &inner_cfg, true);
     for mut d in nested.diagnostics {
