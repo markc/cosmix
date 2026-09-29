@@ -609,18 +609,40 @@ impl Lexer {
                 },
             });
         }
-        if !s.contains('.') && !s.contains('e') && !s.contains('E') && n.abs() > 9_007_199_254_740_992.0 {
-            return Err(MixError::LexerError {
-                msg: format!(
-                    "integer literal '{s}' exceeds the exact range (2^53) — a number would \
-                     silently round; use a string for ids/digests"
-                ),
-                span: Span {
-                    line,
-                    column: col,
-                    file: None,
-                },
-            });
+        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+            // An integral literal must round-trip exactly: parse the SOURCE
+            // digits as u128 and compare against their f64 rendering. The
+            // f64 `n` above is already rounded, so comparing against it
+            // directly would accept the very loss being refused.
+            let exact = match s.parse::<u128>() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(MixError::LexerError {
+                        msg: format!(
+                            "integer literal '{s}' exceeds the exact range (2^53) — a number \
+                             would silently round; use a string for ids/digests"
+                        ),
+                        span: Span {
+                            line,
+                            column: col,
+                            file: None,
+                        },
+                    });
+                }
+            };
+            if (exact as f64) as u128 != exact {
+                return Err(MixError::LexerError {
+                    msg: format!(
+                        "integer literal '{s}' exceeds the exact range (2^53) — a number would \
+                         silently round; use a string for ids/digests"
+                    ),
+                    span: Span {
+                        line,
+                        column: col,
+                        file: None,
+                    },
+                });
+            }
         }
         Ok(self.spanned(Token::Number(n), line, col))
     }
