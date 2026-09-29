@@ -41,6 +41,10 @@ pub enum Token {
     Step,
     Next,
     While,
+    /// Reserved and refused: `do` is lexed to this token so the parser can
+    /// raise an instructional error ("blocks close with `end` — no `do`")
+    /// instead of treating it as a bare-identifier no-op. Not in `KEYWORDS`.
+    Do,
     Done,
     Loop,
     Break,

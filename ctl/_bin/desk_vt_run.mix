@@ -272,7 +272,7 @@ try
   -- Use a wall-clock deadline so journal and systemctl latency cannot stretch
   -- the first-frame gate indefinitely.
   $first_frame_deadline = time() + $FIRST_FRAME_DEADLINE
-  while time() < $first_frame_deadline and not $lit do
+  while time() < $first_frame_deadline and not $lit
     $_sleep = run_argv(["sleep", "3"])
     $journal = run_argv(["journalctl", "-M", $CT, "-u", $UNIT, "--no-pager"],
       {timeout: 15, max_output: 67108864})
@@ -317,7 +317,7 @@ try
 
   $close_deadline = time() + 30
   $unit_final = "unknown"
-  while time() < $close_deadline do
+  while time() < $close_deadline
     $unit_active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
     $unit_final = trim($unit_active["stdout"])
     if unit_gone($unit_final) then
@@ -331,7 +331,7 @@ try
     $_stop = run_argv(["systemctl", "-M", $CT, "stop", $UNIT .. ".service"],
       {timeout: 150})
     $stop_deadline = time() + 120
-    while time() < $stop_deadline do
+    while time() < $stop_deadline
       $unit_active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
       $unit_final = trim($unit_active["stdout"])
       if unit_gone($unit_final) then

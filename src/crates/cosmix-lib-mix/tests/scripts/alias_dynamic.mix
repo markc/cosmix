@@ -9,7 +9,7 @@
 -- This is the bash-port repro from feedback_mix_alias_static_only that
 -- was rejected as "expected identifier, got Variable" before the
 -- parse_command_expr lift.
-for each $h in ["gw", "mgo", "motd"] do
+for each $h in ["gw", "mgo", "motd"]
     alias $h = "ssh " .. $h
 end
 alias gw

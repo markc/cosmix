@@ -644,7 +644,9 @@ a hard statement boundary. Use trailing <code>\</code> for general continuation 
 other operator; no other binary operator gains this newline rule.</p>
 <h2 id="blocks-close-with-end--no-do">Blocks close with <code>end</code> — no <code>do</code></h2>
 <p>Every compound form (<code>if</code>, <code>for</code>, <code>while</code>, <code>function</code>/<code>fn</code>, <code>on</code>, <code>try</code>) is closed
-by <code>end</code>. There is <strong>no <code>do</code> keyword</strong>; writing one breaks an inline body. (A few
+by <code>end</code>. There is <strong>no <code>do</code> keyword</strong>: since 0.98.0 <code>do</code> is reserved and
+<strong>refused with a parse error</strong> (<code>unexpected </code>do<code>— Mix has no</code>do<code>keyword; blocks close with</code>end``). Before 0.98.0 a stray <code>do</code> was silently absorbed
+as a bare-identifier no-op — the bash reflex ran, and meant nothing. (A few
 legacy terminators — <code>next</code> for loops, <code>done</code> for <code>while</code>/<code>loop</code>/<code>on</code> — still
 parse with a deprecation warning; <code>if</code> and <code>function</code>/<code>fn</code> accept <strong>only</strong> <code>end</code>.
 Prefer <code>end</code> everywhere.) Full grammar of each block lives in

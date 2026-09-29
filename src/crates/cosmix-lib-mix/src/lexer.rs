@@ -1338,8 +1338,13 @@ impl Lexer {
         }
         // Dispatch from the single keyword table above — keyword_token is
         // generated from the same rows as KEYWORDS, so the two cannot
-        // drift. The fallback is the bare-identifier path (function
-        // names, map keys, etc.).
+        // drift. `do` is reserved-and-refused, not a keyword: it lexes to
+        // Token::Do so the parser can raise an instructional error rather
+        // than a bare-identifier no-op. The fallback is the bare-identifier
+        // path (function names, map keys, etc.).
+        if name == "do" {
+            return Ok(self.spanned(Token::Do, line, col));
+        }
         let token = keyword_token(&name).unwrap_or(Token::String(name));
         Ok(self.spanned(token, line, col))
     }
@@ -1528,6 +1533,7 @@ fn classify(token: &Token, first: char) -> TokenClass {
         | Token::Eprint
         | Token::Source
         | Token::Include
+        | Token::Do
         | Token::Sh
         | Token::Label
         | Token::StrEq

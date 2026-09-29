@@ -139,7 +139,7 @@ try
   else
     $started = true
     $deadline = time() + 30
-    while time() < $deadline and not socket_ready($SOCKET_PATH) do
+    while time() < $deadline and not socket_ready($SOCKET_PATH)
       sleep(0.5)
     end
     if not socket_ready($SOCKET_PATH) then
