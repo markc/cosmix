@@ -2,7 +2,9 @@
 
 How Mix reads source: what a token is, how statements end, and the one rule that
 trips up everyone coming from bash or Python — **when a line is run as Mix code
-versus dispatched to the shell**. Verified against **mix 0.57.0**.
+versus dispatched to the shell**. Verified against the live binary (the version
+stamp is checked by `cargo test -p cosmix-mix --test man_pages`; ask
+`mix --version` for the number).
 
 > Mental model: Mix is a Bus-native shell where every variable carries a `$`
 > sigil, concatenation is `..`, and statements are separated by a **newline or
@@ -401,13 +403,11 @@ double-quoted string, a heredoc body **does** interpolate `${var}` *and* run
 
 ### Keywords — reserved as identifiers, usable as names
 
-Identifiers matching a keyword become that keyword token. (`mix keywords` prints
-a curated subset; the complete lexer set — which also includes `then`/`each`/
-`to`/`step`/`next`/`done`/`with`/`on`/`include`/`label`/`eq`/`ne` — is below.)
-The full set: `if then else end for each in to step next while done loop break
-continue function fn return select when otherwise and or not true false nil
-parse with send address emit on try catch die export alias print eprint source
-include label sh eq ne`. See [keywords](keywords.md) for what each one does.
+Identifiers matching a keyword become that keyword token. The complete set is
+printed by `mix keywords` and each resolves via `mix what NAME` — the binary
+is the oracle, and the manual's table ([keywords](keywords.md)) is held to the
+same lexer set by the build, so the list is never enumerated here where it
+could rot.
 
 Keywords **cannot** be function names or bare user identifiers:
 

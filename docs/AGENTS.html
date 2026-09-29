@@ -501,6 +501,10 @@ defaults. Never hardcode an install path.</p>
 <h2 id="conventions">Conventions</h2>
 <ul>
 <li>Scripts are Mix. No Python; sh only for <code>bootstrap</code>.</li>
+<li><strong>Read <code>docs/mix/gotchas.md</code> before writing any Mix</strong> — it is the errata
+against bash/Python/JS reflexes (every row executed by the build, so it
+cannot rot). <code>docs/mix/syntax.md</code> is the mental model; gotchas is the
+corrections. New to the language? Run <code>mix man gotchas</code> first.</li>
 <li>Docs for a behaviour change go in the same commit, in <code>docs/</code>.</li>
 <li>Desktop furniture belongs to compositor-hosted Quoin. Apps use conventional
 CTK menus and purpose-specific controls with compositor-managed window chrome;

@@ -1244,6 +1244,24 @@ impl Lexer {
         Ok(self.spanned(Token::CommandSub(cmd), line, col))
     }
 
+    /// The complete reserved-word set, one name per lexer keyword token.
+    ///
+    /// `mix keywords` and `mix what` read this through the lib, so it must
+    /// mirror the `match` arms in [`lex_identifier`] character-for-character.
+    /// The drift test at the bottom of this module (`keyword_set_matches_lexer`)
+    /// fails the build when the two disagree — a new keyword token added to
+    /// the match without an entry here (or vice versa) cannot ship silently.
+    /// The manual page `docs/mix/keywords.md` is held to the same set by
+    /// `cosmix-mix/tests/man_pages.rs`.
+    pub const KEYWORDS: &[&str] = &[
+        "if", "then", "else", "elif", "end", "for", "each", "in", "to", "step",
+        "next", "while", "done", "loop", "break", "continue", "function", "fn",
+        "return", "select", "when", "otherwise", "and", "or", "not", "true",
+        "false", "nil", "parse", "with", "send", "address", "emit", "on", "try",
+        "catch", "finally", "die", "export", "alias", "print", "eprint",
+        "source", "include", "label", "sh", "eq", "ne",
+    ];
+
     fn lex_identifier(&mut self, line: usize, col: usize) -> MixResult<SpannedToken> {
         let mut name = String::new();
         while let Some(ch) = self.peek() {
@@ -1537,6 +1555,25 @@ mod highlight_tests {
     use super::{MixFlavor, TokenClass, highlight};
     use TokenClass::*;
     use proptest::prelude::*;
+
+    /// Every name in `KEYWORDS` must lex to a keyword token (never a bare
+    /// identifier) — the registry list and the lexer match cannot drift.
+    /// A keyword added to the match without a `KEYWORDS` entry is caught
+    /// the other way by `cosmix-mix/tests/man_pages.rs`, which holds the
+    /// manual's keyword table to exactly this set.
+    #[test]
+    fn keyword_set_matches_lexer() {
+        use super::{Lexer, Token};
+        for name in super::KEYWORDS {
+            let mut lexer = Lexer::new(name);
+            let tokens = lexer.tokenize().expect("keyword must lex");
+            assert_eq!(tokens.len(), 1, "keyword '{name}' should be one token");
+            assert!(
+                !matches!(tokens[0].token, Token::String(_)),
+                "keyword '{name}' lexed as a bare identifier — add it to KEYWORDS"
+            );
+        }
+    }
 
     fn classes(src: &str, flavor: MixFlavor) -> Vec<(&str, TokenClass)> {
         highlight(src, flavor).into_iter().map(|(r, c)| (&src[r], c)).collect()

@@ -445,7 +445,7 @@
 <p>Every operator Mix's expression grammar knows, with verified precedence and the
 exact coercion rules. Statements use newline or <code>;</code> separators, every
 variable is <code>$</code>-sigil, and string concatenation is <strong><code>..</code></strong> — not <code>+</code>, not <code>.</code>.
-Verified against <strong>mix 0.56.0</strong>; the binary is the oracle.</p>
+The binary is the oracle; page stamps are held fresh by <code>cargo test -p cosmix-mix --test man_pages</code>.</p>
 <h2 id="precedence--associativity">Precedence &amp; associativity</h2>
 <p>From the parser (<code>parse_binary_rhs</code>, <code>parser.rs</code>). <strong>All binary operators are
 left-associative</strong> — including <code>**</code>. Higher number = binds tighter.</p>

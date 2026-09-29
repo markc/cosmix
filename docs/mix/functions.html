@@ -449,7 +449,7 @@
 </ul>
 <p>Both share one tail grammar (<code>($params) ... end</code> or <code>($params) = expr</code>), one binding model (args by value, writes function-local), and one capture rule (closures see their defining scope for <em>reads</em>). Get those four facts straight and everything else follows.</p>
 <blockquote>
-<p>Verified against <strong>mix 0.21.2</strong>. Every example below was run with <code>mix -c</code> and shows its real output. The binary is the oracle — if anything here disagrees with live behaviour, the binary wins.</p>
+<p>The binary is the oracle — if anything here disagrees with live behaviour, the binary wins. Page stamps are held fresh by <code>cargo test -p cosmix-mix --test man_pages</code> (ask <code>mix --version</code> for the current number).</p>
 </blockquote>
 <h2 id="named-functions--the-statement-form">Named functions — the statement form</h2>
 <pre><code class="language-mix">function add($a, $b)

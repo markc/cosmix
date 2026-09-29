@@ -449,7 +449,7 @@ Bus daemon, and a family of one-shot meta commands (<code>mix help</code>, <code
 <code>ssh host '&lt;mix source&gt;'</code> is evaluated by Mix, not bash. This page covers how to
 start Mix in each mode and the rules that decide whether a <code>-c</code> / login-shell
 line runs as Mix code or dispatches a shell command.</p>
-<p>Verified against <strong>mix 0.61.0</strong> — the binary is the oracle. Argument parsing
+<p>The binary is the oracle; page stamps are held fresh by <code>cargo test -p cosmix-mix --test man_pages</code>. Argument parsing
 lives in <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-mix/src/main.rs"><code>cosmix-mix/src/main.rs</code></a>;
 the shell-first classifier is in <code>cosmix-mix/src/shell.rs</code>.</p>
 <pre><code class="language-text">$ mix --version

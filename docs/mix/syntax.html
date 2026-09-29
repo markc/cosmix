@@ -444,7 +444,9 @@
         <div id="content-doc" data-prerendered="mix/syntax.md"><div class="prose"><h1 id="syntax--lexical-structure--the-shellmix-classifier">syntax — lexical structure &amp; the shell/Mix classifier</h1>
 <p>How Mix reads source: what a token is, how statements end, and the one rule that
 trips up everyone coming from bash or Python — <strong>when a line is run as Mix code
-versus dispatched to the shell</strong>. Verified against <strong>mix 0.57.0</strong>.</p>
+versus dispatched to the shell</strong>. Verified against the live binary (the version
+stamp is checked by <code>cargo test -p cosmix-mix --test man_pages</code>; ask
+<code>mix --version</code> for the number).</p>
 <blockquote>
 <p>Mental model: Mix is a Bus-native shell where every variable carries a <code>$</code>
 sigil, concatenation is <code>..</code>, and statements are separated by a <strong>newline or
@@ -741,10 +743,11 @@ if-expression form). A lone <code>&amp;</code> is a lex error <em>with a hint</e
 double-quoted string, a heredoc body <strong>does</strong> interpolate <code>${var}</code> <em>and</em> run
 <code>$(command)</code> substitution. See <a href="/mix/strings">strings</a> for the full treatment.</p>
 <h3 id="keywords--reserved-as-identifiers-usable-as-names">Keywords — reserved as identifiers, usable as names</h3>
-<p>Identifiers matching a keyword become that keyword token. (<code>mix keywords</code> prints
-a curated subset; the complete lexer set — which also includes <code>then</code>/<code>each</code>/
-<code>to</code>/<code>step</code>/<code>next</code>/<code>done</code>/<code>with</code>/<code>on</code>/<code>include</code>/<code>label</code>/<code>eq</code>/<code>ne</code> — is below.)
-The full set: <code>if then else end for each in to step next while done loop break continue function fn return select when otherwise and or not true false nil parse with send address emit on try catch die export alias print eprint source include label sh eq ne</code>. See <a href="/mix/keywords">keywords</a> for what each one does.</p>
+<p>Identifiers matching a keyword become that keyword token. The complete set is
+printed by <code>mix keywords</code> and each resolves via <code>mix what NAME</code> — the binary
+is the oracle, and the manual's table (<a href="/mix/keywords">keywords</a>) is held to the
+same lexer set by the build, so the list is never enumerated here where it
+could rot.</p>
 <p>Keywords <strong>cannot</strong> be function names or bare user identifiers:</p>
 <pre><code class="language-mix">function step($x) return $x end
 </code></pre>

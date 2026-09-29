@@ -68,6 +68,10 @@ defaults. Never hardcode an install path.
 ## Conventions
 
 - Scripts are Mix. No Python; sh only for `bootstrap`.
+- **Read `docs/mix/gotchas.md` before writing any Mix** — it is the errata
+  against bash/Python/JS reflexes (every row executed by the build, so it
+  cannot rot). `docs/mix/syntax.md` is the mental model; gotchas is the
+  corrections. New to the language? Run `mix man gotchas` first.
 - Docs for a behaviour change go in the same commit, in `docs/`.
 - Desktop furniture belongs to compositor-hosted Quoin. Apps use conventional
   CTK menus and purpose-specific controls with compositor-managed window chrome;

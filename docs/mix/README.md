@@ -2,15 +2,24 @@
 
 The reference manual for the **Mix** language, one page per topic. The canonical
 home of these pages is
-[`docs/_man/`](https://github.com/markc/cosmix/tree/main/docs/mix) in the public
-[markc/mix](https://github.com/markc/cosmix) repo; add a page by dropping `TOPIC.md`
-there. The same files render everywhere:
+[`docs/mix/`](https://github.com/markc/cosmix/tree/main/docs/mix) in the public
+[markc/cosmix](https://github.com/markc/cosmix) monorepo; add a page by dropping
+`TOPIC.md` there. The same files render everywhere:
 
-- **Terminal** — `mix man TOPIC` (`mix man` alone prints this index).
-- **`mix man`** — reads [cosmix.dev/mix](https://cosmix.dev/mix/overview), a mirror of this directory in the `cosmix` repo (`$COSMIX/mix/`). It is kept in step automatically: the mix repo's post-commit hook runs `$COSMIX/build/sync-man.mix` whenever a page here is committed (copy, prune, regenerate HTML stubs, commit, push). If `mix man` looks stale, run that script by hand and check `~/.cache/cosmix/man/` (24 h cache).
-- **Web** — [markc.github.io/mix](https://markc.github.io/mix/#_man/overview.md) serves the manual in the site's left-hand **Manual** pane; any page deep-links as `#_man/PAGE.md`.
-- **GitHub** — browse [`docs/_man/`](https://github.com/markc/cosmix/tree/main/docs/mix) directly; this file doubles as the directory README.
-- **Local clone** — plain markdown with relative links; any editor or viewer works.
+- **Terminal** — `mix man TOPIC` (`mix man` alone prints this index). Online
+  source with a local `$COSMIX/docs/mix` fallback and a 24 h cache at
+  `~/.cache/cosmix/man/`.
+- **Web** — [cosmix.dev/mix](https://cosmix.dev/mix/overview) serves this
+  directory.
+- **GitHub** — browse [`docs/mix/`](https://github.com/markc/cosmix/tree/main/docs/mix)
+  directly; this file doubles as the directory README.
+- **Local clone** — plain markdown with relative links; any editor or viewer
+  works.
+
+**New to Mix, or coming from bash/Python/JS? Read [gotchas](gotchas.md) first** —
+it is the errata against every other language's reflexes, and every row of its
+table is executed by `cargo test -p cosmix-mix --test man_gotchas`, so it cannot
+rot. `mix man syntax` is the mental model; gotchas is the corrections.
 
 ## Start here
 
@@ -38,6 +47,7 @@ there. The same files render everywhere:
 - **[math](math.md)** — rounding, powers, logs, trig, `min`/`max`/`clamp`, constants.
 - **[files & I/O](io.md)** — `read_file`/`write_file`/`glob`/`stat`/`chmod`/`walk`/…
 - **[processes & system](system.md)** — `run`/`run_rc`/`run_stream`/`spawn`/`env`/`exit`/…
+- **[job control](job-control.md)** — foreground/background jobs, suspension, resume (interactive).
 - **[data & serialization](data.md)** — JSON, TOML, `jq`, `data_encode`, strict-data `.mix`.
 - **[byte buffers](buffer.md)** — `buffer`/`buffer_push`/`freeze`, the one reference-semantic type.
 - **[regular expressions](regex.md)** — `re_match`/`re_find`/`re_replace`/`re_split`/`grep_lines` (subject first).
@@ -56,8 +66,10 @@ there. The same files render everywhere:
 ## Reference
 
 - **[builtin index](builtins.md)** — every builtin by category.
+- **[lint diagnostics](lint.md)** — every MIX-XXXX code and its story.
 - **[reserved words](keywords.md)** — the keyword set, keywords-as-names.
 - **[shell-dispatch mode](shell-mode.md)** — pipes, `&&`, brace expansion, `$(...)`, redirects.
+- **[owned interactive editor](owned-editor.md)** — `MIX_EDITOR=owned` (preview).
 - **[usage statistics](stats.md)** — runtime modes, report windows, persistence, kill switch, static coverage.
 
 ## Design docs & specs
