@@ -19329,9 +19329,8 @@ fn builtin_password_verify(args: Vec<Value>) -> MixResult<Option<Value>> {
         } else {
             return Err(MixError::RuntimeError {
                 span: None,
-                msg: format!(
-                    "password_verify(): hash has the {{SHA512-CRYPT}} prefix but no $6$/$5$ body"
-                ),
+                msg: "password_verify(): hash has the {SHA512-CRYPT} prefix but no $6$/$5$ body"
+                    .to_string(),
             });
         }
     }
