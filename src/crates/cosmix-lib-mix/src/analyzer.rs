@@ -3755,6 +3755,12 @@ pub(crate) const FOREIGN_FUNCTION_SYNONYMS: &[(&str, &str, &str)] = &[
     ("uppercase", "upper", ""),
     ("getenv", "env", ""),
     ("file_exists", "exists", ""),
+    // Host-injected scoped DB (db_open/db_query/db_close) is not the
+    // SQLite-file API — the sqlopen/sqlexec/sqlclose family is (09-25
+    // SHA512-CRYPT session: secrets.db checks called db_open by mistake).
+    ("db_open", "sqlopen", " (the SQLite-file API — db_open is the host-injected scoped DB)"),
+    ("db_query", "sqlexec", " (the SQLite-file API)"),
+    ("db_close", "sqlclose", " (the SQLite-file API)"),
 ];
 
 /// The "did you mean" for an undefined function, WITHOUT framing — shared by

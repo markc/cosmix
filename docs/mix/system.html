@@ -1711,18 +1711,24 @@ hash_file(p[, algo][, {raw:true}])   streaming digest of a FILE
 base64_encode(v)       base64 of a string or bytes buffer
 base64_decode(s)       decode base64 -&gt; a bytes buffer
 password_hash(pw[, cost])   bcrypt "$2b$…" hash; cost 4-31, default 12 (v0.71.0)
-password_verify(pw, hash)   check against a bcrypt hash -&gt; bool (v0.71.0)
+password_hash(pw, {scheme: "sha512-crypt"[, rounds]})
+                        "$6$…" SHA512-crypt hash; rounds 1000..999999999,
+                        default 5000 (v0.102.6)
+password_verify(pw, hash)   check against a bcrypt OR SHA-crypt hash -&gt; bool;
+                        accepts $6$/$5$ and the Dovecot {SHA512-CRYPT} prefix
+                        (v0.71.0, sha-crypt v0.102.6)
 </code></pre>
 <p><code>password_hash</code>/<code>password_verify</code> exist for <strong>account passwords written over
 the Bus</strong>: a raw <code>props.set</code> of <code>maild.accounts.password</code> stores the field
-verbatim (only the <code>account add</code> CLI hashed it), so the bcrypt has to happen
-client-side — which used to mean shelling out to PHP. Three deliberate
-edges: input over <strong>72 bytes raises</strong> (bcrypt's own truncation limit,
-surfaced instead of silently applied — hash a digest of longer secrets);
-a <strong>malformed hash raises</strong> in <code>password_verify</code> rather than answering
-<code>false</code> (a corrupt stored hash is a config fault, and "wrong password"
-would misdirect the operator); and the general-purpose digests above are
-<strong>not</strong> password hashes — <code>hash_sha256</code> has no work factor.</p>
+verbatim (only the <code>account add</code> CLI hashed it), so the hashing has to happen
+client-side — which used to mean shelling out to PHP (bcrypt) or <code>mkpasswd -m sha512crypt</code> (NS/Dovecot passdbs, whose <code>{SHA512-CRYPT}$6$…</code> records are
+what the sha512-crypt scheme and the verify prefixes interop with). Three
+deliberate edges: input over <strong>72 bytes raises</strong> on the bcrypt side (bcrypt's
+own truncation limit, surfaced instead of silently applied — hash a digest of
+longer secrets); a <strong>malformed hash raises</strong> in <code>password_verify</code> rather than
+answering <code>false</code> (a corrupt stored hash is a config fault, and "wrong
+password" would misdirect the operator); and the general-purpose digests
+above are <strong>not</strong> password hashes — <code>hash_sha256</code> has no work factor.</p>
 <p>Every <code>hash_*</code> call takes the same trailing options map, and the only option is
 <strong><code>{raw: true}</code></strong> (v0.66.0): return the digest as raw <code>bytes</code> instead of
 lowercase hex. <code>hash_sha256($x, {raw:true})</code> is 32 bytes, <code>hash_md5</code> 16,

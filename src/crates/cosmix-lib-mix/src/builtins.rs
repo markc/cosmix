@@ -365,8 +365,8 @@ builtin_table! {
     ("hash_md5", CapabilityClass::Pure,        "system",  "MD5 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (collisions since 2004) — legacy interop only (Content-MD5, mail dedup keys, checksums against existing tools), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
     ("hash_sha1", CapabilityClass::Pure,       "system",  "SHA-1 hash of a string/bytes/buffer → lowercase hex; {raw:true} → bytes. ⚠ CRYPTOGRAPHICALLY BROKEN (SHAttered, 2017) — legacy interop only (git object ids, older ETags/APIs), NEVER a security decision; use hash_sha256/hash_blake3 for those (v0.66.0)", contract!((s: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
     ("hmac_sha256", CapabilityClass::Pure,     "system",  "HMAC-SHA256 (RFC 2104) of a message with a secret key → lowercase hex; {raw:true} → the 32 MAC bytes (v0.66.0) — webhook signature verification (Stripe-Signature etc). Accepts string/bytes/buffer for both args (requires crypto feature)", contract!((key: any_of(string, bytes, buffer), msg: any_of(string, bytes, buffer), opts?: map) -> any_of(string, bytes); failure[raises])),
-    ("password_hash", CapabilityClass::Pure,   "system",  "bcrypt-hash a password: password_hash(plaintext[, cost]) → $2b$… string; cost 4-31, default 12; input over 72 bytes raises (bcrypt's own truncation limit, surfaced instead of silently applied). For client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0)", contract!((plaintext: string, cost?: number) -> string; failure[raises])),
-    ("password_verify", CapabilityClass::Pure, "system",  "Check a plaintext password against a bcrypt hash from password_hash() (any $2a$/$2b$/$2y$ form) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0)", contract!((plaintext: string, hash: string) -> bool; failure[raises])),
+    ("password_hash", CapabilityClass::Pure,   "system",  "Hash a password: password_hash(plaintext[, cost]) → bcrypt $2b$… string (cost 4-31, default 12; input over 72 bytes raises), or password_hash(plaintext, {scheme: \"sha512-crypt\"[, rounds]}) → $6$… for Dovecot/NS passdbs (rounds 1000-999999999, default 5000). Client-side hashing before writing maild.accounts.password over the Bus — a raw props.set stores the field verbatim (requires crypto feature; v0.71.0, sha512-crypt v0.102.6)", contract!((plaintext: string, opts?: map) -> string; failure[raises])),
+    ("password_verify", CapabilityClass::Pure, "system",  "Check a plaintext password against a hash: bcrypt (any $2a$/$2b$/$2y$ form) or SHA-crypt ($6$/$5$, incl. the Dovecot {SHA512-CRYPT} prefix) → bool. A malformed hash RAISES rather than answering false — a corrupt stored hash is a config fault, not a wrong password (requires crypto feature; v0.71.0, sha-crypt v0.102.6)", contract!((plaintext: string, hash: string) -> bool; failure[raises])),
     ("constant_time_eq", CapabilityClass::Pure, "system",  "Timing-safe equality for secrets/MACs: compares full length with no early exit (plain == leaks a timing oracle). Use for webhook signature comparison. Accepts string/bytes/buffer", contract!((a: any_of(string, bytes, buffer), b: any_of(string, bytes, buffer)) -> bool)),
     ("hash_file", CapabilityClass::FsRead,     "system",  "Streaming digest of a file, fixed 64 KiB working set whatever the size: hash_file(path[, \"md5\"|\"sha1\"|\"sha256\"|\"blake3\"][, {raw:true}]) → lowercase hex, or bytes with {raw:true}. md5/sha1 added v0.66.0 and are BROKEN hashes for legacy interop only (v0.24.0)", contract!((path: string, algo?: string, opts?: map) -> any_of(string, bytes); failure[raises])),
     ("uuid", CapabilityClass::Pure,            "system",  "Generate a new random UUID v4 string", contract!(() -> string)),
@@ -19122,13 +19122,17 @@ fn hash_value(name: &str, algo: DigestAlgo, args: Vec<Value>) -> MixResult<Optio
     hash_output(name, algo.digest(buf.as_ref()), args.get(1))
 }
 
-/// `password_hash(plaintext[, cost])` → bcrypt `$2b$…` string (v0.71.0).
+/// `password_hash(plaintext[, cost])` → bcrypt `$2b$…` string (v0.71.0),
+/// `password_hash(plaintext, {scheme: "sha512-crypt"[, rounds]})` → `$6$…`
+/// (v0.102.6).
 ///
 /// The write-side primitive for account passwords set over the Bus: a raw
 /// `props.set` of `maild.accounts.password` stores the field verbatim, so
 /// the hashing has to happen client-side — which used to mean shelling out
-/// to PHP. Cost defaults to bcrypt's 12; the valid range 4-31 is validated
-/// here so the error names the bound rather than echoing the crate's.
+/// to PHP (bcrypt) or `mkpasswd -m sha512crypt` (NS/Dovecot passdbs). Cost
+/// defaults to bcrypt's 12; the valid range 4-31 is validated here so the
+/// error names the bound rather than echoing the crate's. SHA512-crypt
+/// rounds default to the algorithm's 5000 and must lie in 1000..=999999999.
 #[cfg(feature = "crypto")]
 fn builtin_password_hash(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args_between("password_hash", &args, 1, 2)?;
@@ -19144,6 +19148,101 @@ fn builtin_password_hash(args: Vec<Value>) -> MixResult<Option<Value>> {
             });
         }
     };
+    // Opts map form: {scheme: "sha512-crypt"|"bcrypt", rounds: N}.
+    if let Some(Value::Map(opts)) = args.get(1) {
+        let scheme = match opts.get("scheme") {
+            Some(Value::String(s)) => s.as_str(),
+            Some(other) => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "password_hash(): opts.scheme must be a string, got {}",
+                        other.type_name()
+                    ),
+                });
+            }
+            None => "bcrypt",
+        };
+        return match scheme {
+            "bcrypt" => {
+                let cost = match opts.get("cost") {
+                    None | Some(Value::Nil) => bcrypt::DEFAULT_COST,
+                    Some(v) => {
+                        let n = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                            MixError::RuntimeError {
+                                span: None,
+                                msg: format!(
+                                    "password_hash(): opts.cost must be a number, got {}",
+                                    v.type_name()
+                                ),
+                            }
+                        })?;
+                        as_exact_integer("password_hash(): opts.cost", n, 4, 31)? as u32
+                    }
+                };
+                // bcrypt truncates input at 72 bytes SILENTLY in most
+                // implementations; the crate raises instead. Surface that
+                // contract in our own words.
+                if plaintext.len() > 72 {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "password_hash(): bcrypt reads at most 72 bytes of input, got {} — hash a digest of longer secrets instead",
+                            plaintext.len()
+                        ),
+                    });
+                }
+                match bcrypt::hash(&plaintext, cost) {
+                    Ok(h) => Ok(Some(Value::String(h))),
+                    Err(e) => Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!("password_hash(): {e}"),
+                    }),
+                }
+            }
+            "sha512-crypt" => {
+                use sha_crypt::{Params, PasswordHasher, ShaCrypt};
+                let rounds = match opts.get("rounds") {
+                    None | Some(Value::Nil) => sha_crypt::Params::RECOMMENDED_ROUNDS,
+                    Some(v) => {
+                        let n = extract_number(v, InputPolicy::NumberOnly).ok_or_else(|| {
+                            MixError::RuntimeError {
+                                span: None,
+                                msg: format!(
+                                    "password_hash(): opts.rounds must be a number, got {}",
+                                    v.type_name()
+                                ),
+                            }
+                        })?;
+                        as_exact_integer(
+                            "password_hash(): opts.rounds",
+                            n,
+                            sha_crypt::Params::ROUNDS_MIN as i64,
+                            sha_crypt::Params::ROUNDS_MAX as i64,
+                        )? as u32
+                    }
+                };
+                let params = Params::new(rounds).map_err(|e| MixError::RuntimeError {
+                    span: None,
+                    msg: format!("password_hash(): {e}"),
+                })?;
+                let hasher = ShaCrypt::new(sha_crypt::Algorithm::Sha512, params);
+                match hasher.hash_password(plaintext.as_bytes()) {
+                    Ok(h) => Ok(Some(Value::String(h.to_string()))),
+                    Err(e) => Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!("password_hash(): sha512-crypt failed: {e}"),
+                    }),
+                }
+            }
+            other => Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "password_hash(): unknown scheme {other:?} — use \"bcrypt\" or \"sha512-crypt\""
+                ),
+            }),
+        };
+    }
     let cost = match args.get(1) {
         None | Some(Value::Nil) => bcrypt::DEFAULT_COST,
         Some(v) => {
@@ -19215,11 +19314,56 @@ fn builtin_password_verify(args: Vec<Value>) -> MixResult<Option<Value>> {
             });
         }
     };
+    // SHA-crypt: $6$ (SHA512) / $5$ (SHA256) — with the Dovecot
+    // `{SHA512-CRYPT}` passdb prefix stripped first (case-insensitive, as
+    // Dovecot prints it in caps but passdbs get hand-edited).
+    if hash
+        .get(..14)
+        .is_some_and(|p| p.eq_ignore_ascii_case("{SHA512-CRYPT}"))
+    {
+        let body = &hash[14..];
+        if body.starts_with("$6$") {
+            return verify_sha_crypt(&plaintext, body, sha_crypt::Algorithm::Sha512);
+        } else if body.starts_with("$5$") {
+            return verify_sha_crypt(&plaintext, body, sha_crypt::Algorithm::Sha256);
+        } else {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "password_verify(): hash has the {{SHA512-CRYPT}} prefix but no $6$/$5$ body"
+                ),
+            });
+        }
+    }
+    if hash.starts_with("$6$") {
+        return verify_sha_crypt(&plaintext, &hash, sha_crypt::Algorithm::Sha512);
+    }
+    if hash.starts_with("$5$") {
+        return verify_sha_crypt(&plaintext, &hash, sha_crypt::Algorithm::Sha256);
+    }
     match bcrypt::verify(&plaintext, &hash) {
         Ok(ok) => Ok(Some(Value::Bool(ok))),
         Err(e) => Err(MixError::RuntimeError {
             span: None,
             msg: format!("password_verify(): invalid bcrypt hash: {e}"),
+        }),
+    }
+}
+
+/// Verify a plaintext against a SHA-crypt `$6$…`/`$5$…` hash string with
+/// the named algorithm. `Ok(())` from the crate is a match; its `Password`
+/// error is a mismatch (bool false); anything else is a malformed hash and
+/// raises, same policy as the bcrypt arm.
+#[cfg(feature = "crypto")]
+fn verify_sha_crypt(plaintext: &str, hash: &str, algorithm: sha_crypt::Algorithm) -> MixResult<Option<Value>> {
+    use sha_crypt::{PasswordVerifier, ShaCrypt};
+    let verifier = ShaCrypt::new(algorithm, sha_crypt::Params::RECOMMENDED);
+    match verifier.verify_password(plaintext.as_bytes(), hash) {
+        Ok(()) => Ok(Some(Value::Bool(true))),
+        Err(sha_crypt::Error::Password) => Ok(Some(Value::Bool(false))),
+        Err(e) => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("password_verify(): invalid sha-crypt hash: {e}"),
         }),
     }
 }
