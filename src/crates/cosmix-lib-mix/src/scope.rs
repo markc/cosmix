@@ -1135,10 +1135,16 @@ impl Scope {
         let floor = *self.function_floors.last()?;
         for frame in self.frames[floor..].iter().rev() {
             if let Some(v) = frame.get(name) {
-                return match v {
-                    Value::Function(rc) => Some(Rc::clone(rc)),
-                    _ => None,
-                };
+                if let Value::Function(rc) = v {
+                    return Some(Rc::clone(rc));
+                }
+                // A non-Function variable sharing the name does NOT shadow
+                // the module's function (09-24 entry: `$rows = []` inside a
+                // module fn used to make `rows(3)` raise FUNCTION_UNDEFINED
+                // because the frame-injected sibling was shadowed and the
+                // walk stopped here). Keep walking the outer frames — the
+                // callable-variable dispatch is handled separately at the
+                // call site via get_value.
             }
         }
         None
