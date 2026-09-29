@@ -1340,7 +1340,7 @@ impl Lexer {
         // generated from the same rows as KEYWORDS, so the two cannot
         // drift. The fallback is the bare-identifier path (function
         // names, map keys, etc.).
-        let token = keyword_token(&name).unwrap_or_else(|| Token::String(name));
+        let token = keyword_token(&name).unwrap_or(Token::String(name));
         Ok(self.spanned(token, line, col))
     }
 }
