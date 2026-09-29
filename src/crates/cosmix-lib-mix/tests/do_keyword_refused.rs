@@ -62,10 +62,10 @@ fn sigil_variable_named_do_still_works() {
 
 #[test]
 fn do_is_a_keyword_token_for_highlighting() {
-    use cosmix_mix::lexer::{Token, TokenClass};
-    let mut lexer = Lexer::new("do");
-    let tokens = lexer.tokenize().expect("do lexes");
-    assert!(matches!(tokens[0].token, Token::Do));
+    // `Token` itself is private to the lib, but the public highlight
+    // surface proves the point: `do` classifies as Keyword, so it is
+    // reserved — never a bare identifier.
+    use cosmix_mix::lexer::TokenClass;
     let classes = cosmix_mix::lexer::highlight("do", cosmix_mix::lexer::MixFlavor::Script);
     assert_eq!(classes[0].1, TokenClass::Keyword);
 }
