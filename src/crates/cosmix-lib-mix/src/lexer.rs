@@ -1112,12 +1112,30 @@ impl Lexer {
         }
 
         // Skip to end of current line (consume the newline after <<TAG)
+        let mut trailing = String::new();
         while let Some(ch) = self.peek() {
             if ch == '\n' {
                 self.advance(); // advance() handles line counting
                 break;
             }
+            trailing.push(ch);
             self.advance();
+        }
+        // B7 (TODO-mix 2026-09-24): `$s = <<END ; die "stop"` used to
+        // DROP everything after the tag — the `die` never ran and the
+        // script continued, rc 0. A heredoc opener owns its line: only
+        // whitespace and a `--` comment may follow the tag.
+        if !trailing.trim().is_empty() && !trailing.trim_start().starts_with("--") {
+            return Err(MixError::LexerError {
+                msg: format!(
+                    "unexpected text after heredoc tag '<<{tag}': the opener owns its line — put '{trailing}' on the next line"
+                ),
+                span: Span {
+                    line,
+                    column: col,
+                    file: None,
+                },
+            });
         }
 
         // Accumulate lines until we find the closing tag on its own line

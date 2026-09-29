@@ -6038,7 +6038,14 @@ impl Evaluator {
     /// Checks the user's config dir for a `prelude.mix` override first —
     /// `$COSMIX_ETC`, else `$COSMIX/etc`, else `~/.config/cosmix` — and
     /// falls back to the built-in prelude.
-    pub async fn load_prelude(&mut self) {
+    ///
+    /// B10 (TODO-mix 2026-09-24): failures used to be PRINTED and
+    /// suppressed — a configured prelude that failed to parse or raised
+    /// kept the session running on the embedded prelude, and an
+    /// unreadable override fell back silently. Both now return an error
+    /// so the caller can refuse to start, and the two cases are
+    /// distinguished in the message ("override failed" vs "no override").
+    pub async fn load_prelude(&mut self) -> MixResult<()> {
         const BUILTIN_PRELUDE: &str = include_str!("../std/prelude.mix");
         // Record for exec_require: modules see the prelude iff the
         // program loaded it (a --no-prelude run stays prelude-free in
@@ -6046,20 +6053,27 @@ impl Evaluator {
         self.globals.borrow_mut().prelude_loaded = true;
 
         // Check for user override
-        let source = if let Some(home) = dirs_home() {
+        let (source, override_path) = if let Some(home) = dirs_home() {
             let etc = std::env::var_os("COSMIX_ETC")
                 .map(std::path::PathBuf::from)
                 .or_else(|| std::env::var_os("COSMIX").map(|r| std::path::PathBuf::from(r).join("etc")))
                 .unwrap_or_else(|| home.join(".config/cosmix"));
             let user_prelude = etc.join("prelude.mix");
             if user_prelude.exists() {
-                std::fs::read_to_string(&user_prelude)
-                    .unwrap_or_else(|_| BUILTIN_PRELUDE.to_string())
+                match std::fs::read_to_string(&user_prelude) {
+                    Ok(s) => (s, Some(user_prelude)),
+                    Err(e) => {
+                        return Err(MixError::structured(
+                            "PRELUDE_FAILED",
+                            format!("prelude override unreadable ({}): {e}", user_prelude.display()),
+                        ));
+                    }
+                }
             } else {
-                BUILTIN_PRELUDE.to_string()
+                (BUILTIN_PRELUDE.to_string(), None)
             }
         } else {
-            BUILTIN_PRELUDE.to_string()
+            (BUILTIN_PRELUDE.to_string(), None)
         };
 
         let mut lexer = crate::lexer::Lexer::new(&source);
@@ -6082,10 +6096,27 @@ impl Evaluator {
                 let result = self.execute(&stmts).await;
                 self.ctx.current_file = saved_file;
                 if let Err(e) = result {
-                    eprintln!("prelude: {}", e);
+                    let origin = match &override_path {
+                        Some(p) => format!("override {}", p.display()),
+                        None => "embedded".to_string(),
+                    };
+                    return Err(MixError::structured(
+                        "PRELUDE_FAILED",
+                        format!("prelude ({origin}) failed: {e}"),
+                    ));
                 }
+                Ok(())
             }
-            Err(e) => eprintln!("prelude: {}", e),
+            Err(e) => {
+                let origin = match &override_path {
+                    Some(p) => format!("override {}", p.display()),
+                    None => "embedded".to_string(),
+                };
+                Err(MixError::structured(
+                    "PRELUDE_FAILED",
+                    format!("prelude ({origin}) failed to parse: {e}"),
+                ))
+            }
         }
     }
 
@@ -6180,6 +6211,31 @@ impl Evaluator {
     /// builtin dispatch sites, and when `catch` binds its optional
     /// second variable. Control-flow variants (`Return`/`Break`/
     /// `Continue`/`ExitRequest`) and lex/parse errors pass through untouched.
+    /// Write to the named session sink and RAISE on failure (B9): the
+    /// raw-output family's contract — the bytes reached the consumer —
+    /// extended to `print`/`printf`/`eprintf`. A broken pipe or full
+    /// destination must not read as success to an agent checking rc.
+    fn sink_write(&self, to_stderr: bool, bytes: &[u8]) -> MixResult<()> {
+        let res = {
+            let mut g = self.globals.borrow_mut();
+            let sink: &mut dyn Write = if to_stderr {
+                &mut g.stderr
+            } else {
+                &mut g.stdout
+            };
+            sink.write_all(bytes).and_then(|()| sink.flush())
+        };
+        if let Err(e) = res {
+            let code = if e.kind() == std::io::ErrorKind::BrokenPipe {
+                "IO_BROKEN_PIPE"
+            } else {
+                "IO_WRITE_FAILED"
+            };
+            return Err(MixError::structured(code, format!("{e}")));
+        }
+        Ok(())
+    }
+
     pub(crate) fn snapshot_error(&self, e: MixError) -> MixError {
         use crate::error::ErrorInfo;
         match e {
@@ -8258,13 +8314,13 @@ impl Evaluator {
                     for a in args {
                         parts.push(self.eval_expr(a).await?.to_mix_string());
                     }
-                    let output = parts.join(" ");
-                    let mut g = self.globals.borrow_mut();
-                    if *stderr {
-                        writeln!(g.stderr, "{}", output).ok();
-                    } else {
-                        writeln!(g.stdout, "{}", output).ok();
-                    }
+                    let output = parts.join(" ") + "\n";
+                    // B9: print used to swallow a failed write with .ok() —
+                    // a full/broken destination reported success. The
+                    // raw-output family already raises IO_BROKEN_PIPE /
+                    // IO_WRITE_FAILED; print now does the same, so an agent
+                    // reading rc sees the delivery failure instead of a lie.
+                    self.sink_write(*stderr, output.as_bytes())?;
                     Ok(Value::Nil)
                 }
 
@@ -8437,7 +8493,17 @@ impl Evaluator {
                             if let Some(expansion) = g.aliases.get(&n).cloned() {
                                 writeln!(g.stdout, "{} = {}", n, expansion).ok();
                             } else {
-                                writeln!(g.stderr, "alias: {}: not found", n).ok();
+                                // B8 (TODO-mix 2026-09-24): a missing alias
+                                // used to print "not found" to stderr and
+                                // return rc 0 — the script continued as
+                                // though the lookup had succeeded. Raise
+                                // instead, so `alias x; next()` cannot run.
+                                return Err(MixError::Structured(Box::new(
+                                    crate::error::ErrorInfo::new(
+                                        "ALIAS_UNDEFINED",
+                                        format!("alias: {n}: not found"),
+                                    ),
+                                )));
                             }
                         }
                         // `alias` — list all
@@ -11399,12 +11465,10 @@ impl Evaluator {
                         }
                         let tmpl = eval_args[0].to_mix_string();
                         let formatted = builtins::mix_format_public(name, &tmpl, &eval_args[1..])?;
-                        let mut g = self.globals.borrow_mut();
-                        if name == "eprintf" {
-                            write!(g.stderr, "{}", formatted).ok();
-                        } else {
-                            write!(g.stdout, "{}", formatted).ok();
-                        }
+                        // B9: printf/eprintf propagate a failed write the
+                        // same way the raw-output family does — a broken
+                        // pipe or full disk must not read as success.
+                        self.sink_write(name == "eprintf", formatted.as_bytes())?;
                         return Ok(Value::Nil);
                     }
 
@@ -14941,7 +15005,10 @@ impl Evaluator {
         let outcome = std::panic::AssertUnwindSafe(async {
             let mut prelude_fns: HashMap<String, Rc<MixFunction>> = HashMap::new();
             if replay_prelude {
-                self.load_prelude().await;
+                // B10: a prelude failure now surfaces as an error instead
+                // of a swallowed eprintln — a module loaded with a broken
+                // prelude must refuse, like a top-level program does.
+                self.load_prelude().await?;
                 // Snapshot the prelude's registry entries (by Rc
                 // identity) so auto-export can exclude them while a
                 // module REDEFINING a prelude name (fresh Rc) still
