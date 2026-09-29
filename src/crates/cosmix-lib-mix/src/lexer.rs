@@ -1567,10 +1567,20 @@ mod highlight_tests {
         for name in super::KEYWORDS {
             let mut lexer = Lexer::new(name);
             let tokens = lexer.tokenize().expect("keyword must lex");
-            assert_eq!(tokens.len(), 1, "keyword '{name}' should be one token");
+            // The lexer appends a trailing Eof token; the keyword itself
+            // must be the first (and only non-Eof) token.
+            assert_eq!(
+                tokens.len(),
+                2,
+                "keyword '{name}' should lex to [kw, Eof], got {tokens:?}"
+            );
             assert!(
                 !matches!(tokens[0].token, Token::String(_)),
                 "keyword '{name}' lexed as a bare identifier — add it to KEYWORDS"
+            );
+            assert!(
+                matches!(tokens[1].token, Token::Eof),
+                "keyword '{name}': trailing token is not Eof"
             );
         }
     }
