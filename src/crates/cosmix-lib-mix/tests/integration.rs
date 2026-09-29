@@ -2721,7 +2721,7 @@ async fn caught_die_in_request_handler_does_not_synthesize_reply() {
             "q".to_string(),
             Some("4".to_string()),
             17u8,
-            crate::evaluator::NO_REPLY_BODY.to_string(),
+            cosmix_mix::evaluator::NO_REPLY_BODY.to_string(),
         )],
         "a recovered-but-unanswered request handler gets the NO_REPLY boundary (17), \
          never the FAULT boundary (15)"
