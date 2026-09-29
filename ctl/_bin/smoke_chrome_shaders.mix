@@ -131,7 +131,7 @@ fn smoke($style)
     else
       $started = true
       $deadline = time() + 30
-      while time() < $deadline and not exists($socket_path) do
+      while time() < $deadline and not exists($socket_path)
         sleep(0.5)
       end
       if not exists($socket_path) then

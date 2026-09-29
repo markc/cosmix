@@ -172,7 +172,7 @@ fn matching_tail($text, $pattern, $limit)
   end
   $tail = []
   $i = $start
-  while $i < length($matches) do
+  while $i < length($matches)
     push($tail, $matches[$i])
     $i = $i + 1
   end
@@ -412,7 +412,7 @@ try
   print("  launched " .. $UNIT .. " (TERM backstop " .. to_string($bound) .. "s)")
 
   $first_frame_deadline = time() + $FIRST_FRAME_DEADLINE
-  while time() < $first_frame_deadline and not $lit do
+  while time() < $first_frame_deadline and not $lit
     $_sleep_first = run_argv(["sleep", "3"])
     if journal_count($CT, $UNIT, "live KMS first frame submitted") > 0 then
       $lit = true
@@ -435,7 +435,7 @@ try
     print("  baseline: pid=" .. $pid0 .. " fds=" .. $fd0 .. " threads=" .. $th0)
 
     $i = 0
-    while $i < $cycles do
+    while $i < $cycles
       $i = $i + 1
       -- Lazily opened steady-state resources make the post-cycle-1 sample the
       -- meaningful flatness baseline for multi-cycle runs.
@@ -456,7 +456,7 @@ try
 
       $pause_deadline = time() + $PAUSE_DEADLINE
       $paused = false
-      while time() < $pause_deadline and not $paused do
+      while time() < $pause_deadline and not $paused
         $_sleep_pause = run_argv(["sleep", "2"])
         if journal_count($CT, $UNIT, "lifecycle boundary state=.Paused") > $paused_before then
           $paused = true
@@ -475,7 +475,7 @@ try
       $cycle_dwell = $dwell
       if length($dwell_list) > 0 then
         $dwell_index = $i - 1
-        while $dwell_index >= length($dwell_list) do
+        while $dwell_index >= length($dwell_list)
           $dwell_index = $dwell_index - length($dwell_list)
         end
         $cycle_dwell = $dwell_list[$dwell_index]
@@ -507,7 +507,7 @@ try
 
       $resume_deadline = time() + $RESUME_DEADLINE
       $resumed = false
-      while time() < $resume_deadline and not $resumed do
+      while time() < $resume_deadline and not $resumed
         $_sleep_resume = run_argv(["sleep", "2"])
         if journal_count($CT, $UNIT, "submitted-frame telemetry") > $telemetry_before then
           $resumed = true
@@ -560,7 +560,7 @@ try
 
   $close_deadline = time() + 30
   $unit_final = "unknown"
-  while time() < $close_deadline do
+  while time() < $close_deadline
     $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
     $unit_final = trim($active["stdout"])
     if unit_gone($unit_final) then
@@ -571,7 +571,7 @@ try
   if not unit_gone($unit_final) then
     $_stop = run_argv(["systemctl", "-M", $CT, "stop", $UNIT .. ".service"], {timeout: 150})
     $stop_deadline = time() + 120
-    while time() < $stop_deadline do
+    while time() < $stop_deadline
       $active = run_argv(["systemctl", "-M", $CT, "is-active", $UNIT .. ".service"])
       $unit_final = trim($active["stdout"])
       if unit_gone($unit_final) then

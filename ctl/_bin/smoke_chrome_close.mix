@@ -331,7 +331,7 @@ end
 -- Bounded because a non-terminal stdin returns an unusable answer forever.
 fn ask($question)
   $tries = 0
-  while $tries < 5 do
+  while $tries < 5
     $answer = lower(trim(readline($question .. " [y/n/s=skip] ")))
     if $answer == "y" then return "pass" end
     if $answer == "n" then return "fail" end
@@ -455,7 +455,7 @@ fn nested_run($style)
   end
 
   $attempt = 0
-  while not exists($sock_path) and $attempt < 60 do
+  while not exists($sock_path) and $attempt < 60
     sleep(0.5)
     $attempt = $attempt + 1
   end

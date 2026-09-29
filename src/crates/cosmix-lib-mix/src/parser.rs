@@ -68,6 +68,7 @@ fn keyword_lexeme(tok: &Token) -> Option<&'static str> {
         Token::Eprint => "eprint",
         Token::Source => "source",
         Token::Include => "include",
+        Token::Do => "do",
         Token::Label => "label",
         Token::Sh => "sh",
         Token::StrEq => "eq",
@@ -595,6 +596,13 @@ impl Parser {
             Token::On => self.parse_on(),
             Token::Source => self.parse_source(),
             Token::Include => self.parse_include(),
+            Token::Do => Err(MixError::ParseError {
+                msg: "unexpected `do` — Mix has no `do` keyword; blocks close with `end` \
+                      (write `for $i = 1 to 3 … end`, `while … end`, `on verb … end` — \
+                      drop the `do`)"
+                    .to_string(),
+                span: self.peek_span(),
+            }),
             Token::Sh => self.parse_sh(),
             Token::Variable(_) => self.parse_variable_stmt(),
             _ => {

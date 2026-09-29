@@ -4,9 +4,9 @@ if $c then
 else
   print(2)
 end
-for each $x in $list do
+for each $x in $list
   print($x)
 end
-while $n do
+while $n
   $n = $n - 1
 end

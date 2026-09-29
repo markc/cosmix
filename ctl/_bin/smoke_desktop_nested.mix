@@ -433,14 +433,14 @@ finally
   end
 
   $deadline = time() + 30
-  while time() < $deadline and unit_running($comp_unit) do
+  while time() < $deadline and unit_running($comp_unit)
     sleep(0.5)
   end
   if unit_running($comp_unit) then
     print("  note: compositor ignored TERM for 30s — escalating to KILL")
     $_comp_kill = run_argv(["pkill", "-KILL", "-f", "--", $comp_pattern])
     $kill_deadline = time() + 10
-    while time() < $kill_deadline and unit_running($comp_unit) do
+    while time() < $kill_deadline and unit_running($comp_unit)
       sleep(0.5)
     end
   end
