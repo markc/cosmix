@@ -61,7 +61,7 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
             "$a = repeat(\"A\", {SIZE})\n\
              $b = repeat(\"B\", {SIZE})\n\
              $i = 0\n\
-             while true do\n  \
+             while true\n  \
                if $i % 2 == 0 then\n    write_atomic(\"{t}\", $a)\n  else\n    write_atomic(\"{t}\", $b)\n  end\n  \
                $i = $i + 1\n\
              end\n",

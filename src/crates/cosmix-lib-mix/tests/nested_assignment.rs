@@ -379,7 +379,7 @@ async fn grouping_a_map_of_maps_stays_linear() {
     let out = ok(concat!(
         "$m = {}\n",
         "$i = 0\n",
-        "while $i < 200 do\n",
+        "while $i < 200\n",
         "  $m[\"g\" .. ($i % 4)][to_string($i)] = $i\n",
         "  $i = $i + 1\n",
         "end\n",
