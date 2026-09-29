@@ -62,9 +62,9 @@ fn index_topics(index: &str) -> BTreeSet<String> {
             let Some(close) = rest[open..].find(']') else { break };
             let Some(paren) = rest[open + close..].find('(') else { break };
             let target_start = open + close + paren + 1;
-            let target = &rest[target_start..];
-            if let Some(end) = target.find(')') {
-                let target = &target[..end];
+            let target_full = &rest[target_start..];
+            if let Some(end) = target_full.find(')') {
+                let target = &target_full[..end];
                 // Only relative `topic.md` links name a manual page; skip
                 // external URLs (e.g. the AGENTS.md GitHub link).
                 if !target.contains("://")
@@ -72,7 +72,10 @@ fn index_topics(index: &str) -> BTreeSet<String> {
                 {
                     out.insert(name.to_string());
                 }
-                rest = &target[end..];
+                // Advance past this link in the ORIGINAL line, not the
+                // shadowed slice — slicing `target` again would always
+                // yield "" and silently drop every later link on the line.
+                rest = &target_full[end..];
             } else {
                 break;
             }
@@ -204,24 +207,32 @@ fn no_stale_version_stamps_or_banned_citations() {
             );
         }
         for line in content.lines() {
-            if let Some(pos) = line.find("Verified against") {                // A numeric stamp has the shape "**mix X.Y.Z**" — it must
-                // not trail the binary. (Pages may instead name this suite,
-                // which is the preferred form.)
+            if let Some(pos) = line.find("Verified against") {
+                // A numeric stamp is "mix X.Y.Z" (bold or not) — it must
+                // not trail the binary. (Pages may instead name this
+                // suite, which is the preferred form.) Scan for any
+                // digit-led "mix N" token on the line so an un-bolded
+                // stamp cannot slip past the check.
                 let rest = &line[pos..];
-                if let Some(open) = rest.find("**mix ") {
-                    let after = &rest[open + 6..];
-                    if let Some(end) = after.find("**") {
-                        let stamped = after[..end].trim();
+                let mut idx = 0;
+                while let Some(m) = rest[idx..].find("mix ") {
+                    let after = &rest[idx + m + 4..];
+                    if after.starts_with(|c: char| c.is_ascii_digit()) {
+                        let stamped: String = after
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '.')
+                            .collect();
                         let ver = |v: &str| -> Vec<u64> {
                             v.split('.')
                                 .map(|p| p.parse::<u64>().unwrap_or(0))
                                 .collect()
                         };
                         assert!(
-                            ver(stamped) >= ver(this_version),
+                            ver(&stamped) >= ver(this_version),
                             "docs/mix/{page} stamps 'mix {stamped}' which trails the binary (mix {this_version}) — re-verify the page and bump the stamp, or drop it for the man_pages pointer"
                         );
                     }
+                    idx += m + 4;
                 }
             }
         }

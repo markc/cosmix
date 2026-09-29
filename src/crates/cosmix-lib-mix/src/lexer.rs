@@ -42,6 +42,7 @@ pub struct Lexer {
     data_mode: bool,
 }
 
+
 /// The complete reserved-word set, one name per lexer keyword token.
 ///
 /// `mix keywords` and `mix what` read this through the lib, so it must
@@ -51,14 +52,77 @@ pub struct Lexer {
 /// a new keyword token added to the match without an entry here (or vice
 /// versa) cannot ship silently. The manual page `docs/mix/keywords.md` is
 /// held to the same set by `cosmix-mix/tests/man_pages.rs`.
-pub const KEYWORDS: &[&str] = &[
-    "if", "then", "else", "elif", "end", "for", "each", "in", "to", "step",
-    "next", "while", "done", "loop", "break", "continue", "function", "fn",
-    "return", "select", "when", "otherwise", "and", "or", "not", "true",
-    "false", "nil", "parse", "with", "send", "address", "emit", "on", "try",
-    "catch", "finally", "die", "export", "alias", "print", "eprint", "source",
-    "include", "label", "sh", "eq", "ne",
-];
+///
+/// Generated, not hand-maintained: the table below is ONE source for the
+/// `KEYWORDS` list AND the identifier dispatch in [`Lexer::lex_identifier`],
+/// so a keyword cannot exist in one place and not the other. (Review
+/// finding F3 of the 2026-09-29 man-discovery arc: a hand-kept pair of
+/// list and match arms could gain a match arm that no test would catch.)
+macro_rules! keyword_table {
+    ($(($name:literal, $token:ident)),* $(,)?) => {
+        /// Every reserved word, in lexer table order.
+        pub const KEYWORDS: &[&str] = &[$($name),*];
+
+        /// The lexer's keyword dispatch: reserved name → token, else None.
+        fn keyword_token(name: &str) -> Option<Token> {
+            match name {
+                $( $name => Some(Token::$token), )*
+                _ => None,
+            }
+        }
+    };
+}
+
+keyword_table!(
+    ("if", If),
+    ("then", Then),
+    ("else", Else),
+    ("elif", Elif),
+    ("end", End),
+    ("for", For),
+    ("each", Each),
+    ("in", In),
+    ("to", To),
+    ("step", Step),
+    ("next", Next),
+    ("while", While),
+    ("done", Done),
+    ("loop", Loop),
+    ("break", Break),
+    ("continue", Continue),
+    ("function", Function),
+    ("fn", Function),
+    ("return", Return),
+    ("select", Select),
+    ("when", When),
+    ("otherwise", Otherwise),
+    ("and", And),
+    ("or", Or),
+    ("not", Not),
+    ("true", True),
+    ("false", False),
+    ("nil", Nil),
+    ("parse", Parse),
+    ("with", With),
+    ("send", Send),
+    ("address", Address),
+    ("emit", Emit),
+    ("on", On),
+    ("try", Try),
+    ("catch", Catch),
+    ("finally", Finally),
+    ("die", Die),
+    ("export", Export),
+    ("alias", Alias),
+    ("print", Print),
+    ("eprint", Eprint),
+    ("source", Source),
+    ("include", Include),
+    ("label", Label),
+    ("sh", Sh),
+    ("eq", StrEq),
+    ("ne", StrNe),
+);
 
 impl Lexer {
     pub fn new(source: &str) -> Self {
@@ -1272,57 +1336,11 @@ impl Lexer {
                 break;
             }
         }
-        let token = match name.as_str() {
-            "if" => Token::If,
-            "then" => Token::Then,
-            "else" => Token::Else,
-            "elif" => Token::Elif,
-            "end" => Token::End,
-            "for" => Token::For,
-            "each" => Token::Each,
-            "in" => Token::In,
-            "to" => Token::To,
-            "step" => Token::Step,
-            "next" => Token::Next,
-            "while" => Token::While,
-            "done" => Token::Done,
-            "loop" => Token::Loop,
-            "break" => Token::Break,
-            "continue" => Token::Continue,
-            "function" => Token::Function,
-            "fn" => Token::Function, // Rust-style short alias for `function`
-            "return" => Token::Return,
-            "select" => Token::Select,
-            "when" => Token::When,
-            "otherwise" => Token::Otherwise,
-            "and" => Token::And,
-            "or" => Token::Or,
-            "not" => Token::Not,
-            "true" => Token::True,
-            "false" => Token::False,
-            "nil" => Token::Nil,
-            "parse" => Token::Parse,
-            "with" => Token::With,
-            "send" => Token::Send,
-            "address" => Token::Address,
-            "emit" => Token::Emit,
-            "on" => Token::On,
-            "try" => Token::Try,
-            "catch" => Token::Catch,
-            "finally" => Token::Finally,
-            "die" => Token::Die,
-            "export" => Token::Export,
-            "alias" => Token::Alias,
-            "print" => Token::Print,
-            "eprint" => Token::Eprint,
-            "source" => Token::Source,
-            "include" => Token::Include,
-            "label" => Token::Label,
-            "sh" => Token::Sh,
-            "eq" => Token::StrEq,
-            "ne" => Token::StrNe,
-            _ => Token::String(name), // bare identifier — used for function names, map keys, etc.
-        };
+        // Dispatch from the single keyword table above — keyword_token is
+        // generated from the same rows as KEYWORDS, so the two cannot
+        // drift. The fallback is the bare-identifier path (function
+        // names, map keys, etc.).
+        let token = keyword_token(&name).unwrap_or_else(|| Token::String(name));
         Ok(self.spanned(token, line, col))
     }
 }
@@ -1576,7 +1594,7 @@ mod highlight_tests {
             );
             assert!(
                 !matches!(tokens[0].token, Token::String(_)),
-                "keyword '{name}' lexed as a bare identifier — add it to KEYWORDS"
+                "keyword '{name}' lexed as a bare identifier — the keyword_table entry and its Token are out of step"
             );
             assert!(
                 matches!(tokens[1].token, Token::Eof),

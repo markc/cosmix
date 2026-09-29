@@ -452,7 +452,8 @@ access, strict-data keys, <code>send</code> kwargs, <code>parse … with</code> 
 <em>Keywords as names</em> below. What remains reserved: a keyword cannot be a
 <strong>function name</strong> or fill any other bare-identifier slot.</p>
 <h2 id="the-full-set">The full set</h2>
-<p>The lexer reserves <strong>47 lexemes</strong> (<code>fn</code> and <code>function</code> share one token):</p>
+<p>The lexer reserves <strong>48 words</strong> across <strong>47 token kinds</strong> (<code>fn</code> and
+<code>function</code> share one token):</p>
 <table><thead><tr><th>Group</th><th>Lexemes</th></tr></thead><tbody>
 <tr><td>Conditionals &amp; matching</td><td><code>if</code> <code>then</code> <code>else</code> <code>elif</code> <code>end</code> <code>select</code> <code>when</code> <code>otherwise</code></td></tr>
 <tr><td>Loops</td><td><code>for</code> <code>each</code> <code>in</code> <code>to</code> <code>step</code> <code>while</code> <code>loop</code> <code>break</code> <code>continue</code> <code>label</code> — plus the legacy terminators <code>next</code> (for) and <code>done</code> (while/loop/on)</td></tr>

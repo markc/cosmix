@@ -457,7 +457,7 @@ const KEYWORD_DESCRIPTIONS: &[(&str, &str)] = &[
         "Bus handler registration: on verb ... end (a serve citizen answers verb calls)",
     ),
     ("step", "Numeric loop stride: for $i = 1 to 10 step 2 ... end"),
-    ("then", "Terminate an if/elif condition: if EXPR then ... end (then is optional)"),
+    ("then", "Terminate an if/elif condition (required): if EXPR then ... end"),
     ("to", "Numeric loop range: for $i = 1 to 10 ... end"),
     ("with", "Template separator in parse statements: parse $src with ..."),
 ];

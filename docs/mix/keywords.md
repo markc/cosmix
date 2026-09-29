@@ -12,7 +12,8 @@ access, strict-data keys, `send` kwargs, `parse … with` delimiters) — see
 
 ## The full set
 
-The lexer reserves **47 lexemes** (`fn` and `function` share one token):
+The lexer reserves **48 words** across **47 token kinds** (`fn` and
+`function` share one token):
 
 | Group | Lexemes |
 |---|---|
