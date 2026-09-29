@@ -8,7 +8,7 @@ Bus daemon, and a family of one-shot meta commands (`mix help`, `mix man`,
 start Mix in each mode and the rules that decide whether a `-c` / login-shell
 line runs as Mix code or dispatches a shell command.
 
-Verified against **mix 0.61.0** — the binary is the oracle. Argument parsing
+The binary is the oracle; page stamps are held fresh by `cargo test -p cosmix-mix --test man_pages`. Argument parsing
 lives in [`cosmix-mix/src/main.rs`](https://github.com/markc/cosmix/blob/main/src/crates/cosmix-mix/src/main.rs);
 the shell-first classifier is in `cosmix-mix/src/shell.rs`.
 

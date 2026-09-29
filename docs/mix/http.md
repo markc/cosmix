@@ -450,7 +450,7 @@ the common case — `json_parse` turns the body into a map/list with dotted /
 indexed field access:
 
 ```mix
-$r = http_get("https://api.github.com/repos/markc/mix",
+$r = http_get("https://api.github.com/repos/markc/cosmix",
   { "User-Agent": "mix-docs", "Accept": "application/vnd.github+json" })
 if $r["status"] == 200 then
   $j = json_parse($r["body"])

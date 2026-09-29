@@ -442,16 +442,20 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="mix/keywords.md"><div class="prose"><h1 id="reserved-words">Reserved words</h1>
-<p>Mix's keyword lexemes, verified against the lexer (mix 0.21.x). Since 0.21 the
-old reserved-word footgun is retired: a keyword is accepted anywhere it is
-unambiguously a <strong>name</strong> (bare map keys, <code>.field</code> access, strict-data keys,
-<code>send</code> kwargs, <code>parse … with</code> delimiters) — see <em>Keywords as names</em> below.
-What remains reserved: a keyword cannot be a <strong>function name</strong> or fill any
-other bare-identifier slot.</p>
+<p>Mix's keyword lexemes, held to the lexer by
+<code>cargo test -p cosmix-lib-mix keyword_set_matches_lexer</code> (the lib's
+<code>KEYWORDS</code> list and the lexer match arms must agree, and
+<code>cargo test -p cosmix-mix --test man_pages</code> holds this table to the same
+set). Since 0.21 the old reserved-word footgun is retired: a keyword is
+accepted anywhere it is unambiguously a <strong>name</strong> (bare map keys, <code>.field</code>
+access, strict-data keys, <code>send</code> kwargs, <code>parse … with</code> delimiters) — see
+<em>Keywords as names</em> below. What remains reserved: a keyword cannot be a
+<strong>function name</strong> or fill any other bare-identifier slot.</p>
 <h2 id="the-full-set">The full set</h2>
-<p>The lexer reserves <strong>46 lexemes</strong> (<code>fn</code> and <code>function</code> share one token):</p>
+<p>The lexer reserves <strong>48 words</strong> across <strong>47 token kinds</strong> (<code>fn</code> and
+<code>function</code> share one token):</p>
 <table><thead><tr><th>Group</th><th>Lexemes</th></tr></thead><tbody>
-<tr><td>Conditionals &amp; matching</td><td><code>if</code> <code>then</code> <code>else</code> <code>end</code> <code>select</code> <code>when</code> <code>otherwise</code></td></tr>
+<tr><td>Conditionals &amp; matching</td><td><code>if</code> <code>then</code> <code>else</code> <code>elif</code> <code>end</code> <code>select</code> <code>when</code> <code>otherwise</code></td></tr>
 <tr><td>Loops</td><td><code>for</code> <code>each</code> <code>in</code> <code>to</code> <code>step</code> <code>while</code> <code>loop</code> <code>break</code> <code>continue</code> <code>label</code> — plus the legacy terminators <code>next</code> (for) and <code>done</code> (while/loop/on)</td></tr>
 <tr><td>Functions</td><td><code>function</code> <code>fn</code> <code>return</code></td></tr>
 <tr><td>Errors</td><td><code>try</code> <code>catch</code> <code>finally</code> <code>die</code></td></tr>
@@ -461,9 +465,9 @@ other bare-identifier slot.</p>
 <tr><td>Shell &amp; loading</td><td><code>export</code> <code>alias</code> <code>source</code> <code>include</code> <code>sh</code></td></tr>
 <tr><td>Operators &amp; literals</td><td><code>and</code> <code>or</code> <code>not</code> <code>eq</code> <code>ne</code> <code>true</code> <code>false</code> <code>nil</code></td></tr>
 </tbody></table>
-<p><code>mix keywords</code> prints a 34-word core list; the other 12 lexemes (<code>then</code> <code>each</code>
-<code>to</code> <code>step</code> <code>next</code> <code>done</code> <code>with</code> <code>on</code> <code>include</code> <code>label</code> <code>eq</code> <code>ne</code>) are just as
-reserved — each fails identically as an identifier
+<p><code>mix keywords</code> prints the complete set and <code>mix what NAME</code> resolves every
+one — no "core list" subset remains. All of them are equally reserved: each
+fails identically as an identifier
 (<code>function step($x)</code> → <code>Parse error … expected identifier, got Step</code>).</p>
 <h2 id="what-is-and-isnt-restricted">What is (and isn't) restricted</h2>
 <ul>

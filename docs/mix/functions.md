@@ -7,7 +7,7 @@ Mix functions come in two shapes that look almost identical but mean different t
 
 Both share one tail grammar (`($params) ... end` or `($params) = expr`), one binding model (args by value, writes function-local), and one capture rule (closures see their defining scope for *reads*). Get those four facts straight and everything else follows.
 
-> Verified against **mix 0.21.2**. Every example below was run with `mix -c` and shows its real output. The binary is the oracle — if anything here disagrees with live behaviour, the binary wins.
+> The binary is the oracle — if anything here disagrees with live behaviour, the binary wins. Page stamps are held fresh by `cargo test -p cosmix-mix --test man_pages` (ask `mix --version` for the current number).
 
 ## Named functions — the statement form
 

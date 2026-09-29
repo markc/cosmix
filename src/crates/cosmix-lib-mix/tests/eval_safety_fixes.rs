@@ -155,24 +155,59 @@ fn right_nested(var: &str, wraps: usize) -> String {
     expr
 }
 
-#[tokio::test]
-async fn deep_right_nesting_in_for_body_falls_back_instead_of_panicking() {
-    let expr = right_nested("$i", 20); // 21 live operands > 16 slots
-    let src = format!("$sum = 1\nfor $i = 1 to 3\n  $sum = {expr}\nend\nprint($sum)\n");
-    let out = run(&src, |_| {}).await.expect("AST fallback computes it");
-    assert_eq!(out.trim(), "0");
+/// Run an async probe on a thread with a deliberately large stack.
+///
+/// The depth-gating probes recurse the AST fallback synchronously
+/// through the evaluator (function call × nesting level), and the depth
+/// that survives is a function of the host's default thread stack —
+/// the fib probe overflowed a default 8 MiB libtest thread on the cbc
+/// build workers while passing on the desktop, which made the gate
+/// depend on where it ran. An explicit 64 MiB stack keeps the probe
+/// deterministic everywhere: the assertion being tested is the builder's
+/// refusal + correct fallback value, not the ambient stack size.
+fn on_large_stack(
+    make_fut: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>
+        + Send
+        + 'static,
+) {
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            rt.block_on(make_fut());
+        })
+        .expect("spawn large-stack thread");
+    handle.join().expect("large-stack thread panicked");
 }
 
-#[tokio::test]
-async fn deep_right_nesting_in_fib_bytecode_falls_back_instead_of_panicking() {
+#[test]
+fn deep_right_nesting_in_for_body_falls_back_instead_of_panicking() {
+    let expr = right_nested("$i", 20); // 21 live operands > 16 slots
+    let src = format!("$sum = 1\nfor $i = 1 to 3\n  $sum = {expr}\nend\nprint($sum)\n");
+    on_large_stack(|| {
+        Box::pin(async move {
+            let out = run(&src, |_| {}).await.expect("AST fallback computes it");
+            assert_eq!(out.trim(), "0");
+        })
+    });
+}
+
+#[test]
+fn deep_right_nesting_in_fib_bytecode_falls_back_instead_of_panicking() {
     // Recursive call + deep nesting in the else branch: the fib
     // bytecode VM would execute the nesting with the call result live.
     let expr = right_nested("$n", 20);
     let src = format!(
         "function f($n)\n  if $n < 1 then\n    return 0\n  end\n  return f($n - 1) + ({expr})\nend\nprint(f(3))\n"
     );
-    let out = run(&src, |_| {}).await.expect("AST fallback computes it");
-    assert_eq!(out.trim(), "0");
+    on_large_stack(|| {
+        Box::pin(async move {
+            let out = run(&src, |_| {}).await.expect("AST fallback computes it");
+            assert_eq!(out.trim(), "0");
+        })
+    });
 }
 
 #[tokio::test]

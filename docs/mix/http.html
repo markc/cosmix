@@ -784,7 +784,7 @@ its own <code>{timeout: seconds}</code> opts map if you want the download bounde
 <p><code>body</code> is just a string, so feed it to the <a href="/mix/data">data</a> builtins. JSON is
 the common case — <code>json_parse</code> turns the body into a map/list with dotted /
 indexed field access:</p>
-<pre><code class="language-mix">$r = http_get("https://api.github.com/repos/markc/mix",
+<pre><code class="language-mix">$r = http_get("https://api.github.com/repos/markc/cosmix",
   { "User-Agent": "mix-docs", "Accept": "application/vnd.github+json" })
 if $r["status"] == 200 then
   $j = json_parse($r["body"])

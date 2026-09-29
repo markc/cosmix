@@ -104,7 +104,7 @@ async fn reload_request(
         .into(),
     })
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+    tokio::time::timeout(Duration::from_secs(30), e.run_event_pump())
         .await
         .unwrap()
         .unwrap();
@@ -140,7 +140,13 @@ async fn watcher(root: &Path, recursive: bool) -> Evaluator {
 async fn delivered(e: &mut Evaluator, path: &Path, kind: &str) -> Value {
     e.set_global("wanted_path", Value::String(path.to_str().unwrap().into()));
     e.set_global("wanted_kind", Value::String(kind.into()));
-    tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+    // 30 s, not 5: the pump waits for an inotify delivery that a busy cbc
+    // worker under a parallel test battery can miss past a 5 s budget
+    // (the native_session_pty 5 s-wait flake family, TODO-mix.md). The
+    // timeout is a fail-fast guard, not the thing under test, so a
+    // generous total keeps the gate load-independent while a genuine
+    // regression still fails in bounded time.
+    tokio::time::timeout(Duration::from_secs(30), e.run_event_pump())
         .await
         .expect("native event deadline")
         .unwrap();
@@ -349,7 +355,7 @@ async fn serve_managed_child_exits_are_reaped_and_generation_tagged() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+    tokio::time::timeout(Duration::from_secs(30), e.run_event_pump())
         .await
         .unwrap()
         .unwrap();
@@ -519,7 +525,7 @@ async fn plain_pump_finishes_after_the_last_managed_exit_without_quit() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+    tokio::time::timeout(Duration::from_secs(30), e.run_event_pump())
         .await
         .unwrap()
         .unwrap();
@@ -561,7 +567,7 @@ async fn sleep_with_child_handler_preserves_batches_for_fs_wait() {
             .await
             .unwrap()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+        tokio::time::timeout(Duration::from_secs(30), e.run_event_pump())
             .await
             .unwrap()
             .unwrap();
@@ -685,7 +691,7 @@ async fn managed_signal_delivery_and_shutdown_have_one_reaper() {
         .unwrap();
     blocked_child(&mut e).await;
     exec(&mut e, "kill($pid, 15)").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+    tokio::time::timeout(Duration::from_secs(30), e.run_event_pump())
         .await
         .unwrap()
         .unwrap();
@@ -728,7 +734,7 @@ async fn managed_exit_async_handler_uses_existing_scheduler_and_drain() {
             )
             .await
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), e.run_event_pump())
+            tokio::time::timeout(Duration::from_secs(30), e.run_event_pump())
                 .await
                 .unwrap()
                 .unwrap();

@@ -3,7 +3,7 @@
 Every operator Mix's expression grammar knows, with verified precedence and the
 exact coercion rules. Statements use newline or `;` separators, every
 variable is `$`-sigil, and string concatenation is **`..`** — not `+`, not `.`.
-Verified against **mix 0.56.0**; the binary is the oracle.
+The binary is the oracle; page stamps are held fresh by `cargo test -p cosmix-mix --test man_pages`.
 
 ## Precedence & associativity
 

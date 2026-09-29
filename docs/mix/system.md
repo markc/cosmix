@@ -644,7 +644,7 @@ existing result-handling code ports unchanged. One job's ordinary failure
 $hosts = ["alpha", "beta", "gamma"]
 $jobs = map($hosts, fn($h) = ["ssh", $h, "uptime"])
 $results = run_parallel($jobs, {max: 8, timeout: 10})
-for each $i in range(0, len($hosts))
+for each $i in range(0, len($hosts) - 1)   -- range is INCLUSIVE: len-1, never len
   $r = $results[$i]
   print($hosts[$i] .. ": " .. ($r.ok ? trim($r.stdout) : "DOWN (" .. $r.exit_code .. ")"))
 end

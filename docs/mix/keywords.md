@@ -1,19 +1,23 @@
 # Reserved words
 
-Mix's keyword lexemes, verified against the lexer (mix 0.21.x). Since 0.21 the
-old reserved-word footgun is retired: a keyword is accepted anywhere it is
-unambiguously a **name** (bare map keys, `.field` access, strict-data keys,
-`send` kwargs, `parse … with` delimiters) — see *Keywords as names* below.
-What remains reserved: a keyword cannot be a **function name** or fill any
-other bare-identifier slot.
+Mix's keyword lexemes, held to the lexer by
+`cargo test -p cosmix-lib-mix keyword_set_matches_lexer` (the lib's
+`KEYWORDS` list and the lexer match arms must agree, and
+`cargo test -p cosmix-mix --test man_pages` holds this table to the same
+set). Since 0.21 the old reserved-word footgun is retired: a keyword is
+accepted anywhere it is unambiguously a **name** (bare map keys, `.field`
+access, strict-data keys, `send` kwargs, `parse … with` delimiters) — see
+*Keywords as names* below. What remains reserved: a keyword cannot be a
+**function name** or fill any other bare-identifier slot.
 
 ## The full set
 
-The lexer reserves **46 lexemes** (`fn` and `function` share one token):
+The lexer reserves **48 words** across **47 token kinds** (`fn` and
+`function` share one token):
 
 | Group | Lexemes |
 |---|---|
-| Conditionals & matching | `if` `then` `else` `end` `select` `when` `otherwise` |
+| Conditionals & matching | `if` `then` `else` `elif` `end` `select` `when` `otherwise` |
 | Loops | `for` `each` `in` `to` `step` `while` `loop` `break` `continue` `label` — plus the legacy terminators `next` (for) and `done` (while/loop/on) |
 | Functions | `function` `fn` `return` |
 | Errors | `try` `catch` `finally` `die` |
@@ -23,9 +27,9 @@ The lexer reserves **46 lexemes** (`fn` and `function` share one token):
 | Shell & loading | `export` `alias` `source` `include` `sh` |
 | Operators & literals | `and` `or` `not` `eq` `ne` `true` `false` `nil` |
 
-`mix keywords` prints a 34-word core list; the other 12 lexemes (`then` `each`
-`to` `step` `next` `done` `with` `on` `include` `label` `eq` `ne`) are just as
-reserved — each fails identically as an identifier
+`mix keywords` prints the complete set and `mix what NAME` resolves every
+one — no "core list" subset remains. All of them are equally reserved: each
+fails identically as an identifier
 (`function step($x)` → `Parse error … expected identifier, got Step`).
 
 ## What is (and isn't) restricted

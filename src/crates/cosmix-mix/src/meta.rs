@@ -28,44 +28,11 @@ pub fn init_start_time() {
     START_TIME.get_or_init(Instant::now);
 }
 
-/// Mix language keywords (for `mix type` lookups).
-const MIX_KEYWORDS: &[&str] = &[
-    "if",
-    "else",
-    "end",
-    "for",
-    "in",
-    "while",
-    "loop",
-    "function",
-    "fn",
-    "return",
-    "select",
-    "when",
-    "otherwise",
-    "print",
-    "eprint",
-    "die",
-    "try",
-    "catch",
-    "finally",
-    "parse",
-    "export",
-    "alias",
-    "break",
-    "continue",
-    "true",
-    "false",
-    "nil",
-    "send",
-    "address",
-    "emit",
-    "source",
-    "sh",
-    "and",
-    "or",
-    "not",
-];
+// Mix language keywords — the complete reserved-word set, read from the
+// lexer itself (`cosmix_mix::lexer::KEYWORDS`) so the discovery surface
+// can never drift from the grammar. `mix keywords`, `mix what` and
+// `mix type` all resolve through this one source.
+use cosmix_mix::lexer::KEYWORDS;
 
 /// Extra entries for `mix help` / `mix builtins` / `mix what` that
 /// don't correspond to a builtin function call — they're statements
@@ -470,6 +437,29 @@ const KEYWORD_DESCRIPTIONS: &[(&str, &str)] = &[
         "done",
         "Close while/loop/on block (v0.1.x legacy — use 'end' in new code, v0.2.2)",
     ),
+    ("each", "Optional marker in for-each loops: for each $x in LIST ... end"),
+    (
+        "elif",
+        "Else-if branch: if ... elif EXPR then ... else ... end",
+    ),
+    ("eq", "String equality operator: a eq b (== is numeric equality)"),
+    (
+        "include",
+        "Splice a script-relative file into the current scope, load-once (libs): include \"lib.mix\"",
+    ),
+    (
+        "label",
+        "Loop label: while true label outer ... end (break/continue can name it)",
+    ),
+    ("ne", "String inequality operator: a ne b"),
+    (
+        "on",
+        "Bus handler registration: on verb ... end (a serve citizen answers verb calls)",
+    ),
+    ("step", "Numeric loop stride: for $i = 1 to 10 step 2 ... end"),
+    ("then", "Terminate an if/elif condition (required): if EXPR then ... end"),
+    ("to", "Numeric loop range: for $i = 1 to 10 ... end"),
+    ("with", "Template separator in parse statements: parse $src with ..."),
 ];
 
 /// The canonical `mix X.Y.Z` version line. Shared by the CLI `--version` flag,
@@ -1135,7 +1125,7 @@ fn cmd_type(name: &str, eval: &Evaluator) {
     }
 
     // Keyword
-    if MIX_KEYWORDS.contains(&name) {
+    if KEYWORDS.contains(&name) {
         println!("{} is a keyword", name);
         return;
     }
@@ -1641,6 +1631,7 @@ fn cmd_help_overview() {
     println!("  mix tutorial     Guided walkthrough of Mix basics");
     println!("  mix examples     Runnable code snippets by category");
     println!("  mix man [TOPIC]  Read manual pages (no args = index)");
+    println!("  mix man gotchas  The bash/Python/JS guesses that are silently wrong here — read before writing Mix");
     println!("  mix keywords     List all reserved words");
     println!("  mix builtins [X] Full builtin list; X = a name, category, --json, or --names");
     println!("  mix what NAME    One-line description of a builtin or keyword");
@@ -2775,7 +2766,7 @@ fn cmd_help_full(version: &str) {
 fn cmd_keywords() {
     println!("Mix reserved words:");
     println!();
-    for kw in MIX_KEYWORDS {
+    for kw in KEYWORDS {
         println!("  {}", kw);
     }
 }
@@ -3483,6 +3474,29 @@ mod builtins_introspection_tests {
 #[cfg(test)]
 mod version_line_tests {
     use super::*;
+
+    /// `mix what` and `mix type` resolve every keyword through
+    /// [`KEYWORD_DESCRIPTIONS`]; `mix keywords` prints the lexer's
+    /// [`KEYWORDS`]. The two lists must cover each other exactly — a
+    /// keyword with no description is unresolvable, and a description
+    /// for a name that is not a keyword points at nothing. This test is
+    /// the build-time gate for that symmetry (the manual's keyword table
+    /// is held to the same set by `tests/man_pages.rs`).
+    #[test]
+    fn keyword_registry_is_complete_in_both_directions() {
+        for (name, _desc) in KEYWORD_DESCRIPTIONS {
+            assert!(
+                KEYWORDS.contains(name),
+                "KEYWORD_DESCRIPTIONS names '{name}', which is not a keyword"
+            );
+        }
+        for kw in KEYWORDS {
+            assert!(
+                KEYWORD_DESCRIPTIONS.iter().any(|(name, _)| name == kw),
+                "keyword '{kw}' has no description — mix what '{kw}' would not resolve"
+            );
+        }
+    }
 
     /// The REPL `mix --version`, the CLI `--version` flag, and the status
     /// header all route through `version_line`; guard the exact `mix X.Y.Z`

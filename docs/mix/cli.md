@@ -267,7 +267,7 @@ mix man nope        -- "no manual page for 'nope'" + available topics
 
 `mix syntax` and `mix operators` are thin aliases — `mix man variables` and
 `mix man operators` respectively. To add a topic, drop `TOPIC.md` into
-`docs/_man/`; it publishes to `cosmix.dev/mix` on the next Pages build and is
+`docs/mix/`; it publishes to `cosmix.dev/mix` on the next Pages build and is
 reachable as `mix man TOPIC` with no code change.
 
 ### `mix diff bash`
