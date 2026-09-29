@@ -41,3 +41,18 @@ async fn dot_fn_reads_the_fn_key_not_function() {
         .expect(".function");
     assert!(out.contains('2'), "got: {out}");
 }
+
+#[tokio::test]
+async fn select_on_collections_raises_like_the_equality_binop() {
+    // C7: select [1] when [1] used to silently take `otherwise`; now it
+    // raises the same TYPE_ERROR the == binop does, naming deep_eq.
+    let err = run("select [1] when [1] then\n  print(\"m\")\notherwise\n  print(\"o\")\nend\n")
+        .await
+        .expect_err("collection select must raise");
+    assert!(err.contains("deep_eq"), "got: {err}");
+    // Scalar select still works.
+    let out = run("select 1 when 1 then\n  print(\"m\")\notherwise\n  print(\"o\")\nend\n")
+        .await
+        .expect("scalar select");
+    assert!(out.contains('m'), "got: {out}");
+}
