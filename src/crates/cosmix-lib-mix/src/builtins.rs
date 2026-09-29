@@ -6902,6 +6902,35 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {
+                // 09-25 entry: Ctrl-C must stop the fan-out — the pool
+                // kept spawning jobs after the interrupt flag was set,
+                // so a cancelled batch still launched every remaining
+                // child. A worker seeing the flag marks its SLOT as an
+                // interrupted outcome and stops pulling indices; the
+                // marshal below encodes the flag like run_argv does.
+                if crate::interrupt::is_interrupted() {
+                    // Claim remaining indices as interrupted so every
+                    // slot is assigned exactly once (the marshal
+                    // expects that invariant).
+                    let mut i = next.fetch_add(1, Ordering::Relaxed);
+                    while i < n {
+                        *slots[i].lock().expect("run_parallel slot poisoned") =
+                            Some(Ok(ProcOutcome {
+                                stdout: Vec::new(),
+                                stderr: Vec::new(),
+                                exit_code: 0,
+                                timed_out: false,
+                                interrupted: true,
+                                signal: None,
+                                natural_code: None,
+                                stdout_truncated: false,
+                                stderr_truncated: false,
+                                duration_ms: 0,
+                            }));
+                        i = next.fetch_add(1, Ordering::Relaxed);
+                    }
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
