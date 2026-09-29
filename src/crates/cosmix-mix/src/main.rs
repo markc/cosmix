@@ -612,11 +612,11 @@ fn run_source(
         repl::register_ai_extensions(&mut eval);
 
         // Load prelude
-        if !no_prelude {
-            if let Err(e) = eval.load_prelude().await {
-                eprintln!("{e}");
-                return (ScriptOutcome::Ran(Err(e)), eval.take_stats());
-            }
+        if !no_prelude
+            && let Err(e) = eval.load_prelude().await
+        {
+            eprintln!("{e}");
+            return (ScriptOutcome::Ran(Err(e)), eval.take_stats());
         }
 
         if stats_io::stats_enabled() {
@@ -729,11 +729,11 @@ fn run_command_line(
         eval.set_shell_handler(std::rc::Rc::new(shell_handler::ReplShellHandler::new()));
         cosmix_mix::interrupt::init(eval.interrupt_flag());
         repl::register_ai_extensions(&mut eval);
-        if !no_prelude {
-            if let Err(e) = eval.load_prelude().await {
-                eprintln!("{e}");
-                return (1, eval.take_stats());
-            }
+        if !no_prelude
+            && let Err(e) = eval.load_prelude().await
+        {
+            eprintln!("{e}");
+            return (1, eval.take_stats());
         }
         for (idx, arg) in script_args.iter().enumerate() {
             eval.set_global(&(idx + 1).to_string(), Value::String(arg.clone()));
