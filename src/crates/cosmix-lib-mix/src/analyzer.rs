@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, ChainOp, Expr, FunctionBody, Param, PathSeg, Stmt, StmtKind, UnaryOp};
 use crate::builtin_info::{FieldInfo, TypeShape};
-use crate::builtins;
+use crate::builtins::{self, CapabilityClass};
 use crate::evaluator::INLINE_SPECIAL_FORMS;
 use crate::scope::param_arity;
 use crate::token::StringPart;
@@ -1085,24 +1085,44 @@ fn check_scope(
         let result_consumed = last_in_block && block_is_value;
         // W2201: a discarded must-use operation as a bare expression
         // statement (skip the last statement of a block — it may be the
-        // block's value).
+        // block's value). Also covers a discarded PURE transform: a
+        // CapabilityClass::Pure builtin that returns a value and mutates
+        // nothing does nothing at all when its result is dropped
+        // (`upper($s)` alone is a no-op) — D3, TODO-mix 2026-09-24.
         if let StmtKind::Expression(Expr::FunctionCall { name, .. }) = &stmt.kind
             && !last_in_block
             && let Some(info) = builtins::builtin_info_of(name)
-            && info.contract.effects.must_use
         {
-            a.diagnostics.push(diag(
-                ctx,
-                "MIX-W2201",
-                Severity::Warning,
-                stmt.line,
-                format!(
-                    "result of {name}() is discarded — its failure signal is in the returned value"
-                ),
-                Some(format!(
-                    "bind it: $r = {name}(...) and branch on the result"
-                )),
-            ));
+            let pure_transform_discarded = info.capability == CapabilityClass::Pure
+                && !info.contract.effects.mutates_args
+                && !matches!(info.contract.returns, TypeShape::Nil | TypeShape::Any);
+            if info.contract.effects.must_use || pure_transform_discarded {
+                let (msg, hint) = if pure_transform_discarded
+                    && !info.contract.effects.must_use
+                {
+                    (
+                        format!(
+                            "result of {name}() is discarded — it is a pure transform: it returns a new value and mutates nothing, so this statement does nothing"
+                        ),
+                        format!("bind or use it: $r = {name}(...)"),
+                    )
+                } else {
+                    (
+                        format!(
+                            "result of {name}() is discarded — its failure signal is in the returned value"
+                        ),
+                        format!("bind it: $r = {name}(...) and branch on the result"),
+                    )
+                };
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-W2201",
+                    Severity::Warning,
+                    stmt.line,
+                    msg,
+                    Some(hint),
+                ));
+            }
         }
 
         // E1501 / E1502: a statement whose whole effect is provably lost.
