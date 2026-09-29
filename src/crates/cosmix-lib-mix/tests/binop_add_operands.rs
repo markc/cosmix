@@ -60,15 +60,34 @@ async fn collection_operands_raise_and_name_the_builtin() {
 
 #[tokio::test]
 async fn scalar_addition_and_the_string_fallback_are_unchanged() {
-    // The legacy coercions every fleet script leans on. `nil` stays a
-    // SCALAR on purpose: `nil + 1` is "nil1", its own footgun but not this
-    // one, and moving it would break absent-key-into-a-message lines
-    // data-dependently.
+    // The legacy coercions every fleet script leans on. nil is NO LONGER
+    // a scalar (C1, 2026-09-24): `nil + 1` used to be "nil1", a missing
+    // numeric field silently becoming text — the sweep's later decision
+    // overrode the 0.90.0 carve-out deliberately.
     let out = run("print(1 + 2)\nprint(\"a\" + \"b\")\nprint(\"3\" + 4)\n\
-                   print(true + 1)\nprint(nil + 1)\n")
+                   print(true + 1)\n")
         .await
         .unwrap();
-    assert_eq!(out, "3\nab\n7\n2\nnil1\n");
+    assert_eq!(out, "3\nab\n7\n2\n");
+
+    let err = run("print(nil + 1)\n").await.expect_err("nil + 1 must raise (C1)");
+    assert!(err.contains("nil is not a number"), "{err}");
+    // The ?? guard the error teaches (bound-nil, the absent-value shape).
+    let out = run("$n = nil\nprint(($n ?? 0) + 1)\n").await.unwrap();
+    assert_eq!(out, "1\n");
+}
+
+#[tokio::test]
+async fn literal_range_violations_are_lexer_errors() {
+    // C5: a literal that silently rounds or overflows is refused at the
+    // lexer — the fabricated number never flows anywhere.
+    let err = run("print(9007199254740993)\n").await.expect_err("2^53+1 must refuse");
+    assert!(err.contains("exceeds the exact range"), "{err}");
+    let err = run("print(1e999)\n").await.expect_err("1e999 must refuse");
+    assert!(err.contains("out of range"), "{err}");
+    // Plain whole floats and scientific notation stay legal.
+    let out = run("print(9007199254740992)\nprint(1e3)\n").await.unwrap();
+    assert_eq!(out, "9007199254740992\n1000\n");
 }
 
 #[tokio::test]

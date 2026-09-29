@@ -45,7 +45,7 @@ async fn run_err(source: &str) -> String {
 /// past usize::MAX into a start>end slice panic.
 #[tokio::test]
 async fn substr_huge_len_no_panic() {
-    let out = run_ok(r#"print(substr("hello world abc foo", 10, 100000000000000000000))"#).await;
+    let out = run_ok(r#"print(substr("hello world abc foo", 10, to_number("100000000000000000000")))"#).await;
     assert_eq!(out, "d abc foo");
 }
 
@@ -76,7 +76,7 @@ async fn substr_negative_args() {
 #[tokio::test]
 async fn substr_huge_start_and_len() {
     let out =
-        run_ok(r#"print("[" .. substr("abc", 9999999999999999999999999999999999, 9999999999999999999999999999999999) .. "]")"#).await;
+        run_ok(r#"print("[" .. substr("abc", to_number("9999999999999999999999999999999999"), to_number("9999999999999999999999999999999999")) .. "]")"#).await;
     assert_eq!(out, "[]");
 }
 
@@ -135,7 +135,7 @@ async fn repeat_over_cap_errors() {
 /// the cap error too (checked_mul, no wrap).
 #[tokio::test]
 async fn repeat_astronomical_count_errors() {
-    let err = run_err(r#"$x = repeat("ab", 999999999999999999999999999999999999)"#).await;
+    let err = run_err(r#"$x = repeat("ab", to_number("999999999999999999999999999999999999"))"#).await;
     assert!(err.contains("256 MiB cap"), "got: {err}");
 }
 
@@ -148,20 +148,20 @@ async fn repeat_normal_and_edge_ok() {
     assert_eq!(out, "[]");
     // Empty string repeated a huge number of times is still empty (0 bytes).
     let out =
-        run_ok(r#"print("[" .. repeat("", 999999999999999999999999999999999999) .. "]")"#).await;
+        run_ok(r#"print("[" .. repeat("", to_number("999999999999999999999999999999999999")) .. "]")"#).await;
     assert_eq!(out, "[]");
 }
 
 #[tokio::test]
 async fn lpad_rpad_over_cap_error() {
-    let err = run_err(r#"$x = lpad("x", 999999999999999999)"#).await;
+    let err = run_err(r#"$x = lpad("x", to_number("999999999999999999"))"#).await;
     assert!(err.contains("256 MiB cap"), "got: {err}");
-    let err = run_err(r#"$x = rpad("x", 999999999999999999)"#).await;
+    let err = run_err(r#"$x = rpad("x", to_number("999999999999999999"))"#).await;
     assert!(err.contains("256 MiB cap"), "got: {err}");
     // The display-cell twins share the same hazard and cap.
-    let err = run_err(r#"$x = lpad_w("x", 999999999999999999)"#).await;
+    let err = run_err(r#"$x = lpad_w("x", to_number("999999999999999999"))"#).await;
     assert!(err.contains("256 MiB cap"), "got: {err}");
-    let err = run_err(r#"$x = rpad_w("x", 999999999999999999)"#).await;
+    let err = run_err(r#"$x = rpad_w("x", to_number("999999999999999999"))"#).await;
     assert!(err.contains("256 MiB cap"), "got: {err}");
 }
 
@@ -173,19 +173,19 @@ async fn lpad_rpad_over_cap_error() {
 /// while panicking on this one line (0.59.0 review round 2).
 #[tokio::test]
 async fn saturating_negative_bounds_clamp_without_panic() {
-    let out = run_ok(r#"print(length(take([1,2,3], -10000000000000000000000000)))"#).await;
+    let out = run_ok(r#"print(length(take([1,2,3], -to_number("10000000000000000000000000"))))"#).await;
     assert_eq!(out, "3");
-    let out = run_ok(r#"print(length(drop([1,2,3], -10000000000000000000000000)))"#).await;
+    let out = run_ok(r#"print(length(drop([1,2,3], -to_number("10000000000000000000000000"))))"#).await;
     assert_eq!(out, "0");
     let out = run_ok(
-        r#"print(length(slice([1,2,3], -10000000000000000000000000, 10000000000000000000000000)))"#,
+        r#"print(length(slice([1,2,3], -to_number("10000000000000000000000000"), to_number("10000000000000000000000000"))))"#,
     )
     .await;
     assert_eq!(out, "3");
     // String arms share the same negation sites.
-    let out = run_ok(r#"print("[" .. take("abc", -10000000000000000000000000) .. "]")"#).await;
+    let out = run_ok(r#"print("[" .. take("abc", -to_number("10000000000000000000000000")) .. "]")"#).await;
     assert_eq!(out, "[abc]");
-    let out = run_ok(r#"print("[" .. drop("abc", -10000000000000000000000000) .. "]")"#).await;
+    let out = run_ok(r#"print("[" .. drop("abc", -to_number("10000000000000000000000000")) .. "]")"#).await;
     assert_eq!(out, "[]");
 }
 
@@ -220,10 +220,10 @@ async fn lpad_rpad_normal_ok() {
 
 #[tokio::test]
 async fn range_over_cap_errors() {
-    let err = run_err(r#"$x = range(0, 1000000000000000000)"#).await;
+    let err = run_err(r#"$x = range(0, to_number("1000000000000000000"))"#).await;
     assert!(err.contains("cap 10000000"), "got: {err}");
     // Descending direction hits the same cap.
-    let err = run_err(r#"$x = range(1000000000000000000, 0, -1)"#).await;
+    let err = run_err(r#"$x = range(to_number("1000000000000000000"), 0, -1)"#).await;
     assert!(err.contains("cap 10000000"), "got: {err}");
 }
 
@@ -253,7 +253,7 @@ async fn range_at_i64_extremes_no_overflow() {
     // silently fabricated 9223372036854775807. The length-only assertion
     // here used to bless that corruption. Out-of-i64 bounds now refuse.
     let err =
-        run_err(r#"$x = range(1000000000000000000000000000000, 1000000000000000000000000000000)"#)
+        run_err(r#"$x = range(to_number("1000000000000000000000000000000"), to_number("1000000000000000000000000000000"))"#)
             .await;
     // The message now NAMES the bound (0.69.x) rather than saying "the
     // declared range" and leaving the reader to guess which one — so this
@@ -264,20 +264,20 @@ async fn range_at_i64_extremes_no_overflow() {
             && err.contains("..="),
         "got: {err}"
     );
-    let err = run_err(r#"$x = range(0, -1000000000000000000000000000000)"#).await;
+    let err = run_err(r#"$x = range(0, -to_number("1000000000000000000000000000000"))"#).await;
     assert!(err.contains("range(): argument 2"), "got: {err}");
     // The stride-overflow regression this test was born for, kept at the
     // true extreme: the largest whole f64 below 2^63 is a VALID bound, and
     // the post-loop stride at that magnitude must not overflow i64 (debug
     // panic / release wraparound). One element, value intact.
     let out = run_ok(
-        r#"$r = range(9223372036854774784, 9223372036854774784)
+        r#"$r = range(to_number("9223372036854774784"), to_number("9223372036854774784"))
 print(length($r) .. ":" .. $r[0])"#,
     )
     .await;
     assert_eq!(out, "1:9223372036854774784");
     let out =
-        run_ok(r#"print(length(range(-9223372036854774784, -9223372036854774784, -1)))"#).await;
+        run_ok(r#"print(length(range(-to_number("9223372036854774784"), -to_number("9223372036854774784"), -1)))"#).await;
     assert_eq!(out, "1");
 }
 
@@ -394,7 +394,7 @@ async fn json_encode_i64_boundary_takes_real_path() {
     // 2^63 == i64::MAX as f64 (rounds UP one past i64::MAX): the integer
     // fast path must NOT claim it — `as` would saturate to i64::MAX and
     // silently emit 9223372036854775807. It encodes as a real instead.
-    let out = run_ok(r#"print(json_encode(9223372036854775808))"#).await;
+    let out = run_ok(r#"print(json_encode(to_number("9223372036854775808")))"#).await;
     assert_ne!(out, "9223372036854775807");
     assert!(
         out.contains("e") || out.contains("."),
@@ -402,7 +402,7 @@ async fn json_encode_i64_boundary_takes_real_path() {
     );
     // The largest exactly-representable f64 BELOW 2^63 still takes the
     // integer path, as does -2^63 (exactly representable, inclusive bound).
-    let out = run_ok(r#"print(json_encode(9223372036854774784))"#).await;
+    let out = run_ok(r#"print(json_encode(to_number("9223372036854774784")))"#).await;
     assert_eq!(out, "9223372036854774784");
     let out = run_ok(r#"print(json_encode(0 - 9223372036854775808))"#).await;
     assert_eq!(out, "-9223372036854775808");
