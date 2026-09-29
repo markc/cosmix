@@ -37,8 +37,10 @@ async fn nil_env_value_removes_the_variable() {
 
 #[tokio::test]
 async fn remove_refuses_a_non_string_path() {
+    // The structured CODE is TYPE_MISMATCH (catchable via $e.code); the
+    // legacy display renders the message without the code prefix.
     let err = run("remove({a: 1})\n").await.expect_err("must raise");
-    assert!(err.contains("TYPE_MISMATCH"), "got: {err}");
+    assert!(err.contains("path must be a string"), "got: {err}");
     let err = run("remove_dir([1, 2])\n").await.expect_err("must raise");
-    assert!(err.contains("TYPE_MISMATCH"), "got: {err}");
+    assert!(err.contains("path must be a string"), "got: {err}");
 }
