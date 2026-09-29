@@ -306,26 +306,17 @@ impl fmt::Display for MixError {
                 if info.code == "USER_DIE" {
                     write!(f, "{}", info.message)
                 } else if let Some(span) = &info.span {
-                    // B13: a REAL code renders as CODE: message — the
-                    // legacy "Runtime error" bucket is the only one that
-                    // keeps the bare prefix.
-                    let label = if info.code == "RUNTIME_ERROR" {
-                        "Runtime error"
-                    } else {
-                        &info.code
-                    };
                     if let Some(file) = &span.file {
-                        write!(f, "{label} at {}:{}: {}", file, span.line, info.message)
+                        write!(
+                            f,
+                            "Runtime error at {}:{}: {}",
+                            file, span.line, info.message
+                        )
                     } else {
-                        write!(f, "{label} at line {}: {}", span.line, info.message)
+                        write!(f, "Runtime error at line {}: {}", span.line, info.message)
                     }
                 } else {
-                    let label = if info.code == "RUNTIME_ERROR" {
-                        "Runtime error"
-                    } else {
-                        &info.code
-                    };
-                    write!(f, "{label}: {}", info.message)
+                    write!(f, "Runtime error: {}", info.message)
                 }
             }
             MixError::Return { .. } => write!(f, "unexpected return outside function"),
