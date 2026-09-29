@@ -165,14 +165,18 @@ fn right_nested(var: &str, wraps: usize) -> String {
 /// depend on where it ran. An explicit 64 MiB stack keeps the probe
 /// deterministic everywhere: the assertion being tested is the builder's
 /// refusal + correct fallback value, not the ambient stack size.
-fn on_large_stack(fut: impl std::future::Future<Output = ()> + 'static) {
+fn on_large_stack(
+    make_fut: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>
+        + Send
+        + 'static,
+) {
     let handle = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime");
-            rt.block_on(fut);
+            rt.block_on(make_fut());
         })
         .expect("spawn large-stack thread");
     handle.join().expect("large-stack thread panicked");
@@ -182,9 +186,11 @@ fn on_large_stack(fut: impl std::future::Future<Output = ()> + 'static) {
 fn deep_right_nesting_in_for_body_falls_back_instead_of_panicking() {
     let expr = right_nested("$i", 20); // 21 live operands > 16 slots
     let src = format!("$sum = 1\nfor $i = 1 to 3\n  $sum = {expr}\nend\nprint($sum)\n");
-    on_large_stack(async move {
-        let out = run(&src, |_| {}).await.expect("AST fallback computes it");
-        assert_eq!(out.trim(), "0");
+    on_large_stack(|| {
+        Box::pin(async move {
+            let out = run(&src, |_| {}).await.expect("AST fallback computes it");
+            assert_eq!(out.trim(), "0");
+        })
     });
 }
 
@@ -196,9 +202,11 @@ fn deep_right_nesting_in_fib_bytecode_falls_back_instead_of_panicking() {
     let src = format!(
         "function f($n)\n  if $n < 1 then\n    return 0\n  end\n  return f($n - 1) + ({expr})\nend\nprint(f(3))\n"
     );
-    on_large_stack(async move {
-        let out = run(&src, |_| {}).await.expect("AST fallback computes it");
-        assert_eq!(out.trim(), "0");
+    on_large_stack(|| {
+        Box::pin(async move {
+            let out = run(&src, |_| {}).await.expect("AST fallback computes it");
+            assert_eq!(out.trim(), "0");
+        })
     });
 }
 
