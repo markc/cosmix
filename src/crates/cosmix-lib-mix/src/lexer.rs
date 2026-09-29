@@ -593,6 +593,35 @@ impl Lexer {
                 file: None,
             },
         })?;
+        // C5 (TODO-mix 2026-09-24): a literal that does not round-trip
+        // silently loses value — `9007199254740993` became …992 and
+        // `1e999` became `inf`, both rc 0. Refuse both at the lexer so a
+        // fabricated number never flows anywhere: an INTEGER literal past
+        // 2^53 must be a string (the numeric-width Watch rule), and a
+        // non-finite result is a plain refusal.
+        if !n.is_finite() {
+            return Err(MixError::LexerError {
+                msg: format!("number '{s}' is out of range (infinity)"),
+                span: Span {
+                    line,
+                    column: col,
+                    file: None,
+                },
+            });
+        }
+        if !s.contains('.') && !s.contains('e') && !s.contains('E') && n.abs() > 9_007_199_254_740_992.0 {
+            return Err(MixError::LexerError {
+                msg: format!(
+                    "integer literal '{s}' exceeds the exact range (2^53) — a number would \
+                     silently round; use a string for ids/digests"
+                ),
+                span: Span {
+                    line,
+                    column: col,
+                    file: None,
+                },
+            });
+        }
         Ok(self.spanned(Token::Number(n), line, col))
     }
 

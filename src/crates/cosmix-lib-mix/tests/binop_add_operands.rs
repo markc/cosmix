@@ -72,9 +72,22 @@ async fn scalar_addition_and_the_string_fallback_are_unchanged() {
 
     let err = run("print(nil + 1)\n").await.expect_err("nil + 1 must raise (C1)");
     assert!(err.contains("nil is not a number"), "{err}");
-    // The ?? guard the error teaches.
-    let out = run("print(($n ?? 0) + 1)\n").await.unwrap();
+    // The ?? guard the error teaches (bound-nil, the absent-value shape).
+    let out = run("$n = nil\nprint(($n ?? 0) + 1)\n").await.unwrap();
     assert_eq!(out, "1\n");
+}
+
+#[tokio::test]
+async fn literal_range_violations_are_lexer_errors() {
+    // C5: a literal that silently rounds or overflows is refused at the
+    // lexer — the fabricated number never flows anywhere.
+    let err = run("print(9007199254740993)\n").await.expect_err("2^53+1 must refuse");
+    assert!(err.contains("exceeds the exact range"), "{err}");
+    let err = run("print(1e999)\n").await.expect_err("1e999 must refuse");
+    assert!(err.contains("out of range"), "{err}");
+    // Plain whole floats and scientific notation stay legal.
+    let out = run("print(9007199254740992)\nprint(1e3)\n").await.unwrap();
+    assert_eq!(out, "9007199254740992\n1000\n");
 }
 
 #[tokio::test]
