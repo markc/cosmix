@@ -288,6 +288,15 @@ pub fn split_on_control_ops(s: &str) -> Vec<(Connector, &str)> {
                 conn = Connector::Always;
                 start = i + 1;
             }
+            // B1 (TODO-mix 2026-09-24): an unquoted newline is a `;`, as in
+            // sh. `mix -c $'touch a\nrm -f a'` used to run ONE command whose
+            // filename contained the newline, never running `rm`, exiting 0 —
+            // the same trap as the login-shell two-line command.
+            '\n' if !in_double => {
+                parts.push((conn, &s[start..i]));
+                conn = Connector::Always;
+                start = i + 1;
+            }
             '&' if !in_double && bytes.get(i + 1) == Some(&b'&') => {
                 parts.push((conn, &s[start..i]));
                 conn = Connector::And;
@@ -403,6 +412,69 @@ pub fn execute_command_list_outcome(
     execute_command_list_with_policy(items, vars, jobs, &policy)
 }
 
+/// B3: the bash keywords a shell line must refuse, each with its Mix form.
+const BASH_KEYWORDS: &[(&str, &str)] = &[
+    ("for", "write `for $i = 1 to N … end`"),
+    ("do", "drop it — blocks close with `end`"),
+    ("done", "drop it — blocks close with `end`"),
+    ("if", "write `if EXPR then … end`"),
+    ("then", "keep it — the condition terminator IS `then` in Mix"),
+    ("elif", "write `elif EXPR then`"),
+    ("fi", "drop it — blocks close with `end`"),
+    ("case", "write `select EXPR when … otherwise … end`"),
+    ("esac", "drop it — select closes with `end`"),
+    ("while", "write `while EXPR … end`"),
+    ("until", "write `while not EXPR … end`"),
+    ("select", "write `select EXPR when … end`"),
+    ("function", "write `function name($a) … end` (or `fn`)"),
+    ("{", "drop it — block grouping is not a Mix form"),
+    ("}", "drop it — blocks close with `end`"),
+    ("[[", "write the condition as a Mix expression (no [[ ]])"),
+    ("set", "drop it — Mix needs no `set`"),
+    ("export", "write `export $VAR`"),
+    ("local", "drop it — fn bodies bind locals by assignment"),
+    ("declare", "drop it — see local"),
+    ("unset", "assign nil or re-scope; there is no unset"),
+    ("trap", "use try/catch/finally"),
+    ("eval", "call the program directly, or eval_expr_string"),
+    ("command", "call the program directly"),
+    ("source", "write `source \"file.mix\"`"),
+    (".", "write `source \"file.mix\"`"),
+];
+
+/// The first non-env-prefix word of a shell piece.
+fn head_word(piece: &str) -> &str {
+    piece
+        .split_whitespace()
+        .find(|w| !w.contains('='))
+        .unwrap_or("")
+}
+
+/// Byte offset of a bare (quote-aware: NOT inside single quotes) `$?`.
+fn bare_dollar_question(piece: &str) -> Option<usize> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (i, ch) in piece.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '$' if !in_single
+                && piece[i + 1..].starts_with('?') =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn execute_command_list_with_policy(
     items: &[(Connector, &str)],
     vars: &dyn ShellVarResolver,
@@ -412,7 +484,40 @@ pub fn execute_command_list_with_policy(
     // Up-front structural validation (no resolver → never spawns a `$(...)`),
     // matching the old behavior where parsing the whole list preceded running
     // any of it. A bad pipeline in ANY branch (even a skipped one) aborts.
+    //
+    // B3 (TODO-mix 2026-09-24): a bash keyword written as a shell command
+    // used to fail per piece with rc 127 and the chain CARRIED ON —
+    // `for x in 1; do echo hi; done; echo END` printed three "No such
+    // file" lines, then END, rc 0. Refuse the WHOLE list up front, naming
+    // the Mix equivalent, so a login-shell command that is really Mix
+    // fails once and legibly instead of piecemeal at exit 0.
     for (_, piece) in items {
+        // 09-29 #1 sibling: a literal `$?` is bash's last-status — Mix has
+        // `$rc` and `.exit_code`. Quote-aware: inside single quotes `$?`
+        // is literal text, so it stays.
+        if let Some(pos) = bare_dollar_question(piece) {
+            eprintln!(
+                "mix: `$?` at byte {pos} is bash syntax — in Mix read `$rc` (or a run result's \
+                 `.exit_code`); the whole command list was refused"
+            );
+            return ListOutcome {
+                code: 2,
+                backgrounded: false,
+                commands: Vec::new(),
+            };
+        }
+        let head = head_word(piece);
+        if let Some((kw, equivalent)) = BASH_KEYWORDS.iter().find(|(k, _)| *k == head) {
+            eprintln!(
+                "mix: `{kw}` is bash, not Mix — {equivalent}. The whole command list was \
+                 refused; write the Mix form instead."
+            );
+            return ListOutcome {
+                code: 2,
+                backgrounded: false,
+                commands: Vec::new(),
+            };
+        }
         if let Err(e) = parse_pipeline(piece, &NoVars) {
             eprintln!("mix: {}", e);
             return ListOutcome {
@@ -427,6 +532,11 @@ pub fn execute_command_list_with_policy(
     let mut last_success = true;
     let mut backgrounded = false;
     let mut commands = Vec::new();
+    // 09-29 #1 heuristic accounting: how many pieces executed, how many of
+    // those died at SPAWN with ENOENT (a misrouted Mix one-liner's signature
+    // is several consecutive "No such file" pieces, not one typo).
+    let mut executed = 0;
+    let mut enoint = 0;
 
     for (conn, piece) in items {
         let run = match conn {
@@ -472,6 +582,7 @@ pub fn execute_command_list_with_policy(
         last_code = match execute_pipeline_with_policy(&pipeline, policy) {
             Ok(PipelineResult::Managed(outcome)) => {
                 backgrounded |= outcome.background;
+                executed += 1;
                 if outcome.stopped {
                     return ListOutcome {
                         code: outcome.code,
@@ -481,7 +592,10 @@ pub fn execute_command_list_with_policy(
                 }
                 outcome.code
             }
-            Ok(PipelineResult::Done(status)) => exit_code(status),
+            Ok(PipelineResult::Done(status)) => {
+                executed += 1;
+                exit_code(status)
+            }
             // Backgrounded (`&`) inside a list: track it in the caller's job
             // table when one exists (the REPL), else reap it on a detached
             // thread — never leave a child un-waited. Treated as launched-ok
@@ -503,10 +617,26 @@ pub fn execute_command_list_with_policy(
                     .map(|s| s.program.as_str())
                     .unwrap_or("command");
                 eprintln!("mix: {}: {}", prog, e);
+                executed += 1;
+                let msg = format!("{e}");
+                if msg.contains("No such file") || msg.contains("os error 2") {
+                    enoint += 1;
+                }
                 127
             }
         };
         last_success = last_code == 0;
+    }
+
+    // 09-29 #1 (TODO-mix): when every executed piece died at spawn with
+    // ENOENT and there were at least two of them, the line was almost
+    // certainly Mix source misrouted to the shell — say so, instead of
+    // leaving the reader hunting for a missing binary.
+    if executed > 1 && enoint == executed {
+        eprintln!(
+            "mix: every command in this line failed with 'No such file' — these look like Mix \
+             keywords; run this as a .mix file or `mix -` to parse it as source"
+        );
     }
 
     ListOutcome {
