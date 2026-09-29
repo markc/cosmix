@@ -46,7 +46,7 @@ fn pages() -> Vec<String> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            name.ends_with(".md").then(|| name)
+            name.ends_with(".md").then_some(name)
         })
         .collect();
     out.sort();
@@ -67,10 +67,10 @@ fn index_topics(index: &str) -> BTreeSet<String> {
                 let target = &target[..end];
                 // Only relative `topic.md` links name a manual page; skip
                 // external URLs (e.g. the AGENTS.md GitHub link).
-                if !target.contains("://") {
-                    if let Some(name) = target.strip_suffix(".md") {
-                        out.insert(name.to_string());
-                    }
+                if !target.contains("://")
+                    && let Some(name) = target.strip_suffix(".md")
+                {
+                    out.insert(name.to_string());
                 }
                 rest = &target[end..];
             } else {
