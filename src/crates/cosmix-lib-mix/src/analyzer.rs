@@ -1963,7 +1963,7 @@ fn check_send_rc_reads(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
         // end of the block, for a read of $rc / $result / $reply.
         let read_before_next = stmts[idx + 1..].iter().take_while(|s| {
             !matches!(s.kind, StmtKind::Send { .. })
-        }).any(|s| stmt_reads_send_status(s));
+        }).any(stmt_reads_send_status);
         if !read_before_next {
             a.diagnostics.push(diag(
                 ctx,
