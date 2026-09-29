@@ -22,8 +22,8 @@ async fn run(src: &str) -> Result<String, String> {
 async fn nil_arithmetic_raises() {
     let err = run("print(nil + 1)\n").await.expect_err("nil + 1 must raise");
     assert!(err.contains("nil is not a number"), "got: {err}");
-    // The `??` guard is the fix the message teaches.
-    let out = run("print(($n ?? 0) + 1)\n").await.expect("guarded arithmetic");
+    // The `??` guard is the fix the message teaches (bound-nil shape).
+    let out = run("$n = nil\nprint(($n ?? 0) + 1)\n").await.expect("guarded arithmetic");
     assert!(out.contains("1"), "got: {out}");
     // String concat stays `..`; nil via `..` is untouched.
     let out = run("print(\"x\" .. nil)\n").await.expect(".. concat");
