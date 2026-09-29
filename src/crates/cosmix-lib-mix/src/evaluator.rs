@@ -8336,6 +8336,23 @@ impl Evaluator {
                     let val = self.eval_expr(value).await?;
                     for (case_expr, case_body) in cases {
                         let case_val = self.eval_expr(case_expr).await?;
+                        // C7 (TODO-mix 2026-09-24): the `==` binop raises on
+                        // List/Map operands (it would always answer false),
+                        // but select's Value PartialEq silently fell through
+                        // to `otherwise`. Apply the same guard, naming
+                        // deep_eq — Bytes/Buffer keep their content equality
+                        // like the binop.
+                        if matches!(&val, Value::List(_) | Value::Map(_))
+                            && matches!(&case_val, Value::List(_) | Value::Map(_))
+                        {
+                            return Err(MixError::structured(
+                                "TYPE_ERROR",
+                                "`select` cannot compare two collections with == — it would \
+                                 always take the otherwise arm, not compare them. Use deep_eq(a, \
+                                 b) in a when guard"
+                                    .to_string(),
+                            ));
+                        }
                         if val == case_val {
                             return self.execute_block(case_body).await;
                         }
