@@ -4033,6 +4033,13 @@ pub(crate) struct InvocationCtx {
     /// same module never false-positive on each other's in-flight
     /// loads.
     pub(crate) require_stack: Vec<String>,
+    /// Per-call stack of a module function's SIBLINGS: when a
+    /// `require()`d function executes, its module env's Function-valued
+    /// entries are pushed here so sibling calls resolve even when a
+    /// user local variable shares the name (09-24 `$rows` entry — the
+    /// frame injection was overwritten by the local assignment). Popped
+    /// on function leave, mirroring the frame lifecycle.
+    pub(crate) module_fn_frames: Vec<std::collections::HashMap<String, Rc<MixFunction>>>,
 }
 
 impl InvocationCtx {
@@ -4057,6 +4064,7 @@ impl InvocationCtx {
             max_map_len: None,
             max_string_len: None,
             require_stack: Vec::new(),
+            module_fn_frames: Vec::new(),
         }
     }
 
@@ -12377,6 +12385,11 @@ impl Evaluator {
                     // checked after extensions (so extensions keep their
                     // precedence) and before the address-send guess / the
                     // caller's function registry:
+                    //   0. FIRST, a module sibling pushed by the current
+                    //      call (module_fn_frames) — this survives a
+                    //      same-named user local, which shadows the
+                    //      VARIABLE but must never shadow the FUNCTION
+                    //      (09-24 `$rows` entry).
                     //   1. A Function-valued local in the ACTIVE function
                     //      frame (module_env / captures / params are frame-
                     //      injected) wins over the caller's registry — this
@@ -12389,6 +12402,13 @@ impl Evaluator {
                     //      … end; b()`) is callable bareword — fires only
                     //      where dispatch previously errored or guessed an
                     //      address-send.
+                    if let Some(fns) = self.ctx.module_fn_frames.last()
+                        && let Some(func) = fns.get(name)
+                    {
+                        let func = Rc::clone(func);
+                        self.track_function_attempt(name);
+                        return self.call_function(&func, &eval_args).await;
+                    }
                     let func_var = match self.scope.get_function_var_in_function_frames(name) {
                         Some(f) => Some(f),
                         None if !self.scope.has_function(name) => {
@@ -13963,6 +13983,10 @@ impl Evaluator {
             // this frame (plus globals) until we leave — no per-call
             // Vec<HashMap> stash/restore.
             self.scope.enter_function_frame();
+            // Whether THIS call pushed a module-fn frame — a per-call
+            // local so a nested non-module call cannot pop the outer
+            // call's frame.
+            let mut pushed_here = false;
             // Knob B: increment BEFORE binding parameters. A default-
             // parameter expression (`function f($x = f()) ... end`) can
             // recurse via `eval_expr(default)` below, so the depth must
@@ -14004,9 +14028,22 @@ impl Evaluator {
             if let Some(env) = &func.module_env
                 && let Some(map) = env.get()
             {
+                // 09-24 `$rows` entry: the Function-valued siblings are
+                // ALSO pushed onto the per-call module-fn stack, because
+                // the frame injection here can be OVERWRITTEN by a user
+                // local assignment of the same name (`$rows = []`), which
+                // made the sibling unresolvable. The resolver consults
+                // the stack first, so a same-named non-Function local
+                // shadows the VARIABLE but never the FUNCTION.
+                let mut fns = std::collections::HashMap::new();
                 for (k, v) in map {
+                    if let Value::Function(rc) = v {
+                        fns.insert(k.clone(), Rc::clone(rc));
+                    }
                     self.scope.set_in_current(k.clone(), v.clone());
                 }
+                self.ctx.module_fn_frames.push(fns);
+                pushed_here = true;
             }
 
             // Inject captured frame for inner-frame lambdas.
@@ -14124,6 +14161,9 @@ impl Evaluator {
                 self.ctx.current_file = caller_file;
             }
             self.ctx.function_depth -= 1;
+            if pushed_here {
+                self.ctx.module_fn_frames.pop();
+            }
             self.scope.leave_function_frame();
 
             result
