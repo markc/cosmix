@@ -15684,10 +15684,10 @@ impl Evaluator {
             }
             // A trailing delimiter in the template must match at the end
             // of the source.
-            if let Some(delim) = trailing_delim {
-                if !remaining.trim_end().ends_with(delim) {
-                    parse_ok = false;
-                }
+            if let Some(delim) = trailing_delim
+                && !remaining.trim_end().ends_with(delim)
+            {
+                parse_ok = false;
             }
         }
         self.bind_scoped("parse_ok", Value::Bool(parse_ok));
