@@ -19360,7 +19360,7 @@ fn verify_sha_crypt(plaintext: &str, hash: &str, algorithm: sha_crypt::Algorithm
     let verifier = ShaCrypt::new(algorithm, sha_crypt::Params::RECOMMENDED);
     match verifier.verify_password(plaintext.as_bytes(), hash) {
         Ok(()) => Ok(Some(Value::Bool(true))),
-        Err(sha_crypt::password_hash::Error::Password) => Ok(Some(Value::Bool(false))),
+        Err(sha_crypt::password_hash::Error::PasswordInvalid) => Ok(Some(Value::Bool(false))),
         Err(e) => Err(MixError::RuntimeError {
             span: None,
             msg: format!("password_verify(): invalid sha-crypt hash: {e}"),
