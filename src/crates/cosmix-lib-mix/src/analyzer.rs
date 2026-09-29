@@ -465,17 +465,30 @@ fn promote_agent_diagnostics(a: &mut Analysis) {
 /// until these have been triaged against real scripts).
 fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     let known: HashSet<String> = ctx.known_callables.clone();
+    // R4 compares against OUTER VARIABLES, not callables: `$sum = 0` in a
+    // fn must not fire because the prelude defines a `sum` FUNCTION (review
+    // F3.1/F3.4). Only a top-level $variable of the same name is shadowed.
+    let outer_vars: HashSet<String> = ctx.top_level_names.clone();
 
-    fn walk(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis, known: &HashSet<String>) {
+    fn walk(
+        stmts: &[Stmt],
+        ctx: &FileContext,
+        a: &mut Analysis,
+        known: &HashSet<String>,
+        outer_vars: &HashSet<String>,
+    ) {
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::Assignment { name: _, value } => {
-                    // R2: `$f = upper` stores the STRING "upper" — Mix has
-                    // no first-class function values.
+                    // R2: `$f = bump` stores the STRING "bump" — Mix has
+                    // no first-class function values. Scoped to USER-DEFINED
+                    // names only (file functions, prelude, allow-list):
+                    // builtin names are ordinary string values in config
+                    // (`$mode = "json"`, `$action = "print"` — review F3.1),
+                    // while naming a script's own function is almost always
+                    // the store-then-call bug.
                     if let Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) = value
-                        && (known.contains(s)
-                            || crate::builtins::builtin_info_of(s).is_some()
-                            || crate::builtins_hof::HOF_NAMES.contains(&s.as_str()))
+                        && known.contains(s)
                     {
                         a.diagnostics.push(diag(
                             ctx,
@@ -518,32 +531,36 @@ fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
                     for (cond, _) in else_ifs {
                         check_truthy(cond, stmt.line, ctx, a);
                     }
-                    walk(then_body, ctx, a, known);
+                    walk(then_body, ctx, a, known, outer_vars);
                     for (_, body) in else_ifs {
-                        walk(body, ctx, a, known);
+                        walk(body, ctx, a, known, outer_vars);
                     }
                     if let Some(els) = else_body {
-                        walk(els, ctx, a, known);
+                        walk(els, ctx, a, known, outer_vars);
                     }
                 }
                 StmtKind::While { condition, body, .. } => {
-                    check_truthy(condition, stmt.line, ctx, a);
-                    walk(body, ctx, a, known);
+                    // `while true` is the canonical event-pump idiom (review
+                    // F3.3) — exempt it; a `while false` is still flagged.
+                    if !matches!(condition, Expr::BoolLiteral(true)) {
+                        check_truthy(condition, stmt.line, ctx, a);
+                    }
+                    walk(body, ctx, a, known, outer_vars);
                 }
                 StmtKind::For { body, .. }
                 | StmtKind::ForEach { body, .. }
                 | StmtKind::Address { body, .. }
-                | StmtKind::On { body, .. } => walk(body, ctx, a, known),
+                | StmtKind::On { body, .. } => walk(body, ctx, a, known, outer_vars),
                 StmtKind::FunctionDef { name, params, body, .. } => {
-                    // R4: an assignment to a name that exists OUTSIDE this
-                    // fn (and is not one of its params) creates a new local
-                    // — the outer variable is unchanged.
+                    // R4: an assignment to a name that exists as an OUTER
+                    // VARIABLE (and is not one of this fn's params) creates
+                    // a new local — the outer variable is unchanged.
                     let param_names: HashSet<&str> =
                         params.iter().map(|p| p.name.as_str()).collect();
                     let mut written: HashSet<String> = HashSet::new();
                     collect_written(body_stmt_list(body), &mut written);
                     for w in &written {
-                        if known.contains(w) && !param_names.contains(w.as_str()) {
+                        if outer_vars.contains(w) && !param_names.contains(w.as_str()) {
                             a.diagnostics.push(diag(
                                 ctx,
                                 "MIX-E1506",
@@ -558,19 +575,19 @@ fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
                             ));
                         }
                     }
-                    walk(body_stmt_list(body), ctx, a, known);
+                    walk(body_stmt_list(body), ctx, a, known, outer_vars);
                 }
                 StmtKind::TryCatch {
                     try_body,
                     catch,
                     finally_body,
                 } => {
-                    walk(try_body, ctx, a, known);
+                    walk(try_body, ctx, a, known, outer_vars);
                     if let Some(clause) = catch {
-                        walk(&clause.body, ctx, a, known);
+                        walk(&clause.body, ctx, a, known, outer_vars);
                     }
                     if let Some(fb) = finally_body {
-                        walk(fb, ctx, a, known);
+                        walk(fb, ctx, a, known, outer_vars);
                     }
                 }
                 _ => {}
@@ -578,7 +595,7 @@ fn check_agent_rules(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
         }
     }
 
-    walk(stmts, ctx, a, &known);
+    walk(stmts, ctx, a, &known, &outer_vars);
 }
 
 /// R1: a condition that is a literal (string/bool/nil/map) or a

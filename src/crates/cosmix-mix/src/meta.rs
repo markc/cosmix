@@ -1287,9 +1287,16 @@ fn cmd_config(version: &str) {
     // until then the per-invocation flag is the whole story, and saying
     // so beats printing a knob that does not exist.
     let argv0 = std::env::args().next().unwrap_or_default();
+    // A login shell is signalled by a '-' prefix on the basename
+    // (`-mix`); a full path like /opt/cosmix/bin/-mix still ends in the
+    // prefixed name, so check the file name, not the whole argv[0].
+    let login = Path::new(&argv0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('-'));
     println!("arity:    compat (default) — --strict-arity per invocation (env/rc knobs land with the sweep)");
     println!("lint:     opt-in per invocation — mix lint --deny-warnings gates deploys (no env gate yet)");
-    println!("login shell: {}", if argv0.starts_with('-') { "yes (argv[0] '-'-prefixed)" } else { "no" });
+    println!("login shell: {}", if login { "yes ('-'-prefixed basename)" } else { "no" });
 }
 
 /// `mix build`: cargo build --release, strip, install to $COSMIX_BIN/

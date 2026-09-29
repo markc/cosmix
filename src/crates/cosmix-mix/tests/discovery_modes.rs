@@ -85,9 +85,12 @@ fn agent_profile_adds_rules_and_promotes() {
     writeln!(f, "end").unwrap();
     writeln!(f, "$l = [1]").unwrap();
     writeln!(f, "$n = push($l, 2)").unwrap();
-    writeln!(f, "$f = upper").unwrap();
+    writeln!(f, "$f = f").unwrap();
     writeln!(f, "if \"false\" then").unwrap();
     writeln!(f, "  print(\"never\")").unwrap();
+    writeln!(f, "end").unwrap();
+    writeln!(f, "while true").unwrap();
+    writeln!(f, "  break").unwrap();
     writeln!(f, "end").unwrap();
     writeln!(f, "print(\"$x\")").unwrap();
     drop(f);
@@ -99,12 +102,19 @@ fn agent_profile_adds_rules_and_promotes() {
         assert!(!out.contains(code), "ordinary profile must not emit {code}: {out}");
     }
 
-    // Agent profile: all four rules fire as errors, and D3015 promotes
-    // from note to error.
+    // Agent profile: all four rules fire as errors, `while true` stays
+    // clean (the canonical event-pump idiom), and D3015 promotes from
+    // note to error.
     let (out, _) = mix(&["lint", "--agent", "--json", path]);
     for code in ["MIX-E1503", "MIX-E1504", "MIX-E1505", "MIX-E1506"] {
         assert!(out.contains(code), "--agent must emit {code}: {out}");
     }
+    // Exactly ONE E1505 (the if-condition), never the while-true loop.
+    assert_eq!(
+        out.matches("MIX-E1505").count(),
+        1,
+        "E1505 must fire once (the string condition), not on while true: {out}"
+    );
     assert!(
         out.contains("MIX-D3015") && out.contains("\"severity\":\"error\""),
         "D3015 must promote to error under --agent: {out}"
