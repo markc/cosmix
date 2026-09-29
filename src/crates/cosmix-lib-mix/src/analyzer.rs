@@ -1975,10 +1975,10 @@ fn check_collection_literal_traps(stmts: &[Stmt], ctx: &FileContext, a: &mut Ana
                     }
                 }
             }
-            Expr::FieldAccess {
-                object: box Expr::MapLiteral(entries),
-                field,
-            } => {
+            Expr::FieldAccess { object, field } => {
+                let Expr::MapLiteral(entries) = object.as_ref() else {
+                    return;
+                };
                 if !entries.iter().any(|(k, _)| k == field) {
                     a.diagnostics.push(diag(
                         ctx,
@@ -1990,10 +1990,12 @@ fn check_collection_literal_traps(stmts: &[Stmt], ctx: &FileContext, a: &mut Ana
                     ));
                 }
             }
-            Expr::Index {
-                object: box Expr::ListLiteral(items),
-                index: box Expr::NumberLiteral(n),
-            } => {
+            Expr::Index { object, index } => {
+                let (Expr::ListLiteral(items), Expr::NumberLiteral(n)) =
+                    (object.as_ref(), index.as_ref())
+                else {
+                    return;
+                };
                 if *n >= 0.0 && (*n as usize) >= items.len() {
                     a.diagnostics.push(diag(
                         ctx,

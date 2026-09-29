@@ -365,8 +365,8 @@ impl Parser {
             // READ the "function" key (`{"fn":1,"function":2}.fn` -> 2).
             // Read the SOURCE spelling instead (same rule as the Bus-name
             // segments), so `.fn` and `.function` each read their own key.
-            let st = self.advance().clone();
-            let offset = st.offset;
+            let offset = self.tokens[self.pos].offset;
+            self.advance();
             let spelling = ["fn", "function"]
                 .into_iter()
                 .find(|kw| {
