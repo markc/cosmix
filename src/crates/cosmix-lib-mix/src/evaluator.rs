@@ -12645,8 +12645,18 @@ impl Evaluator {
                     }
 
                     // 1. Extensions — same clone-out + yield discipline
-                    // as the FunctionCall arm.
-                    if let Some(ext_fn) = { self.globals.borrow().extensions.get(field).cloned() } {
+                    // as the FunctionCall arm. EXTENSION-FIRST ONLY in
+                    // serve mode: the citizen's reserved verbs
+                    // (props.*, lifecycle.*) are injected as extensions,
+                    // and a citizen's map member must never fake them
+                    // (the 09-26 `$module.fn()` entry — in a plain
+                    // script, the AI helpers (ai, ai_diagnose, context)
+                    // shadowed module exports; a map member holding a
+                    // Function now wins there).
+                    let serve_extensions_first = self.serve_runtime.is_some();
+                    if serve_extensions_first
+                        && let Some(ext_fn) = { self.globals.borrow().extensions.get(field).cloned() }
+                    {
                         let fut = ext_fn(ufcs_args);
                         return self.await_with_class_c_yield(fut).await?;
                     }
@@ -12657,18 +12667,27 @@ impl Evaluator {
                     // made a module export named `sum` or `lines` silently
                     // unreachable via dot-call — the prelude function ran
                     // on the stringified map instead). Extensions stay
-                    // ABOVE members on purpose: serve-mode injects reserved
-                    // verbs (props.*) as extensions, and a citizen's map
-                    // must never fake those. Builtin-named members remain
-                    // unreachable via dot-call — `.name(` where name is a
-                    // builtin desugars to a plain FunctionCall at PARSE
-                    // time; index access is still the spelling for those.
+                    // ABOVE members on purpose ONLY in serve mode (see
+                    // above); builtin-named members remain unreachable via
+                    // dot-call — `.name(` where name is a builtin
+                    // desugars to a plain FunctionCall at PARSE time;
+                    // index access is still the spelling for those.
                     if let Value::Map(map) = &ufcs_args[0]
                         && let Some(Value::Function(rc)) = map.get(field)
                     {
                         let func = Rc::clone(rc);
                         self.track_function_attempt(field);
                         return self.call_function(&func, &ufcs_args[1..]).await;
+                    }
+
+                    // 1b. Extensions in NON-serve mode — after members,
+                    // before user functions: the AI helpers stay
+                    // reachable, they just no longer shadow exports.
+                    if !serve_extensions_first
+                        && let Some(ext_fn) = { self.globals.borrow().extensions.get(field).cloned() }
+                    {
+                        let fut = ext_fn(ufcs_args);
+                        return self.await_with_class_c_yield(fut).await?;
                     }
 
                     // 3. User functions (UFCS).
