@@ -3,24 +3,25 @@
 //! frame-injected sibling function was shadowed by the same-named local
 //! variable. A non-Function variable must not shadow a module function.
 
-use std::io::Write;
-use std::process::Command;
+use cosmix_mix::evaluator::Evaluator;
+use cosmix_mix::lexer::Lexer;
+use cosmix_mix::parser::Parser;
 
-fn mix(args: &[&str]) -> (i32, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mix"))
-        .args(args)
-        .env("MIX_STATS", "off")
-        .env_remove("MIXRC")
-        .output()
-        .expect("run mix");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    )
+async fn run(src: &str) -> Result<String, String> {
+    let mut lexer = Lexer::new(src);
+    let tokens = lexer.tokenize().map_err(|e| e.to_string())?;
+    let mut parser = Parser::new(tokens, src);
+    let stmts = parser.parse_program().map_err(|e| e.to_string())?;
+    let stdout = cosmix_mix::evaluator::SharedBuf::new();
+    let stderr = cosmix_mix::evaluator::SharedBuf::new();
+    let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(stderr.clone()));
+    eval.execute(&stmts).await.map_err(|e| e.to_string())?;
+    Ok(stdout.to_string_lossy())
 }
 
-#[test]
-fn module_fn_call_survives_a_same_named_local_variable() {
+#[tokio::test]
+async fn module_fn_call_survives_a_same_named_local_variable() {
+    use std::io::Write;
     let dir = std::env::temp_dir().join(format!("mix-rows-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("tmp dir");
     let lib = dir.join("lib.mix");
@@ -33,13 +34,8 @@ fn module_fn_call_survives_a_same_named_local_variable() {
     writeln!(f, "  return rows(3)").unwrap();
     writeln!(f, "end").unwrap();
     drop(f);
-    let main = dir.join("main.mix");
-    let mut f = std::fs::File::create(&main).expect("write main");
-    writeln!(f, "$l = require(\"{}\")", lib.display()).unwrap();
-    writeln!(f, "print($l.g())").unwrap();
-    drop(f);
-    let (code, out) = mix(&[main.to_str().unwrap()]);
-    assert_eq!(code, 0, "module fn call must survive the local: {out}");
+    let src = format!("$l = require(\"{}\")\nprint($l.g())\n", lib.display());
+    let out = run(&src).await.expect("module fn call must survive the local");
     assert!(out.contains('1'), "got: {out}");
     std::fs::remove_dir_all(&dir).ok();
 }
