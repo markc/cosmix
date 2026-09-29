@@ -599,7 +599,13 @@ impl Lexer {
         // fabricated number never flows anywhere: an INTEGER literal past
         // 2^53 must be a string (the numeric-width Watch rule), and a
         // non-finite result is a plain refusal.
-        if !n.is_finite() {
+        //
+        // STRICT-DATA MODE IS EXEMPT: `write_mix_data` emits large
+        // integral floats (`1000000000000000000000000000000`) and
+        // `data_parse(data_encode(v)) == v` is a guarantee (strict_data
+        // pins the round-trip). That output is machine-generated, not an
+        // authoring mistake, so the refusal is a script-source gate only.
+        if !self.data_mode && !n.is_finite() {
             return Err(MixError::LexerError {
                 msg: format!("number '{s}' is out of range (infinity)"),
                 span: Span {
@@ -609,7 +615,11 @@ impl Lexer {
                 },
             });
         }
-        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        if !self.data_mode
+            && !s.contains('.')
+            && !s.contains('e')
+            && !s.contains('E')
+        {
             // An integral literal must round-trip exactly: parse the SOURCE
             // digits as u128 and compare against their f64 rendering. The
             // f64 `n` above is already rounded, so comparing against it
