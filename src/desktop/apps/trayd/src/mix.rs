@@ -3445,7 +3445,7 @@ mod tests {
 
     #[test]
     fn update_rewrites_only_the_header_and_sanitises_newlines() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "old").expect("create script");
         let path = controller.store.entry(&id, false);
         fs::write(
@@ -3569,7 +3569,7 @@ mod tests {
 
     #[test]
     fn drop_in_file_appears_in_the_inotify_scan() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         controller.create("Alpha", "").expect("materialise store");
         wait_for(|| controller.watcher_ready.load(Ordering::Acquire));
         write_private_file(
@@ -3610,7 +3610,7 @@ mod tests {
 
     #[test]
     fn scan_ignores_dot_entries_and_subdirectories_in_the_path_root() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         controller.create("Alpha", "").expect("materialise store");
         write_private_file(
             controller.store.root.join(".operator-note"),
@@ -3628,7 +3628,7 @@ mod tests {
 
     #[test]
     fn inotify_rescans_external_script_edits() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "old").expect("create script");
         wait_for(|| controller.watcher_ready.load(Ordering::Acquire));
         fs::write(
@@ -3647,7 +3647,7 @@ mod tests {
 
     #[test]
     fn create_and_rename_collisions_are_typed() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         controller.create("Alpha", "").expect("create Alpha");
         controller.create("Beta", "").expect("create Beta");
         assert!(matches!(
@@ -3662,7 +3662,7 @@ mod tests {
 
     #[test]
     fn create_slugifies_free_text_and_rejects_an_empty_slug() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller
             .create("My script!", "slugged")
             .expect("create slugged script");
@@ -3680,7 +3680,7 @@ mod tests {
 
     #[test]
     fn live_name_slugging_preserves_a_mix_suffix() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller
             .create("backup.mix", "created")
             .expect("create dotted script name");
@@ -3694,7 +3694,7 @@ mod tests {
 
     #[test]
     fn scan_accepts_private_non_executable_and_executable_modes_only() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").expect("create script");
         let path = controller.store.entry(&id, false);
 
@@ -3714,7 +3714,7 @@ mod tests {
 
     #[test]
     fn inotify_rescans_permission_changes_without_an_attrib_loop() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").expect("create script");
         let path = controller.store.entry(&id, false);
         wait_for(|| controller.watcher_ready.load(Ordering::Acquire));
@@ -3731,7 +3731,7 @@ mod tests {
 
     #[test]
     fn trash_restore_and_purge_are_identity_only() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").expect("create script");
         controller.trash(&id).expect("trash");
         assert!(controller.snapshot().scripts[0].3);
@@ -3748,7 +3748,7 @@ mod tests {
 
     #[test]
     fn trash_and_restore_collisions_are_typed_and_never_overwrite() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").expect("create script");
         let trash = controller.store.entry(&id, true);
         write_private_file(&trash, "trash collision\n", 0o600);
@@ -4045,7 +4045,7 @@ mod tests {
 
     #[test]
     fn fake_runner_surfaces_separate_success_and_failure_output() {
-        let (_, controller, runner) = fixture(FakeMode::Succeed);
+        let (_temporary, controller, runner) = fixture(FakeMode::Succeed);
         let id = controller.create("Alpha", "").expect("create script");
         let success = controller.run(&id).expect("start success");
         wait_for(|| run_state(&controller, &success) == "succeeded");
@@ -4074,7 +4074,7 @@ mod tests {
 
     #[test]
     fn four_active_runs_are_allowed_and_the_fifth_is_rejected() {
-        let (_, controller, runner) = fixture(FakeMode::Hold);
+        let (_temporary, controller, runner) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").expect("create script");
         let mut runs = Vec::new();
         for _ in 0..MAX_ACTIVE_RUNS {
@@ -4092,7 +4092,7 @@ mod tests {
 
     #[test]
     fn update_rejects_a_script_with_an_active_run() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller
             .create("Alpha", "original")
             .expect("create script");
@@ -4225,7 +4225,7 @@ mod tests {
 
     #[test]
     fn output_tail_chunks_and_signal_batches_stay_bounded() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").expect("create script");
         let run_id = controller.run(&id).expect("start run");
         while controller.take_publication().is_some() {}
@@ -4274,7 +4274,7 @@ mod tests {
 
     #[test]
     fn mix_snapshot_carries_the_next_output_sequence_baseline() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").expect("create script");
         let run_id = controller.run(&id).expect("start run");
         controller.apply_runner_event(RunnerEvent::Output {
@@ -4293,7 +4293,7 @@ mod tests {
 
     #[test]
     fn publication_queue_evictions_are_counted() {
-        let (_, controller, _) = fixture(FakeMode::Hold);
+        let (_temporary, controller, _) = fixture(FakeMode::Hold);
         let id = controller.create("Alpha", "").unwrap();
         let run_id = controller.run(&id).unwrap();
         while controller.take_publication().is_some() {}
@@ -4310,7 +4310,7 @@ mod tests {
 
     #[test]
     fn run_history_keeps_only_the_newest_thirty_two_records() {
-        let (_, controller, runner) = fixture(FakeMode::Succeed);
+        let (_temporary, controller, runner) = fixture(FakeMode::Succeed);
         let id = controller.create("Alpha", "").expect("create script");
         for _ in 0..(MAX_RUN_HISTORY + 5) {
             let run = controller.run(&id).expect("start historical run");

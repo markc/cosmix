@@ -12,6 +12,7 @@ fn command(state: &Path) -> Command {
     command
         .env("XDG_STATE_HOME", state)
         .env("HOME", state)
+        .env_remove("MIX_STATS")
         .arg("--no-prelude");
     command
 }
@@ -64,6 +65,7 @@ fn records_c_script_and_stdin_modes_with_basename_only() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_mix"))
         .env("XDG_STATE_HOME", &state)
         .env("HOME", &state)
+        .env_remove("MIX_STATS")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()

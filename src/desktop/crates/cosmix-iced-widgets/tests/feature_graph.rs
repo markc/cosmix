@@ -10,9 +10,10 @@ fn graph(edges: &str, features: Option<&str>, with_shell: bool) -> String {
     cargo_tree(edges, None, features, with_shell)
 }
 
-/// Normal dependencies as `name vX.Y.Z feature,feature` lines.
+/// Normal dependencies as `name vX.Y.Z[ (path)]\tfeature,feature` lines: the
+/// tab keeps the package annotation out of the trailing features field.
 fn enabled_features(features: &str) -> String {
-    cargo_tree("normal", Some("{p} {f}"), Some(features), false)
+    cargo_tree("normal", Some("{p}\t{f}"), Some(features), false)
 }
 
 fn cargo_tree(
@@ -115,8 +116,7 @@ fn renderer_features_select_one_backend_with_geometry_and_no_winit() {
         assert!(
             enabled.lines().any(|line| line.starts_with(&prefix)
                 && line
-                    .split_once(' ')
-                    .and_then(|(_, rest)| rest.split_once(' '))
+                    .rsplit_once('\t')
                     .is_some_and(|(_, features)| features
                         .split(',')
                         .any(|feature| feature.trim_end_matches(" (*)") == "geometry"))),

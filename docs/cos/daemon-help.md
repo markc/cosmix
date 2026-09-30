@@ -19,6 +19,15 @@ set/delete and other mutations are marked writable. A read-only flag describes
 the command's operation, not an authorisation grant or a promise that diagnostic
 counters will remain unchanged.
 
+## Startup identity reports
+
+Dnsd, wgd and nspawnd's citizen builds report registry version 1.4.8 in
+their structured startup identity logs. Their registered UID/GID pairs are
+506/506, 515/515 and 518/518 respectively, with Bus services `dnsd`, `wgd`
+and `nspawnd`. Unit tests cross-check these independently pinned facts against
+the checked-in `src/_etc/sysusers/cosmix.conf` projection. Systemd and sysusers
+enforce the running identity; these startup reports are advisory.
+
 ## Inputd key and pointer injection
 
 `cosmix-inputd` 0.4.0 serves these writable verbs on the `inputd` Bus service.

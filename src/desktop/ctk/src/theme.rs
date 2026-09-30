@@ -3402,12 +3402,12 @@ mod tests {
                 ctk_source.semantics.pairs = cosmix_design::TEXT_PAIR_NAMES
                     .into_iter()
                     .map(|name| {
-                        // `muted` and `elevated` must stay visibly off the
-                        // black `base` or the surface-distinction rule refuses
-                        // the synthesized source this test only uses as a
-                        // pipeline vehicle for its anchors.
+                        // `muted`, `elevated` and `popover` must stay visibly
+                        // off the black `base` or the surface-distinction rule
+                        // refuses the synthesized source this test only uses as
+                        // a pipeline vehicle for its anchors.
                         let surface = match name {
-                            "muted" | "elevated" => "web-anchor-verbatim.grey",
+                            "muted" | "elevated" | "popover" => "web-anchor-verbatim.grey",
                             _ => "web-anchor-verbatim.black",
                         };
                         (
@@ -5018,6 +5018,14 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(CtkThemePlugin::default());
         let text = app.world_mut().spawn(TextFont::from_font_size(12.0)).id();
+
+        // Pin the fixture to the authoring baseline: an inherited environment
+        // must not map the size before the test's own mapping exists.
+        {
+            let mut typography = app.world_mut().resource_mut::<CtkTypography>();
+            typography.effective_family = None;
+            typography.body_px = AUTHORED_BODY_PX;
+        }
 
         // No mapping yet: the entity becomes managed but nothing is stamped.
         app.update();
