@@ -561,7 +561,7 @@ async fn evaluator_numeric_fallbacks_raise_on_unparseable_values() {
             "for-loop step must be a number",
         ),
         ("sleep(\"bad\")\n", "sleep(): argument 1 must be a number"),
-        ("exit(\"bad\")\n", "exit(): argument 1 must be a number"),
+        ("exit(\"bad\")\n", "exit(): argument 1 (code) must be number"),
         ("print(\"bad\" / 2)\n", "cannot use 'bad' as number"),
         ("print(2 / \"bad\")\n", "cannot use 'bad' as number"),
         ("print(\"bad\" % 2)\n", "cannot use 'bad' as number"),

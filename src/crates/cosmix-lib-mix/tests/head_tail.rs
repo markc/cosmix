@@ -178,7 +178,6 @@ async fn head_tail_reject_bad_n() {
     for call in [
         format!(r#"head("{}", -1)"#, p.display()),
         format!(r#"head("{}", 1.5)"#, p.display()),
-        format!(r#"tail("{}", "5")"#, p.display()),
     ] {
         let err = run_err(&format!("print({call})")).await;
         assert!(
@@ -186,6 +185,12 @@ async fn head_tail_reject_bad_n() {
             "bad n must be rejected loudly: {err}"
         );
     }
+    // A non-number n hits the A2 contract-type gate (0.103.1) first.
+    let err = run_err(&format!(r#"print(tail("{}", "5"))"#, p.display())).await;
+    assert!(
+        err.contains("argument 2 (n) must be number"),
+        "non-number n must be rejected loudly: {err}"
+    );
 }
 
 #[tokio::test]

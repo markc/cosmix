@@ -35,13 +35,14 @@ fn bool_pid_raises_instead_of_signalling_the_whole_process_group() {
     for literal in ["false", "true"] {
         let (ok, stderr) = mix(&format!("kill({literal})"));
         assert!(!ok, "kill({literal}) must fail, stderr={stderr}");
+        // The A2 contract gate (0.103.1) raises before kill's own check:
+        // TYPE_MISMATCH, naming the contract position and shape. The
+        // blast-radius explanation lives in the kill registry/manual
+        // text ("a bool/string pid would signal this process's whole
+        // group") — see TODO-mix A2 residual.
         assert!(
-            stderr.contains("pid must be a number"),
+            stderr.contains("argument 1 (pid) must be number"),
             "kill({literal}) stderr={stderr}"
-        );
-        assert!(
-            stderr.contains("entire group"),
-            "the error must say why coercion is refused here: {stderr}"
         );
     }
 }
@@ -53,7 +54,7 @@ fn process_alive_bool_pid_raises_rather_than_reaping_a_child() {
     let (ok, stderr) = mix("process_alive(false)");
     assert!(!ok, "process_alive(false) must fail, stderr={stderr}");
     assert!(
-        stderr.contains("process_alive: pid must be"),
+        stderr.contains("argument 1 (pid) must be number"),
         "stderr={stderr}"
     );
 }

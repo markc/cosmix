@@ -179,7 +179,9 @@ async fn bus_call_rejects_bad_arguments() {
         .expect_err("empty verb rejected");
     assert!(err.contains("non-empty"), "got: {err}");
 
-    // Non-map args.
+    // Non-map args — the A2 contract-type gate (0.103.1) now raises
+    // before bus_call's own check, naming the argument and the declared
+    // shape.
     let a = Rc::new(StubBus::default());
     let a2 = a.clone();
     let err = run_with("bus_call(\"maild.vtoken.list\", \"nope\")\n", move |e| {
@@ -187,7 +189,7 @@ async fn bus_call_rejects_bad_arguments() {
     })
     .await
     .expect_err("non-map args rejected");
-    assert!(err.contains("args map"), "got: {err}");
+    assert!(err.contains("must be map"), "got: {err}");
 
     // Too many args.
     let a = Rc::new(StubBus::default());

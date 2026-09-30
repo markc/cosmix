@@ -47,8 +47,27 @@ enum InterpCoalesce {
 /// lazily by the caller, only when the fallback actually fires). Both sides are
 /// trimmed. A lone `?` not forming `??`/`?:` is left in the path (it will fail
 /// to resolve and surface a normal error).
-fn split_interp_coalesce(spec: &str) -> (&str, Option<(InterpCoalesce, &str)>) {
-    let bytes = spec.as_bytes();
+/// A2 (TODO-mix 2026-09-24): does a runtime Value satisfy a contract
+/// `TypeShape`? Shallow — a `list(string)` checks list-ness only; deep
+/// element typing stays out of the first release.
+fn value_matches_shape(v: &Value, shape: &crate::builtin_info::TypeShape) -> bool {
+    use crate::builtin_info::TypeShape;
+    match shape {
+        TypeShape::Any => true,
+        TypeShape::AnyOf(shapes) => shapes.iter().any(|s| value_matches_shape(v, s)),
+        TypeShape::Nil => matches!(v, Value::Nil),
+        TypeShape::String => matches!(v, Value::String(_)),
+        TypeShape::Number => matches!(v, Value::Number(_)),
+        TypeShape::Bool => matches!(v, Value::Bool(_)),
+        TypeShape::Bytes => matches!(v, Value::Bytes(_)),
+        TypeShape::Buffer => matches!(v, Value::Buffer(_)),
+        TypeShape::Function => matches!(v, Value::Function(_)),
+        TypeShape::List(_) => matches!(v, Value::List(_)),
+        TypeShape::Map { .. } => matches!(v, Value::Map(_)),
+    }
+}
+
+fn split_interp_coalesce(spec: &str) -> (&str, Option<(InterpCoalesce, &str)>) {    let bytes = spec.as_bytes();
     let mut i = 0;
     while i + 1 < bytes.len() {
         if bytes[i] == b'?' {
@@ -11406,6 +11425,19 @@ impl Evaluator {
                         }
                     }
 
+                    // A2 (TODO-mix 2026-09-24): contract argument TYPES —
+                    // always-on for the side-effect classes (fs/process/
+                    // network/bus: a wrong-typed operand is a side effect
+                    // on the wrong target), strict-mode-only for pure
+                    // builtins in this first release. Placed AFTER the
+                    // args evaluate (types live on Values, not Exprs) and
+                    // BEFORE any dispatch.
+                    if self.ctx.arity_strict {
+                        self.check_builtin_args(name, &eval_args, false)?;
+                    } else {
+                        self.check_builtin_args(name, &eval_args, true)?;
+                    }
+
                     if name == "task_start" {
                         self.check_capability(name)?;
                         self.check_builtin_arity(name, eval_args.len())?;
@@ -13937,6 +13969,55 @@ impl Evaluator {
     /// (`n < min`) is the compatible nil binding, not an ignored surplus —
     /// flagging it here would mislabel the mode's own documented behavior.
     /// Variadic builtins have no max and can never warn.
+    /// A2 (TODO-mix 2026-09-24): contract argument TYPES. `critical_only`
+    /// limits the gate to the side-effect classes — fs-write/fs-read/
+    /// process/network/bus — where a wrong-typed operand means a side
+    /// effect on the wrong target (`mkdir(42)` created a directory named
+    /// `42`); pure builtins are gated only under strict mode in this
+    /// first release. A nil argument is the documented omitted-arg
+    /// sentinel and never a type fault on its own (A6).
+    fn check_builtin_args(&self, name: &str, args: &[Value], critical_only: bool) -> MixResult<()> {
+        use crate::builtin_info::TypeShape;
+        let Some(info) = builtins::builtin_info_of(name) else {
+            return Ok(());
+        };
+        if critical_only
+            && !matches!(
+                info.capability,
+                builtins::CapabilityClass::FsWrite
+                    | builtins::CapabilityClass::FsRead
+                    | builtins::CapabilityClass::Process
+                    | builtins::CapabilityClass::Network
+                    | builtins::CapabilityClass::Bus
+            )
+        {
+            return Ok(());
+        }
+        for (i, (value, arg_info)) in args.iter().zip(info.contract.args).enumerate() {
+            if matches!(value, Value::Nil) || arg_info.variadic {
+                continue;
+            }
+            let shape = arg_info.kind;
+            if matches!(shape, TypeShape::Any) {
+                continue;
+            }
+            if !value_matches_shape(value, &shape) {
+                return Err(self.coded_err(
+                    "TYPE_MISMATCH",
+                    format!(
+                        "{}(): argument {} ({}) must be {}, got {} (see: mix man io)",
+                        name,
+                        i + 1,
+                        arg_info.name,
+                        shape.human(),
+                        value.type_name()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn warn_surplus_arity(&self, name: &str, n: usize) {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};

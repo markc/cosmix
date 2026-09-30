@@ -115,5 +115,5 @@ end
 -- hash_sha1() expects at most 2 argument(s), got 3
 -- OPTION_INVALID
 -- string bytes
--- OPTION_INVALID hash_file(): argument 2 is the ALGORITHM ("md5", "sha1", "sha256" or "blake3"), not the options map — write hash_file(path, "sha256", {raw: true}) (see: mix man system)
+-- TYPE_MISMATCH hash_file(): argument 2 (algo) must be string, got map (see: mix man io)
 -- hash_file: unknown algorithm 'sha512' (expected "md5", "sha1", "sha256" or "blake3")

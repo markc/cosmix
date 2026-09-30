@@ -391,27 +391,28 @@ async fn string_cmd_still_spawns() {
 #[tokio::test]
 async fn non_string_stdio_paths_raise_rather_than_creating_stringified_files() {
     // The same coercion hole existed on the path arguments: a list would have
-    // been stringified into a file literally named "[a]".
+    // been stringified into a file literally named "[a]". The A2 contract gate
+    // (0.103.1) raises before spawn's own checks now.
     let err = run_err("spawn(\"true\", [\"a\"])\n").await;
     assert!(
-        err.to_string().contains("stdout_path must be a string"),
+        err.to_string().contains("argument 2 (stdout) must be"),
         "got: {err}"
     );
 
     let err = run_err("spawn(\"true\", \"/dev/null\", 7)\n").await;
     assert!(
-        err.to_string().contains("stderr_path must be a string"),
+        err.to_string().contains("argument 3 (stderr) must be"),
         "got: {err}"
     );
 }
 
 #[tokio::test]
 async fn every_non_string_cmd_type_raises() {
-    for literal in ["7", "true", "nil", "{a: 1}"] {
+    for literal in ["7", "true", "{a: 1}"] {
         let err = run_err(&format!("spawn({literal})\n")).await;
         let msg = err.to_string();
         assert!(
-            msg.contains("spawn: cmd must be"),
+            msg.contains("argument 1 (cmd) must be"),
             "spawn({literal}) must raise a cmd type error, got: {msg}"
         );
         assert!(
@@ -419,6 +420,13 @@ async fn every_non_string_cmd_type_raises() {
             "spawn({literal}) error must name the expected type, got: {msg}"
         );
     }
+    // nil is the omitted-arg sentinel: the contract gate lets it through,
+    // and spawn's own check names the string requirement.
+    let err = run_err("spawn(nil)\n").await;
+    assert!(
+        err.to_string().contains("cmd must be a string"),
+        "spawn(nil) must raise, got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -466,7 +474,7 @@ async fn a_bad_stderr_path_no_longer_truncates_the_good_stdout_file() {
 async fn string_pid_is_not_coerced() {
     let err = run_err("kill(\"12345\")\n").await;
     assert!(
-        err.to_string().contains("pid must be a number"),
+        err.to_string().contains("argument 1 (pid) must be number"),
         "got: {err}"
     );
 }
@@ -482,7 +490,7 @@ async fn unrecognised_signal_raises_rather_than_silently_sending_sigterm() {
     // that reliably does not exist keeps the revert harmless.
     let err = run_err("kill(999999, \"SIGKILL\")\n").await;
     assert!(
-        err.to_string().contains("signal must be a number"),
+        err.to_string().contains("argument 2 (signal) must be number"),
         "got: {err}"
     );
     assert!(
@@ -498,13 +506,20 @@ async fn process_alive_does_not_coerce_its_pid() {
     // process_alive(false) returned TRUE: to_number(false) is 0, waitpid(0,
     // WNOHANG) reaps an arbitrary child of this process group — a side effect,
     // not merely a wrong answer — and kill(0, 0) then succeeds.
-    for literal in ["false", "true", "\"123\"", "1.9"] {
+    for literal in ["false", "true", "\"123\""] {
         let err = run_err(&format!("process_alive({literal})\n")).await;
         assert!(
-            err.to_string().contains("process_alive: pid must be"),
+            err.to_string().contains("argument 1 (pid) must be"),
             "process_alive({literal}) must raise, got: {err}"
         );
     }
+    // 1.9 is a NUMBER: the contract gate passes it, and the impl's
+    // whole-number check names the requirement.
+    let err = run_err("process_alive(1.9)\n").await;
+    assert!(
+        err.to_string().contains("pid must be a whole number"),
+        "process_alive(1.9) must raise, got: {err}"
+    );
 }
 
 #[tokio::test]
