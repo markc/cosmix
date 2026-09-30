@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.103.11"
+version = "0.103.12"
 edition = "2024"
 license = "MIT"
 
