@@ -1503,19 +1503,26 @@ hash_file(p[, algo][, {raw:true}])   streaming digest of a FILE
 base64_encode(v)       base64 of a string or bytes buffer
 base64_decode(s)       decode base64 -> a bytes buffer
 password_hash(pw[, cost])   bcrypt "$2b$…" hash; cost 4-31, default 12 (v0.71.0)
-password_verify(pw, hash)   check against a bcrypt hash -> bool (v0.71.0)
+password_hash(pw, {scheme: "sha512-crypt"[, rounds]})
+                        "$6$…" SHA512-crypt hash; rounds 1000..999999999,
+                        default 5000 (v0.102.6)
+password_verify(pw, hash)   check against a bcrypt OR SHA-crypt hash -> bool;
+                        accepts $6$/$5$ and the Dovecot {SHA512-CRYPT} prefix
+                        (v0.71.0, sha-crypt v0.102.6)
 ```
 
 `password_hash`/`password_verify` exist for **account passwords written over
 the Bus**: a raw `props.set` of `maild.accounts.password` stores the field
-verbatim (only the `account add` CLI hashed it), so the bcrypt has to happen
-client-side — which used to mean shelling out to PHP. Three deliberate
-edges: input over **72 bytes raises** (bcrypt's own truncation limit,
-surfaced instead of silently applied — hash a digest of longer secrets);
-a **malformed hash raises** in `password_verify` rather than answering
-`false` (a corrupt stored hash is a config fault, and "wrong password"
-would misdirect the operator); and the general-purpose digests above are
-**not** password hashes — `hash_sha256` has no work factor.
+verbatim (only the `account add` CLI hashed it), so the hashing has to happen
+client-side — which used to mean shelling out to PHP (bcrypt) or `mkpasswd
+-m sha512crypt` (NS/Dovecot passdbs, whose `{SHA512-CRYPT}$6$…` records are
+what the sha512-crypt scheme and the verify prefixes interop with). Three
+deliberate edges: input over **72 bytes raises** on the bcrypt side (bcrypt's
+own truncation limit, surfaced instead of silently applied — hash a digest of
+longer secrets); a **malformed hash raises** in `password_verify` rather than
+answering `false` (a corrupt stored hash is a config fault, and "wrong
+password" would misdirect the operator); and the general-purpose digests
+above are **not** password hashes — `hash_sha256` has no work factor.
 
 Every `hash_*` call takes the same trailing options map, and the only option is
 **`{raw: true}`** (v0.66.0): return the digest as raw `bytes` instead of

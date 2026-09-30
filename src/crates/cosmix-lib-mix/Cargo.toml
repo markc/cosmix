@@ -28,7 +28,9 @@ url = ["dep:url"]
 # `bcrypt` joined 0.71.0 for password_hash()/password_verify() — client-side
 # bcrypt for maild.accounts.password writes over the Bus (a raw props.set
 # stores the field verbatim; only the CLI hashed before this existed).
-crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt"]
+# `sha-crypt` joined 0.102.6 for the $6$/$5$ schemes every NS passdb
+# (Dovecot {SHA512-CRYPT}) uses — same feature, same client-side story.
+crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt", "dep:sha-crypt"]
 http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile", "dep:blake3"]
 sqlite = ["dep:rusqlite"]
 # `tokio-sleep` is an alias-only feature kept for backwards
@@ -96,6 +98,7 @@ tracing = "0.1"
 futures-util = { workspace = true }
 base64 = { version = "0.22", optional = true }
 bcrypt = { version = "0.16", optional = true }
+sha-crypt = { version = "0.6", optional = true, features = ["password-hash", "getrandom"] }
 tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 blake3 = { version = "1", optional = true }
