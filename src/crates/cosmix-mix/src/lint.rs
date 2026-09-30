@@ -425,10 +425,10 @@ fn lint_one(
         })
     };
     // AMP scene envelope (2026-09-26 entry): a `---` front-matter header
-    // followed by a ```mix-fenced map. The script lexer has no backtick
-    // token, so it E1003s on the fence; both halves are data-shaped
-    // (`key: value`), so lint validates the extracted body as strict data
-    // instead of failing every scene file.
+    // (YAML scene metadata, opaque to Mix) followed by a ```mix-fenced
+    // map. The script lexer has no backtick token, so it E1003s on the
+    // fence; the fenced map is Mix strict data, so lint validates it as
+    // data instead of failing every scene file.
     if let Some(body) = amp_strict_data(source) {
         return match cosmix_mix::parse_data(&body) {
             Ok(_) => Ok(LintOutcome::StrictData),
@@ -509,11 +509,9 @@ fn strict_data_fallback(
 }
 
 /// Extract the strict-data body of an AMP scene envelope, or `None` when
-/// the source is not one. An envelope is a `---`-delimited front-matter
-/// header followed by a ````mix-fenced map; both halves are `key: value`
-/// data, so lint validates them as a single data document. The header
-/// lines between the two `---` markers and the fenced body are
-/// concatenated with the markers and fences removed.
+/// the source is not one. An envelope is a `---` front-matter header
+/// (YAML scene metadata, opaque to Mix) followed by a ````mix-fenced map;
+/// only the fenced map is Mix strict data, so lint validates that alone.
 fn amp_strict_data(source: &str) -> Option<String> {
     let fence = "```mix";
     let fence_at = source.find(fence)?;
@@ -523,17 +521,10 @@ fn amp_strict_data(source: &str) -> Option<String> {
     let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(0);
     let close_at = rest[body_start..].find("\n```")?;
     let body = rest[body_start..body_start + close_at].trim();
-    // Header: strip the two `---` markers around the front matter.
-    let head = source[..fence_at].trim();
-    let header = head
-        .strip_prefix("---")
-        .and_then(|inner| inner.strip_suffix("---"))
-        .map(str::trim)
-        .unwrap_or(head);
-    if header.is_empty() && body.is_empty() {
+    if body.is_empty() {
         return None;
     }
-    Some(format!("{header}\n{body}"))
+    Some(body.to_string())
 }
 
 /// A successful strict-data parse is decisive. When both grammars fail,
