@@ -85,7 +85,14 @@ including stopped/continued states. SIGCHLD wakes it independently of REPL
 input or evaluator progress. It never waits for arbitrary child PIDs.
 `process_alive(pid)` requires a positive whole-number PID. It may reap an
 exited unmanaged child (including a legacy `spawn` child), but only probes
-controller-owned job PIDs with signal 0. A managed zombie can briefly report
-alive until the controller reaps it; the builtin never steals its status.
+controller-owned job PIDs with signal 0. Registered native-task PIDs share
+that no-reap ownership seam from Mix 0.109.1, including pending cleanup after
+an Unknown report. A managed zombie can briefly report alive until its owner
+reaps it; the builtin never steals its status after registration. Task admission
+is published after registration; this does not claim protection before the
+task's initial exec.
+The internal no-reap markers are reference counted so retirement after a
+numeric PID is reused cannot erase a newer owner's registration. Each owner
+balances its own registration; this does not prevent kernel PID reuse.
 Signal 0 returning `EPERM` counts as alive, including for another user's
 process. This reports existence, not permission to signal that process.

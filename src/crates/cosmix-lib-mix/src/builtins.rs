@@ -336,7 +336,7 @@ builtin_table! {
     ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers — run_parallel's numbers, its own loop). Options are validated once (even for an empty host list) and every host is checked before any ssh spawns; a wrong argument type raises TYPE_MISMATCH. After that nothing raises — one host's failure is DATA in its own map: unreachable, nonzero exit and timeout arrive as ok:false; a local spawn/pipe failure as ok:false with error_code (`PROCESS_SPAWN`, `PROCESS_STDIO`, …) and error; a decode refusal (truncated or unparseable stdout, where ssh_mix raises) as ok:false, decode_error and no value; a host never started because of Ctrl-C as ok:false, interrupted:true. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch); there is no whole-call deadline", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
     ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id (+ host, only with the host opt). Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client; ok means the MTA accepted it, not that it was delivered. to is a string or list of strings; Cc/Bcc go in headers. from is exactly one mailbox, addr or Name <addr> (a comment, a second mailbox or <> raises); its address is the envelope sender. Long headers are folded within 78 columns (an unbreakable run over 998 raises); a non-ASCII body or one with a line over 998 bytes goes quoted-printable, else 7bit. A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL in any header raises. headers adds headers or replaces the generated Date/Message-ID/MIME-Version; From/To/Subject there raise (set them in msg), and so do Content-Type/Content-Transfer-Encoding (send_mail encodes the body itself, always text/plain utf-8). sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host via ssh_exec (remote default /usr/sbin/sendmail). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); bad input raises before anything runs: OPTION_INVALID (msg fields, options), TYPE_MISMATCH (msg not a map, arity), or ssh_exec's own validation errors with host", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: any_of(map("send_mail_options", {host: string, sendmail: string, timeout: number}), nil)) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: any_of(map, nil)) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
-    ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
+    ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job and registered native-task PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
     ("net_watch", CapabilityClass::Env, "system", "Subscribe to Linux rtnetlink link/address changes; returns an evaluator-owned opaque handle. Delivers net.changed {watch, changes:[{kind:\"link\"|\"addr\", ifname, index, up, removed, operstate?, loopback?, wireless?, family?, address?, prefix?}], overflow, closed?} via $event.args; bursts coalesce per link/address, repeats that change nothing are dropped, overflow means re-read net_state(). opts {events: [\"link\",\"addr\"]}. No polling fallback", contract!((opts?: map("net_watch_options", {events: list(string)})) -> string; failure[raises])),
     ("net_unwatch", CapabilityClass::Env, "system", "Cancel a net_watch handle and its pending changes", contract!((handle: string) -> nil; failure[raises])),
     ("net_state", CapabilityClass::Env, "system", "Snapshot of network links and addresses from an rtnetlink dump: {links:[{ifname, index, up, operstate?, loopback, wireless}], addresses:[{ifname, index, family, address, prefix}]}. up = operstate up, or IFF_UP+IFF_RUNNING when the driver reports unknown (lo, WireGuard)", contract!(() -> map("net_state", {links: list(map), addresses: list(map)}); effects[must_use, blocking]; failure[raises])),
@@ -4982,19 +4982,29 @@ fn builtin_kill(args: Vec<Value>) -> MixResult<Option<Value>> {
     }
 }
 
-// Shared ownership seam: the binary registers managed children before target
-// release. Launch and process_alive run on the same evaluator thread; this
-// registry identifies which statuses the builtin must leave to the monitor.
-// The mutex also serialises registry access with monitor-side retirement.
-static MANAGED_PIDS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+// Shared ownership seam: wait owners register their children so the liveness
+// builtin leaves their statuses alone. Job-controller children register before
+// target release; native-task supervisors register before admission is published.
+// The mutex serialises probes with registration and owner-side retirement.
+// Each registration must be balanced. References can overlap after a PID is
+// reaped and reused but before its old owner retires its registry entry; one
+// retirement must not remove another owner's no-reap marker.
+static MANAGED_PIDS: std::sync::Mutex<std::collections::BTreeMap<i32, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 pub fn register_managed_pid(pid: i32) {
-    MANAGED_PIDS.lock().unwrap().insert(pid);
+    *MANAGED_PIDS.lock().unwrap().entry(pid).or_insert(0) += 1;
 }
 
 pub fn unregister_managed_pid(pid: i32) {
-    MANAGED_PIDS.lock().unwrap().remove(&pid);
+    let mut managed = MANAGED_PIDS.lock().unwrap();
+    if let Some(count) = managed.get_mut(&pid) {
+        if *count > 1 {
+            *count -= 1;
+        } else {
+            managed.remove(&pid);
+        }
+    }
 }
 
 /// process_alive(pid) — check if a process is running (signal 0 test).
@@ -5036,7 +5046,7 @@ fn builtin_process_alive(args: Vec<Value>) -> MixResult<Option<Value>> {
             return Ok(Some(Value::Bool(alive)));
         }
         let managed = MANAGED_PIDS.lock().unwrap();
-        if !managed.contains(&pid) {
+        if !managed.contains_key(&pid) {
             unsafe {
                 let _ = libc::waitpid(pid, &mut status, libc::WNOHANG);
             }
@@ -35107,6 +35117,40 @@ mod loud_numeric_argument_tests {
             let err = call_builtin("process_alive", vec![Value::Number(pid)]).unwrap_err();
             assert_eq!(err.info().map(|i| i.code.as_str()), Some("TYPE_MISMATCH"));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_alive_preserves_overlapping_owner_registrations() {
+        struct Owned {
+            child: std::process::Child,
+            registrations: usize,
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.child.wait();
+                for _ in 0..self.registrations {
+                    super::unregister_managed_pid(self.child.id() as i32);
+                }
+            }
+        }
+        let child = std::process::Command::new("/bin/false").spawn().unwrap();
+        let pid = child.id() as i32;
+        super::register_managed_pid(pid);
+        super::register_managed_pid(pid);
+        let mut owned = Owned { child, registrations: 2 };
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::waitid(libc::P_PID, pid as u32, &mut info, libc::WEXITED | libc::WNOWAIT) }, 0);
+        // One owner retiring must not release another owner's protection.
+        // This models the registry interleaving around a recycled numeric PID;
+        // the real zombie proves the resulting probe retains kernel status.
+        super::unregister_managed_pid(pid);
+        owned.registrations -= 1;
+        let alive = call_builtin("process_alive", vec![Value::Number(f64::from(pid))]).unwrap();
+        let status = owned.child.wait();
+        drop(owned);
+        assert_eq!(alive, Some(Value::Bool(true)));
+        assert_eq!(status.unwrap().code(), Some(1));
     }
 
     #[test]
