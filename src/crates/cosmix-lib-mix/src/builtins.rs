@@ -432,6 +432,7 @@ builtin_table! {
     ("yaml_encode", CapabilityClass::Pure,     "json",    "Encode a Mix value as YAML (requires yaml feature; v0.71.0). No leading --- marker, trailing newline guaranteed; whole numbers emit as integers; nil/bool/number/string/list/map only — bytes, buffer or function values raise", contract!((v: any) -> string; failure[raises])),
     ("toml_parse", CapabilityClass::Pure,      "json",    "Parse TOML string into Mix map", contract!((s: string) -> map)),
     ("toml_encode", CapabilityClass::Pure,     "json",    "Encode Mix value as TOML. Raises TOML_UNREPRESENTABLE with {path,type} details for nil, function, bytes, or buffer values instead of silently replacing them with empty strings (strict since v0.55.0)", contract!((v: any) -> string; failure[raises])),
+    ("project_info", CapabilityClass::FsRead,  "system",  "Read-only workspace introspection: project_info() -> {root, main: {members: [crate names], exclude, toolchain}, desktop: bool} — the main workspace members (crates/* minus excludes), the pinned rust-toolchain channel, and whether the desktop workspace is present. For orchestration scripts, no ad-hoc TOML parsing (v0.103.15)", contract!(() -> map; failure[raises])),
     ("data_parse", CapabilityClass::Pure,      "json",    "Parse a strict-data `.conf.mix` string into a Mix value (inverse of data_encode) (v0.3.2)", contract!((s: string) -> any; failure[raises])),
     ("data_encode", CapabilityClass::Pure,     "json",    "Encode a Mix value as a strict-data `.conf.mix` string with correct \\$ / \\~ / \\\\ escaping; round-trips through data_parse. data_encode(value, [pretty]) — truthy 2nd arg emits multi-line indented output (v0.3.2)", contract!((v: any, pretty?: any) -> string)),
 
@@ -669,6 +670,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         }),
         #[cfg(feature = "toml")]
         "toml_parse" => builtin_toml_parse(args),
+        #[cfg(feature = "toml")]
+        "project_info" => builtin_project_info(args),
         #[cfg(feature = "toml")]
         "toml_encode" => builtin_toml_encode(args),
         #[cfg(feature = "yaml")]
@@ -15725,6 +15728,101 @@ fn builtin_toml_encode(args: Vec<Value>) -> MixResult<Option<Value>> {
         msg: format!("toml_encode: {e}"),
     })?;
     Ok(Some(Value::String(s)))
+}
+
+/// `project_info()` — read-only workspace introspection (P5, v0.103.15).
+/// Reports the main workspace members (the `crates/*` glob minus excludes),
+/// the pinned rust-toolchain channel, and whether the desktop workspace is
+/// present — as structured data for orchestration, no ad-hoc TOML parsing.
+#[cfg(feature = "toml")]
+fn builtin_project_info(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("project_info", &args, 0)?;
+    let root = std::env::var("COSMIX")
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| format!("{h}/Projects/cosmix"))
+        })
+        .unwrap_or_else(|| ".".to_string());
+    let src = std::path::Path::new(&root).join("src");
+
+    let toml_err = |what: &str, e: impl std::fmt::Display| MixError::RuntimeError {
+        span: None,
+        msg: format!("project_info(): {what}: {e}"),
+    };
+
+    let ws_text = std::fs::read_to_string(src.join("Cargo.toml"))
+        .map_err(|e| toml_err("cannot read src/Cargo.toml", e))?;
+    let ws: toml::Value = ws_text.parse().map_err(|e| toml_err("bad src/Cargo.toml", e))?;
+
+    let toml_strings = |table: &toml::Value, key: &str| -> Vec<String> {
+        table
+            .get("workspace")
+            .and_then(|w| w.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let members = toml_strings(&ws, "members");
+    let exclude = toml_strings(&ws, "exclude");
+
+    // Expand the `crates/*` glob into member crate names.
+    let mut member_names: Vec<String> = Vec::new();
+    for glob in &members {
+        if let Some(dir_rel) = glob.strip_suffix("/*") {
+            if let Ok(entries) = std::fs::read_dir(src.join(dir_rel)) {
+                let mut names: Vec<String> = entries
+                    .flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                for name in names {
+                    let rel = format!("{dir_rel}/{name}");
+                    if !exclude.contains(&rel) && !exclude.contains(&name) {
+                        member_names.push(name);
+                    }
+                }
+            }
+        } else if !exclude.contains(glob) {
+            member_names.push(glob.clone());
+        }
+    }
+
+    let toolchain = std::fs::read_to_string(src.join("rust-toolchain.toml"))
+        .ok()
+        .and_then(|t| t.parse::<toml::Value>().ok())
+        .and_then(|t| {
+            t.get("toolchain")
+                .and_then(|c| c.get("channel"))
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "stable".to_string());
+
+    let desktop = src.join("desktop").join("Cargo.toml").is_file();
+
+    let mut main = indexmap::IndexMap::new();
+    main.insert(
+        "members".into(),
+        Value::list(member_names.into_iter().map(Value::String).collect()),
+    );
+    main.insert(
+        "exclude".into(),
+        Value::list(exclude.into_iter().map(Value::String).collect()),
+    );
+    main.insert("toolchain".into(), Value::String(toolchain));
+
+    let mut out = indexmap::IndexMap::new();
+    out.insert("root".into(), Value::String(root));
+    out.insert("main".into(), Value::map(main));
+    out.insert("desktop".into(), Value::Bool(desktop));
+    Ok(Some(Value::map(out)))
 }
 
 #[cfg(feature = "toml")]
