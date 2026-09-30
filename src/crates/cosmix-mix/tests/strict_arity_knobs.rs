@@ -107,3 +107,20 @@ fn contract_clean_builtin_calls_do_not_warn() {
         "contract-clean calls must not warn: {stderr}"
     );
 }
+
+#[test]
+fn missing_args_are_not_mislabeled_as_surplus() {
+    // A missing argument is the compatible nil binding — NOT an ignored
+    // surplus — so a 0-arg pop() must not print the surplus warning,
+    // whatever the call itself then does.
+    let out = mix_bin()
+        .env_remove("MIX_STRICT_ARITY")
+        .args(["-c", "print(pop())"])
+        .output()
+        .expect("run mix");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("surplus is ignored"),
+        "missing is not surplus: {stderr}"
+    );
+}

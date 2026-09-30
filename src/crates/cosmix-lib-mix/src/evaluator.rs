@@ -13932,21 +13932,29 @@ impl Evaluator {
     /// surplus argument is silently ignored. Warn — once per (builtin,
     /// count) per process, so a loop does not flood — naming the contract
     /// and that the surplus becomes an error when the default flips.
+    ///
+    /// SURPLUS only: `n` above the contract max. A MISSING argument
+    /// (`n < min`) is the compatible nil binding, not an ignored surplus —
+    /// flagging it here would mislabel the mode's own documented behavior.
+    /// Variadic builtins have no max and can never warn.
     fn warn_surplus_arity(&self, name: &str, n: usize) {
         use std::collections::HashSet;
         use std::sync::{Mutex, OnceLock};
         let Some(info) = builtins::builtin_info_of(name) else {
             return;
         };
-        if info.contract.accepts_arity(n) {
+        if !info.contract.arity_max().is_some_and(|max| n > max) {
             return;
         }
         static SEEN: OnceLock<Mutex<HashSet<(String, usize)>>> = OnceLock::new();
         let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
         let mut seen = set.lock().unwrap_or_else(|p| p.into_inner());
-        if !seen.insert((name.to_string(), n)) {
+        // Borrow-key containment first: the hot repeat path takes the lock
+        // but allocates nothing — only a FIRST (builtin, count) inserts.
+        if seen.contains(&(name, n)) {
             return;
         }
+        seen.insert((name.to_string(), n));
         drop(seen);
         eprintln!(
             "mix: warning: {name}() called with {n} argument(s), contract is {} — the \
