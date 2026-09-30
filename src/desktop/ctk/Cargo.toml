@@ -189,3 +189,7 @@ required-features = ["body-view", "system-clipboard"]
 [[example]]
 name = "mixer_strip"
 required-features = ["mixer", "bus"]
+
+[[example]]
+name = "mcp_control_probe"
+required-features = ["bus"]
