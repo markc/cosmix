@@ -38,8 +38,8 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.103.14 |
-| `cosmix-mix` | 0.103.14 |
+| `cosmix-lib-mix` | 0.103.15 |
+| `cosmix-mix` | 0.103.15 |
 | `mix-bench` | 0.1.1 |
 
 ## cos
@@ -82,7 +82,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-maild-auth` | 0.2.0 |
 | `cosmix-maild-bayesian` | 0.7.1 |
 | `cosmix-maild-rules` | 0.3.1 |
-| `cosmix-mcp` | 0.6.0 |
+| `cosmix-mcp` | 0.7.0 |
 | `cosmix-mds` | 0.3.5 |
 | `cosmix-mesh-sign` | 0.8.1 |
 | `cosmix-midicomp` | 0.3.1 |
