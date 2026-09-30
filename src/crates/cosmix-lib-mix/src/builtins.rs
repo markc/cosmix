@@ -258,7 +258,7 @@ builtin_table! {
     ("access", CapabilityClass::FsRead,          "io",      "Ask the kernel whether this process can access path using its effective uid/gid: mode is a non-empty, duplicate-free string of r/w/x/f letters (f = existence and is redundant when combined). Follows symlinks. Unlike inspecting stat().perm, this honours POSIX ACLs. Ordinary absence/denial returns false; malformed input or an unexpected syscall failure raises (v0.45.0).", contract!((path: string, mode: string) -> bool; failure[raises])),
     ("is_dir", CapabilityClass::FsRead,          "io",      "Test if path is a directory", contract!((path: string) -> bool)),
     ("is_file", CapabilityClass::FsRead,         "io",      "Test if path is a regular file", contract!((path: string) -> bool)),
-    ("realpath", CapabilityClass::FsRead,        "io",      "Canonicalise a path: resolve every symlink + `.`/`..` to the absolute real path (like `readlink -f` / realpath(3)). The path MUST exist. realpath(path) -> string | nil (nil when it can't be resolved — a missing component, a symlink loop, or a non-UTF-8 resolved path). NORMALISATION ONLY, not a race-free authorization primitive: canonicalise-then-use is not atomic, so for an exec/open safety check, exec/open the RETURNED canonical path (which has no symlinks to re-traverse), not the original (v0.31.2)", contract!((path: string) -> any_of(string, nil))),
+    ("realpath", CapabilityClass::FsRead,        "io",      "Canonicalise a path: resolve every symlink + `.`/`..` to the absolute real path (like `readlink -f` / realpath(3)). The path MUST exist. realpath(path) -> string | nil (nil ONLY when a component is missing; a permission/IO/symlink-loop/non-UTF-8 failure RAISES — v0.103.14). NORMALISATION ONLY, not a race-free authorization primitive: canonicalise-then-use is not atomic, so for an exec/open safety check, exec/open the RETURNED canonical path (which has no symlinks to re-traverse), not the original (v0.31.2)", contract!((path: string) -> any_of(string, nil); failure[raises])),
     ("glob", CapabilityClass::FsRead,            "io",      "List files matching a glob pattern (supports ** globstar in v0.2.1)", contract!((pattern: string) -> list(string); failure[raises])),
     ("ls", CapabilityClass::FsRead,              "io",      "List directory entries", contract!((path?: string) -> list(string); failure[raises])),
     ("mkdir", CapabilityClass::FsWrite,           "io",      "Create directory: mkdir(path[, {parents}]). parents defaults to true (create_dir_all). {parents: false} creates only the final component and fails if the parent is missing — the form to use when the parent was placed deliberately and re-creating it would hide its removal (v0.42.0)", contract!((path: string, opts?: map) -> nil; failure[raises])),
@@ -13217,13 +13217,25 @@ pub(crate) fn canonicalize_path(path: &str) -> Option<String> {
 fn builtin_realpath(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("realpath", &args, 1)?;
     let path = args[0].to_mix_string();
-    // A missing component or a symlink loop is a normal not-resolvable outcome, so this
-    // returns nil rather than raising — the caller decides (an exec-safety check treats
-    // nil as "refuse").
-    Ok(Some(match canonicalize_path(&path) {
-        Some(s) => Value::String(s),
-        None => Value::Nil,
-    }))
+    // A6: nil now means ONLY "the path does not exist" (absence). A
+    // permission, IO, symlink-loop or non-UTF-8 failure RAISES instead —
+    // collapsing them to nil misread a denied or broken path as "missing"
+    // and let the nil persist into a later open() (read_link/stat already
+    // raise).
+    match std::fs::canonicalize(&path) {
+        Ok(p) => match p.into_os_string().into_string() {
+            Ok(s) => Ok(Some(Value::String(s))),
+            Err(_) => Err(MixError::RuntimeError {
+                span: None,
+                msg: format!("realpath(): resolved path is not valid UTF-8: {path}"),
+            }),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(Value::Nil)),
+        Err(e) => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("realpath(): cannot resolve {path}: {e}"),
+        }),
+    }
 }
 
 fn builtin_glob(args: Vec<Value>) -> MixResult<Option<Value>> {
