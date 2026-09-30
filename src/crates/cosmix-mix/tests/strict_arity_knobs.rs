@@ -27,7 +27,7 @@ fn env_knob_turns_on_strict_arity() {
         .expect("run mix");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "surplus-arity call must fail under the env knob");
-    assert!(stderr.contains("ARITY_MISMATCH"), "got: {stderr}");
+    assert!(stderr.contains("expected 1 argument(s), got 2"), "got: {stderr}");
     // And without the knob the same call is the compatible extra-ignored
     // binding. The knob is inherited through the environment, so the
     // default arm must REMOVE it explicitly — a harness or fleet host
@@ -59,7 +59,7 @@ fn mixrc_strict_arity_variable_turns_on_strict_mode() {
         .expect("run mix -ci");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "mixrc $strict_arity must apply: {stderr}");
-    assert!(stderr.contains("ARITY_MISMATCH"), "got: {stderr}");
+    assert!(stderr.contains("expected 1 argument(s), got 2"), "got: {stderr}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
