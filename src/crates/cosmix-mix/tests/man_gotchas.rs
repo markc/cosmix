@@ -109,7 +109,12 @@ fn rows(markdown: &str) -> (Vec<Row>, Vec<String>) {
 
 fn run_probe(src: &str) -> (bool, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_mix"))
-        .args(["-c", src])
+        // The table documents the LANGUAGE — several rows are deliberate
+        // anti-examples (dead mutation, surplus args) that the D1
+        // pre-execution gate would refuse before they can demonstrate the
+        // behavior. --no-lint lets the probe show the language, which is
+        // what this table pins; the gate gets its own row below.
+        .args(["--no-lint", "-c", src])
         .env("MIX_STATS", "off")
         // The probes are pure language; no rc, no aliases, no PATH from
         // whoever is running the suite.

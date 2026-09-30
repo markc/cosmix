@@ -49,6 +49,7 @@ must appear in the error.
 | `replace()` tells you it missed | it returns the input unchanged, **silently** — check the result, or use `mix edit` from a prompt | `print(replace("abc", "zz", "!"))` | `abc` |
 | `replace()` replaces the first | it replaces **all** of them | `print(replace("a a a", "a", "b"))` | `b b b` |
 | `mix -c 'print(x)'` needs escaping gymnastics | it does not; a probe is one call and the binary is the oracle | `print(mix_version() != "")` | `true` |
+| a provable `-c` arity/dead-mutation snippet runs | the D1 lint gate REFUSES it with exit 2 before any line runs — `--no-lint` overrides (0.103.4) | `mix -c '$m = {}; remove($m, "k")'` | `!refusing to run` |
 
 ## Three rules that are not a syntax trap
 

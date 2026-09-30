@@ -485,6 +485,7 @@ must appear in the error.</p>
 <tr><td><code>replace()</code> tells you it missed</td><td>it returns the input unchanged, <strong>silently</strong> — check the result, or use <code>mix edit</code> from a prompt</td><td><code>print(replace("abc", "zz", "!"))</code></td><td><code>abc</code></td></tr>
 <tr><td><code>replace()</code> replaces the first</td><td>it replaces <strong>all</strong> of them</td><td><code>print(replace("a a a", "a", "b"))</code></td><td><code>b b b</code></td></tr>
 <tr><td><code>mix -c 'print(x)'</code> needs escaping gymnastics</td><td>it does not; a probe is one call and the binary is the oracle</td><td><code>print(mix_version() != "")</code></td><td><code>true</code></td></tr>
+<tr><td>a provable <code>-c</code> arity/dead-mutation snippet runs</td><td>the D1 lint gate REFUSES it with exit 2 before any line runs — <code>--no-lint</code> overrides (0.103.4)</td><td><code>mix -c '$m = {}; remove($m, "k")'</code></td><td><code>!refusing to run</code></td></tr>
 </tbody></table>
 <h2 id="three-rules-that-are-not-a-syntax-trap">Three rules that are not a syntax trap</h2>
 <p>These cost more than any row above, and no probe can catch them.</p>
