@@ -115,9 +115,12 @@ async fn publish_opts_command_override_headers_and_retain() {
 
 #[tokio::test]
 async fn publish_refuses_the_silent_wrong_shapes() {
-    // Map body: no hidden encoding — the caller chooses the wire format.
+    // Map body: the A2 contract-type gate (0.103.1) now raises first —
+    // the declared shape is string|nil, so the json_encode-the-map choice
+    // stays the caller's. The other three shapes still reach publish's
+    // own checks (they are type-correct).
     let (_eval, bus, out) = run_with_bus(
-        "try\n  publish(\"t\", {a: 1})\ncatch $e\n  print(\"map:\" .. contains(\"\" .. $e, \"json_encode\"))\nend\ntry\n  publish(\"bad\\ntopic\", \"x\")\ncatch $e\n  print(\"nl:\" .. contains(\"\" .. $e, \"newline\"))\nend\ntry\n  publish(\"t\", \"x\", {bogus: 1})\ncatch $e\n  print(\"opt:\" .. contains(\"\" .. $e, \"unknown option\"))\nend\ntry\n  publish(\"t\", \"x\", {headers: {\"k:ey\": \"v\"}})\ncatch $e\n  print(\"hdr:\" .. contains(\"\" .. $e, \"frame-injection\"))\nend\n",
+        "try\n  publish(\"t\", {a: 1})\ncatch $e\n  print(\"map:\" .. contains(\"\" .. $e, \"must be\"))\nend\ntry\n  publish(\"bad\\ntopic\", \"x\")\ncatch $e\n  print(\"nl:\" .. contains(\"\" .. $e, \"newline\"))\nend\ntry\n  publish(\"t\", \"x\", {bogus: 1})\ncatch $e\n  print(\"opt:\" .. contains(\"\" .. $e, \"unknown option\"))\nend\ntry\n  publish(\"t\", \"x\", {headers: {\"k:ey\": \"v\"}})\ncatch $e\n  print(\"hdr:\" .. contains(\"\" .. $e, \"frame-injection\"))\nend\n",
     )
     .await;
     assert_eq!(out, "map:true\nnl:true\nopt:true\nhdr:true\n");
