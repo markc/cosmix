@@ -22,7 +22,7 @@ fn env_knob_turns_on_strict_arity() {
     // key) a TYPE_MISMATCH in every mode.)
     let out = mix_bin()
         .env("MIX_STRICT_ARITY", "1")
-        .args(["-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
+        .args(["--no-lint", "-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
         .output()
         .expect("run mix");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -31,7 +31,7 @@ fn env_knob_turns_on_strict_arity() {
     // Strict is the DEFAULT since 0.103.0 — no flag, no env, still raises.
     let def = mix_bin()
         .env_remove("MIX_STRICT_ARITY")
-        .args(["-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
+        .args(["--no-lint", "-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
         .output()
         .expect("run mix");
     let stderr = String::from_utf8_lossy(&def.stderr);
@@ -40,7 +40,7 @@ fn env_knob_turns_on_strict_arity() {
     // The escape hatch restores the compatible extra-ignored binding.
     let ok = mix_bin()
         .env_remove("MIX_STRICT_ARITY")
-        .args(["--compat-arity", "-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
+        .args(["--no-lint", "--compat-arity", "-c", "fn f($x) return 1 end\nprint(f(1, 2))"])
         .output()
         .expect("run mix");
     assert!(
@@ -59,7 +59,7 @@ fn mixrc_strict_arity_variable_turns_on_strict_mode() {
     let out = mix_bin()
         .env("HOME", &dir)
         .env_remove("MIX_STRICT_ARITY")
-        .args(["-ci", "fn f($x) return 1 end\nprint(f(1, 2))"])
+        .args(["--no-lint", "-ci", "fn f($x) return 1 end\nprint(f(1, 2))"])
         .output()
         .expect("run mix -ci");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -89,7 +89,7 @@ fn surplus_builtin_args_warn_once_in_compat_mode() {
     // surplus argument.
     let out = mix_bin()
         .env_remove("MIX_STRICT_ARITY")
-        .args(["--compat-arity", "-c", "pop([1, 2], 0)\npop([1, 2], 0)"])
+        .args(["--no-lint", "--compat-arity", "-c", "pop([1, 2], 0)\npop([1, 2], 0)"])
         .output()
         .expect("run mix");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -118,10 +118,12 @@ fn contract_clean_builtin_calls_do_not_warn() {
 fn missing_args_are_not_mislabeled_as_surplus() {
     // A missing argument is the compatible nil binding — NOT an ignored
     // surplus — so a 0-arg pop() under --compat-arity must not print the
-    // surplus warning, whatever the call itself then does.
+    // surplus warning, whatever the call itself then does. --no-lint:
+    // the gate would refuse the under-min arity before the runtime mode
+    // that this test pins gets a chance to speak.
     let out = mix_bin()
         .env_remove("MIX_STRICT_ARITY")
-        .args(["--compat-arity", "-c", "print(pop())"])
+        .args(["--no-lint", "--compat-arity", "-c", "print(pop())"])
         .output()
         .expect("run mix");
     let stderr = String::from_utf8_lossy(&out.stderr);
