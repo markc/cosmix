@@ -106,7 +106,7 @@ async fn stdout_is_not_trimmed() {
 async fn argv_validation_raises_type_mismatch() {
     for (snippet, needle) in [
         ("run_argv([])", "must not be empty"),
-        ("run_argv(\"echo hi\")", "must be a list"),
+        ("run_argv(\"echo hi\")", "must be list"),
         ("run_argv([\"echo\", 42])", "argv[1] must be a string"),
     ] {
         let src =
