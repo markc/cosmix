@@ -281,6 +281,18 @@ fn stmt_bodies(kind: &StmtKind) -> Vec<&[Stmt]> {
             }
             out
         }
+        // Lint-walker gap (TODO-mix 2026-09-24): a BLOCK statement used as
+        // a chain operand (`if … end && print(2)`) had its body never
+        // walked — the operand statements' own bodies are reached through
+        // walk_stmt_exprs, but their NESTED bodies were not. Recurse the
+        // operand statements' bodies here so `print($nope)` inside that
+        // if-block is no longer invisible.
+        StmtKind::Chain { left, right, .. } => {
+            let mut out = stmt_bodies(&left.kind);
+            out.extend(stmt_bodies(&right.kind));
+            out
+        }
+        StmtKind::PipeToExternal { stmt: inner, .. } => stmt_bodies(&inner.kind),
         // FunctionDef bodies are handled by the function-scope pass;
         // walk them here too so nested defs/binders are discovered by
         // universe collection (callers that must not descend filter on
@@ -1904,8 +1916,13 @@ fn walk_stmt_exprs(stmt: &Stmt, visit: &mut dyn FnMut(&Expr)) {
             }
         }
         StmtKind::Parse { source, .. } => go(source),
-        StmtKind::Send { target, args, .. } | StmtKind::Emit { target, args, .. } => {
+        StmtKind::Send { target, command, args, .. }
+        | StmtKind::Emit { target, command, args, .. } => {
             go(target);
+            // Lint-walker gap (TODO-mix 2026-09-24): the COMMAND expression
+            // was never visited — a call or binder inside it was invisible
+            // to every check that rides this walker.
+            go(command);
             for (_, v) in args {
                 go(v);
             }
