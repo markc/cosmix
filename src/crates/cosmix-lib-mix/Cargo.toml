@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-lib-mix"
-version = "0.103.15"
+version = "0.104.0"
 edition = "2024"
 license = "MIT"
 
@@ -30,7 +30,7 @@ url = ["dep:url"]
 # stores the field verbatim; only the CLI hashed before this existed).
 # `sha-crypt` joined 0.102.6 for the $6$/$5$ schemes every NS passdb
 # (Dovecot {SHA512-CRYPT}) uses — same feature, same client-side story.
-crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt", "dep:sha-crypt"]
+crypto = ["dep:blake3", "dep:sha2", "dep:sha1", "dep:md-5", "dep:base64", "dep:uuid", "dep:bcrypt", "dep:sha-crypt", "dep:ring", "dep:rustls-pemfile"]
 http = ["dep:ureq", "dep:webpki-roots", "dep:rustls-pemfile", "dep:blake3"]
 sqlite = ["dep:rusqlite"]
 # `tokio-sleep` is an alias-only feature kept for backwards
@@ -97,6 +97,7 @@ tracing = "0.1"
 # crate (like indexmap/libc/rand), not a Cosmix-internal dependency.
 futures-util = { workspace = true }
 base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true }
 bcrypt = { version = "0.16", optional = true }
 sha-crypt = { version = "0.6", optional = true, features = ["password-hash", "getrandom"] }
 tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }

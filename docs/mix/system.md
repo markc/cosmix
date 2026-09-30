@@ -1496,6 +1496,7 @@ hash_blake3(s[, {raw:true}])  BLAKE3 digest
 hash_md5(s[, {raw:true}])     MD5 digest    -- BROKEN hash, legacy interop only
 hash_sha1(s[, {raw:true}])    SHA-1 digest  -- BROKEN hash, legacy interop only
 hmac_sha256(key, msg[, {raw:true}])  HMAC-SHA256 (RFC 2104) — webhook signatures
+jwt_rs256_sign(claims_json, private_pem[, header_json])  compact RS256 JWT
 constant_time_eq(a, b) timing-safe equality — compare MACs/secrets with this, not ==
 hash_file(p[, algo][, {raw:true}])   streaming digest of a FILE
                        algo: "sha256" (default) "blake3" "md5" "sha1"
@@ -1629,7 +1630,30 @@ print(hmac_sha256("Jefe", "what do ya want for nothing?"))
 ```
 
 Compare a computed MAC against a received signature with
-`constant_time_eq(a, b)`, never `==` — plain equality short-circuits on the
+`jwt_rs256_sign(claims_json, private_pem[, header_json])` signs a compact
+JWT with an RSA private key in PKCS8 or PKCS1 PEM form (crypto feature).
+The RSA modulus must be at least 2048 bits. The first PEM item must be the
+private key; certificate-first bundles are refused.
+Pass JSON objects as strings, typically from `json_encode`. The default
+header is `{"alg":"RS256","typ":"JWT"}`. A supplied header keeps its
+extra fields such as `kid`; a missing `alg` is filled with `RS256`, and
+any other algorithm is refused. Explicit nil means the default header.
+Input JSON is parsed and re-encoded, so duplicate object keys collapse to
+the final value. Each input is limited to 256 KiB. Malformed or non-object
+JSON raises `JWT_CLAIMS_INVALID` / `JWT_HEADER_INVALID`; unsupported or
+invalid keys raise `JWT_KEY_INVALID`, and signing failure raises
+`JWT_SIGN_FAILED`. These errors do not echo input values.
+
+The primitive signs only: scripts choose claims, expiry and audience,
+exchange tokens and call any provider. Keep keys in files or bindings,
+rather than source literals. For example:
+
+```mix
+$claims = json_encode({iss: $issuer, aud: $audience, iat: time(), exp: time() + 3600})
+$jwt = jwt_rs256_sign($claims, read_file($key_file))
+```
+
+Compare MACs with `constant_time_eq(a, b)`, never `==` — plain equality short-circuits on the
 first differing byte, a timing oracle. `constant_time_eq` scans the full
 length unconditionally (a length mismatch returns false immediately; MAC
 lengths are public):
