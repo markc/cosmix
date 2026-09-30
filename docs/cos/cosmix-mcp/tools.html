@@ -442,16 +442,34 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/cosmix-mcp/tools.md"><div class="prose"><h1 id="mcp-tools">MCP tools</h1>
-<p><code>cosmix-mcp</code> exposes tools through the MCP <code>tools</code> capability. Parameter schemas are generated from the Rust request types. Unless noted otherwise, each tool returns text; JSON values are encoded as JSON text and operational failures begin with <code>ERROR:</code>.</p>
+<p><code>cosmix-mcp</code> exposes tools through the MCP <code>tools</code> capability. Parameter schemas are generated from strict Rust request types. Successful results contain readable text and <code>structuredContent</code> matching the advertised <code>outputSchema</code>. Operational failures set <code>isError: true</code>. See <a href="/cos/cosmix-mcp/#return-conventions">return conventions</a>.</p>
 <h2 id="bus-tools">Bus tools</h2>
 <table><thead><tr><th>Tool</th><th>Parameters</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>bus_call</code></td><td><code>to</code> string, <code>command</code> string, optional <code>args</code> string</td><td>Call a Bus command on a named service. <code>args</code> contains JSON text. Missing or invalid JSON becomes <code>null</code>.</td></tr>
+<tr><td><code>bus_call</code></td><td><code>to</code> string, <code>command</code> string, optional <code>args</code> string</td><td>Call a native Bus command once. Missing <code>args</code> becomes <code>null</code>; malformed JSON is rejected before delivery. Application error results retain <code>rc</code> and message.</td></tr>
 <tr><td><code>bus_list_services</code></td><td>None</td><td>Return the broker service inventory, including available build provenance.</td></tr>
 <tr><td><code>bus_node_info</code></td><td>None</td><td>Call <code>noded.info</code> for node identity, broker build, uptime, and registered-service count.</td></tr>
 <tr><td><code>bus_list_peers</code></td><td>None</td><td>Call <code>noded.peers</code> and return the known mesh peers.</td></tr>
 <tr><td><code>noded_ping</code></td><td>None</td><td>Call <code>noded.ping</code> to check broker connectivity.</td></tr>
 </tbody></table>
-<p>The broker connection is established on the first Bus-dependent call and retained for the process lifetime. A connection failure advises that <code>cosmix-noded</code> must be running.</p>
+<p>The registered broker connection is established lazily. A later request reconnects after a disconnected client; it never replays a failed command.</p>
+<h2 id="terminal-tools">Terminal tools</h2>
+<p><code>term_list</code> returns <code>{service, instance, tabs, panes}</code> in both typed content and readable JSON. Rows retain native ids and dimensions; the two listing reads are sequential, not atomic. <code>term_snapshot</code> returns bounded screen observations. <code>term_type</code> requires a pane or tab and uses the last listed service/instance when omitted; without a listing it refuses. A restarted terminal refuses a stale instance. These compatibility tools retain the native terminal's diagnostic admission contract; registration and instance tokens are not authenticated authority.</p>
+<p><code>term_tab</code> accepts <code>op: new|select|close</code> and an id for select/close. <code>term_pane</code> accepts <code>op: split|select|close</code>, a split direction, or a selection id. They retain the existing native behaviour.</p>
+<h2 id="semantic-application-and-compositor-tools">Semantic application and compositor tools</h2>
+<p>Every call requires an explicit <code>service</code>. The bridge does not resolve mutation targets by focus, title or caption. Results are <code>{service, command, result}</code>; the owning service defines the inner result.</p>
+<table><thead><tr><th>Tool</th><th>Other arguments</th><th>Native command</th></tr></thead><tbody>
+<tr><td><code>app_describe</code></td><td>None</td><td><code>app.describe</code></td></tr>
+<tr><td><code>app_controls_list</code></td><td>None</td><td><code>app.controls.list</code></td></tr>
+<tr><td><code>app_control_get</code></td><td><code>target</code></td><td><code>app.controls.get</code></td></tr>
+<tr><td><code>app_control_set</code></td><td><code>target</code>, JSON domain <code>value</code></td><td><code>app.controls.set</code></td></tr>
+<tr><td><code>app_control_wait</code></td><td><code>target</code>, expected <code>value</code>, <code>timeout_ms</code></td><td>Poll <code>app.controls.get</code> every 250 ms, bounded by the requested timeout.</td></tr>
+<tr><td><code>app_actions_list</code></td><td>None</td><td><code>actions.list</code></td></tr>
+<tr><td><code>app_action_invoke</code></td><td><code>id</code>, optional object <code>args</code></td><td><code>action.invoke</code> once</td></tr>
+<tr><td><code>desktop_windows</code></td><td>Optional <code>app_id</code>, <code>title</code>, <code>title_contains</code>, <code>visible</code>, <code>workspace</code></td><td><code>comp.windows.list</code></td></tr>
+<tr><td><code>desktop_window_wait</code></td><td><code>window: {id, generation}</code>, <code>until</code>, <code>timeout_ms</code></td><td><code>comp.window.wait</code></td></tr>
+</tbody></table>
+<p>Wait timeouts must be in <code>1..=55000</code> milliseconds. Window conditions are <code>mapped</code>, <code>visible</code>, <code>presented</code>, <code>focused</code>, <code>maximized</code>, <code>unmaximized</code>, <code>fullscreen</code>, <code>unfullscreen</code>, <code>unmapped</code> or <code>gone</code>. Generation identifies a surface role, not a compositor process incarnation. Window-list filters restrict observations only.</p>
+<p>CTK owns control type/range canonicalisation and disabled/busy checks. Its <code>applied</code> reply acknowledges local dispatch. Action <code>accepted</code> replies also acknowledge admission rather than downstream completion. Read or wait for a concrete observable value after acting. Control waits compare the exact native domain value; account for owner canonicalisation. Control metadata is not a full accessibility tree.</p>
 <p>Example tool arguments:</p>
 <pre><code class="language-json">{
   "to": "edit",
@@ -529,20 +547,20 @@
 <table><thead><tr><th>Tool</th><th>Parameters</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>mix_execute</code></td><td><code>script</code> string, optional <code>cwd</code> string</td><td>Parse and execute inline Mix source and return captured output.</td></tr>
 </tbody></table>
-<p>The evaluator runs on a dedicated thread with JSON, regular expression, TOML, date and time, URL, and cryptographic facilities enabled.</p>
-<p>If a broker connection is available, Mix <code>send</code>, <code>emit</code>, and <code>port_exists</code> route through Bus. A failed attempt to establish the broker does not prevent a script that does not require Bus from running.</p>
+<p>The evaluator runs in an owned Rust worker process with JSON, regular expression, TOML, date and time, URL, and cryptographic facilities enabled.</p>
+<p>Mix <code>send</code>, <code>emit</code>, and <code>port_exists</code> lazily acquire a native Bus connection. A script that does not require Bus does not attempt to connect.</p>
 <p><code>send</code> preserves Bus return-code bands. Transport failures remain Mix transport errors, while application replies retain their return codes. Values that cannot be encoded as JSON produce an error rather than a modified payload.</p>
-<p><code>emit</code> is fire-and-forget. Payload encoding errors are reported; the send result itself is discarded.</p>
+<p><code>emit</code> is fire-and-forget. Payload encoding and transport-send errors are reported; successful local sending does not prove delivery or application completion.</p>
 <p><code>port_exists</code> obtains the current broker service list and returns false if that lookup fails.</p>
 <p>The MCP process does not deliver incoming events to long-lived Mix <code>on</code> handlers.</p>
-<p>When <code>cwd</code> begins with <code>~/</code>, the prefix is expanded from <code>HOME</code>. A directory change applies to the MCP process and therefore remains in effect for later operations.</p>
-<p>Successful execution returns standard output. Empty output becomes <code>(no output)</code>. When standard error is present it follows a <code>--- stderr ---</code> separator. Parse and runtime failures include any output already produced.</p>
+<p>When <code>cwd</code> begins with <code>~/</code>, the prefix is expanded from <code>HOME</code>. Directory changes affect only that worker.</p>
+<p>Structured results contain <code>result</code> (readable combined text), <code>stdout</code>, <code>stderr</code> and <code>exit_code</code>. Empty combined output is rendered as <code>(no output)</code>. Standard error follows a <code>--- stderr ---</code> separator in readable text. Runtime failures preserve captured output and mark the result as an error. Script and output bounds, worker cleanup and cancellation are described in the <a href="/cos/cosmix-mcp/#mix-execution">server manual</a>.</p>
 <h2 id="status-tool">Status tool</h2>
 <table><thead><tr><th>Tool</th><th>Parameters</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>mcp_status</code></td><td>None</td><td>Return process start time, uptime, broker state, aggregate counts, per-tool counts, and recent calls.</td></tr>
 </tbody></table>
 <p>The recent-call queue retains at most 50 records, newest first. Each record contains the tool name, UTC timestamp, elapsed milliseconds, and success flag.</p>
-<p><code>broker_connected</code> means that the lazy broker client has been initialised. It does not perform a fresh connectivity probe; use <code>noded_ping</code> for that.</p>
+<p><code>broker_connected</code> reflects the cached native client's live state. It does not send a fresh probe; use <code>noded_ping</code> for that. The dedicated status schema exposes the metric fields directly.</p>
 <h2 id="recommended-knowledge-sequence">Recommended knowledge sequence</h2>
 <p>The server advertises this workflow to MCP clients:</p>
 <ol>

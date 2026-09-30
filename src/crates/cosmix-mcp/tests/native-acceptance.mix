@@ -1,0 +1,18 @@
+-- version: 0.1.0
+-- Build and test the actual MCP/native path. Run under the local build guard.
+-- mix native-acceptance.mix /absolute/path/to/cosmix [desktop-target-dir]
+$argv = args()
+if len($argv) < 1 or len($argv) > 2 then raise("USAGE", "pass the absolute Cosmix checkout root and optional desktop target directory") end
+$root = $argv[0]
+$core = $root .. "/src"
+$desktop = $core .. "/desktop"
+$desktop_target = $desktop .. "/target"
+if len($argv) == 2 then $desktop_target = $argv[1] end
+print(run_argv_must(["cargo", "build", "--manifest-path", $core .. "/Cargo.toml", "-p", "cosmix-noded", "-p", "cosmix-mcp", "-j4"], {cwd: $core, env: {CARGO_TARGET_DIR: $core .. "/target"}, timeout: 900}))
+print(run_argv_must(["cargo", "build", "--manifest-path", $desktop .. "/Cargo.toml", "-p", "ctk", "--example", "mcp_control_probe", "--features", "bus", "-j4"], {cwd: $desktop, env: {CARGO_TARGET_DIR: $desktop_target}, timeout: 900}))
+print(run_argv_must(["cargo", "test", "--manifest-path", $core .. "/Cargo.toml", "-p", "cosmix-mcp", "-j4"], {cwd: $core, env: {CARGO_TARGET_DIR: $core .. "/target"}, timeout: 120}))
+print(run_argv_must(["cargo", "test", "--manifest-path", $core .. "/Cargo.toml", "-p", "cosmix-mcp", "--test", "native_mcp", "--", "--ignored", "--nocapture"], {cwd: $core, env: {
+    CARGO_TARGET_DIR: $core .. "/target",
+    COSMIX_MCP_TEST_NODED: $core .. "/target/debug/cosmix-noded",
+    COSMIX_MCP_TEST_CTK_PROBE: $desktop_target .. "/debug/examples/mcp_control_probe"
+}, timeout: 120}))

@@ -14,10 +14,13 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_router};
 use serde::Deserialize;
-use tokio::sync::OnceCell;
+mod connection;
+mod mix_worker;
+mod native_tools;
+mod tool_output;
 
 struct CosmixMcp {
-    noded: OnceCell<Arc<cosmix_client::NodedClient>>,
+    noded: connection::BrokerConnection,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
     metrics: Arc<Metrics>,
     /// The frontend and instance the last successful term_list read: the
@@ -93,30 +96,28 @@ impl Metrics {
         }
     }
 
-    fn snapshot_json(&self, broker_connected: bool) -> serde_json::Value {
+    fn snapshot(&self, broker_connected: bool) -> tool_output::StatusSnapshot {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let recent: Vec<serde_json::Value> = g
+        let recent = g
             .recent
             .iter()
             .rev()
-            .map(|r| {
-                serde_json::json!({
-                    "tool": r.tool,
-                    "at": r.at.to_rfc3339(),
-                    "ms": r.ms,
-                    "ok": r.ok,
-                })
+            .map(|r| tool_output::RecentCall {
+                tool: r.tool.clone(),
+                at: r.at.to_rfc3339(),
+                ms: r.ms,
+                ok: r.ok,
             })
             .collect();
-        serde_json::json!({
-            "started": self.started.to_rfc3339(),
-            "uptime_secs": self.started_at.elapsed().as_secs(),
-            "broker_connected": broker_connected,
-            "total_calls": g.total,
-            "error_calls": g.errors,
-            "per_tool": g.counts,
-            "recent": recent,
-        })
+        tool_output::StatusSnapshot {
+            started: self.started.to_rfc3339(),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            broker_connected,
+            total_calls: g.total,
+            error_calls: g.errors,
+            per_tool: g.counts.clone(),
+            recent,
+        }
     }
 }
 
@@ -221,7 +222,7 @@ fn summarize_result(r: &rmcp::model::CallToolResult) -> String {
 
 /// Bus handler that routes Mix `send`/`emit`/`port_exists` to the broker.
 struct McpBusHandler {
-    noded: Arc<cosmix_client::NodedClient>,
+    noded: connection::BrokerConnection,
 }
 
 impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
@@ -257,7 +258,15 @@ impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
             // status (→ `$rc = rc`) and a success carries its rc (0 or a
             // warning 5) — the Mix rc-band contract (was every Err → rc=10,
             // conflating transport with application error).
-            match self.noded.call_typed(target, command, json_args).await {
+            let noded =
+                self.noded
+                    .get()
+                    .await
+                    .map_err(|e| cosmix_mix::error::MixError::RuntimeError {
+                        span: None,
+                        msg: format!("mcp send broker unavailable: {e}"),
+                    })?;
+            match noded.call_typed(target, command, json_args).await {
                 Ok(cosmix_client::PortReply::Ok { rc, value }) => {
                     Ok((i32::from(rc), cosmix_mix::json::json_to_mix(value)))
                 }
@@ -289,7 +298,20 @@ impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
                     msg: format!("emit args not JSON-encodable: {e}"),
                 }
             })?;
-            let _ = self.noded.send(target, command, json_args).await;
+            let noded =
+                self.noded
+                    .get()
+                    .await
+                    .map_err(|e| cosmix_mix::error::MixError::RuntimeError {
+                        span: None,
+                        msg: format!("mcp emit broker unavailable: {e}"),
+                    })?;
+            noded.send(target, command, json_args).await.map_err(|e| {
+                cosmix_mix::error::MixError::RuntimeError {
+                    span: None,
+                    msg: format!("mcp emit transport failure: {e}; delivery outcome unknown"),
+                }
+            })?;
             Ok(())
         })
     }
@@ -300,7 +322,11 @@ impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = cosmix_mix::error::MixResult<bool>> + 'a>>
     {
         Box::pin(async move {
-            match self.noded.list_services().await {
+            let noded = match self.noded.get().await {
+                Ok(noded) => noded,
+                Err(_) => return Ok(false),
+            };
+            match noded.list_services().await {
                 Ok(services) => Ok(services.iter().any(|s| s == target)),
                 Err(_) => Ok(false),
             }
@@ -322,6 +348,7 @@ impl cosmix_mix::evaluator::BusHandler for McpBusHandler {
 
 // VERIFY: dedicated Term MCP argument schemas.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TermTypeParams {
     /// Diagnostic synthetic input; max 8192 UTF-8 bytes including JSON envelope on the wire.
     text: String,
@@ -341,6 +368,7 @@ struct TermTypeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TermTabParams {
     /// Operation: new, select, or close.
     op: String,
@@ -349,6 +377,7 @@ struct TermTabParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TermPaneParams {
     /// Operation: split, select, or close (active pane).
     op: String,
@@ -512,9 +541,11 @@ fn term_type_request(
         return Err("pane and tab ids start at 1".into());
     }
     let service = match p.service.as_deref() {
-        None => remembered
-            .map(|(service, _)| service)
-            .ok_or_else(|| term_invalid("call term_list first: term_type types only into a terminal term_list has read"))?,
+        None => remembered.map(|(service, _)| service).ok_or_else(|| {
+            term_invalid(
+                "call term_list first: term_type types only into a terminal term_list has read",
+            )
+        })?,
         Some(name) => TERM_SERVICES
             .into_iter()
             .find(|known| *known == name)
@@ -560,13 +591,21 @@ fn term_listing_instance(
     panes: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let mut seen = serde_json::Value::Null;
-    for row in tabs.as_array().into_iter().chain(panes.as_array()).flatten() {
+    for row in tabs
+        .as_array()
+        .into_iter()
+        .chain(panes.as_array())
+        .flatten()
+    {
         let instance = &row["instance"];
         if instance.is_null() {
             continue;
         }
         if !seen.is_null() && seen != *instance {
-            return Err("the term process changed between the tab and pane reads; call term_list again".into());
+            return Err(
+                "the term process changed between the tab and pane reads; call term_list again"
+                    .into(),
+            );
         }
         seen = instance.clone();
     }
@@ -651,6 +690,7 @@ fn term_listing(text: &str, tabs: bool) -> Result<serde_json::Value, String> {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct BusCallParams {
     /// Target service name (e.g. "edit", "view", "mon")
     to: String,
@@ -662,6 +702,7 @@ struct BusCallParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LogTailParams {
     /// Log file: "bus" for Bus traffic, or app name like "cosmix-edit"
     file: String,
@@ -671,6 +712,7 @@ struct LogTailParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LogSearchParams {
     /// Log file name
     file: String,
@@ -684,6 +726,7 @@ struct LogSearchParams {
 // --- Knowledge base tool params ---
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ContextSearchParams {
     /// Natural language description of what you need context for
     query: String,
@@ -697,6 +740,7 @@ struct ContextSearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct IndexWorkspaceParams {
     /// Workspace path to index (e.g. "$COSMIX_SRC", "~/.ns"). Empty = current working directory.
     #[serde(default)]
@@ -709,6 +753,7 @@ struct IndexWorkspaceParams {
 // --- Skills tool params ---
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillsRetrieveParams {
     /// Description of the task you're about to work on
     task: String,
@@ -721,6 +766,7 @@ struct SkillsRetrieveParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillsStoreParams {
     /// Skill name (short, descriptive)
     name: String,
@@ -749,6 +795,7 @@ struct SkillsStoreParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillsRefineParams {
     /// ID of the skill to refine (from skills_retrieve results)
     id: i64,
@@ -759,6 +806,7 @@ struct SkillsRefineParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillsListParams {
     /// Max skills to return (default 20)
     #[serde(default)]
@@ -769,12 +817,14 @@ struct SkillsListParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillsDeleteParams {
     /// ID of the skill to delete
     id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DocsFeedbackParams {
     /// ID of the document chunk (from context_search results)
     id: i64,
@@ -783,6 +833,7 @@ struct DocsFeedbackParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct JournalFeedbackParams {
     /// ID of the journal chunk (from context_search results)
     id: i64,
@@ -791,6 +842,7 @@ struct JournalFeedbackParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MemoryFeedbackParams {
     /// ID of the memory chunk (from context_search results)
     id: i64,
@@ -799,6 +851,7 @@ struct MemoryFeedbackParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct JournalSupersedeParams {
     /// ID of the older journal chunk being superseded (will be hidden from context_search).
     old_id: i64,
@@ -810,12 +863,14 @@ struct JournalSupersedeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillsGraduateParams {
     /// ID of the skill to manually graduate to CLAUDE.md
     id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct KnowledgeDigestParams {
     /// Project domain (e.g. "cosmix", "ns"). Empty = auto-detect from PWD.
     #[serde(default)]
@@ -823,6 +878,7 @@ struct KnowledgeDigestParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct KnowledgeBriefParams {
     /// Description of the task the subagent will work on
     task: String,
@@ -837,6 +893,7 @@ struct KnowledgeBriefParams {
 // --- Mix execution params ---
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MixExecuteParams {
     /// Mix script source code to execute
     script: String,
@@ -846,20 +903,8 @@ struct MixExecuteParams {
 }
 
 impl CosmixMcp {
-    async fn noded(&self) -> Result<&Arc<cosmix_client::NodedClient>, String> {
-        self.noded
-            .get_or_try_init(|| async {
-                tracing::info!(target: "cosmix_mcp", "connecting to broker...");
-                let client = cosmix_config::client_helpers::connect_anonymous_default()
-                    .await
-                    .map_err(|e| {
-                        format!("broker connect failed: {e}. Ensure cosmix-noded is running.")
-                    })?;
-                tracing::info!(target: "cosmix_mcp", "broker connected");
-                Ok(Arc::new(client))
-            })
-            .await
-            .map_err(|e: String| e)
+    async fn noded(&self) -> Result<Arc<cosmix_client::NodedClient>, String> {
+        self.noded.get().await
     }
 
     /// Which terminal frontend is live RIGHT NOW, per call.
@@ -918,7 +963,10 @@ impl CosmixMcp {
             // discards a reply with no pending entry — so a late answer to a
             // cancelled probe cannot resolve a different request.
             let probe = noded.call(name, "INFO", serde_json::Value::Null);
-            if matches!(tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await, Ok(Ok(_))) {
+            if matches!(
+                tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await,
+                Ok(Ok(_))
+            ) {
                 return Ok(name);
             }
         }
@@ -930,7 +978,10 @@ impl CosmixMcp {
         // would send an operator hunting one that is perfectly healthy.
         // One bounded ping settles which it was, and only on this path.
         let ping = noded.call("noded", "noded.ping", serde_json::Value::Null);
-        if !matches!(tokio::time::timeout(TERM_PROBE_TIMEOUT, ping).await, Ok(Ok(_))) {
+        if !matches!(
+            tokio::time::timeout(TERM_PROBE_TIMEOUT, ping).await,
+            Ok(Ok(_))
+        ) {
             return Err(format!(
                 "the broker stopped answering while probing for a CosMix terminal \
                  ({} registered, none reachable) — this is a Bus problem, not a wedged \
@@ -960,19 +1011,44 @@ impl CosmixMcp {
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
     #[tool]
-    async fn term_list(&self) -> String {
-        let result: Result<String, String> = async {
-            let service = self.term_service().await?;
-            let noded = self.noded().await?;
-            let tabs = term_reply(noded.call(service, &term_verb(service, "tabs")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
-            let panes = term_reply(noded.call(service, &term_verb(service, "panes")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
-            let (tabs, panes) = (term_listing(&tabs, true)?, term_listing(&panes, false)?);
-            let instance = term_listing_instance(&tabs, &panes)?;
-            let reply = term_reply(serde_json::json!({"service": service, "instance": instance, "tabs": tabs, "panes": panes}))?;
-            *self.term_pin.lock().unwrap_or_else(|p| p.into_inner()) = Some((service, instance.as_u64()));
-            Ok(reply)
-        }.await;
-        result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
+    async fn term_list(
+        &self,
+    ) -> Result<rmcp::handler::server::wrapper::Json<tool_output::TermListObservation>, String>
+    {
+        let service = self.term_service().await?;
+        let noded = self.noded().await?;
+        let tabs = term_reply(
+            noded
+                .call(service, &term_verb(service, "tabs")?, serde_json::json!({}))
+                .await
+                .map_err(|e| e.to_string())?,
+        )?;
+        let panes = term_reply(
+            noded
+                .call(
+                    service,
+                    &term_verb(service, "panes")?,
+                    serde_json::json!({}),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+        )?;
+        let (tabs, panes) = (term_listing(&tabs, true)?, term_listing(&panes, false)?);
+        let instance = term_listing_instance(&tabs, &panes)?;
+        // Retain the aggregate wire bound as well as per-listing bounds.
+        term_reply(
+            serde_json::json!({"service": service, "instance": instance, "tabs": tabs, "panes": panes}),
+        )?;
+        *self.term_pin.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((service, instance.as_u64()));
+        Ok(rmcp::handler::server::wrapper::Json(
+            tool_output::TermListObservation {
+                service: service.into(),
+                instance: instance.as_u64(),
+                tabs: tabs.as_array().ok_or("invalid tab rows")?.clone(),
+                panes: panes.as_array().ok_or("invalid pane rows")?.clone(),
+            },
+        ))
     }
 
     /// Read-only active screen text, dimensions, cursor, pid and diagnostic timings
@@ -980,7 +1056,7 @@ impl CosmixMcp {
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
     #[tool]
-    async fn term_snapshot(&self) -> String {
+    async fn term_snapshot(&self) -> Result<String, String> {
         self.term_request("snapshot", serde_json::json!({})).await
     }
 
@@ -996,14 +1072,15 @@ impl CosmixMcp {
     /// Omitted, they default to the last term_list in this MCP process; with no
     /// term_list yet the call is refused (never probed and never falls back).
     #[tool]
-    async fn term_type(&self, Parameters(p): Parameters<TermTypeParams>) -> String {
+    async fn term_type(&self, Parameters(p): Parameters<TermTypeParams>) -> Result<String, String> {
         // VERIFY: MCP Term tool is a thin structured-argument ABP translation.
         let remembered = *self.term_pin.lock().unwrap_or_else(|p| p.into_inner());
         match term_type_request(p, remembered) {
-            Ok((service, args)) => {
-                term_type_outcome(self.term_request_to(Some(service), "type", args).await)
-            }
-            Err(e) => format!("ERROR: {e}"),
+            Ok((service, args)) => self
+                .term_request_to(Some(service), "type", args)
+                .await
+                .map_err(|e| term_type_outcome(format!("ERROR: {e}"))),
+            Err(e) => Err(format!("ERROR: {e}")),
         }
     }
 
@@ -1011,10 +1088,10 @@ impl CosmixMcp {
     /// Closing the last tab quits. The term service is a self-asserted diagnostic
     /// surface pending authenticated per-instance identity (P0-I).
     #[tool]
-    async fn term_tab(&self, Parameters(p): Parameters<TermTabParams>) -> String {
+    async fn term_tab(&self, Parameters(p): Parameters<TermTabParams>) -> Result<String, String> {
         match term_tab_request(p) {
             Ok((verb, args)) => self.term_request(verb, args).await,
-            Err(e) => format!("ERROR: {e}"),
+            Err(e) => Err(format!("ERROR: {e}")),
         }
     }
 
@@ -1023,17 +1100,21 @@ impl CosmixMcp {
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
     #[tool]
-    async fn term_pane(&self, Parameters(p): Parameters<TermPaneParams>) -> String {
+    async fn term_pane(&self, Parameters(p): Parameters<TermPaneParams>) -> Result<String, String> {
         match term_pane_request(p) {
             Ok((verb, args)) => self.term_request(verb, args).await,
-            Err(e) => format!("ERROR: {e}"),
+            Err(e) => Err(format!("ERROR: {e}")),
         }
     }
 
     /// Send one verb, named by its namespace-free SUFFIX, to whichever
     /// terminal frontend is live. The namespace comes from the resolved
     /// service, never from the caller.
-    async fn term_request(&self, verb_suffix: &str, args: serde_json::Value) -> String {
+    async fn term_request(
+        &self,
+        verb_suffix: &str,
+        args: serde_json::Value,
+    ) -> Result<String, String> {
         self.term_request_to(None, verb_suffix, args).await
     }
 
@@ -1045,9 +1126,9 @@ impl CosmixMcp {
         pinned: Option<&'static str>,
         verb_suffix: &str,
         args: serde_json::Value,
-    ) -> String {
+    ) -> Result<String, String> {
         if args.to_string().len() > 8192 {
-            return "ERROR: request exceeds 8192 bytes".into();
+            return Err("request exceeds 8192 bytes".into());
         }
         let result: Result<String, String> = async {
             let service = match pinned {
@@ -1063,23 +1144,35 @@ impl CosmixMcp {
             )
         }
         .await;
-        result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
+        result.map_err(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
     }
 
     /// Call an Bus command on a cosmix service and return the response.
     #[tool]
-    async fn bus_call(&self, Parameters(p): Parameters<BusCallParams>) -> String {
+    async fn bus_call(
+        &self,
+        Parameters(p): Parameters<BusCallParams>,
+    ) -> rmcp::model::CallToolResult {
+        let args_val = match p.args {
+            Some(args) => match serde_json::from_str(&args) {
+                Ok(value) => value,
+                Err(error) => {
+                    return tool_output::failure(format!(
+                        "invalid args JSON: {error}; nothing was sent"
+                    ));
+                }
+            },
+            None => serde_json::Value::Null,
+        };
         let noded = match self.noded().await {
             Ok(h) => h,
-            Err(e) => return format!("ERROR: {e}"),
+            Err(e) => return tool_output::failure(e),
         };
-        let args_val = p
-            .args
-            .and_then(|a: String| serde_json::from_str(&a).ok())
-            .unwrap_or(serde_json::Value::Null);
-        match noded.call(&p.to, &p.command, args_val).await {
-            Ok(val) => serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()),
-            Err(e) => format!("ERROR: {e}"),
+        match noded.call_typed(&p.to, &p.command, args_val).await {
+            Ok(reply) => tool_output::bus_reply(reply),
+            Err(e) => tool_output::failure(format!(
+                "native request failed: {e}; outcome unknown if delivered; verify effects before retrying"
+            )),
         }
     }
 
@@ -1152,22 +1245,25 @@ impl CosmixMcp {
 
     /// Read last N lines from a cosmix log file. file="bus" for Bus traffic.
     #[tool]
-    async fn log_tail(&self, Parameters(p): Parameters<LogTailParams>) -> String {
+    async fn log_tail(&self, Parameters(p): Parameters<LogTailParams>) -> Result<String, String> {
         let n = p.lines.unwrap_or(50);
         let path = resolve_log_path(&p.file);
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let all: Vec<&str> = content.lines().collect();
                 let start = all.len().saturating_sub(n);
-                all[start..].join("\n")
+                Ok(all[start..].join("\n"))
             }
-            Err(e) => format!("ERROR reading {}: {e}", path.display()),
+            Err(e) => Err(format!("ERROR reading {}: {e}", path.display())),
         }
     }
 
     /// Search a cosmix log file for a pattern (case-insensitive).
     #[tool]
-    async fn log_search(&self, Parameters(p): Parameters<LogSearchParams>) -> String {
+    async fn log_search(
+        &self,
+        Parameters(p): Parameters<LogSearchParams>,
+    ) -> Result<String, String> {
         let max = p.limit.unwrap_or(20);
         let path = resolve_log_path(&p.file);
         let pat = p.pattern.to_lowercase();
@@ -1178,13 +1274,13 @@ impl CosmixMcp {
                     .filter(|line| line.to_lowercase().contains(&pat))
                     .collect();
                 if matches.is_empty() {
-                    "No matches found".to_string()
+                    Ok("No matches found".to_string())
                 } else {
                     let start = matches.len().saturating_sub(max);
-                    matches[start..].join("\n")
+                    Ok(matches[start..].join("\n"))
                 }
             }
-            Err(e) => format!("ERROR reading {}: {e}", path.display()),
+            Err(e) => Err(format!("ERROR reading {}: {e}", path.display())),
         }
     }
 
@@ -2273,27 +2369,11 @@ impl CosmixMcp {
     /// Mix has ~300 builtins including JSON, YAML, regex (subject-first re_*), TOML, datetime, crypto, URL parsing.
     /// The script runs with Bus connectivity — `send`/`emit`/`port_exists` route to the broker.
     #[tool]
-    async fn mix_execute(&self, Parameters(p): Parameters<MixExecuteParams>) -> String {
-        // Get broker connection before spawning (ref is !Send across spawn_blocking)
-        let noded = self.noded().await.ok().cloned();
-        let script = p.script;
-        let cwd = p.cwd;
-
-        // Run evaluator on a dedicated thread (Evaluator is !Send due to Rc<RefCell>)
-        match tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            rt.block_on(async move { run_mix_script(&script, cwd.as_deref(), noded).await })
-        })
-        .await
-        {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => err,
-            Err(e) => format!("ERROR: task panicked: {e}"),
-        }
+    async fn mix_execute(
+        &self,
+        Parameters(p): Parameters<MixExecuteParams>,
+    ) -> rmcp::model::CallToolResult {
+        mix_worker::execute(p.script, p.cwd).await
     }
 
     /// Report cosmix-mcp's own runtime state: start time, uptime, broker
@@ -2302,19 +2382,16 @@ impl CosmixMcp {
     /// for a live human stream see `journalctl -t cosmix-mcp -f` or
     /// `~/.local/log/cosmix/cosmix-mcp.log`.
     #[tool]
-    async fn mcp_status(&self) -> String {
-        let broker = self.noded.get().is_some();
-        serde_json::to_string_pretty(&self.metrics.snapshot_json(broker))
-            .unwrap_or_else(|e| format!("ERROR: {e}"))
+    async fn mcp_status(
+        &self,
+    ) -> rmcp::handler::server::wrapper::Json<tool_output::StatusSnapshot> {
+        let broker = self.noded.is_connected();
+        rmcp::handler::server::wrapper::Json(self.metrics.snapshot(broker))
     }
 }
 
-/// Run a Mix script with optional Bus connectivity. Called from spawn_blocking.
-async fn run_mix_script(
-    script: &str,
-    cwd: Option<&str>,
-    noded: Option<Arc<cosmix_client::NodedClient>>,
-) -> Result<String, String> {
+/// Run a Mix script in the internal isolated worker process only.
+async fn run_mix_script(script: &str, cwd: Option<&str>) -> Result<(String, String, i32), String> {
     // Set working directory if requested
     if let Some(cwd) = cwd {
         let expanded = if cwd.starts_with("~/") {
@@ -2341,44 +2418,34 @@ async fn run_mix_script(
         .map_err(|e| format!("ERROR: parse error: {e}"))?;
 
     // Create evaluator
-    let stdout = cosmix_mix::evaluator::SharedBuf::new();
-    let stderr = cosmix_mix::evaluator::SharedBuf::new();
+    let stdout = mix_worker::CaptureBuffer::default();
+    let stderr = mix_worker::CaptureBuffer::default();
     let mut eval = cosmix_mix::evaluator::Evaluator::with_output(
         Box::new(stdout.clone()),
         Box::new(stderr.clone()),
     );
 
-    // Wire Bus IPC if broker is available
-    if let Some(noded) = noded {
-        eval.set_bus_handler(std::rc::Rc::new(McpBusHandler { noded }));
-    }
+    // Native connection is lazy even inside the worker. Pure local scripts
+    // need no broker; the first send/emit/port_exists acquires an owned client.
+    eval.set_bus_handler(std::rc::Rc::new(McpBusHandler {
+        noded: connection::BrokerConnection::new(),
+    }));
 
     // Execute
-    match eval.execute(&stmts).await {
+    let execution = eval.execute(&stmts).await;
+    if stdout.exceeded() || stderr.exceeded() {
+        return Err("Mix captured output exceeded 1 MiB; effects may already have occurred".into());
+    }
+    match execution {
         Ok(_) => {
             let out = stdout.to_string_lossy();
             let err = stderr.to_string_lossy();
-            Ok(if err.is_empty() {
-                if out.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    out
-                }
-            } else {
-                format!("{out}\n--- stderr ---\n{err}")
-            })
+            Ok((out, err, 0))
         }
         Err(e) => {
             let out = stdout.to_string_lossy();
             let err = stderr.to_string_lossy();
-            let mut result = format!("ERROR: {e}");
-            if !out.is_empty() {
-                result = format!("{out}\n{result}");
-            }
-            if !err.is_empty() {
-                result = format!("{result}\n--- stderr ---\n{err}");
-            }
-            Err(result)
+            Ok((out, format!("{err}\nERROR: {e}"), 1))
         }
     }
 }
@@ -2683,11 +2750,10 @@ async fn delete_by_path(
 /// (observed: a context_search received at 01:59:53 on 2026-07-29 that never
 /// logged `tool done`; the client gave up after 1800s).
 ///
-/// A deadline is only applied where dropping the in-flight future is safe:
-/// NodedClient correlates replies via a pending-map with an RAII removal
-/// guard, read-only indexd/HTTP futures are plain drops, and mix_execute's
-/// spawn_blocking task is ABANDONED on cancel — it runs to completion in the
-/// background (consistent final state, unobserved result).
+/// Dropping a native call removes its local reply correlation; it does not
+/// stop delivered work. The response therefore reports an unknown outcome,
+/// never an instruction to replay a mutation. Mix owns a transient worker
+/// process group, terminated on drop; already committed effects remain.
 ///
 /// Three tools are EXEMPT because they are multi-step mutating pipelines that
 /// are NOT cancellation-safe: dropping them mid-await can leave partial state
@@ -2720,11 +2786,22 @@ fn tool_deadline_secs(tool: &str) -> u64 {
         // delta twice. Owed: request-level idempotency keys in indexd, then
         // these get a deadline too.
         "docs_feedback" | "journal_feedback" | "memory_feedback" => 0,
-        // spawn_blocking-backed: cancel = abandon-to-completion, so a deadline
-        // is safe; long, because scripts are legitimately slow.
+        // Owned process worker; long because scripts are legitimately slow.
         "mix_execute" => base.max(LONG_SECS),
         _ => base,
     }
+}
+
+fn tool_requires_completion(tool: &str) -> bool {
+    matches!(
+        tool,
+        "index_workspace"
+            | "skills_refine"
+            | "skills_graduate"
+            | "docs_feedback"
+            | "journal_feedback"
+            | "memory_feedback"
+    )
 }
 
 // `call_tool` is hand-written (not via `#[tool_handler]`) so every tool
@@ -2800,51 +2877,80 @@ impl ServerHandler for CosmixMcp {
             );
         }
         let started = std::time::Instant::now();
+        let progress = context.meta.get_progress_token();
+        let progress_peer = context.peer.clone();
+        let cancellation = context.ct.clone();
+        if let Some(token) = progress.clone()
+            && !cancellation.is_cancelled()
+        {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                progress_peer.notify_progress(
+                    rmcp::model::ProgressNotificationParam::new(token, 1.0)
+                        .with_message("request received"),
+                ),
+            )
+            .await;
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let deadline = tool_deadline_secs(&tool);
-        let result = if deadline == 0 {
-            self.tool_router.call(tcc).await
-        } else {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(deadline),
-                self.tool_router.call(tcc),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_elapsed) => {
-                    // Always-on: the silent-hang class this deadline exists to
-                    // kill must never be silent again. (The generic Err branch
-                    // below logs only the numeric code always-on.)
-                    tracing::warn!(
-                        target: "cosmix_mcp",
-                        tool = %tool,
-                        deadline_secs = deadline,
-                        "tool deadline exceeded: {tool} after {deadline}s"
-                    );
-                    // The advice must match the cancellation semantics:
-                    // mix_execute's spawn_blocking task is ABANDONED, not
-                    // cancelled — the script keeps running to completion, so
-                    // a blind retry would execute it twice.
-                    let msg = if tool == "mix_execute" {
-                        format!(
-                            "tool '{tool}' exceeded its {deadline}s deadline. The script was \
-                             NOT cancelled — it continues running to completion in the \
-                             background; only its result is lost. Do NOT retry blindly: \
-                             verify the script's effects first."
-                        )
-                    } else {
-                        format!(
-                            "tool '{tool}' exceeded its {deadline}s deadline and was cancelled \
-                             — a backend leg (broker connect, indexd, or an embedding/LLM \
-                             round-trip) is unresponsive. The server remains usable; retry \
-                             once the backend recovers (mcp_status shows broker state)."
-                        )
-                    };
-                    Err(rmcp::ErrorData::internal_error(msg, None))
+        let work = async {
+            if deadline == 0 {
+                self.tool_router.call(tcc).await
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(deadline),
+                    self.tool_router.call(tcc),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        // Always-on: the silent-hang class this deadline exists to
+                        // kill must never be silent again. (The generic Err branch
+                        // below logs only the numeric code always-on.)
+                        tracing::warn!(
+                            target: "cosmix_mcp",
+                            tool = %tool,
+                            deadline_secs = deadline,
+                            "tool deadline exceeded: {tool} after {deadline}s"
+                        );
+                        Ok(tool_output::failure(format!(
+                            "tool '{tool}' exceeded its {deadline}s deadline. Outcome unknown: \
+                         stopping the request does not undo native work already delivered. \
+                         Do not retry a mutation blindly; verify observable effects first."
+                        ))
+                        .into())
+                    }
                 }
             }
         };
+        // Preserve the existing completion policy of non-transactional
+        // knowledge pipelines. Cancelling a caller must not newly interrupt
+        // them between their writes. Other requests drop their owned work.
+        let result = if tool_requires_completion(&tool) {
+            work.await
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Ok(tool_output::failure(
+                    "request cancelled; outcome unknown for delivered native work; verify effects before retrying"
+                ).into()),
+                result = work => result,
+            }
+        }.map(|response| tool_output::normalize(&tool, response));
+        if let Some(token) = progress
+            && !cancellation.is_cancelled()
+        {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                progress_peer.notify_progress(
+                    rmcp::model::ProgressNotificationParam::new(token, 2.0)
+                        .with_message("request finished"),
+                ),
+            )
+            .await;
+        }
         let ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok(r) => {
@@ -2902,7 +3008,12 @@ impl ServerHandler for CosmixMcp {
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
-            tools: self.tool_router.list_all(),
+            tools: self
+                .tool_router
+                .list_all()
+                .into_iter()
+                .map(tool_output::decorate)
+                .collect(),
             meta: None,
             next_cursor: None,
             ttl_ms: supports_cache_hints.then_some(0),
@@ -2911,18 +3022,22 @@ impl ServerHandler for CosmixMcp {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        self.tool_router.get(name).cloned()
+        self.tool_router
+            .get(name)
+            .cloned()
+            .map(tool_output::decorate)
     }
 }
 
 fn main() {
     // --version / -V: print build provenance and exit BEFORE starting the
     // stdio server — and before the tokio runtime exists, so a thread- or
-    // fd-starved host still gets an answer. mcp connects anonymously (no
-    // noded.register), so this CLI line is its only version surface — the
-    // 2026-06-01 stale-binary case, where a sha + build_time would have
-    // made the staleness obvious.
+    // fd-starved host still gets an answer. Lazy native registration also
+    // publishes this build provenance when the first Bus tool is called.
     cosmix_buildinfo::exit_on_version!();
+    if std::env::args().nth(1).as_deref() == Some(mix_worker::WORKER_ARG) {
+        std::process::exit(mix_worker::main());
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -2954,8 +3069,8 @@ async fn async_main() {
         "cosmix-mcp starting (broker + indexd connections deferred until first tool call)"
     );
     let server = CosmixMcp {
-        noded: OnceCell::new(),
-        tool_router: CosmixMcp::tool_router(),
+        noded: connection::BrokerConnection::new(),
+        tool_router: CosmixMcp::tool_router() + CosmixMcp::native_tool_router(),
         metrics: Arc::new(Metrics::new()),
         term_pin: std::sync::Mutex::new(None),
     };
@@ -2987,9 +3102,15 @@ mod tests {
     #[test]
     fn term_type_without_term_list_is_refused() {
         let refusal: serde_json::Value =
-            serde_json::from_str(&super::term_type_request(bare_type(), None).unwrap_err()).unwrap();
+            serde_json::from_str(&super::term_type_request(bare_type(), None).unwrap_err())
+                .unwrap();
         assert_eq!(refusal["error_code"], "INVALID_ARGUMENT");
-        assert!(refusal["message"].as_str().unwrap().contains("call term_list first"));
+        assert!(
+            refusal["message"]
+                .as_str()
+                .unwrap()
+                .contains("call term_list first")
+        );
     }
 
     /// Case 2: the remembered pair is the default — its service AND instance.
@@ -2999,12 +3120,21 @@ mod tests {
         let remembered: Option<TermPin> = Some(("term", Some(77)));
         assert_eq!(
             term_type_request(bare_type(), remembered).unwrap(),
-            ("term", serde_json::json!({"text":"x","pane":3,"instance":77}))
+            (
+                "term",
+                serde_json::json!({"text":"x","pane":3,"instance":77})
+            )
         );
         // An explicit OTHER service does not inherit the remembered instance.
         assert_eq!(
-            term_type_request(TermTypeParams { service: Some("bterm".into()), ..bare_type() }, remembered)
-                .unwrap(),
+            term_type_request(
+                TermTypeParams {
+                    service: Some("bterm".into()),
+                    ..bare_type()
+                },
+                remembered
+            )
+            .unwrap(),
             ("bterm", serde_json::json!({"text":"x","pane":3}))
         );
     }
@@ -3020,8 +3150,14 @@ mod tests {
         let refusal: serde_json::Value =
             serde_json::from_str(restarted.strip_prefix("ERROR: ").unwrap()).unwrap();
         assert_eq!(refusal["error_code"], "INVALID_ARGUMENT");
-        assert_eq!(refusal["message"], "terminal restarted since term_list; call term_list again");
-        for other in ["DIAGNOSTIC synthetic keys queued tab=1 pane=3", "ERROR: not-found: pane id=3"] {
+        assert_eq!(
+            refusal["message"],
+            "terminal restarted since term_list; call term_list again"
+        );
+        for other in [
+            "DIAGNOSTIC synthetic keys queued tab=1 pane=3",
+            "ERROR: not-found: pane id=3",
+        ] {
             assert_eq!(term_type_outcome(other.into()), other);
         }
     }
@@ -3044,8 +3180,14 @@ mod tests {
             )
         };
         assert_eq!(typed(None, None).unwrap_err(), "pane or tab is required");
-        assert_eq!(typed(Some(3), None).unwrap(), ("bterm", serde_json::json!({"text":"hi\n","pane":3})));
-        assert_eq!(typed(None, Some(2)).unwrap(), ("bterm", serde_json::json!({"text":"hi\n","tab":2})));
+        assert_eq!(
+            typed(Some(3), None).unwrap(),
+            ("bterm", serde_json::json!({"text":"hi\n","pane":3}))
+        );
+        assert_eq!(
+            typed(None, Some(2)).unwrap(),
+            ("bterm", serde_json::json!({"text":"hi\n","tab":2}))
+        );
         assert_eq!(
             typed(Some(3), Some(2)).unwrap(),
             ("bterm", serde_json::json!({"text":"hi\n","pane":3,"tab":2}))
@@ -3069,7 +3211,10 @@ mod tests {
                     None
                 )
                 .unwrap(),
-                (service, serde_json::json!({"text":"x","pane":3,"instance":42}))
+                (
+                    service,
+                    serde_json::json!({"text":"x","pane":3,"instance":42})
+                )
             );
         }
         assert!(
@@ -3102,7 +3247,11 @@ mod tests {
             term_listing_instance(&rows(&[Some(9)]), &rows(&[Some(9), Some(9)])).unwrap(),
             9
         );
-        assert!(term_listing_instance(&rows(&[None]), &rows(&[None])).unwrap().is_null());
+        assert!(
+            term_listing_instance(&rows(&[None]), &rows(&[None]))
+                .unwrap()
+                .is_null()
+        );
         assert!(term_listing_instance(&rows(&[Some(9)]), &rows(&[Some(8)])).is_err());
         for (op, verb) in [
             ("new", "tab.new"),
@@ -3194,7 +3343,9 @@ mod tests {
         // term-core 0.8.0 appends the instance token; it survives exactly.
         let token = (1_u64 << 53) - 1;
         let tabs = term_listing(
-            &format!("id=1 active=true title=a b cols=80 rows=24 child_pid=1 revision=2 instance={token}"),
+            &format!(
+                "id=1 active=true title=a b cols=80 rows=24 child_pid=1 revision=2 instance={token}"
+            ),
             true,
         )
         .unwrap();
@@ -3238,7 +3389,10 @@ mod tests {
             ["bterm", "term"]
         );
         // Only the iced one.
-        assert_eq!(registered_term_services(&names(&["noded", "term"])), ["term"]);
+        assert_eq!(
+            registered_term_services(&names(&["noded", "term"])),
+            ["term"]
+        );
         // Only the Bevy one — today's state after the rename, before the
         // iced frontend ships.
         assert_eq!(
@@ -3281,8 +3435,10 @@ mod tests {
         // The handler blocks the serve runtime's pump, so the name stays
         // registered while INFO stops being answered — exactly the state a
         // registration-only resolver cannot see.
-        f.write_all(b"on wedge.hang desc \"block the pump\"\n  sleep(30)\n  reply(\"done\")\nend\n")
-            .unwrap();
+        f.write_all(
+            b"on wedge.hang desc \"block the pump\"\n  sleep(30)\n  reply(\"done\")\nend\n",
+        )
+        .unwrap();
         drop(f);
 
         // Unique per run: the name is a GLOBAL Bus registration, so a fixed
@@ -3318,7 +3474,11 @@ mod tests {
             // Wait for it to register and answer.
             let mut healthy = false;
             for _ in 0..40 {
-                if client.call(&service, "INFO", serde_json::Value::Null).await.is_ok() {
+                if client
+                    .call(&service, "INFO", serde_json::Value::Null)
+                    .await
+                    .is_ok()
+                {
                     healthy = true;
                     break;
                 }
@@ -3332,7 +3492,9 @@ mod tests {
             }
 
             // Wedge it, then probe.
-            let _ = client.send(&service, "wedge.hang", serde_json::Value::Null).await;
+            let _ = client
+                .send(&service, "wedge.hang", serde_json::Value::Null)
+                .await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             let start = std::time::Instant::now();
@@ -3341,7 +3503,9 @@ mod tests {
             let elapsed = start.elapsed();
 
             // The connection must still work for the NEXT candidate.
-            let after = client.call("noded", "noded.ping", serde_json::Value::Null).await;
+            let after = client
+                .call("noded", "noded.ping", serde_json::Value::Null)
+                .await;
             Some((wedged.is_err(), elapsed, after.is_ok()))
         });
 
@@ -3372,7 +3536,10 @@ mod tests {
     fn unresponsive_is_distinguishable_from_absent() {
         use super::*;
         let absent = term_no_frontend();
-        assert!(absent.contains("`term`") && absent.contains("`bterm`"), "{absent}");
+        assert!(
+            absent.contains("`term`") && absent.contains("`bterm`"),
+            "{absent}"
+        );
         // The message must state the order it will actually try, not a
         // hand-written guess at it. This is the assertion that was missing
         // while the string claimed `term` first and the list said otherwise.
@@ -3380,7 +3547,10 @@ mod tests {
             absent.contains(&TERM_SERVICES.map(|n| format!("`{n}`")).join(", then ")),
             "the error must name the frontends in TERM_SERVICES order: {absent}"
         );
-        assert!(absent.contains("not registered") || absent.contains("no CosMix terminal is registered"));
+        assert!(
+            absent.contains("not registered")
+                || absent.contains("no CosMix terminal is registered")
+        );
 
         let wedged_one = term_unresponsive(&["bterm"]);
         let wedged_both = term_unresponsive(&["term", "bterm"]);
@@ -3409,8 +3579,16 @@ mod tests {
         use super::*;
         for service in TERM_SERVICES {
             for suffix in [
-                "tabs", "panes", "snapshot", "type", "tab.new", "tab.select", "tab.close",
-                "pane.split", "pane.select", "pane.close",
+                "tabs",
+                "panes",
+                "snapshot",
+                "type",
+                "tab.new",
+                "tab.select",
+                "tab.close",
+                "pane.split",
+                "pane.select",
+                "pane.close",
             ] {
                 let verb = term_verb(service, suffix).unwrap();
                 assert_eq!(verb, format!("{service}.{suffix}"));

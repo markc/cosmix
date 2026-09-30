@@ -1,18 +1,44 @@
 # MCP tools
 
-`cosmix-mcp` exposes tools through the MCP `tools` capability. Parameter schemas are generated from the Rust request types. Unless noted otherwise, each tool returns text; JSON values are encoded as JSON text and operational failures begin with `ERROR:`.
+`cosmix-mcp` exposes tools through the MCP `tools` capability. Parameter schemas are generated from strict Rust request types. Successful results contain readable text and `structuredContent` matching the advertised `outputSchema`. Operational failures set `isError: true`. See [return conventions](README.md#return-conventions).
 
 ## Bus tools
 
 | Tool | Parameters | Description |
 |---|---|---|
-| `bus_call` | `to` string, `command` string, optional `args` string | Call a Bus command on a named service. `args` contains JSON text. Missing or invalid JSON becomes `null`. |
+| `bus_call` | `to` string, `command` string, optional `args` string | Call a native Bus command once. Missing `args` becomes `null`; malformed JSON is rejected before delivery. Application error results retain `rc` and message. |
 | `bus_list_services` | None | Return the broker service inventory, including available build provenance. |
 | `bus_node_info` | None | Call `noded.info` for node identity, broker build, uptime, and registered-service count. |
 | `bus_list_peers` | None | Call `noded.peers` and return the known mesh peers. |
 | `noded_ping` | None | Call `noded.ping` to check broker connectivity. |
 
-The broker connection is established on the first Bus-dependent call and retained for the process lifetime. A connection failure advises that `cosmix-noded` must be running.
+The registered broker connection is established lazily. A later request reconnects after a disconnected client; it never replays a failed command.
+
+## Terminal tools
+
+`term_list` returns `{service, instance, tabs, panes}` in both typed content and readable JSON. Rows retain native ids and dimensions; the two listing reads are sequential, not atomic. `term_snapshot` returns bounded screen observations. `term_type` requires a pane or tab and uses the last listed service/instance when omitted; without a listing it refuses. A restarted terminal refuses a stale instance. These compatibility tools retain the native terminal's diagnostic admission contract; registration and instance tokens are not authenticated authority.
+
+`term_tab` accepts `op: new|select|close` and an id for select/close. `term_pane` accepts `op: split|select|close`, a split direction, or a selection id. They retain the existing native behaviour.
+
+## Semantic application and compositor tools
+
+Every call requires an explicit `service`. The bridge does not resolve mutation targets by focus, title or caption. Results are `{service, command, result}`; the owning service defines the inner result.
+
+| Tool | Other arguments | Native command |
+|---|---|---|
+| `app_describe` | None | `app.describe` |
+| `app_controls_list` | None | `app.controls.list` |
+| `app_control_get` | `target` | `app.controls.get` |
+| `app_control_set` | `target`, JSON domain `value` | `app.controls.set` |
+| `app_control_wait` | `target`, expected `value`, `timeout_ms` | Poll `app.controls.get` every 250 ms, bounded by the requested timeout. |
+| `app_actions_list` | None | `actions.list` |
+| `app_action_invoke` | `id`, optional object `args` | `action.invoke` once |
+| `desktop_windows` | Optional `app_id`, `title`, `title_contains`, `visible`, `workspace` | `comp.windows.list` |
+| `desktop_window_wait` | `window: {id, generation}`, `until`, `timeout_ms` | `comp.window.wait` |
+
+Wait timeouts must be in `1..=55000` milliseconds. Window conditions are `mapped`, `visible`, `presented`, `focused`, `maximized`, `unmaximized`, `fullscreen`, `unfullscreen`, `unmapped` or `gone`. Generation identifies a surface role, not a compositor process incarnation. Window-list filters restrict observations only.
+
+CTK owns control type/range canonicalisation and disabled/busy checks. Its `applied` reply acknowledges local dispatch. Action `accepted` replies also acknowledge admission rather than downstream completion. Read or wait for a concrete observable value after acting. Control waits compare the exact native domain value; account for owner canonicalisation. Control metadata is not a full accessibility tree.
 
 Example tool arguments:
 
@@ -123,21 +149,21 @@ Superseding retains the old journal entry for audit and rollback but filters it 
 |---|---|---|
 | `mix_execute` | `script` string, optional `cwd` string | Parse and execute inline Mix source and return captured output. |
 
-The evaluator runs on a dedicated thread with JSON, regular expression, TOML, date and time, URL, and cryptographic facilities enabled.
+The evaluator runs in an owned Rust worker process with JSON, regular expression, TOML, date and time, URL, and cryptographic facilities enabled.
 
-If a broker connection is available, Mix `send`, `emit`, and `port_exists` route through Bus. A failed attempt to establish the broker does not prevent a script that does not require Bus from running.
+Mix `send`, `emit`, and `port_exists` lazily acquire a native Bus connection. A script that does not require Bus does not attempt to connect.
 
 `send` preserves Bus return-code bands. Transport failures remain Mix transport errors, while application replies retain their return codes. Values that cannot be encoded as JSON produce an error rather than a modified payload.
 
-`emit` is fire-and-forget. Payload encoding errors are reported; the send result itself is discarded.
+`emit` is fire-and-forget. Payload encoding and transport-send errors are reported; successful local sending does not prove delivery or application completion.
 
 `port_exists` obtains the current broker service list and returns false if that lookup fails.
 
 The MCP process does not deliver incoming events to long-lived Mix `on` handlers.
 
-When `cwd` begins with `~/`, the prefix is expanded from `HOME`. A directory change applies to the MCP process and therefore remains in effect for later operations.
+When `cwd` begins with `~/`, the prefix is expanded from `HOME`. Directory changes affect only that worker.
 
-Successful execution returns standard output. Empty output becomes `(no output)`. When standard error is present it follows a `--- stderr ---` separator. Parse and runtime failures include any output already produced.
+Structured results contain `result` (readable combined text), `stdout`, `stderr` and `exit_code`. Empty combined output is rendered as `(no output)`. Standard error follows a `--- stderr ---` separator in readable text. Runtime failures preserve captured output and mark the result as an error. Script and output bounds, worker cleanup and cancellation are described in the [server manual](README.md#mix-execution).
 
 ## Status tool
 
@@ -147,7 +173,7 @@ Successful execution returns standard output. Empty output becomes `(no output)`
 
 The recent-call queue retains at most 50 records, newest first. Each record contains the tool name, UTC timestamp, elapsed milliseconds, and success flag.
 
-`broker_connected` means that the lazy broker client has been initialised. It does not perform a fresh connectivity probe; use `noded_ping` for that.
+`broker_connected` reflects the cached native client's live state. It does not send a fresh probe; use `noded_ping` for that. The dedicated status schema exposes the metric fields directly.
 
 ## Recommended knowledge sequence
 

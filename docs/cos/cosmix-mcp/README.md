@@ -13,18 +13,18 @@ cosmix-mcp -V
 Example MCP registration:
 
 ```sh
-claude mcp add cosmix-mcp -- ~/.local/bin/cosmix-mcp
+claude mcp add cosmix-mcp -- /opt/cosmix/bin/cosmix-mcp
 ```
 
 ## Description
 
 The normal invocation starts an MCP server over standard input and standard output. The client owns the process lifetime; end-of-file or client disconnection ends the service.
 
-Broker access is anonymous and lazy. Startup does not contact `cosmix-noded`. The first broker-dependent tool initialises and retains the Bus client connection.
+Broker access is lazy. Startup does not contact `cosmix-noded`. The first broker-dependent tool registers a unique process-scoped `mcp-…` caller with build provenance. A new request reconnects after a dead connection; an in-flight command is never replayed.
 
-Knowledge and skill tools connect to `cosmix-indexd` when called. The server can therefore start before either backend is available. A failed connection is returned as an `ERROR:` string in the tool result.
+Knowledge and skill tools connect to `cosmix-indexd` when called. The server can therefore start before either backend is available. Operational failures return MCP tool results with `isError: true` and readable error text.
 
-`cosmix-mcp` does not register as a Bus service and does not host Bus verbs. It calls existing services through the broker and exposes those operations as MCP tools.
+Registration satisfies CTK's existing named-local-caller admission lane. It does **not** authenticate a principal or grant authority. Owning services retain admission and validation. The bridge exposes no application Bus verbs and refuses addressed commands. Tool annotations describe behaviour; they do not enforce permissions.
 
 ## Command-line interface
 
@@ -39,11 +39,14 @@ There are no subcommands and no crate-specific Cargo features.
 
 ## MCP tool groups
 
-The server publishes 23 tools.
+The server publishes Bus, terminal, semantic desktop, knowledge and execution tools.
 
 | Group | Tools |
 |---|---|
 | Bus | `bus_call`, `bus_list_services`, `bus_node_info`, `bus_list_peers`, `noded_ping` |
+| Terminal | `term_list`, `term_snapshot`, `term_type`, `term_tab`, `term_pane` |
+| Semantic applications | `app_describe`, `app_controls_list`, `app_control_get`, `app_control_set`, `app_control_wait`, `app_actions_list`, `app_action_invoke` |
+| Compositor observations | `desktop_windows`, `desktop_window_wait` |
 | Logs | `log_tail`, `log_search` |
 | Knowledge | `context_search`, `index_workspace`, `knowledge_digest`, `knowledge_brief` |
 | Feedback | `docs_feedback`, `journal_feedback`, `memory_feedback`, `journal_supersede` |
@@ -59,7 +62,7 @@ See [MCP tools](tools.md) for parameters, defaults, and return behaviour.
 
 The inventory path includes service build provenance where supplied by the broker. `bus_node_info` calls `noded.info`; peer and connectivity tools call `noded.peers` and `noded.ping`.
 
-The Mix evaluator also receives a Bus handler. Mix `send`, `emit`, and `port_exists` operations route through the same broker connection. Incoming long-lived `on` delivery is not supported.
+Each Mix worker receives a lazy native Bus handler. Mix `send`, `emit`, and `port_exists` operations use ABP through noded. Incoming long-lived `on` delivery is not supported. Communication between nodes retains the native noded-to-noded ABP path.
 
 ## Knowledge and skills
 
@@ -73,11 +76,11 @@ Feedback tools update retrieval scoring for document, journal, and memory chunks
 
 ## Mix execution
 
-`mix_execute` parses and evaluates inline Mix source on a dedicated thread. The crate enables Mix support for JSON, regular expressions, TOML, date and time values, URLs, and cryptography.
+`mix_execute` parses and evaluates inline Mix source in an owned Rust subprocess of the same binary, with a current-thread Tokio runtime. The crate enables Mix support for JSON, regular expressions, TOML, date and time values, URLs, and cryptography. Local scripts do not connect to the broker.
 
-The tool captures standard output and standard error and returns both as text. Parse, evaluation, working-directory, and task failures are returned with an `ERROR:` prefix.
+The worker isolates process cwd and inherited stdio from the MCP transport. Results include readable text and typed `stdout`, `stderr` and `exit_code`. Scripts are limited to 256 KiB; captured output and each worker pipe are bounded to 1 MiB. Limit failures report that effects may already have occurred.
 
-An optional working directory may be supplied. A leading `~/` is expanded from `HOME`.
+An optional working directory may be supplied. A leading `~/` is expanded from `HOME`. Directory changes affect only that worker. Completion or cancellation terminates its owned process group, including descendants; persistent application lifetimes belong to their native service. This is process ownership, not a security sandbox.
 
 ## Configuration
 
@@ -85,7 +88,7 @@ The crate defines no standalone configuration file or command-line configuration
 
 | Surface | Use |
 |---|---|
-| Shared client configuration | Resolves the anonymous default broker connection. |
+| Shared client configuration | Resolves the native default broker connection. |
 | Shared index configuration | Resolves the `cosmix-indexd` client. |
 | `knowledge` settings | Supply search trust weights and journal ageing policy. |
 | `skills` settings | Supply retrieval limits, refinement backend, and skill lifecycle policy. |
@@ -111,7 +114,7 @@ Setting `RUST_LOG=cosmix_mcp=trace` enables full request arguments. This can exp
 `mcp_status` returns:
 
 - process start time and uptime;
-- whether the lazy broker connection has been initialised;
+- whether the cached native client is currently connected;
 - total and failed tool-call counts;
 - counts by tool name;
 - the newest retained call records, including timestamp, duration, and outcome.
@@ -120,11 +123,19 @@ The status data is process-local and resets when the MCP server restarts.
 
 ## Return conventions
 
-Tools return text. Structured broker and index responses are serialised as JSON text where applicable.
+Every tool advertises an `outputSchema` and descriptive annotations. Successful results contain `structuredContent` alongside readable text. `term_list`, `mcp_status`, Mix execution and semantic desktop tools have dedicated schemas; legacy text tools retain their text and add a `{ "result": … }` envelope. Owning-service payloads remain JSON values inside the relevant envelope.
 
-Most runtime failures are returned in-band with an `ERROR:` prefix. MCP parameter-deserialisation and routing failures remain protocol-level tool errors.
+Operational and parameter-validation failures use `isError: true`; unknown-tool routing remains a protocol error. Observed log or terminal text beginning with `ERROR:` remains data. Generic `bus_call` preserves native application return codes and messages.
 
-`bus_call` treats an absent or invalid JSON argument string as JSON `null`.
+`bus_call` treats an absent argument string as JSON `null` and rejects malformed JSON before connecting or delivering anything. Request structures reject unknown fields.
+
+When a client supplies a progress token, the bridge sends correlated, increasing receipt and finish notifications. These report request lifecycle, not a percentage of native work completed.
+
+Cancellation or timeout stops waiting for a native reply; it does not undo delivered work. Outcomes can be unknown. Never blindly retry typing, actions, clipboard writes or other mutations. Mix cancellation terminates owned local work but cannot reverse completed filesystem or Bus effects. Existing non-transactional knowledge pipelines and feedback operations retain their completion policy on client cancellation; they need owning-service transaction or idempotency support before safe interruption.
+
+## Native acceptance and remaining desktop facilities
+
+See [native acceptance](native-acceptance.md) for the real stdio MCP harness, CTK control probe and the remaining owning-component acceptance tests. Screenshot delivery, a complete accessibility tree and clipboard-based Unicode fallback require native contracts; this bridge does not substitute KWin internals, a Python sidecar or another control transport.
 
 ## Build dependencies
 
