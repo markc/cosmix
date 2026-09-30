@@ -130,3 +130,34 @@ fn missing_args_are_not_mislabeled_as_surplus() {
         "missing is not surplus: {stderr}"
     );
 }
+
+#[test]
+fn script_file_mode_flips_with_the_default_and_the_hatch() {
+    // The flip covers the FILE mode too, not just -c: a script with a
+    // surplus user-function call raises by default and runs under
+    // --compat-arity.
+    let dir = std::env::temp_dir().join(format!("mix-flip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+    let script = dir.join("probe.mix");
+    std::fs::write(&script, "fn f($x) return 1 end\nprint(f(1, 2))\n").expect("write script");
+    let out = mix_bin()
+        .env_remove("MIX_STRICT_ARITY")
+        .arg(script.to_str().unwrap())
+        .output()
+        .expect("run script");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "strict default applies to files: {stderr}");
+    assert!(stderr.contains("expected 1 argument(s), got 2"), "got: {stderr}");
+    let ok = mix_bin()
+        .env_remove("MIX_STRICT_ARITY")
+        .arg("--compat-arity")
+        .arg(script.to_str().unwrap())
+        .output()
+        .expect("run script compat");
+    assert!(
+        ok.status.success(),
+        "--compat-arity applies to files: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

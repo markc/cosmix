@@ -151,12 +151,15 @@ Since 0.29.0 that tolerance is a **mode**: strict arity raises a catchable `ARIT
 Since 0.102.8, the compatible mode stops being *silent* about the builtin
 surplus: a metadata-builtin call with an extra argument prints one stderr
 warning per (builtin, count) per process — `mix: warning: pop() called with
-2 argument(s), contract is pop(list) -> any — the surplus is ignored for now
-and will become an error in the next minor release`. A missing argument
-binds nil as ever, and the always-strict families (above) keep raising in
-every mode. Operator-facing equivalents of the flag are `MIX_STRICT_ARITY=1`,
-`$strict_arity = true` in `~/.mixrc`, and `ssh_mix(host, src, {strict_arity:
-true})` (0.102.7 — see [invocation](invocation.md)).
+2 argument(s), contract is pop(list) -> any — the surplus is ignored under
+--compat-arity and is an error in strict mode (the default since 0.103.0)`.
+A missing argument binds nil as ever, and the always-strict families (above)
+keep raising in every mode. Operator-facing equivalents of the flag are
+`MIX_STRICT_ARITY=1`, `$strict_arity = true` in `~/.mixrc`, and
+`ssh_mix(host, src, {strict_arity: true})` — with the flip these are
+explicit opt-ins over an already-strict default; the remote escape hatch is
+`ssh_mix(host, src, {strict_arity: false})` (0.102.7 — see
+[invocation](invocation.md)).
 
 > **A keyword can't be a function name.** `function step(...)` and `fn to(...)` are parse errors (`expected identifier, got Step`) — and that includes non-obvious [reserved words](keywords.md) like `step`, `to`, `label`. Pick `phase`, `say_step`, etc. `$`-sigil *variable* and *parameter* names are unaffected — the sigil disambiguates, so `$step = 1` and `function f($to)` both work.
 

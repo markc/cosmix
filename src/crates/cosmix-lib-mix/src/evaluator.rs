@@ -13959,7 +13959,8 @@ impl Evaluator {
         drop(seen);
         eprintln!(
             "mix: warning: {name}() called with {n} argument(s), contract is {} — the \
-             surplus is ignored for now and will become an error in the next minor release",
+             surplus is ignored under --compat-arity and is an error in strict mode \
+             (the default since 0.103.0)",
             info.signature()
         );
     }

@@ -111,7 +111,7 @@ $SETTINGS = $CONF["settings"]
 -- worker can be launched as the webd account before any write is attempted.
 $preflight = ssh_mix($ADDRESS, '
 if not is_file($db_path) then
-  raise("ESCHEMA",  .. " does not exist yet — warm the site once to create the schema, then re-run")
+  raise("ESCHEMA", $db_path .. " does not exist yet — warm the site once to create the schema, then re-run")
 end
 $uid = trim(run("id -u cosmix-webd"))
 if $rc != 0 or not re_match($uid, "^[0-9]+$") then
