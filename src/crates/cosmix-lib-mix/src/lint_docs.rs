@@ -93,6 +93,11 @@ pub const LINT_DOCS: &[LintDoc] = &[
         detail: "A bareword call that resolves against nothing: not a builtin, HOF, evaluator special form, `function` definition in the file, the embedded prelude, an `--allow-function` name, or an assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside `address … end` blocks are sends and never flagged; `MethodCall`/`ValueCall` are dynamic dispatch and skipped. A deleted legacy name (e.g. `grep`) gets this AND its MIX-D30xx rename pointer. The hint carries the same \"did you mean\" the runtime prints for that name (one shared suggester): deleted-name pointers first, then a foreign-name synonym table (`json_decode`/`json_loads` → `json_parse`, `str` → `to_string`, `trim_end`/`rstrip` → `rtrim`, `len_bytes` → `byte_length`, …), then edit distance — so `json_decode` suggests `json_parse`, not its nearest-spelled opposite `json_encode`.",
     },
     LintDoc {
+        code: "MIX-E1203",
+        summary: "literal argument contradicts the builtin's contract type",
+        detail: "`mkdir({a:1})`, `exists([1,2])`, `len(3)` — a literal whose type cannot satisfy the contract's declared shape. The runtime raises TYPE_MISMATCH on the same call (0.103.1), so this makes the lint agree with the runtime instead of letting the script crash mid-run; a wrong-typed path/target literal is a side effect on the wrong target. Variables and expressions are not judged — only a literal proves the type.",
+    },
+    LintDoc {
         code: "MIX-E1201",
         summary: "builtin arity mismatch",
         detail: "A builtin call outside its documented arity, checked against the structured contract metadata (`mix builtins --json`), including non-contiguous exact-arity sets — `random(1)` is an error, `random()`/`random(min, max)` are not. The contract is the documented surface; some older builtins tolerate surplus arguments at runtime, and lint is deliberately stricter (`mix --strict-arity` makes the runtime agree).",
