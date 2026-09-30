@@ -2549,7 +2549,15 @@ fn build_num_program(
     expr: &Expr,
     cache: &[(*const str, *const f64)],
     out: &mut Vec<NumOpcode>,
+    nesting: usize,
 ) -> Option<usize> {
+    // 2026-09-24 entry: bound the build walk's own recursion — a
+    // left-nested operator chain (which parses iteratively, no parser
+    // depth) builds a tree this walk would otherwise traverse to native
+    // stack exhaustion before any evaluator guard runs.
+    if nesting > MAX_EXPR_DEPTH {
+        return None;
+    }
     match expr {
         Expr::NumberLiteral(n) => {
             out.push(NumOpcode::PushConst(*n));
@@ -2567,7 +2575,7 @@ fn build_num_program(
             None
         }
         Expr::BinaryOp { left, op, right } => {
-            let left_depth = build_num_program(left, cache, out)?;
+            let left_depth = build_num_program(left, cache, out, nesting + 1)?;
             // Try to fuse `<left> <op> <const_or_var>` into a single opcode
             // by emitting the right side's atom into the BinOp itself rather
             // than as a separate Push. Saves one dispatch + one stack
@@ -2620,7 +2628,7 @@ fn build_num_program(
             }
             // The right side evaluates with the left's result still live
             // on the stack, hence the `1 +`.
-            let right_depth = build_num_program(right, cache, out)?;
+            let right_depth = build_num_program(right, cache, out, nesting + 1)?;
             out.push(match op {
                 BinOp::Add => NumOpcode::Add,
                 BinOp::Sub => NumOpcode::Sub,
@@ -3066,6 +3074,32 @@ impl Default for EvalLimits {
 /// a left-associative operator chain parses iteratively but still
 /// builds a deep tree, so this walk carries its own cap.
 pub const MAX_EXPR_DEPTH: usize = 256;
+
+/// Decrements a recursion-depth counter on drop — the async `eval_expr`
+/// has many early `return`s, so a manual decrement-at-the-end would leak
+/// the increment past any of them. The raw pointer borrows nothing, so the
+/// async body can keep using `self` while the guard is live; the pointer
+/// is valid because `self.ctx` outlives the boxed future.
+struct ExprDepthGuard(*mut usize);
+
+impl ExprDepthGuard {
+    unsafe fn enter(depth: *mut usize) -> Self {
+        // SAFETY: the caller passes a pointer into `self.ctx.expr_depth`,
+        // which outlives the guard.
+        unsafe {
+            *depth += 1;
+        }
+        ExprDepthGuard(depth)
+    }
+}
+
+impl Drop for ExprDepthGuard {
+    fn drop(&mut self) {
+        // SAFETY: the pointer was taken from `self.ctx.expr_depth`, which
+        // lives as long as the evaluator that owns the boxed future.
+        unsafe { *self.0 -= 1; }
+    }
+}
 
 /// Builtins denied BY NAME in expression mode: each blocks on
 /// wall-clock or host input, and the mode's fuel premise — cost bounded
@@ -4138,6 +4172,11 @@ pub(crate) struct InvocationCtx {
     /// frame injection was overwritten by the local assignment). Popped
     /// on function leave, mirroring the frame lifecycle.
     pub(crate) module_fn_frames: Vec<std::collections::HashMap<String, Rc<MixFunction>>>,
+    /// Sync (try_eval_expr_sync / try_eval_expr_num) recursion depth —
+    /// the AST fallback walks a right-nested expression tree with no
+    /// bound, overflowing the native stack. This counter turns that into
+    /// a NESTING_LIMIT error past [`MAX_EXPR_DEPTH`] (2026-09-24 entry).
+    pub(crate) expr_depth: usize,
 }
 
 impl InvocationCtx {
@@ -4163,6 +4202,7 @@ impl InvocationCtx {
             max_string_len: None,
             require_stack: Vec::new(),
             module_fn_frames: Vec::new(),
+            expr_depth: 0,
         }
     }
 
@@ -7905,6 +7945,7 @@ impl Evaluator {
                                         assign_value,
                                         &self.ctx.var_slot_cache_f64,
                                         &mut prog,
+                                        0,
                                     )
                                     .is_some_and(|depth| depth <= NUM_STACK_SLOTS);
                                     i += step_val;
@@ -9027,7 +9068,28 @@ impl Evaluator {
     /// the sync path can't handle (function calls, short-circuit ops,
     /// strings/lists/maps that need allocation handling, etc.) — caller
     /// then falls back to the async `eval_expr`.
+    /// Sync expression evaluation with a recursion-depth bound. The AST
+    /// fallback walks a right-nested tree synchronously; without this the
+    /// native stack grows unbounded (2026-09-24 entry). Raises NESTING_LIMIT
+    /// past [`MAX_EXPR_DEPTH`].
     fn try_eval_expr_sync(&mut self, expr: &Expr) -> Option<MixResult<Value>> {
+        self.ctx.expr_depth += 1;
+        if self.ctx.expr_depth > MAX_EXPR_DEPTH {
+            self.ctx.expr_depth -= 1;
+            return Some(Err(MixError::structured(
+                "NESTING_LIMIT",
+                format!(
+                    "expression nesting exceeds MAX_EXPR_DEPTH ({MAX_EXPR_DEPTH}); \
+                     the AST fallback would overflow the native stack"
+                ),
+            )));
+        }
+        let r = self.try_eval_expr_sync_inner(expr);
+        self.ctx.expr_depth -= 1;
+        r
+    }
+
+    fn try_eval_expr_sync_inner(&mut self, expr: &Expr) -> Option<MixResult<Value>> {
         match expr {
             Expr::NumberLiteral(n) => Some(Ok(Value::Number(*n))),
             Expr::StringLiteral(s) | Expr::EscapedQuoteStringLiteral(s) => {
@@ -9050,7 +9112,14 @@ impl Evaluator {
                             // A coalescing default (`?? / ?:`) may need to parse
                             // and evaluate an expression — that lives on the
                             // async path, so defer the whole interpolation.
-                            if coalesce.is_some() {
+                            // An index/call suffix (`${a[0]}`, `${f()}`) is
+                            // async-only too (the sync walker reads a plain
+                            // dotted name); defer rather than misread it.
+                            if coalesce.is_some()
+                                || path
+                                    .bytes()
+                                    .any(|b| matches!(b, b'[' | b']' | b'(' | b')'))
+                            {
                                 return None;
                             }
                             let mut parts_iter = path.split('.');
@@ -9483,7 +9552,28 @@ impl Evaluator {
         }
     }
 
+    /// Numeric sync evaluation with a recursion-depth bound — the same
+    /// [`MAX_EXPR_DEPTH`] guard as [`Self::try_eval_expr_sync`], so the
+    /// fib/for-loop AST fallback raises NESTING_LIMIT instead of
+    /// overflowing the native stack.
     fn try_eval_expr_num(&mut self, expr: &Expr) -> Option<MixResult<f64>> {
+        self.ctx.expr_depth += 1;
+        if self.ctx.expr_depth > MAX_EXPR_DEPTH {
+            self.ctx.expr_depth -= 1;
+            return Some(Err(MixError::structured(
+                "NESTING_LIMIT",
+                format!(
+                    "expression nesting exceeds MAX_EXPR_DEPTH ({MAX_EXPR_DEPTH}); \
+                     the AST fallback would overflow the native stack"
+                ),
+            )));
+        }
+        let r = self.try_eval_expr_num_inner(expr);
+        self.ctx.expr_depth -= 1;
+        r
+    }
+
+    fn try_eval_expr_num_inner(&mut self, expr: &Expr) -> Option<MixResult<f64>> {
         match expr {
             Expr::NumberLiteral(n) => Some(Ok(*n)),
             Expr::Variable(name) => {
@@ -9909,7 +9999,16 @@ impl Evaluator {
             Expr::InterpolatedString(parts) | Expr::Heredoc(parts) => {
                 parts.iter().all(|p| match p {
                     StringPart::Literal(_) | StringPart::EnvVar(_) => true,
-                    StringPart::Variable(spec) => split_interp_coalesce(spec).1.is_none(),
+                    // Sync only when the spec is a plain dotted name — a
+                    // coalescing default or an index/call suffix (${a[0]},
+                    // ${f()}) needs the async resolver.
+                    StringPart::Variable(spec) => {
+                        let (path, coalesce) = split_interp_coalesce(spec);
+                        coalesce.is_none()
+                            && !path
+                                .bytes()
+                                .any(|b| matches!(b, b'[' | b']' | b'(' | b')'))
+                    }
                     _ => false,
                 })
             }
@@ -10985,14 +11084,14 @@ impl Evaluator {
         // operand evaluates with the left's result live on the stack
         // (hence `1 +`); the JZ pops both, so the then/else branches
         // start back at depth 0.
-        let cmp_l_depth = Self::compile_fib_arith(cmp_l, name, arity, &param_names, &mut prog)?;
-        let cmp_r_depth = Self::compile_fib_arith(cmp_r, name, arity, &param_names, &mut prog)?;
+        let cmp_l_depth = Self::compile_fib_arith(cmp_l, name, arity, &param_names, &mut prog, 0)?;
+        let cmp_r_depth = Self::compile_fib_arith(cmp_r, name, arity, &param_names, &mut prog, 0)?;
         // Reserve the comparison-jump opcode; we'll patch the target
         // once we know where the else-branch starts.
         let cmp_jump_idx = prog.len();
         prog.push(FibOp::Jump(0)); // placeholder, replaced below
         // Then-branch: evaluate then_expr, return.
-        let then_depth = Self::compile_fib_arith(then_expr, name, arity, &param_names, &mut prog)?;
+        let then_depth = Self::compile_fib_arith(then_expr, name, arity, &param_names, &mut prog, 0)?;
         prog.push(FibOp::Ret);
         // Patch the comparison-jump target to land here (start of else).
         let else_target: u16 = prog.len().try_into().ok()?;
@@ -11006,7 +11105,7 @@ impl Evaluator {
             _ => return None,
         };
         // Else-branch: evaluate else_expr, return.
-        let else_depth = Self::compile_fib_arith(else_expr, name, arity, &param_names, &mut prog)?;
+        let else_depth = Self::compile_fib_arith(else_expr, name, arity, &param_names, &mut prog, 0)?;
         prog.push(FibOp::Ret);
         // `eval_fib_program` runs on a fixed [f64; NUM_STACK_SLOTS]
         // operand stack; refuse any program that would index past it.
@@ -11036,7 +11135,13 @@ impl Evaluator {
         self_arity: u8,
         param_names: &[&str],
         out: &mut Vec<FibOp>,
+        nesting: usize,
     ) -> Option<usize> {
+        // 2026-09-24 entry: bound the fib-compile walk's own recursion —
+        // the same left-nested-chain overflow as `build_num_program`.
+        if nesting > MAX_EXPR_DEPTH {
+            return None;
+        }
         match expr {
             Expr::NumberLiteral(n) => {
                 out.push(FibOp::PushConst(*n));
@@ -11049,9 +11154,9 @@ impl Evaluator {
             }
             Expr::BinaryOp { left, op, right } => {
                 let left_depth =
-                    Self::compile_fib_arith(left, self_name, self_arity, param_names, out)?;
+                    Self::compile_fib_arith(left, self_name, self_arity, param_names, out, nesting + 1)?;
                 let right_depth =
-                    Self::compile_fib_arith(right, self_name, self_arity, param_names, out)?;
+                    Self::compile_fib_arith(right, self_name, self_arity, param_names, out, nesting + 1)?;
                 out.push(match op {
                     BinOp::Add => FibOp::Add,
                     BinOp::Sub => FibOp::Sub,
@@ -11070,7 +11175,7 @@ impl Evaluator {
                 // Arg i evaluates with the previous i results live.
                 let mut depth = 1; // the CallSelf result
                 for (i, arg) in args.iter().enumerate() {
-                    let d = Self::compile_fib_arith(arg, self_name, self_arity, param_names, out)?;
+                    let d = Self::compile_fib_arith(arg, self_name, self_arity, param_names, out, nesting + 1)?;
                     depth = depth.max(i + d);
                 }
                 out.push(FibOp::CallSelf(self_arity));
@@ -11233,6 +11338,33 @@ impl Evaluator {
         expr: &'a Expr,
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            // 2026-09-24 entry: bound the AST fallback's recursion depth —
+            // a deep right/left-nested expression that the bytecode builder
+            // refuses would otherwise recurse `eval_expr` unboundedly and
+            // overflow the native stack (a serve citizen on a 2 MiB runtime
+            // thread SIGSEGVs). The guard decrements on every exit path.
+            let _depth_guard =
+                unsafe { ExprDepthGuard::enter(&mut self.ctx.expr_depth) };
+            if self.ctx.expr_depth > MAX_EXPR_DEPTH {
+                return Err(MixError::structured(
+                    "NESTING_LIMIT",
+                    format!(
+                        "expression nesting exceeds MAX_EXPR_DEPTH ({MAX_EXPR_DEPTH}); \
+                         the AST fallback would overflow the native stack"
+                    ),
+                ));
+            }
+            // Delegate sync-classified expressions to the small-frame sync
+            // evaluator. A deep pure-arithmetic sub-expression would
+            // otherwise recurse THIS (async, huge-in-debug) `eval_expr`
+            // and overflow the native stack at ~20 levels; the sync path's
+            // frames are tiny and its depth is capped, so the async
+            // recursion stays bounded by the non-sync (call) nesting.
+            if Self::is_expr_sync(expr)
+                && let Some(r) = self.try_eval_expr_sync(expr)
+            {
+                return r;
+            }
             if let Some(limit) = self.ctx.time_limit {
                 let deadline = *self
                     .ctx
