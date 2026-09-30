@@ -26,24 +26,26 @@ async fn run(src: &str, strict: bool) -> Result<String, String> {
 #[tokio::test]
 async fn critical_class_types_gate_in_every_mode() {
     // exists(path: string) — FsRead — gates in BOTH modes: a number path
-    // is a probe on the wrong target.
+    // is a probe on the wrong target. The TYPE_MISMATCH code rides the
+    // structured error (catch $m, $e → $e.code); the plain message names
+    // the argument, the shape and the actual type.
     for strict in [false, true] {
         let err = run("print(exists(42))", strict)
             .await
             .expect_err("number path must raise");
-        assert!(err.contains("TYPE_MISMATCH"), "mode {strict}: got: {err}");
         assert!(err.contains("must be string"), "mode {strict}: got: {err}");
+        assert!(err.contains("got number"), "mode {strict}: got: {err}");
     }
 }
 
 #[tokio::test]
 async fn pure_builtin_types_gate_only_under_strict_mode() {
-    // len(list) — Pure — gates under strict mode only in this first
+    // len(v) — Pure — gates under strict mode only in this first
     // release; the compatible mode keeps whatever len(3) used to do.
     let err = run("print(len(3))", true)
         .await
         .expect_err("strict mode gates pure types");
-    assert!(err.contains("TYPE_MISMATCH"), "got: {err}");
+    assert!(err.contains("must be string | list | map | bytes | buffer"), "got: {err}");
     run("print(len(3))", false).await.expect("compat mode leaves pure types alone");
 }
 
